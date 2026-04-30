@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Explore Manager节点 -->
+
+  
+  <node name="explore_manager" pkg="explore_pkg" type="explore_manager_node" output="screen" respawn="true">
+    <!-- 加载Explore Manager配置文件 -->
+    <rosparam file="$(find explore_pkg)/config/explore_manager_params.yaml" command="load" />
+    
+    <!-- 加载Exploration Planner配置文件 -->
+    <rosparam file="$(find explore_pkg)/config/exploration_planner_params.yaml" command="load" />
+
+    
+    <!-- 目标描述参数（如果为空字符串，则进行通用探索） -->
+    <param name="target_description" value=""/>
+  </node>
+</launch>

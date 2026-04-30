@@ -1,0 +1,7 @@
+<launch>
+  <!-- RViz可视化 -->
+  <node name="rviz2" pkg="rviz" type="rviz" args="-d $(find semantic_mapping_pkg)/config/semantic_mapping.rviz" respawn="true">
+    <env name="QT_X11_NO_MITSHM" value="1"/>
+  </node>
+</launch>
+

@@ -1,0 +1,43 @@
+<launch>
+  <!-- 统一系统启动文件，按照5、4、1的顺序启动 -->
+  <!-- 5: explore_manager (包含在habitat_sim中) -->
+  <!-- 4: struct_mapping (gmapping) -->
+  <!-- 1: semantic_mapping -->
+  <!-- 注意：new_move.launch (3) 在nav-master工作空间，需要在启动脚本中单独启动 -->
+  
+  <!-- 参数配置 -->
+  <arg name="config_file" default="$(find semantic_mapping_pkg)/config/default.yaml"/>
+  <arg name="blip_mode" default="client" doc="BLIP节点模式: client（客户端版本）或 mock（模拟版本）"/>
+  
+  <!-- 统一加载配置文件（只加载一次，避免重复） -->
+  <rosparam file="$(arg config_file)" command="load"/>
+  
+  <!-- 加载场景类型映射配置 -->
+  <rosparam file="$(find semantic_mapping_pkg)/config/scene_type_mapping.yaml" command="load"/>
+  
+  <!-- ========== 第一阶段：Habitat (5) ========== -->
+  <!-- 注意：habitat_sim.launch需要conda环境habitat，需要在启动脚本中处理 -->
+  <include file="$(find habitat_pkg)/launch/habitat_sim.launch" >
+  </include>
+  <!-- ========== 第二阶段：Explore Manager (5) ========== -->
+  <include file="$(find explore_pkg)/launch/explore_manager.launch">
+  </include>  
+  <!-- ========== 第三阶段：Struct Mapping (4) ========== -->
+  <include file="$(find struct_mapping_pkg)/launch/struct_mapping.launch">
+  </include>
+  
+  <!-- ========== BLIP节点 ========== -->
+  <include file="$(find semantic_mapping_pkg)/launch/blip_node.launch">
+    <arg name="blip_mode" value="$(arg blip_mode)"/>
+  </include>
+  
+  <!-- ========== 第四阶段：Semantic Mapping (1) ========== -->
+  <include file="$(find semantic_mapping_pkg)/launch/semantic_mapping.launch">
+  </include>
+  
+  <!-- ========== RViz可视化 ========== -->
+  <include file="$(find semantic_mapping_pkg)/launch/rviz.launch">
+  </include>
+  
+</launch>
+

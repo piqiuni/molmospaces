@@ -1,0 +1,53 @@
+# 地图更新间隔
+map_update_interval: 0.5
+
+# GMapping核心参数
+maxUrange: 16.0 #激光扫描最大距离
+sigma: 0.05
+kernelSize: 1
+lstep: 0.05
+astep: 0.05
+iterations: 5
+lsigma: 0.075
+ogain: 3.0 #新测量的权重
+lskip: 1 #跳过某些激光束
+
+# 运动模型参数（仿真里程计精准，大幅降低噪声）
+srr: 0.001  # 平移→平移噪声，原0.2降至0.01
+srt: 0.002  # 平移→旋转噪声，原0.4降至0.02  
+str: 0.001  # 旋转→平移噪声，原0.2降至0.01
+stt: 0.002  # 旋转→旋转噪声，原0.4降至0.02
+
+# 地图更新阈值
+linearUpdate: 0.5
+angularUpdate: 0.2
+temporalUpdate: 1.0
+resampleThreshold: 0.5
+
+# 粒子滤波参数（里程计准确时可以用更少粒子）
+particles: 10   # 原30，减少到10节省计算
+
+# 地图范围
+xmin: -50.0
+ymin: -50.0
+xmax: 50.0
+ymax: 50.0
+#分辨率
+delta: 0.1 
+
+# 采样参数
+llsamplerange: 0.01
+llsamplestep: 0.01
+lasamplerange: 0.005
+lasamplestep: 0.005
+
+# 点云高度滤波参数
+enable_height_filter: true
+filter_height_center: 1
+filter_height_tolerance: 0.9
+
+# 障碍物膨胀参数
+enable_obstacle_inflation: true
+inflation_radius: 0.05  # 膨胀半径（米），通常设置为机器人半径
+inscribed_radius: 0.1  # 内切半径（米），障碍物核心区域
+

@@ -5,7 +5,7 @@ from pathlib import Path
 
 def get_args():
     parser = argparse.ArgumentParser()
-    subparser = parser.add_subparsers(
+    subparser = parser.add_subparls sers(
         dest="asset_type", help="Type of asset to fetch.", required=True
     )
 

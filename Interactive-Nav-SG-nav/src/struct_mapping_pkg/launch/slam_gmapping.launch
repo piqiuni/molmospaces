@@ -1,0 +1,23 @@
+<launch>
+
+    <param name="use_sim_time" value="false"/>
+    
+    <!-- 发布静态TF: base_link -> lidar -->
+    <node pkg="tf" type="static_transform_publisher" name="base_to_lidar_broadcaster"
+          args="0 0 0 0 0 0 tf_frame_base_link tf_frame_lidar 100" />
+    
+    <!-- 发布静态TF: base_link -> camera (RGB相机，habitat_pkg中位于agent上方1.5m，base_link在agent底部0.5m，所以z=1.0m) -->
+    <!--node pkg="tf" type="static_transform_publisher" name="base_to_camera_broadcaster"
+          args="0 0 1.0 0 0 0 tf_frame_base_link tf_frame_camera 100" /-->
+
+    <node pkg="struct_mapping_pkg" type="slam_gmapping" name="slam_gmapping" output="screen">
+      <rosparam command="load" file="$(find struct_mapping_pkg)/config/slam_gmapping_params.yaml" />
+    </node>
+
+    <!-- Voronoi Mapping Node -->
+    <node pkg="struct_mapping_pkg" type="voronoi_mapping_node" name="voronoi_mapping" respawn="true">
+        <!-- 加载参数配置 -->
+        <rosparam command="load" file="$(find struct_mapping_pkg)/config/voronoi_params.yaml" />
+    </node>
+
+</launch>

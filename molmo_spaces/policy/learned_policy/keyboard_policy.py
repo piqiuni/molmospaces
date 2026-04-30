@@ -38,6 +38,10 @@ class Keyboard_Policy(InferencePolicy):
             "Space: toggle gripper. q: pause."
         )
 
+    def prepare_model(self, model_name: str = "") -> None:
+        # Keyboard teleop has no learned weights to initialize.
+        return None
+
     def _on_press(self, key):
         self._pressed.add(key)
         if key == keyboard.Key.space:

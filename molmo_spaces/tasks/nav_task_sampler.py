@@ -62,14 +62,16 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
         # Generate occupancy map ONCE per house (for A* planner)
         import gc
 
-        from molmo_spaces.utils.scene_maps import ProcTHORMap
+        from molmo_spaces.utils.scene_maps import ProcTHORMap, iTHORMap
 
         if self._cached_thormap is not None:
             del self._cached_thormap
             gc.collect()
 
         log.info(f"Generating occupancy map for house {self.current_house_index}")
-        self._cached_thormap = ProcTHORMap.from_mj_model_path(
+        scene_dataset = str(getattr(self.config, "scene_dataset", "")).lower()
+        map_cls = iTHORMap if "ithor" in scene_dataset else ProcTHORMap
+        self._cached_thormap = map_cls.from_mj_model_path(
             model_path=env.current_model_path,
             agent_radius=self.config.task_sampler_config.robot_safety_radius,
             px_per_m=200,
@@ -186,11 +188,14 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
                 ]
 
                 if len(same_type_candidates) > self.config.task_sampler_config.max_valid_candidates:
+                    max_candidates = self.config.task_sampler_config.max_valid_candidates
                     log.info(
-                        f"Skipping {pickup_obj_type} with {len(same_type_candidates)} instances in scene."
+                        f"Capping {pickup_obj_type} candidates from {len(same_type_candidates)} to {max_candidates}."
                     )
-                    excluded_types.add(pickup_obj_type)
-                    continue
+                    # Keep selected instance and sample the rest to limit ambiguity.
+                    remaining = [n for n in same_type_candidates if n != selected_obj.name]
+                    np.random.shuffle(remaining)
+                    same_type_candidates = [selected_obj.name] + remaining[: max_candidates - 1]
 
                 # Set the instance name and store all candidates
                 self.config.task_config.pickup_obj_name = selected_obj.name

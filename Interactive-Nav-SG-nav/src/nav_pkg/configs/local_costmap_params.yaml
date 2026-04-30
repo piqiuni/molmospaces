@@ -1,0 +1,12 @@
+local_costmap:
+   global_frame: tf_frame_odom
+   robot_base_frame: tf_frame_base_link
+   static_map: false
+   rolling_window: true
+   width: 4.0
+   height: 4.0
+   update_frequency: 10.0
+   publish_frequency: 10.0
+   transform_tolerance: 2.0
+   resolution: 0.05
+   

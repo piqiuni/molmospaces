@@ -1,0 +1,35 @@
+<launch>
+  <!-- 场景建图到14通道格式转换节点 -->
+  <!-- 功能：订阅场景语义地图，转换为14通道格式并保存为npz文件 -->
+  
+  <!-- 参数配置 -->
+  <arg name="occupancy_grid_topic" default="/struct_mapping/occ_map"/>
+  <arg name="scene_id_grid_topic" default="/semantic_mapping/scene_id_grid"/>
+  <arg name="scene_confidence_grid_topic" default="/semantic_mapping/scene_confidence_grid"/>
+  <arg name="agent_frame" default="tf_frame_base_link"/>
+  <arg name="map_frame" default="tf_frame_map"/>
+  <arg name="save_rate" default="1.0"/>
+  <arg name="save_dir" default=""/>  <!-- 空字符串表示使用默认路径（package/data） -->
+  
+  <!-- 场景ID到场景类型的映射（可选，用于更精确的语义类别映射） -->
+  <!-- 格式：scene_id -> scene_type字符串 -->
+  <!-- 例如：{"3": "kitchen", "4": "bedroom", "5": "livingroom"} -->
+  <arg name="scene_id_to_type_map" default="{}"/>
+  
+  <!-- 转换节点 -->
+  <node name="scene_to_14channel_converter" 
+        pkg="semantic_mapping_pkg" 
+        type="scene_to_14channel_converter.py" 
+
+        respawn="true">
+    <param name="occupancy_grid_topic" value="$(arg occupancy_grid_topic)"/>
+    <param name="scene_id_grid_topic" value="$(arg scene_id_grid_topic)"/>
+    <param name="scene_confidence_grid_topic" value="$(arg scene_confidence_grid_topic)"/>
+    <param name="agent_frame" value="$(arg agent_frame)"/>
+    <param name="map_frame" value="$(arg map_frame)"/>
+    <param name="save_rate" value="$(arg save_rate)"/>
+    <param name="save_dir" value="$(arg save_dir)" if="$(eval arg('save_dir') != '')"/>
+    <rosparam param="scene_id_to_type_map" subst_value="true">$(arg scene_id_to_type_map)</rosparam>
+  </node>
+</launch>
+

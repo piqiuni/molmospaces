@@ -1,0 +1,41 @@
+# Default configuration file for semantic_mapping_pkg
+# Object semantic mapping configuration
+
+# ========== 功能开关 ==========
+enable_object_mapping: true   # 启用物体语义建图
+enable_scene_mapping: true    # 启用场景语义建图
+
+# ========== 物体建图参数 ==========
+voxel_size: 0.1               # 体素大小（米），默认0.1m
+position_threshold: 0.5        # 位置匹配阈值（米），默认0.5m
+size_threshold: 0.3            # 尺寸差异阈值，默认0.3（30%）
+time_window: 5.0              # 时间窗口（秒），默认5.0s
+confidence_threshold: 0.5     # 置信度阈值，默认0.5
+
+# ========== 场景建图参数 ==========
+scene_map_resolution: 0.1      # 场景地图分辨率（米/像素），默认0.1m
+scene_map_width: 400          # 场景地图宽度（像素），默认1000
+scene_map_height: 400         # 场景地图高度（像素），默认1000
+scene_map_origin_x: -50.0      # 场景地图原点x坐标（米），默认-50.0
+scene_map_origin_y: -50.0      # 场景地图原点y坐标（米），默认-50.0
+scene_max_range: 3.0          # 场景建图最大有效距离（米），默认10.0m
+scene_min_range: 1.0       # 场景建图最小有效距离（米），默认0.1m
+scene_occlusion_threshold: 50  # 遮挡检测阈值（occupancy grid值），默认50
+
+# ========== 坐标系参数 ==========
+camera_frame: "tf_frame_camera"         # 相机坐标系名称（habitat发布的是base_link）
+world_frame: "tf_frame_map"             # 世界坐标系名称（habitat发布的是odom）
+input_in_world_frame: true     # 输入坐标是否为世界坐标系（true=世界坐标系，false=相机坐标系）
+
+# ========== 话题参数 ==========
+detection_topic: "/explore_agent/result_info"  # 检测结果话题（JSON格式）
+pointcloud_topic: "/registered_scan"                # 点云话题（用于场景建图）
+scene_attribute_topic: "/semantic_mapping/scene_attribute" # BLIP场景属性话题（输入到场景建图）
+occupancy_grid_topic: "/struct_mapping/occ_map"       # 占据栅格地图话题（用于场景建图）
+
+# ========== BLIP参数 ==========
+blip_model_path: "/home/wxy/Downloads/blip2-opt-2.7b"  # BLIP模型路径
+blip_image_topic: "/ai2thor/rgb_image"                 # BLIP订阅的图片话题
+blip_output_topic: "/semantic_mapping/scene_attribute"             # BLIP发布的场景属性话题
+blip_question: "What type of room or scene is this? Answer with only one word,if not sure, answer with 'unknown'."  # BLIP问题（如果为空，则生成图像描述；如果提供问题，则进行视觉问答）
+blip_max_new_tokens: 5                                 # BLIP生成的最大token数（场景名称只需1-2个词，设置为5足够）

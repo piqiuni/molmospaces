@@ -1,0 +1,15 @@
+<launch>
+    <!-- 加载地图配置参数 -->
+    <rosparam command="load" file="$(find grid_map_pkg)/config/mapping_config.yaml"/>
+    
+    <!-- 启动网格地图节点 -->
+    <node pkg="grid_map_pkg" type="grid_mapper_node" name="grid_mapper" output="screen">
+        <remap from="/registered_scan" to="/registered_scan"/>
+        <remap from="/odometry" to="/odometry"/>
+    </node>
+    
+    <!-- RViz可视化（可选） -->
+    <arg name="rviz" default="false"/>
+    <node if="$(arg rviz)" pkg="rviz" type="rviz" name="grid_mapping_rviz" 
+          args="-d $(find grid_map_pkg)/config/mapping.rviz"/>
+</launch>

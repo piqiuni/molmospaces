@@ -1,0 +1,27 @@
+<launch>
+  <!-- BLIP节点启动文件 -->
+  <!-- 支持两种模式：client（客户端版本，通过HTTP调用远程BLIP服务）或 mock（模拟版本，用于测试） -->
+  
+  <!-- BLIP节点模式选择 -->
+  <arg name="blip_mode" default="client" doc="BLIP节点模式: client（客户端版本）或 mock（模拟版本）"/>
+  
+  <!-- 配置文件参数（如果单独启动此launch文件时使用） -->
+  <!--arg name="config_file" default="$(find semantic_mapping_pkg)/config/default.yaml"/-->
+  
+  <!-- 加载配置文件（仅在单独启动此launch文件时加载） -->
+  <!-- 注意：如果通过unified_system.launch启动，配置文件已在父launch中统一加载，这里不会重复加载 -->
+  <!--rosparam file="$(arg config_file)" command="load"/-->
+  
+  <!-- BLIP ROS节点（根据blip_mode参数选择版本） -->
+  <group if="$(eval arg('blip_mode') == 'mock')">
+    <!-- BLIP ROS节点（模拟版本，用于测试，不加载BLIP模型） -->
+    <node name="blip_ros_node_mock" pkg="semantic_mapping_pkg" type="blip_ros_node_mock.py" output="screen" respawn="true">
+    </node>
+  </group>
+  <group unless="$(eval arg('blip_mode') == 'mock')">
+    <!-- BLIP ROS节点（客户端版本，通过HTTP调用远程BLIP服务） -->
+    <node name="blip_ros_node_client" pkg="semantic_mapping_pkg" type="blip_ros_node_client.py" respawn="true">
+    </node>
+  </group>
+</launch>
+

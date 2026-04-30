@@ -220,15 +220,18 @@ class AStarPlannerPolicy(PlannerPolicy):
     def max_angle_waypoints(self, angles: np.ndarray) -> np.ndarray:
         assert angles.shape == (2, 1)
 
-        angle = float(abs(normalize_ang_error(angles[1] - angles[0])))
+        start_angle = float(np.asarray(angles[0]).reshape(-1)[0])
+        end_angle = float(np.asarray(angles[1]).reshape(-1)[0])
+        angle_delta = normalize_ang_error(end_angle - start_angle)
+        angle = float(np.abs(np.asarray(angle_delta)).reshape(-1)[0])
         num_points = int(np.ceil(angle / self.config.policy_config.path_max_inter_waypoint_angle))
         if num_points <= 1:
             # Enofrce always at least one orientation correction
             return angles[1:]
 
         steps = np.linspace(0, 1, num_points + 1)[1:]
-        r0 = R.from_euler("z", angles[0], degrees=False)
-        r1 = R.from_euler("z", angles[1], degrees=False)
+        r0 = R.from_euler("z", start_angle, degrees=False)
+        r1 = R.from_euler("z", end_angle, degrees=False)
         rots = Slerp([0, 1], R.concatenate([r0, r1]))(steps)
         new_angles = rots.as_euler("xyz", degrees=False)[:, 2:]
 

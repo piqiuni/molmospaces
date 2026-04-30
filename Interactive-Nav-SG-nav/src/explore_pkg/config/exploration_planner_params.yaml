@@ -1,0 +1,79 @@
+# Exploration Planner 配置参数
+# 探索算法专用参数
+
+# ========== 评分地图参数 ==========
+# 评分地图由ExploreManager生成，供探索算法使用
+# 评分地图标识了哪些区域值得探索（边界区域）
+score_map:
+  # 评分地图发布频率（Hz）
+  publish_rate: 2
+  
+  # 边界权重（用于生成评分地图）
+  # 评分地图由两部分组成：
+  # 1. 占据边界：已知自由空间(0)和未知空间(-1)之间的边界
+  # 2. 环境属性边界：已知环境属性与未知环境属性的边界，以及不同已知环境属性之间的边界
+  # 
+  # 优化说明：
+  # - 统一检测：一次遍历完成所有边界检测，提高计算效率
+  # - 墙壁过滤：如果栅格邻域中有占据区域（墙壁），则跳过场景边界评分，避免误判墙壁边缘
+  #   例如：墙壁边缘即使被场景填充，也不会被算作场景边界
+  # 
+  # 权重说明：所有权重都乘以50.0得到最终评分（0-100）
+  # - 权重1.0 = 评分50
+  # - 权重1.5 = 评分75
+  # - 权重2.0 = 评分100（上限）
+  occupancy_boundary_weight: 2                    # 占据边界权重（已知自由和未知边界）
+  scene_known_unknown_boundary_weight: 0          # 已知/未知环境属性边界权重（墙壁边缘会被过滤）
+  scene_different_boundary_weight: 0              # 不同环境属性边界权重（墙壁边缘会被过滤）
+
+# ========== Voronoi探索参数 ==========
+voronoi:
+  
+  # 节点状态管理参数
+  cooldown_period: 30.0                   # 节点冷却期（秒），用于updateNodeStates函数
+  
+  # Voronoi图相关话题
+  voronoi_map_topic: "/struct_mapping/voronoi_map"              # Voronoi图输入话题
+  score_map_topic: "/explore_manager/score_map"                 # 评分地图输入话题（由explore_manager生成）
+  exploration_relevance_map_topic: "/explore_manager/exploration_relevance_map"  # 探索关联地图输入话题（由大语言模型评价生成）
+  
+  # TSP相关参数（用于避免震荡和优化探索路径）
+  # 注意：TSP节点选择策略为选择评分最高的10个节点（相对排名，不使用绝对值阈值）
+  tsp_goal_reach_threshold: 1.0              # TSP目标到达阈值（米）
+  tsp_goal_timeout: 60.0                     # TSP目标超时时间（秒）
+  tsp_top_num: 1.0                   # TSP节点选择比例（0.0-1.0，1.0表示尽量纳入全部候选节点，提高覆盖性）
+  
+  tsp_replan_frequency: -1               # TSP重新规划频率（Hz），-1表示不按时间重新规划，只在路径完成时重新规划
+  blacklist_match_threshold: 0.2         # 黑名单点匹配阈值（米），距离该阈值内视为同一点
+  
+  # 场景分数对TSP代价的影响权重（tsp_scene_score_weight）
+  tsp_scene_score_weight: 0.3
+  # 作用：根据场景类型（如卧室、客厅等）调整TSP路径中节点间的通行代价
+  #      高价值场景（如卧室，scene_score=100）的到达代价会被降低，使TSP优先选择这些场景
+  #
+  # 公式说明：
+  # 1. 节点间距离代价调整（节点i到节点j）：
+  #    base_cost = 10.0 × 欧氏距离(i, j)
+  #    avg_score = (scene_score[i] + scene_score[j]) / 2.0
+  #    score_reduction = tsp_scene_score_weight × (avg_score / 100.0)
+  #    adjusted_cost = base_cost × (1.0 - score_reduction)
+  #
+  # 2. 机器人到节点距离代价调整（机器人到节点i）：
+  #    base_cost = 10.0 × 欧氏距离(robot, i)
+  #    score_reduction = tsp_scene_score_weight × (scene_score[i] / 100.0)
+  #    adjusted_cost = base_cost × (1.0 - score_reduction)
+  #
+  # 示例（tsp_scene_score_weight = 0.3）：
+  # - 机器人到卧室节点（scene_score=100，距离10m）：
+  #   base_cost = 100, score_reduction = 0.3 × (100/100) = 0.3
+  #   adjusted_cost = 100 × (1.0 - 0.3) = 70（降低30%）
+  # - 机器人到客厅节点（scene_score=0，距离10m）：
+  #   base_cost = 100, score_reduction = 0.3 × (0/100) = 0
+  #   adjusted_cost = 100 × (1.0 - 0) = 100（不变）
+  # 结果：TSP会优先选择卧室节点（代价70 < 100）
+  #
+  # 参数范围：0.0-1.0
+  # - 0.0：场景分数不影响代价（完全基于距离）
+  # - 1.0：场景分数影响最大（scene_score=100时，代价降低100%，即变为0）
+  # - 0.3（推荐）：场景分数适度影响，平衡距离和场景价值
+

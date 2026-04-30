@@ -1,0 +1,30 @@
+# 地图配置参数
+mapping:
+  map:
+    sizex: 1000          # 地图X方向栅格数
+    sizey: 1000          # 地图Y方向栅格数
+    initx: 500           # 地图原点X索引
+    inity: 500           # 地图原点Y索引
+    cell_size: 0.05      # 栅格大小（米）
+  
+  robot_laser:
+    x: 0.0               # 激光相对机器人X偏移
+    y: 0.0               # 激光相对机器人Y偏移
+    theta: 0.0           # 激光相对机器人角度偏移
+  
+  sensor_model:
+    P_occ: 0.7           # 占据概率
+    P_free: 0.3          # 自由概率
+    P_prior: 0.5         # 先验概率
+
+# 平均滤波核大小（-1表示不使用）
+averagefilter: 3
+
+# 多楼层参数
+multi_floor:
+  enabled: true
+  altitude_threshold: 2.5      # 楼层高度容差（米）
+  relative_height_offset: 0.7  # 相机相对机器人高度偏移（米）- AI2-THOR眼睛高度
+  z_threshold: 0.1           # 相对高度过滤阈值（米）- 保留0.1-1.7米高度的障碍物
+
+ 

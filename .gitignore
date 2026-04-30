@@ -1,3 +1,10 @@
+Interactive-Nav-SG-nav/ai2thor_demo_output/*
+Interactive-Nav-SG-nav/semantic_ws/data
+Interactive-Nav-SG-nav/GLIP
+Interactive-Nav-SG-nav/GroundingDINO
+Interactive-Nav-SG-nav/segment_anything
+
+
 # ignore nfs files
 *.nfs*
 # compiled python files

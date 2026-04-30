@@ -215,14 +215,16 @@ def setup_config(args: argparse.ArgumentParser) -> MlSpacesExpConfig:
         datagen_cfg.robot_config = FrankaRobotConfig()
         datagen_cfg.camera_config = FrankaDroidCameraSystem()
         datagen_cfg.camera_config.img_resolution = (1280, 720)
-        datagen_cfg.policy_config.phase_timeout = 20.0
+        if hasattr(datagen_cfg.policy_config, "phase_timeout"):
+            datagen_cfg.policy_config.phase_timeout = 20.0
     elif robot == "rum":
         datagen_cfg.robot_config = FloatingRUMRobotConfig()
         datagen_cfg.task_sampler_config.robot_object_z_offset = 0
         datagen_cfg.task_sampler_config.base_pose_sampling_radius_range = (0, 0.8)
         datagen_cfg.task_sampler_config.robot_safety_radius = 0.2
         datagen_cfg.camera_config.img_resolution = (960, 720)
-        datagen_cfg.policy_config.phase_timeout = 30.0
+        if hasattr(datagen_cfg.policy_config, "phase_timeout"):
+            datagen_cfg.policy_config.phase_timeout = 30.0
     elif robot == "rby1":
         datagen_cfg.robot_config = RBY1Config()
         datagen_cfg.camera_config = RBY1GoProD455CameraSystem()
@@ -316,7 +318,7 @@ def main(args: argparse.ArgumentParser) -> None:
             exp_config.policy_dt_ms = 40  # More responsive for teleoperation
             exp_config.task_horizon = 1000
         exp_config.policy_config = get_policy_config(args.policy, robot=args.robot)
-        policy = exp_config.policy_config.policy_cls(exp_config)
+        policy = exp_config.policy_config.policy_cls(exp_config, exp_config.task_type)
     elif args.policy == "planner":
         pass
     else:

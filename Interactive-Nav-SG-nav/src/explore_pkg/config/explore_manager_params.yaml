@@ -1,0 +1,68 @@
+# Explore Manager 配置参数
+# 零样本目标导航管理器
+
+# ========== ROS话题配置 ==========
+topics:
+  # 语义地图（由感知模块发布，包含置信度和3D位置）
+  semantic_map_topic: "/semantic_mapping/obj_map"
+  
+  # 导航相关
+  navigation:
+    goal_topic: "/move_base_simple/goal"
+    odom_topic: "/odometry"
+    map_topic: "/struct_mapping/occ_map"
+    cmd_vel_topic: "/cmd_vel"
+    move_base_status_topic: "/move_base/status"
+  
+  # 状态发布
+  state_topic: "/explore_manager/state"
+  status_topic: "/explore_manager/status"
+  exploration_path_topic: "/explore_manager/exploration_path"
+  
+  # 评分地图相关话题
+  scene_id_grid_topic: "/semantic_mapping/scene_id_grid"  # 场景ID栅格地图（输入）
+  score_map_topic: "/explore_manager/score_map"           # 评分地图（输出，由explore_manager生成）
+  exploration_relevance_map_topic: "/explore_manager/exploration_relevance_map"  # 探索关联地图（输入，由大语言模型评价生成）
+
+# ========== 坐标系配置 ==========
+frames:
+  base_frame: "tf_frame_base_link"
+  map_frame: "tf_frame_map"
+
+# ========== 阈值参数 ==========
+thresholds:
+  # 到达目标的距离阈值（米）
+  target_reach: 1
+  # 语义地图中目标的置信度阈值
+  semantic_confidence: 0.7
+
+# ========== 导航参数 ==========
+navigation:
+  # 探索频率（Hz）
+  exploration_rate: 1.0
+  # 目标检查频率（Hz）
+  goal_check_rate: 5.0
+  # 同一目标重发间隔（秒），防止导航端漏接首次goal导致机器人不动
+  goal_republish_interval: 2.0
+  # move_base失败状态处理最小间隔（秒），避免同一失败频繁触发
+  move_base_failure_cooldown: 1.0
+  # 失败目标短期黑名单持续时间（秒），黑名单内不会再次选到同一点
+  failed_goal_blacklist_duration: 10.0
+  # 恢复策略：无可行探索目标时原地旋转角速度（rad/s）
+  recovery_rotate_speed: 0.4
+  # 恢复策略：原地旋转控制命令发布频率（Hz）
+  recovery_rotate_rate: 10.0
+
+# ========== 探索算法参数 ==========
+exploration:
+  # 探索算法类型: "voronoi", "frontier", "rrt", "coverage"
+  # 注意: 目前只有 "voronoi" 已实现，其他类型会回退到 voronoi
+  algorithm_type: "voronoi"
+
+# ========== 路径记录参数 ==========
+path_recording:
+  # 是否记录探索路径
+  enable: true
+  # 路径点采样间隔（米），避免记录过于密集的点
+  sampling_distance: 0.5
+

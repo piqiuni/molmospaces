@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>ai2thor_pkg</name>
+  <version>1.0.0</version>
+  <description>AI2-THOR simulator interface for semantic navigation</description>
+
+  <maintainer email="user@example.com">Developer</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>cv_bridge</depend>
+
+  <export>
+  </export>
+</package>
+
+

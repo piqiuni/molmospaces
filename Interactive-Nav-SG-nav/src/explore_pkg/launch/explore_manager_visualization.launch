@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<launch>
+  <!--
+    ExploreManager 可视化:
+    - 地图: /struct_mapping/occ_map
+    - 目标点(含朝向): /move_base_simple/goal
+    - 机器人位姿/朝向: /odometry
+    - 探索轨迹: /explore_manager/exploration_path
+  -->
+  <arg name="rviz_config" default="$(find explore_pkg)/rviz/explore_manager_visualization.rviz" />
+
+  <node pkg="rviz" type="rviz" name="explore_manager_rviz" output="screen"
+        args="-d $(arg rviz_config)" />
+</launch>

@@ -1,0 +1,18 @@
+<launch>
+
+    <node pkg="nav_pkg" type="relay_node" name="relay_node" output="screen"/>
+
+    <node pkg="move_base" type="move_base" name="move_base" output="screen" >
+        <rosparam file="$(find nav_pkg)/configs/costmap_common_params.yaml" command="load" ns="global_costmap" />
+        <rosparam file="$(find nav_pkg)/configs/costmap_common_params.yaml" command="load" ns="local_costmap" />
+
+        <rosparam file="$(find nav_pkg)/configs/global_costmap_params.yaml" command="load" />
+        <rosparam file="$(find nav_pkg)/configs/local_costmap_params.yaml" command="load" />
+        <rosparam file="$(find nav_pkg)/configs/move_base_params.yaml" command="load" />
+        <param name="base_global_planner" type="string" value="global_planner/GlobalPlanner" />
+        <param name="GlobalPlanner/use_dijkstra" value="true" />
+        <param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS"/>        
+        <rosparam file="$(find nav_pkg)/configs/teb_local_planner_params.yaml" command="load" />
+    </node>
+
+</launch>

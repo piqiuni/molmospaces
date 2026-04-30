@@ -1,0 +1,100 @@
+# 场景类型映射配置文件
+# 用于统一处理场景类型的标准化和语义类别映射
+
+# 场景类型标准化规则（同义词映射）
+# 将各种变体统一到标准名称
+scene_type_synonyms:
+  # 客厅相关
+  "living": "livingroom"
+  "lounge": "livingroom"
+  "sittingroom": "livingroom"
+  "room": "livingroom"  # room通常指客厅
+  "客厅": "livingroom"
+  
+  # 卧室相关
+  "bed": "bedroom"
+  "bedroom": "bedroom"
+  "卧室": "bedroom"
+  
+  # 厨房相关
+  "kitchen": "kitchen"
+  "厨房": "kitchen"
+  
+  # 洗手间相关
+  "bath": "bathroom"
+  "bathroom": "bathroom"
+  "toilet": "bathroom"
+  "restroom": "bathroom"
+  "洗手间": "bathroom"
+  "卫生间": "bathroom"
+  
+  # 阳台相关
+  "balcony": "balcony"
+  "阳台": "balcony"
+  
+  # 储藏间相关
+  "storage": "storage"
+  "storeroom": "storage"
+  "储藏": "storage"
+  "储藏间": "storage"
+  
+  # 门相关
+  "door": "door"
+  "门": "door"
+  
+  # 墙相关
+  "wall": "wall"
+  "墙": "wall"
+  
+  # 大门/入口相关
+  "entrance": "entrance"
+  "gate": "entrance"
+  "大门": "entrance"
+  "入口": "entrance"
+  
+  # 外部区域相关
+  "outside": "outside"
+  "external": "outside"
+  "外部": "outside"
+  
+  # 走廊相关（可选，如果不需要可以注释掉）
+  "hallway": "corridor"
+  "hall": "corridor"
+  "corridor": "corridor"
+  "走廊": "corridor"
+  
+  # 餐厅相关（可选）
+  "diningroom": "diningroom"
+  "dinningroom": "diningroom"
+  "dining": "diningroom"
+  "餐厅": "diningroom"
+
+# 场景类型到语义类别索引的映射
+# 语义类别索引对应14通道格式中的通道4-13
+# 索引范围：0-9，对应通道4-13
+scene_type_to_semantic_index:
+  "livingroom": 0    # 通道4: 客厅
+  "bedroom": 1       # 通道5: 卧室
+  "kitchen": 2       # 通道6: 厨房
+  "bathroom": 3      # 通道7: 洗手间
+  "balcony": 4       # 通道8: 阳台
+  "storage": 5      # 通道9: 储藏间
+  "door": 6         # 通道10: 门
+  "wall": 7         # 通道11: 墙
+  "entrance": 8     # 通道12: 大门
+  "outside": 9      # 通道13: 外部区域
+  # 注意：corridor和diningroom等未映射到语义类别，返回-1
+
+# 语义类别名称列表（用于调试和日志）
+semantic_class_names:
+  - "livingroom"
+  - "bedroom"
+  - "kitchen"
+  - "bathroom"
+  - "balcony"
+  - "storage"
+  - "door"
+  - "wall"
+  - "entrance"
+  - "outside"
+
