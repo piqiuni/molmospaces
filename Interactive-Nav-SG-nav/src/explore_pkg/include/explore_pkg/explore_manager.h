@@ -8,6 +8,7 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Point.h>
 #include <std_msgs/String.h>
+#include <std_msgs/Empty.h>
 #include <actionlib_msgs/GoalStatusArray.h>
 #include <memory>
 #include <vector>
@@ -81,6 +82,7 @@ private:
   void mapCallback(const nav_msgs::OccupancyGridConstPtr& msg);
   void sceneIdGridCallback(const nav_msgs::OccupancyGridConstPtr& msg);
   void moveBaseStatusCallback(const actionlib_msgs::GoalStatusArrayConstPtr& msg);
+  void resetCallback(const std_msgs::EmptyConstPtr& msg);
 
   // ========== 核心功能函数 ==========
   void stateMachineLoop(const ros::TimerEvent& event);
@@ -151,6 +153,7 @@ private:
   ros::Subscriber map_sub_;
   ros::Subscriber scene_id_grid_sub_;
   ros::Subscriber move_base_status_sub_;
+  ros::Subscriber reset_sub_;
 
   // ========== 发布者 ==========
   ros::Publisher goal_pub_;
@@ -223,6 +226,7 @@ private:
   std::string exploration_path_topic_;
   std::string scene_id_grid_topic_;
   std::string score_map_topic_;
+  std::string reset_topic_;
   
   // 坐标系
   std::string base_frame_;

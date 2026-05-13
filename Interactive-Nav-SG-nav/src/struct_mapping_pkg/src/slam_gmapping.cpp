@@ -121,6 +121,7 @@ Initial map dimensions and resolution:
 #include "slam_gmapping.h"
 
 #include <iostream>
+#include <cmath>
 
 #include <time.h>
 
@@ -195,6 +196,8 @@ void SlamGMapping::init()
     map_frame_ = "tf_frame_map";
   if(!private_nh_.getParam("odom_frame", odom_frame_))
     odom_frame_ = "tf_frame_odom";
+  if(!private_nh_.getParam("reset_topic", reset_topic_))
+    reset_topic_ = "/nav_system/reset";
 
   private_nh_.param("transform_publish_period", transform_publish_period_, 0.05);
 
@@ -269,6 +272,8 @@ void SlamGMapping::init()
     filter_height_center_ = 0.6;  // 默认0米高度
   if(!private_nh_.getParam("filter_height_tolerance", filter_height_tolerance_))
     filter_height_tolerance_ = 0.5;  // 默认保留±0.5米范围
+  if(!private_nh_.getParam("filter_height_frame", filter_height_frame_))
+    filter_height_frame_ = base_frame_;
   
   // 障碍物膨胀参数
   if(!private_nh_.getParam("enable_obstacle_inflation", enable_obstacle_inflation_))
@@ -277,6 +282,14 @@ void SlamGMapping::init()
     inflation_radius_ = 0.3;  // 默认0.3米膨胀半径
   if(!private_nh_.getParam("inscribed_radius", inscribed_radius_))
     inscribed_radius_ = 0.2;  // 默认0.2米内切半径
+
+  // 局部覆写参数
+  if(!private_nh_.getParam("enable_local_overwrite", enable_local_overwrite_))
+    enable_local_overwrite_ = false;
+  if(!private_nh_.getParam("local_overwrite_radius", local_overwrite_radius_))
+    local_overwrite_radius_ = 8.0;  // 默认仅覆写机器人附近8米范围
+  if(!private_nh_.getParam("local_overwrite_mark_occupied", local_overwrite_mark_occupied_))
+    local_overwrite_mark_occupied_ = true;
     
   if(!private_nh_.getParam("tf_delay", tf_delay_))
     tf_delay_ = transform_publish_period_;
@@ -292,6 +305,7 @@ void SlamGMapping::startLiveSlam()
   sstm_ = node_.advertise<nav_msgs::MapMetaData>("map_metadata", 1, true);
   filtered_cloud_pub_ = node_.advertise<sensor_msgs::PointCloud2>("filtered_pointcloud", 1, true);
   ss_ = node_.advertiseService("dynamic_map", &SlamGMapping::mapCallback, this);
+  reset_sub_ = node_.subscribe(reset_topic_, 1, &SlamGMapping::resetCallback, this);
   scan_filter_sub_ = new message_filters::Subscriber<sensor_msgs::PointCloud2>(node_, "registered_scan", 5);
   scan_filter_ = new tf::MessageFilter<sensor_msgs::PointCloud2>(*scan_filter_sub_, tf_, odom_frame_, 5);
   scan_filter_->setTolerance(ros::Duration(0.1));
@@ -302,6 +316,7 @@ void SlamGMapping::startLiveSlam()
   ROS_INFO("Subscribed to topic: /registered_scan (PointCloud2)");
   ROS_INFO("Target odom frame: %s", odom_frame_.c_str());
   ROS_INFO("Publishing map to topic: /struct_mapping/occ_map");
+  ROS_INFO("Subscribed to reset topic: %s", reset_topic_.c_str());
 }
 
 void SlamGMapping::startReplay(const std::string & bag_fname, std::string scan_topic)
@@ -312,6 +327,7 @@ void SlamGMapping::startReplay(const std::string & bag_fname, std::string scan_t
   sst_ = node_.advertise<nav_msgs::OccupancyGrid>("map", 1, true);
   sstm_ = node_.advertise<nav_msgs::MapMetaData>("map_metadata", 1, true);
   ss_ = node_.advertiseService("dynamic_map", &SlamGMapping::mapCallback, this);
+  reset_sub_ = node_.subscribe(reset_topic_, 1, &SlamGMapping::resetCallback, this);
   
   rosbag::Bag bag;
   bag.open(bag_fname, rosbag::bagmode::Read);
@@ -372,6 +388,40 @@ void SlamGMapping::startReplay(const std::string & bag_fname, std::string scan_t
   }
 
   bag.close();
+}
+
+void SlamGMapping::resetCallback(const std_msgs::Empty::ConstPtr& msg)
+{
+  (void)msg;
+
+  boost::mutex::scoped_lock map_lock(map_mutex_);
+  boost::mutex::scoped_lock tf_lock(map_to_odom_mutex_);
+
+  delete gsp_;
+  gsp_ = new GMapping::GridSlamProcessor();
+  ROS_ASSERT(gsp_);
+
+  if (gsp_laser_) {
+    delete gsp_laser_;
+    gsp_laser_ = NULL;
+  }
+  if (gsp_odom_) {
+    delete gsp_odom_;
+    gsp_odom_ = NULL;
+  }
+
+  got_first_scan_ = false;
+  got_map_ = false;
+  laser_count_ = 0;
+  map_ = nav_msgs::GetMap::Response();
+  map_to_odom_ = tf::Transform(tf::createQuaternionFromRPY(0, 0, 0), tf::Point(0, 0, 0));
+
+  nav_msgs::OccupancyGrid cleared_map;
+  cleared_map.header.stamp = ros::Time::now();
+  cleared_map.header.frame_id = tf_.resolve(map_frame_);
+  sst_.publish(cleared_map);
+
+  ROS_WARN("Received reset signal on %s, gmapping map/state cleared", reset_topic_.c_str());
 }
 
 void SlamGMapping::publishLoop(double transform_publish_period){
@@ -880,6 +930,11 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan)
     }
   }
   got_map_ = true;
+
+  if (enable_local_overwrite_)
+  {
+    applyLocalOverwrite(map_.map, scan, best.pose);
+  }
   
   // 应用障碍物膨胀
   if (enable_obstacle_inflation_)
@@ -987,6 +1042,33 @@ void SlamGMapping::filterPointCloudByHeight(sensor_msgs::PointCloud2& cloud)
   // 计算高度范围
   double height_min = filter_height_center_ - filter_height_tolerance_;
   double height_max = filter_height_center_ + filter_height_tolerance_;
+  const std::string source_frame = cloud.header.frame_id;
+
+  // Height threshold should be interpreted in a stable robot frame (e.g. base_link).
+  // We only use transformed z for filtering, while keeping original point coords for scan conversion.
+  bool use_transformed_height = false;
+  tf::StampedTransform source_to_height_tf;
+  if (!filter_height_frame_.empty() && source_frame != filter_height_frame_)
+  {
+    try
+    {
+      tf_.lookupTransform(
+          filter_height_frame_,
+          source_frame,
+          cloud.header.stamp,
+          source_to_height_tf);
+      use_transformed_height = true;
+    }
+    catch (tf::TransformException& e)
+    {
+      ROS_WARN_THROTTLE(
+          5.0,
+          "Height filter TF lookup failed (%s -> %s): %s. Falling back to source-frame z.",
+          source_frame.c_str(),
+          filter_height_frame_.c_str(),
+          e.what());
+    }
+  }
   
   // 原地过滤：使用双指针法，只遍历一次
   sensor_msgs::PointCloud2Iterator<float> iter_x_read(cloud, "x");
@@ -1011,8 +1093,16 @@ void SlamGMapping::filterPointCloudByHeight(sensor_msgs::PointCloud2& cloud)
     if (std::isnan(x) || std::isnan(y) || std::isnan(z))
       continue;
     
-    // 检查z坐标（高度）是否在指定范围内
-    if (z >= height_min && z <= height_max)
+    double z_for_filter = z;
+    if (use_transformed_height)
+    {
+      tf::Vector3 p_src(x, y, z);
+      tf::Vector3 p_height = source_to_height_tf * p_src;
+      z_for_filter = p_height.z();
+    }
+
+    // 检查高度是否在指定范围内（可在目标高度坐标系中判定）
+    if (z_for_filter >= height_min && z_for_filter <= height_max)
     {
       // 只有当写位置不同于读位置时才需要复制
       if (filtered_points != i)
@@ -1134,4 +1224,113 @@ void SlamGMapping::inflateObstacles(nav_msgs::OccupancyGrid& map)
   }
   
   ROS_DEBUG_THROTTLE(5.0, "Obstacle inflation completed");
+}
+
+bool SlamGMapping::worldToMap(const nav_msgs::OccupancyGrid& map, double wx, double wy, int& mx, int& my) const
+{
+  const double origin_x = map.info.origin.position.x;
+  const double origin_y = map.info.origin.position.y;
+  const double resolution = map.info.resolution;
+
+  if (wx < origin_x || wy < origin_y)
+    return false;
+
+  mx = static_cast<int>((wx - origin_x) / resolution);
+  my = static_cast<int>((wy - origin_y) / resolution);
+
+  if (mx < 0 || my < 0 ||
+      mx >= static_cast<int>(map.info.width) ||
+      my >= static_cast<int>(map.info.height))
+    return false;
+
+  return true;
+}
+
+void SlamGMapping::applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
+                                       const sensor_msgs::LaserScan& scan,
+                                       const GMapping::OrientedPoint& sensor_pose)
+{
+  if (map.info.width == 0 || map.info.height == 0 || scan.ranges.empty())
+    return;
+
+  const double resolution = map.info.resolution;
+  const double usable_radius = std::max(0.0, std::min(local_overwrite_radius_, maxUrange_));
+  if (usable_radius <= 0.0)
+    return;
+
+  int sensor_mx = 0;
+  int sensor_my = 0;
+  if (!worldToMap(map, sensor_pose.x, sensor_pose.y, sensor_mx, sensor_my))
+  {
+    ROS_WARN_THROTTLE(5.0, "Local overwrite skipped: sensor pose is outside map bounds");
+    return;
+  }
+
+  size_t updated_free_cells = 0;
+  size_t updated_occupied_cells = 0;
+
+  for (size_t i = 0; i < scan.ranges.size(); ++i)
+  {
+    // 对于由前向深度相机生成的“伪360 LaserScan”，仅处理真实观测到的波束。
+    // 未观测方向（如后方）会保持 intensity=0，必须跳过，避免被错误清空。
+    if (i >= scan.intensities.size() || scan.intensities[i] <= 0.0)
+      continue;
+
+    const double beam_angle = sensor_pose.theta + scan.angle_min + static_cast<double>(i) * scan.angle_increment;
+    const double measured_range = scan.ranges[i];
+
+    if (!std::isfinite(measured_range) || measured_range < scan.range_min)
+      continue;
+
+    const bool valid_hit = measured_range < scan.range_max;
+    const double trace_range = std::min(measured_range, usable_radius);
+    if (trace_range <= 0.0)
+      continue;
+
+    const int step_count = std::max(1, static_cast<int>(trace_range / resolution));
+    const double cos_theta = std::cos(beam_angle);
+    const double sin_theta = std::sin(beam_angle);
+
+    for (int step = 1; step <= step_count; ++step)
+    {
+      const double dist = std::min(trace_range, static_cast<double>(step) * resolution);
+      const double wx = sensor_pose.x + dist * cos_theta;
+      const double wy = sensor_pose.y + dist * sin_theta;
+
+      int mx = 0;
+      int my = 0;
+      if (!worldToMap(map, wx, wy, mx, my))
+        break;
+
+      const int idx = MAP_IDX(map.info.width, mx, my);
+      if (map.data[idx] != 0)
+      {
+        map.data[idx] = 0;
+        ++updated_free_cells;
+      }
+    }
+
+    if (valid_hit && measured_range <= usable_radius && local_overwrite_mark_occupied_)
+    {
+      const double hit_wx = sensor_pose.x + measured_range * cos_theta;
+      const double hit_wy = sensor_pose.y + measured_range * sin_theta;
+      int hit_mx = 0;
+      int hit_my = 0;
+      if (worldToMap(map, hit_wx, hit_wy, hit_mx, hit_my))
+      {
+        const int hit_idx = MAP_IDX(map.info.width, hit_mx, hit_my);
+        if (map.data[hit_idx] != 100)
+        {
+          map.data[hit_idx] = 100;
+          ++updated_occupied_cells;
+        }
+      }
+    }
+  }
+
+  ROS_DEBUG_THROTTLE(2.0,
+                     "Local overwrite updated map: free_cells=%zu, occupied_cells=%zu, radius=%.2f",
+                     updated_free_cells,
+                     updated_occupied_cells,
+                     usable_radius);
 }

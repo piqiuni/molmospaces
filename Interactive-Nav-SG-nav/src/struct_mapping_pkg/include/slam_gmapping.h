@@ -33,6 +33,7 @@
 #include "sensor_msgs/LaserScan.h"
 #include "sensor_msgs/PointCloud2.h"
 #include "std_msgs/Float64.h"
+#include "std_msgs/Empty.h"
 #include "nav_msgs/GetMap.h"
 #include "tf/transform_listener.h"
 #include "tf/transform_broadcaster.h"
@@ -59,6 +60,7 @@ class SlamGMapping
   
     void laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan);
     void pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud);
+    void resetCallback(const std_msgs::Empty::ConstPtr& msg);
     bool mapCallback(nav_msgs::GetMap::Request  &req,
                      nav_msgs::GetMap::Response &res);
     void publishLoop(double transform_publish_period);
@@ -70,6 +72,7 @@ class SlamGMapping
     ros::Publisher sstm_;
     ros::Publisher filtered_cloud_pub_;  // 发布高度滤波后的点云
     ros::ServiceServer ss_;
+    ros::Subscriber reset_sub_;
     tf::TransformListener tf_;
     message_filters::Subscriber<sensor_msgs::PointCloud2>* scan_filter_sub_;
     tf::MessageFilter<sensor_msgs::PointCloud2>* scan_filter_;
@@ -107,6 +110,7 @@ class SlamGMapping
     std::string laser_frame_;
     std::string map_frame_;
     std::string odom_frame_;
+    std::string reset_topic_;
 
     void updateMap(const sensor_msgs::LaserScan& scan);
     bool getOdomPose(GMapping::OrientedPoint& gmap_pose, const ros::Time& t);
@@ -116,6 +120,10 @@ class SlamGMapping
     double computePoseEntropy();
     void filterPointCloudByHeight(sensor_msgs::PointCloud2& cloud);
     void inflateObstacles(nav_msgs::OccupancyGrid& map);
+    void applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
+                             const sensor_msgs::LaserScan& scan,
+                             const GMapping::OrientedPoint& sensor_pose);
+    bool worldToMap(const nav_msgs::OccupancyGrid& map, double wx, double wy, int& mx, int& my) const;
     
     // Parameters used by GMapping
     double maxRange_;
@@ -154,11 +162,17 @@ class SlamGMapping
     bool enable_height_filter_;
     double filter_height_center_;
     double filter_height_tolerance_;
+    std::string filter_height_frame_;
     
     // 障碍物膨胀参数
     bool enable_obstacle_inflation_;
     double inflation_radius_;
     double inscribed_radius_;
+
+    // 局部覆写参数（用最新扫描覆盖机器人附近区域）
+    bool enable_local_overwrite_;
+    double local_overwrite_radius_;
+    bool local_overwrite_mark_occupied_;
     
     ros::NodeHandle private_nh_;
     

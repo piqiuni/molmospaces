@@ -17,13 +17,13 @@ publish_distance_map: true
 # 1-2: 轻度裁剪（仍有较多端点）
 # 3-5: 中度裁剪（适中，推荐）
 # 6-10: 重度裁剪（只保留主干）
-prune_iterations: 1
+prune_iterations: 2
 
 # 障碍物距离阈值（单位：grid cells）
 # 控制Voronoi点生成时两个障碍物之间的最小距离阈值
 # 较小的值（如1-2）：允许在更接近的障碍物之间生成Voronoi点，可能产生更多平行线
 # 较大的值（如3-5）：只在距离较远的障碍物之间生成Voronoi点，可能减少平行线
 # 默认值：1
-obstacle_distance_threshold: 4
+obstacle_distance_threshold: 5
 #outside6
 

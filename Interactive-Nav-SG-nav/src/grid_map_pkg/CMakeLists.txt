@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(grid_map_pkg)
 
-## C++14标准
-add_compile_options(-std=c++14)
+## C++17标准（required by log4cxx headers in current toolchain）
+add_compile_options(-std=c++17)
 
 ## Find catkin macros and libraries
 find_package(catkin REQUIRED COMPONENTS

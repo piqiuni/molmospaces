@@ -1,8 +1,9 @@
 # 地图更新间隔
 map_update_interval: 0.5
+reset_topic: "/nav_system/reset"
 
 # GMapping核心参数
-maxUrange: 16.0 #激光扫描最大距离
+maxUrange: 20.0 #激光扫描最大距离
 sigma: 0.05
 kernelSize: 1
 lstep: 0.05
@@ -28,10 +29,10 @@ resampleThreshold: 0.5
 particles: 10   # 原30，减少到10节省计算
 
 # 地图范围
-xmin: -50.0
-ymin: -50.0
-xmax: 50.0
-ymax: 50.0
+xmin: -100.0
+ymin: -100.0
+xmax: 100.0
+ymax: 100.0
 #分辨率
 delta: 0.1 
 
@@ -43,11 +44,17 @@ lasamplestep: 0.005
 
 # 点云高度滤波参数
 enable_height_filter: true
-filter_height_center: 1
-filter_height_tolerance: 0.9
+filter_height_center: 1.0
+filter_height_tolerance: 0.8
+filter_height_frame: tf_frame_base_link
 
 # 障碍物膨胀参数
 enable_obstacle_inflation: true
-inflation_radius: 0.05  # 膨胀半径（米），通常设置为机器人半径
+inflation_radius: 0.20  # 膨胀半径（米），通常设置为机器人半径
 inscribed_radius: 0.1  # 内切半径（米），障碍物核心区域
+
+# 局部覆写参数（用最新扫描实时覆盖机器人附近区域）
+enable_local_overwrite: true
+local_overwrite_radius: 8.0
+local_overwrite_mark_occupied: true
 

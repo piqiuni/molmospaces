@@ -1,13 +1,13 @@
 # 占据地图配置参数
 
 # 地图尺寸
-map_size_x: 50.0  # 米
-map_size_y: 50.0  # 米
+map_size_x: 100.0  # 米
+map_size_y: 100.0  # 米
 resolution: 0.05   # 米/格子
 
 # 地图原点（相对于世界坐标系）
-origin_x: -25.0
-origin_y: -25.0
+origin_x: 0.0
+origin_y: 0.0
 
 # 概率参数
 P_occ: 0.7    # 占据概率

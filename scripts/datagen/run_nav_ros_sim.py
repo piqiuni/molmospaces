@@ -17,12 +17,34 @@ from molmo_spaces.configs.policy_configs import AStarNavToObjPolicyConfig
 from molmo_spaces.configs.robot_configs import FloatingRUMRobotConfig, FrankaRobotConfig, RBY1Config
 from molmo_spaces.data_generation.pipeline import ParallelRolloutRunner
 from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
+from molmo_spaces.policy.learned_policy.left_arm_keyboard_debug_policy import (
+    LeftArmKeyboardDebugPolicy,
+)
 from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.profiler_utils import Profiler
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def configure_run_file_logging(output_dir: Path) -> Path:
+    """Attach a file logger under the current run output directory."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "run_nav_ros_sim.log"
+
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_path:
+            return log_path
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
+    root_logger.addHandler(file_handler)
+    return log_path
 
 
 def ensure_head_camera_exists(camera_system) -> None:
@@ -52,6 +74,15 @@ def ensure_head_camera_exists(camera_system) -> None:
         camera_system.cameras[0].name = "head_camera"
 
 
+def enable_depth_for_camera(camera_system, camera_name: str) -> bool:
+    """Enable depth output for a specific camera if present."""
+    for cam in camera_system.cameras:
+        if cam.name == camera_name:
+            cam.record_depth = True
+            return True
+    return False
+
+
 class NavRosRolloutRunner(ParallelRolloutRunner):
     @staticmethod
     def patch_config(frozen_config, data=None, exp_config=None):
@@ -74,7 +105,7 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         log.info("Starting task.reset() ...")
         observation, _info = task.reset()
         log.info("task.reset() completed.")
-        print(f"Observation: {observation}", flush=True)
+        # print(f"Observation: {observation}", flush=True)
         if viewer is not None:
             viewer.sync()
 
@@ -87,16 +118,18 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             log.warning("Sleep flag not set.")
 
         success = False
+        step_idx = 0
         while not task.is_done():
             if shutdown_event is not None and shutdown_event.is_set():
                 return False
 
             action_cmd = policy.get_action(observation)
-            print(f"Action command: {action_cmd}", flush=True)
             if action_cmd is None:
                 break
-
+            print(f"Step: {step_idx} Action command[base]: {action_cmd['base']}", flush=True)
+            
             observation, reward, terminal, truncated, infos = task.step(action_cmd)
+            step_idx += 1
             # print(f"Observation: {observation}", flush=True)
             # print(f"Reward: {reward}", flush=True)
             # print(f"Terminal: {terminal}", flush=True)
@@ -129,6 +162,11 @@ def build_nav_config(args) -> NavToObjBaseConfig:
     cfg.use_passive_viewer = args.viewer
 
     cfg.task_sampler_config.samples_per_house = args.samples_per_house
+    # nav_ros_sim is usually used for live ROS debugging; default to a single attempt.
+    cfg.task_sampler_config.max_total_attempts_multiplier = 1
+    if args.policy_mode == "left_arm_debug":
+        # Keep the same scene running for multiple debug episodes.
+        cfg.task_sampler_config.samples_per_house = max(args.samples_per_house, args.debug_loop_episodes)
     cfg.task_sampler_config.house_inds = [args.house_ind]
     cfg.task_sampler_config.randomize_lighting = args.randomize_scene
     cfg.task_sampler_config.randomize_textures = args.randomize_scene
@@ -154,6 +192,10 @@ def build_nav_config(args) -> NavToObjBaseConfig:
         cfg.robot_config = RBY1Config()
         cfg.camera_config = RBY1GoProD455CameraSystem()
         ensure_head_camera_exists(cfg.camera_config)
+        if enable_depth_for_camera(cfg.camera_config, "head_camera"):
+            log.info("Enabled depth for head_camera in this run.")
+        else:
+            log.warning("head_camera not found; cannot enable head depth for this run.")
     elif args.robot == "rum":
         cfg.robot_config = FloatingRUMRobotConfig()
         # RUM camera config may come from base config; still enforce camera naming compatibility.
@@ -165,6 +207,8 @@ def build_nav_config(args) -> NavToObjBaseConfig:
     # Keep planner config available for fallback/debugging.
     cfg.policy_config = AStarNavToObjPolicyConfig()
     cfg.policy_dt_ms = args.policy_dt_ms
+    # For ROS runtime/debugging, stop after the first sampled episode regardless of success.
+    cfg.filter_for_successful_trajectories = False
     return cfg
 
 
@@ -187,7 +231,7 @@ def parse_args():
     parser.add_argument("--samples_per_house", type=int, default=1)
     parser.add_argument("--target_types", type=str, default=None)
     parser.add_argument("--task_horizon", type=int, default=300)
-    parser.add_argument("--policy_dt_ms", type=float, default=200.0)
+    parser.add_argument("--policy_dt_ms", type=float, default=100.0)
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--randomize_scene", action="store_true")
     parser.add_argument("--run_name_prefix", type=str, default="")
@@ -204,9 +248,60 @@ def parse_args():
         help="Enable task sensor suite (may be significantly slower at reset).",
     )
 
-    parser.add_argument("--observation_topic", type=str, default="/molmo_spaces/observation")
+    parser.add_argument("--observation_topic", type=str, default="/molmo_spaces/head_camera/image")
+    parser.add_argument("--depth_topic", type=str, default="/molmo_spaces/head_camera/depth")
     parser.add_argument("--action_topic", type=str, default="/molmo_spaces/action")
-    parser.add_argument("--action_timeout_s", type=float, default=1.0)
+    parser.add_argument("--pointcloud_topic", type=str, default="/registered_scan")
+    parser.add_argument("--camera_info_topic", type=str, default="/molmo_spaces/head_camera/camera_info")
+    parser.add_argument("--depth_camera_name", type=str, default="head_camera")
+    parser.add_argument("--pointcloud_frame_id", type=str, default="tf_frame_lidar")
+    parser.add_argument("--pointcloud_stride", type=int, default=2)
+    parser.add_argument(
+        "--pointcloud_roll_correction_deg",
+        type=float,
+        default=0.0,
+        help="Roll correction (deg) around robot forward axis for pointcloud leveling.",
+    )
+    parser.add_argument("--depth_fov_deg", type=float, default=90.0)
+    parser.add_argument("--depth_min_m", type=float, default=0.1)
+    parser.add_argument("--depth_max_m", type=float, default=30.0)
+    parser.add_argument("--action_timeout_s", type=float, default=0.1)
+    parser.add_argument(
+        "--cmd_vel_linear_gain",
+        type=float,
+        default=3.0,
+        help="Linear velocity gain applied to incoming /cmd_vel_stamped before stepping base.",
+    )
+    parser.add_argument(
+        "--immediate_noop_after_publish",
+        action="store_true",
+        help="Publish observations then immediately return noop action (no ROS action wait).",
+    )
+    parser.add_argument(
+        "--timing_log_every_n_frames",
+        type=int,
+        default=20,
+        help="Log averaged per-frame ROS bridge timing every N frames (0 disables).",
+    )
+    parser.add_argument(
+        "--policy_mode",
+        type=str,
+        default="ros_bridge",
+        choices=["ros_bridge", "left_arm_debug"],
+        help="Policy mode: ROS bridge or keyboard left-arm debug.",
+    )
+    parser.add_argument(
+        "--left_arm_joint_delta",
+        type=float,
+        default=0.05,
+        help="Joint delta for left-arm keyboard debug policy.",
+    )
+    parser.add_argument(
+        "--debug_loop_episodes",
+        type=int,
+        default=1,
+        help="For left_arm_debug mode: minimum episodes to run on the same house/scene.",
+    )
     return parser.parse_args()
 
 
@@ -215,14 +310,36 @@ def main():
     exp_config = build_nav_config(args)
     exp_config.output_dir = build_output_dir(args.run_name_prefix)
     exp_config.save_config()
+    log_path = configure_run_file_logging(exp_config.output_dir)
+    log.info("Run log file: %s", log_path)
 
-    policy = RosBridgePolicy(
-        config=exp_config,
-        task=None,
-        observation_topic=args.observation_topic,
-        action_topic=args.action_topic,
-        action_timeout_s=args.action_timeout_s,
-    )
+    if args.policy_mode == "left_arm_debug":
+        policy = LeftArmKeyboardDebugPolicy(
+            config=exp_config,
+            task=None,
+            joint_delta=args.left_arm_joint_delta,
+        )
+    else:
+        policy = RosBridgePolicy(
+            config=exp_config,
+            task=None,
+            observation_topic=args.observation_topic,
+            action_topic=args.action_topic,
+            pointcloud_topic=args.pointcloud_topic,
+            camera_info_topic=args.camera_info_topic,
+            depth_topic=args.depth_topic,
+            action_timeout_s=args.action_timeout_s,
+            depth_camera_name=args.depth_camera_name,
+            pointcloud_frame_id=args.pointcloud_frame_id,
+            pointcloud_stride=args.pointcloud_stride,
+            pointcloud_roll_correction_deg=args.pointcloud_roll_correction_deg,
+            depth_fov_deg=args.depth_fov_deg,
+            depth_min_m=args.depth_min_m,
+            depth_max_m=args.depth_max_m,
+            cmd_vel_linear_gain=args.cmd_vel_linear_gain,
+            immediate_noop_after_publish=args.immediate_noop_after_publish,
+            timing_log_every_n_frames=args.timing_log_every_n_frames,
+        )
     print("Creating runner ...")
     runner = NavRosRolloutRunner(exp_config)
     print("Starting runner.run() ...")
@@ -231,7 +348,8 @@ def main():
         runner.run(preloaded_policy=policy)
     finally:
         print("Closing policy ...")
-        policy.close()
+        if hasattr(policy, "close"):
+            policy.close()
 
 
 if __name__ == "__main__":

@@ -154,11 +154,19 @@ class EGLGLContext:
 
     def make_current(self) -> None:
         global EGL_DISPLAY
-        if not EGL.eglMakeCurrent(
-            EGL_DISPLAY, EGL.EGL_NO_SURFACE, EGL.EGL_NO_SURFACE, self._context
-        ):
-            error = EGL.eglGetError()
-            raise RuntimeError(f"Failed to make the EGL context current. EGL error: {error}")
+        # Some drivers can transiently fail when a stale context remains bound to a thread.
+        # Retry once after releasing thread-local EGL state.
+        if EGL.eglMakeCurrent(EGL_DISPLAY, EGL.EGL_NO_SURFACE, EGL.EGL_NO_SURFACE, self._context):
+            return
+        first_error = EGL.eglGetError()
+        EGL.eglReleaseThread()
+        if EGL.eglMakeCurrent(EGL_DISPLAY, EGL.EGL_NO_SURFACE, EGL.EGL_NO_SURFACE, self._context):
+            return
+        second_error = EGL.eglGetError()
+        raise RuntimeError(
+            "Failed to make the EGL context current. "
+            f"EGL errors: first={first_error}, second={second_error}"
+        )
 
     def free(self) -> None:
         """Frees resources associated with this context."""

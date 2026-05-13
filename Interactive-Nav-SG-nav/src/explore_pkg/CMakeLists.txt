@@ -29,12 +29,8 @@ find_package(catkin REQUIRED COMPONENTS
   visualization_msgs
   actionlib
   actionlib_msgs
-  move_base_msgs
-  cv_bridge
   tf
 )
-
-find_package(OpenCV REQUIRED)
 
 # RapidJSON is header-only, try to find it but don't fail if not found
 find_package(RapidJSON QUIET)
@@ -155,10 +151,7 @@ catkin_package(
     visualization_msgs
     actionlib
     actionlib_msgs
-    move_base_msgs
-    cv_bridge
     tf
-  DEPENDS OpenCV
 )
 
 ###########
@@ -171,7 +164,6 @@ include_directories(
   include
   or-tools/include
   ${catkin_INCLUDE_DIRS}
-  ${OpenCV_INCLUDE_DIRS}
 )
 
 link_directories(
@@ -214,7 +206,6 @@ add_dependencies(${PROJECT_NAME} ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EX
 
 target_link_libraries(${PROJECT_NAME}
   ${catkin_LIBRARIES}
-  ${OpenCV_LIBS}
   ${CMAKE_CURRENT_SOURCE_DIR}/or-tools/lib/libortools.so
 )
 
@@ -228,7 +219,6 @@ add_dependencies(explore_manager_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catk
 target_link_libraries(explore_manager_node
   ${PROJECT_NAME}
   ${catkin_LIBRARIES}
-  ${OpenCV_LIBS}
 )
 
 #############

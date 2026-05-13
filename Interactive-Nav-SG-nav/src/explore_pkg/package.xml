@@ -60,12 +60,7 @@
   <depend>visualization_msgs</depend>
   <depend>actionlib</depend>
   <depend>actionlib_msgs</depend>
-  <depend>move_base_msgs</depend>
-  <depend>cv_bridge</depend>
   <depend>tf</depend>
-  
-  <build_depend>OpenCV</build_depend>
-  <exec_depend>OpenCV</exec_depend>
 
 
   <!-- The export tag contains other, unspecified, tags -->

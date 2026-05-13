@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(semantic_mapping_pkg)
 
-# Set C++ standard (required for shared_mutex)
-set(CMAKE_CXX_STANDARD 14)
+# Set C++ standard (required for shared_mutex in log4cxx headers)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(catkin REQUIRED COMPONENTS
@@ -23,7 +23,23 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(OpenCV 3.0 QUIET)
 find_package(Eigen3 REQUIRED)
-find_package(RapidJSON REQUIRED)
+# RapidJSON is header-only; some systems do not ship RapidJSONConfig.cmake.
+find_package(RapidJSON QUIET)
+if(NOT RapidJSON_FOUND)
+  find_path(RAPIDJSON_INCLUDE_DIR rapidjson/document.h
+    PATHS
+      /usr/include
+      /usr/local/include
+      /opt/local/include
+  )
+  if(RAPIDJSON_INCLUDE_DIR)
+    set(RapidJSON_FOUND TRUE)
+    set(RapidJSON_INCLUDE_DIRS ${RAPIDJSON_INCLUDE_DIR})
+  endif()
+endif()
+if(NOT RapidJSON_FOUND)
+  message(FATAL_ERROR "RapidJSON headers not found. Please install rapidjson-dev.")
+endif()
 find_package(yaml-cpp REQUIRED)
 find_package(PCL REQUIRED)
 
@@ -52,7 +68,7 @@ include_directories(
   ${PROJECT_SOURCE_DIR}/include
   ${EIGEN3_INCLUDE_DIRS}
   ${YAML_CPP_INCLUDE_DIR}
-  ${RapidJSON_DIR}
+  ${RapidJSON_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
   /usr/local/include
   /usr/include

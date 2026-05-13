@@ -40,7 +40,7 @@ voronoi:
   # TSP相关参数（用于避免震荡和优化探索路径）
   # 注意：TSP节点选择策略为选择评分最高的10个节点（相对排名，不使用绝对值阈值）
   tsp_goal_reach_threshold: 1.0              # TSP目标到达阈值（米）
-  tsp_goal_timeout: 60.0                     # TSP目标超时时间（秒）
+  tsp_goal_timeout: 40.0                     # TSP目标超时时间（秒）
   tsp_top_num: 1.0                   # TSP节点选择比例（0.0-1.0，1.0表示尽量纳入全部候选节点，提高覆盖性）
   
   tsp_replan_frequency: -1               # TSP重新规划频率（Hz），-1表示不按时间重新规划，只在路径完成时重新规划

@@ -58,6 +58,7 @@ bool ExploreManager::initialize()
                                      &ExploreManager::sceneIdGridCallback, this);
   move_base_status_sub_ = nh_.subscribe(move_base_status_topic_, 10,
                                         &ExploreManager::moveBaseStatusCallback, this);
+  reset_sub_ = nh_.subscribe(reset_topic_, 1, &ExploreManager::resetCallback, this);
                                      
   goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(goal_topic_, 10);
   goal_point_pub_ = nh_.advertise<geometry_msgs::PointStamped>("/explore_manager/goal_point", 10);
@@ -89,7 +90,7 @@ void ExploreManager::loadParameters()
   // 目标描述（从参数读取）
   private_nh_.param("target_description", target_description_, std::string(""));
   private_nh_.param("topics/navigation/odom_topic", odom_topic_,
-                     std::string("/odometry"));
+                    std::string("/odom"));
   private_nh_.param("topics/navigation/map_topic", map_topic_,
                      std::string("/struct_mapping/occ_map"));
   private_nh_.param("topics/navigation/cmd_vel_topic", cmd_vel_topic_,
@@ -128,6 +129,8 @@ void ExploreManager::loadParameters()
                      std::string("/semantic_mapping/scene_id_grid"));
   private_nh_.param("topics/score_map_topic", score_map_topic_,
                      std::string("/explore_manager/score_map"));
+  private_nh_.param("topics/reset_topic", reset_topic_,
+                     std::string("/nav_system/reset"));
   private_nh_.param("score_map/occupancy_boundary_weight", occupancy_boundary_weight_, 1.0);
   private_nh_.param("score_map/scene_known_unknown_boundary_weight", scene_known_unknown_boundary_weight_, 1.0);
   private_nh_.param("score_map/scene_different_boundary_weight", scene_different_boundary_weight_, 1.5);
@@ -298,6 +301,41 @@ void ExploreManager::moveBaseStatusCallback(const actionlib_msgs::GoalStatusArra
 
   ROS_WARN("[ExploreManager] move_base reported planning failure (status=%u), "
            "forcing goal reselection in next exploration cycle", status);
+}
+
+void ExploreManager::resetCallback(const std_msgs::EmptyConstPtr& msg)
+{
+  (void)msg;
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
+  stopRecoveryRotation();
+
+  semantic_objects_.clear();
+  visited_points_.clear();
+  exploration_path_.poses.clear();
+  exploration_path_.header.stamp = ros::Time::now();
+  score_map_.data.clear();
+  current_map_.data.clear();
+  scene_id_grid_.data.clear();
+
+  has_target_position_ = false;
+  has_active_goal_ = false;
+  rotating_in_place_ = false;
+  map_received_ = false;
+  scene_id_grid_received_ = false;
+  last_goal_publish_time_ = ros::Time(0);
+  last_move_base_failure_handle_time_ = ros::Time(0);
+  last_failed_goal_id_.clear();
+
+  geometry_msgs::Twist stop_cmd;
+  cmd_vel_pub_.publish(stop_cmd);
+
+  explorer_.reset();
+
+  updateState(NavigationState::EXPLORING);
+  publishStatus();
+
+  ROS_WARN("[ExploreManager] Received reset signal on %s, exploration state cleared", reset_topic_.c_str());
 }
 
 // ========== 核心功能函数实现 ==========

@@ -172,7 +172,7 @@ def setup_config(args: argparse.ArgumentParser) -> MlSpacesExpConfig:
     datagen_cfg.data_split = args.data_split  # train or test
     datagen_cfg.task_type = task_type
 
-    datagen_cfg.task_horizon = 300
+    datagen_cfg.task_horizon = 500
     if args.target_types:
         datagen_cfg.task_sampler_config.pickup_types = args.target_types.split(",")
     datagen_cfg.task_sampler_config.samples_per_house = (

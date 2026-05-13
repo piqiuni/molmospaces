@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 2.8.12)
 project(struct_mapping_pkg)
 
-find_package(catkin REQUIRED nav_msgs nodelet openslam_gmapping roscpp tf rosbag_storage)
+find_package(catkin REQUIRED nav_msgs nodelet openslam_gmapping roscpp tf rosbag_storage std_msgs)
 
 find_package(Boost REQUIRED)
 
@@ -12,6 +12,7 @@ include_directories(include)
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES voronoi_mapping_pkg
+  CATKIN_DEPENDS std_msgs nav_msgs roscpp tf nodelet
 )
 
 add_executable(slam_gmapping src/slam_gmapping.cpp src/main.cpp)

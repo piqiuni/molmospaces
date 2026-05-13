@@ -9,10 +9,11 @@ topics:
   # 导航相关
   navigation:
     goal_topic: "/move_base_simple/goal"
-    odom_topic: "/odometry"
+    odom_topic: "/odom"
     map_topic: "/struct_mapping/occ_map"
     cmd_vel_topic: "/cmd_vel"
     move_base_status_topic: "/move_base/status"
+  reset_topic: "/nav_system/reset"
   
   # 状态发布
   state_topic: "/explore_manager/state"

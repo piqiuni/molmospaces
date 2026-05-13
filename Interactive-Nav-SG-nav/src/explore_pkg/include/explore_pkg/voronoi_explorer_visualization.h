@@ -56,6 +56,11 @@ public:
                       const geometry_msgs::Point& current_goal_position,
                       const std::string& frame_id);
 
+  /**
+   * @brief 清空已发布的可视化标记
+   */
+  void clearAllMarkers(const std::string& frame_id);
+
 private:
   ros::Publisher scored_marker_pub_;
   ros::Publisher tsp_path_pub_;

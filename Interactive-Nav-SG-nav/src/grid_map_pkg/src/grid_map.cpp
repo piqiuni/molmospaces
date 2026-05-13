@@ -1,5 +1,6 @@
 #include <grid_map_pkg/grid_map.h>
 #include <ros/ros.h>
+#include <fstream>
 
 GridMap::GridMap(const int &size_x, const int &size_y, const int &init_x, const int &init_y, 
                  const double &cell_size, int &average_filter) 

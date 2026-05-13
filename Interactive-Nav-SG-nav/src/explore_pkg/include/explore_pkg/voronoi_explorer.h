@@ -83,6 +83,11 @@ public:
    */
   void addTemporaryBlacklistPoint(const geometry_msgs::Point& point, double duration_sec);
 
+  /**
+   * @brief 重置内部缓存（维诺节点/TSP路径/黑名单等）
+   */
+  void reset();
+
 private:
   // ========== Voronoi图构建 ==========
   void buildVoronoiGraph(const nav_msgs::OccupancyGrid& voronoi_map);

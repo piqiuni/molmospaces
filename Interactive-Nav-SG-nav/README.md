@@ -152,7 +152,7 @@ source ./devel/setup.bash
 roslaunch semantic_mapping_pkg semantic_mapping.launch
 ```
 
-```
+```bash
 cd /home/wxy/Downloads/Interactive-Nav-SG-nav
 source ./devel/setup.bash
 roslaunch explore_pkg explore_manager.launch

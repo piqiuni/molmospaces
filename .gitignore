@@ -3,6 +3,7 @@ Interactive-Nav-SG-nav/semantic_ws/data
 Interactive-Nav-SG-nav/GLIP
 Interactive-Nav-SG-nav/GroundingDINO
 Interactive-Nav-SG-nav/segment_anything
+.cursor_pydeps
 
 
 # ignore nfs files

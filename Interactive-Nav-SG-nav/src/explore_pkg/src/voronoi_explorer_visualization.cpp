@@ -254,6 +254,24 @@ void VoronoiExplorerVisualization::publishTSPPath(
             tsp_path.size(), current_index, tsp_path.size() - current_index);
 }
 
+void VoronoiExplorerVisualization::clearAllMarkers(const std::string& frame_id)
+{
+  if (!initialized_) {
+    return;
+  }
+
+  visualization_msgs::Marker delete_all_marker;
+  delete_all_marker.header.frame_id = frame_id.empty() ? "map" : frame_id;
+  delete_all_marker.header.stamp = ros::Time::now();
+  delete_all_marker.action = visualization_msgs::Marker::DELETEALL;
+
+  tsp_path_pub_.publish(delete_all_marker);
+
+  visualization_msgs::MarkerArray delete_all_array;
+  delete_all_array.markers.push_back(delete_all_marker);
+  scored_marker_pub_.publish(delete_all_array);
+}
+
 void VoronoiExplorerVisualization::worldToMap(double wx, double wy, int& mx, int& my,
                                               const nav_msgs::OccupancyGrid& map)
 {

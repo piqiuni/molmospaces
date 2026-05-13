@@ -555,6 +555,32 @@ void VoronoiExplorer::addTemporaryBlacklistPoint(const geometry_msgs::Point& poi
            duration_sec, point.x, point.y, point.z);
 }
 
+void VoronoiExplorer::reset()
+{
+  voronoi_nodes_.clear();
+  tsp_path_.clear();
+  temporary_blacklisted_goals_.clear();
+
+  score_map_.data.clear();
+  scene_id_grid_.data.clear();
+  scene_score_grid_.data.clear();
+  current_map_.data.clear();
+
+  voronoi_map_received_ = false;
+  score_map_received_ = false;
+  scene_id_grid_received_ = false;
+  tsp_current_index_ = 0;
+  current_goal_set_time_ = ros::Time(0);
+  current_goal_position_ = geometry_msgs::Point();
+
+  if (visualization_) {
+    const std::string frame_id = current_map_.header.frame_id;
+    visualization_->clearAllMarkers(frame_id);
+  }
+
+  ROS_WARN("[VoronoiExplorer] Internal graph/TSP state reset");
+}
+
 void VoronoiExplorer::updateVisualization()
 {
   if (!visualization_) {

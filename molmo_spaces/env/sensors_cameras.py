@@ -26,13 +26,17 @@ class CameraSensor(Sensor):
 
     def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
         """Get camera image from environment rendering."""
-
-        # Use camera-specific frame access for multi-camera support
-        # if hasattr(env, 'render_rgb_frame') and callable(env.render_rgb_frame):
-        frame = env.render_rgb_frame(self.camera_name)
-
-        if frame is not None:
-            return frame
+        try:
+            frame = env.render_rgb_frame(self.camera_name)
+            if frame is not None:
+                return frame
+        except RuntimeError as e:
+            # In viewer debug mode, offscreen EGL can fail to bind context on some drivers.
+            # Fall back to a black frame to keep teleop/debug loop alive.
+            if "EGL" in str(e):
+                width, height = self.img_resolution
+                return np.zeros((height, width, 3), dtype=np.uint8)
+            raise
 
         # Return black image if no rendering available
         width, height = self.img_resolution
@@ -67,9 +71,13 @@ class DepthSensor(Sensor):
         """Get depth image from environment rendering."""
         # Use camera-specific frame access for multi-camera support
         if hasattr(env, "render_depth_frame") and callable(env.render_depth_frame):
-            frame = env.render_depth_frame(self.camera_name)
-            if frame is not None:
-                return frame
+            try:
+                frame = env.render_depth_frame(self.camera_name)
+                if frame is not None:
+                    return frame
+            except RuntimeError as e:
+                if "EGL" not in str(e):
+                    raise
 
         # Fallback to default camera for backward compatibility
         if hasattr(env, "depth_frame") and env.depth_frame is not None:
@@ -149,7 +157,8 @@ class CameraParameterSensor(Sensor):
         extrinsic_cv = np.linalg.inv(world2cam)[:3, :]  # 3x4 matrix
         cam2world_gl = world2cam
 
-        height, width = self.img_resolution
+        # img_resolution is stored as (width, height)
+        width, height = self.img_resolution
         fovy_degrees = camera.fov
 
         # Convert field of view to focal length
