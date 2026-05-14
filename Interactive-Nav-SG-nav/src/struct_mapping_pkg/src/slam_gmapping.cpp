@@ -122,6 +122,7 @@ Initial map dimensions and resolution:
 
 #include <iostream>
 #include <cmath>
+#include <limits>
 
 #include <time.h>
 
@@ -198,6 +199,12 @@ void SlamGMapping::init()
     odom_frame_ = "tf_frame_odom";
   if(!private_nh_.getParam("reset_topic", reset_topic_))
     reset_topic_ = "/nav_system/reset";
+  if(!private_nh_.getParam("odom_topic", odom_topic_))
+    odom_topic_ = "/odom";
+  if(!private_nh_.getParam("scan_filter_queue_size", scan_filter_queue_size_))
+    scan_filter_queue_size_ = 1;
+  if (scan_filter_queue_size_ < 1)
+    scan_filter_queue_size_ = 1;
 
   private_nh_.param("transform_publish_period", transform_publish_period_, 0.05);
 
@@ -290,6 +297,20 @@ void SlamGMapping::init()
     local_overwrite_radius_ = 8.0;  // 默认仅覆写机器人附近8米范围
   if(!private_nh_.getParam("local_overwrite_mark_occupied", local_overwrite_mark_occupied_))
     local_overwrite_mark_occupied_ = true;
+
+  // 时间同步保护参数
+  if(!private_nh_.getParam("enable_time_sync_guard", enable_time_sync_guard_))
+    enable_time_sync_guard_ = true;
+  if(!private_nh_.getParam("max_odom_cloud_time_diff", max_odom_cloud_time_diff_))
+    max_odom_cloud_time_diff_ = 0.03;  // 默认30ms
+  if(!private_nh_.getParam("max_cloud_age_sec", max_cloud_age_sec_))
+    max_cloud_age_sec_ = 0.20;  // 默认丢弃超过200ms的延迟点云
+  if(!private_nh_.getParam("enforce_cloud_age_drop", enforce_cloud_age_drop_))
+    enforce_cloud_age_drop_ = false;  // 默认仅告警，不直接丢弃
+  int odom_stamp_buffer_size = 200;
+  if(!private_nh_.getParam("odom_stamp_buffer_size", odom_stamp_buffer_size))
+    odom_stamp_buffer_size = 200;
+  odom_stamp_buffer_size_ = static_cast<size_t>(std::max(10, odom_stamp_buffer_size));
     
   if(!private_nh_.getParam("tf_delay", tf_delay_))
     tf_delay_ = transform_publish_period_;
@@ -306,15 +327,20 @@ void SlamGMapping::startLiveSlam()
   filtered_cloud_pub_ = node_.advertise<sensor_msgs::PointCloud2>("filtered_pointcloud", 1, true);
   ss_ = node_.advertiseService("dynamic_map", &SlamGMapping::mapCallback, this);
   reset_sub_ = node_.subscribe(reset_topic_, 1, &SlamGMapping::resetCallback, this);
-  scan_filter_sub_ = new message_filters::Subscriber<sensor_msgs::PointCloud2>(node_, "registered_scan", 5);
-  scan_filter_ = new tf::MessageFilter<sensor_msgs::PointCloud2>(*scan_filter_sub_, tf_, odom_frame_, 5);
-  scan_filter_->setTolerance(ros::Duration(0.1));
+  odom_sub_ = node_.subscribe(odom_topic_, 200, &SlamGMapping::odomCallback, this);
+  scan_filter_sub_ = new message_filters::Subscriber<sensor_msgs::PointCloud2>(
+      node_, "registered_scan", scan_filter_queue_size_);
+  scan_filter_ = new tf::MessageFilter<sensor_msgs::PointCloud2>(
+      *scan_filter_sub_, tf_, odom_frame_, scan_filter_queue_size_);
+  scan_filter_->setTolerance(ros::Duration(0.03));
   scan_filter_->registerCallback([this](auto msg){ pointCloudCallback(msg); });
 
   transform_thread_ = new boost::thread(boost::bind(&SlamGMapping::publishLoop, this, transform_publish_period_));
   ROS_INFO("SLAM GMapping started. Waiting for TF and scan data...");
   ROS_INFO("Subscribed to topic: /registered_scan (PointCloud2)");
   ROS_INFO("Target odom frame: %s", odom_frame_.c_str());
+  ROS_INFO("Subscribed to odom topic: %s", odom_topic_.c_str());
+  ROS_INFO("Scan filter queue size: %d", scan_filter_queue_size_);
   ROS_INFO("Publishing map to topic: /struct_mapping/occ_map");
   ROS_INFO("Subscribed to reset topic: %s", reset_topic_.c_str());
 }
@@ -642,21 +668,31 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
     int num_ranges = scan.ranges.size();
     for(int i=0; i < num_ranges; i++)
     {
-      // Must filter out short readings, because the mapper won't
-      if(scan.ranges[num_ranges - i - 1] < scan.range_min)
-        ranges_double[i] = (double)scan.range_max;
+      const int src_idx = num_ranges - i - 1;
+      const bool observed = (src_idx >= 0 &&
+                             src_idx < static_cast<int>(scan.intensities.size()) &&
+                             scan.intensities[src_idx] > 0.0f);
+      const float r = scan.ranges[src_idx];
+
+      // 对于前向深度相机生成的伪360scan：
+      // 未观测波束必须忽略（设为 > maxRange），避免被错误当成“远距离自由空间”。
+      if (!observed || !std::isfinite(r) || r < scan.range_min)
+        ranges_double[i] = maxRange_ + 1.0;
       else
-        ranges_double[i] = (double)scan.ranges[num_ranges - i - 1];
+        ranges_double[i] = static_cast<double>(r);
     }
   } else 
   {
     for(unsigned int i=0; i < scan.ranges.size(); i++)
     {
-      // Must filter out short readings, because the mapper won't
-      if(scan.ranges[i] < scan.range_min)
-        ranges_double[i] = (double)scan.range_max;
+      const bool observed = (i < scan.intensities.size() &&
+                             scan.intensities[i] > 0.0f);
+      const float r = scan.ranges[i];
+
+      if (!observed || !std::isfinite(r) || r < scan.range_min)
+        ranges_double[i] = maxRange_ + 1.0;
       else
-        ranges_double[i] = (double)scan.ranges[i];
+        ranges_double[i] = static_cast<double>(r);
     }
   }
 
@@ -686,6 +722,43 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
 void
 SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud)
 {
+  if (enable_time_sync_guard_)
+  {
+    const ros::Time now = ros::Time::now();
+    if (!cloud->header.stamp.isZero())
+    {
+      const double cloud_age_sec = (now - cloud->header.stamp).toSec();
+      if (cloud_age_sec > max_cloud_age_sec_)
+      {
+        if (enforce_cloud_age_drop_)
+        {
+          ROS_WARN_THROTTLE(
+              2.0,
+              "Drop stale pointcloud: age=%.3fs exceeds max_cloud_age_sec=%.3fs",
+              cloud_age_sec,
+              max_cloud_age_sec_);
+          return;
+        }
+        ROS_WARN_THROTTLE(
+            2.0,
+            "Stale pointcloud accepted (no drop): age=%.3fs exceeds max_cloud_age_sec=%.3fs",
+            cloud_age_sec,
+            max_cloud_age_sec_);
+      }
+    }
+
+    double odom_dt_sec = 0.0;
+    if (!hasMatchedOdomStamp(cloud->header.stamp, &odom_dt_sec))
+    {
+      ROS_WARN_THROTTLE(
+          2.0,
+          "Drop unsynced pointcloud: nearest odom dt=%.4fs exceeds threshold=%.4fs",
+          odom_dt_sec,
+          max_odom_cloud_time_diff_);
+      return;
+    }
+  }
+
   laser_count_++;
   if ((laser_count_ % throttle_scans_) != 0)
     return;
@@ -807,6 +880,14 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     }
   } else
     ROS_DEBUG("cannot process scan");
+}
+
+void SlamGMapping::odomCallback(const nav_msgs::Odometry::ConstPtr& odom)
+{
+  boost::mutex::scoped_lock lock(odom_time_mutex_);
+  odom_stamp_buffer_.push_back(odom->header.stamp);
+  while (odom_stamp_buffer_.size() > odom_stamp_buffer_size_)
+    odom_stamp_buffer_.pop_front();
 }
 
 double
@@ -1244,6 +1325,29 @@ bool SlamGMapping::worldToMap(const nav_msgs::OccupancyGrid& map, double wx, dou
     return false;
 
   return true;
+}
+
+bool SlamGMapping::hasMatchedOdomStamp(const ros::Time& stamp, double* dt_sec)
+{
+  boost::mutex::scoped_lock lock(odom_time_mutex_);
+  if (odom_stamp_buffer_.empty())
+  {
+    if (dt_sec)
+      *dt_sec = std::numeric_limits<double>::infinity();
+    return false;
+  }
+
+  double best_dt = std::numeric_limits<double>::infinity();
+  for (const ros::Time& t : odom_stamp_buffer_)
+  {
+    const double dt = std::fabs((t - stamp).toSec());
+    if (dt < best_dt)
+      best_dt = dt;
+  }
+
+  if (dt_sec)
+    *dt_sec = best_dt;
+  return best_dt <= max_odom_cloud_time_diff_;
 }
 
 void SlamGMapping::applyLocalOverwrite(nav_msgs::OccupancyGrid& map,

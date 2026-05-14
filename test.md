@@ -87,5 +87,7 @@ rostopic pub -1 /nav_system/reset std_msgs/Empty "{}"
 source ./Interactive-Nav-SG-nav/devel/setup.zsh
 roslaunch nav_pkg nav.launch
 
+
+
 #### Log 位置
 /home/user/ldl/molmospaces/assets/datagen/nav_to_obj_ros_sim_v1

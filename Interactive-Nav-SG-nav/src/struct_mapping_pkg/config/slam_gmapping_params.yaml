@@ -1,6 +1,8 @@
 # 地图更新间隔
 map_update_interval: 0.5
 reset_topic: "/nav_system/reset"
+odom_topic: "/odom"
+scan_filter_queue_size: 1
 
 # GMapping核心参数
 maxUrange: 20.0 #激光扫描最大距离
@@ -54,7 +56,14 @@ inflation_radius: 0.20  # 膨胀半径（米），通常设置为机器人半径
 inscribed_radius: 0.1  # 内切半径（米），障碍物核心区域
 
 # 局部覆写参数（用最新扫描实时覆盖机器人附近区域）
-enable_local_overwrite: true
+enable_local_overwrite: false
 local_overwrite_radius: 8.0
 local_overwrite_mark_occupied: true
+
+# 时间同步保护（避免 odom 与 pointcloud 时间错配）
+enable_time_sync_guard: true
+max_odom_cloud_time_diff: 0.03
+max_cloud_age_sec: 0.35
+enforce_cloud_age_drop: false
+odom_stamp_buffer_size: 200
 

@@ -39,11 +39,13 @@
 #include "tf/transform_broadcaster.h"
 #include "message_filters/subscriber.h"
 #include "tf/message_filter.h"
+#include "nav_msgs/Odometry.h"
 
 #include "gmapping/gridfastslam/gridslamprocessor.h"
 #include "gmapping/sensor/sensor_base/sensor.h"
 
 #include <boost/thread.hpp>
+#include <deque>
 
 class SlamGMapping
 {
@@ -60,6 +62,7 @@ class SlamGMapping
   
     void laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan);
     void pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud);
+    void odomCallback(const nav_msgs::Odometry::ConstPtr& odom);
     void resetCallback(const std_msgs::Empty::ConstPtr& msg);
     bool mapCallback(nav_msgs::GetMap::Request  &req,
                      nav_msgs::GetMap::Response &res);
@@ -73,6 +76,7 @@ class SlamGMapping
     ros::Publisher filtered_cloud_pub_;  // 发布高度滤波后的点云
     ros::ServiceServer ss_;
     ros::Subscriber reset_sub_;
+    ros::Subscriber odom_sub_;
     tf::TransformListener tf_;
     message_filters::Subscriber<sensor_msgs::PointCloud2>* scan_filter_sub_;
     tf::MessageFilter<sensor_msgs::PointCloud2>* scan_filter_;
@@ -100,6 +104,7 @@ class SlamGMapping
     tf::Transform map_to_odom_;
     boost::mutex map_to_odom_mutex_;
     boost::mutex map_mutex_;
+    boost::mutex odom_time_mutex_;
 
     int laser_count_;
     int throttle_scans_;
@@ -111,6 +116,7 @@ class SlamGMapping
     std::string map_frame_;
     std::string odom_frame_;
     std::string reset_topic_;
+    std::string odom_topic_;
 
     void updateMap(const sensor_msgs::LaserScan& scan);
     bool getOdomPose(GMapping::OrientedPoint& gmap_pose, const ros::Time& t);
@@ -124,6 +130,7 @@ class SlamGMapping
                              const sensor_msgs::LaserScan& scan,
                              const GMapping::OrientedPoint& sensor_pose);
     bool worldToMap(const nav_msgs::OccupancyGrid& map, double wx, double wy, int& mx, int& my) const;
+    bool hasMatchedOdomStamp(const ros::Time& stamp, double* dt_sec = NULL);
     
     // Parameters used by GMapping
     double maxRange_;
@@ -173,6 +180,15 @@ class SlamGMapping
     bool enable_local_overwrite_;
     double local_overwrite_radius_;
     bool local_overwrite_mark_occupied_;
+
+    // 时间同步保护参数
+    bool enable_time_sync_guard_;
+    double max_odom_cloud_time_diff_;
+    double max_cloud_age_sec_;
+    bool enforce_cloud_age_drop_;
+    size_t odom_stamp_buffer_size_;
+    std::deque<ros::Time> odom_stamp_buffer_;
+    int scan_filter_queue_size_;
     
     ros::NodeHandle private_nh_;
     

@@ -6,7 +6,6 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
-        - /Odometry1
         - /Odometry1/Shape1
         - /DepthCloud1/Auto Size1
         - /base_link1
@@ -353,7 +352,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 4.997194290161133
+      Distance: 18.610612869262695
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -361,17 +360,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 11.722207069396973
-        Y: 2.858435869216919
-        Z: 1.4089322090148926
+        X: 12.453919410705566
+        Y: 1.2565937042236328
+        Z: -1.8163224458694458
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.1047967672348022
+      Pitch: 1.5247962474822998
       Target Frame: <Fixed Frame>
-      Yaw: 3.939969539642334
+      Yaw: 6.280488014221191
     Saved: ~
 Window Geometry:
   Displays:
@@ -391,5 +390,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1840
-  X: 543
-  Y: 27
+  X: 79
+  Y: 48
