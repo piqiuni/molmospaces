@@ -1,0 +1,145 @@
+# Python semantic mapping pipeline configuration.
+
+frames:
+  world_frame: "tf_frame_map"
+  base_frame: "tf_frame_base_link"
+  camera_frame: "tf_frame_lidar"
+
+topics:
+  rgb_image: "/molmo_spaces/head_camera/image"
+  depth_image: "/molmo_spaces/head_camera/depth"
+  camera_info: "/molmo_spaces/head_camera/camera_info"
+  pointcloud: "/registered_scan"
+  occupancy_grid: "/struct_mapping/occ_map"
+
+  object_detections: "/semantic_mapping/object_detections"
+  scene_attribute: "/semantic_mapping/scene_attribute"
+
+  object_map: "/semantic_mapping/obj_map"
+  object_markers: "/semantic_mapping/object_semantic_map_markers"
+  scene_id_grid: "/semantic_mapping/scene_id_grid"
+  scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
+  scene_colored_pointcloud: "/semantic_mapping/scene_semantic_map/colored_pointcloud"
+  scene_legend: "/semantic_mapping/scene_semantic_map/legend"
+
+object_detection:
+  backend: "mock_empty"       # no_detection | mock_empty | external_http | yolo_world_center_projection | yolo_world_sam_box3d | sam3_box3d
+  provider: "external_http"   # external_http | mock_empty
+  external_url: "http://127.0.0.1:8000/detect"
+  timeout: 5.0
+  include_depth: false
+  confidence_threshold: 0.5
+  publish_rate: 5.0
+  point_stride: 4
+  max_depth_m: 8.0
+  min_valid_points: 12
+  center_kernel_size: 5
+  trim_ratio: 0.1
+
+visual_test:
+  rgb_path: ""
+  depth_path: ""
+  frame_id: "semantic_test_camera"
+  depth_scale: 0.001          # uint16 depth in millimeters -> meters
+  fx: 0.0                     # <=0 estimates from fov_deg
+  fy: 0.0
+  cx: -1.0                    # <0 uses image center
+  cy: -1.0
+  fov_deg: 69.0
+  max_depth: 6.0
+  point_stride: 2
+  bbox_format: "xyxy"         # xyxy | xywh, used when backend returns only 2D boxes
+  fallback_box_depth: 0.25
+  label_height: 0.12
+  publish_rate: 1.0
+  rgb_topic: "/semantic_mapping/test/rgb_image"
+  depth_viz_topic: "/semantic_mapping/test/depth_viz"
+  cloud_topic: "/semantic_mapping/test/rgb_depth_cloud"
+  box_topic: "/semantic_mapping/test/boxes_3d"
+  detections_topic: "/semantic_mapping/test/detections"
+
+room_inference:
+  backend: "object_rules"     # object_rules | external_http | passthrough
+  external_url: "http://127.0.0.1:8000/room"
+  publish_rate: 2.0
+  min_confidence: 0.2
+  evidence_window_sec: 5.0
+
+semantic_map:
+  enable_object_mapping: true
+  enable_scene_mapping: true
+  publish_rate: 2.0
+  object_match_distance: 0.5
+  object_stale_after_sec: 0.0   # 0 keeps objects indefinitely
+  scene_max_range: 3.0
+  scene_min_range: 0.1
+  scene_confidence_step: 5
+
+scene_types:
+  unknown_id: -1
+  class_to_id:
+    livingroom: 0
+    bedroom: 1
+    kitchen: 2
+    bathroom: 3
+    balcony: 4
+    storage: 5
+    door: 6
+    wall: 7
+    entrance: 8
+    outside: 9
+  synonyms:
+    living: livingroom
+    lounge: livingroom
+    sittingroom: livingroom
+    room: livingroom
+    bed: bedroom
+    bedroom: bedroom
+    kitchen: kitchen
+    bath: bathroom
+    bathroom: bathroom
+    toilet: bathroom
+    restroom: bathroom
+    balcony: balcony
+    storage: storage
+    storeroom: storage
+    door: door
+    wall: wall
+    entrance: entrance
+    gate: entrance
+    outside: outside
+    external: outside
+
+object_room_priors:
+  kitchen:
+    stove: 1.0
+    oven: 0.9
+    microwave: 0.8
+    refrigerator: 0.9
+    fridge: 0.9
+    sink: 0.4
+    cabinet: 0.3
+  bedroom:
+    bed: 1.0
+    pillow: 0.8
+    nightstand: 0.8
+    dresser: 0.6
+    wardrobe: 0.6
+  bathroom:
+    toilet: 1.0
+    bathtub: 0.9
+    shower: 0.9
+    sink: 0.5
+    towel: 0.5
+  livingroom:
+    sofa: 1.0
+    couch: 1.0
+    tv: 0.7
+    television: 0.7
+    coffee_table: 0.6
+    chair: 0.3
+    table: 0.2
+  storage:
+    box: 0.5
+    shelf: 0.4
+    rack: 0.4

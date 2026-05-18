@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="config_file" default="$(find semantic_mapping_py_pkg)/config/default.yaml"/>
+  <arg name="start_object_detection" default="true"/>
+  <arg name="start_room_attribute" default="true"/>
+  <arg name="start_semantic_mapping" default="true"/>
+
+  <group if="$(arg start_object_detection)">
+    <node name="semantic_object_detection"
+          pkg="semantic_mapping_py_pkg"
+          type="object_detection_node.py"
+          output="screen"
+          respawn="true">
+      <rosparam file="$(arg config_file)" command="load"/>
+    </node>
+  </group>
+
+  <group if="$(arg start_room_attribute)">
+    <node name="semantic_room_attribute"
+          pkg="semantic_mapping_py_pkg"
+          type="room_attribute_node.py"
+          output="screen"
+          respawn="true">
+      <rosparam file="$(arg config_file)" command="load"/>
+    </node>
+  </group>
+
+  <group if="$(arg start_semantic_mapping)">
+    <node name="semantic_mapping_py"
+          pkg="semantic_mapping_py_pkg"
+          type="semantic_mapping_node.py"
+          output="screen"
+          respawn="true">
+      <rosparam file="$(arg config_file)" command="load"/>
+    </node>
+  </group>
+</launch>

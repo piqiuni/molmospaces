@@ -1,0 +1,486 @@
+import base64
+import json
+import math
+import urllib.error
+import urllib.request
+
+import numpy as np
+
+from .geometry_utils import point_dict
+
+
+def _normalize_label(value):
+    return str(value or "").strip().lower().replace(" ", "_")
+
+
+def _bbox_from_detection(det):
+    bbox = det.get("bbox") or det.get("box_2d") or det.get("xyxy")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+    except (TypeError, ValueError):
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _clip_bbox(bbox, image_shape):
+    if bbox is None:
+        return None
+    height, width = image_shape[:2]
+    x1 = max(0, min(width - 1, bbox[0]))
+    y1 = max(0, min(height - 1, bbox[1]))
+    x2 = max(x1 + 1, min(width, bbox[2]))
+    y2 = max(y1 + 1, min(height, bbox[3]))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _depth_to_meters(depth_values):
+    if depth_values is None:
+        return None
+    depth = np.asarray(depth_values, dtype=np.float32)
+    finite = np.isfinite(depth)
+    if not finite.any():
+        return None
+    positive = depth[finite & (depth > 0.0)]
+    if positive.size == 0:
+        return None
+    if positive.mean() > 20.0:
+        depth = depth / 1000.0
+    return depth
+
+
+def _camera_intrinsics(camera_info, image_shape):
+    if camera_info is not None and len(camera_info.K) >= 9 and camera_info.K[0] > 0.0 and camera_info.K[4] > 0.0:
+        return {
+            "fx": float(camera_info.K[0]),
+            "fy": float(camera_info.K[4]),
+            "cx": float(camera_info.K[2]),
+            "cy": float(camera_info.K[5]),
+        }
+    height, width = image_shape[:2]
+    fx = fy = 0.5 * float(width)
+    return {
+        "fx": fx,
+        "fy": fy,
+        "cx": 0.5 * float(width - 1),
+        "cy": 0.5 * float(height - 1),
+    }
+
+
+def _pixels_to_camera_points(pixels, depths, intrinsics):
+    fx = max(intrinsics["fx"], 1e-6)
+    fy = max(intrinsics["fy"], 1e-6)
+    cx = intrinsics["cx"]
+    cy = intrinsics["cy"]
+    cols = pixels[:, 0].astype(np.float32)
+    rows = pixels[:, 1].astype(np.float32)
+    z = depths.astype(np.float32)
+    x = (cols - cx) * z / fx
+    y = (rows - cy) * z / fy
+    return np.stack([x, y, z], axis=1)
+
+
+def _trim_points(points, trim_ratio):
+    if points.shape[0] < 4:
+        return points
+    trim_ratio = min(max(float(trim_ratio), 0.0), 0.45)
+    if trim_ratio <= 0.0:
+        return points
+    mins = np.quantile(points, trim_ratio, axis=0)
+    maxs = np.quantile(points, 1.0 - trim_ratio, axis=0)
+    mask = np.all((points >= mins) & (points <= maxs), axis=1)
+    trimmed = points[mask]
+    return trimmed if trimmed.shape[0] >= 4 else points
+
+
+def _transform_point(tf_listener, target_frame, source_frame, stamp, point):
+    from geometry_msgs.msg import PointStamped
+
+    point_msg = PointStamped()
+    point_msg.header.frame_id = source_frame
+    point_msg.header.stamp = stamp
+    point_msg.point.x = float(point[0])
+    point_msg.point.y = float(point[1])
+    point_msg.point.z = float(point[2])
+    transformed = tf_listener.transformPoint(target_frame, point_msg)
+    return np.array([transformed.point.x, transformed.point.y, transformed.point.z], dtype=np.float32)
+
+
+def _sample_center_point(depth_image_m, bbox, kernel_size):
+    kernel_size = max(1, int(kernel_size))
+    x1, y1, x2, y2 = bbox
+    cx = int(round(0.5 * (x1 + x2 - 1)))
+    cy = int(round(0.5 * (y1 + y2 - 1)))
+    half = kernel_size // 2
+    xs = slice(max(0, cx - half), min(depth_image_m.shape[1], cx + half + 1))
+    ys = slice(max(0, cy - half), min(depth_image_m.shape[0], cy + half + 1))
+    window = depth_image_m[ys, xs]
+    valid = window[np.isfinite(window) & (window > 0.0)]
+    if valid.size == 0:
+        return None
+    return cx, cy, float(np.median(valid))
+
+
+def _sample_box_points(depth_image_m, bbox, point_stride):
+    x1, y1, x2, y2 = bbox
+    cols = np.arange(x1, x2, max(1, int(point_stride)), dtype=np.int32)
+    rows = np.arange(y1, y2, max(1, int(point_stride)), dtype=np.int32)
+    if cols.size == 0 or rows.size == 0:
+        return None, None
+    grid_cols, grid_rows = np.meshgrid(cols, rows)
+    depths = depth_image_m[grid_rows, grid_cols]
+    valid = np.isfinite(depths) & (depths > 0.0)
+    if not valid.any():
+        return None, None
+    pixels = np.stack([grid_cols[valid], grid_rows[valid]], axis=1)
+    values = depths[valid]
+    return pixels, values
+
+
+def _mask_to_pixels(mask, bbox, image_shape, point_stride):
+    if mask is None:
+        return None
+    height, width = image_shape[:2]
+    if isinstance(mask, dict):
+        rows = np.asarray(mask.get("rows", []), dtype=np.int32)
+        cols = np.asarray(mask.get("cols", []), dtype=np.int32)
+        if rows.size == cols.size and rows.size > 0:
+            valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+            if valid.any():
+                return np.stack([cols[valid], rows[valid]], axis=1)
+    if isinstance(mask, list):
+        mask_array = np.asarray(mask)
+        if mask_array.ndim == 2 and mask_array.shape == (height, width):
+            rows, cols = np.nonzero(mask_array)
+            if rows.size > 0:
+                stride = max(1, int(point_stride))
+                return np.stack([cols[::stride], rows[::stride]], axis=1)
+    return None
+
+
+def _normalize_detection(det, bbox, projection_method, camera_center, world_center, size, source_frame):
+    confidence = float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
+    semantic_class = det.get("semantic_class") or det.get("class") or det.get("semantic_name")
+    normalized = {
+        "semantic_class": _normalize_label(semantic_class),
+        "confidence": confidence,
+        "bbox": [int(v) for v in bbox] if bbox is not None else None,
+        "position": point_dict(camera_center[0], camera_center[1], camera_center[2]),
+        "projection_method": projection_method,
+        "source_frame": str(source_frame or ""),
+    }
+    if world_center is not None:
+        normalized["world_position"] = point_dict(world_center[0], world_center[1], world_center[2])
+    if size is not None:
+        normalized["size"] = point_dict(size[0], size[1], size[2])
+        normalized["box3d_center"] = point_dict(camera_center[0], camera_center[1], camera_center[2])
+        normalized["box3d_size"] = point_dict(size[0], size[1], size[2])
+    instance_id = det.get("instance_id")
+    if instance_id:
+        normalized["instance_id"] = str(instance_id)
+    if "mask_area" in det:
+        normalized["mask_area"] = int(det["mask_area"])
+    return normalized
+
+
+class ObjectDetectorBackend:
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+        raise NotImplementedError
+
+
+class RawDetectionProvider:
+    def detect_2d(self, rgb_image, depth_image, camera_info, stamp):
+        raise NotImplementedError
+
+
+class NoDetectionDetector(ObjectDetectorBackend):
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+        return []
+
+
+class MockEmptyDetector(NoDetectionDetector):
+    pass
+
+
+class MockEmptyProvider(RawDetectionProvider):
+    def detect_2d(self, rgb_image, depth_image, camera_info, stamp):
+        return []
+
+
+class ExternalHttpProvider(RawDetectionProvider):
+    def __init__(self, url, timeout=5.0, include_depth=False):
+        self.url = url
+        self.timeout = float(timeout)
+        self.include_depth = bool(include_depth)
+
+    def detect_2d(self, rgb_image, depth_image, camera_info, stamp):
+        import cv2
+
+        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
+        if not ok:
+            return []
+
+        payload = {
+            "image_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+            "stamp_sec": int(stamp.secs),
+            "stamp_nsec": int(stamp.nsecs),
+        }
+        if self.include_depth and depth_image is not None:
+            depth = np.asarray(depth_image)
+            payload["depth"] = {
+                "dtype": str(depth.dtype),
+                "shape": list(depth.shape),
+                "data_b64": base64.b64encode(depth.tobytes(order="C")).decode("ascii"),
+            }
+        if camera_info is not None:
+            payload["camera_info"] = {
+                "width": int(camera_info.width),
+                "height": int(camera_info.height),
+                "K": list(camera_info.K),
+            }
+
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, ValueError, TimeoutError):
+            return []
+
+        if isinstance(data, dict):
+            data = data.get("detections", [])
+        return data if isinstance(data, list) else []
+
+
+class ExternalHttpDetector(ObjectDetectorBackend):
+    def __init__(self, provider):
+        self.provider = provider
+
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+        detections = []
+        for det in self.provider.detect_2d(rgb_image, depth_image, camera_info, stamp):
+            bbox = _clip_bbox(_bbox_from_detection(det), rgb_image.shape)
+            semantic_class = det.get("semantic_class") or det.get("class") or det.get("semantic_name")
+            if not semantic_class:
+                continue
+            normalized = {
+                "semantic_class": _normalize_label(semantic_class),
+                "confidence": float(det.get("confidence", det.get("conf", 0.0)) or 0.0),
+                "bbox": bbox,
+                "projection_method": det.get("projection_method", "provider_passthrough"),
+                "source_frame": str(frame_id or ""),
+            }
+            for key in ("position", "world_position", "size", "instance_id", "mask_area", "box3d_center", "box3d_size"):
+                if key in det:
+                    normalized[key] = det[key]
+            detections.append(normalized)
+        return detections
+
+
+class CenterProjectionDetector(ObjectDetectorBackend):
+    def __init__(self, provider, world_frame, point_stride=4, max_depth_m=8.0, center_kernel_size=5):
+        import rospy
+        import tf
+
+        self.provider = provider
+        self.world_frame = world_frame
+        self.point_stride = max(1, int(point_stride))
+        self.max_depth_m = float(max_depth_m)
+        self.center_kernel_size = max(1, int(center_kernel_size))
+        self.rospy = rospy
+        self.tf_listener = tf.TransformListener()
+
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+        if depth_image is None:
+            return []
+        depth_image_m = _depth_to_meters(depth_image)
+        if depth_image_m is None:
+            return []
+        intrinsics = _camera_intrinsics(camera_info, rgb_image.shape)
+        detections = []
+        for det in self.provider.detect_2d(rgb_image, depth_image, camera_info, stamp):
+            bbox = _clip_bbox(_bbox_from_detection(det), rgb_image.shape)
+            if bbox is None:
+                continue
+            sample = _sample_center_point(depth_image_m, bbox, self.center_kernel_size)
+            if sample is None:
+                continue
+            col, row, depth_m = sample
+            if depth_m <= 0.0 or depth_m > self.max_depth_m:
+                continue
+            camera_center = _pixels_to_camera_points(
+                np.asarray([[col, row]], dtype=np.float32),
+                np.asarray([depth_m], dtype=np.float32),
+                intrinsics,
+            )[0]
+            world_center = None
+            if frame_id:
+                try:
+                    self.tf_listener.waitForTransform(
+                        self.world_frame, frame_id, stamp, self.rospy.Duration(0.15)
+                    )
+                    world_center = _transform_point(
+                        self.tf_listener, self.world_frame, frame_id, stamp, camera_center
+                    )
+                except Exception as exc:
+                    self.rospy.logwarn_throttle(2.0, "[object_detection_node] TF center projection failed: %s", exc)
+            detections.append(
+                _normalize_detection(
+                    det=det,
+                    bbox=bbox,
+                    projection_method="bbox_center_projection",
+                    camera_center=camera_center,
+                    world_center=world_center,
+                    size=None,
+                    source_frame=frame_id,
+                )
+            )
+        return detections
+
+
+class SamBox3DDetector(ObjectDetectorBackend):
+    def __init__(
+        self,
+        provider,
+        world_frame,
+        point_stride=4,
+        max_depth_m=8.0,
+        min_valid_points=12,
+        trim_ratio=0.1,
+    ):
+        import rospy
+        import tf
+
+        self.provider = provider
+        self.world_frame = world_frame
+        self.point_stride = max(1, int(point_stride))
+        self.max_depth_m = float(max_depth_m)
+        self.min_valid_points = max(4, int(min_valid_points))
+        self.trim_ratio = float(trim_ratio)
+        self.rospy = rospy
+        self.tf_listener = tf.TransformListener()
+
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+        if depth_image is None:
+            return []
+        depth_image_m = _depth_to_meters(depth_image)
+        if depth_image_m is None:
+            return []
+        intrinsics = _camera_intrinsics(camera_info, rgb_image.shape)
+        detections = []
+        for det in self.provider.detect_2d(rgb_image, depth_image, camera_info, stamp):
+            bbox = _clip_bbox(_bbox_from_detection(det), rgb_image.shape)
+            if bbox is None:
+                continue
+            pixels = _mask_to_pixels(det.get("mask"), bbox, rgb_image.shape, self.point_stride)
+            if pixels is None or pixels.shape[0] == 0:
+                pixels, values = _sample_box_points(depth_image_m, bbox, self.point_stride)
+            else:
+                cols = np.clip(pixels[:, 0], 0, depth_image_m.shape[1] - 1)
+                rows = np.clip(pixels[:, 1], 0, depth_image_m.shape[0] - 1)
+                values = depth_image_m[rows, cols]
+                valid = np.isfinite(values) & (values > 0.0)
+                pixels = pixels[valid]
+                values = values[valid]
+            if pixels is None or values is None or values.size < self.min_valid_points:
+                continue
+            valid_depth = values <= self.max_depth_m
+            pixels = pixels[valid_depth]
+            values = values[valid_depth]
+            if values.size < self.min_valid_points:
+                continue
+            points = _pixels_to_camera_points(pixels, values, intrinsics)
+            points = _trim_points(points, self.trim_ratio)
+            if points.shape[0] < self.min_valid_points:
+                continue
+            mins = points.min(axis=0)
+            maxs = points.max(axis=0)
+            camera_center = 0.5 * (mins + maxs)
+            size = np.maximum(maxs - mins, 0.0)
+            world_center = None
+            if frame_id:
+                try:
+                    self.tf_listener.waitForTransform(
+                        self.world_frame, frame_id, stamp, self.rospy.Duration(0.15)
+                    )
+                    world_center = _transform_point(
+                        self.tf_listener, self.world_frame, frame_id, stamp, camera_center
+                    )
+                except Exception as exc:
+                    self.rospy.logwarn_throttle(2.0, "[object_detection_node] TF mask box projection failed: %s", exc)
+            enriched = dict(det)
+            enriched["mask_area"] = int(points.shape[0])
+            detections.append(
+                _normalize_detection(
+                    det=enriched,
+                    bbox=bbox,
+                    projection_method="mask_box3d_projection",
+                    camera_center=camera_center,
+                    world_center=world_center,
+                    size=size,
+                    source_frame=frame_id,
+                )
+            )
+        return detections
+
+
+def make_raw_detection_provider(kind, config):
+    kind = str(kind or "external_http").strip().lower()
+    if kind == "external_http":
+        return ExternalHttpProvider(
+            config.get("external_url", "http://127.0.0.1:8000/detect"),
+            timeout=config.get("timeout", 5.0),
+            include_depth=config.get("include_depth", False),
+        )
+    return MockEmptyProvider()
+
+
+def make_detector_backend(kind, config, frames=None):
+    kind = str(kind or "mock_empty").strip().lower()
+    frames = frames or {}
+    if kind in ("no_detection", "none", "disabled", "off"):
+        return NoDetectionDetector()
+    if kind == "mock_empty":
+        return MockEmptyDetector()
+
+    provider = make_raw_detection_provider(config.get("provider", "external_http"), config)
+    world_frame = frames.get("world_frame", "tf_frame_map")
+
+    if kind == "external_http":
+        return ExternalHttpDetector(provider)
+    if kind == "yolo_world_center_projection":
+        return CenterProjectionDetector(
+            provider=provider,
+            world_frame=world_frame,
+            point_stride=config.get("point_stride", 4),
+            max_depth_m=config.get("max_depth_m", 8.0),
+            center_kernel_size=config.get("center_kernel_size", 5),
+        )
+    if kind == "yolo_world_sam_box3d":
+        return SamBox3DDetector(
+            provider=provider,
+            world_frame=world_frame,
+            point_stride=config.get("point_stride", 4),
+            max_depth_m=config.get("max_depth_m", 8.0),
+            min_valid_points=config.get("min_valid_points", 12),
+            trim_ratio=config.get("trim_ratio", 0.1),
+        )
+    if kind == "sam3_box3d":
+        return SamBox3DDetector(
+            provider=provider,
+            world_frame=world_frame,
+            point_stride=config.get("point_stride", 4),
+            max_depth_m=config.get("max_depth_m", 8.0),
+            min_valid_points=config.get("min_valid_points", 12),
+            trim_ratio=config.get("trim_ratio", 0.1),
+        )
+    return MockEmptyDetector()

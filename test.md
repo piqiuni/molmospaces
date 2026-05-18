@@ -25,7 +25,7 @@ python scripts/datagen/rank_nav_scenes.py --scene_dataset procthor-10k --data_sp
 
 
 ## ROS
-python scripts/datagen/run_nav_ros_sim.py \
+python scripts/InteractiveNav/run_nav_ros_sim.py \
   --robot rby1 \
   --scene_dataset procthor-10k \
   --data_split train \
@@ -97,3 +97,7 @@ roslaunch nav_pkg nav.launch
 conda activate mlspaces
 source ./Interactive-Nav-SG-nav/devel/setup.zsh
 roslaunch nav_pkg molmospaces_nav_system.launch
+
+
+## 检测包
+### 

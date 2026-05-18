@@ -7,6 +7,11 @@ import runpy
 import sys
 
 
+def strip_roslaunch_remaps(argv: list[str]) -> list[str]:
+    """Remove ROS remapping args before forwarding to argparse-based scripts."""
+    return [arg for arg in argv if not arg.startswith("__")]
+
+
 def find_repo_root(start: Path) -> Path:
     for parent in (start, *start.parents):
         sim_script = parent / "scripts" / "InteractiveNav" / "run_nav_ros_sim.py"
@@ -20,8 +25,9 @@ def main() -> None:
     sim_script = repo_root / "scripts" / "InteractiveNav" / "run_nav_ros_sim.py"
 
     os.chdir(repo_root)
+    sys.path.insert(0, str(sim_script.parent))
     sys.path.insert(0, str(repo_root))
-    sys.argv = [str(sim_script), *sys.argv[1:]]
+    sys.argv = [str(sim_script), *strip_roslaunch_remaps(sys.argv[1:])]
     runpy.run_path(str(sim_script), run_name="__main__")
 
 
