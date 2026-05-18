@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- MolmoSpaces ROS navigation stack: simulator + mapping + exploration + navigation. -->
+
+  <arg name="start_sim" default="true"/>
+  <arg name="start_mapping" default="true"/>
+  <arg name="start_explore" default="true"/>
+  <arg name="start_nav" default="true"/>
+
+  <arg name="robot" default="rby1"/>
+  <arg name="scene_dataset" default="procthor-10k"/>
+  <arg name="data_split" default="train"/>
+  <arg name="house_ind" default="1"/>
+  <arg name="target_types" default="Apple"/>
+  <arg name="task_horizon" default="3000"/>
+  <arg name="sim_extra_args" default=""/>
+
+  <group if="$(arg start_sim)">
+    <node pkg="nav_pkg"
+          type="run_nav_ros_sim.py"
+          name="molmospaces_nav_ros_sim"
+          output="screen"
+          required="true"
+          args="--robot $(arg robot) --scene_dataset $(arg scene_dataset) --data_split $(arg data_split) --house_ind $(arg house_ind) --target_types $(arg target_types) --task_horizon $(arg task_horizon) $(arg sim_extra_args)"/>
+  </group>
+
+  <group if="$(arg start_mapping)">
+    <include file="$(find struct_mapping_pkg)/launch/slam_gmapping.launch"/>
+  </group>
+
+  <group if="$(arg start_explore)">
+    <include file="$(find explore_pkg)/launch/explore_manager.launch"/>
+  </group>
+
+  <group if="$(arg start_nav)">
+    <include file="$(find nav_pkg)/launch/nav.launch"/>
+  </group>
+</launch>

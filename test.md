@@ -91,3 +91,9 @@ roslaunch nav_pkg nav.launch
 
 #### Log 位置
 /home/user/ldl/molmospaces/assets/datagen/nav_to_obj_ros_sim_v1
+
+
+## 直接启动
+conda activate mlspaces
+source ./Interactive-Nav-SG-nav/devel/setup.zsh
+roslaunch nav_pkg molmospaces_nav_system.launch
