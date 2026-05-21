@@ -1,49 +1,33 @@
 #!/usr/bin/env python3
 import argparse
-import logging
 import math
 import os
 import socket
 import struct
 import sys
+import time
 import xmlrpc.client
 import cv2
 import numpy as np
 import rospy
 import sensor_msgs.point_cloud2 as pc2
-from geometry_msgs.msg import Point
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from std_msgs.msg import Header, String
-from visualization_msgs.msg import Marker, MarkerArray
+from visualization_msgs.msg import MarkerArray
 
 from semantic_mapping_py_pkg.detector_backends import make_detector_backend
 from semantic_mapping_py_pkg.messages import dumps_compact, stamp_to_json
+from semantic_mapping_py_pkg.object_debug_viz import (
+    get_confidence,
+    make_box_markers,
+    make_segmented_cloud,
+)
+from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param
 
 
 def _print_status(message):
     print(message, flush=True)
-
-
-def _patch_roslogging_findcaller_for_py311():
-    if sys.version_info < (3, 11):
-        return
-    try:
-        import rosgraph.roslogging as roslogging
-    except Exception:
-        return
-    if getattr(roslogging.RospyLogger.findCaller, "_semantic_mapping_py_safe", False):
-        return
-
-    def _safe_find_caller(self, *args, **kwargs):
-        result = logging.Logger.findCaller(self, *args, **kwargs)
-        if len(result) == 3:
-            return result[0], result[1], result[2], None
-        return result
-
-    _safe_find_caller._semantic_mapping_py_safe = True
-    roslogging.RospyLogger.findCaller = _safe_find_caller
-    _print_status("Applied Python 3.11 rospy logging workaround")
 
 
 def _ros_master_reachable(timeout=1.0):
@@ -76,6 +60,8 @@ def _parse_cli_args():
     parser.add_argument("--backend", default="", help="Detector backend kind.")
     parser.add_argument("--provider", default="", help="Raw detection provider kind.")
     parser.add_argument("--external_url", default="", help="External HTTP detector URL.")
+    parser.add_argument("--model_path", default="", help="Path to a local detector model.")
+    parser.add_argument("--class_mapping", default="", help="Path to a JSON class mapping file.")
     parser.add_argument("--include_depth", default="", help="Whether to include depth in HTTP payload.")
     parser.add_argument("--confidence_threshold", default="", help="Confidence threshold.")
     parser.add_argument("--frame_id", default="", help="RViz fixed/camera frame.")
@@ -99,7 +85,7 @@ def _apply_cli_overrides(config, detector_config, args):
     if args.point_stride:
         config["point_stride"] = int(args.point_stride)
 
-    for key in ("backend", "provider", "external_url"):
+    for key in ("backend", "provider", "external_url", "model_path", "class_mapping"):
         value = getattr(args, key)
         if value:
             detector_config[key] = value
@@ -212,148 +198,15 @@ def _image_msg(image, encoding, frame_id, stamp):
     return msg
 
 
-def _get_label(det):
-    return str(det.get("semantic_class") or det.get("class") or det.get("label") or
-               det.get("semantic_name") or det.get("name") or "object")
-
-
-def _get_confidence(det):
-    return float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
-
-
-def _bbox_xyxy(det):
-    box = det.get("bbox_xyxy") or det.get("bbox") or det.get("box_2d") or det.get("xyxy")
-    if isinstance(box, dict):
-        return [box.get("x1", box.get("xmin")), box.get("y1", box.get("ymin")),
-                box.get("x2", box.get("xmax")), box.get("y2", box.get("ymax"))]
-    if isinstance(box, (list, tuple)) and len(box) >= 4:
-        return [box[0], box[1], box[2], box[3]]
-    return None
-
-
-def _point_dict_to_list(value):
-    if isinstance(value, dict):
-        return [value.get("x", 0.0), value.get("y", 0.0), value.get("z", 0.0)]
-    if isinstance(value, (list, tuple)) and len(value) >= 3:
-        return [value[0], value[1], value[2]]
-    return None
-
-
-def _optical_to_rviz_camera(point):
-    # Backend depth projection uses optical coordinates: x right, y down, z forward.
-    return [float(point[2]), float(-point[0]), float(-point[1])]
-
-
-def _optical_size_to_rviz_camera(size):
-    return [float(size[2]), float(size[0]), float(size[1])]
-
-
-def _box_from_detection(det, depth, info, config):
-    center = _point_dict_to_list(det.get("box3d_center"))
-    size = _point_dict_to_list(det.get("box3d_size") or det.get("size"))
-    if center is not None and size is not None:
-        return _optical_to_rviz_camera(center), _optical_size_to_rviz_camera(size)
-
-    box3d = det.get("box_3d") or det.get("bbox_3d")
-    if isinstance(box3d, dict):
-        center = box3d.get("center") or box3d.get("position")
-        size = box3d.get("size") or box3d.get("dimensions") or box3d.get("extent")
-        if isinstance(center, dict):
-            center = [center.get("x", 0.0), center.get("y", 0.0), center.get("z", 0.0)]
-        if isinstance(size, dict):
-            size = [size.get("x", 0.2), size.get("y", 0.2), size.get("z", 0.2)]
-        if isinstance(center, (list, tuple)) and len(center) >= 3 and isinstance(size, (list, tuple)) and len(size) >= 3:
-            return [float(center[0]), float(center[1]), float(center[2])], [float(size[0]), float(size[1]), float(size[2])]
-
-    bbox = _bbox_xyxy(det)
-    if bbox is None:
-        pos = det.get("camera_position") or det.get("position_3d") or det.get("position")
-        center = _point_dict_to_list(pos)
-        if center is not None:
-            if det.get("projection_method"):
-                center = _optical_to_rviz_camera(center)
-            size = [float(config.get("fallback_box_depth", 0.25))] * 3
-            return center, size
-        return None, None
-
-    height, width = depth.shape[:2]
-    if any(v is None for v in bbox):
-        return None, None
-    x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
-    if config.get("bbox_format", "xyxy") == "xywh":
-        x2 = x1 + x2
-        y2 = y1 + y2
-    x1, x2 = sorted([max(0, min(width - 1, x1)), max(0, min(width - 1, x2))])
-    y1, y2 = sorted([max(0, min(height - 1, y1)), max(0, min(height - 1, y2))])
-    if x2 <= x1 or y2 <= y1:
-        return None, None
-
-    roi = depth[y1:y2 + 1, x1:x2 + 1]
-    valid = roi[np.isfinite(roi) & (roi > 0.0)]
-    if valid.size == 0:
-        return None, None
-    z = float(np.median(valid))
-    center_u = 0.5 * (x1 + x2)
-    center_v = 0.5 * (y1 + y2)
-    center = list(_camera_point(center_u, center_v, z, info))
-    fx, fy = info.K[0], info.K[4]
-    width_m = max(0.05, abs((x2 - x1) * z / fx))
-    height_m = max(0.05, abs((y2 - y1) * z / fy))
-    depth_m = float(config.get("fallback_box_depth", 0.25))
-    return center, [depth_m, width_m, height_m]
-
-
-def _make_box_markers(detections, depth, info, frame_id, stamp, config):
-    markers = MarkerArray()
-    for idx, det in enumerate(detections):
-        center, size = _box_from_detection(det, depth, info, config)
-        if center is None:
-            continue
-
-        marker = Marker()
-        marker.header.stamp = stamp
-        marker.header.frame_id = frame_id
-        marker.ns = "semantic_detection_boxes"
-        marker.id = idx * 2
-        marker.type = Marker.CUBE
-        marker.action = Marker.ADD
-        marker.pose.position.x = center[0]
-        marker.pose.position.y = center[1]
-        marker.pose.position.z = center[2]
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = max(0.02, size[0])
-        marker.scale.y = max(0.02, size[1])
-        marker.scale.z = max(0.02, size[2])
-        marker.color.r = 0.1
-        marker.color.g = 0.8
-        marker.color.b = 1.0
-        marker.color.a = 0.32
-        marker.lifetime = rospy.Duration(0.0)
-        markers.markers.append(marker)
-
-        text = Marker()
-        text.header.stamp = stamp
-        text.header.frame_id = frame_id
-        text.ns = "semantic_detection_labels"
-        text.id = idx * 2 + 1
-        text.type = Marker.TEXT_VIEW_FACING
-        text.action = Marker.ADD
-        text.pose.position = Point(center[0], center[1], center[2] + 0.5 * marker.scale.z + 0.08)
-        text.pose.orientation.w = 1.0
-        text.scale.z = float(config.get("label_height", 0.12))
-        text.color.r = 1.0
-        text.color.g = 1.0
-        text.color.b = 1.0
-        text.color.a = 1.0
-        text.text = "%s %.2f" % (_get_label(det), _get_confidence(det))
-        text.lifetime = rospy.Duration(0.0)
-        markers.markers.append(text)
-    return markers
+def _timed_publish(name, publisher, msg):
+    start_time = time.perf_counter()
+    publisher.publish(msg)
+    return name, max(time.perf_counter() - start_time, 0.0)
 
 
 class ObjectDetectionVisualTest:
     def __init__(self):
-        _patch_roslogging_findcaller_for_py311()
+        patch_roslogging_findcaller_for_py311()
         ok, master_uri = _ros_master_reachable()
         if not ok:
             raise RuntimeError(
@@ -406,26 +259,22 @@ class ObjectDetectionVisualTest:
         self.info = _camera_info(self.rgb.shape[1], self.rgb.shape[0], self.config)
 
         self.stamp = rospy.Time.now()
-        backend_name = detector_config.get("backend", "mock_empty")
-        backend = make_detector_backend(backend_name, detector_config, frames=frames)
+        self.backend_name = detector_config.get("backend", "mock_empty")
+        self.backend = make_detector_backend(self.backend_name, detector_config, frames=frames)
+        self.confidence_threshold = float(detector_config.get("confidence_threshold", 0.0))
         _print_status(
             "Running backend=%s provider=%s rgb=%s depth=%s" % (
-                backend_name,
+                self.backend_name,
                 detector_config.get("provider", "external_http"),
                 rgb_path,
                 depth_path,
             )
         )
-        self.detections = backend.detect(self.rgb, self.depth, self.info, self.stamp, self.frame_id)
-        threshold = float(detector_config.get("confidence_threshold", 0.0))
-        self.detections = [det for det in self.detections if _get_confidence(det) >= threshold]
-        _print_status("Detections: %s" % self.detections)
 
         self.cloud_msg = _make_cloud(self.rgb, self.depth, self.info, self.frame_id, self.stamp, self.stride, self.max_depth)
         self.depth_msg = _image_msg(_depth_viz(self.depth, self.max_depth), "bgr8", self.frame_id, self.stamp)
         self.rgb_msg = _image_msg(self.rgb, "rgb8", self.frame_id, self.stamp)
-        self.box_msg = _make_box_markers(self.detections, self.depth, self.info, self.frame_id, self.stamp, self.config)
-        self.det_msg = String(data=dumps_compact({**stamp_to_json(self.stamp), "detections": self.detections}))
+        self.detections = []
 
         self.cloud_pub = rospy.Publisher(self.config.get("cloud_topic", "/semantic_mapping/test/rgb_depth_cloud"),
                                          PointCloud2, queue_size=1, latch=True)
@@ -435,31 +284,58 @@ class ObjectDetectionVisualTest:
                                        Image, queue_size=1, latch=True)
         self.box_pub = rospy.Publisher(self.config.get("box_topic", "/semantic_mapping/test/boxes_3d"),
                                        MarkerArray, queue_size=1, latch=True)
+        self.segmented_cloud_pub = rospy.Publisher(
+            self.config.get("segmented_cloud_topic", "/semantic_mapping/test/segmented_object_cloud"),
+            PointCloud2,
+            queue_size=1,
+            latch=True,
+        )
         self.det_pub = rospy.Publisher(self.config.get("detections_topic", "/semantic_mapping/test/detections"),
                                        String, queue_size=1, latch=True)
 
-        rospy.loginfo("[object_detection_visual_test] backend=%s detections=%d frame=%s cloud_points=%d",
-                      backend_name, len(self.detections), self.frame_id, self.cloud_msg.width)
+        rospy.loginfo("[object_detection_visual_test] backend=%s frame=%s cloud_points=%d",
+                      self.backend_name, self.frame_id, self.cloud_msg.width)
+
+    def _detect_latest(self, stamp):
+        start_time = time.perf_counter()
+        detections = self.backend.detect(self.rgb, self.depth, self.info, stamp, self.frame_id)
+        detections = [det for det in detections if get_confidence(det) >= self.confidence_threshold]
+        elapsed_s = max(time.perf_counter() - start_time, 1e-9)
+        self.detections = detections
+        box_msg = make_box_markers(detections, self.depth, self.info, self.frame_id, stamp, self.config)
+        segmented_cloud_msg = make_segmented_cloud(
+            detections, self.rgb, self.depth, self.info, self.frame_id, stamp, self.stride, self.max_depth
+        )
+        det_msg = String(data=dumps_compact({**stamp_to_json(stamp), "detections": detections}))
+        return detections, box_msg, segmented_cloud_msg, det_msg, elapsed_s
 
     def spin(self):
-        _print_status("Publishing RViz topics. Fixed frame: %s" % self.frame_id)
-        rate = rospy.Rate(max(self.publish_rate, 0.1))
-        last_print = rospy.Time.now()
+        _print_status("Looping backend.detect() and publishing latest RViz topics. Fixed frame: %s" % self.frame_id)
+        
+        iteration = 0
         while not rospy.is_shutdown():
             stamp = rospy.Time.now()
-            for msg in (self.cloud_msg, self.depth_msg, self.rgb_msg):
+            detections, box_msg, segmented_cloud_msg, det_msg, detect_elapsed_s = self._detect_latest(stamp)
+            for msg in (self.cloud_msg, self.depth_msg, self.rgb_msg, segmented_cloud_msg):
                 msg.header.stamp = stamp
-            for marker in self.box_msg.markers:
+            for marker in box_msg.markers:
                 marker.header.stamp = stamp
-            self.cloud_pub.publish(self.cloud_msg)
-            self.depth_pub.publish(self.depth_msg)
-            self.rgb_pub.publish(self.rgb_msg)
-            self.box_pub.publish(self.box_msg)
-            self.det_pub.publish(self.det_msg)
-            if (stamp - last_print).to_sec() >= 2.0:
-                _print_status("Published %d detections" % len(self.detections))
-                last_print = stamp
-            rate.sleep()
+            publish_timings = [
+                _timed_publish("cloud", self.cloud_pub, self.cloud_msg),
+                _timed_publish("depth_viz", self.depth_pub, self.depth_msg),
+                _timed_publish("rgb", self.rgb_pub, self.rgb_msg),
+                _timed_publish("boxes", self.box_pub, box_msg),
+                _timed_publish("segmented_cloud", self.segmented_cloud_pub, segmented_cloud_msg),
+                _timed_publish("detections", self.det_pub, det_msg),
+            ]
+            publish_total_s = sum(elapsed_s for _name, elapsed_s in publish_timings)
+            iteration += 1
+            timing_text = " ".join("%s=%.4fs" % (name, elapsed_s) for name, elapsed_s in publish_timings)
+            _print_status(
+                "Iteration %d: detect=%.4fs (%.2f Hz) publish_total=%.4fs %s detections=%d"
+                % (iteration, detect_elapsed_s, 1.0 / detect_elapsed_s, publish_total_s, timing_text, len(detections))
+            )
+            
 
 
 if __name__ == "__main__":

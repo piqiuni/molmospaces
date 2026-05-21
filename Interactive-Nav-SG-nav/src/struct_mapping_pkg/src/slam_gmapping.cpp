@@ -774,6 +774,15 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
   
   // 应用高度滤波
   filterPointCloudByHeight(filtered_cloud);
+
+  // GMapping only supports planar laser frames. The incoming /registered_scan may
+  // follow the real head-camera pose (with pitch/roll), so we level it into the
+  // robot base frame before synthesizing the 2D scan used by gmapping.
+  if(!transformPointCloudToFrame(filtered_cloud, base_frame_))
+  {
+    ROS_WARN_THROTTLE(2.0, "Failed to transform pointcloud into base frame for planar gmapping");
+    return;
+  }
   
   // 发布滤波后的点云
   if (filtered_cloud_pub_.getNumSubscribers() > 0)
@@ -821,9 +830,9 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
     tf::Transform laser_to_map = tf::Transform(tf::createQuaternionFromRPY(0, 0, mpose.theta), tf::Vector3(mpose.x, mpose.y, 0.0));
     tf::Transform odom_to_laser = tf::Transform(tf::createQuaternionFromRPY(0, 0, odom_pose.theta), tf::Vector3(odom_pose.x, odom_pose.y, 0.0));
 
-    // map_to_odom_mutex_.lock();
-    // map_to_odom_ = (odom_to_laser * laser_to_map).inverse();
-    // map_to_odom_mutex_.unlock();
+    // map_to_odom_ 保持为上游系统定义的坐标关系。
+    // 当前工程中的 /registered_scan 与 /odom 不是标准激光SLAM输入链路，
+    // 这里不在 gmapping 内部额外发布校正，避免与上游坐标约定冲突。
 
     if(!got_map_ || (cloud->header.stamp - last_map_update) > map_update_interval_)
     {
@@ -868,9 +877,9 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     tf::Transform laser_to_map = tf::Transform(tf::createQuaternionFromRPY(0, 0, mpose.theta), tf::Vector3(mpose.x, mpose.y, 0.0));
     tf::Transform odom_to_laser = tf::Transform(tf::createQuaternionFromRPY(0, 0, odom_pose.theta), tf::Vector3(odom_pose.x, odom_pose.y, 0.0));
 
-    // map_to_odom_mutex_.lock();
-    // map_to_odom_ = (odom_to_laser * laser_to_map).inverse();
-    // map_to_odom_mutex_.unlock();
+    // map_to_odom_ 保持为上游系统定义的坐标关系。
+    // 当前工程中的 /registered_scan 与 /odom 不是标准激光SLAM输入链路，
+    // 这里不在 gmapping 内部额外发布校正，避免与上游坐标约定冲突。
 
     if(!got_map_ || (scan->header.stamp - last_map_update) > map_update_interval_)
     {
@@ -1112,6 +1121,55 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     }
   }
   
+  return true;
+}
+
+bool SlamGMapping::transformPointCloudToFrame(sensor_msgs::PointCloud2& cloud, const std::string& target_frame)
+{
+  const std::string source_frame = cloud.header.frame_id;
+  if (source_frame.empty() || target_frame.empty() || source_frame == target_frame)
+  {
+    cloud.header.frame_id = target_frame.empty() ? source_frame : target_frame;
+    return true;
+  }
+
+  tf::StampedTransform target_from_source;
+  try
+  {
+    tf_.lookupTransform(target_frame, source_frame, cloud.header.stamp, target_from_source);
+  }
+  catch (tf::TransformException& e)
+  {
+    ROS_WARN_THROTTLE(
+        2.0,
+        "Pointcloud TF lookup failed (%s -> %s): %s",
+        source_frame.c_str(),
+        target_frame.c_str(),
+        e.what());
+    return false;
+  }
+
+  sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+  sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+  sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+  const size_t point_count = cloud.width * cloud.height;
+
+  for (size_t i = 0; i < point_count; ++i, ++iter_x, ++iter_y, ++iter_z)
+  {
+    const float x = *iter_x;
+    const float y = *iter_y;
+    const float z = *iter_z;
+    if (std::isnan(x) || std::isnan(y) || std::isnan(z))
+      continue;
+
+    const tf::Vector3 p_src(x, y, z);
+    const tf::Vector3 p_tgt = target_from_source * p_src;
+    *iter_x = static_cast<float>(p_tgt.x());
+    *iter_y = static_cast<float>(p_tgt.y());
+    *iter_z = static_cast<float>(p_tgt.z());
+  }
+
+  cloud.header.frame_id = target_frame;
   return true;
 }
 

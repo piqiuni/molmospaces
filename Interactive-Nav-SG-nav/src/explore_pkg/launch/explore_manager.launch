@@ -1,6 +1,7 @@
 <?xml version="1.0"?>
 <launch>
   <!-- Explore Manager节点 -->
+  <arg name="target_description" default=""/>
 
   
   <node name="explore_manager" pkg="explore_pkg" type="explore_manager_node" output="screen" respawn="true">
@@ -12,6 +13,6 @@
 
     
     <!-- 目标描述参数（如果为空字符串，则进行通用探索） -->
-    <param name="target_description" value=""/>
+    <param name="target_description" value="$(arg target_description)"/>
   </node>
 </launch>

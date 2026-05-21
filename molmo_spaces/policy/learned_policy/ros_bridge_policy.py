@@ -230,22 +230,8 @@ class RosBridgePolicy(BasePolicy):
         return tf_msg
 
     def _build_base_to_lidar_static_tf(self):
-        """Build static TF from base frame to lidar frame."""
-        if self.base_frame_id == self.pointcloud_frame_id:
-            return None
-
-        tf_msg = self._TransformStamped()
-        tf_msg.header.stamp = self._rospy.Time.now()
-        tf_msg.header.frame_id = self.base_frame_id
-        tf_msg.child_frame_id = self.pointcloud_frame_id
-        tf_msg.transform.translation.x = self.lidar_offset_x_m
-        tf_msg.transform.translation.y = self.lidar_offset_y_m
-        tf_msg.transform.translation.z = self.lidar_offset_z_m
-        tf_msg.transform.rotation.x = 0.0
-        tf_msg.transform.rotation.y = 0.0
-        tf_msg.transform.rotation.z = 0.0
-        tf_msg.transform.rotation.w = 1.0
-        return tf_msg
+        """Base->lidar is published dynamically from observation camera extrinsics."""
+        return None
 
     def _publish_static_tfs(self) -> None:
         """
@@ -253,11 +239,118 @@ class RosBridgePolicy(BasePolicy):
         In rospy tf2, each sendTransform() publishes only provided transforms.
         """
         tfs = []
-        base_to_lidar = self._build_base_to_lidar_static_tf()
-        if base_to_lidar is not None:
-            tfs.append(base_to_lidar)
         tfs.append(self._build_optical_static_tf())
         self._static_tf_pub.sendTransform(tfs)
+
+    @staticmethod
+    def _quat_wxyz_to_rotmat(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+        """Convert scalar-first quaternion to a 3x3 rotation matrix."""
+        xx = qx * qx
+        yy = qy * qy
+        zz = qz * qz
+        xy = qx * qy
+        xz = qx * qz
+        yz = qy * qz
+        wx = qw * qx
+        wy = qw * qy
+        wz = qw * qz
+        return np.array(
+            [
+                [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+                [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+                [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+            ],
+            dtype=np.float64,
+        )
+
+    def _extract_lidar_pose_rel_base(self, observation: Any) -> np.ndarray | None:
+        """Return lidar pose in base frame as a 4x4 transform."""
+        obs_dict = self._extract_observation_dict(observation)
+        if obs_dict is None:
+            return None
+
+        base_pose = self._extract_base_pose_from_observation(observation)
+        if base_pose is None:
+            return None
+
+        sensor_params = obs_dict.get(f"sensor_param_{self.depth_camera_name}")
+        if not isinstance(sensor_params, dict):
+            return None
+
+        cam2world_gl = sensor_params.get("cam2world_gl")
+        if cam2world_gl is None:
+            return None
+
+        T_world_optical = np.asarray(cam2world_gl, dtype=np.float64)
+        if T_world_optical.shape != (4, 4):
+            return None
+
+        px, py, pz = float(base_pose[0]), float(base_pose[1]), float(base_pose[2])
+        qw, qx, qy, qz = (
+            float(base_pose[3]),
+            float(base_pose[4]),
+            float(base_pose[5]),
+            float(base_pose[6]),
+        )
+        T_world_base = np.eye(4, dtype=np.float64)
+        T_world_base[:3, :3] = self._quat_wxyz_to_rotmat(qw, qx, qy, qz)
+        T_world_base[:3, 3] = np.array([px, py, pz], dtype=np.float64)
+
+        # The pointcloud is published in a robot-centric lidar/body frame:
+        # x forward, y left, z up. The optical frame is related by the fixed
+        # lidar->optical rotation used in _build_optical_static_tf().
+        R_lidar_to_optical = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        T_optical_lidar = np.eye(4, dtype=np.float64)
+        T_optical_lidar[:3, :3] = R_lidar_to_optical.T
+
+        return np.linalg.inv(T_world_base) @ T_world_optical @ T_optical_lidar
+
+    def _publish_base_to_lidar_tf(self, observation: Any, stamp) -> bool:
+        if self.base_frame_id == self.pointcloud_frame_id:
+            return True
+
+        T_base_lidar = self._extract_lidar_pose_rel_base(observation)
+        if T_base_lidar is None:
+            self._rospy.logwarn_throttle(
+                5.0,
+                "RosBridgePolicy: sensor_param_%s missing; falling back to configured base->lidar static offset.",
+                self.depth_camera_name,
+            )
+            tf_msg = self._TransformStamped()
+            tf_msg.header.stamp = stamp
+            tf_msg.header.frame_id = self.base_frame_id
+            tf_msg.child_frame_id = self.pointcloud_frame_id
+            tf_msg.transform.translation.x = self.lidar_offset_x_m
+            tf_msg.transform.translation.y = self.lidar_offset_y_m
+            tf_msg.transform.translation.z = self.lidar_offset_z_m
+            tf_msg.transform.rotation.x = 0.0
+            tf_msg.transform.rotation.y = 0.0
+            tf_msg.transform.rotation.z = 0.0
+            tf_msg.transform.rotation.w = 1.0
+            self._tf_broadcaster.sendTransform(tf_msg)
+            return False
+
+        qx, qy, qz, qw = self._rotation_matrix_to_quaternion(T_base_lidar[:3, :3])
+        tf_msg = self._TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = self.base_frame_id
+        tf_msg.child_frame_id = self.pointcloud_frame_id
+        tf_msg.transform.translation.x = float(T_base_lidar[0, 3])
+        tf_msg.transform.translation.y = float(T_base_lidar[1, 3])
+        tf_msg.transform.translation.z = float(T_base_lidar[2, 3])
+        tf_msg.transform.rotation.x = qx
+        tf_msg.transform.rotation.y = qy
+        tf_msg.transform.rotation.z = qz
+        tf_msg.transform.rotation.w = qw
+        self._tf_broadcaster.sendTransform(tf_msg)
+        return True
 
     @staticmethod
     def _patch_rosgraph_logger_for_py311() -> None:
@@ -859,6 +952,7 @@ class RosBridgePolicy(BasePolicy):
         tf_msg.transform.rotation.z = qz
         tf_msg.transform.rotation.w = qw
         self._tf_broadcaster.sendTransform(tf_msg)
+        self._publish_base_to_lidar_tf(observation, stamp)
         return True
 
     def get_action(self, observation):

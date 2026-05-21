@@ -6,7 +6,7 @@ Interactive-Nav-SG-nav/segment_anything
 .cursor_pydeps
 .*cache/
 detection_models/outputs/*
-
+detection_models/yoloe/outputs/*
 
 # ignore nfs files
 *.nfs*

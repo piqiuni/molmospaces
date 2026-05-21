@@ -4,16 +4,34 @@
 
   <arg name="start_sim" default="true"/>
   <arg name="start_mapping" default="true"/>
+  <arg name="start_semantic_mapping" default="false"/>
   <arg name="start_explore" default="true"/>
   <arg name="start_nav" default="true"/>
+  <arg name="semantic_use_gt" default="false"/>
 
   <arg name="robot" default="rby1"/>
   <arg name="scene_dataset" default="procthor-10k"/>
   <arg name="data_split" default="train"/>
   <arg name="house_ind" default="1"/>
   <arg name="target_types" default="Apple"/>
+  <arg name="explore_target_description" default="$(arg target_types)"/>
   <arg name="task_horizon" default="3000"/>
   <arg name="sim_extra_args" default=""/>
+  <arg name="semantic_config_file" default="$(find semantic_mapping_py_pkg)/config/default.yaml"/>
+  <arg name="semantic_object_detection_backend" default="yoloe_pf_box3d"/>
+  <arg name="semantic_object_detection_provider" default="yoloe_local"/>
+  <arg name="semantic_object_detection_model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
+  <arg name="semantic_object_detection_class_mapping" default="$(find semantic_mapping_py_pkg)/config/object_class_mapping.json"/>
+  <arg name="semantic_object_detection_confidence_threshold" default="0.55"/>
+  <arg name="semantic_object_detection_device" default="cuda:0"/>
+  <arg name="semantic_publish_debug_markers" default="false"/>
+  <arg name="semantic_publish_debug_segmented_cloud" default="false"/>
+  <arg name="semantic_publish_debug_detection_image" default="true"/>
+  <arg name="semantic_room_inference_backend" default="object_rules"/>
+  <arg name="semantic_gt_scene_json" default=""/>
+  <arg name="semantic_gt_batch_size" default="8"/>
+  <arg name="semantic_gt_publish_rate" default="1.0"/>
+  <arg name="semantic_gt_loop" default="true"/>
 
   <group if="$(arg start_sim)">
     <node pkg="nav_pkg"
@@ -28,8 +46,45 @@
     <include file="$(find struct_mapping_pkg)/launch/slam_gmapping.launch"/>
   </group>
 
+  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_use_gt') != 'true')">
+    <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
+      <arg name="config_file" value="$(arg semantic_config_file)"/>
+      <arg name="start_object_detection" value="true"/>
+      <arg name="start_room_attribute" value="true"/>
+      <arg name="start_semantic_mapping" value="true"/>
+      <arg name="object_detection_backend" value="$(arg semantic_object_detection_backend)"/>
+      <arg name="object_detection_provider" value="$(arg semantic_object_detection_provider)"/>
+      <arg name="object_detection_model_path" value="$(arg semantic_object_detection_model_path)"/>
+      <arg name="object_detection_class_mapping" value="$(arg semantic_object_detection_class_mapping)"/>
+      <arg name="object_detection_confidence_threshold" value="$(arg semantic_object_detection_confidence_threshold)"/>
+      <arg name="object_detection_device" value="$(arg semantic_object_detection_device)"/>
+      <arg name="publish_debug_markers" value="$(arg semantic_publish_debug_markers)"/>
+      <arg name="publish_debug_segmented_cloud" value="$(arg semantic_publish_debug_segmented_cloud)"/>
+      <arg name="publish_debug_detection_image" value="$(arg semantic_publish_debug_detection_image)"/>
+      <arg name="room_inference_backend" value="$(arg semantic_room_inference_backend)"/>
+    </include>
+  </group>
+
+  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_use_gt') == 'true')">
+    <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
+      <arg name="config_file" value="$(arg semantic_config_file)"/>
+      <arg name="start_object_detection" value="false"/>
+      <arg name="start_room_attribute" value="true"/>
+      <arg name="start_semantic_mapping" value="true"/>
+      <arg name="room_inference_backend" value="$(arg semantic_room_inference_backend)"/>
+    </include>
+
+    <node name="semantic_mapping_gt_replay"
+          pkg="semantic_mapping_py_pkg"
+          type="semantic_mapping_gt_replay.py"
+          output="screen"
+          args="$(arg semantic_gt_scene_json) --batch-size $(arg semantic_gt_batch_size) --publish-rate $(arg semantic_gt_publish_rate) $(eval '--loop' if arg('semantic_gt_loop') == 'true' else '')"/>
+  </group>
+
   <group if="$(arg start_explore)">
-    <include file="$(find explore_pkg)/launch/explore_manager.launch"/>
+    <include file="$(find explore_pkg)/launch/explore_manager.launch">
+      <arg name="target_description" value="$(arg explore_target_description)"/>
+    </include>
   </group>
 
   <group if="$(arg start_nav)">

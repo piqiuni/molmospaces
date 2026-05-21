@@ -123,6 +123,7 @@ class SlamGMapping
     bool initMapper(const sensor_msgs::LaserScan& scan);
     bool addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoint& gmap_pose);
     bool convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::ConstPtr& cloud, sensor_msgs::LaserScan& scan);
+    bool transformPointCloudToFrame(sensor_msgs::PointCloud2& cloud, const std::string& target_frame);
     double computePoseEntropy();
     void filterPointCloudByHeight(sensor_msgs::PointCloud2& cloud);
     void inflateObstacles(nav_msgs::OccupancyGrid& map);

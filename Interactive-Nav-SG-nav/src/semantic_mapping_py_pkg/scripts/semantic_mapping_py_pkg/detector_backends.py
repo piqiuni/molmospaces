@@ -3,6 +3,7 @@ import json
 import math
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import numpy as np
 
@@ -11,6 +12,70 @@ from .geometry_utils import point_dict
 
 def _normalize_label(value):
     return str(value or "").strip().lower().replace(" ", "_")
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CLASS_MAPPING_PATH = PACKAGE_ROOT / "config" / "object_class_mapping.json"
+
+
+DEFAULT_CLASS_MAPPING = {
+    "bed": "bed",
+    "bunk_bed": "bed",
+    "playpen": "bed",
+    "guzheng": "bed",
+    "quilting": "bed",
+    "chair": "chair",
+    "electric_chair": "chair",
+    "office_chair": "chair",
+    "bowl": "bowl",
+    "plate": "plate",
+    "glass_plate": "plate",
+    "cup": "cup",
+    "bottle": "bottle",
+    "kitchen_table": "table",
+    "dinning_table": "table",
+    "dining_table": "table",
+    "table": "table",
+    "cabinet": "cabinet",
+    "drawer": "drawer",
+    "fridge": "fridge",
+    "refrigerator": "fridge",
+    "microwave": "microwave",
+    "shelf": "shelf",
+    "shelfs": "shelf",
+    "storage_box": "box",
+    "box": "box",
+    "sofa": "sofa",
+    "couch": "sofa",
+    "toilet": "toilet",
+    "sink": "sink",
+    "door": "door",
+    "window_sill": "window",
+}
+
+
+DEFAULT_CLASS_KEYWORDS = [
+    ("bed", "bed"),
+    ("chair", "chair"),
+    ("bowl", "bowl"),
+    ("bottle", "bottle"),
+    ("table", "table"),
+    ("cabinet", "cabinet"),
+    ("drawer", "drawer"),
+    ("fridge", "fridge"),
+    ("refrigerator", "fridge"),
+    ("microwave", "microwave"),
+    ("shelf", "shelf"),
+    ("sofa", "sofa"),
+    ("couch", "sofa"),
+    ("toilet", "toilet"),
+    ("sink", "sink"),
+    ("door", "door"),
+    ("window", "window"),
+    ("cup", "cup"),
+    ("plate", "plate"),
+    ("box", "box"),
+]
 
 
 def _bbox_from_detection(det):
@@ -24,6 +89,63 @@ def _bbox_from_detection(det):
     if x2 <= x1 or y2 <= y1:
         return None
     return [x1, y1, x2, y2]
+
+
+def _sparse_mask_from_array(mask_array):
+    if mask_array is None:
+        return None, 0
+    mask = np.asarray(mask_array)
+    if mask.ndim != 2:
+        return None, 0
+    rows, cols = np.nonzero(mask > 0)
+    if rows.size == 0:
+        return None, 0
+    return {
+        "rows": rows.astype(np.int32).tolist(),
+        "cols": cols.astype(np.int32).tolist(),
+    }, int(rows.size)
+
+
+def _resolve_mapping_path(raw_path):
+    if not isinstance(raw_path, str):
+        return None
+    text = raw_path.strip()
+    if not text:
+        return None
+    package_token = "$(find semantic_mapping_py_pkg)"
+    if package_token in text:
+        text = text.replace(package_token, str(PACKAGE_ROOT))
+    return Path(text).expanduser()
+
+
+def _load_mapping_config(raw_mapping):
+    if isinstance(raw_mapping, dict):
+        return {_normalize_label(k): _normalize_label(v) for k, v in raw_mapping.items() if v}
+    path = _resolve_mapping_path(raw_mapping) if raw_mapping else DEFAULT_CLASS_MAPPING_PATH
+    if path is not None and path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {_normalize_label(k): _normalize_label(v) for k, v in data.items() if v}
+        except Exception:
+            return {}
+    return {}
+
+
+def _map_open_vocabulary_class(raw_name, mapping_config=None):
+    raw_label = _normalize_label(raw_name)
+    if not raw_label:
+        return "unknown_open_set"
+    merged = dict(DEFAULT_CLASS_MAPPING)
+    if mapping_config:
+        merged.update(mapping_config)
+    if raw_label in merged:
+        return merged[raw_label]
+    for needle, normalized in DEFAULT_CLASS_KEYWORDS:
+        if needle in raw_label:
+            return normalized
+    return "unknown_open_set"
 
 
 def _clip_bbox(bbox, image_shape):
@@ -111,6 +233,24 @@ def _transform_point(tf_listener, target_frame, source_frame, stamp, point):
     return np.array([transformed.point.x, transformed.point.y, transformed.point.z], dtype=np.float32)
 
 
+def _transform_point_best_effort(tf_listener, target_frame, source_frame, stamp, point):
+    import rospy
+
+    candidate_stamps = []
+    if stamp is not None:
+        candidate_stamps.append(stamp)
+    candidate_stamps.append(rospy.Time(0))
+    last_exc = None
+    for candidate_stamp in candidate_stamps:
+        try:
+            return _transform_point(tf_listener, target_frame, source_frame, candidate_stamp, point), candidate_stamp
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("no TF candidate stamp available")
+
+
 def _sample_center_point(depth_image_m, bbox, kernel_size):
     kernel_size = max(1, int(kernel_size))
     x1, y1, x2, y2 = bbox
@@ -163,11 +303,23 @@ def _mask_to_pixels(mask, bbox, image_shape, point_stride):
     return None
 
 
-def _normalize_detection(det, bbox, projection_method, camera_center, world_center, size, source_frame):
+def _normalize_detection(
+    det,
+    bbox,
+    projection_method,
+    camera_center,
+    world_center,
+    size,
+    source_frame,
+    world_frame=None,
+    world_stamp=None,
+):
     confidence = float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
     semantic_class = det.get("semantic_class") or det.get("class") or det.get("semantic_name")
+    semantic_class_raw = det.get("semantic_class_raw") or semantic_class
     normalized = {
         "semantic_class": _normalize_label(semantic_class),
+        "semantic_class_raw": _normalize_label(semantic_class_raw),
         "confidence": confidence,
         "bbox": [int(v) for v in bbox] if bbox is not None else None,
         "position": point_dict(camera_center[0], camera_center[1], camera_center[2]),
@@ -176,6 +328,13 @@ def _normalize_detection(det, bbox, projection_method, camera_center, world_cent
     }
     if world_center is not None:
         normalized["world_position"] = point_dict(world_center[0], world_center[1], world_center[2])
+        normalized["world_frame"] = str(world_frame or "")
+        if world_stamp is not None:
+            normalized["world_position_stamp"] = {
+                "secs": int(world_stamp.secs),
+                "nsecs": int(world_stamp.nsecs),
+                "is_latest_tf": bool(getattr(world_stamp, "is_zero", lambda: False)()),
+            }
     if size is not None:
         normalized["size"] = point_dict(size[0], size[1], size[2])
         normalized["box3d_center"] = point_dict(camera_center[0], camera_center[1], camera_center[2])
@@ -185,6 +344,8 @@ def _normalize_detection(det, bbox, projection_method, camera_center, world_cent
         normalized["instance_id"] = str(instance_id)
     if "mask_area" in det:
         normalized["mask_area"] = int(det["mask_area"])
+    if "source_model" in det:
+        normalized["source_model"] = str(det["source_model"])
     return normalized
 
 
@@ -261,6 +422,92 @@ class ExternalHttpProvider(RawDetectionProvider):
         return data if isinstance(data, list) else []
 
 
+class YoloeLocalProvider(RawDetectionProvider):
+    def __init__(
+        self,
+        model_path,
+        confidence_threshold=0.35,
+        iou_threshold=0.7,
+        imgsz=640,
+        device="cuda:0",
+        max_detections=50,
+        keep_unknown_open_set=False,
+        class_mapping=None,
+    ):
+        self.model_path = str(model_path)
+        self.confidence_threshold = float(confidence_threshold)
+        self.iou_threshold = float(iou_threshold)
+        self.imgsz = int(imgsz)
+        self.device = str(device)
+        self.max_detections = max(1, int(max_detections))
+        self.keep_unknown_open_set = bool(keep_unknown_open_set)
+        self.class_mapping = _load_mapping_config(class_mapping)
+        self._model = None
+
+    def _get_model(self):
+        if self._model is None:
+            from ultralytics import YOLOE
+
+            self._model = YOLOE(self.model_path)
+        return self._model
+
+    def detect_2d(self, rgb_image, depth_image, camera_info, stamp):
+        model = self._get_model()
+        results = model.predict(
+            source=rgb_image,
+            device=self.device,
+            imgsz=self.imgsz,
+            conf=self.confidence_threshold,
+            iou=self.iou_threshold,
+            agnostic_nms=True,
+            max_det=self.max_detections,
+            verbose=False,
+            save=False,
+        )
+        if not results:
+            return []
+
+        result = results[0]
+        boxes = result.boxes
+        names = result.names or {}
+        masks = result.masks
+        if boxes is None:
+            return []
+
+        xyxy = boxes.xyxy.detach().cpu().numpy()
+        confs = boxes.conf.detach().cpu().numpy()
+        classes = boxes.cls.detach().cpu().numpy().astype(int)
+        mask_array = None
+        if masks is not None and getattr(masks, "data", None) is not None:
+            mask_array = masks.data.detach().cpu().numpy()
+
+        detections = []
+        for idx in range(len(xyxy)):
+            raw_name = str(names.get(int(classes[idx]), str(classes[idx])))
+            semantic_class_raw = _normalize_label(raw_name)
+            semantic_class = _map_open_vocabulary_class(raw_name, self.class_mapping)
+            if semantic_class == "unknown_open_set" and not self.keep_unknown_open_set:
+                continue
+
+            sparse_mask = None
+            mask_area = 0
+            if mask_array is not None and idx < len(mask_array):
+                sparse_mask, mask_area = _sparse_mask_from_array(mask_array[idx] > 0.5)
+
+            detections.append(
+                {
+                    "semantic_class_raw": semantic_class_raw,
+                    "semantic_class": semantic_class,
+                    "confidence": float(confs[idx]),
+                    "bbox": [float(v) for v in xyxy[idx].tolist()],
+                    "mask": sparse_mask,
+                    "mask_area": int(mask_area),
+                    "source_model": Path(self.model_path).name,
+                }
+            )
+        return detections
+
+
 class ExternalHttpDetector(ObjectDetectorBackend):
     def __init__(self, provider):
         self.provider = provider
@@ -274,12 +521,22 @@ class ExternalHttpDetector(ObjectDetectorBackend):
                 continue
             normalized = {
                 "semantic_class": _normalize_label(semantic_class),
+                "semantic_class_raw": _normalize_label(det.get("semantic_class_raw") or semantic_class),
                 "confidence": float(det.get("confidence", det.get("conf", 0.0)) or 0.0),
                 "bbox": bbox,
                 "projection_method": det.get("projection_method", "provider_passthrough"),
                 "source_frame": str(frame_id or ""),
             }
-            for key in ("position", "world_position", "size", "instance_id", "mask_area", "box3d_center", "box3d_size"):
+            for key in (
+                "position",
+                "world_position",
+                "size",
+                "instance_id",
+                "mask_area",
+                "box3d_center",
+                "box3d_size",
+                "source_model",
+            ):
                 if key in det:
                     normalized[key] = det[key]
             detections.append(normalized)
@@ -323,14 +580,20 @@ class CenterProjectionDetector(ObjectDetectorBackend):
                 intrinsics,
             )[0]
             world_center = None
+            world_stamp = None
             if frame_id:
                 try:
-                    self.tf_listener.waitForTransform(
-                        self.world_frame, frame_id, stamp, self.rospy.Duration(0.15)
-                    )
-                    world_center = _transform_point(
+                    world_center, used_stamp = _transform_point_best_effort(
                         self.tf_listener, self.world_frame, frame_id, stamp, camera_center
                     )
+                    world_stamp = used_stamp
+                    if used_stamp == self.rospy.Time(0):
+                        self.rospy.logwarn_throttle(
+                            2.0,
+                            "[object_detection_node] TF center projection fallback to latest transform for %s <- %s",
+                            self.world_frame,
+                            frame_id,
+                        )
                 except Exception as exc:
                     self.rospy.logwarn_throttle(2.0, "[object_detection_node] TF center projection failed: %s", exc)
             detections.append(
@@ -342,6 +605,8 @@ class CenterProjectionDetector(ObjectDetectorBackend):
                     world_center=world_center,
                     size=None,
                     source_frame=frame_id,
+                    world_frame=self.world_frame,
+                    world_stamp=world_stamp,
                 )
             )
         return detections
@@ -368,6 +633,39 @@ class SamBox3DDetector(ObjectDetectorBackend):
         self.trim_ratio = float(trim_ratio)
         self.rospy = rospy
         self.tf_listener = tf.TransformListener()
+        self._tf_unavailable_warned = False
+
+    def _try_transform_center(self, frame_id, stamp, camera_center):
+        if not self.world_frame or not frame_id or self.world_frame == frame_id:
+            return None
+        try:
+            try:
+                if self.tf_listener.canTransform(self.world_frame, frame_id, stamp):
+                    world_center, used_stamp = _transform_point_best_effort(
+                        self.tf_listener, self.world_frame, frame_id, stamp, camera_center
+                    )
+                    return world_center, used_stamp
+            except Exception:
+                pass
+            world_center, used_stamp = _transform_point_best_effort(
+                self.tf_listener, self.world_frame, frame_id, stamp, camera_center
+            )
+            if used_stamp == self.rospy.Time(0) and not self._tf_unavailable_warned:
+                self.rospy.logwarn(
+                    "[object_detection_node] TF %s <- %s unavailable at exact stamp; fallback to latest transform",
+                    self.world_frame,
+                    frame_id,
+                )
+                self._tf_unavailable_warned = True
+            return world_center, used_stamp
+        except Exception as exc:
+            if not self._tf_unavailable_warned:
+                self.rospy.logwarn(
+                    "[object_detection_node] TF mask box projection skipped; using camera-frame box3d_center only: %s",
+                    exc,
+                )
+                self._tf_unavailable_warned = True
+            return None, None
 
     def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
         if depth_image is None:
@@ -406,17 +704,7 @@ class SamBox3DDetector(ObjectDetectorBackend):
             maxs = points.max(axis=0)
             camera_center = 0.5 * (mins + maxs)
             size = np.maximum(maxs - mins, 0.0)
-            world_center = None
-            if frame_id:
-                try:
-                    self.tf_listener.waitForTransform(
-                        self.world_frame, frame_id, stamp, self.rospy.Duration(0.15)
-                    )
-                    world_center = _transform_point(
-                        self.tf_listener, self.world_frame, frame_id, stamp, camera_center
-                    )
-                except Exception as exc:
-                    self.rospy.logwarn_throttle(2.0, "[object_detection_node] TF mask box projection failed: %s", exc)
+            world_center, world_stamp = self._try_transform_center(frame_id, stamp, camera_center)
             enriched = dict(det)
             enriched["mask_area"] = int(points.shape[0])
             detections.append(
@@ -428,6 +716,8 @@ class SamBox3DDetector(ObjectDetectorBackend):
                     world_center=world_center,
                     size=size,
                     source_frame=frame_id,
+                    world_frame=self.world_frame,
+                    world_stamp=world_stamp,
                 )
             )
         return detections
@@ -435,6 +725,20 @@ class SamBox3DDetector(ObjectDetectorBackend):
 
 def make_raw_detection_provider(kind, config):
     kind = str(kind or "external_http").strip().lower()
+    if kind == "yoloe_local":
+        return YoloeLocalProvider(
+            model_path=config.get(
+                "model_path",
+                "/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt",
+            ),
+            confidence_threshold=config.get("confidence_threshold", 0.35),
+            iou_threshold=config.get("iou_threshold", 0.7),
+            imgsz=config.get("imgsz", 640),
+            device=config.get("device", "cuda:0"),
+            max_detections=config.get("max_detections", 50),
+            keep_unknown_open_set=config.get("keep_unknown_open_set", False),
+            class_mapping=config.get("class_mapping", {}),
+        )
     if kind == "external_http":
         return ExternalHttpProvider(
             config.get("external_url", "http://127.0.0.1:8000/detect"),
@@ -466,6 +770,15 @@ def make_detector_backend(kind, config, frames=None):
             center_kernel_size=config.get("center_kernel_size", 5),
         )
     if kind == "yolo_world_sam_box3d":
+        return SamBox3DDetector(
+            provider=provider,
+            world_frame=world_frame,
+            point_stride=config.get("point_stride", 4),
+            max_depth_m=config.get("max_depth_m", 8.0),
+            min_valid_points=config.get("min_valid_points", 12),
+            trim_ratio=config.get("trim_ratio", 0.1),
+        )
+    if kind == "yoloe_pf_box3d":
         return SamBox3DDetector(
             provider=provider,
             world_frame=world_frame,

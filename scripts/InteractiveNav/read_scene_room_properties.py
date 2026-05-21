@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import signal
 from collections import defaultdict
@@ -16,13 +17,15 @@ from molmo_spaces.configs.camera_configs import (
 from molmo_spaces.configs.policy_configs import AStarNavToObjPolicyConfig
 from molmo_spaces.configs.robot_configs import FloatingRUMRobotConfig, FrankaRobotConfig, RBY1Config
 from molmo_spaces.env.env import BaseMujocoEnv
-from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.tasks.task_sampler import BaseMujocoTaskSampler
+from molmo_spaces.utils.articulation_utils import gather_joint_info
 from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+DEFAULT_OUTPUT_DIR = Path("/home/user/ldl/molmospaces/scripts/InteractiveNav/output")
 
 
 class SceneOnlyTaskSampler(BaseMujocoTaskSampler):
@@ -82,6 +85,18 @@ def safe_body_aabb(model: mujoco.MjModel, data: mujoco.MjData, body_id: int) -> 
         return data.xpos[body_id].copy(), np.zeros(3)
 
 
+def to_jsonable(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+    return value
+
+
 def object_record(
     env,
     om,
@@ -96,6 +111,21 @@ def object_record(
     joints = meta.get("name_map", {}).get("joints", {})
     sites = meta.get("name_map", {}).get("sites", {})
     is_door = force_door
+    joint_infos = []
+    for joint_name in sorted(joints.keys()):
+        try:
+            joint_info = gather_joint_info(model, data, joint_name)
+        except Exception as exc:
+            log.debug("Failed to gather joint info for %s on %s: %s", joint_name, object_name, exc)
+            continue
+        joint_infos.append(
+            {
+                "joint_name": str(joint_name),
+                "joint_type": joint_type_name(joint_info.get("joint_type")),
+                "joint_range": [float(v) for v in joint_info.get("joint_range", [0.0, 0.0])],
+                "joint_value": float(joint_info.get("joint_pos", 0.0)),
+            }
+        )
 
     return {
         "name": object_name,
@@ -114,6 +144,7 @@ def object_record(
         "is_door": is_door,
         "is_movable_door": force_door,
         "joint_names": sorted(joints.keys()),
+        "joint_infos": joint_infos,
         "site_names": sorted(sites.keys()),
         "position": data.xpos[body_id].copy(),
         "aabb_center": center,
@@ -281,6 +312,116 @@ def collect_scene_records(env, room_selector: str | None) -> tuple[int | None, l
     for names in room_to_objects.values():
         names.sort()
     return room_id, records, dict(sorted(room_to_objects.items()))
+
+
+def joint_type_name(joint_type: Any) -> str:
+    text = str(joint_type).lower()
+    if "hinge" in text:
+        return "hinge"
+    if "slide" in text:
+        return "slide"
+    return "none"
+
+
+def derive_room_graph_context(
+    env,
+    scene_dataset: str,
+    records: list[dict[str, Any]],
+    px_per_m: int = 40,
+) -> tuple[dict[str, list[int]], dict[int, str], list[dict[str, Any]]]:
+    from molmo_spaces.utils.scene_maps import ProcTHORMap, iTHORMap
+
+    map_cls = iTHORMap if "ithor" in scene_dataset.lower() else ProcTHORMap
+    try:
+        scene_map = map_cls.from_mj_model_path(
+            model_path=env.current_model_path,
+            agent_radius=0.0,
+            px_per_m=px_per_m,
+            device_id=None,
+        )
+    except Exception as exc:
+        log.warning("Could not derive room graph context from room map: %s", exc)
+        return {}, {}, []
+
+    room_map = getattr(scene_map, "room_map", None)
+    if room_map is None:
+        return {}, {}, []
+
+    room_connections = {}
+    room_id_to_name = {
+        int(room_id): str(room_name)
+        for room_id, room_name in getattr(scene_map, "room_ids_to_name", {}).items()
+    }
+    room_entries = []
+
+    for room_id in sorted(int(room) for room in np.unique(room_map).tolist() if int(room) > 0):
+        px_points = np.argwhere(room_map == room_id)
+        if len(px_points) == 0:
+            continue
+        world_points = scene_map.pos_px_to_m(px_points[:, :2])
+        xs = [float(point[0]) for point in world_points]
+        ys = [float(point[1]) for point in world_points]
+        center = [float(np.mean(xs)), float(np.mean(ys)), 0.0]
+        size = [
+            max(float(max(xs) - min(xs)), 1.0 / float(px_per_m)),
+            max(float(max(ys) - min(ys)), 1.0 / float(px_per_m)),
+            0.1,
+        ]
+        room_entries.append(
+            {
+                "room_id": int(room_id),
+                "name": room_id_to_name.get(int(room_id), f"room_{room_id}"),
+                "center": center,
+                "aabb_center": center,
+                "aabb_size": size,
+                "cell_count": int(len(px_points)),
+            }
+        )
+
+    for rec in records:
+        if not rec.get("is_door"):
+            continue
+        center = np.array(rec["aabb_center"], dtype=float)
+        px = scene_map.pos_m_to_px(center.reshape(1, 3))[0]
+        radius = max(2, int(max(float(rec["aabb_size"][0]), float(rec["aabb_size"][1]), 0.1) * px_per_m * 0.5))
+        r0 = max(0, int(px[0]) - radius)
+        r1 = min(room_map.shape[0], int(px[0]) + radius + 1)
+        c0 = max(0, int(px[1]) - radius)
+        c1 = min(room_map.shape[1], int(px[1]) + radius + 1)
+        window = room_map[r0:r1, c0:c1]
+        room_ids = [int(room_id) for room_id in np.unique(window).tolist() if int(room_id) > 0]
+        if room_ids:
+            room_connections[rec["name"]] = sorted(room_ids)
+    return room_connections, room_id_to_name, room_entries
+
+
+def export_scene_json(
+    out_path: Path,
+    scene_id: str,
+    records: list[dict[str, Any]],
+    room_to_objects: dict[int, list[str]],
+    room_id_to_name: dict[int, str],
+    rooms: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> None:
+    payload = {
+        "scene_id": scene_id,
+        "metadata": metadata,
+        "room_to_objects": {str(int(room_id)): list(names) for room_id, names in room_to_objects.items()},
+        "room_id_to_name": {str(int(room_id)): str(name) for room_id, name in room_id_to_name.items()},
+        "rooms": rooms,
+        "records": records,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2))
+
+
+def scene_id_from_args(args: argparse.Namespace) -> str:
+    return f"{args.scene_dataset}_{args.data_split}_{args.house_ind}_{args.variant}"
+
+
+def default_scene_json_path(args: argparse.Namespace) -> Path:
+    return DEFAULT_OUTPUT_DIR / f"{scene_id_from_args(args)}_scene_full.json"
 
 
 def fmt_vec(vec: np.ndarray, ndigits: int = 3) -> str:
@@ -721,8 +862,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/home/user/ldl/molmospaces/scripts/InteractiveNav"),
-        help="Output PNG path. Defaults under assets/datagen/interactive_nav_scene_attrs/.",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Output directory for the top-down PNG.",
     )
     parser.add_argument(
         "--background_mode",
@@ -749,6 +890,12 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Maximum seconds to spend generating occupancy background. Use 0 to disable timeout.",
     )
+    parser.add_argument(
+        "--export_scene_json",
+        type=Path,
+        default=None,
+        help="Path to export the full scene/object GT JSON. Defaults to output/<scene>_scene_full.json.",
+    )
     return parser.parse_args()
 
 
@@ -760,7 +907,33 @@ def main() -> None:
         sampler.update_scene(variant=args.variant)
         env = sampler.env
         room_id, records, room_to_objects = collect_scene_records(env, args.room)
+        connected_room_ids, room_id_to_name, rooms = derive_room_graph_context(env, args.scene_dataset, records)
+        for record in records:
+            if record["name"] in connected_room_ids:
+                record["connected_room_ids"] = connected_room_ids[record["name"]]
         print_room_report(env, room_id, records, room_to_objects)
+
+        scene_json_path = args.export_scene_json or default_scene_json_path(args)
+        if scene_json_path is not None:
+            scene_id = scene_id_from_args(args)
+            export_scene_json(
+                scene_json_path,
+                scene_id=scene_id,
+                records=records,
+                room_to_objects=room_to_objects,
+                room_id_to_name=room_id_to_name,
+                rooms=rooms,
+                metadata={
+                    "scene_dataset": args.scene_dataset,
+                    "data_split": args.data_split,
+                    "house_ind": int(args.house_ind),
+                    "variant": args.variant,
+                    "room_selector": args.room,
+                    "selected_room_id": room_id,
+                    "model_path": str(env.current_model_path),
+                },
+            )
+            print(f"\nScene JSON saved to: {scene_json_path}")
 
         if not args.no_plot:
             if args.room is not None and room_id not in room_to_objects:
@@ -774,11 +947,7 @@ def main() -> None:
                 log.error("No records to plot; no image will be saved.")
                 return
             room_label = "all_rooms" if room_id is None else f"room_{room_id}"
-            out_folder_path = args.output or (
-                ASSETS_DIR
-                / "datagen"
-                / "interactive_nav_scene_attrs"
-            )
+            out_folder_path = args.output
             out_path = out_folder_path / f"{args.scene_dataset}_{args.data_split}_{args.house_ind}_{args.variant}_{room_label}_{args.background_mode}.png"
             plot_topdown(
                 env,

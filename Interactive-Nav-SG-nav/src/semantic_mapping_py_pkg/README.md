@@ -36,11 +36,13 @@ Current backends:
 - `yolo_world_center_projection`: use 2D `bbox` center plus depth to estimate a 3D point.
 - `yolo_world_sam_box3d`: use `mask` when available, otherwise `bbox` depth samples, and fit an axis-aligned 3D box.
 - `sam3_box3d`: assume the provider returns SAM3-style masks, then fit an axis-aligned 3D box from the masked depth/point cloud.
+- `yoloe_pf_box3d`: run local YOLOE prompt-free segmentation and fit an axis-aligned 3D box from masked depth/point cloud.
 
 Current providers:
 
 - `external_http`
 - `mock_empty`
+- `yoloe_local`
 
 This keeps the node interface stable while letting us swap:
 
@@ -58,6 +60,7 @@ This keeps the node interface stable while letting us swap:
   "detections": [
     {
       "semantic_class": "apple",
+      "semantic_class_raw": "apple",
       "confidence": 0.92,
       "bbox": [120, 80, 180, 150],
       "position": {"x": 1.2, "y": 0.1, "z": 0.7},
@@ -91,6 +94,27 @@ If `mask` is missing, the backend falls back to sampling depth points inside `bb
 
 For `sam3_box3d`, we expect the provider to primarily return masks. It still accepts `bbox` for clipping and fallback, but the intended use is "SAM3 first" rather than "YOLO first".
 
+For `yoloe_local`, the provider loads a local Ultralytics YOLOE prompt-free segmentation model and returns:
+
+- `semantic_class_raw`: original YOLOE open-vocabulary class
+- `semantic_class`: mapped navigation-friendly class
+- `bbox`
+- sparse `mask` using `rows` and `cols`
+- `mask_area` (`provider` stage stores mask pixels, `box3d` stage overwrites it with valid projected point count)
+- `source_model`
+
+Unknown open-set classes are dropped by default. Set `keep_unknown_open_set: true` to keep them as
+`semantic_class: unknown_open_set`.
+
+The default raw-to-navigation mapping now lives in:
+
+- [`config/object_class_mapping.json`](./config/object_class_mapping.json)
+
+Downstream nodes already consume the normalized `semantic_class`:
+
+- `semantic_mapping_node.py` uses it to build `/semantic_mapping/obj_map`
+- `explore_pkg` consumes `/semantic_mapping/obj_map` and therefore sees the normalized navigation label
+
 ## Offline detector RViz test
 
 `object_detection_visual_test.py` reads one RGB image and one depth image, calls the configured object detector backend, and republishes the result in a camera-centered RViz frame.
@@ -108,13 +132,151 @@ roslaunch semantic_mapping_py_pkg object_detection_visual_test.launch \
 
 Supported `backend` values are the same as `object_detection_node.py`: `no_detection`,
 `mock_empty`, `external_http`, `yolo_world_center_projection`, `yolo_world_sam_box3d`,
-and `sam3_box3d`.
+`sam3_box3d`, and `yoloe_pf_box3d`.
 Use `include_depth:=true` when the external provider needs the depth array in the HTTP payload.
+
+Example local YOLOE prompt-free test:
+
+```bash
+roslaunch semantic_mapping_py_pkg object_detection_visual_test.launch \
+  rgb_path:=/home/user/ldl/molmospaces/detection_models/tum_rgbd_scribble_samples/bedroom_12_image.png \
+  depth_path:=/home/user/ldl/molmospaces/detection_models/tum_rgbd_scribble_samples/bedroom_12_depth.png \
+  backend:=yoloe_pf_box3d \
+  provider:=yoloe_local \
+  model_path:=/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt
+```
 
 RViz fixed frame can be set to `semantic_test_camera`. Published topics:
 
 - `/semantic_mapping/test/rgb_image`
 - `/semantic_mapping/test/depth_viz`
 - `/semantic_mapping/test/rgb_depth_cloud`
+- `/semantic_mapping/test/segmented_object_cloud`
 - `/semantic_mapping/test/boxes_3d`
 - `/semantic_mapping/test/detections`
+
+## Incremental interaction graph
+
+`semantic_mapping_node.py` now maintains the legacy semantic mapping outputs and an incremental
+interaction-aware scene graph in parallel.
+
+Additional topics:
+
+- `/semantic_mapping/unified_graph`
+- `/semantic_mapping/navigation_hints`
+
+Online data flow:
+
+`detections or GT replay -> normalized observations -> InteractionGraphStore -> semantic_mapping outputs`
+
+### Observation contract
+
+Both detector output and GT replay are normalized into one observation format before entering the
+graph store:
+
+```json
+{
+  "observation_id": "obs_001",
+  "instance_id": "door_12",
+  "semantic_name": "door",
+  "category": "Door",
+  "confidence": 1.0,
+  "position": [1.0, 2.0, 0.9],
+  "aabb_center": [1.0, 2.0, 0.9],
+  "aabb_size": [0.9, 0.1, 2.0],
+  "room_id": 2,
+  "is_receptacle": false,
+  "is_pickup_candidate": false,
+  "is_articulable": true,
+  "is_door": true,
+  "is_movable_door": true,
+  "joint_type": "hinge",
+  "joint_range": [0.0, 1.57],
+  "joint_value": 0.0,
+  "source": "gt_replay"
+}
+```
+
+### Unified graph JSON
+
+`/semantic_mapping/unified_graph` publishes:
+
+```json
+{
+  "scene_id": "semantic_mapping_scene",
+  "source_mode": "detector_online",
+  "timestamp": 123.4,
+  "nodes": [],
+  "edges": [],
+  "views": {
+    "semantic_view": {"node_ids": [], "edge_ids": []},
+    "interaction_view": {"node_ids": [], "edge_ids": []},
+    "navigation_view": {"node_ids": [], "edge_ids": [], "hints": []}
+  }
+}
+```
+
+Node types are fixed to `room`, `portal`, `support`, `container`, and `object`.
+Doors are always represented as `portal` nodes.
+
+### Navigation hints
+
+`/semantic_mapping/navigation_hints` is a lighter navigation-facing view:
+
+```json
+[
+  {
+    "hint_id": "hint_0001",
+    "type": "interactive_portal",
+    "node_id": "portal_door_12",
+    "position": [1.0, 2.0, 0.9],
+    "room_id": 2,
+    "priority": 1.0,
+    "confidence": 1.0,
+    "requires_interaction": true,
+    "interaction_node_id": "portal_door_12",
+    "interaction_mode": "open_close",
+    "state": "closed",
+    "reason": "door_may_unlock_room"
+  }
+]
+```
+
+### Full scene JSON export
+
+`read_scene_room_properties.py` should now be treated as a scene inspection and plotting tool.
+When you want data for later graph or replay tasks, export the full scene JSON:
+
+```bash
+python scripts/InteractiveNav/read_scene_room_properties.py \
+  --scene_dataset procthor-10k \
+  --house_ind 0 \
+  --export_scene_json /tmp/scene_full.json \
+  --no_plot
+```
+
+### GT detector replay with graph visualization
+
+Replay the full scene JSON as incrementally published detection messages, unified graph JSON,
+navigation hints, and RViz graph markers:
+
+```bash
+python Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/semantic_mapping_gt_replay.py \
+  /tmp/scene_full.json \
+  --batch-size 4 \
+  --publish-rate 1.0
+```
+
+This now publishes to:
+
+- `/semantic_mapping/object_detections`
+- `/semantic_mapping/unified_graph`
+- `/semantic_mapping/navigation_hints`
+- `/semantic_mapping/unified_graph_markers`
+
+So `semantic_mapping_node.py` and RViz can consume GT replay exactly like the online pipeline.
+
+Current limitation:
+
+- GT replay carries stronger room and joint metadata than detector-only observations.
+- Support/container assignment from detector-only observations is still heuristic.

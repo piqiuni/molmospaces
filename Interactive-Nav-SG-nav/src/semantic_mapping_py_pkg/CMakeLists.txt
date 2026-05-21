@@ -19,6 +19,7 @@ catkin_install_python(PROGRAMS
   scripts/object_detection_visual_test.py
   scripts/object_detection_node.py
   scripts/room_attribute_node.py
+  scripts/semantic_mapping_gt_replay.py
   scripts/semantic_mapping_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

@@ -11,6 +11,7 @@ topics:
   camera_info: "/molmo_spaces/head_camera/camera_info"
   pointcloud: "/registered_scan"
   occupancy_grid: "/struct_mapping/occ_map"
+  room_context: "/semantic_mapping/room_context"
 
   object_detections: "/semantic_mapping/object_detections"
   scene_attribute: "/semantic_mapping/scene_attribute"
@@ -19,22 +20,42 @@ topics:
   object_markers: "/semantic_mapping/object_semantic_map_markers"
   scene_id_grid: "/semantic_mapping/scene_id_grid"
   scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
+  unified_graph: "/semantic_mapping/unified_graph"
+  unified_graph_markers: "/semantic_mapping/unified_graph_markers"
+  navigation_hints: "/semantic_mapping/navigation_hints"
   scene_colored_pointcloud: "/semantic_mapping/scene_semantic_map/colored_pointcloud"
   scene_legend: "/semantic_mapping/scene_semantic_map/legend"
 
 object_detection:
-  backend: "mock_empty"       # no_detection | mock_empty | external_http | yolo_world_center_projection | yolo_world_sam_box3d | sam3_box3d
-  provider: "external_http"   # external_http | mock_empty
+  backend: "mock_empty"       # no_detection | mock_empty | external_http | yolo_world_center_projection | yolo_world_sam_box3d | sam3_box3d | yoloe_pf_box3d
+  provider: "external_http"   # external_http | mock_empty | yoloe_local
   external_url: "http://127.0.0.1:8000/detect"
   timeout: 5.0
   include_depth: false
-  confidence_threshold: 0.5
+  confidence_threshold: 0.35
   publish_rate: 5.0
+  model_path: "/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"
+  device: "cuda:0"
+  imgsz: 640
+  iou_threshold: 0.7
+  max_detections: 50
+  keep_unknown_open_set: false
+  class_mapping: "$(find semantic_mapping_py_pkg)/config/object_class_mapping.json"
   point_stride: 4
   max_depth_m: 8.0
   min_valid_points: 12
   center_kernel_size: 5
   trim_ratio: 0.1
+  publish_debug_markers: false
+  publish_debug_segmented_cloud: false
+  publish_debug_detection_image: false
+  publish_debug_world_markers: false
+  publish_debug_world_segmented_cloud: false
+  debug_marker_topic: "/semantic_mapping/debug/boxes_3d"
+  debug_segmented_cloud_topic: "/semantic_mapping/debug/segmented_object_cloud"
+  debug_detection_image_topic: "/semantic_mapping/debug/detections_2d"
+  debug_world_marker_topic: "/semantic_mapping/debug/boxes_3d_world"
+  debug_world_segmented_cloud_topic: "/semantic_mapping/debug/segmented_object_cloud_world"
 
 visual_test:
   rgb_path: ""
@@ -55,6 +76,7 @@ visual_test:
   rgb_topic: "/semantic_mapping/test/rgb_image"
   depth_viz_topic: "/semantic_mapping/test/depth_viz"
   cloud_topic: "/semantic_mapping/test/rgb_depth_cloud"
+  segmented_cloud_topic: "/semantic_mapping/test/segmented_object_cloud"
   box_topic: "/semantic_mapping/test/boxes_3d"
   detections_topic: "/semantic_mapping/test/detections"
 
@@ -74,6 +96,15 @@ semantic_map:
   scene_max_range: 3.0
   scene_min_range: 0.1
   scene_confidence_step: 5
+
+interaction_graph:
+  scene_id: "semantic_mapping_scene"
+  match_distance: 0.5
+  gt_replay:
+    enable: false
+    shuffle: false
+    batch_count: 1
+    seed: 0
 
 scene_types:
   unknown_id: -1

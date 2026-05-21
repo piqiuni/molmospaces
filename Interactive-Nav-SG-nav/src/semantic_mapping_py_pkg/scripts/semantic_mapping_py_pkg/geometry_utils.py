@@ -36,3 +36,19 @@ def transform_point(tf_listener, target_frame, source_frame, stamp, point):
     msg.point.z = float(point[2])
     out = tf_listener.transformPoint(target_frame, msg)
     return out.point.x, out.point.y, out.point.z
+
+
+def transform_point_best_effort(tf_listener, target_frame, source_frame, stamp, point):
+    import rospy
+
+    last_exc = None
+    for candidate_stamp in [stamp, rospy.Time(0)]:
+        if candidate_stamp is None:
+            continue
+        try:
+            return transform_point(tf_listener, target_frame, source_frame, candidate_stamp, point), candidate_stamp
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("unable to transform point")

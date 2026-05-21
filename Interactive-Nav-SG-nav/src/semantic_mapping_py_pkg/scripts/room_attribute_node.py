@@ -6,11 +6,13 @@ from std_msgs.msg import String
 
 from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text
 from semantic_mapping_py_pkg.room_inference_backends import make_room_backend
+from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_nested_param, get_topics
 
 
 class RoomAttributeNode:
     def __init__(self):
+        patch_roslogging_findcaller_for_py311()
         rospy.init_node("semantic_room_attribute")
         topics = get_topics(rospy)
         config = get_nested_param(rospy, "room_inference", {}) or {}
