@@ -43,6 +43,7 @@ object_detection:
   class_mapping: "$(find semantic_mapping_py_pkg)/config/object_class_mapping.json"
   point_stride: 4
   max_depth_m: 8.0
+  projection_frame_id: "tf_frame_lidar"
   min_valid_points: 12
   center_kernel_size: 5
   trim_ratio: 0.1
@@ -51,6 +52,9 @@ object_detection:
   publish_debug_detection_image: false
   publish_debug_world_markers: false
   publish_debug_world_segmented_cloud: false
+  debug_markers_use_world: true
+  debug_segmented_cloud_use_world: true
+  tf_snapshot_use_latest: true
   debug_marker_topic: "/semantic_mapping/debug/boxes_3d"
   debug_segmented_cloud_topic: "/semantic_mapping/debug/segmented_object_cloud"
   debug_detection_image_topic: "/semantic_mapping/debug/detections_2d"

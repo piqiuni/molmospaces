@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .geometry_utils import point_dict
+from .geometry_utils import point_dict, transform_point_with_snapshot, transform_points_with_snapshot
 
 
 def _normalize_label(value):
@@ -104,6 +104,45 @@ def _sparse_mask_from_array(mask_array):
         "rows": rows.astype(np.int32).tolist(),
         "cols": cols.astype(np.int32).tolist(),
     }, int(rows.size)
+
+
+def _resize_mask_to_image(mask_array, image_shape):
+    mask = np.asarray(mask_array)
+    if mask.ndim != 2:
+        return None
+    target_h, target_w = image_shape[:2]
+    if mask.shape == (target_h, target_w):
+        return mask
+    if mask.size == 0 or target_h <= 0 or target_w <= 0:
+        return None
+    try:
+        import cv2
+
+        return cv2.resize(mask.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    except ImportError:
+        src_h, src_w = mask.shape
+        row_idx = np.minimum((np.arange(target_h) * src_h / target_h).astype(np.int32), src_h - 1)
+        col_idx = np.minimum((np.arange(target_w) * src_w / target_w).astype(np.int32), src_w - 1)
+        return mask[row_idx[:, None], col_idx[None, :]]
+
+
+def _sparse_mask_from_polygons(polygons, image_shape):
+    if not polygons:
+        return None, 0
+    height, width = image_shape[:2]
+    try:
+        import cv2
+    except ImportError:
+        return None, 0
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for polygon in polygons:
+        points = np.asarray(polygon, dtype=np.float32)
+        if points.ndim != 2 or points.shape[0] < 3 or points.shape[1] < 2:
+            continue
+        points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+        points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+        cv2.fillPoly(mask, [np.round(points).astype(np.int32)], 1)
+    return _sparse_mask_from_array(mask)
 
 
 def _resolve_mapping_path(raw_path):
@@ -205,6 +244,21 @@ def _pixels_to_camera_points(pixels, depths, intrinsics):
     x = (cols - cx) * z / fx
     y = (rows - cy) * z / fy
     return np.stack([x, y, z], axis=1)
+
+
+def _uses_optical_frame(frame_id):
+    return "optical" in str(frame_id or "").lower()
+
+
+def _optical_points_to_source_frame(points, frame_id):
+    points = np.asarray(points, dtype=np.float32)
+    if _uses_optical_frame(frame_id):
+        return points
+    converted = np.empty_like(points)
+    converted[:, 0] = points[:, 2]
+    converted[:, 1] = -points[:, 0]
+    converted[:, 2] = -points[:, 1]
+    return converted
 
 
 def _trim_points(points, trim_ratio):
@@ -313,6 +367,8 @@ def _normalize_detection(
     source_frame,
     world_frame=None,
     world_stamp=None,
+    world_box_center=None,
+    world_box_size=None,
 ):
     confidence = float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
     semantic_class = det.get("semantic_class") or det.get("class") or det.get("semantic_name")
@@ -339,18 +395,24 @@ def _normalize_detection(
         normalized["size"] = point_dict(size[0], size[1], size[2])
         normalized["box3d_center"] = point_dict(camera_center[0], camera_center[1], camera_center[2])
         normalized["box3d_size"] = point_dict(size[0], size[1], size[2])
+    if world_box_center is not None:
+        normalized["world_box3d_center"] = point_dict(world_box_center[0], world_box_center[1], world_box_center[2])
+    if world_box_size is not None:
+        normalized["world_box3d_size"] = point_dict(world_box_size[0], world_box_size[1], world_box_size[2])
     instance_id = det.get("instance_id")
     if instance_id:
         normalized["instance_id"] = str(instance_id)
     if "mask_area" in det:
         normalized["mask_area"] = int(det["mask_area"])
+    if "mask" in det and det["mask"] is not None:
+        normalized["mask"] = det["mask"]
     if "source_model" in det:
         normalized["source_model"] = str(det["source_model"])
     return normalized
 
 
 class ObjectDetectorBackend:
-    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
         raise NotImplementedError
 
 
@@ -360,7 +422,7 @@ class RawDetectionProvider:
 
 
 class NoDetectionDetector(ObjectDetectorBackend):
-    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
         return []
 
 
@@ -478,8 +540,10 @@ class YoloeLocalProvider(RawDetectionProvider):
         confs = boxes.conf.detach().cpu().numpy()
         classes = boxes.cls.detach().cpu().numpy().astype(int)
         mask_array = None
+        mask_polygons = None
         if masks is not None and getattr(masks, "data", None) is not None:
             mask_array = masks.data.detach().cpu().numpy()
+            mask_polygons = getattr(masks, "xy", None)
 
         detections = []
         for idx in range(len(xyxy)):
@@ -491,8 +555,12 @@ class YoloeLocalProvider(RawDetectionProvider):
 
             sparse_mask = None
             mask_area = 0
-            if mask_array is not None and idx < len(mask_array):
-                sparse_mask, mask_area = _sparse_mask_from_array(mask_array[idx] > 0.5)
+            if mask_polygons is not None and idx < len(mask_polygons):
+                sparse_mask, mask_area = _sparse_mask_from_polygons([mask_polygons[idx]], rgb_image.shape)
+            if sparse_mask is None and mask_array is not None and idx < len(mask_array):
+                image_mask = _resize_mask_to_image(mask_array[idx], rgb_image.shape)
+                if image_mask is not None:
+                    sparse_mask, mask_area = _sparse_mask_from_array(image_mask > 0.5)
 
             detections.append(
                 {
@@ -512,7 +580,7 @@ class ExternalHttpDetector(ObjectDetectorBackend):
     def __init__(self, provider):
         self.provider = provider
 
-    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
         detections = []
         for det in self.provider.detect_2d(rgb_image, depth_image, camera_info, stamp):
             bbox = _clip_bbox(_bbox_from_detection(det), rgb_image.shape)
@@ -532,6 +600,7 @@ class ExternalHttpDetector(ObjectDetectorBackend):
                 "world_position",
                 "size",
                 "instance_id",
+                "mask",
                 "mask_area",
                 "box3d_center",
                 "box3d_size",
@@ -556,7 +625,7 @@ class CenterProjectionDetector(ObjectDetectorBackend):
         self.rospy = rospy
         self.tf_listener = tf.TransformListener()
 
-    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
         if depth_image is None:
             return []
         depth_image_m = _depth_to_meters(depth_image)
@@ -579,9 +648,16 @@ class CenterProjectionDetector(ObjectDetectorBackend):
                 np.asarray([depth_m], dtype=np.float32),
                 intrinsics,
             )[0]
+            camera_center = _optical_points_to_source_frame(camera_center[None, :], frame_id)[0]
             world_center = None
             world_stamp = None
-            if frame_id:
+            if tf_snapshot is not None:
+                try:
+                    world_center = np.asarray(transform_point_with_snapshot(tf_snapshot, camera_center), dtype=np.float32)
+                    world_stamp = tf_snapshot.get("stamp")
+                except Exception as exc:
+                    self.rospy.logwarn_throttle(2.0, "[object_detection_node] TF snapshot center projection failed: %s", exc)
+            elif frame_id:
                 try:
                     world_center, used_stamp = _transform_point_best_effort(
                         self.tf_listener, self.world_frame, frame_id, stamp, camera_center
@@ -635,9 +711,22 @@ class SamBox3DDetector(ObjectDetectorBackend):
         self.tf_listener = tf.TransformListener()
         self._tf_unavailable_warned = False
 
-    def _try_transform_center(self, frame_id, stamp, camera_center):
-        if not self.world_frame or not frame_id or self.world_frame == frame_id:
+    def _try_transform_center(self, frame_id, stamp, camera_center, tf_snapshot=None):
+        if not self.world_frame:
             return None
+        if tf_snapshot is not None:
+            try:
+                world_center = np.asarray(transform_point_with_snapshot(tf_snapshot, camera_center), dtype=np.float32)
+                return world_center, tf_snapshot.get("stamp")
+            except Exception as exc:
+                if not self._tf_unavailable_warned:
+                    self.rospy.logwarn(
+                        "[object_detection_node] TF snapshot box projection failed; fallback to live TF: %s",
+                        exc,
+                    )
+                    self._tf_unavailable_warned = True
+        if not frame_id or self.world_frame == frame_id:
+            return None, None
         try:
             try:
                 if self.tf_listener.canTransform(self.world_frame, frame_id, stamp):
@@ -667,7 +756,7 @@ class SamBox3DDetector(ObjectDetectorBackend):
                 self._tf_unavailable_warned = True
             return None, None
 
-    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id):
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
         if depth_image is None:
             return []
         depth_image_m = _depth_to_meters(depth_image)
@@ -681,14 +770,13 @@ class SamBox3DDetector(ObjectDetectorBackend):
                 continue
             pixels = _mask_to_pixels(det.get("mask"), bbox, rgb_image.shape, self.point_stride)
             if pixels is None or pixels.shape[0] == 0:
-                pixels, values = _sample_box_points(depth_image_m, bbox, self.point_stride)
-            else:
-                cols = np.clip(pixels[:, 0], 0, depth_image_m.shape[1] - 1)
-                rows = np.clip(pixels[:, 1], 0, depth_image_m.shape[0] - 1)
-                values = depth_image_m[rows, cols]
-                valid = np.isfinite(values) & (values > 0.0)
-                pixels = pixels[valid]
-                values = values[valid]
+                continue
+            cols = np.clip(pixels[:, 0], 0, depth_image_m.shape[1] - 1)
+            rows = np.clip(pixels[:, 1], 0, depth_image_m.shape[0] - 1)
+            values = depth_image_m[rows, cols]
+            valid = np.isfinite(values) & (values > 0.0)
+            pixels = pixels[valid]
+            values = values[valid]
             if pixels is None or values is None or values.size < self.min_valid_points:
                 continue
             valid_depth = values <= self.max_depth_m
@@ -697,6 +785,7 @@ class SamBox3DDetector(ObjectDetectorBackend):
             if values.size < self.min_valid_points:
                 continue
             points = _pixels_to_camera_points(pixels, values, intrinsics)
+            points = _optical_points_to_source_frame(points, frame_id)
             points = _trim_points(points, self.trim_ratio)
             if points.shape[0] < self.min_valid_points:
                 continue
@@ -704,7 +793,18 @@ class SamBox3DDetector(ObjectDetectorBackend):
             maxs = points.max(axis=0)
             camera_center = 0.5 * (mins + maxs)
             size = np.maximum(maxs - mins, 0.0)
-            world_center, world_stamp = self._try_transform_center(frame_id, stamp, camera_center)
+            world_center, world_stamp = self._try_transform_center(frame_id, stamp, camera_center, tf_snapshot=tf_snapshot)
+            world_box_center = None
+            world_box_size = None
+            if tf_snapshot is not None and world_center is not None:
+                try:
+                    world_points = transform_points_with_snapshot(tf_snapshot, points)
+                    world_mins = world_points.min(axis=0)
+                    world_maxs = world_points.max(axis=0)
+                    world_box_center = 0.5 * (world_mins + world_maxs)
+                    world_box_size = np.maximum(world_maxs - world_mins, 0.0)
+                except Exception:
+                    pass
             enriched = dict(det)
             enriched["mask_area"] = int(points.shape[0])
             detections.append(
@@ -718,6 +818,8 @@ class SamBox3DDetector(ObjectDetectorBackend):
                     source_frame=frame_id,
                     world_frame=self.world_frame,
                     world_stamp=world_stamp,
+                    world_box_center=world_box_center,
+                    world_box_size=world_box_size,
                 )
             )
         return detections

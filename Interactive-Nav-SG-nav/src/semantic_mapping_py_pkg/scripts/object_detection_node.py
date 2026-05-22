@@ -11,6 +11,7 @@ from visualization_msgs.msg import MarkerArray
 
 from semantic_mapping_py_pkg.detector_backends import make_detector_backend
 from semantic_mapping_py_pkg.messages import dumps_compact, stamp_to_json
+from semantic_mapping_py_pkg import object_debug_viz
 from semantic_mapping_py_pkg.object_debug_viz import (
     make_box_markers,
     make_box_markers_world,
@@ -20,6 +21,7 @@ from semantic_mapping_py_pkg.object_debug_viz import (
 )
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param, get_topics
+from semantic_mapping_py_pkg.geometry_utils import lookup_transform_snapshot_best_effort
 
 
 def _image_encoding_info(encoding):
@@ -107,6 +109,7 @@ class ObjectDetectionNode:
         self.max_depth_m = float(config.get("max_depth_m", 8.0))
         self.point_stride = max(1, int(config.get("point_stride", 4)))
         self.default_frame_id = frames.get("camera_frame", "tf_frame_lidar")
+        self.projection_frame_id = str(config.get("projection_frame_id", self.default_frame_id) or self.default_frame_id)
         self.world_frame = frames.get("world_frame", "tf_frame_map")
         self.backend = make_detector_backend(config.get("backend", "mock_empty"), config, frames=frames)
         self.publish_debug_markers = bool(config.get("publish_debug_markers", False))
@@ -114,6 +117,9 @@ class ObjectDetectionNode:
         self.publish_debug_detection_image = bool(config.get("publish_debug_detection_image", False))
         self.publish_debug_world_markers = bool(config.get("publish_debug_world_markers", False))
         self.publish_debug_world_segmented_cloud = bool(config.get("publish_debug_world_segmented_cloud", False))
+        self.debug_markers_use_world = bool(config.get("debug_markers_use_world", True))
+        self.debug_segmented_cloud_use_world = bool(config.get("debug_segmented_cloud_use_world", True))
+        self.tf_snapshot_use_latest = bool(config.get("tf_snapshot_use_latest", True))
         self.debug_marker_topic = config.get("debug_marker_topic", "/semantic_mapping/debug/boxes_3d")
         self.debug_segmented_cloud_topic = config.get(
             "debug_segmented_cloud_topic", "/semantic_mapping/debug/segmented_object_cloud"
@@ -142,7 +148,7 @@ class ObjectDetectionNode:
         self.debug_image_pub = None
         self.world_marker_pub = None
         self.world_segmented_cloud_pub = None
-        self.tf_listener = None
+        self.tf_listener = tf.TransformListener()
         if self.publish_debug_markers:
             self.marker_pub = rospy.Publisher(self.debug_marker_topic, MarkerArray, queue_size=1)
         if self.publish_debug_segmented_cloud:
@@ -155,15 +161,27 @@ class ObjectDetectionNode:
             self.world_segmented_cloud_pub = rospy.Publisher(
                 self.debug_world_segmented_cloud_topic, PointCloud2, queue_size=1
             )
-        if self.publish_debug_world_markers or self.publish_debug_world_segmented_cloud:
-            self.tf_listener = tf.TransformListener()
         self.rgb_sub = rospy.Subscriber(self.rgb_topic, Image, self.rgb_callback, queue_size=1)
         self.depth_sub = rospy.Subscriber(self.depth_topic, Image, self.depth_callback, queue_size=1)
         self.info_sub = rospy.Subscriber(self.camera_info_topic, CameraInfo, self.camera_info_callback, queue_size=1)
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.publish_rate, 1e-3)), self.timer_callback)
 
-        rospy.loginfo("[object_detection_node] backend=%s rgb=%s depth=%s output=%s",
-                      config.get("backend", "mock_empty"), self.rgb_topic, self.depth_topic, self.output_topic)
+        cv2_version = object_debug_viz.cv2.__version__ if object_debug_viz.cv2 is not None else "missing"
+        rospy.loginfo(
+            "[object_detection_node] python=%s cv2=%s backend=%s rgb=%s depth=%s output=%s",
+            sys.executable,
+            cv2_version,
+            config.get("backend", "mock_empty"),
+            self.rgb_topic,
+            self.depth_topic,
+            self.output_topic,
+        )
+        if self.publish_debug_detection_image and object_debug_viz.cv2 is None:
+            rospy.logwarn(
+                "[object_detection_node] cv2 unavailable in %s; 2D debug overlay uses numpy fallback. "
+                "Activate mlspaces (or rebuild catkin with that env) before roslaunch.",
+                sys.executable,
+            )
 
     def rgb_callback(self, msg):
         try:
@@ -198,12 +216,30 @@ class ObjectDetectionNode:
             depth = self.latest_depth
             camera_info = self.latest_camera_info
             stamp = self.latest_stamp or rospy.Time.now()
-            frame_id = self.latest_camera_frame_id or self.latest_frame_id or self.default_frame_id
+            sensor_frame_id = self.latest_camera_frame_id or self.latest_frame_id or self.default_frame_id
+            frame_id = self.projection_frame_id or sensor_frame_id
 
         if rgb is None:
             return
 
-        detections = self.backend.detect(rgb, depth, camera_info, stamp, frame_id)
+        tf_snapshot = None
+        if self.tf_listener is not None and frame_id and self.world_frame and frame_id != self.world_frame:
+            try:
+                snapshot_stamp = rospy.Time(0) if self.tf_snapshot_use_latest else stamp
+                tf_snapshot = lookup_transform_snapshot_best_effort(
+                    self.tf_listener, self.world_frame, frame_id, snapshot_stamp
+                )
+                if tf_snapshot.get("used_latest_tf"):
+                    rospy.logwarn_throttle(
+                        2.0,
+                        "[object_detection_node] TF snapshot fallback to latest transform for %s <- %s",
+                        self.world_frame,
+                        frame_id,
+                    )
+            except Exception as exc:
+                rospy.logwarn_throttle(2.0, "[object_detection_node] TF snapshot unavailable: %s", exc)
+
+        detections = self.backend.detect(rgb, depth, camera_info, stamp, frame_id, tf_snapshot=tf_snapshot)
         detections = [
             det for det in detections
             if float(det.get("confidence", det.get("conf", 0.0)) or 0.0) >= self.confidence_threshold
@@ -215,12 +251,40 @@ class ObjectDetectionNode:
         self.pub.publish(String(data=dumps_compact(payload)))
 
         if self.marker_pub is not None and depth is not None and camera_info is not None:
-            marker_msg = make_box_markers(detections, depth, camera_info, frame_id, stamp, {"label_height": 0.12})
+            if self.debug_markers_use_world and self.tf_listener is not None:
+                marker_msg = make_box_markers_world(
+                    detections,
+                    depth,
+                    camera_info,
+                    frame_id,
+                    self.world_frame,
+                    stamp,
+                    {"label_height": 0.12, "point_stride": self.point_stride, "max_depth_m": self.max_depth_m},
+                    self.tf_listener,
+                    tf_snapshot=tf_snapshot,
+                )
+            else:
+                marker_msg = make_box_markers(detections, depth, camera_info, frame_id, stamp, {"label_height": 0.12})
             self.marker_pub.publish(marker_msg)
         if self.segmented_cloud_pub is not None and depth is not None and camera_info is not None:
-            cloud_msg = make_segmented_cloud(
-                detections, rgb, depth, camera_info, frame_id, stamp, self.point_stride, self.max_depth_m
-            )
+            if self.debug_segmented_cloud_use_world and self.tf_listener is not None:
+                cloud_msg = make_segmented_cloud_world(
+                    detections,
+                    rgb,
+                    depth,
+                    camera_info,
+                    frame_id,
+                    self.world_frame,
+                    stamp,
+                    self.point_stride,
+                    self.max_depth_m,
+                    self.tf_listener,
+                    tf_snapshot=tf_snapshot,
+                )
+            else:
+                cloud_msg = make_segmented_cloud(
+                    detections, rgb, depth, camera_info, frame_id, stamp, self.point_stride, self.max_depth_m
+                )
             self.segmented_cloud_pub.publish(cloud_msg)
         if (
             self.world_marker_pub is not None
@@ -235,8 +299,9 @@ class ObjectDetectionNode:
                 frame_id,
                 self.world_frame,
                 stamp,
-                {"label_height": 0.12},
+                {"label_height": 0.12, "point_stride": self.point_stride, "max_depth_m": self.max_depth_m},
                 self.tf_listener,
+                tf_snapshot=tf_snapshot,
             )
             self.world_marker_pub.publish(world_marker_msg)
         if (
@@ -256,11 +321,12 @@ class ObjectDetectionNode:
                 self.point_stride,
                 self.max_depth_m,
                 self.tf_listener,
+                tf_snapshot=tf_snapshot,
             )
             self.world_segmented_cloud_pub.publish(world_cloud_msg)
         if self.debug_image_pub is not None:
             overlay = render_detection_overlay(rgb, detections)
-            overlay_msg = _numpy_to_image_msg(overlay, "rgb8", stamp, frame_id)
+            overlay_msg = _numpy_to_image_msg(overlay, "rgb8", stamp, sensor_frame_id)
             self.debug_image_pub.publish(overlay_msg)
 
 

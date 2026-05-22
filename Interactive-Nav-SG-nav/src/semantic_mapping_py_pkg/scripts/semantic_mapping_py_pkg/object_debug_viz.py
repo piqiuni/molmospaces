@@ -8,7 +8,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .geometry_utils import transform_point_best_effort
+from .geometry_utils import transform_point_best_effort, transform_point_with_snapshot
 
 try:
     import cv2
@@ -73,13 +73,17 @@ def is_virtual_camera_frame(frame_id):
     return str(frame_id or "") == "semantic_test_camera"
 
 
+def is_optical_frame(frame_id):
+    return "optical" in str(frame_id or "").lower()
+
+
 def camera_point_from_uvd(u, v, depth, info, frame_id=None):
     fx, fy = info.K[0], info.K[4]
     cx, cy = info.K[2], info.K[5]
     x = float((u - cx) * depth / fx)
     y = float((v - cy) * depth / fy)
     z = float(depth)
-    if is_virtual_camera_frame(frame_id):
+    if is_virtual_camera_frame(frame_id) or not is_optical_frame(frame_id):
         return z, -x, -y
     return x, y, z
 
@@ -91,6 +95,10 @@ def optical_point_from_uvd(u, v, depth, info):
     y = float((v - cy) * depth / fy)
     z = float(depth)
     return x, y, z
+
+
+def optical_to_robot_frame(point):
+    return float(point[2]), float(-point[0]), float(-point[1])
 
 
 def pack_rgb_float(r, g, b):
@@ -110,6 +118,35 @@ def color_for_index(index):
         (220, 20, 60),
     ]
     return palette[index % len(palette)]
+
+
+def mask_rows_cols(mask, height, width):
+    if mask is None:
+        return None, None
+    if isinstance(mask, dict):
+        rows = np.asarray(mask.get("rows", []), dtype=np.int32)
+        cols = np.asarray(mask.get("cols", []), dtype=np.int32)
+    else:
+        mask_array = np.asarray(mask)
+        if mask_array.ndim != 2 or mask_array.shape[0] != height or mask_array.shape[1] != width:
+            return None, None
+        rows, cols = np.nonzero(mask_array > 0)
+        rows = rows.astype(np.int32)
+        cols = cols.astype(np.int32)
+    if rows.size != cols.size or rows.size == 0:
+        return None, None
+    valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    rows = rows[valid]
+    cols = cols[valid]
+    if rows.size == 0:
+        return None, None
+    return rows, cols
+
+
+def _paint_mask_pixels(image, rows, cols, color, alpha=0.65):
+    color = np.asarray(color, dtype=np.float32)
+    painted = image[rows, cols].astype(np.float32)
+    image[rows, cols] = (painted * (1.0 - alpha) + color * alpha).astype(np.uint8)
 
 
 def render_detection_overlay(rgb, detections):
@@ -132,15 +169,9 @@ def render_detection_overlay(rgb, detections):
             image[y1:y2, max(x2 - 2, x1):x2] = color
             image[y1:y1 + 2, x1:x2] = color
             image[max(y2 - 2, y1):y2, x1:x2] = color
-            mask = det.get("mask")
-            if isinstance(mask, dict):
-                rows = np.asarray(mask.get("rows", []), dtype=np.int32)
-                cols = np.asarray(mask.get("cols", []), dtype=np.int32)
-                if rows.size == cols.size and rows.size > 0:
-                    valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
-                    rows = rows[valid]
-                    cols = cols[valid]
-                    image[rows, cols] = (0.65 * image[rows, cols] + 0.35 * color).astype(np.uint8)
+            rows, cols = mask_rows_cols(det.get("mask"), height, width)
+            if rows is not None:
+                _paint_mask_pixels(image, rows, cols, color, alpha=0.65)
         return image
 
     image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -167,31 +198,23 @@ def render_detection_overlay(rgb, detections):
             1,
             cv2.LINE_AA,
         )
-        mask = det.get("mask")
-        if isinstance(mask, dict):
-            rows = np.asarray(mask.get("rows", []), dtype=np.int32)
-            cols = np.asarray(mask.get("cols", []), dtype=np.int32)
-            if rows.size == cols.size and rows.size > 0:
-                valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
-                rows = rows[valid]
-                cols = cols[valid]
-                image_bgr[rows, cols] = (0.65 * image_bgr[rows, cols] + 0.35 * np.asarray(color)).astype(np.uint8)
+        rows, cols = mask_rows_cols(det.get("mask"), height, width)
+        if rows is not None:
+            _paint_mask_pixels(image_bgr, rows, cols, color, alpha=0.7)
+            contours_mask = np.zeros((height, width), dtype=np.uint8)
+            contours_mask[rows, cols] = 255
+            contours, _hierarchy = cv2.findContours(contours_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cv2.drawContours(image_bgr, contours, -1, color, 2)
     return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
 
 def sparse_mask_pixels(det, image_shape, stride):
     height, width = image_shape[:2]
     stride = max(1, int(stride))
-    mask = det.get("mask")
-    if isinstance(mask, dict):
-        rows = np.asarray(mask.get("rows", []), dtype=np.int32)
-        cols = np.asarray(mask.get("cols", []), dtype=np.int32)
-        if rows.size == cols.size and rows.size > 0:
-            valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
-            rows = rows[valid]
-            cols = cols[valid]
-            if rows.size:
-                return np.stack([cols[::stride], rows[::stride]], axis=1)
+    rows, cols = mask_rows_cols(det.get("mask"), height, width)
+    if rows is not None:
+        return np.stack([cols[::stride], rows[::stride]], axis=1)
     bbox = bbox_xyxy(det)
     if bbox is None:
         return None
@@ -206,6 +229,15 @@ def sparse_mask_pixels(det, image_shape, stride):
         return None
     grid_cols, grid_rows = np.meshgrid(cols, rows)
     return np.stack([grid_cols.reshape(-1), grid_rows.reshape(-1)], axis=1)
+
+
+def sparse_mask_pixels_no_bbox_fallback(det, image_shape, stride):
+    height, width = image_shape[:2]
+    stride = max(1, int(stride))
+    rows, cols = mask_rows_cols(det.get("mask"), height, width)
+    if rows is not None:
+        return np.stack([cols[::stride], rows[::stride]], axis=1)
+    return None
 
 
 def make_segmented_cloud(detections, rgb, depth, info, frame_id, stamp, stride, max_depth):
@@ -238,6 +270,49 @@ def make_segmented_cloud(detections, rgb, depth, info, frame_id, stamp, stride, 
     return pc2.create_cloud(header, fields, points)
 
 
+def world_points_from_detection_mask(
+    det,
+    depth,
+    info,
+    source_frame,
+    target_frame,
+    stamp,
+    stride,
+    max_depth,
+    tf_listener,
+    tf_snapshot=None,
+):
+    world_points = []
+    height, width = depth.shape[:2]
+    depth_m = depth_to_meters(depth)
+    pixels = sparse_mask_pixels_no_bbox_fallback(det, depth.shape, stride)
+    if pixels is None or pixels.shape[0] == 0:
+        return world_points
+    cols = np.clip(pixels[:, 0], 0, width - 1)
+    rows = np.clip(pixels[:, 1], 0, height - 1)
+    sampled_depths = depth_m[rows, cols].astype(np.float32)
+    valid = np.isfinite(sampled_depths) & (sampled_depths > 0.0) & (sampled_depths <= float(max_depth))
+    cols = cols[valid]
+    rows = rows[valid]
+    sampled_depths = sampled_depths[valid]
+    for col, row, depth_value in zip(cols, rows, sampled_depths):
+        px, py, pz = camera_point_from_uvd(col, row, depth_value, info, frame_id=source_frame)
+        if tf_snapshot is not None:
+            try:
+                wx, wy, wz = transform_point_with_snapshot(tf_snapshot, (px, py, pz))
+            except Exception:
+                continue
+        else:
+            try:
+                (wx, wy, wz), _used_stamp = transform_point_best_effort(
+                    tf_listener, target_frame, source_frame, stamp, (px, py, pz)
+                )
+            except Exception:
+                continue
+        world_points.append((float(wx), float(wy), float(wz)))
+    return world_points
+
+
 def make_segmented_cloud_world(
     detections,
     rgb,
@@ -249,30 +324,19 @@ def make_segmented_cloud_world(
     stride,
     max_depth,
     tf_listener,
+    tf_snapshot=None,
 ):
     points = []
     height, width = depth.shape[:2]
     depth_m = depth_to_meters(depth)
     for idx, det in enumerate(detections):
-        pixels = sparse_mask_pixels(det, depth.shape, stride)
-        if pixels is None or pixels.shape[0] == 0:
-            continue
         color = color_for_index(idx)
-        cols = np.clip(pixels[:, 0], 0, width - 1)
-        rows = np.clip(pixels[:, 1], 0, height - 1)
-        sampled_depths = depth_m[rows, cols].astype(np.float32)
-        valid = np.isfinite(sampled_depths) & (sampled_depths > 0.0) & (sampled_depths <= float(max_depth))
-        cols = cols[valid]
-        rows = rows[valid]
-        sampled_depths = sampled_depths[valid]
-        for col, row, depth_value in zip(cols, rows, sampled_depths):
-            px, py, pz = optical_point_from_uvd(col, row, depth_value, info)
-            try:
-                (wx, wy, wz), _used_stamp = transform_point_best_effort(
-                    tf_listener, target_frame, source_frame, stamp, (px, py, pz)
-                )
-            except Exception:
-                continue
+        world_points = world_points_from_detection_mask(
+            det, depth, info, source_frame, target_frame, stamp, stride, max_depth, tf_listener, tf_snapshot=tf_snapshot
+        )
+        if not world_points:
+            continue
+        for wx, wy, wz in world_points:
             points.append([wx, wy, wz, pack_rgb_float(*color)])
 
     fields = [
@@ -391,23 +455,28 @@ def make_box_markers(detections, depth, info, frame_id, stamp, config):
     return markers
 
 
-def make_box_markers_world(detections, depth, info, source_frame, target_frame, stamp, config, tf_listener):
+def make_box_markers_world(detections, depth, info, source_frame, target_frame, stamp, config, tf_listener, tf_snapshot=None):
     markers = MarkerArray()
     for idx, det in enumerate(detections):
-        center = point_dict_to_list(det.get("world_position"))
-        size = point_dict_to_list(det.get("box3d_size") or det.get("size"))
-
-        if center is None or size is None:
-            camera_center, camera_size = box_from_detection(det, depth, info, source_frame, config)
-            if camera_center is None or camera_size is None:
-                continue
-            size = camera_size
-            try:
-                center, _used_stamp = transform_point_best_effort(
-                    tf_listener, target_frame, source_frame, stamp, camera_center
-                )
-            except Exception:
-                continue
+        world_points = world_points_from_detection_mask(
+            det,
+            depth,
+            info,
+            source_frame,
+            target_frame,
+            stamp,
+            config.get("point_stride", 4),
+            config.get("max_depth_m", 8.0),
+            tf_listener,
+            tf_snapshot=tf_snapshot,
+        )
+        if not world_points:
+            continue
+        world_points_np = np.asarray(world_points, dtype=np.float32)
+        mins = world_points_np.min(axis=0)
+        maxs = world_points_np.max(axis=0)
+        center = (0.5 * (mins + maxs)).tolist()
+        size = np.maximum(maxs - mins, 0.0).tolist()
 
         marker = Marker()
         marker.header.stamp = stamp
