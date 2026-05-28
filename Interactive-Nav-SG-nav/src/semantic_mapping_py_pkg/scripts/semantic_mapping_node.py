@@ -5,7 +5,9 @@ import threading
 import rospy
 import sensor_msgs.point_cloud2 as pc2
 import tf
+import tf2_ros
 from geometry_msgs.msg import Point
+from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import String
@@ -46,12 +48,22 @@ class SemanticMappingNode:
         self.unified_graph_markers_topic = topics.get(
             "unified_graph_markers", "/semantic_mapping/unified_graph_markers"
         )
+        self.unified_graph_markers_lifted_topic = topics.get(
+            "unified_graph_markers_lifted", "/semantic_mapping/unified_graph_markers_lifted"
+        )
 
         self.enable_object_mapping = bool(config.get("enable_object_mapping", True))
         self.enable_scene_mapping = bool(config.get("enable_scene_mapping", True))
         self.publish_rate = float(config.get("publish_rate", 2.0))
+        self.object_stale_after_sec = float(config.get("object_stale_after_sec", 0.0))
         self.scene_min_range = float(config.get("scene_min_range", 0.1))
         self.scene_max_range = float(config.get("scene_max_range", 3.0))
+        self.room_free_threshold = int(config.get("room_free_threshold", 20))
+        self.room_unknown_id = int(config.get("room_unknown_id", -1))
+        self.room_box_height = float(config.get("room_box_height", 0.2))
+        self.room_min_component_cells = int(config.get("room_min_component_cells", 25))
+        self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
+        self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
         graph_config = get_nested_param(rospy, "interaction_graph", {}) or {}
         self.class_to_id = {
             normalize_label(name): int(value)
@@ -65,7 +77,9 @@ class SemanticMappingNode:
 
         self.object_store = ObjectMapStore(
             match_distance=config.get("object_match_distance", 0.5),
-            stale_after_sec=config.get("object_stale_after_sec", 0.0),
+            stale_after_sec=self.object_stale_after_sec,
+            min_confirmations=config.get("object_min_confirmations", 2),
+            size_match_ratio=config.get("object_size_match_ratio", 0.7),
         )
         self.scene_store = SceneGridStore(
             unknown_id=scene_types.get("unknown_id", -1),
@@ -75,6 +89,7 @@ class SemanticMappingNode:
             scene_id=graph_config.get("scene_id", rospy.get_name().strip("/") or "semantic_mapping_scene"),
             match_distance=graph_config.get("match_distance", config.get("object_match_distance", 0.5)),
             room_id_to_name=self.id_to_class,
+            room_box_height=self.room_box_height,
         )
 
         self.lock = threading.Lock()
@@ -97,7 +112,12 @@ class SemanticMappingNode:
         self.unified_graph_markers_pub = rospy.Publisher(
             self.unified_graph_markers_topic, MarkerArray, queue_size=1, latch=True
         )
+        self.unified_graph_markers_lifted_pub = rospy.Publisher(
+            self.unified_graph_markers_lifted_topic, MarkerArray, queue_size=1, latch=True
+        )
+        self.static_tf_broadcaster = tf2_ros.StaticTransformBroadcaster()
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.publish_rate, 1e-3)), self.publish_callback)
+        self._publish_lifted_graph_tf()
 
         rospy.loginfo("[semantic_mapping_node.py] object_in=%s scene_in=%s cloud=%s occ=%s",
                       self.object_detection_topic, self.scene_attribute_topic,
@@ -112,13 +132,18 @@ class SemanticMappingNode:
             detections = parse_json_list(msg.data)
         if not isinstance(detections, list):
             return
+        stamp = self._stamp_from_detection_payload(parsed)
         with self.lock:
-            self.object_store.update(detections, msg._connection_header.get("stamp") if hasattr(msg, "_connection_header") else rospy.Time.now())
+            self.object_store.update(detections, stamp)
+            tracked_detections = self.object_store.as_tracked_detections()
             observations = [
                 observation_from_detection(det, observation_id=f"det_{index:04d}")
-                for index, det in enumerate(detections, start=1)
+                for index, det in enumerate(tracked_detections, start=1)
             ]
-            self.graph_store.update_observations(observations, source_mode="detector_online")
+            self.graph_store.update_observations(observations, stamp=stamp, source_mode="detector_online")
+            self.graph_store.prune_stale_nodes(self.object_stale_after_sec, now=stamp)
+            publish_bundle = self._collect_publish_bundle_locked()
+        self._publish_bundle(publish_bundle)
 
     def scene_callback(self, msg):
         if not self.enable_scene_mapping:
@@ -157,31 +182,18 @@ class SemanticMappingNode:
     def occupancy_callback(self, msg):
         with self.lock:
             self.scene_store.initialize_from_occupancy_grid(msg)
+            room_ids, room_conf = self._segment_rooms_from_occupancy(msg)
             self.graph_store.update_room_grid(
                 msg.info,
-                self.scene_store.scene_data,
-                self.scene_store.confidence_data,
+                room_ids,
+                room_conf,
                 room_id_to_name=self.id_to_class,
             )
 
     def publish_callback(self, _event):
         with self.lock:
-            obj_map = self.object_store.as_obj_map() if self.enable_object_mapping else None
-            scene_info_ready = self.enable_scene_mapping and self.scene_store.info is not None
-            scene_grid = self._build_grid(self.scene_store.scene_data) if scene_info_ready else None
-            scene_conf_grid = self._build_grid(self.scene_store.confidence_data) if scene_info_ready else None
-            graph_payload = self.graph_store.as_graph_dict()
-
-        if obj_map is not None:
-            self.object_pub.publish(String(data=dumps_compact(obj_map)))
-            self.marker_pub.publish(self._build_object_markers(obj_map))
-
-        if scene_grid is not None and scene_conf_grid is not None:
-            self.scene_id_pub.publish(scene_grid)
-            self.scene_conf_pub.publish(scene_conf_grid)
-        self.unified_graph_pub.publish(String(data=dumps_compact(graph_payload)))
-        self.navigation_hints_pub.publish(String(data=dumps_compact(graph_payload["views"]["navigation_view"]["hints"])))
-        self.unified_graph_markers_pub.publish(build_graph_marker_array(graph_payload, self.world_frame))
+            publish_bundle = self._collect_publish_bundle_locked()
+        self._publish_bundle(publish_bundle)
 
     def _update_scene_from_cloud(self, cloud, scene_id):
         points = []
@@ -209,12 +221,6 @@ class SemanticMappingNode:
             points.append((wx, wy))
         with self.lock:
             self.scene_store.update_cells(points, scene_id)
-            self.graph_store.update_room_grid(
-                self.scene_store.info,
-                self.scene_store.scene_data,
-                self.scene_store.confidence_data,
-                room_id_to_name=self.id_to_class,
-            )
 
     def _build_grid(self, data):
         grid = OccupancyGrid()
@@ -223,6 +229,107 @@ class SemanticMappingNode:
         grid.info = self.scene_store.info
         grid.data = [int(v) for v in data]
         return grid
+
+    def _collect_publish_bundle_locked(self):
+        obj_map = self.object_store.as_obj_map() if self.enable_object_mapping else None
+        scene_info_ready = self.enable_scene_mapping and self.scene_store.info is not None
+        scene_grid = self._build_grid(self.scene_store.scene_data) if scene_info_ready else None
+        scene_conf_grid = self._build_grid(self.scene_store.confidence_data) if scene_info_ready else None
+        graph_payload = self.graph_store.as_graph_dict()
+        return {
+            "obj_map": obj_map,
+            "scene_grid": scene_grid,
+            "scene_conf_grid": scene_conf_grid,
+            "graph_payload": graph_payload,
+        }
+
+    def _publish_bundle(self, bundle):
+        obj_map = bundle["obj_map"]
+        scene_grid = bundle["scene_grid"]
+        scene_conf_grid = bundle["scene_conf_grid"]
+        graph_payload = bundle["graph_payload"]
+        if obj_map is not None:
+            self.object_pub.publish(String(data=dumps_compact(obj_map)))
+            self.marker_pub.publish(self._build_object_markers(obj_map))
+        if scene_grid is not None and scene_conf_grid is not None:
+            self.scene_id_pub.publish(scene_grid)
+            self.scene_conf_pub.publish(scene_conf_grid)
+        self.unified_graph_pub.publish(String(data=dumps_compact(graph_payload)))
+        self.navigation_hints_pub.publish(String(data=dumps_compact(graph_payload["views"]["navigation_view"]["hints"])))
+        self.unified_graph_markers_pub.publish(build_graph_marker_array(graph_payload, self.world_frame))
+        self.unified_graph_markers_lifted_pub.publish(
+            build_graph_marker_array(
+                graph_payload,
+                self.lifted_graph_frame,
+            )
+        )
+
+    def _stamp_from_detection_payload(self, parsed):
+        secs = parsed.get("secs")
+        nsecs = parsed.get("nsecs")
+        if secs is None:
+            return rospy.Time.now().to_sec()
+        try:
+            return float(secs) + float(nsecs or 0) * 1e-9
+        except (TypeError, ValueError):
+            return rospy.Time.now().to_sec()
+
+    def _publish_lifted_graph_tf(self):
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = rospy.Time.now()
+        tf_msg.header.frame_id = self.world_frame
+        tf_msg.child_frame_id = self.lifted_graph_frame
+        tf_msg.transform.translation.z = float(self.lifted_graph_z_offset)
+        tf_msg.transform.rotation.w = 1.0
+        self.static_tf_broadcaster.sendTransform(tf_msg)
+
+    def _segment_rooms_from_occupancy(self, occ_grid):
+        width = int(occ_grid.info.width)
+        height = int(occ_grid.info.height)
+        size = width * height
+        room_ids = [self.room_unknown_id] * size
+        room_conf = [-1] * size
+        if size <= 0 or len(occ_grid.data) != size:
+            return room_ids, room_conf
+        visited = [False] * size
+        values = [int(v) for v in occ_grid.data]
+        next_room_id = 1
+
+        def is_free(index):
+            value = values[index]
+            return value >= 0 and value <= self.room_free_threshold
+
+        for index in range(size):
+            if visited[index]:
+                continue
+            visited[index] = True
+            if not is_free(index):
+                continue
+            component = []
+            stack = [index]
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                x = current % width
+                y = current // width
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx = x + dx
+                    ny = y + dy
+                    if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                        continue
+                    nidx = ny * width + nx
+                    if visited[nidx]:
+                        continue
+                    visited[nidx] = True
+                    if is_free(nidx):
+                        stack.append(nidx)
+            if len(component) < self.room_min_component_cells:
+                continue
+            for comp_idx in component:
+                room_ids[comp_idx] = next_room_id
+                room_conf[comp_idx] = 100
+            next_room_id += 1
+        return room_ids, room_conf
 
     def _build_object_markers(self, obj_map):
         markers = MarkerArray()

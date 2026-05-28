@@ -357,6 +357,244 @@ def _mask_to_pixels(mask, bbox, image_shape, point_stride):
     return None
 
 
+def _mask_rows_cols(mask, image_shape):
+    height, width = image_shape[:2]
+    if mask is None:
+        return None, None
+    if isinstance(mask, dict):
+        rows = np.asarray(mask.get("rows", []), dtype=np.int32)
+        cols = np.asarray(mask.get("cols", []), dtype=np.int32)
+    else:
+        mask_array = np.asarray(mask)
+        if mask_array.ndim != 2 or mask_array.shape[:2] != (height, width):
+            return None, None
+        rows, cols = np.nonzero(mask_array > 0)
+        rows = rows.astype(np.int32)
+        cols = cols.astype(np.int32)
+    if rows.size != cols.size or rows.size == 0:
+        return None, None
+    valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    rows = rows[valid]
+    cols = cols[valid]
+    if rows.size == 0:
+        return None, None
+    return rows, cols
+
+
+def _binary_mask_from_sparse(mask, image_shape):
+    rows, cols = _mask_rows_cols(mask, image_shape)
+    if rows is None:
+        return None
+    binary = np.zeros(image_shape[:2], dtype=np.uint8)
+    binary[rows, cols] = 1
+    return binary
+
+
+def _sparse_mask_from_binary(mask_binary):
+    rows, cols = np.nonzero(mask_binary > 0)
+    if rows.size == 0:
+        return None, 0
+    return _sparse_mask_from_array(mask_binary > 0)
+
+
+def _neighbor_offsets():
+    return (
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),           (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    )
+
+
+def _connected_components_from_binary(mask_binary):
+    height, width = mask_binary.shape[:2]
+    visited = np.zeros_like(mask_binary, dtype=np.uint8)
+    components = []
+    neighbors = _neighbor_offsets()
+    rows, cols = np.nonzero(mask_binary > 0)
+    for row, col in zip(rows.tolist(), cols.tolist()):
+        if visited[row, col]:
+            continue
+        stack = [(row, col)]
+        visited[row, col] = 1
+        comp_rows = []
+        comp_cols = []
+        while stack:
+            cur_row, cur_col = stack.pop()
+            comp_rows.append(cur_row)
+            comp_cols.append(cur_col)
+            for d_row, d_col in neighbors:
+                nxt_row = cur_row + d_row
+                nxt_col = cur_col + d_col
+                if nxt_row < 0 or nxt_col < 0 or nxt_row >= height or nxt_col >= width:
+                    continue
+                if visited[nxt_row, nxt_col] or mask_binary[nxt_row, nxt_col] == 0:
+                    continue
+                visited[nxt_row, nxt_col] = 1
+                stack.append((nxt_row, nxt_col))
+        components.append(
+            {
+                "rows": np.asarray(comp_rows, dtype=np.int32),
+                "cols": np.asarray(comp_cols, dtype=np.int32),
+                "area": len(comp_rows),
+            }
+        )
+    return components
+
+
+def _bbox_center_from_bbox(bbox):
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    return 0.5 * (float(x1) + float(x2)), 0.5 * (float(y1) + float(y2))
+
+
+def _filter_mask_components(mask, bbox, image_shape, min_area, max_area_ratio):
+    mask_binary = _binary_mask_from_sparse(mask, image_shape)
+    if mask_binary is None:
+        return mask, 0
+    total_area = int(mask_binary.sum())
+    if total_area <= 0:
+        return None, 0
+    components = _connected_components_from_binary(mask_binary)
+    if not components:
+        return None, 0
+    max_area = max(int(total_area * float(max_area_ratio)), int(min_area))
+    center = _bbox_center_from_bbox(bbox)
+    candidates = []
+    for component in components:
+        area = int(component["area"])
+        if area < int(min_area) or area > max_area:
+            continue
+        score = float(area)
+        if center is not None:
+            cx = float(component["cols"].mean())
+            cy = float(component["rows"].mean())
+            score -= 0.25 * np.hypot(cx - center[0], cy - center[1])
+            if (
+                component["rows"].min() <= center[1] <= component["rows"].max()
+                and component["cols"].min() <= center[0] <= component["cols"].max()
+            ):
+                score += float(area)
+        candidates.append((score, component))
+    if not candidates:
+        best = max(components, key=lambda item: item["area"])
+    else:
+        best = max(candidates, key=lambda item: item[0])[1]
+    filtered_binary = np.zeros_like(mask_binary)
+    filtered_binary[best["rows"], best["cols"]] = 1
+    sparse_mask, area = _sparse_mask_from_binary(filtered_binary)
+    return sparse_mask, int(area)
+
+
+def _pairwise_l2(points, query):
+    diffs = points - query[None, :]
+    return np.sqrt(np.sum(diffs * diffs, axis=1))
+
+
+def _largest_euclidean_cluster(points, cluster_eps, min_points):
+    if points.shape[0] == 0:
+        return points
+    if points.shape[0] > 800:
+        step = int(np.ceil(points.shape[0] / 800.0))
+        sampled = points[::step]
+    else:
+        sampled = points
+    count = sampled.shape[0]
+    visited = np.zeros(count, dtype=bool)
+    best_indices = None
+    for start in range(count):
+        if visited[start]:
+            continue
+        queue = [start]
+        visited[start] = True
+        cluster = []
+        while queue:
+            index = queue.pop()
+            cluster.append(index)
+            distances = _pairwise_l2(sampled, sampled[index])
+            neighbors = np.where(distances <= float(cluster_eps))[0]
+            for neighbor in neighbors.tolist():
+                if visited[neighbor]:
+                    continue
+                visited[neighbor] = True
+                queue.append(neighbor)
+        if best_indices is None or len(cluster) > len(best_indices):
+            best_indices = cluster
+    if best_indices is None or len(best_indices) < int(min_points):
+        return points
+    sampled_cluster = sampled[np.asarray(best_indices, dtype=np.int32)]
+    centroid = sampled_cluster.mean(axis=0)
+    keep_radius = max(float(cluster_eps) * 1.5, 1e-3)
+    keep_mask = _pairwise_l2(points, centroid) <= keep_radius
+    kept = points[keep_mask]
+    return kept if kept.shape[0] >= int(min_points) else sampled_cluster
+
+
+def _sanitize_instance_pixels(det, bbox, image_shape, config):
+    if det.get("mask") is None:
+        return det.get("mask"), int(det.get("mask_area", 0) or 0)
+    min_area = max(1, int(config.get("mask_component_min_area", 48)))
+    max_area_ratio = min(max(float(config.get("mask_component_max_area_ratio", 0.85)), 0.05), 1.0)
+    return _filter_mask_components(det.get("mask"), bbox, image_shape, min_area, max_area_ratio)
+
+
+def _drop_bottom_rows(pixels, values, bottom_ratio):
+    if pixels.shape[0] == 0 or bottom_ratio <= 0.0:
+        return pixels, values
+    row_threshold = np.quantile(pixels[:, 1].astype(np.float32), 1.0 - bottom_ratio)
+    keep = pixels[:, 1].astype(np.float32) < float(row_threshold)
+    kept_pixels = pixels[keep]
+    kept_values = values[keep]
+    return (kept_pixels, kept_values) if kept_values.size >= 4 else (pixels, values)
+
+
+def _filter_depth_band(pixels, values, lower_q, upper_q):
+    if values.size == 0:
+        return pixels, values
+    lower_q = min(max(float(lower_q), 0.0), 1.0)
+    upper_q = min(max(float(upper_q), lower_q), 1.0)
+    lower = float(np.quantile(values, lower_q))
+    upper = float(np.quantile(values, upper_q))
+    keep = (values >= lower) & (values <= upper)
+    kept_pixels = pixels[keep]
+    kept_values = values[keep]
+    return (kept_pixels, kept_values) if kept_values.size >= 4 else (pixels, values)
+
+
+def _robust_bounds(points, lower_q, upper_q):
+    lower_q = min(max(float(lower_q), 0.0), 1.0)
+    upper_q = min(max(float(upper_q), lower_q), 1.0)
+    mins = np.quantile(points, lower_q, axis=0)
+    maxs = np.quantile(points, upper_q, axis=0)
+    return mins.astype(np.float32), maxs.astype(np.float32)
+
+
+def _reject_ground_like_detection(label, world_box_center, world_box_size, config):
+    if world_box_center is None or world_box_size is None:
+        return False
+    reject_labels = {
+        _normalize_label(item)
+        for item in (config.get("ground_reject_labels") or ["floor", "ground"])
+    }
+    if label in reject_labels:
+        return True
+    min_xy_span = float(config.get("ground_reject_min_xy_span", 1.2))
+    max_height = float(config.get("ground_reject_max_height", 0.25))
+    max_center_z = float(config.get("ground_reject_max_center_z", 0.25))
+    xy_span = max(float(world_box_size[0]), float(world_box_size[1]))
+    return (
+        xy_span >= min_xy_span
+        and float(world_box_size[2]) <= max_height
+        and float(world_box_center[2]) <= max_center_z
+    )
+
+
+def _mean_height(points):
+    if points is None or points.shape[0] == 0:
+        return None
+    return float(np.mean(points[:, 2]))
+
+
 def _normalize_detection(
     det,
     bbox,
@@ -505,6 +743,8 @@ class YoloeLocalProvider(RawDetectionProvider):
         self.keep_unknown_open_set = bool(keep_unknown_open_set)
         self.class_mapping = _load_mapping_config(class_mapping)
         self._model = None
+        self.mask_component_min_area = 48
+        self.mask_component_max_area_ratio = 0.85
 
     def _get_model(self):
         if self._model is None:
@@ -561,6 +801,15 @@ class YoloeLocalProvider(RawDetectionProvider):
                 image_mask = _resize_mask_to_image(mask_array[idx], rgb_image.shape)
                 if image_mask is not None:
                     sparse_mask, mask_area = _sparse_mask_from_array(image_mask > 0.5)
+            sparse_mask, mask_area = _sanitize_instance_pixels(
+                {"mask": sparse_mask, "mask_area": mask_area},
+                [float(v) for v in xyxy[idx].tolist()],
+                rgb_image.shape,
+                {
+                    "mask_component_min_area": self.mask_component_min_area,
+                    "mask_component_max_area_ratio": self.mask_component_max_area_ratio,
+                },
+            )
 
             detections.append(
                 {
@@ -697,6 +946,18 @@ class SamBox3DDetector(ObjectDetectorBackend):
         max_depth_m=8.0,
         min_valid_points=12,
         trim_ratio=0.1,
+        mask_component_min_area=48,
+        mask_component_max_area_ratio=0.85,
+        drop_bottom_ratio=0.12,
+        depth_band_lower_quantile=0.05,
+        depth_band_upper_quantile=0.7,
+        cluster_eps=0.18,
+        cluster_min_points=12,
+        bbox_quantile_lower=0.1,
+        bbox_quantile_upper=0.9,
+        enable_euclidean_cluster=True,
+        reject_low_mean_height=True,
+        min_mean_height_m=0.08,
     ):
         import rospy
         import tf
@@ -707,6 +968,18 @@ class SamBox3DDetector(ObjectDetectorBackend):
         self.max_depth_m = float(max_depth_m)
         self.min_valid_points = max(4, int(min_valid_points))
         self.trim_ratio = float(trim_ratio)
+        self.mask_component_min_area = max(1, int(mask_component_min_area))
+        self.mask_component_max_area_ratio = float(mask_component_max_area_ratio)
+        self.drop_bottom_ratio = float(drop_bottom_ratio)
+        self.depth_band_lower_quantile = float(depth_band_lower_quantile)
+        self.depth_band_upper_quantile = float(depth_band_upper_quantile)
+        self.cluster_eps = float(cluster_eps)
+        self.cluster_min_points = max(4, int(cluster_min_points))
+        self.bbox_quantile_lower = float(bbox_quantile_lower)
+        self.bbox_quantile_upper = float(bbox_quantile_upper)
+        self.enable_euclidean_cluster = bool(enable_euclidean_cluster)
+        self.reject_low_mean_height = bool(reject_low_mean_height)
+        self.min_mean_height_m = float(min_mean_height_m)
         self.rospy = rospy
         self.tf_listener = tf.TransformListener()
         self._tf_unavailable_warned = False
@@ -768,6 +1041,18 @@ class SamBox3DDetector(ObjectDetectorBackend):
             bbox = _clip_bbox(_bbox_from_detection(det), rgb_image.shape)
             if bbox is None:
                 continue
+            sanitized_mask, sanitized_area = _sanitize_instance_pixels(
+                det,
+                bbox,
+                rgb_image.shape,
+                {
+                    "mask_component_min_area": self.mask_component_min_area,
+                    "mask_component_max_area_ratio": self.mask_component_max_area_ratio,
+                },
+            )
+            det = dict(det)
+            det["mask"] = sanitized_mask
+            det["mask_area"] = int(sanitized_area)
             pixels = _mask_to_pixels(det.get("mask"), bbox, rgb_image.shape, self.point_stride)
             if pixels is None or pixels.shape[0] == 0:
                 continue
@@ -784,27 +1069,77 @@ class SamBox3DDetector(ObjectDetectorBackend):
             values = values[valid_depth]
             if values.size < self.min_valid_points:
                 continue
+            pixels, values = _drop_bottom_rows(pixels, values, self.drop_bottom_ratio)
+            if values.size < self.min_valid_points:
+                continue
+            pixels, values = _filter_depth_band(
+                pixels,
+                values,
+                self.depth_band_lower_quantile,
+                self.depth_band_upper_quantile,
+            )
+            if values.size < self.min_valid_points:
+                continue
             points = _pixels_to_camera_points(pixels, values, intrinsics)
             points = _optical_points_to_source_frame(points, frame_id)
             points = _trim_points(points, self.trim_ratio)
+            if self.enable_euclidean_cluster:
+                points = _largest_euclidean_cluster(points, self.cluster_eps, self.cluster_min_points)
             if points.shape[0] < self.min_valid_points:
                 continue
-            mins = points.min(axis=0)
-            maxs = points.max(axis=0)
+            mins, maxs = _robust_bounds(points, self.bbox_quantile_lower, self.bbox_quantile_upper)
             camera_center = 0.5 * (mins + maxs)
             size = np.maximum(maxs - mins, 0.0)
             world_center, world_stamp = self._try_transform_center(frame_id, stamp, camera_center, tf_snapshot=tf_snapshot)
             world_box_center = None
             world_box_size = None
+            world_points = None
             if tf_snapshot is not None and world_center is not None:
                 try:
                     world_points = transform_points_with_snapshot(tf_snapshot, points)
-                    world_mins = world_points.min(axis=0)
-                    world_maxs = world_points.max(axis=0)
+                    world_mins, world_maxs = _robust_bounds(
+                        world_points,
+                        self.bbox_quantile_lower,
+                        self.bbox_quantile_upper,
+                    )
                     world_box_center = 0.5 * (world_mins + world_maxs)
                     world_box_size = np.maximum(world_maxs - world_mins, 0.0)
                 except Exception:
                     pass
+            elif world_center is not None:
+                try:
+                    transformed_points = []
+                    for point in points:
+                        transformed_points.append(
+                            _transform_point(self.tf_listener, self.world_frame, frame_id, stamp, point)
+                        )
+                    if transformed_points:
+                        world_points = np.asarray(transformed_points, dtype=np.float32)
+                        world_mins, world_maxs = _robust_bounds(
+                            world_points,
+                            self.bbox_quantile_lower,
+                            self.bbox_quantile_upper,
+                        )
+                        world_box_center = 0.5 * (world_mins + world_maxs)
+                        world_box_size = np.maximum(world_maxs - world_mins, 0.0)
+                except Exception:
+                    world_points = None
+            if self.reject_low_mean_height and world_points is not None:
+                mean_height = _mean_height(world_points)
+                if mean_height is not None and mean_height <= self.min_mean_height_m:
+                    continue
+            if _reject_ground_like_detection(
+                _normalize_label(det.get("semantic_class") or det.get("semantic_class_raw")),
+                world_box_center if world_box_center is not None else world_center,
+                world_box_size if world_box_size is not None else size,
+                {
+                    "ground_reject_labels": [],
+                    "ground_reject_min_xy_span": 1.2,
+                    "ground_reject_max_height": 0.22,
+                    "ground_reject_max_center_z": 0.2,
+                },
+            ):
+                continue
             enriched = dict(det)
             enriched["mask_area"] = int(points.shape[0])
             detections.append(
@@ -879,6 +1214,18 @@ def make_detector_backend(kind, config, frames=None):
             max_depth_m=config.get("max_depth_m", 8.0),
             min_valid_points=config.get("min_valid_points", 12),
             trim_ratio=config.get("trim_ratio", 0.1),
+            mask_component_min_area=config.get("mask_component_min_area", 48),
+            mask_component_max_area_ratio=config.get("mask_component_max_area_ratio", 0.85),
+            drop_bottom_ratio=config.get("drop_bottom_ratio", 0.12),
+            depth_band_lower_quantile=config.get("depth_band_lower_quantile", 0.05),
+            depth_band_upper_quantile=config.get("depth_band_upper_quantile", 0.7),
+            cluster_eps=config.get("cluster_eps", 0.18),
+            cluster_min_points=config.get("cluster_min_points", 12),
+            bbox_quantile_lower=config.get("bbox_quantile_lower", 0.1),
+            bbox_quantile_upper=config.get("bbox_quantile_upper", 0.9),
+            enable_euclidean_cluster=config.get("enable_euclidean_cluster", True),
+            reject_low_mean_height=config.get("reject_low_mean_height", True),
+            min_mean_height_m=config.get("min_mean_height_m", 0.08),
         )
     if kind == "yoloe_pf_box3d":
         return SamBox3DDetector(
@@ -888,6 +1235,18 @@ def make_detector_backend(kind, config, frames=None):
             max_depth_m=config.get("max_depth_m", 8.0),
             min_valid_points=config.get("min_valid_points", 12),
             trim_ratio=config.get("trim_ratio", 0.1),
+            mask_component_min_area=config.get("mask_component_min_area", 48),
+            mask_component_max_area_ratio=config.get("mask_component_max_area_ratio", 0.85),
+            drop_bottom_ratio=config.get("drop_bottom_ratio", 0.12),
+            depth_band_lower_quantile=config.get("depth_band_lower_quantile", 0.05),
+            depth_band_upper_quantile=config.get("depth_band_upper_quantile", 0.7),
+            cluster_eps=config.get("cluster_eps", 0.18),
+            cluster_min_points=config.get("cluster_min_points", 12),
+            bbox_quantile_lower=config.get("bbox_quantile_lower", 0.1),
+            bbox_quantile_upper=config.get("bbox_quantile_upper", 0.9),
+            enable_euclidean_cluster=config.get("enable_euclidean_cluster", True),
+            reject_low_mean_height=config.get("reject_low_mean_height", True),
+            min_mean_height_m=config.get("min_mean_height_m", 0.08),
         )
     if kind == "sam3_box3d":
         return SamBox3DDetector(
@@ -897,5 +1256,17 @@ def make_detector_backend(kind, config, frames=None):
             max_depth_m=config.get("max_depth_m", 8.0),
             min_valid_points=config.get("min_valid_points", 12),
             trim_ratio=config.get("trim_ratio", 0.1),
+            mask_component_min_area=config.get("mask_component_min_area", 48),
+            mask_component_max_area_ratio=config.get("mask_component_max_area_ratio", 0.85),
+            drop_bottom_ratio=config.get("drop_bottom_ratio", 0.12),
+            depth_band_lower_quantile=config.get("depth_band_lower_quantile", 0.05),
+            depth_band_upper_quantile=config.get("depth_band_upper_quantile", 0.7),
+            cluster_eps=config.get("cluster_eps", 0.18),
+            cluster_min_points=config.get("cluster_min_points", 12),
+            bbox_quantile_lower=config.get("bbox_quantile_lower", 0.1),
+            bbox_quantile_upper=config.get("bbox_quantile_upper", 0.9),
+            enable_euclidean_cluster=config.get("enable_euclidean_cluster", True),
+            reject_low_mean_height=config.get("reject_low_mean_height", True),
+            min_mean_height_m=config.get("min_mean_height_m", 0.08),
         )
     return MockEmptyDetector()

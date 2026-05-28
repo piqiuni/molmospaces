@@ -409,6 +409,11 @@ def box_from_detection(det, depth, info, frame_id, config):
 
 def make_box_markers(detections, depth, info, frame_id, stamp, config):
     markers = MarkerArray()
+    clear = Marker()
+    clear.header.stamp = stamp
+    clear.header.frame_id = frame_id
+    clear.action = Marker.DELETEALL
+    markers.markers.append(clear)
     for idx, det in enumerate(detections):
         center, size = box_from_detection(det, depth, info, frame_id, config)
         if center is None:
@@ -457,6 +462,11 @@ def make_box_markers(detections, depth, info, frame_id, stamp, config):
 
 def make_box_markers_world(detections, depth, info, source_frame, target_frame, stamp, config, tf_listener, tf_snapshot=None):
     markers = MarkerArray()
+    clear = Marker()
+    clear.header.stamp = stamp
+    clear.header.frame_id = target_frame
+    clear.action = Marker.DELETEALL
+    markers.markers.append(clear)
     for idx, det in enumerate(detections):
         world_points = world_points_from_detection_mask(
             det,

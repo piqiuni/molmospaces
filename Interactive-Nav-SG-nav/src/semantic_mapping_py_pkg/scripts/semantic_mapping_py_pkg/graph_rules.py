@@ -92,6 +92,8 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
             room_id = int(room_id)
         except (TypeError, ValueError):
             room_id = None
+    viz_aabb_center = observation.get("viz_aabb_center") or observation.get("world_box3d_center") or observation.get("aabb_center")
+    viz_aabb_size = observation.get("viz_aabb_size") or observation.get("world_box3d_size") or observation.get("aabb_size") or observation.get("size")
     return {
         "observation_id": str(observation.get("observation_id") or ""),
         "instance_id": str(observation.get("instance_id") or ""),
@@ -117,6 +119,8 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "name": str(observation.get("name") or observation.get("object_name") or semantic_name or "object"),
         "asset_id": observation.get("asset_id"),
         "object_id": observation.get("object_id"),
+        "viz_aabb_center": point3(viz_aabb_center),
+        "viz_aabb_size": point3(viz_aabb_size),
     }
 
 
@@ -195,7 +199,8 @@ def infer_interaction_state(node_type: str, joint_type: str, joint_range: list[f
 
 def observation_from_detection(detection: dict[str, Any], observation_id: str, source: str = "detector") -> dict[str, Any]:
     world_position = detection.get("world_position") or detection.get("position") or {}
-    size = detection.get("size") or detection.get("box3d_size") or {}
+    world_box_center = detection.get("world_box3d_center") or detection.get("aabb_center") or detection.get("box3d_center") or world_position
+    size = detection.get("world_box3d_size") or detection.get("aabb_size") or detection.get("box3d_size") or detection.get("size") or {}
     if isinstance(world_position, dict):
         position = [
             world_position.get("x", 0.0),
@@ -204,6 +209,14 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
         ]
     else:
         position = point3(world_position)
+    if isinstance(world_box_center, dict):
+        aabb_center = [
+            world_box_center.get("x", 0.0),
+            world_box_center.get("y", 0.0),
+            world_box_center.get("z", 0.0),
+        ]
+    else:
+        aabb_center = point3(world_box_center)
     if isinstance(size, dict):
         aabb_size = [
             size.get("x", 0.0),
@@ -221,7 +234,7 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
             "category": detection.get("category") or detection.get("semantic_class") or detection.get("class") or semantic_name,
             "confidence": detection.get("confidence", detection.get("conf", 0.0)),
             "position": position,
-            "aabb_center": point3(detection.get("aabb_center") or detection.get("box3d_center") or position),
+            "aabb_center": aabb_center,
             "aabb_size": aabb_size,
             "room_id": detection.get("room_id"),
             "connected_room_ids": detection.get("connected_room_ids") or [],
@@ -239,6 +252,8 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
             "asset_id": detection.get("asset_id"),
             "object_id": detection.get("object_id"),
             "source": source,
+            "viz_aabb_center": aabb_center,
+            "viz_aabb_size": aabb_size,
         }
     )
 

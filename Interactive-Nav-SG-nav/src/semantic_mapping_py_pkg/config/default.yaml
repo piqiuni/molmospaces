@@ -22,6 +22,7 @@ topics:
   scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
   unified_graph: "/semantic_mapping/unified_graph"
   unified_graph_markers: "/semantic_mapping/unified_graph_markers"
+  unified_graph_markers_lifted: "/semantic_mapping/unified_graph_markers_lifted"
   navigation_hints: "/semantic_mapping/navigation_hints"
   scene_colored_pointcloud: "/semantic_mapping/scene_semantic_map/colored_pointcloud"
   scene_legend: "/semantic_mapping/scene_semantic_map/legend"
@@ -34,6 +35,8 @@ object_detection:
   include_depth: false
   confidence_threshold: 0.35
   publish_rate: 5.0
+  max_sync_slop_sec: 0.2
+  skip_if_busy: true
   model_path: "/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"
   device: "cuda:0"
   imgsz: 640
@@ -47,6 +50,18 @@ object_detection:
   min_valid_points: 12
   center_kernel_size: 5
   trim_ratio: 0.1
+  mask_component_min_area: 48
+  mask_component_max_area_ratio: 0.85
+  drop_bottom_ratio: 0.12
+  depth_band_lower_quantile: 0.05
+  depth_band_upper_quantile: 0.7
+  cluster_eps: 0.18
+  cluster_min_points: 12
+  bbox_quantile_lower: 0.1
+  bbox_quantile_upper: 0.9
+  enable_euclidean_cluster: true
+  reject_low_mean_height: true
+  min_mean_height_m: 0.08
   publish_debug_markers: false
   publish_debug_segmented_cloud: false
   publish_debug_detection_image: false
@@ -96,7 +111,15 @@ semantic_map:
   enable_scene_mapping: true
   publish_rate: 2.0
   object_match_distance: 0.5
+  object_min_confirmations: 2
+  object_size_match_ratio: 0.7
   object_stale_after_sec: 0.0   # 0 keeps objects indefinitely
+  room_free_threshold: 20
+  room_unknown_id: -1
+  room_box_height: 0.2
+  room_min_component_cells: 25
+  lifted_graph_frame: "tf_frame_map_graph"
+  lifted_graph_z_offset: 10.0
   scene_max_range: 3.0
   scene_min_range: 0.1
   scene_confidence_step: 5

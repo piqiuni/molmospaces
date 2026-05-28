@@ -16,10 +16,11 @@ from .graph_schema import NavigationHint, SceneGraphBundle, SceneGraphEdge, Scen
 
 
 class InteractionGraphStore:
-    def __init__(self, scene_id="scene", match_distance=0.5, room_id_to_name=None):
+    def __init__(self, scene_id="scene", match_distance=0.5, room_id_to_name=None, room_box_height=0.2):
         self.scene_id = str(scene_id or "scene")
         self.match_distance = float(match_distance)
         self.room_id_to_name = dict(room_id_to_name or {})
+        self.room_box_height = float(room_box_height)
         self.room_geometries = {}
         self.nodes = {}
         self.edges = {}
@@ -47,9 +48,9 @@ class InteractionGraphStore:
                 continue
             room_id = int(room_id)
             self.room_geometries[room_id] = {
-                "center": list(room.get("center") or room.get("aabb_center") or [float(room_id), 0.0, 0.0]),
-                "aabb_center": list(room.get("aabb_center") or room.get("center") or [float(room_id), 0.0, 0.0]),
-                "aabb_size": list(room.get("aabb_size") or [0.5, 0.5, 0.1]),
+                "center": self._grounded_center(room.get("center") or room.get("aabb_center") or [float(room_id), 0.0, 0.0]),
+                "aabb_center": self._grounded_center(room.get("aabb_center") or room.get("center") or [float(room_id), 0.0, 0.0]),
+                "aabb_size": self._room_box_size(room.get("aabb_size") or [0.5, 0.5, self.room_box_height]),
                 "name": str(room.get("name") or room_node_label(self.room_id_to_name, room_id)),
                 "cell_count": int(room.get("cell_count", 0)),
             }
@@ -118,6 +119,28 @@ class InteractionGraphStore:
     def as_navigation_hints(self):
         return [hint.to_dict() for hint in self._build_navigation_hints()]
 
+    def prune_stale_nodes(self, stale_after_sec, now=None):
+        stale_after_sec = float(stale_after_sec)
+        if stale_after_sec <= 0.0:
+            return
+        now = float(now if now is not None else time.time())
+        stale_ids = [
+            node_id
+            for node_id, node in self.nodes.items()
+            if node.type != "room" and node.last_seen is not None and now - float(node.last_seen) > stale_after_sec
+        ]
+        if not stale_ids:
+            return
+        stale_id_set = set(stale_ids)
+        for node_id in stale_ids:
+            self.nodes.pop(node_id, None)
+        self.edges = {
+            edge_id: edge
+            for edge_id, edge in self.edges.items()
+            if edge.src_id not in stale_id_set and edge.dst_id not in stale_id_set
+        }
+        self._rebuild_relations(now=now)
+
     def _find_or_create_node(self, observation):
         instance_id = observation.get("instance_id")
         if instance_id:
@@ -168,8 +191,8 @@ class InteractionGraphStore:
         node.type = infer_node_type(observation)
         node.label = normalize_label(observation.get("semantic_name")) or node.type
         node.name = str(observation.get("name") or node.label or node.type)
-        node.centroid = list(observation["position"])
-        node.aabb_center = list(observation["aabb_center"])
+        node.centroid = self._ground_non_room_centroid(observation["position"], observation["aabb_size"])
+        node.aabb_center = self._ground_non_room_centroid(observation["aabb_center"], observation["aabb_size"])
         node.aabb_size = list(observation["aabb_size"])
         node.room_id = observation.get("room_id") if observation.get("room_id") is not None else node.room_id
         node.confidence = max(float(node.confidence), float(observation.get("confidence", 0.0)))
@@ -190,6 +213,8 @@ class InteractionGraphStore:
                 "asset_id": observation.get("asset_id"),
                 "object_id": observation.get("object_id"),
                 "source": observation.get("source"),
+                "viz_aabb_center": list(observation.get("viz_aabb_center") or observation["aabb_center"]),
+                "viz_aabb_size": list(observation.get("viz_aabb_size") or observation["aabb_size"]),
             }
         )
         node.interaction = default_interaction_payload(node.type, observation)
@@ -220,11 +245,11 @@ class InteractionGraphStore:
             node = self._ensure_room_node(room_id)
             xs = [point[0] for point in points]
             ys = [point[1] for point in points]
-            center = [sum(xs) / len(xs), sum(ys) / len(ys), 0.0]
+            center = [sum(xs) / len(xs), sum(ys) / len(ys), 0.5 * self.room_box_height]
             size = [
                 (max(xs) - min(xs)) if len(xs) > 1 else float(grid_info.resolution),
                 (max(ys) - min(ys)) if len(ys) > 1 else float(grid_info.resolution),
-                0.0,
+                self.room_box_height,
             ]
             node.centroid = center
             node.aabb_center = center
@@ -254,7 +279,9 @@ class InteractionGraphStore:
             min_corner = [min(point[i] for point in mins) for i in range(3)]
             max_corner = [max(point[i] for point in maxs) for i in range(3)]
             center = [(min_corner[i] + max_corner[i]) * 0.5 for i in range(3)]
+            center[2] = 0.5 * self.room_box_height
             size = [max(max_corner[i] - min_corner[i], 0.1) for i in range(3)]
+            size[2] = self.room_box_height
             room_node.centroid = center
             room_node.aabb_center = center
             room_node.aabb_size = size
@@ -268,9 +295,9 @@ class InteractionGraphStore:
         if node is None:
             label = room_node_label(self.room_id_to_name, room_id)
             geometry = self.room_geometries.get(room_id, {})
-            center = list(geometry.get("center") or self._default_room_center(room_id))
-            aabb_center = list(geometry.get("aabb_center") or center)
-            size = list(geometry.get("aabb_size") or self._default_room_size(room_id))
+            center = self._grounded_center(geometry.get("center") or self._default_room_center(room_id))
+            aabb_center = self._grounded_center(geometry.get("aabb_center") or center)
+            size = self._room_box_size(geometry.get("aabb_size") or self._default_room_size(room_id))
             node = SceneGraphNode(
                 id=node_id,
                 type="room",
@@ -304,7 +331,7 @@ class InteractionGraphStore:
             xs.append(float(grid_info.origin.position.x) + (mx + 0.5) * float(grid_info.resolution))
             ys.append(float(grid_info.origin.position.y) + (my + 0.5) * float(grid_info.resolution))
         if xs and ys:
-            return [sum(xs) / len(xs), sum(ys) / len(ys), 0.0]
+            return [sum(xs) / len(xs), sum(ys) / len(ys), 0.5 * self.room_box_height]
         return [float(room_id), 0.0, 0.0]
 
     def _default_room_size(self, room_id):
@@ -325,9 +352,30 @@ class InteractionGraphStore:
             xs.append(float(grid_info.origin.position.x) + (mx + 0.5) * float(grid_info.resolution))
             ys.append(float(grid_info.origin.position.y) + (my + 0.5) * float(grid_info.resolution))
         if len(xs) > 1 and len(ys) > 1:
-            return [max(max(xs) - min(xs), float(grid_info.resolution)), max(max(ys) - min(ys), float(grid_info.resolution)), 0.1]
+            return [max(max(xs) - min(xs), float(grid_info.resolution)), max(max(ys) - min(ys), float(grid_info.resolution)), self.room_box_height]
         resolution = float(grid_info.resolution) if grid_info is not None else 0.5
-        return [resolution, resolution, 0.1]
+        return [resolution, resolution, self.room_box_height]
+
+    def _ground_non_room_centroid(self, center, size):
+        grounded = [float(center[0]), float(center[1]), float(center[2])]
+        half_height = max(float(size[2]) * 0.5, 0.01)
+        grounded[2] = max(grounded[2], half_height)
+        return grounded
+
+    def _grounded_center(self, center):
+        grounded = list(center)
+        if len(grounded) < 3:
+            grounded.extend([0.0] * (3 - len(grounded)))
+        grounded = [float(v) for v in grounded[:3]]
+        grounded[2] = 0.5 * self.room_box_height
+        return grounded
+
+    def _room_box_size(self, size):
+        size = list(size or [])
+        if len(size) < 3:
+            size.extend([0.0] * (3 - len(size)))
+        room_size = [max(float(size[0]), 0.1), max(float(size[1]), 0.1), self.room_box_height]
+        return room_size
 
     def _rebuild_relations(self, now=None):
         now = float(now if now is not None else time.time())
@@ -338,7 +386,7 @@ class InteractionGraphStore:
         for node in non_rooms:
             room_id = node.room_id
             if room_id is None:
-                room_id = self._infer_room_id_from_position(node.centroid)
+                room_id = self._infer_room_id_from_node(node)
                 node.room_id = room_id
             if room_id is not None:
                 room_node = self._ensure_room_node(room_id)
@@ -408,21 +456,38 @@ class InteractionGraphStore:
             last_seen=now,
         )
 
-    def _infer_room_id_from_position(self, position):
+    def _infer_room_id_from_node(self, node):
         if not self.room_grid:
             return None
         grid_info = self.room_grid["info"]
         scene_data = self.room_grid["scene_data"]
         if grid_info is None or not scene_data:
             return None
-        coords = world_to_grid(position[0], position[1], grid_info)
-        if coords is None:
-            return None
-        idx = grid_index(coords[0], coords[1], grid_info.width)
-        if idx < 0 or idx >= len(scene_data):
-            return None
-        room_id = int(scene_data[idx])
-        return None if room_id < 0 else room_id
+        candidates = defaultdict(int)
+        center = node.aabb_center
+        size = node.aabb_size
+        half_x = max(float(size[0]) * 0.45, 0.02)
+        half_y = max(float(size[1]) * 0.45, 0.02)
+        sample_points = [
+            (float(center[0]), float(center[1])),
+            (float(center[0]) - half_x, float(center[1]) - half_y),
+            (float(center[0]) - half_x, float(center[1]) + half_y),
+            (float(center[0]) + half_x, float(center[1]) - half_y),
+            (float(center[0]) + half_x, float(center[1]) + half_y),
+        ]
+        for px, py in sample_points:
+            coords = world_to_grid(px, py, grid_info)
+            if coords is None:
+                continue
+            idx = grid_index(coords[0], coords[1], grid_info.width)
+            if idx < 0 or idx >= len(scene_data):
+                continue
+            room_id = int(scene_data[idx])
+            if room_id >= 0:
+                candidates[room_id] += 1
+        if candidates:
+            return max(sorted(candidates.keys()), key=lambda room_id: candidates[room_id])
+        return None
 
     def _build_navigation_hints(self):
         hints = []
