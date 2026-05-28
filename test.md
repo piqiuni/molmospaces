@@ -10,6 +10,7 @@
   - [可视化](#可视化)
   - [探索包](#探索包)
     - [一键启动](#一键启动)
+      - [手动操作测试](#手动操作测试)
     - [占据地图](#占据地图)
       - [配置文件](#配置文件)
     - [探索策略包](#探索策略包)
@@ -103,6 +104,18 @@ roslaunch nav_pkg molmospaces_nav_system.launch
 
 source ./Interactive-Nav-SG-nav/devel/setup.zsh
 roslaunch semantic_mapping_py_pkg semantic_mapping_debug.launch
+
+
+#### 手动操作测试
+conda activate mlspaces
+source /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/devel/setup.zsh
+roslaunch nav_pkg molmospaces_nav_system.launch manual_control:=true
+
+conda activate mlspaces
+source /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/devel/setup.zsh
+rosrun nav_pkg manual_cmd_vel.py
+控制键是：w 前进，s 后退，a 原地左转，d 原地右转，空格停止，+/- 调速度，q 退出。脚本直接发布 /cmd_vel_stamped，会被 RosBridgePolicy 读取并控制机器人移动。
+
 
 ### 占据地图
 source ./Interactive-Nav-SG-nav/devel/setup.zsh

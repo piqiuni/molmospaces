@@ -46,6 +46,13 @@ class RosBridgePolicy(BasePolicy):
         lidar_offset_x_m: float = 0.0,
         lidar_offset_y_m: float = 0.0,
         lidar_offset_z_m: float = 1.6,
+        lidar_calib_x_m: float = 0.0,
+        lidar_calib_y_m: float = 0.0,
+        lidar_calib_z_m: float = 0.0,
+        lidar_calib_roll_deg: float = 0.0,
+        lidar_calib_pitch_deg: float = 0.0,
+        lidar_calib_yaw_deg: float = 0.0,
+        allow_static_lidar_tf_fallback: bool = False,
         cmd_vel_topic: str = "/cmd_vel_stamped",
         cmd_vel_timeout_s: float = 0.5,
         cmd_vel_control_dt_s: float | None = None,
@@ -80,6 +87,13 @@ class RosBridgePolicy(BasePolicy):
         self.lidar_offset_x_m = float(lidar_offset_x_m)
         self.lidar_offset_y_m = float(lidar_offset_y_m)
         self.lidar_offset_z_m = float(lidar_offset_z_m)
+        self.lidar_calib_x_m = float(lidar_calib_x_m)
+        self.lidar_calib_y_m = float(lidar_calib_y_m)
+        self.lidar_calib_z_m = float(lidar_calib_z_m)
+        self.lidar_calib_roll_deg = float(lidar_calib_roll_deg)
+        self.lidar_calib_pitch_deg = float(lidar_calib_pitch_deg)
+        self.lidar_calib_yaw_deg = float(lidar_calib_yaw_deg)
+        self.allow_static_lidar_tf_fallback = bool(allow_static_lidar_tf_fallback)
         self.cmd_vel_topic = cmd_vel_topic
         self.cmd_vel_timeout_s = float(cmd_vel_timeout_s)
         self.cmd_vel_linear_gain = max(0.0, float(cmd_vel_linear_gain))
@@ -263,6 +277,49 @@ class RosBridgePolicy(BasePolicy):
             dtype=np.float64,
         )
 
+    @staticmethod
+    def _rpy_to_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        rot_x = np.array(
+            [[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]],
+            dtype=np.float64,
+        )
+        rot_y = np.array(
+            [[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]],
+            dtype=np.float64,
+        )
+        rot_z = np.array(
+            [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        return rot_z @ rot_y @ rot_x
+
+    def _apply_lidar_calibration(self, T_base_lidar: np.ndarray) -> np.ndarray:
+        """Apply a small tunable correction in the lidar frame."""
+        if (
+            abs(self.lidar_calib_x_m) < 1e-9
+            and abs(self.lidar_calib_y_m) < 1e-9
+            and abs(self.lidar_calib_z_m) < 1e-9
+            and abs(self.lidar_calib_roll_deg) < 1e-9
+            and abs(self.lidar_calib_pitch_deg) < 1e-9
+            and abs(self.lidar_calib_yaw_deg) < 1e-9
+        ):
+            return T_base_lidar
+
+        T_lidar_calib = np.eye(4, dtype=np.float64)
+        T_lidar_calib[:3, 3] = np.array(
+            [self.lidar_calib_x_m, self.lidar_calib_y_m, self.lidar_calib_z_m],
+            dtype=np.float64,
+        )
+        T_lidar_calib[:3, :3] = self._rpy_to_rotmat(
+            np.deg2rad(self.lidar_calib_roll_deg),
+            np.deg2rad(self.lidar_calib_pitch_deg),
+            np.deg2rad(self.lidar_calib_yaw_deg),
+        )
+        return T_base_lidar @ T_lidar_calib
+
     def _extract_lidar_pose_rel_base(self, observation: Any) -> np.ndarray | None:
         """Return lidar pose in base frame as a 4x4 transform."""
         obs_dict = self._extract_observation_dict(observation)
@@ -318,26 +375,57 @@ class RosBridgePolicy(BasePolicy):
 
         T_base_lidar = self._extract_lidar_pose_rel_base(observation)
         if T_base_lidar is None:
+            if not self.allow_static_lidar_tf_fallback:
+                self._rospy.logwarn_throttle(
+                    2.0,
+                    "RosBridgePolicy: sensor_param_%s missing; skip mapping observation instead of publishing fixed base->lidar TF.",
+                    self.depth_camera_name,
+                )
+                return False
+
             self._rospy.logwarn_throttle(
                 5.0,
-                "RosBridgePolicy: sensor_param_%s missing; falling back to configured base->lidar static offset.",
+                "RosBridgePolicy: sensor_param_%s missing; falling back to configured fixed base->lidar TF.",
                 self.depth_camera_name,
             )
+            T_base_lidar = np.eye(4, dtype=np.float64)
+            T_base_lidar[:3, 3] = np.array(
+                [self.lidar_offset_x_m, self.lidar_offset_y_m, self.lidar_offset_z_m],
+                dtype=np.float64,
+            )
+            T_base_lidar = self._apply_lidar_calibration(T_base_lidar)
+            qx, qy, qz, qw = self._rotation_matrix_to_quaternion(T_base_lidar[:3, :3])
             tf_msg = self._TransformStamped()
             tf_msg.header.stamp = stamp
             tf_msg.header.frame_id = self.base_frame_id
             tf_msg.child_frame_id = self.pointcloud_frame_id
-            tf_msg.transform.translation.x = self.lidar_offset_x_m
-            tf_msg.transform.translation.y = self.lidar_offset_y_m
-            tf_msg.transform.translation.z = self.lidar_offset_z_m
-            tf_msg.transform.rotation.x = 0.0
-            tf_msg.transform.rotation.y = 0.0
-            tf_msg.transform.rotation.z = 0.0
-            tf_msg.transform.rotation.w = 1.0
+            tf_msg.transform.translation.x = float(T_base_lidar[0, 3])
+            tf_msg.transform.translation.y = float(T_base_lidar[1, 3])
+            tf_msg.transform.translation.z = float(T_base_lidar[2, 3])
+            tf_msg.transform.rotation.x = qx
+            tf_msg.transform.rotation.y = qy
+            tf_msg.transform.rotation.z = qz
+            tf_msg.transform.rotation.w = qw
             self._tf_broadcaster.sendTransform(tf_msg)
             return False
 
+        T_base_lidar = self._apply_lidar_calibration(T_base_lidar)
         qx, qy, qz, qw = self._rotation_matrix_to_quaternion(T_base_lidar[:3, :3])
+        self._rospy.loginfo_throttle(
+            2.0,
+            (
+                "RosBridgePolicy: publishing dynamic base->lidar TF from sensor_param_%s: "
+                "xyz=(%.3f, %.3f, %.3f), quat=(%.4f, %.4f, %.4f, %.4f)"
+            ),
+            self.depth_camera_name,
+            float(T_base_lidar[0, 3]),
+            float(T_base_lidar[1, 3]),
+            float(T_base_lidar[2, 3]),
+            qx,
+            qy,
+            qz,
+            qw,
+        )
         tf_msg = self._TransformStamped()
         tf_msg.header.stamp = stamp
         tf_msg.header.frame_id = self.base_frame_id
@@ -952,8 +1040,7 @@ class RosBridgePolicy(BasePolicy):
         tf_msg.transform.rotation.z = qz
         tf_msg.transform.rotation.w = qw
         self._tf_broadcaster.sendTransform(tf_msg)
-        self._publish_base_to_lidar_tf(observation, stamp)
-        return True
+        return self._publish_base_to_lidar_tf(observation, stamp)
 
     def get_action(self, observation):
         frame_t0 = time.perf_counter()

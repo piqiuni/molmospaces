@@ -46,8 +46,8 @@ lasamplestep: 0.005
 
 # 点云高度滤波参数
 enable_height_filter: true
-filter_height_center: 1.0
-filter_height_tolerance: 0.8
+filter_height_center: 0.95
+filter_height_tolerance: 0.85
 filter_height_frame: tf_frame_base_link
 
 # 障碍物膨胀参数
@@ -56,7 +56,7 @@ inflation_radius: 0.20  # 膨胀半径（米），通常设置为机器人半径
 inscribed_radius: 0.1  # 内切半径（米），障碍物核心区域
 
 # 局部覆写参数（用最新扫描实时覆盖机器人附近区域）
-enable_local_overwrite: false
+enable_local_overwrite: true
 local_overwrite_radius: 8.0
 local_overwrite_mark_occupied: true
 

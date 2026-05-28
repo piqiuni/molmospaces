@@ -83,6 +83,17 @@ def enable_depth_for_camera(camera_system, camera_name: str) -> bool:
     return False
 
 
+def disable_camera_randomization(camera_system) -> None:
+    """Disable camera pose/FOV noise for deterministic ROS mapping/debug runs."""
+    for cam in camera_system.cameras:
+        if hasattr(cam, "fov_noise_degrees"):
+            cam.fov_noise_degrees = None
+        if hasattr(cam, "pos_noise_range"):
+            cam.pos_noise_range = None
+        if hasattr(cam, "orientation_noise_degrees"):
+            cam.orientation_noise_degrees = None
+
+
 class NavRosRolloutRunner(ParallelRolloutRunner):
     @staticmethod
     def patch_config(frozen_config, data=None, exp_config=None):
@@ -191,6 +202,8 @@ def build_nav_config(args) -> NavToObjBaseConfig:
     elif args.robot == "rby1":
         cfg.robot_config = RBY1Config()
         cfg.camera_config = RBY1GoProD455CameraSystem()
+        if not args.randomize_camera:
+            disable_camera_randomization(cfg.camera_config)
         ensure_head_camera_exists(cfg.camera_config)
         if enable_depth_for_camera(cfg.camera_config, "head_camera"):
             log.info("Enabled depth for head_camera in this run.")
@@ -219,6 +232,17 @@ def build_output_dir(run_name_prefix: str) -> Path:
     return ASSETS_DIR / "datagen" / "nav_to_obj_ros_sim_v1" / run_name
 
 
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    value_lower = str(value).strip().lower()
+    if value_lower in {"true", "1", "yes", "y"}:
+        return True
+    if value_lower in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run nav-to-object simulation with ROS bridge policy."
@@ -234,6 +258,14 @@ def parse_args():
     parser.add_argument("--policy_dt_ms", type=float, default=100.0)
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--randomize_scene", action="store_true")
+    parser.add_argument(
+        "--randomize_camera",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Keep camera pose/FOV randomization enabled. Disabled by default for ROS mapping debug.",
+    )
     parser.add_argument("--run_name_prefix", type=str, default="")
     parser.add_argument(
         "--disable_task_sensors",
@@ -261,6 +293,50 @@ def parse_args():
         type=float,
         default=0.0,
         help="Roll correction (deg) around robot forward axis for pointcloud leveling.",
+    )
+    parser.add_argument(
+        "--lidar_calib_x_m",
+        type=float,
+        default=0.0,
+        help="Extra base->lidar TF calibration x offset in lidar frame (meters).",
+    )
+    parser.add_argument(
+        "--lidar_calib_y_m",
+        type=float,
+        default=0.0,
+        help="Extra base->lidar TF calibration y offset in lidar frame (meters).",
+    )
+    parser.add_argument(
+        "--lidar_calib_z_m",
+        type=float,
+        default=0.0,
+        help="Extra base->lidar TF calibration z offset in lidar frame (meters).",
+    )
+    parser.add_argument(
+        "--lidar_calib_roll_deg",
+        type=float,
+        default=0.0,
+        help="Extra base->lidar TF roll calibration in lidar frame (degrees).",
+    )
+    parser.add_argument(
+        "--lidar_calib_pitch_deg",
+        type=float,
+        default=0.0,
+        help="Extra base->lidar TF pitch calibration in lidar frame (degrees).",
+    )
+    parser.add_argument(
+        "--lidar_calib_yaw_deg",
+        type=float,
+        default=0.0,
+        help="Extra base->lidar TF yaw calibration in lidar frame (degrees).",
+    )
+    parser.add_argument(
+        "--allow_static_lidar_tf_fallback",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Allow fixed base->lidar TF fallback when live camera sensor_param is missing.",
     )
     parser.add_argument("--depth_fov_deg", type=float, default=90.0)
     parser.add_argument("--depth_min_m", type=float, default=0.1)
@@ -333,6 +409,13 @@ def main():
             pointcloud_frame_id=args.pointcloud_frame_id,
             pointcloud_stride=args.pointcloud_stride,
             pointcloud_roll_correction_deg=args.pointcloud_roll_correction_deg,
+            lidar_calib_x_m=args.lidar_calib_x_m,
+            lidar_calib_y_m=args.lidar_calib_y_m,
+            lidar_calib_z_m=args.lidar_calib_z_m,
+            lidar_calib_roll_deg=args.lidar_calib_roll_deg,
+            lidar_calib_pitch_deg=args.lidar_calib_pitch_deg,
+            lidar_calib_yaw_deg=args.lidar_calib_yaw_deg,
+            allow_static_lidar_tf_fallback=args.allow_static_lidar_tf_fallback,
             depth_fov_deg=args.depth_fov_deg,
             depth_min_m=args.depth_min_m,
             depth_max_m=args.depth_max_m,
