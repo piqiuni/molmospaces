@@ -318,6 +318,101 @@
 - [ ] 明确 door 检测成功之外还缺哪些交互属性字段
 - [ ] 明确 door state 是从关节值直接读，还是从图像/几何间接估计
 - [ ] 明确 room_id / connectivity 的可信来源
+
+## 4.4 已梳理的 MolmoSpaces GT / 交互接口
+
+当前已新增探索脚本：
+
+- `scripts/InteractiveNav/explore_molmo_interactions.py`
+  - `inspect-scene`：枚举场景中的 door / cabinet / drawer / fridge / microwave 等 articulation，以及 lights
+  - `nav-gt`：在 `nav_to_obj` 采样结果上，读取固定起点、目标与 GT path
+  - `door-path-study`：固定起终点后，切换指定 door 的 open / closed 状态并重算路径
+  - `set-articulation`：对通用 articulation object 直接设置 joint open fraction
+  - `task-config-template`：导出固定 `nav_to_obj` / `door_opening` / `open_close` episode 的配置草稿
+  - `action-schema`：导出 navigation / door / container 的 oracle 或 planner action 模板
+  - `benchmark-episode-template`：导出 `benchmark_schema.EpisodeSpec` 级别的 JSON 骨架
+  - `integration-recipe`：导出导航层如何调用 oracle / planner 交互的接线伪代码
+  - `env-check`：检查当前环境是否具备实跑 scene 的基本条件
+
+当前已新增配套说明：
+
+- `scripts/InteractiveNav/molmo_interaction_interfaces.md`
+  - 汇总 task config、GT 接口、step action、灯光控制现状
+- `scripts/InteractiveNav/molmo_gt_workflow.md`
+  - 按 `2.1 -> 3.2` 目标串成可执行工作流
+- `scripts/InteractiveNav/molmo_objective_status.md`
+  - 按目标编号逐项整理当前证据、完成项与剩余缺口
+- `scripts/InteractiveNav/molmo_runtime_validation.md`
+  - 记录真实在 `mlspaces` 环境中运行时遇到的 cache / network blocker
+
+当前已确认的环境侧 blocker：
+
+- 真实 scene-loading 需要可写资源缓存目录：
+  - 推荐 `MLSPACES_CACHE_DIR=/tmp/molmo-spaces-resources`
+- 若本机已有 `~/.cache/molmo-spaces-resources`，可在 `/tmp` 建一个 proxy cache 根目录，并把现有 `robots / scenes / objects / grasps / benchmarks / test_data` 软链进去
+- Linux headless 环境建议显式设置：
+  - `MUJOCO_GL=egl`
+  - `PYOPENGL_PLATFORM=egl`
+- 当前已真实验证：
+  - `inspect-scene` 可在 `train_10_ceiling.xml` 上成功输出 4 个 door、10 个 articulated objects、1 个 light
+  - `nav-gt` 可真实跑到 `scene loading -> occupancy map -> nav_to_obj task sample -> target selection`
+- 当前剩余真实问题已从“scene 无法加载”收敛为：
+  - 某些 house 会在 `NavGoalSampler` 上失败，拿不到 nav goal
+  - `door-path-study` 仍需在更合适的 house 上继续筛选
+
+当前确认的 GT path 代码链路：
+
+- `scripts/datagen/run_pipeline.py --task_type nav_to_obj --policy planner`
+- `NavToObjTaskSampler.init_scene()`：为 house 生成 occupancy map，并存到 `task.occupancy_map`
+- `AStarNavToObjPolicy / AStarPlanner`：基于 occupancy map + graph search 生成 waypoint path
+- 需要注意：现有 `AStarPlanner` 默认按 `model_path` 重建 map，不直接消费运行时 door state
+- 因此若要做“固定起终点 + 改门状态 + 重算 GT path”，应优先使用 live model/data 重新建图，而不是只调用现成 policy
+
+当前确认的固定 episode 入口：
+
+- 固定导航起点：`NavToObjTaskConfig.robot_base_pose`
+- 固定导航目标实例：`NavToObjTaskConfig.pickup_obj_name`
+- 固定目标候选集：`NavToObjTaskConfig.pickup_obj_candidates`
+- 固定 door episode：`DoorOpeningTaskConfig.door_body_name`、`robot_base_pose`、`articulated_joint_range`、`articulated_joint_reset_state`
+- 固定通用 container/open-close episode：`OpeningTaskConfig.joint_name`、`joint_index`、`joint_start_position`
+
+当前确认的状态修改接口：
+
+- 通道属性（door）：
+  - `Door(name, env.current_data)`
+  - `get_hinge_joint_index()`
+  - `get_joint_range(i)`
+  - `set_joint_position(i, position)`
+- 容器属性（drawer / cabinet / fridge / microwave / oven / dishwasher 等）：
+  - `ObjectManager.get_object_by_name(name)` 返回 `MlSpacesArticulationObject`
+  - `joint_names / get_joint_range(i) / get_joint_position(i) / set_joint_position(i, position)`
+- door 打开任务和通用 open/close 任务是两条独立 task 线：
+  - `DoorOpeningTask / DoorOpeningTaskSampler / opening_solver.py`
+  - `OpeningTask / OpenTaskSampler / open_close_planner_policy.py`
+
+当前确认的 step-level action 接口：
+
+- `task.step(action)` 接受单环境 `dict` 或多环境 `list[dict]`
+- `done` 是保留字段，`task.step()` 会先剥离，再标记 episode 结束
+- 导航 policy 输出：
+  - `{\"base\": waypoint, \"done\": False}`
+  - 结束时为 `{\"done\": True, ...base noop...}`
+- 若只想让导航层“直接开关门/容器”做 GT study，当前最自然的接口不是单独 task action，而是：
+  - door：`Door(...).set_joint_position(...)`
+  - container：`MlSpacesArticulationObject.set_joint_position(...)`
+- door opening solver 输出：
+  - 分 phase 生成 `base / arm / gripper / head / done` 组合动作
+- 通用 container open/close planner：
+  - 通过 `OpeningTask + OpenClosePlannerPolicy` 执行，不是单独的“open drawer” primitive API
+
+关于灯光 / 开关类交互的当前判断：
+
+- 代码里已有 light 元数据和随机化器：
+  - `molmo_spaces/env/mj_extensions.py`
+  - `molmo_spaces/env/arena/randomization/lighting.py`
+- 当前更像“场景随机化 / 低层属性控制”，不是完整任务接口
+- 低层可直接读写 `model.light_active[light_id]`
+- 目前没有与 `nav_to_obj` / `OpeningTask` 对齐的高层 `light-switch task`，因此应先视为 future extension，而不是第一阶段主线
 - [ ] 为后续 container / movable obstacle 预留观测字段
 - [ ] 为 future extension 中的 switch / light / curtain 类交互预留扩展字段
 

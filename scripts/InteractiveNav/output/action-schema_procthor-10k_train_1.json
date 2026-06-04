@@ -1,0 +1,15 @@
+{
+  "mode": "container_oracle",
+  "schema": {
+    "description": "Direct GT/oracle state change for articulated containers.",
+    "example_python": {
+      "obj_ctor": "obj = env.object_managers[0].get_object_by_name(object_name)",
+      "joint_range": "joint_range = obj.get_joint_range(joint_index)",
+      "set_fraction": "obj.set_joint_position(joint_index, joint_range[0] + frac * (joint_range[1] - joint_range[0]))"
+    },
+    "notes": [
+      "Use this for fridge/drawer/cabinet GT studies.",
+      "Planner-style execution should go through OpeningTask + OpenClosePlannerPolicy."
+    ]
+  }
+}

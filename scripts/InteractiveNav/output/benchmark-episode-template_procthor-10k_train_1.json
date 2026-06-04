@@ -1,0 +1,63 @@
+{
+  "task_kind": "nav_to_obj",
+  "episode_spec_template": {
+    "source": {
+      "h5_file": "/path/to/source.h5",
+      "traj_key": "traj_0",
+      "episode_length": 0,
+      "camera_system_class": "RBY1GoProD455CameraSystem",
+      "source_data_date": "2026-06-04",
+      "benchmark_created_date": "2026-06-04"
+    },
+    "house_index": 1,
+    "scene_dataset": "procthor-10k",
+    "data_split": "train",
+    "seed": 2,
+    "robot": {
+      "name": "rby1",
+      "description": "Fill with benchmark robot spec fields used in your eval setup."
+    },
+    "img_resolution": [
+      640,
+      480
+    ],
+    "cameras": [],
+    "scene_modifications": {
+      "added_objects": {},
+      "object_poses": {},
+      "removed_objects": []
+    },
+    "task_relevant_objects": [],
+    "language": {
+      "task_description": "",
+      "referral_expressions": {},
+      "referral_expressions_priority": {}
+    },
+    "task": {
+      "task_cls": "molmo_spaces.tasks.nav_task.NavToObjTask",
+      "task_type": "nav_to_obj",
+      "robot_base_pose": [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "pickup_obj_name": "apple_xxx",
+      "pickup_obj_candidates": [
+        "apple_xxx",
+        "apple_yyy"
+      ],
+      "pickup_obj_start_pose": null,
+      "receptacle_name": null,
+      "succ_pos_threshold": 1.5
+    }
+  },
+  "notes": [
+    "This matches benchmark_schema.NavToObjTaskSpec fields.",
+    "If you want to study door state changes, freeze robot_base_pose and pickup_obj_name first.",
+    "Then apply post-init door overrides and recompute GT path on the live model."
+  ]
+}

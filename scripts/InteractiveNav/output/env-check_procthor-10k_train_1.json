@@ -1,0 +1,21 @@
+{
+  "checks": {
+    "current_python": "/home/user/miniconda3/envs/mlspaces/bin/python",
+    "recommended_python": "/home/user/miniconda3/envs/mlspaces/bin/python",
+    "using_mlspaces_python": true,
+    "repo_root_on_syspath": true,
+    "mujoco_importable": true,
+    "networkx_importable": true,
+    "opencv_importable": true,
+    "molmo_spaces_importable": true,
+    "mlspaces_cache_dir": "/home/user/.cache/molmo-spaces-resources",
+    "mlspaces_cache_parent_exists": true,
+    "mlspaces_cache_dir_exists": true,
+    "mlspaces_cache_parent_writable": false,
+    "tmp_writable": true
+  },
+  "recommendations": [
+    "In the current sandbox, prefer MLSPACES_CACHE_DIR=/tmp/molmo-spaces-resources or another writable cache path.",
+    "Real scene-loading commands still require pre-populated local MolmoSpaces resources or outbound network access for remote manifests/assets."
+  ]
+}

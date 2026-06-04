@@ -1,0 +1,24 @@
+{
+  "mode": "door_oracle_nav_loop",
+  "recipe": {
+    "description": "Navigation loop with direct oracle door open/close overrides.",
+    "pseudo_code": [
+      "task = sampler.sample_task(...)",
+      "obs, info = task.reset()",
+      "planner_path = compute_gt_path(...)",
+      "if need_interaction(door, planner_path):",
+      "    door = Door(door_body_name, env.current_data)",
+      "    hinge_idx = door.get_hinge_joint_index()",
+      "    door.set_joint_position(hinge_idx, target_open_position)",
+      "    planner_path = recompute_gt_path_on_live_map(...)",
+      "while not task.is_done():",
+      "    waypoint = next_waypoint(planner_path)",
+      "    action = {'base': waypoint, 'done': False}",
+      "    obs, reward, terminated, truncated, info = task.step(action)"
+    ],
+    "notes": [
+      "This is the cleanest recipe for proving interaction changes reachability/cost.",
+      "It avoids mixing navigation research with physical door-manipulation execution."
+    ]
+  }
+}

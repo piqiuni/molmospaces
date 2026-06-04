@@ -1,0 +1,426 @@
+{
+  "scene_dataset": "procthor-10k",
+  "data_split": "train",
+  "house_ind": 10,
+  "scene_path": "/tmp/molmo-spaces-assets-proxy/scenes/procthor-10k-train/train_10_ceiling.xml",
+  "door_names": [
+    "doorway_030fdfd554ade2f91f34609bc2ffcbeb_1_2_4",
+    "doorway_45464d422eed5854abea0fa44fe9b45b_1_2_2",
+    "doorway_45464d422eed5854abea0fa44fe9b45b_1_4_2",
+    "doorway_b395de4844c86757425df4041f75ab82_1_2_5"
+  ],
+  "articulated_objects": [
+    {
+      "name": "box_465e7d4e80136319b6d39b823a19ed1c_1_0_6",
+      "category": "Box",
+      "interaction_group": "container",
+      "joint_count": 5,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "box_465e7d4e80136319b6d39b823a19ed1c_1_0_6_jntfree_0",
+          "joint_type": "[0]",
+          "joint_range": [
+            0.0,
+            0.0
+          ],
+          "joint_position": 11.1937011673699
+        },
+        {
+          "joint_index": 1,
+          "joint_name": "box_465e7d4e80136319b6d39b823a19ed1c_1_1_6_box27flapouter1joint0_1",
+          "joint_type": "[3]",
+          "joint_range": [
+            0.0,
+            2.48074
+          ],
+          "joint_position": 2.480740104272416
+        },
+        {
+          "joint_index": 2,
+          "joint_name": "box_465e7d4e80136319b6d39b823a19ed1c_1_2_6_box27flapouter2joint0_2",
+          "joint_type": "[3]",
+          "joint_range": [
+            -2.44238,
+            0.0
+          ],
+          "joint_position": -2.442380100925006
+        },
+        {
+          "joint_index": 3,
+          "joint_name": "box_465e7d4e80136319b6d39b823a19ed1c_1_3_6_box27flapinner1joint0_3",
+          "joint_type": "[3]",
+          "joint_range": [
+            -2.56778,
+            0.0
+          ],
+          "joint_position": -2.56778007521514
+        },
+        {
+          "joint_index": 4,
+          "joint_name": "box_465e7d4e80136319b6d39b823a19ed1c_1_4_6_box27flapinner2joint0_4",
+          "joint_type": "[3]",
+          "joint_range": [
+            0.0,
+            2.57286
+          ],
+          "joint_position": 2.57286009300412
+        }
+      ],
+      "is_named_door": false
+    },
+    {
+      "name": "box_51a230e474493f3fb9a8fbbf7298d54d_1_0_5",
+      "category": "Box",
+      "interaction_group": "container",
+      "joint_count": 5,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "box_51a230e474493f3fb9a8fbbf7298d54d_1_0_5_jntfree_0",
+          "joint_type": "[0]",
+          "joint_range": [
+            0.0,
+            0.0
+          ],
+          "joint_position": 2.137524719146961
+        },
+        {
+          "joint_index": 1,
+          "joint_name": "box_51a230e474493f3fb9a8fbbf7298d54d_1_1_5_box15flapouter2joint0_1",
+          "joint_type": "[3]",
+          "joint_range": [
+            0.0,
+            2.6103
+          ],
+          "joint_position": 2.6103001918962603
+        },
+        {
+          "joint_index": 2,
+          "joint_name": "box_51a230e474493f3fb9a8fbbf7298d54d_1_2_5_box15flapouter1joint0_2",
+          "joint_type": "[3]",
+          "joint_range": [
+            -2.59314,
+            0.0
+          ],
+          "joint_position": -2.5931402067284166
+        },
+        {
+          "joint_index": 3,
+          "joint_name": "box_51a230e474493f3fb9a8fbbf7298d54d_1_4_5_box15flapinner2joint0_3",
+          "joint_type": "[3]",
+          "joint_range": [
+            -2.61864,
+            0.0
+          ],
+          "joint_position": -2.618640057596821
+        },
+        {
+          "joint_index": 4,
+          "joint_name": "box_51a230e474493f3fb9a8fbbf7298d54d_1_5_5_box15flapinner1joint0_4",
+          "joint_type": "[3]",
+          "joint_range": [
+            0.0,
+            2.61168
+          ],
+          "joint_position": 2.6116800460253904
+        }
+      ],
+      "is_named_door": false
+    },
+    {
+      "name": "chestofdrawers_995745317704128ee80131356cba94cc_1_0_5",
+      "category": "Dresser",
+      "interaction_group": "container",
+      "joint_count": 4,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "chestofdrawers_995745317704128ee80131356cba94cc_1_2_5_joint_0",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.201
+          ],
+          "joint_position": -1.9869560529271504e-10
+        },
+        {
+          "joint_index": 1,
+          "joint_name": "chestofdrawers_995745317704128ee80131356cba94cc_1_4_5_DrawerMesh021_1",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.201
+          ],
+          "joint_position": 0.0
+        },
+        {
+          "joint_index": 2,
+          "joint_name": "chestofdrawers_995745317704128ee80131356cba94cc_1_6_5_DrawerMesh031_2",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.201
+          ],
+          "joint_position": 0.0
+        },
+        {
+          "joint_index": 3,
+          "joint_name": "chestofdrawers_995745317704128ee80131356cba94cc_1_8_5_DrawerMesh041_3",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.201
+          ],
+          "joint_position": 0.0
+        }
+      ],
+      "is_named_door": false
+    },
+    {
+      "name": "chestofdrawers_995745317704128ee80131356cba94cc_2_0_6",
+      "category": "Dresser",
+      "interaction_group": "container",
+      "joint_count": 4,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "chestofdrawers_995745317704128ee80131356cba94cc_2_2_6_joint_0",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.201
+          ],
+          "joint_position": 0.0
+        },
+        {
+          "joint_index": 1,
+          "joint_name": "chestofdrawers_995745317704128ee80131356cba94cc_2_4_6_DrawerMesh021_1",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.201
+          ],
+          "joint_position": 8.454272823304843e-25
+        },
+        {
+          "joint_index": 2,
+          "joint_name": "chestofdrawers_995745317704128ee80131356cba94cc_2_6_6_DrawerMesh031_2",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.201
+          ],
+          "joint_position": 0.0
+        },
+        {
+          "joint_index": 3,
+          "joint_name": "chestofdrawers_995745317704128ee80131356cba94cc_2_8_6_DrawerMesh041_3",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.201
+          ],
+          "joint_position": 0.0
+        }
+      ],
+      "is_named_door": false
+    },
+    {
+      "name": "chestofdrawers_fdf8ab53e7ce731f1fcbde4be80ad603_1_0_4",
+      "category": "Dresser",
+      "interaction_group": "container",
+      "joint_count": 3,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "chestofdrawers_fdf8ab53e7ce731f1fcbde4be80ad603_1_2_4_joint_0",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.213
+          ],
+          "joint_position": 1.9340527554759423e-12
+        },
+        {
+          "joint_index": 1,
+          "joint_name": "chestofdrawers_fdf8ab53e7ce731f1fcbde4be80ad603_1_3_4_DrawerMesh021_1",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.213
+          ],
+          "joint_position": -6.131187248365348e-14
+        },
+        {
+          "joint_index": 2,
+          "joint_name": "chestofdrawers_fdf8ab53e7ce731f1fcbde4be80ad603_1_4_4_DrawerMesh031_2",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.213
+          ],
+          "joint_position": -2.4370266902566944e-20
+        }
+      ],
+      "is_named_door": false
+    },
+    {
+      "name": "crapper_cd6fa77f725b7ec4a4ced5913731ae93_1_0_3",
+      "category": "Toilet",
+      "interaction_group": "other_articulated",
+      "joint_count": 1,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "crapper_cd6fa77f725b7ec4a4ced5913731ae93_1_2_3_joint_0",
+          "joint_type": "[3]",
+          "joint_range": [
+            -1.51844,
+            0.0
+          ],
+          "joint_position": 7.1036943151302306e-06
+        }
+      ],
+      "is_named_door": false
+    },
+    {
+      "name": "laptop_43e89717f8a1761a63a8d6a7b9fe9725_1_0_6",
+      "category": "Laptop",
+      "interaction_group": "other_articulated",
+      "joint_count": 2,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "laptop_43e89717f8a1761a63a8d6a7b9fe9725_1_0_6_jntfree_0",
+          "joint_type": "[0]",
+          "joint_range": [
+            0.0,
+            0.0
+          ],
+          "joint_position": 7.480699999954885
+        },
+        {
+          "joint_index": 1,
+          "joint_name": "laptop_43e89717f8a1761a63a8d6a7b9fe9725_1_1_6_laptoplid20joint0_1",
+          "joint_type": "[3]",
+          "joint_range": [
+            0.0,
+            1.5708
+          ],
+          "joint_position": 1.5707999999999889
+        }
+      ],
+      "is_named_door": false
+    },
+    {
+      "name": "laptop_569267daeb482c3c237b5c02c85d890b_1_0_4",
+      "category": "Laptop",
+      "interaction_group": "other_articulated",
+      "joint_count": 2,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "laptop_569267daeb482c3c237b5c02c85d890b_1_0_4_jntfree_0",
+          "joint_type": "[0]",
+          "joint_range": [
+            0.0,
+            0.0
+          ],
+          "joint_position": 5.232730000093241
+        },
+        {
+          "joint_index": 1,
+          "joint_name": "laptop_569267daeb482c3c237b5c02c85d890b_1_1_4_laptoplid19joint0_1",
+          "joint_type": "[3]",
+          "joint_range": [
+            0.0,
+            1.5708
+          ],
+          "joint_position": 1.5707999999999869
+        }
+      ],
+      "is_named_door": false
+    },
+    {
+      "name": "refrigerator_94125164ce2627fb0bd4d5a4178ec16c_1_0_2",
+      "category": "Fridge",
+      "interaction_group": "container",
+      "joint_count": 3,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "refrigerator_94125164ce2627fb0bd4d5a4178ec16c_1_2_2_joint_0",
+          "joint_type": "[3]",
+          "joint_range": [
+            0.0,
+            1.5708
+          ],
+          "joint_position": 0.0
+        },
+        {
+          "joint_index": 1,
+          "joint_name": "refrigerator_94125164ce2627fb0bd4d5a4178ec16c_1_4_2_fridgedrawer127d18a8aa21_1",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.209
+          ],
+          "joint_position": 1.4745141965135763e-34
+        },
+        {
+          "joint_index": 2,
+          "joint_name": "refrigerator_94125164ce2627fb0bd4d5a4178ec16c_1_5_2_fridgedrawer2271828b25f1_2",
+          "joint_type": "[2]",
+          "joint_range": [
+            0.0,
+            0.209
+          ],
+          "joint_position": -3.90097568584027e-34
+        }
+      ],
+      "is_named_door": false
+    },
+    {
+      "name": "safe_5ea0563319e8e09ddd8f7b0099388eb0_1_0_5",
+      "category": "Safe",
+      "interaction_group": "other_articulated",
+      "joint_count": 2,
+      "joints": [
+        {
+          "joint_index": 0,
+          "joint_name": "safe_5ea0563319e8e09ddd8f7b0099388eb0_1_0_5_jntfree_0",
+          "joint_type": "[0]",
+          "joint_range": [
+            0.0,
+            0.0
+          ],
+          "joint_position": 1.6194707892202511
+        },
+        {
+          "joint_index": 1,
+          "joint_name": "safe_5ea0563319e8e09ddd8f7b0099388eb0_1_2_5_safedoor18joint0_1",
+          "joint_type": "[3]",
+          "joint_range": [
+            0.0,
+            1.5708
+          ],
+          "joint_position": 7.689891904139418e-11
+        }
+      ],
+      "is_named_door": false
+    }
+  ],
+  "lights": [
+    {
+      "light_id": 0,
+      "light_name": null,
+      "active": 1,
+      "position": [
+        1.0,
+        -1.0,
+        1.5
+      ]
+    }
+  ]
+}

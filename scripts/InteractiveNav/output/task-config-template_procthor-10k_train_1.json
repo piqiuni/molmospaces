@@ -1,0 +1,39 @@
+{
+  "task_kind": "nav_to_obj",
+  "template": {
+    "task_cls": "molmo_spaces.tasks.nav_task.NavToObjTask",
+    "task_type": "nav_to_obj",
+    "robot_base_pose": [
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "pickup_obj_name": "apple_xxx",
+    "pickup_obj_candidates": [
+      "apple_xxx",
+      "apple_yyy"
+    ],
+    "pickup_obj_category": "apple",
+    "succ_pos_threshold": 1.5,
+    "post_init_overrides": {
+      "doors_to_close": [
+        {
+          "door_body_name": "door|...",
+          "state": "closed",
+          "api": "Door(door_body_name, env.current_data).set_joint_position(hinge_idx, 0.0)"
+        }
+      ]
+    }
+  },
+  "notes": [
+    "robot_base_pose can be filled from a sampled nav_to_obj episode and then frozen.",
+    "pickup_obj_name should be a concrete object instance name.",
+    "pickup_obj_candidates should contain same-category alternatives if you want eval-style ambiguity.",
+    "After task init, you can directly call Door(...).set_joint_position(...) to force door states before recomputing GT path."
+  ],
+  "source_configs": "molmo_spaces.configs.task_configs.NavToObjTaskConfig"
+}

@@ -1,0 +1,31 @@
+{
+  "scene_path": "/tmp/molmo-spaces-assets-proxy/scenes/procthor-10k-train/train_10_ceiling.xml",
+  "target_object": "refrigerator_94125164ce2627fb0bd4d5a4178ec16c_1_0_2",
+  "robot_xy": [
+    9.203271300988956,
+    8.129698938352925
+  ],
+  "baseline_plot_path": "scripts/InteractiveNav/output/door-path-study_procthor-10k_train_10_fridge_baseline.png",
+  "compare_plot_path": "scripts/InteractiveNav/output/door-path-study_procthor-10k_train_10_fridge_compare.png",
+  "nav_goal": [
+    8.03569,
+    6.12642,
+    0.941304
+  ],
+  "nav_goal_source": "target_object_center_fallback",
+  "all_door_names": [
+    "doorway_45464d422eed5854abea0fa44fe9b45b_1_2_2",
+    "doorway_45464d422eed5854abea0fa44fe9b45b_1_4_2",
+    "doorway_030fdfd554ade2f91f34609bc2ffcbeb_1_2_4",
+    "doorway_b395de4844c86757425df4041f75ab82_1_2_5"
+  ],
+  "selected_doors": [],
+  "door_transitions": [],
+  "baseline_path_found": false,
+  "baseline_path_length_m": null,
+  "changed_path_found": false,
+  "changed_path_length_m": null,
+  "baseline_waypoints": null,
+  "changed_waypoints": null,
+  "nav_goal_sampling_error": "Failed to sample a nav goal near target object"
+}
