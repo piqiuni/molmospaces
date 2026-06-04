@@ -11,6 +11,23 @@
 - 各子目录下的 `README.md`：模块级说明。
 - `scripts/InteractiveNav/interactive_navigation/`：交互式导航课题文档、讨论记录、阶段规划与文献调研。
 
+## 当前核心高层文档
+
+当前交互导航相关的高层信息，应优先维护并收敛到以下 4 个核心文档：
+
+1. `TODO.md`：项目子任务拆解、阶段规划与开发推进
+2. `readme_pi.md`：项目整体立意、研究目标、系统概述与文档索引
+3. `AGENTS.md`：Agent 协作约定、工作边界与文档维护规范
+4. `test.md`：开发测试命令汇总、流程测试方式与参数配置
+
+维护原则：
+
+- 子任务拆解与当前阶段判断，以 `TODO.md` 为准。
+- 项目整体立意、系统主线与文档入口，以 `readme_pi.md` 为准。
+- Agent 的工作边界、协作约定和文档维护规范，以 `AGENTS.md` 为准。
+- 命令、测试流程和调试入口，以 `test.md` 为准。
+- `scripts/InteractiveNav/interactive_navigation/` 下的历史方案与讨论，后续应被逐步吸收进上述 4 个文档，避免继续作为唯一高层入口依赖。
+
 ## 当前重点课题：交互式导航
 
 交互式导航课题的核心目标是在传统语义地图导航或 SLAM 导航基础上，增加环境交互能力，使机器人能够通过开门、开冰箱、开衣柜、开抽屉等交互行为完成更具体的导航与探索任务。
@@ -18,10 +35,14 @@
 当前研究定位：
 
 - 核心贡献聚焦于**交互图的构建与感知**，不是底层 manipulation 控制。
-- 重点判断哪些对象具有交互属性，以及交互类型是什么，例如开关、按钮、推、拉、滑动、旋转。
-- 将交互对象、交互类型、交互状态、交互代价链接到场景拓扑图或语义图中。
+- 当前第一阶段应把**交互性作为导航空间中的一等变量**建模，重点放在交互如何改变可达性、可见性和路径代价。
+- 当前主类优先聚焦于：
+  - **通道属性**：改变空间连通性与可达性，例如 door、sliding door、gate-like barrier、可移动阻挡物
+  - **容器属性**：改变目标可见性、可取性与内部可访问性，例如 fridge、cabinet、drawer
+- 设备、开关、灯光、窗帘等更适合作为后续扩展，而不是第一阶段主线。
+- 将交互对象、交互状态、交互代价和状态转移链接到场景拓扑图或语义图中。
 - 操作执行阶段优先使用 oracle interaction、已有 open/close policy 或 MolmoSpaces 内置任务能力。
-- 评估重点是是否正确识别需要交互、是否维护交互状态、交互后导航成功率和路径效率是否提升。
+- 评估重点是是否正确识别需要交互、是否维护交互状态，以及交互后导航成功率和路径效率是否提升。
 
 交互式导航相关文档：
 
@@ -30,19 +51,21 @@
 - `scripts/InteractiveNav/interactive_navigation/discussion.md`：课题讨论记录。
 - `scripts/InteractiveNav/interactive_navigation/survey_2026-04-11.md`：文献调研与研究空白。
 
-该课题的差异化表达应保持清晰：不是“做一个更强的开门控制器”，而是“为导航地图增加可交互对象、状态和代价，使导航规划能主动利用交互改变可达性与效率”。
+该课题的差异化表达应保持清晰：不是“做一个更强的开门控制器”，而是“把交互性作为导航图中的状态变化因素来建模，使规划能够主动利用交互改变可达性、可见性与效率”。
 
 ## 交互式导航技术路线
 
 优先采用 MolmoSpaces 作为实验平台，结合其大规模多房间场景、可操作对象、MuJoCo 物理仿真、`nav_to_obj` 导航任务、`DoorOpeningTask` / open-close 任务与 benchmark/evaluation 框架。
 
-建议阶段：
+当前建议阶段：
 
-1. 基础搭建：跑通 `nav_to_obj` 和 door opening/open-close 相关 demo，确认场景、对象、关节、门状态、导航目标的可读接口。
-2. 交互对象分析：从 MolmoSpaces 元数据、MuJoCo joint、object manager、task config 中抽取可交互对象候选，先聚焦 door/cabinet/drawer/fridge。
-3. 交互图表示：设计 `InteractionEdge` 或类似数据结构，记录对象、连接空间、交互类型、状态、代价与置信度。
-4. 规划验证：在语义/拓扑图上比较 pure navigation、oracle interaction、random interaction、interactive graph planner。
-5. Benchmark 构建：基于 MolmoSpaces episode/benchmark JSON 生成交互式导航任务，量化不可达比例、SPL/SFT、路径长度、Navigation SR、Oracle SR、交互检测准确率。
+1. 基础搭建：跑通 `nav_to_obj` 和 door opening/open-close 相关能力，确认场景、对象、关节、门状态、导航目标的可读接口。
+2. 双主线收敛：
+   - MolmoSpaces 主线：基于 GT / oracle 构建交互导航任务、表示、规划与 benchmark
+   - ROS 模块化主线：基于 detector-only 构建交互图和可复用工程基线
+3. 交互图表示：设计能表达状态转移、交互触发边和交互代价的导航表示。
+4. 规划验证：比较 `pure nav`、`nav + oracle open`、`interactive graph planner` 与 ROS 模块化基线。
+5. 后续扩展：在 door-centric 最小闭环稳定后，再扩展到 container 类对象、数据采集、Agent 架构与端到端基线。
 
 优先研究问题：
 
@@ -50,7 +73,7 @@
 - 门的 open/closed/locked 状态如何定义和读取？
 - 交互代价如何建模：固定代价、基于对象类型、基于预计时间，还是基于失败概率？
 - 交互图如何和已有 nav map / scene graph / ProcTHOR room graph 对齐？
-- 第一阶段是否只做 door-open path unlocking，从最小闭环证明必要性？
+- 第一阶段如何对齐 MolmoSpaces 主线和 ROS 模块化主线的公共表示接口？
 
 ## 工作原则
 

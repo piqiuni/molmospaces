@@ -1,3 +1,15 @@
+> 历史文档说明
+>
+> 本文件保留为交互导航项目的早期规划记录。
+> 当前项目的高层主入口已转移到以下 4 个核心文档：
+>
+> - `/home/user/ldl/molmospaces/TODO.md`
+> - `/home/user/ldl/molmospaces/readme_pi.md`
+> - `/home/user/ldl/molmospaces/AGENTS.md`
+> - `/home/user/ldl/molmospaces/test.md`
+>
+> 如果本文件与上述核心文档存在冲突，以 4 个核心文档为准。
+
 # 交互式导航 (Interactive Navigation) — 项目规划
 
 **创建日期：** 2026-04-11  
