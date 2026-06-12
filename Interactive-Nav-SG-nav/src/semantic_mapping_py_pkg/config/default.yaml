@@ -112,14 +112,22 @@ semantic_map:
   publish_rate: 2.0
   object_match_distance: 0.5
   object_min_confirmations: 2
+  graph_min_observations: 1
   object_size_match_ratio: 0.7
+  object_stable_history_size: 5
   object_stale_after_sec: 0.0   # 0 keeps objects indefinitely
   room_free_threshold: 20
   room_unknown_id: -1
   room_box_height: 0.2
   room_min_component_cells: 25
+  room_boundary_margin_cells: 1
+  room_core_min_component_cells: 60
+  room_core_clearance_cells: 5
+  room_small_obstacle_max_cells: 0
   lifted_graph_frame: "tf_frame_map_graph"
   lifted_graph_z_offset: 10.0
+  graph_save_path: ""
+  graph_save_pretty: true
   scene_max_range: 3.0
   scene_min_range: 0.1
   scene_confidence_step: 5

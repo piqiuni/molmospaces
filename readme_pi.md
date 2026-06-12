@@ -63,15 +63,7 @@
 
 ### 4.1 当前主线
 
-当前范围优先聚焦于室内家居场景下的两类交互对象：
-
-1. **通道属性**
-   - 直接改变空间连通性与可达性
-   - 典型对象：hinge door、sliding door、gate-like barrier、可移动阻挡物
-
-2. **容器属性**
-   - 直接改变目标可见性、可取性与内部可访问性
-   - 典型对象：fridge、cabinet、drawer、microwave、box / lid-like container
+c
 
 ### 4.2 当前不作为第一阶段主线的内容
 

@@ -342,6 +342,22 @@ python Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/semantic_mappi
   --publish-rate 1.0
 ```
 
+
+## 8.4 Room分割测试
+
+python /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/room_segmentation_debug_tool.py live \
+  --output-dir /home/user/ldl/molmospaces/scripts/InteractiveNav/output/room_occ_snaps
+这个 live 模式会订阅 /struct_mapping/occ_map，默认只有当和上一次保存相比，变化栅格数超过 500 或变化比例超过 0.02 才保存一次。保存格式是 .npz 快照。
+
+离线回放模式：
+python /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/room_segmentation_debug_tool.py replay \
+  --input /home/user/ldl/molmospaces/scripts/InteractiveNav/output/room_occ_snaps \
+  --output-dir /home/user/ldl/molmospaces/scripts/InteractiveNav/output/room_occ_overlays
+这个 replay 模式会读取单个 .npz 或整个目录，调用 import 进来的 RoomSegmenter 做分割，然后输出：
+每张占据图的 room 叠加图 *_room_overlay.png
+一个汇总 summary.json
+
+
 ---
 
 ## 9. 常见测试组合

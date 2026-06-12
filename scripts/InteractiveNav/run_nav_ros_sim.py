@@ -388,6 +388,13 @@ def main():
     exp_config.save_config()
     log_path = configure_run_file_logging(exp_config.output_dir)
     log.info("Run log file: %s", log_path)
+    log.info(
+        "Starting nav ROS sim: dataset=%s split=%s house_ind=%s target_types=%s",
+        args.scene_dataset,
+        args.data_split,
+        args.house_ind,
+        args.target_types or "<any>",
+    )
 
     if args.policy_mode == "left_arm_debug":
         policy = LeftArmKeyboardDebugPolicy(

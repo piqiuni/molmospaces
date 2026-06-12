@@ -202,6 +202,8 @@ class InteractionGraphStore:
             {
                 "instance_id": observation.get("instance_id") or node.attributes.get("instance_id") or "",
                 "category": observation.get("category"),
+                "candidate_labels": list(observation.get("candidate_labels") or []),
+                "label_votes": dict(observation.get("label_votes") or {}),
                 "parent": observation.get("parent"),
                 "children": list(observation.get("children") or []),
                 "is_receptacle": bool(observation.get("is_receptacle", False)),

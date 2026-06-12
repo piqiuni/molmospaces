@@ -46,6 +46,7 @@
 
 #include <boost/thread.hpp>
 #include <deque>
+#include <vector>
 
 class SlamGMapping
 {
@@ -130,6 +131,18 @@ class SlamGMapping
     void applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
                              const sensor_msgs::LaserScan& scan,
                              const GMapping::OrientedPoint& sensor_pose);
+    void syncOverwriteLayerToMap(const nav_msgs::MapMetaData& info);
+    void updateOverwriteLayer(const nav_msgs::OccupancyGrid& map,
+                              const sensor_msgs::LaserScan& scan,
+                              const GMapping::OrientedPoint& sensor_pose);
+    void applyOverwriteLayer(nav_msgs::OccupancyGrid& map);
+    bool mapInfoMatchesOverwriteLayer(const nav_msgs::MapMetaData& info) const;
+    bool worldToMapInfo(const nav_msgs::MapMetaData& info, double wx, double wy, int& mx, int& my) const;
+    void clearOverwriteCell(size_t idx);
+    void clearOverwriteLayer();
+    void resetOverwriteLayerIfPoseCorrectionJumped(const GMapping::OrientedPoint& map_pose,
+                                                   const GMapping::OrientedPoint& odom_pose);
+    double angleDiff(double a, double b) const;
     bool worldToMap(const nav_msgs::OccupancyGrid& map, double wx, double wy, int& mx, int& my) const;
     bool hasMatchedOdomStamp(const ros::Time& stamp, double* dt_sec = NULL);
     
@@ -181,6 +194,20 @@ class SlamGMapping
     bool enable_local_overwrite_;
     double local_overwrite_radius_;
     bool local_overwrite_mark_occupied_;
+    int local_overwrite_clear_confirm_count_;
+    int local_overwrite_occupy_confirm_count_;
+    double local_overwrite_ttl_sec_;
+    bool local_overwrite_clear_static_occupied_;
+    double local_overwrite_reset_on_correction_trans_delta_;
+    double local_overwrite_reset_on_correction_rot_delta_;
+    bool overwrite_layer_initialized_;
+    bool overwrite_correction_anchor_initialized_;
+    GMapping::OrientedPoint overwrite_correction_anchor_;
+    nav_msgs::MapMetaData overwrite_layer_info_;
+    std::vector<int8_t> overwrite_values_;
+    std::vector<unsigned short> overwrite_free_counts_;
+    std::vector<unsigned short> overwrite_occupied_counts_;
+    std::vector<ros::Time> overwrite_last_seen_;
 
     // 时间同步保护参数
     bool enable_time_sync_guard_;

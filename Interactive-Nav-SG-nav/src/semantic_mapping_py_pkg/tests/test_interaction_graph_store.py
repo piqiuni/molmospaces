@@ -9,7 +9,9 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from semantic_mapping_py_pkg.gt_observation_provider import build_gt_observation_batches
+from semantic_mapping_py_pkg.graph_rules import observation_from_detection
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
+from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore
 
 
 def observation(**kwargs):
@@ -160,6 +162,149 @@ def test_existing_instance_updates_instead_of_duplication():
     nodes = [node for node in store.as_graph_dict()["nodes"] if node["type"] == "object"]
     assert len(nodes) == 1
     assert nodes[0]["observation_count"] == 2
+
+
+def test_object_store_confirms_same_label_despite_box_size_jitter():
+    store = ObjectMapStore(match_distance=0.5, min_confirmations=2, size_match_ratio=0.7)
+    store.update(
+        [
+            {
+                "semantic_class": "window",
+                "confidence": 0.8,
+                "world_position": {"x": 1.0, "y": 2.0, "z": 0.8},
+                "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.8},
+                "world_box3d_size": {"x": 0.03, "y": 0.32, "z": 0.38},
+            }
+        ],
+        stamp=1.0,
+    )
+    store.update(
+        [
+            {
+                "semantic_class": "window",
+                "confidence": 0.9,
+                "world_position": {"x": 1.02, "y": 2.01, "z": 0.8},
+                "world_box3d_center": {"x": 1.02, "y": 2.01, "z": 0.8},
+                "world_box3d_size": {"x": 0.12, "y": 0.28, "z": 0.41},
+            }
+        ],
+        stamp=2.0,
+    )
+
+    tracked = store.as_tracked_detections()
+    assert len(tracked) == 1
+    assert tracked[0]["observation_count"] == 2
+    assert tracked[0]["world_box3d_size"] == {"x": 0.07050000000000001, "y": 0.30200000000000005, "z": 0.3935}
+
+
+def test_object_store_rejects_large_box_outlier_from_stable_box():
+    store = ObjectMapStore(match_distance=0.5, min_confirmations=2, size_match_ratio=0.7)
+    store.update(
+        [
+            {
+                "semantic_class": "chair",
+                "confidence": 0.8,
+                "world_position": {"x": 1.0, "y": 2.0, "z": 0.8},
+                "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.8},
+                "world_box3d_size": {"x": 0.3, "y": 0.3, "z": 0.8},
+            }
+        ],
+        stamp=1.0,
+    )
+    store.update(
+        [
+            {
+                "semantic_class": "chair",
+                "confidence": 0.9,
+                "world_position": {"x": 1.01, "y": 2.01, "z": 0.8},
+                "world_box3d_center": {"x": 1.01, "y": 2.01, "z": 0.8},
+                "world_box3d_size": {"x": 3.0, "y": 3.0, "z": 3.0},
+            }
+        ],
+        stamp=2.0,
+    )
+
+    tracked = store.as_tracked_detections()
+    assert len(tracked) == 1
+    assert tracked[0]["observation_count"] == 2
+    assert tracked[0]["world_box3d_size"] == {"x": 0.3, "y": 0.3, "z": 0.8}
+    assert tracked[0]["latest_box3d_size"] == {"x": 3.0, "y": 3.0, "z": 3.0}
+
+
+def test_object_store_can_expose_tentative_tracks_for_graph():
+    store = ObjectMapStore(match_distance=0.5, min_confirmations=2, size_match_ratio=0.7)
+    store.update(
+        [
+            {
+                "semantic_class": "bottle",
+                "confidence": 0.75,
+                "world_position": {"x": 1.0, "y": 2.0, "z": 0.8},
+                "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.8},
+                "world_box3d_size": {"x": 0.08, "y": 0.08, "z": 0.24},
+            }
+        ],
+        stamp=1.0,
+    )
+
+    assert store.as_tracked_detections() == []
+    tentative = store.as_tracked_detections(min_observations=1, confirmed_only=False)
+    assert len(tentative) == 1
+    assert tentative[0]["semantic_class"] == "bottle"
+    assert tentative[0]["observation_count"] == 1
+
+
+def test_object_store_merges_overlapping_different_labels():
+    store = ObjectMapStore(match_distance=0.5, min_confirmations=2, size_match_ratio=0.7)
+    store.update(
+        [
+            {
+                "semantic_class": "window",
+                "confidence": 0.8,
+                "world_position": {"x": 1.0, "y": 2.0, "z": 0.8},
+                "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.8},
+                "world_box3d_size": {"x": 0.2, "y": 0.4, "z": 0.5},
+            }
+        ],
+        stamp=1.0,
+    )
+    store.update(
+        [
+            {
+                "semantic_class": "curtain",
+                "confidence": 0.9,
+                "world_position": {"x": 1.02, "y": 2.01, "z": 0.8},
+                "world_box3d_center": {"x": 1.02, "y": 2.01, "z": 0.8},
+                "world_box3d_size": {"x": 0.21, "y": 0.39, "z": 0.49},
+            }
+        ],
+        stamp=2.0,
+    )
+
+    tracked = store.as_tracked_detections()
+    assert len(tracked) == 1
+    assert tracked[0]["semantic_class"] == "curtain"
+    assert tracked[0]["candidate_labels"] == ["curtain", "window"]
+    assert tracked[0]["label_votes"]["window"] == 0.8
+    assert tracked[0]["label_votes"]["curtain"] == 0.9
+
+
+def test_detection_observation_keeps_latest_visual_box():
+    obs = observation_from_detection(
+        {
+            "semantic_class": "window",
+            "confidence": 0.9,
+            "world_position": {"x": 1.0, "y": 2.0, "z": 0.8},
+            "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.8},
+            "world_box3d_size": {"x": 0.12, "y": 0.28, "z": 0.41},
+            "viz_aabb_center": {"x": 1.1, "y": 2.1, "z": 0.9},
+            "viz_aabb_size": {"x": 0.2, "y": 0.3, "z": 0.4},
+        },
+        observation_id="det_0001",
+    )
+
+    assert obs["aabb_size"] == [0.12, 0.28, 0.41]
+    assert obs["viz_aabb_center"] == [1.1, 2.1, 0.9]
+    assert obs["viz_aabb_size"] == [0.2, 0.3, 0.4]
 
 
 def test_json_serializable_and_gt_batches():

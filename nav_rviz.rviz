@@ -6,10 +6,9 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
-        - /PointCloud21/Status1
         - /Odometry1/Shape1
         - /DepthCloud1/Auto Size1
-        - /segmented_object_cloud_world1/Status1
+        - /unified_graph1
       Splitter Ratio: 0.5
     Tree Height: 632
   - Class: rviz/Selection
@@ -24,6 +23,7 @@ Panels:
   - Class: rviz/Views
     Expanded:
       - /Current View1
+      - /Current View1/Focal Point1
     Name: Views
     Splitter Ratio: 0.5
   - Class: rviz/Time
@@ -181,8 +181,7 @@ Visualization Manager:
       Marker Topic: /exploration_planner/scored_voronoi_markers
       Name: scored_voronoi_markers
       Namespaces:
-        scored_voronoi_nodes: true
-        tsp_node_labels: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -190,8 +189,7 @@ Visualization Manager:
       Marker Topic: /exploration_planner/tsp_exploration_path
       Name: tsp_exploration_path
       Namespaces:
-        tsp_exploration_path: true
-        tsp_path_nodes: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 0.699999988079071
@@ -325,13 +323,14 @@ Visualization Manager:
       Queue Size: 100
       Value: false
     - Class: rviz/MarkerArray
-      Enabled: false
+      Enabled: true
       Marker Topic: /semantic_mapping/unified_graph_markers
       Name: unified_graph
       Namespaces:
-        {}
+        interaction_graph_labels: true
+        interaction_graph_nodes: true
       Queue Size: 100
-      Value: false
+      Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -370,13 +369,14 @@ Visualization Manager:
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
-      Enabled: false
-      Marker Topic: /semantic_mapping/debug/boxes_3d_world
-      Name: MarkerArray
+      Enabled: true
+      Marker Topic: /semantic_mapping/unified_graph_markers_lifted
+      Name: unified_graph_markers_lifted
       Namespaces:
-        {}
+        interaction_graph_labels: true
+        interaction_graph_nodes: true
       Queue Size: 100
-      Value: false
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -405,25 +405,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/ThirdPersonFollower
-      Distance: 8.190953254699707
+      Distance: 25.606698989868164
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
-      Field of View: 0.800000011920929
+      Field of View: 0.7853981852531433
       Focal Point:
-        X: -0.342926025390625
-        Y: 1.0816872119903564
-        Z: -1.49429452419281
+        X: 1.2896586656570435
+        Y: -3.251596450805664
+        Z: 1.1920928955078125e-07
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.0997970774769783
+      Pitch: 0.2647967040538788
       Target Frame: head_camera_optical_frame
-      Yaw: 4.797861099243164
+      Yaw: 4.8135762214660645
     Saved: ~
 Window Geometry:
   Displays:

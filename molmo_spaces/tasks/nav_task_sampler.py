@@ -304,22 +304,42 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
         log.info(f"Found {len(candidates)} candidate nav objects in the scene")
 
         if not len(candidates) > 0:
-            log.info("[WARN] No candidate nav objects found in the scene")
-            # print all the top-level objects in the scene for debugging
-            om = env.object_managers[env.current_batch_index]
-            all_objects = MlSpacesObject.get_top_level_bodies(model=self.env.mj_model)
-            for b in all_objects[:30]:
-                name = self.env.mj_model.body(b).name
-                pos = self.env.current_data.xpos[b]
-                possible_types = om.get_possible_object_types(b)
-                log.info(
-                    f"  - #{b:02d} {name} (types={possible_types}) pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})"
-                )
-
-            # log.info(f"Scene objects (no candidates): {[obj.name for obj in all_objects]}")
+            requested_types = self.config.task_sampler_config.pickup_types or ["<any>"]
+            log.warning(
+                "No candidate nav objects found in the scene for target types: %s",
+                requested_types,
+            )
+            self._log_available_scene_objects(env)
             raise HouseInvalidForTask("No nav candidates found in the scene")
 
         return candidates
+
+    def _log_available_scene_objects(self, env: CPUMujocoEnv) -> None:
+        """Print all non-structural top-level objects for debugging missing target types."""
+        om = env.object_managers[env.current_batch_index]
+        available_objects = om.list_top_level_objects()
+
+        if not available_objects:
+            log.warning("Scene has no non-structural top-level objects available.")
+            return
+
+        log.info(
+            "Scene exposes %d available top-level objects (name | category | possible_types):",
+            len(available_objects),
+        )
+        for obj in available_objects:
+            pos = obj.position
+            category = om.category_from_name(obj.name)
+            possible_types = om.get_possible_object_types(obj.name)
+            log.info(
+                "  - %s | category=%s | types=%s | pos=(%.3f, %.3f, %.3f)",
+                obj.name,
+                category,
+                possible_types,
+                pos[0],
+                pos[1],
+                pos[2],
+            )
 
     def _sample_and_place_robot(self, env: CPUMujocoEnv) -> None:
         """Sample a nav object, place robot using occupancy map, and return sampled params.

@@ -4,7 +4,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 
 TYPE_TO_COLOR = {
-    "room": (0.9, 0.9, 0.2, 0.18),
+    "room": (0.2, 0.75, 0.95, 0.14),
     "portal": (0.95, 0.3, 0.2, 0.9),
     "support": (0.1, 0.55, 0.95, 0.85),
     "container": (0.95, 0.55, 0.1, 0.85),
@@ -20,6 +20,25 @@ RELATION_TO_COLOR = {
     "adjacent_via": (1.0, 0.2, 0.65, 0.9),
 }
 
+OBJECT_LABEL_PALETTE = (
+    (0.94, 0.49, 0.36, 0.92),
+    (0.27, 0.74, 0.58, 0.92),
+    (0.30, 0.62, 0.95, 0.92),
+    (0.92, 0.74, 0.26, 0.92),
+    (0.70, 0.50, 0.92, 0.92),
+    (0.95, 0.37, 0.60, 0.92),
+    (0.44, 0.82, 0.83, 0.92),
+    (0.66, 0.76, 0.33, 0.92),
+)
+
+
+def _node_color(node):
+    if node.get("type") != "object":
+        return TYPE_TO_COLOR.get(node["type"], (1.0, 1.0, 1.0, 0.9))
+    label = str(node.get("label") or "object")
+    palette_index = sum(ord(ch) for ch in label) % len(OBJECT_LABEL_PALETTE)
+    return OBJECT_LABEL_PALETTE[palette_index]
+
 
 def build_graph_marker_array(graph_payload, frame_id, stamp=None):
     markers = MarkerArray()
@@ -33,11 +52,6 @@ def build_graph_marker_array(graph_payload, frame_id, stamp=None):
 
     nodes = {node["id"]: node for node in graph_payload.get("nodes", [])}
     edges = list(graph_payload.get("edges", []))
-    supported_object_ids = {
-        edge["dst_id"]
-        for edge in edges
-        if edge.get("relation") == "supports"
-    }
     connect_pairs = {
         frozenset((edge["src_id"], edge["dst_id"]))
         for edge in edges
@@ -45,7 +59,7 @@ def build_graph_marker_array(graph_payload, frame_id, stamp=None):
     }
 
     for index, node in enumerate(graph_payload.get("nodes", [])):
-        color = TYPE_TO_COLOR.get(node["type"], (1.0, 1.0, 1.0, 0.9))
+        color = _node_color(node)
         box_center = node.get("attributes", {}).get("viz_aabb_center") or node["aabb_center"]
         box_size = node.get("attributes", {}).get("viz_aabb_size") or node["aabb_size"]
         marker = Marker()
@@ -94,24 +108,6 @@ def build_graph_marker_array(graph_payload, frame_id, stamp=None):
         edge_pair = frozenset((edge["src_id"], edge["dst_id"]))
         if relation == "adjacent_via" and edge_pair in connect_pairs:
             continue
-        if relation in {"in_room", "has_child"}:
-            object_node = (
-                src
-                if src.get("type") == "object"
-                else dst
-                if dst.get("type") == "object"
-                else None
-            )
-            room_node = src if src.get("type") == "room" else dst if dst.get("type") == "room" else None
-            if (
-                object_node is not None
-                and room_node is not None
-                and (
-                    object_node["id"] in supported_object_ids
-                    or object_node.get("parent_id") is not None
-                )
-            ):
-                continue
         line = Marker()
         line.header.frame_id = frame_id
         line.header.stamp = stamp

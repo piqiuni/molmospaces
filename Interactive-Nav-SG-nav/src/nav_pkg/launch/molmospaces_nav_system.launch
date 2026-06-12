@@ -14,7 +14,7 @@
   <arg name="scene_dataset" default="procthor-10k"/>
   <arg name="data_split" default="train"/>
   <arg name="house_ind" default="1"/>
-  <arg name="target_types" default="Apple"/>
+  <arg name="target_types" default="Chair"/>
   <arg name="explore_target_description" default="$(arg target_types)"/>
   <arg name="task_horizon" default="3000"/>
   <arg name="sim_extra_args" default=""/>

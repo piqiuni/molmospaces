@@ -535,7 +535,48 @@ def _sanitize_instance_pixels(det, bbox, image_shape, config):
         return det.get("mask"), int(det.get("mask_area", 0) or 0)
     min_area = max(1, int(config.get("mask_component_min_area", 48)))
     max_area_ratio = min(max(float(config.get("mask_component_max_area_ratio", 0.85)), 0.05), 1.0)
-    return _filter_mask_components(det.get("mask"), bbox, image_shape, min_area, max_area_ratio)
+    filtered_mask, filtered_area = _filter_mask_components(
+        det.get("mask"), bbox, image_shape, min_area, max_area_ratio
+    )
+    # After selecting the best connected component, trim door center pixels
+    # using proportional side width rather than absolute pixel widths.
+    return _trim_door_center_pixels(det, filtered_mask, filtered_area, config)
+
+
+def _trim_door_center_pixels(det, sparse_mask, mask_area, config):
+    if sparse_mask is None:
+        return sparse_mask, int(mask_area or 0)
+    if not bool(config.get("door_mask_trim_enabled", False)):
+        return sparse_mask, int(mask_area or 0)
+    label = _normalize_label(
+        det.get("semantic_class") or det.get("semantic_class_raw") or det.get("class") or det.get("semantic_name")
+    )
+    if label not in {"door", "doorway", "entrance", "gate"}:
+        return sparse_mask, int(mask_area or 0)
+    rows = np.asarray(sparse_mask.get("rows") or [], dtype=np.int32)
+    cols = np.asarray(sparse_mask.get("cols") or [], dtype=np.int32)
+    if rows.size == 0 or cols.size == 0 or rows.size != cols.size:
+        return sparse_mask, int(mask_area or 0)
+    # Proportional keep ratio (fraction of width to keep on each side)
+    keep_ratio = min(max(float(config.get("door_outer_side_keep_ratio", 0.22)), 0.01), 0.45)
+    left = int(np.min(cols))
+    right = int(np.max(cols))
+    width = right - left + 1
+    side_width = max(1, int(round(width * keep_ratio)))
+    # If side regions would overlap or cover whole width, skip trimming
+    if side_width * 2 >= width:
+        return sparse_mask, int(mask_area or rows.size)
+    keep = (cols <= left + side_width - 1) | (cols >= right - side_width + 1)
+    kept_rows = rows[keep]
+    kept_cols = cols[keep]
+    # Require a minimum number of kept pixels (scale with mask size but at least 8)
+    min_kept = max(8, int(round(rows.size * keep_ratio * 2)))
+    if kept_rows.size < min_kept:
+        return sparse_mask, int(mask_area or rows.size)
+    return {
+        "rows": kept_rows.astype(np.int32).tolist(),
+        "cols": kept_cols.astype(np.int32).tolist(),
+    }, int(kept_rows.size)
 
 
 def _drop_bottom_rows(pixels, values, bottom_ratio):
@@ -802,7 +843,12 @@ class YoloeLocalProvider(RawDetectionProvider):
                 if image_mask is not None:
                     sparse_mask, mask_area = _sparse_mask_from_array(image_mask > 0.5)
             sparse_mask, mask_area = _sanitize_instance_pixels(
-                {"mask": sparse_mask, "mask_area": mask_area},
+                {
+                    "mask": sparse_mask,
+                    "mask_area": mask_area,
+                    "semantic_class": semantic_class,
+                    "semantic_class_raw": semantic_class_raw,
+                },
                 [float(v) for v in xyxy[idx].tolist()],
                 rgb_image.shape,
                 {

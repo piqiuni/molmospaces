@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import json
 import math
+import os
 import threading
 
 import rospy
@@ -18,6 +20,7 @@ from semantic_mapping_py_pkg.graph_rules import observation_from_detection
 from semantic_mapping_py_pkg.interaction_graph_viz import build_graph_marker_array
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text
+from semantic_mapping_py_pkg.room_segmentation import RoomSegmenter, RoomSegmentationState
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param, get_topics
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore, SceneGridStore
@@ -62,8 +65,18 @@ class SemanticMappingNode:
         self.room_unknown_id = int(config.get("room_unknown_id", -1))
         self.room_box_height = float(config.get("room_box_height", 0.2))
         self.room_min_component_cells = int(config.get("room_min_component_cells", 25))
+        self.room_boundary_margin_cells = max(0, int(config.get("room_boundary_margin_cells", 1)))
+        self.room_core_min_component_cells = max(
+            self.room_min_component_cells,
+            int(config.get("room_core_min_component_cells", 60)),
+        )
+        self.room_core_clearance_cells = max(1, int(config.get("room_core_clearance_cells", 5)))
+        self.room_small_obstacle_max_cells = max(0, int(config.get("room_small_obstacle_max_cells", 0)))
         self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
         self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
+        self.graph_min_observations = max(1, int(config.get("graph_min_observations", 1)))
+        self.graph_save_path = str(config.get("graph_save_path", "") or "").strip()
+        self.graph_save_pretty = bool(config.get("graph_save_pretty", True))
         graph_config = get_nested_param(rospy, "interaction_graph", {}) or {}
         self.class_to_id = {
             normalize_label(name): int(value)
@@ -80,6 +93,7 @@ class SemanticMappingNode:
             stale_after_sec=self.object_stale_after_sec,
             min_confirmations=config.get("object_min_confirmations", 2),
             size_match_ratio=config.get("object_size_match_ratio", 0.7),
+            stable_history_size=config.get("object_stable_history_size", 5),
         )
         self.scene_store = SceneGridStore(
             unknown_id=scene_types.get("unknown_id", -1),
@@ -95,6 +109,16 @@ class SemanticMappingNode:
         self.lock = threading.Lock()
         self.latest_cloud = None
         self.latest_scene = None
+        self.room_segmenter = RoomSegmenter(
+            room_free_threshold=self.room_free_threshold,
+            room_unknown_id=self.room_unknown_id,
+            room_min_component_cells=self.room_min_component_cells,
+            room_boundary_margin_cells=self.room_boundary_margin_cells,
+            room_core_min_component_cells=self.room_core_min_component_cells,
+            room_core_clearance_cells=self.room_core_clearance_cells,
+            room_small_obstacle_max_cells=self.room_small_obstacle_max_cells,
+            state=RoomSegmentationState(),
+        )
         self.tf_listener = tf.TransformListener()
 
         self.object_sub = rospy.Subscriber(self.object_detection_topic, String, self.object_callback, queue_size=10)
@@ -135,7 +159,10 @@ class SemanticMappingNode:
         stamp = self._stamp_from_detection_payload(parsed)
         with self.lock:
             self.object_store.update(detections, stamp)
-            tracked_detections = self.object_store.as_tracked_detections()
+            tracked_detections = self.object_store.as_tracked_detections(
+                min_observations=self.graph_min_observations,
+                confirmed_only=False,
+            )
             observations = [
                 observation_from_detection(det, observation_id=f"det_{index:04d}")
                 for index, det in enumerate(tracked_detections, start=1)
@@ -263,6 +290,7 @@ class SemanticMappingNode:
                 self.lifted_graph_frame,
             )
         )
+        self._save_graph_payload(graph_payload)
 
     def _stamp_from_detection_payload(self, parsed):
         secs = parsed.get("secs")
@@ -284,52 +312,19 @@ class SemanticMappingNode:
         self.static_tf_broadcaster.sendTransform(tf_msg)
 
     def _segment_rooms_from_occupancy(self, occ_grid):
-        width = int(occ_grid.info.width)
-        height = int(occ_grid.info.height)
-        size = width * height
-        room_ids = [self.room_unknown_id] * size
-        room_conf = [-1] * size
-        if size <= 0 or len(occ_grid.data) != size:
-            return room_ids, room_conf
-        visited = [False] * size
-        values = [int(v) for v in occ_grid.data]
-        next_room_id = 1
+        return self.room_segmenter.segment(occ_grid)
 
-        def is_free(index):
-            value = values[index]
-            return value >= 0 and value <= self.room_free_threshold
-
-        for index in range(size):
-            if visited[index]:
-                continue
-            visited[index] = True
-            if not is_free(index):
-                continue
-            component = []
-            stack = [index]
-            while stack:
-                current = stack.pop()
-                component.append(current)
-                x = current % width
-                y = current // width
-                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                    nx = x + dx
-                    ny = y + dy
-                    if nx < 0 or ny < 0 or nx >= width or ny >= height:
-                        continue
-                    nidx = ny * width + nx
-                    if visited[nidx]:
-                        continue
-                    visited[nidx] = True
-                    if is_free(nidx):
-                        stack.append(nidx)
-            if len(component) < self.room_min_component_cells:
-                continue
-            for comp_idx in component:
-                room_ids[comp_idx] = next_room_id
-                room_conf[comp_idx] = 100
-            next_room_id += 1
-        return room_ids, room_conf
+    def _save_graph_payload(self, graph_payload):
+        if not self.graph_save_path:
+            return
+        target_dir = os.path.dirname(self.graph_save_path)
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+        with open(self.graph_save_path, "w", encoding="utf-8") as handle:
+            if self.graph_save_pretty:
+                json.dump(graph_payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            else:
+                json.dump(graph_payload, handle, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
     def _build_object_markers(self, obj_map):
         markers = MarkerArray()

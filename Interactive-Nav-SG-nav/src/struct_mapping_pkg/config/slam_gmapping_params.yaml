@@ -58,7 +58,13 @@ inscribed_radius: 0.1  # 内切半径（米），障碍物核心区域
 # 局部覆写参数（用最新扫描实时覆盖机器人附近区域）
 enable_local_overwrite: true
 local_overwrite_radius: 8.0
-local_overwrite_mark_occupied: true
+local_overwrite_mark_occupied: false
+local_overwrite_clear_confirm_count: 3
+local_overwrite_occupy_confirm_count: 3
+local_overwrite_ttl_sec: 10.0
+local_overwrite_clear_static_occupied: true
+local_overwrite_reset_on_correction_trans_delta: 0.25
+local_overwrite_reset_on_correction_rot_delta: 0.10
 
 # 时间同步保护（避免 odom 与 pointcloud 时间错配）
 enable_time_sync_guard: true
@@ -66,4 +72,3 @@ max_odom_cloud_time_diff: 0.03
 max_cloud_age_sec: 0.35
 enforce_cloud_age_drop: false
 odom_stamp_buffer_size: 200
-

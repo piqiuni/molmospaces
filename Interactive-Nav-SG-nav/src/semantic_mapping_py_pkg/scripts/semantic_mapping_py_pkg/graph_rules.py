@@ -99,6 +99,8 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "instance_id": str(observation.get("instance_id") or ""),
         "semantic_name": semantic_name or "object",
         "category": category,
+        "candidate_labels": list(observation.get("candidate_labels") or []),
+        "label_votes": dict(observation.get("label_votes") or {}),
         "confidence": float(observation.get("confidence", observation.get("conf", 0.0)) or 0.0),
         "position": position,
         "aabb_center": aabb_center,
@@ -201,6 +203,8 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
     world_position = detection.get("world_position") or detection.get("position") or {}
     world_box_center = detection.get("world_box3d_center") or detection.get("aabb_center") or detection.get("box3d_center") or world_position
     size = detection.get("world_box3d_size") or detection.get("aabb_size") or detection.get("box3d_size") or detection.get("size") or {}
+    viz_box_center = detection.get("viz_aabb_center") or world_box_center
+    viz_box_size = detection.get("viz_aabb_size") or size
     if isinstance(world_position, dict):
         position = [
             world_position.get("x", 0.0),
@@ -225,6 +229,8 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
         ]
     else:
         aabb_size = point3(size)
+    viz_aabb_center = point3(viz_box_center)
+    viz_aabb_size = point3(viz_box_size)
     semantic_name = detection.get("semantic_class") or detection.get("semantic_name") or detection.get("class") or "object"
     return normalize_observation(
         {
@@ -232,6 +238,8 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
             "instance_id": detection.get("instance_id") or "",
             "semantic_name": semantic_name,
             "category": detection.get("category") or detection.get("semantic_class") or detection.get("class") or semantic_name,
+            "candidate_labels": list(detection.get("candidate_labels") or []),
+            "label_votes": dict(detection.get("label_votes") or {}),
             "confidence": detection.get("confidence", detection.get("conf", 0.0)),
             "position": position,
             "aabb_center": aabb_center,
@@ -252,8 +260,8 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
             "asset_id": detection.get("asset_id"),
             "object_id": detection.get("object_id"),
             "source": source,
-            "viz_aabb_center": aabb_center,
-            "viz_aabb_size": aabb_size,
+            "viz_aabb_center": viz_aabb_center,
+            "viz_aabb_size": viz_aabb_size,
         }
     )
 
