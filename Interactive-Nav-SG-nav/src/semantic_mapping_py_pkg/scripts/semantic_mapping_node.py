@@ -70,8 +70,17 @@ class SemanticMappingNode:
             self.room_min_component_cells,
             int(config.get("room_core_min_component_cells", 60)),
         )
-        self.room_core_clearance_cells = max(1, int(config.get("room_core_clearance_cells", 5)))
+        self.room_core_clearance_cells = max(1, int(config.get("room_core_clearance_cells", 7)))
         self.room_small_obstacle_max_cells = max(0, int(config.get("room_small_obstacle_max_cells", 0)))
+        self.room_remove_enclosed_occupied = bool(config.get("room_remove_enclosed_occupied", True))
+        self.room_enclosed_occupied_max_cells = max(0, int(config.get("room_enclosed_occupied_max_cells", 700)))
+        self.room_enclosed_occupied_max_aspect = float(config.get("room_enclosed_occupied_max_aspect", 2.5))
+        self.room_enclosed_occupied_known_ring_ratio = float(
+            config.get("room_enclosed_occupied_known_ring_ratio", 0.95)
+        )
+        self.room_enclosed_occupied_free_ring_ratio = float(
+            config.get("room_enclosed_occupied_free_ring_ratio", 0.45)
+        )
         self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
         self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
         self.graph_min_observations = max(1, int(config.get("graph_min_observations", 1)))
@@ -117,6 +126,11 @@ class SemanticMappingNode:
             room_core_min_component_cells=self.room_core_min_component_cells,
             room_core_clearance_cells=self.room_core_clearance_cells,
             room_small_obstacle_max_cells=self.room_small_obstacle_max_cells,
+            room_remove_enclosed_occupied=self.room_remove_enclosed_occupied,
+            room_enclosed_occupied_max_cells=self.room_enclosed_occupied_max_cells,
+            room_enclosed_occupied_max_aspect=self.room_enclosed_occupied_max_aspect,
+            room_enclosed_occupied_known_ring_ratio=self.room_enclosed_occupied_known_ring_ratio,
+            room_enclosed_occupied_free_ring_ratio=self.room_enclosed_occupied_free_ring_ratio,
             state=RoomSegmentationState(),
         )
         self.tf_listener = tf.TransformListener()

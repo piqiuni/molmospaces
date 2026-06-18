@@ -6,7 +6,8 @@
   <arg name="start_mapping" default="true"/>
   <arg name="start_semantic_mapping" default="false"/>
   <arg name="manual_control" default="false"/>
-  <arg name="start_explore" default="$(eval 'false' if arg('manual_control') else 'true')"/>
+  <arg name="start_explore_py" default="false"/>
+  <arg name="start_explore" default="$(eval 'false' if arg('manual_control') == 'true' or arg('start_explore_py') == 'true' else 'true')"/>
   <arg name="start_nav" default="$(eval 'false' if arg('manual_control') else 'true')"/>
   <arg name="semantic_use_gt" default="false"/>
 
@@ -94,6 +95,10 @@
     <include file="$(find explore_pkg)/launch/explore_manager.launch">
       <arg name="target_description" value="$(arg explore_target_description)"/>
     </include>
+  </group>
+
+  <group if="$(arg start_explore_py)">
+    <include file="$(find explore_py_pkg)/launch/explore_py.launch"/>
   </group>
 
   <group if="$(arg start_nav)">

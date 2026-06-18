@@ -35,9 +35,20 @@ def build_arg_parser():
     replay.add_argument("--room-unknown-id", type=int, default=-1)
     replay.add_argument("--room-min-component-cells", type=int, default=25)
     replay.add_argument("--room-boundary-margin-cells", type=int, default=1)
-    replay.add_argument("--room-core-min-component-cells", type=int, default=60)
-    replay.add_argument("--room-core-clearance-cells", type=int, default=5)
+    replay.add_argument("--room-core-min-component-cells", type=int, default=40)
+    replay.add_argument("--room-core-clearance-cells", type=int, default=7)
     replay.add_argument("--room-small-obstacle-max-cells", type=int, default=0)
+    replay.add_argument("--room-remove-enclosed-occupied", dest="room_remove_enclosed_occupied", action="store_true")
+    replay.add_argument("--no-room-remove-enclosed-occupied", dest="room_remove_enclosed_occupied", action="store_false")
+    replay.set_defaults(room_remove_enclosed_occupied=True)
+    replay.add_argument("--room-enclosed-occupied-max-cells", type=int, default=800)
+    replay.add_argument("--room-enclosed-occupied-max-aspect", type=float, default=3.0)
+    replay.add_argument("--room-enclosed-occupied-known-ring-ratio", type=float, default=0.95)
+    replay.add_argument("--room-enclosed-occupied-free-ring-ratio", type=float, default=0.4)
+    replay.add_argument("--room-fill-enclosed-obstacles", action="store_true")
+    replay.add_argument("--room-enclosed-obstacle-min-cells", type=int, default=120)
+    replay.add_argument("--room-enclosed-obstacle-max-cells", type=int, default=700)
+    replay.add_argument("--room-enclosed-obstacle-dominance-ratio", type=float, default=0.82)
     replay.add_argument("--crop-padding-cells", type=int, default=12)
     replay.add_argument("--min-output-size", type=int, default=960)
     return parser
@@ -274,6 +285,15 @@ def run_replay(args):
         room_core_min_component_cells=args.room_core_min_component_cells,
         room_core_clearance_cells=args.room_core_clearance_cells,
         room_small_obstacle_max_cells=args.room_small_obstacle_max_cells,
+        room_remove_enclosed_occupied=args.room_remove_enclosed_occupied,
+        room_enclosed_occupied_max_cells=args.room_enclosed_occupied_max_cells,
+        room_enclosed_occupied_max_aspect=args.room_enclosed_occupied_max_aspect,
+        room_enclosed_occupied_known_ring_ratio=args.room_enclosed_occupied_known_ring_ratio,
+        room_enclosed_occupied_free_ring_ratio=args.room_enclosed_occupied_free_ring_ratio,
+        room_fill_enclosed_obstacles=args.room_fill_enclosed_obstacles,
+        room_enclosed_obstacle_min_cells=args.room_enclosed_obstacle_min_cells,
+        room_enclosed_obstacle_max_cells=args.room_enclosed_obstacle_max_cells,
+        room_enclosed_obstacle_dominance_ratio=args.room_enclosed_obstacle_dominance_ratio,
         state=state,
     )
     summary = []

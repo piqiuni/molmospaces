@@ -1,0 +1,47 @@
+frames:
+  map_frame: "tf_frame_map"
+
+topics:
+  occupancy_grid: "/struct_mapping/occ_map"
+  odom: "/odom"
+  move_base_status: "/move_base/status"
+  goal: "/move_base_simple/goal"
+  status: "/explore_py/status"
+  frontiers: "/explore_py/frontiers"
+  current_subgoal: "/explore_py/current_subgoal"
+  llm_value_grid: "/explore_py/llm_value_grid"
+  strategy_bias: "/explore_py/strategy_bias"
+  object_map: "/semantic_mapping/obj_map"
+  scene_id_grid: "/semantic_mapping/scene_id_grid"
+  scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
+  unified_graph: "/semantic_mapping/unified_graph"
+  navigation_hints: "/semantic_mapping/navigation_hints"
+
+exploration:
+  tick_rate_hz: 1.0
+  goal_republish_interval_sec: 2.0
+  goal_reach_tolerance_m: 0.75
+  goal_timeout_sec: 45.0
+  stall_timeout_sec: 12.0
+  stall_distance_m: 0.15
+  blacklist_duration_sec: 25.0
+  failed_cluster_retry_sec: 120.0
+  frontier_match_distance_m: 1.0
+  active_goal_frontier_min_cells: 1
+
+frontier:
+  free_max: 20
+  occupied_min: 50
+  min_cluster_cells: 3
+  connect_8: true
+  candidate_top_k: 12
+  sensor_range_m: 5.0
+  subgoal_search_radius_cells: 8
+
+scoring:
+  information_weight: 1.0
+  distance_weight: 0.55
+  semantic_weight: 0.35
+  llm_weight: 0.8
+  revisit_penalty: 0.6
+  failure_penalty: 1.0

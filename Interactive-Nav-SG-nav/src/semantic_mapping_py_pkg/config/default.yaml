@@ -121,9 +121,14 @@ semantic_map:
   room_box_height: 0.2
   room_min_component_cells: 25
   room_boundary_margin_cells: 1
-  room_core_min_component_cells: 60
-  room_core_clearance_cells: 5
+  room_core_min_component_cells: 40
+  room_core_clearance_cells: 7
   room_small_obstacle_max_cells: 0
+  room_remove_enclosed_occupied: true
+  room_enclosed_occupied_max_cells: 700
+  room_enclosed_occupied_max_aspect: 2.5
+  room_enclosed_occupied_known_ring_ratio: 0.95
+  room_enclosed_occupied_free_ring_ratio: 0.45
   lifted_graph_frame: "tf_frame_map_graph"
   lifted_graph_z_offset: 10.0
   graph_save_path: ""

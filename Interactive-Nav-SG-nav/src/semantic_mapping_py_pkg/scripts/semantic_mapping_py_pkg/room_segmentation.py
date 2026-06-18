@@ -19,9 +19,18 @@ class RoomSegmenter:
         room_unknown_id=-1,
         room_min_component_cells=25,
         room_boundary_margin_cells=1,
-        room_core_min_component_cells=60,
-        room_core_clearance_cells=5,
+        room_core_min_component_cells=40,
+        room_core_clearance_cells=7,
         room_small_obstacle_max_cells=0,
+        room_remove_enclosed_occupied=True,
+        room_enclosed_occupied_max_cells=700,
+        room_enclosed_occupied_max_aspect=2.5,
+        room_enclosed_occupied_known_ring_ratio=0.95,
+        room_enclosed_occupied_free_ring_ratio=0.45,
+        room_fill_enclosed_obstacles=False,
+        room_enclosed_obstacle_min_cells=120,
+        room_enclosed_obstacle_max_cells=700,
+        room_enclosed_obstacle_dominance_ratio=0.82,
         state=None,
     ):
         self.room_free_threshold = int(room_free_threshold)
@@ -34,6 +43,18 @@ class RoomSegmenter:
         )
         self.room_core_clearance_cells = max(1, int(room_core_clearance_cells))
         self.room_small_obstacle_max_cells = max(0, int(room_small_obstacle_max_cells))
+        self.room_remove_enclosed_occupied = bool(room_remove_enclosed_occupied)
+        self.room_enclosed_occupied_max_cells = max(0, int(room_enclosed_occupied_max_cells))
+        self.room_enclosed_occupied_max_aspect = float(room_enclosed_occupied_max_aspect)
+        self.room_enclosed_occupied_known_ring_ratio = float(room_enclosed_occupied_known_ring_ratio)
+        self.room_enclosed_occupied_free_ring_ratio = float(room_enclosed_occupied_free_ring_ratio)
+        self.room_fill_enclosed_obstacles = bool(room_fill_enclosed_obstacles)
+        self.room_enclosed_obstacle_min_cells = max(0, int(room_enclosed_obstacle_min_cells))
+        self.room_enclosed_obstacle_max_cells = max(
+            self.room_enclosed_obstacle_min_cells,
+            int(room_enclosed_obstacle_max_cells),
+        )
+        self.room_enclosed_obstacle_dominance_ratio = float(room_enclosed_obstacle_dominance_ratio)
         self.state = state if state is not None else RoomSegmentationState()
 
     def segment(self, occ_grid):
@@ -52,6 +73,56 @@ class RoomSegmenter:
         free_mask = ((values >= 0) & (values <= self.room_free_threshold)).astype(np.uint8)
         occupied_mask = (values > self.room_free_threshold).astype(np.uint8)
         segmentation_free = free_mask.copy()
+
+        if cv2 is not None and self.room_remove_enclosed_occupied and np.any(occupied_mask):
+            known_mask = (values >= 0).astype(np.uint8)
+            known_ys, known_xs = np.where(known_mask > 0)
+            if known_ys.size > 0 and known_xs.size > 0:
+                row_min = int(np.min(known_ys))
+                row_max = int(np.max(known_ys)) + 1
+                col_min = int(np.min(known_xs))
+                col_max = int(np.max(known_xs)) + 1
+                component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(occupied_mask, 8)
+                for component_id in range(1, component_count):
+                    area = int(stats[component_id, cv2.CC_STAT_AREA])
+                    if area <= 0 or area > self.room_enclosed_occupied_max_cells:
+                        continue
+                    left = int(stats[component_id, cv2.CC_STAT_LEFT])
+                    top = int(stats[component_id, cv2.CC_STAT_TOP])
+                    comp_width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+                    comp_height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+                    if (
+                        left <= col_min
+                        or top <= row_min
+                        or (left + comp_width) >= col_max
+                        or (top + comp_height) >= row_max
+                    ):
+                        continue
+                    aspect = max(float(comp_width), float(comp_height)) / max(
+                        min(float(comp_width), float(comp_height)),
+                        1.0,
+                    )
+                    if aspect > self.room_enclosed_occupied_max_aspect:
+                        continue
+                    ring_row_min = max(top - 1, 0)
+                    ring_row_max = min(top + comp_height + 1, height)
+                    ring_col_min = max(left - 1, 0)
+                    ring_col_max = min(left + comp_width + 1, width)
+                    ring_mask = np.ones(
+                        (ring_row_max - ring_row_min, ring_col_max - ring_col_min),
+                        dtype=bool,
+                    )
+                    if ring_mask.shape[0] > 2 and ring_mask.shape[1] > 2:
+                        ring_mask[1:-1, 1:-1] = False
+                    ring_known = known_mask[ring_row_min:ring_row_max, ring_col_min:ring_col_max][ring_mask]
+                    ring_free = free_mask[ring_row_min:ring_row_max, ring_col_min:ring_col_max][ring_mask]
+                    if ring_known.size == 0:
+                        continue
+                    if float(np.mean(ring_known)) < self.room_enclosed_occupied_known_ring_ratio:
+                        continue
+                    if float(np.mean(ring_free)) < self.room_enclosed_occupied_free_ring_ratio:
+                        continue
+                    segmentation_free[labels == component_id] = 1
 
         if cv2 is not None and self.room_small_obstacle_max_cells > 0 and np.any(occupied_mask):
             component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(occupied_mask, 8)
@@ -130,10 +201,71 @@ class RoomSegmenter:
                 room_conf[nidx] = max(current_conf - 5, 60)
                 queue.append(nidx)
 
+        if cv2 is not None and self.room_fill_enclosed_obstacles:
+            room_ids, room_conf = self._fill_enclosed_obstacles(
+                values,
+                room_ids,
+                room_conf,
+                width,
+                height,
+                cv2,
+            )
+
         signature = self._grid_signature(occ_grid.info)
         self.state.prev_room_grid_signature = signature
         self.state.prev_room_ids = list(room_ids)
         return room_ids, room_conf
+
+    def _fill_enclosed_obstacles(self, values, room_ids, room_conf, width, height, cv2):
+        room_grid = np.asarray(room_ids, dtype=np.int32).reshape(height, width)
+        conf_grid = np.asarray(room_conf, dtype=np.int32).reshape(height, width)
+        occupied_mask = (values > self.room_free_threshold).astype(np.uint8)
+        known_mask = (values >= 0).astype(np.uint8)
+        if not np.any(occupied_mask) or not np.any(known_mask):
+            return room_ids, room_conf
+        ys, xs = np.where(known_mask > 0)
+        row_min, row_max = int(np.min(ys)), int(np.max(ys)) + 1
+        col_min, col_max = int(np.min(xs)), int(np.max(xs)) + 1
+        component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(occupied_mask, 8)
+        for component_id in range(1, component_count):
+            area = int(stats[component_id, cv2.CC_STAT_AREA])
+            if area < self.room_enclosed_obstacle_min_cells or area > self.room_enclosed_obstacle_max_cells:
+                continue
+            left = int(stats[component_id, cv2.CC_STAT_LEFT])
+            top = int(stats[component_id, cv2.CC_STAT_TOP])
+            comp_width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+            comp_height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+            if (
+                left <= col_min
+                or top <= row_min
+                or (left + comp_width) >= col_max
+                or (top + comp_height) >= row_max
+            ):
+                continue
+            ys_comp, xs_comp = np.where(labels == component_id)
+            neighbor_rooms = []
+            for y, x in zip(ys_comp.tolist(), xs_comp.tolist()):
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx = x + dx
+                    ny = y + dy
+                    if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                        continue
+                    room_id = int(room_grid[ny, nx])
+                    if room_id >= 0:
+                        neighbor_rooms.append(room_id)
+            if not neighbor_rooms:
+                continue
+            room_counts = {}
+            for room_id in neighbor_rooms:
+                room_counts[room_id] = room_counts.get(room_id, 0) + 1
+            dominant_room_id = max(sorted(room_counts.keys()), key=lambda room_id: room_counts[room_id])
+            dominant_ratio = float(room_counts[dominant_room_id]) / float(sum(room_counts.values()))
+            if dominant_ratio < self.room_enclosed_obstacle_dominance_ratio:
+                continue
+            mask = labels == component_id
+            room_grid[mask] = int(dominant_room_id)
+            conf_grid[mask] = 55
+        return room_grid.reshape(height * width).tolist(), conf_grid.reshape(height * width).tolist()
 
     def _fallback_component_cells(self, segmentation_free, width, height):
         flat = segmentation_free.reshape(height * width)
