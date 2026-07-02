@@ -5,6 +5,7 @@ import gc
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,8 @@ BaseMujocoTaskSampler = None
 NavGoalSampler = None
 inverse_homogeneous_matrix = None
 geom_aabb = None
+body_aabb = None
+descendant_geoms = None
 ProcTHORMap = None
 circular_kernel = None
 
@@ -70,7 +73,8 @@ def ensure_runtime_dependencies() -> None:
     global NavToObjBaseConfig, FrankaDroidCameraSystem, RBY1GoProD455CameraSystem
     global AStarNavToObjPolicyConfig, FloatingRUMRobotConfig, FrankaRobotConfig, RBY1Config
     global Door, MlSpacesArticulationObject, MjOpenGLRenderer, BaseMujocoTaskSampler
-    global NavGoalSampler, inverse_homogeneous_matrix, geom_aabb, ProcTHORMap, circular_kernel
+    global NavGoalSampler, inverse_homogeneous_matrix, geom_aabb, body_aabb, descendant_geoms
+    global ProcTHORMap, circular_kernel
 
     if mujoco is None:
         raise RuntimeError(
@@ -114,7 +118,11 @@ def ensure_runtime_dependencies() -> None:
         from molmo_spaces.utils.linalg_utils import (
             inverse_homogeneous_matrix as _inverse_homogeneous_matrix,
         )
-        from molmo_spaces.utils.mj_model_and_data_utils import geom_aabb as _geom_aabb
+        from molmo_spaces.utils.mj_model_and_data_utils import (
+            body_aabb as _body_aabb,
+            descendant_geoms as _descendant_geoms,
+            geom_aabb as _geom_aabb,
+        )
         from molmo_spaces.utils.scene_maps import (
             ProcTHORMap as _ProcTHORMap,
             circular_kernel as _circular_kernel,
@@ -138,6 +146,8 @@ def ensure_runtime_dependencies() -> None:
         NavGoalSampler = _NavGoalSampler
         inverse_homogeneous_matrix = _inverse_homogeneous_matrix
         geom_aabb = _geom_aabb
+        body_aabb = _body_aabb
+        descendant_geoms = _descendant_geoms
         ProcTHORMap = _ProcTHORMap
         circular_kernel = _circular_kernel
 
@@ -183,6 +193,18 @@ def build_config(args: argparse.Namespace, task_mode: str):
         cfg.task_sampler_config.task_sampler_class = make_scene_only_task_sampler()
     if args.target_types:
         cfg.task_sampler_config.pickup_types = args.target_types.split(",")
+    benchmark_episode = getattr(args, "benchmark_episode", None)
+    if benchmark_episode is not None:
+        task_spec = benchmark_episode["task"]
+        cfg.scene_dataset = benchmark_episode["scene_dataset"]
+        cfg.data_split = benchmark_episode["data_split"]
+        cfg.task_sampler_config.house_inds = [benchmark_episode["house_index"]]
+        cfg.task_config.robot_base_pose = task_spec.get("robot_base_pose")
+        cfg.task_config.pickup_obj_name = task_spec.get("pickup_obj_name")
+        cfg.task_config.pickup_obj_candidates = task_spec.get("pickup_obj_candidates")
+        succ_pos_threshold = task_spec.get("succ_pos_threshold")
+        if succ_pos_threshold is not None:
+            cfg.task_config.succ_pos_threshold = succ_pos_threshold
 
     if args.robot == "droid":
         cfg.robot_config = FrankaRobotConfig()
@@ -322,41 +344,247 @@ def _collect_open_door_root_ids(model: mujoco.MjModel, data: mujoco.MjData, open
     return open_door_ids, doorway_ids
 
 
+def _collect_doorway_analysis(
+    model: mujoco.MjModel, data: mujoco.MjData, open_threshold: float
+) -> dict[str, Any]:
+    parent_to_child: dict[int, list[int]] = {}
+    for body_id in range(model.nbody):
+        root_body = model.body(model.body(body_id).rootid.item())
+        root_body_id = int(root_body.id)
+        root_body_name = root_body.name
+        if root_body_name and (
+            root_body_name.startswith("door_")
+            or root_body_name.startswith("doorway_")
+            or root_body_name.startswith("doorframe_")
+        ):
+            parent_to_child.setdefault(root_body_id, []).append(body_id)
+
+    open_door_ids: set[int] = set()
+    doorway_root_ids: set[int] = set()
+    non_interactive_root_ids: set[int] = set()
+    interactive_door_body_ids: set[int] = set()
+    fixed_opening_root_ids: set[int] = set()
+    root_records: list[dict[str, Any]] = []
+
+    for root_body_id, children in sorted(parent_to_child.items()):
+        root_body = model.body(root_body_id)
+        root_body_name = root_body.name
+        if root_body_name.startswith("doorframe_"):
+            root_kind = "doorframe"
+        elif root_body_name.startswith("doorway_"):
+            root_kind = "doorway"
+        else:
+            root_kind = "door"
+
+        hinge_body_ids: list[int] = []
+        open_hinge_body_ids: list[int] = []
+        no_joint_body_ids: list[int] = []
+
+        for body_id in children:
+            body = model.body(body_id)
+            jntadr = int(body.jntadr.item())
+            if jntadr >= 0 and model.joint(jntadr).type == mujoco.mjtJoint.mjJNT_HINGE:
+                hinge_body_ids.append(body_id)
+                qposadr = int(model.joint(jntadr).qposadr.item())
+                if abs(float(data.qpos[qposadr])) > open_threshold:
+                    open_hinge_body_ids.append(body_id)
+            elif jntadr < 0:
+                no_joint_body_ids.append(body_id)
+
+        interactive = len(hinge_body_ids) > 0
+        pipeline_static_passage = (root_kind == "doorway") and (len(children) == 2) and (not interactive)
+        fixed_opening = pipeline_static_passage or (
+            root_kind == "doorframe" and len(children) == 2 and not interactive
+        )
+        if interactive:
+            interactive_door_body_ids.update(hinge_body_ids)
+            if open_hinge_body_ids:
+                open_door_ids.update(open_hinge_body_ids)
+                doorway_root_ids.add(root_body_id)
+        else:
+            non_interactive_root_ids.add(root_body_id)
+            if fixed_opening:
+                doorway_root_ids.add(root_body_id)
+                fixed_opening_root_ids.add(root_body_id)
+
+        root_records.append(
+            {
+                "root_body_id": root_body_id,
+                "root_body_name": root_body_name,
+                "root_kind": root_kind,
+                "interactive": interactive,
+                "child_body_names": [model.body(body_id).name for body_id in children],
+                "hinge_body_names": [model.body(body_id).name for body_id in hinge_body_ids],
+                "open_hinge_body_names": [model.body(body_id).name for body_id in open_hinge_body_ids],
+                "no_joint_body_names": [model.body(body_id).name for body_id in no_joint_body_ids],
+                "pipeline_static_passage": pipeline_static_passage,
+                "fixed_opening": fixed_opening,
+            }
+        )
+
+    return {
+        "open_door_ids": open_door_ids,
+        "doorway_root_ids": doorway_root_ids,
+        "non_interactive_root_ids": non_interactive_root_ids,
+        "interactive_door_body_ids": interactive_door_body_ids,
+        "fixed_opening_root_ids": fixed_opening_root_ids,
+        "root_records": root_records,
+    }
+
+
+def collect_runtime_doorway_analysis(
+    env,
+    open_threshold: float = 1e-3,
+) -> dict[str, Any]:
+    return _collect_doorway_analysis(env.current_model, env.current_data, open_threshold)
+
+
+def _compile_model_without_ceiling_geoms(model_path: str) -> mujoco.MjModel:
+    spec = mujoco.MjSpec.from_file(model_path)
+
+    ceiling_geoms = []
+
+    def collect_ceiling_geoms_recursively(body_spec: mujoco.MjsBody) -> None:
+        for geom in body_spec.geoms:
+            geom_name = geom.name
+            if geom_name and "ceiling" in geom_name.lower():
+                ceiling_geoms.append(geom)
+        for child_body in body_spec.bodies:
+            collect_ceiling_geoms_recursively(child_body)
+
+    collect_ceiling_geoms_recursively(spec.worldbody)
+    for geom in ceiling_geoms:
+        spec.delete(geom)
+
+    try:
+        return spec.compile()
+    finally:
+        del spec
+
+
+def _joint_qpos_width(joint_type: int) -> int:
+    if joint_type == mujoco.mjtJoint.mjJNT_FREE:
+        return 7
+    if joint_type == mujoco.mjtJoint.mjJNT_BALL:
+        return 4
+    return 1
+
+
+def _copy_joint_positions_by_name(
+    src_model: mujoco.MjModel,
+    src_data: mujoco.MjData,
+    dst_model: mujoco.MjModel,
+    dst_data: mujoco.MjData,
+) -> None:
+    for src_joint_id in range(src_model.njnt):
+        joint_name = mujoco.mj_id2name(src_model, mujoco.mjtObj.mjOBJ_JOINT, src_joint_id)
+        if not joint_name:
+            continue
+
+        dst_joint_id = mujoco.mj_name2id(dst_model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if dst_joint_id < 0:
+            continue
+
+        src_width = _joint_qpos_width(int(src_model.jnt_type[src_joint_id]))
+        dst_width = _joint_qpos_width(int(dst_model.jnt_type[dst_joint_id]))
+        width = min(src_width, dst_width)
+        src_adr = int(src_model.jnt_qposadr[src_joint_id])
+        dst_adr = int(dst_model.jnt_qposadr[dst_joint_id])
+        dst_data.qpos[dst_adr : dst_adr + width] = src_data.qpos[src_adr : src_adr + width]
+
+
+def _move_root_free_joint_far_away(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    root_body_name: str,
+    translation_xyz: np.ndarray | None = None,
+) -> bool:
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, root_body_name)
+    if body_id < 0:
+        return False
+
+    if translation_xyz is None:
+        translation_xyz = np.array([1000.0, 1000.0, -100.0], dtype=float)
+
+    body = model.body(body_id)
+    jntadr = int(body.jntadr.item())
+    if jntadr < 0:
+        return False
+    joint = model.joint(jntadr)
+    if joint.type != mujoco.mjtJoint.mjJNT_FREE:
+        return False
+
+    qposadr = int(joint.qposadr.item())
+    data.qpos[qposadr : qposadr + 3] = np.asarray(translation_xyz, dtype=float)
+    data.qpos[qposadr + 3 : qposadr + 7] = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+    return True
+
+
 def build_live_procthor_map(
     model: mujoco.MjModel,
     data: mujoco.MjData,
+    model_path: str | None = None,
     px_per_m: int = 200,
     agent_radius: float | None = None,
     open_threshold: float = 1e-3,
     device_id: int | None = None,
-) -> ProcTHORMap:
+    treat_all_non_interactive_doorways_as_open: bool = False,
+    return_doorway_analysis: bool = False,
+    ignored_root_body_names: set[str] | None = None,
+) -> ProcTHORMap | tuple[ProcTHORMap, dict[str, Any] | None]:
     ensure_runtime_dependencies()
+    work_model = model
+    work_data = data
+    owns_work_model = False
+
+    if model_path is not None:
+        work_model = _compile_model_without_ceiling_geoms(model_path)
+        work_data = mujoco.MjData(work_model)
+        _copy_joint_positions_by_name(model, data, work_model, work_data)
+        if ignored_root_body_names:
+            ignored_moved = []
+            for root_body_name in ignored_root_body_names:
+                if _move_root_free_joint_far_away(work_model, work_data, root_body_name):
+                    ignored_moved.append(root_body_name)
+            if ignored_moved:
+                log.info("Moved %d ignored movable roots out of scene for occupancy: %s", len(ignored_moved), ignored_moved[:8])
+        mujoco.mj_forward(work_model, work_data)
+        owns_work_model = True
+
     floor_ids = []
     room_ids_to_name = {}
-    for geom_id in range(model.ngeom):
-        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+    for geom_id in range(work_model.ngeom):
+        geom_name = mujoco.mj_id2name(work_model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
         if geom_name and (geom_name.startswith("room|") or geom_name.startswith("room_")):
             floor_ids.append(geom_id)
-            room_body_id = model.geom(geom_id).bodyid.item()
-            room_ids_to_name[geom_id + 1] = model.body(room_body_id).name
+            room_body_id = work_model.geom(geom_id).bodyid.item()
+            room_ids_to_name[geom_id + 1] = work_model.body(room_body_id).name
 
     if not floor_ids:
         raise ValueError("No floors found in the live model.")
 
-    open_door_ids, doorway_ids = _collect_open_door_root_ids(model, data, open_threshold)
+    doorway_analysis: dict[str, Any] | None = None
+    if treat_all_non_interactive_doorways_as_open:
+        doorway_analysis = _collect_doorway_analysis(work_model, work_data, open_threshold)
+        open_door_ids = doorway_analysis["open_door_ids"]
+        doorway_ids = doorway_analysis["doorway_root_ids"]
+    else:
+        open_door_ids, doorway_ids = _collect_open_door_root_ids(
+            work_model, work_data, open_threshold
+        )
 
     doorframe_geom_ids = []
     door_geom_ids = []
-    for geom_id in range(model.ngeom):
-        body_id = model.geom(geom_id).bodyid.item()
-        parent_body_id = model.body(body_id).parentid.item()
+    for geom_id in range(work_model.ngeom):
+        body_id = work_model.geom(geom_id).bodyid.item()
+        parent_body_id = work_model.body(body_id).parentid.item()
         if body_id in open_door_ids or parent_body_id in open_door_ids:
             door_geom_ids.append(geom_id)
-        root_body_id = model.body(body_id).rootid.item()
+        root_body_id = work_model.body(body_id).rootid.item()
         if root_body_id in doorway_ids:
             doorframe_geom_ids.append(geom_id)
 
-    aabb_center, aabb_size = geom_aabb(model, data, floor_ids, tight_mesh=False)
+    aabb_center, aabb_size = geom_aabb(work_model, work_data, floor_ids, tight_mesh=False)
     aabb_size += np.array([2, 2, 0])
 
     def render_occupancy(cam_distance: float):
@@ -372,8 +600,8 @@ def build_live_procthor_map(
         w = round(px_per_m * aabb_size[1])
         effective_px = h / aabb_size[0]
 
-        renderer = MjOpenGLRenderer(model=model, height=h, width=w, device_id=device_id)
-        renderer.update(data, cam)
+        renderer = MjOpenGLRenderer(model=work_model, height=h, width=w, device_id=device_id)
+        renderer.update(work_data, cam)
         for camera in renderer.scene.camera:
             camera.orthographic = 1
             camera.frustum_bottom = -aabb_size[0] / 2
@@ -438,6 +666,12 @@ def build_live_procthor_map(
     map_to_world = cam_to_world_floor @ centered_to_cam @ map_to_centered
 
     occ_final = ~occ_final
+    if not np.any(occ_final) or np.all(occ_final):
+        raise RuntimeError(
+            "build_live_procthor_map produced a degenerate occupancy map "
+            f"(all_free={bool(np.all(occ_final))}, all_blocked={bool(not np.any(occ_final))})."
+        )
+
     instance = ProcTHORMap(
         occupancy=occ_final,
         room_map=room_map_final,
@@ -447,8 +681,63 @@ def build_live_procthor_map(
         px_per_m=effective_px,
     )
     instance.occupancy_base = occ_map_5
+
+    if owns_work_model:
+        del work_data
+        del work_model
+
     gc.collect()
+    if return_doorway_analysis:
+        return instance, doorway_analysis
     return instance
+
+
+def render_topdown_geom_mask(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    geom_ids: list[int],
+    px_per_m: int = 200,
+    device_id: int | None = None,
+) -> tuple[np.ndarray, float]:
+    ensure_runtime_dependencies()
+    floor_ids = []
+    for geom_id in range(model.ngeom):
+        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        if geom_name and (geom_name.startswith("room|") or geom_name.startswith("room_")):
+            floor_ids.append(geom_id)
+    if not floor_ids:
+        raise ValueError("No floors found in the live model.")
+
+    aabb_center, aabb_size = geom_aabb(model, data, floor_ids, tight_mesh=False)
+    aabb_size += np.array([2, 2, 0])
+
+    cam = mujoco.MjvCamera()
+    cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    cam.lookat[:] = aabb_center
+    cam.distance = 5.0
+    cam.azimuth = 0
+    cam.elevation = -90
+    cam.orthographic = 1
+
+    h = round(px_per_m * aabb_size[0])
+    w = round(px_per_m * aabb_size[1])
+    effective_px = h / aabb_size[0]
+
+    renderer = MjOpenGLRenderer(model=model, height=h, width=w, device_id=device_id)
+    renderer.update(data, cam)
+    for camera in renderer.scene.camera:
+        camera.orthographic = 1
+        camera.frustum_bottom = -aabb_size[0] / 2
+        camera.frustum_top = aabb_size[0] / 2
+    renderer.enable_segmentation_rendering()
+    seg = renderer.render()
+    renderer.close()
+
+    seg_geom = seg[..., 0]
+    mask = np.zeros_like(seg_geom, dtype=bool)
+    for geom_id in geom_ids:
+        mask |= seg_geom == geom_id
+    return mask, effective_px
 
 
 def compute_path_from_map(
@@ -518,18 +807,290 @@ def compute_path_from_map(
     return scene_map.pos_px_to_m(pixel_waypoints)[:, :2]
 
 
+def safe_body_aabb(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    body_id: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        return body_aabb(model, data, body_id, visual_only=True)
+    except Exception as exc:
+        log.debug("Failed to compute visual AABB for body %s: %s", body_id, exc)
+        return np.asarray(data.xpos[body_id]).copy(), np.zeros(3, dtype=float)
+
+
+def joint_type_name(joint_type: Any) -> str:
+    text = str(joint_type).lower()
+    if "hinge" in text:
+        return "hinge"
+    if "slide" in text:
+        return "slide"
+    if "free" in text:
+        return "free"
+    return "none"
+
+
+def scene_object_record(env, om, object_name: str, meta: dict[str, Any], force_door: bool = False) -> dict[str, Any]:
+    model = env.current_model
+    data = env.current_data
+    body_id = model.body(object_name).id
+    center, size = safe_body_aabb(model, data, body_id)
+    joints = meta.get("name_map", {}).get("joints", {})
+    sites = meta.get("name_map", {}).get("sites", {})
+    joint_infos = []
+    for joint_name in sorted(joints.keys()):
+        try:
+            joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            if joint_id < 0:
+                continue
+            joint_infos.append(
+                {
+                    "joint_name": str(joint_name),
+                    "joint_type": joint_type_name(model.joint(joint_id).type),
+                    "joint_range": [float(v) for v in model.joint(joint_id).range],
+                }
+            )
+        except Exception as exc:
+            log.debug("Failed to gather joint info for %s on %s: %s", joint_name, object_name, exc)
+            continue
+
+    return {
+        "name": object_name,
+        "body_id": int(body_id),
+        "_model": model,
+        "_data": data,
+        "object_id": meta.get("object_id"),
+        "asset_id": meta.get("asset_id"),
+        "category": "Door" if force_door else meta.get("category"),
+        "room_id": meta.get("room_id"),
+        "parent": meta.get("parent") or None,
+        "children": meta.get("children", []),
+        "is_static": bool(meta.get("is_static", False)),
+        "is_structural": False if force_door else bool(om.is_structural(object_name)),
+        "is_receptacle": bool(om.has_receptacle_site(object_name)),
+        "is_pickup_candidate": bool(om.has_free_joint(object_name)),
+        "is_articulable": bool(om.is_object_articulable(object_name)),
+        "is_door": bool(force_door or str(object_name).lower().startswith(("door_", "doorway_", "doorframe_"))),
+        "is_movable_door": bool(force_door),
+        "joint_infos": joint_infos,
+        "position": np.asarray(data.xpos[body_id]).copy(),
+        "aabb_center": np.asarray(center).copy(),
+        "aabb_size": np.asarray(size).copy(),
+    }
+
+
+def door_parent_metadata(objects_meta: dict[str, dict[str, Any]], door_body_name: str) -> dict[str, Any]:
+    for object_name, meta in objects_meta.items():
+        bodies = meta.get("name_map", {}).get("bodies", {})
+        if door_body_name in bodies:
+            door_meta = dict(meta)
+            door_meta["parent"] = object_name
+            door_meta["children"] = []
+            return door_meta
+    return {
+        "category": "Door",
+        "object_id": door_body_name,
+        "asset_id": None,
+        "room_id": None,
+        "parent": None,
+        "children": [],
+        "is_static": True,
+        "name_map": {"joints": {}, "sites": {}},
+    }
+
+
+def collect_scene_plot_records(env) -> list[dict[str, Any]]:
+    om = env.object_managers[env.current_batch_index]
+    objects_meta = env.current_scene_metadata.get("objects", {})
+    records: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for object_name, meta in objects_meta.items():
+        try:
+            env.current_model.body(object_name)
+        except KeyError:
+            continue
+        records.append(scene_object_record(env, om, object_name, meta))
+        seen_names.add(object_name)
+
+    try:
+        doorway_analysis = collect_runtime_doorway_analysis(env)
+        for rec in collect_interactive_door_root_object_records(env, doorway_analysis):
+            if rec["name"] in seen_names:
+                continue
+            records.append(rec)
+            seen_names.add(rec["name"])
+    except Exception as exc:
+        log.warning("Could not enumerate interactive door roots for plotting: %s", exc)
+
+    records.sort(key=lambda item: (str(item.get("room_id")), str(item.get("category")), item["name"]))
+    return records
+
+
+def collect_non_interactive_doorway_object_records(
+    env,
+    doorway_analysis: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if doorway_analysis is None:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for rec in doorway_analysis.get("root_records", []):
+        if rec.get("interactive", True):
+            continue
+        root_body_name = rec.get("root_body_name")
+        if not root_body_name:
+            continue
+        try:
+            body_id = env.current_model.body(root_body_name).id
+        except KeyError:
+            continue
+
+        center, size = safe_body_aabb(env.current_model, env.current_data, body_id)
+        root_kind = str(rec.get("root_kind", "doorway"))
+        category = "Doorframe" if root_kind == "doorframe" else "Doorway"
+        records.append(
+            {
+                "name": root_body_name,
+                "body_id": int(body_id),
+                "_model": env.current_model,
+                "_data": env.current_data,
+                "object_id": root_body_name,
+                "asset_id": None,
+                "category": category,
+                "room_id": None,
+                "parent": None,
+                "children": rec.get("child_body_names", []),
+                "is_static": True,
+                "is_structural": False,
+                "is_receptacle": False,
+                "is_pickup_candidate": False,
+                "is_articulable": False,
+                "is_door": True,
+                "is_movable_door": False,
+                "is_fixed_opening": bool(rec.get("fixed_opening", False)),
+                "is_noninteractive_doorway": True,
+                "record_type": f"non_interactive_{root_kind}",
+                "position": np.asarray(env.current_data.xpos[body_id]).copy(),
+                "aabb_center": np.asarray(center).copy(),
+                "aabb_size": np.asarray(size).copy(),
+            }
+        )
+
+    records.sort(key=lambda item: item["name"])
+    return records
+
+
+def collect_interactive_door_root_object_records(
+    env,
+    doorway_analysis: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if doorway_analysis is None:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for rec in doorway_analysis.get("root_records", []):
+        if not rec.get("interactive", False):
+            continue
+        root_body_name = rec.get("root_body_name")
+        if not root_body_name:
+            continue
+        try:
+            body_id = env.current_model.body(root_body_name).id
+        except KeyError:
+            continue
+
+        center, size = safe_body_aabb(env.current_model, env.current_data, body_id)
+        records.append(
+            {
+                "name": root_body_name,
+                "body_id": int(body_id),
+                "_model": env.current_model,
+                "_data": env.current_data,
+                "object_id": root_body_name,
+                "asset_id": None,
+                "category": "Door",
+                "room_id": None,
+                "parent": None,
+                "children": rec.get("child_body_names", []),
+                "is_static": True,
+                "is_structural": False,
+                "is_receptacle": False,
+                "is_pickup_candidate": False,
+                "is_articulable": True,
+                "is_door": True,
+                "is_movable_door": True,
+                "interactive_root_name": root_body_name,
+                "position": np.asarray(env.current_data.xpos[body_id]).copy(),
+                "aabb_center": np.asarray(center).copy(),
+                "aabb_size": np.asarray(size).copy(),
+            }
+        )
+
+    records.sort(key=lambda item: item["name"])
+    return records
+
+
+def dedupe_plot_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rec in records:
+        name = str(rec.get("name", ""))
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append(rec)
+    return deduped
+
+
 def path_length(path: np.ndarray | None) -> float | None:
     if path is None or len(path) < 2:
         return None
     return float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum())
 
 
-def image_output_paths(output_json: Path) -> tuple[Path, Path]:
+def image_output_paths(output_json: Path) -> tuple[Path, Path, Path]:
     stem = output_json.stem
     return (
+        output_json.with_name(f"{stem}_map.png"),
         output_json.with_name(f"{stem}_baseline.png"),
         output_json.with_name(f"{stem}_compare.png"),
     )
+
+
+def map_compare_output_paths(output_json: Path) -> tuple[Path, Path, Path]:
+    stem = output_json.stem
+    return (
+        output_json.with_name(f"{stem}_closed.png"),
+        output_json.with_name(f"{stem}_cached.png"),
+        output_json.with_name(f"{stem}_open.png"),
+    )
+
+
+def movable_clear_output_path(output_json: Path) -> Path:
+    stem = output_json.stem
+    return output_json.with_name(f"{stem}_movable-cleared.png")
+
+
+def door_path_study_output_paths(output_json: Path, door_names: list[str]) -> tuple[Path, list[Path]]:
+    stem = output_json.stem
+    baseline_path = output_json.with_name(f"{stem}_all-open.png")
+    compare_paths = []
+    for idx, door_name in enumerate(door_names):
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "-", door_name)
+        compare_paths.append(output_json.with_name(f"{stem}_close-{idx:02d}_{safe_name}.png"))
+    return baseline_path, compare_paths
+
+
+def door_path_study_all_closed_output_path(output_json: Path) -> Path:
+    stem = output_json.stem
+    return output_json.with_name(f"{stem}_all-closed.png")
+
+
+def local_patch_debug_output_path(output_json: Path, object_name: str) -> Path:
+    stem = output_json.stem
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "-", object_name)
+    return output_json.with_name(f"{stem}_local-patch_{safe_name}.png")
 
 
 def points_xy_to_px(scene_map: ProcTHORMap, points_xy: np.ndarray | None) -> np.ndarray | None:
@@ -557,6 +1118,81 @@ def make_scene_plot_background(scene_map: ProcTHORMap) -> np.ndarray:
         bg[contours] = np.array([0.72, 0.76, 0.82], dtype=float)
 
     return bg
+
+
+def scene_visual_kind(rec: dict[str, Any]) -> str:
+    if rec.get("is_movable_door", False):
+        return "movable_door"
+    if rec.get("is_fixed_opening", False):
+        return "fixed_opening"
+    if rec.get("is_noninteractive_doorway", False):
+        return "noninteractive_doorway"
+    if rec.get("is_pickup_candidate", False):
+        return "pickup"
+    if rec.get("is_receptacle", False):
+        return "receptacle"
+    if rec.get("is_articulable", False):
+        return "articulable"
+    if rec.get("is_structural", False):
+        return "structural"
+    return "plain"
+
+
+def scene_plot_color(kind: str) -> str:
+    return {
+        "structural": "#6b7280",
+        "receptacle": "#2563eb",
+        "pickup": "#f97316",
+        "articulable": "#dc2626",
+        "movable_door": "#7c3aed",
+        "fixed_opening": "#0ea5e9",
+        "noninteractive_doorway": "#f97316",
+        "plain": "#0f766e",
+    }[kind]
+
+
+def scene_plot_label(rec: dict[str, Any]) -> str:
+    category = str(rec.get("category") or rec["name"])
+    if rec.get("is_movable_door", False):
+        return f"door: {category}"
+    if rec.get("is_fixed_opening", False):
+        return f"doorframe: {category}"
+    if rec.get("is_noninteractive_doorway", False):
+        return f"doorway: {category}"
+    if rec.get("is_pickup_candidate", False):
+        return f"pickup: {category}"
+    if rec.get("is_receptacle", False):
+        return f"receptacle: {category}"
+    if rec.get("is_articulable", False):
+        return category
+    return category
+
+
+def object_box_to_px(scene_map: ProcTHORMap, rec: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    center = np.asarray(rec["aabb_center"], dtype=float)
+    size = np.asarray(rec["aabb_size"], dtype=float)
+    if np.any(size[:2] <= 1e-6):
+        center = np.asarray(rec["position"], dtype=float)
+        size = np.array([0.15, 0.15, 0.0], dtype=float)
+    corners_xy = np.asarray(
+        [
+            [center[0] - size[0] / 2.0, center[1] - size[1] / 2.0],
+            [center[0] + size[0] / 2.0, center[1] - size[1] / 2.0],
+            [center[0] + size[0] / 2.0, center[1] + size[1] / 2.0],
+            [center[0] - size[0] / 2.0, center[1] + size[1] / 2.0],
+        ],
+        dtype=float,
+    )
+    corners_px = points_xy_to_px(scene_map, corners_xy)
+    if corners_px is None or len(corners_px) != 4:
+        return None
+    rows = corners_px[:, 0]
+    cols = corners_px[:, 1]
+    col_min = float(np.min(cols))
+    col_max = float(np.max(cols))
+    row_min = float(np.min(rows))
+    row_max = float(np.max(rows))
+    return col_min, row_min, col_max - col_min, row_max - row_min
 
 
 def pick_plot_scene_map(primary_map: ProcTHORMap, fallback_map: ProcTHORMap | None, use_fallback: bool = False) -> ProcTHORMap:
@@ -607,6 +1243,912 @@ def nearest_free_point_xy(
     return None
 
 
+def removable_obstacle_overlap_stats(
+    scene_map: ProcTHORMap,
+    rec: dict[str, Any],
+    padding_px: int = 4,
+) -> dict[str, Any] | None:
+    box = object_box_to_px(scene_map, rec)
+    if box is None:
+        return None
+    col, row, width, height = box
+    occ_free = np.asarray(scene_map.occupancy).astype(bool)
+    h, w = occ_free.shape
+    r0 = max(0, int(np.floor(row)) - padding_px)
+    r1 = min(h, int(np.ceil(row + height)) + padding_px)
+    c0 = max(0, int(np.floor(col)) - padding_px)
+    c1 = min(w, int(np.ceil(col + width)) + padding_px)
+    if r0 >= r1 or c0 >= c1:
+        return None
+
+    free_window = occ_free[r0:r1, c0:c1]
+    blocked_mask = ~free_window
+    blocked_pixels = int(np.count_nonzero(blocked_mask))
+    total_pixels = int(blocked_mask.size)
+    if blocked_pixels == 0:
+        return {
+            "bbox_px": [c0, r0, c1, r1],
+            "blocked_pixels": 0,
+            "blocked_ratio": 0.0,
+            "neighbor_component_count": 0,
+            "neighbor_component_labels": [],
+        }
+
+    dilated = cv2.dilate(blocked_mask.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1)
+    neighbor_free = free_window & (~dilated.astype(bool))
+    num_labels, labels = cv2.connectedComponents(neighbor_free.astype(np.uint8))
+    touching_labels: set[int] = set()
+    for rr, cc in np.argwhere(blocked_mask):
+        rr0 = max(0, rr - 1)
+        rr1 = min(labels.shape[0], rr + 2)
+        cc0 = max(0, cc - 1)
+        cc1 = min(labels.shape[1], cc + 2)
+        touching_labels.update(int(v) for v in np.unique(labels[rr0:rr1, cc0:cc1]) if int(v) > 0)
+
+    return {
+        "bbox_px": [c0, r0, c1, r1],
+        "blocked_pixels": blocked_pixels,
+        "blocked_ratio": float(blocked_pixels / max(total_pixels, 1)),
+        "neighbor_component_count": len(touching_labels),
+        "neighbor_component_labels": sorted(touching_labels),
+    }
+
+
+def local_patch_connectivity_stats(
+    scene_map: ProcTHORMap,
+    rec: dict[str, Any],
+    margin_px: int = 24,
+    dilation_px: int = 6,
+) -> dict[str, Any] | None:
+    box = object_box_to_px(scene_map, rec)
+    if box is None:
+        return None
+
+    col, row, width, height = box
+    occ_free = np.asarray(scene_map.occupancy).astype(bool)
+    h, w = occ_free.shape
+
+    obj_c0 = max(0, int(np.floor(col)))
+    obj_c1 = min(w, int(np.ceil(col + width)))
+    obj_r0 = max(0, int(np.floor(row)))
+    obj_r1 = min(h, int(np.ceil(row + height)))
+    if obj_r0 >= obj_r1 or obj_c0 >= obj_c1:
+        return None
+
+    r0 = max(0, obj_r0 - margin_px)
+    r1 = min(h, obj_r1 + margin_px)
+    c0 = max(0, obj_c0 - margin_px)
+    c1 = min(w, obj_c1 + margin_px)
+    if r0 >= r1 or c0 >= c1:
+        return None
+
+    patch_free = occ_free[r0:r1, c0:c1].copy()
+    object_mask = np.zeros_like(patch_free, dtype=bool)
+    object_mask[(obj_r0 - r0) : (obj_r1 - r0), (obj_c0 - c0) : (obj_c1 - c0)] = True
+    removable_mask = object_mask & (~patch_free)
+    blocked_pixels = int(np.count_nonzero(removable_mask))
+    if blocked_pixels == 0:
+        return None
+
+    kernel_size = max(1, int(dilation_px))
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    neighbor_mask = cv2.dilate(removable_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+    neighbor_free_before = patch_free & neighbor_mask
+
+    _, before_labels = cv2.connectedComponents(patch_free.astype(np.uint8))
+    before_touching_labels = sorted(
+        int(v) for v in np.unique(before_labels[neighbor_free_before]) if int(v) > 0
+    )
+
+    patch_opened = patch_free.copy()
+    patch_opened[removable_mask] = True
+    _, after_labels = cv2.connectedComponents(patch_opened.astype(np.uint8))
+    neighbor_free_after = patch_opened & neighbor_mask
+    after_touching_labels = sorted(
+        int(v) for v in np.unique(after_labels[neighbor_free_after]) if int(v) > 0
+    )
+
+    bridge_detected = len(before_touching_labels) >= 2 and len(after_touching_labels) == 1
+    component_reduction = max(0, len(before_touching_labels) - len(after_touching_labels))
+
+    return {
+        "bbox_px": [obj_c0, obj_r0, obj_c1, obj_r1],
+        "patch_bbox_px": [c0, r0, c1, r1],
+        "blocked_pixels": blocked_pixels,
+        "before_touching_component_count": len(before_touching_labels),
+        "before_touching_component_labels": before_touching_labels,
+        "after_touching_component_count": len(after_touching_labels),
+        "after_touching_component_labels": after_touching_labels,
+        "component_reduction": component_reduction,
+        "bridge_detected": bool(bridge_detected),
+    }
+
+
+def _empty_component_merge_stats(
+    bbox_px: list[int],
+    patch_bbox_px: list[int],
+    freed_pixels: int = 0,
+) -> dict[str, Any]:
+    return {
+        "bbox_px": bbox_px,
+        "patch_bbox_px": patch_bbox_px,
+        "freed_pixels": int(freed_pixels),
+        "before_touching_component_count": 0,
+        "before_touching_component_labels": [],
+        "after_touching_component_count": 0,
+        "after_touching_component_labels": [],
+        "component_reduction": 0,
+        "connectivity_changed": False,
+    }
+
+
+def component_merge_stats_from_patches(
+    before_patch: np.ndarray,
+    after_patch: np.ndarray,
+    freed_patch: np.ndarray,
+    bbox_px: list[int],
+    patch_bbox_px: list[int],
+    touch_dilation_px: int = 8,
+) -> dict[str, Any]:
+    freed_pixels = int(np.count_nonzero(freed_patch))
+    if freed_pixels == 0:
+        return _empty_component_merge_stats(bbox_px, patch_bbox_px)
+
+    kernel_size = max(1, int(touch_dilation_px))
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    touch_band = cv2.dilate(freed_patch.astype(np.uint8), kernel, iterations=1).astype(bool)
+    touch_band &= ~freed_patch
+
+    _, before_labels = cv2.connectedComponents(before_patch.astype(np.uint8), connectivity=8)
+    _, after_labels = cv2.connectedComponents(after_patch.astype(np.uint8), connectivity=8)
+
+    before_touch_labels = sorted(
+        int(v) for v in np.unique(before_labels[touch_band & before_patch]) if int(v) > 0
+    )
+    after_touch_region = (touch_band | freed_patch) & after_patch
+    after_touch_labels = sorted(
+        int(v) for v in np.unique(after_labels[after_touch_region]) if int(v) > 0
+    )
+    component_reduction = max(0, len(before_touch_labels) - len(after_touch_labels))
+    connectivity_changed = len(before_touch_labels) >= 2 and component_reduction > 0
+
+    return {
+        "bbox_px": bbox_px,
+        "patch_bbox_px": patch_bbox_px,
+        "freed_pixels": freed_pixels,
+        "before_touching_component_count": len(before_touch_labels),
+        "before_touching_component_labels": before_touch_labels,
+        "after_touching_component_count": len(after_touch_labels),
+        "after_touching_component_labels": after_touch_labels,
+        "component_reduction": component_reduction,
+        "connectivity_changed": bool(connectivity_changed),
+    }
+
+
+def local_component_merge_approx_from_bbox(
+    scene_map: ProcTHORMap,
+    rec: dict[str, Any],
+    margin_px: int = 120,
+    release_expansion_px: int = 60,
+    touch_dilation_px: int = 8,
+) -> dict[str, Any] | None:
+    box = object_box_to_px(scene_map, rec)
+    if box is None:
+        return None
+
+    before_free = np.asarray(scene_map.occupancy).astype(bool)
+    h, w = before_free.shape
+    col, row, width, height = box
+    obj_c0 = max(0, int(np.floor(col)))
+    obj_c1 = min(w, int(np.ceil(col + width)))
+    obj_r0 = max(0, int(np.floor(row)))
+    obj_r1 = min(h, int(np.ceil(row + height)))
+    if obj_r0 >= obj_r1 or obj_c0 >= obj_c1:
+        return None
+
+    r0 = max(0, obj_r0 - margin_px)
+    r1 = min(h, obj_r1 + margin_px)
+    c0 = max(0, obj_c0 - margin_px)
+    c1 = min(w, obj_c1 + margin_px)
+    if r0 >= r1 or c0 >= c1:
+        return None
+
+    before_patch = before_free[r0:r1, c0:c1]
+    release_r0 = max(r0, max(0, obj_r0 - release_expansion_px)) - r0
+    release_r1 = min(r1, min(h, obj_r1 + release_expansion_px)) - r0
+    release_c0 = max(c0, max(0, obj_c0 - release_expansion_px)) - c0
+    release_c1 = min(c1, min(w, obj_c1 + release_expansion_px)) - c0
+    release_mask = np.zeros_like(before_patch, dtype=bool)
+    release_mask[release_r0:release_r1, release_c0:release_c1] = True
+    freed_patch = release_mask & (~before_patch)
+    after_patch = before_patch.copy()
+    after_patch[freed_patch] = True
+
+    return component_merge_stats_from_patches(
+        before_patch=before_patch,
+        after_patch=after_patch,
+        freed_patch=freed_patch,
+        bbox_px=[obj_c0, obj_r0, obj_c1, obj_r1],
+        patch_bbox_px=[c0, r0, c1, r1],
+        touch_dilation_px=touch_dilation_px,
+    )
+
+
+def local_connectivity_change_between_maps(
+    before_map: ProcTHORMap,
+    after_map: ProcTHORMap,
+    rec: dict[str, Any],
+    margin_px: int = 120,
+) -> dict[str, Any] | None:
+    box = object_box_to_px(before_map, rec)
+    if box is None:
+        return None
+
+    before_free = np.asarray(before_map.occupancy).astype(bool)
+    after_free = np.asarray(after_map.occupancy).astype(bool)
+    if before_free.shape != after_free.shape:
+        return None
+
+    col, row, width, height = box
+    h, w = before_free.shape
+    obj_c0 = max(0, int(np.floor(col)))
+    obj_c1 = min(w, int(np.ceil(col + width)))
+    obj_r0 = max(0, int(np.floor(row)))
+    obj_r1 = min(h, int(np.ceil(row + height)))
+    if obj_r0 >= obj_r1 or obj_c0 >= obj_c1:
+        return None
+
+    r0 = max(0, obj_r0 - margin_px)
+    r1 = min(h, obj_r1 + margin_px)
+    c0 = max(0, obj_c0 - margin_px)
+    c1 = min(w, obj_c1 + margin_px)
+    if r0 >= r1 or c0 >= c1:
+        return None
+
+    before_patch = before_free[r0:r1, c0:c1]
+    after_patch = after_free[r0:r1, c0:c1]
+    freed_patch = after_patch & (~before_patch)
+    merge_stats = component_merge_stats_from_patches(
+        before_patch=before_patch,
+        after_patch=after_patch,
+        freed_patch=freed_patch,
+        bbox_px=[obj_c0, obj_r0, obj_c1, obj_r1],
+        patch_bbox_px=[c0, r0, c1, r1],
+    )
+
+    _, before_labels = cv2.connectedComponents(before_patch.astype(np.uint8), connectivity=8)
+    _, after_labels = cv2.connectedComponents(after_patch.astype(np.uint8), connectivity=8)
+
+    obj_r0p = obj_r0 - r0
+    obj_r1p = obj_r1 - r0
+    obj_c0p = obj_c0 - c0
+    obj_c1p = obj_c1 - c0
+
+    col_pad = max(8, (obj_c1p - obj_c0p) // 2)
+    row_pad = max(8, (obj_r1p - obj_r0p) // 2)
+    top_mask = np.zeros_like(before_patch, dtype=bool)
+    bottom_mask = np.zeros_like(before_patch, dtype=bool)
+    left_mask = np.zeros_like(before_patch, dtype=bool)
+    right_mask = np.zeros_like(before_patch, dtype=bool)
+
+    cc0 = max(0, obj_c0p - col_pad)
+    cc1 = min(before_patch.shape[1], obj_c1p + col_pad)
+    rr0 = max(0, obj_r0p - row_pad)
+    rr1 = min(before_patch.shape[0], obj_r1p + row_pad)
+    top_mask[:obj_r0p, cc0:cc1] = True
+    bottom_mask[obj_r1p:, cc0:cc1] = True
+    left_mask[rr0:rr1, :obj_c0p] = True
+    right_mask[rr0:rr1, obj_c1p:] = True
+
+    def label_set(labels: np.ndarray, side_mask: np.ndarray) -> set[int]:
+        values = labels[side_mask]
+        return {int(v) for v in np.unique(values) if int(v) > 0}
+
+    def connected(labels: np.ndarray, a_mask: np.ndarray, b_mask: np.ndarray) -> bool:
+        a = label_set(labels, a_mask)
+        b = label_set(labels, b_mask)
+        return bool(a and b and (a & b))
+
+    vertical_before = connected(before_labels, top_mask, bottom_mask)
+    vertical_after = connected(after_labels, top_mask, bottom_mask)
+    horizontal_before = connected(before_labels, left_mask, right_mask)
+    horizontal_after = connected(after_labels, left_mask, right_mask)
+
+    return {
+        **merge_stats,
+        "vertical_connected_before": bool(vertical_before),
+        "vertical_connected_after": bool(vertical_after),
+        "horizontal_connected_before": bool(horizontal_before),
+        "horizontal_connected_after": bool(horizontal_after),
+        "top_component_labels_before": sorted(label_set(before_labels, top_mask)),
+        "bottom_component_labels_before": sorted(label_set(before_labels, bottom_mask)),
+        "left_component_labels_before": sorted(label_set(before_labels, left_mask)),
+        "right_component_labels_before": sorted(label_set(before_labels, right_mask)),
+        "top_component_labels_after": sorted(label_set(after_labels, top_mask)),
+        "bottom_component_labels_after": sorted(label_set(after_labels, bottom_mask)),
+        "left_component_labels_after": sorted(label_set(after_labels, left_mask)),
+        "right_component_labels_after": sorted(label_set(after_labels, right_mask)),
+    }
+
+
+def compute_local_patch_connectivity_debug(
+    scene_map: ProcTHORMap,
+    rec: dict[str, Any],
+    margin_px: int = 24,
+    dilation_px: int = 6,
+    removal_expansion_px: int = 0,
+) -> dict[str, Any] | None:
+    box = object_box_to_px(scene_map, rec)
+    if box is None:
+        return None
+
+    col, row, width, height = box
+    occ_free = np.asarray(scene_map.occupancy).astype(bool)
+    h, w = occ_free.shape
+
+    obj_c0 = max(0, int(np.floor(col)))
+    obj_c1 = min(w, int(np.ceil(col + width)))
+    obj_r0 = max(0, int(np.floor(row)))
+    obj_r1 = min(h, int(np.ceil(row + height)))
+    if obj_r0 >= obj_r1 or obj_c0 >= obj_c1:
+        return None
+
+    r0 = max(0, obj_r0 - margin_px)
+    r1 = min(h, obj_r1 + margin_px)
+    c0 = max(0, obj_c0 - margin_px)
+    c1 = min(w, obj_c1 + margin_px)
+    if r0 >= r1 or c0 >= c1:
+        return None
+
+    patch_free = occ_free[r0:r1, c0:c1].copy()
+    object_mask = np.zeros_like(patch_free, dtype=bool)
+    object_mask[(obj_r0 - r0) : (obj_r1 - r0), (obj_c0 - c0) : (obj_c1 - c0)] = True
+    removable_mask = object_mask & (~patch_free)
+    blocked_pixels = int(np.count_nonzero(removable_mask))
+    if blocked_pixels == 0:
+        return None
+
+    removal_mask = removable_mask.copy()
+    if removal_expansion_px > 0:
+        expand_kernel = np.ones((removal_expansion_px, removal_expansion_px), dtype=np.uint8)
+        removal_mask = cv2.dilate(removal_mask.astype(np.uint8), expand_kernel, iterations=1).astype(bool)
+        removal_mask &= ~patch_free
+
+    kernel_size = max(1, int(dilation_px))
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    neighbor_mask = cv2.dilate(removal_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+    neighbor_free_before = patch_free & neighbor_mask
+
+    before_count, before_labels = cv2.connectedComponents(patch_free.astype(np.uint8))
+    before_touching_labels = sorted(
+        int(v) for v in np.unique(before_labels[neighbor_free_before]) if int(v) > 0
+    )
+
+    patch_opened = patch_free.copy()
+    patch_opened[removal_mask] = True
+    after_count, after_labels = cv2.connectedComponents(patch_opened.astype(np.uint8))
+    neighbor_free_after = patch_opened & neighbor_mask
+    after_touching_labels = sorted(
+        int(v) for v in np.unique(after_labels[neighbor_free_after]) if int(v) > 0
+    )
+
+    return {
+        "bbox_px": [obj_c0, obj_r0, obj_c1, obj_r1],
+        "patch_bbox_px": [c0, r0, c1, r1],
+        "patch_free": patch_free,
+        "object_mask": object_mask,
+        "removable_mask": removable_mask,
+        "removal_mask": removal_mask,
+        "neighbor_mask": neighbor_mask,
+        "before_labels": before_labels,
+        "after_labels": after_labels,
+        "before_component_count": int(max(0, before_count - 1)),
+        "after_component_count": int(max(0, after_count - 1)),
+        "before_touching_component_labels": before_touching_labels,
+        "after_touching_component_labels": after_touching_labels,
+        "before_touching_component_count": len(before_touching_labels),
+        "after_touching_component_count": len(after_touching_labels),
+        "bridge_detected": bool(len(before_touching_labels) >= 2 and len(after_touching_labels) == 1),
+    }
+
+
+def save_local_patch_connectivity_figure(
+    out_path: Path,
+    scene_map: ProcTHORMap,
+    rec: dict[str, Any],
+    margin_px: int = 24,
+    dilation_px: int = 6,
+    removal_expansion_px: int = 0,
+) -> dict[str, Any] | None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    debug = compute_local_patch_connectivity_debug(
+        scene_map,
+        rec,
+        margin_px=margin_px,
+        dilation_px=dilation_px,
+        removal_expansion_px=removal_expansion_px,
+    )
+    if debug is None:
+        return None
+
+    patch_free = debug["patch_free"]
+    patch_occ = ~patch_free
+    removal_mask = debug["removal_mask"]
+    removable_mask = debug["removable_mask"]
+    neighbor_mask = debug["neighbor_mask"]
+    patch_opened = patch_free.copy()
+    patch_opened[removal_mask] = True
+
+    before_rgb = np.zeros((*patch_free.shape, 3), dtype=float)
+    before_rgb[patch_free] = np.array([0.95, 0.95, 0.92])
+    before_rgb[patch_occ] = np.array([0.18, 0.20, 0.22])
+    before_rgb[neighbor_mask] = before_rgb[neighbor_mask] * 0.6 + np.array([0.2, 0.4, 1.0]) * 0.4
+    before_rgb[removable_mask] = np.array([0.96, 0.45, 0.12])
+    before_rgb[removal_mask & ~removable_mask] = np.array([0.95, 0.75, 0.2])
+
+    after_rgb = np.zeros((*patch_opened.shape, 3), dtype=float)
+    after_rgb[patch_opened] = np.array([0.95, 0.95, 0.92])
+    after_rgb[~patch_opened] = np.array([0.18, 0.20, 0.22])
+    after_rgb[removal_mask] = np.array([0.22, 0.78, 0.33])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    titles = [
+        (
+            "Before patch",
+            f"touching comps={debug['before_touching_component_count']} "
+            f"labels={debug['before_touching_component_labels']}",
+        ),
+        (
+            "After local removal",
+            f"touching comps={debug['after_touching_component_count']} "
+            f"labels={debug['after_touching_component_labels']}",
+        ),
+    ]
+    images = [before_rgb, after_rgb]
+
+    for ax, image, (title, subtitle) in zip(axes, images, titles):
+        ax.imshow(image, origin="upper")
+        obj_c0, obj_r0, obj_c1, obj_r1 = debug["bbox_px"]
+        patch_c0, patch_r0, _, _ = debug["patch_bbox_px"]
+        rect = Rectangle(
+            (obj_c0 - patch_c0, obj_r0 - patch_r0),
+            obj_c1 - obj_c0,
+            obj_r1 - obj_r0,
+            facecolor="none",
+            edgecolor="#ef4444",
+            linewidth=2.0,
+        )
+        ax.add_patch(rect)
+        ax.set_title(f"{title}\n{subtitle}", fontsize=10)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.suptitle(
+        f"Local Patch Connectivity | {rec['name']} | margin={margin_px}px | expansion={removal_expansion_px}px",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return {
+        "debug_path": str(out_path),
+        "bbox_px": debug["bbox_px"],
+        "patch_bbox_px": debug["patch_bbox_px"],
+        "before_touching_component_count": debug["before_touching_component_count"],
+        "after_touching_component_count": debug["after_touching_component_count"],
+        "before_touching_component_labels": debug["before_touching_component_labels"],
+        "after_touching_component_labels": debug["after_touching_component_labels"],
+        "bridge_detected": debug["bridge_detected"],
+        "removal_expansion_px": removal_expansion_px,
+    }
+
+
+def save_global_object_inflation_overlay_figure(
+    out_path: Path,
+    scene_map: ProcTHORMap,
+    rec: dict[str, Any],
+    inflation_px: int,
+    title: str | None = None,
+) -> dict[str, Any] | None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    box = object_box_to_px(scene_map, rec)
+    if box is None:
+        return None
+
+    occ_free = np.asarray(scene_map.occupancy).astype(bool)
+    h, w = occ_free.shape
+    obj_c0 = max(0, int(np.floor(box[0])))
+    obj_c1 = min(w, int(np.ceil(box[0] + box[2])))
+    obj_r0 = max(0, int(np.floor(box[1])))
+    obj_r1 = min(h, int(np.ceil(box[1] + box[3])))
+
+    removable_mask = None
+    try:
+        body_id = int(rec["body_id"])
+        geom_ids = descendant_geoms(rec["_model"], body_id, visual_only=False)
+        rendered_mask, effective_px = render_topdown_geom_mask(
+            rec["_model"],
+            rec["_data"],
+            geom_ids,
+            px_per_m=int(round(scene_map.px_per_m)),
+        )
+        if rendered_mask.shape == occ_free.shape:
+            removable_mask = rendered_mask & (~occ_free)
+    except Exception as exc:
+        log.warning("Falling back to bbox seed for %s overlay: %s", rec["name"], exc)
+
+    if removable_mask is None:
+        object_mask = np.zeros((h, w), dtype=bool)
+        object_mask[obj_r0:obj_r1, obj_c0:obj_c1] = True
+        removable_mask = object_mask & (~occ_free)
+
+    kernel_size = max(1, int(inflation_px))
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    inflated_mask = cv2.dilate(removable_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+    inflated_mask &= ~occ_free
+
+    bg = make_scene_plot_background(scene_map)
+    overlay = bg.copy()
+    overlay[inflated_mask] = 0.55 * overlay[inflated_mask] + 0.45 * np.array([0.20, 0.78, 0.33])
+    overlay[removable_mask] = np.array([0.96, 0.45, 0.12])
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(overlay, origin="upper")
+    rect = Rectangle(
+        (obj_c0, obj_r0),
+        obj_c1 - obj_c0,
+        obj_r1 - obj_r0,
+        facecolor="none",
+        edgecolor="#ef4444",
+        linewidth=2.0,
+    )
+    ax.add_patch(rect)
+    ax.set_title(
+        title
+        or f"Global Object Inflation Overlay | {rec['name']} | inflation={inflation_px}px"
+    )
+    ax.set_xlabel("map x (px)")
+    ax.set_ylabel("map y (px)")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return {
+        "overlay_path": str(out_path),
+        "bbox_px": [obj_c0, obj_r0, obj_c1, obj_r1],
+        "inflation_px": inflation_px,
+        "removable_pixels": int(np.count_nonzero(removable_mask)),
+        "inflated_pixels": int(np.count_nonzero(inflated_mask)),
+    }
+
+
+def analyze_local_blocking_movable_obstacles(
+    base_scene_map: ProcTHORMap,
+    candidate_records: list[dict[str, Any]],
+    baseline_path: np.ndarray | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    baseline_path_px = points_xy_to_px(base_scene_map, baseline_path) if baseline_path is not None else None
+    analyzed = []
+    blocking_names: list[str] = []
+
+    for rec in candidate_records:
+        if not rec.get("is_pickup_candidate", False):
+            continue
+        if rec.get("is_structural", False) or rec.get("is_door", False):
+            continue
+
+        overlap_stats = removable_obstacle_overlap_stats(base_scene_map, rec)
+        local_stats = local_patch_connectivity_stats(base_scene_map, rec)
+        if overlap_stats is None or local_stats is None:
+            continue
+
+        center_dist_to_path_px = None
+        if baseline_path_px is not None and len(baseline_path_px) > 0:
+            center_px = np.array(
+                [
+                    0.5 * (local_stats["bbox_px"][1] + local_stats["bbox_px"][3]),
+                    0.5 * (local_stats["bbox_px"][0] + local_stats["bbox_px"][2]),
+                ],
+                dtype=float,
+            )
+            center_dist_to_path_px = float(
+                np.min(np.linalg.norm(np.asarray(baseline_path_px, dtype=float) - center_px, axis=1))
+            )
+
+        score = float(local_stats["component_reduction"])
+        if local_stats["bridge_detected"]:
+            score += 3.0
+        if center_dist_to_path_px is not None and center_dist_to_path_px <= 120.0:
+            score += 1.0
+
+        analyzed.append(
+            {
+                "name": rec["name"],
+                "category": rec.get("category"),
+                "room_id": rec.get("room_id"),
+                "blocked_pixels": overlap_stats["blocked_pixels"],
+                "blocked_ratio": overlap_stats["blocked_ratio"],
+                "neighbor_component_count": overlap_stats["neighbor_component_count"],
+                "bbox_px": local_stats["bbox_px"],
+                "patch_bbox_px": local_stats["patch_bbox_px"],
+                "before_touching_component_count": local_stats["before_touching_component_count"],
+                "after_touching_component_count": local_stats["after_touching_component_count"],
+                "component_reduction": local_stats["component_reduction"],
+                "bridge_detected": local_stats["bridge_detected"],
+                "center_dist_to_path_px": center_dist_to_path_px,
+                "local_blocking_score": score,
+            }
+        )
+        if local_stats["bridge_detected"]:
+            blocking_names.append(rec["name"])
+
+    analyzed.sort(
+        key=lambda item: (
+            item["local_blocking_score"],
+            item["blocked_pixels"],
+        ),
+        reverse=True,
+    )
+    return analyzed, blocking_names
+
+
+def analyze_blocking_movable_obstacles(
+    env,
+    base_scene_map: ProcTHORMap,
+    start_xy: np.ndarray,
+    goal_xy: np.ndarray,
+    model_path: str,
+    agent_radius: float,
+    px_per_m: int,
+    open_threshold: float,
+    candidate_records: list[dict[str, Any]],
+    downscale_factor: int = 5,
+) -> tuple[list[dict[str, Any]], ProcTHORMap | None, list[str], np.ndarray | None]:
+    margin_px = max(120, int(round(agent_radius * px_per_m * 2)))
+    release_expansion_px = max(4, int(round(agent_radius * px_per_m)))
+    max_precise_checks = 12
+    fast_candidates = []
+    for rec in candidate_records:
+        if not rec.get("is_pickup_candidate", False):
+            continue
+        if rec.get("is_structural", False) or rec.get("is_door", False):
+            continue
+        stats = removable_obstacle_overlap_stats(base_scene_map, rec)
+        if stats is None:
+            continue
+        if stats["blocked_pixels"] <= 64:
+            continue
+        fast_stats = local_component_merge_approx_from_bbox(
+            base_scene_map,
+            rec,
+            margin_px=margin_px,
+            release_expansion_px=release_expansion_px,
+        )
+        if fast_stats is None:
+            continue
+        fast_score = (
+            10.0 * float(fast_stats["connectivity_changed"])
+            + float(fast_stats["component_reduction"])
+            + 0.0001 * float(fast_stats["freed_pixels"])
+        )
+        fast_candidates.append((fast_score, rec, stats, fast_stats))
+
+    fast_candidates.sort(
+        key=lambda item: (
+            item[3]["connectivity_changed"],
+            item[3]["component_reduction"],
+            item[3]["before_touching_component_count"],
+            item[3]["freed_pixels"],
+            item[2]["blocked_pixels"],
+        ),
+        reverse=True,
+    )
+
+    analyzed = []
+    blocking_names: list[str] = []
+    cleared_map = None
+    cleared_path = None
+    best_freed_pixels = -1
+
+    selected_names: set[str] = set()
+    selected_for_precise = []
+    for item in fast_candidates:
+        _, rec, _, fast_stats = item
+        if fast_stats["connectivity_changed"]:
+            selected_for_precise.append(item)
+            selected_names.add(rec["name"])
+        if len(selected_for_precise) >= max_precise_checks:
+            break
+
+    if len(selected_for_precise) < max_precise_checks:
+        for item in fast_candidates:
+            _, rec, _, fast_stats = item
+            if rec["name"] in selected_names:
+                continue
+            if fast_stats["before_touching_component_count"] < 2:
+                continue
+            selected_for_precise.append(item)
+            selected_names.add(rec["name"])
+            if len(selected_for_precise) >= max_precise_checks:
+                break
+
+    if len(selected_for_precise) < max_precise_checks:
+        for item in fast_candidates:
+            _, rec, _, _ = item
+            if rec["name"] in selected_names:
+                continue
+            selected_for_precise.append(item)
+            selected_names.add(rec["name"])
+            if len(selected_for_precise) >= max_precise_checks:
+                break
+
+    precise_by_name: dict[str, tuple[ProcTHORMap, dict[str, Any]]] = {}
+    for _, rec, _, _ in selected_for_precise:
+        removed_map = build_live_procthor_map(
+            env.current_model,
+            env.current_data,
+            model_path=model_path,
+            px_per_m=px_per_m,
+            agent_radius=agent_radius,
+            open_threshold=open_threshold,
+            ignored_root_body_names={rec["name"]},
+        )
+        connectivity_stats = local_connectivity_change_between_maps(
+            base_scene_map,
+            removed_map,
+            rec,
+            margin_px=margin_px,
+        )
+        if connectivity_stats is None:
+            continue
+        precise_by_name[rec["name"]] = (removed_map, connectivity_stats)
+
+    for _, rec, stats, fast_stats in fast_candidates:
+        precise_item = precise_by_name.get(rec["name"])
+        removed_map = None
+        connectivity_stats = None
+        if precise_item is not None:
+            removed_map, connectivity_stats = precise_item
+
+        blocking = bool(
+            connectivity_stats is not None and connectivity_stats["connectivity_changed"]
+        )
+        precise_checked = connectivity_stats is not None
+        analyzed.append(
+            {
+                "name": rec["name"],
+                "category": rec.get("category"),
+                "room_id": rec.get("room_id"),
+                "blocked_pixels": stats["blocked_pixels"],
+                "blocked_ratio": stats["blocked_ratio"],
+                "neighbor_component_count": stats["neighbor_component_count"],
+                "bbox_px": stats["bbox_px"],
+                "fast_local_patch_bbox_px": fast_stats["patch_bbox_px"],
+                "fast_freed_pixels": fast_stats["freed_pixels"],
+                "fast_before_touching_component_count": fast_stats[
+                    "before_touching_component_count"
+                ],
+                "fast_after_touching_component_count": fast_stats[
+                    "after_touching_component_count"
+                ],
+                "fast_component_reduction": fast_stats["component_reduction"],
+                "fast_connectivity_changed": fast_stats["connectivity_changed"],
+                "precise_checked": bool(precise_checked),
+                "local_patch_bbox_px": None
+                if connectivity_stats is None
+                else connectivity_stats["patch_bbox_px"],
+                "freed_pixels_after_removal": None
+                if connectivity_stats is None
+                else connectivity_stats["freed_pixels"],
+                "before_touching_component_count": None
+                if connectivity_stats is None
+                else connectivity_stats["before_touching_component_count"],
+                "after_touching_component_count": None
+                if connectivity_stats is None
+                else connectivity_stats["after_touching_component_count"],
+                "component_reduction": None
+                if connectivity_stats is None
+                else connectivity_stats["component_reduction"],
+                "vertical_connected_before": None
+                if connectivity_stats is None
+                else connectivity_stats["vertical_connected_before"],
+                "vertical_connected_after": None
+                if connectivity_stats is None
+                else connectivity_stats["vertical_connected_after"],
+                "horizontal_connected_before": None
+                if connectivity_stats is None
+                else connectivity_stats["horizontal_connected_before"],
+                "horizontal_connected_after": None
+                if connectivity_stats is None
+                else connectivity_stats["horizontal_connected_after"],
+                "connectivity_changed": False
+                if connectivity_stats is None
+                else connectivity_stats["connectivity_changed"],
+                "top_component_labels_before": []
+                if connectivity_stats is None
+                else connectivity_stats["top_component_labels_before"],
+                "bottom_component_labels_before": []
+                if connectivity_stats is None
+                else connectivity_stats["bottom_component_labels_before"],
+                "left_component_labels_before": []
+                if connectivity_stats is None
+                else connectivity_stats["left_component_labels_before"],
+                "right_component_labels_before": []
+                if connectivity_stats is None
+                else connectivity_stats["right_component_labels_before"],
+                "top_component_labels_after": []
+                if connectivity_stats is None
+                else connectivity_stats["top_component_labels_after"],
+                "bottom_component_labels_after": []
+                if connectivity_stats is None
+                else connectivity_stats["bottom_component_labels_after"],
+                "left_component_labels_after": []
+                if connectivity_stats is None
+                else connectivity_stats["left_component_labels_after"],
+                "right_component_labels_after": []
+                if connectivity_stats is None
+                else connectivity_stats["right_component_labels_after"],
+                "considered_blocking": bool(blocking),
+            }
+        )
+        if blocking:
+            blocking_names.append(rec["name"])
+            freed_pixels = int(connectivity_stats["freed_pixels"])
+            if freed_pixels > best_freed_pixels:
+                best_freed_pixels = freed_pixels
+                cleared_map = removed_map
+                cleared_path = None
+
+    return analyzed, cleared_map, blocking_names, cleared_path
+
+
+def _collect_numeric_scalars(value: Any, out: list[float]) -> None:
+    if value is None:
+        return
+    if isinstance(value, np.ndarray):
+        for item in value.reshape(-1):
+            _collect_numeric_scalars(item, out)
+        return
+    if isinstance(value, np.generic):
+        out.append(float(value))
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_numeric_scalars(item, out)
+        return
+    try:
+        out.append(float(value))
+    except (TypeError, ValueError):
+        return
+
+
+def normalize_point3d(point: Any) -> np.ndarray:
+    try:
+        arr = np.asarray(point, dtype=float)
+        arr = np.squeeze(arr)
+        if arr.size >= 3:
+            return arr.reshape(-1)[:3].astype(float)
+    except (TypeError, ValueError):
+        pass
+
+    flat: list[float] = []
+    _collect_numeric_scalars(point, flat)
+    if len(flat) < 3:
+        raise ValueError(f"Expected at least 3 numeric coordinates, got {point!r}")
+    return np.asarray(flat[:3], dtype=float)
+
+
 def collect_door_plot_records(env, door_names: list[str]) -> list[dict[str, Any]]:
     records = []
     for door_name in door_names:
@@ -619,6 +2161,8 @@ def collect_door_plot_records(env, door_names: list[str]) -> list[dict[str, Any]
                     "hinge_xy": door.get_joint_anchor_position(hinge_idx)[:2].copy(),
                     "joint_position": float(door.get_joint_position(hinge_idx)),
                     "joint_range": [float(v) for v in door.get_joint_range(hinge_idx)],
+                    "interactive": True,
+                    "record_type": "interactive_door",
                 }
             )
         except Exception as exc:
@@ -626,11 +2170,66 @@ def collect_door_plot_records(env, door_names: list[str]) -> list[dict[str, Any]
     return records
 
 
+def collect_non_interactive_doorway_plot_records(
+    env, scene_map: ProcTHORMap, doorway_analysis: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    if doorway_analysis is None:
+        return []
+
+    records = []
+    for rec in doorway_analysis.get("root_records", []):
+        if rec.get("interactive", True):
+            continue
+        root_body_name = rec["root_body_name"]
+        try:
+            root_body_id = mujoco.mj_name2id(
+                env.current_model, mujoco.mjtObj.mjOBJ_BODY, root_body_name
+            )
+            if root_body_id < 0:
+                raise ValueError(f"Body not found in env model: {root_body_name}")
+            candidate_xys = [np.asarray(env.current_data.xpos[root_body_id][:2], dtype=float).copy()]
+            for child_name in rec.get("child_body_names", []):
+                child_body_id = mujoco.mj_name2id(
+                    env.current_model, mujoco.mjtObj.mjOBJ_BODY, child_name
+                )
+                if child_body_id >= 0:
+                    candidate_xys.append(
+                        np.asarray(env.current_data.xpos[child_body_id][:2], dtype=float).copy()
+                    )
+
+            xy = candidate_xys[0]
+            if rec.get("fixed_opening", False):
+                for candidate_xy in candidate_xys:
+                    nearest_xy = nearest_free_point_xy(scene_map, candidate_xy, max_radius_px=120)
+                    if nearest_xy is not None:
+                        xy = np.asarray(nearest_xy, dtype=float).copy()
+                        break
+        except Exception as exc:
+            log.warning(
+                "Failed to collect plotting data for non-interactive doorway %s: %s",
+                root_body_name,
+                exc,
+            )
+            continue
+        records.append(
+            {
+                "door_name": root_body_name,
+                "hinge_xy": xy,
+                "interactive": False,
+                "fixed_opening": bool(rec.get("fixed_opening", False)),
+                "record_type": f"non_interactive_{rec.get('root_kind', 'doorway')}",
+            }
+        )
+    return records
+
+
 def save_door_path_figure(
     out_path: Path,
     scene_map: ProcTHORMap,
     door_records: list[dict[str, Any]],
+    object_records: list[dict[str, Any]] | None,
     selected_doors: list[str],
+    highlighted_object_names: list[str],
     start_xy: np.ndarray,
     goal_xy: np.ndarray,
     primary_path: np.ndarray | None,
@@ -643,10 +2242,50 @@ def save_door_path_figure(
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch, Rectangle
 
     bg = make_scene_plot_background(scene_map)
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.imshow(bg, origin="upper")
+
+    if object_records:
+        for rec in object_records:
+            box = object_box_to_px(scene_map, rec)
+            if box is None:
+                continue
+            col, row, width, height = box
+            kind = scene_visual_kind(rec)
+            color = scene_plot_color(kind)
+            is_highlighted = rec["name"] in highlighted_object_names
+            rect = Rectangle(
+                (col, row),
+                max(width, 3.0),
+                max(height, 3.0),
+                facecolor="none",
+                edgecolor="#ef4444" if is_highlighted else color,
+                linewidth=2.2 if is_highlighted else (1.0 if kind != "structural" else 0.6),
+                linestyle="--" if rec.get("is_pickup_candidate", False) else "-",
+                alpha=0.95 if is_highlighted else (0.75 if kind != "structural" else 0.35),
+                zorder=3 if is_highlighted else 2,
+            )
+            ax.add_patch(rect)
+            label = scene_plot_label(rec)
+            ax.text(
+                col + width / 2.0,
+                row - 4.0,
+                label[:28],
+                fontsize=6 if rec.get("is_pickup_candidate", False) else 5,
+                color="#ef4444" if is_highlighted else color,
+                ha="center",
+                va="bottom",
+                zorder=4 if is_highlighted else 3,
+                bbox={
+                    "facecolor": (1.0, 1.0, 1.0, 0.65),
+                    "edgecolor": "none",
+                    "pad": 0.4,
+                },
+            )
 
     for record in door_records:
         marker_px = points_xy_to_px(scene_map, np.asarray([record["hinge_xy"]]))
@@ -654,11 +2293,19 @@ def save_door_path_figure(
             continue
         row, col = marker_px[0]
         is_selected = record["door_name"] in selected_doors
+        is_interactive = bool(record.get("interactive", True))
+        record_type = record.get("record_type", "")
+        if is_interactive:
+            base_color = "#7c3aed"
+        elif "doorframe" in record_type:
+            base_color = "#0ea5e9"
+        else:
+            base_color = "#f97316"
         ax.scatter(
             col,
             row,
-            s=34 if is_selected else 20,
-            c="#dc2626" if is_selected else "#7c3aed",
+            s=34 if is_selected else (26 if not is_interactive else 20),
+            c="#dc2626" if is_selected else base_color,
             edgecolors="white",
             linewidths=0.7,
             zorder=5,
@@ -700,7 +2347,57 @@ def save_door_path_figure(
     ax.set_xlabel("map x (px)")
     ax.set_ylabel("map y (px)")
     ax.set_title(title or "Door Path Study")
-    ax.legend(loc="upper right")
+    has_movable_door_boxes = bool(
+        object_records and any(rec.get("is_movable_door", False) for rec in object_records)
+    )
+    has_fixed_opening_boxes = bool(
+        object_records and any(rec.get("is_fixed_opening", False) for rec in object_records)
+    )
+    has_noninteractive_doorway_boxes = bool(
+        object_records and any(rec.get("is_noninteractive_doorway", False) for rec in object_records)
+    )
+
+    legend_handles = [
+        Patch(facecolor="#eeeeee", edgecolor="black", alpha=0.55, label="free space"),
+        Patch(facecolor="#2f3437", edgecolor="black", alpha=0.85, label="occupied"),
+        Patch(facecolor="none", edgecolor=scene_plot_color("pickup"), linestyle="--", label="pickup / movable"),
+        Patch(facecolor="none", edgecolor=scene_plot_color("receptacle"), label="receptacle"),
+        Patch(facecolor="none", edgecolor=scene_plot_color("articulable"), label="articulable"),
+        Patch(facecolor="none", edgecolor=scene_plot_color("structural"), label="structural"),
+    ]
+    if has_movable_door_boxes:
+        legend_handles.append(
+            Patch(facecolor="none", edgecolor=scene_plot_color("movable_door"), linewidth=1.4, label="interactive door")
+        )
+    if has_fixed_opening_boxes:
+        legend_handles.append(
+            Patch(facecolor="none", edgecolor=scene_plot_color("fixed_opening"), linewidth=1.4, label="fixed doorframe opening")
+        )
+    if has_noninteractive_doorway_boxes:
+        legend_handles.append(
+            Patch(facecolor="none", edgecolor=scene_plot_color("noninteractive_doorway"), linewidth=1.4, label="non-interactive doorway")
+        )
+    if door_records:
+        legend_handles.extend(
+            [
+                Line2D([0], [0], marker="o", color="w", markerfacecolor="#7c3aed", markeredgecolor="white", markersize=6, label="interactive door marker"),
+                Line2D([0], [0], marker="o", color="w", markerfacecolor="#0ea5e9", markeredgecolor="white", markersize=6, label="fixed opening marker"),
+                Line2D([0], [0], marker="o", color="w", markerfacecolor="#f97316", markeredgecolor="white", markersize=6, label="doorway marker"),
+            ]
+        )
+    legend_handles.extend(
+        [
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#16a34a", markeredgecolor="black", markersize=7, label="start"),
+            Line2D([0], [0], marker="*", color="w", markerfacecolor="#f59e0b", markeredgecolor="black", markersize=10, label="goal"),
+        ]
+    )
+    if primary_px is not None:
+        legend_handles.append(Line2D([0], [0], color="#2563eb", linewidth=2.4, label=primary_label))
+    if secondary_px is not None and secondary_label is not None:
+        legend_handles.append(Line2D([0], [0], color="#ea580c", linewidth=2.4, linestyle="--", label=secondary_label))
+    if highlighted_object_names:
+        legend_handles.append(Patch(facecolor="none", edgecolor="#ef4444", linewidth=2.2, label="blocking movable obstacle"))
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=7, framealpha=0.96)
     ax.grid(False)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -712,17 +2409,18 @@ def sample_navigation_goal(task: BaseMujocoTask, scene_map: ProcTHORMap) -> tupl
     nav_goal_sampler = NavGoalSampler(scene_map, check_target_in_view=False, camera_name="head_camera")
     batch_idx = task.env.current_batch_index
     target_obj = task.get_nearest_nav_object(batch_idx)
+    target_pos = normalize_point3d(target_obj.position)
     nav_goal_sampler.set_target(target_obj)
     nav_goal_sampler.set_robot_view(task.env.current_robot.robot_view)
     goal = nav_goal_sampler.sample()
     if goal is not None:
-        return np.asarray(goal), "nav_goal_sampler", None
+        return normalize_point3d(goal), "nav_goal_sampler", None
 
-    target_xy = np.asarray(target_obj.position[:2], dtype=float)
+    target_xy = target_pos[:2].copy()
     nearest_free_xy_goal = nearest_free_point_xy(scene_map, target_xy)
     if nearest_free_xy_goal is not None:
         fallback_goal = np.array(
-            [nearest_free_xy_goal[0], nearest_free_xy_goal[1], float(target_obj.position[2])],
+            [nearest_free_xy_goal[0], nearest_free_xy_goal[1], float(target_pos[2])],
             dtype=float,
         )
         return (
@@ -731,7 +2429,7 @@ def sample_navigation_goal(task: BaseMujocoTask, scene_map: ProcTHORMap) -> tupl
             "Failed to sample a nav goal near target object",
         )
 
-    fallback_goal = np.asarray(target_obj.position[:3], dtype=float)
+    fallback_goal = target_pos.copy()
     return (
         fallback_goal,
         "target_object_center_fallback",
@@ -746,6 +2444,16 @@ def get_robot_xy(env) -> np.ndarray:
 def get_open_position_for_joint(joint_range: tuple[float, float]) -> float:
     low, high = float(joint_range[0]), float(joint_range[1])
     return high if abs(high) >= abs(low) else low
+
+
+def interactive_door_root_names(doorway_analysis: dict[str, Any] | None) -> list[str]:
+    if doorway_analysis is None:
+        return []
+    return [
+        rec["root_body_name"]
+        for rec in doorway_analysis.get("root_records", [])
+        if rec.get("interactive", False)
+    ]
 
 
 def set_door_state(env, door_name: str, state: str) -> dict[str, Any]:
@@ -766,6 +2474,52 @@ def set_door_state(env, door_name: str, state: str) -> dict[str, Any]:
         "joint_range": [float(v) for v in joint_range],
         "joint_position": float(door.get_joint_position(hinge_idx)),
         "state": state,
+    }
+
+
+def set_door_root_state(
+    env,
+    doorway_analysis: dict[str, Any] | None,
+    root_door_name: str,
+    state: str,
+) -> dict[str, Any]:
+    if doorway_analysis is None:
+        raise ValueError("doorway_analysis is required for root door control")
+
+    matched = None
+    for rec in doorway_analysis.get("root_records", []):
+        if rec.get("root_body_name") == root_door_name:
+            matched = rec
+            break
+    if matched is None:
+        raise ValueError(f"Interactive door root not found: {root_door_name}")
+
+    transitions = []
+    skipped_children = []
+    for child_name in matched.get("hinge_body_names", []):
+        try:
+            transitions.append(set_door_state(env, child_name, state))
+        except Exception as exc:
+            log.debug(
+                "Skipping non-door hinge child while setting root %s: %s (%s)",
+                root_door_name,
+                child_name,
+                exc,
+            )
+            skipped_children.append(child_name)
+
+    if not transitions:
+        raise ValueError(
+            f"No valid interactive door leaf joints found for root {root_door_name}. "
+            f"Candidates were {matched.get('hinge_body_names', [])}"
+        )
+
+    return {
+        "door_root_name": root_door_name,
+        "state": state,
+        "hinge_body_names": list(matched.get("hinge_body_names", [])),
+        "skipped_hinge_body_names": skipped_children,
+        "transitions": transitions,
     }
 
 
@@ -801,6 +2555,241 @@ def choose_doors_on_path(env, door_names: list[str], path: np.ndarray, top_k: in
     return [name for _, name in scored[:top_k]]
 
 
+def open_all_doors(env) -> list[dict[str, Any]]:
+    doorway_analysis = collect_runtime_doorway_analysis(env)
+    transitions = []
+    for door_root_name in interactive_door_root_names(doorway_analysis):
+        transitions.append(set_door_root_state(env, doorway_analysis, door_root_name, "open"))
+    return transitions
+
+
+def close_all_doors(env) -> list[dict[str, Any]]:
+    doorway_analysis = collect_runtime_doorway_analysis(env)
+    transitions = []
+    for door_root_name in interactive_door_root_names(doorway_analysis):
+        transitions.append(set_door_root_state(env, doorway_analysis, door_root_name, "closed"))
+    return transitions
+
+
+def command_door_map_compare(args: argparse.Namespace) -> dict[str, Any]:
+    ctx = load_context(args, task_mode="nav_task")
+    try:
+        closed_plot_path, cached_plot_path, open_plot_path = map_compare_output_paths(args.output_json)
+        start_xy = get_robot_xy(ctx.env)
+        initial_scene_object_records = collect_scene_plot_records(ctx.env)
+
+        cached_plot_map = getattr(ctx.task, "occupancy_map", None)
+
+        close_transitions = close_all_doors(ctx.env)
+        closed_scene_object_records = collect_scene_plot_records(ctx.env)
+        closed_candidate_records = [
+            rec
+            for rec in closed_scene_object_records
+            if rec.get("is_pickup_candidate", False) and not rec.get("is_structural", False)
+        ]
+        closed_map, closed_analysis = build_live_procthor_map(
+            ctx.env.current_model,
+            ctx.env.current_data,
+            model_path=str(ctx.env.current_model_path),
+            px_per_m=args.px_per_m,
+            agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
+            open_threshold=args.open_threshold,
+            treat_all_non_interactive_doorways_as_open=True,
+            return_doorway_analysis=True,
+        )
+
+        if cached_plot_map is None:
+            cached_plot_map = closed_map
+        all_door_names = interactive_door_root_names(closed_analysis)
+        nav_goal, _, _ = sample_navigation_goal(ctx.task, cached_plot_map)
+        raw_live_map = build_live_procthor_map(
+            ctx.env.current_model,
+            ctx.env.current_data,
+            model_path=str(ctx.env.current_model_path),
+            px_per_m=args.px_per_m,
+            agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
+            open_threshold=args.open_threshold,
+        )
+        movable_analysis, _, blocking_movable_names, _ = analyze_blocking_movable_obstacles(
+            env=ctx.env,
+            base_scene_map=raw_live_map,
+            start_xy=start_xy,
+            goal_xy=nav_goal[:2],
+            model_path=str(ctx.env.current_model_path),
+            agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
+            px_per_m=args.px_per_m,
+            open_threshold=args.open_threshold,
+            candidate_records=closed_candidate_records,
+            downscale_factor=args.downscale,
+        )
+
+        closed_door_object_records = collect_interactive_door_root_object_records(
+            ctx.env, closed_analysis
+        )
+        closed_noninteractive_door_records = collect_non_interactive_doorway_object_records(
+            ctx.env, closed_analysis
+        )
+        closed_blocking_object_records = [
+            rec for rec in closed_scene_object_records if rec["name"] in blocking_movable_names
+        ]
+        closed_focus_records = dedupe_plot_records(
+            closed_door_object_records
+            + closed_noninteractive_door_records
+            + closed_blocking_object_records
+        )
+
+        open_transitions = open_all_doors(ctx.env)
+        open_scene_object_records = collect_scene_plot_records(ctx.env)
+        ignored_blocking_names = set(blocking_movable_names)
+        open_map, open_analysis = build_live_procthor_map(
+            ctx.env.current_model,
+            ctx.env.current_data,
+            model_path=str(ctx.env.current_model_path),
+            px_per_m=args.px_per_m,
+            agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
+            open_threshold=args.open_threshold,
+            treat_all_non_interactive_doorways_as_open=True,
+            return_doorway_analysis=True,
+            ignored_root_body_names=ignored_blocking_names if ignored_blocking_names else None,
+        )
+        open_door_object_records = collect_interactive_door_root_object_records(
+            ctx.env, open_analysis
+        )
+        open_noninteractive_door_records = collect_non_interactive_doorway_object_records(
+            ctx.env, open_analysis
+        )
+        open_blocking_object_records = [
+            rec for rec in open_scene_object_records if rec["name"] in blocking_movable_names
+        ]
+        open_focus_records = dedupe_plot_records(
+            open_door_object_records + open_noninteractive_door_records + open_blocking_object_records
+        )
+
+        save_door_path_figure(
+            out_path=cached_plot_path,
+            scene_map=cached_plot_map,
+            door_records=[],
+            object_records=initial_scene_object_records,
+            selected_doors=[],
+            highlighted_object_names=[],
+            start_xy=start_xy,
+            goal_xy=nav_goal[:2],
+            primary_path=None,
+            primary_label="cached occupancy",
+            title="Door Map Compare | cached occupancy + all objects",
+        )
+        save_door_path_figure(
+            out_path=open_plot_path,
+            scene_map=open_map,
+            door_records=[],
+            object_records=open_focus_records,
+            selected_doors=[],
+            highlighted_object_names=blocking_movable_names,
+            start_xy=start_xy,
+            goal_xy=nav_goal[:2],
+            primary_path=None,
+            primary_label="open occupancy",
+            title="Door Map Compare | all interactive doors open + blocking movable removed",
+        )
+        save_door_path_figure(
+            out_path=closed_plot_path,
+            scene_map=closed_map,
+            door_records=[],
+            object_records=closed_focus_records,
+            selected_doors=[],
+            highlighted_object_names=blocking_movable_names,
+            start_xy=start_xy,
+            goal_xy=nav_goal[:2],
+            primary_path=None,
+            primary_label="closed occupancy",
+            title="Door Map Compare | all interactive doors closed",
+        )
+
+        changed_pixels = int(
+            np.count_nonzero(
+                np.asarray(closed_map.occupancy).astype(bool)
+                != np.asarray(open_map.occupancy).astype(bool)
+            )
+        )
+
+        return {
+            "scene_path": str(ctx.env.current_model_path),
+            "target_object": ctx.task.config.task_config.pickup_obj_name,
+            "robot_xy": start_xy.tolist(),
+            "all_door_names": all_door_names,
+            "interactive_door_count": len(all_door_names),
+            "interactive_door_names": all_door_names,
+            "movable_candidate_names": [rec["name"] for rec in closed_candidate_records],
+            "movable_candidate_count": len(closed_candidate_records),
+            "blocking_movable_obstacle_names": blocking_movable_names,
+            "movable_obstacle_analysis": movable_analysis,
+            "movable_fast_analysis_count": len(movable_analysis),
+            "movable_precise_check_count": sum(
+                1 for item in movable_analysis if item.get("precise_checked", False)
+            ),
+            "non_interactive_doorway_root_names": []
+            if closed_analysis is None
+            else [
+                rec["root_body_name"]
+                for rec in closed_analysis["root_records"]
+                if not rec["interactive"] and rec.get("root_kind") == "doorway"
+            ],
+            "doorframe_root_names": []
+            if closed_analysis is None
+            else [
+                rec["root_body_name"]
+                for rec in closed_analysis["root_records"]
+                if not rec["interactive"] and rec.get("root_kind") == "doorframe"
+            ],
+            "doorway_root_records": []
+            if closed_analysis is None
+            else closed_analysis["root_records"],
+            "close_all_doors_transitions": close_transitions,
+            "open_all_doors_transitions": open_transitions,
+            "closed_plot_path": str(closed_plot_path),
+            "cached_plot_path": str(cached_plot_path),
+            "open_plot_path": str(open_plot_path),
+            "movable_cleared_plot_path": None,
+            "closed_free_ratio": float(np.mean(np.asarray(closed_map.occupancy).astype(bool))),
+            "cached_free_ratio": float(np.mean(np.asarray(cached_plot_map.occupancy).astype(bool))),
+            "open_free_ratio": float(np.mean(np.asarray(open_map.occupancy).astype(bool))),
+            "movable_cleared_free_ratio": None,
+            "closed_open_changed_pixels": changed_pixels,
+            "fixed_opening_changed_pixels": int(
+                np.count_nonzero(
+                    np.asarray(closed_map.occupancy).astype(bool)
+                    != np.asarray(cached_plot_map.occupancy).astype(bool)
+                )
+            ),
+            "cached_object_box_count": len(initial_scene_object_records),
+            "closed_focus_object_count": len(closed_focus_records),
+            "open_focus_object_count": len(open_focus_records),
+            "closed_non_interactive_root_count": 0
+            if closed_analysis is None
+            else len(closed_analysis["non_interactive_root_ids"]),
+            "closed_non_interactive_doorway_count": 0
+            if closed_analysis is None
+            else sum(
+                1
+                for rec in closed_analysis["root_records"]
+                if not rec["interactive"] and rec.get("root_kind") == "doorway"
+            ),
+            "closed_doorframe_root_count": 0
+            if closed_analysis is None
+            else sum(
+                1
+                for rec in closed_analysis["root_records"]
+                if not rec["interactive"] and rec.get("root_kind") == "doorframe"
+            ),
+            "open_non_interactive_root_count": 0
+            if open_analysis is None
+            else len(open_analysis["non_interactive_root_ids"]),
+            "local_patch_debug": None,
+        }
+    finally:
+        close_context(ctx)
+
+
 def command_inspect_scene(args: argparse.Namespace) -> dict[str, Any]:
     ctx = load_context(args, task_mode="scene_only")
     try:
@@ -815,6 +2804,7 @@ def command_nav_gt(args: argparse.Namespace) -> dict[str, Any]:
         live_map = build_live_procthor_map(
             ctx.env.current_model,
             ctx.env.current_data,
+            model_path=str(ctx.env.current_model_path),
             px_per_m=args.px_per_m,
             agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
             open_threshold=args.open_threshold,
@@ -841,13 +2831,19 @@ def command_nav_gt(args: argparse.Namespace) -> dict[str, Any]:
         close_context(ctx)
 
 
-def command_door_path_study(args: argparse.Namespace) -> dict[str, Any]:
-    ctx = load_context(args, task_mode="nav_task")
-    try:
-        baseline_plot_path, compare_plot_path = image_output_paths(args.output_json)
-        baseline_map = build_live_procthor_map(
+def run_door_path_study(ctx: LoadedContext, args: argparse.Namespace) -> dict[str, Any]:
+        start_xy = get_robot_xy(ctx.env)
+        open_transitions = open_all_doors(ctx.env)
+        open_scene_object_records = collect_scene_plot_records(ctx.env)
+        open_candidate_records = [
+            rec
+            for rec in open_scene_object_records
+            if rec.get("is_pickup_candidate", False) and not rec.get("is_structural", False)
+        ]
+        raw_open_live_map = build_live_procthor_map(
             ctx.env.current_model,
             ctx.env.current_data,
+            model_path=str(ctx.env.current_model_path),
             px_per_m=args.px_per_m,
             agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
             open_threshold=args.open_threshold,
@@ -858,70 +2854,176 @@ def command_door_path_study(args: argparse.Namespace) -> dict[str, Any]:
             "target_object": ctx.task.config.task_config.pickup_obj_name,
             "robot_xy": start_xy.tolist(),
             "baseline_plot_path": None,
-            "compare_plot_path": None,
+            "compare_plot_paths": [],
         }
-        nav_goal, nav_goal_source, nav_goal_sampling_error = sample_navigation_goal(ctx.task, baseline_map)
+
+        nav_goal, nav_goal_source, nav_goal_sampling_error = sample_navigation_goal(
+            ctx.task, raw_open_live_map
+        )
+        movable_analysis, _, blocking_movable_names, _ = analyze_blocking_movable_obstacles(
+            env=ctx.env,
+            base_scene_map=raw_open_live_map,
+            start_xy=start_xy,
+            goal_xy=nav_goal[:2],
+            model_path=str(ctx.env.current_model_path),
+            agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
+            px_per_m=args.px_per_m,
+            open_threshold=args.open_threshold,
+            candidate_records=open_candidate_records,
+            downscale_factor=args.downscale,
+        )
+
+        ignored_blocking_names = set(blocking_movable_names)
+        baseline_map, baseline_analysis = build_live_procthor_map(
+            ctx.env.current_model,
+            ctx.env.current_data,
+            model_path=str(ctx.env.current_model_path),
+            px_per_m=args.px_per_m,
+            agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
+            open_threshold=args.open_threshold,
+            treat_all_non_interactive_doorways_as_open=True,
+            return_doorway_analysis=True,
+            ignored_root_body_names=ignored_blocking_names if ignored_blocking_names else None,
+        )
+        all_door_names = interactive_door_root_names(baseline_analysis)
+        if args.door_names:
+            requested = [name.strip() for name in args.door_names.split(",") if name.strip()]
+            target_door_names = [name for name in requested if name in set(all_door_names)]
+        else:
+            target_door_names = list(all_door_names)
+        baseline_plot_path, compare_plot_paths = door_path_study_output_paths(
+            args.output_json, target_door_names
+        )
+        all_closed_plot_path = door_path_study_all_closed_output_path(args.output_json)
         baseline_path = compute_path_from_map(
             baseline_map, start_xy, nav_goal[:2], downscale_factor=args.downscale
         )
 
-        om = ctx.env.object_managers[ctx.env.current_batch_index]
-        all_door_names = om.find_door_names()
-        baseline_door_records = collect_door_plot_records(ctx.env, all_door_names)
-        if args.door_names:
-            selected_doors = [name.strip() for name in args.door_names.split(",") if name.strip()]
-        elif args.close_doors_on_path > 0:
-            selected_doors = choose_doors_on_path(
-                ctx.env, all_door_names, baseline_path, args.close_doors_on_path
-            )
-        else:
-            selected_doors = []
-
-        transitions = []
-        for door_name in selected_doors:
-            transitions.append(set_door_state(ctx.env, door_name, args.study_state))
-
-        changed_map = build_live_procthor_map(
-            ctx.env.current_model,
-            ctx.env.current_data,
-            px_per_m=args.px_per_m,
-            agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
-            open_threshold=args.open_threshold,
+        baseline_door_object_records = collect_interactive_door_root_object_records(
+            ctx.env, baseline_analysis
         )
-        changed_path = compute_path_from_map(
-            changed_map, start_xy, nav_goal[:2], downscale_factor=args.downscale
+        baseline_noninteractive_door_records = collect_non_interactive_doorway_object_records(
+            ctx.env, baseline_analysis
         )
-        changed_door_records = collect_door_plot_records(ctx.env, all_door_names)
-        cached_plot_map = getattr(ctx.task, "occupancy_map", None)
-        baseline_plot_map = pick_plot_scene_map(baseline_map, cached_plot_map)
-        changed_plot_map = pick_plot_scene_map(changed_map, cached_plot_map)
+        baseline_blocking_object_records = [
+            rec for rec in open_scene_object_records if rec["name"] in blocking_movable_names
+        ]
+        baseline_focus_records = dedupe_plot_records(
+            baseline_door_object_records
+            + baseline_noninteractive_door_records
+            + baseline_blocking_object_records
+        )
 
         save_door_path_figure(
             out_path=baseline_plot_path,
-            scene_map=baseline_plot_map,
-            door_records=baseline_door_records,
-            selected_doors=selected_doors,
+            scene_map=baseline_map,
+            door_records=[],
+            object_records=baseline_focus_records,
+            selected_doors=[],
+            highlighted_object_names=blocking_movable_names,
             start_xy=start_xy,
             goal_xy=nav_goal[:2],
             primary_path=baseline_path,
-            primary_label="baseline GT path",
-            title=f"Door Path Study Baseline | target={ctx.task.config.task_config.pickup_obj_name}",
+            primary_label="all-open GT path",
+            title=f"Door Path Study | all doors open | target={ctx.task.config.task_config.pickup_obj_name}",
+        )
+
+        per_door_results = []
+        for door_name, compare_plot_path in zip(target_door_names, compare_plot_paths):
+            open_all_doors(ctx.env)
+            transition = set_door_root_state(ctx.env, baseline_analysis, door_name, "closed")
+            changed_map, changed_analysis = build_live_procthor_map(
+                ctx.env.current_model,
+                ctx.env.current_data,
+                model_path=str(ctx.env.current_model_path),
+                px_per_m=args.px_per_m,
+                agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
+                open_threshold=args.open_threshold,
+                treat_all_non_interactive_doorways_as_open=True,
+                return_doorway_analysis=True,
+                ignored_root_body_names=ignored_blocking_names if ignored_blocking_names else None,
+            )
+            changed_path = compute_path_from_map(
+                changed_map, start_xy, nav_goal[:2], downscale_factor=args.downscale
+            )
+            changed_door_object_records = collect_interactive_door_root_object_records(
+                ctx.env, changed_analysis
+            )
+            changed_noninteractive_door_records = collect_non_interactive_doorway_object_records(
+                ctx.env, changed_analysis
+            )
+            changed_focus_records = dedupe_plot_records(
+                changed_door_object_records
+                + changed_noninteractive_door_records
+                + baseline_blocking_object_records
+            )
+
+            save_door_path_figure(
+                out_path=compare_plot_path,
+                scene_map=changed_map,
+                door_records=[],
+                object_records=changed_focus_records,
+                selected_doors=[door_name],
+                highlighted_object_names=blocking_movable_names,
+                start_xy=start_xy,
+                goal_xy=nav_goal[:2],
+                primary_path=changed_path,
+                primary_label=f"path with {door_name} closed",
+                secondary_path=baseline_path,
+                secondary_label="all-open GT path",
+                title=f"Door Path Study | close {door_name}",
+            )
+            per_door_results.append(
+                {
+                    "door_name": door_name,
+                    "transition": transition,
+                    "path_found": changed_path is not None,
+                    "path_length_m": path_length(changed_path),
+                    "waypoints": None if changed_path is None else changed_path.tolist(),
+                    "plot_path": str(compare_plot_path),
+                }
+            )
+
+        close_all_transitions = close_all_doors(ctx.env)
+        all_closed_map, all_closed_analysis = build_live_procthor_map(
+            ctx.env.current_model,
+            ctx.env.current_data,
+            model_path=str(ctx.env.current_model_path),
+            px_per_m=args.px_per_m,
+            agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius,
+            open_threshold=args.open_threshold,
+            treat_all_non_interactive_doorways_as_open=True,
+            return_doorway_analysis=True,
+            ignored_root_body_names=ignored_blocking_names if ignored_blocking_names else None,
+        )
+        all_closed_path = compute_path_from_map(
+            all_closed_map, start_xy, nav_goal[:2], downscale_factor=args.downscale
+        )
+        all_closed_door_object_records = collect_interactive_door_root_object_records(
+            ctx.env, all_closed_analysis
+        )
+        all_closed_noninteractive_door_records = collect_non_interactive_doorway_object_records(
+            ctx.env, all_closed_analysis
+        )
+        all_closed_focus_records = dedupe_plot_records(
+            all_closed_door_object_records
+            + all_closed_noninteractive_door_records
+            + baseline_blocking_object_records
         )
         save_door_path_figure(
-            out_path=compare_plot_path,
-            scene_map=changed_plot_map,
-            door_records=changed_door_records,
-            selected_doors=selected_doors,
+            out_path=all_closed_plot_path,
+            scene_map=all_closed_map,
+            door_records=[],
+            object_records=all_closed_focus_records,
+            selected_doors=list(all_door_names),
+            highlighted_object_names=blocking_movable_names,
             start_xy=start_xy,
             goal_xy=nav_goal[:2],
-            primary_path=changed_path,
-            primary_label=f"{args.study_state} door GT path",
+            primary_path=all_closed_path,
+            primary_label="all-closed GT path",
             secondary_path=baseline_path,
-            secondary_label="baseline GT path",
-            title=(
-                f"Door Path Study Compare | state={args.study_state} | "
-                f"doors={len(selected_doors)}"
-            ),
+            secondary_label="all-open GT path",
+            title="Door Path Study | all interactive doors closed",
         )
 
         return {
@@ -929,20 +3031,100 @@ def command_door_path_study(args: argparse.Namespace) -> dict[str, Any]:
             "nav_goal": nav_goal.tolist(),
             "nav_goal_source": nav_goal_source,
             "all_door_names": all_door_names,
-            "selected_doors": selected_doors,
-            "door_transitions": transitions,
+            "selected_doors": target_door_names,
+            "door_transitions": [item["transition"] for item in per_door_results],
             "baseline_path_found": baseline_path is not None,
             "baseline_path_length_m": path_length(baseline_path),
-            "changed_path_found": changed_path is not None,
-            "changed_path_length_m": path_length(changed_path),
             "baseline_waypoints": None if baseline_path is None else baseline_path.tolist(),
-            "changed_waypoints": None if changed_path is None else changed_path.tolist(),
+            "changed_path_found": any(item["path_found"] for item in per_door_results),
+            "changed_path_length_m": None,
+            "changed_waypoints": None,
             "baseline_plot_path": str(baseline_plot_path),
-            "compare_plot_path": str(compare_plot_path),
+            "compare_plot_path": None,
+            "compare_plot_paths": [item["plot_path"] for item in per_door_results],
+            "open_all_doors_transitions": open_transitions,
+            "close_all_doors_transitions": close_all_transitions,
+            "all_closed_path_found": all_closed_path is not None,
+            "all_closed_path_length_m": path_length(all_closed_path),
+            "all_closed_waypoints": None if all_closed_path is None else all_closed_path.tolist(),
+            "all_closed_plot_path": str(all_closed_plot_path),
+            "blocking_movable_obstacle_names": blocking_movable_names,
+            "movable_obstacle_analysis": movable_analysis,
+            "per_door_results": per_door_results,
             "nav_goal_sampling_error": nav_goal_sampling_error,
         }
+
+
+def command_door_path_study(args: argparse.Namespace) -> dict[str, Any]:
+    ctx = load_context(args, task_mode="nav_task")
+    try:
+        return run_door_path_study(ctx, args)
+    except Exception as exc:
+        log.error("Error during door path study: %s", exc, exc_info=True)
+        raise
     finally:
         close_context(ctx)
+
+
+def load_benchmark_episodes(benchmark_dir: Path) -> list[dict[str, Any]]:
+    benchmark_file = benchmark_dir / "benchmark.json"
+    with open(benchmark_file) as f:
+        return json.load(f)
+
+
+def command_benchmark_door_path_study(args: argparse.Namespace) -> dict[str, Any]:
+    benchmark_dir = Path(args.benchmark_dir)
+    episodes = load_benchmark_episodes(benchmark_dir)
+    end = min(len(episodes), args.start_idx + args.max_episodes)
+    selected = episodes[args.start_idx:end]
+    run_dir = args.output_json.with_suffix("")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    failures = []
+    for episode_idx, episode in enumerate(selected, start=args.start_idx):
+        episode_args = argparse.Namespace(**vars(args))
+        episode_args.scene_dataset = episode["scene_dataset"]
+        episode_args.data_split = episode["data_split"]
+        episode_args.house_ind = episode["house_index"]
+        episode_args.robot = episode.get("robot", {}).get("robot_name", args.robot)
+        episode_args.target_types = None
+        episode_args.benchmark_episode = episode
+        episode_name = f"benchmark_ep_{episode_idx:04d}_house_{episode['house_index']}"
+        episode_dir = run_dir / episode_name
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        episode_args.output_json = episode_dir / f"{episode_name}.json"
+        ctx = None
+        try:
+            ctx = load_context(episode_args, task_mode="nav_task")
+            episode_result = run_door_path_study(ctx, episode_args)
+            episode_result["benchmark_episode_index"] = episode_idx
+            episode_result["benchmark_source_traj_key"] = episode.get("source", {}).get("traj_key")
+            episode_result["episode_output_dir"] = str(episode_dir)
+            results.append(episode_result)
+        except Exception as exc:
+            failures.append(
+                {
+                    "benchmark_episode_index": episode_idx,
+                    "house_index": episode["house_index"],
+                    "pickup_obj_name": episode.get("task", {}).get("pickup_obj_name"),
+                    "error": str(exc),
+                }
+            )
+        finally:
+            if ctx is not None:
+                close_context(ctx)
+
+    return {
+        "benchmark_dir": str(benchmark_dir),
+        "start_idx": args.start_idx,
+        "max_episodes": args.max_episodes,
+        "processed_episode_count": len(results),
+        "failed_episode_count": len(failures),
+        "output_dir": str(run_dir),
+        "results": results,
+        "failures": failures,
+    }
 
 
 def command_set_articulation(args: argparse.Namespace) -> dict[str, Any]:
@@ -1372,6 +3554,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--study_state", choices=["open", "closed"], default="closed"
     )
 
+    bench_door_parser = subparsers.add_parser("benchmark-door-path-study")
+    add_common(bench_door_parser)
+    bench_door_parser.add_argument("--benchmark_dir", type=Path, required=True)
+    bench_door_parser.add_argument("--start_idx", type=int, default=0)
+    bench_door_parser.add_argument("--max_episodes", type=int, default=10)
+    bench_door_parser.add_argument("--px_per_m", type=int, default=200)
+    bench_door_parser.add_argument("--downscale", type=int, default=5)
+    bench_door_parser.add_argument("--open_threshold", type=float, default=1e-3)
+    bench_door_parser.add_argument("--door_names", default=None)
+
+    door_map_parser = subparsers.add_parser("door-map-compare")
+    add_common(door_map_parser)
+    door_map_parser.add_argument("--px_per_m", type=int, default=200)
+    door_map_parser.add_argument("--open_threshold", type=float, default=1e-3)
+    door_map_parser.add_argument("--downscale", type=int, default=5)
+
     set_parser = subparsers.add_parser("set-articulation")
     add_common(set_parser)
     set_parser.add_argument("--object-name", dest="object_name", required=True)
@@ -1442,6 +3640,10 @@ def main() -> None:
             result = command_nav_gt(args)
         elif args.command == "door-path-study":
             result = command_door_path_study(args)
+        elif args.command == "benchmark-door-path-study":
+            result = command_benchmark_door_path_study(args)
+        elif args.command == "door-map-compare":
+            result = command_door_map_compare(args)
         elif args.command == "set-articulation":
             result = command_set_articulation(args)
         elif args.command == "task-config-template":

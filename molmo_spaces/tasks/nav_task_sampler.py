@@ -139,6 +139,56 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
         # Delegate to base class for other keys (e.g., __gripper__)
         return super().resolve_visibility_object(env, key)
 
+    @staticmethod
+    def _swap_benchmark_alias_prefix(object_name: str) -> str | None:
+        alias_prefix = {
+            "trashcan_": "ashcan_",
+            "ashcan_": "trashcan_",
+        }
+        for src_prefix, dst_prefix in alias_prefix.items():
+            if object_name.startswith(src_prefix):
+                return dst_prefix + object_name[len(src_prefix) :]
+        return None
+
+    def _normalize_benchmark_object_name(self, object_name: str, om) -> str:
+        valid_names = {obj.name for obj in self.candidate_objects or []}
+        if object_name in valid_names:
+            return object_name
+
+        alias_name = self._swap_benchmark_alias_prefix(object_name)
+        if alias_name is not None and alias_name in valid_names:
+            log.info(
+                "[NavTaskSampler] Remapped benchmark object alias '%s' -> '%s'",
+                object_name,
+                alias_name,
+            )
+            return alias_name
+
+        return object_name
+
+    def _normalize_benchmark_task_config(self, om) -> None:
+        task_cfg = self.config.task_config
+        if task_cfg.pickup_obj_name is None:
+            return
+
+        task_cfg.pickup_obj_name = self._normalize_benchmark_object_name(
+            task_cfg.pickup_obj_name, om
+        )
+
+        if task_cfg.pickup_obj_candidates is None:
+            return
+
+        normalized_candidates = []
+        seen = set()
+        for candidate_name in task_cfg.pickup_obj_candidates:
+            normalized_name = self._normalize_benchmark_object_name(candidate_name, om)
+            if normalized_name in seen:
+                continue
+            seen.add(normalized_name)
+            normalized_candidates.append(normalized_name)
+
+        task_cfg.pickup_obj_candidates = normalized_candidates
+
     def _sample_task(self, env: CPUMujocoEnv) -> NavToObjTask:
         """Sample a navigation to object task configuration and create the task."""
         # Set current batch index to 0 (most common case for single-batch environments)
@@ -212,6 +262,7 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
             else:
                 # If pickup_obj_name is pre-specified, it might be a type or specific instance
                 # Try to interpret it as a type and collect candidates
+                self._normalize_benchmark_task_config(om)
                 if self.config.task_config.pickup_obj_candidates is None:
                     pickup_obj_type = om.category_from_name(self.config.task_config.pickup_obj_name)
                     synset = om.get_annotation_synset(self.config.task_config.pickup_obj_name)

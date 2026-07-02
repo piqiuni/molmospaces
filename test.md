@@ -113,6 +113,16 @@ source ~/miniconda3/etc/profile.d/conda.sh && conda activate mlspaces && for i i
 
 ---
 
+## 4.4 开关门 GT path获取
+
+
+测试
+```bash
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MLSPACES_CACHE_DIR=/tmp/molmo-spaces-cache-proxy MLSPACES_ASSETS_DIR=/tmp/molmo-spaces-assets-proxy /home/user/miniconda3/envs/mlspaces/bin/python scripts/InteractiveNav/explore_molmo_interactions.py door-path-study --house_ind 10 --variant ceiling --target_types fridge --close_doors_on_path 0 --output_json scripts/InteractiveNav/output/door-path-study_procthor-10k_train_10_fridge
+```
+
+
+
 ## 5. 导航仿真与 ROS 联调
 
 ## 5.1 启动导航仿真

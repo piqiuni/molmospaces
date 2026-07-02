@@ -468,9 +468,12 @@ class BaseMujocoTask(ABC):
 
     def close(self):
         # Clear any MlSpacesObject references
+        mlspaces_object_type = (
+            MlSpacesObjectAbstract if isinstance(MlSpacesObjectAbstract, type) else None
+        )
         for attr in list(vars(self).keys()):
             obj = getattr(self, attr, None)
-            if isinstance(obj, MlSpacesObjectAbstract):
+            if mlspaces_object_type is not None and isinstance(obj, mlspaces_object_type):
                 setattr(self, attr, None)
 
         # Clear sensor suite
@@ -487,4 +490,5 @@ class BaseMujocoTask(ABC):
     def __del__(self) -> None:
         """Clean up resources when the task is destroyed."""
         # TODO(all): cleanup?
-        self.close()
+        with contextlib.suppress(Exception):
+            self.close()
