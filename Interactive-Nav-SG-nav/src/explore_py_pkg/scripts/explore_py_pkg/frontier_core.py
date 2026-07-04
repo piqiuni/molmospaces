@@ -64,6 +64,10 @@ class FrontierConfig:
     candidate_top_k: int = 12
     sensor_range_m: float = 5.0
     subgoal_search_radius_cells: int = 8
+    min_subgoal_distance_m: float = 0.75
+    target_frontier_offset_m: float = 0.35
+    min_obstacle_clearance_m: float = 0.25
+    max_clearance_check_m: float = 0.8
     information_weight: float = 1.0
     distance_weight: float = 0.55
     semantic_weight: float = 0.35
@@ -91,7 +95,7 @@ class FrontierExplorerCore:
         for cells in raw_clusters:
             if len(cells) < self.config.min_cluster_cells:
                 continue
-            cluster = self._build_cluster(grid, cells, robot_xy)
+            cluster = self._build_cluster(grid, cells, robot_xy, state=state)
             if cluster is None:
                 continue
             if state is not None and not state.is_cluster_available(cluster):
@@ -177,11 +181,12 @@ class FrontierExplorerCore:
         grid: OccupancyGridData,
         cells: list[tuple[int, int]],
         robot_xy: tuple[float, float],
+        state=None,
     ) -> FrontierCluster | None:
         cx = sum(cell[0] for cell in cells) / float(len(cells))
         cy = sum(cell[1] for cell in cells) / float(len(cells))
         centroid_world = grid.spec.grid_to_world(round(cx), round(cy))
-        subgoal_cell = self._choose_subgoal_cell(grid, cells, robot_xy)
+        subgoal_cell = self._choose_subgoal_cell(grid, cells, robot_xy, state=state)
         if subgoal_cell is None:
             return None
         subgoal_world = grid.spec.grid_to_world(subgoal_cell[0], subgoal_cell[1])
@@ -203,10 +208,12 @@ class FrontierExplorerCore:
         grid: OccupancyGridData,
         cells: list[tuple[int, int]],
         robot_xy: tuple[float, float],
+        state=None,
     ) -> tuple[int, int] | None:
         robot_cell = grid.spec.world_to_grid(robot_xy[0], robot_xy[1])
         candidates: set[tuple[int, int]] = set()
         radius = max(1, self.config.subgoal_search_radius_cells)
+        min_robot_dist_cells = max(1.0, self.config.min_subgoal_distance_m / max(grid.spec.resolution, 1e-6))
         for fx, fy in cells:
             for y in range(fy - radius, fy + radius + 1):
                 for x in range(fx - radius, fx + radius + 1):
@@ -214,16 +221,49 @@ class FrontierExplorerCore:
                         continue
                     if not self._is_free(grid.cell(x, y)):
                         continue
+                    if state is not None:
+                        wx, wy = grid.spec.grid_to_world(x, y)
+                        if state.is_goal_point_blocked((wx, wy)):
+                            continue
                     candidates.add((x, y))
         if not candidates:
             return None
 
-        def key(cell: tuple[int, int]) -> tuple[float, float]:
-            near_frontier = min(hypot(cell[0] - fx, cell[1] - fy) for fx, fy in cells)
-            robot_dist = hypot(cell[0] - robot_cell[0], cell[1] - robot_cell[1])
-            return near_frontier, robot_dist
+        distant_candidates = [
+            cell
+            for cell in candidates
+            if hypot(cell[0] - robot_cell[0], cell[1] - robot_cell[1]) >= min_robot_dist_cells
+        ]
+        if not distant_candidates:
+            distant_candidates = list(candidates)
 
-        return min(candidates, key=key)
+        resolution = max(grid.spec.resolution, 1e-6)
+        min_clearance_cells = max(0, int(round(self.config.min_obstacle_clearance_m / resolution)))
+        max_clearance_cells = max(min_clearance_cells, int(round(self.config.max_clearance_check_m / resolution)))
+        clear_candidates = [
+            cell
+            for cell in distant_candidates
+            if self._occupied_clearance_cells(grid, cell, max_clearance_cells) >= min_clearance_cells
+        ]
+        if not clear_candidates:
+            clear_candidates = distant_candidates
+
+        frontier_cx = sum(fx for fx, _ in cells) / float(len(cells))
+        frontier_cy = sum(fy for _, fy in cells) / float(len(cells))
+        frontier_anchor = min(cells, key=lambda item: hypot(item[0] - frontier_cx, item[1] - frontier_cy))
+        target_offset_cells = max(1.0, self.config.target_frontier_offset_m / resolution)
+
+        def key(cell: tuple[int, int]) -> tuple[float, float, float, float]:
+            center_dist = hypot(cell[0] - frontier_cx, cell[1] - frontier_cy)
+            anchor_dist = hypot(cell[0] - frontier_anchor[0], cell[1] - frontier_anchor[1])
+            near_frontier = min(hypot(cell[0] - fx, cell[1] - fy) for fx, fy in cells)
+            desired_offset_error = abs(near_frontier - target_offset_cells)
+            clearance = self._occupied_clearance_cells(grid, cell, max_clearance_cells)
+            robot_dist = hypot(cell[0] - robot_cell[0], cell[1] - robot_cell[1])
+            # Prefer a central observation point for the cluster, not a far endpoint.
+            return center_dist + 0.25 * anchor_dist, desired_offset_error, -clearance, robot_dist
+
+        return min(clear_candidates, key=key)
 
     def _score_cluster(self, cluster: FrontierCluster, grid, robot_xy, value_provider, state) -> None:
         info = self._normalize_information(cluster.information_gain)
@@ -277,6 +317,29 @@ class FrontierExplorerCore:
 
     def _is_free(self, value: int | None) -> bool:
         return value is not None and 0 <= int(value) <= self.config.free_max
+
+    def _occupied_clearance_cells(
+        self,
+        grid: OccupancyGridData,
+        cell: tuple[int, int],
+        max_radius_cells: int,
+    ) -> float:
+        max_radius_cells = max(0, max_radius_cells)
+        if max_radius_cells == 0:
+            return float("inf")
+        cx, cy = cell
+        best: float | None = None
+        for y in range(cy - max_radius_cells, cy + max_radius_cells + 1):
+            for x in range(cx - max_radius_cells, cx + max_radius_cells + 1):
+                if not grid.spec.in_bounds(x, y):
+                    continue
+                value = grid.cell(x, y)
+                if value is None or int(value) < self.config.occupied_min:
+                    continue
+                dist = hypot(x - cx, y - cy)
+                if dist <= max_radius_cells and (best is None or dist < best):
+                    best = dist
+        return float(max_radius_cells + 1 if best is None else best)
 
     @staticmethod
     def _is_unknown(value: int | None) -> bool:

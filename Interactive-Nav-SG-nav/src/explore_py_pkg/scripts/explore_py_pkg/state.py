@@ -14,8 +14,16 @@ SUBGOAL_IDLE = "idle"
 SUBGOAL_SENT = "sent"
 SUBGOAL_WAITING = "waiting"
 SUBGOAL_REACHED = "reached"
+SUBGOAL_REACHED_POSE_ONLY = "reached_pose_only"
 SUBGOAL_FAILED = "failed"
 SUBGOAL_STALLED = "stalled"
+
+
+@dataclass
+class BlockedGoalPoint:
+    point: tuple[float, float]
+    expire_time: float
+    radius_m: float
 
 
 @dataclass
@@ -45,12 +53,16 @@ class ActiveGoal:
 @dataclass
 class ExplorerStateConfig:
     goal_reach_tolerance_m: float = 0.75
-    goal_timeout_sec: float = 45.0
-    stall_timeout_sec: float = 12.0
+    goal_timeout_sec: float = 90.0
+    stall_timeout_sec: float = 30.0
     stall_distance_m: float = 0.15
     blacklist_duration_sec: float = 25.0
     failed_cluster_retry_sec: float = 120.0
     frontier_match_distance_m: float = 1.0
+    failed_point_blacklist_sec: float = 180.0
+    failed_point_blacklist_radius_m: float = 1.25
+    reached_point_blacklist_sec: float = 90.0
+    reached_point_blacklist_radius_m: float = 0.75
 
 
 @dataclass
@@ -58,7 +70,12 @@ class ExplorerState:
     config: ExplorerStateConfig = field(default_factory=ExplorerStateConfig)
     records: dict[str, ClusterRecord] = field(default_factory=dict)
     active_goal: ActiveGoal | None = None
+    blocked_goal_points: list[BlockedGoalPoint] = field(default_factory=list)
     last_event: str = ""
+    last_failure_reason: str = ""
+    last_failure_source: str = ""
+    last_replan_reason: str = ""
+    last_replan_source: str = ""
 
     def update_seen_clusters(self, clusters, now: float | None = None) -> None:
         now = self._now(now)
@@ -105,12 +122,12 @@ class ExplorerState:
         self.last_event = "goal_sent"
         return self.active_goal
 
-    def clear_active_goal(self, status: str, now: float | None = None) -> None:
+    def clear_active_goal(self, status: str, now: float | None = None, event: str | None = None) -> None:
         now = self._now(now)
         if self.active_goal is not None:
             self.active_goal.status = status
         self.active_goal = None
-        self.last_event = status
+        self.last_event = status if event is None else event
 
     def mark_active_reached(self, now: float | None = None) -> None:
         now = self._now(now)
@@ -121,7 +138,22 @@ class ExplorerState:
         record.updated_at = now
         self.clear_active_goal(SUBGOAL_REACHED, now)
 
-    def mark_active_failed(self, reason: str, now: float | None = None) -> None:
+    def mark_active_reached_pose_only(self, now: float | None = None) -> None:
+        now = self._now(now)
+        if self.active_goal is None:
+            return
+        self.block_goal_point(
+            self.active_goal.point,
+            duration_sec=self.config.reached_point_blacklist_sec,
+            radius_m=self.config.reached_point_blacklist_radius_m,
+            now=now,
+        )
+        record = self._record_for(self.active_goal.cluster_id)
+        record.status = CLUSTER_ACTIVE
+        record.updated_at = now
+        self.clear_active_goal(SUBGOAL_REACHED_POSE_ONLY, now)
+
+    def mark_active_failed(self, reason: str, now: float | None = None, source: str = "explorer") -> None:
         now = self._now(now)
         if self.active_goal is None:
             return
@@ -130,8 +162,17 @@ class ExplorerState:
         record.failure_count += 1
         record.blacklist_until = now + self.config.failed_cluster_retry_sec
         record.updated_at = now
-        self.last_event = reason
-        self.clear_active_goal(SUBGOAL_FAILED, now)
+        self.block_goal_point(
+            self.active_goal.point,
+            duration_sec=self.config.failed_point_blacklist_sec,
+            radius_m=self.config.failed_point_blacklist_radius_m,
+            now=now,
+        )
+        self.last_failure_reason = reason
+        self.last_failure_source = source
+        self.last_replan_reason = reason
+        self.last_replan_source = source
+        self.clear_active_goal(SUBGOAL_FAILED, now, event=reason)
 
     def blacklist_cluster(self, cluster_id: str, now: float | None = None) -> None:
         now = self._now(now)
@@ -149,17 +190,16 @@ class ExplorerState:
         goal.status = SUBGOAL_WAITING
         dist_to_goal = hypot(goal.point[0] - robot_xy[0], goal.point[1] - robot_xy[1])
         if dist_to_goal <= self.config.goal_reach_tolerance_m:
-            self.mark_active_reached(now)
             return SUBGOAL_REACHED
         if now - goal.sent_at > self.config.goal_timeout_sec:
-            self.mark_active_failed("goal_timeout", now)
+            self.mark_active_failed("goal_timeout", now, source="explorer")
             return SUBGOAL_FAILED
         moved = hypot(robot_xy[0] - goal.last_robot_xy[0], robot_xy[1] - goal.last_robot_xy[1])
         if moved >= self.config.stall_distance_m:
             goal.last_robot_xy = robot_xy
             goal.last_progress_at = now
         elif now - goal.last_progress_at > self.config.stall_timeout_sec:
-            self.mark_active_failed("goal_stalled", now)
+            self.mark_active_failed("goal_stalled", now, source="explorer")
             return SUBGOAL_STALLED
         return SUBGOAL_WAITING
 
@@ -173,8 +213,33 @@ class ExplorerState:
     def fail_active_if_goal_not_free(self, is_free: bool, now: float | None = None) -> bool:
         if self.active_goal is None or is_free:
             return False
-        self.mark_active_failed("goal_not_free", now)
+        self.mark_active_failed("goal_not_free", now, source="explorer")
         return True
+
+    def block_goal_point(
+        self,
+        point: tuple[float, float],
+        duration_sec: float,
+        radius_m: float | None = None,
+        now: float | None = None,
+    ) -> None:
+        now = self._now(now)
+        self._purge_blocked_goal_points(now)
+        self.blocked_goal_points.append(
+            BlockedGoalPoint(
+                point=point,
+                expire_time=now + duration_sec,
+                radius_m=self.config.reached_point_blacklist_radius_m if radius_m is None else radius_m,
+            )
+        )
+
+    def is_goal_point_blocked(self, point: tuple[float, float], now: float | None = None) -> bool:
+        now = self._now(now)
+        self._purge_blocked_goal_points(now)
+        for item in self.blocked_goal_points:
+            if hypot(point[0] - item.point[0], point[1] - item.point[1]) <= item.radius_m:
+                return True
+        return False
 
     def revisit_penalty(self, cluster) -> float:
         record = self.records.get(cluster.cluster_id)
@@ -203,7 +268,12 @@ class ExplorerState:
         return {
             "cluster_counts": counts,
             "active_goal": active,
+            "blocked_goal_points": len(self.blocked_goal_points),
             "last_event": self.last_event,
+            "last_failure_reason": self.last_failure_reason,
+            "last_failure_source": self.last_failure_source,
+            "last_replan_reason": self.last_replan_reason,
+            "last_replan_source": self.last_replan_source,
         }
 
     def _record_for(self, cluster_id: str) -> ClusterRecord:
@@ -216,3 +286,6 @@ class ExplorerState:
     @staticmethod
     def _now(now: float | None = None) -> float:
         return float(time.time() if now is None else now)
+
+    def _purge_blocked_goal_points(self, now: float) -> None:
+        self.blocked_goal_points = [item for item in self.blocked_goal_points if item.expire_time > now]

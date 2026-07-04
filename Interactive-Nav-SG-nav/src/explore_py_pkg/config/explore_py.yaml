@@ -19,14 +19,18 @@ topics:
 
 exploration:
   tick_rate_hz: 1.0
-  goal_republish_interval_sec: 2.0
+  goal_republish_interval_sec: 0.0
   goal_reach_tolerance_m: 0.75
-  goal_timeout_sec: 45.0
-  stall_timeout_sec: 12.0
+  goal_timeout_sec: 90.0
+  stall_timeout_sec: 30.0
   stall_distance_m: 0.15
   blacklist_duration_sec: 25.0
   failed_cluster_retry_sec: 120.0
   frontier_match_distance_m: 1.0
+  failed_point_blacklist_sec: 180.0
+  failed_point_blacklist_radius_m: 1.25
+  reached_point_blacklist_sec: 90.0
+  reached_point_blacklist_radius_m: 0.75
   active_goal_frontier_min_cells: 1
 
 frontier:
@@ -37,6 +41,10 @@ frontier:
   candidate_top_k: 12
   sensor_range_m: 5.0
   subgoal_search_radius_cells: 8
+  min_subgoal_distance_m: 0.75
+  target_frontier_offset_m: 0.35
+  min_obstacle_clearance_m: 0.25
+  max_clearance_check_m: 0.8
 
 scoring:
   information_weight: 1.0

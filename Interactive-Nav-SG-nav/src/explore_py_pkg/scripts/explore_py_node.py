@@ -42,9 +42,9 @@ from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from explore_py_pkg.frontier_core import FrontierConfig, FrontierExplorerCore, GridSpec, OccupancyGridData
-from explore_py_pkg.nav_client import TERMINAL_FAILURE, TERMINAL_SUCCESS, latest_status, status_name
+from explore_py_pkg.nav_client import TERMINAL_FAILURE, TERMINAL_SUCCESS, status_name
 from explore_py_pkg.skill_api import ExplorationSkillApi
-from explore_py_pkg.state import ExplorerState, ExplorerStateConfig, SUBGOAL_WAITING
+from explore_py_pkg.state import ExplorerState, ExplorerStateConfig, SUBGOAL_REACHED, SUBGOAL_WAITING
 from explore_py_pkg.value_maps import ValueMapFusion
 
 
@@ -63,6 +63,8 @@ class ExplorePyNode:
         self.active_goal_frontier_min_cells = int(exploration_cfg.get("active_goal_frontier_min_cells", 1))
         self.last_goal_publish_time = 0.0
         self.last_status_key = ""
+        self.seen_terminal_status_keys = set()
+        self.last_move_base_feedback = None
 
         core_config = FrontierConfig(
             free_max=int(frontier_cfg.get("free_max", 20)),
@@ -72,6 +74,10 @@ class ExplorePyNode:
             candidate_top_k=int(frontier_cfg.get("candidate_top_k", 12)),
             sensor_range_m=float(frontier_cfg.get("sensor_range_m", 5.0)),
             subgoal_search_radius_cells=int(frontier_cfg.get("subgoal_search_radius_cells", 8)),
+            min_subgoal_distance_m=float(frontier_cfg.get("min_subgoal_distance_m", 0.75)),
+            target_frontier_offset_m=float(frontier_cfg.get("target_frontier_offset_m", 0.35)),
+            min_obstacle_clearance_m=float(frontier_cfg.get("min_obstacle_clearance_m", 0.25)),
+            max_clearance_check_m=float(frontier_cfg.get("max_clearance_check_m", 0.8)),
             information_weight=float(scoring_cfg.get("information_weight", 1.0)),
             distance_weight=float(scoring_cfg.get("distance_weight", 0.55)),
             semantic_weight=float(scoring_cfg.get("semantic_weight", 0.35)),
@@ -81,12 +87,16 @@ class ExplorePyNode:
         )
         state_config = ExplorerStateConfig(
             goal_reach_tolerance_m=float(exploration_cfg.get("goal_reach_tolerance_m", 0.75)),
-            goal_timeout_sec=float(exploration_cfg.get("goal_timeout_sec", 45.0)),
-            stall_timeout_sec=float(exploration_cfg.get("stall_timeout_sec", 12.0)),
+            goal_timeout_sec=float(exploration_cfg.get("goal_timeout_sec", 90.0)),
+            stall_timeout_sec=float(exploration_cfg.get("stall_timeout_sec", 30.0)),
             stall_distance_m=float(exploration_cfg.get("stall_distance_m", 0.15)),
             blacklist_duration_sec=float(exploration_cfg.get("blacklist_duration_sec", 25.0)),
             failed_cluster_retry_sec=float(exploration_cfg.get("failed_cluster_retry_sec", 120.0)),
             frontier_match_distance_m=float(exploration_cfg.get("frontier_match_distance_m", 1.0)),
+            failed_point_blacklist_sec=float(exploration_cfg.get("failed_point_blacklist_sec", 180.0)),
+            failed_point_blacklist_radius_m=float(exploration_cfg.get("failed_point_blacklist_radius_m", 1.25)),
+            reached_point_blacklist_sec=float(exploration_cfg.get("reached_point_blacklist_sec", 90.0)),
+            reached_point_blacklist_radius_m=float(exploration_cfg.get("reached_point_blacklist_radius_m", 0.75)),
         )
 
         self.core = FrontierExplorerCore(core_config)
@@ -154,19 +164,35 @@ class ExplorePyNode:
         self.value_fusion.set_navigation_hints_json(msg.data)
 
     def move_base_status_callback(self, msg):
-        status = latest_status(msg)
-        if status is None or self.state.active_goal is None:
-            return
-        status_key = f"{getattr(status.goal_id, 'id', '')}:{int(status.status)}:{getattr(msg.header, 'seq', 0)}"
-        if status_key == self.last_status_key:
-            return
-        self.last_status_key = status_key
-        code = int(status.status)
-        if code in TERMINAL_FAILURE:
-            rospy.logwarn("[explore_py] move_base reported %s, replanning next tick", status_name(code))
-            self.state.mark_active_failed(f"move_base_{status_name(code).lower()}")
-        elif code in TERMINAL_SUCCESS and self._active_goal_distance() <= self.state.config.goal_reach_tolerance_m * 1.5:
-            self.state.mark_active_reached()
+        has_active_goal = self.state.active_goal is not None
+        for status in getattr(msg, "status_list", []) or []:
+            code = int(status.status)
+            if code not in TERMINAL_FAILURE and code not in TERMINAL_SUCCESS:
+                continue
+            feedback = {
+                "goal_id": getattr(status.goal_id, "id", ""),
+                "status": code,
+                "status_name": status_name(code),
+                "text": getattr(status, "text", ""),
+                "stamp": msg.header.stamp.to_sec() if msg.header.stamp else 0.0,
+                "is_terminal_failure": code in TERMINAL_FAILURE,
+                "is_terminal_success": code in TERMINAL_SUCCESS,
+            }
+            self.last_move_base_feedback = feedback
+            status_key = f"{getattr(status.goal_id, 'id', '')}:{code}:{getattr(status, 'text', '')}"
+            if status_key in self.seen_terminal_status_keys:
+                continue
+            self.seen_terminal_status_keys.add(status_key)
+            self.last_status_key = status_key
+            if not has_active_goal:
+                continue
+            if code in TERMINAL_FAILURE:
+                rospy.logwarn("[explore_py] move_base reported %s, replanning next tick", status_name(code))
+                self.state.mark_active_failed(f"move_base_{status_name(code).lower()}", source="move_base")
+                return
+            if code in TERMINAL_SUCCESS and self._active_goal_distance() <= self.state.config.goal_reach_tolerance_m * 1.5:
+                self.state.mark_active_reached()
+                return
 
     def tick(self, _event):
         if self.latest_grid is None or self.robot_xy is None:
@@ -183,9 +209,14 @@ class ExplorePyNode:
                     self.state.config.frontier_match_distance_m,
                     min_cells=self.active_goal_frontier_min_cells,
                 )
-                self.state.mark_active_covered_if_frontier_gone(has_frontier)
-                if self.state.active_goal is not None:
-                    self.state.update_goal_progress(self.robot_xy)
+                progress = self.state.update_goal_progress(self.robot_xy)
+                if progress == SUBGOAL_REACHED:
+                    if has_frontier:
+                        self.state.mark_active_reached_pose_only()
+                    else:
+                        self.state.mark_active_reached()
+                elif self.state.active_goal is not None:
+                    self.state.mark_active_covered_if_frontier_gone(has_frontier)
 
         if self.state.active_goal is None:
             cluster = self.compute_next_subgoal(force=True)
@@ -193,7 +224,7 @@ class ExplorePyNode:
                 self._send_goal(cluster)
         else:
             now = time.time()
-            if now - self.last_goal_publish_time >= self.goal_republish_interval_sec:
+            if self.goal_republish_interval_sec > 0.0 and now - self.last_goal_publish_time >= self.goal_republish_interval_sec:
                 self._publish_active_goal()
 
         self._publish_frontiers()
@@ -238,6 +269,8 @@ class ExplorePyNode:
         }
         if self.state.active_goal is not None:
             payload["active_goal_distance"] = self._active_goal_distance()
+        if self.last_move_base_feedback is not None:
+            payload["move_base_feedback"] = self.last_move_base_feedback
         return payload
 
     def _send_goal(self, cluster):

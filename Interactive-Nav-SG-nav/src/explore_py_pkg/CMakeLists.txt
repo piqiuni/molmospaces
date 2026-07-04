@@ -14,6 +14,7 @@ catkin_package()
 
 catkin_install_python(PROGRAMS
   scripts/explore_py_node.py
+  scripts/record_explore_debug.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 def get_args():
     parser = argparse.ArgumentParser()
-    subparser = parser.add_subparls sers(
+    subparser = parser.add_subparsers(
         dest="asset_type", help="Type of asset to fetch.", required=True
     )
 
@@ -36,7 +36,8 @@ def fetch_scene(args):
         install_scene_with_objects_and_grasps_from_path,
     )
 
-    scenes = get_scenes(args.scene_type)
+    scenes = get_scenes(args.scene_type, split=args.split)
+    print(f"Fetching scene {args.scene_type} index {args.index} split {args.split} variant {args.variant}")
     scene_path_or_dict = scenes[args.split][args.index]
     if isinstance(scene_path_or_dict, dict):
         scene_path = scene_path_or_dict[args.variant]

@@ -102,11 +102,17 @@ python scripts/datagen/rank_nav_scenes.py --scene_dataset procthor-10k --data_sp
 
 适用场景：
 
-- 提前准备一批场景资源
+- 提前准备一批场景资源，从cache软链接到本地资产目录
 - 避免运行时逐个下载
 
 ```bash
+export MLSPACES_CACHE_DIR=/home/user/.cache/molmo-spaces-resources
+export MLSPACES_ASSETS_DIR=/home/user/ldl/molmospaces/assets
+
 source ~/miniconda3/etc/profile.d/conda.sh && conda activate mlspaces && for i in $(seq 0 100); do python scripts/datagen/fetch_assets.py scene procthor-10k $i --split train --variant ceiling || true; done
+
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate mlspaces && for i in $(seq 0 1000); do python scripts/datagen/fetch_assets.py scene procthor-10k $i --split val --variant ceiling || true; done
+
 ```
 
 注意：该命令较重，不应在普通文档修改后顺手执行。
