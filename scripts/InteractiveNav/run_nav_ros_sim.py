@@ -2,16 +2,21 @@ import argparse
 import datetime
 import logging
 from pathlib import Path
+import struct
 import time
+import zlib
 
 import mujoco
+import numpy as np
 
 from robot_conversion_patches import patch_droid_config_for_rum
 
 from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
 from molmo_spaces.configs.camera_configs import (
+    FixedExocentricCameraConfig,
     FrankaDroidCameraSystem,
     RBY1GoProD455CameraSystem,
+    RobotMountedCameraConfig,
 )
 from molmo_spaces.configs.policy_configs import AStarNavToObjPolicyConfig
 from molmo_spaces.configs.robot_configs import FloatingRUMRobotConfig, FrankaRobotConfig, RBY1Config
@@ -26,6 +31,58 @@ from molmo_spaces.utils.profiler_utils import Profiler
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+
+def write_rgb_png(path: Path, frame) -> None:
+    arr = np.asarray(frame)
+    if arr.dtype != np.uint8:
+        if np.issubdtype(arr.dtype, np.floating) and arr.size and float(np.nanmax(arr)) <= 1.0:
+            arr = np.nan_to_num(arr, nan=0.0) * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[:, :, None], 3, axis=2)
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        raise ValueError(f"Expected image-like array, got shape {arr.shape}")
+    arr = np.ascontiguousarray(arr[:, :, :3])
+    height, width = arr.shape[:2]
+    rows = [b"\x00" + arr[y].tobytes() for y in range(height)]
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    data = b"\x89PNG\r\n\x1a\n"
+    data += _png_chunk(b"IHDR", header)
+    data += _png_chunk(b"IDAT", zlib.compress(b"".join(rows), 6))
+    data += _png_chunk(b"IEND", b"")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def extract_observation_image(observation, camera_name: str):
+    if isinstance(observation, list) and observation:
+        observation = observation[0]
+    if not isinstance(observation, dict):
+        return None
+    frame = observation.get(camera_name)
+    if frame is not None:
+        return frame
+    return None
+
+
+def maybe_save_debug_snapshot(policy, observation) -> None:
+    snapshot_path = getattr(policy, "debug_snapshot_path", "")
+    if not snapshot_path or getattr(policy, "debug_snapshot_saved", False):
+        return
+    camera_name = getattr(policy, "debug_snapshot_camera_name", "debug_front_camera")
+    frame = extract_observation_image(observation, camera_name)
+    if frame is None:
+        return
+    path = Path(snapshot_path).expanduser().resolve()
+    write_rgb_png(path, frame)
+    path.with_suffix(".txt").write_text(f"camera={camera_name}\nshape={np.asarray(frame).shape}\n")
+    policy.debug_snapshot_saved = True
+    log.info("Saved debug camera snapshot: %s", path)
 
 
 def configure_run_file_logging(output_dir: Path) -> Path:
@@ -94,6 +151,44 @@ def disable_camera_randomization(camera_system) -> None:
             cam.orientation_noise_degrees = None
 
 
+def parse_qpos_csv(value: str | None, expected_len: int = 7):
+    if not value:
+        return None
+    values = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if len(values) != expected_len:
+        raise ValueError(f"Expected {expected_len} comma-separated joint values, got {len(values)}: {value!r}")
+    import numpy as np
+
+    return np.asarray(values, dtype="float32")
+
+
+def parse_float_csv(value: str | None, expected_len: int):
+    if not value:
+        return None
+    values = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if len(values) != expected_len:
+        raise ValueError(f"Expected {expected_len} comma-separated values, got {len(values)}: {value!r}")
+    return values
+
+
+def yaw_to_quat_wxyz(yaw: float) -> list[float]:
+    return [float(np.cos(yaw * 0.5)), 0.0, 0.0, float(np.sin(yaw * 0.5))]
+
+
+def lookat_forward_up(camera_pos: list[float], target_pos: list[float]) -> tuple[list[float], list[float]]:
+    forward = np.asarray(target_pos, dtype=float) - np.asarray(camera_pos, dtype=float)
+    forward = forward / max(np.linalg.norm(forward), 1e-6)
+    world_up = np.asarray([0.0, 0.0, 1.0], dtype=float)
+    right = np.cross(forward, world_up)
+    if np.linalg.norm(right) < 1e-6:
+        right = np.asarray([1.0, 0.0, 0.0], dtype=float)
+    else:
+        right = right / np.linalg.norm(right)
+    up = np.cross(right, forward)
+    up = up / max(np.linalg.norm(up), 1e-6)
+    return forward.tolist(), up.tolist()
+
+
 class NavRosRolloutRunner(ParallelRolloutRunner):
     @staticmethod
     def patch_config(frozen_config, data=None, exp_config=None):
@@ -122,6 +217,7 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
         policy.task = task
         policy.reset()
+        maybe_save_debug_snapshot(policy, observation)
 
         try:
             task.env.current_model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_SLEEP)
@@ -134,6 +230,7 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             if shutdown_event is not None and shutdown_event.is_set():
                 return False
 
+            maybe_save_debug_snapshot(policy, observation)
             action_cmd = policy.get_action(observation)
             if action_cmd is None:
                 break
@@ -191,7 +288,9 @@ def build_nav_config(args) -> NavToObjBaseConfig:
             "requires sensor observation field 'qpos'."
         )
 
-    if args.target_types:
+    if args.exploration_only:
+        cfg.task_sampler_config.pickup_types = []
+    elif args.target_types:
         cfg.task_sampler_config.pickup_types = [s.strip() for s in args.target_types.split(",")]
 
     if args.robot == "droid":
@@ -201,7 +300,54 @@ def build_nav_config(args) -> NavToObjBaseConfig:
         ensure_head_camera_exists(cfg.camera_config)
     elif args.robot == "rby1":
         cfg.robot_config = RBY1Config()
+        arm_qpos = parse_qpos_csv(args.initial_arm_qpos)
+        left_arm_qpos = parse_qpos_csv(args.initial_left_arm_qpos)
+        right_arm_qpos = parse_qpos_csv(args.initial_right_arm_qpos)
+        if left_arm_qpos is None:
+            left_arm_qpos = arm_qpos
+        if right_arm_qpos is None:
+            right_arm_qpos = arm_qpos
+        if left_arm_qpos is not None:
+            cfg.robot_config.init_qpos["left_arm"] = left_arm_qpos.copy()
+            cfg.robot_config.init_qpos_noise_range["left_arm"] = left_arm_qpos * 0.0
+        if right_arm_qpos is not None:
+            cfg.robot_config.init_qpos["right_arm"] = right_arm_qpos.copy()
+            cfg.robot_config.init_qpos_noise_range["right_arm"] = right_arm_qpos * 0.0
+        fixed_pose_xyyaw = parse_float_csv(args.fixed_robot_xyyaw, expected_len=3)
+        if fixed_pose_xyyaw is not None:
+            x, y, yaw = fixed_pose_xyyaw
+            cfg.task_config.robot_base_pose = [x, y, 0.1, *yaw_to_quat_wxyz(yaw)]
         cfg.camera_config = RBY1GoProD455CameraSystem()
+        if args.publish_debug_front_camera:
+            fixed_camera_pos = parse_float_csv(args.fixed_debug_camera_pos, expected_len=3)
+            fixed_camera_target = parse_float_csv(args.fixed_debug_camera_target, expected_len=3)
+            if fixed_camera_pos is not None and fixed_camera_target is not None:
+                forward, up = lookat_forward_up(fixed_camera_pos, fixed_camera_target)
+                cfg.camera_config.cameras.append(
+                    FixedExocentricCameraConfig(
+                        name=args.debug_front_camera_name,
+                        pos=fixed_camera_pos,
+                        forward=forward,
+                        up=up,
+                        fov=75.0,
+                        skip_erosion=True,
+                    )
+                )
+            else:
+                debug_camera_offset = parse_float_csv(args.debug_front_camera_offset, expected_len=3)
+                debug_camera_lookat_offset = parse_float_csv(args.debug_front_camera_lookat_offset, expected_len=3)
+                cfg.camera_config.cameras.append(
+                    RobotMountedCameraConfig(
+                        name=args.debug_front_camera_name,
+                        reference_body_names=["robot_0/base", "base"],
+                        camera_offset=debug_camera_offset or [-1.4, 0.0, 1.35],
+                        lookat_offset=debug_camera_lookat_offset or [0.0, 0.0, 0.35],
+                        camera_quaternion=[0.5, 0.5, -0.5, -0.5],
+                        up_axis="z",
+                        fov=75.0,
+                        skip_erosion=True,
+                    )
+                )
         if not args.randomize_camera:
             disable_camera_randomization(cfg.camera_config)
         ensure_head_camera_exists(cfg.camera_config)
@@ -254,6 +400,14 @@ def parse_args():
     parser.add_argument("--house_ind", type=int, default=0)
     parser.add_argument("--samples_per_house", type=int, default=1)
     parser.add_argument("--target_types", type=str, default=None)
+    parser.add_argument(
+        "--exploration_only",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Do not filter the scene by a requested target type; use any navigable object only to initialize the scene.",
+    )
     parser.add_argument("--task_horizon", type=int, default=300)
     parser.add_argument("--policy_dt_ms", type=float, default=100.0)
     parser.add_argument("--seed", type=int, default=2)
@@ -285,6 +439,16 @@ def parse_args():
     parser.add_argument("--action_topic", type=str, default="/molmo_spaces/action")
     parser.add_argument("--pointcloud_topic", type=str, default="/registered_scan")
     parser.add_argument("--camera_info_topic", type=str, default="/molmo_spaces/head_camera/camera_info")
+    parser.add_argument("--extra_image_topic", type=str, default="/molmo_spaces/debug_front_camera/image")
+    parser.add_argument("--debug_front_camera_name", type=str, default="debug_front_camera")
+    parser.add_argument("--publish_debug_front_camera", type=str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--debug_snapshot_path", type=str, default="")
+    parser.add_argument("--debug_snapshot_camera_name", type=str, default="debug_front_camera")
+    parser.add_argument("--fixed_robot_xyyaw", type=str, default="")
+    parser.add_argument("--fixed_debug_camera_pos", type=str, default="")
+    parser.add_argument("--fixed_debug_camera_target", type=str, default="")
+    parser.add_argument("--debug_front_camera_offset", type=str, default="-1.4,0.0,1.35")
+    parser.add_argument("--debug_front_camera_lookat_offset", type=str, default="0.0,0.0,0.35")
     parser.add_argument("--depth_camera_name", type=str, default="head_camera")
     parser.add_argument("--pointcloud_frame_id", type=str, default="tf_frame_lidar")
     parser.add_argument("--pointcloud_stride", type=int, default=2)
@@ -348,6 +512,14 @@ def parse_args():
         default=3.0,
         help="Linear velocity gain applied to incoming /cmd_vel_stamped before stepping base.",
     )
+    parser.add_argument(
+        "--initial_arm_qpos",
+        type=str,
+        default="0.28,0.0,0.0,-0.64,0.39,-0.26,-0.04",
+        help="Comma-separated 7-DoF RBY1 left/right arm initial and hold qpos for ROS navigation runs.",
+    )
+    parser.add_argument("--initial_left_arm_qpos", type=str, default="")
+    parser.add_argument("--initial_right_arm_qpos", type=str, default="")
     parser.add_argument(
         "--immediate_noop_after_publish",
         action="store_true",
@@ -429,7 +601,23 @@ def main():
             cmd_vel_linear_gain=args.cmd_vel_linear_gain,
             immediate_noop_after_publish=args.immediate_noop_after_publish,
             timing_log_every_n_frames=args.timing_log_every_n_frames,
+            extra_image_topic=args.extra_image_topic,
+            extra_image_camera_name=args.debug_front_camera_name,
         )
+        arm_qpos = parse_qpos_csv(args.initial_arm_qpos)
+        left_arm_qpos = parse_qpos_csv(args.initial_left_arm_qpos)
+        right_arm_qpos = parse_qpos_csv(args.initial_right_arm_qpos)
+        if left_arm_qpos is None:
+            left_arm_qpos = arm_qpos
+        if right_arm_qpos is None:
+            right_arm_qpos = arm_qpos
+        if left_arm_qpos is not None:
+            policy.default_left_arm_qpos = left_arm_qpos.copy()
+        if right_arm_qpos is not None:
+            policy.default_right_arm_qpos = right_arm_qpos.copy()
+    policy.debug_snapshot_path = args.debug_snapshot_path
+    policy.debug_snapshot_camera_name = args.debug_snapshot_camera_name
+    policy.debug_snapshot_saved = False
     print("Creating runner ...")
     runner = NavRosRolloutRunner(exp_config)
     print("Starting runner.run() ...")

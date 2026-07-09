@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import hypot
+from math import atan2, ceil, hypot
 from typing import Iterable
 
 
@@ -49,6 +49,7 @@ class FrontierCluster:
     centroid_world: tuple[float, float]
     subgoal_cell: tuple[int, int]
     subgoal_world: tuple[float, float]
+    subgoal_yaw: float
     information_gain: float
     distance_to_robot: float
     score: float = 0.0
@@ -59,6 +60,7 @@ class FrontierCluster:
 class FrontierConfig:
     free_max: int = 20
     occupied_min: int = 50
+    hard_min_cluster_cells: int = 3
     min_cluster_cells: int = 3
     connect_8: bool = True
     candidate_top_k: int = 12
@@ -66,14 +68,33 @@ class FrontierConfig:
     subgoal_search_radius_cells: int = 8
     min_subgoal_distance_m: float = 0.75
     target_frontier_offset_m: float = 0.35
+    use_voronoi_viewpoints: bool = True
+    min_viewpoint_frontier_distance_m: float = 0.65
+    max_viewpoint_frontier_distance_m: float = 2.8
+    clearance_weight: float = 0.8
+    frontier_offset_weight: float = 0.45
+    local_horizon_m: float = 3.0
+    local_horizon_penalty: float = 0.35
+    far_cluster_penalty: float = 0.45
+    far_cluster_penalty_saturation_m: float = 4.0
     min_obstacle_clearance_m: float = 0.25
     max_clearance_check_m: float = 0.8
+    robot_radius_m: float = 0.35
+    footprint_safety_margin_m: float = 0.10
+    require_footprint_free: bool = True
+    footprint_unknown_is_free: bool = True
+    turning_safety_margin_m: float = 0.25
+    require_turning_clearance: bool = True
     information_weight: float = 1.0
     distance_weight: float = 0.55
     semantic_weight: float = 0.35
     llm_weight: float = 0.8
     revisit_penalty: float = 0.6
     failure_penalty: float = 1.0
+    receding_distance_weight: float = 0.15
+    previous_subgoal_weight: float = 0.35
+    near_frontier_relax_distance_m: float = 1.5
+    relaxed_min_viewpoint_frontier_distance_m: float = 0.35
 
 
 class FrontierExplorerCore:
@@ -81,6 +102,7 @@ class FrontierExplorerCore:
 
     def __init__(self, config: FrontierConfig | None = None):
         self.config = config or FrontierConfig()
+        self.last_debug_stats: dict[str, int] = {}
 
     def extract_frontier_clusters(
         self,
@@ -91,17 +113,30 @@ class FrontierExplorerCore:
     ) -> list[FrontierCluster]:
         frontier_cells = self._find_frontier_cells(grid)
         raw_clusters = self._cluster_cells(frontier_cells)
+        stats = {
+            "frontier_cells": len(frontier_cells),
+            "raw_clusters": len(raw_clusters),
+            "dropped_tiny": 0,
+            "dropped_no_viewpoint": 0,
+            "dropped_state": 0,
+            "kept_clusters": 0,
+        }
         clusters: list[FrontierCluster] = []
         for cells in raw_clusters:
-            if len(cells) < self.config.min_cluster_cells:
+            if len(cells) < max(1, self.config.hard_min_cluster_cells):
+                stats["dropped_tiny"] += 1
                 continue
             cluster = self._build_cluster(grid, cells, robot_xy, state=state)
             if cluster is None:
+                stats["dropped_no_viewpoint"] += 1
                 continue
             if state is not None and not state.is_cluster_available(cluster):
+                stats["dropped_state"] += 1
                 continue
             self._score_cluster(cluster, grid, robot_xy, value_provider, state)
             clusters.append(cluster)
+        stats["kept_clusters"] = len(clusters)
+        self.last_debug_stats = stats
         clusters.sort(key=lambda item: item.score, reverse=True)
         return clusters
 
@@ -115,7 +150,10 @@ class FrontierExplorerCore:
         clusters = self.extract_frontier_clusters(grid, robot_xy, value_provider=value_provider, state=state)
         if not clusters:
             return None
-        ranked = self._receding_horizon_rank(clusters[: max(1, self.config.candidate_top_k)], robot_xy)
+        cursor_xy = robot_xy
+        if state is not None and getattr(state, "last_subgoal_world", None) is not None:
+            cursor_xy = state.last_subgoal_world
+        ranked = self._receding_horizon_rank(clusters[: max(1, self.config.candidate_top_k)], cursor_xy)
         return ranked[0] if ranked else None
 
     def has_frontier_near(
@@ -190,6 +228,7 @@ class FrontierExplorerCore:
         if subgoal_cell is None:
             return None
         subgoal_world = grid.spec.grid_to_world(subgoal_cell[0], subgoal_cell[1])
+        subgoal_yaw = atan2(centroid_world[1] - subgoal_world[1], centroid_world[0] - subgoal_world[0])
         dist = hypot(subgoal_world[0] - robot_xy[0], subgoal_world[1] - robot_xy[1])
         cluster_id = self._cluster_id(grid, centroid_world)
         return FrontierCluster(
@@ -199,6 +238,7 @@ class FrontierExplorerCore:
             centroid_world=centroid_world,
             subgoal_cell=subgoal_cell,
             subgoal_world=subgoal_world,
+            subgoal_yaw=subgoal_yaw,
             information_gain=float(len(cells)),
             distance_to_robot=dist,
         )
@@ -214,6 +254,8 @@ class FrontierExplorerCore:
         candidates: set[tuple[int, int]] = set()
         radius = max(1, self.config.subgoal_search_radius_cells)
         min_robot_dist_cells = max(1.0, self.config.min_subgoal_distance_m / max(grid.spec.resolution, 1e-6))
+        min_view_frontier_cells = self.config.min_viewpoint_frontier_distance_m / max(grid.spec.resolution, 1e-6)
+        max_view_frontier_cells = self.config.max_viewpoint_frontier_distance_m / max(grid.spec.resolution, 1e-6)
         for fx, fy in cells:
             for y in range(fy - radius, fy + radius + 1):
                 for x in range(fx - radius, fx + radius + 1):
@@ -229,54 +271,168 @@ class FrontierExplorerCore:
         if not candidates:
             return None
 
-        distant_candidates = [
-            cell
-            for cell in candidates
-            if hypot(cell[0] - robot_cell[0], cell[1] - robot_cell[1]) >= min_robot_dist_cells
-        ]
-        if not distant_candidates:
-            distant_candidates = list(candidates)
-
         resolution = max(grid.spec.resolution, 1e-6)
         min_clearance_cells = max(0, int(round(self.config.min_obstacle_clearance_m / resolution)))
         max_clearance_cells = max(min_clearance_cells, int(round(self.config.max_clearance_check_m / resolution)))
+        footprint_radius_cells = max(
+            0,
+            int(ceil((self.config.robot_radius_m + self.config.footprint_safety_margin_m) / resolution)),
+        )
+        turning_radius_cells = max(
+            footprint_radius_cells,
+            int(
+                ceil(
+                    (
+                        self.config.robot_radius_m
+                        + self.config.footprint_safety_margin_m
+                        + self.config.turning_safety_margin_m
+                    )
+                    / resolution
+                )
+            ),
+        )
+        if self.config.require_footprint_free and footprint_radius_cells > 0:
+            candidates = {
+                cell
+                for cell in candidates
+                if self._footprint_is_free(grid, cell, footprint_radius_cells)
+            }
+            if not candidates:
+                return None
+        if self.config.require_turning_clearance and turning_radius_cells > footprint_radius_cells:
+            turning_candidates = {
+                cell
+                for cell in candidates
+                if self._footprint_is_free(grid, cell, turning_radius_cells)
+            }
+            if not turning_candidates:
+                return None
+            candidates = turning_candidates
+        clearance_by_cell = {
+            cell: self._occupied_clearance_cells(grid, cell, max_clearance_cells)
+            for cell in candidates
+        }
+        nearest_frontier_by_cell = {
+            cell: min(hypot(cell[0] - fx, cell[1] - fy) for fx, fy in cells)
+            for cell in candidates
+        }
+
+        if self.config.use_voronoi_viewpoints:
+            relax_dist_cells = self.config.near_frontier_relax_distance_m / max(grid.spec.resolution, 1e-6)
+            relaxed_min_view_frontier_cells = (
+                self.config.relaxed_min_viewpoint_frontier_distance_m / max(grid.spec.resolution, 1e-6)
+            )
+            viewpoint_candidates = [
+                cell
+                for cell in candidates
+                if nearest_frontier_by_cell[cell] >= (
+                    relaxed_min_view_frontier_cells
+                    if hypot(cell[0] - robot_cell[0], cell[1] - robot_cell[1]) <= relax_dist_cells
+                    else min_view_frontier_cells
+                )
+                and nearest_frontier_by_cell[cell] <= max_view_frontier_cells
+                and clearance_by_cell[cell] >= min_clearance_cells
+            ]
+            if not viewpoint_candidates:
+                viewpoint_candidates = [
+                    cell
+                    for cell in candidates
+                    if nearest_frontier_by_cell[cell] >= min_view_frontier_cells * 0.5
+                    and clearance_by_cell[cell] >= min_clearance_cells
+                ]
+            if not viewpoint_candidates:
+                return None
+        else:
+            viewpoint_candidates = list(candidates)
+
+        distant_candidates = [
+            cell
+            for cell in viewpoint_candidates
+            if hypot(cell[0] - robot_cell[0], cell[1] - robot_cell[1]) >= min_robot_dist_cells
+        ]
+        if not distant_candidates:
+            distant_candidates = list(viewpoint_candidates)
+
         clear_candidates = [
             cell
             for cell in distant_candidates
-            if self._occupied_clearance_cells(grid, cell, max_clearance_cells) >= min_clearance_cells
+            if clearance_by_cell[cell] >= min_clearance_cells
         ]
         if not clear_candidates:
-            clear_candidates = distant_candidates
+            return None
 
         frontier_cx = sum(fx for fx, _ in cells) / float(len(cells))
         frontier_cy = sum(fy for _, fy in cells) / float(len(cells))
         frontier_anchor = min(cells, key=lambda item: hypot(item[0] - frontier_cx, item[1] - frontier_cy))
         target_offset_cells = max(1.0, self.config.target_frontier_offset_m / resolution)
+        if self.config.use_voronoi_viewpoints:
+            target_offset_cells = max(target_offset_cells, min_view_frontier_cells)
+        local_horizon_cells = max(1.0, self.config.local_horizon_m / resolution)
 
         def key(cell: tuple[int, int]) -> tuple[float, float, float, float]:
             center_dist = hypot(cell[0] - frontier_cx, cell[1] - frontier_cy)
             anchor_dist = hypot(cell[0] - frontier_anchor[0], cell[1] - frontier_anchor[1])
-            near_frontier = min(hypot(cell[0] - fx, cell[1] - fy) for fx, fy in cells)
+            near_frontier = nearest_frontier_by_cell[cell]
             desired_offset_error = abs(near_frontier - target_offset_cells)
-            clearance = self._occupied_clearance_cells(grid, cell, max_clearance_cells)
+            clearance = clearance_by_cell[cell]
             robot_dist = hypot(cell[0] - robot_cell[0], cell[1] - robot_cell[1])
-            # Prefer a central observation point for the cluster, not a far endpoint.
-            return center_dist + 0.25 * anchor_dist, desired_offset_error, -clearance, robot_dist
+            horizon_penalty = max(0.0, robot_dist - local_horizon_cells)
+            ridge_bonus = self._clearance_ridge_bonus(grid, cell, clearance, clearance_by_cell, max_clearance_cells)
+            # Frontier picks the information target; this key picks a safer stand-off viewpoint.
+            return (
+                center_dist + 0.25 * anchor_dist,
+                self.config.frontier_offset_weight * desired_offset_error,
+                self.config.local_horizon_penalty * horizon_penalty,
+                -self.config.clearance_weight * clearance - ridge_bonus,
+                robot_dist,
+            )
 
         return min(clear_candidates, key=key)
+
+    def _footprint_is_free(
+        self,
+        grid: OccupancyGridData,
+        cell: tuple[int, int],
+        radius_cells: int,
+    ) -> bool:
+        cx, cy = cell
+        radius_sq = radius_cells * radius_cells
+        for y in range(cy - radius_cells, cy + radius_cells + 1):
+            for x in range(cx - radius_cells, cx + radius_cells + 1):
+                if (x - cx) * (x - cx) + (y - cy) * (y - cy) > radius_sq:
+                    continue
+                if not grid.spec.in_bounds(x, y):
+                    return False
+                value = grid.cell(x, y)
+                if self.config.footprint_unknown_is_free and self._is_unknown(value):
+                    continue
+                if not self._is_free(value):
+                    return False
+        return True
 
     def _score_cluster(self, cluster: FrontierCluster, grid, robot_xy, value_provider, state) -> None:
         info = self._normalize_information(cluster.information_gain)
         distance_score = 1.0 / (1.0 + cluster.distance_to_robot)
+        far_overrun_m = max(0.0, cluster.distance_to_robot - self.config.local_horizon_m)
+        far_denominator = max(self.config.far_cluster_penalty_saturation_m, 1e-6)
+        far_penalty = min(1.0, far_overrun_m / far_denominator)
         semantic = float(value_provider.semantic_value(cluster, grid) if value_provider is not None else 0.0)
         llm = float(value_provider.llm_value(cluster, grid) if value_provider is not None else 0.0)
         revisit = float(state.revisit_penalty(cluster) if state is not None else 0.0)
         failure = float(state.failure_penalty(cluster) if state is not None else 0.0)
+        previous_subgoal_score = 0.0
+        if state is not None and getattr(state, "last_subgoal_world", None) is not None:
+            previous = state.last_subgoal_world
+            previous_subgoal_score = 1.0 / (
+                1.0 + hypot(cluster.subgoal_world[0] - previous[0], cluster.subgoal_world[1] - previous[1])
+            )
         score = (
             self.config.information_weight * info
             + self.config.distance_weight * distance_score
+            + self.config.previous_subgoal_weight * previous_subgoal_score
             + self.config.semantic_weight * semantic
             + self.config.llm_weight * llm
+            - self.config.far_cluster_penalty * far_penalty
             - self.config.revisit_penalty * revisit
             - self.config.failure_penalty * failure
         )
@@ -284,6 +440,8 @@ class FrontierExplorerCore:
         cluster.score_terms = {
             "information": info,
             "distance": distance_score,
+            "previous_subgoal": previous_subgoal_score,
+            "far_cluster_penalty": far_penalty,
             "semantic": semantic,
             "llm": llm,
             "revisit_penalty": revisit,
@@ -301,7 +459,9 @@ class FrontierExplorerCore:
         while remaining:
             next_cluster = max(
                 remaining,
-                key=lambda item: item.score - 0.05 * hypot(item.subgoal_world[0] - cursor[0], item.subgoal_world[1] - cursor[1]),
+                key=lambda item: item.score
+                - self.config.receding_distance_weight
+                * hypot(item.subgoal_world[0] - cursor[0], item.subgoal_world[1] - cursor[1]),
             )
             ordered.append(next_cluster)
             remaining.remove(next_cluster)
@@ -340,6 +500,31 @@ class FrontierExplorerCore:
                 if dist <= max_radius_cells and (best is None or dist < best):
                     best = dist
         return float(max_radius_cells + 1 if best is None else best)
+
+    def _clearance_ridge_bonus(
+        self,
+        grid: OccupancyGridData,
+        cell: tuple[int, int],
+        clearance: float,
+        cached_clearance: dict[tuple[int, int], float],
+        max_radius_cells: int,
+    ) -> float:
+        if not self.config.use_voronoi_viewpoints:
+            return 0.0
+        lower_or_equal = 0
+        checked = 0
+        for nx, ny in self._neighbors8(cell[0], cell[1]):
+            if not grid.spec.in_bounds(nx, ny) or not self._is_free(grid.cell(nx, ny)):
+                continue
+            checked += 1
+            neighbor = cached_clearance.get((nx, ny))
+            if neighbor is None:
+                neighbor = self._occupied_clearance_cells(grid, (nx, ny), max_radius_cells)
+            if clearance >= neighbor:
+                lower_or_equal += 1
+        if checked == 0:
+            return 0.0
+        return 0.15 * float(lower_or_equal) / float(checked)
 
     @staticmethod
     def _is_unknown(value: int | None) -> bool:

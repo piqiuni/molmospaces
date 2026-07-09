@@ -52,8 +52,8 @@ filter_height_frame: tf_frame_base_link
 
 # 障碍物膨胀参数
 enable_obstacle_inflation: true
-inflation_radius: 0.20  # 膨胀半径（米），通常设置为机器人半径
-inscribed_radius: 0.1  # 内切半径（米），障碍物核心区域
+inflation_radius: 0.10  # 膨胀半径（米）
+inscribed_radius: 0.05  # 障碍物核心区域
 
 # 局部覆写参数（用最新扫描实时覆盖机器人附近区域）
 enable_local_overwrite: true

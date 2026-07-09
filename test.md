@@ -1,6 +1,6 @@
 # 交互导航开发测试手册
 
-最后更新：2026-06-03
+最后更新：2026-07-06
 
 ## 1. 文档定位
 
@@ -181,6 +181,73 @@ roslaunch nav_pkg molmospaces_nav_system.launch
 conda activate mlspaces
 source ./Interactive-Nav-SG-nav/devel/setup.zsh
 roslaunch semantic_mapping_py_pkg semantic_mapping_debug.launch
+```
+
+## 5.5 RBY1 初始机械臂姿态验证
+
+适用场景：
+
+- 调试探索过程中机器人手臂碰撞墙体、门框或家具的问题
+- 固定机器人位置和外部相机，比较不同初始手臂姿态
+- 保存正视图和侧视图，作为后续导航探索配置依据
+
+当前推荐初始姿态为 `shoulder_roll_in_045`，该姿态主要做水平方向贴近身体，不做明显前后或上下抬放：
+
+```text
+left_arm_qpos  = 0.28,0.0,-0.45,-0.64,0.39,-0.26,-0.04
+right_arm_qpos = 0.28,0.0, 0.45,-0.64,0.39,-0.26,-0.04
+```
+
+该姿态已经配置为 `Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch` 中的默认左右臂初始姿态。启动完整导航系统时默认生效：
+
+```bash
+conda activate mlspaces
+source /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/devel/setup.zsh
+roslaunch nav_pkg molmospaces_nav_system.launch start_explore_py:=true
+```
+
+如需重新生成固定外部相机快照，可关闭 mapping/nav/explore，只启动仿真并保存 reset 后的 debug snapshot。侧视图示例：
+
+```bash
+conda activate mlspaces
+source /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/devel/setup.zsh
+roslaunch nav_pkg molmospaces_nav_system.launch \
+  start_mapping:=false \
+  start_nav:=false \
+  start_explore:=false \
+  start_explore_py:=false \
+  start_semantic_mapping:=false \
+  exploration_only:=true \
+  publish_debug_front_camera:=true \
+  house_ind:=1 \
+  target_types:="" \
+  task_horizon:=20 \
+  sim_extra_args:="--immediate_noop_after_publish --timing_log_every_n_frames 0 --fixed_robot_xyyaw 6.7,7.8,-0.53 --fixed_debug_camera_pos 5.9,6.9,1.25 --fixed_debug_camera_target 6.7,7.8,0.85 --initial_left_arm_qpos 0.28,0.0,-0.45,-0.64,0.39,-0.26,-0.04 --initial_right_arm_qpos 0.28,0.0,0.45,-0.64,0.39,-0.26,-0.04 --debug_snapshot_path /home/user/ldl/molmospaces/outputs/important_results/rby1_initial_arm_pose_shoulder_roll_in_045/side_view.png"
+```
+
+正视图只需要替换固定相机位置：
+
+```bash
+conda activate mlspaces
+source /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/devel/setup.zsh
+roslaunch nav_pkg molmospaces_nav_system.launch \
+  start_mapping:=false \
+  start_nav:=false \
+  start_explore:=false \
+  start_explore_py:=false \
+  start_semantic_mapping:=false \
+  exploration_only:=true \
+  publish_debug_front_camera:=true \
+  house_ind:=1 \
+  target_types:="" \
+  task_horizon:=20 \
+  sim_extra_args:="--immediate_noop_after_publish --timing_log_every_n_frames 0 --fixed_robot_xyyaw 6.7,7.8,-0.53 --fixed_debug_camera_pos 8.15,6.95,1.15 --fixed_debug_camera_target 6.7,7.8,0.85 --initial_left_arm_qpos 0.28,0.0,-0.45,-0.64,0.39,-0.26,-0.04 --initial_right_arm_qpos 0.28,0.0,0.45,-0.64,0.39,-0.26,-0.04 --debug_snapshot_path /home/user/ldl/molmospaces/outputs/important_results/rby1_initial_arm_pose_shoulder_roll_in_045/front_view.png"
+```
+
+重要测试结果归档目录：
+
+```text
+/home/user/ldl/molmospaces/outputs/important_results/rby1_initial_arm_pose_shoulder_roll_in_045
 ```
 
 ---

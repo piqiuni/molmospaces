@@ -60,6 +60,8 @@ class RosBridgePolicy(BasePolicy):
         map_warmup_skip_frames: int = 10,
         immediate_noop_after_publish: bool = False,
         timing_log_every_n_frames: int = 30,
+        extra_image_topic: str = "/molmo_spaces/debug_front_camera/image",
+        extra_image_camera_name: str = "debug_front_camera",
     ) -> None:
         super().__init__(config, task)
         self.observation_topic = observation_topic
@@ -100,6 +102,8 @@ class RosBridgePolicy(BasePolicy):
         self.map_warmup_skip_frames = max(0, int(map_warmup_skip_frames))
         self.immediate_noop_after_publish = bool(immediate_noop_after_publish)
         self.timing_log_every_n_frames = max(0, int(timing_log_every_n_frames))
+        self.extra_image_topic = extra_image_topic
+        self.extra_image_camera_name = extra_image_camera_name
         if cmd_vel_control_dt_s is None:
             cfg_dt_ms = getattr(config, "policy_dt_ms", None)
             if cfg_dt_ms is not None and float(cfg_dt_ms) > 0.0:
@@ -168,6 +172,9 @@ class RosBridgePolicy(BasePolicy):
             rospy.init_node("molmo_spaces_ros_policy", anonymous=True, disable_signals=True)
 
         self._obs_pub = rospy.Publisher(self.observation_topic, Image, queue_size=self.queue_size)
+        self._extra_image_pub = None
+        if self.extra_image_topic and self.extra_image_camera_name:
+            self._extra_image_pub = rospy.Publisher(self.extra_image_topic, Image, queue_size=self.queue_size)
         self._depth_pub = rospy.Publisher(self.depth_topic, Image, queue_size=self.queue_size)
         self._pointcloud_pub = rospy.Publisher(self.pointcloud_topic, PointCloud2, queue_size=self.queue_size)
         self._camera_info_pub = rospy.Publisher(
@@ -670,6 +677,15 @@ class RosBridgePolicy(BasePolicy):
                 return value
         return None
 
+    def _extract_named_image_from_observation(self, observation: Any, camera_name: str) -> np.ndarray | None:
+        obs_dict = self._extract_observation_dict(observation)
+        if obs_dict is None or not camera_name:
+            return None
+        value = obs_dict.get(camera_name)
+        if isinstance(value, np.ndarray) and value.ndim in (2, 3):
+            return value
+        return None
+
     def _extract_observation_dict(self, observation: Any) -> dict[str, Any] | None:
         if isinstance(observation, list) and len(observation) > 0:
             observation = observation[0]
@@ -915,7 +931,7 @@ class RosBridgePolicy(BasePolicy):
         info.P = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
         return info
 
-    def _to_image_msg(self, frame: np.ndarray):
+    def _to_image_msg(self, frame: np.ndarray, stamp=None):
         img = frame
         if img.dtype != np.uint8:
             if np.issubdtype(img.dtype, np.floating):
@@ -942,7 +958,7 @@ class RosBridgePolicy(BasePolicy):
             return None
 
         msg = self._Image()
-        msg.header.stamp = self._rospy.Time.now()
+        msg.header.stamp = stamp if stamp is not None else self._rospy.Time.now()
         msg.header.frame_id = self.optical_frame_id
         msg.height = h
         msg.width = w
@@ -1070,7 +1086,7 @@ class RosBridgePolicy(BasePolicy):
             t0 = time.perf_counter()
             frame = self._extract_image_from_observation(observation)
             if frame is not None:
-                msg = self._to_image_msg(frame)
+                msg = self._to_image_msg(frame, stamp=common_stamp)
                 if msg is not None:
                     self._obs_pub.publish(msg)
                 else:
@@ -1080,6 +1096,12 @@ class RosBridgePolicy(BasePolicy):
                     2.0,
                     "RosBridgePolicy: no image-like tensor found in observation."
                 )
+            if self._extra_image_pub is not None:
+                extra_frame = self._extract_named_image_from_observation(observation, self.extra_image_camera_name)
+                if extra_frame is not None:
+                    extra_msg = self._to_image_msg(extra_frame, stamp=common_stamp)
+                    if extra_msg is not None:
+                        self._extra_image_pub.publish(extra_msg)
             stage_ms["rgb_publish"] = (time.perf_counter() - t0) * 1000.0
 
         if self.publish_pointcloud and not skip_mapping_observation:
