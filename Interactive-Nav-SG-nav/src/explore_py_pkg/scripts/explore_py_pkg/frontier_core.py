@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from math import atan2, ceil, hypot
 from typing import Iterable
 
@@ -93,8 +94,12 @@ class FrontierConfig:
     failure_penalty: float = 1.0
     receding_distance_weight: float = 0.15
     previous_subgoal_weight: float = 0.35
+    continuity_cost_weight: float = 0.25
+    continuity_cost_saturation_m: float = 4.0
     near_frontier_relax_distance_m: float = 1.5
     relaxed_min_viewpoint_frontier_distance_m: float = 0.35
+    initial_local_radius_m: float = 2.2
+    initial_backward_weight: float = 0.35
 
 
 class FrontierExplorerCore:
@@ -148,13 +153,52 @@ class FrontierExplorerCore:
         state=None,
     ) -> FrontierCluster | None:
         clusters = self.extract_frontier_clusters(grid, robot_xy, value_provider=value_provider, state=state)
+        ranked = self.rank_clusters(clusters, robot_xy, state=state)
+        return ranked[0] if ranked else None
+
+    def rank_clusters(
+        self,
+        clusters: list[FrontierCluster],
+        robot_xy: tuple[float, float],
+        state=None,
+    ) -> list[FrontierCluster]:
         if not clusters:
-            return None
+            return []
         cursor_xy = robot_xy
         if state is not None and getattr(state, "last_subgoal_world", None) is not None:
             cursor_xy = state.last_subgoal_world
-        ranked = self._receding_horizon_rank(clusters[: max(1, self.config.candidate_top_k)], cursor_xy)
-        return ranked[0] if ranked else None
+        return self._receding_horizon_rank(clusters[: max(1, self.config.candidate_top_k)], cursor_xy)
+
+    def select_initial_local_cluster(
+        self,
+        clusters: list[FrontierCluster],
+        robot_xy: tuple[float, float],
+        robot_yaw: float | None = None,
+    ) -> FrontierCluster | None:
+        if not clusters:
+            return None
+        radius = max(0.0, self.config.initial_local_radius_m)
+        local = [cluster for cluster in clusters if cluster.distance_to_robot <= radius]
+        candidates = local if local else list(clusters)
+
+        def key(cluster: FrontierCluster) -> tuple[float, float, float]:
+            dx = cluster.subgoal_world[0] - robot_xy[0]
+            dy = cluster.subgoal_world[1] - robot_xy[1]
+            behind_bonus = 0.0
+            if robot_yaw is not None:
+                heading_x = math.cos(robot_yaw)
+                heading_y = math.sin(robot_yaw)
+                dist = max(cluster.distance_to_robot, 1e-6)
+                # Positive when the candidate is behind the robot.
+                behind_bonus = max(0.0, -(dx * heading_x + dy * heading_y) / dist)
+            info_tie_break = self._normalize_information(cluster.information_gain)
+            return (
+                cluster.distance_to_robot - self.config.initial_backward_weight * behind_bonus,
+                -info_tie_break,
+                -cluster.score,
+            )
+
+        return min(candidates, key=key)
 
     def has_frontier_near(
         self,
@@ -421,11 +465,16 @@ class FrontierExplorerCore:
         revisit = float(state.revisit_penalty(cluster) if state is not None else 0.0)
         failure = float(state.failure_penalty(cluster) if state is not None else 0.0)
         previous_subgoal_score = 0.0
+        continuity_cost = 0.0
+        cursor_xy = robot_xy
         if state is not None and getattr(state, "last_subgoal_world", None) is not None:
             previous = state.last_subgoal_world
             previous_subgoal_score = 1.0 / (
                 1.0 + hypot(cluster.subgoal_world[0] - previous[0], cluster.subgoal_world[1] - previous[1])
             )
+            cursor_xy = previous
+        continuity_dist = hypot(cluster.subgoal_world[0] - cursor_xy[0], cluster.subgoal_world[1] - cursor_xy[1])
+        continuity_cost = min(1.0, continuity_dist / max(self.config.continuity_cost_saturation_m, 1e-6))
         score = (
             self.config.information_weight * info
             + self.config.distance_weight * distance_score
@@ -433,6 +482,7 @@ class FrontierExplorerCore:
             + self.config.semantic_weight * semantic
             + self.config.llm_weight * llm
             - self.config.far_cluster_penalty * far_penalty
+            - self.config.continuity_cost_weight * continuity_cost
             - self.config.revisit_penalty * revisit
             - self.config.failure_penalty * failure
         )
@@ -441,6 +491,7 @@ class FrontierExplorerCore:
             "information": info,
             "distance": distance_score,
             "previous_subgoal": previous_subgoal_score,
+            "continuity_cost": continuity_cost,
             "far_cluster_penalty": far_penalty,
             "semantic": semantic,
             "llm": llm,

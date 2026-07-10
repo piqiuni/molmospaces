@@ -82,9 +82,20 @@ class ExplorePyNode:
         self.local_plan_min_length_m = float(exploration_cfg.get("local_plan_min_length_m", 0.20))
         self.global_plan_min_poses = int(exploration_cfg.get("global_plan_min_poses", 3))
         self.plan_freshness_sec = float(exploration_cfg.get("plan_freshness_sec", 4.0))
+        self.global_plan_current_goal_check_enabled = bool(
+            exploration_cfg.get("global_plan_current_goal_check_enabled", True)
+        )
+        self.global_plan_current_goal_grace_sec = float(
+            exploration_cfg.get("global_plan_current_goal_grace_sec", 4.0)
+        )
+        self.global_plan_goal_tolerance_m = float(exploration_cfg.get("global_plan_goal_tolerance_m", 0.6))
+        self.initial_local_goal_count = int(exploration_cfg.get("initial_local_goal_count", 3))
         self.latest_global_plan_pose_count = 0
         self.latest_global_plan_length_m = 0.0
         self.latest_global_plan_time = 0.0
+        self.latest_global_plan_endpoint = None
+        self.latest_global_plan_goal_distance_m = float("inf")
+        self.latest_global_plan_matches_active_goal = False
         self.latest_local_plan_pose_count = 0
         self.latest_local_plan_length_m = 0.0
         self.latest_local_plan_time = 0.0
@@ -96,6 +107,7 @@ class ExplorePyNode:
         self.active_move_base_goal_id = ""
         self.active_goal_publish_ros_time = 0.0
         self.active_goal_publish_wall_time = 0.0
+        self.sent_goal_count = 0
 
         core_config = FrontierConfig(
             free_max=int(frontier_cfg.get("free_max", 20)),
@@ -133,10 +145,14 @@ class ExplorePyNode:
             failure_penalty=float(scoring_cfg.get("failure_penalty", 1.0)),
             receding_distance_weight=float(scoring_cfg.get("receding_distance_weight", 0.15)),
             previous_subgoal_weight=float(scoring_cfg.get("previous_subgoal_weight", 0.35)),
+            continuity_cost_weight=float(scoring_cfg.get("continuity_cost_weight", 0.25)),
+            continuity_cost_saturation_m=float(scoring_cfg.get("continuity_cost_saturation_m", 4.0)),
             near_frontier_relax_distance_m=float(frontier_cfg.get("near_frontier_relax_distance_m", 1.5)),
             relaxed_min_viewpoint_frontier_distance_m=float(
                 frontier_cfg.get("relaxed_min_viewpoint_frontier_distance_m", 0.35)
             ),
+            initial_local_radius_m=float(frontier_cfg.get("initial_local_radius_m", 2.2)),
+            initial_backward_weight=float(frontier_cfg.get("initial_backward_weight", 0.35)),
         )
         state_config = ExplorerStateConfig(
             goal_reach_tolerance_m=float(exploration_cfg.get("goal_reach_tolerance_m", 0.75)),
@@ -170,7 +186,6 @@ class ExplorePyNode:
         self.robot_yaw = None
         self.latest_clusters = []
         self.last_selected_cluster = None
-        self.preplanned_cluster = None
 
         self.goal_pub = rospy.Publisher(self.topics.get("goal", "/move_base_simple/goal"), PoseStamped, queue_size=1)
         self.cancel_pub = rospy.Publisher(self.topics.get("move_base_cancel", "/move_base/cancel"), GoalID, queue_size=1)
@@ -238,6 +253,21 @@ class ExplorePyNode:
         self.latest_global_plan_pose_count = len(msg.poses)
         self.latest_global_plan_length_m = self._path_length(msg)
         self.latest_global_plan_time = time.time()
+        self.latest_global_plan_endpoint = None
+        self.latest_global_plan_goal_distance_m = float("inf")
+        self.latest_global_plan_matches_active_goal = False
+        if msg.poses:
+            endpoint = msg.poses[-1].pose.position
+            self.latest_global_plan_endpoint = (float(endpoint.x), float(endpoint.y))
+            if self.state.active_goal is not None:
+                goal = self.state.active_goal.point
+                self.latest_global_plan_goal_distance_m = math.hypot(
+                    self.latest_global_plan_endpoint[0] - goal[0],
+                    self.latest_global_plan_endpoint[1] - goal[1],
+                )
+                self.latest_global_plan_matches_active_goal = (
+                    self.latest_global_plan_goal_distance_m <= self.global_plan_goal_tolerance_m
+                )
 
     def local_plan_callback(self, msg: NavPath):
         self.latest_local_plan_pose_count = len(msg.poses)
@@ -308,12 +338,10 @@ class ExplorePyNode:
                 rospy.logwarn("[explore_py] move_base reported %s, replanning next tick", status_name(code))
                 self.state.mark_active_failed(f"move_base_{status_name(code).lower()}", source="move_base")
                 self.active_move_base_goal_id = ""
-                self.preplanned_cluster = None
                 return
             if code in TERMINAL_SUCCESS and self._active_goal_distance() <= self.state.config.goal_reach_tolerance_m * 1.5:
                 self.state.mark_active_reached()
                 self.active_move_base_goal_id = ""
-                self.preplanned_cluster = None
                 return
 
     def tick(self, _event):
@@ -346,6 +374,8 @@ class ExplorePyNode:
                     else:
                         self.state.mark_active_reached()
                 elif self.state.active_goal is not None:
+                    self._fail_if_global_plan_not_current_goal()
+                if self.state.active_goal is not None:
                     self._fail_if_local_plan_missing()
                 if self.state.active_goal is not None:
                     self.state.mark_active_covered_if_frontier_gone(
@@ -354,17 +384,14 @@ class ExplorePyNode:
                         min_goal_age_sec=self.frontier_gone_min_goal_age_sec,
                     )
         if active_goal_before_update and self.state.active_goal is None:
-            self.preplanned_cluster = None
             self._cancel_move_base_goal(self.state.last_event or "explorer_closed_goal")
             self.active_move_base_goal_id = ""
 
         if self.state.active_goal is None:
-            cluster = self.preplanned_cluster or self.compute_next_subgoal(force=True)
-            self.preplanned_cluster = None
+            cluster = self.compute_next_subgoal(force=True)
             if cluster is not None:
                 self._send_goal(cluster)
         else:
-            self.preplanned_cluster = self.compute_next_subgoal(force=False, publish_selection=False)
             now = time.time()
             if self.goal_republish_interval_sec > 0.0 and now - self.last_goal_publish_time >= self.goal_republish_interval_sec:
                 self._publish_active_goal()
@@ -407,6 +434,28 @@ class ExplorePyNode:
             self.state.mark_active_failed("local_plan_degenerate", source="explorer")
             self.local_plan_bad_since = 0.0
 
+    def _fail_if_global_plan_not_current_goal(self):
+        if not self.global_plan_current_goal_check_enabled or self.state.active_goal is None:
+            return
+        now = time.time()
+        goal_age = now - self.state.active_goal.sent_at
+        if goal_age < self.global_plan_current_goal_grace_sec:
+            return
+        fresh_after_goal = self.latest_global_plan_time >= self.active_goal_publish_wall_time
+        plan_available = fresh_after_goal and self.latest_global_plan_pose_count >= self.global_plan_min_poses
+        if plan_available and self.latest_global_plan_matches_active_goal:
+            return
+        reason = "global_plan_not_for_current_goal" if plan_available else "global_plan_missing_current_goal"
+        rospy.logwarn(
+            "[explore_py] current goal has no matching global plan: reason=%s poses=%d endpoint=%s goal_dist=%.2f age=%.1fs",
+            reason,
+            self.latest_global_plan_pose_count,
+            self.latest_global_plan_endpoint,
+            self.latest_global_plan_goal_distance_m,
+            goal_age,
+        )
+        self.state.mark_active_failed(reason, source="explorer")
+
     def compute_next_subgoal(self, force=False, publish_selection=True):
         if self.latest_grid is None or self.robot_xy is None:
             return None
@@ -422,12 +471,11 @@ class ExplorePyNode:
             if publish_selection:
                 self.last_selected_cluster = None
             return None
-        cluster = self.core.select_next_cluster(
-            self.latest_grid,
-            self.robot_xy,
-            value_provider=self.value_fusion,
-            state=self.state,
-        )
+        if self.sent_goal_count < self.initial_local_goal_count:
+            cluster = self.core.select_initial_local_cluster(clusters, self.robot_xy, robot_yaw=self.robot_yaw)
+        else:
+            ranked = self.core.rank_clusters(clusters, self.robot_xy, state=self.state)
+            cluster = ranked[0] if ranked else None
         if publish_selection:
             self.last_selected_cluster = cluster
         return cluster
@@ -459,6 +507,9 @@ class ExplorePyNode:
                 "enabled": self.local_plan_watchdog_enabled,
                 "global_plan_poses": self.latest_global_plan_pose_count,
                 "global_plan_length_m": self.latest_global_plan_length_m,
+                "global_plan_endpoint": self.latest_global_plan_endpoint,
+                "global_plan_goal_distance_m": self._finite_or_none(self.latest_global_plan_goal_distance_m),
+                "global_plan_matches_active_goal": self.latest_global_plan_matches_active_goal,
                 "local_plan_poses": self.latest_local_plan_pose_count,
                 "local_plan_length_m": self.latest_local_plan_length_m,
                 "local_plan_bad_since": self.local_plan_bad_since,
@@ -474,12 +525,19 @@ class ExplorePyNode:
         self.local_plan_bad_since = 0.0
         self.latest_global_plan_pose_count = 0
         self.latest_global_plan_length_m = 0.0
+        self.latest_global_plan_time = 0.0
+        self.latest_global_plan_endpoint = None
+        self.latest_global_plan_goal_distance_m = float("inf")
+        self.latest_global_plan_matches_active_goal = False
         self.latest_local_plan_pose_count = 0
         self.latest_local_plan_length_m = 0.0
+        self.latest_local_plan_time = 0.0
         self.active_move_base_goal_id = ""
         self.active_goal_publish_ros_time = 0.0
         self.active_goal_publish_wall_time = 0.0
+        self.last_selected_cluster = cluster
         self.state.start_goal(cluster, self.robot_xy, robot_yaw=self.robot_yaw, goal_id=cluster.cluster_id)
+        self.sent_goal_count += 1
         self._publish_status()
         self._publish_active_goal()
         rospy.loginfo("[explore_py] sent subgoal cluster=%s point=(%.2f, %.2f, yaw=%.2f) score=%.3f reason=%s",
@@ -738,6 +796,14 @@ class ExplorePyNode:
             "score_terms": cluster.score_terms,
             "cell_count": len(cluster.cells),
         }
+
+    @staticmethod
+    def _finite_or_none(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
 
     @staticmethod
     def _yaw_from_quaternion(q) -> float:

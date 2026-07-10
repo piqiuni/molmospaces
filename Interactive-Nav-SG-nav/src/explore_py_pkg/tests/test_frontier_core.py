@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from explore_py_pkg.frontier_core import FrontierConfig, FrontierExplorerCore, GridSpec, OccupancyGridData
+from explore_py_pkg.frontier_core import FrontierCluster, FrontierConfig, FrontierExplorerCore, GridSpec, OccupancyGridData
 from explore_py_pkg.state import CLUSTER_ACTIVE, CLUSTER_FAILED, ExplorerState, ExplorerStateConfig
 from explore_py_pkg.value_maps import ValueMapFusion
 
@@ -233,6 +233,81 @@ def test_far_frontier_is_penalized_but_not_hard_filtered():
     assert far_clusters
     assert far_clusters[0].score_terms["far_cluster_penalty"] > 0.0
     assert far_clusters[0].score > -1.0
+
+
+def test_initial_local_selection_prefers_near_backward_frontier():
+    core = FrontierExplorerCore(FrontierConfig(initial_local_radius_m=3.0, initial_backward_weight=0.5))
+    front = FrontierCluster(
+        cluster_id="front",
+        cells=[(0, 0)] * 100,
+        centroid_cell=(0.0, 0.0),
+        centroid_world=(3.0, 0.0),
+        subgoal_cell=(3, 0),
+        subgoal_world=(3.0, 0.0),
+        subgoal_yaw=0.0,
+        information_gain=100.0,
+        distance_to_robot=3.0,
+        score=10.0,
+    )
+    back = FrontierCluster(
+        cluster_id="back",
+        cells=[(0, 0)] * 10,
+        centroid_cell=(0.0, 0.0),
+        centroid_world=(-1.5, 0.0),
+        subgoal_cell=(-1, 0),
+        subgoal_world=(-1.5, 0.0),
+        subgoal_yaw=0.0,
+        information_gain=10.0,
+        distance_to_robot=1.5,
+        score=1.0,
+    )
+
+    chosen = core.select_initial_local_cluster([front, back], robot_xy=(0.0, 0.0), robot_yaw=0.0)
+
+    assert chosen is back
+
+
+def test_continuity_is_soft_cost_not_hard_gate():
+    core = FrontierExplorerCore(
+        FrontierConfig(
+            continuity_cost_weight=0.2,
+            continuity_cost_saturation_m=4.0,
+            receding_distance_weight=0.0,
+        )
+    )
+    state = ExplorerState()
+    near = FrontierCluster(
+        cluster_id="near",
+        cells=[(0, 0)],
+        centroid_cell=(0.0, 0.0),
+        centroid_world=(1.0, 0.0),
+        subgoal_cell=(1, 0),
+        subgoal_world=(1.0, 0.0),
+        subgoal_yaw=0.0,
+        information_gain=1.0,
+        distance_to_robot=1.0,
+        score=0.1,
+    )
+    far = FrontierCluster(
+        cluster_id="far",
+        cells=[(0, 0)] * 100,
+        centroid_cell=(0.0, 0.0),
+        centroid_world=(8.0, 0.0),
+        subgoal_cell=(8, 0),
+        subgoal_world=(8.0, 0.0),
+        subgoal_yaw=0.0,
+        information_gain=100.0,
+        distance_to_robot=8.0,
+        score=10.0,
+    )
+    state.last_subgoal_world = (0.0, 0.0)
+    core._score_cluster(near, grid=None, robot_xy=(0.0, 0.0), value_provider=None, state=state)
+    core._score_cluster(far, grid=None, robot_xy=(0.0, 0.0), value_provider=None, state=state)
+
+    ranked = core.rank_clusters([far, near], robot_xy=(0.0, 0.0), state=None)
+
+    assert ranked[0] is far
+    assert far.score_terms["continuity_cost"] > near.score_terms["continuity_cost"]
 
 
 def test_covered_cluster_is_not_selected_again():

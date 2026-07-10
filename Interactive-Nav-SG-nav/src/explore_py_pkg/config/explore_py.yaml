@@ -55,6 +55,10 @@ exploration:
   local_plan_min_length_m: 0.20
   global_plan_min_poses: 3
   plan_freshness_sec: 4.0
+  global_plan_current_goal_check_enabled: true
+  global_plan_current_goal_grace_sec: 4.0
+  global_plan_goal_tolerance_m: 0.6
+  initial_local_goal_count: 3
 
 frontier:
   free_max: 20
@@ -86,6 +90,8 @@ frontier:
   require_turning_clearance: true
   near_frontier_relax_distance_m: 1.5
   relaxed_min_viewpoint_frontier_distance_m: 0.35
+  initial_local_radius_m: 2.2
+  initial_backward_weight: 0.35
 
 scoring:
   information_weight: 1.0
@@ -96,3 +102,5 @@ scoring:
   failure_penalty: 1.0
   receding_distance_weight: 0.15
   previous_subgoal_weight: 0.35
+  continuity_cost_weight: 0.25
+  continuity_cost_saturation_m: 4.0
