@@ -38,7 +38,7 @@ import rospy
 from actionlib_msgs.msg import GoalID, GoalStatusArray
 from geometry_msgs.msg import Point, PointStamped, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from explore_py_pkg.frontier_core import FrontierConfig, FrontierExplorerCore, GridSpec, OccupancyGridData
@@ -218,6 +218,7 @@ class ExplorePyNode:
             self.navigation_hints_callback,
             queue_size=1,
         )
+        rospy.Subscriber(self.topics.get("reset", "/explore_py/reset"), Empty, self.reset_callback, queue_size=1)
 
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.tick_rate_hz, 1e-3)), self.tick)
         self.initial_spin_cmd_timer = rospy.Timer(
@@ -228,6 +229,46 @@ class ExplorePyNode:
                       self.topics.get("occupancy_grid", "/struct_mapping/occ_map"),
                       self.topics.get("goal", "/move_base_simple/goal"),
                       self.topics.get("move_base_status", "/move_base/status"))
+
+    def reset_callback(self, _msg):
+        self._cancel_move_base_goal("external_reset")
+        self.state = ExplorerState(self.state.config)
+        self.value_fusion = ValueMapFusion()
+        self.latest_grid_msg = None
+        self.latest_grid = None
+        self.robot_xy = None
+        self.robot_yaw = None
+        self.latest_clusters = []
+        self.last_selected_cluster = None
+        self.latest_global_plan_pose_count = 0
+        self.latest_global_plan_length_m = 0.0
+        self.latest_global_plan_time = 0.0
+        self.latest_global_plan_endpoint = None
+        self.latest_global_plan_goal_distance_m = float("inf")
+        self.latest_global_plan_matches_active_goal = False
+        self.latest_local_plan_pose_count = 0
+        self.latest_local_plan_length_m = 0.0
+        self.latest_local_plan_time = 0.0
+        self.local_plan_bad_since = 0.0
+        self.last_goal_publish_time = 0.0
+        self.last_status_key = ""
+        self.seen_terminal_status_keys.clear()
+        self.last_move_base_feedback = None
+        self.active_move_base_goal_id = ""
+        self.active_goal_publish_ros_time = 0.0
+        self.active_goal_publish_wall_time = 0.0
+        self.sent_goal_count = 0
+        self.initial_spin_done = not self.initial_spin_enabled
+        self.initial_spin_active = False
+        self.initial_spin_start_time = 0.0
+        self.initial_spin_done_time = 0.0
+        self.initial_spin_last_yaw = None
+        self.initial_spin_accumulated_yaw = 0.0
+        self.initial_spin_reason = "disabled" if self.initial_spin_done else "pending"
+        marker = Marker()
+        marker.action = Marker.DELETEALL
+        self.frontier_pub.publish(MarkerArray(markers=[marker]))
+        rospy.logwarn("[explore_py] exploration state reset for a new scene")
 
     def occupancy_callback(self, msg):
         self.latest_grid_msg = msg

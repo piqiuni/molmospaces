@@ -6,6 +6,7 @@ import csv
 import json
 import logging
 import math
+import queue
 import subprocess
 import struct
 import sys
@@ -160,6 +161,134 @@ def _write_png(path: Path, width: int, height: int, rgb: bytearray) -> None:
     data += _chunk(b"IDAT", zlib.compress(payload, 6))
     data += _chunk(b"IEND", b"")
     path.write_bytes(data)
+
+
+class _AsyncArtifactWriter:
+    def __init__(self, fps: float, crf: int, preset: str, max_queue: int):
+        self.fps = max(0.1, float(fps))
+        self.crf = int(crf)
+        self.preset = str(preset)
+        self.jobs: queue.Queue = queue.Queue(maxsize=max(8, int(max_queue)))
+        self.video_jobs: queue.Queue = queue.Queue(maxsize=max(8, int(max_queue)))
+        self.processes: dict[str, subprocess.Popen] = {}
+        self.process_sizes: dict[str, tuple[int, int]] = {}
+        self.errors: list[str] = []
+        self.dropped_jobs = 0
+        self.thread = threading.Thread(target=self._run, name="explore-artifact-writer", daemon=True)
+        self.video_thread = threading.Thread(target=self._run_video, name="explore-video-writer", daemon=True)
+        self.thread.start()
+        self.video_thread.start()
+
+    def submit_png(self, path: Path, frame) -> None:
+        self._submit(("png", Path(path), frame.copy()))
+
+    def submit_video(self, stream: str, path: Path, frame) -> None:
+        try:
+            self.video_jobs.put_nowait((str(stream), Path(path), frame.copy()))
+        except queue.Full:
+            self.dropped_jobs += 1
+
+    def _submit(self, job) -> None:
+        try:
+            self.jobs.put_nowait(job)
+        except queue.Full:
+            self.dropped_jobs += 1
+
+    def _open_video(self, stream: str, path: Path, width: int, height: int):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        log_path = path.with_name(f"{path.stem}_runtime_ffmpeg.log")
+        log_handle = log_path.open("wb")
+        command = [
+            "ffmpeg", "-nostdin", "-y", "-loglevel", "warning",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
+            "-r", f"{self.fps:.6f}", "-i", "-", "-an", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", "-crf", str(self.crf), "-preset", self.preset,
+            "-g", str(max(1, int(round(self.fps)))),
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof", str(path),
+        ]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log_handle, stderr=subprocess.STDOUT)
+        process._explore_log_handle = log_handle  # type: ignore[attr-defined]
+        self.processes[stream] = process
+        self.process_sizes[stream] = (width, height)
+        return process
+
+    def _write_video(self, stream: str, path: Path, frame) -> None:
+        height, width = frame.shape[:2]
+        process = self.processes.get(stream)
+        if process is None:
+            process = self._open_video(stream, path, width, height)
+        if self.process_sizes.get(stream) != (width, height):
+            frame = cv2.resize(frame, self.process_sizes[stream], interpolation=cv2.INTER_AREA)
+        if process.stdin is None:
+            raise RuntimeError(f"ffmpeg stdin unavailable for {stream}")
+        process.stdin.write(frame.tobytes())
+
+    def _run(self) -> None:
+        while True:
+            job = self.jobs.get()
+            try:
+                if job is None:
+                    return
+                _kind, path, frame = job
+                path.parent.mkdir(parents=True, exist_ok=True)
+                ok = cv2.imwrite(
+                    str(path),
+                    cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                    [cv2.IMWRITE_PNG_COMPRESSION, 1],
+                )
+                if not ok:
+                    raise RuntimeError(f"failed to write {path}")
+            except Exception as exc:  # pragma: no cover - debug artifact best effort
+                self.errors.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                self.jobs.task_done()
+
+    def _run_video(self) -> None:
+        while True:
+            job = self.video_jobs.get()
+            try:
+                if job is None:
+                    return
+                stream, path, frame = job
+                self._write_video(stream, path, frame)
+            except Exception as exc:  # pragma: no cover - debug artifact best effort
+                self.errors.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                self.video_jobs.task_done()
+
+    def close(self) -> None:
+        self.video_jobs.join()
+        self.video_jobs.put(None)
+        self.video_thread.join(timeout=30.0)
+        self.jobs.join()
+        self.jobs.put(None)
+        self.thread.join(timeout=30.0)
+        for process in self.processes.values():
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception as exc:
+                self.errors.append(f"ffmpeg_stdin_close:{type(exc).__name__}: {exc}")
+        for stream, process in self.processes.items():
+            try:
+                returncode = process.wait(timeout=15.0)
+                if returncode != 0:
+                    self.errors.append(f"ffmpeg_{stream}_exit={returncode}")
+            except subprocess.TimeoutExpired:
+                self.errors.append(f"ffmpeg_{stream}_wait_timeout")
+                process.terminate()
+                try:
+                    process.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3.0)
+            except Exception as exc:
+                self.errors.append(f"ffmpeg_{stream}_close:{type(exc).__name__}: {exc}")
+                process.kill()
+            finally:
+                log_handle = getattr(process, "_explore_log_handle", None)
+                if log_handle is not None:
+                    log_handle.close()
 
 
 def _write_grid_pgm_yaml(prefix: Path, grid: OccupancyGrid) -> None:
@@ -788,6 +917,14 @@ class ExploreDebugRecorder:
         self.last_external_video_frame_time = 0.0
         self.external_video_error = ""
         self.external_video_codec_name = "h264" if args.first_person_video_h264 else str(args.first_person_video_codec)
+        self.artifact_writer = None
+        if args.async_artifact_writes and cv2 is not None and np is not None:
+            self.artifact_writer = _AsyncArtifactWriter(
+                fps=args.first_person_video_fps,
+                crf=args.first_person_video_h264_crf,
+                preset=args.first_person_video_h264_preset,
+                max_queue=args.artifact_write_queue_size,
+            )
         self.subscribers = []
         if args.first_person_video and (cv2 is None or np is None):
             self.first_person_video_error = "cv2_or_numpy_unavailable"
@@ -1175,24 +1312,26 @@ class ExploreDebugRecorder:
             global_costmap_path = self.video_global_costmap_frame_dir / f"frame_{frame_index:06d}_global_costmap.png"
             local_costmap_path = self.video_local_costmap_frame_dir / f"frame_{frame_index:06d}_local_costmap.png"
             composite_path = self.video_composite_frame_dir / f"frame_{frame_index:06d}_composite.png"
-            _write_png(camera_path, frame_width, frame_height, bytearray(camera_frame.tobytes()))
-            if occ_panel is not None:
-                _write_png(map_path, int(occ_panel.shape[1]), int(occ_panel.shape[0]), bytearray(occ_panel.tobytes()))
-            if global_costmap_panel is not None:
-                _write_png(
-                    global_costmap_path,
-                    int(global_costmap_panel.shape[1]),
-                    int(global_costmap_panel.shape[0]),
-                    bytearray(global_costmap_panel.tobytes()),
-                )
-            if local_costmap_panel is not None:
-                _write_png(
-                    local_costmap_path,
-                    int(local_costmap_panel.shape[1]),
-                    int(local_costmap_panel.shape[0]),
-                    bytearray(local_costmap_panel.tobytes()),
-                )
-            _write_png(composite_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
+            if self.artifact_writer is not None:
+                self.artifact_writer.submit_png(camera_path, camera_frame)
+                if occ_panel is not None:
+                    self.artifact_writer.submit_png(map_path, occ_panel)
+                if global_costmap_panel is not None:
+                    self.artifact_writer.submit_png(global_costmap_path, global_costmap_panel)
+                if local_costmap_panel is not None:
+                    self.artifact_writer.submit_png(local_costmap_path, local_costmap_panel)
+                self.artifact_writer.submit_png(composite_path, frame)
+                if self.args.runtime_video_encode:
+                    self.artifact_writer.submit_video("first_person", Path(self.first_person_video_path), frame)
+            else:
+                _write_png(camera_path, frame_width, frame_height, bytearray(camera_frame.tobytes()))
+                if occ_panel is not None:
+                    _write_png(map_path, int(occ_panel.shape[1]), int(occ_panel.shape[0]), bytearray(occ_panel.tobytes()))
+                if global_costmap_panel is not None:
+                    _write_png(global_costmap_path, int(global_costmap_panel.shape[1]), int(global_costmap_panel.shape[0]), bytearray(global_costmap_panel.tobytes()))
+                if local_costmap_panel is not None:
+                    _write_png(local_costmap_path, int(local_costmap_panel.shape[1]), int(local_costmap_panel.shape[0]), bytearray(local_costmap_panel.tobytes()))
+                _write_png(composite_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
             record = {
                 "frame_index": frame_index,
                 "step_id": image_step,
@@ -1280,7 +1419,12 @@ class ExploreDebugRecorder:
             self.external_video_frame_count += 1
             frame_index = self.external_video_frame_count
             frame_path = self.video_external_frame_dir / f"frame_{frame_index:06d}_external.png"
-            _write_png(frame_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
+            if self.artifact_writer is not None:
+                self.artifact_writer.submit_png(frame_path, frame)
+                if self.args.runtime_video_encode:
+                    self.artifact_writer.submit_video("external", Path(self.external_video_path), frame)
+            else:
+                _write_png(frame_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
             self.external_video_frames.append(
                 {
                     "frame_index": frame_index,
@@ -1362,6 +1506,8 @@ class ExploreDebugRecorder:
         return self.first_person_video_path
 
     def _finalize_first_person_video_locked(self) -> None:
+        if self.args.runtime_video_encode and self.artifact_writer is not None:
+            return
         if self.first_person_video_writer is not None:
             self.first_person_video_writer.release()
             self.first_person_video_writer = None
@@ -1476,6 +1622,8 @@ class ExploreDebugRecorder:
         self.first_person_video_frame_count = written
 
     def _finalize_external_video_locked(self) -> None:
+        if self.args.runtime_video_encode and self.artifact_writer is not None:
+            return
         if not self.args.external_video or self.external_video_frame_count <= 0:
             return
         self._build_external_video_from_frames_locked()
@@ -3186,8 +3334,12 @@ class ExploreDebugRecorder:
         self.events_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
     def shutdown(self) -> None:
+        # Video callbacks render under video_lock and then snapshot state under
+        # self.lock. Preserve that order during shutdown to avoid lock inversion.
+        self.video_lock.acquire()
         with self.lock:
             if self.shutting_down:
+                self.video_lock.release()
                 return
             self.shutting_down = True
             try:
@@ -3227,6 +3379,59 @@ class ExploreDebugRecorder:
             uniform_subgoal_crop = self._render_uniform_subgoal_crops_locked()
             subgoal_contact_sheet = self._render_subgoal_contact_sheet()
             subgoal_overlay_contact_sheet = self._render_subgoal_overlay_contact_sheet()
+            if self.artifact_writer is not None:
+                self.artifact_writer.close()
+                if self.artifact_writer.errors:
+                    error_text = "; ".join(self.artifact_writer.errors[-5:])
+                    self.first_person_video_error = error_text
+                    self.external_video_error = error_text
+            summary_checkpoint = {
+                "duration_sec": time.time() - self.start_wall_time,
+                "final_step_id": self.debug_step,
+                "final_grid_step": self.latest_grid_step,
+                "final_image_step": self.latest_image_step,
+                "distance_m": self.distance_m,
+                "trajectory_samples": len(self.trajectory),
+                "subgoal_count": self.goal_count,
+                "current_subgoal_count": self.current_subgoal_count,
+                "status_counts": self.status_counts,
+                "cmd_vel_counts": self.cmd_vel_counts,
+                "cmd_vel_nonzero_counts": self.cmd_vel_nonzero_counts,
+                "cmd_vel_max_speed": self.cmd_vel_max_speed,
+                "plan_message_counts": self.plan_message_counts,
+                "stall_snapshot_count": self.stall_snapshot_count,
+                "stall_snapshots": self.stall_snapshot_records,
+                "first_pose": list(self.trajectory[0][1:]) if self.trajectory else None,
+                "last_pose": list(self.trajectory[-1][1:]) if self.trajectory else None,
+                "subgoals": self._json_safe_subgoals(),
+                "final_overlay": final_overlay,
+                "final_overlay_crop": final_overlay_crop,
+                "final_first_person": final_first_person,
+                "final_external_camera": final_external,
+                "refreshed_subgoal_overlays": refreshed_subgoal_overlays,
+                "uniform_subgoal_crop": uniform_subgoal_crop,
+                "subgoal_contact_sheet": subgoal_contact_sheet,
+                "subgoal_overlay_contact_sheet": subgoal_overlay_contact_sheet,
+                "move_base_plan_csv": str(self.output_dir / "move_base_plans.csv"),
+                "move_base_rosout_log": str(self.output_dir / "move_base_rosout.log"),
+                "finalization_complete": False,
+                "video_finalization_pending": True,
+                "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
+            }
+            (self.output_dir / "summary.json").write_text(
+                json.dumps(summary_checkpoint, ensure_ascii=False, indent=2, sort_keys=True)
+            )
+            for handle in [
+                self.events_file,
+                self.trajectory_file,
+                self.subgoals_file,
+                self.status_file,
+                self.cmd_vel_file,
+                self.plan_file,
+                self.video_frames_file,
+                self.move_base_log_file,
+            ]:
+                handle.flush()
             with self.video_lock:
                 self._finalize_first_person_video_locked()
                 self._finalize_external_video_locked()
@@ -3264,6 +3469,7 @@ class ExploreDebugRecorder:
                 "first_person_video_fps": self.args.first_person_video_fps,
                 "first_person_video_codec": self.first_person_video_codec_name,
                 "first_person_video_error": self.first_person_video_error,
+                "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
                 "first_person_video_map_mode": "latest_occ_snapshot_on_image_callback",
                 "first_person_video_map_max_age_sec": self.args.video_map_max_age_sec,
                 "first_person_video_frames_csv": str(self.output_dir / "video_frames.csv"),
@@ -3288,6 +3494,8 @@ class ExploreDebugRecorder:
                 "subgoal_overlay_contact_sheet": subgoal_overlay_contact_sheet,
                 "move_base_plan_csv": str(self.output_dir / "move_base_plans.csv"),
                 "move_base_rosout_log": str(self.output_dir / "move_base_rosout.log"),
+                "finalization_complete": True,
+                "video_finalization_pending": False,
             }
             (self.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
             self._write_event("recorder_shutdown", summary)
@@ -3302,6 +3510,7 @@ class ExploreDebugRecorder:
                 self.move_base_log_file,
             ]:
                 handle.close()
+        self.video_lock.release()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -3359,6 +3568,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--first-person-video-h264-crf", type=int, default=23)
     parser.add_argument("--first-person-video-h264-preset", default="veryfast")
     parser.add_argument("--first-person-video-h264-timeout-sec", type=float, default=180.0)
+    parser.add_argument("--runtime-video-encode", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--async-artifact-writes", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--artifact-write-queue-size", type=int, default=512)
     parser.add_argument("--video-map-crop-margin-px", type=int, default=90)
     parser.add_argument("--video-map-desync-step-warn", type=int, default=3)
     parser.add_argument("--video-map-max-age-sec", type=float, default=2.0)

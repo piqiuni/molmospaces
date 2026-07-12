@@ -47,7 +47,7 @@ lasamplestep: 0.005
 # 点云高度滤波参数
 enable_height_filter: true
 filter_height_center: 0.95
-filter_height_tolerance: 0.85
+filter_height_tolerance: 0.9r
 filter_height_frame: tf_frame_base_link
 
 # 障碍物膨胀参数

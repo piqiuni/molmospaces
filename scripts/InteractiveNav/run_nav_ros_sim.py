@@ -33,6 +33,18 @@ log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+class SceneExecutionTimeout(RuntimeError):
+    pass
+
+
+def resolve_action_timeout_s(action_timeout_s: float, scene_timeout_s: float) -> float:
+    if action_timeout_s > 0.0:
+        return action_timeout_s
+    if scene_timeout_s > 0.0:
+        return min(5.0, scene_timeout_s)
+    return action_timeout_s
+
+
 def _png_chunk(kind: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
 
@@ -209,6 +221,8 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         end_on_success: bool = False,
     ):
         log.info("Starting task.reset() ...")
+        if hasattr(policy, "prepare_episode_reset"):
+            policy.prepare_episode_reset()
         observation, _info = task.reset()
         log.info("task.reset() completed.")
         # print(f"Observation: {observation}", flush=True)
@@ -226,17 +240,87 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
         success = False
         step_idx = 0
+        episode_started_mono = time.monotonic()
+        consecutive_action_timeouts = 0
+        scene_timeout_s = max(0.0, float(getattr(policy, "scene_timeout_s", 0.0)))
+        max_consecutive_action_timeouts = max(
+            0, int(getattr(policy, "max_consecutive_action_timeouts", 0))
+        )
+        timing_count = 0
+        timing_sums_ms = {
+            "policy": 0.0,
+            "task": 0.0,
+            "physics": 0.0,
+            "sensors": 0.0,
+            "loop": 0.0,
+        }
+        timing_log_every = max(0, int(getattr(policy, "sim_timing_log_every_n_steps", 20)))
+        step_log_every = max(0, int(getattr(policy, "step_log_every_n_steps", 10)))
         while not task.is_done():
             if shutdown_event is not None and shutdown_event.is_set():
                 return False
+            elapsed_s = time.monotonic() - episode_started_mono
+            if scene_timeout_s > 0.0 and elapsed_s >= scene_timeout_s:
+                raise SceneExecutionTimeout(
+                    f"Scene exceeded wall timeout of {scene_timeout_s:.1f}s "
+                    f"after {step_idx} completed steps"
+                )
 
             maybe_save_debug_snapshot(policy, observation)
+            loop_t0 = time.perf_counter()
+            policy_t0 = time.perf_counter()
             action_cmd = policy.get_action(observation)
+            policy_ms = (time.perf_counter() - policy_t0) * 1000.0
+            if getattr(policy, "last_action_timed_out", False):
+                consecutive_action_timeouts += 1
+            else:
+                consecutive_action_timeouts = 0
+            elapsed_s = time.monotonic() - episode_started_mono
+            if scene_timeout_s > 0.0 and elapsed_s >= scene_timeout_s:
+                raise SceneExecutionTimeout(
+                    f"Scene exceeded wall timeout of {scene_timeout_s:.1f}s "
+                    f"while waiting for action after {step_idx} completed steps"
+                )
+            if (
+                max_consecutive_action_timeouts > 0
+                and consecutive_action_timeouts >= max_consecutive_action_timeouts
+            ):
+                raise SceneExecutionTimeout(
+                    f"Scene produced no fresh navigation action for "
+                    f"{consecutive_action_timeouts} consecutive waits "
+                    f"after {step_idx} completed steps"
+                )
             if action_cmd is None:
                 break
-            print(f"Step: {step_idx} Action command[base]: {action_cmd['base']}", flush=True)
-            
+
+            if step_log_every > 0 and (step_idx < 5 or step_idx % step_log_every == 0):
+                print(f"Step: {step_idx} Action command[base]: {action_cmd['base']}", flush=True)
+
+            task_t0 = time.perf_counter()
             observation, reward, terminal, truncated, infos = task.step(action_cmd)
+            task_ms = (time.perf_counter() - task_t0) * 1000.0
+            loop_ms = (time.perf_counter() - loop_t0) * 1000.0
+            task_timing = getattr(task, "last_step_timing_ms", {})
+            timing_count += 1
+            timing_sums_ms["policy"] += policy_ms
+            timing_sums_ms["task"] += task_ms
+            timing_sums_ms["physics"] += float(task_timing.get("physics_step", 0.0))
+            timing_sums_ms["sensors"] += float(task_timing.get("sensor_polling", 0.0))
+            timing_sums_ms["loop"] += loop_ms
+            if timing_log_every > 0 and timing_count >= timing_log_every:
+                avg = {key: value / timing_count for key, value in timing_sums_ms.items()}
+                print(
+                    "SimLoop timing over "
+                    f"{timing_count} steps: policy={avg['policy']:.2f}ms, "
+                    f"task={avg['task']:.2f}ms "
+                    f"(physics={avg['physics']:.2f}ms sensors={avg['sensors']:.2f}ms), "
+                    f"loop={avg['loop']:.2f}ms, "
+                    f"simulated_dt={float(task.config.policy_dt_ms) / 1000.0:.3f}s",
+                    flush=True,
+                )
+                timing_count = 0
+                for key in timing_sums_ms:
+                    timing_sums_ms[key] = 0.0
             step_idx += 1
             # print(f"Observation: {observation}", flush=True)
             # print(f"Reward: {reward}", flush=True)
@@ -260,6 +344,23 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
 
 def build_nav_config(args) -> NavToObjBaseConfig:
+    control_steps_per_policy = args.policy_dt_ms / args.ctrl_dt_ms
+    if args.ctrl_dt_ms <= 0.0 or not np.isclose(
+        control_steps_per_policy, round(control_steps_per_policy)
+    ):
+        raise ValueError(
+            "policy_dt_ms must be an integer multiple of ctrl_dt_ms "
+            f"(got {args.policy_dt_ms} and {args.ctrl_dt_ms})"
+        )
+    sim_steps_per_control = args.ctrl_dt_ms / args.sim_dt_ms
+    if args.sim_dt_ms <= 0.0 or not np.isclose(
+        sim_steps_per_control, round(sim_steps_per_control)
+    ):
+        raise ValueError(
+            "ctrl_dt_ms must be an integer multiple of sim_dt_ms "
+            f"(got {args.ctrl_dt_ms} and {args.sim_dt_ms})"
+        )
+
     cfg = NavToObjBaseConfig()
     cfg.seed = args.seed
     cfg.task_type = "nav_to_obj"
@@ -268,14 +369,16 @@ def build_nav_config(args) -> NavToObjBaseConfig:
     cfg.task_horizon = args.task_horizon
     cfg.num_workers = 1
     cfg.use_passive_viewer = args.viewer
+    cfg.ctrl_dt_ms = args.ctrl_dt_ms
+    cfg.sim_dt_ms = args.sim_dt_ms
 
     cfg.task_sampler_config.samples_per_house = args.samples_per_house
     # nav_ros_sim is usually used for live ROS debugging; default to a single attempt.
-    cfg.task_sampler_config.max_total_attempts_multiplier = 1
+    cfg.task_sampler_config.max_total_attempts_multiplier = args.max_scene_attempts
     if args.policy_mode == "left_arm_debug":
         # Keep the same scene running for multiple debug episodes.
         cfg.task_sampler_config.samples_per_house = max(args.samples_per_house, args.debug_loop_episodes)
-    cfg.task_sampler_config.house_inds = [args.house_ind]
+    cfg.task_sampler_config.house_inds = args.house_inds or [args.house_ind]
     cfg.task_sampler_config.randomize_lighting = args.randomize_scene
     cfg.task_sampler_config.randomize_textures = args.randomize_scene
     cfg.task_sampler_config.randomize_dynamics = args.randomize_scene
@@ -318,6 +421,10 @@ def build_nav_config(args) -> NavToObjBaseConfig:
             x, y, yaw = fixed_pose_xyyaw
             cfg.task_config.robot_base_pose = [x, y, 0.1, *yaw_to_quat_wxyz(yaw)]
         cfg.camera_config = RBY1GoProD455CameraSystem()
+        if not args.include_wrist_cameras:
+            cfg.camera_config.cameras = [
+                camera for camera in cfg.camera_config.cameras if camera.name == "head_camera"
+            ]
         if args.publish_debug_front_camera:
             fixed_camera_pos = parse_float_csv(args.fixed_debug_camera_pos, expected_len=3)
             fixed_camera_target = parse_float_csv(args.fixed_debug_camera_target, expected_len=3)
@@ -398,6 +505,12 @@ def parse_args():
     parser.add_argument("--scene_dataset", type=str, default="procthor-10k")
     parser.add_argument("--data_split", type=str, default="train")
     parser.add_argument("--house_ind", type=int, default=0)
+    parser.add_argument(
+        "--house_inds",
+        type=lambda value: [int(item.strip()) for item in value.split(",") if item.strip()],
+        default=None,
+        help="Comma-separated houses processed sequentially in one simulator/ROS process.",
+    )
     parser.add_argument("--samples_per_house", type=int, default=1)
     parser.add_argument("--target_types", type=str, default=None)
     parser.add_argument(
@@ -409,7 +522,14 @@ def parse_args():
         help="Do not filter the scene by a requested target type; use any navigable object only to initialize the scene.",
     )
     parser.add_argument("--task_horizon", type=int, default=300)
-    parser.add_argument("--policy_dt_ms", type=float, default=100.0)
+    parser.add_argument("--policy_dt_ms", type=float, default=200.0)
+    parser.add_argument(
+        "--ctrl_dt_ms",
+        type=float,
+        default=10.0,
+        help="Low-level control update period in milliseconds.",
+    )
+    parser.add_argument("--sim_dt_ms", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--randomize_scene", action="store_true")
     parser.add_argument(
@@ -421,6 +541,12 @@ def parse_args():
         help="Keep camera pose/FOV randomization enabled. Disabled by default for ROS mapping debug.",
     )
     parser.add_argument("--run_name_prefix", type=str, default="")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="",
+        help="Explicit run output directory; overrides the timestamped default.",
+    )
     parser.add_argument(
         "--disable_task_sensors",
         action="store_true",
@@ -442,6 +568,14 @@ def parse_args():
     parser.add_argument("--extra_image_topic", type=str, default="/molmo_spaces/debug_front_camera/image")
     parser.add_argument("--debug_front_camera_name", type=str, default="debug_front_camera")
     parser.add_argument("--publish_debug_front_camera", type=str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument(
+        "--include_wrist_cameras",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Render wrist RGB/depth streams; disabled by default because ROS exploration does not use them.",
+    )
     parser.add_argument("--debug_snapshot_path", type=str, default="")
     parser.add_argument("--debug_snapshot_camera_name", type=str, default="debug_front_camera")
     parser.add_argument("--fixed_robot_xyyaw", type=str, default="")
@@ -505,7 +639,58 @@ def parse_args():
     parser.add_argument("--depth_fov_deg", type=float, default=90.0)
     parser.add_argument("--depth_min_m", type=float, default=0.1)
     parser.add_argument("--depth_max_m", type=float, default=30.0)
-    parser.add_argument("--action_timeout_s", type=float, default=0.1)
+    parser.add_argument(
+        "--action_timeout_s",
+        type=float,
+        default=0.0,
+        help="ROS action wait timeout; <=0 blocks until a fresh action is available.",
+    )
+    parser.add_argument(
+        "--scene_timeout_s",
+        type=float,
+        default=0.0,
+        help="Maximum wall-clock seconds per scene attempt; 0 disables scene timeout.",
+    )
+    parser.add_argument(
+        "--max_scene_attempts",
+        type=int,
+        default=1,
+        help="Maximum attempts after scene execution errors or timeouts.",
+    )
+    parser.add_argument(
+        "--max_consecutive_action_timeouts",
+        type=int,
+        default=12,
+        help="Abort an attempt after this many consecutive action wait timeouts; 0 disables.",
+    )
+    parser.add_argument(
+        "--blocking_observation_republish_period_s",
+        type=float,
+        default=0.25,
+        help="Republish the current observation while blocking so ROS can initialize and plan.",
+    )
+    parser.add_argument(
+        "--map_warmup_skip_frames",
+        type=int,
+        default=0,
+        help="Observation frames skipped before mapping publish; keep 0 for blocking startup.",
+    )
+    parser.add_argument(
+        "--require_fresh_cmd_vel",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Only execute cmd_vel received after the current observation was published.",
+    )
+    parser.add_argument(
+        "--require_move_base_active_for_cmd_vel",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Do not advance simulation on startup/no-goal zero velocity commands.",
+    )
     parser.add_argument(
         "--cmd_vel_linear_gain",
         type=float,
@@ -532,6 +717,18 @@ def parse_args():
         help="Log averaged per-frame ROS bridge timing every N frames (0 disables).",
     )
     parser.add_argument(
+        "--sim_timing_log_every_n_steps",
+        type=int,
+        default=20,
+        help="Log policy wait, physics, sensor, and full task timing every N simulation steps.",
+    )
+    parser.add_argument(
+        "--step_log_every_n_steps",
+        type=int,
+        default=10,
+        help="Print action details every N steps after the first five (0 disables).",
+    )
+    parser.add_argument(
         "--policy_mode",
         type=str,
         default="ros_bridge",
@@ -555,17 +752,33 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.max_scene_attempts < 1:
+        raise ValueError("--max_scene_attempts must be at least 1")
+    if args.scene_timeout_s < 0.0:
+        raise ValueError("--scene_timeout_s cannot be negative")
+    if args.max_consecutive_action_timeouts < 0:
+        raise ValueError("--max_consecutive_action_timeouts cannot be negative")
     exp_config = build_nav_config(args)
-    exp_config.output_dir = build_output_dir(args.run_name_prefix)
+    exp_config.output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else build_output_dir(args.run_name_prefix)
+    )
     exp_config.save_config()
     log_path = configure_run_file_logging(exp_config.output_dir)
     log.info("Run log file: %s", log_path)
     log.info(
-        "Starting nav ROS sim: dataset=%s split=%s house_ind=%s target_types=%s",
+        "Starting nav ROS sim: dataset=%s split=%s house_ind=%s target_types=%s "
+        "policy_dt_ms=%.1f ctrl_dt_ms=%.1f sim_dt_ms=%.1f action_timeout_s=%.3f cameras=%s",
         args.scene_dataset,
         args.data_split,
         args.house_ind,
         args.target_types or "<any>",
+        args.policy_dt_ms,
+        args.ctrl_dt_ms,
+        args.sim_dt_ms,
+        args.action_timeout_s,
+        ",".join(camera.name for camera in exp_config.camera_config.cameras),
     )
 
     if args.policy_mode == "left_arm_debug":
@@ -575,6 +788,9 @@ def main():
             joint_delta=args.left_arm_joint_delta,
         )
     else:
+        effective_action_timeout_s = resolve_action_timeout_s(
+            args.action_timeout_s, args.scene_timeout_s
+        )
         policy = RosBridgePolicy(
             config=exp_config,
             task=None,
@@ -583,7 +799,8 @@ def main():
             pointcloud_topic=args.pointcloud_topic,
             camera_info_topic=args.camera_info_topic,
             depth_topic=args.depth_topic,
-            action_timeout_s=args.action_timeout_s,
+            action_timeout_s=effective_action_timeout_s,
+            blocking_observation_republish_period_s=args.blocking_observation_republish_period_s,
             depth_camera_name=args.depth_camera_name,
             pointcloud_frame_id=args.pointcloud_frame_id,
             pointcloud_stride=args.pointcloud_stride,
@@ -598,7 +815,11 @@ def main():
             depth_fov_deg=args.depth_fov_deg,
             depth_min_m=args.depth_min_m,
             depth_max_m=args.depth_max_m,
+            cmd_vel_control_dt_s=args.policy_dt_ms / 1000.0,
             cmd_vel_linear_gain=args.cmd_vel_linear_gain,
+            require_fresh_cmd_vel=args.require_fresh_cmd_vel,
+            require_move_base_active_for_cmd_vel=args.require_move_base_active_for_cmd_vel,
+            map_warmup_skip_frames=args.map_warmup_skip_frames,
             immediate_noop_after_publish=args.immediate_noop_after_publish,
             timing_log_every_n_frames=args.timing_log_every_n_frames,
             extra_image_topic=args.extra_image_topic,
@@ -615,6 +836,10 @@ def main():
             policy.default_left_arm_qpos = left_arm_qpos.copy()
         if right_arm_qpos is not None:
             policy.default_right_arm_qpos = right_arm_qpos.copy()
+        policy.scene_timeout_s = args.scene_timeout_s
+        policy.max_consecutive_action_timeouts = args.max_consecutive_action_timeouts
+    policy.sim_timing_log_every_n_steps = args.sim_timing_log_every_n_steps
+    policy.step_log_every_n_steps = args.step_log_every_n_steps
     policy.debug_snapshot_path = args.debug_snapshot_path
     policy.debug_snapshot_camera_name = args.debug_snapshot_camera_name
     policy.debug_snapshot_saved = False

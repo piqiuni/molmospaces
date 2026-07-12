@@ -13,6 +13,7 @@ topics:
   status: "/explore_py/status"
   frontiers: "/explore_py/frontiers"
   current_subgoal: "/explore_py/current_subgoal"
+  reset: "/explore_py/reset"
   llm_value_grid: "/explore_py/llm_value_grid"
   strategy_bias: "/explore_py/strategy_bias"
   object_map: "/semantic_mapping/obj_map"

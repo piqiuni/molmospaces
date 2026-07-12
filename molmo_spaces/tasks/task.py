@@ -14,6 +14,7 @@ Action Noise:
 
 import contextlib
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -85,6 +86,11 @@ class BaseMujocoTask(ABC):
 
         # Optional profiler for granular timing (set via set_datagen_profiler)
         self._datagen_profiler = None
+        self.last_step_timing_ms: dict[str, float] = {
+            "physics_step": 0.0,
+            "sensor_polling": 0.0,
+            "total": 0.0,
+        }
 
         # Please don't call self.reset() here. reset should return the first observation, if we do it in
         # __init__ it will end up in the cache, but not being returned to the user.
@@ -314,6 +320,8 @@ class BaseMujocoTask(ABC):
                             # Replace the cached observation with the current one
                             self.observation_cache[0] = obs
 
+        step_t0 = time.perf_counter()
+
         # Check if all environments are done
         if np.all(self.is_done()):
             print("Warning: step() called on task where all environments are already done")
@@ -335,10 +343,12 @@ class BaseMujocoTask(ABC):
         # Physics step (MuJoCo simulation)
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("physics_step")
+        physics_t0 = time.perf_counter()
         for _ in range(self._n_ctrl_steps_per_policy):
             for robot in self._env.robots:
                 robot.compute_control()
             self._env.step(self._n_sim_steps_per_ctrl)
+        physics_ms = (time.perf_counter() - physics_t0) * 1000.0
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("physics_step")
 
@@ -348,9 +358,17 @@ class BaseMujocoTask(ABC):
         # Sensor polling (cameras, proprioception, etc.)
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("sensor_polling")
+        sensor_t0 = time.perf_counter()
         observation, reward, terminated, truncated, info = self.get_and_cache_all_step_information()
+        sensor_ms = (time.perf_counter() - sensor_t0) * 1000.0
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("sensor_polling")
+
+        self.last_step_timing_ms = {
+            "physics_step": physics_ms,
+            "sensor_polling": sensor_ms,
+            "total": (time.perf_counter() - step_t0) * 1000.0,
+        }
 
         done = np.logical_or(terminated, truncated)
         self._cumulative_reward += np.where(done, 0, reward)
