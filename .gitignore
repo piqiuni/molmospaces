@@ -65,3 +65,16 @@ mlspaces_tests/**/test_data
 # pytest
 .pytest_cache/
 __pycache__/
+
+# Model weights and serialized model artifacts
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.msgpack
+*.ot
+*.bin
+*.mlmodel
+*.ckpt
+*.pb
+*.tflite
