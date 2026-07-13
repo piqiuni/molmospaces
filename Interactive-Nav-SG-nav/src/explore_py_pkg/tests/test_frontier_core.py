@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from explore_py_pkg.frontier_core import FrontierCluster, FrontierConfig, FrontierExplorerCore, GridSpec, OccupancyGridData
-from explore_py_pkg.state import CLUSTER_ACTIVE, CLUSTER_FAILED, ExplorerState, ExplorerStateConfig
+from explore_py_pkg.state import CLUSTER_ACTIVE, CLUSTER_FAILED, CLUSTER_UNREACHABLE, ExplorerState, ExplorerStateConfig
 from explore_py_pkg.value_maps import ValueMapFusion
 
 
@@ -416,7 +416,7 @@ def test_frontier_gone_requires_consecutive_confirmations_and_min_age():
     assert state.active_goal is None
 
 
-def test_reached_pose_only_blocks_point_but_keeps_cluster_active():
+def test_reached_viewpoint_with_remaining_frontier_marks_it_unreachable():
     grid = make_grid(10, 10, (2, 2, 8, 8))
     core = FrontierExplorerCore(FrontierConfig(min_cluster_cells=2))
     state = ExplorerState()
@@ -424,11 +424,69 @@ def test_reached_pose_only_blocks_point_but_keeps_cluster_active():
 
     assert cluster is not None
     state.start_goal(cluster, robot_xy=(5.0, 5.0))
-    state.mark_active_reached_pose_only()
+    state.mark_active_frontier_unreachable()
 
     record = state.records[cluster.cluster_id]
-    assert record.status == CLUSTER_ACTIVE
+    assert record.status == CLUSTER_UNREACHABLE
     assert state.is_goal_point_blocked(cluster.subgoal_world)
+    assert state.is_frontier_unreachable(cluster.centroid_world)
+    assert not state.is_cluster_available(cluster)
+
+
+def test_unreachable_frontier_blocks_nearby_reclustered_candidate():
+    state = ExplorerState(ExplorerStateConfig(unreachable_frontier_radius_m=1.0))
+    reached = type(
+        "Cluster",
+        (),
+        {
+            "cluster_id": "old-id",
+            "centroid_world": (8.0, 3.0),
+            "subgoal_world": (5.0, 3.0),
+        },
+    )()
+    reclustered = type(
+        "Cluster",
+        (),
+        {
+            "cluster_id": "new-id",
+            "centroid_world": (8.6, 3.2),
+            "subgoal_world": (6.0, 3.0),
+        },
+    )()
+    separate = type(
+        "Cluster",
+        (),
+        {
+            "cluster_id": "separate",
+            "centroid_world": (10.0, 3.0),
+            "subgoal_world": (8.0, 3.0),
+        },
+    )()
+
+    state.start_goal(reached, robot_xy=(5.0, 3.0), now=10.0)
+    state.mark_active_frontier_unreachable(now=20.0)
+
+    assert not state.is_cluster_available(reclustered, now=21.0)
+    assert state.is_cluster_available(separate, now=21.0)
+
+
+def test_active_goal_keeps_frontier_reference_separate_from_viewpoint():
+    state = ExplorerState()
+    cluster = type(
+        "Cluster",
+        (),
+        {
+            "cluster_id": "frontier",
+            "centroid_world": (8.0, 3.0),
+            "subgoal_world": (5.0, 3.0),
+            "subgoal_yaw": 0.0,
+        },
+    )()
+
+    goal = state.start_goal(cluster, robot_xy=(4.0, 3.0), now=10.0)
+
+    assert goal.point == (5.0, 3.0)
+    assert goal.frontier_point == (8.0, 3.0)
 
 
 def test_llm_value_grid_changes_candidate_ranking_without_generating_goal():

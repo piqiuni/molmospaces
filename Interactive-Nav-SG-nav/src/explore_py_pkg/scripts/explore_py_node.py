@@ -173,6 +173,7 @@ class ExplorePyNode:
             failed_point_blacklist_radius_m=float(exploration_cfg.get("failed_point_blacklist_radius_m", 1.25)),
             reached_point_blacklist_sec=float(exploration_cfg.get("reached_point_blacklist_sec", 90.0)),
             reached_point_blacklist_radius_m=float(exploration_cfg.get("reached_point_blacklist_radius_m", 0.75)),
+            unreachable_frontier_radius_m=float(exploration_cfg.get("unreachable_frontier_radius_m", 1.0)),
         )
 
         self.core = FrontierExplorerCore(core_config)
@@ -381,7 +382,10 @@ class ExplorePyNode:
                 self.active_move_base_goal_id = ""
                 return
             if code in TERMINAL_SUCCESS and self._active_goal_distance() <= self.state.config.goal_reach_tolerance_m * 1.5:
-                self.state.mark_active_reached()
+                if self._active_goal_has_frontier():
+                    self.state.mark_active_frontier_unreachable()
+                else:
+                    self.state.mark_active_reached()
                 self.active_move_base_goal_id = ""
                 return
 
@@ -402,16 +406,11 @@ class ExplorePyNode:
             if not self.core.is_free_world(self.latest_grid, self.state.active_goal.point):
                 self.state.fail_active_if_goal_not_free(False)
             else:
-                has_frontier = self.core.has_frontier_near(
-                    self.latest_grid,
-                    self.state.active_goal.point,
-                    self.state.config.frontier_match_distance_m,
-                    min_cells=self.active_goal_frontier_min_cells,
-                )
+                has_frontier = self._active_goal_has_frontier()
                 progress = self.state.update_goal_progress(self.robot_xy, robot_yaw=self.robot_yaw)
                 if progress == SUBGOAL_REACHED:
                     if has_frontier:
-                        self.state.mark_active_reached_pose_only()
+                        self.state.mark_active_frontier_unreachable()
                     else:
                         self.state.mark_active_reached()
                 elif self.state.active_goal is not None:
@@ -439,6 +438,20 @@ class ExplorePyNode:
 
         self._publish_frontiers()
         self._publish_status()
+
+    def _active_goal_has_frontier(self) -> bool:
+        goal = self.state.active_goal
+        if goal is None:
+            return False
+        if self.latest_grid is None:
+            # Without a current map, navigation success must not erase exploration work.
+            return True
+        return self.core.has_frontier_near(
+            self.latest_grid,
+            goal.frontier_point,
+            self.state.config.frontier_match_distance_m,
+            min_cells=self.active_goal_frontier_min_cells,
+        )
 
     def _fail_if_local_plan_missing(self):
         if not self.local_plan_watchdog_enabled or self.state.active_goal is None:
@@ -619,11 +632,20 @@ class ExplorePyNode:
     def _publish_frontiers(self):
         markers = MarkerArray()
         now = rospy.Time.now()
-        for index, cluster in enumerate(self.latest_clusters[:100]):
+        delete_all = Marker()
+        delete_all.action = Marker.DELETEALL
+        markers.markers.append(delete_all)
+
+        scores = [float(cluster.score) for cluster in self.latest_clusters]
+        min_score = min(scores) if scores else 0.0
+        max_score = max(scores) if scores else 1.0
+        score_span = max(max_score - min_score, 1e-6)
+        for index, cluster in enumerate(self.latest_clusters):
+            normalized_score = (float(cluster.score) - min_score) / score_span
             marker = Marker()
             marker.header.frame_id = self.map_frame
             marker.header.stamp = now
-            marker.ns = "frontier_clusters"
+            marker.ns = "voronoi_viewpoints"
             marker.id = index
             marker.type = Marker.SPHERE
             marker.action = Marker.ADD
@@ -633,11 +655,27 @@ class ExplorePyNode:
             marker.pose.orientation.w = 1.0
             scale = max(0.12, min(0.8, math.sqrt(len(cluster.cells)) * 0.06))
             marker.scale.x = marker.scale.y = marker.scale.z = scale
-            marker.color.r = 0.1
-            marker.color.g = max(0.2, min(1.0, cluster.score))
-            marker.color.b = 1.0 - marker.color.g * 0.4
-            marker.color.a = 0.85
+            marker.color.r = 1.0 - 0.85 * normalized_score
+            marker.color.g = 0.25 + 0.70 * normalized_score
+            marker.color.b = 0.15
+            marker.color.a = 0.90
             markers.markers.append(marker)
+
+            link = Marker()
+            link.header = marker.header
+            link.ns = "voronoi_frontier_links"
+            link.id = 2000 + index
+            link.type = Marker.LINE_LIST
+            link.action = Marker.ADD
+            link.pose.orientation.w = 1.0
+            link.scale.x = 0.035
+            link.color.r = 0.95
+            link.color.g = 0.80
+            link.color.b = 0.15
+            link.color.a = 0.75
+            link.points.append(Point(cluster.subgoal_world[0], cluster.subgoal_world[1], 0.10))
+            link.points.append(Point(cluster.centroid_world[0], cluster.centroid_world[1], 0.10))
+            markers.markers.append(link)
 
             if self.last_selected_cluster is not None and cluster.cluster_id == self.last_selected_cluster.cluster_id:
                 frontier_points = Marker()
@@ -660,7 +698,7 @@ class ExplorePyNode:
 
             text = Marker()
             text.header = marker.header
-            text.ns = "frontier_cluster_labels"
+            text.ns = "voronoi_viewpoint_scores"
             text.id = 1000 + index
             text.type = Marker.TEXT_VIEW_FACING
             text.action = Marker.ADD
@@ -670,7 +708,14 @@ class ExplorePyNode:
             text.pose.orientation.w = 1.0
             text.scale.z = 0.22
             text.color.r = text.color.g = text.color.b = text.color.a = 1.0
-            text.text = f"{index}:{cluster.score:.2f}"
+            terms = cluster.score_terms
+            text.text = (
+                f"V{index:02d} S={cluster.score:.2f} F={len(cluster.cells)}\n"
+                f"I={terms.get('information', 0.0):.2f} "
+                f"D={terms.get('distance', 0.0):.2f} "
+                f"P={terms.get('previous_subgoal', 0.0):.2f} "
+                f"X={terms.get('failure_penalty', 0.0):.2f}"
+            )
             markers.markers.append(text)
         if self.state.active_goal is not None:
             goal = self.state.active_goal

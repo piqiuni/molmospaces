@@ -886,10 +886,14 @@ class ExploreDebugRecorder:
         self.last_recorded_odom_time = 0.0
         self.stall_reference_xy: tuple[float, float] | None = None
         self.stall_reference_yaw: float | None = None
+        self.stall_reference_yaw_motion_rad = 0.0
         self.stall_reference_time = 0.0
+        self.total_yaw_motion_rad = 0.0
+        self.last_yaw_for_motion: float | None = None
         self.last_stall_snapshot_time = 0.0
         self.stall_snapshot_count = 0
         self.stall_snapshot_records: list[dict] = []
+        self.stuck_exit_requested = False
         self.distance_m = 0.0
         self.trajectory: list[tuple[float, float, float, float]] = []
         self.goal_count = 0
@@ -1043,6 +1047,7 @@ class ExploreDebugRecorder:
                 "stuck_duration_sec",
                 "stuck_moved_m",
                 "stuck_yaw_delta_rad",
+                "stuck_yaw_motion_rad",
                 "camera_frame",
                 "map_frame",
                 "global_costmap_step",
@@ -1251,6 +1256,7 @@ class ExploreDebugRecorder:
                     global_plan=global_plan,
                     local_plan=local_plan,
                     image_step=image_step,
+                    crop_margin_px=int(self.args.video_occ_crop_margin_px),
                 )
                 global_costmap_panel = self._render_video_map_panel_locked(
                     frame_width,
@@ -1329,7 +1335,8 @@ class ExploreDebugRecorder:
             )
             stuck_label = (
                 f"STUCK_TEST={stuck['state']} dur={stuck['duration_sec']:.1f}s "
-                f"move={stuck['moved_m']:.2f}m yaw={stuck['yaw_delta_rad']:.2f}rad"
+                f"move={stuck['moved_m']:.2f}m yaw_net={stuck['yaw_delta_rad']:.2f} "
+                f"yaw_sum={stuck['yaw_motion_rad']:.2f}rad"
             )
             text_right = min(frame_width - 8, 620)
             cv2.rectangle(frame, (8, 8), (text_right, 88), (255, 255, 255), -1)
@@ -1406,6 +1413,7 @@ class ExploreDebugRecorder:
                     "stuck_duration_sec": f"{stuck['duration_sec']:.3f}",
                     "stuck_moved_m": f"{stuck['moved_m']:.6f}",
                     "stuck_yaw_delta_rad": f"{stuck['yaw_delta_rad']:.6f}",
+                    "stuck_yaw_motion_rad": f"{stuck['yaw_motion_rad']:.6f}",
                     "camera_frame": str(camera_path),
                     "map_frame": str(map_path) if occ_panel is not None else "",
                     "global_costmap_step": global_costmap_step,
@@ -1442,7 +1450,8 @@ class ExploreDebugRecorder:
             )
             stuck_label = (
                 f"STUCK_TEST={stuck['state']} dur={stuck['duration_sec']:.1f}s "
-                f"move={stuck['moved_m']:.2f}m yaw={stuck['yaw_delta_rad']:.2f}rad"
+                f"move={stuck['moved_m']:.2f}m yaw_net={stuck['yaw_delta_rad']:.2f} "
+                f"yaw_sum={stuck['yaw_motion_rad']:.2f}rad"
             )
             cv2.rectangle(frame, (8, 8), (min(frame.shape[1] - 8, 900), 66), (255, 255, 255), -1)
             cv2.putText(frame, label, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (15, 15, 15), 2, cv2.LINE_AA)
@@ -1499,6 +1508,7 @@ class ExploreDebugRecorder:
                 "duration_sec": 0.0,
                 "moved_m": 0.0,
                 "yaw_delta_rad": 0.0,
+                "yaw_motion_rad": 0.0,
             }
         if pose is None or self.stall_reference_xy is None:
             return {
@@ -1506,18 +1516,20 @@ class ExploreDebugRecorder:
                 "duration_sec": 0.0,
                 "moved_m": 0.0,
                 "yaw_delta_rad": 0.0,
+                "yaw_motion_rad": 0.0,
             }
         duration = max(0.0, now - self.stall_reference_time)
         moved = math.hypot(pose[0] - self.stall_reference_xy[0], pose[1] - self.stall_reference_xy[1])
         yaw_delta = 0.0
         if self.stall_reference_yaw is not None:
             yaw_delta = self._angle_distance(pose[2], self.stall_reference_yaw)
+        yaw_motion = max(0.0, self.total_yaw_motion_rad - self.stall_reference_yaw_motion_rad)
         if duration < float(self.args.video_stuck_window_sec):
             state = "OBSERVING"
         elif moved > float(self.args.video_stuck_distance_m):
             state = "MOVING"
-        elif yaw_delta >= float(self.args.video_stuck_rotation_yaw_rad):
-            state = "STUCK_ROTATING"
+        elif yaw_motion >= float(self.args.video_stuck_rotation_yaw_rad):
+            state = "ROTATING_PROGRESS"
         else:
             state = "STUCK_STATIC"
         return {
@@ -1525,6 +1537,7 @@ class ExploreDebugRecorder:
             "duration_sec": duration,
             "moved_m": moved,
             "yaw_delta_rad": yaw_delta,
+            "yaw_motion_rad": yaw_motion,
         }
 
     @staticmethod
@@ -1836,6 +1849,7 @@ class ExploreDebugRecorder:
         local_global_plan: dict | None = None,
         local_plan: dict | None = None,
         image_step: int | None = None,
+        crop_margin_px: int | None = None,
     ):
         if cv2 is None or np is None:
             return None
@@ -1934,7 +1948,10 @@ class ExploreDebugRecorder:
         if points:
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
-            margin = max(40, int(self.args.video_map_crop_margin_px))
+            margin = max(
+                8,
+                int(self.args.video_map_crop_margin_px if crop_margin_px is None else crop_margin_px),
+            )
             current_bbox = (
                 max(0, min(xs) - margin),
                 max(0, min(ys) - margin),
@@ -2134,6 +2151,9 @@ class ExploreDebugRecorder:
         with self.lock:
             if self.shutting_down:
                 return
+            if self.last_yaw_for_motion is not None:
+                self.total_yaw_motion_rad += self._angle_distance(yaw, self.last_yaw_for_motion)
+            self.last_yaw_for_motion = yaw
             step = 0.0
             if self.last_odom_xy is not None:
                 step = math.hypot(x - self.last_odom_xy[0], y - self.last_odom_xy[1])
@@ -2158,10 +2178,12 @@ class ExploreDebugRecorder:
             if self.stall_reference_xy is None:
                 self.stall_reference_xy = (x, y)
                 self.stall_reference_yaw = yaw
+                self.stall_reference_yaw_motion_rad = self.total_yaw_motion_rad
                 self.stall_reference_time = now
             elif math.hypot(x - self.stall_reference_xy[0], y - self.stall_reference_xy[1]) >= self.args.stall_snapshot_distance_m:
                 self.stall_reference_xy = (x, y)
                 self.stall_reference_yaw = yaw
+                self.stall_reference_yaw_motion_rad = self.total_yaw_motion_rad
                 self.stall_reference_time = now
             should_record = (
                 not self.trajectory
@@ -2875,6 +2897,7 @@ class ExploreDebugRecorder:
         if self.shutting_down:
             return
         now = time.time()
+        request_shutdown = False
         with self.lock:
             if self.shutting_down or self.latest_pose is None or self.stall_reference_xy is None:
                 return
@@ -2889,6 +2912,28 @@ class ExploreDebugRecorder:
                 return
             self._write_stall_snapshot_locked(now, moved)
             self.last_stall_snapshot_time = now
+            stuck = self._stuck_test_locked(now)
+            if (
+                self.args.exit_on_stuck
+                and stuck["state"] == "STUCK_STATIC"
+                and not self.stuck_exit_requested
+            ):
+                self.stuck_exit_requested = True
+                payload = {
+                    "reason": "stable_static_stuck",
+                    "step_id": self.debug_step,
+                    "elapsed_sec": now - self.start_wall_time,
+                    "robot_pose": list(self.latest_pose),
+                    "active_goal": self.last_explore_active_goal,
+                    "stuck": stuck,
+                }
+                (self.output_dir / "stuck_exit.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                )
+                self._write_event("stuck_exit_requested", payload)
+                request_shutdown = True
+        if request_shutdown:
+            rospy.signal_shutdown("stable static stuck detected")
 
     def _write_stall_snapshot_locked(self, now: float, moved_m: float) -> None:
         self.stall_snapshot_count += 1
@@ -3721,6 +3766,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stall-snapshot-distance-m", type=float, default=0.15)
     parser.add_argument("--stall-snapshot-cooldown-sec", type=float, default=45.0)
     parser.add_argument("--stall-snapshot-require-active-goal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--exit-on-stuck", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--path-check-max-hits", type=int, default=25)
     parser.add_argument("--first-person-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--first-person-video-with-map", action=argparse.BooleanOptionalAction, default=True)
@@ -3736,6 +3782,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--async-artifact-writes", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--artifact-write-queue-size", type=int, default=512)
     parser.add_argument("--video-map-crop-margin-px", type=int, default=90)
+    parser.add_argument("--video-occ-crop-margin-px", type=int, default=25)
     parser.add_argument("--video-map-desync-step-warn", type=int, default=3)
     parser.add_argument("--video-map-max-age-sec", type=float, default=2.0)
     parser.add_argument("--video-sync-max-delta-sec", type=float, default=0.05)

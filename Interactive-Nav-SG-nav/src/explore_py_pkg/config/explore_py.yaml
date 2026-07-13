@@ -43,6 +43,9 @@ exploration:
   failed_point_blacklist_radius_m: 1.25
   reached_point_blacklist_sec: 90.0
   reached_point_blacklist_radius_m: 0.75
+  # Reaching a viewpoint without clearing its frontier means that frontier is
+  # not observable from the navigable free space. Suppress nearby re-clusters.
+  unreachable_frontier_radius_m: 1.0
   active_goal_frontier_min_cells: 3
   initial_spin_enabled: false
   initial_spin_angle_rad: 6.283185307179586
