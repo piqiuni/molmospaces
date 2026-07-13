@@ -274,6 +274,10 @@ void SlamGMapping::init()
     lasamplerange_ = 0.005;
   if(!private_nh_.getParam("lasamplestep", lasamplestep_))
     lasamplestep_ = 0.005;
+  if(!private_nh_.getParam("use_odom_pose_for_mapping", use_odom_pose_for_mapping_))
+    use_odom_pose_for_mapping_ = false;
+  private_nh_.param("scan_matching_lock_yaw_to_odom", scan_matching_lock_yaw_to_odom_, false);
+  private_nh_.param("scan_matching_max_translation_correction", scan_matching_max_translation_correction_, 0.0);
     
   // 点云高度滤波参数
   if(!private_nh_.getParam("enable_height_filter", enable_height_filter_))
@@ -653,11 +657,26 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
                               kernelSize_, lstep_, astep_, iterations_,
                               lsigma_, ogain_, lskip_);
 
-  gsp_->setMotionModelParameters(srr_, srt_, str_, stt_);
+  const double motion_srr = use_odom_pose_for_mapping_ ? 0.0 : srr_;
+  const double motion_srt = use_odom_pose_for_mapping_ ? 0.0 : srt_;
+  const double motion_str = use_odom_pose_for_mapping_ ? 0.0 : str_;
+  const double motion_stt = use_odom_pose_for_mapping_ ? 0.0 : stt_;
+  const int mapper_particles = use_odom_pose_for_mapping_ ? 1 : particles_;
+
+  gsp_->setMotionModelParameters(motion_srr, motion_srt, motion_str, motion_stt);
+  gsp_->setUseOdometryPose(use_odom_pose_for_mapping_);
+  gsp_->setScanMatchingCorrectionLimits(
+      scan_matching_lock_yaw_to_odom_, scan_matching_max_translation_correction_);
+  if (!use_odom_pose_for_mapping_ && scan_matching_lock_yaw_to_odom_)
+  {
+    ROS_WARN(
+        "Scan matching yaw is locked to odometry; scan matching only corrects translation (max %.3fm/update)",
+        scan_matching_max_translation_correction_);
+  }
   gsp_->setUpdateDistances(linearUpdate_, angularUpdate_, resampleThreshold_);
   gsp_->setUpdatePeriod(temporalUpdate_);
   gsp_->setgenerateMap(false);
-  gsp_->GridSlamProcessor::init(particles_, xmin_, ymin_, xmax_, ymax_,
+  gsp_->GridSlamProcessor::init(mapper_particles, xmin_, ymin_, xmax_, ymax_,
                                 delta_, initialPose);
   gsp_->setllsamplerange(llsamplerange_);
   gsp_->setllsamplestep(llsamplestep_);
@@ -666,7 +685,14 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
   /// lasamplerange.  It was probably a typo, but who knows.
   gsp_->setlasamplerange(lasamplerange_);
   gsp_->setlasamplestep(lasamplestep_);
-  gsp_->setminimumScore(minimum_score_);
+  gsp_->setminimumScore(
+      use_odom_pose_for_mapping_ ? std::numeric_limits<double>::max() : minimum_score_);
+
+  if (use_odom_pose_for_mapping_)
+  {
+    ROS_WARN(
+        "Odometry-locked mapping enabled: using one zero-noise particle and rejecting scan-matching pose corrections");
+  }
 
   // Call the sampling function once to set the seed.
   GMapping::sampleGaussian(1,seed_);
@@ -857,9 +883,27 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
     tf::Transform laser_to_map = tf::Transform(tf::createQuaternionFromRPY(0, 0, mpose.theta), tf::Vector3(mpose.x, mpose.y, 0.0));
     tf::Transform odom_to_laser = tf::Transform(tf::createQuaternionFromRPY(0, 0, odom_pose.theta), tf::Vector3(odom_pose.x, odom_pose.y, 0.0));
 
-    // map_to_odom_ 保持为上游系统定义的坐标关系。
-    // 当前工程中的 /registered_scan 与 /odom 不是标准激光SLAM输入链路，
-    // 这里不在 gmapping 内部额外发布校正，避免与上游坐标约定冲突。
+    {
+      boost::mutex::scoped_lock tf_lock(map_to_odom_mutex_);
+      if (use_odom_pose_for_mapping_)
+      {
+        map_to_odom_.setIdentity();
+        const double correction_trans = std::hypot(mpose.x - odom_pose.x, mpose.y - odom_pose.y);
+        const double correction_rot = std::fabs(angleDiff(mpose.theta, odom_pose.theta));
+        if (correction_trans > 1e-4 || correction_rot > 1e-4)
+        {
+          ROS_ERROR_THROTTLE(
+              1.0,
+              "Odometry-locked mapping invariant violated: translation=%.6fm rotation=%.6frad",
+              correction_trans,
+              correction_rot);
+        }
+      }
+      else
+      {
+        map_to_odom_ = laser_to_map * odom_to_laser.inverse();
+      }
+    }
 
     if(!got_map_ || (cloud->header.stamp - last_map_update) > map_update_interval_)
     {
@@ -905,9 +949,17 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     tf::Transform laser_to_map = tf::Transform(tf::createQuaternionFromRPY(0, 0, mpose.theta), tf::Vector3(mpose.x, mpose.y, 0.0));
     tf::Transform odom_to_laser = tf::Transform(tf::createQuaternionFromRPY(0, 0, odom_pose.theta), tf::Vector3(odom_pose.x, odom_pose.y, 0.0));
 
-    // map_to_odom_ 保持为上游系统定义的坐标关系。
-    // 当前工程中的 /registered_scan 与 /odom 不是标准激光SLAM输入链路，
-    // 这里不在 gmapping 内部额外发布校正，避免与上游坐标约定冲突。
+    {
+      boost::mutex::scoped_lock tf_lock(map_to_odom_mutex_);
+      if (use_odom_pose_for_mapping_)
+      {
+        map_to_odom_.setIdentity();
+      }
+      else
+      {
+        map_to_odom_ = laser_to_map * odom_to_laser.inverse();
+      }
+    }
 
     if(!got_map_ || (scan->header.stamp - last_map_update) > map_update_interval_)
     {

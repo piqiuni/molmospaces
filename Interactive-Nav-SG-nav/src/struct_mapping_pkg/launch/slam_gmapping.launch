@@ -2,6 +2,7 @@
 
     <param name="use_sim_time" value="false"/>
     <arg name="publish_base_to_lidar_tf" default="false"/>
+    <arg name="mapping_mode" default="odom_locked"/>
     
     <!-- 发布静态TF: base_link -> lidar -->
     <node if="$(arg publish_base_to_lidar_tf)" pkg="tf" type="static_transform_publisher" name="base_to_lidar_broadcaster"
@@ -13,6 +14,8 @@
 
     <node pkg="struct_mapping_pkg" type="slam_gmapping" name="slam_gmapping" output="screen">
       <rosparam command="load" file="$(find struct_mapping_pkg)/config/slam_gmapping_params.yaml" />
+      <param name="use_odom_pose_for_mapping"
+             value="$(eval 'true' if arg('mapping_mode') == 'odom_locked' else 'false')"/>
     </node>
 
     <!-- Voronoi Mapping Node -->

@@ -178,6 +178,9 @@ class SlamGMapping
     double llsamplestep_;
     double lasamplerange_;
     double lasamplestep_;
+    bool use_odom_pose_for_mapping_;
+    bool scan_matching_lock_yaw_to_odom_;
+    double scan_matching_max_translation_correction_;
     
     // 点云高度滤波参数
     bool enable_height_filter_;

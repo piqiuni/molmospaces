@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import zlib
+from collections import deque
 from pathlib import Path
 
 
@@ -358,6 +359,12 @@ def _apply_grid_update(grid: OccupancyGrid, update: OccupancyGridUpdate) -> bool
 
 
 def _read_png(path: Path) -> tuple[int, int, bytearray] | None:
+    if cv2 is not None:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is not None:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            height, width = rgb.shape[:2]
+            return int(width), int(height), bytearray(rgb.tobytes())
     data = path.read_bytes()
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         return None
@@ -869,6 +876,8 @@ class ExploreDebugRecorder:
         self.last_image_wall_time = 0.0
         self.final_first_person_path = ""
         self.latest_pose: tuple[float, float, float] | None = None
+        self.latest_pose_stamp = 0.0
+        self.pose_history = deque(maxlen=2000)
         self.latest_pose_step = 0
         self.latest_global_plan: dict | None = None
         self.latest_local_global_plan: dict | None = None
@@ -936,6 +945,7 @@ class ExploreDebugRecorder:
         self.status_file = (output_dir / "move_base_status.csv").open("a", newline="", buffering=1)
         self.cmd_vel_file = (output_dir / "cmd_vel.csv").open("a", newline="", buffering=1)
         self.plan_file = (output_dir / "move_base_plans.csv").open("a", newline="", buffering=1)
+        self.map_to_odom_file = (output_dir / "map_to_odom.csv").open("a", newline="", buffering=1)
         self.move_base_log_file = (output_dir / "move_base_rosout.log").open("a", buffering=1)
         self.video_frames_file = (output_dir / "video_frames.csv").open("a", newline="", buffering=1)
 
@@ -983,7 +993,12 @@ class ExploreDebugRecorder:
         )
         self.cmd_vel_writer = csv.DictWriter(
             self.cmd_vel_file,
-            fieldnames=["step_id", "elapsed_sec", "stamp", "topic", "linear_x", "linear_y", "angular_z", "speed"],
+            fieldnames=[
+                "step_id", "elapsed_sec", "stamp", "topic", "linear_x", "linear_y", "angular_z", "speed",
+                "image_stamp", "image_wall_age_sec", "map_stamp", "map_step", "map_wall_age_sec",
+                "global_plan_stamp", "global_plan_step", "global_plan_wall_age_sec",
+                "local_plan_stamp", "local_plan_step", "local_plan_wall_age_sec",
+            ],
         )
         self.plan_writer = csv.DictWriter(
             self.plan_file,
@@ -1001,6 +1016,10 @@ class ExploreDebugRecorder:
                 "y",
                 "yaw",
             ],
+        )
+        self.map_to_odom_writer = csv.DictWriter(
+            self.map_to_odom_file,
+            fieldnames=["step_id", "elapsed_sec", "stamp", "x", "y", "yaw"],
         )
         self.video_frames_writer = csv.DictWriter(
             self.video_frames_file,
@@ -1038,6 +1057,7 @@ class ExploreDebugRecorder:
         self.status_writer.writeheader()
         self.cmd_vel_writer.writeheader()
         self.plan_writer.writeheader()
+        self.map_to_odom_writer.writeheader()
         self.video_frames_writer.writeheader()
 
         self.subscribers.append(rospy.Subscriber(args.occupancy_grid_topic, OccupancyGrid, self.occupancy_callback, queue_size=1))
@@ -1066,24 +1086,28 @@ class ExploreDebugRecorder:
             queue_size=50,
         ))
         self.stall_timer = rospy.Timer(rospy.Duration(max(0.5, args.stall_check_period_sec)), self.stall_timer_callback)
+        self.tf_record_timer = rospy.Timer(rospy.Duration(max(0.1, args.tf_record_period_sec)), self.tf_record_timer_callback)
         rospy.on_shutdown(self.shutdown)
 
     def occupancy_callback(self, msg: OccupancyGrid) -> None:
+        video_rgb = self._grid_to_video_rgb_locked(msg)
         with self.lock:
             if self.shutting_down:
                 return
             self.latest_grid = msg
-            self.latest_grid_video_rgb = self._grid_to_video_rgb_locked(msg)
+            self.latest_grid_video_rgb = video_rgb
             self.latest_grid_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_grid_wall_time = time.time()
             self.latest_grid_step = self.debug_step
 
     def global_costmap_callback(self, msg: OccupancyGrid) -> None:
+        copied = _copy_grid(msg)
+        video_rgb = self._costmap_to_video_rgb_locked(copied)
         with self.lock:
             if self.shutting_down:
                 return
-            self.latest_global_costmap = _copy_grid(msg)
-            self.latest_global_costmap_video_rgb = self._grid_to_video_rgb_locked(msg)
+            self.latest_global_costmap = copied
+            self.latest_global_costmap_video_rgb = video_rgb
             self.latest_global_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_global_costmap_wall_time = time.time()
             self.latest_global_costmap_step = self.debug_step
@@ -1094,17 +1118,24 @@ class ExploreDebugRecorder:
                 return
             if not _apply_grid_update(self.latest_global_costmap, msg):
                 return
-            self.latest_global_costmap_video_rgb = self._grid_to_video_rgb_locked(self.latest_global_costmap)
+            grid_snapshot = _copy_grid(self.latest_global_costmap)
+        video_rgb = self._costmap_to_video_rgb_locked(grid_snapshot)
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.latest_global_costmap_video_rgb = video_rgb
             self.latest_global_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_global_costmap_wall_time = time.time()
             self.latest_global_costmap_step = self.debug_step
 
     def local_costmap_callback(self, msg: OccupancyGrid) -> None:
+        copied = _copy_grid(msg)
+        video_rgb = self._costmap_to_video_rgb_locked(copied)
         with self.lock:
             if self.shutting_down:
                 return
-            self.latest_local_costmap = _copy_grid(msg)
-            self.latest_local_costmap_video_rgb = self._grid_to_video_rgb_locked(msg)
+            self.latest_local_costmap = copied
+            self.latest_local_costmap_video_rgb = video_rgb
             self.latest_local_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_local_costmap_wall_time = time.time()
             self.latest_local_costmap_step = self.debug_step
@@ -1183,7 +1214,7 @@ class ExploreDebugRecorder:
                 local_costmap = self.latest_local_costmap
                 local_costmap_base = self.latest_local_costmap_video_rgb
                 local_costmap_step = int(self.latest_local_costmap_step)
-                pose = self.latest_pose
+                pose = self._pose_at_stamp_locked(image_stamp)
                 trajectory = list(self.trajectory)
                 active_goal = self._active_goal_xy_locked()
                 active_goal_yaw = self._active_goal_yaw_locked()
@@ -1194,7 +1225,7 @@ class ExploreDebugRecorder:
                 goal_count = int(self.goal_count)
             stamp_delta = abs(image_stamp - map_stamp) if image_stamp > 0.0 and map_stamp > 0.0 else float("inf")
             map_available = map_grid is not None and map_base is not None
-            map_age = now - map_wall_time if map_wall_time > 0.0 else float("inf")
+            map_age = max(0.0, now - map_wall_time) if map_wall_time > 0.0 else float("inf")
             map_fresh = map_available and map_age <= float(self.args.video_map_max_age_sec)
             map_sync = map_available
             frame_width = int(self.args.first_person_video_width_px)
@@ -1613,7 +1644,8 @@ class ExploreDebugRecorder:
                 frame = np.frombuffer(bytes(frame_rgb), dtype=np.uint8).reshape((frame_h, frame_w, 3))
                 if frame_w != width or frame_h != height:
                     frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                writer.write(bgr)
                 written += 1
         finally:
             writer.release()
@@ -1760,6 +1792,29 @@ class ExploreDebugRecorder:
         rgb[np.flipud(raw_frontier)] = (112, 36, 170)
         return rgb
 
+    def _costmap_to_video_rgb_locked(self, grid: OccupancyGrid):
+        if np is None:
+            return None
+        width = int(grid.info.width)
+        height = int(grid.info.height)
+        if width <= 0 or height <= 0:
+            return None
+        values = np.flipud(np.asarray(grid.data, dtype=np.int16).reshape((height, width)))
+        rgb = np.empty((height, width, 3), dtype=np.uint8)
+        rgb[values < 0] = (178, 178, 178)       # Unknown
+        rgb[values == 0] = (248, 248, 245)      # Free
+
+        inflated = (values > 0) & (values < 99)
+        if np.any(inflated):
+            strength = values[inflated].astype(np.float32) / 98.0
+            rgb[inflated, 0] = 255
+            rgb[inflated, 1] = np.clip(232.0 - 82.0 * strength, 0, 255).astype(np.uint8)
+            rgb[inflated, 2] = np.clip(110.0 - 80.0 * strength, 0, 255).astype(np.uint8)
+
+        rgb[values == 99] = (245, 92, 28)       # Inscribed footprint cost
+        rgb[values >= 100] = (128, 20, 28)      # Raw lethal obstacle
+        return rgb
+
     def _render_video_map_panel_locked(
         self,
         panel_width: int,
@@ -1819,6 +1874,22 @@ class ExploreDebugRecorder:
         global_plan_poses = self._plan_poses_for_grid(grid, global_plan) if draw_global_plan else None
         local_global_plan_poses = self._plan_poses_for_grid(grid, local_global_plan) if draw_local_global_plan else None
         local_plan_poses = self._plan_poses_for_grid(grid, local_plan) if draw_local_plan else None
+        if pose_in_grid is not None:
+            def prune_to_robot(plan_poses):
+                if not plan_poses:
+                    return plan_poses
+                nearest_index = min(
+                    range(len(plan_poses)),
+                    key=lambda index: math.hypot(
+                        float(plan_poses[index][0]) - pose_in_grid[0],
+                        float(plan_poses[index][1]) - pose_in_grid[1],
+                    ),
+                )
+                return [(pose_in_grid[0], pose_in_grid[1], pose_in_grid[2])] + list(plan_poses[nearest_index:])
+
+            global_plan_poses = prune_to_robot(global_plan_poses)
+            local_global_plan_poses = prune_to_robot(local_global_plan_poses)
+            local_plan_poses = prune_to_robot(local_plan_poses)
         has_active_goal = draw_goal and goal_xy is not None
 
         def cell_to_px(cell: tuple[int, int] | None) -> tuple[int, int] | None:
@@ -1973,6 +2044,35 @@ class ExploreDebugRecorder:
             2,
             cv2.LINE_AA,
         )
+        if "COSTMAP" in title.upper():
+            legend = (
+                ("LETHAL", (128, 20, 28)),
+                ("INSCRIBED", (245, 92, 28)),
+                ("INFLATION", (255, 190, 60)),
+            )
+            legend_y = panel.shape[0] - 10
+            legend_width = min(panel.shape[1] - 12, 410)
+            cv2.rectangle(
+                panel,
+                (6, legend_y - 24),
+                (6 + legend_width, panel.shape[0] - 2),
+                (255, 255, 255),
+                -1,
+            )
+            legend_x = 12
+            for label, color in legend:
+                cv2.rectangle(panel, (legend_x, legend_y - 17), (legend_x + 13, legend_y - 4), color, -1)
+                cv2.putText(
+                    panel,
+                    label,
+                    (legend_x + 18, legend_y - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38,
+                    (20, 20, 20),
+                    1,
+                    cv2.LINE_AA,
+                )
+                legend_x += 126
         return panel
 
     @staticmethod
@@ -2051,6 +2151,8 @@ class ExploreDebugRecorder:
                     )
                     step = 0.0
             self.latest_pose = (x, y, yaw)
+            self.latest_pose_stamp = stamp
+            self.pose_history.append((stamp, x, y, yaw))
             self.latest_pose_step = self.debug_step
             self.last_odom_xy = (x, y)
             if self.stall_reference_xy is None:
@@ -2082,6 +2184,14 @@ class ExploreDebugRecorder:
                         "total_distance_m": f"{self.distance_m:.6f}",
                     }
                 )
+
+    def _pose_at_stamp_locked(self, stamp: float) -> tuple[float, float, float] | None:
+        if stamp <= 0.0 or not self.pose_history:
+            return self.latest_pose
+        nearest = min(self.pose_history, key=lambda item: abs(item[0] - stamp) if item[0] > 0.0 else float("inf"))
+        if nearest[0] <= 0.0:
+            return self.latest_pose
+        return nearest[1], nearest[2], nearest[3]
 
     def goal_callback(self, msg: PoseStamped) -> None:
         if self.shutting_down:
@@ -2317,6 +2427,14 @@ class ExploreDebugRecorder:
             if is_nonzero or now - last_time >= self.args.cmd_vel_record_period_sec:
                 self.last_cmd_vel_record_time[topic] = now
                 elapsed = now - self.start_wall_time
+                image_stamp = 0.0 if self.latest_image is None else float(self.latest_image[0])
+                image_wall_age = max(0.0, now - self.last_image_wall_time) if self.last_image_wall_time > 0.0 else float("inf")
+                map_stamp = float(self.latest_grid_video_stamp)
+                map_wall_age = max(0.0, now - self.latest_grid_wall_time) if self.latest_grid_wall_time > 0.0 else float("inf")
+                global_plan = self.latest_global_plan or {}
+                local_plan = self.latest_local_plan or {}
+                global_plan_elapsed = float(global_plan.get("elapsed_sec", 0.0))
+                local_plan_elapsed = float(local_plan.get("elapsed_sec", 0.0))
                 self.cmd_vel_writer.writerow(
                     {
                         "step_id": self.debug_step,
@@ -2327,8 +2445,45 @@ class ExploreDebugRecorder:
                         "linear_y": f"{linear_y:.6f}",
                         "angular_z": f"{angular_z:.6f}",
                         "speed": f"{speed:.6f}",
+                        "image_stamp": f"{image_stamp:.6f}" if image_stamp > 0.0 else "",
+                        "image_wall_age_sec": "" if not math.isfinite(image_wall_age) else f"{image_wall_age:.6f}",
+                        "map_stamp": f"{map_stamp:.6f}" if map_stamp > 0.0 else "",
+                        "map_step": self.latest_grid_step,
+                        "map_wall_age_sec": "" if not math.isfinite(map_wall_age) else f"{map_wall_age:.6f}",
+                        "global_plan_stamp": f"{float(global_plan.get('stamp', 0.0)):.6f}" if global_plan else "",
+                        "global_plan_step": global_plan.get("step_id", ""),
+                        "global_plan_wall_age_sec": "" if not global_plan_elapsed else f"{max(0.0, elapsed - global_plan_elapsed):.6f}",
+                        "local_plan_stamp": f"{float(local_plan.get('stamp', 0.0)):.6f}" if local_plan else "",
+                        "local_plan_step": local_plan.get("step_id", ""),
+                        "local_plan_wall_age_sec": "" if not local_plan_elapsed else f"{max(0.0, elapsed - local_plan_elapsed):.6f}",
                     }
                 )
+
+    def tf_record_timer_callback(self, _event) -> None:
+        if self.shutting_down:
+            return
+        try:
+            translation, rotation = self.tf_listener.lookupTransform(
+                self.args.map_frame, self.args.odom_frame, rospy.Time(0)
+            )
+            stamp = self.tf_listener.getLatestCommonTime(self.args.map_frame, self.args.odom_frame).to_sec()
+            yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            return
+        now = time.time()
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.map_to_odom_writer.writerow(
+                {
+                    "step_id": self.debug_step,
+                    "elapsed_sec": f"{now - self.start_wall_time:.3f}",
+                    "stamp": f"{stamp:.6f}",
+                    "x": f"{float(translation[0]):.6f}",
+                    "y": f"{float(translation[1]):.6f}",
+                    "yaw": f"{float(yaw):.6f}",
+                }
+            )
 
     def plan_callback(self, msg: NavPath, callback_args: tuple[str, str]) -> None:
         if self.shutting_down:
@@ -3346,6 +3501,10 @@ class ExploreDebugRecorder:
                 self.stall_timer.shutdown()
             except Exception:
                 pass
+            try:
+                self.tf_record_timer.shutdown()
+            except Exception:
+                pass
             for subscriber in self.subscribers:
                 try:
                     subscriber.unregister()
@@ -3413,6 +3572,7 @@ class ExploreDebugRecorder:
                 "subgoal_contact_sheet": subgoal_contact_sheet,
                 "subgoal_overlay_contact_sheet": subgoal_overlay_contact_sheet,
                 "move_base_plan_csv": str(self.output_dir / "move_base_plans.csv"),
+                "map_to_odom_csv": str(self.output_dir / "map_to_odom.csv"),
                 "move_base_rosout_log": str(self.output_dir / "move_base_rosout.log"),
                 "finalization_complete": False,
                 "video_finalization_pending": True,
@@ -3428,6 +3588,7 @@ class ExploreDebugRecorder:
                 self.status_file,
                 self.cmd_vel_file,
                 self.plan_file,
+                self.map_to_odom_file,
                 self.video_frames_file,
                 self.move_base_log_file,
             ]:
@@ -3493,6 +3654,7 @@ class ExploreDebugRecorder:
                 "subgoal_contact_sheet": subgoal_contact_sheet,
                 "subgoal_overlay_contact_sheet": subgoal_overlay_contact_sheet,
                 "move_base_plan_csv": str(self.output_dir / "move_base_plans.csv"),
+                "map_to_odom_csv": str(self.output_dir / "map_to_odom.csv"),
                 "move_base_rosout_log": str(self.output_dir / "move_base_rosout.log"),
                 "finalization_complete": True,
                 "video_finalization_pending": False,
@@ -3506,6 +3668,7 @@ class ExploreDebugRecorder:
                 self.status_file,
                 self.cmd_vel_file,
                 self.plan_file,
+                self.map_to_odom_file,
                 self.video_frames_file,
                 self.move_base_log_file,
             ]:
@@ -3552,6 +3715,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-sheet-gap-px", type=int, default=16)
     parser.add_argument("--cmd-vel-record-period-sec", type=float, default=0.2)
     parser.add_argument("--cmd-vel-nonzero-threshold", type=float, default=1e-4)
+    parser.add_argument("--tf-record-period-sec", type=float, default=0.5)
     parser.add_argument("--stall-check-period-sec", type=float, default=1.0)
     parser.add_argument("--stall-snapshot-sec", type=float, default=30.0)
     parser.add_argument("--stall-snapshot-distance-m", type=float, default=0.15)
@@ -3568,7 +3732,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--first-person-video-h264-crf", type=int, default=23)
     parser.add_argument("--first-person-video-h264-preset", default="veryfast")
     parser.add_argument("--first-person-video-h264-timeout-sec", type=float, default=180.0)
-    parser.add_argument("--runtime-video-encode", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--runtime-video-encode", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--async-artifact-writes", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--artifact-write-queue-size", type=int, default=512)
     parser.add_argument("--video-map-crop-margin-px", type=int, default=90)

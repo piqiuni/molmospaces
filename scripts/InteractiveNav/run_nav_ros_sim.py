@@ -403,6 +403,10 @@ def build_nav_config(args) -> NavToObjBaseConfig:
         ensure_head_camera_exists(cfg.camera_config)
     elif args.robot == "rby1":
         cfg.robot_config = RBY1Config()
+        # Keep the navigation sensor head level from the first simulation step.
+        # The sampler synchronizes the actuator target with this qpos below.
+        cfg.robot_config.init_qpos["head"] = np.zeros(2, dtype=float)
+        cfg.robot_config.init_qpos_noise_range["head"] = np.zeros(2, dtype=float)
         arm_qpos = parse_qpos_csv(args.initial_arm_qpos)
         left_arm_qpos = parse_qpos_csv(args.initial_left_arm_qpos)
         right_arm_qpos = parse_qpos_csv(args.initial_right_arm_qpos)

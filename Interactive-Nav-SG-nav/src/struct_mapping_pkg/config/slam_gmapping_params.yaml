@@ -5,6 +5,12 @@ odom_topic: "/odom"
 scan_filter_queue_size: 1
 
 # GMapping核心参数
+use_odom_pose_for_mapping: true  # 仿真 odom 为真值；禁止 scan matching 旋转/平移地图
+# Hybrid scan matching: trust fused odom/IMU yaw and only allow bounded
+# translation correction. This prevents false angular matches from rotating
+# successive scans into different map orientations.
+scan_matching_lock_yaw_to_odom: true
+scan_matching_max_translation_correction: 0.15
 maxUrange: 20.0 #激光扫描最大距离
 sigma: 0.05
 kernelSize: 1
@@ -47,7 +53,7 @@ lasamplestep: 0.005
 # 点云高度滤波参数
 enable_height_filter: true
 filter_height_center: 0.95
-filter_height_tolerance: 0.9r
+filter_height_tolerance: 0.9
 filter_height_frame: tf_frame_base_link
 
 # 障碍物膨胀参数
@@ -56,7 +62,7 @@ inflation_radius: 0.10  # 膨胀半径（米）
 inscribed_radius: 0.05  # 障碍物核心区域
 
 # 局部覆写参数（用最新扫描实时覆盖机器人附近区域）
-enable_local_overwrite: true
+enable_local_overwrite: false
 local_overwrite_radius: 8.0
 local_overwrite_mark_occupied: false
 local_overwrite_clear_confirm_count: 3

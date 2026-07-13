@@ -35,6 +35,6 @@ local_costmap:
        min_obstacle_height: 0.02
 
    inflation_layer:
-     inflation_radius: 0.2
+     inflation_radius: 0.1
      cost_scaling_factor: 10.0
    

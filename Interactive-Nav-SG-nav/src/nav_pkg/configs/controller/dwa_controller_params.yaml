@@ -42,6 +42,14 @@ DWAPlannerROS:
   # Oscillation Prevention Parameters
   oscillation_reset_dist: 0.05
 
+  # A path directly behind the robot is symmetric for DWA. Commit to one
+  # collision-checked turn direction until the path is in the forward sector.
+  rear_path_prerotate_enabled: true
+  rear_path_enter_angle: 2.2
+  rear_path_exit_angle: 0.9
+  rear_path_lookahead_dist: 0.45
+  rear_path_rotate_speed: 0.22
+
   # Debugging
   publish_traj_pc: true
   publish_cost_grid_pc: true

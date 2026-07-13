@@ -4,6 +4,7 @@
 
   <arg name="start_sim" default="true"/>
   <arg name="start_mapping" default="true"/>
+  <arg name="mapping_mode" default="odom_locked"/>
   <arg name="start_semantic_mapping" default="false"/>
   <arg name="manual_control" default="false"/>
   <arg name="start_explore_py" default="false"/>
@@ -63,7 +64,9 @@
   </group>
 
   <group if="$(arg start_mapping)">
-    <include file="$(find struct_mapping_pkg)/launch/slam_gmapping.launch"/>
+    <include file="$(find struct_mapping_pkg)/launch/slam_gmapping.launch">
+      <arg name="mapping_mode" value="$(arg mapping_mode)"/>
+    </include>
   </group>
 
   <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_use_gt') != 'true')">

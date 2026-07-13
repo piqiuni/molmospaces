@@ -108,10 +108,15 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
                 perturb = np.zeros_like(qpos)
             robot_view.get_move_group(group_name).joint_pos = qpos + perturb
 
-        # Reset controllers to hold current positions (important for torso/head)
+        # Reset controllers to hold current positions. The RBY1 head has
+        # actuators but no controller, so synchronize its target explicitly;
+        # otherwise mj_resetData() leaves ctrl at zero even when head qpos is not.
         for robot in env.robots:
             for controller in robot.controllers.values():
                 controller.reset()
+            if "head" in robot.robot_view.move_group_ids():
+                head_mg = robot.robot_view.get_move_group("head")
+                head_mg.ctrl = head_mg.noop_ctrl
 
         log.info("Scene setup completed.\n")
 
