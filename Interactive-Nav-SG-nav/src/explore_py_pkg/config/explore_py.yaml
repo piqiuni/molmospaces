@@ -1,0 +1,107 @@
+frames:
+  map_frame: "tf_frame_map"
+
+topics:
+  occupancy_grid: "/struct_mapping/occ_map"
+  odom: "/odom"
+  move_base_status: "/move_base/status"
+  goal: "/move_base_simple/goal"
+  move_base_cancel: "/move_base/cancel"
+  cmd_vel: "/cmd_vel"
+  global_plan: "/move_base/GlobalPlanner/plan"
+  local_plan: "/move_base/DWAPlannerROS/local_plan"
+  status: "/explore_py/status"
+  frontiers: "/explore_py/frontiers"
+  current_subgoal: "/explore_py/current_subgoal"
+  reset: "/explore_py/reset"
+  llm_value_grid: "/explore_py/llm_value_grid"
+  strategy_bias: "/explore_py/strategy_bias"
+  object_map: "/semantic_mapping/obj_map"
+  scene_id_grid: "/semantic_mapping/scene_id_grid"
+  scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
+  unified_graph: "/semantic_mapping/unified_graph"
+  navigation_hints: "/semantic_mapping/navigation_hints"
+
+exploration:
+  tick_rate_hz: 1.0
+  goal_republish_interval_sec: 0.0
+  goal_reach_tolerance_m: 0.45
+  goal_timeout_sec: 90.0
+  stall_timeout_sec: 30.0
+  stall_distance_m: 0.15
+  min_goal_lifetime_sec: 8.0
+  stall_yaw_progress_rad: 0.20
+  rotation_stall_timeout_sec: 45.0
+  blacklist_duration_sec: 25.0
+  failed_cluster_retry_sec: 120.0
+  failed_cluster_max_failures: 3
+  frontier_match_distance_m: 1.0
+  frontier_gone_confirm_ticks: 3
+  frontier_gone_min_goal_age_sec: 8.0
+  failed_point_soft_blacklist_sec: 45.0
+  failed_point_blacklist_sec: 180.0
+  failed_point_blacklist_radius_m: 1.25
+  reached_point_blacklist_sec: 90.0
+  reached_point_blacklist_radius_m: 0.75
+  active_goal_frontier_min_cells: 3
+  initial_spin_enabled: false
+  initial_spin_angle_rad: 6.283185307179586
+  initial_spin_angular_speed: 0.15
+  initial_spin_timeout_sec: 95.0
+  initial_spin_settle_sec: 1.0
+  initial_spin_cmd_rate_hz: 10.0
+  local_plan_watchdog_enabled: false
+  local_plan_watchdog_sec: 12.0
+  local_plan_min_poses: 3
+  local_plan_min_length_m: 0.20
+  global_plan_min_poses: 3
+  plan_freshness_sec: 4.0
+  global_plan_current_goal_check_enabled: true
+  global_plan_current_goal_grace_sec: 4.0
+  global_plan_goal_tolerance_m: 0.6
+  initial_local_goal_count: 3
+
+frontier:
+  free_max: 20
+  occupied_min: 50
+  hard_min_cluster_cells: 3
+  min_cluster_cells: 12
+  connect_8: true
+  candidate_top_k: 12
+  sensor_range_m: 5.0
+  subgoal_search_radius_cells: 18
+  min_subgoal_distance_m: 1.00
+  target_frontier_offset_m: 1.0
+  use_voronoi_viewpoints: true
+  min_viewpoint_frontier_distance_m: 0.8
+  max_viewpoint_frontier_distance_m: 3.0
+  clearance_weight: 1.0
+  frontier_offset_weight: 0.55
+  local_horizon_m: 3.0
+  local_horizon_penalty: 0.45
+  far_cluster_penalty: 0.45
+  far_cluster_penalty_saturation_m: 4.0
+  min_obstacle_clearance_m: 0.35
+  max_clearance_check_m: 1.2
+  robot_radius_m: 0.30
+  footprint_safety_margin_m: 0.15
+  require_footprint_free: true
+  footprint_unknown_is_free: true
+  turning_safety_margin_m: 0.0
+  require_turning_clearance: true
+  near_frontier_relax_distance_m: 1.5
+  relaxed_min_viewpoint_frontier_distance_m: 0.35
+  initial_local_radius_m: 2.2
+  initial_backward_weight: 0.35
+
+scoring:
+  information_weight: 1.0
+  distance_weight: 0.80
+  semantic_weight: 0.35
+  llm_weight: 0.8
+  revisit_penalty: 0.6
+  failure_penalty: 1.0
+  receding_distance_weight: 0.15
+  previous_subgoal_weight: 0.35
+  continuity_cost_weight: 0.25
+  continuity_cost_saturation_m: 4.0

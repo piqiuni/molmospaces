@@ -121,6 +121,7 @@ Initial map dimensions and resolution:
 #include "slam_gmapping.h"
 
 #include <iostream>
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -185,6 +186,8 @@ void SlamGMapping::init()
 
   got_first_scan_ = false;
   got_map_ = false;
+  overwrite_layer_initialized_ = false;
+  overwrite_correction_anchor_initialized_ = false;
   
 
   
@@ -271,6 +274,10 @@ void SlamGMapping::init()
     lasamplerange_ = 0.005;
   if(!private_nh_.getParam("lasamplestep", lasamplestep_))
     lasamplestep_ = 0.005;
+  if(!private_nh_.getParam("use_odom_pose_for_mapping", use_odom_pose_for_mapping_))
+    use_odom_pose_for_mapping_ = false;
+  private_nh_.param("scan_matching_lock_yaw_to_odom", scan_matching_lock_yaw_to_odom_, false);
+  private_nh_.param("scan_matching_max_translation_correction", scan_matching_max_translation_correction_, 0.0);
     
   // 点云高度滤波参数
   if(!private_nh_.getParam("enable_height_filter", enable_height_filter_))
@@ -297,6 +304,23 @@ void SlamGMapping::init()
     local_overwrite_radius_ = 8.0;  // 默认仅覆写机器人附近8米范围
   if(!private_nh_.getParam("local_overwrite_mark_occupied", local_overwrite_mark_occupied_))
     local_overwrite_mark_occupied_ = true;
+  if(!private_nh_.getParam("local_overwrite_clear_confirm_count", local_overwrite_clear_confirm_count_))
+    local_overwrite_clear_confirm_count_ = 1;
+  if(!private_nh_.getParam("local_overwrite_occupy_confirm_count", local_overwrite_occupy_confirm_count_))
+    local_overwrite_occupy_confirm_count_ = 1;
+  local_overwrite_clear_confirm_count_ = std::max(1, local_overwrite_clear_confirm_count_);
+  local_overwrite_occupy_confirm_count_ = std::max(1, local_overwrite_occupy_confirm_count_);
+  if(!private_nh_.getParam("local_overwrite_ttl_sec", local_overwrite_ttl_sec_))
+    local_overwrite_ttl_sec_ = 0.0;
+  local_overwrite_ttl_sec_ = std::max(0.0, local_overwrite_ttl_sec_);
+  if(!private_nh_.getParam("local_overwrite_clear_static_occupied", local_overwrite_clear_static_occupied_))
+    local_overwrite_clear_static_occupied_ = false;
+  if(!private_nh_.getParam("local_overwrite_reset_on_correction_trans_delta", local_overwrite_reset_on_correction_trans_delta_))
+    local_overwrite_reset_on_correction_trans_delta_ = 0.25;
+  if(!private_nh_.getParam("local_overwrite_reset_on_correction_rot_delta", local_overwrite_reset_on_correction_rot_delta_))
+    local_overwrite_reset_on_correction_rot_delta_ = 0.10;
+  local_overwrite_reset_on_correction_trans_delta_ = std::max(0.0, local_overwrite_reset_on_correction_trans_delta_);
+  local_overwrite_reset_on_correction_rot_delta_ = std::max(0.0, local_overwrite_reset_on_correction_rot_delta_);
 
   // 时间同步保护参数
   if(!private_nh_.getParam("enable_time_sync_guard", enable_time_sync_guard_))
@@ -440,6 +464,12 @@ void SlamGMapping::resetCallback(const std_msgs::Empty::ConstPtr& msg)
   got_map_ = false;
   laser_count_ = 0;
   map_ = nav_msgs::GetMap::Response();
+  overwrite_layer_initialized_ = false;
+  overwrite_values_.clear();
+  overwrite_free_counts_.clear();
+  overwrite_occupied_counts_.clear();
+  overwrite_last_seen_.clear();
+  overwrite_correction_anchor_initialized_ = false;
   map_to_odom_ = tf::Transform(tf::createQuaternionFromRPY(0, 0, 0), tf::Point(0, 0, 0));
 
   nav_msgs::OccupancyGrid cleared_map;
@@ -627,11 +657,26 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
                               kernelSize_, lstep_, astep_, iterations_,
                               lsigma_, ogain_, lskip_);
 
-  gsp_->setMotionModelParameters(srr_, srt_, str_, stt_);
+  const double motion_srr = use_odom_pose_for_mapping_ ? 0.0 : srr_;
+  const double motion_srt = use_odom_pose_for_mapping_ ? 0.0 : srt_;
+  const double motion_str = use_odom_pose_for_mapping_ ? 0.0 : str_;
+  const double motion_stt = use_odom_pose_for_mapping_ ? 0.0 : stt_;
+  const int mapper_particles = use_odom_pose_for_mapping_ ? 1 : particles_;
+
+  gsp_->setMotionModelParameters(motion_srr, motion_srt, motion_str, motion_stt);
+  gsp_->setUseOdometryPose(use_odom_pose_for_mapping_);
+  gsp_->setScanMatchingCorrectionLimits(
+      scan_matching_lock_yaw_to_odom_, scan_matching_max_translation_correction_);
+  if (!use_odom_pose_for_mapping_ && scan_matching_lock_yaw_to_odom_)
+  {
+    ROS_WARN(
+        "Scan matching yaw is locked to odometry; scan matching only corrects translation (max %.3fm/update)",
+        scan_matching_max_translation_correction_);
+  }
   gsp_->setUpdateDistances(linearUpdate_, angularUpdate_, resampleThreshold_);
   gsp_->setUpdatePeriod(temporalUpdate_);
   gsp_->setgenerateMap(false);
-  gsp_->GridSlamProcessor::init(particles_, xmin_, ymin_, xmax_, ymax_,
+  gsp_->GridSlamProcessor::init(mapper_particles, xmin_, ymin_, xmax_, ymax_,
                                 delta_, initialPose);
   gsp_->setllsamplerange(llsamplerange_);
   gsp_->setllsamplestep(llsamplestep_);
@@ -640,7 +685,14 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
   /// lasamplerange.  It was probably a typo, but who knows.
   gsp_->setlasamplerange(lasamplerange_);
   gsp_->setlasamplestep(lasamplestep_);
-  gsp_->setminimumScore(minimum_score_);
+  gsp_->setminimumScore(
+      use_odom_pose_for_mapping_ ? std::numeric_limits<double>::max() : minimum_score_);
+
+  if (use_odom_pose_for_mapping_)
+  {
+    ROS_WARN(
+        "Odometry-locked mapping enabled: using one zero-noise particle and rejecting scan-matching pose corrections");
+  }
 
   // Call the sampling function once to set the seed.
   GMapping::sampleGaussian(1,seed_);
@@ -774,6 +826,15 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
   
   // 应用高度滤波
   filterPointCloudByHeight(filtered_cloud);
+
+  // GMapping only supports planar laser frames. The incoming /registered_scan may
+  // follow the real head-camera pose (with pitch/roll), so we level it into the
+  // robot base frame before synthesizing the 2D scan used by gmapping.
+  if(!transformPointCloudToFrame(filtered_cloud, base_frame_))
+  {
+    ROS_WARN_THROTTLE(2.0, "Failed to transform pointcloud into base frame for planar gmapping");
+    return;
+  }
   
   // 发布滤波后的点云
   if (filtered_cloud_pub_.getNumSubscribers() > 0)
@@ -810,6 +871,7 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
     ROS_DEBUG("scan processed");
 
     GMapping::OrientedPoint mpose = gsp_->getParticles()[gsp_->getBestParticleIndex()].pose;
+    resetOverwriteLayerIfPoseCorrectionJumped(mpose, odom_pose);
     ROS_DEBUG("new best pose: %.3f %.3f %.3f", mpose.x, mpose.y, mpose.theta);
     ROS_DEBUG("odom pose: %.3f %.3f %.3f", odom_pose.x, odom_pose.y, odom_pose.theta);
     ROS_DEBUG("correction: %.3f %.3f %.3f", mpose.x - odom_pose.x, mpose.y - odom_pose.y, mpose.theta - odom_pose.theta);
@@ -821,9 +883,27 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
     tf::Transform laser_to_map = tf::Transform(tf::createQuaternionFromRPY(0, 0, mpose.theta), tf::Vector3(mpose.x, mpose.y, 0.0));
     tf::Transform odom_to_laser = tf::Transform(tf::createQuaternionFromRPY(0, 0, odom_pose.theta), tf::Vector3(odom_pose.x, odom_pose.y, 0.0));
 
-    // map_to_odom_mutex_.lock();
-    // map_to_odom_ = (odom_to_laser * laser_to_map).inverse();
-    // map_to_odom_mutex_.unlock();
+    {
+      boost::mutex::scoped_lock tf_lock(map_to_odom_mutex_);
+      if (use_odom_pose_for_mapping_)
+      {
+        map_to_odom_.setIdentity();
+        const double correction_trans = std::hypot(mpose.x - odom_pose.x, mpose.y - odom_pose.y);
+        const double correction_rot = std::fabs(angleDiff(mpose.theta, odom_pose.theta));
+        if (correction_trans > 1e-4 || correction_rot > 1e-4)
+        {
+          ROS_ERROR_THROTTLE(
+              1.0,
+              "Odometry-locked mapping invariant violated: translation=%.6fm rotation=%.6frad",
+              correction_trans,
+              correction_rot);
+        }
+      }
+      else
+      {
+        map_to_odom_ = laser_to_map * odom_to_laser.inverse();
+      }
+    }
 
     if(!got_map_ || (cloud->header.stamp - last_map_update) > map_update_interval_)
     {
@@ -861,6 +941,7 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     ROS_DEBUG("scan processed");
 
     GMapping::OrientedPoint mpose = gsp_->getParticles()[gsp_->getBestParticleIndex()].pose;
+    resetOverwriteLayerIfPoseCorrectionJumped(mpose, odom_pose);
     ROS_DEBUG("new best pose: %.3f %.3f %.3f", mpose.x, mpose.y, mpose.theta);
     ROS_DEBUG("odom pose: %.3f %.3f %.3f", odom_pose.x, odom_pose.y, odom_pose.theta);
     ROS_DEBUG("correction: %.3f %.3f %.3f", mpose.x - odom_pose.x, mpose.y - odom_pose.y, mpose.theta - odom_pose.theta);
@@ -868,9 +949,17 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     tf::Transform laser_to_map = tf::Transform(tf::createQuaternionFromRPY(0, 0, mpose.theta), tf::Vector3(mpose.x, mpose.y, 0.0));
     tf::Transform odom_to_laser = tf::Transform(tf::createQuaternionFromRPY(0, 0, odom_pose.theta), tf::Vector3(odom_pose.x, odom_pose.y, 0.0));
 
-    // map_to_odom_mutex_.lock();
-    // map_to_odom_ = (odom_to_laser * laser_to_map).inverse();
-    // map_to_odom_mutex_.unlock();
+    {
+      boost::mutex::scoped_lock tf_lock(map_to_odom_mutex_);
+      if (use_odom_pose_for_mapping_)
+      {
+        map_to_odom_.setIdentity();
+      }
+      else
+      {
+        map_to_odom_ = laser_to_map * odom_to_laser.inverse();
+      }
+    }
 
     if(!got_map_ || (scan->header.stamp - last_map_update) > map_update_interval_)
     {
@@ -1115,6 +1204,55 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
   return true;
 }
 
+bool SlamGMapping::transformPointCloudToFrame(sensor_msgs::PointCloud2& cloud, const std::string& target_frame)
+{
+  const std::string source_frame = cloud.header.frame_id;
+  if (source_frame.empty() || target_frame.empty() || source_frame == target_frame)
+  {
+    cloud.header.frame_id = target_frame.empty() ? source_frame : target_frame;
+    return true;
+  }
+
+  tf::StampedTransform target_from_source;
+  try
+  {
+    tf_.lookupTransform(target_frame, source_frame, cloud.header.stamp, target_from_source);
+  }
+  catch (tf::TransformException& e)
+  {
+    ROS_WARN_THROTTLE(
+        2.0,
+        "Pointcloud TF lookup failed (%s -> %s): %s",
+        source_frame.c_str(),
+        target_frame.c_str(),
+        e.what());
+    return false;
+  }
+
+  sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+  sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+  sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+  const size_t point_count = cloud.width * cloud.height;
+
+  for (size_t i = 0; i < point_count; ++i, ++iter_x, ++iter_y, ++iter_z)
+  {
+    const float x = *iter_x;
+    const float y = *iter_y;
+    const float z = *iter_z;
+    if (std::isnan(x) || std::isnan(y) || std::isnan(z))
+      continue;
+
+    const tf::Vector3 p_src(x, y, z);
+    const tf::Vector3 p_tgt = target_from_source * p_src;
+    *iter_x = static_cast<float>(p_tgt.x());
+    *iter_y = static_cast<float>(p_tgt.y());
+    *iter_z = static_cast<float>(p_tgt.z());
+  }
+
+  cloud.header.frame_id = target_frame;
+  return true;
+}
+
 void SlamGMapping::filterPointCloudByHeight(sensor_msgs::PointCloud2& cloud)
 {
   if (!enable_height_filter_)
@@ -1309,9 +1447,17 @@ void SlamGMapping::inflateObstacles(nav_msgs::OccupancyGrid& map)
 
 bool SlamGMapping::worldToMap(const nav_msgs::OccupancyGrid& map, double wx, double wy, int& mx, int& my) const
 {
-  const double origin_x = map.info.origin.position.x;
-  const double origin_y = map.info.origin.position.y;
-  const double resolution = map.info.resolution;
+  return worldToMapInfo(map.info, wx, wy, mx, my);
+}
+
+bool SlamGMapping::worldToMapInfo(const nav_msgs::MapMetaData& info, double wx, double wy, int& mx, int& my) const
+{
+  const double origin_x = info.origin.position.x;
+  const double origin_y = info.origin.position.y;
+  const double resolution = info.resolution;
+
+  if (resolution <= 0.0 || info.width == 0 || info.height == 0)
+    return false;
 
   if (wx < origin_x || wy < origin_y)
     return false;
@@ -1320,11 +1466,158 @@ bool SlamGMapping::worldToMap(const nav_msgs::OccupancyGrid& map, double wx, dou
   my = static_cast<int>((wy - origin_y) / resolution);
 
   if (mx < 0 || my < 0 ||
-      mx >= static_cast<int>(map.info.width) ||
-      my >= static_cast<int>(map.info.height))
+      mx >= static_cast<int>(info.width) ||
+      my >= static_cast<int>(info.height))
     return false;
 
   return true;
+}
+
+bool SlamGMapping::mapInfoMatchesOverwriteLayer(const nav_msgs::MapMetaData& info) const
+{
+  if (!overwrite_layer_initialized_)
+    return false;
+
+  const double eps = 1e-9;
+  return overwrite_layer_info_.width == info.width &&
+         overwrite_layer_info_.height == info.height &&
+         std::fabs(overwrite_layer_info_.resolution - info.resolution) < eps &&
+         std::fabs(overwrite_layer_info_.origin.position.x - info.origin.position.x) < eps &&
+         std::fabs(overwrite_layer_info_.origin.position.y - info.origin.position.y) < eps;
+}
+
+void SlamGMapping::clearOverwriteCell(size_t idx)
+{
+  if (idx >= overwrite_values_.size())
+    return;
+  overwrite_values_[idx] = -1;
+  overwrite_free_counts_[idx] = 0;
+  overwrite_occupied_counts_[idx] = 0;
+  overwrite_last_seen_[idx] = ros::Time(0);
+}
+
+void SlamGMapping::clearOverwriteLayer()
+{
+  std::fill(overwrite_values_.begin(), overwrite_values_.end(), static_cast<int8_t>(-1));
+  std::fill(overwrite_free_counts_.begin(), overwrite_free_counts_.end(), static_cast<unsigned short>(0));
+  std::fill(overwrite_occupied_counts_.begin(), overwrite_occupied_counts_.end(), static_cast<unsigned short>(0));
+  std::fill(overwrite_last_seen_.begin(), overwrite_last_seen_.end(), ros::Time(0));
+}
+
+double SlamGMapping::angleDiff(double a, double b) const
+{
+  double d = a - b;
+  while (d > M_PI)
+    d -= 2.0 * M_PI;
+  while (d < -M_PI)
+    d += 2.0 * M_PI;
+  return d;
+}
+
+void SlamGMapping::resetOverwriteLayerIfPoseCorrectionJumped(const GMapping::OrientedPoint& map_pose,
+                                                             const GMapping::OrientedPoint& odom_pose)
+{
+  if (!enable_local_overwrite_)
+    return;
+
+  const GMapping::OrientedPoint correction(
+      map_pose.x - odom_pose.x,
+      map_pose.y - odom_pose.y,
+      angleDiff(map_pose.theta, odom_pose.theta));
+
+  if (!overwrite_correction_anchor_initialized_)
+  {
+    overwrite_correction_anchor_ = correction;
+    overwrite_correction_anchor_initialized_ = true;
+    return;
+  }
+
+  const double trans_delta = std::hypot(correction.x - overwrite_correction_anchor_.x,
+                                        correction.y - overwrite_correction_anchor_.y);
+  const double rot_delta = std::fabs(angleDiff(correction.theta, overwrite_correction_anchor_.theta));
+
+  if ((local_overwrite_reset_on_correction_trans_delta_ > 0.0 &&
+       trans_delta > local_overwrite_reset_on_correction_trans_delta_) ||
+      (local_overwrite_reset_on_correction_rot_delta_ > 0.0 &&
+       rot_delta > local_overwrite_reset_on_correction_rot_delta_))
+  {
+    clearOverwriteLayer();
+    overwrite_correction_anchor_ = correction;
+    ROS_WARN_THROTTLE(
+        2.0,
+        "Persistent local overwrite layer cleared because gmapping pose correction changed: dxy=%.3f m, dyaw=%.3f rad",
+        trans_delta,
+        rot_delta);
+  }
+}
+
+void SlamGMapping::syncOverwriteLayerToMap(const nav_msgs::MapMetaData& info)
+{
+  const size_t cell_count = static_cast<size_t>(info.width) * static_cast<size_t>(info.height);
+  if (cell_count == 0)
+  {
+    overwrite_layer_initialized_ = false;
+    overwrite_values_.clear();
+    overwrite_free_counts_.clear();
+    overwrite_occupied_counts_.clear();
+    overwrite_last_seen_.clear();
+    return;
+  }
+
+  if (mapInfoMatchesOverwriteLayer(info) && overwrite_values_.size() == cell_count)
+    return;
+
+  std::vector<int8_t> new_values(cell_count, -1);
+  std::vector<unsigned short> new_free_counts(cell_count, 0);
+  std::vector<unsigned short> new_occupied_counts(cell_count, 0);
+  std::vector<ros::Time> new_last_seen(cell_count, ros::Time(0));
+
+  if (overwrite_layer_initialized_ && !overwrite_values_.empty())
+  {
+    for (unsigned int y = 0; y < overwrite_layer_info_.height; ++y)
+    {
+      for (unsigned int x = 0; x < overwrite_layer_info_.width; ++x)
+      {
+        const size_t old_idx = MAP_IDX(overwrite_layer_info_.width, x, y);
+        if (old_idx >= overwrite_values_.size())
+          continue;
+        if (overwrite_values_[old_idx] < 0 &&
+            overwrite_free_counts_[old_idx] == 0 &&
+            overwrite_occupied_counts_[old_idx] == 0)
+          continue;
+
+        const double wx = overwrite_layer_info_.origin.position.x +
+                          (static_cast<double>(x) + 0.5) * overwrite_layer_info_.resolution;
+        const double wy = overwrite_layer_info_.origin.position.y +
+                          (static_cast<double>(y) + 0.5) * overwrite_layer_info_.resolution;
+
+        int new_mx = 0;
+        int new_my = 0;
+        if (!worldToMapInfo(info, wx, wy, new_mx, new_my))
+          continue;
+
+        const size_t new_idx = MAP_IDX(info.width, new_mx, new_my);
+        if (new_idx >= new_values.size())
+          continue;
+
+        if (new_last_seen[new_idx].isZero() ||
+            overwrite_last_seen_[old_idx] >= new_last_seen[new_idx])
+        {
+          new_values[new_idx] = overwrite_values_[old_idx];
+          new_free_counts[new_idx] = overwrite_free_counts_[old_idx];
+          new_occupied_counts[new_idx] = overwrite_occupied_counts_[old_idx];
+          new_last_seen[new_idx] = overwrite_last_seen_[old_idx];
+        }
+      }
+    }
+  }
+
+  overwrite_layer_info_ = info;
+  overwrite_values_.swap(new_values);
+  overwrite_free_counts_.swap(new_free_counts);
+  overwrite_occupied_counts_.swap(new_occupied_counts);
+  overwrite_last_seen_.swap(new_last_seen);
+  overwrite_layer_initialized_ = true;
 }
 
 bool SlamGMapping::hasMatchedOdomStamp(const ros::Time& stamp, double* dt_sec)
@@ -1354,7 +1647,19 @@ void SlamGMapping::applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
                                        const sensor_msgs::LaserScan& scan,
                                        const GMapping::OrientedPoint& sensor_pose)
 {
+  updateOverwriteLayer(map, scan, sensor_pose);
+  applyOverwriteLayer(map);
+}
+
+void SlamGMapping::updateOverwriteLayer(const nav_msgs::OccupancyGrid& map,
+                                        const sensor_msgs::LaserScan& scan,
+                                        const GMapping::OrientedPoint& sensor_pose)
+{
   if (map.info.width == 0 || map.info.height == 0 || scan.ranges.empty())
+    return;
+
+  syncOverwriteLayerToMap(map.info);
+  if (!overwrite_layer_initialized_)
     return;
 
   const double resolution = map.info.resolution;
@@ -1372,6 +1677,7 @@ void SlamGMapping::applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
 
   size_t updated_free_cells = 0;
   size_t updated_occupied_cells = 0;
+  const ros::Time stamp = scan.header.stamp.isZero() ? ros::Time::now() : scan.header.stamp;
 
   for (size_t i = 0; i < scan.ranges.size(); ++i)
   {
@@ -1394,9 +1700,13 @@ void SlamGMapping::applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
     const int step_count = std::max(1, static_cast<int>(trace_range / resolution));
     const double cos_theta = std::cos(beam_angle);
     const double sin_theta = std::sin(beam_angle);
+    const bool hit_within_radius = valid_hit && measured_range <= usable_radius;
 
     for (int step = 1; step <= step_count; ++step)
     {
+      if (hit_within_radius && step == step_count)
+        continue;
+
       const double dist = std::min(trace_range, static_cast<double>(step) * resolution);
       const double wx = sensor_pose.x + dist * cos_theta;
       const double wy = sensor_pose.y + dist * sin_theta;
@@ -1407,14 +1717,29 @@ void SlamGMapping::applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
         break;
 
       const int idx = MAP_IDX(map.info.width, mx, my);
-      if (map.data[idx] != 0)
+      if (idx >= static_cast<int>(overwrite_values_.size()))
+        continue;
+
+      if (!local_overwrite_clear_static_occupied_ &&
+          map.data[idx] >= 100 &&
+          overwrite_values_[idx] != 100)
+        continue;
+
+      if (overwrite_free_counts_[idx] < std::numeric_limits<unsigned short>::max())
+        overwrite_free_counts_[idx]++;
+      if (overwrite_occupied_counts_[idx] > 0)
+        overwrite_occupied_counts_[idx]--;
+      overwrite_last_seen_[idx] = stamp;
+
+      if (overwrite_free_counts_[idx] >= static_cast<unsigned short>(local_overwrite_clear_confirm_count_) &&
+          overwrite_values_[idx] != 0)
       {
-        map.data[idx] = 0;
+        overwrite_values_[idx] = 0;
         ++updated_free_cells;
       }
     }
 
-    if (valid_hit && measured_range <= usable_radius && local_overwrite_mark_occupied_)
+    if (hit_within_radius && local_overwrite_mark_occupied_)
     {
       const double hit_wx = sensor_pose.x + measured_range * cos_theta;
       const double hit_wy = sensor_pose.y + measured_range * sin_theta;
@@ -1423,9 +1748,19 @@ void SlamGMapping::applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
       if (worldToMap(map, hit_wx, hit_wy, hit_mx, hit_my))
       {
         const int hit_idx = MAP_IDX(map.info.width, hit_mx, hit_my);
-        if (map.data[hit_idx] != 100)
+        if (hit_idx >= static_cast<int>(overwrite_values_.size()))
+          continue;
+
+        if (overwrite_occupied_counts_[hit_idx] < std::numeric_limits<unsigned short>::max())
+          overwrite_occupied_counts_[hit_idx]++;
+        if (overwrite_free_counts_[hit_idx] > 0)
+          overwrite_free_counts_[hit_idx]--;
+        overwrite_last_seen_[hit_idx] = stamp;
+
+        if (overwrite_occupied_counts_[hit_idx] >= static_cast<unsigned short>(local_overwrite_occupy_confirm_count_) &&
+            overwrite_values_[hit_idx] != 100)
         {
-          map.data[hit_idx] = 100;
+          overwrite_values_[hit_idx] = 100;
           ++updated_occupied_cells;
         }
       }
@@ -1433,8 +1768,52 @@ void SlamGMapping::applyLocalOverwrite(nav_msgs::OccupancyGrid& map,
   }
 
   ROS_DEBUG_THROTTLE(2.0,
-                     "Local overwrite updated map: free_cells=%zu, occupied_cells=%zu, radius=%.2f",
+                     "Persistent local overwrite updated: free_cells=%zu, occupied_cells=%zu, radius=%.2f",
                      updated_free_cells,
                      updated_occupied_cells,
                      usable_radius);
+}
+
+void SlamGMapping::applyOverwriteLayer(nav_msgs::OccupancyGrid& map)
+{
+  if (!overwrite_layer_initialized_ || overwrite_values_.empty())
+    return;
+
+  syncOverwriteLayerToMap(map.info);
+  if (!overwrite_layer_initialized_ || overwrite_values_.size() != map.data.size())
+    return;
+
+  const ros::Time now = ros::Time::now();
+  size_t applied_free_cells = 0;
+  size_t applied_occupied_cells = 0;
+  size_t expired_cells = 0;
+
+  for (size_t idx = 0; idx < overwrite_values_.size(); ++idx)
+  {
+    if (local_overwrite_ttl_sec_ > 0.0 &&
+        !overwrite_last_seen_[idx].isZero() &&
+        (now - overwrite_last_seen_[idx]).toSec() > local_overwrite_ttl_sec_)
+    {
+      clearOverwriteCell(idx);
+      ++expired_cells;
+      continue;
+    }
+
+    if (overwrite_values_[idx] == 0)
+    {
+      map.data[idx] = 0;
+      ++applied_free_cells;
+    }
+    else if (overwrite_values_[idx] == 100)
+    {
+      map.data[idx] = 100;
+      ++applied_occupied_cells;
+    }
+  }
+
+  ROS_DEBUG_THROTTLE(2.0,
+                     "Persistent local overwrite applied: free_cells=%zu, occupied_cells=%zu, expired_cells=%zu",
+                     applied_free_cells,
+                     applied_occupied_cells,
+                     expired_cells);
 }

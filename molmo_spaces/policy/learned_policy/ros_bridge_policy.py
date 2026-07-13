@@ -26,7 +26,8 @@ class RosBridgePolicy(BasePolicy):
         pointcloud_topic: str = "/registered_scan",
         camera_info_topic: str = "/molmo_spaces/head_camera/camera_info",
         depth_topic: str = "/molmo_spaces/head_camera/depth",
-        action_timeout_s: float = 0.1,
+        action_timeout_s: float = 0.0,
+        blocking_observation_republish_period_s: float = 0.25,
         queue_size: int = 1,
         publish_pointcloud: bool = True,
         publish_camera_info: bool = True,
@@ -46,13 +47,25 @@ class RosBridgePolicy(BasePolicy):
         lidar_offset_x_m: float = 0.0,
         lidar_offset_y_m: float = 0.0,
         lidar_offset_z_m: float = 1.6,
+        lidar_calib_x_m: float = 0.0,
+        lidar_calib_y_m: float = 0.0,
+        lidar_calib_z_m: float = 0.0,
+        lidar_calib_roll_deg: float = 0.0,
+        lidar_calib_pitch_deg: float = 0.0,
+        lidar_calib_yaw_deg: float = 0.0,
+        allow_static_lidar_tf_fallback: bool = False,
         cmd_vel_topic: str = "/cmd_vel_stamped",
         cmd_vel_timeout_s: float = 0.5,
         cmd_vel_control_dt_s: float | None = None,
         cmd_vel_linear_gain: float = 1.0,
+        require_fresh_cmd_vel: bool = True,
+        require_move_base_active_for_cmd_vel: bool = False,
+        move_base_status_topic: str = "/move_base/status",
         map_warmup_skip_frames: int = 10,
         immediate_noop_after_publish: bool = False,
         timing_log_every_n_frames: int = 30,
+        extra_image_topic: str = "/molmo_spaces/debug_front_camera/image",
+        extra_image_camera_name: str = "debug_front_camera",
     ) -> None:
         super().__init__(config, task)
         self.observation_topic = observation_topic
@@ -60,7 +73,11 @@ class RosBridgePolicy(BasePolicy):
         self.pointcloud_topic = pointcloud_topic
         self.camera_info_topic = camera_info_topic
         self.depth_topic = depth_topic
-        self.action_timeout_s = action_timeout_s
+        self.action_timeout_s = float(action_timeout_s)
+        self.last_action_timed_out = False
+        self.blocking_observation_republish_period_s = max(
+            0.0, float(blocking_observation_republish_period_s)
+        )
         self.queue_size = queue_size
         self.publish_pointcloud = publish_pointcloud
         self.publish_camera_info = publish_camera_info
@@ -80,12 +97,24 @@ class RosBridgePolicy(BasePolicy):
         self.lidar_offset_x_m = float(lidar_offset_x_m)
         self.lidar_offset_y_m = float(lidar_offset_y_m)
         self.lidar_offset_z_m = float(lidar_offset_z_m)
+        self.lidar_calib_x_m = float(lidar_calib_x_m)
+        self.lidar_calib_y_m = float(lidar_calib_y_m)
+        self.lidar_calib_z_m = float(lidar_calib_z_m)
+        self.lidar_calib_roll_deg = float(lidar_calib_roll_deg)
+        self.lidar_calib_pitch_deg = float(lidar_calib_pitch_deg)
+        self.lidar_calib_yaw_deg = float(lidar_calib_yaw_deg)
+        self.allow_static_lidar_tf_fallback = bool(allow_static_lidar_tf_fallback)
         self.cmd_vel_topic = cmd_vel_topic
         self.cmd_vel_timeout_s = float(cmd_vel_timeout_s)
         self.cmd_vel_linear_gain = max(0.0, float(cmd_vel_linear_gain))
+        self.require_fresh_cmd_vel = bool(require_fresh_cmd_vel)
+        self.require_move_base_active_for_cmd_vel = bool(require_move_base_active_for_cmd_vel)
+        self.move_base_status_topic = move_base_status_topic
         self.map_warmup_skip_frames = max(0, int(map_warmup_skip_frames))
         self.immediate_noop_after_publish = bool(immediate_noop_after_publish)
         self.timing_log_every_n_frames = max(0, int(timing_log_every_n_frames))
+        self.extra_image_topic = extra_image_topic
+        self.extra_image_camera_name = extra_image_camera_name
         if cmd_vel_control_dt_s is None:
             cfg_dt_ms = getattr(config, "policy_dt_ms", None)
             if cfg_dt_ms is not None and float(cfg_dt_ms) > 0.0:
@@ -110,9 +139,11 @@ class RosBridgePolicy(BasePolicy):
         self._step_idx = 0
         self._latest_action: dict[str, Any] | None = None
         self._latest_action_step: int = -1
+        self._latest_action_mono_s: float = 0.0
         self._last_consumed_action_step: int = -1
         self._latest_cmd_vel: np.ndarray | None = None
         self._latest_cmd_vel_mono_s: float = 0.0
+        self._move_base_active: bool = False
         self._last_base_position_xyz: np.ndarray | None = None
         self._last_common_stamp_s: float | None = None
         self._base_position_jump_warn_m: float = 1.0
@@ -126,6 +157,7 @@ class RosBridgePolicy(BasePolicy):
             "pointcloud_convert": 0.0,
             "pointcloud_publish": 0.0,
             "camera_info_publish": 0.0,
+            "blocking_republish": 0.0,
             "action_wait": 0.0,
             "postprocess_action": 0.0,
         }
@@ -133,12 +165,14 @@ class RosBridgePolicy(BasePolicy):
 
         self._patch_rosgraph_logger_for_py311()
         import rospy
+        from actionlib_msgs.msg import GoalID, GoalStatusArray
         from geometry_msgs.msg import TransformStamped, TwistStamped
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import CameraInfo
         from sensor_msgs.msg import Image
         from sensor_msgs.msg import PointCloud2, PointField
-        from std_msgs.msg import String
+        from std_msgs.msg import Empty, String
+        from std_srvs.srv import Empty as EmptyService
         from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
         self._rospy = rospy
@@ -149,11 +183,17 @@ class RosBridgePolicy(BasePolicy):
         self._PointCloud2 = PointCloud2
         self._PointField = PointField
         self._String = String
+        self._GoalStatusArray = GoalStatusArray
+        self._GoalID = GoalID
+        self._Empty = Empty
         self._Odometry = Odometry
         if not rospy.core.is_initialized():
             rospy.init_node("molmo_spaces_ros_policy", anonymous=True, disable_signals=True)
 
         self._obs_pub = rospy.Publisher(self.observation_topic, Image, queue_size=self.queue_size)
+        self._extra_image_pub = None
+        if self.extra_image_topic and self.extra_image_camera_name:
+            self._extra_image_pub = rospy.Publisher(self.extra_image_topic, Image, queue_size=self.queue_size)
         self._depth_pub = rospy.Publisher(self.depth_topic, Image, queue_size=self.queue_size)
         self._pointcloud_pub = rospy.Publisher(self.pointcloud_topic, PointCloud2, queue_size=self.queue_size)
         self._camera_info_pub = rospy.Publisher(
@@ -171,6 +211,16 @@ class RosBridgePolicy(BasePolicy):
         self._publish_static_tfs()
         self._action_sub = rospy.Subscriber(self.action_topic, String, self._action_callback)
         self._cmd_vel_sub = rospy.Subscriber(self.cmd_vel_topic, TwistStamped, self._cmd_vel_callback)
+        self._move_base_status_sub = rospy.Subscriber(
+            self.move_base_status_topic,
+            GoalStatusArray,
+            self._move_base_status_callback,
+        )
+        self._move_base_cancel_pub = rospy.Publisher("/move_base/cancel", GoalID, queue_size=1)
+        self._mapping_reset_pub = rospy.Publisher("/nav_system/reset", Empty, queue_size=1)
+        self._explorer_reset_pub = rospy.Publisher("/explore_py/reset", Empty, queue_size=1)
+        self._clear_costmaps = rospy.ServiceProxy("/move_base/clear_costmaps", EmptyService)
+        self._episode_count = 0
 
     @staticmethod
     def _rotation_matrix_to_quaternion(rot: np.ndarray) -> tuple[float, float, float, float]:
@@ -230,22 +280,8 @@ class RosBridgePolicy(BasePolicy):
         return tf_msg
 
     def _build_base_to_lidar_static_tf(self):
-        """Build static TF from base frame to lidar frame."""
-        if self.base_frame_id == self.pointcloud_frame_id:
-            return None
-
-        tf_msg = self._TransformStamped()
-        tf_msg.header.stamp = self._rospy.Time.now()
-        tf_msg.header.frame_id = self.base_frame_id
-        tf_msg.child_frame_id = self.pointcloud_frame_id
-        tf_msg.transform.translation.x = self.lidar_offset_x_m
-        tf_msg.transform.translation.y = self.lidar_offset_y_m
-        tf_msg.transform.translation.z = self.lidar_offset_z_m
-        tf_msg.transform.rotation.x = 0.0
-        tf_msg.transform.rotation.y = 0.0
-        tf_msg.transform.rotation.z = 0.0
-        tf_msg.transform.rotation.w = 1.0
-        return tf_msg
+        """Base->lidar is published dynamically from observation camera extrinsics."""
+        return None
 
     def _publish_static_tfs(self) -> None:
         """
@@ -253,11 +289,192 @@ class RosBridgePolicy(BasePolicy):
         In rospy tf2, each sendTransform() publishes only provided transforms.
         """
         tfs = []
-        base_to_lidar = self._build_base_to_lidar_static_tf()
-        if base_to_lidar is not None:
-            tfs.append(base_to_lidar)
         tfs.append(self._build_optical_static_tf())
         self._static_tf_pub.sendTransform(tfs)
+
+    @staticmethod
+    def _quat_wxyz_to_rotmat(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+        """Convert scalar-first quaternion to a 3x3 rotation matrix."""
+        xx = qx * qx
+        yy = qy * qy
+        zz = qz * qz
+        xy = qx * qy
+        xz = qx * qz
+        yz = qy * qz
+        wx = qw * qx
+        wy = qw * qy
+        wz = qw * qz
+        return np.array(
+            [
+                [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+                [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+                [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+            ],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _rpy_to_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        rot_x = np.array(
+            [[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]],
+            dtype=np.float64,
+        )
+        rot_y = np.array(
+            [[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]],
+            dtype=np.float64,
+        )
+        rot_z = np.array(
+            [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        return rot_z @ rot_y @ rot_x
+
+    def _apply_lidar_calibration(self, T_base_lidar: np.ndarray) -> np.ndarray:
+        """Apply a small tunable correction in the lidar frame."""
+        if (
+            abs(self.lidar_calib_x_m) < 1e-9
+            and abs(self.lidar_calib_y_m) < 1e-9
+            and abs(self.lidar_calib_z_m) < 1e-9
+            and abs(self.lidar_calib_roll_deg) < 1e-9
+            and abs(self.lidar_calib_pitch_deg) < 1e-9
+            and abs(self.lidar_calib_yaw_deg) < 1e-9
+        ):
+            return T_base_lidar
+
+        T_lidar_calib = np.eye(4, dtype=np.float64)
+        T_lidar_calib[:3, 3] = np.array(
+            [self.lidar_calib_x_m, self.lidar_calib_y_m, self.lidar_calib_z_m],
+            dtype=np.float64,
+        )
+        T_lidar_calib[:3, :3] = self._rpy_to_rotmat(
+            np.deg2rad(self.lidar_calib_roll_deg),
+            np.deg2rad(self.lidar_calib_pitch_deg),
+            np.deg2rad(self.lidar_calib_yaw_deg),
+        )
+        return T_base_lidar @ T_lidar_calib
+
+    def _extract_lidar_pose_rel_base(self, observation: Any) -> np.ndarray | None:
+        """Return lidar pose in base frame as a 4x4 transform."""
+        obs_dict = self._extract_observation_dict(observation)
+        if obs_dict is None:
+            return None
+
+        base_pose = self._extract_base_pose_from_observation(observation)
+        if base_pose is None:
+            return None
+
+        sensor_params = obs_dict.get(f"sensor_param_{self.depth_camera_name}")
+        if not isinstance(sensor_params, dict):
+            return None
+
+        cam2world_gl = sensor_params.get("cam2world_gl")
+        if cam2world_gl is None:
+            return None
+
+        T_world_optical = np.asarray(cam2world_gl, dtype=np.float64)
+        if T_world_optical.shape != (4, 4):
+            return None
+
+        px, py, pz = float(base_pose[0]), float(base_pose[1]), float(base_pose[2])
+        qw, qx, qy, qz = (
+            float(base_pose[3]),
+            float(base_pose[4]),
+            float(base_pose[5]),
+            float(base_pose[6]),
+        )
+        T_world_base = np.eye(4, dtype=np.float64)
+        T_world_base[:3, :3] = self._quat_wxyz_to_rotmat(qw, qx, qy, qz)
+        T_world_base[:3, 3] = np.array([px, py, pz], dtype=np.float64)
+
+        # The pointcloud is published in a robot-centric lidar/body frame:
+        # x forward, y left, z up. The optical frame is related by the fixed
+        # lidar->optical rotation used in _build_optical_static_tf().
+        R_lidar_to_optical = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        T_optical_lidar = np.eye(4, dtype=np.float64)
+        T_optical_lidar[:3, :3] = R_lidar_to_optical.T
+
+        return np.linalg.inv(T_world_base) @ T_world_optical @ T_optical_lidar
+
+    def _publish_base_to_lidar_tf(self, observation: Any, stamp) -> bool:
+        if self.base_frame_id == self.pointcloud_frame_id:
+            return True
+
+        T_base_lidar = self._extract_lidar_pose_rel_base(observation)
+        if T_base_lidar is None:
+            if not self.allow_static_lidar_tf_fallback:
+                self._rospy.logwarn_throttle(
+                    2.0,
+                    "RosBridgePolicy: sensor_param_%s missing; skip mapping observation instead of publishing fixed base->lidar TF.",
+                    self.depth_camera_name,
+                )
+                return False
+
+            self._rospy.logwarn_throttle(
+                5.0,
+                "RosBridgePolicy: sensor_param_%s missing; falling back to configured fixed base->lidar TF.",
+                self.depth_camera_name,
+            )
+            T_base_lidar = np.eye(4, dtype=np.float64)
+            T_base_lidar[:3, 3] = np.array(
+                [self.lidar_offset_x_m, self.lidar_offset_y_m, self.lidar_offset_z_m],
+                dtype=np.float64,
+            )
+            T_base_lidar = self._apply_lidar_calibration(T_base_lidar)
+            qx, qy, qz, qw = self._rotation_matrix_to_quaternion(T_base_lidar[:3, :3])
+            tf_msg = self._TransformStamped()
+            tf_msg.header.stamp = stamp
+            tf_msg.header.frame_id = self.base_frame_id
+            tf_msg.child_frame_id = self.pointcloud_frame_id
+            tf_msg.transform.translation.x = float(T_base_lidar[0, 3])
+            tf_msg.transform.translation.y = float(T_base_lidar[1, 3])
+            tf_msg.transform.translation.z = float(T_base_lidar[2, 3])
+            tf_msg.transform.rotation.x = qx
+            tf_msg.transform.rotation.y = qy
+            tf_msg.transform.rotation.z = qz
+            tf_msg.transform.rotation.w = qw
+            self._tf_broadcaster.sendTransform(tf_msg)
+            return False
+
+        T_base_lidar = self._apply_lidar_calibration(T_base_lidar)
+        qx, qy, qz, qw = self._rotation_matrix_to_quaternion(T_base_lidar[:3, :3])
+        self._rospy.loginfo_throttle(
+            2.0,
+            (
+                "RosBridgePolicy: publishing dynamic base->lidar TF from sensor_param_%s: "
+                "xyz=(%.3f, %.3f, %.3f), quat=(%.4f, %.4f, %.4f, %.4f)"
+            ),
+            self.depth_camera_name,
+            float(T_base_lidar[0, 3]),
+            float(T_base_lidar[1, 3]),
+            float(T_base_lidar[2, 3]),
+            qx,
+            qy,
+            qz,
+            qw,
+        )
+        tf_msg = self._TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = self.base_frame_id
+        tf_msg.child_frame_id = self.pointcloud_frame_id
+        tf_msg.transform.translation.x = float(T_base_lidar[0, 3])
+        tf_msg.transform.translation.y = float(T_base_lidar[1, 3])
+        tf_msg.transform.translation.z = float(T_base_lidar[2, 3])
+        tf_msg.transform.rotation.x = qx
+        tf_msg.transform.rotation.y = qy
+        tf_msg.transform.rotation.z = qz
+        tf_msg.transform.rotation.w = qw
+        self._tf_broadcaster.sendTransform(tf_msg)
+        return True
 
     @staticmethod
     def _patch_rosgraph_logger_for_py311() -> None:
@@ -330,10 +547,27 @@ class RosBridgePolicy(BasePolicy):
         with self._lock:
             self._latest_action = None
             self._latest_action_step = -1
+            self._latest_action_mono_s = 0.0
             self._last_consumed_action_step = -1
             self._latest_cmd_vel = None
             self._latest_cmd_vel_mono_s = 0.0
+            self._move_base_active = False
         self._last_base_position_xyz = None
+
+    def prepare_episode_reset(self) -> None:
+        self._episode_count += 1
+        if self._episode_count <= 1:
+            return
+        self._rospy.logwarn("RosBridgePolicy: resetting ROS navigation state before episode %d", self._episode_count)
+        self._move_base_cancel_pub.publish(self._GoalID())
+        self._explorer_reset_pub.publish(self._Empty())
+        self._mapping_reset_pub.publish(self._Empty())
+        try:
+            self._clear_costmaps.wait_for_service(timeout=2.0)
+            self._clear_costmaps()
+        except Exception as exc:
+            self._rospy.logwarn("RosBridgePolicy: clear_costmaps during scene reset failed: %s", exc)
+        self._rospy.sleep(1.0)
 
     def _record_timing(self, stage_ms: dict[str, float]) -> None:
         if self.timing_log_every_n_frames <= 0:
@@ -354,7 +588,8 @@ class RosBridgePolicy(BasePolicy):
                 "RosBridgePolicy timing avg over %d frames: total=%.2fms (%.2fHz), "
                 "odom_tf=%.2fms, rgb_pub=%.2fms, depth_extract_intrinsics=%.2fms, "
                 "depth_msg_pub=%.2fms, pcd_convert=%.2fms, pcd_pub=%.2fms, "
-                "camera_info_pub=%.2fms, action_wait=%.2fms, postprocess=%.2fms"
+                "camera_info_pub=%.2fms, blocking_republish=%.2fms, "
+                "action_wait=%.2fms, postprocess=%.2fms"
             ),
             int(n),
             avg["total"],
@@ -366,6 +601,7 @@ class RosBridgePolicy(BasePolicy):
             avg["pointcloud_convert"],
             avg["pointcloud_publish"],
             avg["camera_info_publish"],
+            avg["blocking_republish"],
             avg["action_wait"],
             avg["postprocess_action"],
         )
@@ -383,6 +619,7 @@ class RosBridgePolicy(BasePolicy):
         with self._lock:
             self._latest_action = action
             self._latest_action_step = step
+            self._latest_action_mono_s = time.monotonic()
 
     def _cmd_vel_callback(self, msg) -> None:
         twist = msg.twist
@@ -393,6 +630,11 @@ class RosBridgePolicy(BasePolicy):
         with self._lock:
             self._latest_cmd_vel = cmd
             self._latest_cmd_vel_mono_s = time.monotonic()
+
+    def _move_base_status_callback(self, msg) -> None:
+        active = any(int(status.status) == 1 for status in msg.status_list)
+        with self._lock:
+            self._move_base_active = active
 
     @staticmethod
     def _quat_wxyz_to_yaw(qw: float, qx: float, qy: float, qz: float) -> float:
@@ -487,6 +729,15 @@ class RosBridgePolicy(BasePolicy):
         for value in obs_dict.values():
             if isinstance(value, np.ndarray) and value.ndim in (2, 3):
                 return value
+        return None
+
+    def _extract_named_image_from_observation(self, observation: Any, camera_name: str) -> np.ndarray | None:
+        obs_dict = self._extract_observation_dict(observation)
+        if obs_dict is None or not camera_name:
+            return None
+        value = obs_dict.get(camera_name)
+        if isinstance(value, np.ndarray) and value.ndim in (2, 3):
+            return value
         return None
 
     def _extract_observation_dict(self, observation: Any) -> dict[str, Any] | None:
@@ -734,7 +985,7 @@ class RosBridgePolicy(BasePolicy):
         info.P = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
         return info
 
-    def _to_image_msg(self, frame: np.ndarray):
+    def _to_image_msg(self, frame: np.ndarray, stamp=None):
         img = frame
         if img.dtype != np.uint8:
             if np.issubdtype(img.dtype, np.floating):
@@ -761,7 +1012,7 @@ class RosBridgePolicy(BasePolicy):
             return None
 
         msg = self._Image()
-        msg.header.stamp = self._rospy.Time.now()
+        msg.header.stamp = stamp if stamp is not None else self._rospy.Time.now()
         msg.header.frame_id = self.optical_frame_id
         msg.height = h
         msg.width = w
@@ -859,11 +1110,40 @@ class RosBridgePolicy(BasePolicy):
         tf_msg.transform.rotation.z = qz
         tf_msg.transform.rotation.w = qw
         self._tf_broadcaster.sendTransform(tf_msg)
-        return True
+        return self._publish_base_to_lidar_tf(observation, stamp)
+
+    def _republish_observation_messages(
+        self,
+        observation: Any,
+        messages: dict[str, Any],
+    ) -> None:
+        stamp = self._next_common_stamp()
+        self._publish_odom_and_tf(observation, stamp)
+
+        topic_messages = (
+            (self._obs_pub, messages.get("rgb")),
+            (self._extra_image_pub, messages.get("extra_rgb")),
+            (self._depth_pub, messages.get("depth")),
+            (self._pointcloud_pub, messages.get("pointcloud")),
+        )
+        for publisher, message in topic_messages:
+            if publisher is None or message is None:
+                continue
+            message.header.stamp = stamp
+            publisher.publish(message)
+
+        camera_info = messages.get("camera_info")
+        if camera_info is not None:
+            camera_info.header.stamp = stamp
+            self._camera_info_pub.publish(camera_info)
+            self._image_camera_info_pub.publish(camera_info)
+            self._depth_camera_info_pub.publish(camera_info)
 
     def get_action(self, observation):
+        self.last_action_timed_out = False
         frame_t0 = time.perf_counter()
         stage_ms = {k: 0.0 for k in self._timing_acc_ms}
+        published_messages: dict[str, Any] = {}
 
         t0 = time.perf_counter()
         common_stamp = self._next_common_stamp()
@@ -889,9 +1169,10 @@ class RosBridgePolicy(BasePolicy):
             t0 = time.perf_counter()
             frame = self._extract_image_from_observation(observation)
             if frame is not None:
-                msg = self._to_image_msg(frame)
+                msg = self._to_image_msg(frame, stamp=common_stamp)
                 if msg is not None:
                     self._obs_pub.publish(msg)
+                    published_messages["rgb"] = msg
                 else:
                     self._rospy.logwarn_throttle(2.0, "RosBridgePolicy: failed to encode image.")
             else:
@@ -899,6 +1180,13 @@ class RosBridgePolicy(BasePolicy):
                     2.0,
                     "RosBridgePolicy: no image-like tensor found in observation."
                 )
+            if self._extra_image_pub is not None:
+                extra_frame = self._extract_named_image_from_observation(observation, self.extra_image_camera_name)
+                if extra_frame is not None:
+                    extra_msg = self._to_image_msg(extra_frame, stamp=common_stamp)
+                    if extra_msg is not None:
+                        self._extra_image_pub.publish(extra_msg)
+                        published_messages["extra_rgb"] = extra_msg
             stage_ms["rgb_publish"] = (time.perf_counter() - t0) * 1000.0
 
         if self.publish_pointcloud and not skip_mapping_observation:
@@ -942,7 +1230,9 @@ class RosBridgePolicy(BasePolicy):
                 
                 stamp = common_stamp
                 t0_depth_msg = time.perf_counter()
-                self._depth_pub.publish(self._to_depth_msg(depth, stamp=stamp))
+                depth_msg = self._to_depth_msg(depth, stamp=stamp)
+                self._depth_pub.publish(depth_msg)
+                published_messages["depth"] = depth_msg
                 stage_ms["depth_msg_publish"] = (time.perf_counter() - t0_depth_msg) * 1000.0
                 t0_pcd_convert = time.perf_counter()
                 cloud_msg = self._depth_to_pointcloud_msg(depth, intrinsics=intrinsics, stamp=stamp)
@@ -950,6 +1240,7 @@ class RosBridgePolicy(BasePolicy):
                 if cloud_msg is not None:
                     t0_pcd_pub = time.perf_counter()
                     self._pointcloud_pub.publish(cloud_msg)
+                    published_messages["pointcloud"] = cloud_msg
                     stage_ms["pointcloud_publish"] = (time.perf_counter() - t0_pcd_pub) * 1000.0
                     if self.publish_camera_info:
                         t0_cam_info = time.perf_counter()
@@ -963,6 +1254,7 @@ class RosBridgePolicy(BasePolicy):
                             self._camera_info_pub.publish(info_msg)
                             self._image_camera_info_pub.publish(info_msg)
                             self._depth_camera_info_pub.publish(info_msg)
+                            published_messages["camera_info"] = info_msg
                         stage_ms["camera_info_publish"] = (
                             time.perf_counter() - t0_cam_info
                         ) * 1000.0
@@ -990,35 +1282,81 @@ class RosBridgePolicy(BasePolicy):
             return chosen_action
 
         t0_wait = time.perf_counter()
-        deadline = time.monotonic() + self.action_timeout_s
+        wait_start_mono = time.monotonic()
+        deadline = (
+            wait_start_mono + self.action_timeout_s if self.action_timeout_s > 0.0 else None
+        )
+        next_republish_mono = (
+            wait_start_mono + self.blocking_observation_republish_period_s
+            if self.blocking_observation_republish_period_s > 0.0
+            else None
+        )
         chosen_action = None
-        while time.monotonic() < deadline and not self._rospy.is_shutdown():
+        while not self._rospy.is_shutdown():
+            now_mono = time.monotonic()
+            if deadline is not None and now_mono >= deadline:
+                break
+
             cmd_vel = None
             cmd_vel_ts = 0.0
+            action_ts = 0.0
+            move_base_active = False
             with self._lock:
                 if self._latest_action is not None:
-                    if self._latest_action_step < 0:
+                    action_ts = self._latest_action_mono_s
+                    action_is_fresh = action_ts >= wait_start_mono
+                    if self._latest_action_step < 0 and action_is_fresh:
                         # Allow action payloads without explicit step field.
                         chosen_action = self._latest_action
                         self._last_consumed_action_step += 1
                         break
-                    if self._latest_action_step > self._last_consumed_action_step:
+                    if (
+                        self._latest_action_step > self._last_consumed_action_step
+                        and action_is_fresh
+                    ):
                         chosen_action = self._latest_action
                         self._last_consumed_action_step = self._latest_action_step
                         break
                 cmd_vel = self._latest_cmd_vel
                 cmd_vel_ts = self._latest_cmd_vel_mono_s
-            if cmd_vel is not None and (time.monotonic() - cmd_vel_ts) <= self.cmd_vel_timeout_s:
+                move_base_active = self._move_base_active
+
+            cmd_is_recent = cmd_vel is not None and (now_mono - cmd_vel_ts) <= self.cmd_vel_timeout_s
+            cmd_is_fresh = (not self.require_fresh_cmd_vel) or cmd_vel_ts >= wait_start_mono
+            nav_is_ready = (
+                (not self.require_move_base_active_for_cmd_vel) or move_base_active
+            )
+            if cmd_is_recent and cmd_is_fresh and nav_is_ready:
                 cmd_action = self._cmd_vel_to_base_action(cmd_vel, observation)
                 if cmd_action is not None:
                     chosen_action = cmd_action
                     break
+
+            if next_republish_mono is not None and now_mono >= next_republish_mono:
+                republish_t0 = time.perf_counter()
+                self._republish_observation_messages(observation, published_messages)
+                stage_ms["blocking_republish"] += (
+                    time.perf_counter() - republish_t0
+                ) * 1000.0
+                next_republish_mono = now_mono + self.blocking_observation_republish_period_s
+                self._rospy.loginfo_throttle(
+                    5.0,
+                    "RosBridgePolicy: blocking for a fresh navigation command; observation republished.",
+                )
             time.sleep(0.005)
         stage_ms["action_wait"] = (time.perf_counter() - t0_wait) * 1000.0
 
         if chosen_action is None:
+            if self._rospy.is_shutdown():
+                stage_ms["total"] = (time.perf_counter() - frame_t0) * 1000.0
+                self._record_timing(stage_ms)
+                return None
             chosen_action = self._build_noop_action()
-            self._rospy.logwarn_throttle(2.0, "RosBridgePolicy: action timeout, using noop action.")
+            if deadline is not None:
+                self.last_action_timed_out = True
+                self._rospy.logwarn_throttle(
+                    2.0, "RosBridgePolicy: action timeout, using noop action."
+                )
 
         t0_post = time.perf_counter()
         if isinstance(chosen_action, dict):
@@ -1073,3 +1411,6 @@ class RosBridgePolicy(BasePolicy):
         if hasattr(self, "_cmd_vel_sub") and self._cmd_vel_sub is not None:
             self._cmd_vel_sub.unregister()
             self._cmd_vel_sub = None
+        if hasattr(self, "_move_base_status_sub") and self._move_base_status_sub is not None:
+            self._move_base_status_sub.unregister()
+            self._move_base_status_sub = None

@@ -5,11 +5,27 @@
 #include <rapidjson/stringbuffer.h>
 #include <tf/tf.h>
 #include <cmath>
+#include <algorithm>
+#include <cctype>
 #include <geometry_msgs/PointStamped.h>
 #include <geometry_msgs/Twist.h>
 
 namespace explore_pkg
 {
+
+namespace
+{
+
+std::string normalizeSemanticToken(const std::string& text)
+{
+  std::string normalized = text;
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::replace(normalized.begin(), normalized.end(), ' ', '_');
+  return normalized;
+}
+
+}  // namespace
 
 ExploreManager::ExploreManager()
   : nh_()
@@ -89,6 +105,7 @@ void ExploreManager::loadParameters()
   
   // 目标描述（从参数读取）
   private_nh_.param("target_description", target_description_, std::string(""));
+  target_description_ = normalizeSemanticToken(target_description_);
   private_nh_.param("topics/navigation/odom_topic", odom_topic_,
                     std::string("/odom"));
   private_nh_.param("topics/navigation/map_topic", map_topic_,
@@ -410,7 +427,7 @@ void ExploreManager::processSemanticMap(const std::string& json_data)
 
       // 检查是否匹配目标
       if (!target_description_.empty() && 
-          semantic_obj.semantic_name == target_description_ && 
+          normalizeSemanticToken(semantic_obj.semantic_name) == target_description_ && 
           semantic_obj.confidence >= semantic_confidence_threshold_) {
         target_position_ = semantic_obj.coord_3d;
         has_target_position_ = true;

@@ -4,7 +4,11 @@ Interactive-Nav-SG-nav/GLIP
 Interactive-Nav-SG-nav/GroundingDINO
 Interactive-Nav-SG-nav/segment_anything
 .cursor_pydeps
-
+.*cache/
+detection_models/outputs/*
+detection_models/yoloe/outputs/*
+scripts/InteractiveNav/output/*
+outputs/
 
 # ignore nfs files
 *.nfs*
