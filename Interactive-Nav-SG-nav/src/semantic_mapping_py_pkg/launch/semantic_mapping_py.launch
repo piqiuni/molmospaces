@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="config_file" default="$(find semantic_mapping_py_pkg)/config/default.yaml"/>
+  <arg name="start_object_detection" default="true"/>
+  <arg name="start_room_attribute" default="true"/>
+  <arg name="start_semantic_mapping" default="true"/>
+  <arg name="object_detection_backend" default="mock_empty"/>
+  <arg name="object_detection_provider" default="external_http"/>
+  <arg name="object_detection_model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
+  <arg name="object_detection_class_mapping" default="$(find semantic_mapping_py_pkg)/config/object_class_mapping.json"/>
+  <arg name="object_detection_confidence_threshold" default="0.35"/>
+  <arg name="object_detection_device" default="cuda:0"/>
+  <arg name="publish_debug_markers" default="false"/>
+  <arg name="publish_debug_segmented_cloud" default="false"/>
+  <arg name="publish_debug_detection_image" default="false"/>
+  <arg name="publish_debug_world_markers" default="false"/>
+  <arg name="publish_debug_world_segmented_cloud" default="false"/>
+  <arg name="room_inference_backend" default="object_rules"/>
+
+  <group if="$(arg start_object_detection)">
+    <node name="semantic_object_detection"
+          pkg="semantic_mapping_py_pkg"
+          type="object_detection_node.py"
+          output="screen"
+          respawn="true">
+      <rosparam file="$(arg config_file)" command="load"/>
+      <param name="object_detection/backend" value="$(arg object_detection_backend)"/>
+      <param name="object_detection/provider" value="$(arg object_detection_provider)"/>
+      <param name="object_detection/model_path" value="$(arg object_detection_model_path)"/>
+      <param name="object_detection/class_mapping" value="$(arg object_detection_class_mapping)"/>
+      <param name="object_detection/confidence_threshold" value="$(arg object_detection_confidence_threshold)"/>
+      <param name="object_detection/device" value="$(arg object_detection_device)"/>
+      <param name="object_detection/publish_debug_markers" value="$(arg publish_debug_markers)"/>
+      <param name="object_detection/publish_debug_segmented_cloud" value="$(arg publish_debug_segmented_cloud)"/>
+      <param name="object_detection/publish_debug_detection_image" value="$(arg publish_debug_detection_image)"/>
+      <param name="object_detection/publish_debug_world_markers" value="$(arg publish_debug_world_markers)"/>
+      <param name="object_detection/publish_debug_world_segmented_cloud" value="$(arg publish_debug_world_segmented_cloud)"/>
+    </node>
+  </group>
+
+  <group if="$(arg start_room_attribute)">
+    <node name="semantic_room_attribute"
+          pkg="semantic_mapping_py_pkg"
+          type="room_attribute_node.py"
+          output="screen"
+          respawn="true">
+      <rosparam file="$(arg config_file)" command="load"/>
+      <param name="room_inference/backend" value="$(arg room_inference_backend)"/>
+    </node>
+  </group>
+
+  <group if="$(arg start_semantic_mapping)">
+    <node name="semantic_mapping_py"
+          pkg="semantic_mapping_py_pkg"
+          type="semantic_mapping_node.py"
+          output="screen"
+          respawn="true">
+      <rosparam file="$(arg config_file)" command="load"/>
+    </node>
+  </group>
+</launch>

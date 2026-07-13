@@ -1,0 +1,120 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- MolmoSpaces ROS navigation stack: simulator + mapping + exploration + navigation. -->
+
+  <arg name="start_sim" default="true"/>
+  <arg name="start_mapping" default="true"/>
+  <arg name="mapping_mode" default="odom_locked"/>
+  <arg name="start_semantic_mapping" default="false"/>
+  <arg name="manual_control" default="false"/>
+  <arg name="start_explore_py" default="false"/>
+  <arg name="start_explore" default="$(eval 'false' if arg('manual_control') == 'true' else 'true')"/>
+  <arg name="start_nav" default="$(eval 'false' if arg('manual_control') else 'true')"/>
+  <arg name="semantic_use_gt" default="false"/>
+
+  <arg name="robot" default="rby1"/>
+  <arg name="scene_dataset" default="procthor-10k"/>
+  <arg name="data_split" default="train"/>
+  <arg name="house_ind" default="1"/>
+  <arg name="house_inds" default="$(arg house_ind)"/>
+  <arg name="target_types" default="Chair"/>
+  <arg name="exploration_only" default="false"/>
+  <arg name="explore_target_description" default="$(arg target_types)"/>
+  <arg name="task_horizon" default="3000"/>
+  <arg name="scene_timeout_s" default="0"/>
+  <arg name="max_scene_attempts" default="1"/>
+  <arg name="max_consecutive_action_timeouts" default="12"/>
+  <arg name="output_dir" default=""/>
+  <arg name="sim_extra_args" default=""/>
+  <arg name="randomize_camera" default="false"/>
+  <arg name="lidar_calib_x_m" default="0.0"/>
+  <arg name="lidar_calib_y_m" default="0.0"/>
+  <arg name="lidar_calib_z_m" default="0.0"/>
+  <arg name="lidar_calib_roll_deg" default="0.0"/>
+  <arg name="lidar_calib_pitch_deg" default="0.0"/>
+  <arg name="lidar_calib_yaw_deg" default="0.0"/>
+  <arg name="allow_static_lidar_tf_fallback" default="false"/>
+  <arg name="initial_arm_qpos" default="0.28,0.0,0.0,-0.64,0.39,-0.26,-0.04"/>
+  <arg name="initial_left_arm_qpos" default="0.28,0.0,-0.45,-0.64,0.39,-0.26,-0.04"/>
+  <arg name="initial_right_arm_qpos" default="0.28,0.0,0.45,-0.64,0.39,-0.26,-0.04"/>
+  <arg name="publish_debug_front_camera" default="false"/>
+  <arg name="semantic_config_file" default="$(find semantic_mapping_py_pkg)/config/default.yaml"/>
+  <arg name="semantic_object_detection_backend" default="yoloe_pf_box3d"/>
+  <arg name="semantic_object_detection_provider" default="yoloe_local"/>
+  <arg name="semantic_object_detection_model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
+  <arg name="semantic_object_detection_class_mapping" default="$(find semantic_mapping_py_pkg)/config/object_class_mapping.json"/>
+  <arg name="semantic_object_detection_confidence_threshold" default="0.55"/>
+  <arg name="semantic_object_detection_device" default="cuda:0"/>
+  <arg name="semantic_publish_debug_markers" default="false"/>
+  <arg name="semantic_publish_debug_segmented_cloud" default="false"/>
+  <arg name="semantic_publish_debug_detection_image" default="true"/>
+  <arg name="semantic_room_inference_backend" default="object_rules"/>
+  <arg name="semantic_gt_scene_json" default=""/>
+  <arg name="semantic_gt_batch_size" default="8"/>
+  <arg name="semantic_gt_publish_rate" default="1.0"/>
+  <arg name="semantic_gt_loop" default="true"/>
+
+  <group if="$(arg start_sim)">
+    <node pkg="nav_pkg"
+          type="run_nav_ros_sim.py"
+          name="molmospaces_nav_ros_sim"
+          output="screen"
+          required="true"
+          args="--robot $(arg robot) --scene_dataset $(arg scene_dataset) --data_split $(arg data_split) --house_ind $(arg house_ind) --house_inds $(arg house_inds) --target_types $(arg target_types) --exploration_only $(arg exploration_only) --task_horizon $(arg task_horizon) --scene_timeout_s $(arg scene_timeout_s) --max_scene_attempts $(arg max_scene_attempts) --max_consecutive_action_timeouts $(arg max_consecutive_action_timeouts) --output_dir=$(arg output_dir) --randomize_camera $(arg randomize_camera) --lidar_calib_x_m $(arg lidar_calib_x_m) --lidar_calib_y_m $(arg lidar_calib_y_m) --lidar_calib_z_m $(arg lidar_calib_z_m) --lidar_calib_roll_deg $(arg lidar_calib_roll_deg) --lidar_calib_pitch_deg $(arg lidar_calib_pitch_deg) --lidar_calib_yaw_deg $(arg lidar_calib_yaw_deg) --allow_static_lidar_tf_fallback $(arg allow_static_lidar_tf_fallback) --initial_arm_qpos $(arg initial_arm_qpos) --initial_left_arm_qpos $(arg initial_left_arm_qpos) --initial_right_arm_qpos $(arg initial_right_arm_qpos) --publish_debug_front_camera $(arg publish_debug_front_camera) $(arg sim_extra_args)"/>
+  </group>
+
+  <group if="$(arg start_mapping)">
+    <include file="$(find struct_mapping_pkg)/launch/slam_gmapping.launch">
+      <arg name="mapping_mode" value="$(arg mapping_mode)"/>
+    </include>
+  </group>
+
+  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_use_gt') != 'true')">
+    <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
+      <arg name="config_file" value="$(arg semantic_config_file)"/>
+      <arg name="start_object_detection" value="true"/>
+      <arg name="start_room_attribute" value="true"/>
+      <arg name="start_semantic_mapping" value="true"/>
+      <arg name="object_detection_backend" value="$(arg semantic_object_detection_backend)"/>
+      <arg name="object_detection_provider" value="$(arg semantic_object_detection_provider)"/>
+      <arg name="object_detection_model_path" value="$(arg semantic_object_detection_model_path)"/>
+      <arg name="object_detection_class_mapping" value="$(arg semantic_object_detection_class_mapping)"/>
+      <arg name="object_detection_confidence_threshold" value="$(arg semantic_object_detection_confidence_threshold)"/>
+      <arg name="object_detection_device" value="$(arg semantic_object_detection_device)"/>
+      <arg name="publish_debug_markers" value="$(arg semantic_publish_debug_markers)"/>
+      <arg name="publish_debug_segmented_cloud" value="$(arg semantic_publish_debug_segmented_cloud)"/>
+      <arg name="publish_debug_detection_image" value="$(arg semantic_publish_debug_detection_image)"/>
+      <arg name="room_inference_backend" value="$(arg semantic_room_inference_backend)"/>
+    </include>
+  </group>
+
+  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_use_gt') == 'true')">
+    <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
+      <arg name="config_file" value="$(arg semantic_config_file)"/>
+      <arg name="start_object_detection" value="false"/>
+      <arg name="start_room_attribute" value="true"/>
+      <arg name="start_semantic_mapping" value="true"/>
+      <arg name="room_inference_backend" value="$(arg semantic_room_inference_backend)"/>
+    </include>
+
+    <node name="semantic_mapping_gt_replay"
+          pkg="semantic_mapping_py_pkg"
+          type="semantic_mapping_gt_replay.py"
+          output="screen"
+          args="$(arg semantic_gt_scene_json) --batch-size $(arg semantic_gt_batch_size) --publish-rate $(arg semantic_gt_publish_rate) $(eval '--loop' if arg('semantic_gt_loop') == 'true' else '')"/>
+  </group>
+
+  <group if="$(eval arg('start_explore') == 'true' and arg('start_explore_py') != 'true')">
+    <include file="$(find explore_pkg)/launch/explore_manager.launch">
+      <arg name="target_description" value="$(arg explore_target_description)"/>
+    </include>
+  </group>
+
+  <group if="$(arg start_explore_py)">
+    <include file="$(find explore_py_pkg)/launch/explore_py.launch"/>
+  </group>
+
+  <group if="$(arg start_nav)">
+    <include file="$(find nav_pkg)/launch/nav.launch"/>
+  </group>
+</launch>

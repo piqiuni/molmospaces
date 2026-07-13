@@ -1,0 +1,1318 @@
+import base64
+import json
+import math
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+
+from .geometry_utils import point_dict, transform_point_with_snapshot, transform_points_with_snapshot
+
+
+def _normalize_label(value):
+    return str(value or "").strip().lower().replace(" ", "_")
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CLASS_MAPPING_PATH = PACKAGE_ROOT / "config" / "object_class_mapping.json"
+
+
+DEFAULT_CLASS_MAPPING = {
+    "bed": "bed",
+    "bunk_bed": "bed",
+    "playpen": "bed",
+    "guzheng": "bed",
+    "quilting": "bed",
+    "chair": "chair",
+    "electric_chair": "chair",
+    "office_chair": "chair",
+    "bowl": "bowl",
+    "plate": "plate",
+    "glass_plate": "plate",
+    "cup": "cup",
+    "bottle": "bottle",
+    "kitchen_table": "table",
+    "dinning_table": "table",
+    "dining_table": "table",
+    "table": "table",
+    "cabinet": "cabinet",
+    "drawer": "drawer",
+    "fridge": "fridge",
+    "refrigerator": "fridge",
+    "microwave": "microwave",
+    "shelf": "shelf",
+    "shelfs": "shelf",
+    "storage_box": "box",
+    "box": "box",
+    "sofa": "sofa",
+    "couch": "sofa",
+    "toilet": "toilet",
+    "sink": "sink",
+    "door": "door",
+    "window_sill": "window",
+}
+
+
+DEFAULT_CLASS_KEYWORDS = [
+    ("bed", "bed"),
+    ("chair", "chair"),
+    ("bowl", "bowl"),
+    ("bottle", "bottle"),
+    ("table", "table"),
+    ("cabinet", "cabinet"),
+    ("drawer", "drawer"),
+    ("fridge", "fridge"),
+    ("refrigerator", "fridge"),
+    ("microwave", "microwave"),
+    ("shelf", "shelf"),
+    ("sofa", "sofa"),
+    ("couch", "sofa"),
+    ("toilet", "toilet"),
+    ("sink", "sink"),
+    ("door", "door"),
+    ("window", "window"),
+    ("cup", "cup"),
+    ("plate", "plate"),
+    ("box", "box"),
+]
+
+
+def _bbox_from_detection(det):
+    bbox = det.get("bbox") or det.get("box_2d") or det.get("xyxy")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+    except (TypeError, ValueError):
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _sparse_mask_from_array(mask_array):
+    if mask_array is None:
+        return None, 0
+    mask = np.asarray(mask_array)
+    if mask.ndim != 2:
+        return None, 0
+    rows, cols = np.nonzero(mask > 0)
+    if rows.size == 0:
+        return None, 0
+    return {
+        "rows": rows.astype(np.int32).tolist(),
+        "cols": cols.astype(np.int32).tolist(),
+    }, int(rows.size)
+
+
+def _resize_mask_to_image(mask_array, image_shape):
+    mask = np.asarray(mask_array)
+    if mask.ndim != 2:
+        return None
+    target_h, target_w = image_shape[:2]
+    if mask.shape == (target_h, target_w):
+        return mask
+    if mask.size == 0 or target_h <= 0 or target_w <= 0:
+        return None
+    try:
+        import cv2
+
+        return cv2.resize(mask.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    except ImportError:
+        src_h, src_w = mask.shape
+        row_idx = np.minimum((np.arange(target_h) * src_h / target_h).astype(np.int32), src_h - 1)
+        col_idx = np.minimum((np.arange(target_w) * src_w / target_w).astype(np.int32), src_w - 1)
+        return mask[row_idx[:, None], col_idx[None, :]]
+
+
+def _sparse_mask_from_polygons(polygons, image_shape):
+    if not polygons:
+        return None, 0
+    height, width = image_shape[:2]
+    try:
+        import cv2
+    except ImportError:
+        return None, 0
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for polygon in polygons:
+        points = np.asarray(polygon, dtype=np.float32)
+        if points.ndim != 2 or points.shape[0] < 3 or points.shape[1] < 2:
+            continue
+        points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+        points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+        cv2.fillPoly(mask, [np.round(points).astype(np.int32)], 1)
+    return _sparse_mask_from_array(mask)
+
+
+def _resolve_mapping_path(raw_path):
+    if not isinstance(raw_path, str):
+        return None
+    text = raw_path.strip()
+    if not text:
+        return None
+    package_token = "$(find semantic_mapping_py_pkg)"
+    if package_token in text:
+        text = text.replace(package_token, str(PACKAGE_ROOT))
+    return Path(text).expanduser()
+
+
+def _load_mapping_config(raw_mapping):
+    if isinstance(raw_mapping, dict):
+        return {_normalize_label(k): _normalize_label(v) for k, v in raw_mapping.items() if v}
+    path = _resolve_mapping_path(raw_mapping) if raw_mapping else DEFAULT_CLASS_MAPPING_PATH
+    if path is not None and path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {_normalize_label(k): _normalize_label(v) for k, v in data.items() if v}
+        except Exception:
+            return {}
+    return {}
+
+
+def _map_open_vocabulary_class(raw_name, mapping_config=None):
+    raw_label = _normalize_label(raw_name)
+    if not raw_label:
+        return "unknown_open_set"
+    merged = dict(DEFAULT_CLASS_MAPPING)
+    if mapping_config:
+        merged.update(mapping_config)
+    if raw_label in merged:
+        return merged[raw_label]
+    for needle, normalized in DEFAULT_CLASS_KEYWORDS:
+        if needle in raw_label:
+            return normalized
+    return "unknown_open_set"
+
+
+def _clip_bbox(bbox, image_shape):
+    if bbox is None:
+        return None
+    height, width = image_shape[:2]
+    x1 = max(0, min(width - 1, bbox[0]))
+    y1 = max(0, min(height - 1, bbox[1]))
+    x2 = max(x1 + 1, min(width, bbox[2]))
+    y2 = max(y1 + 1, min(height, bbox[3]))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _depth_to_meters(depth_values):
+    if depth_values is None:
+        return None
+    depth = np.asarray(depth_values, dtype=np.float32)
+    finite = np.isfinite(depth)
+    if not finite.any():
+        return None
+    positive = depth[finite & (depth > 0.0)]
+    if positive.size == 0:
+        return None
+    if positive.mean() > 20.0:
+        depth = depth / 1000.0
+    return depth
+
+
+def _camera_intrinsics(camera_info, image_shape):
+    if camera_info is not None and len(camera_info.K) >= 9 and camera_info.K[0] > 0.0 and camera_info.K[4] > 0.0:
+        return {
+            "fx": float(camera_info.K[0]),
+            "fy": float(camera_info.K[4]),
+            "cx": float(camera_info.K[2]),
+            "cy": float(camera_info.K[5]),
+        }
+    height, width = image_shape[:2]
+    fx = fy = 0.5 * float(width)
+    return {
+        "fx": fx,
+        "fy": fy,
+        "cx": 0.5 * float(width - 1),
+        "cy": 0.5 * float(height - 1),
+    }
+
+
+def _pixels_to_camera_points(pixels, depths, intrinsics):
+    fx = max(intrinsics["fx"], 1e-6)
+    fy = max(intrinsics["fy"], 1e-6)
+    cx = intrinsics["cx"]
+    cy = intrinsics["cy"]
+    cols = pixels[:, 0].astype(np.float32)
+    rows = pixels[:, 1].astype(np.float32)
+    z = depths.astype(np.float32)
+    x = (cols - cx) * z / fx
+    y = (rows - cy) * z / fy
+    return np.stack([x, y, z], axis=1)
+
+
+def _uses_optical_frame(frame_id):
+    return "optical" in str(frame_id or "").lower()
+
+
+def _optical_points_to_source_frame(points, frame_id):
+    points = np.asarray(points, dtype=np.float32)
+    if _uses_optical_frame(frame_id):
+        return points
+    converted = np.empty_like(points)
+    converted[:, 0] = points[:, 2]
+    converted[:, 1] = -points[:, 0]
+    converted[:, 2] = -points[:, 1]
+    return converted
+
+
+def _trim_points(points, trim_ratio):
+    if points.shape[0] < 4:
+        return points
+    trim_ratio = min(max(float(trim_ratio), 0.0), 0.45)
+    if trim_ratio <= 0.0:
+        return points
+    mins = np.quantile(points, trim_ratio, axis=0)
+    maxs = np.quantile(points, 1.0 - trim_ratio, axis=0)
+    mask = np.all((points >= mins) & (points <= maxs), axis=1)
+    trimmed = points[mask]
+    return trimmed if trimmed.shape[0] >= 4 else points
+
+
+def _transform_point(tf_listener, target_frame, source_frame, stamp, point):
+    from geometry_msgs.msg import PointStamped
+
+    point_msg = PointStamped()
+    point_msg.header.frame_id = source_frame
+    point_msg.header.stamp = stamp
+    point_msg.point.x = float(point[0])
+    point_msg.point.y = float(point[1])
+    point_msg.point.z = float(point[2])
+    transformed = tf_listener.transformPoint(target_frame, point_msg)
+    return np.array([transformed.point.x, transformed.point.y, transformed.point.z], dtype=np.float32)
+
+
+def _transform_point_best_effort(tf_listener, target_frame, source_frame, stamp, point):
+    import rospy
+
+    candidate_stamps = []
+    if stamp is not None:
+        candidate_stamps.append(stamp)
+    candidate_stamps.append(rospy.Time(0))
+    last_exc = None
+    for candidate_stamp in candidate_stamps:
+        try:
+            return _transform_point(tf_listener, target_frame, source_frame, candidate_stamp, point), candidate_stamp
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("no TF candidate stamp available")
+
+
+def _sample_center_point(depth_image_m, bbox, kernel_size):
+    kernel_size = max(1, int(kernel_size))
+    x1, y1, x2, y2 = bbox
+    cx = int(round(0.5 * (x1 + x2 - 1)))
+    cy = int(round(0.5 * (y1 + y2 - 1)))
+    half = kernel_size // 2
+    xs = slice(max(0, cx - half), min(depth_image_m.shape[1], cx + half + 1))
+    ys = slice(max(0, cy - half), min(depth_image_m.shape[0], cy + half + 1))
+    window = depth_image_m[ys, xs]
+    valid = window[np.isfinite(window) & (window > 0.0)]
+    if valid.size == 0:
+        return None
+    return cx, cy, float(np.median(valid))
+
+
+def _sample_box_points(depth_image_m, bbox, point_stride):
+    x1, y1, x2, y2 = bbox
+    cols = np.arange(x1, x2, max(1, int(point_stride)), dtype=np.int32)
+    rows = np.arange(y1, y2, max(1, int(point_stride)), dtype=np.int32)
+    if cols.size == 0 or rows.size == 0:
+        return None, None
+    grid_cols, grid_rows = np.meshgrid(cols, rows)
+    depths = depth_image_m[grid_rows, grid_cols]
+    valid = np.isfinite(depths) & (depths > 0.0)
+    if not valid.any():
+        return None, None
+    pixels = np.stack([grid_cols[valid], grid_rows[valid]], axis=1)
+    values = depths[valid]
+    return pixels, values
+
+
+def _mask_to_pixels(mask, bbox, image_shape, point_stride):
+    if mask is None:
+        return None
+    height, width = image_shape[:2]
+    if isinstance(mask, dict):
+        rows = np.asarray(mask.get("rows", []), dtype=np.int32)
+        cols = np.asarray(mask.get("cols", []), dtype=np.int32)
+        if rows.size == cols.size and rows.size > 0:
+            valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+            if valid.any():
+                return np.stack([cols[valid], rows[valid]], axis=1)
+    if isinstance(mask, list):
+        mask_array = np.asarray(mask)
+        if mask_array.ndim == 2 and mask_array.shape == (height, width):
+            rows, cols = np.nonzero(mask_array)
+            if rows.size > 0:
+                stride = max(1, int(point_stride))
+                return np.stack([cols[::stride], rows[::stride]], axis=1)
+    return None
+
+
+def _mask_rows_cols(mask, image_shape):
+    height, width = image_shape[:2]
+    if mask is None:
+        return None, None
+    if isinstance(mask, dict):
+        rows = np.asarray(mask.get("rows", []), dtype=np.int32)
+        cols = np.asarray(mask.get("cols", []), dtype=np.int32)
+    else:
+        mask_array = np.asarray(mask)
+        if mask_array.ndim != 2 or mask_array.shape[:2] != (height, width):
+            return None, None
+        rows, cols = np.nonzero(mask_array > 0)
+        rows = rows.astype(np.int32)
+        cols = cols.astype(np.int32)
+    if rows.size != cols.size or rows.size == 0:
+        return None, None
+    valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    rows = rows[valid]
+    cols = cols[valid]
+    if rows.size == 0:
+        return None, None
+    return rows, cols
+
+
+def _binary_mask_from_sparse(mask, image_shape):
+    rows, cols = _mask_rows_cols(mask, image_shape)
+    if rows is None:
+        return None
+    binary = np.zeros(image_shape[:2], dtype=np.uint8)
+    binary[rows, cols] = 1
+    return binary
+
+
+def _sparse_mask_from_binary(mask_binary):
+    rows, cols = np.nonzero(mask_binary > 0)
+    if rows.size == 0:
+        return None, 0
+    return _sparse_mask_from_array(mask_binary > 0)
+
+
+def _neighbor_offsets():
+    return (
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),           (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    )
+
+
+def _connected_components_from_binary(mask_binary):
+    height, width = mask_binary.shape[:2]
+    visited = np.zeros_like(mask_binary, dtype=np.uint8)
+    components = []
+    neighbors = _neighbor_offsets()
+    rows, cols = np.nonzero(mask_binary > 0)
+    for row, col in zip(rows.tolist(), cols.tolist()):
+        if visited[row, col]:
+            continue
+        stack = [(row, col)]
+        visited[row, col] = 1
+        comp_rows = []
+        comp_cols = []
+        while stack:
+            cur_row, cur_col = stack.pop()
+            comp_rows.append(cur_row)
+            comp_cols.append(cur_col)
+            for d_row, d_col in neighbors:
+                nxt_row = cur_row + d_row
+                nxt_col = cur_col + d_col
+                if nxt_row < 0 or nxt_col < 0 or nxt_row >= height or nxt_col >= width:
+                    continue
+                if visited[nxt_row, nxt_col] or mask_binary[nxt_row, nxt_col] == 0:
+                    continue
+                visited[nxt_row, nxt_col] = 1
+                stack.append((nxt_row, nxt_col))
+        components.append(
+            {
+                "rows": np.asarray(comp_rows, dtype=np.int32),
+                "cols": np.asarray(comp_cols, dtype=np.int32),
+                "area": len(comp_rows),
+            }
+        )
+    return components
+
+
+def _bbox_center_from_bbox(bbox):
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    return 0.5 * (float(x1) + float(x2)), 0.5 * (float(y1) + float(y2))
+
+
+def _filter_mask_components(mask, bbox, image_shape, min_area, max_area_ratio):
+    mask_binary = _binary_mask_from_sparse(mask, image_shape)
+    if mask_binary is None:
+        return mask, 0
+    total_area = int(mask_binary.sum())
+    if total_area <= 0:
+        return None, 0
+    components = _connected_components_from_binary(mask_binary)
+    if not components:
+        return None, 0
+    max_area = max(int(total_area * float(max_area_ratio)), int(min_area))
+    center = _bbox_center_from_bbox(bbox)
+    candidates = []
+    for component in components:
+        area = int(component["area"])
+        if area < int(min_area) or area > max_area:
+            continue
+        score = float(area)
+        if center is not None:
+            cx = float(component["cols"].mean())
+            cy = float(component["rows"].mean())
+            score -= 0.25 * np.hypot(cx - center[0], cy - center[1])
+            if (
+                component["rows"].min() <= center[1] <= component["rows"].max()
+                and component["cols"].min() <= center[0] <= component["cols"].max()
+            ):
+                score += float(area)
+        candidates.append((score, component))
+    if not candidates:
+        best = max(components, key=lambda item: item["area"])
+    else:
+        best = max(candidates, key=lambda item: item[0])[1]
+    filtered_binary = np.zeros_like(mask_binary)
+    filtered_binary[best["rows"], best["cols"]] = 1
+    sparse_mask, area = _sparse_mask_from_binary(filtered_binary)
+    return sparse_mask, int(area)
+
+
+def _pairwise_l2(points, query):
+    diffs = points - query[None, :]
+    return np.sqrt(np.sum(diffs * diffs, axis=1))
+
+
+def _largest_euclidean_cluster(points, cluster_eps, min_points):
+    if points.shape[0] == 0:
+        return points
+    if points.shape[0] > 800:
+        step = int(np.ceil(points.shape[0] / 800.0))
+        sampled = points[::step]
+    else:
+        sampled = points
+    count = sampled.shape[0]
+    visited = np.zeros(count, dtype=bool)
+    best_indices = None
+    for start in range(count):
+        if visited[start]:
+            continue
+        queue = [start]
+        visited[start] = True
+        cluster = []
+        while queue:
+            index = queue.pop()
+            cluster.append(index)
+            distances = _pairwise_l2(sampled, sampled[index])
+            neighbors = np.where(distances <= float(cluster_eps))[0]
+            for neighbor in neighbors.tolist():
+                if visited[neighbor]:
+                    continue
+                visited[neighbor] = True
+                queue.append(neighbor)
+        if best_indices is None or len(cluster) > len(best_indices):
+            best_indices = cluster
+    if best_indices is None or len(best_indices) < int(min_points):
+        return points
+    sampled_cluster = sampled[np.asarray(best_indices, dtype=np.int32)]
+    centroid = sampled_cluster.mean(axis=0)
+    keep_radius = max(float(cluster_eps) * 1.5, 1e-3)
+    keep_mask = _pairwise_l2(points, centroid) <= keep_radius
+    kept = points[keep_mask]
+    return kept if kept.shape[0] >= int(min_points) else sampled_cluster
+
+
+def _sanitize_instance_pixels(det, bbox, image_shape, config):
+    if det.get("mask") is None:
+        return det.get("mask"), int(det.get("mask_area", 0) or 0)
+    min_area = max(1, int(config.get("mask_component_min_area", 48)))
+    max_area_ratio = min(max(float(config.get("mask_component_max_area_ratio", 0.85)), 0.05), 1.0)
+    filtered_mask, filtered_area = _filter_mask_components(
+        det.get("mask"), bbox, image_shape, min_area, max_area_ratio
+    )
+    # After selecting the best connected component, trim door center pixels
+    # using proportional side width rather than absolute pixel widths.
+    return _trim_door_center_pixels(det, filtered_mask, filtered_area, config)
+
+
+def _trim_door_center_pixels(det, sparse_mask, mask_area, config):
+    if sparse_mask is None:
+        return sparse_mask, int(mask_area or 0)
+    if not bool(config.get("door_mask_trim_enabled", False)):
+        return sparse_mask, int(mask_area or 0)
+    label = _normalize_label(
+        det.get("semantic_class") or det.get("semantic_class_raw") or det.get("class") or det.get("semantic_name")
+    )
+    if label not in {"door", "doorway", "entrance", "gate"}:
+        return sparse_mask, int(mask_area or 0)
+    rows = np.asarray(sparse_mask.get("rows") or [], dtype=np.int32)
+    cols = np.asarray(sparse_mask.get("cols") or [], dtype=np.int32)
+    if rows.size == 0 or cols.size == 0 or rows.size != cols.size:
+        return sparse_mask, int(mask_area or 0)
+    # Proportional keep ratio (fraction of width to keep on each side)
+    keep_ratio = min(max(float(config.get("door_outer_side_keep_ratio", 0.22)), 0.01), 0.45)
+    left = int(np.min(cols))
+    right = int(np.max(cols))
+    width = right - left + 1
+    side_width = max(1, int(round(width * keep_ratio)))
+    # If side regions would overlap or cover whole width, skip trimming
+    if side_width * 2 >= width:
+        return sparse_mask, int(mask_area or rows.size)
+    keep = (cols <= left + side_width - 1) | (cols >= right - side_width + 1)
+    kept_rows = rows[keep]
+    kept_cols = cols[keep]
+    # Require a minimum number of kept pixels (scale with mask size but at least 8)
+    min_kept = max(8, int(round(rows.size * keep_ratio * 2)))
+    if kept_rows.size < min_kept:
+        return sparse_mask, int(mask_area or rows.size)
+    return {
+        "rows": kept_rows.astype(np.int32).tolist(),
+        "cols": kept_cols.astype(np.int32).tolist(),
+    }, int(kept_rows.size)
+
+
+def _drop_bottom_rows(pixels, values, bottom_ratio):
+    if pixels.shape[0] == 0 or bottom_ratio <= 0.0:
+        return pixels, values
+    row_threshold = np.quantile(pixels[:, 1].astype(np.float32), 1.0 - bottom_ratio)
+    keep = pixels[:, 1].astype(np.float32) < float(row_threshold)
+    kept_pixels = pixels[keep]
+    kept_values = values[keep]
+    return (kept_pixels, kept_values) if kept_values.size >= 4 else (pixels, values)
+
+
+def _filter_depth_band(pixels, values, lower_q, upper_q):
+    if values.size == 0:
+        return pixels, values
+    lower_q = min(max(float(lower_q), 0.0), 1.0)
+    upper_q = min(max(float(upper_q), lower_q), 1.0)
+    lower = float(np.quantile(values, lower_q))
+    upper = float(np.quantile(values, upper_q))
+    keep = (values >= lower) & (values <= upper)
+    kept_pixels = pixels[keep]
+    kept_values = values[keep]
+    return (kept_pixels, kept_values) if kept_values.size >= 4 else (pixels, values)
+
+
+def _robust_bounds(points, lower_q, upper_q):
+    lower_q = min(max(float(lower_q), 0.0), 1.0)
+    upper_q = min(max(float(upper_q), lower_q), 1.0)
+    mins = np.quantile(points, lower_q, axis=0)
+    maxs = np.quantile(points, upper_q, axis=0)
+    return mins.astype(np.float32), maxs.astype(np.float32)
+
+
+def _reject_ground_like_detection(label, world_box_center, world_box_size, config):
+    if world_box_center is None or world_box_size is None:
+        return False
+    reject_labels = {
+        _normalize_label(item)
+        for item in (config.get("ground_reject_labels") or ["floor", "ground"])
+    }
+    if label in reject_labels:
+        return True
+    min_xy_span = float(config.get("ground_reject_min_xy_span", 1.2))
+    max_height = float(config.get("ground_reject_max_height", 0.25))
+    max_center_z = float(config.get("ground_reject_max_center_z", 0.25))
+    xy_span = max(float(world_box_size[0]), float(world_box_size[1]))
+    return (
+        xy_span >= min_xy_span
+        and float(world_box_size[2]) <= max_height
+        and float(world_box_center[2]) <= max_center_z
+    )
+
+
+def _mean_height(points):
+    if points is None or points.shape[0] == 0:
+        return None
+    return float(np.mean(points[:, 2]))
+
+
+def _normalize_detection(
+    det,
+    bbox,
+    projection_method,
+    camera_center,
+    world_center,
+    size,
+    source_frame,
+    world_frame=None,
+    world_stamp=None,
+    world_box_center=None,
+    world_box_size=None,
+):
+    confidence = float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
+    semantic_class = det.get("semantic_class") or det.get("class") or det.get("semantic_name")
+    semantic_class_raw = det.get("semantic_class_raw") or semantic_class
+    normalized = {
+        "semantic_class": _normalize_label(semantic_class),
+        "semantic_class_raw": _normalize_label(semantic_class_raw),
+        "confidence": confidence,
+        "bbox": [int(v) for v in bbox] if bbox is not None else None,
+        "position": point_dict(camera_center[0], camera_center[1], camera_center[2]),
+        "projection_method": projection_method,
+        "source_frame": str(source_frame or ""),
+    }
+    if world_center is not None:
+        normalized["world_position"] = point_dict(world_center[0], world_center[1], world_center[2])
+        normalized["world_frame"] = str(world_frame or "")
+        if world_stamp is not None:
+            normalized["world_position_stamp"] = {
+                "secs": int(world_stamp.secs),
+                "nsecs": int(world_stamp.nsecs),
+                "is_latest_tf": bool(getattr(world_stamp, "is_zero", lambda: False)()),
+            }
+    if size is not None:
+        normalized["size"] = point_dict(size[0], size[1], size[2])
+        normalized["box3d_center"] = point_dict(camera_center[0], camera_center[1], camera_center[2])
+        normalized["box3d_size"] = point_dict(size[0], size[1], size[2])
+    if world_box_center is not None:
+        normalized["world_box3d_center"] = point_dict(world_box_center[0], world_box_center[1], world_box_center[2])
+    if world_box_size is not None:
+        normalized["world_box3d_size"] = point_dict(world_box_size[0], world_box_size[1], world_box_size[2])
+    instance_id = det.get("instance_id")
+    if instance_id:
+        normalized["instance_id"] = str(instance_id)
+    if "mask_area" in det:
+        normalized["mask_area"] = int(det["mask_area"])
+    if "mask" in det and det["mask"] is not None:
+        normalized["mask"] = det["mask"]
+    if "source_model" in det:
+        normalized["source_model"] = str(det["source_model"])
+    return normalized
+
+
+class ObjectDetectorBackend:
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
+        raise NotImplementedError
+
+
+class RawDetectionProvider:
+    def detect_2d(self, rgb_image, depth_image, camera_info, stamp):
+        raise NotImplementedError
+
+
+class NoDetectionDetector(ObjectDetectorBackend):
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
+        return []
+
+
+class MockEmptyDetector(NoDetectionDetector):
+    pass
+
+
+class MockEmptyProvider(RawDetectionProvider):
+    def detect_2d(self, rgb_image, depth_image, camera_info, stamp):
+        return []
+
+
+class ExternalHttpProvider(RawDetectionProvider):
+    def __init__(self, url, timeout=5.0, include_depth=False):
+        self.url = url
+        self.timeout = float(timeout)
+        self.include_depth = bool(include_depth)
+
+    def detect_2d(self, rgb_image, depth_image, camera_info, stamp):
+        import cv2
+
+        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
+        if not ok:
+            return []
+
+        payload = {
+            "image_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+            "stamp_sec": int(stamp.secs),
+            "stamp_nsec": int(stamp.nsecs),
+        }
+        if self.include_depth and depth_image is not None:
+            depth = np.asarray(depth_image)
+            payload["depth"] = {
+                "dtype": str(depth.dtype),
+                "shape": list(depth.shape),
+                "data_b64": base64.b64encode(depth.tobytes(order="C")).decode("ascii"),
+            }
+        if camera_info is not None:
+            payload["camera_info"] = {
+                "width": int(camera_info.width),
+                "height": int(camera_info.height),
+                "K": list(camera_info.K),
+            }
+
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, ValueError, TimeoutError):
+            return []
+
+        if isinstance(data, dict):
+            data = data.get("detections", [])
+        return data if isinstance(data, list) else []
+
+
+class YoloeLocalProvider(RawDetectionProvider):
+    def __init__(
+        self,
+        model_path,
+        confidence_threshold=0.35,
+        iou_threshold=0.7,
+        imgsz=640,
+        device="cuda:0",
+        max_detections=50,
+        keep_unknown_open_set=False,
+        class_mapping=None,
+    ):
+        self.model_path = str(model_path)
+        self.confidence_threshold = float(confidence_threshold)
+        self.iou_threshold = float(iou_threshold)
+        self.imgsz = int(imgsz)
+        self.device = str(device)
+        self.max_detections = max(1, int(max_detections))
+        self.keep_unknown_open_set = bool(keep_unknown_open_set)
+        self.class_mapping = _load_mapping_config(class_mapping)
+        self._model = None
+        self.mask_component_min_area = 48
+        self.mask_component_max_area_ratio = 0.85
+
+    def _get_model(self):
+        if self._model is None:
+            from ultralytics import YOLOE
+
+            self._model = YOLOE(self.model_path)
+        return self._model
+
+    def detect_2d(self, rgb_image, depth_image, camera_info, stamp):
+        model = self._get_model()
+        results = model.predict(
+            source=rgb_image,
+            device=self.device,
+            imgsz=self.imgsz,
+            conf=self.confidence_threshold,
+            iou=self.iou_threshold,
+            agnostic_nms=True,
+            max_det=self.max_detections,
+            verbose=False,
+            save=False,
+        )
+        if not results:
+            return []
+
+        result = results[0]
+        boxes = result.boxes
+        names = result.names or {}
+        masks = result.masks
+        if boxes is None:
+            return []
+
+        xyxy = boxes.xyxy.detach().cpu().numpy()
+        confs = boxes.conf.detach().cpu().numpy()
+        classes = boxes.cls.detach().cpu().numpy().astype(int)
+        mask_array = None
+        mask_polygons = None
+        if masks is not None and getattr(masks, "data", None) is not None:
+            mask_array = masks.data.detach().cpu().numpy()
+            mask_polygons = getattr(masks, "xy", None)
+
+        detections = []
+        for idx in range(len(xyxy)):
+            raw_name = str(names.get(int(classes[idx]), str(classes[idx])))
+            semantic_class_raw = _normalize_label(raw_name)
+            semantic_class = _map_open_vocabulary_class(raw_name, self.class_mapping)
+            if semantic_class == "unknown_open_set" and not self.keep_unknown_open_set:
+                continue
+
+            sparse_mask = None
+            mask_area = 0
+            if mask_polygons is not None and idx < len(mask_polygons):
+                sparse_mask, mask_area = _sparse_mask_from_polygons([mask_polygons[idx]], rgb_image.shape)
+            if sparse_mask is None and mask_array is not None and idx < len(mask_array):
+                image_mask = _resize_mask_to_image(mask_array[idx], rgb_image.shape)
+                if image_mask is not None:
+                    sparse_mask, mask_area = _sparse_mask_from_array(image_mask > 0.5)
+            sparse_mask, mask_area = _sanitize_instance_pixels(
+                {
+                    "mask": sparse_mask,
+                    "mask_area": mask_area,
+                    "semantic_class": semantic_class,
+                    "semantic_class_raw": semantic_class_raw,
+                },
+                [float(v) for v in xyxy[idx].tolist()],
+                rgb_image.shape,
+                {
+                    "mask_component_min_area": self.mask_component_min_area,
+                    "mask_component_max_area_ratio": self.mask_component_max_area_ratio,
+                },
+            )
+
+            detections.append(
+                {
+                    "semantic_class_raw": semantic_class_raw,
+                    "semantic_class": semantic_class,
+                    "confidence": float(confs[idx]),
+                    "bbox": [float(v) for v in xyxy[idx].tolist()],
+                    "mask": sparse_mask,
+                    "mask_area": int(mask_area),
+                    "source_model": Path(self.model_path).name,
+                }
+            )
+        return detections
+
+
+class ExternalHttpDetector(ObjectDetectorBackend):
+    def __init__(self, provider):
+        self.provider = provider
+
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
+        detections = []
+        for det in self.provider.detect_2d(rgb_image, depth_image, camera_info, stamp):
+            bbox = _clip_bbox(_bbox_from_detection(det), rgb_image.shape)
+            semantic_class = det.get("semantic_class") or det.get("class") or det.get("semantic_name")
+            if not semantic_class:
+                continue
+            normalized = {
+                "semantic_class": _normalize_label(semantic_class),
+                "semantic_class_raw": _normalize_label(det.get("semantic_class_raw") or semantic_class),
+                "confidence": float(det.get("confidence", det.get("conf", 0.0)) or 0.0),
+                "bbox": bbox,
+                "projection_method": det.get("projection_method", "provider_passthrough"),
+                "source_frame": str(frame_id or ""),
+            }
+            for key in (
+                "position",
+                "world_position",
+                "size",
+                "instance_id",
+                "mask",
+                "mask_area",
+                "box3d_center",
+                "box3d_size",
+                "source_model",
+            ):
+                if key in det:
+                    normalized[key] = det[key]
+            detections.append(normalized)
+        return detections
+
+
+class CenterProjectionDetector(ObjectDetectorBackend):
+    def __init__(self, provider, world_frame, point_stride=4, max_depth_m=8.0, center_kernel_size=5):
+        import rospy
+        import tf
+
+        self.provider = provider
+        self.world_frame = world_frame
+        self.point_stride = max(1, int(point_stride))
+        self.max_depth_m = float(max_depth_m)
+        self.center_kernel_size = max(1, int(center_kernel_size))
+        self.rospy = rospy
+        self.tf_listener = tf.TransformListener()
+
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
+        if depth_image is None:
+            return []
+        depth_image_m = _depth_to_meters(depth_image)
+        if depth_image_m is None:
+            return []
+        intrinsics = _camera_intrinsics(camera_info, rgb_image.shape)
+        detections = []
+        for det in self.provider.detect_2d(rgb_image, depth_image, camera_info, stamp):
+            bbox = _clip_bbox(_bbox_from_detection(det), rgb_image.shape)
+            if bbox is None:
+                continue
+            sample = _sample_center_point(depth_image_m, bbox, self.center_kernel_size)
+            if sample is None:
+                continue
+            col, row, depth_m = sample
+            if depth_m <= 0.0 or depth_m > self.max_depth_m:
+                continue
+            camera_center = _pixels_to_camera_points(
+                np.asarray([[col, row]], dtype=np.float32),
+                np.asarray([depth_m], dtype=np.float32),
+                intrinsics,
+            )[0]
+            camera_center = _optical_points_to_source_frame(camera_center[None, :], frame_id)[0]
+            world_center = None
+            world_stamp = None
+            if tf_snapshot is not None:
+                try:
+                    world_center = np.asarray(transform_point_with_snapshot(tf_snapshot, camera_center), dtype=np.float32)
+                    world_stamp = tf_snapshot.get("stamp")
+                except Exception as exc:
+                    self.rospy.logwarn_throttle(2.0, "[object_detection_node] TF snapshot center projection failed: %s", exc)
+            elif frame_id:
+                try:
+                    world_center, used_stamp = _transform_point_best_effort(
+                        self.tf_listener, self.world_frame, frame_id, stamp, camera_center
+                    )
+                    world_stamp = used_stamp
+                    if used_stamp == self.rospy.Time(0):
+                        self.rospy.logwarn_throttle(
+                            2.0,
+                            "[object_detection_node] TF center projection fallback to latest transform for %s <- %s",
+                            self.world_frame,
+                            frame_id,
+                        )
+                except Exception as exc:
+                    self.rospy.logwarn_throttle(2.0, "[object_detection_node] TF center projection failed: %s", exc)
+            detections.append(
+                _normalize_detection(
+                    det=det,
+                    bbox=bbox,
+                    projection_method="bbox_center_projection",
+                    camera_center=camera_center,
+                    world_center=world_center,
+                    size=None,
+                    source_frame=frame_id,
+                    world_frame=self.world_frame,
+                    world_stamp=world_stamp,
+                )
+            )
+        return detections
+
+
+class SamBox3DDetector(ObjectDetectorBackend):
+    def __init__(
+        self,
+        provider,
+        world_frame,
+        point_stride=4,
+        max_depth_m=8.0,
+        min_valid_points=12,
+        trim_ratio=0.1,
+        mask_component_min_area=48,
+        mask_component_max_area_ratio=0.85,
+        drop_bottom_ratio=0.12,
+        depth_band_lower_quantile=0.05,
+        depth_band_upper_quantile=0.7,
+        cluster_eps=0.18,
+        cluster_min_points=12,
+        bbox_quantile_lower=0.1,
+        bbox_quantile_upper=0.9,
+        enable_euclidean_cluster=True,
+        reject_low_mean_height=True,
+        min_mean_height_m=0.08,
+    ):
+        import rospy
+        import tf
+
+        self.provider = provider
+        self.world_frame = world_frame
+        self.point_stride = max(1, int(point_stride))
+        self.max_depth_m = float(max_depth_m)
+        self.min_valid_points = max(4, int(min_valid_points))
+        self.trim_ratio = float(trim_ratio)
+        self.mask_component_min_area = max(1, int(mask_component_min_area))
+        self.mask_component_max_area_ratio = float(mask_component_max_area_ratio)
+        self.drop_bottom_ratio = float(drop_bottom_ratio)
+        self.depth_band_lower_quantile = float(depth_band_lower_quantile)
+        self.depth_band_upper_quantile = float(depth_band_upper_quantile)
+        self.cluster_eps = float(cluster_eps)
+        self.cluster_min_points = max(4, int(cluster_min_points))
+        self.bbox_quantile_lower = float(bbox_quantile_lower)
+        self.bbox_quantile_upper = float(bbox_quantile_upper)
+        self.enable_euclidean_cluster = bool(enable_euclidean_cluster)
+        self.reject_low_mean_height = bool(reject_low_mean_height)
+        self.min_mean_height_m = float(min_mean_height_m)
+        self.rospy = rospy
+        self.tf_listener = tf.TransformListener()
+        self._tf_unavailable_warned = False
+
+    def _try_transform_center(self, frame_id, stamp, camera_center, tf_snapshot=None):
+        if not self.world_frame:
+            return None
+        if tf_snapshot is not None:
+            try:
+                world_center = np.asarray(transform_point_with_snapshot(tf_snapshot, camera_center), dtype=np.float32)
+                return world_center, tf_snapshot.get("stamp")
+            except Exception as exc:
+                if not self._tf_unavailable_warned:
+                    self.rospy.logwarn(
+                        "[object_detection_node] TF snapshot box projection failed; fallback to live TF: %s",
+                        exc,
+                    )
+                    self._tf_unavailable_warned = True
+        if not frame_id or self.world_frame == frame_id:
+            return None, None
+        try:
+            try:
+                if self.tf_listener.canTransform(self.world_frame, frame_id, stamp):
+                    world_center, used_stamp = _transform_point_best_effort(
+                        self.tf_listener, self.world_frame, frame_id, stamp, camera_center
+                    )
+                    return world_center, used_stamp
+            except Exception:
+                pass
+            world_center, used_stamp = _transform_point_best_effort(
+                self.tf_listener, self.world_frame, frame_id, stamp, camera_center
+            )
+            if used_stamp == self.rospy.Time(0) and not self._tf_unavailable_warned:
+                self.rospy.logwarn(
+                    "[object_detection_node] TF %s <- %s unavailable at exact stamp; fallback to latest transform",
+                    self.world_frame,
+                    frame_id,
+                )
+                self._tf_unavailable_warned = True
+            return world_center, used_stamp
+        except Exception as exc:
+            if not self._tf_unavailable_warned:
+                self.rospy.logwarn(
+                    "[object_detection_node] TF mask box projection skipped; using camera-frame box3d_center only: %s",
+                    exc,
+                )
+                self._tf_unavailable_warned = True
+            return None, None
+
+    def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
+        if depth_image is None:
+            return []
+        depth_image_m = _depth_to_meters(depth_image)
+        if depth_image_m is None:
+            return []
+        intrinsics = _camera_intrinsics(camera_info, rgb_image.shape)
+        detections = []
+        for det in self.provider.detect_2d(rgb_image, depth_image, camera_info, stamp):
+            bbox = _clip_bbox(_bbox_from_detection(det), rgb_image.shape)
+            if bbox is None:
+                continue
+            sanitized_mask, sanitized_area = _sanitize_instance_pixels(
+                det,
+                bbox,
+                rgb_image.shape,
+                {
+                    "mask_component_min_area": self.mask_component_min_area,
+                    "mask_component_max_area_ratio": self.mask_component_max_area_ratio,
+                },
+            )
+            det = dict(det)
+            det["mask"] = sanitized_mask
+            det["mask_area"] = int(sanitized_area)
+            pixels = _mask_to_pixels(det.get("mask"), bbox, rgb_image.shape, self.point_stride)
+            if pixels is None or pixels.shape[0] == 0:
+                continue
+            cols = np.clip(pixels[:, 0], 0, depth_image_m.shape[1] - 1)
+            rows = np.clip(pixels[:, 1], 0, depth_image_m.shape[0] - 1)
+            values = depth_image_m[rows, cols]
+            valid = np.isfinite(values) & (values > 0.0)
+            pixels = pixels[valid]
+            values = values[valid]
+            if pixels is None or values is None or values.size < self.min_valid_points:
+                continue
+            valid_depth = values <= self.max_depth_m
+            pixels = pixels[valid_depth]
+            values = values[valid_depth]
+            if values.size < self.min_valid_points:
+                continue
+            pixels, values = _drop_bottom_rows(pixels, values, self.drop_bottom_ratio)
+            if values.size < self.min_valid_points:
+                continue
+            pixels, values = _filter_depth_band(
+                pixels,
+                values,
+                self.depth_band_lower_quantile,
+                self.depth_band_upper_quantile,
+            )
+            if values.size < self.min_valid_points:
+                continue
+            points = _pixels_to_camera_points(pixels, values, intrinsics)
+            points = _optical_points_to_source_frame(points, frame_id)
+            points = _trim_points(points, self.trim_ratio)
+            if self.enable_euclidean_cluster:
+                points = _largest_euclidean_cluster(points, self.cluster_eps, self.cluster_min_points)
+            if points.shape[0] < self.min_valid_points:
+                continue
+            mins, maxs = _robust_bounds(points, self.bbox_quantile_lower, self.bbox_quantile_upper)
+            camera_center = 0.5 * (mins + maxs)
+            size = np.maximum(maxs - mins, 0.0)
+            world_center, world_stamp = self._try_transform_center(frame_id, stamp, camera_center, tf_snapshot=tf_snapshot)
+            world_box_center = None
+            world_box_size = None
+            world_points = None
+            if tf_snapshot is not None and world_center is not None:
+                try:
+                    world_points = transform_points_with_snapshot(tf_snapshot, points)
+                    world_mins, world_maxs = _robust_bounds(
+                        world_points,
+                        self.bbox_quantile_lower,
+                        self.bbox_quantile_upper,
+                    )
+                    world_box_center = 0.5 * (world_mins + world_maxs)
+                    world_box_size = np.maximum(world_maxs - world_mins, 0.0)
+                except Exception:
+                    pass
+            elif world_center is not None:
+                try:
+                    transformed_points = []
+                    for point in points:
+                        transformed_points.append(
+                            _transform_point(self.tf_listener, self.world_frame, frame_id, stamp, point)
+                        )
+                    if transformed_points:
+                        world_points = np.asarray(transformed_points, dtype=np.float32)
+                        world_mins, world_maxs = _robust_bounds(
+                            world_points,
+                            self.bbox_quantile_lower,
+                            self.bbox_quantile_upper,
+                        )
+                        world_box_center = 0.5 * (world_mins + world_maxs)
+                        world_box_size = np.maximum(world_maxs - world_mins, 0.0)
+                except Exception:
+                    world_points = None
+            if self.reject_low_mean_height and world_points is not None:
+                mean_height = _mean_height(world_points)
+                if mean_height is not None and mean_height <= self.min_mean_height_m:
+                    continue
+            if _reject_ground_like_detection(
+                _normalize_label(det.get("semantic_class") or det.get("semantic_class_raw")),
+                world_box_center if world_box_center is not None else world_center,
+                world_box_size if world_box_size is not None else size,
+                {
+                    "ground_reject_labels": [],
+                    "ground_reject_min_xy_span": 1.2,
+                    "ground_reject_max_height": 0.22,
+                    "ground_reject_max_center_z": 0.2,
+                },
+            ):
+                continue
+            enriched = dict(det)
+            enriched["mask_area"] = int(points.shape[0])
+            detections.append(
+                _normalize_detection(
+                    det=enriched,
+                    bbox=bbox,
+                    projection_method="mask_box3d_projection",
+                    camera_center=camera_center,
+                    world_center=world_center,
+                    size=size,
+                    source_frame=frame_id,
+                    world_frame=self.world_frame,
+                    world_stamp=world_stamp,
+                    world_box_center=world_box_center,
+                    world_box_size=world_box_size,
+                )
+            )
+        return detections
+
+
+def make_raw_detection_provider(kind, config):
+    kind = str(kind or "external_http").strip().lower()
+    if kind == "yoloe_local":
+        return YoloeLocalProvider(
+            model_path=config.get(
+                "model_path",
+                "/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt",
+            ),
+            confidence_threshold=config.get("confidence_threshold", 0.35),
+            iou_threshold=config.get("iou_threshold", 0.7),
+            imgsz=config.get("imgsz", 640),
+            device=config.get("device", "cuda:0"),
+            max_detections=config.get("max_detections", 50),
+            keep_unknown_open_set=config.get("keep_unknown_open_set", False),
+            class_mapping=config.get("class_mapping", {}),
+        )
+    if kind == "external_http":
+        return ExternalHttpProvider(
+            config.get("external_url", "http://127.0.0.1:8000/detect"),
+            timeout=config.get("timeout", 5.0),
+            include_depth=config.get("include_depth", False),
+        )
+    return MockEmptyProvider()
+
+
+def make_detector_backend(kind, config, frames=None):
+    kind = str(kind or "mock_empty").strip().lower()
+    frames = frames or {}
+    if kind in ("no_detection", "none", "disabled", "off"):
+        return NoDetectionDetector()
+    if kind == "mock_empty":
+        return MockEmptyDetector()
+
+    provider = make_raw_detection_provider(config.get("provider", "external_http"), config)
+    world_frame = frames.get("world_frame", "tf_frame_map")
+
+    if kind == "external_http":
+        return ExternalHttpDetector(provider)
+    if kind == "yolo_world_center_projection":
+        return CenterProjectionDetector(
+            provider=provider,
+            world_frame=world_frame,
+            point_stride=config.get("point_stride", 4),
+            max_depth_m=config.get("max_depth_m", 8.0),
+            center_kernel_size=config.get("center_kernel_size", 5),
+        )
+    if kind == "yolo_world_sam_box3d":
+        return SamBox3DDetector(
+            provider=provider,
+            world_frame=world_frame,
+            point_stride=config.get("point_stride", 4),
+            max_depth_m=config.get("max_depth_m", 8.0),
+            min_valid_points=config.get("min_valid_points", 12),
+            trim_ratio=config.get("trim_ratio", 0.1),
+            mask_component_min_area=config.get("mask_component_min_area", 48),
+            mask_component_max_area_ratio=config.get("mask_component_max_area_ratio", 0.85),
+            drop_bottom_ratio=config.get("drop_bottom_ratio", 0.12),
+            depth_band_lower_quantile=config.get("depth_band_lower_quantile", 0.05),
+            depth_band_upper_quantile=config.get("depth_band_upper_quantile", 0.7),
+            cluster_eps=config.get("cluster_eps", 0.18),
+            cluster_min_points=config.get("cluster_min_points", 12),
+            bbox_quantile_lower=config.get("bbox_quantile_lower", 0.1),
+            bbox_quantile_upper=config.get("bbox_quantile_upper", 0.9),
+            enable_euclidean_cluster=config.get("enable_euclidean_cluster", True),
+            reject_low_mean_height=config.get("reject_low_mean_height", True),
+            min_mean_height_m=config.get("min_mean_height_m", 0.08),
+        )
+    if kind == "yoloe_pf_box3d":
+        return SamBox3DDetector(
+            provider=provider,
+            world_frame=world_frame,
+            point_stride=config.get("point_stride", 4),
+            max_depth_m=config.get("max_depth_m", 8.0),
+            min_valid_points=config.get("min_valid_points", 12),
+            trim_ratio=config.get("trim_ratio", 0.1),
+            mask_component_min_area=config.get("mask_component_min_area", 48),
+            mask_component_max_area_ratio=config.get("mask_component_max_area_ratio", 0.85),
+            drop_bottom_ratio=config.get("drop_bottom_ratio", 0.12),
+            depth_band_lower_quantile=config.get("depth_band_lower_quantile", 0.05),
+            depth_band_upper_quantile=config.get("depth_band_upper_quantile", 0.7),
+            cluster_eps=config.get("cluster_eps", 0.18),
+            cluster_min_points=config.get("cluster_min_points", 12),
+            bbox_quantile_lower=config.get("bbox_quantile_lower", 0.1),
+            bbox_quantile_upper=config.get("bbox_quantile_upper", 0.9),
+            enable_euclidean_cluster=config.get("enable_euclidean_cluster", True),
+            reject_low_mean_height=config.get("reject_low_mean_height", True),
+            min_mean_height_m=config.get("min_mean_height_m", 0.08),
+        )
+    if kind == "sam3_box3d":
+        return SamBox3DDetector(
+            provider=provider,
+            world_frame=world_frame,
+            point_stride=config.get("point_stride", 4),
+            max_depth_m=config.get("max_depth_m", 8.0),
+            min_valid_points=config.get("min_valid_points", 12),
+            trim_ratio=config.get("trim_ratio", 0.1),
+            mask_component_min_area=config.get("mask_component_min_area", 48),
+            mask_component_max_area_ratio=config.get("mask_component_max_area_ratio", 0.85),
+            drop_bottom_ratio=config.get("drop_bottom_ratio", 0.12),
+            depth_band_lower_quantile=config.get("depth_band_lower_quantile", 0.05),
+            depth_band_upper_quantile=config.get("depth_band_upper_quantile", 0.7),
+            cluster_eps=config.get("cluster_eps", 0.18),
+            cluster_min_points=config.get("cluster_min_points", 12),
+            bbox_quantile_lower=config.get("bbox_quantile_lower", 0.1),
+            bbox_quantile_upper=config.get("bbox_quantile_upper", 0.9),
+            enable_euclidean_cluster=config.get("enable_euclidean_cluster", True),
+            reject_low_mean_height=config.get("reject_low_mean_height", True),
+            min_mean_height_m=config.get("min_mean_height_m", 0.08),
+        )
+    return MockEmptyDetector()

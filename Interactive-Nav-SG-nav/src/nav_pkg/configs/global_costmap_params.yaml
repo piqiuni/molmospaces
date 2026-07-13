@@ -4,8 +4,25 @@ global_costmap:
   update_frequency: 1.0
   publish_frequency: 1.0
   resolution: 0.05
-  static_map: false
   rolling_window: false
   transform_tolerance: 2.0
+  track_unknown_space: true
   width: 50.0
   height: 50.0
+
+  plugins:
+    - {name: static_layer, type: "costmap_2d::StaticLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+
+  static_layer:
+    map_topic: /struct_mapping/occ_map
+    subscribe_to_updates: true
+    track_unknown_space: true
+    unknown_cost_value: -1
+    lethal_cost_threshold: 50
+    trinary_costmap: true
+    first_map_only: false
+
+  inflation_layer:
+    inflation_radius: 0.1
+    cost_scaling_factor: 10.0

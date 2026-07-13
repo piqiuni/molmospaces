@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="config_file" default="$(find explore_py_pkg)/config/explore_py.yaml"/>
+
+  <node name="explore_py"
+        pkg="explore_py_pkg"
+        type="explore_py_node.py"
+        output="screen"
+        respawn="true">
+    <rosparam file="$(arg config_file)" command="load"/>
+  </node>
+</launch>

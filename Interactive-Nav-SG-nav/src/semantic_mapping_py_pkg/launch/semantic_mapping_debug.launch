@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="config_file" default="$(find semantic_mapping_py_pkg)/config/default.yaml"/>
+  <arg name="use_gt" default="false"/>
+
+  <arg name="start_object_detection" default="true"/>
+  <arg name="start_room_attribute" default="true"/>
+  <arg name="start_semantic_mapping" default="true"/>
+
+  <arg name="object_detection_backend" default="yoloe_pf_box3d"/>
+  <arg name="object_detection_provider" default="yoloe_local"/>
+  <arg name="object_detection_model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
+  <arg name="object_detection_class_mapping" default="$(find semantic_mapping_py_pkg)/config/object_class_mapping.json"/>
+  <arg name="object_detection_confidence_threshold" default="0.35"/>
+  <arg name="object_detection_device" default="cuda:0"/>
+  <arg name="publish_debug_markers" default="true"/>
+  <arg name="publish_debug_segmented_cloud" default="true"/>
+  <arg name="publish_debug_detection_image" default="true"/>
+  <arg name="publish_debug_world_markers" default="true"/>
+  <arg name="publish_debug_world_segmented_cloud" default="true"/>
+  <arg name="room_inference_backend" default="object_rules"/>
+
+  <arg name="gt_scene_json" default=""/>
+  <arg name="gt_batch_size" default="4"/>
+  <arg name="gt_publish_rate" default="1.0"/>
+  <arg name="gt_loop" default="true"/>
+
+  <group if="$(eval arg('use_gt') != 'true')">
+    <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
+      <arg name="config_file" value="$(arg config_file)"/>
+      <arg name="start_object_detection" value="$(arg start_object_detection)"/>
+      <arg name="start_room_attribute" value="$(arg start_room_attribute)"/>
+      <arg name="start_semantic_mapping" value="$(arg start_semantic_mapping)"/>
+      <arg name="object_detection_backend" value="$(arg object_detection_backend)"/>
+      <arg name="object_detection_provider" value="$(arg object_detection_provider)"/>
+      <arg name="object_detection_model_path" value="$(arg object_detection_model_path)"/>
+      <arg name="object_detection_class_mapping" value="$(arg object_detection_class_mapping)"/>
+      <arg name="object_detection_confidence_threshold" value="$(arg object_detection_confidence_threshold)"/>
+      <arg name="object_detection_device" value="$(arg object_detection_device)"/>
+      <arg name="publish_debug_markers" value="$(arg publish_debug_markers)"/>
+      <arg name="publish_debug_segmented_cloud" value="$(arg publish_debug_segmented_cloud)"/>
+      <arg name="publish_debug_detection_image" value="$(arg publish_debug_detection_image)"/>
+      <arg name="publish_debug_world_markers" value="$(arg publish_debug_world_markers)"/>
+      <arg name="publish_debug_world_segmented_cloud" value="$(arg publish_debug_world_segmented_cloud)"/>
+      <arg name="room_inference_backend" value="$(arg room_inference_backend)"/>
+    </include>
+  </group>
+
+  <group if="$(eval arg('use_gt') == 'true')">
+    <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
+      <arg name="config_file" value="$(arg config_file)"/>
+      <arg name="start_object_detection" value="false"/>
+      <arg name="start_room_attribute" value="$(arg start_room_attribute)"/>
+      <arg name="start_semantic_mapping" value="$(arg start_semantic_mapping)"/>
+      <arg name="room_inference_backend" value="$(arg room_inference_backend)"/>
+    </include>
+
+    <node name="semantic_mapping_gt_replay"
+          pkg="semantic_mapping_py_pkg"
+          type="semantic_mapping_gt_replay.py"
+          output="screen"
+          args="$(arg gt_scene_json) --batch-size $(arg gt_batch_size) --publish-rate $(arg gt_publish_rate) $(eval '--loop' if arg('gt_loop') == 'true' else '')"/>
+  </group>
+</launch>
