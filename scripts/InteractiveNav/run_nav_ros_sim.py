@@ -565,6 +565,12 @@ def parse_args():
     )
 
     parser.add_argument("--observation_topic", type=str, default="/molmo_spaces/head_camera/image")
+    parser.add_argument(
+        "--observation_queue_size",
+        type=int,
+        default=1,
+        help="ROS RGB publisher queue; use 0 for synchronous per-step debug recording.",
+    )
     parser.add_argument("--depth_topic", type=str, default="/molmo_spaces/head_camera/depth")
     parser.add_argument("--action_topic", type=str, default="/molmo_spaces/action")
     parser.add_argument("--pointcloud_topic", type=str, default="/registered_scan")
@@ -575,6 +581,12 @@ def parse_args():
     parser.add_argument("--realtime_gt_min_visible_pixels", type=int, default=16)
     parser.add_argument("--realtime_gt_step_interval", type=int, default=3)
     parser.add_argument("--realtime_gt_max_distance_m", type=float, default=6.0)
+    parser.add_argument(
+        "--step_frame_dir",
+        type=str,
+        default="",
+        help="Optional directory for asynchronous per-step RGB PNGs and a timestamp manifest.",
+    )
     parser.add_argument("--extra_image_topic", type=str, default="/molmo_spaces/debug_front_camera/image")
     parser.add_argument("--debug_front_camera_name", type=str, default="debug_front_camera")
     parser.add_argument("--publish_debug_front_camera", type=str_to_bool, nargs="?", const=True, default=True)
@@ -679,6 +691,14 @@ def parse_args():
         type=float,
         default=0.25,
         help="Republish the current observation while blocking so ROS can initialize and plan.",
+    )
+    parser.add_argument(
+        "--blocking_republish_pointcloud",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Also republish the same mapping cloud while blocked; disabled to avoid duplicate OCC integration.",
     )
     parser.add_argument(
         "--map_warmup_skip_frames",
@@ -806,12 +826,14 @@ def main():
             config=exp_config,
             task=None,
             observation_topic=args.observation_topic,
+            observation_queue_size=args.observation_queue_size,
             action_topic=args.action_topic,
             pointcloud_topic=args.pointcloud_topic,
             camera_info_topic=args.camera_info_topic,
             depth_topic=args.depth_topic,
             action_timeout_s=effective_action_timeout_s,
             blocking_observation_republish_period_s=args.blocking_observation_republish_period_s,
+            blocking_republish_pointcloud=args.blocking_republish_pointcloud,
             depth_camera_name=args.depth_camera_name,
             pointcloud_frame_id=args.pointcloud_frame_id,
             pointcloud_stride=args.pointcloud_stride,
@@ -842,6 +864,7 @@ def main():
             realtime_gt_min_visible_pixels=args.realtime_gt_min_visible_pixels,
             realtime_gt_step_interval=args.realtime_gt_step_interval,
             realtime_gt_max_distance_m=args.realtime_gt_max_distance_m,
+            step_frame_dir=args.step_frame_dir,
         )
         arm_qpos = parse_qpos_csv(args.initial_arm_qpos)
         left_arm_qpos = parse_qpos_csv(args.initial_left_arm_qpos)
