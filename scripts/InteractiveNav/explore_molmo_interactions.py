@@ -2469,10 +2469,13 @@ def set_door_state(env, door_name: str, state: str) -> dict[str, Any]:
     door.set_joint_position(hinge_idx, target)
     mujoco.mj_forward(env.current_model, env.current_data)
     return {
+        "object_name": door_name,
         "door_name": door_name,
+        "joint_name": door.joint_names[hinge_idx],
         "joint_index": hinge_idx,
         "joint_range": [float(v) for v in joint_range],
         "joint_position": float(door.get_joint_position(hinge_idx)),
+        "open_fraction": 1.0 if state == "open" else 0.0,
         "state": state,
     }
 

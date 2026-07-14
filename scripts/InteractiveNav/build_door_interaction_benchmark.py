@@ -4,6 +4,7 @@ import argparse
 import csv
 import copy
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -34,6 +35,9 @@ DEFAULT_OUTPUT_DIR = Path(
     "/home/user/ldl/molmospaces-exp-setting/scripts/InteractiveNav/output/"
     "door_interaction_benchmark_preview"
 )
+V3_SCHEMA_VERSION = "interactive_nav_v3"
+V3_SCHEMA_PATH = REPO_ROOT / "scripts/InteractiveNav/dataset_definition/v3/interactive_nav_episode.schema.json"
+_V3_SCHEMA_VALIDATOR = None
 
 
 def progress_write(message: str) -> None:
@@ -137,6 +141,63 @@ def door_distance_lookup(
     start_xy: np.ndarray,
 ) -> dict[str, float]:
     return {rec["name"]: door_distance_to_start(rec, start_xy) for rec in records}
+
+
+def door_path_entry_score(
+    record: dict[str, Any],
+    path: np.ndarray | None,
+    *,
+    padding_m: float,
+    sample_step_m: float,
+) -> tuple[int, str]:
+    if path is None or len(path) == 0:
+        return (10**9, record.get("name", ""))
+    center = np.asarray(record["aabb_center"], dtype=float)
+    size = np.asarray(record["aabb_size"], dtype=float)
+    half = np.maximum(size[:2] / 2.0, 0.12) + padding_m
+    dense = door_scan.densify_polyline(np.asarray(path, dtype=float), step_m=sample_step_m)
+    inside = np.logical_and(
+        np.abs(dense[:, 0] - center[0]) <= half[0],
+        np.abs(dense[:, 1] - center[1]) <= half[1],
+    )
+    hit_indices = np.flatnonzero(inside)
+    first_hit = int(hit_indices[0]) if len(hit_indices) else 10**9
+    return (first_hit, record.get("name", ""))
+
+
+def sort_door_records_by_path_entry(
+    records: list[dict[str, Any]],
+    path: np.ndarray | None,
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    return sorted(
+        records,
+        key=lambda rec: door_path_entry_score(
+            rec,
+            path,
+            padding_m=args.door_on_path_padding_m,
+            sample_step_m=args.path_region_sample_step_m,
+        ),
+    )
+
+
+def yaw_towards(src_xy: np.ndarray, dst_xy: np.ndarray) -> float:
+    delta = np.asarray(dst_xy, dtype=float)[:2] - np.asarray(src_xy, dtype=float)[:2]
+    if float(np.linalg.norm(delta)) <= 1e-8:
+        return 0.0
+    return float(math.atan2(delta[1], delta[0]))
+
+
+def nearest_path_point_to_door(
+    path: np.ndarray | None,
+    door_record: dict[str, Any] | None,
+) -> np.ndarray | None:
+    if path is None or len(path) == 0 or door_record is None:
+        return None
+    path_xy = np.asarray(path, dtype=float)
+    center_xy = np.asarray(door_record["aabb_center"], dtype=float)[:2]
+    idx = int(np.argmin(np.linalg.norm(path_xy - center_xy[None, :], axis=1)))
+    return np.asarray([float(path_xy[idx, 0]), float(path_xy[idx, 1]), 0.0], dtype=float)
 
 
 def load_existing_scan_index(output_dir: Path) -> dict[int, dict[str, Any]]:
@@ -248,16 +309,566 @@ def make_interactive_nav_payload(
     }
 
 
+def flatten_root_transitions(root_transitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    leaf_records: list[dict[str, Any]] = []
+    for root_transition in root_transitions:
+        root_name = root_transition.get("door_root_name")
+        root_state = root_transition.get("state")
+        for transition in root_transition.get("transitions", []):
+            state = transition.get("state", root_state)
+            leaf_records.append(
+                {
+                    "door_root_name": root_name,
+                    "object_name": transition.get("object_name") or transition.get("door_name"),
+                    "door_name": transition.get("door_name") or transition.get("object_name"),
+                    "joint_name": transition["joint_name"],
+                    "joint_index": int(transition["joint_index"]),
+                    "joint_position": float(transition["joint_position"]),
+                    "open_fraction": float(
+                        transition.get("open_fraction", 1.0 if state == "open" else 0.0)
+                    ),
+                    "state": state,
+                }
+            )
+    return leaf_records
+
+
+def final_leaf_states_from_transitions(root_transitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_joint: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in flatten_root_transitions(root_transitions):
+        by_joint[(record["object_name"], record["joint_name"])] = record
+    return sorted(
+        by_joint.values(),
+        key=lambda rec: (rec.get("door_root_name") or "", rec["object_name"], rec["joint_index"]),
+    )
+
+
+def articulation_states_from_leaf_records(leaf_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "object_name": rec["object_name"],
+            "joint_name": rec["joint_name"],
+            "joint_index": rec["joint_index"],
+            "position": rec["joint_position"],
+            "open_fraction": rec["open_fraction"],
+        }
+        for rec in leaf_records
+    ]
+
+
+def merge_articulation_states(
+    original_states: list[dict[str, Any]] | None,
+    door_states: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for state in original_states or []:
+        object_name = state.get("object_name")
+        joint_name = state.get("joint_name")
+        if object_name and joint_name:
+            merged[(object_name, joint_name)] = copy.deepcopy(state)
+    for state in door_states:
+        merged[(state["object_name"], state["joint_name"])] = copy.deepcopy(state)
+    return list(merged.values())
+
+
+def leaf_records_by_root(leaf_records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in leaf_records:
+        root_name = record.get("door_root_name")
+        if not root_name:
+            continue
+        grouped.setdefault(root_name, []).append(record)
+    for records in grouped.values():
+        records.sort(key=lambda rec: (rec["object_name"], rec["joint_index"]))
+    return grouped
+
+
+def interaction_id_for(case_id: str, root_name: str, leaf_record: dict[str, Any]) -> str:
+    return (
+        f"channel_{safe_slug(case_id, 40)}_{safe_slug(root_name, 40)}_"
+        f"{safe_slug(leaf_record['object_name'], 40)}_j{leaf_record['joint_index']}"
+    )
+
+
+def build_v3_channel_interactions(
+    *,
+    case_id: str,
+    required_open_doors: list[str],
+    final_leaf_records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    leaves_by_root = leaf_records_by_root(final_leaf_records)
+    interactions: list[dict[str, Any]] = []
+    interaction_ids_by_root: dict[str, list[str]] = {}
+    for root_name in required_open_doors:
+        for leaf in leaves_by_root.get(root_name, []):
+            interaction_id = interaction_id_for(case_id, root_name, leaf)
+            interaction_ids_by_root.setdefault(root_name, []).append(interaction_id)
+            interactions.append(
+                {
+                    "interaction_id": interaction_id,
+                    "type": "channel_hinged_door",
+                    "object_name": leaf["object_name"],
+                    "object_category": "Door",
+                    "joint_name": leaf["joint_name"],
+                    "joint_index": leaf["joint_index"],
+                    "effect_types": ["restore_reachability"],
+                    "prerequisites": [],
+                    "initial_state": {
+                        "joint_fraction": 0.0,
+                        "semantic_state": "closed",
+                    },
+                    "target_state": {
+                        "joint_fraction": 1.0,
+                        "semantic_state": "open",
+                    },
+                    "door_root_name": root_name,
+                    "initial_joint_position": leaf["joint_position"],
+                }
+            )
+    return interactions, interaction_ids_by_root
+
+
+def build_v3_target(
+    *,
+    target_object: str,
+    language: dict[str, Any],
+) -> dict[str, Any]:
+    category = nav_paths.target_category(target_object) or target_object
+    description = (
+        language.get("referral_expressions", {}).get("object_name")
+        or category
+    )
+    return {
+        "selection_mode": "specific_instance",
+        "category": category,
+        "selected_instance": target_object,
+        "instruction_consistent_candidates": [target_object],
+        "container_name": None,
+        "container_category": None,
+        "grounding": {
+            "unique": None,
+            "matching_instance_count": None,
+            "description": description,
+            "attributes": {},
+        },
+    }
+
+
+def build_v3_success_criteria(succ_pos_threshold: float) -> dict[str, Any]:
+    return {
+        "type": "nav_to_obj",
+        "target_selection": "specific_instance",
+        "distance": {
+            "metric": "planar_robot_base_to_object",
+            "threshold_m": float(succ_pos_threshold),
+            "comparison": "strictly_less",
+        },
+        "visibility": {
+            "camera_name": "head_camera",
+            "metric": "visibility_fraction",
+            "threshold": 0.0,
+            "comparison": "strictly_greater",
+        },
+        "combination": "all",
+    }
+
+
+def build_v3_oracle_plan(
+    *,
+    interactions: list[dict[str, Any]],
+    interaction_ids_by_root: dict[str, list[str]],
+    required_open_doors: list[str],
+    door_records_by_name: dict[str, dict[str, Any]],
+    open_path,
+    goal_xy: np.ndarray,
+    target_object: str,
+) -> dict[str, Any]:
+    interactions_by_id = {item["interaction_id"]: item for item in interactions}
+    steps: list[dict[str, Any]] = []
+    required_interaction_ids: list[str] = []
+    previous_xy: np.ndarray | None = None
+    for root_name in required_open_doors:
+        approach = nearest_path_point_to_door(open_path, door_records_by_name.get(root_name))
+        if approach is None:
+            center = np.asarray(door_records_by_name.get(root_name, {}).get("aabb_center", [0.0, 0.0, 0.0]))
+            approach = np.asarray([float(center[0]), float(center[1]), 0.0], dtype=float)
+        yaw_target = np.asarray(goal_xy, dtype=float)
+        goal_yaw = yaw_towards(approach[:2], yaw_target[:2])
+        for interaction_id in interaction_ids_by_root.get(root_name, []):
+            interaction = interactions_by_id[interaction_id]
+            steps.append(
+                {
+                    "type": "navigate",
+                    "interaction_id": interaction_id,
+                    "goal_point": approach.tolist(),
+                    "goal_yaw": goal_yaw,
+                    "position_tolerance_m": 0.25,
+                    "yaw_tolerance_rad": 0.35,
+                    "reason": "approach_channel_interaction",
+                }
+            )
+            steps.append(
+                {
+                    "type": "open_joint",
+                    "interaction_id": interaction_id,
+                    "object_name": interaction["object_name"],
+                    "joint_name": interaction["joint_name"],
+                    "joint_index": interaction["joint_index"],
+                    "target_fraction": 1.0,
+                    "control_mode": "direct",
+                    "reason": "restore_reachability",
+                }
+            )
+            required_interaction_ids.append(interaction_id)
+            previous_xy = approach[:2]
+
+    goal_point = [float(goal_xy[0]), float(goal_xy[1]), 0.0]
+    goal_yaw = yaw_towards(previous_xy if previous_xy is not None else np.asarray(goal_xy[:2]), goal_xy[:2])
+    steps.append(
+        {
+            "type": "navigate",
+            "interaction_id": None,
+            "goal_point": goal_point,
+            "goal_yaw": goal_yaw,
+            "position_tolerance_m": 0.25,
+            "yaw_tolerance_rad": 0.35,
+            "reason": "satisfy_nav_to_obj_success",
+        }
+    )
+    steps.append(
+        {
+            "type": "observe_target",
+            "object_name": target_object,
+            "camera_name": "head_camera",
+            "visibility_threshold": 0.0,
+            "reason": "verify_target_visible",
+        }
+    )
+    return {
+        "plan_id": "oracle_0",
+        "required_interaction_ids": required_interaction_ids,
+        "steps": steps,
+    }
+
+
+def build_v3_generation_validation(
+    args: argparse.Namespace,
+    *,
+    case_type: str,
+    sampling: dict[str, Any] | None,
+    target_object: str,
+    closed_doors: list[str],
+    open_doors: list[str],
+    required_open_doors: list[str],
+    distractor_closed_doors: list[str],
+    open_path,
+    initial_path,
+    oracle_path,
+    all_closed_path,
+    all_closed_changed_strict: bool,
+    all_closed_change_stats: dict[str, Any],
+    critical_door_names: list[str],
+    noncritical_door_names: list[str],
+    interactions: list[dict[str, Any]],
+    oracle_plan: dict[str, Any],
+    succ_pos_threshold: float,
+    plot_path: Path | None,
+) -> dict[str, Any]:
+    required_ids = oracle_plan["required_interaction_ids"]
+    final_prefix = {
+        "plan_id": oracle_plan["plan_id"],
+        "completed_step_count": len(oracle_plan["steps"]),
+        "robot_reachable_to_next_goal": oracle_path is not None,
+        "target_distance_passed": None,
+        "target_visibility_fraction": None,
+        "target_visible_pixels": None,
+        "task_success": None,
+        "opened_interaction_ids": list(required_ids),
+    }
+    return {
+        "navigation_validation": {
+            "validation_mode": "path_feasibility_only",
+            "all_open_path_found": open_path is not None,
+            "all_open_path_length_m": emi.path_length(open_path),
+            "initial_state_path_found": initial_path is not None,
+            "initial_state_path_length_m": emi.path_length(initial_path),
+            "all_closed_path_found": all_closed_path is not None,
+            "all_closed_path_length_m": emi.path_length(all_closed_path),
+            "oracle_restored_path_found": oracle_path is not None,
+            "oracle_restored_path_length_m": emi.path_length(oracle_path),
+            "all_closed_path_changed_strict": all_closed_changed_strict,
+            **all_closed_change_stats,
+        },
+        "interaction_validations": [
+            {
+                "interaction_id": interaction["interaction_id"],
+                "door_root_name": interaction.get("door_root_name"),
+                "object_name": interaction["object_name"],
+                "joint_name": interaction["joint_name"],
+                "joint_index": interaction["joint_index"],
+                "initial_fraction_recorded": interaction["initial_state"]["joint_fraction"],
+                "target_fraction_recorded": interaction["target_state"]["joint_fraction"],
+                "validated_by": "door_state_transition_capture",
+            }
+            for interaction in interactions
+        ],
+        "oracle_prefixes": [
+            {
+                "plan_id": oracle_plan["plan_id"],
+                "completed_step_count": 0,
+                "robot_reachable_to_next_goal": None,
+                "target_distance_passed": None,
+                "target_visibility_fraction": None,
+                "target_visible_pixels": None,
+                "task_success": None,
+                "opened_interaction_ids": [],
+            },
+            final_prefix,
+        ],
+        "compartment_evidence": None,
+        "success_evidence": {
+            "status": "not_executed",
+            "validation_mode": "path_feasibility_only",
+            "target_object_name": target_object,
+            "planar_distance_m": None,
+            "distance_threshold_m": float(succ_pos_threshold),
+            "camera_name": "head_camera",
+            "visibility_fraction": None,
+            "visible_pixels": None,
+            "distance_passed": None,
+            "visibility_passed": None,
+            "expected_task_success": None,
+        },
+        "minimal_plan_verified": None,
+        "legacy_case_type": case_type,
+        "legacy_sampling": sampling,
+        "legacy_door_state": {
+            "closed_doors": list(closed_doors),
+            "open_doors": list(open_doors),
+            "required_open_doors": list(required_open_doors),
+            "distractor_closed_doors": list(distractor_closed_doors),
+        },
+        "legacy_diagnostics": {
+            "critical_door_names": list(critical_door_names),
+            "noncritical_interactive_door_names": list(noncritical_door_names),
+            "critical_door_definition": "interactive door root boxes traversed by P_open",
+            "door_on_path_padding_m": args.door_on_path_padding_m,
+            "path_region_sample_step_m": args.path_region_sample_step_m,
+            "plot_path": None if plot_path is None else str(plot_path),
+        },
+        "door_approach_pose_source": "nearest_point_on_all_open_path",
+    }
+
+
+def make_interactive_nav_v3_payload(
+    args: argparse.Namespace,
+    *,
+    case_id: str,
+    case_type: str,
+    parent_episode_index: int,
+    closed_doors: list[str],
+    open_doors: list[str],
+    required_open_doors: list[str],
+    distractor_closed_doors: list[str],
+    sampling: dict[str, Any] | None,
+    target_object: str,
+    original_episode: dict[str, Any],
+    final_leaf_records: list[dict[str, Any]],
+    door_records_by_name: dict[str, dict[str, Any]],
+    goal_xy: np.ndarray,
+    open_path,
+    initial_path,
+    oracle_path,
+    all_closed_path,
+    all_closed_changed_strict: bool,
+    all_closed_change_stats: dict[str, Any],
+    critical_door_names: list[str],
+    noncritical_door_names: list[str],
+    plot_path: Path | None,
+) -> dict[str, Any]:
+    interactions, interaction_ids_by_root = build_v3_channel_interactions(
+        case_id=case_id,
+        required_open_doors=required_open_doors,
+        final_leaf_records=final_leaf_records,
+    )
+    interaction_requirement = "required" if interactions else "unnecessary"
+    language = original_episode.get("language", {})
+    succ_pos_threshold = float(original_episode["task"]["succ_pos_threshold"])
+    oracle_plan = build_v3_oracle_plan(
+        interactions=interactions,
+        interaction_ids_by_root=interaction_ids_by_root,
+        required_open_doors=required_open_doors,
+        door_records_by_name=door_records_by_name,
+        open_path=open_path,
+        goal_xy=goal_xy,
+        target_object=target_object,
+    )
+    return {
+        "schema_version": V3_SCHEMA_VERSION,
+        "case_id": case_id,
+        "parent_benchmark_episode_index": parent_episode_index,
+        "interaction_domains": ["channel"],
+        "interaction_requirement": interaction_requirement,
+        "target": build_v3_target(target_object=target_object, language=language),
+        "success_criteria": build_v3_success_criteria(succ_pos_threshold),
+        "initial_state": {
+            "interaction_states": [
+                {
+                    "interaction_id": interaction["interaction_id"],
+                    "joint_fraction": interaction["initial_state"]["joint_fraction"],
+                    "semantic_state": interaction["initial_state"]["semantic_state"],
+                }
+                for interaction in interactions
+            ],
+            "distractor_closed_door_roots": list(distractor_closed_doors),
+        },
+        "interactions": interactions,
+        "oracle_plan": oracle_plan,
+        "oracle_plans": [copy.deepcopy(oracle_plan)],
+        "generation_validation": build_v3_generation_validation(
+            args,
+            case_type=case_type,
+            sampling=sampling,
+            target_object=target_object,
+            closed_doors=closed_doors,
+            open_doors=open_doors,
+            required_open_doors=required_open_doors,
+            distractor_closed_doors=distractor_closed_doors,
+            open_path=open_path,
+            initial_path=initial_path,
+            oracle_path=oracle_path,
+            all_closed_path=all_closed_path,
+            all_closed_changed_strict=all_closed_changed_strict,
+            all_closed_change_stats=all_closed_change_stats,
+            critical_door_names=critical_door_names,
+            noncritical_door_names=noncritical_door_names,
+            interactions=interactions,
+            oracle_plan=oracle_plan,
+            succ_pos_threshold=succ_pos_threshold,
+            plot_path=plot_path,
+        ),
+        "legacy_case_type": case_type,
+    }
+
+
+def normalize_episode_for_v3_channel(
+    original_episode: dict[str, Any],
+    *,
+    target_object: str,
+    articulation_states: list[dict[str, Any]],
+    closed_doors: list[str],
+    required_open_doors: list[str],
+) -> dict[str, Any]:
+    sample = copy.deepcopy(original_episode)
+    scene_modifications = copy.deepcopy(sample.get("scene_modifications") or {})
+    scene_modifications.setdefault("added_objects", {})
+    scene_modifications.setdefault("object_poses", {})
+    scene_modifications.setdefault("removed_objects", [])
+    scene_modifications["articulation_states"] = merge_articulation_states(
+        scene_modifications.get("articulation_states"),
+        articulation_states,
+    )
+    sample["scene_modifications"] = scene_modifications
+
+    task = sample.setdefault("task", {})
+    task.setdefault("task_cls", "molmo_spaces.tasks.nav_task.NavToObjTask")
+    task.setdefault("task_type", "nav_to_obj")
+    task["selection_mode"] = "specific_instance"
+    task["pickup_obj_name"] = target_object
+    task["pickup_obj_candidates"] = [target_object]
+
+    language = sample.setdefault("language", {})
+    category = nav_paths.target_category(target_object) or target_object
+    language.setdefault("task_description", f"Find the {category}.")
+    language["instruction_type"] = "object_goal"
+    language["locale"] = "en"
+    language["interaction_disclosure"] = "hidden"
+    language.setdefault("referral_expressions", {}).setdefault("object_name", category)
+    language.setdefault("referral_expressions_priority", {})
+
+    relevant_objects = list(sample.get("task_relevant_objects", []))
+    for name in [target_object] + list(closed_doors) + list(required_open_doors):
+        if name and name not in relevant_objects:
+            relevant_objects.append(name)
+    sample["task_relevant_objects"] = relevant_objects
+    return sample
+
+
+def validate_v3_episode_invariants(sample: dict[str, Any]) -> None:
+    task = sample["task"]
+    interactive_nav = sample["interactive_nav"]
+    target = interactive_nav["target"]
+    interactions = {
+        interaction["interaction_id"]: interaction
+        for interaction in interactive_nav["interactions"]
+    }
+    assert interactive_nav["schema_version"] == V3_SCHEMA_VERSION
+    assert interactive_nav["interaction_domains"] == ["channel"]
+    assert task["selection_mode"] == target["selection_mode"] == "specific_instance"
+    assert task["pickup_obj_name"] == target["selected_instance"]
+    assert task["pickup_obj_candidates"] == [target["selected_instance"]]
+    assert (
+        interactive_nav["success_criteria"]["distance"]["threshold_m"]
+        == task["succ_pos_threshold"]
+    )
+    assert interactive_nav["oracle_plan"] == interactive_nav["oracle_plans"][0]
+    if interactive_nav["interaction_requirement"] == "required":
+        assert interactions
+        assert interactive_nav["oracle_plan"]["required_interaction_ids"]
+    elif interactive_nav["interaction_requirement"] == "unnecessary":
+        assert not interactions
+        assert not interactive_nav["oracle_plan"]["required_interaction_ids"]
+        assert all(step["type"] != "open_joint" for step in interactive_nav["oracle_plan"]["steps"])
+
+    initial_ids = {
+        state["interaction_id"]
+        for state in interactive_nav["initial_state"]["interaction_states"]
+    }
+    assert initial_ids == set(interactions)
+
+    articulation_states = {
+        state["joint_name"]: state
+        for state in sample["scene_modifications"]["articulation_states"]
+    }
+    opened_ids: list[str] = []
+    for step in interactive_nav["oracle_plan"]["steps"]:
+        interaction_id = step.get("interaction_id")
+        if interaction_id is not None:
+            assert interaction_id in interactions
+        if step["type"] != "open_joint":
+            continue
+        interaction = interactions[interaction_id]
+        assert interaction["joint_name"] in articulation_states
+        assert step["object_name"] == interaction["object_name"]
+        assert step["joint_name"] == interaction["joint_name"]
+        assert step["joint_index"] == interaction["joint_index"]
+        if interaction_id not in opened_ids:
+            opened_ids.append(interaction_id)
+    assert opened_ids == interactive_nav["oracle_plan"]["required_interaction_ids"]
+
+
+def validate_v3_episode_schema_if_available(sample: dict[str, Any]) -> None:
+    global _V3_SCHEMA_VALIDATOR
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    if _V3_SCHEMA_VALIDATOR is None:
+        schema = json.loads(V3_SCHEMA_PATH.read_text())
+        _V3_SCHEMA_VALIDATOR = jsonschema.Draft202012Validator(schema)
+    _V3_SCHEMA_VALIDATOR.validate(sample)
+
+
 def write_sample_json(
     output_dir: Path,
-    original_episode: dict[str, Any],
-    interactive_nav: dict[str, Any],
+    sample: dict[str, Any],
 ) -> Path:
+    interactive_nav = sample["interactive_nav"]
     case_id = interactive_nav["case_id"]
     out_path = sample_json_path_for(output_dir, case_id)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    sample = copy.deepcopy(original_episode)
-    sample["interactive_nav"] = interactive_nav
+    validate_v3_episode_invariants(sample)
+    validate_v3_episode_schema_if_available(sample)
     out_path.write_text(json.dumps(sample, indent=2, ensure_ascii=False) + "\n")
     return out_path
 
@@ -379,8 +990,10 @@ def build_case_sample(
     distractor_closed_doors: list[str],
     sampling: dict[str, Any] | None,
     all_interactive_door_names: list[str],
+    door_records_by_name: dict[str, dict[str, Any]],
     critical_door_names: list[str],
     noncritical_door_names: list[str],
+    target_object: str,
     goal_xy: np.ndarray,
     open_path,
     all_closed_path,
@@ -395,7 +1008,7 @@ def build_case_sample(
 
     apply_closed_door_state(ctx, None, [])
     current_analysis = emi.collect_runtime_doorway_analysis(ctx.env)
-    apply_closed_door_state(ctx, current_analysis, closed_doors)
+    initial_transitions = apply_closed_door_state(ctx, current_analysis, closed_doors)
     start_xy = nav_paths.set_episode_robot_pose(ctx.env, original_episode)
     initial_scene_map, initial_analysis, initial_path = compute_path_for_current_state(args, ctx, goal_xy)
 
@@ -418,7 +1031,9 @@ def build_case_sample(
         case_id=case_id,
         required_open_doors=required_open_doors,
     )
-    interactive_nav = make_interactive_nav_payload(
+    final_leaf_records = final_leaf_states_from_transitions(initial_transitions)
+    articulation_states = articulation_states_from_leaf_records(final_leaf_records)
+    interactive_nav = make_interactive_nav_v3_payload(
         args,
         case_id=case_id,
         case_type=case_type,
@@ -428,6 +1043,11 @@ def build_case_sample(
         required_open_doors=required_open_doors,
         distractor_closed_doors=distractor_closed_doors,
         sampling=sampling,
+        target_object=target_object,
+        original_episode=original_episode,
+        final_leaf_records=final_leaf_records,
+        door_records_by_name=door_records_by_name,
+        goal_xy=goal_xy,
         open_path=open_path,
         initial_path=initial_path,
         oracle_path=oracle_path,
@@ -438,10 +1058,19 @@ def build_case_sample(
         noncritical_door_names=noncritical_door_names,
         plot_path=plot_path,
     )
-    sample_path = write_sample_json(output_dir, original_episode, interactive_nav)
+    sample = normalize_episode_for_v3_channel(
+        original_episode,
+        target_object=target_object,
+        articulation_states=articulation_states,
+        closed_doors=closed_doors,
+        required_open_doors=required_open_doors,
+    )
+    sample["interactive_nav"] = interactive_nav
+    sample_path = write_sample_json(output_dir, sample)
     return {
         "case_id": case_id,
         "case_type": case_type,
+        "sample_schema_version": V3_SCHEMA_VERSION,
         "sample_path": str(sample_path),
         "plot_path": None if plot_path is None else str(plot_path),
         "closed_door_count": len(closed_doors),
@@ -499,6 +1128,7 @@ def run_episode_build(
         emi.collect_interactive_door_root_object_records(ctx.env, open_analysis),
         start_xy,
     )
+    door_records_by_name = {rec["name"]: rec for rec in all_interactive_records}
     all_interactive_door_names = [rec["name"] for rec in all_interactive_records]
     critical_records = door_scan.traversed_interactive_doors_on_path(
         ctx.env,
@@ -507,7 +1137,7 @@ def run_episode_build(
         padding_m=args.door_on_path_padding_m,
         sample_step_m=args.path_region_sample_step_m,
     )
-    critical_records = sort_door_records_by_start_distance(critical_records, start_xy)
+    critical_records = sort_door_records_by_path_entry(critical_records, open_path, args)
     critical_door_names = [rec["name"] for rec in critical_records]
     critical_set = set(critical_door_names)
     noncritical_door_names = [name for name in all_interactive_door_names if name not in critical_set]
@@ -560,8 +1190,10 @@ def run_episode_build(
                     "method": "deterministic_all_interactive_doors",
                 },
                 all_interactive_door_names=all_interactive_door_names,
+                door_records_by_name=door_records_by_name,
                 critical_door_names=critical_door_names,
                 noncritical_door_names=noncritical_door_names,
+                target_object=target_object,
                 goal_xy=nav_goal[:2],
                 open_path=open_path,
                 all_closed_path=all_closed_path,
@@ -596,8 +1228,10 @@ def run_episode_build(
                         "door_distance_m": interactive_door_distances_m.get(door_name),
                     },
                     all_interactive_door_names=all_interactive_door_names,
+                    door_records_by_name=door_records_by_name,
                     critical_door_names=critical_door_names,
                     noncritical_door_names=noncritical_door_names,
+                    target_object=target_object,
                     goal_xy=nav_goal[:2],
                     open_path=open_path,
                     all_closed_path=all_closed_path,
@@ -646,8 +1280,10 @@ def run_episode_build(
                     distractor_closed_doors=distractors,
                     sampling=sampling,
                     all_interactive_door_names=all_interactive_door_names,
+                    door_records_by_name=door_records_by_name,
                     critical_door_names=critical_door_names,
                     noncritical_door_names=noncritical_door_names,
+                    target_object=target_object,
                     goal_xy=nav_goal[:2],
                     open_path=open_path,
                     all_closed_path=all_closed_path,
@@ -703,8 +1339,10 @@ def run_episode_build(
                         distractor_closed_doors=distractors,
                         sampling=sampling,
                         all_interactive_door_names=all_interactive_door_names,
+                        door_records_by_name=door_records_by_name,
                         critical_door_names=critical_door_names,
                         noncritical_door_names=noncritical_door_names,
+                        target_object=target_object,
                         goal_xy=nav_goal[:2],
                         open_path=open_path,
                         all_closed_path=all_closed_path,
@@ -715,7 +1353,7 @@ def run_episode_build(
                 built_partial_count += 1
 
     row = {
-        "schema_version": "door_interaction_nav_scan_v1",
+        "schema_version": "door_interaction_nav_scan_v3",
         "mode": "build",
         "parent_benchmark_episode_index": episode_index,
         "case_id": safe_case_id(episode_index, house_index),
@@ -743,7 +1381,10 @@ def run_episode_build(
         "noncritical_interactive_door_count": len(noncritical_door_names),
         "noncritical_interactive_door_names": noncritical_door_names,
         "interactive_door_distances_m": interactive_door_distances_m,
-        "door_order_rule": "interactive and critical doors are ordered by distance from the benchmark robot start pose",
+        "door_order_rule": (
+            "interactive doors are ordered by distance from the benchmark robot start pose; "
+            "critical doors are ordered by first entry along the all-open GT path"
+        ),
         "built_all_closed_record": built_all_closed,
         "built_partial_record_count": built_partial_count,
         "built_case_count": len(case_summaries),
@@ -1257,7 +1898,8 @@ def main() -> None:
             benchmark_samples.append(json.loads(sample_path.read_text()))
 
     summary = {
-        "schema_version": "door_interaction_benchmark_build_summary_v1",
+        "schema_version": "door_interaction_benchmark_build_summary_v3",
+        "sample_schema_version": V3_SCHEMA_VERSION,
         "mode": args.mode,
         "input_mode": args.input_mode,
         "benchmark_dir": str(args.benchmark_dir),

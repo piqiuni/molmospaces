@@ -16,6 +16,8 @@ if str(REPO_ROOT) not in sys.path:
 
 import mujoco
 import numpy as np
+from scipy.ndimage import distance_transform_edt
+from scipy.spatial.transform import Slerp
 from scipy.spatial.transform import Rotation as R
 
 from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
@@ -24,7 +26,11 @@ from molmo_spaces.configs.camera_configs import (
     RBY1GoProD455CameraSystem,
 )
 from molmo_spaces.configs.policy_configs import AStarNavToObjPolicyConfig
-from molmo_spaces.configs.robot_configs import FloatingRUMRobotConfig, FrankaRobotConfig, RBY1Config
+from molmo_spaces.configs.robot_configs import (
+    FloatingRUMRobotConfig,
+    FrankaRobotConfig,
+    RBY1MOpenCloseConfig,
+)
 from molmo_spaces.env.data_views import Door, MlSpacesArticulationObject, MlSpacesFreeJointBody
 from molmo_spaces.evaluation.benchmark_schema import EpisodeSpec
 from molmo_spaces.molmo_spaces_constants import get_resource_manager
@@ -34,7 +40,9 @@ from molmo_spaces.tasks.task_sampler import BaseMujocoTaskSampler
 from molmo_spaces.utils.constants.object_constants import RECEPTACLE_TYPES_THOR
 from molmo_spaces.utils.lazy_loading_utils import install_uid
 from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
+from molmo_spaces.utils.pose import pose_mat_to_7d, pos_quat_to_pose_mat
 from molmo_spaces.utils.rendering_utils import get_geom_seg_mask
+from molmo_spaces.utils.save_utils import save_frames_to_mp4
 from molmo_spaces.utils.scene_metadata_utils import get_scene_metadata
 
 log = logging.getLogger(__name__)
@@ -70,10 +78,70 @@ PORTABLE_PREFERRED_TOKENS = (
     "laptop",
     "basketball",
 )
-DEFAULT_LEFT_ARM_QPOS = np.array([0.28, 0.0, 0.0, -0.64, 0.39, -0.26, -0.04], dtype=np.float32)
-DEFAULT_RIGHT_ARM_QPOS = np.array([0.28, 0.0, 0.0, -0.64, 0.39, -0.26, -0.04], dtype=np.float32)
+DEFAULT_LEFT_ARM_QPOS = np.array([0.5, 0.0, 0.0, -2.3, 0.0, -0.5, 0.0], dtype=np.float32)
+DEFAULT_RIGHT_ARM_QPOS = np.array([0.5, 0.0, 0.0, -2.3, 0.0, -0.5, 0.0], dtype=np.float32)
 DEFAULT_HEAD_QPOS = np.array([0.0, 0.6], dtype=np.float32)
 FORCE_DRIVE_TOLERANCE = 0.01
+DEFAULT_RBY1_INTERACTION_CAMERAS = ("head_camera", "wrist_camera_l", "wrist_camera_r", "camera_follower")
+
+
+def default_rby1_episode_camera_specs() -> list[dict[str, Any]]:
+    """Return deterministic RBY1 camera mounts used by official frozen episodes."""
+    return [
+        {
+            "name": "head_camera",
+            "type": "robot_mounted",
+            "reference_body_names": ["robot_0/link_head_2"],
+            "camera_offset": [0.05, 0.0, 0.05],
+            "lookat_offset": [0.0, 0.0, 0.08],
+            "camera_quaternion": [0.5, 0.5, -0.5, -0.5],
+            "fov": 139.0,
+            "record_depth": False,
+        },
+        {
+            "name": "wrist_camera_l",
+            "type": "robot_mounted",
+            "reference_body_names": ["robot_0/link_left_arm_6"],
+            "camera_offset": [0.0, -0.1, -0.15],
+            "lookat_offset": [0.0, 0.0, 0.08],
+            "camera_quaternion": [0.0, 0.0, -0.258819, 0.965926],
+            "fov": 58.0,
+            "record_depth": False,
+        },
+        {
+            "name": "wrist_camera_r",
+            "type": "robot_mounted",
+            "reference_body_names": ["robot_0/link_right_arm_6"],
+            "camera_offset": [0.0, 0.1, -0.15],
+            "lookat_offset": [0.0, 0.0, 0.08],
+            "camera_quaternion": [0.965926, -0.258819, 0.0, 0.0],
+            "fov": 58.0,
+            "record_depth": False,
+        },
+        {
+            "name": "camera_follower",
+            "type": "robot_mounted",
+            "reference_body_names": ["robot_0/base"],
+            "camera_offset": [-1.3, 0.0, 2.7],
+            "lookat_offset": [0.0, 0.0, 0.08],
+            "camera_quaternion": [0.653288, 0.270582, -0.270582, -0.653288],
+            "fov": 58.0,
+            "record_depth": False,
+        },
+    ]
+
+
+def default_rby1_episode_qpos() -> dict[str, list[float]]:
+    """Return a complete RBY1M state compatible with JSON episode replay."""
+    return {
+        "base": [0.0, 0.0, 0.0],
+        "torso": [0.0] * 6,
+        "left_arm": DEFAULT_LEFT_ARM_QPOS.astype(float).tolist(),
+        "right_arm": DEFAULT_RIGHT_ARM_QPOS.astype(float).tolist(),
+        "left_gripper": [-0.05, 0.05],
+        "right_gripper": [-0.05, 0.05],
+        "head": [0.0, 0.6],
+    }
 
 
 @dataclass
@@ -89,6 +157,36 @@ class LoadedContext:
         return self.sampler.env
 
 
+@dataclass
+class RBY1InteractionRequest:
+    """Algorithm-facing request for opening one articulated scene object."""
+
+    house_ind: int
+    interaction_kind: str
+    target_name: str
+    joint_index: int = 0
+    robot_pose_mode: str = "current_or_adjust"
+    robot_base_pose: list[float] | np.ndarray | None = None
+    door_arm: str = "auto"
+    approach_distance: float = 0.5
+    min_base_clearance: float = 0.15
+    max_approach_distance: float = 1.2
+    max_base_adjustment_distance: float = 0.75
+    max_base_adjustment_steps: int = 120
+    allow_back_approach: bool = False
+    door_tcp_offset: float = 0.03
+    success_threshold: float = 0.67
+    max_steps: int = 400
+    video_fps: float | None = None
+    camera_names: tuple[str, ...] = DEFAULT_RBY1_INTERACTION_CAMERAS
+    output_dir: Path = DEFAULT_OUTPUT_DIR
+    scene_dataset: str = "procthor-10k"
+    data_split: str = "train"
+    variant: str = "base"
+    seed: int = 0
+    curobo_server_url: str | None = None
+
+
 class SceneOnlyTaskSampler(BaseMujocoTaskSampler):
     """Load a MolmoSpaces scene without sampling a concrete task."""
 
@@ -100,6 +198,16 @@ class SceneOnlyTaskSampler(BaseMujocoTaskSampler):
 
     def _sample_task(self, env) -> BaseMujocoTask:
         raise NotImplementedError("SceneOnlyTaskSampler only loads scenes.")
+
+
+class RBY1InteractionJsonTaskSampler(JsonEvalTaskSampler):
+    """Replay JSON episodes with policy-specific pre-compile helper bodies."""
+
+    def add_auxiliary_objects(self, spec) -> None:
+        super().add_auxiliary_objects(spec)
+        policy_cls = getattr(self.config.policy_config, "policy_cls", None)
+        if policy_cls is not None and hasattr(policy_cls, "add_auxiliary_objects"):
+            policy_cls.add_auxiliary_objects(self.config, spec)
 
 
 def build_scene_config(args: argparse.Namespace) -> NavToObjBaseConfig:
@@ -126,7 +234,7 @@ def build_scene_config(args: argparse.Namespace) -> NavToObjBaseConfig:
         cfg.camera_config = FrankaDroidCameraSystem()
         cfg.camera_config.img_resolution = (320, 240)
     elif args.robot == "rby1":
-        cfg.robot_config = RBY1Config()
+        cfg.robot_config = RBY1MOpenCloseConfig()
         cfg.camera_config = RBY1GoProD455CameraSystem()
     elif args.robot == "rum":
         cfg.robot_config = FloatingRUMRobotConfig()
@@ -295,15 +403,16 @@ def prepare_writable_scene_path(scene_path: Path) -> str:
     dst_scene.parent.mkdir(parents=True, exist_ok=True)
     ensure_symlink(dst_scene, scene_path)
 
-    for sibling in scene_path.parent.glob(f"{scene_path.stem}*"):
-        if sibling == scene_path:
+    resolved_scene_path = usable_source(scene_path)
+    for sibling in resolved_scene_path.parent.glob(f"{resolved_scene_path.stem}*"):
+        if sibling == resolved_scene_path:
             continue
         if sibling.is_dir() and not sibling.name.endswith("_assets"):
             continue
         sibling_dst = dst_scene.parent / sibling.name
         ensure_symlink(sibling_dst, sibling)
 
-    scene_assets_dir = scene_path.parent / f"{scene_path.stem}_assets"
+    scene_assets_dir = resolved_scene_path.parent / f"{resolved_scene_path.stem}_assets"
     if scene_assets_dir.exists():
         dst_assets_dir = dst_scene.parent / scene_assets_dir.name
         ensure_symlink(dst_assets_dir, scene_assets_dir)
@@ -324,6 +433,13 @@ def apply_default_arm_pose(env) -> None:
         right = robot_view.get_move_group("right_arm")
         if np.asarray(right.joint_pos).shape == DEFAULT_RIGHT_ARM_QPOS.shape:
             right.joint_pos = DEFAULT_RIGHT_ARM_QPOS.copy()
+    for gripper_name in ("left_gripper", "right_gripper"):
+        if gripper_name not in robot_view.move_group_ids():
+            continue
+        gripper = robot_view.get_move_group(gripper_name)
+        target = np.asarray(default_rby1_episode_qpos()[gripper_name], dtype=float)
+        if np.asarray(gripper.joint_pos).shape == target.shape:
+            gripper.joint_pos = target
     mujoco.mj_forward(env.current_model, env.current_data)
 
 
@@ -711,6 +827,16 @@ def to_jsonable(value: Any) -> Any:
     return value
 
 
+def joint_closed_open_values(joint_range: list[float]) -> tuple[float, float]:
+    """Map an articulation range to semantic closed/open endpoints."""
+    values = [float(value) for value in joint_range]
+    if not values:
+        raise ValueError("Joint range is empty")
+    closed = min(values, key=lambda value: abs(value))
+    open_value = max(values, key=lambda value: abs(value - closed))
+    return float(closed), float(open_value)
+
+
 def collect_scene_records(ctx: LoadedContext) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     env = ctx.env
     om = env.object_managers[env.current_batch_index]
@@ -761,6 +887,7 @@ def collect_scene_records(ctx: LoadedContext) -> tuple[list[dict[str, Any]], lis
             joints = []
             for joint_index, joint_name in enumerate(art_obj.joint_names):
                 joint_range = [float(v) for v in art_obj.get_joint_range(joint_index)]
+                closed_value, open_value = joint_closed_open_values(joint_range)
                 joints.append(
                     {
                         "joint_index": joint_index,
@@ -768,8 +895,8 @@ def collect_scene_records(ctx: LoadedContext) -> tuple[list[dict[str, Any]], lis
                         "joint_type": str(art_obj.get_joint_type(joint_index)).split(".")[-1],
                         "joint_range": joint_range,
                         "current_value": float(art_obj.get_joint_position(joint_index)),
-                        "closed_value": float(min(joint_range)),
-                        "open_value": float(max(joint_range)),
+                        "closed_value": closed_value,
+                        "open_value": open_value,
                     }
                 )
             container_rec = copy.deepcopy(rec)
@@ -788,6 +915,7 @@ def collect_door_records(ctx: LoadedContext) -> list[dict[str, Any]]:
             door = Door(door_name, env.current_data)
             hinge_idx = door.get_hinge_joint_index()
             joint_range = [float(v) for v in door.get_joint_range(hinge_idx)]
+            closed_value, open_value = joint_closed_open_values(joint_range)
             center, size = safe_body_aabb(env.current_model, env.current_data, door.body_id)
             door_records.append(
                 {
@@ -802,8 +930,8 @@ def collect_door_records(ctx: LoadedContext) -> list[dict[str, Any]]:
                     "hinge_joint_index": hinge_idx,
                     "hinge_joint_name": door.joint_names[hinge_idx],
                     "hinge_joint_range": joint_range,
-                    "closed_value": float(min(joint_range)),
-                    "open_value": float(max(joint_range)),
+                    "closed_value": closed_value,
+                    "open_value": open_value,
                 }
             )
         except Exception:
@@ -952,8 +1080,8 @@ def set_container_joint_fraction(
     if not isinstance(container_obj, MlSpacesArticulationObject):
         raise ValueError(f"{container_name} is not an articulable container.")
     joint_range = [float(v) for v in container_obj.get_joint_range(joint_index)]
-    lo, hi = min(joint_range), max(joint_range)
-    target = lo + float(open_fraction) * (hi - lo)
+    closed_value, open_value = joint_closed_open_values(joint_range)
+    target = closed_value + float(open_fraction) * (open_value - closed_value)
     drive_meta = drive_joint_to_value_with_force(env, container_obj.joint_names[joint_index], target)
     return {
         "container_name": container_name,
@@ -977,8 +1105,8 @@ def set_door_open_fraction(env, door_name: str, open_fraction: float) -> dict[st
     door = Door(door_name, env.current_data)
     hinge_idx = door.get_hinge_joint_index()
     joint_range = [float(v) for v in door.get_joint_range(hinge_idx)]
-    lo, hi = min(joint_range), max(joint_range)
-    target = lo + float(open_fraction) * (hi - lo)
+    closed_value, open_value = joint_closed_open_values(joint_range)
+    target = closed_value + float(open_fraction) * (open_value - closed_value)
     drive_meta = drive_joint_to_value_with_force(env, door.joint_names[hinge_idx], target)
     return {
         "door_name": door_name,
@@ -1101,6 +1229,58 @@ def container_front_axis(container_rec: dict[str, Any]) -> np.ndarray:
     return front_axis_xy / norm
 
 
+def container_approach_axis(env, container_rec: dict[str, Any]) -> np.ndarray:
+    """Infer the physical front normal from door hinges or drawer travel."""
+    joints = articulation_joint_records(container_rec)
+    qpos_before = env.current_data.qpos.copy()
+    axes: list[np.ndarray] = []
+    try:
+        set_all_articulation_joints_closed(env, container_rec, joints)
+        for joint in joints:
+            joint_type = joint_mujoco_type_name(env, joint)
+            if joint_type == "slide":
+                closed_center, _ = joint_target_geometry(env, container_rec, joint)
+                set_articulation_state_by_record(
+                    env,
+                    container_rec,
+                    int(joint["joint_index"]),
+                    float(joint["open_value"]),
+                )
+                open_center, _ = joint_target_geometry(env, container_rec, joint)
+                axis = np.asarray(open_center, dtype=float)[:2] - np.asarray(
+                    closed_center, dtype=float
+                )[:2]
+                set_articulation_state_by_record(
+                    env,
+                    container_rec,
+                    int(joint["joint_index"]),
+                    float(joint["closed_value"]),
+                )
+            elif joint_type == "hinge":
+                center, _ = joint_target_geometry(env, container_rec, joint)
+                joint_id = env.current_model.joint(joint["joint_name"]).id
+                anchor = np.asarray(env.current_data.xanchor[joint_id], dtype=float)
+                radial = np.asarray(center, dtype=float)[:2] - anchor[:2]
+                axis = np.array([-radial[1], radial[0]], dtype=float)
+            else:
+                continue
+            norm = float(np.linalg.norm(axis))
+            if norm > 1e-4:
+                axes.append(axis / norm)
+    finally:
+        env.current_data.qpos[:] = qpos_before
+        mujoco.mj_forward(env.current_model, env.current_data)
+    if not axes:
+        return container_front_axis(container_rec)
+    reference = axes[0]
+    aligned = [axis if float(np.dot(axis, reference)) >= 0.0 else -axis for axis in axes]
+    mean_axis = np.mean(aligned, axis=0)
+    norm = float(np.linalg.norm(mean_axis))
+    if norm <= 1e-6:
+        return reference
+    return mean_axis / norm
+
+
 def make_robot_pose_from_xy(robot_view, xy: np.ndarray, yaw: float) -> np.ndarray:
     pose = robot_view.base.pose.copy()
     pose[:3, 3] = np.array([xy[0], xy[1], 0.0], dtype=float)
@@ -1134,44 +1314,47 @@ def choose_pose_valid_for_joint_states(
     closed_val: float,
     open_val: float,
     desired_dist: float = 0.8,
+    torso_heights: tuple[float, ...] = (0.0,),
+    min_clearance_m: float = 0.15,
+    max_center_distance_m: float = 1.2,
+    allow_back_approach: bool = False,
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
     env = ctx.env
     robot_view = env.current_robot.robot_view
     center, _size = joint_target_geometry(env, articulation_rec, joint)
-    front_axis_xy = container_front_axis(articulation_rec)
+    if articulation_rec.get("interaction_group") == "container":
+        front_axis_xy = container_approach_axis(env, articulation_rec)
+    else:
+        front_axis_xy = container_front_axis(articulation_rec)
     thormap = env.get_thormap(agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius)
     free_points = thormap.get_free_points()
+    clearance_map = distance_transform_edt(thormap.occupancy) / float(thormap.px_per_m)
     lateral_xy = np.array([-front_axis_xy[1], front_axis_xy[0]], dtype=float)
 
-    primary_front = center[:2] + front_axis_xy * desired_dist
-    fallback_front = center[:2] - front_axis_xy * desired_dist
-
-    # Prefer positions close to the drawer/fridge center, while still trying
-    # the natural front-facing slot first. Retreat distance is penalized.
+    # Search progressively farther away and laterally around the target. The
+    # score keeps the closest safe pose, but narrow layouts can still fall back
+    # to a farther or off-center stance instead of spawning in collision.
     candidate_specs: list[tuple[np.ndarray, float, str]] = []
-    for base_xy, base_penalty, side_name in (
-        (primary_front, 0.0, "front"),
-        (fallback_front, 1.5, "back"),
+    for direction, side_penalty, side_name in (
+        (front_axis_xy, 0.0, "front"),
+        (-front_axis_xy, 1.5, "back"),
     ):
-        candidate_specs.extend(
-            [
-                (base_xy, base_penalty + 0.00, side_name),
-                (base_xy + front_axis_xy * 0.15, base_penalty + 0.15, side_name),
-                (base_xy + front_axis_xy * 0.30, base_penalty + 0.30, side_name),
-                (base_xy + lateral_xy * 0.20, base_penalty + 0.20, f"{side_name}_left"),
-                (base_xy - lateral_xy * 0.20, base_penalty + 0.20, f"{side_name}_right"),
-                (
-                    base_xy + front_axis_xy * 0.15 + lateral_xy * 0.20,
-                    base_penalty + 0.35,
-                    f"{side_name}_left",
-                ),
-                (
-                    base_xy + front_axis_xy * 0.15 - lateral_xy * 0.20,
-                    base_penalty + 0.35,
-                    f"{side_name}_right",
-                ),
-            ]
-        )
+        for retreat in (0.0, 0.15, 0.30, 0.50, 0.70, 0.90):
+            base_xy = center[:2] + direction * (desired_dist + retreat)
+            for lateral_offset in (0.0, 0.20, -0.20, 0.40, -0.40):
+                if lateral_offset > 0.0:
+                    label = f"{side_name}_left"
+                elif lateral_offset < 0.0:
+                    label = f"{side_name}_right"
+                else:
+                    label = side_name
+                candidate_specs.append(
+                    (
+                        base_xy + lateral_xy * lateral_offset,
+                        side_penalty + retreat + 0.5 * abs(lateral_offset),
+                        label,
+                    )
+                )
 
     qpos_before = env.current_data.qpos.copy()
     robot_pose_before = robot_view.base.pose.copy()
@@ -1181,32 +1364,51 @@ def choose_pose_valid_for_joint_states(
 
     try:
         for candidate_xy, penalty, label in candidate_specs:
+            if (
+                articulation_rec.get("interaction_group") == "container"
+                and label.startswith("back")
+                and not allow_back_approach
+            ):
+                continue
             free_pt = nearest_free_point(free_points, candidate_xy)
             if free_pt is None:
+                continue
+            center_dist = float(np.linalg.norm(free_pt[:2] - center[:2]))
+            if center_dist > max_center_distance_m:
+                continue
+            free_px = np.asarray(thormap.pos_m_to_px(free_pt), dtype=int)
+            if not np.all((free_px >= 0) & (free_px < clearance_map.shape)):
+                continue
+            clearance_m = float(clearance_map[free_px[0], free_px[1]])
+            if clearance_m < min_clearance_m:
                 continue
             yaw = yaw_to_face(free_pt[:2], center[:2])
             pose = make_robot_pose_from_xy(robot_view, free_pt[:2], yaw)
 
-            # Must be collision-free in the closed state.
-            env.current_data.qpos[:] = qpos_before
-            mujoco.mj_forward(env.current_model, env.current_data)
-            set_articulation_state_by_record(
-                env, articulation_rec, joint["joint_index"], closed_val
-            )
-            if env.check_if_robot_collision_at_base_pose(robot_view, pose):
+            collision_free = True
+            for articulation_value in (closed_val, open_val):
+                for torso_height in torso_heights:
+                    env.current_data.qpos[:] = qpos_before
+                    torso_group = robot_view.get_move_group("torso")
+                    torso_group.joint_pos = np.array(
+                        [0.0, torso_height, -2.0 * torso_height, torso_height, 0.0, 0.0]
+                    )
+                    set_articulation_state_by_record(
+                        env,
+                        articulation_rec,
+                        joint["joint_index"],
+                        articulation_value,
+                    )
+                    mujoco.mj_forward(env.current_model, env.current_data)
+                    if env.check_if_robot_collision_at_base_pose(robot_view, pose):
+                        collision_free = False
+                        break
+                if not collision_free:
+                    break
+            if not collision_free:
                 continue
 
-            # Must also be collision-free in the open state.
-            env.current_data.qpos[:] = qpos_before
-            mujoco.mj_forward(env.current_model, env.current_data)
-            set_articulation_state_by_record(
-                env, articulation_rec, joint["joint_index"], open_val
-            )
-            if env.check_if_robot_collision_at_base_pose(robot_view, pose):
-                continue
-
-            center_dist = float(np.linalg.norm(free_pt[:2] - center[:2]))
-            score = center_dist + penalty
+            score = center_dist + penalty - 0.25 * min(clearance_m, 0.5)
             if score < best_score:
                 best_score = score
                 best_pose = pose.copy()
@@ -1215,7 +1417,9 @@ def choose_pose_valid_for_joint_states(
                     "candidate_target_xy": candidate_xy.tolist(),
                     "free_point_xy": free_pt[:2].tolist(),
                     "center_distance": center_dist,
+                    "base_clearance_m": clearance_m,
                     "score": score,
+                    "validated_torso_heights": list(torso_heights),
                 }
     finally:
         env.current_data.qpos[:] = qpos_before
@@ -1223,6 +1427,193 @@ def choose_pose_valid_for_joint_states(
         mujoco.mj_forward(env.current_model, env.current_data)
 
     return best_pose, best_meta
+
+
+def validate_pose_for_joint_states(
+    ctx: LoadedContext,
+    articulation_rec: dict[str, Any],
+    joint: dict[str, Any],
+    robot_pose: np.ndarray,
+    closed_val: float,
+    open_val: float,
+    *,
+    torso_heights: tuple[float, ...] = (0.0,),
+    max_center_distance_m: float = 1.2,
+    max_direct_operation_distance_m: float | None = None,
+    max_facing_error_rad: float = float(np.deg2rad(25.0)),
+) -> tuple[bool, dict[str, Any]]:
+    """Check whether a navigation endpoint is safe throughout an interaction."""
+    env = ctx.env
+    robot_view = env.current_robot.robot_view
+    center, _size = joint_target_geometry(env, articulation_rec, joint)
+    robot_xy = np.asarray(robot_pose, dtype=float)[:2, 3]
+    center_distance = float(np.linalg.norm(robot_xy - center[:2]))
+    meta: dict[str, Any] = {
+        "source": "caller_supplied_robot_base_pose",
+        "center_distance": center_distance,
+        "max_center_distance": float(max_center_distance_m),
+        "validated_torso_heights": list(torso_heights),
+        "collision_states": [],
+    }
+    if center_distance > max_center_distance_m:
+        meta["valid"] = False
+        meta["rejection_reason"] = "target_too_far"
+        return False, meta
+    if (
+        max_direct_operation_distance_m is not None
+        and center_distance > max_direct_operation_distance_m
+    ):
+        meta["valid"] = False
+        meta["max_direct_operation_distance"] = float(max_direct_operation_distance_m)
+        meta["rejection_reason"] = "outside_direct_manipulation_workspace"
+        return False, meta
+
+    robot_forward = np.asarray(robot_pose, dtype=float)[:2, 0]
+    target_direction = center[:2] - robot_xy
+    target_norm = float(np.linalg.norm(target_direction))
+    if target_norm > 1e-8:
+        target_direction /= target_norm
+        facing_error = float(
+            np.arccos(np.clip(np.dot(robot_forward, target_direction), -1.0, 1.0))
+        )
+    else:
+        facing_error = 0.0
+    meta["facing_error_degrees"] = float(np.rad2deg(facing_error))
+    if facing_error > max_facing_error_rad:
+        meta["valid"] = False
+        meta["max_facing_error_degrees"] = float(np.rad2deg(max_facing_error_rad))
+        meta["rejection_reason"] = "not_facing_target"
+        return False, meta
+
+    qpos_before = env.current_data.qpos.copy()
+    robot_pose_before = robot_view.base.pose.copy()
+    try:
+        for state_name, articulation_value in (
+            ("closed", closed_val),
+            ("open", open_val),
+        ):
+            for torso_height in torso_heights:
+                env.current_data.qpos[:] = qpos_before
+                torso_group = robot_view.get_move_group("torso")
+                torso_group.joint_pos = np.array(
+                    [0.0, torso_height, -2.0 * torso_height, torso_height, 0.0, 0.0]
+                )
+                set_articulation_state_by_record(
+                    env,
+                    articulation_rec,
+                    joint["joint_index"],
+                    articulation_value,
+                )
+                mujoco.mj_forward(env.current_model, env.current_data)
+                colliding = bool(
+                    env.check_if_robot_collision_at_base_pose(robot_view, robot_pose)
+                )
+                meta["collision_states"].append(
+                    {
+                        "articulation_state": state_name,
+                        "torso_height": float(torso_height),
+                        "colliding": colliding,
+                    }
+                )
+                if colliding:
+                    meta["valid"] = False
+                    meta["rejection_reason"] = (
+                        f"collision_{state_name}_torso_{torso_height:.3f}"
+                    )
+                    return False, meta
+    finally:
+        env.current_data.qpos[:] = qpos_before
+        robot_view.base.pose = robot_pose_before
+        mujoco.mj_forward(env.current_model, env.current_data)
+
+    meta["valid"] = True
+    return True, meta
+
+
+def resolve_rby1_interaction_pose(
+    ctx: LoadedContext,
+    articulation_rec: dict[str, Any],
+    joint: dict[str, Any],
+    closed_val: float,
+    open_val: float,
+    *,
+    pose_mode: str,
+    supplied_robot_pose: np.ndarray | None,
+    desired_dist: float,
+    torso_heights: tuple[float, ...],
+    min_clearance_m: float,
+    max_center_distance_m: float,
+    max_base_adjustment_distance_m: float,
+    allow_back_approach: bool,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Prefer a safe navigation endpoint and otherwise find a nearby stance."""
+    if pose_mode not in {"auto", "current", "current_or_adjust"}:
+        raise ValueError(f"Unsupported robot_pose_mode: {pose_mode}")
+    if pose_mode in {"current", "current_or_adjust"} and supplied_robot_pose is None:
+        raise ValueError(f"robot_pose_mode={pose_mode} requires robot_base_pose")
+
+    supplied_meta = None
+    if supplied_robot_pose is not None and pose_mode != "auto":
+        valid, supplied_meta = validate_pose_for_joint_states(
+            ctx,
+            articulation_rec,
+            joint,
+            supplied_robot_pose,
+            closed_val,
+            open_val,
+            torso_heights=torso_heights,
+            max_center_distance_m=max_center_distance_m,
+            max_direct_operation_distance_m=desired_dist + 0.30,
+        )
+        if valid:
+            supplied_meta["pose_mode"] = pose_mode
+            supplied_meta["adjusted"] = False
+            return supplied_robot_pose, supplied_meta
+        if pose_mode == "current":
+            return None, supplied_meta
+
+    robot_pose, auto_meta = choose_pose_valid_for_joint_states(
+        ctx,
+        articulation_rec,
+        joint,
+        closed_val,
+        open_val,
+        desired_dist=desired_dist,
+        torso_heights=torso_heights,
+        min_clearance_m=min_clearance_m,
+        max_center_distance_m=max_center_distance_m,
+        allow_back_approach=allow_back_approach,
+    )
+    auto_meta["source"] = "automatic_safe_pose_search"
+    auto_meta["pose_mode"] = pose_mode
+    auto_meta["adjusted"] = supplied_robot_pose is not None
+    if supplied_meta is not None:
+        auto_meta["supplied_pose_validation"] = supplied_meta
+    if supplied_robot_pose is None or pose_mode == "auto" or robot_pose is None:
+        return robot_pose, auto_meta
+
+    closed_collisions = [
+        state["colliding"]
+        for state in supplied_meta.get("collision_states", [])
+        if state["articulation_state"] == "closed"
+    ]
+    if any(closed_collisions):
+        auto_meta["rejection_reason"] = "navigation_endpoint_collides_while_closed"
+        return None, auto_meta
+
+    adjustment_distance = float(
+        np.linalg.norm(robot_pose[:2, 3] - supplied_robot_pose[:2, 3])
+    )
+    auto_meta["adjustment_distance"] = adjustment_distance
+    auto_meta["max_base_adjustment_distance"] = float(max_base_adjustment_distance_m)
+    if adjustment_distance > max_base_adjustment_distance_m:
+        auto_meta["rejection_reason"] = "adjustment_exceeds_local_limit"
+        return None, auto_meta
+
+    auto_meta["adjustment_target_pose"] = pose_mat_to_7d(robot_pose).tolist()
+    auto_meta["episode_start_pose"] = pose_mat_to_7d(supplied_robot_pose).tolist()
+    auto_meta["source"] = "continuous_base_adjustment"
+    return supplied_robot_pose, auto_meta
 
 
 def joint_target_geometry(env, container_rec: dict[str, Any], joint: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
@@ -1730,6 +2121,7 @@ def save_joint_dependency_plot(
     output_path: Path,
     articulation_rec: dict[str, Any],
     joint_dependencies: list[dict[str, Any]],
+    object_rec: dict[str, Any] | None = None,
 ) -> None:
     import matplotlib
 
@@ -1815,6 +2207,21 @@ def save_joint_dependency_plot(
             linewidth=1.0,
         )
 
+    if object_rec is not None:
+        object_center_world = np.asarray(object_rec["aabb_center"], dtype=float)
+        object_size_world = np.asarray(object_rec["aabb_size"], dtype=float)
+        object_center, object_size = local_box(object_center_world, object_size_world)
+        all_centers.append(object_center)
+        all_sizes.append(object_size)
+        add_box_to_ax(
+            ax,
+            object_center,
+            object_size,
+            "black",
+            f"object:{object_rec['name']}",
+            0.45,
+        )
+
     dep_by_index = {int(dep["joint_index"]): dep for dep in joint_dependencies}
     for dep in joint_dependencies:
         target_center = local_point(np.asarray(dep["closed_box"]["center"], dtype=float))
@@ -1879,7 +2286,100 @@ def save_joint_dependency_plot(
     ax.set_ylabel("front_depth")
     ax.set_zlabel("z")
     title = f"{articulation_rec.get('asset_id') or articulation_rec.get('category')} joint boxes"
+    if object_rec is not None:
+        title += f"\nobject: {object_rec['name']}"
     ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def save_slide_force_transition_plot(
+    output_path: Path,
+    articulation_rec: dict[str, Any],
+    joint_index: int,
+    binding: dict[str, Any],
+    front_axis_xy: np.ndarray,
+) -> None:
+    """Plot force-driven drawer and object AABBs before and after opening."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    front_axis = np.asarray(front_axis_xy, dtype=float)
+    front_axis /= max(float(np.linalg.norm(front_axis)), 1e-9)
+    lateral_axis = np.array([-front_axis[1], front_axis[0]], dtype=float)
+    origin_xy = np.asarray(articulation_rec["aabb_center"], dtype=float)[:2]
+
+    def local_box(box: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        corners = compute_box_corners(box["center"], box["size"])
+        xy = corners[:, :2] - origin_xy[None, :]
+        local_corners = np.column_stack(
+            [xy @ lateral_axis, xy @ front_axis, corners[:, 2]]
+        )
+        bmin = local_corners.min(axis=0)
+        bmax = local_corners.max(axis=0)
+        return (bmin + bmax) / 2.0, bmax - bmin
+
+    specs = [
+        ("closed_joint_box", "tab:blue", f"j{joint_index} closed", 0.20),
+        ("open_joint_box", "tab:cyan", f"j{joint_index} force-open", 0.16),
+        ("closed_object_box", "tab:red", "object closed", 0.45),
+        ("open_object_box", "tab:orange", "object force-open", 0.40),
+    ]
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    centers = []
+    sizes = []
+    local_by_key = {}
+    for key, color, label, alpha in specs:
+        center, size = local_box(binding[key])
+        centers.append(center)
+        sizes.append(size)
+        local_by_key[key] = center
+        add_box_to_ax(ax, center, size, color, label, alpha)
+
+    for closed_key, open_key, color in (
+        ("closed_joint_box", "open_joint_box", "tab:blue"),
+        ("closed_object_box", "open_object_box", "tab:red"),
+    ):
+        start = local_by_key[closed_key]
+        end = local_by_key[open_key]
+        delta = end - start
+        ax.quiver(
+            start[0],
+            start[1],
+            start[2],
+            delta[0],
+            delta[1],
+            delta[2],
+            color=color,
+            arrow_length_ratio=0.15,
+            linewidth=1.8,
+        )
+
+    mins = []
+    maxs = []
+    for center, size in zip(centers, sizes):
+        bmin, bmax = aabb_bounds(center, size)
+        mins.append(bmin)
+        maxs.append(bmax)
+    mins_arr = np.min(np.stack(mins), axis=0)
+    maxs_arr = np.max(np.stack(maxs), axis=0)
+    margin = 0.20
+    ax.set_xlim(float(mins_arr[0] - margin), float(maxs_arr[0] + margin))
+    ax.set_ylim(float(mins_arr[1] - margin), float(maxs_arr[1] + margin))
+    ax.set_zlim(max(0.0, float(mins_arr[2] - margin)), float(maxs_arr[2] + margin))
+    set_axes_equal_3d(ax)
+    ax.set_xlabel("lateral")
+    ax.set_ylabel("front_depth")
+    ax.set_zlabel("z")
+    ax.set_title(
+        f"Force-driven slide j{joint_index}\n"
+        f"motion_ratio={binding.get('motion_ratio', 0.0):.3f}"
+    )
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -1946,6 +2446,52 @@ def drawer_joint_contained_objects(
             if aabb_contains_object(center, size, cur_rec, padding=padding):
                 out.append(cur_rec)
         return out
+    finally:
+        env.current_data.qpos[:] = qpos_before
+        mujoco.mj_forward(env.current_model, env.current_data)
+
+
+def object_in_closed_joint_box(
+    ctx: LoadedContext,
+    container_rec: dict[str, Any],
+    joint: dict[str, Any],
+    object_rec: dict[str, Any],
+    *,
+    padding: float = 0.05,
+) -> dict[str, Any]:
+    """Check whether a free object is geometrically contained by a closed joint body."""
+    env = ctx.env
+    qpos_before = env.current_data.qpos.copy()
+    try:
+        set_all_articulation_joints_closed(env, container_rec, container_rec["joints"])
+        joint_center, joint_size = joint_target_geometry(env, container_rec, joint)
+        object_center, object_size = safe_body_aabb(
+            env.current_model,
+            env.current_data,
+            int(object_rec["body_id"]),
+        )
+        current_object = {
+            **object_rec,
+            "aabb_center": object_center,
+            "aabb_size": object_size,
+        }
+        return {
+            "contained": aabb_contains_object(
+                joint_center,
+                joint_size,
+                current_object,
+                padding=padding,
+            ),
+            "padding": float(padding),
+            "joint_box": {
+                "center": np.asarray(joint_center, dtype=float).tolist(),
+                "size": np.asarray(joint_size, dtype=float).tolist(),
+            },
+            "object_box": {
+                "center": np.asarray(object_center, dtype=float).tolist(),
+                "size": np.asarray(object_size, dtype=float).tolist(),
+            },
+        }
     finally:
         env.current_data.qpos[:] = qpos_before
         mujoco.mj_forward(env.current_model, env.current_data)
@@ -2626,10 +3172,1410 @@ def measure_container_visibility(
     return results
 
 
+def articulation_dependency_order(
+    target_joint_index: int,
+    dependency_rows: list[dict[str, Any]],
+) -> list[int]:
+    """Return prerequisite joints in topological order followed by the target."""
+    prerequisites = {
+        int(row["joint_index"]): [int(value) for value in row["prerequisite_joint_indices"]]
+        for row in dependency_rows
+    }
+    visiting: set[int] = set()
+    visited: set[int] = set()
+    order: list[int] = []
+
+    def visit(joint_index: int) -> None:
+        if joint_index in visited:
+            return
+        if joint_index in visiting:
+            raise ValueError(f"Cyclic articulation dependency at joint {joint_index}")
+        visiting.add(joint_index)
+        for prerequisite in prerequisites.get(joint_index, []):
+            visit(prerequisite)
+        visiting.remove(joint_index)
+        visited.add(joint_index)
+        order.append(joint_index)
+
+    visit(int(target_joint_index))
+    return order
+
+
+def apply_container_view_profile(
+    ctx: LoadedContext,
+    view_profile: str,
+) -> dict[str, Any]:
+    """Apply a deterministic head/torso profile used for GT visibility checks."""
+    env = ctx.env
+    torso_qpos = apply_default_torso_pose(env, ctx.initial_torso_qpos)
+    head_qpos = apply_default_head_pose(env, ctx.initial_head_qpos)
+    if view_profile == "drawer_low_view":
+        torso_qpos = lean_torso_for_drawer_view(
+            env,
+            ctx.initial_torso_qpos,
+            pitch_delta=0.35,
+        )
+        apply_default_head_pose(env, ctx.initial_head_qpos)
+        head_qpos = lower_head_for_drawer_view(env, tilt_delta=0.30)
+    elif view_profile != "default":
+        raise ValueError(f"Unsupported container view profile: {view_profile}")
+    apply_default_arm_pose(env)
+    env.camera_manager.registry.update_all_cameras(env)
+    return {
+        "view_profile": view_profile,
+        "head_qpos": None if head_qpos is None else np.asarray(head_qpos, dtype=float).tolist(),
+        "torso_qpos": None
+        if torso_qpos is None
+        else np.asarray(torso_qpos, dtype=float).tolist(),
+    }
+
+
+def object_visibility_measurement(
+    env,
+    object_name: str,
+    camera_name: str = "head_camera",
+) -> tuple[float, int, np.ndarray, np.ndarray]:
+    """Measure GT visibility as target segmentation pixels and image fraction."""
+    segmentation = env.render_segmentation_frame(camera_name)
+    body_id = env.current_model.body(object_name).id
+    mask = get_geom_seg_mask(env.current_model, segmentation[..., :2], body_id)
+    pixels = int(mask.sum())
+    fraction = float(mask.mean())
+    return fraction, pixels, segmentation, mask
+
+
+def valid_robot_poses_for_joint_sequence(
+    ctx: LoadedContext,
+    container_rec: dict[str, Any],
+    joint_sequence: list[int],
+    *,
+    desired_distance: float = 0.8,
+    max_poses: int = 12,
+    front_axis_xy: np.ndarray | None = None,
+) -> list[tuple[np.ndarray, dict[str, Any]]]:
+    """Find robot poses collision-free for every prefix of a joint-open sequence."""
+    env = ctx.env
+    robot_view = env.current_robot.robot_view
+    joints_by_index = {int(joint["joint_index"]): joint for joint in container_rec["joints"]}
+    if not joint_sequence or any(index not in joints_by_index for index in joint_sequence):
+        return []
+    target_joint = joints_by_index[joint_sequence[-1]]
+    target_center, _ = joint_target_geometry(env, container_rec, target_joint)
+    if front_axis_xy is None:
+        front_axis_xy = container_front_axis(container_rec)
+    else:
+        front_axis_xy = np.asarray(front_axis_xy, dtype=float)
+        front_axis_xy /= max(float(np.linalg.norm(front_axis_xy)), 1e-9)
+    lateral_axis_xy = np.array([-front_axis_xy[1], front_axis_xy[0]], dtype=float)
+    thormap = env.get_thormap(agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius)
+    free_points = thormap.get_free_points()
+    if free_points.size == 0:
+        return []
+
+    candidate_specs: list[tuple[np.ndarray, float, str]] = []
+    for side_sign, side_name, side_penalty in (
+        (1.0, "front", 0.0),
+        (-1.0, "opposite", 0.0),
+    ):
+        for distance in (0.5, 0.65, 0.8, 0.95):
+            base_xy = target_center[:2] + side_sign * front_axis_xy * distance
+            for lateral_offset in (0.0, 0.2, -0.2):
+                candidate_xy = base_xy + lateral_axis_xy * lateral_offset
+                score = (
+                    abs(distance - desired_distance)
+                    + abs(lateral_offset)
+                    + side_penalty
+                )
+                candidate_specs.append(
+                    (candidate_xy, score, f"{side_name}_d{distance:.2f}_l{lateral_offset:+.2f}")
+                )
+
+    qpos_before = env.current_data.qpos.copy()
+    robot_pose_before = robot_view.base.pose.copy()
+    valid: list[tuple[np.ndarray, dict[str, Any]]] = []
+    seen_free_points: set[tuple[float, float]] = set()
+    try:
+        for candidate_xy, base_score, label in sorted(candidate_specs, key=lambda item: item[1]):
+            free_point = nearest_free_point(free_points, candidate_xy)
+            if free_point is None:
+                continue
+            free_key = tuple(np.round(np.asarray(free_point[:2], dtype=float), 3))
+            if free_key in seen_free_points:
+                continue
+            seen_free_points.add(free_key)
+            yaw = yaw_to_face(free_point[:2], target_center[:2])
+            pose = make_robot_pose_from_xy(robot_view, free_point[:2], yaw)
+            collision_prefix = None
+            for prefix_length in range(len(joint_sequence) + 1):
+                env.current_data.qpos[:] = qpos_before
+                mujoco.mj_forward(env.current_model, env.current_data)
+                set_all_articulation_joints_closed(env, container_rec, container_rec["joints"])
+                for joint_index in joint_sequence[:prefix_length]:
+                    joint = joints_by_index[joint_index]
+                    set_articulation_state_by_record(
+                        env,
+                        container_rec,
+                        joint_index,
+                        float(joint["open_value"]),
+                    )
+                if env.check_if_robot_collision_at_base_pose(robot_view, pose):
+                    collision_prefix = prefix_length
+                    break
+            if collision_prefix is not None:
+                continue
+            valid.append(
+                (
+                    pose.copy(),
+                    {
+                        "candidate_label": label,
+                        "candidate_target_xy": np.asarray(candidate_xy, dtype=float).tolist(),
+                        "free_point_xy": np.asarray(free_point[:2], dtype=float).tolist(),
+                        "target_center": np.asarray(target_center, dtype=float).tolist(),
+                        "score": float(base_score + np.linalg.norm(free_point[:2] - candidate_xy)),
+                        "validated_prefix_count": len(joint_sequence) + 1,
+                    },
+                )
+            )
+            if len(valid) >= max_poses:
+                break
+    finally:
+        env.current_data.qpos[:] = qpos_before
+        robot_view.base.pose = robot_pose_before
+        mujoco.mj_forward(env.current_model, env.current_data)
+    valid.sort(key=lambda item: item[1]["score"])
+    return valid
+
+
+def container_visibility_trace(
+    ctx: LoadedContext,
+    container_rec: dict[str, Any],
+    object_name: str,
+    joint_sequence: list[int],
+    robot_pose: np.ndarray,
+    *,
+    view_profile: str,
+    force_slide_joints: bool = False,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Render visibility after every prefix of a deterministic joint sequence."""
+    env = ctx.env
+    joints_by_index = {int(joint["joint_index"]): joint for joint in container_rec["joints"]}
+    qpos_before = env.current_data.qpos.copy()
+    qvel_before = env.current_data.qvel.copy()
+    robot_pose_before = env.current_robot.robot_view.base.pose.copy()
+    head_before = get_head_joint_position(env)
+    torso_before = get_torso_joint_position(env)
+    trace: list[dict[str, Any]] = []
+    view_state: dict[str, Any] = {}
+    target_joint = joints_by_index[joint_sequence[-1]] if joint_sequence else None
+    try:
+        set_all_articulation_joints_closed(env, container_rec, container_rec["joints"])
+        env.current_robot.robot_view.base.pose = robot_pose.copy()
+        mujoco.mj_forward(env.current_model, env.current_data)
+        view_state = apply_container_view_profile(ctx, view_profile)
+        for prefix_length in range(len(joint_sequence) + 1):
+            drive = None
+            if prefix_length > 0:
+                joint_index = joint_sequence[prefix_length - 1]
+                joint = joints_by_index[joint_index]
+                if force_slide_joints and joint_mujoco_type_name(env, joint) == "slide":
+                    drive = drive_articulation_state_by_record(
+                        env,
+                        container_rec,
+                        joint_index,
+                        float(joint["open_value"]),
+                    )
+                else:
+                    set_articulation_state_by_record(
+                        env,
+                        container_rec,
+                        joint_index,
+                        float(joint["open_value"]),
+                    )
+            env.current_robot.robot_view.base.pose = robot_pose.copy()
+            mujoco.mj_forward(env.current_model, env.current_data)
+            view_state = apply_container_view_profile(ctx, view_profile)
+            env.camera_manager.registry.update_all_cameras(env)
+            fraction, pixels, segmentation, mask = object_visibility_measurement(env, object_name)
+            container_fraction, container_pixels, _, _ = object_visibility_measurement(
+                env, container_rec["name"]
+            )
+            object_body_id = env.current_model.body(object_name).id
+            object_center, object_size = safe_body_aabb(
+                env.current_model, env.current_data, object_body_id
+            )
+            row = {
+                "prefix_length": prefix_length,
+                "opened_joint_indices": list(joint_sequence[:prefix_length]),
+                "last_opened_joint_index": None
+                if prefix_length == 0
+                else int(joint_sequence[prefix_length - 1]),
+                "visibility_fraction": fraction,
+                "visible_pixels": pixels,
+                "container_visibility_fraction": container_fraction,
+                "container_visible_pixels": container_pixels,
+                "object_position": env.current_data.xpos[object_body_id].copy().tolist(),
+                "object_aabb": {
+                    "center": object_center.tolist(),
+                    "size": object_size.tolist(),
+                },
+                "drive": drive,
+            }
+            if target_joint is not None:
+                joint_center, joint_size = joint_target_geometry(
+                    env, container_rec, target_joint
+                )
+                row["target_joint_aabb"] = {
+                    "center": np.asarray(joint_center, dtype=float).tolist(),
+                    "size": np.asarray(joint_size, dtype=float).tolist(),
+                }
+            if output_dir is not None and prefix_length in {0, len(joint_sequence)}:
+                tag = "closed" if prefix_length == 0 else "final"
+                rgb_path = output_dir / f"{tag}_rgb.png"
+                seg_path = output_dir / f"{tag}_seg.png"
+                mask_path = output_dir / f"{tag}_mask.png"
+                save_rgb_image(rgb_path, env.render_rgb_frame("head_camera"))
+                save_segmentation_preview(seg_path, segmentation)
+                save_object_mask_preview(mask_path, mask)
+                row["image_paths"] = {
+                    "rgb": str(rgb_path),
+                    "segmentation": str(seg_path),
+                    "mask": str(mask_path),
+                }
+            trace.append(row)
+        return {"view_state": view_state, "trace": trace}
+    finally:
+        env.current_data.qpos[:] = qpos_before
+        env.current_data.qvel[:] = qvel_before
+        env.current_robot.robot_view.base.pose = robot_pose_before
+        mujoco.mj_forward(env.current_model, env.current_data)
+        if torso_before is not None:
+            set_torso_joint_position(env, torso_before)
+        if head_before is not None:
+            set_head_joint_position(env, head_before)
+        apply_default_arm_pose(env)
+        env.camera_manager.registry.update_all_cameras(env)
+
+
+def slide_compartment_object_binding(
+    ctx: LoadedContext,
+    container_rec: dict[str, Any],
+    object_name: str,
+    target_joint_index: int,
+    prerequisite_joint_indices: list[int],
+    *,
+    min_joint_motion_m: float = 0.05,
+    min_motion_ratio: float = 0.5,
+) -> dict[str, Any]:
+    """Check whether an object follows a translating compartment during force opening."""
+    env = ctx.env
+    joints_by_index = {int(joint["joint_index"]): joint for joint in container_rec["joints"]}
+    target_joint = joints_by_index[target_joint_index]
+    if joint_mujoco_type_name(env, target_joint) != "slide":
+        return {"applicable": False, "consistent": True, "reason": "target_joint_not_slide"}
+
+    qpos_before = env.current_data.qpos.copy()
+    qvel_before = env.current_data.qvel.copy()
+    object_body_id = env.current_model.body(object_name).id
+    try:
+        set_all_articulation_joints_closed(env, container_rec, container_rec["joints"])
+        for prerequisite_index in prerequisite_joint_indices:
+            prerequisite = joints_by_index[prerequisite_index]
+            set_articulation_state_by_record(
+                env,
+                container_rec,
+                prerequisite_index,
+                float(prerequisite["open_value"]),
+            )
+        closed_object_position = env.current_data.xpos[object_body_id].copy()
+        closed_joint_center, closed_joint_size = joint_target_geometry(
+            env, container_rec, target_joint
+        )
+        closed_object_center, closed_object_size = safe_body_aabb(
+            env.current_model, env.current_data, object_body_id
+        )
+        drive = drive_articulation_state_by_record(
+            env,
+            container_rec,
+            target_joint_index,
+            float(target_joint["open_value"]),
+        )
+        open_joint_center, open_joint_size = joint_target_geometry(
+            env, container_rec, target_joint
+        )
+        open_object_position = env.current_data.xpos[object_body_id].copy()
+        open_object_center, open_object_size = safe_body_aabb(
+            env.current_model, env.current_data, object_body_id
+        )
+        joint_delta = np.asarray(open_joint_center) - np.asarray(closed_joint_center)
+        object_delta = np.asarray(open_object_position) - np.asarray(closed_object_position)
+        joint_motion = float(np.linalg.norm(joint_delta))
+        if joint_motion < min_joint_motion_m:
+            return {
+                "applicable": False,
+                "consistent": True,
+                "reason": "slide_joint_motion_below_threshold",
+                "joint_motion_m": joint_motion,
+                "drive": drive,
+                "closed_joint_box": {
+                    "center": np.asarray(closed_joint_center, dtype=float).tolist(),
+                    "size": np.asarray(closed_joint_size, dtype=float).tolist(),
+                },
+                "open_joint_box": {
+                    "center": np.asarray(open_joint_center, dtype=float).tolist(),
+                    "size": np.asarray(open_joint_size, dtype=float).tolist(),
+                },
+                "closed_object_box": {
+                    "center": np.asarray(closed_object_center, dtype=float).tolist(),
+                    "size": np.asarray(closed_object_size, dtype=float).tolist(),
+                },
+                "open_object_box": {
+                    "center": np.asarray(open_object_center, dtype=float).tolist(),
+                    "size": np.asarray(open_object_size, dtype=float).tolist(),
+                },
+            }
+        axis = joint_delta / joint_motion
+        object_motion_along_axis = float(abs(np.dot(object_delta, axis)))
+        motion_ratio = object_motion_along_axis / joint_motion
+        return {
+            "applicable": True,
+            "consistent": bool(drive.get("reached", False) and motion_ratio >= min_motion_ratio),
+            "joint_motion_m": joint_motion,
+            "object_motion_m": float(np.linalg.norm(object_delta)),
+            "object_motion_along_axis_m": object_motion_along_axis,
+            "motion_ratio": motion_ratio,
+            "minimum_motion_ratio": min_motion_ratio,
+            "drive": drive,
+            "closed_joint_box": {
+                "center": np.asarray(closed_joint_center, dtype=float).tolist(),
+                "size": np.asarray(closed_joint_size, dtype=float).tolist(),
+            },
+            "open_joint_box": {
+                "center": np.asarray(open_joint_center, dtype=float).tolist(),
+                "size": np.asarray(open_joint_size, dtype=float).tolist(),
+            },
+            "closed_object_box": {
+                "center": np.asarray(closed_object_center, dtype=float).tolist(),
+                "size": np.asarray(closed_object_size, dtype=float).tolist(),
+            },
+            "open_object_box": {
+                "center": np.asarray(open_object_center, dtype=float).tolist(),
+                "size": np.asarray(open_object_size, dtype=float).tolist(),
+            },
+        }
+    finally:
+        env.current_data.qpos[:] = qpos_before
+        env.current_data.qvel[:] = qvel_before
+        mujoco.mj_forward(env.current_model, env.current_data)
+
+
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as handle:
         json.dump(to_jsonable(payload), handle, indent=2, ensure_ascii=False)
+
+
+def _frame_to_uint8(frame: np.ndarray) -> np.ndarray:
+    frame = np.asarray(frame)
+    if frame.ndim == 3 and frame.shape[0] in (1, 3, 4) and frame.shape[-1] not in (1, 3, 4):
+        frame = np.transpose(frame, (1, 2, 0))
+    if np.issubdtype(frame.dtype, np.floating):
+        max_value = float(frame.max()) if frame.size else 0.0
+        if max_value <= 1.0 + 1e-6:
+            frame = frame * 255.0
+    return np.clip(frame, 0, 255).astype(np.uint8)
+
+
+def _phase_name(policy: Any) -> str:
+    phase = getattr(policy, "current_phase", None)
+    return getattr(phase, "name", str(phase))
+
+
+def densify_pose_path(
+    start_pose: np.ndarray,
+    target_poses: list[np.ndarray],
+    *,
+    max_translation_m: float,
+    max_rotation_rad: float,
+) -> list[np.ndarray]:
+    """Interpolate an SE(3) path so articulated motion remains contact-friendly."""
+    dense: list[np.ndarray] = []
+    previous = np.asarray(start_pose, dtype=float)
+    for target in target_poses:
+        target = np.asarray(target, dtype=float)
+        translation = float(np.linalg.norm(target[:3, 3] - previous[:3, 3]))
+        relative_rotation = R.from_matrix(previous[:3, :3]).inv() * R.from_matrix(
+            target[:3, :3]
+        )
+        rotation = float(relative_rotation.magnitude())
+        segments = max(
+            1,
+            int(np.ceil(translation / max_translation_m)),
+            int(np.ceil(rotation / max_rotation_rad)),
+        )
+        rotations = R.from_matrix(np.stack([previous[:3, :3], target[:3, :3]]))
+        slerp = Slerp([0.0, 1.0], rotations)
+        for alpha in np.linspace(0.0, 1.0, segments + 1)[1:]:
+            pose = np.eye(4)
+            pose[:3, 3] = (1.0 - alpha) * previous[:3, 3] + alpha * target[:3, 3]
+            pose[:3, :3] = slerp([alpha]).as_matrix()[0]
+            dense.append(pose)
+        previous = target
+    return dense
+
+
+def _read_interaction_joint(task: BaseMujocoTask, interaction_kind: str) -> float:
+    if interaction_kind == "door":
+        door = task.door_object
+        return float(door.get_joint_position(door.get_hinge_joint_index()))
+    target = task.articulation_objects[0][0]
+    return float(target.get_joint_position(task.config.task_config.joint_index))
+
+
+def _read_interaction_joint_range(
+    task: BaseMujocoTask, interaction_kind: str
+) -> list[float]:
+    if interaction_kind == "door":
+        door = task.door_object
+        values = door.get_joint_range(door.get_hinge_joint_index())
+    else:
+        target = task.articulation_objects[0][0]
+        values = target.get_joint_range(task.config.task_config.joint_index)
+    return [float(values[0]), float(values[1])]
+
+
+def stable_rby1_container_policy_cls():
+    """Build a local policy variant that retries a few target-aware torso heights."""
+    from molmo_spaces.controllers.torso_height import TorsoHeightJointPosController
+    from molmo_spaces.policy.solvers.object_manipulation.curobo_open_close_planner_policy import (
+        CuroboOpenClosePlannerPolicy,
+        OpenClosePhase,
+    )
+
+    class StableRBY1ContainerOpenPolicy(CuroboOpenClosePlannerPolicy):
+        def __init__(self, config, task) -> None:
+            super().__init__(config, task)
+            self._torso_height_candidates: list[float] | None = None
+            self._torso_height_index = 0
+            self.torso_height_attempts: list[float] = []
+            self.articulation_grasp_losses = 0
+
+        def reset(self, reset_retries: bool = True) -> None:
+            super().reset(reset_retries=reset_retries)
+            self._torso_height_candidates = None
+            self._torso_height_index = 0
+            self.torso_height_attempts = []
+            self.articulation_grasp_losses = 0
+
+        def _target_joint_center_z(self) -> float:
+            target = self.task.articulation_objects[0][0]
+            joint_id = target.joint_ids[self.config.task_config.joint_index]
+            body_id = int(self.task.env.current_model.jnt_bodyid[joint_id])
+            center, _size = body_aabb(
+                self.task.env.current_model,
+                self.task.env.current_data,
+                body_id,
+                visual_only=False,
+            )
+            return float(center[2])
+
+        def _build_torso_height_candidates(self) -> list[float]:
+            env = self.task.env
+            torso = env.current_robot.robot_view.get_move_group("torso")
+            gripper = env.current_robot.robot_view.get_move_group(f"{self.arm_side}_gripper")
+            torso_ctrl = env.current_robot.controllers["torso"]
+            target_z = self._target_joint_center_z()
+            qpos_before = env.current_data.qpos.copy()
+            samples = np.linspace(0.0, float(torso_ctrl.max_height), 4)
+            scored: list[tuple[float, float]] = []
+            try:
+                for height in samples:
+                    torso.joint_pos = TorsoHeightJointPosController.height_to_joints(float(height))
+                    mujoco.mj_forward(env.current_model, env.current_data)
+                    gripper_z = float(gripper.leaf_frame_to_world[2, 3])
+                    scored.append((abs(gripper_z - target_z), float(height)))
+            finally:
+                env.current_data.qpos[:] = qpos_before
+                mujoco.mj_forward(env.current_model, env.current_data)
+
+            candidates = [height for _score, height in sorted(scored)]
+            log.info(
+                "Target joint center z=%.3f; torso candidates=%s",
+                target_z,
+                [round(value, 3) for value in candidates],
+            )
+            return candidates
+
+        def _select_height(self) -> float:
+            if self._torso_height_candidates is None:
+                self._torso_height_candidates = self._build_torso_height_candidates()
+            height = self._torso_height_candidates[self._torso_height_index]
+            self.torso_height_attempts.append(height)
+            log.info(
+                "Trying target-aware torso height %.3f (%d/%d)",
+                height,
+                self._torso_height_index + 1,
+                len(self._torso_height_candidates),
+            )
+            return height
+
+        def _is_waypoint_reached(self, waypoint, tolerance: float = 0.04) -> bool:
+            return super()._is_waypoint_reached(waypoint, tolerance=tolerance)
+
+        def _stage_torso_height(self, height: float) -> None:
+            """Keep planning and simulation on the same staged torso posture."""
+            torso_group = self.task.env.current_robot.robot_view.get_move_group("torso")
+            torso_group.joint_pos = TorsoHeightJointPosController.height_to_joints(height)
+            torso_group.joint_vel = np.zeros_like(torso_group.joint_vel)
+            mujoco.mj_forward(self.task.env.current_model, self.task.env.current_data)
+
+        def _sync_local_planner_torso_lock(self) -> None:
+            if not self._use_local_planner:
+                return
+            torso_joint_pos = self.task.env.current_robot.robot_view.get_move_group(
+                "torso"
+            ).joint_pos
+            lock_joints = dict(
+                self.planner.curobo_robot_config_dict["kinematics"].get(
+                    "lock_joints", {}
+                )
+            )
+            lock_joints.update(
+                {
+                    "torso_1": float(torso_joint_pos[1]),
+                    "torso_2": float(torso_joint_pos[2]),
+                    "torso_3": float(torso_joint_pos[3]),
+                }
+            )
+            self.planner.motion_gen.update_locked_joints(
+                lock_joints, self.planner.curobo_robot_config_dict
+            )
+            log.info(
+                "Synchronized local CuRobo torso locks: torso_1=%.3f torso_2=%.3f torso_3=%.3f",
+                lock_joints["torso_1"],
+                lock_joints["torso_2"],
+                lock_joints["torso_3"],
+            )
+
+        def get_action(self, info: dict[str, Any]) -> dict[str, Any]:
+            self._stage_torso_height(self.current_height)
+            action = super().get_action(info)
+            self._stage_torso_height(self.current_height)
+            return action
+
+        def _execute_height_selection_phase(self) -> dict[str, Any]:
+            interpolation_steps = int(
+                getattr(self.config.policy_config, "max_height_adjustment_steps", 40)
+            )
+            settle_limit = interpolation_steps * 2
+            settle_tolerance = 0.025
+
+            if self._height_target is None:
+                log.info("ENTERING HEIGHT SELECTION PHASE")
+                self._height_target = self._select_height()
+                torso_joint_pos = self.task.env.current_robot.robot_view.get_move_group(
+                    "torso"
+                ).joint_pos
+                self._height_initial = float(torso_joint_pos[1])
+                log.info(
+                    "Interpolating torso height %.3f -> %.3f over %d steps",
+                    self._height_initial,
+                    self._height_target,
+                    interpolation_steps,
+                )
+
+            self.height_adjustment_steps += 1
+            alpha = min(1.0, self.height_adjustment_steps / interpolation_steps)
+            self.current_height = self._height_initial + alpha * (
+                self._height_target - self._height_initial
+            )
+            torso_group = self.task.env.current_robot.robot_view.get_move_group("torso")
+            torso_controller = self.task.env.current_robot.controllers["torso"]
+            torso_controller.set_target(np.array([self.current_height]))
+            self._stage_torso_height(self.current_height)
+            actual_height = float(torso_group.joint_pos[1])
+            if self.height_adjustment_steps == 1 or self.height_adjustment_steps % 10 == 0:
+                log.info(
+                    "Torso adjustment step=%d command=%.3f controller_target=%.3f actual=%.3f",
+                    self.height_adjustment_steps,
+                    self.current_height,
+                    float(torso_controller.target[0]),
+                    actual_height,
+                )
+            settled = abs(actual_height - self._height_target) <= settle_tolerance
+            timed_out = self.height_adjustment_steps >= settle_limit
+            if self.height_adjustment_steps < interpolation_steps or not (settled or timed_out):
+                return {}
+
+            if timed_out and not settled:
+                log.warning(
+                    "Torso settling timed out: target=%.3f actual=%.3f error=%.3f",
+                    self._height_target,
+                    actual_height,
+                    abs(actual_height - self._height_target),
+                )
+            else:
+                log.info(
+                    "Torso settled: target=%.3f actual=%.3f after %d steps",
+                    self._height_target,
+                    actual_height,
+                    self.height_adjustment_steps,
+                )
+
+            self.current_height = self._height_target
+            torso_controller.hold_at_height(self._height_target)
+            self._sync_local_planner_torso_lock()
+            self.pre_grasp_poses = self._get_pregrasp_poses()
+            self.current_phase = OpenClosePhase.PREGRASP
+            self.height_adjustment_steps = 0
+            self._height_initial = None
+            self._height_target = None
+            return {}
+
+        def _execute_pre_grasp_phase(self) -> dict[str, Any]:
+            if self.planned_trajectory is not None:
+                return super()._execute_pre_grasp_phase()
+
+            log.info("ENTERING PREGRASP PHASE")
+            self.batch_plan_trajectory()
+            if self.planned_trajectory:
+                return self._execute_trajectory({f"{self.arm_side}_gripper": -100})
+
+            assert self._torso_height_candidates is not None
+            if self._torso_height_index + 1 >= len(self._torso_height_candidates):
+                raise ValueError(
+                    "No pregrasp trajectory found for any torso height: "
+                    f"{self.torso_height_attempts}"
+                )
+
+            self._torso_height_index += 1
+            self.current_phase = OpenClosePhase.HEIGHT_SELECTION
+            self.height_adjustment_steps = 0
+            self._height_initial = None
+            self._height_target = None
+            self.pre_grasp_poses = None
+            self.trajectory_index = 0
+            self.steps_spent_in_waypoint = 0
+            log.warning("Pregrasp planning failed; retrying with the next torso height")
+            return {}
+
+        def _execute_articulate_phase(self) -> dict[str, Any]:
+            trajectory_exhausted = (
+                self.planned_trajectory is not None
+                and self.trajectory_index >= len(self.planned_trajectory)
+            )
+            if trajectory_exhausted and not self._grasping_something():
+                self.articulation_grasp_losses += 1
+                if self.articulation_grasp_losses >= 3:
+                    raise ValueError(
+                        "Lost the drawer grasp during articulation 3 times; "
+                        "aborting instead of repeating indefinitely."
+                    )
+            return super()._execute_articulate_phase()
+
+        def _get_articulation_poses(self) -> list[np.ndarray]:
+            coarse_poses = super()._get_articulation_poses()
+            start_pose = self.task.env.current_robot.robot_view.get_move_group(
+                f"{self.arm_side}_gripper"
+            ).leaf_frame_to_world.copy()
+            dense_poses = densify_pose_path(
+                start_pose,
+                coarse_poses,
+                max_translation_m=0.03,
+                max_rotation_rad=float(np.deg2rad(10.0)),
+            )
+            log.info(
+                "Densified articulation path from %d to %d poses",
+                len(coarse_poses),
+                len(dense_poses),
+            )
+            self.articulation_pose_index = 0
+            return dense_poses
+
+    return StableRBY1ContainerOpenPolicy
+
+
+def stable_rby1_door_policy_cls(arm_preference: str = "auto"):
+    """Build a door policy with logged official arm selection or an override."""
+    from molmo_spaces.policy.solvers.opening_solver import DoorOpeningPlannerPolicy
+
+    class StableRBY1DoorOpeningPolicy(DoorOpeningPlannerPolicy):
+        def reset(self) -> None:
+            super().reset()
+            base_offset = float(self.config.task_config.additional_tcp_offset_distance)
+            self.grasp_tcp_offset_candidates = [
+                base_offset,
+                base_offset - 0.015,
+                base_offset + 0.015,
+                base_offset - 0.030,
+                base_offset + 0.030,
+            ]
+            self.grasp_tcp_offset_index = 0
+            self.grasp_tcp_offsets_tried = [base_offset]
+
+        def select_arm_for_opening(self) -> str:
+            if arm_preference in {"left", "right"}:
+                selected_arm = arm_preference
+                selection_reason = "caller_override"
+                handle_y = float("nan")
+                hinge_y = float("nan")
+            else:
+                robot_pose = self.task.env.robots[0].get_world_pose_tf_mat()
+                handle_world = self.task.get_door_handle_position()
+                hinge_world = self.task.get_door_joint_position()
+                handle_robot = np.linalg.inv(robot_pose) @ np.array([*handle_world, 1.0])
+                hinge_robot = np.linalg.inv(robot_pose) @ np.array([*hinge_world, 1.0])
+                handle_y = float(handle_robot[1])
+                hinge_y = float(hinge_robot[1])
+                selected_arm = "left" if hinge_y > handle_y else "right"
+                selection_reason = "official_hinge_side_heuristic"
+
+            self.arm_side = selected_arm
+            self.planner_joint_ranges = self._get_planner_joint_ranges()
+            self.arm_selection_reason = selection_reason
+            self.handle_lateral_position_robot = handle_y
+            self.hinge_lateral_position_robot = hinge_y
+            log.info(
+                "[ARM] Selected %s arm reason=%s hinge_y_robot=%.3f handle_y_robot=%.3f",
+                selected_arm,
+                selection_reason,
+                hinge_y,
+                handle_y,
+            )
+            return selected_arm
+
+        def _execute_grasp_handle_phase(self) -> dict[str, Any]:
+            about_to_fail = (
+                self.grasping_timesteps >= self.config.policy_config.max_grasping_timesteps
+                and not self._grasping_something()
+            )
+            if about_to_fail and self.grasp_tcp_offset_index + 1 < len(
+                self.grasp_tcp_offset_candidates
+            ):
+                self.grasp_tcp_offset_index += 1
+                next_offset = self.grasp_tcp_offset_candidates[self.grasp_tcp_offset_index]
+                self.config.task_config.additional_tcp_offset_distance = next_offset
+                self.grasp_tcp_offsets_tried.append(next_offset)
+                log.warning(
+                    "[GRASP] Retrying with door TCP offset %.3fm",
+                    next_offset,
+                )
+            return super()._execute_grasp_handle_phase()
+
+        def _is_waypoint_reached(self, waypoint, tolerance: float | None = None) -> bool:
+            configured_tolerance = float(self.config.policy_config.joint_position_tolerance)
+            current = np.asarray(self._get_current_joint_positions(), dtype=float)
+            target = np.asarray(waypoint, dtype=float)
+            diff = np.abs(current - target)
+            reached = bool(np.all(diff < configured_tolerance))
+            if not reached and self.steps_spent_in_waypoint + 1 >= self.max_steps_per_waypoint:
+                log.warning(
+                    "Door waypoint tracking max_error=%.4f tolerance=%.4f errors=%s",
+                    float(diff.max()),
+                    configured_tolerance,
+                    np.round(diff, 4).tolist(),
+                )
+            return reached
+
+    return StableRBY1DoorOpeningPolicy
+
+
+def execute_rby1_whole_body_interaction(
+    cfg: Any,
+    episode_spec: EpisodeSpec,
+    *,
+    interaction_kind: str,
+    variant: str,
+    output_dir: Path,
+    camera_names: tuple[str, ...] = DEFAULT_RBY1_INTERACTION_CAMERAS,
+    max_steps: int | None = None,
+    video_fps: float | None = None,
+    base_adjustment_target_pose: np.ndarray | None = None,
+    max_base_adjustment_steps: int = 120,
+) -> dict[str, Any]:
+    """Execute an official RBY1 manipulation policy and record its camera streams.
+
+    This is the algorithm-facing primitive. The caller supplies a frozen episode
+    containing the current robot base pose and a concrete articulation target.
+    """
+    if interaction_kind not in {"container", "door"}:
+        raise ValueError(f"Unsupported interaction kind: {interaction_kind}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    episode_spec.to_json_file(output_dir / "episode_spec.json")
+    sampler = RBY1InteractionJsonTaskSampler(cfg, episode_spec)
+    task = None
+    try:
+        mapping = sampler._get_dataset_index_map()
+        house_variants = mapping[episode_spec.data_split][episode_spec.house_index]
+        original_scene_path = Path(house_variants[variant])
+        house_variants[variant] = prepare_writable_scene_path(original_scene_path)
+        task = sampler.sample_task(house_index=episode_spec.house_index, variant=variant)
+        if task is None:
+            raise RuntimeError("The RBY1 interaction task sampler returned no task.")
+        if cfg.policy_config is None or cfg.policy_config.policy_cls is None:
+            raise RuntimeError("The RBY1 interaction policy config was not initialized.")
+
+        policy = cfg.policy_config.policy_cls(cfg, task)
+        task.register_policy(policy)
+        observation, _info = task.reset()
+        initial_joint_position_before_enforcement = _read_interaction_joint(
+            task, interaction_kind
+        )
+        if interaction_kind == "door":
+            reset_value = float(task.exp_config.task_config.articulated_joint_reset_state[0])
+            task.door_object.set_joint_position(
+                task.door_object.get_hinge_joint_index(), reset_value
+            )
+            task.current_door_joint_state = np.array([reset_value], dtype=float)
+            mujoco.mj_forward(task.env.current_model, task.env.current_data)
+            observation = task.get_observations()
+        initial_joint_position = _read_interaction_joint(task, interaction_kind)
+        robot_base = task.env.current_robot.robot_view.base
+        initial_base_position = robot_base.pose[:3, 3].copy()
+        initial_robot_collision = task.env.check_robot_collision_in_current_pose()
+        if initial_robot_collision:
+            raise RuntimeError(
+                "Selected RBY1 interaction pose is colliding after JSON task initialization."
+            )
+
+        selected_cameras = tuple(
+            name for name in camera_names if name in task.env.camera_manager.registry
+        )
+        if not selected_cameras:
+            raise RuntimeError(f"None of the requested cameras are available: {camera_names}")
+        frames: dict[str, list[np.ndarray]] = {name: [] for name in selected_cameras}
+
+        def capture(obs: list[dict[str, Any]]) -> None:
+            for camera_name in selected_cameras:
+                frame = obs[0].get(camera_name)
+                if frame is None:
+                    frame = task.env.render_rgb_frame(camera_name)
+                frames[camera_name].append(_frame_to_uint8(frame))
+
+        capture(observation)
+        phase_trace: list[str] = []
+        base_adjustment_steps = 0
+        base_adjustment_completed = base_adjustment_target_pose is None
+        base_adjustment_error = None
+        base_position_after_adjustment = robot_base.pose[:3, 3].copy()
+        max_base_adjustment_translation_per_step = 0.0
+        if base_adjustment_target_pose is not None:
+            phase_trace.append("BASE_ADJUSTMENT")
+            target_pose = np.asarray(base_adjustment_target_pose, dtype=float)
+            target_yaw = float(R.from_matrix(target_pose[:3, :3]).as_euler("XYZ")[2])
+            for adjustment_step in range(int(max_base_adjustment_steps)):
+                current_pose = robot_base.pose.copy()
+                current_yaw = float(
+                    R.from_matrix(current_pose[:3, :3]).as_euler("XYZ")[2]
+                )
+                position_error = float(
+                    np.linalg.norm(current_pose[:2, 3] - target_pose[:2, 3])
+                )
+                yaw_error = float(
+                    abs(np.arctan2(np.sin(current_yaw - target_yaw), np.cos(current_yaw - target_yaw)))
+                )
+                if position_error <= 0.03 and yaw_error <= float(np.deg2rad(3.0)):
+                    base_adjustment_completed = True
+                    break
+                position_delta = target_pose[:2, 3] - current_pose[:2, 3]
+                position_step = min(position_error, 0.03)
+                next_xy = current_pose[:2, 3] + (
+                    position_delta / max(position_error, 1e-8) * position_step
+                )
+                signed_yaw_error = float(
+                    np.arctan2(np.sin(target_yaw - current_yaw), np.cos(target_yaw - current_yaw))
+                )
+                next_yaw = current_yaw + float(
+                    np.clip(signed_yaw_error, -np.deg2rad(5.0), np.deg2rad(5.0))
+                )
+                target_action = np.array([next_xy[0], next_xy[1], next_yaw], dtype=float)
+                action_cmd = task.env.current_robot.robot_view.get_noop_ctrl_dict()
+                action_cmd["base"] = target_action
+                position_before_step = robot_base.pose[:3, 3].copy()
+                observation, _reward, _terminal, _truncated, _infos = task.step(action_cmd)
+                base_adjustment_steps = adjustment_step + 1
+                adjustment_translation = float(
+                    np.linalg.norm(
+                        robot_base.pose[:2, 3] - position_before_step[:2]
+                    )
+                )
+                max_base_adjustment_translation_per_step = max(
+                    max_base_adjustment_translation_per_step,
+                    adjustment_translation,
+                )
+                capture(observation)
+                if task.env.check_robot_collision_in_current_pose():
+                    base_adjustment_error = "Robot collided during continuous base adjustment."
+                    break
+
+            if not base_adjustment_completed and base_adjustment_error is None:
+                base_adjustment_error = (
+                    "Base adjustment did not reach the interaction stance within "
+                    f"{max_base_adjustment_steps} steps."
+                )
+            if base_adjustment_error is not None:
+                log.error(base_adjustment_error)
+            else:
+                try:
+                    policy.reset()
+                except TypeError:
+                    policy.reset(reset_retries=True)
+                observation = task.get_observations()
+                capture(observation)
+            base_position_after_adjustment = robot_base.pose[:3, 3].copy()
+
+        phase_trace.append(_phase_name(policy))
+        step_limit = int(max_steps if max_steps is not None else (cfg.task_horizon or 400))
+        error_message = base_adjustment_error
+        previous_base_position = robot_base.pose[:3, 3].copy()
+        max_base_translation_per_step = 0.0
+        max_base_translation_step = 0
+        for _step in range(step_limit if base_adjustment_completed else 0):
+            if bool(np.all(task.is_done())):
+                break
+            try:
+                action_cmd = policy.get_action(observation)
+                if action_cmd is None:
+                    raise RuntimeError(f"Policy returned no action in phase {_phase_name(policy)}")
+                observation, _reward, _terminal, _truncated, _infos = task.step(action_cmd)
+            except Exception as exc:
+                error_message = f"{type(exc).__name__}: {exc}"
+                log.exception("RBY1 interaction failed in phase %s", _phase_name(policy))
+                break
+            current_base_position = robot_base.pose[:3, 3].copy()
+            base_translation = float(
+                np.linalg.norm(current_base_position[:2] - previous_base_position[:2])
+            )
+            if base_translation > max_base_translation_per_step:
+                max_base_translation_per_step = base_translation
+                max_base_translation_step = int(task.episode_step_count)
+            previous_base_position = current_base_position
+            if base_translation > 0.25:
+                error_message = (
+                    "Robot base position jumped "
+                    f"{base_translation:.3f}m at step {task.episode_step_count}; "
+                    "aborting an invalid collision-driven rollout."
+                )
+                log.error(error_message)
+                capture(observation)
+                break
+            capture(observation)
+            current_phase = _phase_name(policy)
+            if current_phase != phase_trace[-1]:
+                phase_trace.append(current_phase)
+
+        fps = float(video_fps if video_fps is not None else cfg.fps)
+        video_paths: dict[str, str] = {}
+        for camera_name, camera_frames in frames.items():
+            path = output_dir / f"{camera_name}.mp4"
+            save_frames_to_mp4(camera_frames, str(path), fps=fps)
+            video_paths[camera_name] = str(path)
+
+        final_joint_position = _read_interaction_joint(task, interaction_kind)
+        final_joint_range = _read_interaction_joint_range(task, interaction_kind)
+        joint_span = abs(final_joint_range[1] - final_joint_range[0])
+        joint_open_fraction = (
+            abs(final_joint_position) / joint_span if joint_span > 1e-8 else 0.0
+        )
+        result = {
+            "success": bool(task.judge_success()),
+            "error": error_message,
+            "interaction_kind": interaction_kind,
+            "selected_arm": getattr(policy, "arm_side", None),
+            "arm_selection_reason": getattr(policy, "arm_selection_reason", None),
+            "handle_lateral_position_robot": getattr(
+                policy, "handle_lateral_position_robot", None
+            ),
+            "hinge_lateral_position_robot": getattr(
+                policy, "hinge_lateral_position_robot", None
+            ),
+            "steps": int(task.episode_step_count),
+            "policy_dt_ms": float(cfg.policy_dt_ms),
+            "simulated_seconds": float(task.episode_step_count * cfg.policy_dt_ms / 1000.0),
+            "phase_trace": phase_trace,
+            "final_phase": _phase_name(policy),
+            "final_joint_position": final_joint_position,
+            "initial_joint_position_before_enforcement": float(
+                initial_joint_position_before_enforcement
+            ),
+            "initial_joint_position": float(initial_joint_position),
+            "final_joint_range": final_joint_range,
+            "joint_open_fraction": float(joint_open_fraction),
+            "policy_done": bool(getattr(policy, "is_done", False)),
+            "torso_height_attempts": [
+                float(value) for value in getattr(policy, "torso_height_attempts", [])
+            ],
+            "articulation_grasp_losses": int(
+                getattr(policy, "articulation_grasp_losses", 0)
+            ),
+            "grasp_tcp_offsets_tried": [
+                float(value) for value in getattr(policy, "grasp_tcp_offsets_tried", [])
+            ],
+            "initial_robot_collision": bool(initial_robot_collision),
+            "initial_base_position": initial_base_position.tolist(),
+            "final_base_position": robot_base.pose[:3, 3].astype(float).tolist(),
+            "max_base_translation_per_step": float(max_base_translation_per_step),
+            "max_base_translation_step": int(max_base_translation_step),
+            "base_adjustment_requested": base_adjustment_target_pose is not None,
+            "base_adjustment_completed": bool(base_adjustment_completed),
+            "base_adjustment_steps": int(base_adjustment_steps),
+            "base_adjustment_error": base_adjustment_error,
+            "base_position_after_adjustment": base_position_after_adjustment.tolist(),
+            "max_base_adjustment_translation_per_step": float(
+                max_base_adjustment_translation_per_step
+            ),
+            "video_fps": fps,
+            "video_paths": video_paths,
+        }
+        write_json(output_dir / "result.json", result)
+        return result
+    finally:
+        sampler.close()
+
+
+def _build_rby1_container_episode(
+    args: argparse.Namespace,
+    container_rec: dict[str, Any],
+    joint: dict[str, Any],
+    robot_pose: np.ndarray,
+    object_pose: np.ndarray,
+) -> EpisodeSpec:
+    start_value = joint["closed_value"] if args.action == "open" else joint["open_value"]
+    goal_value = joint["open_value"] if args.action == "open" else joint["closed_value"]
+    return EpisodeSpec.model_validate(
+        {
+            "house_index": args.house_ind,
+            "scene_dataset": args.scene_dataset,
+            "data_split": args.data_split,
+            "seed": args.seed,
+            "robot": {"robot_name": "rby1m", "init_qpos": default_rby1_episode_qpos()},
+            "img_resolution": [1024, 576],
+            "cameras": default_rby1_episode_camera_specs(),
+            "scene_modifications": {},
+            "task": {
+                "task_cls": "molmo_spaces.tasks.opening_tasks.OpeningTask",
+                "task_type": args.action,
+                "robot_base_pose": pose_mat_to_7d(robot_pose).tolist(),
+                "pickup_obj_name": container_rec["name"],
+                "pickup_obj_start_pose": pose_mat_to_7d(object_pose).tolist(),
+                "articulation_object_name": container_rec["name"],
+                "joint_name": joint["joint_name"],
+                "joint_index": joint["joint_index"],
+                "joint_start_position": [start_value],
+                "joint_goal_position": goal_value,
+                "task_success_threshold": args.success_threshold,
+                "any_inst_of_category": False,
+            },
+            "task_relevant_objects": [container_rec["name"]],
+            "language": {
+                "task_description": f"{args.action.title()} {container_rec['name']} joint {joint['joint_index']}",
+                "referral_expressions": {"pickup_obj_name": container_rec.get("category", "container")},
+                "referral_expressions_priority": {},
+            },
+        }
+    )
+
+
+def _build_rby1_door_episode(
+    args: argparse.Namespace,
+    door_rec: dict[str, Any],
+    robot_pose: np.ndarray,
+) -> EpisodeSpec:
+    if args.action != "open":
+        raise ValueError("The official RBY1 door planner currently supports opening, not closing.")
+    return EpisodeSpec.model_validate(
+        {
+            "house_index": args.house_ind,
+            "scene_dataset": args.scene_dataset,
+            "data_split": args.data_split,
+            "seed": args.seed,
+            "robot": {"robot_name": "rby1m", "init_qpos": default_rby1_episode_qpos()},
+            "img_resolution": [1024, 576],
+            "cameras": default_rby1_episode_camera_specs(),
+            "scene_modifications": {},
+            "task": {
+                "task_cls": "molmo_spaces.tasks.opening_tasks.DoorOpeningTask",
+                "task_type": "open_door",
+                "robot_base_pose": pose_mat_to_7d(robot_pose).tolist(),
+                "door_body_name": door_rec["name"],
+                "articulated_joint_range": door_rec["hinge_joint_range"],
+                "articulated_joint_reset_state": [door_rec["closed_value"]],
+                "door_openness_threshold": args.success_threshold,
+            },
+            "task_relevant_objects": [door_rec["name"]],
+            "language": {
+                "task_description": f"Open door {door_rec['name']}",
+                "referral_expressions": {},
+                "referral_expressions_priority": {},
+            },
+        }
+    )
+
+
+def prepare_rby1_interaction_episode(args: argparse.Namespace) -> tuple[EpisodeSpec, dict[str, Any]]:
+    """Resolve the concrete scene target and freeze an interaction episode."""
+    ctx = load_scene_context(args, args.house_ind)
+    try:
+        supplied_robot_pose = (
+            pos_quat_to_pose_mat(args.robot_base_pose) if args.robot_base_pose is not None else None
+        )
+        if args.interaction_kind == "container":
+            _records, containers = collect_scene_records(ctx)
+            target = next((rec for rec in containers if rec["name"] == args.target_name), None)
+            if target is None:
+                raise RuntimeError(f"Container not found: {args.target_name}")
+            if not 0 <= args.joint_index < len(target["joints"]):
+                raise ValueError(
+                    f"joint_index={args.joint_index} outside [0, {len(target['joints']) - 1}]"
+                )
+            joint = target["joints"][args.joint_index]
+            robot_pose, pose_meta = resolve_rby1_interaction_pose(
+                ctx,
+                target,
+                joint,
+                joint["closed_value"],
+                joint["open_value"],
+                pose_mode=args.robot_pose_mode,
+                supplied_robot_pose=supplied_robot_pose,
+                desired_dist=args.approach_distance,
+                torso_heights=(0.0, 0.246, 0.492, 0.738),
+                min_clearance_m=args.min_base_clearance,
+                max_center_distance_m=args.max_approach_distance,
+                max_base_adjustment_distance_m=args.max_base_adjustment_distance,
+                allow_back_approach=args.allow_back_approach,
+            )
+            if robot_pose is None:
+                raise RuntimeError("Could not find a collision-free robot pose for both joint states.")
+            obj = ctx.env.object_managers[0].get_object_by_name(target["name"])
+            episode = _build_rby1_container_episode(args, target, joint, robot_pose, obj.pose)
+            target_meta = {
+                "target_name": target["name"],
+                "joint_index": joint["joint_index"],
+                "joint_name": joint["joint_name"],
+                "joint_range": joint["joint_range"],
+                "robot_pose_meta": pose_meta,
+            }
+        else:
+            doors = collect_door_records(ctx)
+            target = next((rec for rec in doors if rec["name"] == args.target_name), None)
+            if target is None:
+                raise RuntimeError(f"Door not found: {args.target_name}")
+            joint = {
+                "joint_index": target["hinge_joint_index"],
+                "joint_name": target["hinge_joint_name"],
+            }
+            door_articulation = {
+                "name": target["name"],
+                "interaction_group": "portal",
+                "aabb_center": target["aabb_center"],
+                "aabb_size": target["aabb_size"],
+                "quat": target["quat"],
+            }
+            robot_pose, pose_meta = resolve_rby1_interaction_pose(
+                ctx,
+                door_articulation,
+                joint,
+                target["closed_value"],
+                target["open_value"],
+                pose_mode=args.robot_pose_mode,
+                supplied_robot_pose=supplied_robot_pose,
+                desired_dist=args.approach_distance,
+                torso_heights=(0.0,),
+                min_clearance_m=args.min_base_clearance,
+                max_center_distance_m=args.max_approach_distance,
+                max_base_adjustment_distance_m=args.max_base_adjustment_distance,
+                allow_back_approach=True,
+            )
+            if robot_pose is None:
+                raise RuntimeError("Could not find a collision-free robot pose for the door swing.")
+            episode = _build_rby1_door_episode(args, target, robot_pose)
+            target_meta = {
+                "target_name": target["name"],
+                "joint_index": target["hinge_joint_index"],
+                "joint_name": target["hinge_joint_name"],
+                "joint_range": target["hinge_joint_range"],
+                "robot_pose_meta": pose_meta,
+            }
+        return episode, target_meta
+    finally:
+        close_context(ctx)
+
+
+def plan_rby1_interaction_stance(request: RBY1InteractionRequest) -> dict[str, Any]:
+    """Return a collision-checked operation stance without moving the robot."""
+    planning_request = copy.copy(request)
+    planning_request.robot_pose_mode = "auto"
+    planning_request.robot_base_pose = None
+    args = _rby1_request_to_args(planning_request)
+    episode_spec, target_meta = prepare_rby1_interaction_episode(args)
+    episode_payload = episode_spec.model_dump(mode="json")
+    return {
+        "base_pose": episode_payload["task"]["robot_base_pose"],
+        "interaction_kind": request.interaction_kind,
+        "target_name": request.target_name,
+        "joint_index": request.joint_index,
+        **target_meta["robot_pose_meta"],
+    }
+
+
+def build_rby1_interaction_config(args: argparse.Namespace) -> Any:
+    """Build the official planner config shared by CLI and algorithm callers."""
+    if args.interaction_kind == "container":
+        from molmo_spaces.data_generation.config.object_manipulation_datagen_configs import (
+            RBY1OpenDataGenConfig,
+        )
+
+        cfg = RBY1OpenDataGenConfig()
+        cfg.robot_config.command_mode = {
+            "arm": "joint_position",
+            "gripper": "joint_position",
+            "base": "holo_joint_planar_position",
+            "head": None,
+            "torso": "height",
+        }
+        cfg.policy_config.server_urls = (
+            [args.curobo_server_url] if args.curobo_server_url else []
+        )
+        cfg.policy_config.policy_cls = stable_rby1_container_policy_cls()
+        cfg.policy_config.batch_size = 8
+        cfg.policy_config.max_batch_plan_attempts = 8
+        cfg.policy_config.max_height_adjustment_steps = 40
+        cfg.policy_config.max_steps_per_waypoint = 30
+    else:
+        from molmo_spaces.data_generation.config.door_opening_configs import (
+            DoorOpeningDataGenConfig,
+        )
+
+        cfg = DoorOpeningDataGenConfig()
+        cfg.task_config.additional_tcp_offset_distance = args.door_tcp_offset
+        cfg.policy_config.policy_cls = stable_rby1_door_policy_cls(args.door_arm)
+        cfg.policy_config.max_steps_per_waypoint = 35
+        cfg.policy_config.joint_position_tolerance = 0.10
+        cfg.policy_config.articulation_deltas = [float(np.deg2rad(7.0))]
+
+    cfg.seed = args.seed
+    cfg.scene_dataset = args.scene_dataset
+    cfg.data_split = args.data_split
+    cfg.num_workers = 1
+    cfg.use_passive_viewer = False
+    cfg.use_filament = False
+    cfg.task_horizon = args.max_steps + args.max_base_adjustment_steps
+    cfg.task_sampler_config.randomize_lighting = False
+    cfg.task_sampler_config.randomize_textures = False
+    cfg.task_sampler_config.randomize_dynamics = False
+    return cfg
+
+
+def _rby1_request_to_args(request: RBY1InteractionRequest) -> argparse.Namespace:
+    robot_base_pose = (
+        None
+        if request.robot_base_pose is None
+        else np.asarray(request.robot_base_pose, dtype=float).reshape(7).tolist()
+    )
+    return argparse.Namespace(
+        house_ind=int(request.house_ind),
+        interaction_kind=request.interaction_kind,
+        target_name=request.target_name,
+        joint_index=int(request.joint_index),
+        action="open",
+        robot_pose_mode=request.robot_pose_mode,
+        robot_base_pose=robot_base_pose,
+        door_arm=request.door_arm,
+        approach_distance=float(request.approach_distance),
+        min_base_clearance=float(request.min_base_clearance),
+        max_approach_distance=float(request.max_approach_distance),
+        max_base_adjustment_distance=float(request.max_base_adjustment_distance),
+        max_base_adjustment_steps=int(request.max_base_adjustment_steps),
+        allow_back_approach=bool(request.allow_back_approach),
+        door_tcp_offset=float(request.door_tcp_offset),
+        success_threshold=float(request.success_threshold),
+        max_steps=int(request.max_steps),
+        video_fps=request.video_fps,
+        camera_names=list(request.camera_names),
+        output_dir=Path(request.output_dir),
+        scene_dataset=request.scene_dataset,
+        data_split=request.data_split,
+        variant=request.variant,
+        seed=int(request.seed),
+        robot="rby1",
+        curobo_server_url=request.curobo_server_url,
+    )
+
+
+def open_articulation_with_rby1(request: RBY1InteractionRequest) -> dict[str, Any]:
+    """Open a door/container from a navigation endpoint and record the rollout.
+
+    ``current_or_adjust`` preserves a collision-free supplied base pose. If the
+    navigation endpoint is unsafe or too far away, it falls back to a nearby
+    pose that is valid with the articulation both closed and open.
+    """
+    if request.interaction_kind not in {"container", "door"}:
+        raise ValueError(f"Unsupported interaction kind: {request.interaction_kind}")
+    args = _rby1_request_to_args(request)
+    episode_spec, target_meta = prepare_rby1_interaction_episode(args)
+    run_name = (
+        f"rby1_{args.interaction_kind}_{args.action}_house_{args.house_ind}_"
+        f"{sanitize_name(args.target_name)}_joint_{args.joint_index}"
+    )
+    out_dir = args.output_dir / run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_json(out_dir / "target.json", target_meta)
+    cfg = build_rby1_interaction_config(args)
+    result = execute_rby1_whole_body_interaction(
+        cfg,
+        episode_spec,
+        interaction_kind=args.interaction_kind,
+        variant=args.variant,
+        output_dir=out_dir,
+        camera_names=tuple(args.camera_names),
+        max_steps=args.max_steps,
+        video_fps=args.video_fps,
+        base_adjustment_target_pose=(
+            pos_quat_to_pose_mat(target_meta["robot_pose_meta"]["adjustment_target_pose"])
+            if "adjustment_target_pose" in target_meta["robot_pose_meta"]
+            else None
+        ),
+        max_base_adjustment_steps=args.max_base_adjustment_steps,
+    )
+    result["robot_pose_mode"] = request.robot_pose_mode
+    result["robot_pose_meta"] = target_meta["robot_pose_meta"]
+    write_json(out_dir / "result.json", result)
+    log.info("RBY1 interaction result: %s", result)
+    return result
+
+
+def command_run_rby1_interaction(args: argparse.Namespace) -> int:
+    if args.action != "open":
+        raise ValueError("This RBY1 wrapper currently supports opening doors and containers only.")
+    request = RBY1InteractionRequest(
+        house_ind=args.house_ind,
+        interaction_kind=args.interaction_kind,
+        target_name=args.target_name,
+        joint_index=args.joint_index,
+        robot_pose_mode=args.robot_pose_mode,
+        robot_base_pose=args.robot_base_pose,
+        door_arm=args.door_arm,
+        approach_distance=args.approach_distance,
+        min_base_clearance=args.min_base_clearance,
+        max_approach_distance=args.max_approach_distance,
+        max_base_adjustment_distance=args.max_base_adjustment_distance,
+        max_base_adjustment_steps=args.max_base_adjustment_steps,
+        allow_back_approach=args.allow_back_approach,
+        door_tcp_offset=args.door_tcp_offset,
+        success_threshold=args.success_threshold,
+        max_steps=args.max_steps,
+        video_fps=args.video_fps,
+        camera_names=tuple(args.camera_names),
+        output_dir=args.output_dir,
+        scene_dataset=args.scene_dataset,
+        data_split=args.data_split,
+        variant=args.variant,
+        seed=args.seed,
+        curobo_server_url=args.curobo_server_url,
+    )
+    result = open_articulation_with_rby1(request)
+    return 0 if result["success"] else 2
 
 
 def build_scan_output_dir(args: argparse.Namespace) -> Path:
@@ -3191,6 +5137,72 @@ def build_parser() -> argparse.ArgumentParser:
     debug_door_parser.add_argument("--house_ind", type=int, required=True)
     debug_door_parser.add_argument("--door_name", type=str)
     debug_door_parser.set_defaults(func=command_debug_door_view)
+
+    rby1_parser = subparsers.add_parser(
+        "run-rby1-interaction",
+        help="Execute an official RBY1 whole-body door/container manipulation policy.",
+    )
+    rby1_parser.add_argument("--house_ind", type=int, required=True)
+    rby1_parser.add_argument(
+        "--interaction_kind",
+        choices=["container", "door"],
+        required=True,
+    )
+    rby1_parser.add_argument("--target_name", type=str, required=True)
+    rby1_parser.add_argument("--joint_index", type=int, default=0)
+    rby1_parser.add_argument("--action", choices=["open"], default="open")
+    rby1_parser.add_argument(
+        "--door_arm",
+        choices=["auto", "left", "right"],
+        default="auto",
+        help="Use the official hinge-side heuristic or force the left/right arm.",
+    )
+    rby1_parser.add_argument("--approach_distance", type=float, default=0.5)
+    rby1_parser.add_argument("--min_base_clearance", type=float, default=0.15)
+    rby1_parser.add_argument("--max_approach_distance", type=float, default=1.2)
+    rby1_parser.add_argument("--max_base_adjustment_distance", type=float, default=0.75)
+    rby1_parser.add_argument("--max_base_adjustment_steps", type=int, default=120)
+    rby1_parser.add_argument(
+        "--allow_back_approach",
+        action="store_true",
+        help="Allow a container interaction pose on the inferred rear side.",
+    )
+    rby1_parser.add_argument(
+        "--door_tcp_offset",
+        type=float,
+        default=0.03,
+        help="Initial door-handle TCP depth; failed grasps try nearby offsets.",
+    )
+    rby1_parser.add_argument(
+        "--robot_base_pose",
+        nargs=7,
+        type=float,
+        metavar=("X", "Y", "Z", "QW", "QX", "QY", "QZ"),
+        help="Use the algorithm's current robot pose instead of automatic placement.",
+    )
+    rby1_parser.add_argument(
+        "--robot_pose_mode",
+        choices=["auto", "current", "current_or_adjust"],
+        default="auto",
+        help=(
+            "Use automatic placement, require the supplied navigation endpoint, "
+            "or preserve it when safe and otherwise fall back to a nearby stance."
+        ),
+    )
+    rby1_parser.add_argument("--success_threshold", type=float, default=0.67)
+    rby1_parser.add_argument("--max_steps", type=int, default=400)
+    rby1_parser.add_argument("--video_fps", type=float)
+    rby1_parser.add_argument(
+        "--curobo_server_url",
+        type=str,
+        help="Optional remote Curobo gRPC address. Omit to use the local GPU planner.",
+    )
+    rby1_parser.add_argument(
+        "--camera_names",
+        nargs="+",
+        default=list(DEFAULT_RBY1_INTERACTION_CAMERAS),
+    )
+    rby1_parser.set_defaults(func=command_run_rby1_interaction)
 
     return parser
 

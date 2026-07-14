@@ -1,8 +1,8 @@
-# Container Interaction Probe
+# Container Interaction Probe 与 Benchmark 采集
 
-本文档记录 `scripts/InteractiveNav/container_scene_probe.py` 当前已经实现的能力。它的定位是交互式导航中的容器/门交互探针：读取 MolmoSpaces / ProcTHOR 场景，分析容器、目标物体、关节几何、可见性变化，并提供可复用的开关动作封装与调试渲染。
+本文档记录 `scripts/InteractiveNav/container_scene_probe.py` 及容器交互 benchmark 采集脚本当前已经实现的能力。它们用于读取 MolmoSpaces / ProcTHOR 场景，分析容器、目标物体、关节几何、可见性变化，生成可复现的 GT 交互计划，并提供可复用的开关动作封装、调试渲染和数据采集入口。
 
-当前脚本更接近 benchmark 和方法开发前的实验工具，而不是最终的在线 policy。它主要回答：
+`container_scene_probe.py` 是 benchmark 和方法开发前的实验探针，不是最终在线 policy；`build_container_interaction_benchmark.py`、粗目录和并行采集脚本则负责把这些能力固化为可回放的 benchmark episode。当前代码主要回答：
 
 - 场景里有哪些可交互容器、门和潜在目标物体。
 - 哪些物体严格几何上位于容器内部。
@@ -10,6 +10,18 @@
 - 多 joint 容器中，某个 joint 是否依赖另一个 joint 先打开。
 - 机器人站在容器/门前时，开关前后的第一视角图像是否合理。
 - 是否可以通过 episode spec 在场景中临时增加物体，用于容器内目标构造测试。
+
+## 统一数据集定义 v3
+
+通道交互、容器交互和二者混合 episode 的统一 JSON 规范位于：
+
+```text
+scripts/InteractiveNav/dataset_definition/v3/
+```
+
+该目录包含格式说明、JSON Schema，以及 channel、container、mixed、interaction-unnecessary 四类完整示例。v3 当前先固定 episode、Instruction、交互对象、初始状态、GT oracle 动作和生成验证字段，不强制目标语言 grounding 唯一；门交互示例也暂时采用单一指定目标。
+
+当前容器 fine collection 已直接输出 `interactive_nav_v3`，并使用 `selection_mode=specific_instance`、显式 `interactions`、typed prerequisite、multi-oracle 和结构化 `generation_validation`。门交互与 mixed builder 不属于本次迁移范围，仍不能与新容器 JSON 直接拼接。
 
 ## 运行入口
 
@@ -578,6 +590,315 @@ MUJOCO_GL=egl python scripts/InteractiveNav/container_scene_probe.py \
 - `add-object-test` 只能证明 scene modification 和 readback 成功，不保证新增物体已经稳定、合理地放入某个具体抽屉或柜格。
 - head camera 图像质量依赖机器人站位、躯干/头部姿态和场景 free map。如果某些容器前方空间很窄，仍可能需要按场景调参。
 - 输出目录下的 JSON 和图片是实验产物，不应直接作为固定 benchmark 真值使用。
+
+## Container Interaction Benchmark 采集
+
+### 采集目标与边界
+
+当前 benchmark 只研究容器交互，不把通道门作为任务变量：初始化时打开可直接控制的 door，关闭所有容器 joint。样本目标是严格位于 Fridge 或 Dresser 内部的已有 free-joint 物体，不注入新物体，也不复用原 `nav_to_obj` episode 的 `pickup_obj_name`。
+
+每个有效 episode 保存：
+
+- 原 benchmark house、场景、机器人、相机和一个原始机器人起点。
+- 唯一 GT 目标物体、GT 容器和 controlling joint 候选。
+- 所有 door 打开、所有容器 joint 关闭的初始 articulation state。
+- 到容器交互位姿的 GT shortest path 可达性和长度。
+- 使目标首次从 head camera 中可见的一个或多个 `oracle_plan`。
+- 每个 oracle prefix 的 joint 状态、目标像素、visibility fraction、物体位置和 joint box。
+
+运行时 policy observation 不应暴露 `interactive_nav.oracle_plan`、GT 容器 ID 或 controlling joint；这些字段是 benchmark 构建真值和训练监督。
+
+### 两阶段主线
+
+正式数据管线只保留两个必要阶段：
+
+```text
+原始 NavToObj benchmark
+  -> Stage 1: rough catalog
+  -> Stage 2: fixed-house fine collection
+  -> benchmark + validation + evidence
+```
+
+`select_container_interaction_candidates.py` 仅保留为旧 candidate manifest 复现和离线统计工具，不再属于正式采集主线。新的精采入口直接读取粗目录，在内存中生成并保存 `collection_plan.json`。
+
+### Stage 1：粗目录扫描
+
+入口：
+
+```bash
+python scripts/InteractiveNav/collect_container_rough_catalog_parallel.py \
+  --benchmark_dir assets/benchmarks/molmospaces-bench-v2/procthor-10k/NavToObjDataGenConfig/NavToObjProcthor10kBench_20260112_json_benchmark \
+  --output_dir scripts/InteractiveNav/output/container_interaction_all_houses/rough_catalog \
+  --workers 4 \
+  --mujoco_gl egl
+```
+
+粗扫描按 unique house 加载场景，只做静态/几何目录构建，不做以下操作：
+
+- 不构建 GT occupancy path。
+- 不寻找机器人交互位姿。
+- 不执行容器开关的完整物理验证。
+- 不渲染每个 pair 的 RGB、segmentation 或 mask。
+- 不因为路径、可见性或 joint oracle 失败而删除容器-物体 pair。
+
+`rough_catalog.json` 中每个 house 主要保存：
+
+- `house_index`、模板 episode 和该 house 的全部 `source_episode_indices`。
+- Fridge/Dresser 实例的 `name`、`category`、`asset_id`、AABB 和 joint 列表。
+- 每个 strict contained object 的实例 ID、类别、AABB 中心和尺寸。
+- 原 benchmark 起点以及起点到物体/容器中心的欧氏距离和二维距离。
+- 冰箱 slide joint box 中的几何候选物体，用于后续 multi-interaction 检查。
+
+`asset_id` 表示可复用的 3D/articulation 模板，例如 `Fridge_17` 或 `Dresser_220_1`；`container_name` 才是当前 house 中的唯一实例 ID。
+
+当前已完成的全量粗扫描结果：
+
+| 指标 | 数量 |
+|---|---:|
+| 原 benchmark episode | 2000 |
+| unique house | 898 |
+| 完成扫描 house | 898 |
+| 失败 house | 0 |
+| strict container-object pair | 2603 |
+| Fridge 实例 | 629 |
+| Dresser 实例 | 1158 |
+| 包含严格内部目标的 Fridge | 558 |
+| 包含严格内部目标的 Dresser | 709 |
+| 冰箱 slide joint | 1416 |
+| slide joint box 中有物体的 joint | 29 |
+| slide joint box 中物体 | 32 |
+
+4 worker 全量扫描耗时约 `5654 s`，即 `1.57 h`。结果位于：
+
+```text
+scripts/InteractiveNav/output/container_interaction_all_houses/rough_catalog/
+  rough_catalog.json
+  house_catalog.json
+  summary.json
+  shards/
+```
+
+### Stage 2：固定 House 动态精采
+
+并行入口：
+
+```bash
+python scripts/InteractiveNav/collect_container_fine_parallel.py \
+  --benchmark_dir assets/benchmarks/molmospaces-bench-v2/procthor-10k/NavToObjDataGenConfig/NavToObjProcthor10kBench_20260112_json_benchmark \
+  --rough_catalog scripts/InteractiveNav/output/container_interaction_all_houses/rough_catalog/rough_catalog.json \
+  --output_dir scripts/InteractiveNav/output/container_interaction_all_houses/benchmark \
+  --target_house_count 100 \
+  --max_samples 200 \
+  --samples_per_house 2 \
+  --workers 4 \
+  --mujoco_gl egl \
+  --no-save_images \
+  --no-save_plots
+```
+
+串行或两阶段统一入口：
+
+```bash
+python scripts/InteractiveNav/collect_container_interaction_benchmark_serial.py \
+  --target_house_count 100 \
+  --max_samples 200 \
+  --samples_per_house 2 \
+  --rough_workers 4 \
+  --fine_workers 4 \
+  --no-save_images \
+  --no-save_plots
+```
+
+已有粗目录时可跳过 Stage 1：
+
+```bash
+python scripts/InteractiveNav/collect_container_interaction_benchmark_serial.py \
+  --skip_rough \
+  --target_house_count 100 \
+  --max_samples 200 \
+  --samples_per_house 2 \
+  --fine_workers 4
+```
+
+### Fixed 采样语义
+
+`fixed` 表示在精采开始前确定 house 集合，而不是先建立 150 个 house 再保留成功的 100 个：
+
+- `target_house_count` 限制固定 house 数；也可用 `--house_indices 0,1,2` 显式指定。
+- `samples_per_house=n` 是每个固定 house 的请求上限。
+- `max_samples` 是全部固定 house 的总请求上限，配额按 round-robin 分配。
+- 每个 house 的候选池包含粗目录中的全部 strict pair，不再只有少量 slot backup。
+- 候选成功后才占用样本配额；失败后继续尝试同 house 下一个候选。
+- 候选池耗尽仍不足 `n` 条时，保留已经成功的 0 到 `n-1` 条，然后继续下一个固定 house。
+- 不完整 house 不回滚，也不会自动使用固定集合之外的 house 替换。
+
+`collection_plan.json` 是精采入口根据粗目录自动生成的可复现计划，不是用户需要提前运行的第三阶段。计划首先按容器类别、目标类别、container asset 和 near/medium/far 起点距离做全局均衡，然后把该 house 的其余 strict pair 全部追加为 fallback。
+
+当前粗目录中有 712 个 house 至少包含一个 Fridge/Dresser strict pair：
+
+- `samples_per_house=2` 时最多请求 1424 条。
+- `samples_per_house=3 --max_samples=2000` 时可以请求 2000 条。
+- 2603 是粗目录 pair 上限，不代表 2603 条都会通过 GT path 和交互验证。
+
+### 单个候选的精采验证流程
+
+每个候选按以下顺序验证：
+
+1. 按原 episode object pose 恢复场景，打开 door，关闭所有容器 joint。
+2. 根据 joint 正面遮挡关系推断 prerequisite，并生成 `dependencies + target_joint` 序列。
+3. 对 hinge/slide joint 分别生成容器前方交互位姿；要求同一位姿对整个开关序列无碰撞。
+4. 遍历该 house 的原 benchmark 起点，要求起点处目标不可见。
+5. 在 door-open GT occupancy map 上计算起点到交互位姿的 shortest path；`path is None` 的起点不可用。
+6. 在 `default` 和 `drawer_low_view` 观察姿态下执行 visibility trace。
+7. hinge 候选要求目标像素从 0 变为大于 0；多个 joint 都可揭示目标时保留为 `oracle_plans` 并标记歧义。
+8. slide 候选使用力控制；joint 必须达到目标开度，且目标最终必须在 head camera 中产生正 visibility fraction。
+9. 成功后生成 `NavToObjTask` episode；失败候选写入 `rejected_pairs.json`，然后继续同 house fallback。
+
+当前 reveal mode 包括：
+
+- `hinge_pixel_reveal`：打开 hinge 后 head camera 中目标像素由 0 变为正数。
+- `force_slide_visibility`：力控制打开 slide joint 后目标被 head camera 观察到。
+目标与 moving compartment 的一致位移只写入 `compartment_evidence`，用于证明物体属于抽屉空间；它不能替代 `visibility_fraction > 0` 的 NavToObj 终态成功条件。
+
+GT path 的终点是满足容器正面、朝向、开关空间和碰撞约束的 `interaction_pose`，不是物体中心，也不是直线距离。当前容器样本的路径通常比原始 NavToObj 更长，因为原任务可导航到同类别任一候选附近，而容器任务绑定具体 GT pair 和具体交互位姿。
+
+### Oracle Plan 与 Episode JSON
+
+生成 episode 继续使用 `NavToObjTask`，但替换为严格目标物体 ID，并增加 `interactive_nav`：
+
+```text
+interactive_nav
+  schema_version: interactive_nav_v3
+  interaction_domains: [container]
+  interaction_requirement: required
+  case_id
+  parent_benchmark_episode_index
+  target
+  success_criteria
+  initial_state
+  interactions
+  oracle_plan
+  oracle_plans
+  generation_validation
+```
+
+`target` 保存 `selected_instance`、目标类别、GT 容器、AABB 和 grounding 诊断。`grounding.matching_instance_count` 来自当前 scene 全部目标记录的同类别实例计数，`grounding.unique` 由该实测计数是否等于 1 得出；容器类别缺失时直接拒绝样本，不写入 `unknown`。controlling joint 不再放在 target 主字段中，而是转换为 episode 级 `interactions`。自然语言只使用目标类别，例如 `find the pencil.`，不向 policy 暴露 GT 容器。
+
+`scene_modifications.articulation_states` 是 articulation 回放的权威来源，其中 `position` 和 `open_fraction` 均由设置状态后的 MuJoCo qpos 读回计算；`interactive_nav.initial_state.interaction_states` 保存与 interaction ID 对齐的状态镜像，并附加：
+
+- `all_doors_open=true`
+- `container_joints_closed=true`
+- 每个 interaction 的 `joint_fraction=0` 和 `semantic_state=closed`
+
+`interactions` 将所有 oracle 中出现的 joint 去重。hinge 映射为 `container_hinged_door`，slide 映射为 `container_sliding_drawer`；前置 joint 使用 `enable_interaction`，最终 controlling joint 使用 `reveal_target_object`，冰箱外门与内部抽屉依赖写为 `mechanical` prerequisite。
+
+`oracle_plan.steps` 支持：
+
+- `navigate`：容器交互 `goal_point`、`goal_yaw`、容差、首个 interaction ID 和 `approach_container_interaction` 原因。
+- `set_view`：需要低头/俯身时设置 head/torso qpos，原因为 `improve_target_visibility`。
+- `open_joint`：通过 `interaction_id` 依次打开 prerequisite 和 controlling joint；前置原因为 `prerequisite_for_interaction`，slide controlling joint 使用 `control_mode=force`。
+- `observe_target`：使用 `head_camera` 和严格 `visibility_threshold=0.0` 检查目标可见性，原因为 `verify_target_visible`。
+
+存在多个独立有效交互方案时，`oracle_plan` 保存第一个方案，`oracle_plans` 保存全部方案。当前不保存 waypoint；运行时应根据 `navigate.goal_point` 在线规划路径。
+
+`generation_validation` 按 v3 固定栏目保存：
+
+- `navigation_validation`：GT path、起点可见性、goal 和 collision-free interaction pose。
+- `interaction_validations`：各 oracle joint sequence 的仿真诊断。
+- `oracle_prefixes`：逐 prefix 已打开 interaction、visibility 和任务成功状态。
+- `compartment_evidence`：slide joint 与内部物体的一致运动证据，仅作 compartment 归属验证。
+- `success_evidence`：同一终态的 GT 平面距离与 head-camera visibility；二者必须同时通过。
+- `door_state_validation`：逐门保存读回 qpos、closed/open 端点、归一化 fraction 和阈值判定；只有全部门通过才生成 episode。
+- `container_state_validation`：逐容器 joint 保存相同的读回信息；只有全部容器 joint 处于关闭阈值内才生成 episode。
+- `minimal_plan_verified`：未执行 prerequisite leave-one-out 时为 `null`，并由 `minimal_plan_validation.status=not_executed` 和稳定 reason 明确说明，不能伪写为 `true`。
+- 自动候选 rank、优先 source episode 和粗距离分桶。
+
+写出前会执行 v3 强一致性校验，包括指定实例、grounding 计数、interaction/prerequisite 图、初始 articulation 镜像、门和容器状态读回、oracle 顺序、prefix 初始失败与终态成功、距离/可见性成功证据及 JSON Schema。可选字段中的无信息 `None` 会被移除；当前唯一有意保留的 `null` 是上述尚未执行的 `minimal_plan_verified`。
+
+`scene_modifications.articulation_states` 会在 JsonEvalTaskSampler 恢复 object pose 之后、创建 task 之前按 joint name 应用，并执行 `mj_forward`。
+
+### 输出文件与证据
+
+并行精采输出：
+
+```text
+<output_dir>/
+  benchmark.json
+  valid_pairs.json
+  rejected_pairs.json
+  house_catalog.json
+  fridge_slide_compartment_candidates.json
+  failures.json
+  collection_plan.json
+  summary.json
+  shards/shard_*/
+```
+
+开启 `--save_images` 时，每个有效 pair 的 `evidence/<case_id>/` 保存 closed/final RGB、segmentation、target mask 和各 oracle joint 的 trace。开启 `--save_plots` 时保存 joint/object 3D box 和失败诊断图。大规模采集建议先关闭图片和 plot，完成 JSON 后再对选定样本补充 evidence。
+
+常见候选拒绝原因：
+
+- `no_controlling_joint`：所有 hinge/slide 候选均未通过 reveal、binding、依赖或安全位姿验证；详细 joint 原因位于 `diagnostics.joint_failures`。
+- `no_valid_source_start`：没有原 benchmark 起点同时满足“初始不可见”和“到交互位姿存在 GT path”。
+- `cyclic_dependency`、`no_collision_free_interaction_pose`、`object_not_in_joint_compartment_box`、`object_not_bound_to_moving_compartment` 和 `force_drive_not_reached` 等保存在 joint-level diagnostics。
+- `shard_process_failed`：并行子进程非零退出，由父进程写入最终 `failures.json`。
+
+新的 fixed 模式不会再产生 house-level `incomplete_house_quota` 回滚；不足配额通过 `summary.json` 中的 `partial_collection_house_count` 和 `zero_sample_house_count` 表达。
+
+### 并行实现与耗时
+
+`collect_container_fine_parallel.py` 使用线程池调度子进程，真正的 MuJoCo 采集发生在独立 Python subprocess 中：
+
+- house 在 shard 间互斥，不会被重复采集。
+- 每个 shard 有独立 benchmark 输出、日志和 Matplotlib cache。
+- 父进程按 `case_id` 合并 benchmark 和 valid pair。
+- 任一 shard 非零退出都会进入最终 failure 统计。
+
+4 worker 已在旧 complete-house 200 条测试中稳定运行：耗时约 `3847 s`，即 `1.07 h`。8/16 worker 尚未实测，单 GPU 上可能受到 EGL context、显存和渲染争用影响；正式大规模运行优先使用 4 worker，再用少量 house 测试 8 worker 吞吐。
+
+按现有 200 条实测线性外推，2000 个成功样本的精采时间约为：1 worker `39-42 h`、2 worker `20-22 h`、4 worker `10.7-12 h`。8/16 worker 不建议在未做显存测试时直接用于全量采集。
+
+### 当前数据与验证状态
+
+现有 200 条结果位于：
+
+```text
+scripts/InteractiveNav/output/container_interaction_100house_test/
+  benchmark_parallel_complete100/
+  quality_report/
+```
+
+这批数据是在旧的 complete-house 语义下生成：从更大的 house pool 中保留 100 个完整 house，每个 house 两条。它不是新 fixed 语义重新运行的结果，但其单候选 GT path、oracle、visibility、force-slide 和 episode schema 与当前实现一致。
+
+该批数据统计：
+
+| 指标 | 数值 |
+|---|---:|
+| episode | 200 |
+| house | 100 |
+| Fridge / Dresser | 104 / 96 |
+| 目标类别 | 20 |
+| container asset | 10 |
+| hinge pixel reveal | 102 |
+| force slide visibility | 84 |
+| slide object motion | 14 |
+| GT path 平均 / 中位数 | 10.432 m / 7.331 m |
+| GT path 最小 / 最大 | 0.081 m / 42.182 m |
+
+原始 NavToObj benchmark 现有 GT path 扫描中，1913 条 path-found episode 的平均值为 `6.372 m`、中位数为 `5.799 m`。两者终点定义和地图分辨率配置不完全相同，因此该比较用于观察数据分布，不作为算法性能结论。
+
+当前已完成的代码验证：
+
+- dynamic plan 固定 100 house 时请求 200 条，并保留每个 house 的全部 fallback。
+- fixed merge 会保留只有一条成功样本的 partial house。
+- `samples_per_house=2` 生成 1424 个请求配额；`samples_per_house=3` 可生成 2000 个请求配额。
+- 容器 benchmark、multi-oracle、articulation replay 和 fixed-plan 相关测试通过。
+
+新的 fixed 管线尚未重新执行 GPU 全量精采。后续正式生成前应先运行 5-10 个固定 house，检查 `summary.json` 中的 complete/partial/zero house 数、GT path 分布和 shard 显存占用。
+
+### 质量评估现状
+
+`evaluate_container_interaction_dataset.py` 当前可以统计容器类别、目标类别、asset、距离分桶、reveal mode、candidate rank、GT path 和初始可见性，并生成 JSON/Markdown 报告。现有实现的 completeness quality gates 仍按旧 manifest slot 和每 house 两条设计；对新的 `collection_plan_v2` fixed partial-house 数据使用前，需要将 gate 改为按 `target_sample_count`、`partial_collection_house_count` 和 `zero_sample_house_count` 判断。新 fixed 运行期间应以采集器 `summary.json`、`valid_pairs.json` 和 `failures.json` 为主。
 
 ## 与交互式导航主线的关系
 
