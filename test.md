@@ -542,8 +542,46 @@ python Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/semantic_mappi
   --publish-rate 1.0
 ```
 
+## 8.4 实时 GT 语义交互图
 
-## 8.4 Room分割测试
+只使用当前 `head_camera` segmentation 中可见对象作为 GT observation：
+
+```bash
+conda activate mlspaces
+source ./Interactive-Nav-SG-nav/devel/setup.zsh
+roslaunch nav_pkg molmospaces_nav_system.launch \
+  start_semantic_mapping:=true \
+  semantic_source:=realtime_gt \
+  publish_realtime_gt:=true \
+  start_explore_py:=true
+```
+
+检查实时输入与动态图：
+
+```bash
+rostopic echo -n 1 /semantic_mapping/gt_observations
+rostopic echo -n 1 /semantic_mapping/unified_graph
+rosservice call /semantic_mapping/save_graph
+```
+
+实时 GT 默认每 `3` 个仿真 step 采样一次，单次扫描 segmentation 中的 geom ID，最大观测距离默认 `6m`。
+三场景完整验收默认每场景录制 `600s`：
+
+```bash
+scripts/InteractiveNav/run_semantic_gt_three_scene_test.zsh outputs/semantic_gt_three_scene_10min
+```
+
+六联图在线以 `1 FPS` 合成关键帧，最终每张关键帧只写入一次并编码为 `15 FPS`。因此 `600s` 测试约产生 `600` 个关键帧，合成视频约 `40s`，即约 `15` 倍加速播放，同时避免 15 Hz 在线绘图阻塞 ROS 与仿真。
+
+前期短测可覆盖运行时间和场景：
+
+```bash
+HOUSE_INDS="4" RECORD_SEC=60 TASK_HORIZON=800 \
+  scripts/InteractiveNav/run_semantic_gt_three_scene_test.zsh outputs/semantic_gt_debug_short
+```
+
+
+## 8.5 Room分割测试
 
 python /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/room_segmentation_debug_tool.py live \
   --output-dir /home/user/ldl/molmospaces/scripts/InteractiveNav/output/room_occ_snaps

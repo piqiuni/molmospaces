@@ -565,10 +565,28 @@ def parse_args():
     )
 
     parser.add_argument("--observation_topic", type=str, default="/molmo_spaces/head_camera/image")
+    parser.add_argument(
+        "--observation_queue_size",
+        type=int,
+        default=1,
+        help="ROS RGB publisher queue; use 0 for synchronous per-step debug recording.",
+    )
     parser.add_argument("--depth_topic", type=str, default="/molmo_spaces/head_camera/depth")
     parser.add_argument("--action_topic", type=str, default="/molmo_spaces/action")
     parser.add_argument("--pointcloud_topic", type=str, default="/registered_scan")
     parser.add_argument("--camera_info_topic", type=str, default="/molmo_spaces/head_camera/camera_info")
+    parser.add_argument("--publish_realtime_gt", type=str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument("--realtime_gt_topic", type=str, default="/semantic_mapping/gt_observations")
+    parser.add_argument("--realtime_gt_camera_name", type=str, default="head_camera")
+    parser.add_argument("--realtime_gt_min_visible_pixels", type=int, default=16)
+    parser.add_argument("--realtime_gt_step_interval", type=int, default=3)
+    parser.add_argument("--realtime_gt_max_distance_m", type=float, default=6.0)
+    parser.add_argument(
+        "--step_frame_dir",
+        type=str,
+        default="",
+        help="Optional directory for asynchronous per-step RGB PNGs and a timestamp manifest.",
+    )
     parser.add_argument("--extra_image_topic", type=str, default="/molmo_spaces/debug_front_camera/image")
     parser.add_argument("--debug_front_camera_name", type=str, default="debug_front_camera")
     parser.add_argument("--publish_debug_front_camera", type=str_to_bool, nargs="?", const=True, default=True)
@@ -590,6 +608,7 @@ def parse_args():
     parser.add_argument("--depth_camera_name", type=str, default="head_camera")
     parser.add_argument("--pointcloud_frame_id", type=str, default="tf_frame_lidar")
     parser.add_argument("--pointcloud_stride", type=int, default=2)
+    parser.add_argument("--pointcloud_self_filter_radius_m", type=float, default=0.32)
     parser.add_argument(
         "--pointcloud_roll_correction_deg",
         type=float,
@@ -807,6 +826,7 @@ def main():
             config=exp_config,
             task=None,
             observation_topic=args.observation_topic,
+            observation_queue_size=args.observation_queue_size,
             action_topic=args.action_topic,
             pointcloud_topic=args.pointcloud_topic,
             camera_info_topic=args.camera_info_topic,
@@ -817,6 +837,7 @@ def main():
             depth_camera_name=args.depth_camera_name,
             pointcloud_frame_id=args.pointcloud_frame_id,
             pointcloud_stride=args.pointcloud_stride,
+            pointcloud_self_filter_radius_m=args.pointcloud_self_filter_radius_m,
             pointcloud_roll_correction_deg=args.pointcloud_roll_correction_deg,
             lidar_calib_x_m=args.lidar_calib_x_m,
             lidar_calib_y_m=args.lidar_calib_y_m,
@@ -837,6 +858,13 @@ def main():
             timing_log_every_n_frames=args.timing_log_every_n_frames,
             extra_image_topic=args.extra_image_topic,
             extra_image_camera_name=args.debug_front_camera_name,
+            publish_realtime_gt=args.publish_realtime_gt,
+            realtime_gt_topic=args.realtime_gt_topic,
+            realtime_gt_camera_name=args.realtime_gt_camera_name,
+            realtime_gt_min_visible_pixels=args.realtime_gt_min_visible_pixels,
+            realtime_gt_step_interval=args.realtime_gt_step_interval,
+            realtime_gt_max_distance_m=args.realtime_gt_max_distance_m,
+            step_frame_dir=args.step_frame_dir,
         )
         arm_qpos = parse_qpos_csv(args.initial_arm_qpos)
         left_arm_qpos = parse_qpos_csv(args.initial_left_arm_qpos)

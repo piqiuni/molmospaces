@@ -5,11 +5,8 @@ from pathlib import Path
 
 import rospy
 from std_msgs.msg import String
-from visualization_msgs.msg import MarkerArray
 
 from semantic_mapping_py_pkg.gt_observation_provider import observation_from_gt_record, split_observations_into_batches
-from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
-from semantic_mapping_py_pkg.interaction_graph_viz import build_graph_marker_array
 from semantic_mapping_py_pkg.messages import dumps_compact
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 
@@ -35,30 +32,6 @@ def parse_args():
         type=str,
         default="/semantic_mapping/room_context",
         help="Room context topic to publish.",
-    )
-    parser.add_argument(
-        "--graph-topic",
-        type=str,
-        default="/semantic_mapping/unified_graph",
-        help="Unified graph JSON topic to publish.",
-    )
-    parser.add_argument(
-        "--hints-topic",
-        type=str,
-        default="/semantic_mapping/navigation_hints",
-        help="Navigation hints topic to publish.",
-    )
-    parser.add_argument(
-        "--markers-topic",
-        type=str,
-        default="/semantic_mapping/unified_graph_markers",
-        help="RViz marker topic to publish.",
-    )
-    parser.add_argument(
-        "--frame-id",
-        type=str,
-        default="tf_frame_map",
-        help="Frame id used for graph markers.",
     )
     return parser.parse_args()
 
@@ -127,39 +100,19 @@ def main():
     rospy.init_node("semantic_mapping_gt_replay")
     detection_publisher = rospy.Publisher(args.topic, String, queue_size=10, latch=True)
     room_context_publisher = rospy.Publisher(args.room_context_topic, String, queue_size=1, latch=True)
-    graph_publisher = rospy.Publisher(args.graph_topic, String, queue_size=1, latch=True)
-    hints_publisher = rospy.Publisher(args.hints_topic, String, queue_size=1, latch=True)
-    markers_publisher = rospy.Publisher(args.markers_topic, MarkerArray, queue_size=1, latch=True)
     batches = build_batches(scene_json, args.batch_size, args.shuffle, args.seed)
     rate = rospy.Rate(max(args.publish_rate, 1e-3))
     room_context_payload = build_room_context_payload(scene_json)
     room_context_publisher.publish(String(data=dumps_compact(room_context_payload)))
-    room_id_to_name = {
-        int(room_id): str(name)
-        for room_id, name in (scene_json.get("room_id_to_name") or {}).items()
-    }
-    graph_store = InteractionGraphStore(
-        scene_id=scene_json.get("scene_id", "scene"),
-        room_id_to_name=room_id_to_name,
-    )
-    graph_store.set_room_geometries(scene_json.get("rooms") or [])
-
     rospy.loginfo(
-        "[semantic_mapping_gt_replay] input=%s records=%d batches=%d topic=%s graph_topic=%s markers_topic=%s",
+        "[semantic_mapping_gt_replay] input=%s records=%d batches=%d topic=%s",
         args.input,
         len(scene_json.get("records") or []),
         len(batches),
         args.topic,
-        args.graph_topic,
-        args.markers_topic,
     )
 
     while not rospy.is_shutdown():
-        graph_store = InteractionGraphStore(
-            scene_id=scene_json.get("scene_id", "scene"),
-            room_id_to_name=room_id_to_name,
-        )
-        graph_store.set_room_geometries(scene_json.get("rooms") or [])
         for batch_index, batch in enumerate(batches, start=1):
             stamp = rospy.Time.now()
             detections = [detection_from_observation(observation) for observation in batch]
@@ -172,18 +125,11 @@ def main():
             }
             detection_publisher.publish(String(data=dumps_compact(payload)))
 
-            graph_store.update_observations(batch, source_mode="gt_replay")
-            graph_payload = graph_store.as_graph_dict()
-            graph_publisher.publish(String(data=dumps_compact(graph_payload)))
-            hints_publisher.publish(String(data=dumps_compact(graph_payload["views"]["navigation_view"]["hints"])))
-            markers_publisher.publish(build_graph_marker_array(graph_payload, args.frame_id, stamp=stamp))
-
             rospy.loginfo(
-                "[semantic_mapping_gt_replay] published batch %d/%d (%d detections, %d graph nodes)",
+                "[semantic_mapping_gt_replay] published batch %d/%d (%d detections)",
                 batch_index,
                 len(batches),
                 len(detections),
-                len(graph_payload.get("nodes", [])),
             )
             rate.sleep()
             if rospy.is_shutdown():
