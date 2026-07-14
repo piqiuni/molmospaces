@@ -2888,8 +2888,10 @@ class ExploreDebugRecorder:
             active_changed = active_goal_key != self.last_explore_goal_key
             if now - self.last_explore_status_time < self.args.explore_status_period_sec and not active_changed:
                 return
-            active_presence_changed = (active_goal_key is None) != (self.last_explore_goal_key is None)
-            if active_presence_changed:
+            # A newly published goal needs its own movement window. Reusing the
+            # previous goal's reference can report STUCK_STATIC immediately
+            # after replanning, before move_base has had time to act.
+            if active_changed:
                 self.stall_reference_time = now
                 self.stall_reference_yaw_motion_rad = self.total_yaw_motion_rad
                 if self.latest_pose is None:
@@ -2898,6 +2900,15 @@ class ExploreDebugRecorder:
                 else:
                     self.stall_reference_xy = self.latest_pose[:2]
                     self.stall_reference_yaw = self.latest_pose[2]
+                self._write_event(
+                    "stall_reference_reset_goal_change",
+                    {
+                        "elapsed_sec": now - self.start_wall_time,
+                        "step_id": self.debug_step,
+                        "previous_goal_key": self.last_explore_goal_key,
+                        "active_goal_key": active_goal_key,
+                    },
+                )
             self.last_explore_status_time = now
             self.last_explore_active_goal = active_goal
             self.last_explore_goal_key = active_goal_key
@@ -3595,6 +3606,7 @@ class ExploreDebugRecorder:
                 final_external = str(self.external_dir / "final_external_camera.png")
                 _write_png(Path(final_external), external_width, external_height, external_rgb)
             if self.latest_grid is not None:
+                _write_grid_pgm_yaml(self.output_dir / "final_occ_map", self.latest_grid)
                 final_overlay = str(self.output_dir / "final_map_trajectory.png")
                 final_overlay_crop = self._render_overlay(
                     Path(final_overlay),
@@ -3636,6 +3648,12 @@ class ExploreDebugRecorder:
                 "subgoals": self._json_safe_subgoals(),
                 "final_overlay": final_overlay,
                 "final_overlay_crop": final_overlay_crop,
+                "final_occ_map_pgm": str(self.output_dir / "final_occ_map.pgm")
+                if self.latest_grid is not None
+                else "",
+                "final_occ_map_yaml": str(self.output_dir / "final_occ_map.yaml")
+                if self.latest_grid is not None
+                else "",
                 "final_first_person": final_first_person,
                 "final_external_camera": final_external,
                 "refreshed_subgoal_overlays": refreshed_subgoal_overlays,
@@ -3688,6 +3706,12 @@ class ExploreDebugRecorder:
                 "subgoals": self._json_safe_subgoals(),
                 "final_overlay": final_overlay,
                 "final_overlay_crop": final_overlay_crop,
+                "final_occ_map_pgm": str(self.output_dir / "final_occ_map.pgm")
+                if self.latest_grid is not None
+                else "",
+                "final_occ_map_yaml": str(self.output_dir / "final_occ_map.yaml")
+                if self.latest_grid is not None
+                else "",
                 "final_first_person": final_first_person,
                 "final_external_camera": final_external,
                 "final_first_person_stamp": 0.0 if self.latest_image is None else float(self.latest_image[0]),
