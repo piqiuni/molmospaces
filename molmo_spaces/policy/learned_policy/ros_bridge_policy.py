@@ -28,6 +28,7 @@ class RosBridgePolicy(BasePolicy):
         depth_topic: str = "/molmo_spaces/head_camera/depth",
         action_timeout_s: float = 0.0,
         blocking_observation_republish_period_s: float = 0.25,
+        blocking_republish_pointcloud: bool = False,
         queue_size: int = 1,
         publish_pointcloud: bool = True,
         publish_camera_info: bool = True,
@@ -78,6 +79,7 @@ class RosBridgePolicy(BasePolicy):
         self.blocking_observation_republish_period_s = max(
             0.0, float(blocking_observation_republish_period_s)
         )
+        self.blocking_republish_pointcloud = bool(blocking_republish_pointcloud)
         self.queue_size = queue_size
         self.publish_pointcloud = publish_pointcloud
         self.publish_camera_info = publish_camera_info
@@ -1124,13 +1126,21 @@ class RosBridgePolicy(BasePolicy):
             (self._obs_pub, messages.get("rgb")),
             (self._extra_image_pub, messages.get("extra_rgb")),
             (self._depth_pub, messages.get("depth")),
-            (self._pointcloud_pub, messages.get("pointcloud")),
         )
         for publisher, message in topic_messages:
             if publisher is None or message is None:
                 continue
             message.header.stamp = stamp
             publisher.publish(message)
+
+        # A mapping observation belongs to one simulator step. Re-stamping and
+        # integrating the same cloud while waiting for cmd_vel overweights one
+        # depth frame and can repeatedly clear the same erroneous edge ray.
+        if self.blocking_republish_pointcloud:
+            pointcloud = messages.get("pointcloud")
+            if self._pointcloud_pub is not None and pointcloud is not None:
+                pointcloud.header.stamp = stamp
+                self._pointcloud_pub.publish(pointcloud)
 
         camera_info = messages.get("camera_info")
         if camera_info is not None:

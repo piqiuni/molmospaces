@@ -7,7 +7,18 @@ def _ensure_nltk():
     import nltk
 
     for corpus in ["wordnet", "wordnet2022"]:
-        nltk.download(corpus)
+        candidates = (f"corpora/{corpus}", f"corpora/{corpus}.zip")
+        if any(_nltk_resource_exists(nltk, candidate) for candidate in candidates):
+            continue
+        nltk.download(corpus, quiet=True, raise_on_error=True)
+
+
+def _nltk_resource_exists(nltk, resource: str) -> bool:
+    try:
+        nltk.data.find(resource)
+        return True
+    except LookupError:
+        return False
 
 
 _ensure_nltk()

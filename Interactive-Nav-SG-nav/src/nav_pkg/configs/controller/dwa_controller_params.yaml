@@ -2,14 +2,16 @@ DWAPlannerROS:
 
 # Robot Configuration Parameters
   max_vel_x: 0.46
-  min_vel_x: 0.00
+  # Permit a slow collision-checked reverse escape when the base is too close
+  # to a wall for either a forward arc or an in-place rotation.
+  min_vel_x: -0.10
 
   max_vel_y: 0.0
   min_vel_y: 0.0
 
   # The velocity when robot is moving in a straight line
   max_vel_trans: 0.5
-  min_vel_trans: 0.0
+  min_vel_trans: 0.02
 
   max_vel_theta: 0.35
   min_vel_theta: 0.10
@@ -47,10 +49,19 @@ DWAPlannerROS:
   # A path directly behind the robot is symmetric for DWA. Commit to one
   # collision-checked turn direction until the path is in the forward sector.
   rear_path_prerotate_enabled: true
-  rear_path_enter_angle: 2.2
-  rear_path_exit_angle: 0.9
+  rear_path_enter_angle: 1.75
+  # Do not release forward motion while the rear path is still ~46 deg away.
+  # A tighter exit angle keeps narrow-door turns in the collision-checked
+  # in-place rotation phase until the base is substantially path-aligned.
+  rear_path_exit_angle: 0.35
   rear_path_lookahead_dist: 0.45
-  rear_path_rotate_speed: 0.22
+  rear_path_rotate_speed: 0.18
+
+  # Never report a near-zero command as a valid local trajectory while a
+  # non-empty global path is still active.
+  reject_degenerate_cmd_enabled: true
+  degenerate_cmd_min_trans: 0.02
+  degenerate_cmd_min_rot: 0.08
 
   # Debugging
   publish_traj_pc: true

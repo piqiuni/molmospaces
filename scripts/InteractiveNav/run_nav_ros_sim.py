@@ -674,6 +674,14 @@ def parse_args():
         help="Republish the current observation while blocking so ROS can initialize and plan.",
     )
     parser.add_argument(
+        "--blocking_republish_pointcloud",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Also republish the same mapping cloud while blocked; disabled to avoid duplicate OCC integration.",
+    )
+    parser.add_argument(
         "--map_warmup_skip_frames",
         type=int,
         default=0,
@@ -805,6 +813,7 @@ def main():
             depth_topic=args.depth_topic,
             action_timeout_s=effective_action_timeout_s,
             blocking_observation_republish_period_s=args.blocking_observation_republish_period_s,
+            blocking_republish_pointcloud=args.blocking_republish_pointcloud,
             depth_camera_name=args.depth_camera_name,
             pointcloud_frame_id=args.pointcloud_frame_id,
             pointcloud_stride=args.pointcloud_stride,

@@ -903,6 +903,7 @@ class ExploreDebugRecorder:
         self.seen_status_keys: set[str] = set()
         self.last_explore_status_time = 0.0
         self.last_explore_active_goal = None
+        self.last_explore_goal_key = None
         self.last_cmd_vel_record_time: dict[str, float] = {}
         self.cmd_vel_counts: dict[str, int] = {}
         self.cmd_vel_nonzero_counts: dict[str, int] = {}
@@ -2880,18 +2881,43 @@ class ExploreDebugRecorder:
         state = payload.get("state") if isinstance(payload, dict) else None
         if isinstance(state, dict):
             active_goal = state.get("active_goal")
+        active_goal_key = self._active_goal_key(active_goal)
         with self.lock:
             if self.shutting_down:
                 return
-            active_changed = active_goal != self.last_explore_active_goal
+            active_changed = active_goal_key != self.last_explore_goal_key
             if now - self.last_explore_status_time < self.args.explore_status_period_sec and not active_changed:
                 return
+            active_presence_changed = (active_goal_key is None) != (self.last_explore_goal_key is None)
+            if active_presence_changed:
+                self.stall_reference_time = now
+                self.stall_reference_yaw_motion_rad = self.total_yaw_motion_rad
+                if self.latest_pose is None:
+                    self.stall_reference_xy = None
+                    self.stall_reference_yaw = None
+                else:
+                    self.stall_reference_xy = self.latest_pose[:2]
+                    self.stall_reference_yaw = self.latest_pose[2]
             self.last_explore_status_time = now
             self.last_explore_active_goal = active_goal
+            self.last_explore_goal_key = active_goal_key
             self._write_event(
                 "explore_status",
                 {"elapsed_sec": now - self.start_wall_time, "step_id": self.debug_step, "payload": payload},
             )
+
+    @staticmethod
+    def _active_goal_key(active_goal):  # noqa: ANN001, ANN205
+        if not isinstance(active_goal, dict):
+            return None
+        point = active_goal.get("point")
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            return (active_goal.get("cluster_id"),)
+        return (
+            active_goal.get("cluster_id"),
+            round(float(point[0]), 3),
+            round(float(point[1]), 3),
+        )
 
     def stall_timer_callback(self, _event) -> None:  # noqa: ANN001
         if self.shutting_down:
