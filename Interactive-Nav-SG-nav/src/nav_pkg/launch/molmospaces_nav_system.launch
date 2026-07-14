@@ -4,6 +4,7 @@
 
   <arg name="start_sim" default="true"/>
   <arg name="start_mapping" default="true"/>
+  <arg name="mapping_mode" default="odom_locked"/>
   <arg name="start_semantic_mapping" default="false"/>
   <arg name="manual_control" default="false"/>
   <arg name="start_explore_py" default="false"/>
@@ -12,17 +13,22 @@
   <arg name="semantic_use_gt" default="false"/>
   <arg name="semantic_source" default="detector"/>
   <arg name="publish_realtime_gt" default="false"/>
-  <arg name="local_costmap_inflation_radius" default="0.1"/>
+  <arg name="local_costmap_inflation_radius" default="0.15"/>
   <arg name="explore_py_config_file" default="$(find explore_py_pkg)/config/explore_py.yaml"/>
 
   <arg name="robot" default="rby1"/>
   <arg name="scene_dataset" default="procthor-10k"/>
   <arg name="data_split" default="train"/>
   <arg name="house_ind" default="1"/>
+  <arg name="house_inds" default="$(arg house_ind)"/>
   <arg name="target_types" default="Chair"/>
   <arg name="exploration_only" default="false"/>
   <arg name="explore_target_description" default="$(arg target_types)"/>
   <arg name="task_horizon" default="3000"/>
+  <arg name="scene_timeout_s" default="0"/>
+  <arg name="max_scene_attempts" default="1"/>
+  <arg name="max_consecutive_action_timeouts" default="12"/>
+  <arg name="output_dir" default=""/>
   <arg name="sim_extra_args" default=""/>
   <arg name="randomize_camera" default="false"/>
   <arg name="lidar_calib_x_m" default="0.0"/>
@@ -58,11 +64,13 @@
           name="molmospaces_nav_ros_sim"
           output="screen"
           required="true"
-          args="--robot $(arg robot) --scene_dataset $(arg scene_dataset) --data_split $(arg data_split) --house_ind $(arg house_ind) --target_types $(arg target_types) --exploration_only $(arg exploration_only) --task_horizon $(arg task_horizon) --randomize_camera $(arg randomize_camera) --lidar_calib_x_m $(arg lidar_calib_x_m) --lidar_calib_y_m $(arg lidar_calib_y_m) --lidar_calib_z_m $(arg lidar_calib_z_m) --lidar_calib_roll_deg $(arg lidar_calib_roll_deg) --lidar_calib_pitch_deg $(arg lidar_calib_pitch_deg) --lidar_calib_yaw_deg $(arg lidar_calib_yaw_deg) --allow_static_lidar_tf_fallback $(arg allow_static_lidar_tf_fallback) --initial_arm_qpos $(arg initial_arm_qpos) --initial_left_arm_qpos $(arg initial_left_arm_qpos) --initial_right_arm_qpos $(arg initial_right_arm_qpos) --publish_debug_front_camera $(arg publish_debug_front_camera) --publish_realtime_gt $(arg publish_realtime_gt) $(arg sim_extra_args)"/>
+          args="--robot $(arg robot) --scene_dataset $(arg scene_dataset) --data_split $(arg data_split) --house_ind $(arg house_ind) --house_inds $(arg house_inds) --target_types $(arg target_types) --exploration_only $(arg exploration_only) --task_horizon $(arg task_horizon) --scene_timeout_s $(arg scene_timeout_s) --max_scene_attempts $(arg max_scene_attempts) --max_consecutive_action_timeouts $(arg max_consecutive_action_timeouts) --output_dir=$(arg output_dir) --randomize_camera $(arg randomize_camera) --lidar_calib_x_m $(arg lidar_calib_x_m) --lidar_calib_y_m $(arg lidar_calib_y_m) --lidar_calib_z_m $(arg lidar_calib_z_m) --lidar_calib_roll_deg $(arg lidar_calib_roll_deg) --lidar_calib_pitch_deg $(arg lidar_calib_pitch_deg) --lidar_calib_yaw_deg $(arg lidar_calib_yaw_deg) --allow_static_lidar_tf_fallback $(arg allow_static_lidar_tf_fallback) --initial_arm_qpos $(arg initial_arm_qpos) --initial_left_arm_qpos $(arg initial_left_arm_qpos) --initial_right_arm_qpos $(arg initial_right_arm_qpos) --publish_debug_front_camera $(arg publish_debug_front_camera) --publish_realtime_gt $(arg publish_realtime_gt) $(arg sim_extra_args)"/>
   </group>
 
   <group if="$(arg start_mapping)">
-    <include file="$(find struct_mapping_pkg)/launch/slam_gmapping.launch"/>
+    <include file="$(find struct_mapping_pkg)/launch/slam_gmapping.launch">
+      <arg name="mapping_mode" value="$(arg mapping_mode)"/>
+    </include>
   </group>
 
   <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_source') == 'detector' and arg('semantic_use_gt') != 'true')">

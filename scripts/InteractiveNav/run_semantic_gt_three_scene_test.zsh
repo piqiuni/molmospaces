@@ -103,7 +103,7 @@ for house_ind in "${HOUSES[@]}"; do
   sleep 2
   inflation_radius="$(rosparam get /move_base/local_costmap/inflation_layer/inflation_radius 2>/dev/null || true)"
   print -r -- "${inflation_radius}" > "${scene_dir}/local_inflation_radius.txt"
-  if [[ "${inflation_radius}" != "0.1" ]]; then
+  if [[ "${inflation_radius}" != "0.15" ]]; then
     print -u2 -- "Unexpected local inflation radius for house ${house_ind}: ${inflation_radius}"
     exit 2
   fi

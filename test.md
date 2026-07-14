@@ -136,8 +136,15 @@ python scripts/InteractiveNav/run_nav_ros_sim.py \
   --data_split train \
   --house_ind 1 \
   --target_types Apple \
-  --task_horizon 3000
+  --task_horizon 3000 \
+  --policy_dt_ms 100 \
+  --ctrl_dt_ms 2 \
+  --action_timeout_s 0 \
+  --require_fresh_cmd_vel true \
+  --require_move_base_active_for_cmd_vel true
 ```
+
+`action_timeout_s=0` 表示仿真阻塞等待当前观测之后产生的新 ROS 动作；等待期间会周期性重发当前观测，因此 ROS 启动和首个规划阶段不会推进空动作 step。每次 `task.step()` 固定推进 `100ms` 仿真时间，不按墙钟 10Hz sleep。
 
 ## 5.2 带 timing 日志的仿真测试
 
@@ -148,14 +155,20 @@ python scripts/InteractiveNav/run_nav_ros_sim.py \
 
 ```bash
 conda activate mlspaces
-python scripts/datagen/run_nav_ros_sim.py \
+python scripts/InteractiveNav/run_nav_ros_sim.py \
   --robot rby1 \
   --scene_dataset procthor-10k \
   --data_split train \
   --house_ind 1 \
   --target_types Apple \
-  --timing_log_every_n_frames
+  --timing_log_every_n_frames 20 \
+  --sim_timing_log_every_n_steps 20 \
+  --step_log_every_n_steps 10
 ```
+
+`RosBridgePolicy timing` 分解观测发布与动作等待；`SimLoop timing` 分解 policy、MuJoCo physics、sensor polling 和完整循环耗时。ROS 探索默认不渲染未使用的腕部 RGB/depth，相机需求调试时可传 `--include_wrist_cameras true` 恢复。
+
+默认 `ctrl_dt_ms=2` 保持原有低层控制动态。已验证 `--ctrl_dt_ms 10` 可进一步减少 physics 耗时，但会改变控制更新频率，应作为性能实验参数单独验证，不作为探索基线默认值。
 
 ## 5.3 ROS 导航系统一键启动
 
@@ -169,6 +182,120 @@ conda activate mlspaces
 source ./Interactive-Nav-SG-nav/devel/setup.zsh
 roslaunch nav_pkg molmospaces_nav_system.launch
 ```
+
+## 5.3.1 多 ROS Master 并行运行
+
+并行调度器为每个 worker 创建独立的 `ROS_MASTER_URI`、`ROS_HOME`、ROS 日志目录、仿真输出目录和进程组。不同 worker 可以继续使用相同的话题名与 TF frame。
+
+先检查分片、端口、GPU 和实际启动命令，不启动 ROS：
+
+```bash
+conda activate mlspaces
+python scripts/InteractiveNav/run_parallel_ros_episodes.py \
+  --house-inds 4 7 10 \
+  --num-workers 2 \
+  --base-master-port 11411 \
+  --output-dir /home/user/ldl/molmospaces/outputs/parallel_ros_dryrun \
+  --exploration-only \
+  --start-explore-py \
+  --task-horizon 50 \
+  --dry-run
+```
+
+运行两个短场景 worker：
+
+```bash
+conda activate mlspaces
+python scripts/InteractiveNav/run_parallel_ros_episodes.py \
+  --house-inds 4 7 \
+  --num-workers 2 \
+  --base-master-port 11411 \
+  --output-dir /home/user/ldl/molmospaces/outputs/parallel_ros_houses_04_07 \
+  --exploration-only \
+  --start-explore-py \
+  --task-horizon 50 \
+  --worker-timeout-s 600 \
+  --resource-interval-s 2
+```
+
+如果有多个 GPU，可按 worker 指定；GPU 数量少于 worker 时会轮询复用：
+
+```bash
+--gpu-ids 0 1
+```
+
+主要输出：
+
+- `plan.json`：worker 分片、ROS Master、GPU、命令和 RViz 连接方式
+- `worker_NNN/roscore.log`：独立 Master 日志
+- `worker_NNN/roslaunch.log`：导航系统和仿真日志
+- `worker_NNN/worker.log`：调度器生命周期日志
+- `worker_NNN/episodes.jsonl`：house/episode 的 running 与最终状态事件
+- `worker_NNN/resources.jsonl`：CPU、RSS、主机内存、swap、GPU 利用率与显存采样
+- `worker_NNN/status.json`：worker 退出状态与耗时
+- `summary.json`：全部 worker 状态和资源统计
+
+观察指定 worker：
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:11411 \
+ROS_HOME=/tmp/molmospaces_ros/worker_000 \
+rviz
+```
+
+调度器收到 `Ctrl-C` 后会依次向自己创建的 `roslaunch` 和 `roscore` 进程组发送 `SIGINT`、`SIGTERM` 和最终的 `SIGKILL`。不要使用全局 `pkill roscore` 清理，以免影响其他 ROS 任务。
+
+单场景超时与失败重试：
+
+```bash
+python scripts/InteractiveNav/run_parallel_ros_episodes.py \
+  --house-inds 0 1 2 3 \
+  --num-workers 4 \
+  --output-dir /home/user/ldl/molmospaces/outputs/parallel_ros_retry_example \
+  --data-split val \
+  --exploration-only \
+  --start-explore-py \
+  --task-horizon 850 \
+  --scene-timeout-s 900 \
+  --max-scene-attempts 2 \
+  --max-consecutive-action-timeouts 12
+```
+
+- `scene-timeout-s`：单次场景 attempt 的墙钟上限。
+- `max-scene-attempts`：场景执行异常或超时后的最大尝试次数。
+- `max-consecutive-action-timeouts`：连续没有新 ROS 动作时提前判定本次 attempt 失败。启用场景超时且未显式设置 `action_timeout_s` 时，单次动作等待自动限制为最多5秒。
+- 超时会抛出场景执行异常，当前 attempt 不保存为完成轨迹；pipeline 执行清理和 ROS reset 后进入下一次 attempt。正常跑满 horizon 的场景不会额外重试。
+
+并行运行时为每个 worker 记录探索四宫格、第一视角、外部相机、地图轨迹和调试信息：
+
+```bash
+python scripts/InteractiveNav/run_parallel_ros_episodes.py \
+  --house-inds 0 1 2 3 \
+  --num-workers 4 \
+  --output-dir /home/user/ldl/molmospaces/outputs/parallel_ros_debug_4w \
+  --data-split val \
+  --exploration-only \
+  --start-explore-py \
+  --task-horizon 300 \
+  --record-debug
+```
+
+每个 worker 的 debug 输出位于：
+
+```text
+worker_NNN/debug/
+```
+
+主要产物包括：
+
+- `videos/composite_frames/`：第一视角、地图、规划与状态组成的逐帧四宫格PNG
+- `videos/first_person.mp4`：包含地图四宫格的H264视频
+- `videos/external_camera.mp4`：外部相机视频
+- `summary.json`：轨迹、命令、规划、视频和停滞统计
+- `final_map_trajectory.png`：最终地图与探索轨迹
+- `recorder.log`：独立recorder日志
+
+`--recorder-extra-args` 可继续传递 `record_explore_debug.py` 参数。调度器结束仿真后会先给recorder最多120秒完成异步写盘与视频编码，再关闭ROS Master。
 
 ## 5.4 语义地图调试启动
 
@@ -537,6 +664,32 @@ python /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/src/semantic_mapping_py
 - oracle 开门后是否立即恢复可达性
 - 图/提示是否给出正确的交互信号
 - 交互后是否触发继续导航而不是停在中间状态
+
+## 9.5 Python 探索与多场景检查
+
+单场景探索：
+
+```bash
+conda activate mlspaces
+source /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/devel/setup.zsh
+roslaunch nav_pkg molmospaces_nav_system.launch \
+  start_explore_py:=true \
+  exploration_only:=true \
+  house_ind:=4
+```
+
+同一 simulator 进程顺序加载多个场景：
+
+```bash
+roslaunch nav_pkg molmospaces_nav_system.launch \
+  start_explore_py:=true \
+  exploration_only:=true \
+  house_inds:="4,7,10"
+```
+
+当前 ROS 探索仿真默认使用 `policy_dt_ms=200`、`ctrl_dt_ms=10`、
+`sim_dt_ms=10`，`move_base` controller 为 `5Hz`。场景切换时会取消目标、
+清理 costmap，并重置 gmapping 与 `explore_py` 状态。
 
 ---
 

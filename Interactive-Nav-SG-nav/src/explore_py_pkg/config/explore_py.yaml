@@ -13,6 +13,7 @@ topics:
   status: "/explore_py/status"
   frontiers: "/explore_py/frontiers"
   current_subgoal: "/explore_py/current_subgoal"
+  reset: "/explore_py/reset"
   llm_value_grid: "/explore_py/llm_value_grid"
   strategy_bias: "/explore_py/strategy_bias"
   object_map: "/semantic_mapping/obj_map"
@@ -42,6 +43,9 @@ exploration:
   failed_point_blacklist_radius_m: 1.25
   reached_point_blacklist_sec: 90.0
   reached_point_blacklist_radius_m: 0.75
+  # Reaching a viewpoint without clearing its frontier means that frontier is
+  # not observable from the navigable free space. Suppress nearby re-clusters.
+  unreachable_frontier_radius_m: 1.0
   active_goal_frontier_min_cells: 3
   initial_spin_enabled: false
   initial_spin_angle_rad: 6.283185307179586
@@ -56,7 +60,7 @@ exploration:
   global_plan_min_poses: 3
   plan_freshness_sec: 4.0
   global_plan_current_goal_check_enabled: true
-  global_plan_current_goal_grace_sec: 60.0
+  global_plan_current_goal_grace_sec: 4.0
   global_plan_goal_tolerance_m: 0.6
   initial_local_goal_count: 3
 

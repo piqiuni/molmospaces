@@ -6,12 +6,14 @@ import csv
 import json
 import logging
 import math
+import queue
 import subprocess
 import struct
 import sys
 import threading
 import time
 import zlib
+from collections import deque
 from pathlib import Path
 
 
@@ -162,6 +164,134 @@ def _write_png(path: Path, width: int, height: int, rgb: bytearray) -> None:
     path.write_bytes(data)
 
 
+class _AsyncArtifactWriter:
+    def __init__(self, fps: float, crf: int, preset: str, max_queue: int):
+        self.fps = max(0.1, float(fps))
+        self.crf = int(crf)
+        self.preset = str(preset)
+        self.jobs: queue.Queue = queue.Queue(maxsize=max(8, int(max_queue)))
+        self.video_jobs: queue.Queue = queue.Queue(maxsize=max(8, int(max_queue)))
+        self.processes: dict[str, subprocess.Popen] = {}
+        self.process_sizes: dict[str, tuple[int, int]] = {}
+        self.errors: list[str] = []
+        self.dropped_jobs = 0
+        self.thread = threading.Thread(target=self._run, name="explore-artifact-writer", daemon=True)
+        self.video_thread = threading.Thread(target=self._run_video, name="explore-video-writer", daemon=True)
+        self.thread.start()
+        self.video_thread.start()
+
+    def submit_png(self, path: Path, frame) -> None:
+        self._submit(("png", Path(path), frame.copy()))
+
+    def submit_video(self, stream: str, path: Path, frame) -> None:
+        try:
+            self.video_jobs.put_nowait((str(stream), Path(path), frame.copy()))
+        except queue.Full:
+            self.dropped_jobs += 1
+
+    def _submit(self, job) -> None:
+        try:
+            self.jobs.put_nowait(job)
+        except queue.Full:
+            self.dropped_jobs += 1
+
+    def _open_video(self, stream: str, path: Path, width: int, height: int):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        log_path = path.with_name(f"{path.stem}_runtime_ffmpeg.log")
+        log_handle = log_path.open("wb")
+        command = [
+            "ffmpeg", "-nostdin", "-y", "-loglevel", "warning",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
+            "-r", f"{self.fps:.6f}", "-i", "-", "-an", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", "-crf", str(self.crf), "-preset", self.preset,
+            "-g", str(max(1, int(round(self.fps)))),
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof", str(path),
+        ]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log_handle, stderr=subprocess.STDOUT)
+        process._explore_log_handle = log_handle  # type: ignore[attr-defined]
+        self.processes[stream] = process
+        self.process_sizes[stream] = (width, height)
+        return process
+
+    def _write_video(self, stream: str, path: Path, frame) -> None:
+        height, width = frame.shape[:2]
+        process = self.processes.get(stream)
+        if process is None:
+            process = self._open_video(stream, path, width, height)
+        if self.process_sizes.get(stream) != (width, height):
+            frame = cv2.resize(frame, self.process_sizes[stream], interpolation=cv2.INTER_AREA)
+        if process.stdin is None:
+            raise RuntimeError(f"ffmpeg stdin unavailable for {stream}")
+        process.stdin.write(frame.tobytes())
+
+    def _run(self) -> None:
+        while True:
+            job = self.jobs.get()
+            try:
+                if job is None:
+                    return
+                _kind, path, frame = job
+                path.parent.mkdir(parents=True, exist_ok=True)
+                ok = cv2.imwrite(
+                    str(path),
+                    cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                    [cv2.IMWRITE_PNG_COMPRESSION, 1],
+                )
+                if not ok:
+                    raise RuntimeError(f"failed to write {path}")
+            except Exception as exc:  # pragma: no cover - debug artifact best effort
+                self.errors.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                self.jobs.task_done()
+
+    def _run_video(self) -> None:
+        while True:
+            job = self.video_jobs.get()
+            try:
+                if job is None:
+                    return
+                stream, path, frame = job
+                self._write_video(stream, path, frame)
+            except Exception as exc:  # pragma: no cover - debug artifact best effort
+                self.errors.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                self.video_jobs.task_done()
+
+    def close(self) -> None:
+        self.video_jobs.join()
+        self.video_jobs.put(None)
+        self.video_thread.join(timeout=30.0)
+        self.jobs.join()
+        self.jobs.put(None)
+        self.thread.join(timeout=30.0)
+        for process in self.processes.values():
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception as exc:
+                self.errors.append(f"ffmpeg_stdin_close:{type(exc).__name__}: {exc}")
+        for stream, process in self.processes.items():
+            try:
+                returncode = process.wait(timeout=15.0)
+                if returncode != 0:
+                    self.errors.append(f"ffmpeg_{stream}_exit={returncode}")
+            except subprocess.TimeoutExpired:
+                self.errors.append(f"ffmpeg_{stream}_wait_timeout")
+                process.terminate()
+                try:
+                    process.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3.0)
+            except Exception as exc:
+                self.errors.append(f"ffmpeg_{stream}_close:{type(exc).__name__}: {exc}")
+                process.kill()
+            finally:
+                log_handle = getattr(process, "_explore_log_handle", None)
+                if log_handle is not None:
+                    log_handle.close()
+
+
 def _write_grid_pgm_yaml(prefix: Path, grid: OccupancyGrid) -> None:
     width = int(grid.info.width)
     height = int(grid.info.height)
@@ -229,6 +359,12 @@ def _apply_grid_update(grid: OccupancyGrid, update: OccupancyGridUpdate) -> bool
 
 
 def _read_png(path: Path) -> tuple[int, int, bytearray] | None:
+    if cv2 is not None:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is not None:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            height, width = rgb.shape[:2]
+            return int(width), int(height), bytearray(rgb.tobytes())
     data = path.read_bytes()
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         return None
@@ -748,6 +884,8 @@ class ExploreDebugRecorder:
         self.last_image_wall_time = 0.0
         self.final_first_person_path = ""
         self.latest_pose: tuple[float, float, float] | None = None
+        self.latest_pose_stamp = 0.0
+        self.pose_history = deque(maxlen=2000)
         self.latest_pose_step = 0
         self.latest_global_plan: dict | None = None
         self.latest_local_global_plan: dict | None = None
@@ -766,10 +904,14 @@ class ExploreDebugRecorder:
         self.last_recorded_odom_time = 0.0
         self.stall_reference_xy: tuple[float, float] | None = None
         self.stall_reference_yaw: float | None = None
+        self.stall_reference_yaw_motion_rad = 0.0
         self.stall_reference_time = 0.0
+        self.total_yaw_motion_rad = 0.0
+        self.last_yaw_for_motion: float | None = None
         self.last_stall_snapshot_time = 0.0
         self.stall_snapshot_count = 0
         self.stall_snapshot_records: list[dict] = []
+        self.stuck_exit_requested = False
         self.distance_m = 0.0
         self.trajectory: list[tuple[float, float, float, float]] = []
         self.goal_count = 0
@@ -807,6 +949,14 @@ class ExploreDebugRecorder:
         self.last_external_video_frame_time = 0.0
         self.external_video_error = ""
         self.external_video_codec_name = "h264" if args.first_person_video_h264 else str(args.first_person_video_codec)
+        self.artifact_writer = None
+        if args.async_artifact_writes and cv2 is not None and np is not None:
+            self.artifact_writer = _AsyncArtifactWriter(
+                fps=args.first_person_video_fps,
+                crf=args.first_person_video_h264_crf,
+                preset=args.first_person_video_h264_preset,
+                max_queue=args.artifact_write_queue_size,
+            )
         self.subscribers = []
         if args.first_person_video and (cv2 is None or np is None):
             self.first_person_video_error = "cv2_or_numpy_unavailable"
@@ -818,6 +968,7 @@ class ExploreDebugRecorder:
         self.status_file = (output_dir / "move_base_status.csv").open("a", newline="", buffering=1)
         self.cmd_vel_file = (output_dir / "cmd_vel.csv").open("a", newline="", buffering=1)
         self.plan_file = (output_dir / "move_base_plans.csv").open("a", newline="", buffering=1)
+        self.map_to_odom_file = (output_dir / "map_to_odom.csv").open("a", newline="", buffering=1)
         self.move_base_log_file = (output_dir / "move_base_rosout.log").open("a", buffering=1)
         self.semantic_events_file = (self.graph_dir / "graph_revision_events.jsonl").open("a", buffering=1)
         self.video_frames_file = (output_dir / "video_frames.csv").open("a", newline="", buffering=1)
@@ -866,7 +1017,12 @@ class ExploreDebugRecorder:
         )
         self.cmd_vel_writer = csv.DictWriter(
             self.cmd_vel_file,
-            fieldnames=["step_id", "elapsed_sec", "stamp", "topic", "linear_x", "linear_y", "angular_z", "speed"],
+            fieldnames=[
+                "step_id", "elapsed_sec", "stamp", "topic", "linear_x", "linear_y", "angular_z", "speed",
+                "image_stamp", "image_wall_age_sec", "map_stamp", "map_step", "map_wall_age_sec",
+                "global_plan_stamp", "global_plan_step", "global_plan_wall_age_sec",
+                "local_plan_stamp", "local_plan_step", "local_plan_wall_age_sec",
+            ],
         )
         self.plan_writer = csv.DictWriter(
             self.plan_file,
@@ -884,6 +1040,10 @@ class ExploreDebugRecorder:
                 "y",
                 "yaw",
             ],
+        )
+        self.map_to_odom_writer = csv.DictWriter(
+            self.map_to_odom_file,
+            fieldnames=["step_id", "elapsed_sec", "stamp", "x", "y", "yaw"],
         )
         self.video_frames_writer = csv.DictWriter(
             self.video_frames_file,
@@ -907,6 +1067,7 @@ class ExploreDebugRecorder:
                 "stuck_duration_sec",
                 "stuck_moved_m",
                 "stuck_yaw_delta_rad",
+                "stuck_yaw_motion_rad",
                 "camera_frame",
                 "map_frame",
                 "global_costmap_step",
@@ -923,6 +1084,7 @@ class ExploreDebugRecorder:
         self.status_writer.writeheader()
         self.cmd_vel_writer.writeheader()
         self.plan_writer.writeheader()
+        self.map_to_odom_writer.writeheader()
         self.video_frames_writer.writeheader()
 
         self.subscribers.append(rospy.Subscriber(args.occupancy_grid_topic, OccupancyGrid, self.occupancy_callback, queue_size=1))
@@ -953,14 +1115,16 @@ class ExploreDebugRecorder:
             queue_size=50,
         ))
         self.stall_timer = rospy.Timer(rospy.Duration(max(0.5, args.stall_check_period_sec)), self.stall_timer_callback)
+        self.tf_record_timer = rospy.Timer(rospy.Duration(max(0.1, args.tf_record_period_sec)), self.tf_record_timer_callback)
         rospy.on_shutdown(self.shutdown)
 
     def occupancy_callback(self, msg: OccupancyGrid) -> None:
+        video_rgb = self._grid_to_video_rgb_locked(msg)
         with self.lock:
             if self.shutting_down:
                 return
             self.latest_grid = msg
-            self.latest_grid_video_rgb = self._grid_to_video_rgb_locked(msg)
+            self.latest_grid_video_rgb = video_rgb
             self.latest_grid_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_grid_wall_time = time.time()
             self.latest_grid_step = self.debug_step
@@ -1056,11 +1220,13 @@ class ExploreDebugRecorder:
         return events
 
     def global_costmap_callback(self, msg: OccupancyGrid) -> None:
+        copied = _copy_grid(msg)
+        video_rgb = self._costmap_to_video_rgb_locked(copied)
         with self.lock:
             if self.shutting_down:
                 return
-            self.latest_global_costmap = _copy_grid(msg)
-            self.latest_global_costmap_video_rgb = self._grid_to_video_rgb_locked(msg)
+            self.latest_global_costmap = copied
+            self.latest_global_costmap_video_rgb = video_rgb
             self.latest_global_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_global_costmap_wall_time = time.time()
             self.latest_global_costmap_step = self.debug_step
@@ -1071,17 +1237,24 @@ class ExploreDebugRecorder:
                 return
             if not _apply_grid_update(self.latest_global_costmap, msg):
                 return
-            self.latest_global_costmap_video_rgb = self._grid_to_video_rgb_locked(self.latest_global_costmap)
+            grid_snapshot = _copy_grid(self.latest_global_costmap)
+        video_rgb = self._costmap_to_video_rgb_locked(grid_snapshot)
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.latest_global_costmap_video_rgb = video_rgb
             self.latest_global_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_global_costmap_wall_time = time.time()
             self.latest_global_costmap_step = self.debug_step
 
     def local_costmap_callback(self, msg: OccupancyGrid) -> None:
+        copied = _copy_grid(msg)
+        video_rgb = self._costmap_to_video_rgb_locked(copied)
         with self.lock:
             if self.shutting_down:
                 return
-            self.latest_local_costmap = _copy_grid(msg)
-            self.latest_local_costmap_video_rgb = self._grid_to_video_rgb_locked(msg)
+            self.latest_local_costmap = copied
+            self.latest_local_costmap_video_rgb = video_rgb
             self.latest_local_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_local_costmap_wall_time = time.time()
             self.latest_local_costmap_step = self.debug_step
@@ -1378,7 +1551,7 @@ class ExploreDebugRecorder:
                 local_costmap = self.latest_local_costmap
                 local_costmap_base = self.latest_local_costmap_video_rgb
                 local_costmap_step = int(self.latest_local_costmap_step)
-                pose = self.latest_pose
+                pose = self._pose_at_stamp_locked(image_stamp)
                 trajectory = list(self.trajectory)
                 active_goal = self._active_goal_xy_locked()
                 active_goal_yaw = self._active_goal_yaw_locked()
@@ -1387,9 +1560,11 @@ class ExploreDebugRecorder:
                 local_plan = self.latest_local_plan
                 distance_m = float(self.distance_m)
                 goal_count = int(self.goal_count)
+                graph_revision = int(self.latest_unified_graph.get("graph_revision", 0) or 0)
+                pending_semantic_keyframe_revision = int(self.pending_semantic_keyframe_revision)
             stamp_delta = abs(image_stamp - map_stamp) if image_stamp > 0.0 and map_stamp > 0.0 else float("inf")
             map_available = map_grid is not None and map_base is not None
-            map_age = now - map_wall_time if map_wall_time > 0.0 else float("inf")
+            map_age = max(0.0, now - map_wall_time) if map_wall_time > 0.0 else float("inf")
             map_fresh = map_available and map_age <= float(self.args.video_map_max_age_sec)
             map_sync = map_available
             frame_width = int(self.args.first_person_video_width_px)
@@ -1419,6 +1594,7 @@ class ExploreDebugRecorder:
                     global_plan=global_plan,
                     local_plan=local_plan,
                     image_step=image_step,
+                    crop_margin_px=int(self.args.video_occ_crop_margin_px),
                 )
                 global_costmap_panel = self._render_video_map_panel_locked(
                     frame_width,
@@ -1519,7 +1695,8 @@ class ExploreDebugRecorder:
             )
             stuck_label = (
                 f"STUCK_TEST={stuck['state']} dur={stuck['duration_sec']:.1f}s "
-                f"move={stuck['moved_m']:.2f}m yaw={stuck['yaw_delta_rad']:.2f}rad"
+                f"move={stuck['moved_m']:.2f}m yaw_net={stuck['yaw_delta_rad']:.2f} "
+                f"yaw_sum={stuck['yaw_motion_rad']:.2f}rad"
             )
             text_right = min(frame_width - 8, 620)
             cv2.rectangle(frame, (8, 8), (text_right, 88), (255, 255, 255), -1)
@@ -1535,46 +1712,70 @@ class ExploreDebugRecorder:
             semantic_spatial_path = self.video_semantic_spatial_frame_dir / f"frame_{frame_index:06d}_semantic_spatial.png"
             semantic_topology_path = self.video_semantic_topology_frame_dir / f"frame_{frame_index:06d}_semantic_topology.png"
             composite_path = self.video_composite_frame_dir / f"frame_{frame_index:06d}_composite.png"
-            _write_png(camera_path, frame_width, frame_height, bytearray(camera_frame.tobytes()))
-            if occ_panel is not None:
-                _write_png(map_path, int(occ_panel.shape[1]), int(occ_panel.shape[0]), bytearray(occ_panel.tobytes()))
-            if global_costmap_panel is not None:
-                _write_png(
-                    global_costmap_path,
-                    int(global_costmap_panel.shape[1]),
-                    int(global_costmap_panel.shape[0]),
-                    bytearray(global_costmap_panel.tobytes()),
-                )
-            if local_costmap_panel is not None:
-                _write_png(
-                    local_costmap_path,
-                    int(local_costmap_panel.shape[1]),
-                    int(local_costmap_panel.shape[0]),
-                    bytearray(local_costmap_panel.tobytes()),
-                )
-            if semantic_spatial_panel is not None:
-                _write_png(
-                    semantic_spatial_path,
-                    int(semantic_spatial_panel.shape[1]),
-                    int(semantic_spatial_panel.shape[0]),
-                    bytearray(semantic_spatial_panel.tobytes()),
-                )
-            if semantic_topology_panel is not None:
-                _write_png(
-                    semantic_topology_path,
-                    int(semantic_topology_panel.shape[1]),
-                    int(semantic_topology_panel.shape[0]),
-                    bytearray(semantic_topology_panel.tobytes()),
-                )
-            _write_png(composite_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
-            graph_revision = int(self.latest_unified_graph.get("graph_revision", 0) or 0)
+            semantic_keyframe_path = None
             if (
-                graph_revision == self.pending_semantic_keyframe_revision
+                graph_revision == pending_semantic_keyframe_revision
                 and graph_revision != self.last_semantic_keyframe_revision
             ):
-                keyframe_path = self.semantic_keyframe_dir / f"revision_{graph_revision:06d}.png"
-                _write_png(keyframe_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
+                semantic_keyframe_path = self.semantic_keyframe_dir / f"revision_{graph_revision:06d}.png"
                 self.last_semantic_keyframe_revision = graph_revision
+            if self.artifact_writer is not None:
+                self.artifact_writer.submit_png(camera_path, camera_frame)
+                if occ_panel is not None:
+                    self.artifact_writer.submit_png(map_path, occ_panel)
+                if global_costmap_panel is not None:
+                    self.artifact_writer.submit_png(global_costmap_path, global_costmap_panel)
+                if local_costmap_panel is not None:
+                    self.artifact_writer.submit_png(local_costmap_path, local_costmap_panel)
+                if semantic_spatial_panel is not None:
+                    self.artifact_writer.submit_png(semantic_spatial_path, semantic_spatial_panel)
+                if semantic_topology_panel is not None:
+                    self.artifact_writer.submit_png(semantic_topology_path, semantic_topology_panel)
+                self.artifact_writer.submit_png(composite_path, frame)
+                if semantic_keyframe_path is not None:
+                    self.artifact_writer.submit_png(semantic_keyframe_path, frame)
+                if self.args.runtime_video_encode:
+                    self.artifact_writer.submit_video("first_person", Path(self.first_person_video_path), frame)
+            else:
+                _write_png(camera_path, frame_width, frame_height, bytearray(camera_frame.tobytes()))
+                if occ_panel is not None:
+                    _write_png(map_path, int(occ_panel.shape[1]), int(occ_panel.shape[0]), bytearray(occ_panel.tobytes()))
+                if global_costmap_panel is not None:
+                    _write_png(
+                        global_costmap_path,
+                        int(global_costmap_panel.shape[1]),
+                        int(global_costmap_panel.shape[0]),
+                        bytearray(global_costmap_panel.tobytes()),
+                    )
+                if local_costmap_panel is not None:
+                    _write_png(
+                        local_costmap_path,
+                        int(local_costmap_panel.shape[1]),
+                        int(local_costmap_panel.shape[0]),
+                        bytearray(local_costmap_panel.tobytes()),
+                    )
+                if semantic_spatial_panel is not None:
+                    _write_png(
+                        semantic_spatial_path,
+                        int(semantic_spatial_panel.shape[1]),
+                        int(semantic_spatial_panel.shape[0]),
+                        bytearray(semantic_spatial_panel.tobytes()),
+                    )
+                if semantic_topology_panel is not None:
+                    _write_png(
+                        semantic_topology_path,
+                        int(semantic_topology_panel.shape[1]),
+                        int(semantic_topology_panel.shape[0]),
+                        bytearray(semantic_topology_panel.tobytes()),
+                    )
+                _write_png(composite_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
+                if semantic_keyframe_path is not None:
+                    _write_png(
+                        semantic_keyframe_path,
+                        int(frame.shape[1]),
+                        int(frame.shape[0]),
+                        bytearray(frame.tobytes()),
+                    )
             record = {
                 "frame_index": frame_index,
                 "step_id": image_step,
@@ -1621,6 +1822,7 @@ class ExploreDebugRecorder:
                     "stuck_duration_sec": f"{stuck['duration_sec']:.3f}",
                     "stuck_moved_m": f"{stuck['moved_m']:.6f}",
                     "stuck_yaw_delta_rad": f"{stuck['yaw_delta_rad']:.6f}",
+                    "stuck_yaw_motion_rad": f"{stuck['yaw_motion_rad']:.6f}",
                     "camera_frame": str(camera_path),
                     "map_frame": str(map_path) if occ_panel is not None else "",
                     "global_costmap_step": global_costmap_step,
@@ -1659,7 +1861,8 @@ class ExploreDebugRecorder:
             )
             stuck_label = (
                 f"STUCK_TEST={stuck['state']} dur={stuck['duration_sec']:.1f}s "
-                f"move={stuck['moved_m']:.2f}m yaw={stuck['yaw_delta_rad']:.2f}rad"
+                f"move={stuck['moved_m']:.2f}m yaw_net={stuck['yaw_delta_rad']:.2f} "
+                f"yaw_sum={stuck['yaw_motion_rad']:.2f}rad"
             )
             cv2.rectangle(frame, (8, 8), (min(frame.shape[1] - 8, 900), 66), (255, 255, 255), -1)
             cv2.putText(frame, label, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (15, 15, 15), 2, cv2.LINE_AA)
@@ -1667,7 +1870,12 @@ class ExploreDebugRecorder:
             self.external_video_frame_count += 1
             frame_index = self.external_video_frame_count
             frame_path = self.video_external_frame_dir / f"frame_{frame_index:06d}_external.png"
-            _write_png(frame_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
+            if self.artifact_writer is not None:
+                self.artifact_writer.submit_png(frame_path, frame)
+                if self.args.runtime_video_encode:
+                    self.artifact_writer.submit_video("external", Path(self.external_video_path), frame)
+            else:
+                _write_png(frame_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
             self.external_video_frames.append(
                 {
                     "frame_index": frame_index,
@@ -1711,6 +1919,7 @@ class ExploreDebugRecorder:
                 "duration_sec": 0.0,
                 "moved_m": 0.0,
                 "yaw_delta_rad": 0.0,
+                "yaw_motion_rad": 0.0,
             }
         if pose is None or self.stall_reference_xy is None:
             return {
@@ -1718,18 +1927,20 @@ class ExploreDebugRecorder:
                 "duration_sec": 0.0,
                 "moved_m": 0.0,
                 "yaw_delta_rad": 0.0,
+                "yaw_motion_rad": 0.0,
             }
         duration = max(0.0, now - self.stall_reference_time)
         moved = math.hypot(pose[0] - self.stall_reference_xy[0], pose[1] - self.stall_reference_xy[1])
         yaw_delta = 0.0
         if self.stall_reference_yaw is not None:
             yaw_delta = self._angle_distance(pose[2], self.stall_reference_yaw)
+        yaw_motion = max(0.0, self.total_yaw_motion_rad - self.stall_reference_yaw_motion_rad)
         if duration < float(self.args.video_stuck_window_sec):
             state = "OBSERVING"
         elif moved > float(self.args.video_stuck_distance_m):
             state = "MOVING"
-        elif yaw_delta >= float(self.args.video_stuck_rotation_yaw_rad):
-            state = "STUCK_ROTATING"
+        elif yaw_motion >= float(self.args.video_stuck_rotation_yaw_rad):
+            state = "ROTATING_PROGRESS"
         else:
             state = "STUCK_STATIC"
         return {
@@ -1737,6 +1948,7 @@ class ExploreDebugRecorder:
             "duration_sec": duration,
             "moved_m": moved,
             "yaw_delta_rad": yaw_delta,
+            "yaw_motion_rad": yaw_motion,
         }
 
     @staticmethod
@@ -1749,6 +1961,8 @@ class ExploreDebugRecorder:
         return self.first_person_video_path
 
     def _finalize_first_person_video_locked(self) -> None:
+        if self.args.runtime_video_encode and self.artifact_writer is not None:
+            return
         if self.first_person_video_writer is not None:
             self.first_person_video_writer.release()
             self.first_person_video_writer = None
@@ -1854,7 +2068,8 @@ class ExploreDebugRecorder:
                 frame = np.frombuffer(bytes(frame_rgb), dtype=np.uint8).reshape((frame_h, frame_w, 3))
                 if frame_w != width or frame_h != height:
                     frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                writer.write(bgr)
                 written += 1
         finally:
             writer.release()
@@ -1863,6 +2078,8 @@ class ExploreDebugRecorder:
         self.first_person_video_frame_count = written
 
     def _finalize_external_video_locked(self) -> None:
+        if self.args.runtime_video_encode and self.artifact_writer is not None:
+            return
         if not self.args.external_video or self.external_video_frame_count <= 0:
             return
         self._build_external_video_from_frames_locked()
@@ -1999,6 +2216,29 @@ class ExploreDebugRecorder:
         rgb[np.flipud(raw_frontier)] = (112, 36, 170)
         return rgb
 
+    def _costmap_to_video_rgb_locked(self, grid: OccupancyGrid):
+        if np is None:
+            return None
+        width = int(grid.info.width)
+        height = int(grid.info.height)
+        if width <= 0 or height <= 0:
+            return None
+        values = np.flipud(np.asarray(grid.data, dtype=np.int16).reshape((height, width)))
+        rgb = np.empty((height, width, 3), dtype=np.uint8)
+        rgb[values < 0] = (178, 178, 178)       # Unknown
+        rgb[values == 0] = (248, 248, 245)      # Free
+
+        inflated = (values > 0) & (values < 99)
+        if np.any(inflated):
+            strength = values[inflated].astype(np.float32) / 98.0
+            rgb[inflated, 0] = 255
+            rgb[inflated, 1] = np.clip(232.0 - 82.0 * strength, 0, 255).astype(np.uint8)
+            rgb[inflated, 2] = np.clip(110.0 - 80.0 * strength, 0, 255).astype(np.uint8)
+
+        rgb[values == 99] = (245, 92, 28)       # Inscribed footprint cost
+        rgb[values >= 100] = (128, 20, 28)      # Raw lethal obstacle
+        return rgb
+
     def _render_video_map_panel_locked(
         self,
         panel_width: int,
@@ -2020,6 +2260,7 @@ class ExploreDebugRecorder:
         local_global_plan: dict | None = None,
         local_plan: dict | None = None,
         image_step: int | None = None,
+        crop_margin_px: int | None = None,
     ):
         if cv2 is None or np is None:
             return None
@@ -2058,6 +2299,22 @@ class ExploreDebugRecorder:
         global_plan_poses = self._plan_poses_for_grid(grid, global_plan) if draw_global_plan else None
         local_global_plan_poses = self._plan_poses_for_grid(grid, local_global_plan) if draw_local_global_plan else None
         local_plan_poses = self._plan_poses_for_grid(grid, local_plan) if draw_local_plan else None
+        if pose_in_grid is not None:
+            def prune_to_robot(plan_poses):
+                if not plan_poses:
+                    return plan_poses
+                nearest_index = min(
+                    range(len(plan_poses)),
+                    key=lambda index: math.hypot(
+                        float(plan_poses[index][0]) - pose_in_grid[0],
+                        float(plan_poses[index][1]) - pose_in_grid[1],
+                    ),
+                )
+                return [(pose_in_grid[0], pose_in_grid[1], pose_in_grid[2])] + list(plan_poses[nearest_index:])
+
+            global_plan_poses = prune_to_robot(global_plan_poses)
+            local_global_plan_poses = prune_to_robot(local_global_plan_poses)
+            local_plan_poses = prune_to_robot(local_plan_poses)
         has_active_goal = draw_goal and goal_xy is not None
 
         def cell_to_px(cell: tuple[int, int] | None) -> tuple[int, int] | None:
@@ -2102,7 +2359,10 @@ class ExploreDebugRecorder:
         if points:
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
-            margin = max(40, int(self.args.video_map_crop_margin_px))
+            margin = max(
+                8,
+                int(self.args.video_map_crop_margin_px if crop_margin_px is None else crop_margin_px),
+            )
             current_bbox = (
                 max(0, min(xs) - margin),
                 max(0, min(ys) - margin),
@@ -2212,6 +2472,35 @@ class ExploreDebugRecorder:
             1 if panel_width < 700 else 2,
             cv2.LINE_AA,
         )
+        if "COSTMAP" in title.upper():
+            legend = (
+                ("LETHAL", (128, 20, 28)),
+                ("INSCRIBED", (245, 92, 28)),
+                ("INFLATION", (255, 190, 60)),
+            )
+            legend_y = panel.shape[0] - 10
+            legend_width = min(panel.shape[1] - 12, 410)
+            cv2.rectangle(
+                panel,
+                (6, legend_y - 24),
+                (6 + legend_width, panel.shape[0] - 2),
+                (255, 255, 255),
+                -1,
+            )
+            legend_x = 12
+            for label, color in legend:
+                cv2.rectangle(panel, (legend_x, legend_y - 17), (legend_x + 13, legend_y - 4), color, -1)
+                cv2.putText(
+                    panel,
+                    label,
+                    (legend_x + 18, legend_y - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38,
+                    (20, 20, 20),
+                    1,
+                    cv2.LINE_AA,
+                )
+                legend_x += 126
         return panel
 
     @staticmethod
@@ -2273,6 +2562,9 @@ class ExploreDebugRecorder:
         with self.lock:
             if self.shutting_down:
                 return
+            if self.last_yaw_for_motion is not None:
+                self.total_yaw_motion_rad += self._angle_distance(yaw, self.last_yaw_for_motion)
+            self.last_yaw_for_motion = yaw
             step = 0.0
             if self.last_odom_xy is not None:
                 step = math.hypot(x - self.last_odom_xy[0], y - self.last_odom_xy[1])
@@ -2290,15 +2582,19 @@ class ExploreDebugRecorder:
                     )
                     step = 0.0
             self.latest_pose = (x, y, yaw)
+            self.latest_pose_stamp = stamp
+            self.pose_history.append((stamp, x, y, yaw))
             self.latest_pose_step = self.debug_step
             self.last_odom_xy = (x, y)
             if self.stall_reference_xy is None:
                 self.stall_reference_xy = (x, y)
                 self.stall_reference_yaw = yaw
+                self.stall_reference_yaw_motion_rad = self.total_yaw_motion_rad
                 self.stall_reference_time = now
             elif math.hypot(x - self.stall_reference_xy[0], y - self.stall_reference_xy[1]) >= self.args.stall_snapshot_distance_m:
                 self.stall_reference_xy = (x, y)
                 self.stall_reference_yaw = yaw
+                self.stall_reference_yaw_motion_rad = self.total_yaw_motion_rad
                 self.stall_reference_time = now
             should_record = (
                 not self.trajectory
@@ -2321,6 +2617,14 @@ class ExploreDebugRecorder:
                         "total_distance_m": f"{self.distance_m:.6f}",
                     }
                 )
+
+    def _pose_at_stamp_locked(self, stamp: float) -> tuple[float, float, float] | None:
+        if stamp <= 0.0 or not self.pose_history:
+            return self.latest_pose
+        nearest = min(self.pose_history, key=lambda item: abs(item[0] - stamp) if item[0] > 0.0 else float("inf"))
+        if nearest[0] <= 0.0:
+            return self.latest_pose
+        return nearest[1], nearest[2], nearest[3]
 
     def goal_callback(self, msg: PoseStamped) -> None:
         if self.shutting_down:
@@ -2556,6 +2860,14 @@ class ExploreDebugRecorder:
             if is_nonzero or now - last_time >= self.args.cmd_vel_record_period_sec:
                 self.last_cmd_vel_record_time[topic] = now
                 elapsed = now - self.start_wall_time
+                image_stamp = 0.0 if self.latest_image is None else float(self.latest_image[0])
+                image_wall_age = max(0.0, now - self.last_image_wall_time) if self.last_image_wall_time > 0.0 else float("inf")
+                map_stamp = float(self.latest_grid_video_stamp)
+                map_wall_age = max(0.0, now - self.latest_grid_wall_time) if self.latest_grid_wall_time > 0.0 else float("inf")
+                global_plan = self.latest_global_plan or {}
+                local_plan = self.latest_local_plan or {}
+                global_plan_elapsed = float(global_plan.get("elapsed_sec", 0.0))
+                local_plan_elapsed = float(local_plan.get("elapsed_sec", 0.0))
                 self.cmd_vel_writer.writerow(
                     {
                         "step_id": self.debug_step,
@@ -2566,8 +2878,45 @@ class ExploreDebugRecorder:
                         "linear_y": f"{linear_y:.6f}",
                         "angular_z": f"{angular_z:.6f}",
                         "speed": f"{speed:.6f}",
+                        "image_stamp": f"{image_stamp:.6f}" if image_stamp > 0.0 else "",
+                        "image_wall_age_sec": "" if not math.isfinite(image_wall_age) else f"{image_wall_age:.6f}",
+                        "map_stamp": f"{map_stamp:.6f}" if map_stamp > 0.0 else "",
+                        "map_step": self.latest_grid_step,
+                        "map_wall_age_sec": "" if not math.isfinite(map_wall_age) else f"{map_wall_age:.6f}",
+                        "global_plan_stamp": f"{float(global_plan.get('stamp', 0.0)):.6f}" if global_plan else "",
+                        "global_plan_step": global_plan.get("step_id", ""),
+                        "global_plan_wall_age_sec": "" if not global_plan_elapsed else f"{max(0.0, elapsed - global_plan_elapsed):.6f}",
+                        "local_plan_stamp": f"{float(local_plan.get('stamp', 0.0)):.6f}" if local_plan else "",
+                        "local_plan_step": local_plan.get("step_id", ""),
+                        "local_plan_wall_age_sec": "" if not local_plan_elapsed else f"{max(0.0, elapsed - local_plan_elapsed):.6f}",
                     }
                 )
+
+    def tf_record_timer_callback(self, _event) -> None:
+        if self.shutting_down:
+            return
+        try:
+            translation, rotation = self.tf_listener.lookupTransform(
+                self.args.map_frame, self.args.odom_frame, rospy.Time(0)
+            )
+            stamp = self.tf_listener.getLatestCommonTime(self.args.map_frame, self.args.odom_frame).to_sec()
+            yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            return
+        now = time.time()
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.map_to_odom_writer.writerow(
+                {
+                    "step_id": self.debug_step,
+                    "elapsed_sec": f"{now - self.start_wall_time:.3f}",
+                    "stamp": f"{stamp:.6f}",
+                    "x": f"{float(translation[0]):.6f}",
+                    "y": f"{float(translation[1]):.6f}",
+                    "yaw": f"{float(yaw):.6f}",
+                }
+            )
 
     def plan_callback(self, msg: NavPath, callback_args: tuple[str, str]) -> None:
         if self.shutting_down:
@@ -2959,6 +3308,7 @@ class ExploreDebugRecorder:
         if self.shutting_down:
             return
         now = time.time()
+        request_shutdown = False
         with self.lock:
             if self.shutting_down or self.latest_pose is None or self.stall_reference_xy is None:
                 return
@@ -2973,6 +3323,28 @@ class ExploreDebugRecorder:
                 return
             self._write_stall_snapshot_locked(now, moved)
             self.last_stall_snapshot_time = now
+            stuck = self._stuck_test_locked(now)
+            if (
+                self.args.exit_on_stuck
+                and stuck["state"] == "STUCK_STATIC"
+                and not self.stuck_exit_requested
+            ):
+                self.stuck_exit_requested = True
+                payload = {
+                    "reason": "stable_static_stuck",
+                    "step_id": self.debug_step,
+                    "elapsed_sec": now - self.start_wall_time,
+                    "robot_pose": list(self.latest_pose),
+                    "active_goal": self.last_explore_active_goal,
+                    "stuck": stuck,
+                }
+                (self.output_dir / "stuck_exit.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                )
+                self._write_event("stuck_exit_requested", payload)
+                request_shutdown = True
+        if request_shutdown:
+            rospy.signal_shutdown("stable static stuck detected")
 
     def _write_stall_snapshot_locked(self, now: float, moved_m: float) -> None:
         self.stall_snapshot_count += 1
@@ -3626,16 +3998,18 @@ class ExploreDebugRecorder:
         }
 
     def shutdown(self) -> None:
-        with self.video_lock:
-            self._shutdown_locked()
-
-    def _shutdown_locked(self) -> None:
+        self.video_lock.acquire()
         with self.lock:
             if self.shutting_down:
+                self.video_lock.release()
                 return
             self.shutting_down = True
             try:
                 self.stall_timer.shutdown()
+            except Exception:
+                pass
+            try:
+                self.tf_record_timer.shutdown()
             except Exception:
                 pass
             for subscriber in self.subscribers:
@@ -3671,6 +4045,12 @@ class ExploreDebugRecorder:
             uniform_subgoal_crop = self._render_uniform_subgoal_crops_locked()
             subgoal_contact_sheet = self._render_subgoal_contact_sheet()
             subgoal_overlay_contact_sheet = self._render_subgoal_overlay_contact_sheet()
+            if self.artifact_writer is not None:
+                self.artifact_writer.close()
+                if self.artifact_writer.errors:
+                    error_text = "; ".join(self.artifact_writer.errors[-5:])
+                    self.first_person_video_error = error_text
+                    self.external_video_error = error_text
             semantic_contact_sheet = self._render_semantic_contact_sheet()
             graph_final = ""
             if self.latest_unified_graph:
@@ -3680,9 +4060,8 @@ class ExploreDebugRecorder:
                     json.dumps(self.latest_unified_graph, ensure_ascii=False, indent=2, sort_keys=True)
                 )
                 graph_final = str(graph_final_path)
-            with self.video_lock:
-                self._finalize_first_person_video_locked()
-                self._finalize_external_video_locked()
+            self._finalize_first_person_video_locked()
+            self._finalize_external_video_locked()
             summary = {
                 "duration_sec": time.time() - self.start_wall_time,
                 "final_step_id": self.debug_step,
@@ -3718,6 +4097,7 @@ class ExploreDebugRecorder:
                 "first_person_video_capture_fps": self.args.first_person_video_capture_fps,
                 "first_person_video_codec": self.first_person_video_codec_name,
                 "first_person_video_error": self.first_person_video_error,
+                "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
                 "first_person_video_map_mode": "latest_occ_snapshot_on_image_callback",
                 "semantic_video": bool(self.args.semantic_video),
                 "semantic_summary": self._semantic_summary(),
@@ -3747,7 +4127,10 @@ class ExploreDebugRecorder:
                 "subgoal_contact_sheet": subgoal_contact_sheet,
                 "subgoal_overlay_contact_sheet": subgoal_overlay_contact_sheet,
                 "move_base_plan_csv": str(self.output_dir / "move_base_plans.csv"),
+                "map_to_odom_csv": str(self.output_dir / "map_to_odom.csv"),
                 "move_base_rosout_log": str(self.output_dir / "move_base_rosout.log"),
+                "finalization_complete": True,
+                "video_finalization_pending": False,
             }
             (self.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
             self._write_event("recorder_shutdown", summary)
@@ -3758,11 +4141,13 @@ class ExploreDebugRecorder:
                 self.status_file,
                 self.cmd_vel_file,
                 self.plan_file,
+                self.map_to_odom_file,
                 self.video_frames_file,
                 self.move_base_log_file,
                 self.semantic_events_file,
             ]:
                 handle.close()
+        self.video_lock.release()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -3806,11 +4191,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-sheet-gap-px", type=int, default=16)
     parser.add_argument("--cmd-vel-record-period-sec", type=float, default=0.2)
     parser.add_argument("--cmd-vel-nonzero-threshold", type=float, default=1e-4)
+    parser.add_argument("--tf-record-period-sec", type=float, default=0.5)
     parser.add_argument("--stall-check-period-sec", type=float, default=1.0)
     parser.add_argument("--stall-snapshot-sec", type=float, default=30.0)
     parser.add_argument("--stall-snapshot-distance-m", type=float, default=0.15)
     parser.add_argument("--stall-snapshot-cooldown-sec", type=float, default=45.0)
     parser.add_argument("--stall-snapshot-require-active-goal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--exit-on-stuck", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--path-check-max-hits", type=int, default=25)
     parser.add_argument("--first-person-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--first-person-video-with-map", action=argparse.BooleanOptionalAction, default=True)
@@ -3829,7 +4216,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--first-person-video-h264-crf", type=int, default=23)
     parser.add_argument("--first-person-video-h264-preset", default="veryfast")
     parser.add_argument("--first-person-video-h264-timeout-sec", type=float, default=180.0)
+    parser.add_argument("--runtime-video-encode", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--async-artifact-writes", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--artifact-write-queue-size", type=int, default=512)
     parser.add_argument("--video-map-crop-margin-px", type=int, default=90)
+    parser.add_argument("--video-occ-crop-margin-px", type=int, default=25)
     parser.add_argument("--video-map-desync-step-warn", type=int, default=3)
     parser.add_argument("--video-map-max-age-sec", type=float, default=2.0)
     parser.add_argument("--video-sync-max-delta-sec", type=float, default=0.05)
