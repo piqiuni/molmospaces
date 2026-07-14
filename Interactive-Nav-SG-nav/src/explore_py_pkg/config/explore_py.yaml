@@ -56,7 +56,7 @@ exploration:
   global_plan_min_poses: 3
   plan_freshness_sec: 4.0
   global_plan_current_goal_check_enabled: true
-  global_plan_current_goal_grace_sec: 4.0
+  global_plan_current_goal_grace_sec: 60.0
   global_plan_goal_tolerance_m: 0.6
   initial_local_goal_count: 3
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import math
 from collections import defaultdict
 
 from .geometry_utils import grid_index, normalize_label, world_to_grid
@@ -28,6 +29,24 @@ class InteractionGraphStore:
         self.edge_counter = 1
         self.room_grid = None
         self.source_mode = "detector_online"
+        self.episode_id = ""
+        self.graph_revision = 0
+        self.interaction_event_counter = 1
+        self._ensure_scene_node()
+
+    def reset(self, episode_id="", source_mode=None):
+        self.episode_id = str(episode_id or "")
+        if source_mode:
+            self.source_mode = str(source_mode)
+        self.room_geometries = {}
+        self.nodes = {}
+        self.edges = {}
+        self.next_node_index = 1
+        self.edge_counter = 1
+        self.room_grid = None
+        self.graph_revision = 0
+        self.interaction_event_counter = 1
+        self._ensure_scene_node()
 
     def update_room_grid(self, grid_info, scene_data, confidence_data=None, room_id_to_name=None):
         if room_id_to_name:
@@ -39,6 +58,7 @@ class InteractionGraphStore:
         }
         self._refresh_room_nodes_from_grid()
         self._rebuild_relations()
+        self._bump_revision()
 
     def set_room_geometries(self, rooms):
         self.room_geometries = {}
@@ -67,6 +87,10 @@ class InteractionGraphStore:
         now = float(stamp if stamp is not None else time.time())
         if source_mode:
             self.source_mode = str(source_mode)
+        if self.source_mode == "realtime_gt_observation":
+            for node in self.nodes.values():
+                if node.type not in {"scene", "room"}:
+                    node.is_currently_visible = False
         for raw_observation in observations:
             observation = normalize_observation(raw_observation)
             node = self._find_or_create_node(observation)
@@ -74,9 +98,54 @@ class InteractionGraphStore:
         self._refresh_room_nodes_from_grid()
         self._rebuild_relations(now=now)
         self._refresh_missing_room_nodes_from_observations()
+        self._bump_revision()
+
+    def update_interaction_result(self, result, stamp=None):
+        node_id = str(result.get("node_id") or "")
+        node = self.nodes.get(node_id)
+        if node is None:
+            instance_id = str(result.get("instance_id") or "")
+            node = next(
+                (candidate for candidate in self.nodes.values() if candidate.attributes.get("instance_id") == instance_id),
+                None,
+            )
+        if node is None:
+            return False
+        now = float(stamp if stamp is not None else time.time())
+        pre_state = str(node.interaction.get("state", "unknown"))
+        if result.get("state") is not None:
+            node.interaction["state"] = str(result["state"])
+        node.interaction["state_source"] = str(result.get("source") or "interaction_result")
+        node.interaction["state_confidence"] = float(result.get("confidence", 1.0))
+        state = node.interaction.get("state", "unknown")
+        node.interaction["traversable"] = True if state in {"open", "ajar", "static_open"} else False if state == "closed" else None
+        node.interaction["requires_interaction"] = bool(node.interaction.get("is_interactable") and state in {"closed", "unknown"})
+        history = list(node.interaction.get("operation_history") or [])
+        event_id = str(result.get("event_id") or f"interaction_{self.interaction_event_counter:06d}")
+        self.interaction_event_counter += 1
+        history.append(
+            {
+                "event_id": event_id,
+                "action": str(result.get("action") or result.get("interaction_mode") or "unknown"),
+                "timestamp": now,
+                "pre_state": pre_state,
+                "post_state": str(state),
+                "success": bool(result.get("success", True)),
+                "execution_cost": float(result.get("execution_cost", result.get("cost", 1.0))),
+                "verification_source": str(result.get("verification_source") or result.get("source") or "interaction_result"),
+            }
+        )
+        node.interaction["operation_history"] = history
+        node.last_seen = now
+        self._rebuild_relations(now=now)
+        self._bump_revision()
+        return True
 
     def as_graph_bundle(self, stamp=None):
         now = float(stamp if stamp is not None else time.time())
+        for node in self.nodes.values():
+            node.state_age_sec = max(0.0, now - float(node.last_seen)) if node.last_seen is not None else 0.0
+            node.graph_revision = self.graph_revision
         nodes = sorted(self.nodes.values(), key=lambda item: item.id)
         edges = sorted(self.edges.values(), key=lambda item: item.id)
         semantic_node_ids = [node.id for node in nodes]
@@ -100,7 +169,9 @@ class InteractionGraphStore:
 
         return SceneGraphBundle(
             scene_id=self.scene_id,
+            episode_id=self.episode_id,
             source_mode=self.source_mode,
+            graph_revision=self.graph_revision,
             timestamp=now,
             nodes=nodes,
             edges=edges,
@@ -174,6 +245,40 @@ class InteractionGraphStore:
         self.nodes[node_id] = node
         return node
 
+    def _ensure_scene_node(self):
+        node_id = f"scene_{sanitize_token(self.episode_id or self.scene_id)}"
+        existing = next((node for node in self.nodes.values() if node.type == "scene"), None)
+        if existing is not None:
+            if existing.id != node_id:
+                self.nodes.pop(existing.id, None)
+                existing.id = node_id
+                self.nodes[node_id] = existing
+            existing.name = self.episode_id or self.scene_id
+            existing.label = normalize_label(self.scene_id) or "scene"
+            existing.attributes.update(
+                {
+                    "scene_id": self.scene_id,
+                    "episode_id": self.episode_id,
+                    "source_mode": self.source_mode,
+                }
+            )
+            return existing
+        node = SceneGraphNode(
+            id=node_id,
+            type="scene",
+            label=normalize_label(self.scene_id) or "scene",
+            name=self.episode_id or self.scene_id,
+            confidence=1.0,
+            is_currently_visible=True,
+            attributes={
+                "scene_id": self.scene_id,
+                "episode_id": self.episode_id,
+                "source_mode": self.source_mode,
+            },
+        )
+        self.nodes[node_id] = node
+        return node
+
     def _make_node_id(self, node_type, observation):
         instance_id = sanitize_token(observation.get("instance_id") or "")
         if instance_id:
@@ -197,7 +302,10 @@ class InteractionGraphStore:
         node.room_id = observation.get("room_id") if observation.get("room_id") is not None else node.room_id
         node.confidence = max(float(node.confidence), float(observation.get("confidence", 0.0)))
         node.observation_count += 1
+        if node.first_seen is None:
+            node.first_seen = now
         node.last_seen = now
+        node.is_currently_visible = True
         node.attributes.update(
             {
                 "instance_id": observation.get("instance_id") or node.attributes.get("instance_id") or "",
@@ -215,11 +323,26 @@ class InteractionGraphStore:
                 "asset_id": observation.get("asset_id"),
                 "object_id": observation.get("object_id"),
                 "source": observation.get("source"),
+                "source_object_name": observation.get("source_object_name"),
+                "orientation": list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
+                "visible_pixels": int(observation.get("visible_pixels", 0)),
+                "camera_name": observation.get("camera_name"),
+                "frame_index": int(observation.get("frame_index", 0)),
+                "episode_id": observation.get("episode_id"),
+                "observation_evidence": {
+                    "joint_infos": list(observation.get("joint_infos") or []),
+                    "primary_joint_name": observation.get("primary_joint_name"),
+                    "joint_type": observation.get("joint_type"),
+                    "joint_range": list(observation.get("joint_range") or [0.0, 0.0]),
+                    "joint_value": observation.get("joint_value"),
+                },
                 "viz_aabb_center": list(observation.get("viz_aabb_center") or observation["aabb_center"]),
                 "viz_aabb_size": list(observation.get("viz_aabb_size") or observation["aabb_size"]),
             }
         )
+        previous_history = list(node.interaction.get("operation_history") or [])
         node.interaction = default_interaction_payload(node.type, observation)
+        node.interaction["operation_history"] = previous_history
 
     def _refresh_room_nodes_from_grid(self):
         if not self.room_grid:
@@ -308,6 +431,7 @@ class InteractionGraphStore:
                 centroid=center,
                 aabb_center=aabb_center,
                 aabb_size=size,
+                parent_id=self._ensure_scene_node().id,
                 room_id=room_id,
             )
             if "cell_count" in geometry:
@@ -382,28 +506,53 @@ class InteractionGraphStore:
     def _rebuild_relations(self, now=None):
         now = float(now if now is not None else time.time())
         self.edges = {}
+        scene_node = self._ensure_scene_node()
+        scene_node.attributes["source_mode"] = self.source_mode
+        scene_node.attributes["episode_id"] = self.episode_id
         rooms = {node.id: node for node in self.nodes.values() if node.type == "room"}
-        non_rooms = [node for node in self.nodes.values() if node.type != "room"]
+        for room_node in rooms.values():
+            room_node.parent_id = scene_node.id
+            self._upsert_edge(scene_node.id, "has_room", room_node.id, now=now)
+        non_rooms = [node for node in self.nodes.values() if node.type not in {"scene", "room"}]
 
         for node in non_rooms:
+            if node.type == "portal":
+                node.parent_id = scene_node.id
             room_id = node.room_id
             if room_id is None:
                 room_id = self._infer_room_id_from_node(node)
                 node.room_id = room_id
             if room_id is not None:
                 room_node = self._ensure_room_node(room_id)
+                if node.type != "portal":
+                    node.parent_id = room_node.id
                 self._upsert_edge(node.id, "in_room", room_node.id, now=now)
                 self._upsert_edge(room_node.id, "has_child", node.id, now=now)
 
         for node in non_rooms:
             if node.type == "portal":
                 connected_room_ids = list(node.attributes.get("connected_room_ids") or [])
-                if not connected_room_ids and node.room_id is not None:
-                    connected_room_ids = [node.room_id]
+                if not connected_room_ids:
+                    connected_room_ids = self._infer_portal_room_ids(node)
+                    node.attributes["connected_room_ids"] = connected_room_ids
+                node.attributes["connectivity_status"] = (
+                    "connected" if len(connected_room_ids) >= 2 else "partial" if len(connected_room_ids) == 1 else "unknown"
+                )
+                traversable = node.interaction.get("traversable")
+                edge_attributes = {
+                    "portal_node_id": node.id,
+                    "state": node.interaction.get("state", "unknown"),
+                    "traversable": traversable,
+                    "requires_interaction": bool(node.interaction.get("requires_interaction")),
+                    "interaction_mode": node.interaction.get("interaction_mode", "none"),
+                    "interaction_cost": float(node.interaction.get("interaction_cost", 1.0)),
+                    "expected_effect": "unlock_connectivity",
+                    "connectivity_status": node.attributes["connectivity_status"],
+                }
                 for room_id in sorted(set(int(room) for room in connected_room_ids if room is not None)):
                     room_node = self._ensure_room_node(room_id)
-                    self._upsert_edge(node.id, "connects", room_node.id, now=now)
-                    self._upsert_edge(room_node.id, "adjacent_via", node.id, now=now)
+                    self._upsert_edge(node.id, "connects", room_node.id, attributes=edge_attributes, now=now)
+                    self._upsert_edge(room_node.id, "adjacent_via", node.id, attributes=edge_attributes, now=now)
 
         support_nodes = [node for node in non_rooms if node.type == "support"]
         container_nodes = [node for node in non_rooms if node.type == "container"]
@@ -420,12 +569,18 @@ class InteractionGraphStore:
             obj.parent_id = None
             parent = self._find_parent_node(obj, support_nodes, container_nodes, id_lookup, name_lookup, instance_lookup)
             if parent is None:
+                if obj.room_id is not None:
+                    obj.parent_id = self._ensure_room_node(obj.room_id).id
                 continue
             obj.parent_id = parent.id
             if parent.type == "support":
                 self._upsert_edge(parent.id, "supports", obj.id, now=now)
             elif parent.type == "container":
                 self._upsert_edge(parent.id, "contains", obj.id, now=now)
+
+        for room_node in (node for node in self.nodes.values() if node.type == "room"):
+            room_node.parent_id = scene_node.id
+            self._upsert_edge(scene_node.id, "has_room", room_node.id, now=now)
 
     def _find_parent_node(self, obj, support_nodes, container_nodes, id_lookup, name_lookup, instance_lookup):
         parent_name = obj.attributes.get("parent")
@@ -490,6 +645,40 @@ class InteractionGraphStore:
         if candidates:
             return max(sorted(candidates.keys()), key=lambda room_id: candidates[room_id])
         return None
+
+    def _infer_portal_room_ids(self, node):
+        if not self.room_grid:
+            return [node.room_id] if node.room_id is not None else []
+        grid_info = self.room_grid["info"]
+        scene_data = self.room_grid["scene_data"]
+        if grid_info is None or not scene_data:
+            return [node.room_id] if node.room_id is not None else []
+        counts = defaultdict(int)
+        center_x, center_y = float(node.aabb_center[0]), float(node.aabb_center[1])
+        half_extent = max(float(node.aabb_size[0]), float(node.aabb_size[1])) * 0.5
+        for radius_offset, weight in ((0.30, 3), (0.60, 2), (0.90, 1)):
+            radius = half_extent + radius_offset
+            for index in range(48):
+                angle = 2.0 * math.pi * float(index) / 48.0
+                coords = world_to_grid(
+                    center_x + radius * math.cos(angle),
+                    center_y + radius * math.sin(angle),
+                    grid_info,
+                )
+                if coords is None:
+                    continue
+                data_index = grid_index(coords[0], coords[1], grid_info.width)
+                if 0 <= data_index < len(scene_data):
+                    room_id = int(scene_data[data_index])
+                    if room_id >= 0:
+                        counts[room_id] += weight
+        ranked = sorted(counts, key=lambda room_id: (-counts[room_id], room_id))
+        return ranked[:2]
+
+    def _bump_revision(self):
+        self.graph_revision += 1
+        for node in self.nodes.values():
+            node.graph_revision = self.graph_revision
 
     def _build_navigation_hints(self):
         hints = []

@@ -10,6 +10,7 @@ class RoomSegmentationState:
         self.prev_room_grid_signature = None
         self.prev_room_ids = None
         self.next_room_segment_id = 1
+        self.portal_hints = {}
 
 
 class RoomSegmenter:
@@ -31,6 +32,14 @@ class RoomSegmenter:
         room_enclosed_obstacle_min_cells=120,
         room_enclosed_obstacle_max_cells=700,
         room_enclosed_obstacle_dominance_ratio=0.82,
+        room_portal_cut_enabled=True,
+        room_portal_cut_margin_m=0.15,
+        room_portal_cut_thickness_cells=2,
+        room_portal_detector_min_confirmations=3,
+        room_portal_detector_max_center_jump_m=0.4,
+        room_portal_hint_merge_distance_m=0.6,
+        room_portal_min_width_m=0.5,
+        room_portal_max_width_m=2.5,
         state=None,
     ):
         self.room_free_threshold = int(room_free_threshold)
@@ -55,7 +64,76 @@ class RoomSegmenter:
             int(room_enclosed_obstacle_max_cells),
         )
         self.room_enclosed_obstacle_dominance_ratio = float(room_enclosed_obstacle_dominance_ratio)
+        self.room_portal_cut_enabled = bool(room_portal_cut_enabled)
+        self.room_portal_cut_margin_m = max(0.0, float(room_portal_cut_margin_m))
+        self.room_portal_cut_thickness_cells = max(1, int(room_portal_cut_thickness_cells))
+        self.room_portal_detector_min_confirmations = max(1, int(room_portal_detector_min_confirmations))
+        self.room_portal_detector_max_center_jump_m = max(
+            0.0,
+            float(room_portal_detector_max_center_jump_m),
+        )
+        self.room_portal_hint_merge_distance_m = max(0.0, float(room_portal_hint_merge_distance_m))
+        self.room_portal_min_width_m = max(0.0, float(room_portal_min_width_m))
+        self.room_portal_max_width_m = max(
+            self.room_portal_min_width_m,
+            float(room_portal_max_width_m),
+        )
         self.state = state if state is not None else RoomSegmentationState()
+
+    def update_portal_hints(self, observations, source_mode="detector_online"):
+        if not self.room_portal_cut_enabled:
+            return False
+        changed = False
+        is_gt = str(source_mode) == "realtime_gt_observation"
+        for observation in observations or []:
+            if not self._is_portal_observation(observation):
+                continue
+            center = self._point3(observation.get("aabb_center") or observation.get("position"))
+            size = self._point3(observation.get("aabb_size"))
+            if center is None or size is None:
+                continue
+            span = max(float(size[0]), float(size[1]))
+            if span <= 0.0:
+                continue
+            key = self._portal_hint_key(observation, center)
+            hint = self.state.portal_hints.get(key)
+            if hint is None:
+                hint = {
+                    "center": center,
+                    "size": size,
+                    "candidate_center": center,
+                    "candidate_size": size,
+                    "confirmations": 0,
+                    "active": False,
+                    "source_mode": str(source_mode),
+                }
+                self.state.portal_hints[key] = hint
+            if hint["active"]:
+                continue
+            jump = self._distance_xy(hint["candidate_center"], center)
+            if jump > self.room_portal_detector_max_center_jump_m:
+                hint["candidate_center"] = center
+                hint["candidate_size"] = size
+                hint["confirmations"] = 1
+            else:
+                count = int(hint["confirmations"])
+                blend = 1.0 / float(count + 1)
+                hint["candidate_center"] = [
+                    (1.0 - blend) * float(hint["candidate_center"][axis]) + blend * float(center[axis])
+                    for axis in range(3)
+                ]
+                hint["candidate_size"] = [
+                    (1.0 - blend) * float(hint["candidate_size"][axis]) + blend * float(size[axis])
+                    for axis in range(3)
+                ]
+                hint["confirmations"] = count + 1
+            required = 1 if is_gt else self.room_portal_detector_min_confirmations
+            if int(hint["confirmations"]) >= required:
+                hint["center"] = list(hint["candidate_center"])
+                hint["size"] = list(hint["candidate_size"])
+                hint["active"] = True
+                changed = True
+        return changed
 
     def segment(self, occ_grid):
         try:
@@ -149,6 +227,9 @@ class RoomSegmenter:
                     continue
                 segmentation_free[labels == component_id] = 1
 
+        if cv2 is not None and self.room_portal_cut_enabled:
+            self._apply_portal_cuts(segmentation_free, occ_grid.info, cv2)
+
         if cv2 is not None:
             distance = cv2.distanceTransform((segmentation_free * 255).astype(np.uint8), cv2.DIST_L2, 5)
             core_mask = (
@@ -215,6 +296,99 @@ class RoomSegmenter:
         self.state.prev_room_grid_signature = signature
         self.state.prev_room_ids = list(room_ids)
         return room_ids, room_conf
+
+    def _apply_portal_cuts(self, segmentation_free, grid_info, cv2):
+        resolution = float(grid_info.resolution)
+        if resolution <= 0.0:
+            return
+        origin_x = float(grid_info.origin.position.x)
+        origin_y = float(grid_info.origin.position.y)
+        height, width = segmentation_free.shape
+        for hint in self.state.portal_hints.values():
+            if not hint.get("active"):
+                continue
+            center = hint["center"]
+            size = hint["size"]
+            span_axis = 0 if float(size[0]) >= float(size[1]) else 1
+            span = min(
+                max(max(float(size[0]), float(size[1])), self.room_portal_min_width_m),
+                self.room_portal_max_width_m,
+            ) + 2.0 * self.room_portal_cut_margin_m
+            start = list(center)
+            end = list(center)
+            start[span_axis] -= 0.5 * span
+            end[span_axis] += 0.5 * span
+            start_cell = (
+                int(round((float(start[0]) - origin_x) / resolution)),
+                int(round((float(start[1]) - origin_y) / resolution)),
+            )
+            end_cell = (
+                int(round((float(end[0]) - origin_x) / resolution)),
+                int(round((float(end[1]) - origin_y) / resolution)),
+            )
+            if not self._line_may_intersect_grid(start_cell, end_cell, width, height):
+                continue
+            cv2.line(
+                segmentation_free,
+                start_cell,
+                end_cell,
+                0,
+                thickness=self.room_portal_cut_thickness_cells,
+                lineType=cv2.LINE_8,
+            )
+
+    def _portal_hint_key(self, observation, center):
+        explicit = (
+            observation.get("source_object_name")
+            or observation.get("name")
+            or observation.get("object_id")
+            or observation.get("instance_id")
+        )
+        if explicit not in (None, ""):
+            return str(explicit)
+        for key, hint in self.state.portal_hints.items():
+            if self._distance_xy(hint["candidate_center"], center) <= self.room_portal_hint_merge_distance_m:
+                return key
+        return "portal_{:.2f}_{:.2f}".format(float(center[0]), float(center[1]))
+
+    @staticmethod
+    def _is_portal_observation(observation):
+        if bool(observation.get("is_door")):
+            return True
+        label = str(
+            observation.get("semantic_name")
+            or observation.get("category")
+            or observation.get("name")
+            or ""
+        ).lower()
+        return "door" in label or "portal" in label or "gate" in label
+
+    @staticmethod
+    def _point3(value):
+        if isinstance(value, dict):
+            value = [value.get("x", 0.0), value.get("y", 0.0), value.get("z", 0.0)]
+        if not isinstance(value, (list, tuple)) or len(value) < 2:
+            return None
+        padded = list(value[:3]) + [0.0] * max(0, 3 - len(value))
+        try:
+            return [float(padded[0]), float(padded[1]), float(padded[2])]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _distance_xy(first, second):
+        dx = float(first[0]) - float(second[0])
+        dy = float(first[1]) - float(second[1])
+        return float(np.hypot(dx, dy))
+
+    @staticmethod
+    def _line_may_intersect_grid(start, end, width, height):
+        return not (
+            max(start[0], end[0]) < 0
+            or min(start[0], end[0]) >= width
+            or max(start[1], end[1]) < 0
+            or min(start[1], end[1]) >= height
+        )
 
     def _fill_enclosed_obstacles(self, values, room_ids, room_conf, width, height, cv2):
         room_grid = np.asarray(room_ids, dtype=np.int32).reshape(height, width)

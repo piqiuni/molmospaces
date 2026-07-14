@@ -59,6 +59,8 @@ def build_graph_marker_array(graph_payload, frame_id, stamp=None):
     }
 
     for index, node in enumerate(graph_payload.get("nodes", [])):
+        if node.get("type") == "scene":
+            continue
         color = _node_color(node)
         box_center = node.get("attributes", {}).get("viz_aabb_center") or node["aabb_center"]
         box_size = node.get("attributes", {}).get("viz_aabb_size") or node["aabb_size"]

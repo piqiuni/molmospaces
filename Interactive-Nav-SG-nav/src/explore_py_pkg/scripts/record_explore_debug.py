@@ -691,8 +691,12 @@ class ExploreDebugRecorder:
         self.video_map_frame_dir = self.video_dir / "map_frames"
         self.video_global_costmap_frame_dir = self.video_dir / "global_costmap_frames"
         self.video_local_costmap_frame_dir = self.video_dir / "local_costmap_frames"
+        self.video_semantic_spatial_frame_dir = self.video_dir / "semantic_spatial_frames"
+        self.video_semantic_topology_frame_dir = self.video_dir / "semantic_topology_frames"
         self.video_composite_frame_dir = self.video_dir / "composite_frames"
         self.video_external_frame_dir = self.video_dir / "external_camera_frames"
+        self.semantic_keyframe_dir = output_dir / "semantic_keyframes"
+        self.graph_dir = output_dir / "graph"
         self.panel_dir = output_dir / "subgoal_panels"
         self.uniform_panel_dir = output_dir / "subgoal_panels_uniform_crop"
         self.stall_snapshot_dir = output_dir / "stall_snapshots"
@@ -706,8 +710,12 @@ class ExploreDebugRecorder:
         self.video_map_frame_dir.mkdir(parents=True, exist_ok=True)
         self.video_global_costmap_frame_dir.mkdir(parents=True, exist_ok=True)
         self.video_local_costmap_frame_dir.mkdir(parents=True, exist_ok=True)
+        self.video_semantic_spatial_frame_dir.mkdir(parents=True, exist_ok=True)
+        self.video_semantic_topology_frame_dir.mkdir(parents=True, exist_ok=True)
         self.video_composite_frame_dir.mkdir(parents=True, exist_ok=True)
         self.video_external_frame_dir.mkdir(parents=True, exist_ok=True)
+        self.semantic_keyframe_dir.mkdir(parents=True, exist_ok=True)
+        self.graph_dir.mkdir(parents=True, exist_ok=True)
         self.panel_dir.mkdir(parents=True, exist_ok=True)
         self.uniform_panel_dir.mkdir(parents=True, exist_ok=True)
         self.stall_snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -744,6 +752,16 @@ class ExploreDebugRecorder:
         self.latest_global_plan: dict | None = None
         self.latest_local_global_plan: dict | None = None
         self.latest_local_plan: dict | None = None
+        self.latest_gt_observations: dict = {}
+        self.recording_episode_id = ""
+        self.observed_instance_ids: set[str] = set()
+        self.latest_unified_graph: dict = {}
+        self.previous_unified_graph: dict = {}
+        self.semantic_events: list[dict] = []
+        self.pending_semantic_keyframe_revision = -1
+        self.last_semantic_keyframe_revision = -1
+        self.topology_slots: dict[str, tuple[int, int]] = {}
+        self.topology_next_slot = {"room": 0, "portal": 0, "container": 0, "object": 0}
         self.last_odom_xy: tuple[float, float] | None = None
         self.last_recorded_odom_time = 0.0
         self.stall_reference_xy: tuple[float, float] | None = None
@@ -769,8 +787,9 @@ class ExploreDebugRecorder:
         self.plan_message_counts = {"global": 0, "local_global": 0, "local": 0}
         self.plan_records = {"global": [], "local_global": [], "local": []}
         self.subgoal_records: list[dict] = []
-        self.first_person_video_path = str(self.video_dir / "first_person.mp4")
-        self.first_person_video_raw_path = str(self.video_dir / "first_person_raw.mp4")
+        video_stem = "overview_6panel" if args.semantic_video else "first_person"
+        self.first_person_video_path = str(self.video_dir / f"{video_stem}.mp4")
+        self.first_person_video_raw_path = str(self.video_dir / f"{video_stem}_raw.mp4")
         self.first_person_video_writer = None
         self.first_person_video_size: tuple[int, int] | None = None
         self.first_person_video_frame_count = 0
@@ -800,6 +819,7 @@ class ExploreDebugRecorder:
         self.cmd_vel_file = (output_dir / "cmd_vel.csv").open("a", newline="", buffering=1)
         self.plan_file = (output_dir / "move_base_plans.csv").open("a", newline="", buffering=1)
         self.move_base_log_file = (output_dir / "move_base_rosout.log").open("a", buffering=1)
+        self.semantic_events_file = (self.graph_dir / "graph_revision_events.jsonl").open("a", buffering=1)
         self.video_frames_file = (output_dir / "video_frames.csv").open("a", newline="", buffering=1)
 
         self.trajectory_writer = csv.DictWriter(
@@ -893,6 +913,8 @@ class ExploreDebugRecorder:
                 "local_costmap_step",
                 "global_costmap_frame",
                 "local_costmap_frame",
+                "semantic_spatial_frame",
+                "semantic_topology_frame",
                 "composite_frame",
             ],
         )
@@ -916,6 +938,8 @@ class ExploreDebugRecorder:
         self.subscribers.append(rospy.Subscriber(args.current_subgoal_topic, PointStamped, self.current_subgoal_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.move_base_status_topic, GoalStatusArray, self.move_base_status_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.explore_status_topic, String, self.explore_status_callback, queue_size=20))
+        self.subscribers.append(rospy.Subscriber(args.gt_observations_topic, String, self.gt_observations_callback, queue_size=2))
+        self.subscribers.append(rospy.Subscriber(args.unified_graph_topic, String, self.unified_graph_callback, queue_size=2))
         self.subscribers.append(rospy.Subscriber(args.cmd_vel_topic, Twist, self.cmd_vel_callback, callback_args=args.cmd_vel_topic, queue_size=50))
         self.subscribers.append(rospy.Subscriber(args.global_plan_topic, NavPath, self.plan_callback, callback_args=("global", args.global_plan_topic), queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.local_global_plan_topic, NavPath, self.plan_callback, callback_args=("local_global", args.local_global_plan_topic), queue_size=20))
@@ -940,6 +964,96 @@ class ExploreDebugRecorder:
             self.latest_grid_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_grid_wall_time = time.time()
             self.latest_grid_step = self.debug_step
+
+    def gt_observations_callback(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self.lock:
+            if self.shutting_down:
+                return
+            episode_id = str(payload.get("episode_id") or "")
+            if bool(payload.get("episode_reset")) or (episode_id and episode_id != self.recording_episode_id):
+                self.recording_episode_id = episode_id
+                self.observed_instance_ids.clear()
+                self.topology_slots.clear()
+                self.topology_next_slot = {"room": 0, "portal": 0, "container": 0, "object": 0}
+            for observation in payload.get("observations") or []:
+                instance_id = str(observation.get("instance_id") or "")
+                if instance_id:
+                    self.observed_instance_ids.add(instance_id)
+            self.latest_gt_observations = payload
+
+    def unified_graph_callback(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self.lock:
+            if self.shutting_down:
+                return
+            revision = int(payload.get("graph_revision", 0) or 0)
+            events = self._semantic_graph_delta(self.latest_unified_graph, payload)
+            self.previous_unified_graph = self.latest_unified_graph
+            self.latest_unified_graph = payload
+            (self.graph_dir / "graph_latest.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+            )
+            for event in events:
+                row = {
+                    "wall_time": time.time(),
+                    "elapsed_sec": time.time() - self.start_wall_time,
+                    "step_id": self.debug_step,
+                    "graph_revision": revision,
+                    **event,
+                }
+                self.semantic_events.append(row)
+                self.semantic_events = self.semantic_events[-50:]
+                self.semantic_events_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            if events:
+                self.pending_semantic_keyframe_revision = revision
+
+    @staticmethod
+    def _semantic_graph_delta(previous: dict, current: dict) -> list[dict]:
+        previous_nodes = {node.get("id"): node for node in previous.get("nodes", []) if node.get("id")}
+        current_nodes = {node.get("id"): node for node in current.get("nodes", []) if node.get("id")}
+        previous_edges = {edge.get("id"): edge for edge in previous.get("edges", []) if edge.get("id")}
+        current_edges = {edge.get("id"): edge for edge in current.get("edges", []) if edge.get("id")}
+        events = []
+        for node_id in sorted(current_nodes.keys() - previous_nodes.keys()):
+            node = current_nodes[node_id]
+            events.append({"event": "NEW_NODE", "node_id": node_id, "label": node.get("label", "")})
+        for edge_id in sorted(current_edges.keys() - previous_edges.keys()):
+            edge = current_edges[edge_id]
+            events.append(
+                {
+                    "event": "NEW_EDGE",
+                    "edge_id": edge_id,
+                    "relation": edge.get("relation", ""),
+                    "src_id": edge.get("src_id", ""),
+                    "dst_id": edge.get("dst_id", ""),
+                }
+            )
+        for node_id in sorted(current_nodes.keys() & previous_nodes.keys()):
+            before = previous_nodes[node_id]
+            after = current_nodes[node_id]
+            before_state = (before.get("interaction") or {}).get("state", "unknown")
+            after_state = (after.get("interaction") or {}).get("state", "unknown")
+            if before_state != after_state:
+                events.append(
+                    {
+                        "event": "STATE_CHANGED",
+                        "node_id": node_id,
+                        "before": before_state,
+                        "after": after_state,
+                    }
+                )
+        return events
 
     def global_costmap_callback(self, msg: OccupancyGrid) -> None:
         with self.lock:
@@ -1024,12 +1138,230 @@ class ExploreDebugRecorder:
             "cv2/numpy is unavailable in this Python environment.\n"
         )
 
+    def _draw_gt_observations_locked(self, frame, source_width: int, source_height: int) -> None:
+        observations = list(self.latest_gt_observations.get("observations") or [])
+        scale_x = float(frame.shape[1]) / max(1, source_width)
+        scale_y = float(frame.shape[0]) / max(1, source_height)
+        for observation in observations:
+            bbox = observation.get("bbox_2d") or []
+            image_size = observation.get("image_size") or [source_width, source_height]
+            if len(bbox) != 4 or len(image_size) != 2:
+                continue
+            bbox_scale_x = float(frame.shape[1]) / max(1, int(image_size[0]))
+            bbox_scale_y = float(frame.shape[0]) / max(1, int(image_size[1]))
+            x0, y0, x1, y1 = [int(value) for value in bbox]
+            start = (int(x0 * bbox_scale_x), int(y0 * bbox_scale_y))
+            end = (int(x1 * bbox_scale_x), int(y1 * bbox_scale_y))
+            is_door = bool(observation.get("is_door"))
+            is_container = bool(observation.get("is_receptacle"))
+            color = (238, 80, 50) if is_door else (170, 70, 220) if is_container else (20, 210, 210)
+            cv2.rectangle(frame, start, end, color, 2, cv2.LINE_AA)
+            label = f"{observation.get('semantic_name', 'obj')} {observation.get('instance_id', '')}"
+            joint_value = observation.get("joint_value")
+            if joint_value is not None and observation.get("primary_joint_name"):
+                label += f" q={float(joint_value):.2f}"
+            label_y = max(18, start[1] - 5)
+            cv2.putText(frame, label[:48], (start[0], label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+        cv2.rectangle(frame, (0, max(0, frame.shape[0] - 28)), (min(frame.shape[1] - 1, 420), frame.shape[0] - 1), (255, 255, 255), -1)
+        cv2.putText(
+            frame,
+            f"GT visible={len(observations)} frame={self.latest_gt_observations.get('frame_index', '-')} source=realtime_gt",
+            (8, frame.shape[0] - 9),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (20, 20, 20),
+            1,
+            cv2.LINE_AA,
+        )
+
+    @staticmethod
+    def _node_xy(node: dict) -> tuple[float, float] | None:
+        center = node.get("aabb_center") or node.get("centroid") or []
+        if len(center) < 2:
+            return None
+        return float(center[0]), float(center[1])
+
+    def _node_observed_in_recording(self, node: dict) -> bool:
+        if node.get("type") == "room":
+            return True
+        instance_id = str((node.get("attributes") or {}).get("instance_id") or "")
+        return bool(instance_id and instance_id in self.observed_instance_ids)
+
+    @staticmethod
+    def _short_node_id(node: dict) -> str:
+        instance_id = str((node.get("attributes") or {}).get("instance_id") or "")
+        token = instance_id or str(node.get("id") or "")
+        suffix = token.rsplit("_", 1)[-1]
+        try:
+            return f"#{int(suffix)}"
+        except ValueError:
+            return suffix[-6:]
+
+    @staticmethod
+    def _semantic_node_color(node: dict) -> tuple[int, int, int]:
+        node_type = str(node.get("type", "object"))
+        if node_type == "room":
+            return (205, 225, 245)
+        if node_type == "portal":
+            state = str((node.get("interaction") or {}).get("state", "unknown"))
+            return (50, 190, 70) if state in {"open", "ajar"} else (235, 70, 55) if state == "closed" else (235, 175, 45)
+        if node_type == "container":
+            return (175, 75, 220)
+        if node_type == "support":
+            return (50, 125, 220)
+        return (30, 190, 195) if node.get("is_currently_visible") else (145, 145, 145)
+
+    def _render_semantic_spatial_panel_locked(self, panel_width: int, panel_height: int, pose) -> object:
+        panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
+        graph = self.latest_unified_graph
+        nodes = [node for node in graph.get("nodes") or [] if self._node_observed_in_recording(node)]
+        positions = [self._node_xy(node) for node in nodes]
+        positions = [position for position in positions if position is not None]
+        if pose is not None:
+            positions.append((float(pose[0]), float(pose[1])))
+        cv2.putText(panel, f"SEMANTIC XY rev={graph.get('graph_revision', 0)} nodes={len(nodes)}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (20, 20, 20), 2, cv2.LINE_AA)
+        if not positions:
+            cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, panel_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
+            return panel
+        min_x = min(position[0] for position in positions)
+        max_x = max(position[0] for position in positions)
+        min_y = min(position[1] for position in positions)
+        max_y = max(position[1] for position in positions)
+        for node in nodes:
+            position = self._node_xy(node)
+            size = node.get("aabb_size") or [0.0, 0.0, 0.0]
+            if position is None or len(size) < 2:
+                continue
+            min_x = min(min_x, position[0] - float(size[0]) * 0.5)
+            max_x = max(max_x, position[0] + float(size[0]) * 0.5)
+            min_y = min(min_y, position[1] - float(size[1]) * 0.5)
+            max_y = max(max_y, position[1] + float(size[1]) * 0.5)
+        margin = 38
+        span_x = max(2.0, max_x - min_x)
+        span_y = max(2.0, max_y - min_y)
+        scale = min((panel_width - margin * 2) / span_x, (panel_height - margin * 2 - 20) / span_y)
+        center_x = (min_x + max_x) * 0.5
+        center_y = (min_y + max_y) * 0.5
+
+        def to_px(x: float, y: float) -> tuple[int, int]:
+            return int(panel_width * 0.5 + (x - center_x) * scale), int(panel_height * 0.53 - (y - center_y) * scale)
+
+        for grid_x in range(math.floor(min_x), math.ceil(max_x) + 1):
+            start = to_px(grid_x, min_y)
+            end = to_px(grid_x, max_y)
+            cv2.line(panel, start, end, (226, 226, 226), 1)
+        for grid_y in range(math.floor(min_y), math.ceil(max_y) + 1):
+            start = to_px(min_x, grid_y)
+            end = to_px(max_x, grid_y)
+            cv2.line(panel, start, end, (226, 226, 226), 1)
+        node_lookup = {node.get("id"): node for node in nodes}
+        for edge in graph.get("edges") or []:
+            if edge.get("relation") not in {"connects", "contains", "supports"}:
+                continue
+            src = self._node_xy(node_lookup.get(edge.get("src_id"), {}))
+            dst = self._node_xy(node_lookup.get(edge.get("dst_id"), {}))
+            if src is None or dst is None:
+                continue
+            relation = edge.get("relation")
+            color = (220, 90, 45) if relation == "connects" else (170, 75, 210) if relation == "contains" else (55, 125, 220)
+            cv2.line(panel, to_px(*src), to_px(*dst), color, 2, cv2.LINE_AA)
+        for node in sorted(nodes, key=lambda item: item.get("type") != "room"):
+            position = self._node_xy(node)
+            if position is None:
+                continue
+            size = node.get("aabb_size") or [0.25, 0.25, 0.0]
+            half_w = max(3, int(max(0.08, float(size[0]) * 0.5) * scale))
+            half_h = max(3, int(max(0.08, float(size[1]) * 0.5) * scale))
+            center = to_px(*position)
+            color = self._semantic_node_color(node)
+            thickness = 2 if node.get("is_currently_visible") else 1
+            if node.get("type") == "room":
+                overlay = panel.copy()
+                cv2.rectangle(overlay, (center[0] - half_w, center[1] - half_h), (center[0] + half_w, center[1] + half_h), color, -1)
+                cv2.addWeighted(overlay, 0.35, panel, 0.65, 0, panel)
+                cv2.rectangle(panel, (center[0] - half_w, center[1] - half_h), (center[0] + half_w, center[1] + half_h), (125, 150, 175), 1)
+            else:
+                cv2.rectangle(panel, (center[0] - half_w, center[1] - half_h), (center[0] + half_w, center[1] + half_h), color, thickness)
+            short_id = self._short_node_id(node)
+            if node.get("type") in {"room", "portal", "container"}:
+                label = f"{short_id} {node.get('label', node.get('type', ''))}"[:22]
+            else:
+                label = short_id
+            cv2.putText(panel, label, (center[0] + 3, center[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (35, 35, 35), 1, cv2.LINE_AA)
+        if pose is not None:
+            center = to_px(float(pose[0]), float(pose[1]))
+            self._draw_cv_robot_arrow(panel, center, float(pose[2]), 14)
+        return panel
+
+    def _render_semantic_topology_panel_locked(self, panel_width: int, panel_height: int) -> object:
+        panel = np.full((panel_height, panel_width, 3), 250, dtype=np.uint8)
+        graph = self.latest_unified_graph
+        all_nodes = [node for node in graph.get("nodes") or [] if self._node_observed_in_recording(node)]
+        node_lookup = {node.get("id"): node for node in all_nodes}
+        contains_edges = [edge for edge in graph.get("edges") or [] if edge.get("relation") == "contains"]
+        contained_ids = {edge.get("dst_id") for edge in contains_edges}
+        selected = [
+            node
+            for node in all_nodes
+            if node.get("type") in {"room", "portal", "container"} or node.get("id") in contained_ids
+        ]
+        slot_rows = {
+            "room": (int(panel_height * 0.18), 5),
+            "portal": (int(panel_height * 0.40), 7),
+            "container": (int(panel_height * 0.62), 6),
+            "object": (int(panel_height * 0.78), 8),
+        }
+        positions = {}
+        for node in sorted(selected, key=lambda item: str(item.get("id"))):
+            node_id = str(node.get("id"))
+            node_type = str(node.get("type", "object"))
+            if node_id not in self.topology_slots:
+                slot = int(self.topology_next_slot.get(node_type, 0))
+                self.topology_next_slot[node_type] = slot + 1
+                self.topology_slots[node_id] = (slot, slot_rows.get(node_type, slot_rows["object"])[1])
+            slot, columns = self.topology_slots[node_id]
+            row_y, _ = slot_rows.get(node_type, slot_rows["object"])
+            column = slot % max(1, columns)
+            extra_row = slot // max(1, columns)
+            x = int((column + 1) * panel_width / (columns + 1))
+            y = min(panel_height - 74, row_y + extra_row * 34)
+            positions[node_id] = (x, y)
+        for edge in graph.get("edges") or []:
+            src = positions.get(edge.get("src_id"))
+            dst = positions.get(edge.get("dst_id"))
+            relation = edge.get("relation")
+            if src is None or dst is None or relation not in {"connects", "adjacent_via", "contains"}:
+                continue
+            color = (220, 85, 45) if relation in {"connects", "adjacent_via"} else (170, 75, 210) if relation == "contains" else (90, 130, 190)
+            cv2.line(panel, src, dst, color, 2, cv2.LINE_AA)
+        for node in selected:
+            center = positions.get(node.get("id"))
+            if center is None:
+                continue
+            color = self._semantic_node_color(node)
+            cv2.circle(panel, center, 13 if node.get("type") == "room" else 9, color, -1, cv2.LINE_AA)
+            state = str((node.get("interaction") or {}).get("state", ""))
+            label = f"{self._short_node_id(node)} {node.get('label', node.get('type', ''))}"
+            if state and state != "unknown":
+                label += f"[{state}]"
+            cv2.putText(panel, label[:18], (center[0] - 24, center[1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (30, 30, 30), 1, cv2.LINE_AA)
+        revision = int(graph.get("graph_revision", 0) or 0)
+        cv2.putText(panel, f"INTERACTION TOPOLOGY rev={revision}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (20, 20, 20), 2, cv2.LINE_AA)
+        legend = "ROOM -- PORTAL -- ROOM    CONTAINER --contains--> OBJECT"
+        cv2.putText(panel, legend, (10, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (75, 75, 75), 1, cv2.LINE_AA)
+        event_y = panel_height - 62
+        cv2.rectangle(panel, (6, event_y - 20), (panel_width - 6, panel_height - 6), (238, 238, 238), -1)
+        for index, event in enumerate(self.semantic_events[-3:]):
+            text = f"r{event.get('graph_revision', 0)} {event.get('event', '')} {event.get('node_id') or event.get('relation', '')}"
+            cv2.putText(panel, text[:58], (12, event_y + index * 17), cv2.FONT_HERSHEY_SIMPLEX, 0.31, (45, 45, 45), 1, cv2.LINE_AA)
+        return panel
+
     def _record_first_person_video_frame_locked(self, width: int, height: int, rgb: bytearray) -> None:
         if not self.args.first_person_video or cv2 is None or np is None:
             return
         now = time.time()
-        fps = max(0.1, float(self.args.first_person_video_fps))
-        if self.last_first_person_video_frame_time > 0.0 and now - self.last_first_person_video_frame_time < 1.0 / fps:
+        capture_fps = max(0.1, float(self.args.first_person_video_capture_fps))
+        if self.last_first_person_video_frame_time > 0.0 and now - self.last_first_person_video_frame_time < 1.0 / capture_fps:
             return
         try:
             with self.lock:
@@ -1066,9 +1398,13 @@ class ExploreDebugRecorder:
             frame_height = max(1, frame_height)
             camera_frame = np.frombuffer(bytes(rgb), dtype=np.uint8).reshape((height, width, 3))
             camera_frame = cv2.resize(camera_frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
+            if self.args.semantic_video:
+                self._draw_gt_observations_locked(camera_frame, width, height)
             occ_panel = None
             global_costmap_panel = None
             local_costmap_panel = None
+            semantic_spatial_panel = None
+            semantic_topology_panel = None
             if self.args.first_person_video_with_map:
                 occ_panel = self._render_video_map_panel_locked(
                     frame_width,
@@ -1089,7 +1425,7 @@ class ExploreDebugRecorder:
                     frame_height,
                     grid=global_costmap,
                     base=global_costmap_base,
-                    title=f"GLOBAL COSTMAP step={_step4(global_costmap_step)}",
+                    title=f"GLOBAL step={_step4(global_costmap_step)}",
                     bbox_attr="video_global_costmap_bbox",
                     draw_frontiers=False,
                     draw_global_plan=True,
@@ -1108,7 +1444,7 @@ class ExploreDebugRecorder:
                     frame_height,
                     grid=local_costmap,
                     base=local_costmap_base,
-                    title=f"LOCAL COSTMAP step={_step4(local_costmap_step)}",
+                    title=f"LOCAL step={_step4(local_costmap_step)}",
                     bbox_attr="video_local_costmap_bbox",
                     draw_frontiers=False,
                     draw_global_plan=False,
@@ -1123,13 +1459,38 @@ class ExploreDebugRecorder:
                     local_plan=local_plan,
                     image_step=image_step,
                 )
+            if self.args.semantic_video:
+                semantic_spatial_panel = self._render_semantic_spatial_panel_locked(frame_width, frame_height, pose)
+                semantic_topology_panel = self._render_semantic_topology_panel_locked(frame_width, frame_height)
             video_size = (frame_width, frame_height)
-            if occ_panel is not None and global_costmap_panel is not None and local_costmap_panel is not None:
+            if (
+                occ_panel is not None
+                and global_costmap_panel is not None
+                and local_costmap_panel is not None
+                and semantic_spatial_panel is not None
+                and semantic_topology_panel is not None
+            ):
+                video_size = (frame_width * 3, frame_height * 2)
+            elif occ_panel is not None and global_costmap_panel is not None and local_costmap_panel is not None:
                 video_size = (frame_width * 2, frame_height * 2)
             if self.first_person_video_size is None:
                 self.first_person_video_size = video_size
             target_size = self.first_person_video_size or (frame_width, frame_height)
             if (
+                occ_panel is not None
+                and global_costmap_panel is not None
+                and local_costmap_panel is not None
+                and semantic_spatial_panel is not None
+                and semantic_topology_panel is not None
+                and target_size == (frame_width * 3, frame_height * 2)
+            ):
+                frame = np.vstack(
+                    [
+                        np.concatenate([camera_frame, occ_panel, semantic_spatial_panel], axis=1),
+                        np.concatenate([global_costmap_panel, local_costmap_panel, semantic_topology_panel], axis=1),
+                    ]
+                )
+            elif (
                 occ_panel is not None
                 and global_costmap_panel is not None
                 and local_costmap_panel is not None
@@ -1151,10 +1512,7 @@ class ExploreDebugRecorder:
             map_age_text = "inf" if not math.isfinite(map_age) else f"{map_age:.2f}s"
             stamp_delta_text = "inf" if not math.isfinite(stamp_delta) else f"{stamp_delta:.3f}s"
             active_flag = 1 if active_goal is not None else 0
-            label = (
-                f"STEP={_step4(image_step)} OCC={_step4(map_step)} "
-                f"GCM={_step4(global_costmap_step)} LCM={_step4(local_costmap_step)}{desync}"
-            )
+            label = f"STEP={_step4(image_step)} OCC={_step4(map_step)} G={_step4(global_costmap_step)} L={_step4(local_costmap_step)}{desync}"
             label2 = (
                 f"dist={distance_m:.2f}m goal=#{goal_count:03d} active={active_flag} "
                 f"occ_age={map_age_text} fresh={int(map_fresh)} hdr_dT={stamp_delta_text}"
@@ -1165,15 +1523,17 @@ class ExploreDebugRecorder:
             )
             text_right = min(frame_width - 8, 620)
             cv2.rectangle(frame, (8, 8), (text_right, 88), (255, 255, 255), -1)
-            cv2.putText(frame, label, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (15, 15, 15), 2, cv2.LINE_AA)
+            cv2.putText(frame, label, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (15, 15, 15), 1, cv2.LINE_AA)
             self.first_person_video_frame_count += 1
             frame_index = self.first_person_video_frame_count
-            cv2.putText(frame, label2, (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (15, 15, 15), 2, cv2.LINE_AA)
-            cv2.putText(frame, stuck_label, (18, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (15, 15, 15), 2, cv2.LINE_AA)
+            cv2.putText(frame, label2, (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (15, 15, 15), 1, cv2.LINE_AA)
+            cv2.putText(frame, stuck_label, (18, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (15, 15, 15), 1, cv2.LINE_AA)
             camera_path = self.video_camera_frame_dir / f"frame_{frame_index:06d}_camera.png"
             map_path = self.video_map_frame_dir / f"frame_{frame_index:06d}_map.png"
             global_costmap_path = self.video_global_costmap_frame_dir / f"frame_{frame_index:06d}_global_costmap.png"
             local_costmap_path = self.video_local_costmap_frame_dir / f"frame_{frame_index:06d}_local_costmap.png"
+            semantic_spatial_path = self.video_semantic_spatial_frame_dir / f"frame_{frame_index:06d}_semantic_spatial.png"
+            semantic_topology_path = self.video_semantic_topology_frame_dir / f"frame_{frame_index:06d}_semantic_topology.png"
             composite_path = self.video_composite_frame_dir / f"frame_{frame_index:06d}_composite.png"
             _write_png(camera_path, frame_width, frame_height, bytearray(camera_frame.tobytes()))
             if occ_panel is not None:
@@ -1192,7 +1552,29 @@ class ExploreDebugRecorder:
                     int(local_costmap_panel.shape[0]),
                     bytearray(local_costmap_panel.tobytes()),
                 )
+            if semantic_spatial_panel is not None:
+                _write_png(
+                    semantic_spatial_path,
+                    int(semantic_spatial_panel.shape[1]),
+                    int(semantic_spatial_panel.shape[0]),
+                    bytearray(semantic_spatial_panel.tobytes()),
+                )
+            if semantic_topology_panel is not None:
+                _write_png(
+                    semantic_topology_path,
+                    int(semantic_topology_panel.shape[1]),
+                    int(semantic_topology_panel.shape[0]),
+                    bytearray(semantic_topology_panel.tobytes()),
+                )
             _write_png(composite_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
+            graph_revision = int(self.latest_unified_graph.get("graph_revision", 0) or 0)
+            if (
+                graph_revision == self.pending_semantic_keyframe_revision
+                and graph_revision != self.last_semantic_keyframe_revision
+            ):
+                keyframe_path = self.semantic_keyframe_dir / f"revision_{graph_revision:06d}.png"
+                _write_png(keyframe_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
+                self.last_semantic_keyframe_revision = graph_revision
             record = {
                 "frame_index": frame_index,
                 "step_id": image_step,
@@ -1212,6 +1594,9 @@ class ExploreDebugRecorder:
                 "map_frame": str(map_path) if occ_panel is not None else "",
                 "global_costmap_frame": str(global_costmap_path) if global_costmap_panel is not None else "",
                 "local_costmap_frame": str(local_costmap_path) if local_costmap_panel is not None else "",
+                "semantic_spatial_frame": str(semantic_spatial_path) if semantic_spatial_panel is not None else "",
+                "semantic_topology_frame": str(semantic_topology_path) if semantic_topology_panel is not None else "",
+                "graph_revision": graph_revision,
                 "composite_frame": str(composite_path),
             }
             self.first_person_video_frames.append(record)
@@ -1242,6 +1627,8 @@ class ExploreDebugRecorder:
                     "local_costmap_step": local_costmap_step,
                     "global_costmap_frame": str(global_costmap_path) if global_costmap_panel is not None else "",
                     "local_costmap_frame": str(local_costmap_path) if local_costmap_panel is not None else "",
+                    "semantic_spatial_frame": str(semantic_spatial_path) if semantic_spatial_panel is not None else "",
+                    "semantic_topology_frame": str(semantic_topology_path) if semantic_topology_panel is not None else "",
                     "composite_frame": str(composite_path),
                 }
             )
@@ -1820,9 +2207,9 @@ class ExploreDebugRecorder:
             f"{title}  IMG STEP={_step4(image_step)}",
             (10, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
+            0.50 if panel_width < 700 else 0.65,
             (20, 20, 20),
-            2,
+            1 if panel_width < 700 else 2,
             cv2.LINE_AA,
         )
         return panel
@@ -3185,7 +3572,64 @@ class ExploreDebugRecorder:
         }
         self.events_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
+    def _render_semantic_contact_sheet(self) -> str:
+        paths = sorted(self.semantic_keyframe_dir.glob("revision_*.png"))
+        if len(paths) > 12:
+            sample_indices = np.linspace(0, len(paths) - 1, 12, dtype=int) if np is not None else range(12)
+            paths = [paths[int(index)] for index in sample_indices]
+        panels = []
+        for path in paths:
+            loaded = _read_png(path)
+            if loaded is None:
+                continue
+            width, height, rgb = loaded
+            if cv2 is not None and np is not None:
+                target_width = 900
+                target_height = max(1, int(round(height * target_width / max(1, width))))
+                image = np.frombuffer(bytes(rgb), dtype=np.uint8).reshape((height, width, 3))
+                resized = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+                panels.append((target_width, target_height, bytearray(resized.tobytes())))
+            else:
+                panels.append(_resize_rgb_nearest(rgb, width, height, target_width=900))
+        sheet = _make_contact_sheet(panels, columns=2, gap_px=12)
+        if sheet is None:
+            return ""
+        width, height, rgb = sheet
+        path = self.output_dir / "semantic_contact_sheet.png"
+        _write_png(path, width, height, rgb)
+        return str(path)
+
+    def _semantic_summary(self) -> dict:
+        graph = self.latest_unified_graph
+        nodes = list(graph.get("nodes") or [])
+        edges = list(graph.get("edges") or [])
+        node_counts = {}
+        for node in nodes:
+            node_type = str(node.get("type", "object"))
+            node_counts[node_type] = node_counts.get(node_type, 0) + 1
+        portal_nodes = [node for node in nodes if node.get("type") == "portal"]
+        return {
+            "episode_id": graph.get("episode_id", ""),
+            "graph_revision": int(graph.get("graph_revision", 0) or 0),
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "node_counts": node_counts,
+            "currently_visible_count": sum(bool(node.get("is_currently_visible")) for node in nodes),
+            "connected_portal_count": sum(
+                (node.get("attributes") or {}).get("connectivity_status") == "connected" for node in portal_nodes
+            ),
+            "partial_portal_count": sum(
+                (node.get("attributes") or {}).get("connectivity_status") == "partial" for node in portal_nodes
+            ),
+            "contains_edge_count": sum(edge.get("relation") == "contains" for edge in edges),
+            "semantic_event_count": len(self.semantic_events),
+        }
+
     def shutdown(self) -> None:
+        with self.video_lock:
+            self._shutdown_locked()
+
+    def _shutdown_locked(self) -> None:
         with self.lock:
             if self.shutting_down:
                 return
@@ -3227,6 +3671,15 @@ class ExploreDebugRecorder:
             uniform_subgoal_crop = self._render_uniform_subgoal_crops_locked()
             subgoal_contact_sheet = self._render_subgoal_contact_sheet()
             subgoal_overlay_contact_sheet = self._render_subgoal_overlay_contact_sheet()
+            semantic_contact_sheet = self._render_semantic_contact_sheet()
+            graph_final = ""
+            if self.latest_unified_graph:
+                episode_id = str(self.latest_unified_graph.get("episode_id") or "episode")
+                graph_final_path = self.graph_dir / f"{episode_id}_final.json"
+                graph_final_path.write_text(
+                    json.dumps(self.latest_unified_graph, ensure_ascii=False, indent=2, sort_keys=True)
+                )
+                graph_final = str(graph_final_path)
             with self.video_lock:
                 self._finalize_first_person_video_locked()
                 self._finalize_external_video_locked()
@@ -3262,9 +3715,16 @@ class ExploreDebugRecorder:
                 else "",
                 "first_person_video_frame_count": self.first_person_video_frame_count,
                 "first_person_video_fps": self.args.first_person_video_fps,
+                "first_person_video_capture_fps": self.args.first_person_video_capture_fps,
                 "first_person_video_codec": self.first_person_video_codec_name,
                 "first_person_video_error": self.first_person_video_error,
                 "first_person_video_map_mode": "latest_occ_snapshot_on_image_callback",
+                "semantic_video": bool(self.args.semantic_video),
+                "semantic_summary": self._semantic_summary(),
+                "semantic_graph_final": graph_final,
+                "semantic_events_jsonl": str(self.graph_dir / "graph_revision_events.jsonl"),
+                "semantic_keyframes": str(self.semantic_keyframe_dir),
+                "semantic_contact_sheet": semantic_contact_sheet,
                 "first_person_video_map_max_age_sec": self.args.video_map_max_age_sec,
                 "first_person_video_frames_csv": str(self.output_dir / "video_frames.csv"),
                 "first_person_video_camera_frames": str(self.video_camera_frame_dir),
@@ -3300,6 +3760,7 @@ class ExploreDebugRecorder:
                 self.plan_file,
                 self.video_frames_file,
                 self.move_base_log_file,
+                self.semantic_events_file,
             ]:
                 handle.close()
 
@@ -3315,6 +3776,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--current-subgoal-topic", default="/explore_py/current_subgoal")
     parser.add_argument("--move-base-status-topic", default="/move_base/status")
     parser.add_argument("--explore-status-topic", default="/explore_py/status")
+    parser.add_argument("--gt-observations-topic", default="/semantic_mapping/gt_observations")
+    parser.add_argument("--unified-graph-topic", default="/semantic_mapping/unified_graph")
     parser.add_argument("--global-plan-topic", default="/move_base/GlobalPlanner/plan")
     parser.add_argument("--local-global-plan-topic", default="/move_base/DWAPlannerROS/global_plan")
     parser.add_argument("--local-plan-topic", default="/move_base/DWAPlannerROS/local_plan")
@@ -3351,8 +3814,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--path-check-max-hits", type=int, default=25)
     parser.add_argument("--first-person-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--first-person-video-with-map", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--semantic-video", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--external-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--first-person-video-fps", type=float, default=15.0)
+    parser.add_argument(
+        "--first-person-video-capture-fps",
+        type=float,
+        default=1.0,
+        help="Online six-panel render rate; captured frames are each written once at --first-person-video-fps.",
+    )
     parser.add_argument("--first-person-video-width-px", type=int, default=960)
     parser.add_argument("--first-person-video-codec", default="mp4v")
     parser.add_argument("--first-person-video-h264", action=argparse.BooleanOptionalAction, default=True)

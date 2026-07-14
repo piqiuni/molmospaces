@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from molmo_spaces.policy.base_policy import BasePolicy
+from molmo_spaces.policy.learned_policy.realtime_gt_observation import RealtimeGTObservationPublisher
 from molmo_spaces.tasks.task import BaseMujocoTask
 
 
@@ -37,6 +38,7 @@ class RosBridgePolicy(BasePolicy):
         depth_min_m: float = 0.1,
         depth_max_m: float = 30.0,
         pointcloud_stride: int = 2,
+        pointcloud_self_filter_radius_m: float = 0.32,
         pointcloud_roll_correction_deg: float = 0.0,
         odom_topic: str = "/odom",
         publish_odom: bool = True,
@@ -62,6 +64,12 @@ class RosBridgePolicy(BasePolicy):
         timing_log_every_n_frames: int = 30,
         extra_image_topic: str = "/molmo_spaces/debug_front_camera/image",
         extra_image_camera_name: str = "debug_front_camera",
+        publish_realtime_gt: bool = False,
+        realtime_gt_topic: str = "/semantic_mapping/gt_observations",
+        realtime_gt_camera_name: str = "head_camera",
+        realtime_gt_min_visible_pixels: int = 16,
+        realtime_gt_step_interval: int = 3,
+        realtime_gt_max_distance_m: float = 6.0,
     ) -> None:
         super().__init__(config, task)
         self.observation_topic = observation_topic
@@ -80,6 +88,7 @@ class RosBridgePolicy(BasePolicy):
         self.depth_min_m = float(depth_min_m)
         self.depth_max_m = float(depth_max_m)
         self.pointcloud_stride = max(1, int(pointcloud_stride))
+        self.pointcloud_self_filter_radius_m = max(0.0, float(pointcloud_self_filter_radius_m))
         self.pointcloud_roll_correction_deg = float(pointcloud_roll_correction_deg)
         self.odom_topic = odom_topic
         self.publish_odom = bool(publish_odom)
@@ -104,6 +113,7 @@ class RosBridgePolicy(BasePolicy):
         self.timing_log_every_n_frames = max(0, int(timing_log_every_n_frames))
         self.extra_image_topic = extra_image_topic
         self.extra_image_camera_name = extra_image_camera_name
+        self.publish_realtime_gt = bool(publish_realtime_gt)
         if cmd_vel_control_dt_s is None:
             cfg_dt_ms = getattr(config, "policy_dt_ms", None)
             if cfg_dt_ms is not None and float(cfg_dt_ms) > 0.0:
@@ -192,6 +202,18 @@ class RosBridgePolicy(BasePolicy):
         self._publish_static_tfs()
         self._action_sub = rospy.Subscriber(self.action_topic, String, self._action_callback)
         self._cmd_vel_sub = rospy.Subscriber(self.cmd_vel_topic, TwistStamped, self._cmd_vel_callback)
+        self._realtime_gt_publisher = None
+        if self.publish_realtime_gt:
+            self._realtime_gt_publisher = RealtimeGTObservationPublisher(
+                rospy,
+                String,
+                topic=realtime_gt_topic,
+                camera_name=realtime_gt_camera_name,
+                min_visible_pixels=realtime_gt_min_visible_pixels,
+                step_interval=realtime_gt_step_interval,
+                max_distance_m=realtime_gt_max_distance_m,
+                queue_size=self.queue_size,
+            )
 
     @staticmethod
     def _rotation_matrix_to_quaternion(rot: np.ndarray) -> tuple[float, float, float, float]:
@@ -522,6 +544,8 @@ class RosBridgePolicy(BasePolicy):
             self._latest_cmd_vel = None
             self._latest_cmd_vel_mono_s = 0.0
         self._last_base_position_xyz = None
+        if self._realtime_gt_publisher is not None:
+            self._realtime_gt_publisher.reset()
 
     def _record_timing(self, stage_ms: dict[str, float]) -> None:
         if self.timing_log_every_n_frames <= 0:
@@ -867,6 +891,13 @@ class RosBridgePolicy(BasePolicy):
         points[:, 1] = -x_cam
         points[:, 2] = -y_cam
 
+        if self.pointcloud_self_filter_radius_m > 0.0:
+            horizontal_radius_sq = points[:, 0] * points[:, 0] + points[:, 1] * points[:, 1]
+            keep = horizontal_radius_sq > self.pointcloud_self_filter_radius_m**2
+            points = points[keep]
+            if points.shape[0] == 0:
+                return None
+
         # Optional roll correction around forward axis (robot +x).
         # Positive follows right-hand rule; if you observe clockwise tilt in view,
         # use a negative value to compensate.
@@ -1065,6 +1096,8 @@ class RosBridgePolicy(BasePolicy):
         t0 = time.perf_counter()
         common_stamp = self._next_common_stamp()
         tf_ready = self._publish_odom_and_tf(observation, common_stamp)
+        if self._realtime_gt_publisher is not None:
+            self._realtime_gt_publisher.publish(self.task, stamp=common_stamp, step_index=self._step_idx)
         stage_ms["odom_tf"] = (time.perf_counter() - t0) * 1000.0
 
         skip_mapping_observation = self._step_idx < self.map_warmup_skip_frames or (not tf_ready)
@@ -1270,6 +1303,8 @@ class RosBridgePolicy(BasePolicy):
         return chosen_action
 
     def close(self):
+        if self._realtime_gt_publisher is not None:
+            self._realtime_gt_publisher.close()
         if hasattr(self, "_action_sub") and self._action_sub is not None:
             self._action_sub.unregister()
             self._action_sub = None

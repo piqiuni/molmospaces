@@ -10,6 +10,10 @@
   <arg name="start_explore" default="$(eval 'false' if arg('manual_control') == 'true' else 'true')"/>
   <arg name="start_nav" default="$(eval 'false' if arg('manual_control') else 'true')"/>
   <arg name="semantic_use_gt" default="false"/>
+  <arg name="semantic_source" default="detector"/>
+  <arg name="publish_realtime_gt" default="false"/>
+  <arg name="local_costmap_inflation_radius" default="0.1"/>
+  <arg name="explore_py_config_file" default="$(find explore_py_pkg)/config/explore_py.yaml"/>
 
   <arg name="robot" default="rby1"/>
   <arg name="scene_dataset" default="procthor-10k"/>
@@ -54,14 +58,14 @@
           name="molmospaces_nav_ros_sim"
           output="screen"
           required="true"
-          args="--robot $(arg robot) --scene_dataset $(arg scene_dataset) --data_split $(arg data_split) --house_ind $(arg house_ind) --target_types $(arg target_types) --exploration_only $(arg exploration_only) --task_horizon $(arg task_horizon) --randomize_camera $(arg randomize_camera) --lidar_calib_x_m $(arg lidar_calib_x_m) --lidar_calib_y_m $(arg lidar_calib_y_m) --lidar_calib_z_m $(arg lidar_calib_z_m) --lidar_calib_roll_deg $(arg lidar_calib_roll_deg) --lidar_calib_pitch_deg $(arg lidar_calib_pitch_deg) --lidar_calib_yaw_deg $(arg lidar_calib_yaw_deg) --allow_static_lidar_tf_fallback $(arg allow_static_lidar_tf_fallback) --initial_arm_qpos $(arg initial_arm_qpos) --initial_left_arm_qpos $(arg initial_left_arm_qpos) --initial_right_arm_qpos $(arg initial_right_arm_qpos) --publish_debug_front_camera $(arg publish_debug_front_camera) $(arg sim_extra_args)"/>
+          args="--robot $(arg robot) --scene_dataset $(arg scene_dataset) --data_split $(arg data_split) --house_ind $(arg house_ind) --target_types $(arg target_types) --exploration_only $(arg exploration_only) --task_horizon $(arg task_horizon) --randomize_camera $(arg randomize_camera) --lidar_calib_x_m $(arg lidar_calib_x_m) --lidar_calib_y_m $(arg lidar_calib_y_m) --lidar_calib_z_m $(arg lidar_calib_z_m) --lidar_calib_roll_deg $(arg lidar_calib_roll_deg) --lidar_calib_pitch_deg $(arg lidar_calib_pitch_deg) --lidar_calib_yaw_deg $(arg lidar_calib_yaw_deg) --allow_static_lidar_tf_fallback $(arg allow_static_lidar_tf_fallback) --initial_arm_qpos $(arg initial_arm_qpos) --initial_left_arm_qpos $(arg initial_left_arm_qpos) --initial_right_arm_qpos $(arg initial_right_arm_qpos) --publish_debug_front_camera $(arg publish_debug_front_camera) --publish_realtime_gt $(arg publish_realtime_gt) $(arg sim_extra_args)"/>
   </group>
 
   <group if="$(arg start_mapping)">
     <include file="$(find struct_mapping_pkg)/launch/slam_gmapping.launch"/>
   </group>
 
-  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_use_gt') != 'true')">
+  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_source') == 'detector' and arg('semantic_use_gt') != 'true')">
     <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
       <arg name="config_file" value="$(arg semantic_config_file)"/>
       <arg name="start_object_detection" value="true"/>
@@ -80,7 +84,16 @@
     </include>
   </group>
 
-  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_use_gt') == 'true')">
+  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_source') == 'realtime_gt')">
+    <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
+      <arg name="config_file" value="$(arg semantic_config_file)"/>
+      <arg name="start_object_detection" value="false"/>
+      <arg name="start_room_attribute" value="false"/>
+      <arg name="start_semantic_mapping" value="true"/>
+    </include>
+  </group>
+
+  <group if="$(eval arg('start_semantic_mapping') == 'true' and (arg('semantic_source') == 'offline_gt' or arg('semantic_use_gt') == 'true'))">
     <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
       <arg name="config_file" value="$(arg semantic_config_file)"/>
       <arg name="start_object_detection" value="false"/>
@@ -103,10 +116,14 @@
   </group>
 
   <group if="$(arg start_explore_py)">
-    <include file="$(find explore_py_pkg)/launch/explore_py.launch"/>
+    <include file="$(find explore_py_pkg)/launch/explore_py.launch">
+      <arg name="config_file" value="$(arg explore_py_config_file)"/>
+    </include>
   </group>
 
   <group if="$(arg start_nav)">
     <include file="$(find nav_pkg)/launch/nav.launch"/>
+    <param name="/move_base/local_costmap/inflation_layer/inflation_radius"
+           value="$(arg local_costmap_inflation_radius)"/>
   </group>
 </launch>

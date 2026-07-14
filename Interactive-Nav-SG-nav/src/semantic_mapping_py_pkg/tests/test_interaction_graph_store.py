@@ -51,11 +51,18 @@ def test_incremental_room_object_graph_growth():
     store.update_observations(batches[0], source_mode="gt_replay")
     first_graph = store.as_graph_dict()
     assert any(node["id"] == "room_1" for node in first_graph["nodes"])
-    assert len(first_graph["nodes"]) == 2
+    assert len(first_graph["nodes"]) == 3
+    scene = next(node for node in first_graph["nodes"] if node["type"] == "scene")
+    room = next(node for node in first_graph["nodes"] if node["type"] == "room")
+    assert room["parent_id"] == scene["id"]
+    assert any(
+        edge["src_id"] == scene["id"] and edge["relation"] == "has_room" and edge["dst_id"] == room["id"]
+        for edge in first_graph["edges"]
+    )
 
     store.update_observations(batches[1], source_mode="gt_replay")
     second_graph = store.as_graph_dict()
-    assert len(second_graph["nodes"]) == 3
+    assert len(second_graph["nodes"]) == 4
     assert len(second_graph["views"]["navigation_view"]["hints"]) >= 3
 
 
@@ -349,3 +356,182 @@ def test_json_serializable_and_gt_batches():
     payload = store.as_graph_dict()
     json.dumps(payload)
     json.dumps(store.as_navigation_hints())
+
+
+class FakeGridInfo:
+    width = 8
+    height = 8
+    resolution = 1.0
+
+    class Origin:
+        class Position:
+            x = 0.0
+            y = 0.0
+
+        position = Position()
+
+    origin = Origin()
+
+
+def test_realtime_visibility_age_and_episode_reset():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.reset("episode_000001", source_mode="realtime_gt_observation")
+    door = observation(
+        instance_id="gt_000001",
+        semantic_name="door",
+        is_door=True,
+        is_articulable=True,
+        joint_type="hinge",
+        joint_range=[0.0, 1.0],
+        joint_value=0.0,
+    )
+    store.update_observations([door], stamp=10.0, source_mode="realtime_gt_observation")
+    store.update_observations([], stamp=12.0, source_mode="realtime_gt_observation")
+    graph = store.as_graph_dict(stamp=13.0)
+    portal = next(node for node in graph["nodes"] if node["type"] == "portal")
+    assert portal["is_currently_visible"] is False
+    assert portal["state_age_sec"] == 3.0
+    assert portal["interaction"]["state"] == "closed"
+    assert graph["episode_id"] == "episode_000001"
+    assert graph["graph_revision"] == 2
+
+    store.reset("episode_000002", source_mode="realtime_gt_observation")
+    graph = store.as_graph_dict(stamp=14.0)
+    assert graph["episode_id"] == "episode_000002"
+    assert graph["graph_revision"] == 0
+    assert len(graph["nodes"]) == 1
+    assert graph["nodes"][0]["type"] == "scene"
+    assert graph["nodes"][0]["attributes"]["episode_id"] == "episode_000002"
+
+
+def test_portal_room_connections_are_inferred_from_room_ring():
+    scene_data = []
+    for _y in range(FakeGridInfo.height):
+        scene_data.extend([1, 1, 1, 1, 2, 2, 2, 2])
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_room_grid(FakeGridInfo(), scene_data, [100] * len(scene_data))
+    store.update_observations(
+        [
+            observation(
+                instance_id="gt_000001",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=0.0,
+                position=[4.0, 4.0, 1.0],
+                aabb_center=[4.0, 4.0, 1.0],
+                aabb_size=[0.2, 1.0, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+    graph = store.as_graph_dict()
+    portal = next(node for node in graph["nodes"] if node["type"] == "portal")
+    assert set(portal["attributes"]["connected_room_ids"]) == {1, 2}
+    assert portal["attributes"]["connectivity_status"] == "connected"
+    connects = [edge for edge in graph["edges"] if edge["src_id"] == portal["id"] and edge["relation"] == "connects"]
+    assert {edge["dst_id"] for edge in connects} == {"room_1", "room_2"}
+    assert all(edge["attributes"]["traversable"] is False for edge in connects)
+    assert all(edge["attributes"]["requires_interaction"] is True for edge in connects)
+
+
+def test_container_relation_persists_while_child_is_unobserved_and_clears_after_move():
+    store = InteractionGraphStore(scene_id="test_scene")
+    container = observation(
+        instance_id="gt_000001",
+        semantic_name="fridge",
+        room_id=1,
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="hinge",
+        joint_range=[0.0, 1.0],
+        joint_value=1.0,
+        position=[2.0, 2.0, 1.0],
+        aabb_center=[2.0, 2.0, 1.0],
+        aabb_size=[1.0, 1.0, 2.0],
+    )
+    child = observation(
+        instance_id="gt_000002",
+        semantic_name="milk",
+        room_id=1,
+        position=[2.0, 2.0, 1.0],
+        aabb_center=[2.0, 2.0, 1.0],
+        aabb_size=[0.1, 0.1, 0.2],
+    )
+    store.update_observations([container, child], source_mode="realtime_gt_observation")
+    store.update_observations([container], source_mode="realtime_gt_observation")
+    relations = {(edge["src_id"], edge["relation"], edge["dst_id"]) for edge in store.as_graph_dict()["edges"]}
+    assert ("container_gt_000001", "contains", "object_gt_000002") in relations
+
+    moved_child = dict(child)
+    moved_child["position"] = [4.0, 4.0, 1.0]
+    moved_child["aabb_center"] = [4.0, 4.0, 1.0]
+    store.update_observations([moved_child], source_mode="realtime_gt_observation")
+    relations = {(edge["src_id"], edge["relation"], edge["dst_id"]) for edge in store.as_graph_dict()["edges"]}
+    assert ("container_gt_000001", "contains", "object_gt_000002") not in relations
+
+
+def test_interaction_result_updates_planner_fields():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="gt_000001",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=0.0,
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+    assert store.update_interaction_result(
+        {"instance_id": "gt_000001", "state": "open", "source": "oracle_interaction"},
+        stamp=20.0,
+    )
+    portal = next(node for node in store.as_graph_dict(stamp=20.0)["nodes"] if node["type"] == "portal")
+    assert portal["interaction"]["state"] == "open"
+    assert portal["interaction"]["traversable"] is True
+    assert portal["interaction"]["requires_interaction"] is False
+    assert portal["interaction"]["operation_history"] == [
+        {
+            "event_id": "interaction_000001",
+            "action": "unknown",
+            "timestamp": 20.0,
+            "pre_state": "closed",
+            "post_state": "open",
+            "success": True,
+            "execution_cost": 1.0,
+            "verification_source": "oracle_interaction",
+        }
+    ]
+    assert "joints" not in portal["attributes"]
+    assert "primary_joint_name" not in portal["attributes"]
+    assert "observation_evidence" in portal["attributes"]
+    connects_edges = [
+        edge for edge in store.as_graph_dict(stamp=20.0)["edges"]
+        if edge["relation"] == "connects" and edge["src_id"] == portal["id"]
+    ]
+    assert all(edge["attributes"]["traversable"] is True for edge in connects_edges)
+
+    store.update_observations(
+        [
+            observation(
+                instance_id="gt_000001",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=1.0,
+            )
+        ],
+        stamp=21.0,
+        source_mode="realtime_gt_observation",
+    )
+    portal = next(node for node in store.as_graph_dict(stamp=21.0)["nodes"] if node["type"] == "portal")
+    assert len(portal["interaction"]["operation_history"]) == 1

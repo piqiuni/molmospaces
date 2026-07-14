@@ -13,6 +13,7 @@ from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import String
+from std_srvs.srv import Trigger, TriggerResponse
 from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping_py_pkg.geometry_utils import normalize_label, transform_point_best_effort
@@ -41,6 +42,8 @@ class SemanticMappingNode:
         self.pointcloud_topic = topics.get("pointcloud", "/registered_scan")
         self.occupancy_grid_topic = topics.get("occupancy_grid", "/struct_mapping/occ_map")
         self.room_context_topic = topics.get("room_context", "/semantic_mapping/room_context")
+        self.gt_observations_topic = topics.get("gt_observations", "/semantic_mapping/gt_observations")
+        self.interaction_result_topic = topics.get("interaction_result", "/semantic_mapping/interaction_result")
 
         self.object_map_topic = topics.get("object_map", "/semantic_mapping/obj_map")
         self.object_markers_topic = topics.get("object_markers", "/semantic_mapping/object_semantic_map_markers")
@@ -81,10 +84,25 @@ class SemanticMappingNode:
         self.room_enclosed_occupied_free_ring_ratio = float(
             config.get("room_enclosed_occupied_free_ring_ratio", 0.45)
         )
+        self.room_portal_cut_enabled = bool(config.get("room_portal_cut_enabled", True))
+        self.room_portal_cut_margin_m = float(config.get("room_portal_cut_margin_m", 0.15))
+        self.room_portal_cut_thickness_cells = int(config.get("room_portal_cut_thickness_cells", 2))
+        self.room_portal_detector_min_confirmations = int(
+            config.get("room_portal_detector_min_confirmations", 3)
+        )
+        self.room_portal_detector_max_center_jump_m = float(
+            config.get("room_portal_detector_max_center_jump_m", 0.4)
+        )
+        self.room_portal_hint_merge_distance_m = float(
+            config.get("room_portal_hint_merge_distance_m", 0.6)
+        )
+        self.room_portal_min_width_m = float(config.get("room_portal_min_width_m", 0.5))
+        self.room_portal_max_width_m = float(config.get("room_portal_max_width_m", 2.5))
         self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
         self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
         self.graph_min_observations = max(1, int(config.get("graph_min_observations", 1)))
         self.graph_save_path = str(config.get("graph_save_path", "") or "").strip()
+        self.graph_save_dir = str(config.get("graph_save_dir", "") or "").strip()
         self.graph_save_pretty = bool(config.get("graph_save_pretty", True))
         graph_config = get_nested_param(rospy, "interaction_graph", {}) or {}
         self.class_to_id = {
@@ -118,6 +136,7 @@ class SemanticMappingNode:
         self.lock = threading.Lock()
         self.latest_cloud = None
         self.latest_scene = None
+        self.latest_occupancy_grid = None
         self.room_segmenter = RoomSegmenter(
             room_free_threshold=self.room_free_threshold,
             room_unknown_id=self.room_unknown_id,
@@ -131,6 +150,14 @@ class SemanticMappingNode:
             room_enclosed_occupied_max_aspect=self.room_enclosed_occupied_max_aspect,
             room_enclosed_occupied_known_ring_ratio=self.room_enclosed_occupied_known_ring_ratio,
             room_enclosed_occupied_free_ring_ratio=self.room_enclosed_occupied_free_ring_ratio,
+            room_portal_cut_enabled=self.room_portal_cut_enabled,
+            room_portal_cut_margin_m=self.room_portal_cut_margin_m,
+            room_portal_cut_thickness_cells=self.room_portal_cut_thickness_cells,
+            room_portal_detector_min_confirmations=self.room_portal_detector_min_confirmations,
+            room_portal_detector_max_center_jump_m=self.room_portal_detector_max_center_jump_m,
+            room_portal_hint_merge_distance_m=self.room_portal_hint_merge_distance_m,
+            room_portal_min_width_m=self.room_portal_min_width_m,
+            room_portal_max_width_m=self.room_portal_max_width_m,
             state=RoomSegmentationState(),
         )
         self.tf_listener = tf.TransformListener()
@@ -140,6 +167,12 @@ class SemanticMappingNode:
         self.cloud_sub = rospy.Subscriber(self.pointcloud_topic, PointCloud2, self.pointcloud_callback, queue_size=1)
         self.occ_sub = rospy.Subscriber(self.occupancy_grid_topic, OccupancyGrid, self.occupancy_callback, queue_size=1)
         self.room_context_sub = rospy.Subscriber(self.room_context_topic, String, self.room_context_callback, queue_size=1)
+        self.gt_observation_sub = rospy.Subscriber(
+            self.gt_observations_topic, String, self.gt_observation_callback, queue_size=2
+        )
+        self.interaction_result_sub = rospy.Subscriber(
+            self.interaction_result_topic, String, self.interaction_result_callback, queue_size=2
+        )
 
         self.object_pub = rospy.Publisher(self.object_map_topic, String, queue_size=1)
         self.marker_pub = rospy.Publisher(self.object_markers_topic, MarkerArray, queue_size=1)
@@ -155,6 +188,7 @@ class SemanticMappingNode:
         )
         self.static_tf_broadcaster = tf2_ros.StaticTransformBroadcaster()
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.publish_rate, 1e-3)), self.publish_callback)
+        self.save_graph_service = rospy.Service("/semantic_mapping/save_graph", Trigger, self.save_graph_callback)
         self._publish_lifted_graph_tf()
 
         rospy.loginfo("[semantic_mapping_node.py] object_in=%s scene_in=%s cloud=%s occ=%s",
@@ -181,10 +215,16 @@ class SemanticMappingNode:
                 observation_from_detection(det, observation_id=f"det_{index:04d}")
                 for index, det in enumerate(tracked_detections, start=1)
             ]
+            portal_structure_changed = self.room_segmenter.update_portal_hints(
+                observations,
+                source_mode="detector_online",
+            )
             self.graph_store.update_observations(observations, stamp=stamp, source_mode="detector_online")
+            if portal_structure_changed:
+                self._refresh_room_grid_locked()
             self.graph_store.prune_stale_nodes(self.object_stale_after_sec, now=stamp)
             publish_bundle = self._collect_publish_bundle_locked()
-        self._publish_bundle(publish_bundle)
+        self._safe_publish_bundle(publish_bundle)
 
     def scene_callback(self, msg):
         if not self.enable_scene_mapping:
@@ -200,6 +240,44 @@ class SemanticMappingNode:
             cloud = self.latest_cloud
         if cloud is not None:
             self._update_scene_from_cloud(cloud, scene_id)
+
+    def gt_observation_callback(self, msg):
+        parsed = parse_json_object_or_text(msg.data)
+        observations = parsed.get("observations")
+        if not isinstance(observations, list):
+            return
+        episode_id = str(parsed.get("episode_id") or "")
+        stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
+        with self.lock:
+            episode_changed = episode_id and episode_id != self.graph_store.episode_id
+            if bool(parsed.get("episode_reset")) or episode_changed:
+                self._save_episode_graph_locked(final=True)
+                self.graph_store.reset(episode_id=episode_id, source_mode="realtime_gt_observation")
+                self.object_store.objects = []
+                self.object_store.next_id = 1
+                self.room_segmenter.state = RoomSegmentationState()
+            portal_structure_changed = self.room_segmenter.update_portal_hints(
+                observations,
+                source_mode="realtime_gt_observation",
+            )
+            if bool(parsed.get("episode_reset")) or episode_changed or portal_structure_changed:
+                self._refresh_room_grid_locked()
+            self.graph_store.update_observations(
+                observations,
+                stamp=stamp,
+                source_mode="realtime_gt_observation",
+            )
+            publish_bundle = self._collect_publish_bundle_locked()
+        self._safe_publish_bundle(publish_bundle)
+
+    def interaction_result_callback(self, msg):
+        parsed = parse_json_object_or_text(msg.data)
+        stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
+        with self.lock:
+            changed = self.graph_store.update_interaction_result(parsed, stamp=stamp)
+            publish_bundle = self._collect_publish_bundle_locked() if changed else None
+        if publish_bundle is not None:
+            self._safe_publish_bundle(publish_bundle)
 
     def pointcloud_callback(self, msg):
         with self.lock:
@@ -222,19 +300,34 @@ class SemanticMappingNode:
 
     def occupancy_callback(self, msg):
         with self.lock:
+            self.latest_occupancy_grid = msg
             self.scene_store.initialize_from_occupancy_grid(msg)
-            room_ids, room_conf = self._segment_rooms_from_occupancy(msg)
-            self.graph_store.update_room_grid(
-                msg.info,
-                room_ids,
-                room_conf,
-                room_id_to_name=self.id_to_class,
-            )
+            self._refresh_room_grid_locked()
+
+    def _refresh_room_grid_locked(self):
+        if self.latest_occupancy_grid is None:
+            return
+        room_ids, room_conf = self._segment_rooms_from_occupancy(self.latest_occupancy_grid)
+        self.graph_store.update_room_grid(
+            self.latest_occupancy_grid.info,
+            room_ids,
+            room_conf,
+            room_id_to_name=self.id_to_class,
+        )
 
     def publish_callback(self, _event):
+        if rospy.is_shutdown():
+            return
         with self.lock:
             publish_bundle = self._collect_publish_bundle_locked()
-        self._publish_bundle(publish_bundle)
+        self._safe_publish_bundle(publish_bundle)
+
+    def _safe_publish_bundle(self, bundle):
+        try:
+            self._publish_bundle(bundle)
+        except rospy.ROSException as exc:
+            if "closed topic" not in str(exc).lower() and not rospy.is_shutdown():
+                raise
 
     def _update_scene_from_cloud(self, cloud, scene_id):
         points = []
@@ -339,6 +432,29 @@ class SemanticMappingNode:
                 json.dump(graph_payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
             else:
                 json.dump(graph_payload, handle, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+    def save_graph_callback(self, _request):
+        with self.lock:
+            path = self._save_episode_graph_locked(final=False)
+        if path is None:
+            return TriggerResponse(success=False, message="semantic_map/graph_save_dir is empty")
+        return TriggerResponse(success=True, message=path)
+
+    def _save_episode_graph_locked(self, final=False):
+        if not self.graph_save_dir or not self.graph_store.nodes:
+            return None
+        graph_payload = self.graph_store.as_graph_dict()
+        episode_id = graph_payload.get("episode_id") or "episode_unknown"
+        revision = int(graph_payload.get("graph_revision", 0))
+        suffix = "final" if final else f"revision_{revision}"
+        target_path = os.path.join(self.graph_save_dir, f"{episode_id}_{suffix}.json")
+        os.makedirs(self.graph_save_dir, exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as handle:
+            if self.graph_save_pretty:
+                json.dump(graph_payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            else:
+                json.dump(graph_payload, handle, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return target_path
 
     def _build_object_markers(self, obj_map):
         markers = MarkerArray()
