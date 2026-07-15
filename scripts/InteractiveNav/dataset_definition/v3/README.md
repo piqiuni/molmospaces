@@ -341,6 +341,60 @@ task_success
 
 建议同时保存 `plan_id`、`target_visible_pixels` 和 `opened_interaction_ids`。这些字段用于验证 mixed 计划中“通道恢复可达性、容器 interaction 揭示目标、最终同时满足距离和可见性”的逐步因果链。
 
+## Evaluation Metrics
+
+v3 的 `generation_validation` 用于数据生成质量审计，不等同于 policy 运行结果。正式评测应由独立 scorer 读取 benchmark GT 和 policy rollout 输出后计算。
+
+主评测指标固定为：
+
+| 指标 | 计算对象 | 说明 |
+|------|----------|------|
+| `SR` | episode | 是否满足 `NavToObj` 的最终距离和 head-camera 可见性成功条件 |
+| `SPL` | episode | 成功加权路径效率，参考路径取允许必要交互后的可行计划路径 |
+| `Interaction Success Rate` | required episode | 关键交互效果是否完成 |
+| `Interaction Precision` | interaction event | 执行过的交互中，有多少是有效交互 |
+| `Total Cost` | episode | `path_length + λ * interaction_count`，后续可扩展不同交互类型权重 |
+
+`reachability`、`visibility` 和 `enablement` 不作为主表中的独立指标；它们是 `Interaction Success Rate` 的判定语义：
+
+- `channel`：关键通道交互是否恢复目标区域可达性。
+- `container`：关键容器交互是否让目标满足可见性条件。
+- `mixed`：必要交互链是否按 prerequisite / oracle 语义完成，并最终服务目标可达和可见。
+- `no-interaction`：`Interaction Success Rate` 记为 `N/A`，但任何多余交互都会影响 `Interaction Precision` 和 `Total Cost`。
+
+推荐报告 split：
+
+```text
+all
+channel
+container
+mixed
+no-interaction
+```
+
+主表应优先报告这些 split 的 5 个主指标；更细的 reachability gain、visibility gain、prerequisite violation、distractor interaction 等只作为 debug / appendix 诊断项。
+
+## Planned Evaluation Scripts
+
+建议脚本分为四类，避免把数据集质量和方法性能混在一起：
+
+1. `build_mixed_interaction_benchmark.py`
+   - 合并或生成 `channel`、`container`、`mixed`、`no-interaction` v3 episode。
+   - 输出统一 `benchmark.json`，其中 `oracle_plan` 和 `interactions` 只作为 privileged GT。
+
+2. `evaluate_interactive_nav_dataset.py`
+   - 只检查 benchmark 数据质量。
+   - 检查 schema、占位字段、split 分布、`interaction_requirement`、`success_evidence`、oracle/prerequisite 一致性。
+
+3. `score_interactive_nav_run.py`
+   - 读取 v3 benchmark 和 policy rollout。
+   - 输出 5 个主指标及 per-split 结果。
+   - 需要从 rollout 中恢复实际 path length、成功状态、交互事件、交互成功/失败和多余交互。
+
+4. `summarize_interactive_nav_results.py`
+   - 汇总多个方法的 scorer 输出。
+   - 生成论文表格用 CSV / Markdown。
+
 ## 门必要性
 
 v3 当前门样本先使用 `specific_instance`，不在首版生成规则中处理门的多目标 object-goal 必要性。

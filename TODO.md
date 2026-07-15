@@ -228,7 +228,8 @@
 - [ ] 建立 `nav + oracle open` baseline
 - [ ] 建立 `interactive graph planner` baseline
 - [ ] 建立 `ROS modular detector-only` baseline
-- [ ] 输出首版指标：Navigation SR / Oracle SR / SPL / Path Efficiency / Need-Interaction Detection Acc
+- [ ] 输出首版主指标：SR / SPL / Interaction Success Rate / Interaction Precision / Total Cost
+- [ ] 将 reachability / visibility / enablement 作为 benchmark 分层与 Interaction Success 的判定依据，而不是主表中的独立指标
 
 ## Phase 4：从门推广到更一般的交互对象
 
@@ -432,6 +433,50 @@
 - [ ] 输出路径长度变化、成功率变化和案例可视化
 - [ ] 先形成小样本 sanity check，再考虑自动 benchmark 生成
 - [ ] 明确第一版论文图/表最可能来自哪些实验结果
+
+### 4.5.1 当前固定评测标准
+
+主评测表保持简洁，只报告 5 个方法无关指标：
+
+| 指标 | 定义 | 备注 |
+|------|------|------|
+| `SR` | 最终任务成功率，即满足 `NavToObj` 的距离阈值和 head-camera 可见性条件 | 主结果指标 |
+| `SPL` | 成功加权路径效率，失败计 0，成功时按参考路径长度与实际路径长度的比值加权 | 参考路径应来自允许必要交互后的可行计划，而不是纯静态地图 |
+| `Interaction Success Rate` | 需要交互的 episode 中，关键交互效果是否完成 | door 看 reachability，container 看 visibility，mixed 看必要交互链是否完成并最终服务目标成功 |
+| `Interaction Precision` | 执行过的交互中，有多少是有效交互 | 用于惩罚乱开无关门、无关容器或重复无效交互 |
+| `Total Cost` | `path_length + λ * interaction_count` | 后续可扩展为 door / container / failed interaction 的不同权重 |
+
+说明：
+
+- `reachability`、`visibility` 和 `enablement` 是论文叙事、benchmark 构建和 `Interaction Success Rate` 判定的核心语义，不作为主表中三个并列指标。
+- `Interaction Success Rate` 在不同 split 下使用不同判定：通道交互要求恢复可达性，容器交互要求揭示目标或满足目标可见性，混合交互要求完成必要交互链并最终满足导航成功条件。
+- 无交互样本必须保留，用于评估方法是否克制；其 `Interaction Success Rate` 可记为 `N/A`，但 `Interaction Precision`、`interaction_count` 和 `Total Cost` 仍然参与分析。
+- 主结果应按 `all`、`channel`、`container`、`mixed`、`no-interaction` split 展开，并同时报告 macro average，避免某一类样本数量过大主导总体结论。
+
+### 4.5.2 对应脚本规划
+
+后续脚本优先保持四类职责分离：
+
+1. `build_mixed_interaction_benchmark.py`
+   - 输入：已经稳定的 door v3 数据、container v3 数据和 no-interaction 控制样本。
+   - 输出：统一 `interactive_nav_v3` benchmark，包含 `channel`、`container`、`mixed`、`no-interaction` split。
+   - 规则：不把 `oracle_plan` 暴露给 policy；只作为 evaluator / scorer 的 GT 标签与参考计划。
+
+2. `evaluate_interactive_nav_dataset.py`
+   - 输入：v3 benchmark JSON。
+   - 输出：数据集质量报告，而不是 policy 性能报告。
+   - 检查：schema validity、无占位字段、`interaction_requirement` 分布、split 分布、`success_evidence` 状态、必要交互链与 prerequisite 一致性、no-interaction 样本是否确实不包含 interactions。
+
+3. `score_interactive_nav_run.py`
+   - 输入：v3 benchmark JSON + policy rollout 输出。
+   - 输出：主指标表和 per-episode 诊断。
+   - 主指标：`SR`、`SPL`、`Interaction Success Rate`、`Interaction Precision`、`Total Cost`。
+   - 输出 split：`all`、`channel`、`container`、`mixed`、`no-interaction`，并保留每个 episode 的失败原因用于附录分析。
+
+4. `summarize_interactive_nav_results.py`
+   - 输入：一个或多个 scorer 输出。
+   - 输出：论文表格用 CSV / Markdown。
+   - 作用：对多个方法统一生成主表，避免每个方法单独写统计脚本。
 
 ## 4.6 中远期规划 TODO
 
