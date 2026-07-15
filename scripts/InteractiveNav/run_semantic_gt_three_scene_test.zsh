@@ -11,6 +11,8 @@ FIRST_STEP_TIMEOUT_SEC="${FIRST_STEP_TIMEOUT_SEC:-600}"
 GT_STEP_INTERVAL="${GT_STEP_INTERVAL:-3}"
 GT_MAX_DISTANCE_M="${GT_MAX_DISTANCE_M:-6.0}"
 GT_MIN_VISIBLE_PIXELS="${GT_MIN_VISIBLE_PIXELS:-16}"
+ENABLE_SEMANTIC="${ENABLE_SEMANTIC:-true}"
+ACTION_TIMEOUT_SEC="${ACTION_TIMEOUT_SEC:-0.0}"
 ROS_PORT_BASE="${ROS_PORT_BASE:-11400}"
 HOUSE_LIST="${HOUSE_INDS:-4 7 10}"
 HOUSES=(${=HOUSE_LIST})
@@ -28,8 +30,18 @@ cleanup_process() {
   local pid="${1:-}"
   if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
     kill -INT "${pid}" 2>/dev/null || true
-    sleep 2
+    for _attempt in {1..10}; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        wait "${pid}" 2>/dev/null || true
+        return
+      fi
+      sleep 0.5
+    done
     kill -TERM "${pid}" 2>/dev/null || true
+    sleep 1
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
     wait "${pid}" 2>/dev/null || true
   fi
 }
@@ -57,7 +69,7 @@ for house_ind in "${HOUSES[@]}"; do
   ros_port=$((ROS_PORT_BASE + house_ind))
   export ROS_MASTER_URI="http://127.0.0.1:${ros_port}"
   export ROS_HOSTNAME="127.0.0.1"
-  export ROS_HOME="/tmp/codex_ros_semantic_house_${house_ind}"
+  export ROS_HOME="/tmp/codex_ros_semantic_${ros_port}_house_${house_ind}"
   export ROS_LOG_DIR="${scene_dir}/ros_logs"
   mkdir -p "${ROS_HOME}" "${ROS_LOG_DIR}"
   print -r -- "${ROS_MASTER_URI}" > "${scene_dir}/ros_master_uri.txt"
@@ -90,20 +102,26 @@ for house_ind in "${HOUSES[@]}"; do
     exit 3
   fi
 
-  rosparam load "${ROOT_DIR}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/config/default.yaml" /semantic_mapping_py
-  python3 "${ROOT_DIR}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/semantic_mapping_node.py" \
-    > "${scene_dir}/semantic_mapping.log" 2>&1 &
-  semantic_pid=$!
+  if [[ "${ENABLE_SEMANTIC}" == "true" ]]; then
+    rosparam load "${ROOT_DIR}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/config/default.yaml" /semantic_mapping_py
+    python3 "${ROOT_DIR}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/semantic_mapping_node.py" \
+      > "${scene_dir}/semantic_mapping.log" 2>&1 &
+    semantic_pid=$!
+  fi
 
-  python3 "${ROOT_DIR}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
+  recorder_args=(
     --output-dir "${scene_dir}" \
-    --semantic-video \
     --first-person-video-fps 15 \
     --first-person-video-capture-mode step \
     --image-queue-size 1 \
     --no-video-save-panel-frames \
     --first-person-video-width-px 640 \
-    --no-external-video \
+    --no-external-video
+  )
+  if [[ "${ENABLE_SEMANTIC}" == "true" ]]; then
+    recorder_args+=(--semantic-video)
+  fi
+  python3 "${ROOT_DIR}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" "${recorder_args[@]}" \
     > "${scene_dir}/recorder.log" 2>&1 &
   recorder_pid=$!
 
@@ -115,7 +133,7 @@ for house_ind in "${HOUSES[@]}"; do
     exit 2
   fi
 
-  python3 "${ROOT_DIR}/scripts/InteractiveNav/run_nav_ros_sim.py" \
+  sim_args=(
     --robot rby1 \
     --scene_dataset procthor-10k \
     --data_split train \
@@ -126,11 +144,21 @@ for house_ind in "${HOUSES[@]}"; do
     --randomize_camera false \
     --publish_debug_front_camera false \
     --observation_queue_size 1 \
-    --publish_realtime_gt true \
-    --realtime_gt_step_interval "${GT_STEP_INTERVAL}" \
-    --realtime_gt_max_distance_m "${GT_MAX_DISTANCE_M}" \
-    --realtime_gt_min_visible_pixels "${GT_MIN_VISIBLE_PIXELS}" \
-    --step_frame_dir "${scene_dir}/sim_step_frames" \
+    --action_timeout_s "${ACTION_TIMEOUT_SEC}" \
+    --max_consecutive_action_timeouts 0 \
+    --step_frame_dir "${scene_dir}/sim_step_frames"
+  )
+  if [[ "${ENABLE_SEMANTIC}" == "true" ]]; then
+    sim_args+=(
+      --publish_realtime_gt true
+      --realtime_gt_step_interval "${GT_STEP_INTERVAL}"
+      --realtime_gt_max_distance_m "${GT_MAX_DISTANCE_M}"
+      --realtime_gt_min_visible_pixels "${GT_MIN_VISIBLE_PIXELS}"
+    )
+  else
+    sim_args+=(--publish_realtime_gt false)
+  fi
+  python3 "${ROOT_DIR}/scripts/InteractiveNav/run_nav_ros_sim.py" "${sim_args[@]}" \
     > "${scene_dir}/simulation.log" 2>&1 &
   sim_pid=$!
 
@@ -152,10 +180,12 @@ for house_ind in "${HOUSES[@]}"; do
     sleep 1
     first_step_waited_sec=$((first_step_waited_sec + 1))
   done
-  if ! timeout 60s rostopic echo -n 1 /semantic_mapping/gt_observations \
-    > "${scene_dir}/first_gt_observation.txt" 2>&1; then
-    print -u2 -- "Timed out waiting for realtime GT observations in house ${house_ind}"
-    exit 4
+  if [[ "${ENABLE_SEMANTIC}" == "true" ]]; then
+    if ! timeout 60s rostopic echo -n 1 /semantic_mapping/gt_observations \
+      > "${scene_dir}/first_gt_observation.txt" 2>&1; then
+      print -u2 -- "Timed out waiting for realtime GT observations in house ${house_ind}"
+      exit 4
+    fi
   fi
   print -r -- "$(date --iso-8601=seconds)" > "${scene_dir}/effective_recording_start.txt"
 
@@ -201,9 +231,15 @@ for house_ind in "${HOUSES[@]}"; do
   done
   finish_recorder "${recorder_pid}"
   recorder_pid=""
+  if [[ "${ENABLE_SEMANTIC}" == "true" ]]; then
+    output_stem="overview_6panel"
+  else
+    output_stem="overview_4panel"
+  fi
   python3 "${ROOT_DIR}/scripts/InteractiveNav/build_semantic_video_offline.py" \
     --scene-dir "${scene_dir}" \
     --fps 15 \
+    --output-stem "${output_stem}" \
     > "${scene_dir}/offline_video_build.log" 2>&1
   offline_frames=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["output_frame_count"])' "${scene_dir}/offline_video_summary.json")
   print -r -- "${offline_frames}" > "${scene_dir}/recorded_step_frames.txt"
@@ -218,4 +254,4 @@ for house_ind in "${HOUSES[@]}"; do
   trap - INT TERM EXIT
 done
 
-print -r -- "Three-scene semantic GT test complete: ${OUTPUT_ROOT}"
+print -r -- "Exploration debug test complete (semantic=${ENABLE_SEMANTIC}): ${OUTPUT_ROOT}"

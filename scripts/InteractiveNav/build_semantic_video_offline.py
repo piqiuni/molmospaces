@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import json
 import subprocess
@@ -41,7 +42,22 @@ def causal_recorder_frame(records: list[dict], stamp_sec: float) -> dict | None:
     return selected
 
 
+def nearest_sim_step(sim_stamps: list[float], stamp_sec: float) -> int:
+    index = bisect.bisect_left(sim_stamps, stamp_sec)
+    candidates = []
+    if index < len(sim_stamps):
+        candidates.append(index)
+    if index > 0:
+        candidates.append(index - 1)
+    if not candidates:
+        return 0
+    nearest = min(candidates, key=lambda candidate: abs(sim_stamps[candidate] - stamp_sec))
+    return nearest + 1
+
+
 def draw_gt(frame, payload: dict | None) -> None:
+    if not payload:
+        return
     observations = list((payload or {}).get("observations") or [])
     source_height, source_width = frame.shape[:2]
     for observation in observations:
@@ -67,6 +83,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scene-dir", required=True)
     parser.add_argument("--fps", type=float, default=15.0)
+    parser.add_argument("--output-stem", default="")
     args = parser.parse_args()
 
     scene_dir = Path(args.scene_dir).expanduser().resolve()
@@ -76,18 +93,20 @@ def main() -> None:
         raise RuntimeError("No simulator step frames found")
     if not recorder_records:
         raise RuntimeError("No recorder state frames found")
-
-    output_dir = scene_dir / "videos" / "offline_composite_frames"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    raw_video = scene_dir / "videos" / "overview_6panel_offline_raw.mp4"
-    final_video = scene_dir / "videos" / "overview_6panel.mp4"
-    sync_csv = scene_dir / "offline_video_sync.csv"
+    sim_stamps = [float(record.get("stamp_sec") or 0.0) for record in sim_records]
 
     first_state = cv2.imread(str(recorder_records[0]["composite_frame"]), cv2.IMREAD_COLOR)
     if first_state is None:
         raise RuntimeError("Cannot read first recorder composite frame")
     output_height, output_width = first_state.shape[:2]
-    panel_width = output_width // 3
+    panel_columns = 3 if output_width >= output_height * 2.4 else 2
+    output_stem = args.output_stem or ("overview_6panel" if panel_columns == 3 else "overview_4panel")
+    output_dir = scene_dir / "videos" / "offline_composite_frames"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_video = scene_dir / "videos" / f"{output_stem}_offline_raw.mp4"
+    final_video = scene_dir / "videos" / f"{output_stem}.mp4"
+    sync_csv = scene_dir / "offline_video_sync.csv"
+    panel_width = output_width // panel_columns
     panel_height = output_height // 2
     writer = cv2.VideoWriter(
         str(raw_video),
@@ -111,20 +130,45 @@ def main() -> None:
                 state_frame = cv2.resize(state_frame, (output_width, output_height), interpolation=cv2.INTER_AREA)
             camera_frame = cv2.resize(camera_frame, (panel_width, panel_height), interpolation=cv2.INTER_AREA)
             draw_gt(camera_frame, sim_record.get("gt_observations"))
-            cv2.putText(camera_frame, f"SIM STEP={int(sim_record.get('step_index', frame_index - 1)):04d} STAMP={stamp_sec:.3f}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (15, 15, 15), 2, cv2.LINE_AA)
+            sim_step = int(sim_record.get("step_index", frame_index - 1)) + 1
+            state_stamp = float(state_record.get("image_stamp_value") or 0.0)
+            state_step = nearest_sim_step(sim_stamps, state_stamp)
+            state_age_sec = max(0.0, stamp_sec - state_stamp)
+            cv2.putText(camera_frame, f"SIM STEP={sim_step:04d} STAMP={stamp_sec:.3f}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (15, 15, 15), 2, cv2.LINE_AA)
             state_frame[:panel_height, :panel_width] = camera_frame
+            sync_label = f"TARGET={sim_step:04d} STATE={state_step:04d} AGE={state_age_sec:.2f}s"
+            panel_names = (
+                (("CAMERA", "OCC"), ("GLOBAL", "LOCAL"))
+                if panel_columns == 2
+                else (("CAMERA", "OCC", "SEMANTIC XY"), ("GLOBAL", "LOCAL", "TOPOLOGY"))
+            )
+            for row in range(2):
+                for column in range(panel_columns):
+                    if row == 0 and column == 0:
+                        continue
+                    x0 = column * panel_width
+                    y0 = row * panel_height
+                    title = f"{panel_names[row][column]}  STATE<={state_step:04d}  TARGET={sim_step:04d}"
+                    cv2.rectangle(state_frame, (x0, y0), (x0 + panel_width - 1, y0 + 27), (255, 255, 255), -1)
+                    cv2.putText(state_frame, title, (x0 + 8, y0 + 19), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (20, 20, 20), 1, cv2.LINE_AA)
+                    text_size = cv2.getTextSize(sync_label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
+                    text_x = x0 + panel_width - text_size[0] - 8
+                    text_y = y0 + panel_height - 10
+                    cv2.rectangle(state_frame, (text_x - 4, text_y - 15), (x0 + panel_width - 4, text_y + 4), (255, 255, 255), -1)
+                    cv2.putText(state_frame, sync_label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (20, 20, 20), 1, cv2.LINE_AA)
             output_path = output_dir / f"frame_{frame_index:06d}_composite.png"
             cv2.imwrite(str(output_path), state_frame)
             writer.write(state_frame)
-            state_stamp = float(state_record.get("image_stamp_value") or 0.0)
             sync_rows.append(
                 {
                     "frame_index": frame_index,
-                    "sim_step": int(sim_record.get("step_index", frame_index - 1)),
+                    "sim_step": sim_step,
+                    "sim_step_index": sim_step - 1,
                     "sim_stamp": f"{stamp_sec:.9f}",
                     "state_frame_index": int(state_record.get("frame_index") or 0),
+                    "state_step": state_step,
                     "state_stamp": f"{state_stamp:.9f}",
-                    "state_age_sec": f"{max(0.0, stamp_sec - state_stamp):.9f}",
+                    "state_age_sec": f"{state_age_sec:.9f}",
                     "output_frame": str(output_path),
                 }
             )
@@ -136,7 +180,7 @@ def main() -> None:
         writer_csv.writeheader()
         writer_csv.writerows(sync_rows)
 
-    ffmpeg_log = scene_dir / "videos" / "overview_6panel_offline_ffmpeg.log"
+    ffmpeg_log = scene_dir / "videos" / f"{output_stem}_offline_ffmpeg.log"
     command = [
         "ffmpeg",
         "-y",

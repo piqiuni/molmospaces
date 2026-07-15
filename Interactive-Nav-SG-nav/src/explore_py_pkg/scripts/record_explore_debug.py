@@ -885,6 +885,7 @@ class ExploreDebugRecorder:
         self.unified_graph_history = deque(maxlen=history_size)
         self.latest_image: tuple[float, int, int, bytearray] | None = None
         self.latest_image_step = 0
+        self.last_source_image_seq: int | None = None
         self.last_recorded_image_stamp_ns: int | None = None
         self.latest_external_image: tuple[float, int, int, bytearray] | None = None
         self.latest_external_image_step = 0
@@ -1352,13 +1353,18 @@ class ExploreDebugRecorder:
         with self.lock:
             if self.shutting_down:
                 return
-            self.debug_step += 1
+            source_seq = int(msg.header.seq)
+            if self.last_source_image_seq is not None and source_seq <= self.last_source_image_seq:
+                return
+            source_step = source_seq + 1
+            self.last_source_image_seq = source_seq
+            self.debug_step = max(self.debug_step, source_step)
             self.latest_image = (stamp, width, height, rgb)
-            self.latest_image_step = self.debug_step
+            self.latest_image_step = source_step
             self.last_image_wall_time = time.time()
             snapshot = self._capture_video_snapshot_locked(stamp)
         try:
-            self.video_frame_jobs.put_nowait((width, height, rgb, stamp, self.debug_step, snapshot))
+            self.video_frame_jobs.put_nowait((width, height, rgb, stamp, source_step, snapshot))
         except queue.Full:
             self.video_frame_jobs_dropped += 1
 
