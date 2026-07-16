@@ -185,11 +185,13 @@ head_camera visibility_fraction(selected_target) > 0
 
 ```text
 required
+beneficial
 unnecessary
 unknown
 ```
 
 - `required`：至少存在一个必要 interaction；不执行有效交互计划时不能完成任务。
+- `beneficial`：不执行该 interaction 仍可完成任务，但实测替代路径更长；数据必须保存开门前后路径长度、差值、比例和通过的阈值。该值用于少量路径效率对比，不能伪装成 `required`。
 - `unnecessary`：初始状态下无需任何 interaction 即可完成任务，`interactions=[]`，oracle 只包含导航、观察等非交互步骤。
 - `unknown`：格式已经生成，但尚未完成交互必要性验证。
 
@@ -220,11 +222,12 @@ container_sliding_drawer
 
 ```text
 restore_reachability
+reduce_navigation_cost
 enable_interaction
 reveal_target_object
 ```
 
-一个 interaction 可以同时产生多个 effect，例如 mixed 场景中的通道门既恢复可达性，也使后续容器交互可执行。
+`restore_reachability` 表示关门时无路径；`reduce_navigation_cost` 表示关门时仍有路径，但开门后通过实测阈值验证路径代价下降。一个 interaction 也可以同时产生多个 effect。
 
 固定 prerequisite type：
 
@@ -237,6 +240,10 @@ visibility
 - `mechanical`：例如必须先打开冰箱外门，才能拉出内部抽屉。
 - `reachability`：例如必须先打开通道门，机器人才能到达冰箱。
 - `visibility`：前置 interaction 只负责建立后续观察或揭示条件。
+
+对于 `mixed + beneficial`，通道门不是容器交互的 `reachability` prerequisite；它是 oracle 中的代价优化动作。容器交互仍可保持 `required`，因为目标在容器关闭时仍不可见。
+
+若只有“联合关闭多扇门”才产生捷径收益，rough catalog 使用 `mixed_door_set_shortcut_verified` 单独保留；不要降格成单门 `mixed_shortcut_verified`。当前精细生成器只物化已逐门验证的单门 beneficial 样本，多门 beneficial oracle 需要后续显式生成多个 channel interaction。
 
 每个 interaction 保存：
 
@@ -352,6 +359,7 @@ v3 的 `generation_validation` 用于数据生成质量审计，不等同于 pol
 | `SR` | episode | 是否满足 `NavToObj` 的最终距离和 head-camera 可见性成功条件 |
 | `SPL` | episode | 成功加权路径效率，参考路径取允许必要交互后的可行计划路径 |
 | `Interaction Success Rate` | required episode | 关键交互效果是否完成 |
+| `Shortcut Benefit / Regret` | beneficial episode | 相对开门 oracle 的路径代价收益或策略额外代价 |
 | `Interaction Precision` | interaction event | 执行过的交互中，有多少是有效交互 |
 | `Total Cost` | episode | `path_length + λ * interaction_count`，后续可扩展不同交互类型权重 |
 
@@ -359,7 +367,8 @@ v3 的 `generation_validation` 用于数据生成质量审计，不等同于 pol
 
 - `channel`：关键通道交互是否恢复目标区域可达性。
 - `container`：关键容器交互是否让目标满足可见性条件。
-- `mixed`：必要交互链是否按 prerequisite / oracle 语义完成，并最终服务目标可达和可见。
+- `mixed-required`：必要交互链是否按 prerequisite / oracle 语义完成，并最终服务目标可达和可见。
+- `mixed-beneficial`：目标仍可通过绕行完成；重点报告是否利用捷径、SPL、Total Cost 与相对 oracle regret。
 - `no-interaction`：`Interaction Success Rate` 记为 `N/A`，但任何多余交互都会影响 `Interaction Precision` 和 `Total Cost`。
 
 推荐报告 split：

@@ -174,19 +174,157 @@ def path_traverses_door_region(
     padding_m: float,
     sample_step_m: float,
 ) -> bool:
+    return bool(
+        path_door_crossing_details(
+            path,
+            door_record,
+            padding_m=padding_m,
+            sample_step_m=sample_step_m,
+        )["traverses"]
+    )
+
+
+def door_portal_geometry(
+    door_record: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    if "portal_center_xy" in door_record:
+        center = np.asarray(door_record["portal_center_xy"], dtype=float)[:2]
+        tangent = np.asarray(door_record["portal_tangent_xy"], dtype=float)[:2]
+        normal = np.asarray(door_record["portal_normal_xy"], dtype=float)[:2]
+        half_width = float(door_record["portal_half_width_m"])
+        half_thickness = float(door_record["portal_half_thickness_m"])
+    else:
+        center = np.asarray(door_record["aabb_center"], dtype=float)[:2]
+        size = np.asarray(door_record["aabb_size"], dtype=float)[:2]
+        major_axis = int(np.argmax(size))
+        tangent = np.zeros(2, dtype=float)
+        tangent[major_axis] = 1.0
+        normal = np.asarray([-tangent[1], tangent[0]], dtype=float)
+        half_width = float(size[major_axis] / 2.0)
+        half_thickness = float(size[1 - major_axis] / 2.0)
+
+    tangent_norm = float(np.linalg.norm(tangent))
+    normal_norm = float(np.linalg.norm(normal))
+    if tangent_norm <= 1e-8 or normal_norm <= 1e-8:
+        raise ValueError(f"Invalid portal basis for door {door_record.get('name')}")
+    return (
+        center,
+        tangent / tangent_norm,
+        normal / normal_norm,
+        max(half_width, 0.12),
+        max(half_thickness, 0.02),
+    )
+
+
+def path_door_crossing_details(
+    path: np.ndarray | None,
+    door_record: dict[str, Any],
+    *,
+    padding_m: float,
+    sample_step_m: float,
+) -> dict[str, Any]:
     if path is None or len(path) == 0:
-        return False
-    center = np.asarray(door_record["aabb_center"], dtype=float)
-    size = np.asarray(door_record["aabb_size"], dtype=float)
-    half = np.maximum(size[:2] / 2.0, 0.12) + padding_m
+        return {
+            "traverses": False,
+            "start_inside": False,
+            "ignored_initial_region": False,
+            "entry_index": None,
+            "crossing_index": None,
+        }
+    center, tangent, normal, half_width, half_thickness = door_portal_geometry(
+        door_record
+    )
     dense = densify_polyline(np.asarray(path, dtype=float), step_m=sample_step_m)
     if len(dense) == 0:
-        return False
+        return {
+            "traverses": False,
+            "start_inside": False,
+            "ignored_initial_region": False,
+            "entry_index": None,
+            "crossing_index": None,
+        }
+
+    relative = dense - center[None, :]
+    tangent_offsets = relative @ tangent
+    normal_offsets = relative @ normal
+    padded_half_width = half_width + float(padding_m)
+    padded_half_thickness = half_thickness + float(padding_m)
     inside = np.logical_and(
-        np.abs(dense[:, 0] - center[0]) <= half[0],
-        np.abs(dense[:, 1] - center[1]) <= half[1],
+        np.abs(tangent_offsets) <= padded_half_width,
+        np.abs(normal_offsets) <= padded_half_thickness,
     )
-    return bool(np.any(inside))
+    start_inside = bool(inside[0])
+    search_start = 0
+    ignored_initial_region = False
+    if start_inside:
+        outside_indices = np.flatnonzero(~inside)
+        if not len(outside_indices):
+            return {
+                "traverses": False,
+                "start_inside": True,
+                "ignored_initial_region": True,
+                "entry_index": None,
+                "crossing_index": None,
+            }
+        search_start = int(outside_indices[0])
+        ignored_initial_region = True
+
+    side_standoff = max(half_thickness + min(float(padding_m), 0.1), 0.08)
+    for segment_index in range(search_start, len(dense) - 1):
+        first_normal = float(normal_offsets[segment_index])
+        second_normal = float(normal_offsets[segment_index + 1])
+        if first_normal == second_normal:
+            continue
+        if first_normal * second_normal > 0.0:
+            continue
+        ratio = -first_normal / (second_normal - first_normal)
+        if ratio < 0.0 or ratio > 1.0:
+            continue
+        crossing_tangent = float(
+            tangent_offsets[segment_index]
+            + ratio
+            * (tangent_offsets[segment_index + 1] - tangent_offsets[segment_index])
+        )
+        if abs(crossing_tangent) > padded_half_width:
+            continue
+
+        before_index = segment_index
+        while before_index > search_start and abs(normal_offsets[before_index]) < side_standoff:
+            before_index -= 1
+        after_index = segment_index + 1
+        while after_index < len(dense) - 1 and abs(normal_offsets[after_index]) < side_standoff:
+            after_index += 1
+        before_normal = float(normal_offsets[before_index])
+        after_normal = float(normal_offsets[after_index])
+        if abs(before_normal) < side_standoff or abs(after_normal) < side_standoff:
+            continue
+        if before_normal * after_normal >= 0.0:
+            continue
+
+        entry_index = segment_index
+        while entry_index > search_start and inside[entry_index - 1]:
+            entry_index -= 1
+        return {
+            "traverses": True,
+            "start_inside": start_inside,
+            "ignored_initial_region": ignored_initial_region,
+            "entry_index": int(entry_index),
+            "crossing_index": int(segment_index + 1),
+            "crossing_xy": np.asarray(
+                dense[segment_index]
+                + ratio * (dense[segment_index + 1] - dense[segment_index]),
+                dtype=float,
+            ),
+            "crossing_tangent_offset_m": crossing_tangent,
+        }
+
+    return {
+        "traverses": False,
+        "start_inside": start_inside,
+        "ignored_initial_region": ignored_initial_region,
+        "entry_index": None,
+        "crossing_index": None,
+    }
 
 
 def traversed_interactive_doors_on_path(

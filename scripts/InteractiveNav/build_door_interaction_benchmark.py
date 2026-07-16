@@ -152,16 +152,17 @@ def door_path_entry_score(
 ) -> tuple[int, str]:
     if path is None or len(path) == 0:
         return (10**9, record.get("name", ""))
-    center = np.asarray(record["aabb_center"], dtype=float)
-    size = np.asarray(record["aabb_size"], dtype=float)
-    half = np.maximum(size[:2] / 2.0, 0.12) + padding_m
-    dense = door_scan.densify_polyline(np.asarray(path, dtype=float), step_m=sample_step_m)
-    inside = np.logical_and(
-        np.abs(dense[:, 0] - center[0]) <= half[0],
-        np.abs(dense[:, 1] - center[1]) <= half[1],
+    crossing = door_scan.path_door_crossing_details(
+        path,
+        record,
+        padding_m=padding_m,
+        sample_step_m=sample_step_m,
     )
-    hit_indices = np.flatnonzero(inside)
-    first_hit = int(hit_indices[0]) if len(hit_indices) else 10**9
+    first_hit = (
+        int(crossing["entry_index"])
+        if crossing["traverses"] and crossing["entry_index"] is not None
+        else 10**9
+    )
     return (first_hit, record.get("name", ""))
 
 

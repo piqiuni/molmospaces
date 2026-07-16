@@ -200,7 +200,12 @@ class InteractionSpec(BaseModel):
     joint_name: str
     joint_index: int = Field(..., ge=0)
     effect_types: list[
-        Literal["restore_reachability", "enable_interaction", "reveal_target_object"]
+        Literal[
+            "restore_reachability",
+            "reduce_navigation_cost",
+            "enable_interaction",
+            "reveal_target_object",
+        ]
     ]
     prerequisites: list[InteractionPrerequisiteSpec] = Field(default_factory=list)
     initial_state: InteractionStateSpec
@@ -210,6 +215,7 @@ class InteractionSpec(BaseModel):
 OracleReason = Literal[
     "approach_channel_interaction",
     "restore_reachability",
+    "reduce_navigation_cost",
     "traverse_open_channel",
     "approach_container_interaction",
     "improve_target_visibility",
@@ -375,7 +381,9 @@ class InteractiveNavV3Spec(BaseModel):
     case_id: str
     parent_benchmark_episode_index: int | None = None
     interaction_domains: list[Literal["channel", "container"]]
-    interaction_requirement: Literal["required", "unnecessary", "unknown"]
+    interaction_requirement: Literal[
+        "required", "beneficial", "unnecessary", "unknown"
+    ]
     target: InteractiveNavTargetSpec
     success_criteria: NavToObjSuccessCriteriaSpec
     initial_state: InteractiveNavInitialStateSpec

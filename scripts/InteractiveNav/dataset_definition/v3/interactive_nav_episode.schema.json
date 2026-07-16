@@ -329,6 +329,7 @@
           "items": {
             "enum": [
               "restore_reachability",
+              "reduce_navigation_cost",
               "enable_interaction",
               "reveal_target_object"
             ]
@@ -364,6 +365,7 @@
       "enum": [
         "approach_channel_interaction",
         "restore_reachability",
+        "reduce_navigation_cost",
         "traverse_open_channel",
         "approach_container_interaction",
         "improve_target_visibility",
@@ -626,7 +628,7 @@
           "uniqueItems": true
         },
         "interaction_requirement": {
-          "enum": ["required", "unnecessary", "unknown"]
+          "enum": ["required", "beneficial", "unnecessary", "unknown"]
         },
         "target": {"$ref": "#/$defs/target"},
         "success_criteria": {"$ref": "#/$defs/successCriteria"},
@@ -645,6 +647,18 @@
         "generation_validation": {"$ref": "#/$defs/generationValidation"}
       },
       "allOf": [
+        {
+          "if": {
+            "properties": {
+              "interaction_requirement": {"const": "beneficial"}
+            }
+          },
+          "then": {
+            "properties": {
+              "interactions": {"minItems": 1}
+            }
+          }
+        },
         {
           "if": {
             "properties": {

@@ -235,49 +235,84 @@ def build_oracle_prefixes(
     return prefixes
 
 
-def validate_container_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
+def _interaction_domain(interaction: dict[str, Any]) -> str:
+    interaction_type = str(interaction.get("type", ""))
+    if interaction_type.startswith("channel_"):
+        return "channel"
+    if interaction_type.startswith("container_"):
+        return "container"
+    raise ValueError(f"Unsupported interaction type: {interaction_type!r}")
+
+
+def _validate_common_v3_episode(
+    episode: dict[str, Any],
+    *,
+    expected_domains: list[str] | None = None,
+) -> dict[str, Any]:
     payload = episode.get("interactive_nav", {})
-    if payload.get("interaction_domains") != ["container"]:
-        raise ValueError("Container v3 episodes must use interaction_domains=['container']")
-    if payload.get("interaction_requirement") != "required":
-        raise ValueError("Generated container episodes must require interaction")
+    if payload.get("schema_version") != "interactive_nav_v3":
+        raise ValueError("Unified validator only accepts interactive_nav_v3")
+    domains = payload.get("interaction_domains")
+    if not isinstance(domains, list) or not domains or len(set(domains)) != len(domains):
+        raise ValueError("interaction_domains must be a non-empty unique list")
+    if expected_domains is not None and domains != expected_domains:
+        raise ValueError(f"Expected interaction_domains={expected_domains}, got {domains}")
 
     task = episode.get("task", {})
     target = payload.get("target", {})
     selected_instance = target.get("selected_instance")
     if task.get("selection_mode") != "specific_instance":
-        raise ValueError("Generated container episodes must use specific_instance")
+        raise ValueError("Generated v3 episodes must use specific_instance")
     if task.get("pickup_obj_name") != selected_instance:
         raise ValueError("task.pickup_obj_name does not match target.selected_instance")
     if task.get("pickup_obj_candidates") != [selected_instance]:
         raise ValueError("specific_instance candidates must contain only the selected target")
-    grounding = target.get("grounding", {})
-    matching_count = grounding.get("matching_instance_count")
-    if not isinstance(matching_count, int) or matching_count < 1:
-        raise ValueError("target grounding count must be a positive measured integer")
-    if grounding.get("unique") != (matching_count == 1):
-        raise ValueError("target grounding unique flag does not match the measured count")
+
+    if "container" in domains:
+        grounding = target.get("grounding", {})
+        matching_count = grounding.get("matching_instance_count")
+        if not isinstance(matching_count, int) or matching_count < 1:
+            raise ValueError("container target grounding count must be a measured positive integer")
+        if grounding.get("unique") != (matching_count == 1):
+            raise ValueError("target grounding unique flag disagrees with the measured count")
+        if not target.get("container_name") or target.get("container_category") in {
+            None,
+            "",
+            "unknown",
+        }:
+            raise ValueError("container target grounding must name a measured container")
+
     relevant_objects = episode.get("task_relevant_objects", [])
-    for required_object in (selected_instance, target.get("container_name")):
+    required_objects = [selected_instance]
+    if "container" in domains:
+        required_objects.append(target.get("container_name"))
+    for required_object in required_objects:
         if required_object not in relevant_objects:
             raise ValueError(f"task_relevant_objects is missing {required_object!r}")
 
     interactions = payload.get("interactions", [])
-    interaction_ids = {
-        interaction["interaction_id"] for interaction in payload.get("interactions", [])
-    }
-    if len(interaction_ids) != len(interactions):
-        raise ValueError("Duplicate interaction IDs")
-    for interaction in interactions:
-        if interaction.get("object_category") in {None, "", "unknown"}:
-            raise ValueError("Interaction object_category must be measured, not a placeholder")
-        for prerequisite in interaction.get("prerequisites", []):
-            if prerequisite["interaction_id"] not in interaction_ids:
-                raise ValueError("Interaction prerequisite references an unknown interaction")
-
+    requirement = payload.get("interaction_requirement")
+    if requirement in {"required", "beneficial"} and not interactions:
+        raise ValueError(
+            f"{requirement.capitalize()} v3 episodes must contain interactions"
+        )
+    if requirement == "unnecessary" and interactions:
+        raise ValueError("Unnecessary-interaction episodes must not contain interactions")
+    interaction_ids = [interaction.get("interaction_id") for interaction in interactions]
+    if None in interaction_ids or len(set(interaction_ids)) != len(interaction_ids):
+        raise ValueError("Interaction IDs must be present and unique")
     interaction_by_id = {
         interaction["interaction_id"]: interaction for interaction in interactions
     }
+    for interaction in interactions:
+        if _interaction_domain(interaction) not in domains:
+            raise ValueError("Interaction type is not declared in interaction_domains")
+        if interaction.get("object_category") in {None, "", "unknown"}:
+            raise ValueError("Interaction object_category must be measured, not a placeholder")
+        for prerequisite in interaction.get("prerequisites", []):
+            if prerequisite.get("interaction_id") not in interaction_by_id:
+                raise ValueError("Interaction prerequisite references an unknown interaction")
+
     visiting: set[str] = set()
     visited: set[str] = set()
 
@@ -292,13 +327,13 @@ def validate_container_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
         visiting.remove(interaction_id)
         visited.add(interaction_id)
 
-    for interaction_id in interaction_ids:
+    for interaction_id in interaction_by_id:
         visit(interaction_id)
 
-    initial_by_id = {
-        state["interaction_id"]: state
-        for state in payload.get("initial_state", {}).get("interaction_states", [])
-    }
+    initial_rows = payload.get("initial_state", {}).get("interaction_states", [])
+    initial_by_id = {state.get("interaction_id"): state for state in initial_rows}
+    if set(initial_by_id) != set(interaction_by_id):
+        raise ValueError("initial_state interaction IDs do not exactly match interactions")
     articulation_by_joint = {
         state["joint_name"]: state
         for state in episode.get("scene_modifications", {}).get("articulation_states", [])
@@ -319,31 +354,75 @@ def validate_container_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
         ) > 1e-6:
             raise ValueError("Interaction and scene articulation initial fractions disagree")
 
-    generation_validation = payload.get("generation_validation", {})
-    door_validation = generation_validation.get("door_state_validation", {})
-    door_rows = door_validation.get("doors", [])
-    if door_validation.get("door_count") != len(door_rows):
-        raise ValueError("door_state_validation count does not match its measured rows")
-    if door_validation.get("all_open") != all(row.get("passed") is True for row in door_rows):
-        raise ValueError("door_state_validation all_open does not match measured door rows")
-    for row in door_rows:
-        articulation = articulation_by_joint.get(row["joint_name"])
-        if articulation is None:
-            raise ValueError("Validated channel door is missing from articulation states")
-        if abs(float(articulation.get("position")) - float(row["joint_value"])) > 1e-6:
-            raise ValueError("Door articulation position does not match measured validation")
-        if abs(
-            float(articulation.get("open_fraction")) - float(row["open_fraction"])
-        ) > 1e-6:
-            raise ValueError("Door articulation fraction does not match measured validation")
-    if payload.get("initial_state", {}).get("all_doors_open") is True and not door_validation.get(
-        "all_open", False
-    ):
-        raise ValueError("all_doors_open is not supported by measured door state validation")
+    success_criteria = payload.get("success_criteria", {})
+    task_threshold = float(task.get("succ_pos_threshold", -1.0))
+    if float(success_criteria.get("distance", {}).get("threshold_m", -2.0)) != task_threshold:
+        raise ValueError("success_criteria distance threshold does not mirror the task")
+
+    plans = payload.get("oracle_plans", [])
+    if not plans or plans[0] != payload.get("oracle_plan"):
+        raise ValueError("oracle_plan must equal oracle_plans[0]")
+    for plan in plans:
+        required_ids = plan.get("required_interaction_ids", [])
+        if any(interaction_id not in interaction_by_id for interaction_id in required_ids):
+            raise ValueError(f"Plan {plan.get('plan_id')} references an unknown interaction")
+        step_ids = [
+            step["interaction_id"]
+            for step in plan.get("steps", [])
+            if step.get("type") == "open_joint"
+        ]
+        if step_ids != required_ids:
+            raise ValueError(
+                f"Plan {plan.get('plan_id')} required_interaction_ids do not match steps"
+            )
+        completed: list[str] = []
+        for step in plan.get("steps", []):
+            interaction_id = step.get("interaction_id")
+            if interaction_id is not None and interaction_id not in interaction_by_id:
+                raise ValueError("Oracle step references an unknown interaction")
+            if step.get("type") != "open_joint":
+                continue
+            interaction = interaction_by_id[interaction_id]
+            if (
+                step.get("object_name") != interaction["object_name"]
+                or step.get("joint_name") != interaction["joint_name"]
+                or step.get("joint_index") != interaction["joint_index"]
+            ):
+                raise ValueError("Oracle open_joint step disagrees with its interaction")
+            prerequisites = [
+                prerequisite["interaction_id"]
+                for prerequisite in interaction.get("prerequisites", [])
+            ]
+            if any(prerequisite not in completed for prerequisite in prerequisites):
+                raise ValueError("Oracle plan opens an interaction before its prerequisite")
+            completed.append(interaction_id)
+        observe_steps = [
+            step for step in plan.get("steps", []) if step.get("type") == "observe_target"
+        ]
+        if len(observe_steps) != 1 or observe_steps[0].get("object_name") != selected_instance:
+            raise ValueError("Oracle plan must observe exactly the selected target")
+
+    return {
+        "payload": payload,
+        "task": task,
+        "target": target,
+        "selected_instance": selected_instance,
+        "domains": domains,
+        "interactions": interactions,
+        "interaction_by_id": interaction_by_id,
+        "articulation_by_joint": articulation_by_joint,
+        "generation_validation": payload.get("generation_validation", {}),
+    }
+
+
+def _validate_measured_container_state(context: dict[str, Any]) -> None:
+    payload = context["payload"]
+    generation_validation = context["generation_validation"]
+    articulation_by_joint = context["articulation_by_joint"]
     container_validation = generation_validation.get("container_state_validation", {})
     container_rows = container_validation.get("joints", [])
     if container_validation.get("joint_count") != len(container_rows):
-        raise ValueError("container_state_validation count does not match measured rows")
+        raise ValueError("container_state_validation count does not match its measured rows")
     if container_validation.get("all_closed") != all(
         row.get("passed") is True for row in container_rows
     ):
@@ -364,6 +443,62 @@ def validate_container_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "container_joints_closed is not supported by measured container state validation"
         )
+
+
+def _validate_passing_success(context: dict[str, Any]) -> None:
+    success_evidence = context["generation_validation"].get("success_evidence", {})
+    if not (
+        success_evidence.get("status") == "passed"
+        and success_evidence.get("distance_passed") is True
+        and success_evidence.get("visibility_passed") is True
+        and success_evidence.get("expected_task_success") is True
+    ):
+        raise ValueError("Generated episode lacks passing measured NavToObj success evidence")
+    task_threshold = float(context["task"].get("succ_pos_threshold", -1.0))
+    if float(success_evidence.get("distance_threshold_m", -2.0)) != task_threshold:
+        raise ValueError("success_evidence distance threshold does not mirror the task")
+    if success_evidence.get("target_object_name") != context["selected_instance"]:
+        raise ValueError("success_evidence target does not match the selected instance")
+
+
+def _prefixes_by_plan(context: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    prefixes: dict[str, list[dict[str, Any]]] = {}
+    for prefix in context["generation_validation"].get("oracle_prefixes", []):
+        prefixes.setdefault(prefix["plan_id"], []).append(prefix)
+    return prefixes
+
+
+def _validate_container_scene(context: dict[str, Any]) -> None:
+    payload = context["payload"]
+    generation_validation = context["generation_validation"]
+    articulation_by_joint = context["articulation_by_joint"]
+    if payload.get("interaction_requirement") != "required":
+        raise ValueError("Generated container episodes must require interaction")
+    if any(_interaction_domain(row) != "container" for row in context["interactions"]):
+        raise ValueError("Container episodes may only contain container interactions")
+
+    door_validation = generation_validation.get("door_state_validation", {})
+    door_rows = door_validation.get("doors", [])
+    if door_validation.get("door_count") != len(door_rows):
+        raise ValueError("door_state_validation count does not match its measured rows")
+    if door_validation.get("all_open") != all(row.get("passed") is True for row in door_rows):
+        raise ValueError("door_state_validation all_open does not match measured door rows")
+    for row in door_rows:
+        articulation = articulation_by_joint.get(row["joint_name"])
+        if articulation is None:
+            raise ValueError("Validated channel door is missing from articulation states")
+        if abs(float(articulation.get("position")) - float(row["joint_value"])) > 1e-6:
+            raise ValueError("Door articulation position does not match measured validation")
+        if abs(
+            float(articulation.get("open_fraction")) - float(row["open_fraction"])
+        ) > 1e-6:
+            raise ValueError("Door articulation fraction does not match measured validation")
+    if payload.get("initial_state", {}).get("all_doors_open") is True and not door_validation.get(
+        "all_open", False
+    ):
+        raise ValueError("all_doors_open is not supported by measured door state validation")
+
+    _validate_measured_container_state(context)
     if payload.get("initial_state", {}).get("target_visible") is not False:
         raise ValueError("Required container interactions must start with a hidden target")
     navigation_validation = generation_validation.get("navigation_validation", {})
@@ -373,51 +508,9 @@ def validate_container_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
         navigation_validation.get("start_visible_pixels", 0)
     ) > 0:
         raise ValueError("Generated episode target is visible at the source start")
-    success_evidence = generation_validation.get("success_evidence", {})
-    if not (
-        success_evidence.get("status") == "passed"
-        and success_evidence.get("distance_passed") is True
-        and success_evidence.get("visibility_passed") is True
-        and success_evidence.get("expected_task_success") is True
-    ):
-        raise ValueError("Generated episode lacks passing measured NavToObj success evidence")
-    success_criteria = payload.get("success_criteria", {})
-    task_threshold = float(task.get("succ_pos_threshold", -1.0))
-    if float(success_criteria.get("distance", {}).get("threshold_m", -2.0)) != task_threshold:
-        raise ValueError("success_criteria distance threshold does not mirror the task")
-    if float(success_evidence.get("distance_threshold_m", -2.0)) != task_threshold:
-        raise ValueError("success_evidence distance threshold does not mirror the task")
-    if success_evidence.get("target_object_name") != selected_instance:
-        raise ValueError("success_evidence target does not match the selected instance")
+    _validate_passing_success(context)
 
-    for plan in payload.get("oracle_plans", []):
-        completed: list[str] = []
-        for step in plan.get("steps", []):
-            if step.get("type") != "open_joint":
-                continue
-            interaction = interaction_by_id[step["interaction_id"]]
-            if (
-                step.get("object_name") != interaction["object_name"]
-                or step.get("joint_name") != interaction["joint_name"]
-                or step.get("joint_index") != interaction["joint_index"]
-            ):
-                raise ValueError("Oracle open_joint step disagrees with its interaction")
-            prerequisites = [
-                prerequisite["interaction_id"]
-                for prerequisite in interaction.get("prerequisites", [])
-            ]
-            if any(prerequisite not in completed for prerequisite in prerequisites):
-                raise ValueError("Oracle plan opens an interaction before its prerequisite")
-            completed.append(step["interaction_id"])
-        observe_steps = [
-            step for step in plan.get("steps", []) if step.get("type") == "observe_target"
-        ]
-        if len(observe_steps) != 1 or observe_steps[0].get("object_name") != selected_instance:
-            raise ValueError("Oracle plan must observe exactly the selected target")
-
-    prefixes_by_plan: dict[str, list[dict[str, Any]]] = {}
-    for prefix in generation_validation.get("oracle_prefixes", []):
-        prefixes_by_plan.setdefault(prefix["plan_id"], []).append(prefix)
+    prefixes_by_plan = _prefixes_by_plan(context)
     for plan in payload.get("oracle_plans", []):
         prefixes = prefixes_by_plan.get(plan["plan_id"], [])
         if not prefixes:
@@ -426,37 +519,213 @@ def validate_container_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("Oracle prefix validation does not prove initial failure")
         if prefixes[-1].get("task_success") is not True:
             raise ValueError("Oracle prefix validation does not prove terminal success")
-
     minimal_verified = generation_validation.get("minimal_plan_verified")
     minimal_validation = generation_validation.get("minimal_plan_validation", {})
     if minimal_verified is None and minimal_validation.get("status") != "not_executed":
         raise ValueError("Unverified minimal plan must explicitly record not_executed")
-    for plan in payload.get("oracle_plans", []):
-        required_ids = plan.get("required_interaction_ids", [])
-        if any(interaction_id not in interaction_ids for interaction_id in required_ids):
-            raise ValueError(f"Plan {plan.get('plan_id')} references an unknown interaction")
-        step_ids = [
-            step["interaction_id"]
-            for step in plan.get("steps", [])
-            if step.get("type") == "open_joint"
-        ]
-        if step_ids != required_ids:
-            raise ValueError(
-                f"Plan {plan.get('plan_id')} required_interaction_ids do not match steps"
-            )
-    if payload.get("oracle_plans", [None])[0] != payload.get("oracle_plan"):
-        raise ValueError("oracle_plan must equal oracle_plans[0]")
 
+
+def _validate_channel_scene(context: dict[str, Any]) -> None:
+    interactions = context["interactions"]
+    if any(_interaction_domain(row) != "channel" for row in interactions):
+        raise ValueError("Channel episodes may only contain channel interactions")
+    if context["payload"].get("interaction_requirement") == "required" and not interactions:
+        raise ValueError("Required channel episode has no channel interaction")
+
+
+def _validate_mixed_scene(context: dict[str, Any]) -> None:
+    payload = context["payload"]
+    generation_validation = context["generation_validation"]
+    interactions = context["interactions"]
+    interaction_by_id = context["interaction_by_id"]
+    articulation_by_joint = context["articulation_by_joint"]
+    interaction_requirement = payload.get("interaction_requirement")
+    if interaction_requirement not in {"required", "beneficial"}:
+        raise ValueError(
+            "Mixed production episodes must classify channel interaction as "
+            "required or beneficial"
+        )
+    channel_ids = [
+        row["interaction_id"] for row in interactions if _interaction_domain(row) == "channel"
+    ]
+    container_ids = [
+        row["interaction_id"] for row in interactions if _interaction_domain(row) == "container"
+    ]
+    if not channel_ids or not container_ids:
+        raise ValueError("Mixed episodes must contain both channel and container interactions")
+    first_container = interaction_by_id[container_ids[0]]
+    reachability_prerequisites = {
+        row["interaction_id"]
+        for row in first_container.get("prerequisites", [])
+        if row.get("type") == "reachability"
+    }
+    if interaction_requirement == "required":
+        if not set(channel_ids).issubset(reachability_prerequisites):
+            raise ValueError(
+                "First container interaction must depend on all required channel interactions"
+            )
+        if any(
+            "restore_reachability" not in row.get("effect_types", [])
+            for row in interactions
+            if _interaction_domain(row) == "channel"
+        ):
+            raise ValueError(
+                "Required mixed channel interactions must restore reachability"
+            )
+    else:
+        if set(channel_ids) & reachability_prerequisites:
+            raise ValueError(
+                "Beneficial mixed channels must not be encoded as reachability prerequisites"
+            )
+        if any(
+            "reduce_navigation_cost" not in row.get("effect_types", [])
+            for row in interactions
+            if _interaction_domain(row) == "channel"
+        ):
+            raise ValueError(
+                "Beneficial mixed channel interactions must reduce navigation cost"
+            )
+
+    door_validation = generation_validation.get("door_state_validation", {})
+    door_rows = door_validation.get("doors", [])
+    if door_validation.get("door_count") != len(door_rows) or not door_rows:
+        raise ValueError("Mixed door_state_validation must contain measured door rows")
+    all_closed = door_validation.get(
+        "all_closed", door_validation.get("all_required_closed")
+    )
+    if all_closed is not True:
+        raise ValueError("Mixed initial state must prove all evaluated doors are closed")
+    for row in door_rows:
+        articulation = articulation_by_joint.get(row["joint_name"])
+        if articulation is None:
+            raise ValueError("Validated mixed door is missing from articulation states")
+        if row.get("passed_closed") is not True:
+            raise ValueError("A required mixed door was not measured closed")
+        if abs(float(articulation.get("position")) - float(row["joint_value"])) > 1e-6:
+            raise ValueError("Mixed door articulation position disagrees with readback")
+        if abs(float(articulation.get("open_fraction")) - float(row["open_fraction"])) > 1e-6:
+            raise ValueError("Mixed door articulation fraction disagrees with readback")
+
+    _validate_measured_container_state(context)
+    if payload.get("initial_state", {}).get("target_visible") is not False:
+        raise ValueError("Mixed episodes must start with a hidden target")
+    navigation = generation_validation.get("navigation_validation", {})
+    closed_roots = door_validation.get(
+        "closed_root_names",
+        door_validation.get("required_closed_root_names", []),
+    )
+    crossed_roots = navigation.get("all_open_path_crossed_door_roots", [])
+    if not navigation.get("all_open_path_found", False):
+        raise ValueError("Mixed episode lacks an all-open GT path")
+    if not closed_roots or any(root not in crossed_roots for root in closed_roots):
+        raise ValueError(
+            "All evaluated mixed doors must lie on the measured all-open GT path"
+        )
+    if interaction_requirement == "required":
+        if navigation.get("initial_state_path_found") is not False:
+            raise ValueError(
+                "mixed_required initial state must make the container pose unreachable"
+            )
+    else:
+        if navigation.get("initial_state_path_found") is not True:
+            raise ValueError(
+                "mixed_beneficial initial state must retain a measured alternate path"
+            )
+        if navigation.get("shortcut_verified") is not True:
+            raise ValueError(
+                "mixed_beneficial samples must verify a navigation-cost reduction"
+            )
+        initial_length = navigation.get("initial_state_path_length_m")
+        restored_length = navigation.get("oracle_restored_path_length_m")
+        delta = navigation.get("path_length_delta_m")
+        ratio = navigation.get("path_length_ratio_delta")
+        thresholds = navigation.get("shortcut_thresholds", {})
+        if None in {initial_length, restored_length, delta, ratio}:
+            raise ValueError(
+                "mixed_beneficial navigation evidence is missing measured path lengths"
+            )
+        recomputed_delta = float(initial_length) - float(restored_length)
+        recomputed_ratio = recomputed_delta / max(float(restored_length), 1e-6)
+        if abs(float(delta) - recomputed_delta) > 1e-6:
+            raise ValueError("Beneficial path-length delta disagrees with measured paths")
+        if abs(float(ratio) - recomputed_ratio) > 1e-6:
+            raise ValueError("Beneficial path-length ratio disagrees with measured paths")
+        if recomputed_delta < float(thresholds.get("min_delta_m", float("inf"))):
+            raise ValueError("Beneficial path-length delta does not pass its threshold")
+        if recomputed_ratio < float(thresholds.get("min_ratio", float("inf"))):
+            raise ValueError("Beneficial path-length ratio does not pass its threshold")
+    if navigation.get("approach_path_found") is not True:
+        raise ValueError("Mixed episode lacks a measured path to the closed-door approach pose")
+    if navigation.get("oracle_restored_path_found") is not True:
+        raise ValueError("Opening required doors must restore reachability")
+    if float(navigation.get("start_visibility_fraction", 0.0)) > 0.0 or int(
+        navigation.get("start_visible_pixels", 0)
+    ) > 0:
+        raise ValueError("Mixed target is visible at the source start")
+    _validate_passing_success(context)
+
+    prefixes_by_plan = _prefixes_by_plan(context)
+    for plan in payload.get("oracle_plans", []):
+        prefixes = prefixes_by_plan.get(plan["plan_id"], [])
+        if len(prefixes) < 3:
+            raise ValueError("Mixed oracle plan needs initial, post-door, and terminal prefixes")
+        if prefixes[0].get("task_success") is not False:
+            raise ValueError("Mixed prefix evidence does not prove initial failure")
+        middle = prefixes[1:-1]
+        if not any(
+            row.get("robot_reachable_to_next_goal") is True
+            and row.get("task_success") is False
+            and float(row.get("target_visibility_fraction") or 0.0) == 0.0
+            for row in middle
+        ):
+            raise ValueError("Mixed prefix evidence lacks a reachable-but-still-hidden post-door state")
+        if prefixes[-1].get("task_success") is not True:
+            raise ValueError("Mixed prefix evidence does not prove terminal success")
+
+    minimal_validation = generation_validation.get("minimal_plan_validation", {})
+    if generation_validation.get("minimal_plan_verified") is not True:
+        raise ValueError("Mixed production samples must verify plan necessity/benefit")
+    if minimal_validation.get("status") != "passed":
+        raise ValueError("Mixed minimal-plan validation must pass")
+    required_omission_ids = {
+        row.get("omitted_interaction_id")
+        for row in minimal_validation.get("omission_results", [])
+        if row.get("required") is True
+    }
+    if interaction_requirement == "required":
+        if required_omission_ids != set(channel_ids + container_ids):
+            raise ValueError(
+                "Mixed minimal-plan evidence must cover every required interaction"
+            )
+    else:
+        beneficial_omission_ids = {
+            row.get("omitted_interaction_id")
+            for row in minimal_validation.get("omission_results", [])
+            if row.get("beneficial") is True
+        }
+        if required_omission_ids != set(container_ids):
+            raise ValueError(
+                "Beneficial mixed evidence must keep container interactions required"
+            )
+        if beneficial_omission_ids != set(channel_ids):
+            raise ValueError(
+                "Beneficial mixed evidence must cover every cost-reducing channel"
+            )
+
+
+def _serialize_and_validate_v3(episode: dict[str, Any]) -> dict[str, Any]:
+    minimal_value = episode.get("interactive_nav", {}).get(
+        "generation_validation", {}
+    ).get("minimal_plan_verified")
     cleaned_episode = _without_none(episode)
-    cleaned_episode["interactive_nav"]["generation_validation"][
-        "minimal_plan_verified"
-    ] = None
+    cleaned_episode.setdefault("interactive_nav", {}).setdefault(
+        "generation_validation", {}
+    )["minimal_plan_verified"] = minimal_value
     validated_spec = EpisodeSpec.model_validate(cleaned_episode)
-    # JSON Schema validators treat tuples differently from JSON arrays.
     validated = json.loads(validated_spec.model_dump_json(exclude_none=True))
     validated["interactive_nav"]["generation_validation"][
         "minimal_plan_verified"
-    ] = None
+    ] = minimal_value
     try:
         from jsonschema import Draft202012Validator
     except ImportError:
@@ -464,3 +733,40 @@ def validate_container_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
     schema = json.loads(SCHEMA_PATH.read_text())
     Draft202012Validator(schema).validate(validated)
     return validated
+
+
+def validate_interactive_nav_v3_episode(
+    episode: dict[str, Any],
+    *,
+    expected_domains: list[str] | None = None,
+) -> dict[str, Any]:
+    """Unified V3 entry: common invariants followed by domain-specific checks."""
+    context = _validate_common_v3_episode(episode, expected_domains=expected_domains)
+    domains = context["domains"]
+    if domains == ["container"]:
+        _validate_container_scene(context)
+    elif domains == ["channel"]:
+        _validate_channel_scene(context)
+    elif domains == ["channel", "container"]:
+        _validate_mixed_scene(context)
+    else:
+        raise ValueError(f"Unsupported interaction domain combination: {domains}")
+    return _serialize_and_validate_v3(episode)
+
+
+def validate_channel_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
+    return validate_interactive_nav_v3_episode(
+        episode, expected_domains=["channel"]
+    )
+
+
+def validate_container_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
+    return validate_interactive_nav_v3_episode(
+        episode, expected_domains=["container"]
+    )
+
+
+def validate_mixed_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
+    return validate_interactive_nav_v3_episode(
+        episode, expected_domains=["channel", "container"]
+    )

@@ -55,6 +55,10 @@ else:
     _MUJOCO_IMPORT_ERROR = None
 
 DEFAULT_OUTPUT_DIR = Path("/home/user/ldl/molmospaces-exp-setting/scripts/InteractiveNav/output")
+_WALL_COLLISION_SLICE_CACHE: dict[
+    tuple[str, float], tuple[np.ndarray, dict[str, Any]]
+] = {}
+_WALL_COLLISION_SLICE_CACHE_MAX_SCENES = 8
 
 
 @dataclass
@@ -520,6 +524,249 @@ def _move_root_free_joint_far_away(
     return True
 
 
+def _triangle_horizontal_slice_segment(
+    triangle_xyz: np.ndarray,
+    height_m: float,
+    epsilon: float = 1e-6,
+) -> np.ndarray | None:
+    """Return the longest XY segment where a triangle intersects a Z plane."""
+    triangle = np.asarray(triangle_xyz, dtype=float)
+    if triangle.shape != (3, 3):
+        raise ValueError(f"Expected a (3, 3) triangle, got {triangle.shape}")
+
+    signed = triangle[:, 2] - float(height_m)
+    points: list[np.ndarray] = []
+    for start_index, end_index in ((0, 1), (1, 2), (2, 0)):
+        start = triangle[start_index]
+        end = triangle[end_index]
+        start_signed = float(signed[start_index])
+        end_signed = float(signed[end_index])
+        start_on_plane = abs(start_signed) <= epsilon
+        end_on_plane = abs(end_signed) <= epsilon
+
+        if start_on_plane:
+            points.append(start[:2].copy())
+        if end_on_plane:
+            points.append(end[:2].copy())
+        if start_signed * end_signed < -(epsilon * epsilon):
+            ratio = start_signed / (start_signed - end_signed)
+            points.append((start + ratio * (end - start))[:2])
+
+    unique: list[np.ndarray] = []
+    for point in points:
+        if not any(float(np.linalg.norm(point - other)) <= epsilon for other in unique):
+            unique.append(point)
+    if len(unique) < 2:
+        return None
+
+    best_pair = None
+    best_distance = 0.0
+    for first_index in range(len(unique) - 1):
+        for second_index in range(first_index + 1, len(unique)):
+            distance = float(np.linalg.norm(unique[first_index] - unique[second_index]))
+            if distance > best_distance:
+                best_distance = distance
+                best_pair = (unique[first_index], unique[second_index])
+    if best_pair is None or best_distance <= epsilon:
+        return None
+    return np.asarray(best_pair, dtype=float)
+
+
+def _mesh_geom_world_vertices(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    geom_id: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if int(model.geom_type[geom_id]) != int(mujoco.mjtGeom.mjGEOM_MESH):
+        return None
+    mesh_id = int(model.geom_dataid[geom_id])
+    if mesh_id < 0:
+        return None
+
+    vertex_start = int(model.mesh_vertadr[mesh_id])
+    vertex_count = int(model.mesh_vertnum[mesh_id])
+    face_start = int(model.mesh_faceadr[mesh_id])
+    face_count = int(model.mesh_facenum[mesh_id])
+    local_vertices = np.asarray(
+        model.mesh_vert[vertex_start : vertex_start + vertex_count], dtype=float
+    )
+    faces = np.asarray(
+        model.mesh_face[face_start : face_start + face_count], dtype=np.int64
+    )
+    rotation = np.asarray(data.geom_xmat[geom_id], dtype=float).reshape(3, 3)
+    translation = np.asarray(data.geom_xpos[geom_id], dtype=float)
+    world_vertices = local_vertices @ rotation.T + translation
+    return world_vertices, faces
+
+
+def _geom_world_vertices_for_bounds(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    geom_id: int,
+) -> np.ndarray:
+    mesh_geometry = _mesh_geom_world_vertices(model, data, geom_id)
+    if mesh_geometry is not None:
+        return mesh_geometry[0]
+
+    corners = np.asarray(
+        [
+            [x, y, z]
+            for x in (-1.0, 1.0)
+            for y in (-1.0, 1.0)
+            for z in (-1.0, 1.0)
+        ],
+        dtype=float,
+    )
+    local_aabb = np.asarray(model.geom_aabb[geom_id], dtype=float)
+    local_corners = local_aabb[:3] + corners * local_aabb[3:]
+    rotation = np.asarray(data.geom_xmat[geom_id], dtype=float).reshape(3, 3)
+    translation = np.asarray(data.geom_xpos[geom_id], dtype=float)
+    return local_corners @ rotation.T + translation
+
+
+def oriented_xy_bounds_for_geoms(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    geom_ids: list[int],
+) -> dict[str, Any] | None:
+    ensure_runtime_dependencies()
+    if not geom_ids:
+        return None
+    points_xy = np.concatenate(
+        [
+            _geom_world_vertices_for_bounds(model, data, geom_id)[:, :2]
+            for geom_id in geom_ids
+        ],
+        axis=0,
+    )
+    if len(points_xy) < 2:
+        return None
+
+    centered = points_xy - points_xy.mean(axis=0, keepdims=True)
+    covariance = centered.T @ centered / max(len(centered), 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    tangent = np.asarray(eigenvectors[:, int(np.argmax(eigenvalues))], dtype=float)
+    tangent /= max(float(np.linalg.norm(tangent)), 1e-8)
+    if tangent[0] < -1e-8 or (abs(tangent[0]) <= 1e-8 and tangent[1] < 0.0):
+        tangent = -tangent
+    normal = np.asarray([-tangent[1], tangent[0]], dtype=float)
+
+    tangent_projection = points_xy @ tangent
+    normal_projection = points_xy @ normal
+    tangent_min = float(tangent_projection.min())
+    tangent_max = float(tangent_projection.max())
+    normal_min = float(normal_projection.min())
+    normal_max = float(normal_projection.max())
+    center_xy = (
+        tangent * ((tangent_min + tangent_max) / 2.0)
+        + normal * ((normal_min + normal_max) / 2.0)
+    )
+    return {
+        "center_xy": center_xy,
+        "tangent_xy": tangent,
+        "normal_xy": normal,
+        "width_m": tangent_max - tangent_min,
+        "thickness_m": normal_max - normal_min,
+    }
+
+
+def collect_wall_collision_slice_segments(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    height_m: float = 0.45,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Slice thin ProcTHOR wall collision meshes without filling their door holes."""
+    ensure_runtime_dependencies()
+    segments: list[np.ndarray] = []
+    wall_geom_count = 0
+    sliced_triangle_count = 0
+    for geom_id in range(model.ngeom):
+        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
+        body_id = int(model.geom_bodyid[geom_id])
+        body_name = model.body(body_id).name or ""
+        if not body_name.startswith("wall_") or "collision" not in geom_name.lower():
+            continue
+        mesh_geometry = _mesh_geom_world_vertices(model, data, geom_id)
+        if mesh_geometry is None:
+            continue
+        wall_geom_count += 1
+        world_vertices, faces = mesh_geometry
+        for face in faces:
+            segment = _triangle_horizontal_slice_segment(
+                world_vertices[np.asarray(face, dtype=np.int64)], height_m
+            )
+            if segment is None:
+                continue
+            segments.append(segment)
+            sliced_triangle_count += 1
+
+    segment_array = (
+        np.asarray(segments, dtype=float)
+        if segments
+        else np.empty((0, 2, 2), dtype=float)
+    )
+    return segment_array, {
+        "height_m": float(height_m),
+        "wall_collision_geom_count": int(wall_geom_count),
+        "slice_segment_count": int(len(segment_array)),
+        "sliced_triangle_count": int(sliced_triangle_count),
+    }
+
+
+def cached_wall_collision_slice_segments(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    *,
+    model_path: str | None,
+    height_m: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    cache_key = None
+    if model_path is not None:
+        cache_key = (str(Path(model_path).resolve()), round(float(height_m), 4))
+        cached = _WALL_COLLISION_SLICE_CACHE.get(cache_key)
+        if cached is not None:
+            segments, stats = cached
+            return segments, {**stats, "cache_hit": True}
+
+    segments, stats = collect_wall_collision_slice_segments(
+        model, data, height_m=height_m
+    )
+    if cache_key is not None:
+        if len(_WALL_COLLISION_SLICE_CACHE) >= _WALL_COLLISION_SLICE_CACHE_MAX_SCENES:
+            oldest_key = next(iter(_WALL_COLLISION_SLICE_CACHE))
+            _WALL_COLLISION_SLICE_CACHE.pop(oldest_key)
+        _WALL_COLLISION_SLICE_CACHE[cache_key] = (segments, dict(stats))
+    return segments, {**stats, "cache_hit": False}
+
+
+def rasterize_world_xy_segments(
+    segments_xy: np.ndarray,
+    world_to_map: np.ndarray,
+    shape: tuple[int, int],
+    *,
+    height_m: float = 0.0,
+    thickness_px: int = 1,
+) -> np.ndarray:
+    ensure_runtime_dependencies()
+    mask = np.zeros(shape, dtype=np.uint8)
+    for segment in np.asarray(segments_xy, dtype=float):
+        homogeneous = np.column_stack(
+            [segment, np.full(2, float(height_m)), np.ones(2, dtype=float)]
+        )
+        pixels = homogeneous @ np.asarray(world_to_map, dtype=float).T
+        start = (int(round(float(pixels[0, 1]))), int(round(float(pixels[0, 0]))))
+        end = (int(round(float(pixels[1, 1]))), int(round(float(pixels[1, 0]))))
+        cv2.line(
+            mask,
+            start,
+            end,
+            color=1,
+            thickness=max(1, int(thickness_px)),
+            lineType=cv2.LINE_8,
+        )
+    return mask.astype(bool)
+
+
 def build_live_procthor_map(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -531,6 +778,10 @@ def build_live_procthor_map(
     treat_all_non_interactive_doorways_as_open: bool = False,
     return_doorway_analysis: bool = False,
     ignored_root_body_names: set[str] | None = None,
+    include_wall_collision_slices: bool = True,
+    wall_slice_height_m: float = 0.45,
+    wall_slice_thickness_px: int = 1,
+    doorway_clearance_m: float = 0.30,
 ) -> ProcTHORMap | tuple[ProcTHORMap, dict[str, Any] | None]:
     ensure_runtime_dependencies()
     work_model = model
@@ -637,10 +888,18 @@ def build_live_procthor_map(
             occ_doorframe[seg_geom == did] = True
 
         occ_door_path = occ_doorframe & ~occ_door
-        occ_door_path = cv2.dilate(occ_door_path.astype(np.uint8), circular_kernel(15)).astype(bool)
+        doorway_clearance_px = max(1, int(round(doorway_clearance_m * effective_px)))
+        occ_door_path = cv2.dilate(
+            occ_door_path.astype(np.uint8),
+            circular_kernel(doorway_clearance_px),
+        ).astype(bool)
 
-        occ = occ_floor
+        occ = occ_floor.copy()
         occ[occ_door_path == 1] = False
+        # The carve removes the top-down door-frame/lintel projection. Keep the
+        # actually swung-open leaf as a collision obstacle if it overlaps the
+        # carved portal region.
+        occ[occ_door] = True
 
         if cam_distance == 5.0:
             return occ, occ_room_floor, effective_px, (h, w), cam_to_world
@@ -650,12 +909,6 @@ def build_live_procthor_map(
     occ_final = occ_map_5.copy()
     room_map_final = room_map_5.copy()
 
-    if agent_radius is not None:
-        rad_px = int(agent_radius * effective_px)
-        kernel = circular_kernel(rad_px)
-        occ_final = cv2.dilate(occ_final.astype(np.uint8), kernel).astype(bool)
-        room_map_final[occ_final] = 0
-
     cam_to_map = np.array([[0, -effective_px, 0, h / 2], [effective_px, 0, 0, w / 2]])
     world_to_map = cam_to_map @ inverse_homogeneous_matrix(cam_to_world)
 
@@ -664,6 +917,40 @@ def build_live_procthor_map(
     cam_to_world_floor = cam_to_world[:-1, [0, 1, 3]].copy()
     cam_to_world_floor[2, 2] = 0
     map_to_world = cam_to_world_floor @ centered_to_cam @ map_to_centered
+
+    wall_slice_mask = np.zeros_like(occ_final, dtype=bool)
+    wall_slice_stats = {
+        "enabled": bool(include_wall_collision_slices),
+        "height_m": float(wall_slice_height_m),
+        "wall_collision_geom_count": 0,
+        "slice_segment_count": 0,
+        "sliced_triangle_count": 0,
+        "rasterized_pixel_count": 0,
+    }
+    if include_wall_collision_slices:
+        wall_segments, collected_stats = cached_wall_collision_slice_segments(
+            work_model,
+            work_data,
+            model_path=model_path,
+            height_m=wall_slice_height_m,
+        )
+        wall_slice_mask = rasterize_world_xy_segments(
+            wall_segments,
+            world_to_map,
+            occ_final.shape,
+            height_m=wall_slice_height_m,
+            thickness_px=wall_slice_thickness_px,
+        )
+        occ_final |= wall_slice_mask
+        room_map_final[wall_slice_mask] = 0
+        wall_slice_stats.update(collected_stats)
+        wall_slice_stats["rasterized_pixel_count"] = int(wall_slice_mask.sum())
+
+    if agent_radius is not None:
+        rad_px = int(agent_radius * effective_px)
+        kernel = circular_kernel(rad_px)
+        occ_final = cv2.dilate(occ_final.astype(np.uint8), kernel).astype(bool)
+        room_map_final[occ_final] = 0
 
     occ_final = ~occ_final
     if not np.any(occ_final) or np.all(occ_final):
@@ -680,7 +967,10 @@ def build_live_procthor_map(
         map_to_world=map_to_world,
         px_per_m=effective_px,
     )
-    instance.occupancy_base = occ_map_5
+    instance.occupancy_rendered_base = occ_map_5
+    instance.occupancy_wall_slice_mask = wall_slice_mask
+    instance.occupancy_base = occ_map_5 | wall_slice_mask
+    instance.wall_slice_stats = wall_slice_stats
 
     if owns_work_model:
         del work_data
@@ -961,6 +1251,7 @@ def collect_non_interactive_doorway_object_records(
                 "room_id": None,
                 "parent": None,
                 "children": rec.get("child_body_names", []),
+                "hinge_body_names": rec.get("hinge_body_names", []),
                 "is_static": True,
                 "is_structural": False,
                 "is_receptacle": False,
@@ -1001,6 +1292,84 @@ def collect_interactive_door_root_object_records(
             continue
 
         center, size = safe_body_aabb(env.current_model, env.current_data, body_id)
+        frame_candidates = []
+        for frame_body_name in rec.get("no_joint_body_names", []):
+            try:
+                frame_body_id = env.current_model.body(frame_body_name).id
+            except KeyError:
+                continue
+            direct_geom_ids = [
+                geom_id
+                for geom_id in range(env.current_model.ngeom)
+                if int(env.current_model.geom_bodyid[geom_id]) == int(frame_body_id)
+            ]
+            visual_geom_ids = [
+                geom_id
+                for geom_id in direct_geom_ids
+                if "visual"
+                in (
+                    mujoco.mj_id2name(
+                        env.current_model,
+                        mujoco.mjtObj.mjOBJ_GEOM,
+                        geom_id,
+                    )
+                    or ""
+                ).lower()
+            ]
+            selected_geom_ids = visual_geom_ids or direct_geom_ids
+            if not selected_geom_ids:
+                continue
+            frame_center, frame_size = geom_aabb(
+                env.current_model,
+                env.current_data,
+                selected_geom_ids,
+                tight_mesh=True,
+            )
+            oriented = oriented_xy_bounds_for_geoms(
+                env.current_model,
+                env.current_data,
+                selected_geom_ids,
+            )
+            if oriented is None:
+                continue
+            major_size = float(oriented["width_m"])
+            minor_size = float(oriented["thickness_m"])
+            if major_size < 0.4:
+                continue
+            frame_candidates.append(
+                {
+                    "body_name": frame_body_name,
+                    "center": np.asarray(frame_center, dtype=float),
+                    "size": np.asarray(frame_size, dtype=float),
+                    "portal": oriented,
+                    "score": (
+                        major_size / max(minor_size, 0.02),
+                        major_size,
+                        -minor_size,
+                    ),
+                }
+            )
+
+        if frame_candidates:
+            portal_frame = max(frame_candidates, key=lambda item: item["score"])
+            portal_center_xy = portal_frame["portal"]["center_xy"]
+            portal_tangent_xy = portal_frame["portal"]["tangent_xy"]
+            portal_normal_xy = portal_frame["portal"]["normal_xy"]
+            portal_width_m = float(portal_frame["portal"]["width_m"])
+            portal_thickness_m = float(portal_frame["portal"]["thickness_m"])
+            portal_frame_body_name = str(portal_frame["body_name"])
+        else:
+            portal_center_xy = np.asarray(center, dtype=float)[:2]
+            portal_size_xy = np.asarray(size, dtype=float)[:2]
+            portal_major_axis = int(np.argmax(portal_size_xy))
+            portal_tangent_xy = np.zeros(2, dtype=float)
+            portal_tangent_xy[portal_major_axis] = 1.0
+            portal_normal_xy = np.asarray(
+                [-portal_tangent_xy[1], portal_tangent_xy[0]], dtype=float
+            )
+            portal_width_m = float(portal_size_xy[portal_major_axis])
+            portal_thickness_m = float(portal_size_xy[1 - portal_major_axis])
+            portal_frame_body_name = None
         records.append(
             {
                 "name": root_body_name,
@@ -1013,6 +1382,7 @@ def collect_interactive_door_root_object_records(
                 "room_id": None,
                 "parent": None,
                 "children": rec.get("child_body_names", []),
+                "hinge_body_names": rec.get("hinge_body_names", []),
                 "is_static": True,
                 "is_structural": False,
                 "is_receptacle": False,
@@ -1024,6 +1394,12 @@ def collect_interactive_door_root_object_records(
                 "position": np.asarray(env.current_data.xpos[body_id]).copy(),
                 "aabb_center": np.asarray(center).copy(),
                 "aabb_size": np.asarray(size).copy(),
+                "portal_frame_body_name": portal_frame_body_name,
+                "portal_center_xy": np.asarray(portal_center_xy, dtype=float),
+                "portal_tangent_xy": portal_tangent_xy,
+                "portal_normal_xy": portal_normal_xy,
+                "portal_half_width_m": portal_width_m / 2.0,
+                "portal_half_thickness_m": portal_thickness_m / 2.0,
             }
         )
 
@@ -2457,6 +2833,7 @@ def interactive_door_root_names(doorway_analysis: dict[str, Any] | None) -> list
 
 
 def set_door_state(env, door_name: str, state: str) -> dict[str, Any]:
+    ensure_runtime_dependencies()
     door = Door(door_name, env.current_data)
     hinge_idx = door.get_hinge_joint_index()
     joint_range = door.get_joint_range(hinge_idx)
@@ -2499,6 +2876,7 @@ def set_door_root_state(
 
     transitions = []
     skipped_children = []
+    skipped_child_errors: dict[str, str] = {}
     for child_name in matched.get("hinge_body_names", []):
         try:
             transitions.append(set_door_state(env, child_name, state))
@@ -2510,11 +2888,13 @@ def set_door_root_state(
                 exc,
             )
             skipped_children.append(child_name)
+            skipped_child_errors[child_name] = str(exc)
 
     if not transitions:
         raise ValueError(
             f"No valid interactive door leaf joints found for root {root_door_name}. "
-            f"Candidates were {matched.get('hinge_body_names', [])}"
+            f"Candidates were {matched.get('hinge_body_names', [])}; "
+            f"errors={skipped_child_errors}"
         )
 
     return {
@@ -2522,6 +2902,7 @@ def set_door_root_state(
         "state": state,
         "hinge_body_names": list(matched.get("hinge_body_names", [])),
         "skipped_hinge_body_names": skipped_children,
+        "skipped_hinge_body_errors": skipped_child_errors,
         "transitions": transitions,
     }
 

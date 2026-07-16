@@ -273,6 +273,18 @@
 - [ ] 形成 detector 输入、交互状态、规划决策、执行结果的统一记录格式
 - [ ] 能导出用于后续 agent / end-to-end 方法训练的数据样本
 
+当前 mixed 数据推进状态（2026-07-15）：
+
+- [x] 从 `container_rough_catalog_v1` 二次生产 crossing rough：任一全开 GT path 穿过 interactive door 即保留；关闭门阻断目标且门前几何提示仍可达只作为 `mixed_required_verified` 子集标签，不再作为 rough 输入门槛。门前提示不视为 manipulation-validated 操作姿态。
+- [x] mixed 精采集直接输出 `interactive_nav_v3`，不经过 V2 中间数据。
+- [x] mixed 生产校验覆盖真实门/容器 joint readback、初始失败、开门恢复、目标可见性解锁、终态 NavToObj 成功和 leave-one-interaction-out 最小性。
+- [x] 完成 10 条 mixed V3 小样本端到端 smoke。
+- [x] 完成 crossing/required 拆分后的全量扫描：712 house、2603 pair、失败 0，得到 1609 个 crossing pair、覆盖 456 house；其中 917 个/262 house 为 required 子集，另有 692 个 crossing-only pair。真正无 crossing pair 的 house 为 256 个。旧 443-house 预筛仅覆盖其中 369 个 crossing house，并漏掉 87 个 crossing house，已明确禁止用于输入筛选。
+- [x] 完成 crossing-only rough 双状态俯视诊断脚本与 24-house 分层图册：显示全开 rough GT path、单门关闭后的重规划路径、交互对象和全部 scene object AABB。
+- [x] 完成代表性 mixed V3 场景的五步 GT storyboard：自动选择单关键门 + Fridge 样本，按起点、门前关/开、冰箱前关/开独立重放机器人 pathpoint、交互真值与右肩后上方视角，作为后续连续 GT 视频插值入口。
+- [ ] 对 crossing-only 的闭门可达性做独立重放稳定性复核：当前 24-house 图册发现 house 351/candidate 427 的 catalog/replay 不一致；同时存在较多闭门前后几何路径长度近零或为负的边界样本，需要在正式配额前确定重扫、最小 detour 或路径区域裕量规则。
+- [ ] 基于 full rough 分布确定正式 mixed benchmark 的场景、目标类别、路径长度和交互链配额。
+
 ## Phase 6：Agent 架构与端到端基线
 
 目标：在模块化方法和数据基础稳定后，进一步搭建 agent 化与端到端基线。
@@ -455,25 +467,35 @@
 
 ### 4.5.2 对应脚本规划
 
-后续脚本优先保持四类职责分离：
+后续脚本优先保持以下职责分离：
 
-1. `build_mixed_interaction_benchmark.py`
-   - 输入：已经稳定的 door v3 数据、container v3 数据和 no-interaction 控制样本。
-   - 输出：统一 `interactive_nav_v3` benchmark，包含 `channel`、`container`、`mixed`、`no-interaction` split。
+1. `collect_mixed_rough_catalog.py`
+   - 输入：`container_rough_catalog_v1` 与原始 `nav_to_obj` benchmark 起点。
+   - 输出：`mixed_rough_catalog_v1`，保留所有实测全开 GT path 穿 interactive door 的 crossing 候选，并额外标注 `mixed_required_verified` 子集。
+   - 规则：粗筛的入选门槛只有 GT path 穿门；闭门阻断、门前提示可达属于诊断与优先级标签。粗筛不复用 V2 fine episode，也不把容器中心粗目标冒充最终交互位姿。
+
+2. `build_mixed_interaction_benchmark.py`
+   - 输入：一个或多个 `mixed_rough_catalog_v1`。
+   - 输出：直接符合统一 `interactive_nav_v3` 定义的 mixed benchmark。
+   - 规则：真实容器交互位姿必须再次满足穿门/关门阻断条件；所有 interaction、initial state、success evidence 和 minimality 均来自 MuJoCo/readback 实测。
    - 规则：不把 `oracle_plan` 暴露给 policy；只作为 evaluator / scorer 的 GT 标签与参考计划。
 
-2. `evaluate_interactive_nav_dataset.py`
+3. `interactive_nav_v3.py` 统一校验入口
+   - 结构：公共校验 + channel/container/mixed 场景专用校验。
+   - 兼容：保留 `validate_channel_v3_episode`、`validate_container_v3_episode`、`validate_mixed_v3_episode` 专用入口。
+
+4. `evaluate_interactive_nav_dataset.py`
    - 输入：v3 benchmark JSON。
    - 输出：数据集质量报告，而不是 policy 性能报告。
    - 检查：schema validity、无占位字段、`interaction_requirement` 分布、split 分布、`success_evidence` 状态、必要交互链与 prerequisite 一致性、no-interaction 样本是否确实不包含 interactions。
 
-3. `score_interactive_nav_run.py`
+5. `score_interactive_nav_run.py`
    - 输入：v3 benchmark JSON + policy rollout 输出。
    - 输出：主指标表和 per-episode 诊断。
    - 主指标：`SR`、`SPL`、`Interaction Success Rate`、`Interaction Precision`、`Total Cost`。
    - 输出 split：`all`、`channel`、`container`、`mixed`、`no-interaction`，并保留每个 episode 的失败原因用于附录分析。
 
-4. `summarize_interactive_nav_results.py`
+6. `summarize_interactive_nav_results.py`
    - 输入：一个或多个 scorer 输出。
    - 输出：论文表格用 CSV / Markdown。
    - 作用：对多个方法统一生成主表，避免每个方法单独写统计脚本。

@@ -8,7 +8,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import mujoco
 import numpy as np
@@ -391,6 +391,7 @@ def analyze_object_pair(
     object_record: dict[str, Any],
     dependency_rows: list[dict[str, Any]],
     case_id: str,
+    candidate_acceptor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     valid_joint_candidates: list[dict[str, Any]] = []
     joint_failures: list[dict[str, Any]] = []
@@ -583,7 +584,7 @@ def analyze_object_pair(
                     )
                     continue
                 if valid:
-                    selected = {
+                    candidate = {
                         "joint": joint,
                         "joint_sequence": joint_sequence,
                         "robot_pose": robot_pose,
@@ -601,6 +602,25 @@ def analyze_object_pair(
                         if not drive_reached
                         else None,
                     }
+                    if candidate_acceptor is not None:
+                        acceptance = candidate_acceptor(candidate)
+                        if not acceptance.get("accepted", False):
+                            trace_failures.append(
+                                {
+                                    "pose_label": pose_meta["candidate_label"],
+                                    "pose_meta": pose_meta,
+                                    "robot_pose": robot_pose.tolist(),
+                                    "view_profile": view_profile,
+                                    "view_state": trace_result["view_state"],
+                                    "reason": acceptance.get(
+                                        "reason", "candidate_rejected_by_acceptor"
+                                    ),
+                                    "trace": trace_result["trace"],
+                                }
+                            )
+                            continue
+                        candidate.update(acceptance.get("metadata", {}))
+                    selected = candidate
                     break
                 trace_failures.append(
                     {
