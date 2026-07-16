@@ -789,6 +789,19 @@ python scripts/InteractiveNav/test_semantic_door_occ_house7.py \
   --output /tmp/semantic_door_occ_house7.json
 ```
 
+使用 MuJoCo `xfrc_applied` 力/力矩驱动门关节，而不是直接写关节位置：
+
+```bash
+conda activate mlspaces
+python scripts/InteractiveNav/test_semantic_door_occ_house7.py \
+  --house-ind 7 \
+  --interaction-mode force \
+  --force-max-physics-substeps 3000 \
+  --output /tmp/semantic_door_occ_house7_force.json
+```
+
+该检查要求 force backend 将同一 doorway root 下的全部门板打开到语义 open 阈值以上；若任一门板未达到阈值，测试直接失败，不向上层返回可恢复的交互失败。
+
 正式 ROS 联调会把机器人固定在目标门前，初始化时直接关闭全部门，第 `OPEN_STEP` 个仿真 step 直接将目标门铰链设为全开。测试同时保存 raw OCC、semantic planning OCC、door clear mask、move_base global costmap、闭/开门图状态和对比图：
 
 ```bash
