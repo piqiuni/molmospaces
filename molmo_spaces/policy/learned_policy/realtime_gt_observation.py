@@ -29,6 +29,14 @@ def _joint_type_name(joint_type: Any) -> str:
         return "hinge"
     if "slide" in text:
         return "slide"
+    try:
+        numeric_type = int(np.asarray(joint_type).reshape(-1)[0])
+    except (IndexError, TypeError, ValueError):
+        return "none"
+    if numeric_type == int(mujoco.mjtJoint.mjJNT_HINGE):
+        return "hinge"
+    if numeric_type == int(mujoco.mjtJoint.mjJNT_SLIDE):
+        return "slide"
     return "none"
 
 
@@ -281,8 +289,14 @@ class RealtimeGTObservationPublisher:
             )
 
         geom_to_spec = np.full(int(model.ngeom), -1, dtype=np.int32)
+        canonical_door_specs = self._canonical_door_root_specs(model, specs)
         for geom_id in range(int(model.ngeom)):
             body_id = int(model.geom_bodyid[geom_id])
+            root_id = int(model.body_rootid[body_id])
+            canonical_door_spec = canonical_door_specs.get(root_id)
+            if canonical_door_spec is not None:
+                geom_to_spec[geom_id] = canonical_door_spec
+                continue
             while body_id >= 0:
                 spec_index = body_to_spec.get(body_id)
                 if spec_index is not None:
@@ -295,6 +309,20 @@ class RealtimeGTObservationPublisher:
         self._specs = specs
         self._geom_to_spec = geom_to_spec
         self._cache_model_identity = id(model)
+
+    @staticmethod
+    def _canonical_door_root_specs(model, specs: list[_ObjectSpec]) -> dict[int, int]:
+        """Map an articulated doorway root to its single root-level GT spec."""
+        result = {}
+        for spec_index, spec in enumerate(specs):
+            root_id = int(model.body_rootid[spec.body_id])
+            if (
+                spec.is_door
+                and spec.is_articulable
+                and int(spec.body_id) == root_id
+            ):
+                result[root_id] = int(spec_index)
+        return result
 
     def _visible_instances(self, segmentation: np.ndarray) -> list[tuple[int, int, list[int]]]:
         if not self._specs or self._geom_to_spec.size == 0:

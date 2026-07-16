@@ -14,10 +14,19 @@ from .graph_rules import (
     sanitize_token,
 )
 from .graph_schema import NavigationHint, SceneGraphBundle, SceneGraphEdge, SceneGraphNode
+from .portal_state_tracker import PortalStateTracker
 
 
 class InteractionGraphStore:
-    def __init__(self, scene_id="scene", match_distance=0.5, room_id_to_name=None, room_box_height=0.2):
+    def __init__(
+        self,
+        scene_id="scene",
+        match_distance=0.5,
+        room_id_to_name=None,
+        room_box_height=0.2,
+        portal_closed_threshold=0.10,
+        portal_open_threshold=0.67,
+    ):
         self.scene_id = str(scene_id or "scene")
         self.match_distance = float(match_distance)
         self.room_id_to_name = dict(room_id_to_name or {})
@@ -32,6 +41,10 @@ class InteractionGraphStore:
         self.episode_id = ""
         self.graph_revision = 0
         self.interaction_event_counter = 1
+        self.portal_state_tracker = PortalStateTracker(
+            closed_threshold=portal_closed_threshold,
+            open_threshold=portal_open_threshold,
+        )
         self._ensure_scene_node()
 
     def reset(self, episode_id="", source_mode=None):
@@ -46,6 +59,7 @@ class InteractionGraphStore:
         self.room_grid = None
         self.graph_revision = 0
         self.interaction_event_counter = 1
+        self.portal_state_tracker.reset()
         self._ensure_scene_node()
 
     def update_room_grid(self, grid_info, scene_data, confidence_data=None, room_id_to_name=None):
@@ -110,32 +124,77 @@ class InteractionGraphStore:
                 None,
             )
         if node is None:
+            source_object_name = str(result.get("source_object_name") or "")
+            if source_object_name:
+                node = next(
+                    (
+                        candidate
+                        for candidate in self.nodes.values()
+                        if candidate.attributes.get("source_object_name") == source_object_name
+                        or candidate.name == source_object_name
+                    ),
+                    None,
+                )
+        if node is None:
             return False
         now = float(stamp if stamp is not None else time.time())
         pre_state = str(node.interaction.get("state", "unknown"))
-        if result.get("state") is not None:
+        derived_state = None
+        if node.type == "portal" and (
+            result.get("joint_infos") or result.get("joint_value") is not None
+        ):
+            derived_state = self.portal_state_tracker.update(node.id, result)
+            node.interaction.update(derived_state)
+        elif result.get("state") is not None:
             node.interaction["state"] = str(result["state"])
-        node.interaction["state_source"] = str(result.get("source") or "interaction_result")
+        if derived_state is None:
+            node.interaction["state_source"] = str(result.get("source") or "interaction_result")
         node.interaction["state_confidence"] = float(result.get("confidence", 1.0))
         state = node.interaction.get("state", "unknown")
-        node.interaction["traversable"] = True if state in {"open", "ajar", "static_open"} else False if state == "closed" else None
-        node.interaction["requires_interaction"] = bool(node.interaction.get("is_interactable") and state in {"closed", "unknown"})
+        if node.type == "portal":
+            node.interaction["traversable"] = state in {"open", "static_open"}
+            node.interaction["requires_interaction"] = bool(
+                node.interaction.get("is_interactable") and state not in {"open", "static_open"}
+            )
+        else:
+            node.interaction["traversable"] = True if state in {"open", "ajar", "static_open"} else False if state == "closed" else None
+            node.interaction["requires_interaction"] = bool(
+                node.interaction.get("is_interactable") and state in {"closed", "unknown"}
+            )
         history = list(node.interaction.get("operation_history") or [])
         event_id = str(result.get("event_id") or f"interaction_{self.interaction_event_counter:06d}")
-        self.interaction_event_counter += 1
-        history.append(
-            {
-                "event_id": event_id,
-                "action": str(result.get("action") or result.get("interaction_mode") or "unknown"),
-                "timestamp": now,
-                "pre_state": pre_state,
-                "post_state": str(state),
-                "success": bool(result.get("success", True)),
-                "execution_cost": float(result.get("execution_cost", result.get("cost", 1.0))),
-                "verification_source": str(result.get("verification_source") or result.get("source") or "interaction_result"),
-            }
-        )
+        if not any(entry.get("event_id") == event_id for entry in history):
+            self.interaction_event_counter += 1
+            history.append(
+                {
+                    "event_id": event_id,
+                    "action": str(result.get("action") or result.get("interaction_mode") or "unknown"),
+                    "timestamp": now,
+                    "pre_state": pre_state,
+                    "post_state": str(state),
+                    "success": bool(result.get("success", True)),
+                    "execution_cost": float(result.get("execution_cost", result.get("cost", 1.0))),
+                    "verification_source": str(result.get("verification_source") or result.get("source") or "interaction_result"),
+                }
+            )
         node.interaction["operation_history"] = history
+        if node.type == "portal":
+            node.attributes["interaction_state_override"] = {
+                key: node.interaction.get(key)
+                for key in (
+                    "state",
+                    "open_fraction",
+                    "joint_open_fractions",
+                    "joint_closed_references",
+                    "state_source",
+                    "state_confidence",
+                    "traversable",
+                    "requires_interaction",
+                )
+                if key in node.interaction
+            }
+            node.attributes["interaction_state_override"]["event_id"] = event_id
+            node.attributes["interaction_state_override"]["timestamp"] = now
         node.last_seen = now
         self._rebuild_relations(now=now)
         self._bump_revision()
@@ -293,6 +352,9 @@ class InteractionGraphStore:
                 return node_id
 
     def _apply_observation(self, node, observation, now):
+        interaction_state_override = dict(
+            node.attributes.get("interaction_state_override") or {}
+        )
         node.type = infer_node_type(observation)
         node.label = normalize_label(observation.get("semantic_name")) or node.type
         node.name = str(observation.get("name") or node.label or node.type)
@@ -342,6 +404,29 @@ class InteractionGraphStore:
         )
         previous_history = list(node.interaction.get("operation_history") or [])
         node.interaction = default_interaction_payload(node.type, observation)
+        if node.type == "portal" and bool(
+            observation.get("is_movable_door", False) or observation.get("is_articulable", False)
+        ):
+            node.interaction.update(self.portal_state_tracker.update(node.id, observation))
+            state = node.interaction.get("state", "unknown")
+            node.interaction["state_confidence"] = float(observation.get("confidence", 0.0) or 0.0)
+            node.interaction["traversable"] = state in {"open", "static_open"}
+            node.interaction["requires_interaction"] = bool(
+                node.interaction.get("is_interactable") and state not in {"open", "static_open"}
+            )
+            if interaction_state_override:
+                for key in (
+                    "state",
+                    "open_fraction",
+                    "joint_open_fractions",
+                    "joint_closed_references",
+                    "state_source",
+                    "state_confidence",
+                    "traversable",
+                    "requires_interaction",
+                ):
+                    if key in interaction_state_override:
+                        node.interaction[key] = interaction_state_override[key]
         node.interaction["operation_history"] = previous_history
 
     def _refresh_room_nodes_from_grid(self):

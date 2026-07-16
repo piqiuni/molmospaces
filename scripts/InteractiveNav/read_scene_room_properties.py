@@ -320,6 +320,14 @@ def joint_type_name(joint_type: Any) -> str:
         return "hinge"
     if "slide" in text:
         return "slide"
+    try:
+        numeric_type = int(np.asarray(joint_type).reshape(-1)[0])
+    except (IndexError, TypeError, ValueError):
+        return "none"
+    if numeric_type == int(mujoco.mjtJoint.mjJNT_HINGE):
+        return "hinge"
+    if numeric_type == int(mujoco.mjtJoint.mjJNT_SLIDE):
+        return "slide"
     return "none"
 
 

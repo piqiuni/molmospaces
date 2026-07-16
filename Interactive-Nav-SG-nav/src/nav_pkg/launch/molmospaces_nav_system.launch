@@ -6,6 +6,9 @@
   <arg name="start_mapping" default="true"/>
   <arg name="mapping_mode" default="odom_locked"/>
   <arg name="start_semantic_mapping" default="false"/>
+  <arg name="semantic_planning_occ_topic" default="/semantic_mapping/planning_occ_map"/>
+  <arg name="global_map_topic"
+       default="$(eval arg('semantic_planning_occ_topic') if arg('start_semantic_mapping') else '/struct_mapping/occ_map')"/>
   <arg name="manual_control" default="false"/>
   <arg name="start_explore_py" default="false"/>
   <arg name="start_explore" default="$(eval 'false' if arg('manual_control') == 'true' else 'true')"/>
@@ -73,7 +76,7 @@
     </include>
   </group>
 
-  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_source') == 'detector' and arg('semantic_use_gt') != 'true')">
+  <group if="$(eval arg('start_semantic_mapping') and arg('semantic_source') == 'detector' and not arg('semantic_use_gt'))">
     <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
       <arg name="config_file" value="$(arg semantic_config_file)"/>
       <arg name="start_object_detection" value="true"/>
@@ -92,7 +95,7 @@
     </include>
   </group>
 
-  <group if="$(eval arg('start_semantic_mapping') == 'true' and arg('semantic_source') == 'realtime_gt')">
+  <group if="$(eval arg('start_semantic_mapping') and arg('semantic_source') == 'realtime_gt')">
     <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
       <arg name="config_file" value="$(arg semantic_config_file)"/>
       <arg name="start_object_detection" value="false"/>
@@ -101,7 +104,7 @@
     </include>
   </group>
 
-  <group if="$(eval arg('start_semantic_mapping') == 'true' and (arg('semantic_source') == 'offline_gt' or arg('semantic_use_gt') == 'true'))">
+  <group if="$(eval arg('start_semantic_mapping') and (arg('semantic_source') == 'offline_gt' or arg('semantic_use_gt')))">
     <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
       <arg name="config_file" value="$(arg semantic_config_file)"/>
       <arg name="start_object_detection" value="false"/>
@@ -114,7 +117,7 @@
           pkg="semantic_mapping_py_pkg"
           type="semantic_mapping_gt_replay.py"
           output="screen"
-          args="$(arg semantic_gt_scene_json) --batch-size $(arg semantic_gt_batch_size) --publish-rate $(arg semantic_gt_publish_rate) $(eval '--loop' if arg('semantic_gt_loop') == 'true' else '')"/>
+          args="$(arg semantic_gt_scene_json) --batch-size $(arg semantic_gt_batch_size) --publish-rate $(arg semantic_gt_publish_rate) $(eval '--loop' if arg('semantic_gt_loop') else '')"/>
   </group>
 
   <group if="$(eval arg('start_explore') == 'true' and arg('start_explore_py') != 'true')">
@@ -130,7 +133,9 @@
   </group>
 
   <group if="$(arg start_nav)">
-    <include file="$(find nav_pkg)/launch/nav.launch"/>
+    <include file="$(find nav_pkg)/launch/nav.launch">
+      <arg name="global_map_topic" value="$(arg global_map_topic)"/>
+    </include>
     <param name="/move_base/local_costmap/inflation_layer/inflation_radius"
            value="$(arg local_costmap_inflation_radius)"/>
   </group>

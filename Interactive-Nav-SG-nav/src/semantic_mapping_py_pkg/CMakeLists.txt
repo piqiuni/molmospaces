@@ -4,6 +4,7 @@ project(semantic_mapping_py_pkg)
 find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   geometry_msgs
+  map_msgs
   nav_msgs
   rospy
   sensor_msgs
