@@ -11,6 +11,8 @@ import numpy as np
 
 from robot_conversion_patches import patch_droid_config_for_rum
 from semantic_door_occ_runtime import DoorOccPoseSequenceController, DoorOccRuntimeController
+from force_interaction_bridge import AtomicForceInteractionController
+from force_interaction_runtime import ForceDriveConfig
 
 from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
 from molmo_spaces.configs.camera_configs import (
@@ -233,8 +235,14 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         policy.task = task
         policy.reset()
         door_occ_controller = getattr(policy, "door_occ_test_controller", None)
+        force_interaction_controller = getattr(policy, "force_interaction_controller", None)
         if door_occ_controller is not None:
             door_occ_controller.prepare(task)
+            observation = task.get_observations()
+            if task.observation_cache:
+                task.observation_cache[0] = observation
+        if force_interaction_controller is not None:
+            force_interaction_controller.prepare(task)
             observation = task.get_observations()
             if task.observation_cache:
                 task.observation_cache[0] = observation
@@ -275,6 +283,14 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
             if door_occ_controller is not None and door_occ_controller.before_step(task, step_idx):
                 observation = task.get_observations()
+            if force_interaction_controller is not None:
+                interaction_result = force_interaction_controller.before_step(task, step_idx)
+                if interaction_result is not None:
+                    observation = task.get_observations()
+                    if task.observation_cache:
+                        task.observation_cache[0] = observation
+                    if hasattr(policy, "publish_realtime_gt_now"):
+                        policy.publish_realtime_gt_now(step_index=step_idx)
             maybe_save_debug_snapshot(policy, observation)
             loop_t0 = time.perf_counter()
             policy_t0 = time.perf_counter()
@@ -350,6 +366,9 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
         if door_occ_controller is not None:
             door_occ_controller.finalize(step_idx)
+        if force_interaction_controller is not None:
+            force_interaction_controller.finalize(step_idx)
+            force_interaction_controller.close()
         success = task.judge_success() if hasattr(task, "judge_success") else success
         return success
 
@@ -626,6 +645,28 @@ def parse_args():
         default="",
         help="Optional step:x,y,yaw,state,label phases separated by '/' for direct-pose OCC tests.",
     )
+    parser.add_argument(
+        "--enable_force_interaction",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument(
+        "--force_interaction_command_topic",
+        default="/semantic_decision/interaction_command",
+    )
+    parser.add_argument(
+        "--force_interaction_result_topic",
+        default="/semantic_mapping/interaction_result",
+    )
+    parser.add_argument(
+        "--force_interaction_feedback_topic",
+        default="/semantic_decision/interaction_action_feedback",
+    )
+    parser.add_argument("--force_interaction_log_path", default="")
+    parser.add_argument("--force_interaction_max_physics_substeps", type=int, default=3000)
+    parser.add_argument("--force_interaction_open_fraction_threshold", type=float, default=0.67)
     parser.add_argument("--fixed_debug_camera_pos", type=str, default="")
     parser.add_argument("--fixed_debug_camera_target", type=str, default="")
     parser.add_argument("--debug_front_camera_offset", type=str, default="-1.4,0.0,1.35")
@@ -910,6 +951,28 @@ def main():
     policy.debug_snapshot_camera_name = args.debug_snapshot_camera_name
     policy.debug_snapshot_saved = False
     policy.door_occ_test_controller = None
+    policy.force_interaction_controller = None
+    if args.enable_force_interaction and (
+        args.door_occ_test_pose_sequence or args.door_occ_test_open_step >= 0
+    ):
+        raise ValueError("force interaction and direct door OCC test controllers are mutually exclusive")
+    if args.enable_force_interaction:
+        force_log_path = (
+            Path(args.force_interaction_log_path).expanduser().resolve()
+            if args.force_interaction_log_path
+            else exp_config.output_dir / "force_interaction_events.json"
+        )
+        policy.force_interaction_controller = AtomicForceInteractionController(
+            command_topic=args.force_interaction_command_topic,
+            result_topic=args.force_interaction_result_topic,
+            feedback_topic=args.force_interaction_feedback_topic,
+            output_path=force_log_path,
+            force_config=ForceDriveConfig(
+                max_physics_substeps=args.force_interaction_max_physics_substeps,
+                open_fraction_threshold=args.force_interaction_open_fraction_threshold,
+                assume_success=True,
+            ),
+        )
     if args.door_occ_test_pose_sequence:
         transition_path = (
             Path(args.door_occ_test_transition_path).expanduser().resolve()

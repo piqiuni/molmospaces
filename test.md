@@ -802,6 +802,28 @@ python scripts/InteractiveNav/test_semantic_door_occ_house7.py \
 
 该检查要求 force backend 将同一 doorway root 下的全部门板打开到语义 open 阈值以上；若任一门板未达到阈值，测试直接失败，不向上层返回可恢复的交互失败。
 
+ROS 仿真中启用原子力交互桥：
+
+```bash
+--enable_force_interaction true \
+--force_interaction_command_topic /semantic_decision/interaction_command \
+--force_interaction_result_topic /semantic_mapping/interaction_result \
+--force_interaction_feedback_topic /semantic_decision/interaction_action_feedback \
+--force_interaction_max_physics_substeps 3000
+```
+
+发布一次开门命令：
+
+```bash
+rostopic pub -1 /semantic_decision/interaction_command std_msgs/String \
+  "data: '{\"command_id\":\"house7_force_check\",\"candidate_id\":\"portal_check\",\"source_object_name\":\"doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4\",\"action\":\"open\"}'"
+
+rostopic echo -n 1 /semantic_mapping/interaction_result
+rostopic echo -n 1 /semantic_decision/interaction_action_feedback
+```
+
+当前配置中只有达到 MuJoCo joint readback open threshold 后才发布 `SUCCEEDED`；未达到阈值会使 episode 直接失败，不进入上层交互失败恢复分支。
+
 正式 ROS 联调会把机器人固定在目标门前，初始化时直接关闭全部门，第 `OPEN_STEP` 个仿真 step 直接将目标门铰链设为全开。测试同时保存 raw OCC、semantic planning OCC、door clear mask、move_base global costmap、闭/开门图状态和对比图：
 
 ```bash
