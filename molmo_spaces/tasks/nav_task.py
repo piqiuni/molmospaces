@@ -24,6 +24,9 @@ class NavToObjTask(BaseMujocoTask):
 
         self.nav_objs = self._get_nav_objects()
 
+    def _selection_mode(self) -> str:
+        return getattr(self.config.task_config, "selection_mode", "any_candidate")
+
     def _reconstruct_candidate_list_if_needed(self, env: BaseMujocoEnv) -> None:
         """Reconstruct candidate list from category for eval mode.
 
@@ -36,6 +39,12 @@ class NavToObjTask(BaseMujocoTask):
             not hasattr(self.config.task_config, "pickup_obj_name")
             or self.config.task_config.pickup_obj_name is None
         ):
+            return
+
+        if self._selection_mode() == "specific_instance":
+            self.config.task_config.pickup_obj_candidates = [
+                self.config.task_config.pickup_obj_name
+            ]
             return
 
         # Check if candidates list exists and needs filtering
@@ -125,6 +134,13 @@ class NavToObjTask(BaseMujocoTask):
 
         for i in range(self._env.n_batch):
             data = self._env.mj_datas[i]
+
+            if self._selection_mode() == "specific_instance":
+                pickup_obj = MlSpacesObject(
+                    data=data, object_name=self.config.task_config.pickup_obj_name
+                )
+                nav_objs_per_batch.append([pickup_obj])
+                continue
 
             # If pickup_obj_candidates exists, create objects for all candidates
             if (

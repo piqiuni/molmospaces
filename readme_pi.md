@@ -279,6 +279,28 @@ c
 
 ---
 
+### 6.4 当前评测标准
+
+当前交互导航评测采用简洁主指标，避免把调试诊断项全部放入论文主表。主指标固定为：
+
+| 指标 | 含义 |
+|------|------|
+| `SR` | 最终任务成功率，沿用 `NavToObj` 的距离阈值加 head-camera 可见性条件 |
+| `SPL` | 成功加权路径效率，失败为 0，成功时按参考路径长度与实际路径长度的比值加权 |
+| `Interaction Success Rate` | 需要交互的 episode 中，关键交互效果是否完成 |
+| `Interaction Precision` | 执行过的交互中，有多少是有效交互 |
+| `Total Cost` | 总代价，首版使用 `path_length + λ * interaction_count` |
+
+其中 `reachability`、`visibility` 和 `enablement` 是 benchmark 设计与论文叙事中的交互收益类型：
+
+- 通道交互主要体现 `reachability`：开门或打开通道后，原本不可达的目标区域变得可达。
+- 容器交互主要体现 `visibility`：打开冰箱、柜门或抽屉后，原本不可见的目标变得可见。
+- 混合交互中的 `enablement` 是中间机制：某个交互不一定直接暴露目标，但会使后续交互或后续导航变得可执行。
+
+这些收益类型不作为主表中的三个独立指标，而作为 `Interaction Success Rate` 的判定依据。报告结果时应按 `all`、`channel`、`container`、`mixed`、`no-interaction` 等 split 展开；无交互样本用于惩罚不必要交互，其 `Interaction Success Rate` 可以记为 `N/A`，但 `Interaction Precision` 和 `Total Cost` 仍然有意义。
+
+---
+
 ## 7. 当前代码与实验基础
 
 ### 7.1 MolmoSpaces 侧

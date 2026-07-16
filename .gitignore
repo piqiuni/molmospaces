@@ -7,8 +7,10 @@ Interactive-Nav-SG-nav/segment_anything
 .*cache/
 detection_models/outputs/*
 detection_models/yoloe/outputs/*
-scripts/InteractiveNav/output/*
+scripts/InteractiveNav/output/
 outputs/
+scripts/InteractiveNav/dataset_definition/v1/benchmark.json
+scripts/InteractiveNav/dataset_definition/v2/benchmark.json
 
 # ignore nfs files
 *.nfs*

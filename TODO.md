@@ -1,6 +1,6 @@
 # 交互导航阶段分析与 TODO
 
-最后更新：2026-07-01
+最后更新：2026-07-17
 
 ## 1. 当前课题定位
 
@@ -235,7 +235,8 @@
 - [ ] 建立 `nav + oracle open` baseline
 - [ ] 建立 `interactive graph planner` baseline
 - [ ] 建立 `ROS modular detector-only` baseline
-- [ ] 输出首版指标：Navigation SR / Oracle SR / SPL / Path Efficiency / Need-Interaction Detection Acc
+- [ ] 输出首版主指标：SR / SPL / Interaction Success Rate / Interaction Precision / Total Cost
+- [ ] 将 reachability / visibility / enablement 作为 benchmark 分层与 Interaction Success 的判定依据，而不是主表中的独立指标
 
 ## Phase 4：第二阶段语音交互导航
 
@@ -291,6 +292,18 @@
 - [ ] 形成 detector 输入、交互状态、规划决策、执行结果的统一记录格式
 - [ ] 能导出用于后续 agent / end-to-end 方法训练的数据样本
 
+### Phase 6 当前 mixed 数据推进状态（2026-07-15）
+
+- [x] 从 `container_rough_catalog_v1` 二次生产 crossing rough：任一全开 GT path 穿过 interactive door 即保留；关闭门阻断目标且门前几何提示仍可达只作为 `mixed_required_verified` 子集标签，不再作为 rough 输入门槛。门前提示不视为 manipulation-validated 操作姿态。
+- [x] mixed 精采集直接输出 `interactive_nav_v3`，不经过 V2 中间数据。
+- [x] mixed 生产校验覆盖真实门/容器 joint readback、初始失败、开门恢复、目标可见性解锁、终态 NavToObj 成功和 leave-one-interaction-out 最小性。
+- [x] 完成 10 条 mixed V3 小样本端到端 smoke。
+- [x] 完成 crossing/required 拆分后的全量扫描：712 house、2603 pair、失败 0，得到 1609 个 crossing pair、覆盖 456 house；其中 917 个/262 house 为 required 子集，另有 692 个 crossing-only pair。真正无 crossing pair 的 house 为 256 个。旧 443-house 预筛仅覆盖其中 369 个 crossing house，并漏掉 87 个 crossing house，已明确禁止用于输入筛选。
+- [x] 完成 crossing-only rough 双状态俯视诊断脚本与 24-house 分层图册：显示全开 rough GT path、单门关闭后的重规划路径、交互对象和全部 scene object AABB。
+- [x] 完成代表性 mixed V3 场景的五步 GT storyboard：自动选择单关键门 + Fridge 样本，按起点、门前关/开、冰箱前关/开独立重放机器人 pathpoint、交互真值与右肩后上方视角，作为后续连续 GT 视频插值入口。
+- [ ] 对 crossing-only 的闭门可达性做独立重放稳定性复核：当前 24-house 图册发现 house 351/candidate 427 的 catalog/replay 不一致；同时存在较多闭门前后几何路径长度近零或为负的边界样本，需要在正式配额前确定重扫、最小 detour 或路径区域裕量规则。
+- [ ] 基于 full rough 分布确定正式 mixed benchmark 的场景、目标类别、路径长度和交互链配额。
+
 ## Phase 7：Agent 架构与端到端基线
 
 目标：在模块化方法和数据基础稳定后，进一步搭建 agent 化与端到端基线。
@@ -340,6 +353,101 @@
 - [x] GT 快速版门状态：读取当前 `joint_infos`，过滤 handle joint，以首次有效门板关节值作为 `q_closed`，按 joint range 计算开合比例；双开门要求全部门板达到 open 阈值
 - [ ] 真实场景门关节提取：在没有 MuJoCo joint GT 时，从多帧门板检测/跟踪与几何变化中估计 hinge/slide 类型、转轴或滑动轴、闭合参考位姿和开合比例；置信度不足时保持 `unknown`，不能直接清空 OCC
 - [ ] 明确 room_id / connectivity 的可信来源
+
+## 4.4 已梳理的 MolmoSpaces GT / 交互接口
+
+当前已新增探索脚本：
+
+- `scripts/InteractiveNav/explore_molmo_interactions.py`
+  - `inspect-scene`：枚举场景中的 door / cabinet / drawer / fridge / microwave 等 articulation，以及 lights
+  - `nav-gt`：在 `nav_to_obj` 采样结果上，读取固定起点、目标与 GT path
+  - `door-path-study`：固定起终点后，切换指定 door 的 open / closed 状态并重算路径
+  - `set-articulation`：对通用 articulation object 直接设置 joint open fraction
+  - `task-config-template`：导出固定 `nav_to_obj` / `door_opening` / `open_close` episode 的配置草稿
+  - `action-schema`：导出 navigation / door / container 的 oracle 或 planner action 模板
+  - `benchmark-episode-template`：导出 `benchmark_schema.EpisodeSpec` 级别的 JSON 骨架
+  - `integration-recipe`：导出导航层如何调用 oracle / planner 交互的接线伪代码
+  - `env-check`：检查当前环境是否具备实跑 scene 的基本条件
+
+当前已新增配套说明：
+
+- `scripts/InteractiveNav/molmo_interaction_interfaces.md`
+  - 汇总 task config、GT 接口、step action、灯光控制现状
+- `scripts/InteractiveNav/molmo_gt_workflow.md`
+  - 按 `2.1 -> 3.2` 目标串成可执行工作流
+- `scripts/InteractiveNav/molmo_objective_status.md`
+  - 按目标编号逐项整理当前证据、完成项与剩余缺口
+- `scripts/InteractiveNav/molmo_runtime_validation.md`
+  - 记录真实在 `mlspaces` 环境中运行时遇到的 cache / network blocker
+
+当前已确认的环境侧 blocker：
+
+- 真实 scene-loading 需要可写资源缓存目录：
+  - 推荐 `MLSPACES_CACHE_DIR=/tmp/molmo-spaces-resources`
+- 若本机已有 `~/.cache/molmo-spaces-resources`，可在 `/tmp` 建一个 proxy cache 根目录，并把现有 `robots / scenes / objects / grasps / benchmarks / test_data` 软链进去
+- Linux headless 环境建议显式设置：
+  - `MUJOCO_GL=egl`
+  - `PYOPENGL_PLATFORM=egl`
+- 当前已真实验证：
+  - `inspect-scene` 可在 `train_10_ceiling.xml` 上成功输出 4 个 door、10 个 articulated objects、1 个 light
+  - `nav-gt` 可真实跑到 `scene loading -> occupancy map -> nav_to_obj task sample -> target selection`
+- 当前剩余真实问题已从“scene 无法加载”收敛为：
+  - 某些 house 会在 `NavGoalSampler` 上失败，拿不到 nav goal
+  - `door-path-study` 仍需在更合适的 house 上继续筛选
+
+当前确认的 GT path 代码链路：
+
+- `scripts/datagen/run_pipeline.py --task_type nav_to_obj --policy planner`
+- `NavToObjTaskSampler.init_scene()`：为 house 生成 occupancy map，并存到 `task.occupancy_map`
+- `AStarNavToObjPolicy / AStarPlanner`：基于 occupancy map + graph search 生成 waypoint path
+- 需要注意：现有 `AStarPlanner` 默认按 `model_path` 重建 map，不直接消费运行时 door state
+- 因此若要做“固定起终点 + 改门状态 + 重算 GT path”，应优先使用 live model/data 重新建图，而不是只调用现成 policy
+
+当前确认的固定 episode 入口：
+
+- 固定导航起点：`NavToObjTaskConfig.robot_base_pose`
+- 固定导航目标实例：`NavToObjTaskConfig.pickup_obj_name`
+- 固定目标候选集：`NavToObjTaskConfig.pickup_obj_candidates`
+- 固定 door episode：`DoorOpeningTaskConfig.door_body_name`、`robot_base_pose`、`articulated_joint_range`、`articulated_joint_reset_state`
+- 固定通用 container/open-close episode：`OpeningTaskConfig.joint_name`、`joint_index`、`joint_start_position`
+
+当前确认的状态修改接口：
+
+- 通道属性（door）：
+  - `Door(name, env.current_data)`
+  - `get_hinge_joint_index()`
+  - `get_joint_range(i)`
+  - `set_joint_position(i, position)`
+- 容器属性（drawer / cabinet / fridge / microwave / oven / dishwasher 等）：
+  - `ObjectManager.get_object_by_name(name)` 返回 `MlSpacesArticulationObject`
+  - `joint_names / get_joint_range(i) / get_joint_position(i) / set_joint_position(i, position)`
+- door 打开任务和通用 open/close 任务是两条独立 task 线：
+  - `DoorOpeningTask / DoorOpeningTaskSampler / opening_solver.py`
+  - `OpeningTask / OpenTaskSampler / open_close_planner_policy.py`
+
+当前确认的 step-level action 接口：
+
+- `task.step(action)` 接受单环境 `dict` 或多环境 `list[dict]`
+- `done` 是保留字段，`task.step()` 会先剥离，再标记 episode 结束
+- 导航 policy 输出：
+  - `{\"base\": waypoint, \"done\": False}`
+  - 结束时为 `{\"done\": True, ...base noop...}`
+- 若只想让导航层“直接开关门/容器”做 GT study，当前最自然的接口不是单独 task action，而是：
+  - door：`Door(...).set_joint_position(...)`
+  - container：`MlSpacesArticulationObject.set_joint_position(...)`
+- door opening solver 输出：
+  - 分 phase 生成 `base / arm / gripper / head / done` 组合动作
+- 通用 container open/close planner：
+  - 通过 `OpeningTask + OpenClosePlannerPolicy` 执行，不是单独的“open drawer” primitive API
+
+关于灯光 / 开关类交互的当前判断：
+
+- 代码里已有 light 元数据和随机化器：
+  - `molmo_spaces/env/mj_extensions.py`
+  - `molmo_spaces/env/arena/randomization/lighting.py`
+- 当前更像“场景随机化 / 低层属性控制”，不是完整任务接口
+- 低层可直接读写 `model.light_active[light_id]`
+- 目前没有与 `nav_to_obj` / `OpeningTask` 对齐的高层 `light-switch task`，因此应先视为 future extension，而不是第一阶段主线
 - [ ] 为后续 container / movable obstacle 预留观测字段
 - [ ] 为 future extension 中的 switch / light / curtain 类交互预留扩展字段
 
@@ -360,6 +468,60 @@
 - [ ] 先形成小样本 sanity check，再考虑自动 benchmark 生成
 - [ ] 明确第一版论文图/表最可能来自哪些实验结果
 - [ ] 明确 obj-goal 与 point-goal 两个设置下是否共用一套指标与主表
+
+### 4.5.1 当前固定评测标准
+
+主评测表保持简洁，只报告 5 个方法无关指标：
+
+| 指标 | 定义 | 备注 |
+|------|------|------|
+| `SR` | 最终任务成功率，即满足 `NavToObj` 的距离阈值和 head-camera 可见性条件 | 主结果指标 |
+| `SPL` | 成功加权路径效率，失败计 0，成功时按参考路径长度与实际路径长度的比值加权 | 参考路径应来自允许必要交互后的可行计划，而不是纯静态地图 |
+| `Interaction Success Rate` | 需要交互的 episode 中，关键交互效果是否完成 | door 看 reachability，container 看 visibility，mixed 看必要交互链是否完成并最终服务目标成功 |
+| `Interaction Precision` | 执行过的交互中，有多少是有效交互 | 用于惩罚乱开无关门、无关容器或重复无效交互 |
+| `Total Cost` | `path_length + λ * interaction_count` | 后续可扩展为 door / container / failed interaction 的不同权重 |
+
+说明：
+
+- `reachability`、`visibility` 和 `enablement` 是论文叙事、benchmark 构建和 `Interaction Success Rate` 判定的核心语义，不作为主表中三个并列指标。
+- `Interaction Success Rate` 在不同 split 下使用不同判定：通道交互要求恢复可达性，容器交互要求揭示目标或满足目标可见性，混合交互要求完成必要交互链并最终满足导航成功条件。
+- 无交互样本必须保留，用于评估方法是否克制；其 `Interaction Success Rate` 可记为 `N/A`，但 `Interaction Precision`、`interaction_count` 和 `Total Cost` 仍然参与分析。
+- 主结果应按 `all`、`channel`、`container`、`mixed`、`no-interaction` split 展开，并同时报告 macro average，避免某一类样本数量过大主导总体结论。
+
+### 4.5.2 对应脚本规划
+
+后续脚本优先保持以下职责分离：
+
+1. `collect_mixed_rough_catalog.py`
+   - 输入：`container_rough_catalog_v1` 与原始 `nav_to_obj` benchmark 起点。
+   - 输出：`mixed_rough_catalog_v1`，保留所有实测全开 GT path 穿 interactive door 的 crossing 候选，并额外标注 `mixed_required_verified` 子集。
+   - 规则：粗筛的入选门槛只有 GT path 穿门；闭门阻断、门前提示可达属于诊断与优先级标签。粗筛不复用 V2 fine episode，也不把容器中心粗目标冒充最终交互位姿。
+
+2. `build_mixed_interaction_benchmark.py`
+   - 输入：一个或多个 `mixed_rough_catalog_v1`。
+   - 输出：直接符合统一 `interactive_nav_v3` 定义的 mixed benchmark。
+   - 规则：真实容器交互位姿必须再次满足穿门/关门阻断条件；所有 interaction、initial state、success evidence 和 minimality 均来自 MuJoCo/readback 实测。
+   - 规则：不把 `oracle_plan` 暴露给 policy；只作为 evaluator / scorer 的 GT 标签与参考计划。
+
+3. `interactive_nav_v3.py` 统一校验入口
+   - 结构：公共校验 + channel/container/mixed 场景专用校验。
+   - 兼容：保留 `validate_channel_v3_episode`、`validate_container_v3_episode`、`validate_mixed_v3_episode` 专用入口。
+
+4. `evaluate_interactive_nav_dataset.py`
+   - 输入：v3 benchmark JSON。
+   - 输出：数据集质量报告，而不是 policy 性能报告。
+   - 检查：schema validity、无占位字段、`interaction_requirement` 分布、split 分布、`success_evidence` 状态、必要交互链与 prerequisite 一致性、no-interaction 样本是否确实不包含 interactions。
+
+5. `score_interactive_nav_run.py`
+   - 输入：v3 benchmark JSON + policy rollout 输出。
+   - 输出：主指标表和 per-episode 诊断。
+   - 主指标：`SR`、`SPL`、`Interaction Success Rate`、`Interaction Precision`、`Total Cost`。
+   - 输出 split：`all`、`channel`、`container`、`mixed`、`no-interaction`，并保留每个 episode 的失败原因用于附录分析。
+
+6. `summarize_interactive_nav_results.py`
+   - 输入：一个或多个 scorer 输出。
+   - 输出：论文表格用 CSV / Markdown。
+   - 作用：对多个方法统一生成主表，避免每个方法单独写统计脚本。
 
 ## 4.6 中远期规划 TODO
 
