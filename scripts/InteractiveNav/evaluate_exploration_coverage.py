@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 from pathlib import Path
@@ -69,6 +70,84 @@ def sample_ros_map(
     return sampled
 
 
+def load_trajectory(run_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+    path = run_dir / "trajectory.csv"
+    if not path.exists():
+        return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
+    points = []
+    yaws = []
+    with path.open() as stream:
+        for row in csv.DictReader(stream):
+            try:
+                points.append((float(row["x"]), float(row["y"])))
+                yaws.append(float(row["yaw"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return np.asarray(points, dtype=float), np.asarray(yaws, dtype=float)
+
+
+def load_recorded_frontiers(run_dir: Path) -> np.ndarray:
+    path = run_dir / "events.jsonl"
+    if not path.exists():
+        return np.empty((0, 2), dtype=float)
+    latest = None
+    with path.open() as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "explore_status":
+                latest = event.get("payload", {})
+    points = []
+    for cluster in (latest or {}).get("frontier_clusters", []):
+        for point in cluster.get("frontier_cells_world", []):
+            if isinstance(point, list) and len(point) >= 2:
+                points.append((float(point[0]), float(point[1])))
+    return np.asarray(points, dtype=float) if points else np.empty((0, 2), dtype=float)
+
+
+def reconstruct_frontiers(
+    image: np.ndarray,
+    resolution: float,
+    origin_xy: np.ndarray,
+    origin_yaw: float,
+    min_cluster_cells: int = 3,
+) -> np.ndarray:
+    free = image >= 250
+    unknown = (image > 50) & (image < 250)
+    neighbor_unknown = np.zeros_like(unknown)
+    neighbor_unknown[1:, :] |= unknown[:-1, :]
+    neighbor_unknown[:-1, :] |= unknown[1:, :]
+    neighbor_unknown[:, 1:] |= unknown[:, :-1]
+    neighbor_unknown[:, :-1] |= unknown[:, 1:]
+    frontier = (free & neighbor_unknown).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(frontier, connectivity=8)
+    keep = np.zeros_like(frontier, dtype=bool)
+    for label in range(1, count):
+        if int(stats[label, cv2.CC_STAT_AREA]) >= min_cluster_cells:
+            keep |= labels == label
+    rows, cols = np.nonzero(keep)
+    if not len(rows):
+        return np.empty((0, 2), dtype=float)
+    cell_x = cols.astype(float)
+    cell_y = (image.shape[0] - 1 - rows).astype(float)
+    local_x = (cell_x + 0.5) * resolution
+    local_y = (cell_y + 0.5) * resolution
+    c = math.cos(origin_yaw)
+    s = math.sin(origin_yaw)
+    world_x = origin_xy[0] + c * local_x - s * local_y
+    world_y = origin_xy[1] + s * local_x + c * local_y
+    return np.column_stack((world_x, world_y))
+
+
+def world_to_scene_pixels(scene_map, world_xy: np.ndarray) -> np.ndarray:
+    if not len(world_xy):
+        return np.empty((0, 2), dtype=np.int32)
+    world_xyz = np.column_stack((world_xy, np.zeros(len(world_xy), dtype=float)))
+    return np.asarray(scene_map.pos_m_to_px(world_xyz), dtype=np.int32)
+
+
 def main() -> None:
     args = parse_args()
     args.run_dir = args.run_dir.resolve()
@@ -101,6 +180,18 @@ def main() -> None:
     observed_count = int(np.count_nonzero(observed))
     mapped_free_count = int(np.count_nonzero(mapped_free))
     mapped_occupied_count = int(np.count_nonzero(mapped_occupied))
+    trajectory_world, trajectory_yaw = load_trajectory(args.run_dir)
+    frontier_world = load_recorded_frontiers(args.run_dir)
+    frontier_source = "explorer_status"
+    if not len(frontier_world):
+        frontier_world = reconstruct_frontiers(
+            ros_image,
+            resolution,
+            origin_xy,
+            origin_yaw,
+        )
+        frontier_source = "final_occ_reconstruction"
+
     result = {
         "scene_dataset": args.scene_dataset,
         "data_split": args.data_split,
@@ -120,6 +211,10 @@ def main() -> None:
         "mapped_occupied_on_gt_free_ratio": mapped_occupied_count / gt_count if gt_count else 0.0,
         "ros_map_resolution_m": resolution,
         "ros_map_origin": [float(origin_xy[0]), float(origin_xy[1]), origin_yaw],
+        "trajectory_samples": int(len(trajectory_world)),
+        "final_frontier_cells": int(len(frontier_world)),
+        "final_frontier_source": frontier_source,
+        "render_header_height_px": 122,
     }
     result_path = args.run_dir / "exploration_coverage.json"
     result_path.write_text(json.dumps(result, indent=2, sort_keys=True))
@@ -140,6 +235,38 @@ def main() -> None:
         dtype=np.uint8,
     )
     rgb = colors[coverage]
+    trajectory_px = world_to_scene_pixels(scene_map, trajectory_world)
+    valid_trajectory = (
+        (trajectory_px[:, 0] >= 0)
+        & (trajectory_px[:, 0] < rgb.shape[0])
+        & (trajectory_px[:, 1] >= 0)
+        & (trajectory_px[:, 1] < rgb.shape[1])
+    ) if len(trajectory_px) else np.zeros((0,), dtype=bool)
+    trajectory_px = trajectory_px[valid_trajectory]
+    if len(trajectory_px) >= 2:
+        cv2.polylines(
+            rgb,
+            [trajectory_px[:, [1, 0]].reshape((-1, 1, 2))],
+            False,
+            (0, 170, 255),
+            max(2, int(round(scene_map.px_per_m * 0.035))),
+            cv2.LINE_AA,
+        )
+    frontier_px = world_to_scene_pixels(scene_map, frontier_world)
+    frontier_radius = max(2, int(round(scene_map.px_per_m * 0.035)))
+    for row, col in frontier_px:
+        if 0 <= row < rgb.shape[0] and 0 <= col < rgb.shape[1]:
+            cv2.circle(rgb, (int(col), int(row)), frontier_radius, (128, 35, 180), -1, cv2.LINE_AA)
+    if len(trajectory_px):
+        end_row, end_col = trajectory_px[-1]
+        cv2.circle(
+            rgb,
+            (int(end_col), int(end_row)),
+            max(4, int(round(scene_map.px_per_m * 0.07))),
+            (0, 90, 255),
+            -1,
+            cv2.LINE_AA,
+        )
     scale = max(1.0, min(4.0, 1200.0 / max(rgb.shape[:2])))
     rendered = cv2.resize(
         rgb,
@@ -148,7 +275,14 @@ def main() -> None:
         fy=scale,
         interpolation=cv2.INTER_NEAREST,
     )
-    header = np.full((92, rendered.shape[1], 3), 255, dtype=np.uint8)
+    header_height = int(result["render_header_height_px"])
+    output_width = max(rendered.shape[1], 1050)
+    header = np.full((header_height, output_width, 3), 255, dtype=np.uint8)
+    if rendered.shape[1] < output_width:
+        padded = np.full((rendered.shape[0], output_width, 3), colors[0], dtype=np.uint8)
+        offset = (output_width - rendered.shape[1]) // 2
+        padded[:, offset:offset + rendered.shape[1]] = rendered
+        rendered = padded
     cv2.putText(
         header,
         f"House {args.house_ind}: observed={result['exploration_coverage_ratio']:.1%}  "
@@ -164,6 +298,16 @@ def main() -> None:
         header,
         "blue=unobserved GT free  orange=observed  green=mapped free  red=false occupied",
         (15, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (20, 20, 20),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        header,
+        f"cyan=trajectory  blue=end pose  purple=pending frontier ({result['final_frontier_source']})",
+        (15, 104),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
         (20, 20, 20),

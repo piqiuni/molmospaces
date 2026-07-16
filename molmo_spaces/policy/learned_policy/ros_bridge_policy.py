@@ -47,6 +47,7 @@ class RosBridgePolicy(BasePolicy):
         pointcloud_roll_correction_deg: float = 0.0,
         odom_topic: str = "/odom",
         publish_odom: bool = True,
+        publish_odom_twist: bool = False,
         map_frame_id: str = "tf_frame_map",
         odom_frame_id: str = "tf_frame_odom",
         base_frame_id: str = "tf_frame_base_link",
@@ -79,6 +80,7 @@ class RosBridgePolicy(BasePolicy):
         realtime_gt_step_interval: int = 3,
         realtime_gt_max_distance_m: float = 6.0,
         step_frame_dir: str = "",
+        step_sync_topic: str = "/molmo_spaces/step_sync",
     ) -> None:
         super().__init__(config, task)
         self.observation_topic = observation_topic
@@ -107,6 +109,7 @@ class RosBridgePolicy(BasePolicy):
         self.pointcloud_roll_correction_deg = float(pointcloud_roll_correction_deg)
         self.odom_topic = odom_topic
         self.publish_odom = bool(publish_odom)
+        self.publish_odom_twist = bool(publish_odom_twist)
         self.map_frame_id = map_frame_id
         self.odom_frame_id = odom_frame_id
         self.base_frame_id = base_frame_id
@@ -132,6 +135,7 @@ class RosBridgePolicy(BasePolicy):
         self.extra_image_topic = extra_image_topic
         self.extra_image_camera_name = extra_image_camera_name
         self.step_frame_dir = Path(step_frame_dir).expanduser().resolve() if step_frame_dir else None
+        self.step_sync_topic = str(step_sync_topic)
         self._step_frame_queue: queue.Queue = queue.Queue()
         self._step_frame_thread = None
         self._latest_gt_payload = None
@@ -166,6 +170,7 @@ class RosBridgePolicy(BasePolicy):
         self._latest_cmd_vel_mono_s: float = 0.0
         self._move_base_active: bool = False
         self._last_base_position_xyz: np.ndarray | None = None
+        self._last_base_pose_xyyaw: np.ndarray | None = None
         self._last_common_stamp_s: float | None = None
         self._base_position_jump_warn_m: float = 1.0
         self._timing_frame_count: int = 0
@@ -218,6 +223,11 @@ class RosBridgePolicy(BasePolicy):
             self.observation_topic,
             Image,
             queue_size=observation_queue_size,
+        )
+        self._step_sync_pub = (
+            rospy.Publisher(self.step_sync_topic, String, queue_size=32)
+            if self.step_sync_topic
+            else None
         )
         self._extra_image_pub = None
         if self.extra_image_topic and self.extra_image_camera_name:
@@ -606,6 +616,7 @@ class RosBridgePolicy(BasePolicy):
             self._latest_cmd_vel_mono_s = 0.0
             self._move_base_active = False
         self._last_base_position_xyz = None
+        self._last_base_pose_xyyaw = None
         if self._realtime_gt_publisher is not None:
             self._realtime_gt_publisher.reset()
 
@@ -1098,6 +1109,50 @@ class RosBridgePolicy(BasePolicy):
             return None
         return pose_arr[:7]
 
+    @classmethod
+    def _estimate_planar_twist(
+        cls,
+        previous_pose_xyyaw: np.ndarray,
+        current_pose_xyyaw: np.ndarray,
+        dt_s: float,
+    ) -> tuple[float, float, float]:
+        dt_s = max(1e-6, float(dt_s))
+        dx = float(current_pose_xyyaw[0] - previous_pose_xyyaw[0])
+        dy = float(current_pose_xyyaw[1] - previous_pose_xyyaw[1])
+        yaw_delta = cls._wrap_to_pi(float(current_pose_xyyaw[2] - previous_pose_xyyaw[2]))
+        midpoint_yaw = float(previous_pose_xyyaw[2]) + 0.5 * yaw_delta
+        vx = (np.cos(midpoint_yaw) * dx + np.sin(midpoint_yaw) * dy) / dt_s
+        vy = (-np.sin(midpoint_yaw) * dx + np.cos(midpoint_yaw) * dy) / dt_s
+        return float(vx), float(vy), float(yaw_delta / dt_s)
+
+    @staticmethod
+    def _world_planar_velocity_to_body(
+        vx_world: float,
+        vy_world: float,
+        wz: float,
+        yaw: float,
+    ) -> tuple[float, float, float]:
+        vx = np.cos(yaw) * vx_world + np.sin(yaw) * vy_world
+        vy = -np.sin(yaw) * vx_world + np.cos(yaw) * vy_world
+        return float(vx), float(vy), float(wz)
+
+    def _extract_planar_twist_from_task(self, yaw: float) -> tuple[float, float, float] | None:
+        if self.task is None:
+            return None
+        try:
+            base_group = self.task.env.current_robot.robot_view.get_move_group("base")
+            joint_vel = np.asarray(base_group.joint_vel, dtype=np.float64).reshape(-1)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        if joint_vel.size != 3 or not np.all(np.isfinite(joint_vel)):
+            return None
+        return self._world_planar_velocity_to_body(
+            float(joint_vel[0]),
+            float(joint_vel[1]),
+            float(joint_vel[2]),
+            yaw,
+        )
+
     def _next_common_stamp(self):
         stamp = self._rospy.Time.now()
         stamp_s = float(stamp.to_sec())
@@ -1129,9 +1184,16 @@ class RosBridgePolicy(BasePolicy):
             float(base_pose[6]),
         )
         curr_pos = np.array([px, py, pz], dtype=np.float32)
+        curr_yaw = self._quat_wxyz_to_yaw(qw, qx, qy, qz)
+        curr_pose_xyyaw = np.array([px, py, curr_yaw], dtype=np.float32)
+        twist_x = 0.0
+        twist_y = 0.0
+        twist_yaw = 0.0
+        position_jump = False
         if self._last_base_position_xyz is not None:
             jump_dist = float(np.linalg.norm(curr_pos - self._last_base_position_xyz))
             if jump_dist > self._base_position_jump_warn_m:
+                position_jump = True
                 self._rospy.logwarn(
                     (
                         "RosBridgePolicy: detected base position jump > %.2fm (dist=%.3fm). "
@@ -1147,7 +1209,18 @@ class RosBridgePolicy(BasePolicy):
                     pz,
                     self._step_idx,
                 )
+        if self.publish_odom_twist and not position_jump:
+            instantaneous_twist = self._extract_planar_twist_from_task(curr_yaw)
+            if instantaneous_twist is not None:
+                twist_x, twist_y, twist_yaw = instantaneous_twist
+            elif self._last_base_pose_xyyaw is not None:
+                twist_x, twist_y, twist_yaw = self._estimate_planar_twist(
+                    self._last_base_pose_xyyaw,
+                    curr_pose_xyyaw,
+                    self.cmd_vel_control_dt_s,
+                )
         self._last_base_position_xyz = curr_pos
+        self._last_base_pose_xyyaw = curr_pose_xyyaw
 
         odom_msg = self._Odometry()
         odom_msg.header.stamp = stamp
@@ -1160,6 +1233,9 @@ class RosBridgePolicy(BasePolicy):
         odom_msg.pose.pose.orientation.y = qy
         odom_msg.pose.pose.orientation.z = qz
         odom_msg.pose.pose.orientation.w = qw
+        odom_msg.twist.twist.linear.x = twist_x
+        odom_msg.twist.twist.linear.y = twist_y
+        odom_msg.twist.twist.angular.z = twist_yaw
         self._odom_pub.publish(odom_msg)
 
         tf_msg = self._TransformStamped()
@@ -1216,6 +1292,17 @@ class RosBridgePolicy(BasePolicy):
                 bytes(image_msg.data),
                 self._latest_gt_payload,
             )
+        )
+
+    def _publish_step_sync(self, stamp) -> None:
+        if self._step_sync_pub is None:
+            return
+        payload = {
+            "step_index": int(self._step_idx),
+            "stamp_sec": float(stamp.to_sec()),
+        }
+        self._step_sync_pub.publish(
+            self._String(data=json.dumps(payload, separators=(",", ":")))
         )
 
     def _run_step_frame_writer(self) -> None:
@@ -1394,6 +1481,7 @@ class RosBridgePolicy(BasePolicy):
             stage_ms["postprocess_action"] = (time.perf_counter() - t0_post) * 1000.0
             stage_ms["total"] = (time.perf_counter() - frame_t0) * 1000.0
             self._record_timing(stage_ms)
+            self._publish_step_sync(common_stamp)
             self._step_idx += 1
             return chosen_action
 
@@ -1517,6 +1605,7 @@ class RosBridgePolicy(BasePolicy):
         stage_ms["total"] = (time.perf_counter() - frame_t0) * 1000.0
         self._record_timing(stage_ms)
 
+        self._publish_step_sync(common_stamp)
         self._step_idx += 1
         return chosen_action
 

@@ -1,5 +1,8 @@
 <launch>
 
+    <arg name="override_config_file" default=""/>
+    <arg name="base_local_planner" default="dwa_local_planner/DWAPlannerROS"/>
+
     <node pkg="nav_pkg" type="relay_node" name="relay_node" output="screen"/>
 
     <node pkg="move_base" type="move_base" name="move_base" output="screen" >
@@ -11,9 +14,20 @@
         <rosparam file="$(find nav_pkg)/configs/move_base_params.yaml" command="load" />
         <param name="base_global_planner" type="string" value="global_planner/GlobalPlanner" />
         <param name="GlobalPlanner/use_dijkstra" value="true" />
+        <param name="GlobalPlanner/use_quadratic" value="true" />
+        <param name="GlobalPlanner/use_grid_path" value="false" />
         <param name="GlobalPlanner/allow_unknown" value="false" />
-        <param name="base_local_planner" value="dwa_local_planner/DWAPlannerROS"/>
+        <param name="GlobalPlanner/orientation_window_size" value="8" />
+        <param name="GlobalPlanner/path_smoothing_enabled" value="true" />
+        <param name="GlobalPlanner/path_smoothing_resample_distance" value="0.05" />
+        <param name="GlobalPlanner/path_smoothing_max_skip" value="40" />
+        <param name="GlobalPlanner/path_smoothing_max_cost" value="252" />
+        <param name="GlobalPlanner/path_smoothing_cost_slack" value="12" />
+        <param name="base_local_planner" value="$(arg base_local_planner)"/>
         <rosparam file="$(find nav_pkg)/configs/controller/dwa_controller_params.yaml" command="load" />
+        <rosparam if="$(eval arg('override_config_file') != '')"
+                  file="$(arg override_config_file)"
+                  command="load" />
     </node>
 
 </launch>

@@ -13,8 +13,11 @@
   <arg name="semantic_use_gt" default="false"/>
   <arg name="semantic_source" default="detector"/>
   <arg name="publish_realtime_gt" default="false"/>
-  <arg name="local_costmap_inflation_radius" default="0.15"/>
+  <arg name="local_costmap_inflation_radius" default="0.20"/>
   <arg name="explore_py_config_file" default="$(find explore_py_pkg)/config/explore_py.yaml"/>
+  <arg name="explore_py_config_override_file" default=""/>
+  <arg name="nav_config_override_file" default=""/>
+  <arg name="base_local_planner" default="dwa_local_planner/DWAPlannerROS"/>
 
   <arg name="robot" default="rby1"/>
   <arg name="scene_dataset" default="procthor-10k"/>
@@ -126,11 +129,15 @@
   <group if="$(arg start_explore_py)">
     <include file="$(find explore_py_pkg)/launch/explore_py.launch">
       <arg name="config_file" value="$(arg explore_py_config_file)"/>
+      <arg name="override_config_file" value="$(arg explore_py_config_override_file)"/>
     </include>
   </group>
 
   <group if="$(arg start_nav)">
-    <include file="$(find nav_pkg)/launch/nav.launch"/>
+    <include file="$(find nav_pkg)/launch/nav.launch">
+      <arg name="override_config_file" value="$(arg nav_config_override_file)"/>
+      <arg name="base_local_planner" value="$(arg base_local_planner)"/>
+    </include>
     <param name="/move_base/local_costmap/inflation_layer/inflation_radius"
            value="$(arg local_costmap_inflation_radius)"/>
   </group>

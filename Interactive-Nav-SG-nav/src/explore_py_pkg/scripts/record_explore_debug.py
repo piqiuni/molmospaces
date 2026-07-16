@@ -877,7 +877,7 @@ class ExploreDebugRecorder:
         self.latest_grid_step = 0
         self.latest_global_costmap_step = 0
         self.latest_local_costmap_step = 0
-        history_size = max(64, int(args.image_queue_size) * 2)
+        history_size = max(16, int(args.video_history_size))
         self.grid_video_history = deque(maxlen=history_size)
         self.global_costmap_video_history = deque(maxlen=history_size)
         self.local_costmap_video_history = deque(maxlen=history_size)
@@ -886,6 +886,14 @@ class ExploreDebugRecorder:
         self.latest_image: tuple[float, int, int, bytearray] | None = None
         self.latest_image_step = 0
         self.last_recorded_image_stamp_ns: int | None = None
+        self.last_recorded_image_key: tuple[int, int] | None = None
+        self.image_callback_count = 0
+        self.step_sync_count = 0
+        self.step_sync_placeholder_width = max(1, int(args.step_sync_image_width))
+        self.step_sync_placeholder_height = max(1, int(args.step_sync_image_height))
+        self.step_sync_placeholder_rgb = bytes(
+            self.step_sync_placeholder_width * self.step_sync_placeholder_height * 3
+        )
         self.latest_external_image: tuple[float, int, int, bytearray] | None = None
         self.latest_external_image_step = 0
         self.last_image_wall_time = 0.0
@@ -893,6 +901,7 @@ class ExploreDebugRecorder:
         self.latest_pose: tuple[float, float, float] | None = None
         self.latest_pose_stamp = 0.0
         self.pose_history = deque(maxlen=2000)
+        self.active_goal_video_history = deque(maxlen=max(64, history_size))
         self.latest_pose_step = 0
         self.latest_global_plan: dict | None = None
         self.latest_local_global_plan: dict | None = None
@@ -957,7 +966,9 @@ class ExploreDebugRecorder:
         self.last_external_video_frame_time = 0.0
         self.external_video_error = ""
         self.external_video_codec_name = "h264" if args.first_person_video_h264 else str(args.first_person_video_codec)
-        self.video_frame_jobs: queue.Queue = queue.Queue(maxsize=max(1, int(args.image_queue_size)))
+        self.video_frame_jobs: queue.Queue = queue.Queue(
+            maxsize=max(1, int(args.video_frame_job_queue_size))
+        )
         self.video_frame_jobs_dropped = 0
         self.video_frame_thread = threading.Thread(
             target=self._run_video_frame_renderer,
@@ -1066,6 +1077,8 @@ class ExploreDebugRecorder:
             fieldnames=[
                 "frame_index",
                 "step_id",
+                "source_seq",
+                "callback_index",
                 "elapsed_sec",
                 "image_stamp",
                 "map_stamp",
@@ -1084,6 +1097,8 @@ class ExploreDebugRecorder:
                 "stuck_moved_m",
                 "stuck_yaw_delta_rad",
                 "stuck_yaw_motion_rad",
+                "panel_width",
+                "panel_height",
                 "camera_frame",
                 "map_frame",
                 "global_costmap_step",
@@ -1116,6 +1131,15 @@ class ExploreDebugRecorder:
                 queue_size=max(1, int(args.image_queue_size)),
             )
         )
+        if args.video_step_sync_topic:
+            self.subscribers.append(
+                rospy.Subscriber(
+                    args.video_step_sync_topic,
+                    String,
+                    self.step_sync_callback,
+                    queue_size=max(32, int(args.step_sync_queue_size)),
+                )
+            )
         if args.external_image_topic:
             self.subscribers.append(rospy.Subscriber(args.external_image_topic, Image, self.external_image_callback, queue_size=1))
         self.subscribers.append(rospy.Subscriber(args.odom_topic, Odometry, self.odom_callback, queue_size=50))
@@ -1339,11 +1363,12 @@ class ExploreDebugRecorder:
             return
         step_capture = self.args.first_person_video_capture_mode == "step"
         source_stamp_ns = int(msg.header.stamp.to_nsec()) if msg.header.stamp else 0
+        source_seq = int(msg.header.seq)
+        source_key = (source_seq, source_stamp_ns)
         if step_capture:
             with self.lock:
-                if self.last_recorded_image_stamp_ns == source_stamp_ns:
+                if self.last_recorded_image_key == source_key:
                     return
-                self.last_recorded_image_stamp_ns = source_stamp_ns
         converted = _image_msg_to_rgb(msg)
         if converted is None:
             return
@@ -1352,26 +1377,86 @@ class ExploreDebugRecorder:
         with self.lock:
             if self.shutting_down:
                 return
-            self.debug_step += 1
+            self.image_callback_count += 1
+            image_step = source_seq if source_stamp_ns > 0 else self.image_callback_count
+            self.debug_step = image_step
             self.latest_image = (stamp, width, height, rgb)
-            self.latest_image_step = self.debug_step
+            self.latest_image_step = image_step
             self.last_image_wall_time = time.time()
+            if self.args.video_step_sync_topic:
+                return
             snapshot = self._capture_video_snapshot_locked(stamp)
+            snapshot["source_seq"] = source_seq
+            snapshot["callback_index"] = self.image_callback_count
         try:
-            self.video_frame_jobs.put_nowait((width, height, rgb, stamp, self.debug_step, snapshot))
+            self.video_frame_jobs.put_nowait((width, height, rgb, stamp, image_step, snapshot))
+            if step_capture:
+                with self.lock:
+                    self.last_recorded_image_stamp_ns = source_stamp_ns
+                    self.last_recorded_image_key = source_key
+        except queue.Full:
+            self.video_frame_jobs_dropped += 1
+
+    def step_sync_callback(self, msg: String) -> None:
+        if self.shutting_down:
+            return
+        try:
+            payload = json.loads(msg.data)
+            source_seq = int(payload["step_index"])
+            stamp = float(payload["stamp_sec"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        source_stamp_ns = int(round(stamp * 1_000_000_000.0))
+        source_key = (source_seq, source_stamp_ns)
+        with self.lock:
+            if self.shutting_down or self.last_recorded_image_key == source_key:
+                return
+            self.step_sync_count += 1
+            self.debug_step = source_seq
+            self.latest_image_step = source_seq
+            snapshot = self._capture_video_snapshot_locked(stamp)
+            snapshot["source_seq"] = source_seq
+            snapshot["callback_index"] = self.step_sync_count
+            snapshot["capture_trigger"] = "step_sync"
+        try:
+            self.video_frame_jobs.put_nowait(
+                (
+                    self.step_sync_placeholder_width,
+                    self.step_sync_placeholder_height,
+                    self.step_sync_placeholder_rgb,
+                    stamp,
+                    source_seq,
+                    snapshot,
+                )
+            )
+            with self.lock:
+                self.last_recorded_image_stamp_ns = source_stamp_ns
+                self.last_recorded_image_key = source_key
         except queue.Full:
             self.video_frame_jobs_dropped += 1
 
     def _capture_video_snapshot_locked(self, image_stamp: float) -> dict:
-        def causal(history, fallback):
+        capture_wall_time = time.time()
+
+        def causal(history, fallback, allow_future_fallback: bool = True):
             selected = None
-            for record in reversed(history):
-                if image_stamp <= 0.0 or float(record[0]) <= image_stamp:
-                    selected = record
-                    break
-            if selected is None and history:
-                selected = history[0]
+            for record in history:
+                record_stamp = float(record[0])
+                if image_stamp <= 0.0 or record_stamp <= image_stamp:
+                    if selected is None or record_stamp >= float(selected[0]):
+                        selected = record
+            if selected is None and history and allow_future_fallback:
+                selected = min(history, key=lambda record: float(record[0]))
             return fallback if selected is None else selected
+
+        def causal_plan(plan_type: str):
+            selected = None
+            for record in self.plan_records.get(plan_type, []):
+                record_stamp = float(record.get("stamp", 0.0) or 0.0)
+                if image_stamp <= 0.0 or (record_stamp > 0.0 and record_stamp <= image_stamp):
+                    if selected is None or record_stamp >= float(selected.get("stamp", 0.0) or 0.0):
+                        selected = record
+            return selected
 
         map_record = causal(
             self.grid_video_history,
@@ -1414,6 +1499,29 @@ class ExploreDebugRecorder:
                 int(self.pending_semantic_keyframe_revision),
             ),
         )
+        goal_record = causal(
+            self.active_goal_video_history,
+            (0.0, 0, None, None),
+            allow_future_fallback=False,
+        )
+        pose_records = [
+            record
+            for record in self.pose_history
+            if image_stamp <= 0.0 or (float(record[0]) > 0.0 and float(record[0]) <= image_stamp)
+        ]
+        trajectory = []
+        distance_m = 0.0
+        previous_xy = None
+        for pose_stamp, x, y, yaw in pose_records:
+            if previous_xy is not None:
+                step_distance = math.hypot(float(x) - previous_xy[0], float(y) - previous_xy[1])
+                if step_distance <= self.args.max_odom_jump_m:
+                    distance_m += step_distance
+            previous_xy = (float(x), float(y))
+            trajectory.append((float(pose_stamp), float(x), float(y), float(yaw)))
+        active_goal = goal_record[2]
+        active_goal_yaw = goal_record[3]
+        stuck = self._stuck_test_at_stamp_locked(image_stamp, goal_record, pose_records)
 
         return {
             "map_grid": map_record[1],
@@ -1421,6 +1529,7 @@ class ExploreDebugRecorder:
             "map_stamp": float(map_record[0]),
             "map_step": int(map_record[3]),
             "map_wall_time": float(map_record[4]),
+            "capture_wall_time": capture_wall_time,
             "global_costmap": global_costmap_record[1],
             "global_costmap_base": global_costmap_record[2],
             "global_costmap_step": int(global_costmap_record[3]),
@@ -1428,14 +1537,15 @@ class ExploreDebugRecorder:
             "local_costmap_base": local_costmap_record[2],
             "local_costmap_step": int(local_costmap_record[3]),
             "pose": self._pose_at_stamp_locked(image_stamp),
-            "trajectory": list(self.trajectory),
-            "active_goal": self._active_goal_xy_locked(),
-            "active_goal_yaw": self._active_goal_yaw_locked(),
-            "global_plan": self.latest_global_plan,
-            "local_global_plan": self.latest_local_global_plan,
-            "local_plan": self.latest_local_plan,
-            "distance_m": float(self.distance_m),
-            "goal_count": int(self.goal_count),
+            "trajectory": trajectory,
+            "active_goal": active_goal,
+            "active_goal_yaw": active_goal_yaw,
+            "global_plan": causal_plan("global"),
+            "local_global_plan": causal_plan("local_global"),
+            "local_plan": causal_plan("local"),
+            "distance_m": distance_m,
+            "goal_count": int(goal_record[1]),
+            "stuck": stuck,
             "unified_graph": graph_record[1],
             "gt_observations": gt_record[1],
             "semantic_events": graph_record[2],
@@ -1813,6 +1923,7 @@ class ExploreDebugRecorder:
                 map_stamp = float(snapshot["map_stamp"])
                 map_step = int(snapshot["map_step"])
                 map_wall_time = float(snapshot["map_wall_time"])
+                capture_wall_time = float(snapshot["capture_wall_time"])
                 global_costmap = snapshot["global_costmap"]
                 global_costmap_base = snapshot["global_costmap_base"]
                 global_costmap_step = int(snapshot["global_costmap_step"])
@@ -1828,6 +1939,9 @@ class ExploreDebugRecorder:
                 local_plan = snapshot["local_plan"]
                 distance_m = float(snapshot["distance_m"])
                 goal_count = int(snapshot["goal_count"])
+                stuck = snapshot["stuck"]
+                source_seq = int(snapshot.get("source_seq", image_step))
+                callback_index = int(snapshot.get("callback_index", image_step))
                 graph = snapshot["unified_graph"]
                 gt_observations = snapshot["gt_observations"]
                 semantic_events = snapshot["semantic_events"]
@@ -1836,7 +1950,11 @@ class ExploreDebugRecorder:
                 pending_semantic_keyframe_revision = int(snapshot["pending_semantic_keyframe_revision"])
             stamp_delta = abs(image_stamp - map_stamp) if image_stamp > 0.0 and map_stamp > 0.0 else float("inf")
             map_available = map_grid is not None and map_base is not None
-            map_age = max(0.0, now - map_wall_time) if map_wall_time > 0.0 else float("inf")
+            map_age = (
+                max(0.0, capture_wall_time - map_wall_time)
+                if map_wall_time > 0.0
+                else float("inf")
+            )
             map_fresh = map_available and map_age <= float(self.args.video_map_max_age_sec)
             map_sync = map_available
             frame_width = int(self.args.first_person_video_width_px)
@@ -1858,7 +1976,7 @@ class ExploreDebugRecorder:
                     frame_height,
                     grid=map_grid,
                     base=map_base,
-                    title=f"OCC step={_step4(map_step)}",
+                    title="OCC",
                     pose=pose,
                     goal_xy=active_goal,
                     goal_yaw=active_goal_yaw,
@@ -1873,7 +1991,7 @@ class ExploreDebugRecorder:
                     frame_height,
                     grid=global_costmap,
                     base=global_costmap_base,
-                    title=f"GLOBAL step={_step4(global_costmap_step)}",
+                    title="GLOBAL COSTMAP",
                     bbox_attr="video_global_costmap_bbox",
                     draw_frontiers=False,
                     draw_global_plan=True,
@@ -1892,7 +2010,7 @@ class ExploreDebugRecorder:
                     frame_height,
                     grid=local_costmap,
                     base=local_costmap_base,
-                    title=f"LOCAL step={_step4(local_costmap_step)}",
+                    title="LOCAL COSTMAP",
                     bbox_attr="video_local_costmap_bbox",
                     draw_frontiers=False,
                     draw_global_plan=False,
@@ -1970,11 +2088,13 @@ class ExploreDebugRecorder:
                 frame = camera_frame
             step_gap = abs(int(image_step) - int(map_step))
             desync = f"  MAP_GAP={step_gap}" if step_gap > int(self.args.video_map_desync_step_warn) else ""
-            stuck = self._stuck_test_locked(now)
             map_age_text = "inf" if not math.isfinite(map_age) else f"{map_age:.2f}s"
             stamp_delta_text = "inf" if not math.isfinite(stamp_delta) else f"{stamp_delta:.3f}s"
             active_flag = 1 if active_goal is not None else 0
-            label = f"STEP={_step4(image_step)} OCC={_step4(map_step)} G={_step4(global_costmap_step)} L={_step4(local_costmap_step)}{desync}"
+            label = (
+                f"SIM STEP={_step4(image_step)} OCC_SRC={_step4(map_step)} "
+                f"G_SRC={_step4(global_costmap_step)} L_SRC={_step4(local_costmap_step)}{desync}"
+            )
             label2 = (
                 f"dist={distance_m:.2f}m goal=#{goal_count:03d} active={active_flag} "
                 f"occ_age={map_age_text} fresh={int(map_fresh)} hdr_dT={stamp_delta_text}"
@@ -2066,7 +2186,9 @@ class ExploreDebugRecorder:
             record = {
                 "frame_index": frame_index,
                 "step_id": image_step,
-                "elapsed_sec": now - self.start_wall_time,
+                "source_seq": source_seq,
+                "callback_index": callback_index,
+                "elapsed_sec": capture_wall_time - self.start_wall_time,
                 "image_stamp": image_stamp,
                 "map_stamp": map_stamp,
                 "stamp_delta_sec": stamp_delta,
@@ -2078,7 +2200,9 @@ class ExploreDebugRecorder:
                 "robot_pose": list(pose) if pose is not None else None,
                 "active_goal": list(active_goal) if active_goal is not None else None,
                 "stuck": stuck,
-                "camera_frame": str(camera_path),
+                "panel_width": frame_width,
+                "panel_height": frame_height,
+                "camera_frame": str(camera_path) if self.args.video_save_panel_frames else "",
                 "map_frame": str(map_path) if occ_panel is not None else "",
                 "global_costmap_frame": str(global_costmap_path) if global_costmap_panel is not None else "",
                 "local_costmap_frame": str(local_costmap_path) if local_costmap_panel is not None else "",
@@ -2092,6 +2216,8 @@ class ExploreDebugRecorder:
                 {
                     "frame_index": frame_index,
                     "step_id": image_step,
+                    "source_seq": source_seq,
+                    "callback_index": callback_index,
                     "elapsed_sec": f"{record['elapsed_sec']:.3f}",
                     "image_stamp": f"{image_stamp:.6f}" if image_stamp > 0.0 else "",
                     "map_stamp": f"{map_stamp:.6f}" if map_stamp > 0.0 else "",
@@ -2110,7 +2236,9 @@ class ExploreDebugRecorder:
                     "stuck_moved_m": f"{stuck['moved_m']:.6f}",
                     "stuck_yaw_delta_rad": f"{stuck['yaw_delta_rad']:.6f}",
                     "stuck_yaw_motion_rad": f"{stuck['yaw_motion_rad']:.6f}",
-                    "camera_frame": str(camera_path),
+                    "panel_width": frame_width,
+                    "panel_height": frame_height,
+                    "camera_frame": str(camera_path) if self.args.video_save_panel_frames else "",
                     "map_frame": str(map_path) if occ_panel is not None else "",
                     "global_costmap_step": global_costmap_step,
                     "local_costmap_step": local_costmap_step,
@@ -2233,6 +2361,55 @@ class ExploreDebugRecorder:
         return {
             "state": state,
             "duration_sec": duration,
+            "moved_m": moved,
+            "yaw_delta_rad": yaw_delta,
+            "yaw_motion_rad": yaw_motion,
+        }
+
+    def _stuck_test_at_stamp_locked(self, image_stamp: float, goal_record, pose_records) -> dict:  # noqa: ANN001
+        active_goal = goal_record[2]
+        if active_goal is None:
+            return {
+                "state": "NO_ACTIVE_GOAL",
+                "duration_sec": 0.0,
+                "moved_m": 0.0,
+                "yaw_delta_rad": 0.0,
+                "yaw_motion_rad": 0.0,
+            }
+        if image_stamp <= 0.0 or not pose_records:
+            return {
+                "state": "NO_POSE",
+                "duration_sec": 0.0,
+                "moved_m": 0.0,
+                "yaw_delta_rad": 0.0,
+                "yaw_motion_rad": 0.0,
+            }
+
+        goal_stamp = float(goal_record[0])
+        goal_age = max(0.0, image_stamp - goal_stamp) if goal_stamp > 0.0 else 0.0
+        window_start = max(goal_stamp, image_stamp - float(self.args.video_stuck_window_sec))
+        window = [record for record in pose_records if float(record[0]) >= window_start]
+        if not window:
+            window = [pose_records[-1]]
+        first_pose = window[0]
+        last_pose = window[-1]
+        moved = math.hypot(float(last_pose[1]) - float(first_pose[1]), float(last_pose[2]) - float(first_pose[2]))
+        yaw_delta = self._angle_distance(float(last_pose[3]), float(first_pose[3]))
+        yaw_motion = sum(
+            self._angle_distance(float(current[3]), float(previous[3]))
+            for previous, current in zip(window, window[1:])
+        )
+        if goal_age < float(self.args.video_stuck_window_sec):
+            state = "OBSERVING"
+        elif moved > float(self.args.video_stuck_distance_m):
+            state = "MOVING"
+        elif yaw_motion >= float(self.args.video_stuck_rotation_yaw_rad):
+            state = "ROTATING_PROGRESS"
+        else:
+            state = "STUCK_STATIC"
+        return {
+            "state": state,
+            "duration_sec": goal_age,
             "moved_m": moved,
             "yaw_delta_rad": yaw_delta,
             "yaw_motion_rad": yaw_motion,
@@ -2751,7 +2928,7 @@ class ExploreDebugRecorder:
         cv2.rectangle(panel, (0, 0), (min(panel.shape[1] - 1, 680), 32), (255, 255, 255), -1)
         cv2.putText(
             panel,
-            f"{title}  IMG STEP={_step4(image_step)}",
+            f"{title}  SIM STEP={_step4(image_step)}",
             (10, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50 if panel_width < 700 else 0.65,
@@ -2939,6 +3116,10 @@ class ExploreDebugRecorder:
             if active_xy is not None and active_yaw is not None:
                 if math.hypot(active_xy[0] - goal_xy[0], active_xy[1] - goal_xy[1]) <= 0.25:
                     goal_yaw = active_yaw
+            goal_history_stamp = stamp if stamp > 0.0 else rospy.Time.now().to_sec()
+            self.active_goal_video_history.append(
+                (goal_history_stamp, goal_index, goal_xy, goal_yaw)
+            )
             elapsed = time.time() - self.start_wall_time
 
         analysis = self._analyze_goal(grid_snapshot, pose, goal_xy)
@@ -3606,6 +3787,10 @@ class ExploreDebugRecorder:
                         "active_goal_key": active_goal_key,
                     },
                 )
+                if active_goal is None:
+                    self.active_goal_video_history.append(
+                        (rospy.Time.now().to_sec(), self.goal_count, None, None)
+                    )
             self.last_explore_status_time = now
             self.last_explore_active_goal = active_goal
             self.last_explore_goal_key = active_goal_key
@@ -4321,25 +4506,35 @@ class ExploreDebugRecorder:
         }
 
     def shutdown(self) -> None:
-        self.video_lock.acquire()
         with self.lock:
             if self.shutting_down:
-                self.video_lock.release()
                 return
             self.shutting_down = True
+            subscribers = list(self.subscribers)
+        try:
+            self.stall_timer.shutdown()
+        except Exception:
+            pass
+        try:
+            self.tf_record_timer.shutdown()
+        except Exception:
+            pass
+        for subscriber in subscribers:
             try:
-                self.stall_timer.shutdown()
+                subscriber.unregister()
             except Exception:
                 pass
-            try:
-                self.tf_record_timer.shutdown()
-            except Exception:
-                pass
-            for subscriber in self.subscribers:
-                try:
-                    subscriber.unregister()
-                except Exception:
-                    pass
+
+        # No callbacks can enqueue after shutting_down is set. Drain all frozen
+        # per-step snapshots before closing the asynchronous PNG writer.
+        self.video_frame_jobs.join()
+        self.video_frame_jobs.put(None)
+        self.video_frame_thread.join(timeout=300.0)
+        if self.video_frame_thread.is_alive():
+            self.first_person_video_error = "video_frame_renderer_shutdown_timeout"
+
+        self.video_lock.acquire()
+        with self.lock:
             final_overlay = ""
             final_overlay_crop = ""
             final_first_person = ""
@@ -4389,6 +4584,8 @@ class ExploreDebugRecorder:
                 "final_step_id": self.debug_step,
                 "final_grid_step": self.latest_grid_step,
                 "final_image_step": self.latest_image_step,
+                "image_callback_count": self.image_callback_count,
+                "step_sync_count": self.step_sync_count,
                 "distance_m": self.distance_m,
                 "trajectory_samples": len(self.trajectory),
                 "subgoal_count": self.goal_count,
@@ -4423,6 +4620,7 @@ class ExploreDebugRecorder:
                 "finalization_complete": False,
                 "video_finalization_pending": True,
                 "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
+                "video_frame_jobs_dropped": self.video_frame_jobs_dropped,
             }
             (self.output_dir / "summary.json").write_text(
                 json.dumps(summary_checkpoint, ensure_ascii=False, indent=2, sort_keys=True)
@@ -4448,6 +4646,8 @@ class ExploreDebugRecorder:
                 "final_step_id": self.debug_step,
                 "final_grid_step": self.latest_grid_step,
                 "final_image_step": self.latest_image_step,
+                "image_callback_count": self.image_callback_count,
+                "step_sync_count": self.step_sync_count,
                 "distance_m": self.distance_m,
                 "trajectory_samples": len(self.trajectory),
                 "subgoal_count": self.goal_count,
@@ -4482,6 +4682,10 @@ class ExploreDebugRecorder:
                 "first_person_video_frame_count": self.first_person_video_frame_count,
                 "first_person_video_fps": self.args.first_person_video_fps,
                 "first_person_video_capture_fps": self.args.first_person_video_capture_fps,
+                "first_person_video_capture_mode": self.args.first_person_video_capture_mode,
+                "first_person_video_trigger": (
+                    "step_sync" if self.args.video_step_sync_topic else "image"
+                ),
                 "first_person_video_codec": self.first_person_video_codec_name,
                 "first_person_video_error": self.first_person_video_error,
                 "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
@@ -4560,6 +4764,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--local-costmap-updates-topic", default="/move_base/local_costmap/costmap_updates")
     parser.add_argument("--rosout-topic", default="/rosout_agg")
     parser.add_argument("--image-topic", default="/molmo_spaces/head_camera/image")
+    parser.add_argument("--video-step-sync-topic", default="")
+    parser.add_argument("--step-sync-queue-size", type=int, default=1024)
+    parser.add_argument("--step-sync-image-width", type=int, default=1024)
+    parser.add_argument("--step-sync-image-height", type=int, default=576)
     parser.add_argument("--external-image-topic", default="")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--cmd-vel-stamped-topic", default="/cmd_vel_stamped")
@@ -4606,6 +4814,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--first-person-video-width-px", type=int, default=960)
     parser.add_argument("--image-queue-size", type=int, default=1)
+    parser.add_argument(
+        "--video-frame-job-queue-size",
+        type=int,
+        default=512,
+        help="Frozen per-image state snapshots waiting for asynchronous rendering.",
+    )
+    parser.add_argument(
+        "--video-history-size",
+        type=int,
+        default=64,
+        help="Stamped OCC/costmap snapshots retained for causal image matching.",
+    )
     parser.add_argument(
         "--video-save-panel-frames",
         action=argparse.BooleanOptionalAction,

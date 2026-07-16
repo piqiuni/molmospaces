@@ -68,6 +68,7 @@ class FrontierConfig:
     sensor_range_m: float = 5.0
     subgoal_search_radius_cells: int = 8
     min_subgoal_distance_m: float = 0.75
+    hard_min_subgoal_distance_m: float = 0.50
     target_frontier_offset_m: float = 0.35
     use_voronoi_viewpoints: bool = True
     min_viewpoint_frontier_distance_m: float = 0.65
@@ -274,6 +275,8 @@ class FrontierExplorerCore:
         subgoal_world = grid.spec.grid_to_world(subgoal_cell[0], subgoal_cell[1])
         subgoal_yaw = atan2(centroid_world[1] - subgoal_world[1], centroid_world[0] - subgoal_world[0])
         dist = hypot(subgoal_world[0] - robot_xy[0], subgoal_world[1] - robot_xy[1])
+        if dist + 1e-6 < self.config.hard_min_subgoal_distance_m:
+            return None
         cluster_id = self._cluster_id(grid, centroid_world)
         return FrontierCluster(
             cluster_id=cluster_id,
@@ -297,7 +300,6 @@ class FrontierExplorerCore:
         robot_cell = grid.spec.world_to_grid(robot_xy[0], robot_xy[1])
         candidates: set[tuple[int, int]] = set()
         radius = max(1, self.config.subgoal_search_radius_cells)
-        min_robot_dist_cells = max(1.0, self.config.min_subgoal_distance_m / max(grid.spec.resolution, 1e-6))
         min_view_frontier_cells = self.config.min_viewpoint_frontier_distance_m / max(grid.spec.resolution, 1e-6)
         max_view_frontier_cells = self.config.max_viewpoint_frontier_distance_m / max(grid.spec.resolution, 1e-6)
         for fx, fy in cells:
@@ -389,13 +391,24 @@ class FrontierExplorerCore:
         else:
             viewpoint_candidates = list(candidates)
 
-        distant_candidates = [
+        def robot_world_distance(cell: tuple[int, int]) -> float:
+            wx, wy = grid.spec.grid_to_world(cell[0], cell[1])
+            return hypot(wx - robot_xy[0], wy - robot_xy[1])
+
+        hard_distance_candidates = [
             cell
             for cell in viewpoint_candidates
-            if hypot(cell[0] - robot_cell[0], cell[1] - robot_cell[1]) >= min_robot_dist_cells
+            if robot_world_distance(cell) >= self.config.hard_min_subgoal_distance_m
+        ]
+        if not hard_distance_candidates:
+            return None
+        distant_candidates = [
+            cell
+            for cell in hard_distance_candidates
+            if robot_world_distance(cell) >= self.config.min_subgoal_distance_m
         ]
         if not distant_candidates:
-            distant_candidates = list(viewpoint_candidates)
+            distant_candidates = hard_distance_candidates
 
         clear_candidates = [
             cell

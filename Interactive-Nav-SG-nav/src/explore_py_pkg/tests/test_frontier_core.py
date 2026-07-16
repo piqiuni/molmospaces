@@ -7,7 +7,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from explore_py_pkg.frontier_core import FrontierCluster, FrontierConfig, FrontierExplorerCore, GridSpec, OccupancyGridData
-from explore_py_pkg.state import CLUSTER_ACTIVE, CLUSTER_FAILED, CLUSTER_UNREACHABLE, ExplorerState, ExplorerStateConfig
+from explore_py_pkg.state import (
+    CLUSTER_ACTIVE,
+    CLUSTER_FAILED,
+    CLUSTER_UNREACHABLE,
+    SUBGOAL_REACHED,
+    ExplorerState,
+    ExplorerStateConfig,
+)
 from explore_py_pkg.value_maps import ValueMapFusion
 
 
@@ -71,6 +78,52 @@ def test_subgoal_is_not_robot_current_cell_when_min_distance_is_set():
     dx = cluster.subgoal_world[0] - 5.5
     dy = cluster.subgoal_world[1] - 5.5
     assert (dx * dx + dy * dy) ** 0.5 >= 1.0
+
+
+def test_subgoal_rejects_all_candidates_inside_hard_min_distance():
+    width = height = 9
+    grid = OccupancyGridData(
+        GridSpec(width, height, 0.1, 0.0, 0.0, "map"),
+        [0] * (width * height),
+    )
+    core = FrontierExplorerCore(
+        FrontierConfig(
+            subgoal_search_radius_cells=2,
+            min_subgoal_distance_m=1.0,
+            hard_min_subgoal_distance_m=0.5,
+            use_voronoi_viewpoints=False,
+            require_footprint_free=False,
+            require_turning_clearance=False,
+        )
+    )
+
+    subgoal = core._choose_subgoal_cell(grid, [(4, 4)], robot_xy=(0.45, 0.45))
+
+    assert subgoal is None
+
+
+def test_hard_min_subgoal_distance_uses_world_coordinates():
+    grid = OccupancyGridData(
+        GridSpec(12, 3, 0.1, 0.0, 0.0, "map"),
+        [0] * (12 * 3),
+    )
+    robot_xy = (0.099, 0.15)
+    core = FrontierExplorerCore(
+        FrontierConfig(
+            subgoal_search_radius_cells=6,
+            min_subgoal_distance_m=0.5,
+            hard_min_subgoal_distance_m=0.5,
+            use_voronoi_viewpoints=False,
+            require_footprint_free=False,
+            require_turning_clearance=False,
+        )
+    )
+
+    subgoal = core._choose_subgoal_cell(grid, [(0, 1)], robot_xy=robot_xy)
+
+    assert subgoal is not None
+    subgoal_world = grid.spec.grid_to_world(*subgoal)
+    assert math.dist(subgoal_world, robot_xy) >= 0.5
 
 
 def test_subgoal_prefers_middle_of_long_frontier_over_endpoint():
@@ -386,7 +439,14 @@ def test_failed_goal_blocks_nearby_subgoals_even_if_cluster_id_changes():
 
 
 def test_frontier_gone_requires_consecutive_confirmations_and_min_age():
-    state = ExplorerState(ExplorerStateConfig(frontier_gone_confirm_ticks=3, frontier_gone_min_goal_age_sec=5.0))
+    state = ExplorerState(
+        ExplorerStateConfig(
+            frontier_gone_confirm_ticks=3,
+            frontier_gone_min_goal_age_sec=5.0,
+            reached_point_blacklist_sec=1.0,
+            visit_viewpoint_once=True,
+        )
+    )
     cluster = type(
         "Cluster",
         (),
@@ -414,6 +474,77 @@ def test_frontier_gone_requires_consecutive_confirmations_and_min_age():
 
     assert state.mark_active_covered_if_frontier_gone(False, now=15.1)
     assert state.active_goal is None
+    assert state.visited_viewpoints == []
+    assert not state.is_goal_point_blocked((1.0, 1.0), now=17.0)
+
+
+def test_reaching_goal_is_not_delayed_by_minimum_lifetime():
+    state = ExplorerState(
+        ExplorerStateConfig(
+            goal_reach_tolerance_m=0.35,
+            min_goal_lifetime_sec=8.0,
+        )
+    )
+    cluster = type(
+        "Cluster",
+        (),
+        {
+            "cluster_id": "near-goal",
+            "centroid_world": (1.0, 0.0),
+            "subgoal_world": (0.3, 0.0),
+            "subgoal_yaw": 0.0,
+        },
+    )()
+    state.start_goal(cluster, robot_xy=(0.0, 0.0), now=10.0)
+
+    progress = state.update_goal_progress((0.0, 0.0), now=10.1)
+
+    assert progress == SUBGOAL_REACHED
+
+
+def test_reached_viewpoint_is_permanently_blocked_by_position():
+    state = ExplorerState(
+        ExplorerStateConfig(
+            visit_viewpoint_once=True,
+            visited_viewpoint_radius_m=0.5,
+            reached_point_blacklist_sec=1.0,
+        )
+    )
+    cluster = type(
+        "Cluster",
+        (),
+        {
+            "cluster_id": "visited",
+            "centroid_world": (3.0, 1.0),
+            "subgoal_world": (1.0, 1.0),
+        },
+    )()
+
+    state.start_goal(cluster, robot_xy=(0.0, 1.0), now=10.0)
+    state.mark_active_reached(now=20.0)
+
+    assert state.is_goal_point_blocked((1.0, 1.0), now=100000.0)
+    assert state.is_goal_point_blocked((1.4, 1.0), now=100000.0)
+    assert state.is_goal_point_blocked((1.50000001, 1.0), now=100000.0)
+    assert not state.is_goal_point_blocked((1.6, 1.0), now=100000.0)
+
+
+def test_failed_viewpoint_is_not_marked_visited():
+    state = ExplorerState(ExplorerStateConfig(visit_viewpoint_once=True))
+    cluster = type(
+        "Cluster",
+        (),
+        {
+            "cluster_id": "failed",
+            "centroid_world": (3.0, 1.0),
+            "subgoal_world": (1.0, 1.0),
+        },
+    )()
+
+    state.start_goal(cluster, robot_xy=(0.0, 1.0), now=10.0)
+    state.mark_active_failed("move_base_aborted", now=20.0)
+
+    assert state.visited_viewpoints == []
 
 
 def test_reached_viewpoint_with_remaining_frontier_marks_it_unreachable():

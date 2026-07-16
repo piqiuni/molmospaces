@@ -1,0 +1,7 @@
+DWAPlannerROS:
+  conditional_reverse_enabled: false
+
+local_costmap:
+  obstacle_layer:
+    local_obstacles:
+      observation_persistence: 0.5

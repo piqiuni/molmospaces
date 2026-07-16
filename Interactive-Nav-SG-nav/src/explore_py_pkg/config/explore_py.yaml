@@ -25,13 +25,24 @@ topics:
 exploration:
   tick_rate_hz: 1.0
   goal_republish_interval_sec: 0.0
-  goal_reach_tolerance_m: 0.45
+  goal_reach_tolerance_m: 0.35
   goal_timeout_sec: 90.0
   stall_timeout_sec: 30.0
   stall_distance_m: 0.15
   min_goal_lifetime_sec: 8.0
   stall_yaw_progress_rad: 0.20
   rotation_stall_timeout_sec: 45.0
+  # Event-only global replan fallback for left/right rotation oscillation.
+  rotation_replan_enabled: true
+  rotation_replan_window_sec: 10.0
+  rotation_replan_min_duration_sec: 8.0
+  rotation_replan_max_translation_m: 0.05
+  rotation_replan_min_yaw_sum_rad: 0.80
+  rotation_replan_max_net_yaw_rad: 0.30
+  rotation_replan_min_direction_changes: 3
+  rotation_replan_min_yaw_step_rad: 0.03
+  rotation_replan_max_per_goal: 1
+  rotation_replan_cooldown_sec: 20.0
   blacklist_duration_sec: 25.0
   failed_cluster_retry_sec: 120.0
   failed_cluster_max_failures: 3
@@ -42,7 +53,9 @@ exploration:
   failed_point_blacklist_sec: 180.0
   failed_point_blacklist_radius_m: 1.25
   reached_point_blacklist_sec: 5.0
-  reached_point_blacklist_radius_m: 0.25
+  reached_point_blacklist_radius_m: 0.50
+  visit_viewpoint_once: true
+  visited_viewpoint_radius_m: 0.50
   # Reaching a viewpoint without clearing its frontier means that frontier is
   # not observable from the navigable free space. Suppress nearby re-clusters.
   unreachable_frontier_radius_m: 0.50
@@ -74,6 +87,7 @@ frontier:
   sensor_range_m: 5.0
   subgoal_search_radius_cells: 18
   min_subgoal_distance_m: 1.00
+  hard_min_subgoal_distance_m: 0.50
   target_frontier_offset_m: 1.0
   use_voronoi_viewpoints: true
   min_viewpoint_frontier_distance_m: 0.8

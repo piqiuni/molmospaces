@@ -108,6 +108,33 @@ class ExplorePyNode:
         self.active_goal_publish_ros_time = 0.0
         self.active_goal_publish_wall_time = 0.0
         self.sent_goal_count = 0
+        self.rotation_replan_enabled = bool(exploration_cfg.get("rotation_replan_enabled", True))
+        self.rotation_replan_window_sec = float(exploration_cfg.get("rotation_replan_window_sec", 10.0))
+        self.rotation_replan_min_duration_sec = float(
+            exploration_cfg.get("rotation_replan_min_duration_sec", 8.0)
+        )
+        self.rotation_replan_max_translation_m = float(
+            exploration_cfg.get("rotation_replan_max_translation_m", 0.05)
+        )
+        self.rotation_replan_min_yaw_sum_rad = float(
+            exploration_cfg.get("rotation_replan_min_yaw_sum_rad", 0.8)
+        )
+        self.rotation_replan_max_net_yaw_rad = float(
+            exploration_cfg.get("rotation_replan_max_net_yaw_rad", 0.3)
+        )
+        self.rotation_replan_min_direction_changes = int(
+            exploration_cfg.get("rotation_replan_min_direction_changes", 3)
+        )
+        self.rotation_replan_max_per_goal = int(exploration_cfg.get("rotation_replan_max_per_goal", 1))
+        self.rotation_replan_cooldown_sec = float(exploration_cfg.get("rotation_replan_cooldown_sec", 20.0))
+        self.rotation_replan_min_yaw_step_rad = float(
+            exploration_cfg.get("rotation_replan_min_yaw_step_rad", 0.03)
+        )
+        self.rotation_replan_samples = []
+        self.rotation_replan_goal_key = ""
+        self.rotation_replan_count = 0
+        self.rotation_replan_last_time = 0.0
+        self.rotation_replan_last_metrics = {}
 
         core_config = FrontierConfig(
             free_max=int(frontier_cfg.get("free_max", 20)),
@@ -119,6 +146,9 @@ class ExplorePyNode:
             sensor_range_m=float(frontier_cfg.get("sensor_range_m", 5.0)),
             subgoal_search_radius_cells=int(frontier_cfg.get("subgoal_search_radius_cells", 8)),
             min_subgoal_distance_m=float(frontier_cfg.get("min_subgoal_distance_m", 0.75)),
+            hard_min_subgoal_distance_m=float(
+                frontier_cfg.get("hard_min_subgoal_distance_m", 0.50)
+            ),
             target_frontier_offset_m=float(frontier_cfg.get("target_frontier_offset_m", 0.35)),
             use_voronoi_viewpoints=bool(frontier_cfg.get("use_voronoi_viewpoints", True)),
             min_viewpoint_frontier_distance_m=float(frontier_cfg.get("min_viewpoint_frontier_distance_m", 0.65)),
@@ -155,7 +185,7 @@ class ExplorePyNode:
             initial_backward_weight=float(frontier_cfg.get("initial_backward_weight", 0.35)),
         )
         state_config = ExplorerStateConfig(
-            goal_reach_tolerance_m=float(exploration_cfg.get("goal_reach_tolerance_m", 0.75)),
+            goal_reach_tolerance_m=float(exploration_cfg.get("goal_reach_tolerance_m", 0.35)),
             goal_timeout_sec=float(exploration_cfg.get("goal_timeout_sec", 90.0)),
             stall_timeout_sec=float(exploration_cfg.get("stall_timeout_sec", 30.0)),
             stall_distance_m=float(exploration_cfg.get("stall_distance_m", 0.15)),
@@ -173,6 +203,8 @@ class ExplorePyNode:
             failed_point_blacklist_radius_m=float(exploration_cfg.get("failed_point_blacklist_radius_m", 1.25)),
             reached_point_blacklist_sec=float(exploration_cfg.get("reached_point_blacklist_sec", 90.0)),
             reached_point_blacklist_radius_m=float(exploration_cfg.get("reached_point_blacklist_radius_m", 0.75)),
+            visit_viewpoint_once=bool(exploration_cfg.get("visit_viewpoint_once", False)),
+            visited_viewpoint_radius_m=float(exploration_cfg.get("visited_viewpoint_radius_m", 0.50)),
             unreachable_frontier_radius_m=float(exploration_cfg.get("unreachable_frontier_radius_m", 1.0)),
         )
 
@@ -259,6 +291,7 @@ class ExplorePyNode:
         self.active_goal_publish_ros_time = 0.0
         self.active_goal_publish_wall_time = 0.0
         self.sent_goal_count = 0
+        self._reset_rotation_replan_tracking()
         self.initial_spin_done = not self.initial_spin_enabled
         self.initial_spin_active = False
         self.initial_spin_start_time = 0.0
@@ -407,6 +440,10 @@ class ExplorePyNode:
                 self.state.fail_active_if_goal_not_free(False)
             else:
                 has_frontier = self._active_goal_has_frontier()
+                if self._maybe_replan_rotation_oscillation():
+                    self._publish_frontiers()
+                    self._publish_status()
+                    return
                 progress = self.state.update_goal_progress(self.robot_xy, robot_yaw=self.robot_yaw)
                 if progress == SUBGOAL_REACHED:
                     if has_frontier:
@@ -492,7 +529,9 @@ class ExplorePyNode:
         if not self.global_plan_current_goal_check_enabled or self.state.active_goal is None:
             return
         now = time.time()
-        goal_age = now - self.state.active_goal.sent_at
+        # A forced same-goal replan has a new publication time even though the
+        # exploration goal keeps its original lifetime and timeout budget.
+        goal_age = now - max(self.state.active_goal.sent_at, self.active_goal_publish_wall_time)
         if goal_age < self.global_plan_current_goal_grace_sec:
             return
         fresh_after_goal = self.latest_global_plan_time >= self.active_goal_publish_wall_time
@@ -540,6 +579,10 @@ class ExplorePyNode:
             "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
             "frontier_count": len(self.latest_clusters),
             "frontier_debug": self.core.last_debug_stats,
+            "frontier_clusters": [
+                self._cluster_to_dict(cluster, grid=self.latest_grid, include_cells=True)
+                for cluster in self.latest_clusters
+            ],
             "selected_cluster": self._cluster_to_dict(self.last_selected_cluster),
             "state": self.state.summary(),
             "semantic_inputs": {
@@ -568,6 +611,13 @@ class ExplorePyNode:
                 "local_plan_length_m": self.latest_local_plan_length_m,
                 "local_plan_bad_since": self.local_plan_bad_since,
             },
+            "rotation_replan": {
+                "enabled": self.rotation_replan_enabled,
+                "count": self.rotation_replan_count,
+                "max_per_goal": self.rotation_replan_max_per_goal,
+                "sample_count": len(self.rotation_replan_samples),
+                "last_metrics": self.rotation_replan_last_metrics,
+            },
         }
         if self.state.active_goal is not None:
             payload["active_goal_distance"] = self._active_goal_distance()
@@ -576,6 +626,7 @@ class ExplorePyNode:
         return payload
 
     def _send_goal(self, cluster):
+        self._reset_rotation_replan_tracking()
         self.local_plan_bad_since = 0.0
         self.latest_global_plan_pose_count = 0
         self.latest_global_plan_length_m = 0.0
@@ -601,6 +652,123 @@ class ExplorePyNode:
                       cluster.subgoal_yaw,
                       cluster.score,
                       json.dumps(cluster.score_terms, sort_keys=True))
+
+    def _reset_rotation_replan_tracking(self):
+        self.rotation_replan_samples = []
+        self.rotation_replan_goal_key = ""
+        self.rotation_replan_count = 0
+        self.rotation_replan_last_time = 0.0
+        self.rotation_replan_last_metrics = {}
+
+    def _maybe_replan_rotation_oscillation(self) -> bool:
+        goal = self.state.active_goal
+        if (
+            not self.rotation_replan_enabled
+            or goal is None
+            or self.robot_xy is None
+            or self.robot_yaw is None
+        ):
+            return False
+
+        goal_key = f"{goal.cluster_id}:{goal.sent_at:.6f}"
+        if goal_key != self.rotation_replan_goal_key:
+            self.rotation_replan_goal_key = goal_key
+            self.rotation_replan_samples = []
+            self.rotation_replan_count = 0
+            self.rotation_replan_last_time = 0.0
+            self.rotation_replan_last_metrics = {}
+
+        now = time.time()
+        self.rotation_replan_samples.append(
+            (now, float(self.robot_xy[0]), float(self.robot_xy[1]), float(self.robot_yaw))
+        )
+        cutoff = now - max(1.0, self.rotation_replan_window_sec)
+        self.rotation_replan_samples = [
+            sample for sample in self.rotation_replan_samples if sample[0] >= cutoff
+        ]
+        if len(self.rotation_replan_samples) < 3:
+            return False
+
+        first = self.rotation_replan_samples[0]
+        last = self.rotation_replan_samples[-1]
+        duration = last[0] - first[0]
+        max_translation = max(
+            math.hypot(sample[1] - first[1], sample[2] - first[2])
+            for sample in self.rotation_replan_samples
+        )
+        yaw_deltas = [
+            self._signed_angle_diff(current[3], previous[3])
+            for previous, current in zip(
+                self.rotation_replan_samples,
+                self.rotation_replan_samples[1:],
+            )
+        ]
+        yaw_sum = sum(abs(delta) for delta in yaw_deltas)
+        net_yaw = abs(self._signed_angle_diff(last[3], first[3]))
+        signs = []
+        for delta in yaw_deltas:
+            if abs(delta) < self.rotation_replan_min_yaw_step_rad:
+                continue
+            signs.append(1 if delta > 0.0 else -1)
+        direction_changes = sum(
+            current != previous for previous, current in zip(signs, signs[1:])
+        )
+        metrics = {
+            "duration_sec": duration,
+            "max_translation_m": max_translation,
+            "yaw_sum_rad": yaw_sum,
+            "net_yaw_rad": net_yaw,
+            "direction_changes": direction_changes,
+        }
+        self.rotation_replan_last_metrics = metrics
+
+        oscillating = (
+            duration >= self.rotation_replan_min_duration_sec
+            and max_translation <= self.rotation_replan_max_translation_m
+            and yaw_sum >= self.rotation_replan_min_yaw_sum_rad
+            and net_yaw <= self.rotation_replan_max_net_yaw_rad
+            and direction_changes >= self.rotation_replan_min_direction_changes
+        )
+        if not oscillating:
+            return False
+        if self.rotation_replan_count >= max(0, self.rotation_replan_max_per_goal):
+            return False
+        if now - self.rotation_replan_last_time < max(0.0, self.rotation_replan_cooldown_sec):
+            return False
+
+        self.rotation_replan_count += 1
+        self.rotation_replan_last_time = now
+        self.rotation_replan_samples = [last]
+        self.local_plan_bad_since = 0.0
+        self.latest_global_plan_pose_count = 0
+        self.latest_global_plan_length_m = 0.0
+        self.latest_global_plan_time = 0.0
+        self.latest_global_plan_endpoint = None
+        self.latest_global_plan_goal_distance_m = float("inf")
+        self.latest_global_plan_matches_active_goal = False
+        self.latest_local_plan_pose_count = 0
+        self.latest_local_plan_length_m = 0.0
+        self.latest_local_plan_time = 0.0
+        self.active_move_base_goal_id = ""
+        goal.last_progress_at = now
+        goal.last_yaw_progress_at = now
+        goal.last_robot_xy = self.robot_xy
+        goal.last_robot_yaw = self.robot_yaw
+        self.state.last_event = "rotation_oscillation_global_replan"
+        self.state.last_replan_reason = "rotation_oscillation"
+        self.state.last_replan_source = "explorer"
+        self._publish_zero_cmd_vel()
+        self._publish_active_goal()
+        rospy.logwarn(
+            "[explore_py] rotation oscillation triggered one global replan: "
+            "duration=%.1fs move=%.3fm yaw_sum=%.2f net_yaw=%.2f direction_changes=%d",
+            duration,
+            max_translation,
+            yaw_sum,
+            net_yaw,
+            direction_changes,
+        )
+        return True
 
     def _publish_active_goal(self):
         goal = self.state.active_goal
@@ -868,10 +1036,10 @@ class ExplorePyNode:
         return OccupancyGridData(spec=spec, data=[int(value) for value in msg.data])
 
     @staticmethod
-    def _cluster_to_dict(cluster):
+    def _cluster_to_dict(cluster, grid=None, include_cells=False):
         if cluster is None:
             return None
-        return {
+        payload = {
             "cluster_id": cluster.cluster_id,
             "subgoal_world": list(cluster.subgoal_world),
             "subgoal_yaw": cluster.subgoal_yaw,
@@ -882,6 +1050,12 @@ class ExplorePyNode:
             "score_terms": cluster.score_terms,
             "cell_count": len(cluster.cells),
         }
+        if include_cells and grid is not None:
+            payload["frontier_cells_world"] = [
+                list(grid.spec.grid_to_world(cell_x, cell_y))
+                for cell_x, cell_y in cluster.cells
+            ]
+        return payload
 
     @staticmethod
     def _finite_or_none(value):

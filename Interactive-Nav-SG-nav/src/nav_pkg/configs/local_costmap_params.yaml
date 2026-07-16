@@ -5,8 +5,8 @@ local_costmap:
    rolling_window: true
    width: 4.0
    height: 4.0
-   update_frequency: 10.0
-   publish_frequency: 10.0
+   update_frequency: 5.0
+   publish_frequency: 5.0
    always_send_full_costmap: true
    transform_tolerance: 2.0
    resolution: 0.05
@@ -35,6 +35,6 @@ local_costmap:
        min_obstacle_height: 0.05
 
    inflation_layer:
-     inflation_radius: 0.15
+     inflation_radius: 0.25
      cost_scaling_factor: 10.0
    
