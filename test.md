@@ -824,6 +824,19 @@ rostopic echo -n 1 /semantic_decision/interaction_action_feedback
 
 当前配置中只有达到 MuJoCo joint readback open threshold 后才发布 `SUCCEEDED`；未达到阈值会使 episode 直接失败，不进入上层交互失败恢复分支。
 
+House 7 力交互路线采样会从正常 `NavToObj` 初始位姿扫描多组 seed，最多并行两个 simulator worker，并冻结“关门不可达、开门后可达”的双开门路线：
+
+```bash
+MUJOCO_GL=egl python scripts/InteractiveNav/sample_house7_force_routes.py \
+  --seeds 0:20 \
+  --workers 2 \
+  --max-routes 6
+```
+
+默认要求起点到门前路径不少于 `1.25m`、起点经开门到远端目标的总路径不少于 `5m`。固定路线写入 `scripts/InteractiveNav/configs/semantic_decision/house7_force_routes.yaml`，未通过的采样及路径判定写入同目录 diagnostics JSON。
+
+继续扩大 seed 范围时可通过 `--reuse-diagnostics <path>` 复用已完成样本，只启动缺失 seed。
+
 正式 ROS 联调会把机器人固定在目标门前，初始化时直接关闭全部门，第 `OPEN_STEP` 个仿真 step 直接将目标门铰链设为全开。测试同时保存 raw OCC、semantic planning OCC、door clear mask、move_base global costmap、闭/开门图状态和对比图：
 
 ```bash
