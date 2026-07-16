@@ -535,3 +535,81 @@ def test_interaction_result_updates_planner_fields():
     )
     portal = next(node for node in store.as_graph_dict(stamp=21.0)["nodes"] if node["type"] == "portal")
     assert len(portal["interaction"]["operation_history"]) == 1
+
+
+def test_interaction_result_can_match_source_name_and_is_idempotent_by_event_id():
+    store = InteractionGraphStore(scene_id="test_scene")
+    closed = observation(
+        instance_id="gt_000001",
+        semantic_name="door",
+        is_door=True,
+        is_articulable=True,
+        is_movable_door=True,
+        joint_type="hinge",
+        joint_range=[0.0, 1.0],
+        joint_value=0.0,
+    )
+    closed["source_object_name"] = "double_door_root"
+    store.update_observations([closed], source_mode="realtime_gt_observation")
+    result = {
+        "source_object_name": "double_door_root",
+        "event_id": "phase_04_close",
+        "joint_infos": [
+            {
+                "joint_name": "left_hinge",
+                "joint_type": "hinge",
+                "joint_range": [0.0, 1.0],
+                "joint_value": 0.0,
+            }
+        ],
+        "source": "direct_joint_readback",
+    }
+    assert store.update_interaction_result(result, stamp=30.0)
+    assert store.update_interaction_result(result, stamp=31.0)
+    stale_open = dict(closed)
+    stale_open["joint_value"] = 1.0
+    stale_open["joint_infos"] = [
+        {
+            "joint_name": "left_hinge",
+            "joint_type": "hinge",
+            "joint_range": [0.0, 1.0],
+            "joint_value": 1.0,
+        }
+    ]
+    store.update_observations([stale_open], stamp=32.0, source_mode="realtime_gt_observation")
+    portal = next(node for node in store.as_graph_dict(stamp=31.0)["nodes"] if node["type"] == "portal")
+    assert portal["interaction"]["state"] == "closed"
+    assert [event["event_id"] for event in portal["interaction"]["operation_history"]] == [
+        "phase_04_close"
+    ]
+
+
+def test_portal_state_uses_joint_delta_and_ajar_is_not_traversable():
+    store = InteractionGraphStore(scene_id="test_scene")
+    closed = observation(
+        instance_id="negative_hinge_door",
+        semantic_name="door",
+        is_door=True,
+        is_articulable=True,
+        is_movable_door=True,
+        joint_type="hinge",
+        joint_range=[-1.0, 0.0],
+        joint_value=0.0,
+    )
+    store.update_observations([closed], source_mode="realtime_gt_observation")
+
+    ajar = dict(closed)
+    ajar["joint_value"] = -0.4
+    store.update_observations([ajar], source_mode="realtime_gt_observation")
+    portal = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal")
+    assert portal["interaction"]["state"] == "ajar"
+    assert portal["interaction"]["traversable"] is False
+    assert portal["interaction"]["requires_interaction"] is True
+
+    opened = dict(closed)
+    opened["joint_value"] = -0.8
+    store.update_observations([opened], source_mode="realtime_gt_observation")
+    portal = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal")
+    assert portal["interaction"]["state"] == "open"
+    assert portal["interaction"]["traversable"] is True
+    assert portal["interaction"]["open_fraction"] == 0.8

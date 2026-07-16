@@ -174,6 +174,12 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
         interaction_mode = "pickup"
     state = infer_interaction_state(node_type, joint_type, joint_range, joint_value, observation)
     is_interactable = interaction_mode != "none"
+    if node_type == "portal":
+        requires_interaction = bool(is_interactable and state not in {"open", "static_open"})
+        traversable = state in {"open", "static_open"}
+    else:
+        requires_interaction = bool(is_interactable and state in {"closed", "unknown"})
+        traversable = True if state in {"open", "ajar", "static_open"} else False if state == "closed" else None
     return {
         "is_interactable": is_interactable,
         "interaction_mode": interaction_mode,
@@ -183,8 +189,8 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
         "state_source": str(observation.get("source") or "detector_rule"),
         "state_confidence": float(observation.get("confidence", 0.0) or 0.0),
         "interaction_cost": 1.0,
-        "requires_interaction": bool(is_interactable and state in {"closed", "unknown"}),
-        "traversable": True if state in {"open", "ajar", "static_open"} else False if state == "closed" else None,
+        "requires_interaction": requires_interaction,
+        "traversable": traversable,
         "expected_effect": "unlock_connectivity" if node_type == "portal" else "reveal_contents" if node_type == "container" else "none",
         "operation_history": [],
     }

@@ -1,6 +1,6 @@
 # 交互导航开发测试手册
 
-最后更新：2026-07-06
+最后更新：2026-07-16
 
 ## 1. 文档定位
 
@@ -580,8 +580,85 @@ HOUSE_INDS="4" RECORD_SEC=60 TASK_HORIZON=800 \
   scripts/InteractiveNav/run_semantic_gt_three_scene_test.zsh outputs/semantic_gt_debug_short
 ```
 
+开启 semantic mapping 后，global costmap 自动改读 `/semantic_mapping/planning_occ_map`；semantic 节点仍从原始 `/struct_mapping/occ_map` 构建房间与语义信息，避免处理后的地图反馈回自身。门状态达到 `open` 后，semantic 层会在每一帧原始 OCC 上持续清空缓存的闭合门整体 AABB，并同时发布 `/semantic_mapping/door_clear_mask`。为了让 move_base 的 static layer 立即消费门洞变化，还会持续发布小范围 `/semantic_mapping/planning_occ_map_updates`；门关闭后，原门区恢复值会短期重复发布，覆盖 global costmap 的低频更新周期。已确认的交互关节读回状态优先于后续不稳定的视觉 GT 状态，直到下一次交互结果更新。
 
-## 8.5 Room分割测试
+## 8.5 门状态与语义 OCC 快速测试
+
+定向单测：
+
+```bash
+conda activate mlspaces
+pytest -q \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_portal_state_tracker.py \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_semantic_occ_overlay.py \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_interaction_graph_store.py
+```
+
+7 号场景检查会读取实际 MuJoCo 门关节和 root AABB，分别设置闭合与完全打开状态，并验证单门、双开门的图状态和 OCC 清空结果：
+
+```bash
+conda activate mlspaces
+python scripts/InteractiveNav/test_semantic_door_occ_house7.py \
+  --house-ind 7 \
+  --output /tmp/semantic_door_occ_house7.json
+```
+
+正式 ROS 联调会把机器人固定在目标门前，初始化时直接关闭全部门，第 `OPEN_STEP` 个仿真 step 直接将目标门铰链设为全开。测试同时保存 raw OCC、semantic planning OCC、door clear mask、move_base global costmap、闭/开门图状态和对比图：
+
+```bash
+conda activate mlspaces
+OPEN_STEP=100 \
+  scripts/InteractiveNav/run_semantic_door_occ_house7_ros_test.zsh \
+  outputs/semantic_door_occ_house7_ros
+```
+
+测试 House 7 中相邻的双开门（两块门板同时关闭/打开）：
+
+```bash
+OPEN_STEP=100 \
+TARGET_ROOT=doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4 \
+ROBOT_XYYAW=4.20,4.881,0.0 \
+  scripts/InteractiveNav/run_semantic_door_occ_house7_ros_test.zsh \
+  outputs/semantic_door_occ_house7_double_ros
+```
+
+双开门 5 位姿开门、穿门、回头关门测试。这里直接设置机器人 base 位姿，从而同步改变相机、odom 和 TF，而不是只修改渲染相机：
+
+```bash
+TARGET_ROOT=doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4 \
+ROBOT_XYYAW=4.05,4.881,0.0 \
+POSE_SEQUENCE='0:4.05,4.881,0.0,closed,left_far/75:4.35,4.881,0.0,open,left_near/150:4.99,4.881,0.0,open,doorway/225:5.55,4.881,0.0,open,right_forward/300:5.85,4.881,3.1415926536,closed,right_turnback' \
+EXPECTED_PHASES=5 \
+  scripts/InteractiveNav/run_semantic_door_occ_house7_ros_test.zsh \
+  outputs/semantic_door_occ_house7_double_pose5
+```
+
+该模式只有在每个位姿的关节状态、语义图状态、机器人位姿、raw/planning OCC 和 global costmap 均满足条件并稳定发布后才截取。输出包括 `occ/phase_*.npz`、每阶段图 JSON、`occ/pose_sequence_summary.json` 和 `occ/pose_sequence_occ_comparison.png`。
+
+验收条件：
+
+- 关门时 raw OCC 与 planning OCC 在门区域一致，clear mask 为空。
+- 开门时 clear mask 非空，mask 内 planning OCC 全部为 free。
+- raw OCC 仍允许保留静态门板痕迹，证明清空来自 semantic overlay，而不是 GMapping 自行更新。
+- move_base global costmap 的门区域收到增量更新，至少产生可通行 free 单元且不再含 lethal 单元。
+
+2026-07-16 的 House 7 正式回归结果：门洞 mask 为 `65` 个栅格；raw OCC 仍有 `16` 个 occupied 和 `6` 个 unknown；planning OCC 的 `65/65` 个栅格均为 free；global costmap 有 `57` 个门洞栅格发生变化，最终为 `53` 个 free、`12` 个 inflation/inscribed、`0` 个 lethal。完整结果见输出目录中的 `occ/summary.json` 与 `occ/door_occ_comparison.png`。
+
+同日双开门 5 位姿严格回归通过：开门后 `115/115` 个 mask 栅格在 planning OCC 中均为 free；左侧近门位姿的 global costmap 为 `107` free、`8` inflation、`0` lethal、`0` unknown；门洞内和右侧位姿均为 `101` free、`14` inflation、`0` lethal、`0` unknown。最终在右侧回头并关门后，clear mask 恢复为 `0`，planning OCC 在参考门区恢复 `31` 个 non-free 栅格，global costmap 恢复 `25` 个 lethal 栅格。
+
+运行中的 ROS 话题检查：
+
+```bash
+rostopic echo -n 1 /semantic_mapping/planning_occ_map/info
+rostopic echo -n 1 /semantic_mapping/planning_occ_map_updates
+rostopic echo -n 1 /semantic_mapping/door_clear_mask/info
+rosparam get /move_base/global_costmap/static_layer/map_topic
+```
+
+注意：当前 GT 快速版依赖“首次有效门板关节观测发生在交互前、门处于闭合状态”的任务约束；真实场景中的门关节/转轴提取尚未实现。
+
+
+## 8.6 Room分割测试
 
 python /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/room_segmentation_debug_tool.py live \
   --output-dir /home/user/ldl/molmospaces/scripts/InteractiveNav/output/room_occ_snaps

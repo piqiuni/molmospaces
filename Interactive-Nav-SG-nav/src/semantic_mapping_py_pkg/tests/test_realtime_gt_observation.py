@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import sys
 
 import mujoco
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from molmo_spaces.policy.learned_policy import realtime_gt_observation as realtime_gt
 
@@ -122,6 +128,22 @@ def _set_geom_pixels(geom_ids):
         flat[index, 0] = geom_id
         flat[index, 1] = int(mujoco.mjtObj.mjOBJ_GEOM)
     FakeEnv.segmentation = segmentation
+
+
+def test_numeric_mujoco_joint_types_are_normalized():
+    assert realtime_gt._joint_type_name(int(mujoco.mjtJoint.mjJNT_HINGE)) == "hinge"
+    assert realtime_gt._joint_type_name(int(mujoco.mjtJoint.mjJNT_SLIDE)) == "slide"
+    assert realtime_gt._joint_type_name(np.asarray([int(mujoco.mjtJoint.mjJNT_HINGE)])) == "hinge"
+
+
+def test_articulated_doorway_root_is_the_canonical_gt_spec():
+    model = type("DoorModel", (), {"body_rootid": np.asarray([0, 1, 1, 3])})()
+    specs = [
+        realtime_gt._ObjectSpec("door_root", {}, 1, ("hinge",), True, False, True, False),
+        realtime_gt._ObjectSpec("door_leaf", {}, 2, ("hinge",), True, False, False, False),
+        realtime_gt._ObjectSpec("fixed_door", {}, 3, (), True, False, False, False),
+    ]
+    assert realtime_gt.RealtimeGTObservationPublisher._canonical_door_root_specs(model, specs) == {1: 0}
 
 
 def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():

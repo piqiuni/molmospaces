@@ -10,6 +10,7 @@ import tf
 import tf2_ros
 from geometry_msgs.msg import Point
 from geometry_msgs.msg import TransformStamped
+from map_msgs.msg import OccupancyGridUpdate
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import String
@@ -25,6 +26,7 @@ from semantic_mapping_py_pkg.room_segmentation import RoomSegmenter, RoomSegment
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param, get_topics
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore, SceneGridStore
+from semantic_mapping_py_pkg.semantic_occ_overlay import OverlayUpdateRegionTracker, SemanticOccupancyOverlay
 
 
 class SemanticMappingNode:
@@ -44,6 +46,13 @@ class SemanticMappingNode:
         self.room_context_topic = topics.get("room_context", "/semantic_mapping/room_context")
         self.gt_observations_topic = topics.get("gt_observations", "/semantic_mapping/gt_observations")
         self.interaction_result_topic = topics.get("interaction_result", "/semantic_mapping/interaction_result")
+        self.planning_occupancy_grid_topic = topics.get(
+            "planning_occupancy_grid", "/semantic_mapping/planning_occ_map"
+        )
+        self.planning_occupancy_grid_updates_topic = topics.get(
+            "planning_occupancy_grid_updates", self.planning_occupancy_grid_topic + "_updates"
+        )
+        self.door_clear_mask_topic = topics.get("door_clear_mask", "/semantic_mapping/door_clear_mask")
 
         self.object_map_topic = topics.get("object_map", "/semantic_mapping/obj_map")
         self.object_markers_topic = topics.get("object_markers", "/semantic_mapping/object_semantic_map_markers")
@@ -105,6 +114,7 @@ class SemanticMappingNode:
         self.graph_save_dir = str(config.get("graph_save_dir", "") or "").strip()
         self.graph_save_pretty = bool(config.get("graph_save_pretty", True))
         graph_config = get_nested_param(rospy, "interaction_graph", {}) or {}
+        overlay_config = get_nested_param(rospy, "semantic_occ_overlay", {}) or {}
         self.class_to_id = {
             normalize_label(name): int(value)
             for name, value in (scene_types.get("class_to_id", {}) or {}).items()
@@ -131,7 +141,15 @@ class SemanticMappingNode:
             match_distance=graph_config.get("match_distance", config.get("object_match_distance", 0.5)),
             room_id_to_name=self.id_to_class,
             room_box_height=self.room_box_height,
+            portal_closed_threshold=graph_config.get("portal_closed_threshold", 0.10),
+            portal_open_threshold=graph_config.get("portal_open_threshold", 0.67),
         )
+        self.semantic_occ_overlay = SemanticOccupancyOverlay(
+            enabled=overlay_config.get("enabled", True),
+            clear_padding_m=overlay_config.get("clear_padding_m", 0.10),
+            open_states=overlay_config.get("open_states", ["open"]),
+        )
+        self.semantic_occ_update_tracker = OverlayUpdateRegionTracker()
 
         self.lock = threading.Lock()
         self.latest_cloud = None
@@ -180,6 +198,17 @@ class SemanticMappingNode:
         self.scene_conf_pub = rospy.Publisher(self.scene_confidence_grid_topic, OccupancyGrid, queue_size=1, latch=True)
         self.unified_graph_pub = rospy.Publisher(self.unified_graph_topic, String, queue_size=1, latch=True)
         self.navigation_hints_pub = rospy.Publisher(self.navigation_hints_topic, String, queue_size=1, latch=True)
+        self.planning_occupancy_grid_pub = rospy.Publisher(
+            self.planning_occupancy_grid_topic, OccupancyGrid, queue_size=1, latch=True
+        )
+        self.planning_occupancy_grid_updates_pub = rospy.Publisher(
+            self.planning_occupancy_grid_updates_topic,
+            OccupancyGridUpdate,
+            queue_size=1,
+        )
+        self.door_clear_mask_pub = rospy.Publisher(
+            self.door_clear_mask_topic, OccupancyGrid, queue_size=1, latch=True
+        )
         self.unified_graph_markers_pub = rospy.Publisher(
             self.unified_graph_markers_topic, MarkerArray, queue_size=1, latch=True
         )
@@ -253,6 +282,8 @@ class SemanticMappingNode:
             if bool(parsed.get("episode_reset")) or episode_changed:
                 self._save_episode_graph_locked(final=True)
                 self.graph_store.reset(episode_id=episode_id, source_mode="realtime_gt_observation")
+                self.semantic_occ_overlay.reset()
+                self.semantic_occ_update_tracker.reset()
                 self.object_store.objects = []
                 self.object_store.next_id = 1
                 self.room_segmenter.state = RoomSegmentationState()
@@ -370,11 +401,41 @@ class SemanticMappingNode:
         scene_grid = self._build_grid(self.scene_store.scene_data) if scene_info_ready else None
         scene_conf_grid = self._build_grid(self.scene_store.confidence_data) if scene_info_ready else None
         graph_payload = self.graph_store.as_graph_dict()
+        self.semantic_occ_overlay.update_graph(graph_payload)
+        planning_grid = None
+        planning_update = None
+        door_clear_mask = None
+        overlay_stats = {
+            "active_portal_ids": [],
+            "cleared_cells": 0,
+            "update_bounds": None,
+            "valid": False,
+        }
+        if self.latest_occupancy_grid is not None:
+            planning_data, mask_data, overlay_stats = self.semantic_occ_overlay.apply(
+                self.latest_occupancy_grid.info,
+                self.latest_occupancy_grid.data,
+            )
+            planning_grid = self._build_occupancy_copy(planning_data)
+            door_clear_mask = self._build_occupancy_copy(mask_data)
+            update_region = self.semantic_occ_update_tracker.build(
+                self.latest_occupancy_grid.info.width,
+                self.latest_occupancy_grid.info.height,
+                planning_data,
+                overlay_stats.get("update_bounds"),
+                geometry_key=self._occupancy_geometry_key(self.latest_occupancy_grid),
+            )
+            if update_region is not None:
+                planning_update = self._build_occupancy_update(planning_grid, update_region)
         return {
             "obj_map": obj_map,
             "scene_grid": scene_grid,
             "scene_conf_grid": scene_conf_grid,
             "graph_payload": graph_payload,
+            "planning_grid": planning_grid,
+            "planning_update": planning_update,
+            "door_clear_mask": door_clear_mask,
+            "overlay_stats": overlay_stats,
         }
 
     def _publish_bundle(self, bundle):
@@ -382,12 +443,20 @@ class SemanticMappingNode:
         scene_grid = bundle["scene_grid"]
         scene_conf_grid = bundle["scene_conf_grid"]
         graph_payload = bundle["graph_payload"]
+        planning_grid = bundle["planning_grid"]
+        planning_update = bundle["planning_update"]
+        door_clear_mask = bundle["door_clear_mask"]
         if obj_map is not None:
             self.object_pub.publish(String(data=dumps_compact(obj_map)))
             self.marker_pub.publish(self._build_object_markers(obj_map))
         if scene_grid is not None and scene_conf_grid is not None:
             self.scene_id_pub.publish(scene_grid)
             self.scene_conf_pub.publish(scene_conf_grid)
+        if planning_grid is not None and door_clear_mask is not None:
+            self.planning_occupancy_grid_pub.publish(planning_grid)
+            self.door_clear_mask_pub.publish(door_clear_mask)
+            if planning_update is not None:
+                self.planning_occupancy_grid_updates_pub.publish(planning_update)
         self.unified_graph_pub.publish(String(data=dumps_compact(graph_payload)))
         self.navigation_hints_pub.publish(String(data=dumps_compact(graph_payload["views"]["navigation_view"]["hints"])))
         self.unified_graph_markers_pub.publish(build_graph_marker_array(graph_payload, self.world_frame))
@@ -398,6 +467,44 @@ class SemanticMappingNode:
             )
         )
         self._save_graph_payload(graph_payload)
+
+    def _build_occupancy_copy(self, data):
+        raw = self.latest_occupancy_grid
+        grid = OccupancyGrid()
+        # Keep the raw map timestamp so downstream consumers can pair the
+        # semantic overlay and clear mask with the exact source occupancy map.
+        grid.header.seq = raw.header.seq
+        grid.header.stamp = raw.header.stamp
+        grid.header.frame_id = raw.header.frame_id or self.world_frame
+        grid.info = raw.info
+        grid.data = [int(value) for value in data]
+        return grid
+
+    @staticmethod
+    def _occupancy_geometry_key(grid):
+        info = grid.info
+        origin = info.origin
+        return (
+            int(info.width),
+            int(info.height),
+            round(float(info.resolution), 9),
+            round(float(origin.position.x), 6),
+            round(float(origin.position.y), 6),
+            round(float(origin.orientation.z), 6),
+            round(float(origin.orientation.w), 6),
+            str(grid.header.frame_id),
+        )
+
+    @staticmethod
+    def _build_occupancy_update(planning_grid, region):
+        update = OccupancyGridUpdate()
+        update.header = planning_grid.header
+        update.x = int(region["x"])
+        update.y = int(region["y"])
+        update.width = int(region["width"])
+        update.height = int(region["height"])
+        update.data = [int(value) for value in region["data"]]
+        return update
 
     def _stamp_from_detection_payload(self, parsed):
         secs = parsed.get("secs")

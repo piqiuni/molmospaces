@@ -14,6 +14,9 @@ topics:
   room_context: "/semantic_mapping/room_context"
   gt_observations: "/semantic_mapping/gt_observations"
   interaction_result: "/semantic_mapping/interaction_result"
+  planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
+  planning_occupancy_grid_updates: "/semantic_mapping/planning_occ_map_updates"
+  door_clear_mask: "/semantic_mapping/door_clear_mask"
 
   object_detections: "/semantic_mapping/object_detections"
   scene_attribute: "/semantic_mapping/scene_attribute"
@@ -151,11 +154,18 @@ semantic_map:
 interaction_graph:
   scene_id: "semantic_mapping_scene"
   match_distance: 0.5
+  portal_closed_threshold: 0.10
+  portal_open_threshold: 0.67
   gt_replay:
     enable: false
     shuffle: false
     batch_count: 1
     seed: 0
+
+semantic_occ_overlay:
+  enabled: true
+  clear_padding_m: 0.10
+  open_states: ["open"]
 
 scene_types:
   unknown_id: -1

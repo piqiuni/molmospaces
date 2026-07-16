@@ -2,6 +2,7 @@
 
     <arg name="override_config_file" default=""/>
     <arg name="base_local_planner" default="dwa_local_planner/DWAPlannerROS"/>
+    <arg name="global_map_topic" default="/struct_mapping/occ_map"/>
 
     <node pkg="nav_pkg" type="relay_node" name="relay_node" output="screen"/>
 
@@ -12,6 +13,8 @@
         <rosparam file="$(find nav_pkg)/configs/global_costmap_params.yaml" command="load" />
         <rosparam file="$(find nav_pkg)/configs/local_costmap_params.yaml" command="load" />
         <rosparam file="$(find nav_pkg)/configs/move_base_params.yaml" command="load" />
+        <param name="global_costmap/static_layer/map_topic" type="string" value="$(arg global_map_topic)" />
+        <param name="global_replan_map_topic" type="string" value="$(arg global_map_topic)" />
         <param name="base_global_planner" type="string" value="global_planner/GlobalPlanner" />
         <param name="GlobalPlanner/use_dijkstra" value="true" />
         <param name="GlobalPlanner/use_quadratic" value="true" />

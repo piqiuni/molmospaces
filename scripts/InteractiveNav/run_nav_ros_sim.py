@@ -10,6 +10,7 @@ import mujoco
 import numpy as np
 
 from robot_conversion_patches import patch_droid_config_for_rum
+from semantic_door_occ_runtime import DoorOccPoseSequenceController, DoorOccRuntimeController
 
 from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
 from molmo_spaces.configs.camera_configs import (
@@ -231,6 +232,12 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
         policy.task = task
         policy.reset()
+        door_occ_controller = getattr(policy, "door_occ_test_controller", None)
+        if door_occ_controller is not None:
+            door_occ_controller.prepare(task)
+            observation = task.get_observations()
+            if task.observation_cache:
+                task.observation_cache[0] = observation
         maybe_save_debug_snapshot(policy, observation)
 
         try:
@@ -266,6 +273,8 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                     f"after {step_idx} completed steps"
                 )
 
+            if door_occ_controller is not None and door_occ_controller.before_step(task, step_idx):
+                observation = task.get_observations()
             maybe_save_debug_snapshot(policy, observation)
             loop_t0 = time.perf_counter()
             policy_t0 = time.perf_counter()
@@ -339,6 +348,8 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         except AttributeError:
             log.warning("Sleep flag not reset.")
 
+        if door_occ_controller is not None:
+            door_occ_controller.finalize(step_idx)
         success = task.judge_success() if hasattr(task, "judge_success") else success
         return success
 
@@ -601,6 +612,20 @@ def parse_args():
     parser.add_argument("--debug_snapshot_path", type=str, default="")
     parser.add_argument("--debug_snapshot_camera_name", type=str, default="debug_front_camera")
     parser.add_argument("--fixed_robot_xyyaw", type=str, default="")
+    parser.add_argument("--door_occ_test_root_name", type=str, default="")
+    parser.add_argument(
+        "--door_occ_test_open_step",
+        type=int,
+        default=-1,
+        help="Enable stationary door OCC test and directly open the selected doorway root at this policy step.",
+    )
+    parser.add_argument("--door_occ_test_transition_path", type=str, default="")
+    parser.add_argument(
+        "--door_occ_test_pose_sequence",
+        type=str,
+        default="",
+        help="Optional step:x,y,yaw,state,label phases separated by '/' for direct-pose OCC tests.",
+    )
     parser.add_argument("--fixed_debug_camera_pos", type=str, default="")
     parser.add_argument("--fixed_debug_camera_target", type=str, default="")
     parser.add_argument("--debug_front_camera_offset", type=str, default="-1.4,0.0,1.35")
@@ -884,6 +909,29 @@ def main():
     policy.debug_snapshot_path = args.debug_snapshot_path
     policy.debug_snapshot_camera_name = args.debug_snapshot_camera_name
     policy.debug_snapshot_saved = False
+    policy.door_occ_test_controller = None
+    if args.door_occ_test_pose_sequence:
+        transition_path = (
+            Path(args.door_occ_test_transition_path).expanduser().resolve()
+            if args.door_occ_test_transition_path
+            else exp_config.output_dir / "door_occ_test_transitions.json"
+        )
+        policy.door_occ_test_controller = DoorOccPoseSequenceController(
+            root_name=args.door_occ_test_root_name,
+            pose_sequence=args.door_occ_test_pose_sequence,
+            output_path=transition_path,
+        )
+    elif args.door_occ_test_open_step >= 0:
+        transition_path = (
+            Path(args.door_occ_test_transition_path).expanduser().resolve()
+            if args.door_occ_test_transition_path
+            else exp_config.output_dir / "door_occ_test_transitions.json"
+        )
+        policy.door_occ_test_controller = DoorOccRuntimeController(
+            root_name=args.door_occ_test_root_name,
+            open_step=args.door_occ_test_open_step,
+            output_path=transition_path,
+        )
     print("Creating runner ...")
     runner = NavRosRolloutRunner(exp_config)
     print("Starting runner.run() ...")

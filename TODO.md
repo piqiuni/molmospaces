@@ -316,7 +316,7 @@
 - [ ] 明确 MolmoSpaces 侧交互信息来源：GT / oracle 为主
 - [ ] 明确 ROS 侧交互信息来源：detector-only 为主
 - [ ] 明确“需要交互”的 planner 判定条件
-- [ ] 明确开门后地图/图状态更新的最小机制
+- [x] 完成 GT 快速版开门状态回写与 OCC 更新：首次有效关节值作为闭合参考，门完全打开后由 semantic 层持续清空闭合门整体 AABB，发布 planning OCC 与门洞增量更新，并由 move_base global costmap 实际消费
 - [ ] 固定一组 `obj-goal` / `point-goal` 的最小验证场景与 episode，不先追求大规模
 - [ ] 明确下个月 AAAI 投稿所需的最小实验包与文档产物
 
@@ -337,6 +337,8 @@
 - [ ] 明确 ROS detector-only 管线需要输出哪些最小交互字段
 - [ ] 明确 door 检测成功之外还缺哪些交互属性字段
 - [ ] 明确 door state 是从关节值直接读，还是从图像/几何间接估计
+- [x] GT 快速版门状态：读取当前 `joint_infos`，过滤 handle joint，以首次有效门板关节值作为 `q_closed`，按 joint range 计算开合比例；双开门要求全部门板达到 open 阈值
+- [ ] 真实场景门关节提取：在没有 MuJoCo joint GT 时，从多帧门板检测/跟踪与几何变化中估计 hinge/slide 类型、转轴或滑动轴、闭合参考位姿和开合比例；置信度不足时保持 `unknown`，不能直接清空 OCC
 - [ ] 明确 room_id / connectivity 的可信来源
 - [ ] 为后续 container / movable obstacle 预留观测字段
 - [ ] 为 future extension 中的 switch / light / curtain 类交互预留扩展字段

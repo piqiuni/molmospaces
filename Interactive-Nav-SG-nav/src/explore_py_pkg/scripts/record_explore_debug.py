@@ -885,6 +885,7 @@ class ExploreDebugRecorder:
         self.unified_graph_history = deque(maxlen=history_size)
         self.latest_image: tuple[float, int, int, bytearray] | None = None
         self.latest_image_step = 0
+        self.last_source_image_seq: int | None = None
         self.last_recorded_image_stamp_ns: int | None = None
         self.last_recorded_image_key: tuple[int, int] | None = None
         self.image_callback_count = 0
@@ -1377,11 +1378,14 @@ class ExploreDebugRecorder:
         with self.lock:
             if self.shutting_down:
                 return
+            if self.last_source_image_seq is not None and source_seq <= self.last_source_image_seq:
+                return
             self.image_callback_count += 1
-            image_step = source_seq if source_stamp_ns > 0 else self.image_callback_count
-            self.debug_step = image_step
+            source_step = source_seq + 1
+            self.last_source_image_seq = source_seq
+            self.debug_step = max(self.debug_step, source_step)
             self.latest_image = (stamp, width, height, rgb)
-            self.latest_image_step = image_step
+            self.latest_image_step = source_step
             self.last_image_wall_time = time.time()
             if self.args.video_step_sync_topic:
                 return
@@ -1389,7 +1393,7 @@ class ExploreDebugRecorder:
             snapshot["source_seq"] = source_seq
             snapshot["callback_index"] = self.image_callback_count
         try:
-            self.video_frame_jobs.put_nowait((width, height, rgb, stamp, image_step, snapshot))
+            self.video_frame_jobs.put_nowait((width, height, rgb, stamp, source_step, snapshot))
             if step_capture:
                 with self.lock:
                     self.last_recorded_image_stamp_ns = source_stamp_ns
