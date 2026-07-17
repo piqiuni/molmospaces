@@ -138,13 +138,21 @@ def candidate_approach_points(
     portal_normal_xy: Iterable[float],
     portal_half_width_m: float,
     side_sign: int,
+    min_standoff_m: float = 1.15,
 ) -> list[np.ndarray]:
     center = np.asarray(list(portal_center_xy), dtype=float)
     normal = normalized(portal_normal_xy)
     tangent = np.array([-normal[1], normal[0]], dtype=float)
     tangent_span = min(max(float(portal_half_width_m) * 0.20, 0.08), 0.25)
     candidates = []
-    for distance_m in (0.70, 0.85, 1.00, 1.15):
+    distances = [
+        distance_m
+        for distance_m in (0.70, 0.85, 1.00, 1.15, 1.30)
+        if distance_m + 1e-6 >= float(min_standoff_m)
+    ]
+    if not distances:
+        distances = [float(min_standoff_m)]
+    for distance_m in distances:
         for tangent_offset_m in (0.0, -tangent_span, tangent_span):
             candidates.append(
                 center + int(side_sign) * normal * distance_m + tangent * tangent_offset_m
@@ -322,6 +330,7 @@ def sample_route_for_seed(spec: dict[str, Any]) -> dict[str, Any]:
             portal["portal_normal_xy"],
             portal["portal_half_width_m"],
             start_side_sign,
+            min_standoff_m=float(spec["min_door_standoff_m"]),
         ):
             approach_room_id = supported_room_id(closed_map, approach_xy, radius_m=0.18)
             check = {
@@ -448,6 +457,12 @@ def sample_route_for_seed(spec: dict[str, Any]) -> dict[str, Any]:
                     best_approach["xy"][1],
                     approach_yaw,
                 ],
+                "portal_center_xy": portal_center,
+                "portal_normal_xy": portal["portal_normal_xy"],
+                "portal_half_width_m": float(portal["portal_half_width_m"]),
+                "door_standoff_m": float(
+                    np.linalg.norm(np.asarray(best_approach["xy"], dtype=float) - portal_center)
+                ),
                 "far_goal_xyyaw": [
                     selected_far["xy"][0],
                     selected_far["xy"][1],
@@ -498,6 +513,9 @@ def build_route_config(spec: dict[str, Any], routes: list[dict[str, Any]]) -> di
                 "robot_base_pose": route["robot_base_pose"],
                 "start_xyyaw": route["start_xyyaw"],
                 "door_approach_xyyaw": route["door_approach_xyyaw"],
+                "portal_center_xy": route["portal_center_xy"],
+                "portal_normal_xy": route["portal_normal_xy"],
+                "portal_half_width_m": route["portal_half_width_m"],
                 "far_goal_xyyaw": route["far_goal_xyyaw"],
                 "interaction": {
                     "backend": "force",
@@ -515,6 +533,7 @@ def build_route_config(spec: dict[str, Any], routes: list[dict[str, Any]]) -> di
                         "goal_room_name",
                         "start_side_sign",
                         "first_leg_path_length_m",
+                        "door_standoff_m",
                         "third_leg_path_length_m",
                         "total_route_path_length_m",
                         "far_goal_portal_distance_m",
@@ -544,6 +563,7 @@ def build_route_config(spec: dict[str, Any], routes: list[dict[str, Any]]) -> di
             "px_per_m": int(spec["px_per_m"]),
             "downscale": int(spec["downscale"]),
             "min_first_leg_m": float(spec["min_first_leg_m"]),
+            "min_door_standoff_m": float(spec["min_door_standoff_m"]),
             "min_total_route_m": float(spec["min_total_route_m"]),
             "min_far_goal_distance_m": float(spec["min_far_goal_distance_m"]),
             "min_far_goal_clearance_m": float(spec["min_far_goal_clearance_m"]),
@@ -587,6 +607,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--px-per-m", type=int, default=80)
     parser.add_argument("--downscale", type=int, default=4)
     parser.add_argument("--min-first-leg-m", type=float, default=1.25)
+    parser.add_argument("--min-door-standoff-m", type=float, default=1.15)
     parser.add_argument("--min-total-route-m", type=float, default=5.0)
     parser.add_argument("--min-far-goal-distance-m", type=float, default=2.5)
     parser.add_argument("--min-far-goal-clearance-m", type=float, default=0.45)
@@ -623,6 +644,7 @@ def main() -> None:
         "px_per_m": args.px_per_m,
         "downscale": args.downscale,
         "min_first_leg_m": args.min_first_leg_m,
+        "min_door_standoff_m": args.min_door_standoff_m,
         "min_total_route_m": args.min_total_route_m,
         "min_far_goal_distance_m": args.min_far_goal_distance_m,
         "min_far_goal_clearance_m": args.min_far_goal_clearance_m,

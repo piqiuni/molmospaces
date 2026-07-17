@@ -833,7 +833,7 @@ MUJOCO_GL=egl python scripts/InteractiveNav/sample_house7_force_routes.py \
   --max-routes 6
 ```
 
-默认要求起点到门前路径不少于 `1.25m`、起点经开门到远端目标的总路径不少于 `5m`。固定路线写入 `scripts/InteractiveNav/configs/semantic_decision/house7_force_routes.yaml`，未通过的采样及路径判定写入同目录 diagnostics JSON。
+默认要求起点到门前路径不少于 `1.25m`、门前安全距离不少于 `1.15m`、起点经开门到远端目标的总路径不少于 `5m`。固定路线写入 `scripts/InteractiveNav/configs/semantic_decision/house7_force_routes.yaml`，未通过的采样及路径判定写入同目录 diagnostics JSON。
 
 继续扩大 seed 范围时可通过 `--reuse-diagnostics <path>` 复用已完成样本，只启动缺失 seed。
 
@@ -850,6 +850,24 @@ ROS_MASTER_URI=http://127.0.0.1:11431 \
 occupancy 建图的门后房间；该参数默认仍为 `false`，探索实验不启用。
 
 执行器依次等待 `move_base` 到达门前、验证语义图中的 closed portal、发布力交互原子动作、验证 open portal，再导航到远端目标；事件与最终结果写入 `route_result.json`。
+
+运行多条固定路线时使用最多两个独立 ROS master：
+
+```bash
+python scripts/InteractiveNav/run_house7_force_route_batch.py \
+  --output-dir outputs/house7_force_route_batch \
+  --route-ids house7_force_route_01 house7_force_route_02 house7_force_route_03 \
+  --workers 2 \
+  --base-master-port 11450
+```
+
+批处理器拒绝 `--workers > 2`。每条路线运行阶段保存 simulator RGB step、OCC、global/local costmap、semantic XY 与 topology 快照，结束后通过 `build_semantic_video_offline.py` 以 `source_seq == step_index` 严格匹配并离线编码为 `15 FPS` 六联图。内部缺帧直接失败；roslaunch 关闭后追加的连续尾部清理帧会被裁掉并记录在 `trimmed_trailing_sim_steps`。主要产物为：
+
+- `<route>/route_result.json`
+- `<route>/offline_video_summary.json`
+- `<route>/videos/overview_6panel.mp4`
+- `<route>/offline_video_sync.csv`
+- `<batch>/summary.json`
 
 正式 ROS 联调会把机器人固定在目标门前，初始化时直接关闭全部门，第 `OPEN_STEP` 个仿真 step 直接将目标门铰链设为全开。测试同时保存 raw OCC、semantic planning OCC、door clear mask、move_base global costmap、闭/开门图状态和对比图：
 

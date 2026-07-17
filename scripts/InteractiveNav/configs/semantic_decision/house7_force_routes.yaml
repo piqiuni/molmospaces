@@ -12,6 +12,7 @@ sampling:
   px_per_m: 60
   downscale: 3
   min_first_leg_m: 1.25
+  min_door_standoff_m: 1.15
   min_total_route_m: 5.0
   min_far_goal_distance_m: 2.5
   min_far_goal_clearance_m: 0.45
@@ -32,9 +33,16 @@ routes:
   - 4.787482821447575
   - -0.05836247889746014
   door_approach_xyyaw:
-  - 3.8214205323533017
-  - 4.880765797157467
-  - -4.1329447767518055e-07
+  - 3.6714205323533142
+  - 4.880765859151639
+  - -4.132944776157705e-07
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
   far_goal_xyyaw:
   - 7.03213734981797
   - 3.4363090893178603
@@ -51,9 +59,10 @@ routes:
     start_room_name: room_4
     goal_room_name: room_7
     start_side_sign: 1
-    first_leg_path_length_m: 1.4033578867465897
-    third_leg_path_length_m: 4.519861743948227
-    total_route_path_length_m: 5.923219630694817
+    first_leg_path_length_m: 1.2538068945782377
+    door_standoff_m: 1.3000000000000003
+    third_leg_path_length_m: 4.669817486462565
+    total_route_path_length_m: 5.923624381040803
     far_goal_portal_distance_m: 2.516546762835418
     far_goal_clearance_m: 0.5425465703010559
     closed_start_to_far_path_found: false
@@ -78,6 +87,13 @@ routes:
   - 3.82142045012548
   - 4.681808815530107
   - 0.17130992086883384
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
   far_goal_xyyaw:
   - 7.03213734981797
   - 3.4363090893178603
@@ -95,6 +111,7 @@ routes:
     goal_room_name: room_7
     start_side_sign: 1
     first_leg_path_length_m: 1.2998064236034987
+    door_standoff_m: 1.1670834933878025
     third_leg_path_length_m: 4.548770533144492
     total_route_path_length_m: 5.848576956747991
     far_goal_portal_distance_m: 2.516546762835418
@@ -118,9 +135,16 @@ routes:
   - 3.7867188403724383
   - -0.05960025891399083
   door_approach_xyyaw:
-  - 4.271420532353263
-  - 4.880765611174953
-  - -4.132944780061784e-07
+  - 3.8214206145811236
+  - 5.079722778784828
+  - -0.1713107474577892
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
   far_goal_xyyaw:
   - 7.03213734981797
   - 3.4363090893178603
@@ -137,9 +161,10 @@ routes:
     start_room_name: room_4
     goal_room_name: room_7
     start_side_sign: 1
-    first_leg_path_length_m: 1.309985073285483
-    third_leg_path_length_m: 4.070739287428781
-    total_route_path_length_m: 5.380724360714264
+    first_leg_path_length_m: 1.3696495856803839
+    door_standoff_m: 1.1670834933878023
+    third_leg_path_length_m: 4.528760518176558
+    total_route_path_length_m: 5.898410103856942
     far_goal_portal_distance_m: 2.516546762835418
     far_goal_clearance_m: 0.5425465703010559
     closed_start_to_far_path_found: false
@@ -161,9 +186,16 @@ routes:
   - 3.967093898377278
   - 0.3091601211794534
   door_approach_xyyaw:
-  - 4.121420614581098
-  - 5.079722654796485
-  - -0.22992805382987405
+  - 3.671420614581136
+  - 5.079722840779
+  - -0.15186587630020743
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
   far_goal_xyyaw:
   - 7.03213734981797
   - 3.4363090893178603
@@ -180,9 +212,10 @@ routes:
     start_room_name: room_4
     goal_room_name: room_7
     start_side_sign: 1
-    first_leg_path_length_m: 1.310782011905648
-    third_leg_path_length_m: 4.2334068718977
-    total_route_path_length_m: 5.544188883803348
+    first_leg_path_length_m: 1.2884326081997888
+    door_standoff_m: 1.3151364493991782
+    third_leg_path_length_m: 4.677707444419149
+    total_route_path_length_m: 5.966140052618938
     far_goal_portal_distance_m: 2.516546762835418
     far_goal_clearance_m: 0.5425465703010559
     closed_start_to_far_path_found: false
@@ -207,6 +240,13 @@ routes:
   - 3.8214205323533017
   - 4.880765797157467
   - -4.1329447767518055e-07
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
   far_goal_xyyaw:
   - 7.03213734981797
   - 3.4363090893178603
@@ -224,6 +264,7 @@ routes:
     goal_room_name: room_7
     start_side_sign: 1
     first_leg_path_length_m: 1.3534970646803104
+    door_standoff_m: 1.15
     third_leg_path_length_m: 4.519861743948227
     total_route_path_length_m: 5.873358808628538
     far_goal_portal_distance_m: 2.516546762835418
@@ -247,9 +288,16 @@ routes:
   - 6.170744277993355
   - -0.8595904286154981
   door_approach_xyyaw:
-  - 3.8214206145811236
-  - 5.079722778784828
-  - -0.1713107474577892
+  - 3.671420614581136
+  - 5.079722840779
+  - -0.15186587630020743
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
   far_goal_xyyaw:
   - 7.03213734981797
   - 3.4363090893178603
@@ -266,9 +314,10 @@ routes:
     start_room_name: room_4
     goal_room_name: room_7
     start_side_sign: 1
-    first_leg_path_length_m: 1.6344601056668833
-    third_leg_path_length_m: 4.528760518176558
-    total_route_path_length_m: 6.163220623843441
+    first_leg_path_length_m: 1.5425876709702377
+    door_standoff_m: 1.3151364493991782
+    third_leg_path_length_m: 4.677707444419149
+    total_route_path_length_m: 6.220295115389387
     far_goal_portal_distance_m: 2.516546762835418
     far_goal_clearance_m: 0.5425465703010559
     closed_start_to_far_path_found: false
