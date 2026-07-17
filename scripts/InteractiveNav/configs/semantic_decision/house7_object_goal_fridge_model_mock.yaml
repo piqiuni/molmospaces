@@ -1,0 +1,12 @@
+target:
+  enabled: true
+  target_name: "fridge"
+  object_labels: ["fridge", "refrigerator"]
+  standoff_m: 0.90
+
+policy:
+  backend: "model"
+  target_relevance_weight: 3.0
+
+model:
+  mode: "mock"

@@ -1,6 +1,6 @@
 # 交互导航项目总览（readme_pi）
 
-最后更新：2026-06-03
+最后更新：2026-07-17
 
 ## 1. 文档定位
 
@@ -63,7 +63,16 @@
 
 ### 4.1 当前主线
 
-c
+当前主线已经形成以下在线闭环：
+
+`实时 GT 观测 -> 动态语义交互图 -> frontier/interaction/target 候选 -> 独立决策模块 -> 导航或力交互原子动作 -> 图与 planning OCC 更新 -> 继续规划`
+
+其中：
+
+- 动态语义交互图负责维护场景、房间、通道、容器、物体、状态和操作历史
+- 决策模块只消费图与探索候选，不反向承担图构建职责
+- 当前交互执行默认使用 force backend；RBY1 API 保留为后续可替换 backend
+- 当前规则策略是可复现实验基线，模型评分接口是后续增强项
 
 ### 4.2 当前不作为第一阶段主线的内容
 
@@ -169,6 +178,23 @@ c
 2. 交互状态定义一致
 3. “需要交互”的判断逻辑尽量可对齐
 4. 结果表达能互相支撑，而不是彼此孤立
+
+### 5.4 当前已验证的决策闭环
+
+当前 ROS/MolmoSpaces 联调已经不再依赖固定路线触发交互，而是拆为三个独立模块：
+
+1. `semantic_candidate_node`：统一生成 frontier、portal interaction 与 target navigation 候选
+2. `semantic_rule_decision_node`：基于探索收益、可见性收益、语义收益、目标相关性、距离与交互代价选择行为
+3. `semantic_behavior_executor`：执行 `EXPLORE / NAVIGATE / INTERACT`，并等待探索、move_base、力交互和图状态反馈
+
+House 7 同起点、全部可交互门初始关闭、1000 step 验证中：
+
+- `frontier_only` 探索覆盖率为 `22.60%`
+- `interactive_rule` 探索覆盖率为 `84.73%`
+- 交互策略在第 `27`、`60` 个仿真 step 打开两扇门，最终动态图包含 `3` 个房间
+- 两路视频均为 `1000/1000` 精确 step 匹配、`15 FPS` 六联图
+
+进一步的 fridge obj-goal 测试中，系统先开门与探索，在目标进入动态图后切换到 `NAVIGATE` 并成功到达。通用模型评分 backend 已提供 `mock / command / HTTP` 接口，但第一阶段论文结果仍应以规则基线为主，避免把不可复现的远程模型作为必要条件。
 
 ---
 

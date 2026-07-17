@@ -13,6 +13,8 @@ topics:
   status: "/explore_py/status"
   frontiers: "/explore_py/frontiers"
   current_subgoal: "/explore_py/current_subgoal"
+  command: "/explore_py/command"
+  behavior_feedback: "/explore_py/behavior_feedback"
   reset: "/explore_py/reset"
   llm_value_grid: "/explore_py/llm_value_grid"
   strategy_bias: "/explore_py/strategy_bias"
@@ -23,6 +25,7 @@ topics:
   navigation_hints: "/semantic_mapping/navigation_hints"
 
 exploration:
+  external_control_enabled: false
   tick_rate_hz: 1.0
   goal_republish_interval_sec: 0.0
   goal_reach_tolerance_m: 0.35

@@ -913,6 +913,11 @@ class ExploreDebugRecorder:
         self.latest_unified_graph: dict = {}
         self.previous_unified_graph: dict = {}
         self.semantic_events: list[dict] = []
+        self.latest_semantic_selection: dict = {}
+        self.latest_semantic_execution_state: dict = {}
+        self.latest_semantic_behavior_feedback: dict = {}
+        self.semantic_decision_event_count = 0
+        self.last_semantic_execution_key = None
         self.pending_semantic_keyframe_revision = -1
         self.last_semantic_keyframe_revision = -1
         self.topology_slots: dict[str, tuple[int, int]] = {}
@@ -1150,6 +1155,33 @@ class ExploreDebugRecorder:
         self.subscribers.append(rospy.Subscriber(args.explore_status_topic, String, self.explore_status_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.gt_observations_topic, String, self.gt_observations_callback, queue_size=2))
         self.subscribers.append(rospy.Subscriber(args.unified_graph_topic, String, self.unified_graph_callback, queue_size=2))
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.semantic_selected_behavior_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("semantic_decision_selected", "latest_semantic_selection"),
+                queue_size=10,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.semantic_execution_state_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("semantic_decision_execution", "latest_semantic_execution_state"),
+                queue_size=10,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.semantic_behavior_feedback_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("semantic_decision_feedback", "latest_semantic_behavior_feedback"),
+                queue_size=20,
+            )
+        )
         self.subscribers.append(rospy.Subscriber(args.cmd_vel_topic, Twist, self.cmd_vel_callback, callback_args=args.cmd_vel_topic, queue_size=50))
         self.subscribers.append(rospy.Subscriber(args.global_plan_topic, NavPath, self.plan_callback, callback_args=("global", args.global_plan_topic), queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.local_global_plan_topic, NavPath, self.plan_callback, callback_args=("local_global", args.local_global_plan_topic), queue_size=20))
@@ -1202,6 +1234,10 @@ class ExploreDebugRecorder:
                 self.observed_instance_ids.clear()
                 self.topology_slots.clear()
                 self.topology_next_slot = {"room": 0, "portal": 0, "container": 0, "object": 0}
+                self.latest_semantic_selection = {}
+                self.latest_semantic_execution_state = {}
+                self.latest_semantic_behavior_feedback = {}
+                self.last_semantic_execution_key = None
             for observation in payload.get("observations") or []:
                 instance_id = str(observation.get("instance_id") or "")
                 if instance_id:
@@ -1249,6 +1285,32 @@ class ExploreDebugRecorder:
                     int(self.pending_semantic_keyframe_revision),
                 )
             )
+
+    def semantic_decision_event_callback(self, msg: String, callback_args: tuple[str, str]) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        event_type, attribute_name = callback_args
+        with self.lock:
+            if self.shutting_down:
+                return
+            setattr(self, attribute_name, payload)
+            if event_type == "semantic_decision_execution":
+                execution_key = (
+                    payload.get("state"),
+                    payload.get("decision_id"),
+                    payload.get("candidate_id"),
+                    payload.get("behavior_type"),
+                    payload.get("error"),
+                )
+                if execution_key == self.last_semantic_execution_key:
+                    return
+                self.last_semantic_execution_key = execution_key
+            self.semantic_decision_event_count += 1
+            self._write_event(event_type, {"payload": payload})
 
     @staticmethod
     def _semantic_graph_delta(previous: dict, current: dict) -> list[dict]:
@@ -1555,6 +1617,9 @@ class ExploreDebugRecorder:
             "semantic_events": graph_record[2],
             "observed_instance_ids": gt_record[2],
             "pending_semantic_keyframe_revision": int(graph_record[3]),
+            "semantic_selection": dict(self.latest_semantic_selection),
+            "semantic_execution_state": dict(self.latest_semantic_execution_state),
+            "semantic_behavior_feedback": dict(self.latest_semantic_behavior_feedback),
         }
 
     def _run_video_frame_renderer(self) -> None:
@@ -1827,10 +1892,28 @@ class ExploreDebugRecorder:
         graph: dict | None = None,
         semantic_events: list[dict] | None = None,
         observed_instance_ids: set[str] | None = None,
+        semantic_selection: dict | None = None,
+        semantic_execution_state: dict | None = None,
+        semantic_behavior_feedback: dict | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 250, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
         semantic_events = self.semantic_events if semantic_events is None else semantic_events
+        semantic_selection = (
+            self.latest_semantic_selection
+            if semantic_selection is None
+            else semantic_selection
+        )
+        semantic_execution_state = (
+            self.latest_semantic_execution_state
+            if semantic_execution_state is None
+            else semantic_execution_state
+        )
+        semantic_behavior_feedback = (
+            self.latest_semantic_behavior_feedback
+            if semantic_behavior_feedback is None
+            else semantic_behavior_feedback
+        )
         all_nodes = [
             node
             for node in graph.get("nodes") or []
@@ -1845,8 +1928,8 @@ class ExploreDebugRecorder:
             if node.get("type") in {"room", "portal", "container"} or node.get("id") in contained_ids
         ]
         slot_rows = {
-            "room": (int(panel_height * 0.18), 5),
-            "portal": (int(panel_height * 0.40), 7),
+            "room": (int(panel_height * 0.25), 5),
+            "portal": (int(panel_height * 0.46), 7),
             "container": (int(panel_height * 0.62), 6),
             "object": (int(panel_height * 0.78), 8),
         }
@@ -1879,6 +1962,8 @@ class ExploreDebugRecorder:
                 continue
             color = self._semantic_node_color(node)
             cv2.circle(panel, center, 13 if node.get("type") == "room" else 9, color, -1, cv2.LINE_AA)
+            if str(node.get("id") or "") == str(semantic_selection.get("target_id") or ""):
+                cv2.circle(panel, center, 17 if node.get("type") == "room" else 13, (20, 20, 20), 2, cv2.LINE_AA)
             state = str((node.get("interaction") or {}).get("state", ""))
             label = f"{self._short_node_id(node)} {node.get('label', node.get('type', ''))}"
             if state and state != "unknown":
@@ -1888,6 +1973,27 @@ class ExploreDebugRecorder:
         cv2.putText(panel, f"INTERACTION TOPOLOGY rev={revision}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (20, 20, 20), 2, cv2.LINE_AA)
         legend = "ROOM -- PORTAL -- ROOM    CONTAINER --contains--> OBJECT"
         cv2.putText(panel, legend, (10, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (75, 75, 75), 1, cv2.LINE_AA)
+        execution_state = str(semantic_execution_state.get("state") or "IDLE")
+        behavior_type = str(semantic_selection.get("behavior_type") or "-")
+        target_name = str(
+            semantic_selection.get("target_name")
+            or semantic_selection.get("target_id")
+            or "-"
+        )
+        feedback_status = str(semantic_behavior_feedback.get("status") or "-")
+        decision_text = (
+            f"DECISION {execution_state}  {behavior_type} -> {target_name}  feedback={feedback_status}"
+        )
+        cv2.putText(
+            panel,
+            decision_text[:76],
+            (10, 61),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.31,
+            (25, 25, 25),
+            1,
+            cv2.LINE_AA,
+        )
         event_y = panel_height - 62
         cv2.rectangle(panel, (6, event_y - 20), (panel_width - 6, panel_height - 6), (238, 238, 238), -1)
         for index, event in enumerate(semantic_events[-3:]):
@@ -1950,6 +2056,9 @@ class ExploreDebugRecorder:
                 gt_observations = snapshot["gt_observations"]
                 semantic_events = snapshot["semantic_events"]
                 observed_instance_ids = snapshot["observed_instance_ids"]
+                semantic_selection = snapshot["semantic_selection"]
+                semantic_execution_state = snapshot["semantic_execution_state"]
+                semantic_behavior_feedback = snapshot["semantic_behavior_feedback"]
                 graph_revision = int(graph.get("graph_revision", 0) or 0)
                 pending_semantic_keyframe_revision = int(snapshot["pending_semantic_keyframe_revision"])
             stamp_delta = abs(image_stamp - map_stamp) if image_stamp > 0.0 and map_stamp > 0.0 else float("inf")
@@ -2045,6 +2154,9 @@ class ExploreDebugRecorder:
                     graph=graph,
                     semantic_events=semantic_events,
                     observed_instance_ids=observed_instance_ids,
+                    semantic_selection=semantic_selection,
+                    semantic_execution_state=semantic_execution_state,
+                    semantic_behavior_feedback=semantic_behavior_feedback,
                 )
             video_size = (frame_width, frame_height)
             if (
@@ -4697,6 +4809,10 @@ class ExploreDebugRecorder:
                 "first_person_video_map_mode": "causal_state_snapshot_on_image_callback_offline_encode",
                 "semantic_video": bool(self.args.semantic_video),
                 "semantic_summary": self._semantic_summary(),
+                "semantic_decision_event_count": self.semantic_decision_event_count,
+                "semantic_decision_selection": self.latest_semantic_selection,
+                "semantic_decision_execution_state": self.latest_semantic_execution_state,
+                "semantic_decision_behavior_feedback": self.latest_semantic_behavior_feedback,
                 "semantic_graph_final": graph_final,
                 "semantic_events_jsonl": str(self.graph_dir / "graph_revision_events.jsonl"),
                 "semantic_keyframes": str(self.semantic_keyframe_dir),
@@ -4759,6 +4875,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--explore-status-topic", default="/explore_py/status")
     parser.add_argument("--gt-observations-topic", default="/semantic_mapping/gt_observations")
     parser.add_argument("--unified-graph-topic", default="/semantic_mapping/unified_graph")
+    parser.add_argument(
+        "--semantic-selected-behavior-topic",
+        default="/semantic_decision/selected_behavior",
+    )
+    parser.add_argument(
+        "--semantic-execution-state-topic",
+        default="/semantic_decision/execution_state",
+    )
+    parser.add_argument(
+        "--semantic-behavior-feedback-topic",
+        default="/semantic_decision/behavior_feedback",
+    )
     parser.add_argument("--global-plan-topic", default="/move_base/GlobalPlanner/plan")
     parser.add_argument("--local-global-plan-topic", default="/move_base/DWAPlannerROS/global_plan")
     parser.add_argument("--local-plan-topic", default="/move_base/DWAPlannerROS/local_plan")

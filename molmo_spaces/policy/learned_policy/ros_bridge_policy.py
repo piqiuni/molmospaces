@@ -620,6 +620,20 @@ class RosBridgePolicy(BasePolicy):
         if self._realtime_gt_publisher is not None:
             self._realtime_gt_publisher.reset()
 
+    def publish_realtime_gt_now(self, step_index: int | None = None):
+        if self._realtime_gt_publisher is None or self.task is None:
+            return None
+        stamp = self._next_common_stamp()
+        payload = self._realtime_gt_publisher.publish(
+            self.task,
+            stamp=stamp,
+            step_index=self._step_idx if step_index is None else int(step_index),
+            force=True,
+        )
+        if payload is not None:
+            self._latest_gt_payload = payload
+        return payload
+
     def prepare_episode_reset(self) -> None:
         self._episode_count += 1
         if self._episode_count <= 1:

@@ -1,0 +1,325 @@
+schema_version: 1
+description: House 7 routes sampled from the normal NavToObj initial placement. All
+  doors start closed; the target double door is opened with the force backend.
+scene:
+  scene_dataset: procthor-10k
+  data_split: train
+  house_ind: 7
+  variant: base
+  robot: rby1
+target_door_root: doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4
+sampling:
+  px_per_m: 60
+  downscale: 3
+  min_first_leg_m: 1.25
+  min_door_standoff_m: 1.15
+  min_total_route_m: 5.0
+  min_far_goal_distance_m: 2.5
+  min_far_goal_clearance_m: 0.45
+routes:
+- route_id: house7_force_route_01
+  seed: 0
+  pickup_obj_name: egg_38bed58e7b434c259f681e684f48c41f_1_0_6
+  robot_base_pose:
+  - 2.4119046654520426
+  - 4.787482821447575
+  - 0.0
+  - 0.9995742578449452
+  - 0.0
+  - 0.0
+  - -0.029177098103255115
+  start_xyyaw:
+  - 2.4119046654520426
+  - 4.787482821447575
+  - -0.05836247889746014
+  door_approach_xyyaw:
+  - 3.6714205323533142
+  - 4.880765859151639
+  - -4.132944776157705e-07
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
+  far_goal_xyyaw:
+  - 7.03213734981797
+  - 3.4363090893178603
+  - -0.24497866312686625
+  interaction:
+    backend: force
+    action: open
+    source_object_name: doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4
+    atomic_sim_steps: 1
+    assume_success: true
+  validation:
+    start_room_id: 2
+    goal_room_id: 5
+    start_room_name: room_4
+    goal_room_name: room_7
+    start_side_sign: 1
+    first_leg_path_length_m: 1.2538068945782377
+    door_standoff_m: 1.3000000000000003
+    third_leg_path_length_m: 4.669817486462565
+    total_route_path_length_m: 5.923624381040803
+    far_goal_portal_distance_m: 2.516546762835418
+    far_goal_clearance_m: 0.5425465703010559
+    closed_start_to_far_path_found: false
+    open_approach_to_far_path_found: true
+    start_collision: false
+- route_id: house7_force_route_02
+  seed: 2
+  pickup_obj_name: bed_131d94e4589c211aa2465cd79eb3a22f_1_0_4
+  robot_base_pose:
+  - 2.6194625210640536
+  - 5.153404362395681
+  - 0.0
+  - 0.3448978126369031
+  - 0.0
+  - 0.0
+  - 0.9386402393027266
+  start_xyyaw:
+  - 2.6194625210640536
+  - 5.153404362395681
+  - 2.437332822637999
+  door_approach_xyyaw:
+  - 3.82142045012548
+  - 4.681808815530107
+  - 0.17130992086883384
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
+  far_goal_xyyaw:
+  - 7.03213734981797
+  - 3.4363090893178603
+  - -0.24497866312686625
+  interaction:
+    backend: force
+    action: open
+    source_object_name: doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4
+    atomic_sim_steps: 1
+    assume_success: true
+  validation:
+    start_room_id: 2
+    goal_room_id: 5
+    start_room_name: room_4
+    goal_room_name: room_7
+    start_side_sign: 1
+    first_leg_path_length_m: 1.2998064236034987
+    door_standoff_m: 1.1670834933878025
+    third_leg_path_length_m: 4.548770533144492
+    total_route_path_length_m: 5.848576956747991
+    far_goal_portal_distance_m: 2.516546762835418
+    far_goal_clearance_m: 0.5425465703010559
+    closed_start_to_far_path_found: false
+    open_approach_to_far_path_found: true
+    start_collision: false
+- route_id: house7_force_route_03
+  seed: 9
+  pickup_obj_name: handcart_d34cb9858ee3e5488a511e4e50f6786d_1_0_7
+  robot_base_pose:
+  - 4.209836113421167
+  - 3.7867188403724383
+  - 0.0
+  - 0.9995560090007315
+  - 0.0
+  - 0.0
+  - -0.029795718996686517
+  start_xyyaw:
+  - 4.209836113421167
+  - 3.7867188403724383
+  - -0.05960025891399083
+  door_approach_xyyaw:
+  - 3.8214206145811236
+  - 5.079722778784828
+  - -0.1713107474577892
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
+  far_goal_xyyaw:
+  - 7.03213734981797
+  - 3.4363090893178603
+  - -0.24497866312686625
+  interaction:
+    backend: force
+    action: open
+    source_object_name: doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4
+    atomic_sim_steps: 1
+    assume_success: true
+  validation:
+    start_room_id: 2
+    goal_room_id: 5
+    start_room_name: room_4
+    goal_room_name: room_7
+    start_side_sign: 1
+    first_leg_path_length_m: 1.3696495856803839
+    door_standoff_m: 1.1670834933878023
+    third_leg_path_length_m: 4.528760518176558
+    total_route_path_length_m: 5.898410103856942
+    far_goal_portal_distance_m: 2.516546762835418
+    far_goal_clearance_m: 0.5425465703010559
+    closed_start_to_far_path_found: false
+    open_approach_to_far_path_found: true
+    start_collision: false
+- route_id: house7_force_route_04
+  seed: 10
+  pickup_obj_name: handcart_d34cb9858ee3e5488a511e4e50f6786d_1_0_7
+  robot_base_pose:
+  - 4.322487314524665
+  - 3.967093898377278
+  - 0.0
+  - 0.9880762739427137
+  - 0.0
+  - 0.0
+  - 0.15396518071136533
+  start_xyyaw:
+  - 4.322487314524665
+  - 3.967093898377278
+  - 0.3091601211794534
+  door_approach_xyyaw:
+  - 3.671420614581136
+  - 5.079722840779
+  - -0.15186587630020743
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
+  far_goal_xyyaw:
+  - 7.03213734981797
+  - 3.4363090893178603
+  - -0.24497866312686625
+  interaction:
+    backend: force
+    action: open
+    source_object_name: doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4
+    atomic_sim_steps: 1
+    assume_success: true
+  validation:
+    start_room_id: 2
+    goal_room_id: 5
+    start_room_name: room_4
+    goal_room_name: room_7
+    start_side_sign: 1
+    first_leg_path_length_m: 1.2884326081997888
+    door_standoff_m: 1.3151364493991782
+    third_leg_path_length_m: 4.677707444419149
+    total_route_path_length_m: 5.966140052618938
+    far_goal_portal_distance_m: 2.516546762835418
+    far_goal_clearance_m: 0.5425465703010559
+    closed_start_to_far_path_found: false
+    open_approach_to_far_path_found: true
+    start_collision: false
+- route_id: house7_force_route_05
+  seed: 38
+  pickup_obj_name: toilettissue_ad9a69d48e1d874d5c781c530c5ece52_1_0_5
+  robot_base_pose:
+  - 2.483879065901432
+  - 4.960609915125371
+  - 0.0
+  - -0.5382548447910132
+  - 0.0
+  - 0.0
+  - 0.8427821320240496
+  start_xyyaw:
+  - 2.483879065901432
+  - 4.960609915125371
+  - -2.004862594696924
+  door_approach_xyyaw:
+  - 3.8214205323533017
+  - 4.880765797157467
+  - -4.1329447767518055e-07
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
+  far_goal_xyyaw:
+  - 7.03213734981797
+  - 3.4363090893178603
+  - -0.24497866312686625
+  interaction:
+    backend: force
+    action: open
+    source_object_name: doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4
+    atomic_sim_steps: 1
+    assume_success: true
+  validation:
+    start_room_id: 2
+    goal_room_id: 5
+    start_room_name: room_4
+    goal_room_name: room_7
+    start_side_sign: 1
+    first_leg_path_length_m: 1.3534970646803104
+    door_standoff_m: 1.15
+    third_leg_path_length_m: 4.519861743948227
+    total_route_path_length_m: 5.873358808628538
+    far_goal_portal_distance_m: 2.516546762835418
+    far_goal_clearance_m: 0.5425465703010559
+    closed_start_to_far_path_found: false
+    open_approach_to_far_path_found: true
+    start_collision: false
+- route_id: house7_force_route_06
+  seed: 40
+  pickup_obj_name: diningtable_9c02a064c4b425976de085d4eaaa59cb_1_0_7
+  robot_base_pose:
+  - 2.8601875877314367
+  - 6.170744277993355
+  - 0.0
+  - 0.9090510997904131
+  - 0.0
+  - 0.0
+  - -0.41668465050903936
+  start_xyyaw:
+  - 2.8601875877314367
+  - 6.170744277993355
+  - -0.8595904286154981
+  door_approach_xyyaw:
+  - 3.671420614581136
+  - 5.079722840779
+  - -0.15186587630020743
+  portal_center_xy:
+  - 4.9714205323532035
+  - 4.880765321868818
+  portal_normal_xy:
+  - -0.9999999999999147
+  - 4.1329447748364417e-07
+  portal_half_width_m: 0.994784908136888
+  far_goal_xyyaw:
+  - 7.03213734981797
+  - 3.4363090893178603
+  - -0.24497866312686625
+  interaction:
+    backend: force
+    action: open
+    source_object_name: doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4
+    atomic_sim_steps: 1
+    assume_success: true
+  validation:
+    start_room_id: 2
+    goal_room_id: 5
+    start_room_name: room_4
+    goal_room_name: room_7
+    start_side_sign: 1
+    first_leg_path_length_m: 1.5425876709702377
+    door_standoff_m: 1.3151364493991782
+    third_leg_path_length_m: 4.677707444419149
+    total_route_path_length_m: 6.220295115389387
+    far_goal_portal_distance_m: 2.516546762835418
+    far_goal_clearance_m: 0.5425465703010559
+    closed_start_to_far_path_found: false
+    open_approach_to_far_path_found: true
+    start_collision: false

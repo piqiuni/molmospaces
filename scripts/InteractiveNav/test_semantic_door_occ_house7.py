@@ -24,6 +24,7 @@ from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 from semantic_mapping_py_pkg.semantic_occ_overlay import SemanticOccupancyOverlay
 
+from force_interaction_runtime import ForceDriveConfig, open_door_root_with_force
 from read_scene_room_properties import build_scene_config
 
 
@@ -36,6 +37,8 @@ def parse_args():
     parser.add_argument("--variant", default="base", choices=["base", "ceiling", "map"])
     parser.add_argument("--resolution", type=float, default=0.1)
     parser.add_argument("--clear-padding-m", type=float, default=0.1)
+    parser.add_argument("--interaction-mode", choices=["direct", "force"], default="direct")
+    parser.add_argument("--force-max-physics-substeps", type=int, default=2500)
     parser.add_argument("--output", type=Path, default=Path("/tmp/semantic_door_occ_house7.json"))
     return parser.parse_args()
 
@@ -175,7 +178,17 @@ def run_group(env, root_id, leaves, args):
         if closed_stats["cleared_cells"] != 0:
             raise AssertionError("Closed portal unexpectedly cleared occupancy")
 
-        set_group_state(env, leaves, use_open_state=True)
+        force_result = None
+        if args.interaction_mode == "force":
+            force_result = open_door_root_with_force(
+                env,
+                closed_observation["instance_id"],
+                config=ForceDriveConfig(
+                    max_physics_substeps=args.force_max_physics_substeps,
+                ),
+            )
+        else:
+            set_group_state(env, leaves, use_open_state=True)
         open_observation = root_observation(env, root_id, leaves)
         store.update_observations([open_observation], source_mode="realtime_gt_observation")
         open_graph = store.as_graph_dict()
@@ -199,6 +212,8 @@ def run_group(env, root_id, leaves, args):
             "cleared_cells": int(open_stats["cleared_cells"]),
             "joint_infos_closed": closed_observation["joint_infos"],
             "joint_infos_open": open_observation["joint_infos"],
+            "interaction_mode": args.interaction_mode,
+            "force_result": force_result,
         }
     finally:
         for original, (_door_name, door, hinge_index) in zip(originals, leaves):
@@ -221,6 +236,7 @@ def main():
             "scene_dataset": args.scene_dataset,
             "data_split": args.data_split,
             "house_ind": args.house_ind,
+            "interaction_mode": args.interaction_mode,
             "doorway_root_count": len(results),
             "single_door_root_count": sum(result["leaf_count"] == 1 for result in results),
             "multi_leaf_root_count": sum(result["leaf_count"] > 1 for result in results),

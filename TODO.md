@@ -205,10 +205,16 @@
 - [ ] MolmoSpaces 侧能构造 `obj-goal` / `point-goal` 下“纯导航不可达 / 开门后可达”的 episode
 - [ ] MolmoSpaces 侧能用 GT / oracle 跑通 door-centric 的 obj-goal / point-goal 交互导航基座
 - [ ] ROS 侧能以 detector-only 输入稳定产出交互对象与交互图表示
-- [ ] 能在图或地图层表达 `door -> requires interaction -> unlocks connectivity`
-- [ ] 至少有一条规划链能输出“先交互再导航”的行为序列
-- [ ] 交互后能更新状态并继续导航
-- [ ] 至少有一组可重复的可视化、日志或案例结果，可直接服务论文材料
+- [x] 能在图或地图层表达 `door -> requires interaction -> unlocks connectivity`
+- [x] 固定路线执行链能输出并执行“导航到门前 -> 力交互开门 -> 继续导航”的行为序列
+- [x] 交互结果通过 MuJoCo joint readback 回写图状态，并更新 semantic planning OCC 后继续导航
+- [x] House 7 已形成 6 条随机初始位姿冻结路线、最多 2 worker 回归和逐 step 15 FPS 六联图产物
+- [x] 将固定路线行为序列替换为统一候选生成、规则评分与独立行为执行器
+- [x] House 7 关门条件下完成 `frontier_only` 与 `interactive_rule` 的 1000-step 同起点对比；交互策略依次打开近门和目标双开门
+- [x] 决策模块与动态图分离，统一支持 `EXPLORE / NAVIGATE / INTERACT` 候选及原子动作反馈
+- [x] 完成 fridge obj-goal 场景闭环：目标未观测时探索/开门，目标进入动态图后生成 `NAVIGATE` 候选并到达
+- [x] 预留通用模型评分 backend，支持 `mock / command / HTTP`，默认仍使用可复现规则策略
+- [ ] 将当前单场景结果扩展到多 seed、多场景统计，并加入真实模型 API 对比
 - [ ] 完成 AAAI 投稿版本所需的实验主表、消融表与案例图
 
 ## Phase 2：交互图接口稳定化
