@@ -91,3 +91,30 @@ def test_container_candidates_can_be_enabled_without_changing_portal_logic() -> 
     candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
     assert len(candidates) == 1
     assert candidates[0].metadata["node_type"] == "container"
+
+
+def test_portal_approach_uses_door_aabb_normal() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig(portal_standoff_m=1.15))
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_double",
+                "type": "portal",
+                "centroid": [5.0, 5.0, 1.0],
+                "aabb_size": [0.2, 2.0, 2.1],
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+    candidate = generator.generate({}, graph, robot_xy=(2.0, 3.0))[0]
+    assert math.isclose(candidate.goal_xyyaw[0], 3.75, abs_tol=1e-6)
+    assert math.isclose(candidate.goal_xyyaw[1], 5.0, abs_tol=1e-6)
+    assert math.isclose(candidate.goal_xyyaw[2], 0.0, abs_tol=1e-6)
+    assert candidate.metadata["approach_strategy"] == "portal_aabb_normal"

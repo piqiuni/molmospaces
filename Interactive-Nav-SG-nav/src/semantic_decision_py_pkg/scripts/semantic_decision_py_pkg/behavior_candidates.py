@@ -148,7 +148,11 @@ class CandidateGenerator:
                 if node_type == "portal"
                 else self.config.container_standoff_m
             )
-            approach = self._approach_pose(robot_xy, position, standoff)
+            approach = (
+                self._portal_approach_pose(robot_xy, position, node, standoff)
+                if node_type == "portal"
+                else self._approach_pose(robot_xy, position, standoff)
+            )
             approach_distance = math.hypot(
                 approach[0] - robot_xy[0], approach[1] - robot_xy[1]
             )
@@ -204,6 +208,9 @@ class CandidateGenerator:
                         "state_age_sec": state_age_sec,
                         "object_distance_m": object_distance,
                         "requires_approach": approach_distance > self.config.interaction_ready_distance_m,
+                        "approach_strategy": (
+                            "portal_aabb_normal" if node_type == "portal" else "radial_standoff"
+                        ),
                     },
                 )
             )
@@ -230,5 +237,36 @@ class CandidateGenerator:
             unit_x, unit_y = dx / distance, dy / distance
         x = target_xy[0] + unit_x * max(0.0, standoff_m)
         y = target_xy[1] + unit_y * max(0.0, standoff_m)
+        yaw = math.atan2(target_xy[1] - y, target_xy[0] - x)
+        return [x, y, yaw]
+
+    @classmethod
+    def _portal_approach_pose(
+        cls,
+        robot_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+        node: dict[str, Any],
+        standoff_m: float,
+    ) -> list[float]:
+        size = list(node.get("aabb_size") or [])
+        if len(size) < 2:
+            return cls._approach_pose(robot_xy, target_xy, standoff_m)
+        size_x = max(0.0, float(size[0]))
+        size_y = max(0.0, float(size[1]))
+        major = max(size_x, size_y)
+        minor = min(size_x, size_y)
+        if major <= 1e-6 or major / max(minor, 1e-6) < 1.35:
+            return cls._approach_pose(robot_xy, target_xy, standoff_m)
+        if size_x <= size_y:
+            normal_x, normal_y = 1.0, 0.0
+        else:
+            normal_x, normal_y = 0.0, 1.0
+        side = 1.0 if (
+            (robot_xy[0] - target_xy[0]) * normal_x
+            + (robot_xy[1] - target_xy[1]) * normal_y
+        ) >= 0.0 else -1.0
+        offset = max(0.0, standoff_m) + 0.5 * minor
+        x = target_xy[0] + side * normal_x * offset
+        y = target_xy[1] + side * normal_y * offset
         yaw = math.atan2(target_xy[1] - y, target_xy[0] - x)
         return [x, y, yaw]

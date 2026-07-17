@@ -21,7 +21,7 @@ candidate:
   portal_standoff_m: 1.15
   container_standoff_m: 0.90
   interaction_ready_distance_m: 0.45
-  require_current_visibility: false
+  require_current_visibility: true
 
 policy:
   exploration_gain_weight: 1.0
@@ -38,6 +38,7 @@ policy:
   continuity_bonus: 0.25
   minimum_score: -1000000000.0
   failure_cooldown_s: 45.0
+  success_cooldown_s: 5.0
 
 executor:
   map_frame: "tf_frame_map"

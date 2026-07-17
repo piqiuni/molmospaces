@@ -37,9 +37,12 @@ class SemanticRuleDecisionNode:
             )
         )
         self.failure_cooldown_s = float(config.get("failure_cooldown_s", 45.0))
+        self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
         self.latest_candidates_payload: dict = {}
         self.active_candidate_id = ""
         self.active_decision_id = ""
+        self.active_behavior_type = ""
+        self.minimum_candidate_sequence = 0
         self.cooldown_until: dict[str, float] = {}
         self.decision_index = 0
         self.selected_pub = rospy.Publisher(
@@ -75,6 +78,8 @@ class SemanticRuleDecisionNode:
         if episode_id and previous_episode and episode_id != previous_episode:
             self.active_candidate_id = ""
             self.active_decision_id = ""
+            self.active_behavior_type = ""
+            self.minimum_candidate_sequence = 0
             self.cooldown_until.clear()
         self.latest_candidates_payload = payload
 
@@ -90,14 +95,27 @@ class SemanticRuleDecisionNode:
         status = str(payload.get("status") or "")
         if status not in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
             return
-        if status != "SUCCEEDED" and candidate_id:
-            self.cooldown_until[candidate_id] = time.monotonic() + self.failure_cooldown_s
+        if candidate_id:
+            cooldown_s = (
+                self.success_cooldown_s if status == "SUCCEEDED" else self.failure_cooldown_s
+            )
+            self.cooldown_until[candidate_id] = time.monotonic() + cooldown_s
+        if status == "SUCCEEDED" and self.active_behavior_type == "INTERACT":
+            self.minimum_candidate_sequence = max(
+                self.minimum_candidate_sequence,
+                int(self.latest_candidates_payload.get("sequence", 0) or 0) + 1,
+            )
         self.active_candidate_id = ""
         self.active_decision_id = ""
+        self.active_behavior_type = ""
 
     def _tick(self, _event) -> None:
         if self.active_candidate_id:
             return
+        candidate_sequence = int(self.latest_candidates_payload.get("sequence", 0) or 0)
+        if candidate_sequence < self.minimum_candidate_sequence:
+            return
+        self.minimum_candidate_sequence = 0
         now = time.monotonic()
         candidates = []
         for payload in self.latest_candidates_payload.get("candidates") or []:
@@ -145,6 +163,7 @@ class SemanticRuleDecisionNode:
         )
         self.active_candidate_id = selected.candidate_id
         self.active_decision_id = decision_id
+        self.active_behavior_type = selected.behavior_type
         self.selected_pub.publish(
             String(data=json.dumps(selection, ensure_ascii=False, separators=(",", ":")))
         )
