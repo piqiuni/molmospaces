@@ -11,6 +11,7 @@ class RulePolicyConfig:
     exploration_gain_weight: float = 1.0
     visibility_gain_weight: float = 0.8
     semantic_gain_weight: float = 0.6
+    target_relevance_weight: float = 3.0
     confidence_weight: float = 0.25
     priority_weight: float = 0.45
     distance_cost_weight: float = 0.45
@@ -41,6 +42,8 @@ class RulePolicy:
             * float(features.get("visibility_gain", 0.0)),
             "semantic_gain": self.config.semantic_gain_weight
             * float(features.get("semantic_gain", 0.0)),
+            "target_relevance": self.config.target_relevance_weight
+            * float(features.get("target_relevance", 0.0)),
             "confidence": self.config.confidence_weight
             * float(features.get("confidence", 0.0)),
             "priority": self.config.priority_weight

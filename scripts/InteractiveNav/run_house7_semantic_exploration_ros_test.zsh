@@ -19,6 +19,7 @@ SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
 RECORDER_DRAIN_TIMEOUT_S=${RECORDER_DRAIN_TIMEOUT_S:-240}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/house7_force_route_nav.yaml}
 SEMANTIC_DECISION_CONFIG=${SEMANTIC_DECISION_CONFIG:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/config/default.yaml}
+SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-}
 
 case "${METHOD}" in
   frontier_only)
@@ -27,8 +28,16 @@ case "${METHOD}" in
   interactive_rule)
     START_SEMANTIC_DECISION=true
     ;;
+  object_goal_rule)
+    START_SEMANTIC_DECISION=true
+    SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/house7_object_goal_fridge.yaml}
+    ;;
+  object_goal_model_mock)
+    START_SEMANTIC_DECISION=true
+    SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/house7_object_goal_fridge_model_mock.yaml}
+    ;;
   *)
-    print -u2 -- "Unsupported METHOD=${METHOD}; use frontier_only or interactive_rule"
+    print -u2 -- "Unsupported METHOD=${METHOD}; use frontier_only, interactive_rule, object_goal_rule, or object_goal_model_mock"
     exit 2
     ;;
 esac
@@ -134,6 +143,7 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   start_explore_py:=true \
   start_semantic_decision:="${START_SEMANTIC_DECISION}" \
   semantic_decision_config_file:="${SEMANTIC_DECISION_CONFIG}" \
+  semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
   nav_config_override_file:="${ROUTE_NAV_CONFIG}" \
   global_planner_allow_unknown:=true \
   local_costmap_inflation_radius:=0.20 \
@@ -251,6 +261,11 @@ if events_path.exists():
             pass
 decision_rows = [event for event in debug_events if event.get("type") == "semantic_decision_selected"]
 feedback_rows = [event for event in debug_events if event.get("type") == "semantic_decision_feedback"]
+terminal_feedback = [
+    event.get("payload") or {}
+    for event in feedback_rows
+    if (event.get("payload") or {}).get("status") in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}
+]
 result = {
     "method": method,
     "route_id": route_id,
@@ -269,6 +284,12 @@ result = {
     ],
     "successful_behavior_count": sum(
         (event.get("payload") or {}).get("status") == "SUCCEEDED" for event in feedback_rows
+    ),
+    "target_goal_success": any(
+        payload.get("status") == "SUCCEEDED"
+        and payload.get("behavior_type") == "NAVIGATE"
+        and str(payload.get("candidate_id") or "").startswith("target:")
+        for payload in terminal_feedback
     ),
     "valid_step_video": sim_frames == task_horizon and video.get("output_frame_count") == task_horizon,
 }

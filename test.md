@@ -869,6 +869,60 @@ python scripts/InteractiveNav/run_house7_force_route_batch.py \
 - `<route>/offline_video_sync.csv`
 - `<batch>/summary.json`
 
+运行 House 7 关门条件下的统一探索对比。每个任务使用独立 ROS master，最多两个 worker；两种方法都启动实时 GT 动态图和六联图记录，但只有 `interactive_rule` 启动上层行为决策与力交互：
+
+```bash
+source /home/user/miniconda3/etc/profile.d/conda.sh
+conda activate mlspaces
+SIM_TIMEOUT_S=1800 RECORDER_DRAIN_TIMEOUT_S=300 \
+python scripts/InteractiveNav/run_house7_semantic_exploration_batch.py \
+  --output-dir outputs/house7_semantic_comparison_1000 \
+  --route-ids house7_force_route_01 \
+  --methods frontier_only interactive_rule \
+  --task-horizon 1000 \
+  --workers 2 \
+  --base-master-port 11570 \
+  --route-timeout-s 2400
+```
+
+主要产物：
+
+- `<method>/<route>/semantic_exploration_result.json`
+- `<method>/<route>/debug/exploration_coverage.json`
+- `<method>/<route>/videos/overview_6panel.mp4`
+- `<method>/<route>/offline_video_sync.csv`
+- `<batch>/comparison_summary.csv`
+
+2026-07-17 的同起点 1000-step 验证结果：`frontier_only` 覆盖率 `0.2260`、移动 `0.98m`、房间数 `1`；`interactive_rule` 覆盖率 `0.8473`、移动 `12.64m`、房间数 `3`，在仿真 step `27/60` 各执行一次开门。两路均保存 `1000/1000` 视频帧，精确 step 匹配数为 `1000`，最大时间戳误差为 `4.77e-7s`。
+
+运行 fridge obj-goal 规则测试：
+
+```bash
+python scripts/InteractiveNav/run_house7_semantic_exploration_batch.py \
+  --output-dir outputs/house7_object_goal_fridge \
+  --route-ids house7_force_route_01 \
+  --methods object_goal_rule \
+  --task-horizon 400 \
+  --workers 1 \
+  --base-master-port 11580
+```
+
+该模式加载 `configs/semantic_decision/house7_object_goal_fridge.yaml`。目标未进入动态图时继续评估 frontier 和 portal；发现 `fridge/refrigerator` 后生成 `NAVIGATE` 候选，到达后 `/semantic_decision/goal_status` 发布 `SUCCEEDED` 并停止继续选取新行为。正式回归在 400 step 内完成两次开门、两次探索和一次目标导航，覆盖率为 `0.8157`。
+
+验证模型评分接口时使用本地可复现 mock backend：
+
+```bash
+python scripts/InteractiveNav/run_house7_semantic_exploration_batch.py \
+  --output-dir outputs/house7_object_goal_fridge_model_mock \
+  --route-ids house7_force_route_01 \
+  --methods object_goal_model_mock \
+  --task-horizon 400 \
+  --workers 1 \
+  --base-master-port 11590
+```
+
+真实模型可在 semantic decision override 中将 `policy.backend` 设为 `model`，并把 `model.mode` 设为 `command` 或 `http`；API key 仅从 `model.api_key_env` 指定的环境变量读取，不写入仓库。
+
 正式 ROS 联调会把机器人固定在目标门前，初始化时直接关闭全部门，第 `OPEN_STEP` 个仿真 step 直接将目标门铰链设为全开。测试同时保存 raw OCC、semantic planning OCC、door clear mask、move_base global costmap、闭/开门图状态和对比图：
 
 ```bash

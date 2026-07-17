@@ -39,6 +39,8 @@ class CandidateGeneratorConfig:
     container_standoff_m: float = 0.90
     interaction_ready_distance_m: float = 0.45
     require_current_visibility: bool = False
+    target_standoff_m: float = 0.90
+    target_max_state_age_sec: float = 300.0
 
 
 class CandidateGenerator:
@@ -50,11 +52,108 @@ class CandidateGenerator:
         explorer_status: dict[str, Any] | None,
         graph: dict[str, Any] | None,
         robot_xy: tuple[float, float] | None,
+        target_context: dict[str, Any] | None = None,
     ) -> list[BehaviorCandidate]:
         candidates = self._frontier_candidates(explorer_status or {})
         if robot_xy is not None:
             candidates.extend(self._interaction_candidates(graph or {}, robot_xy))
+            candidates.extend(
+                self._target_candidates(graph or {}, robot_xy, target_context or {})
+            )
         return sorted(candidates, key=lambda candidate: candidate.candidate_id)
+
+    def _target_candidates(
+        self,
+        graph: dict[str, Any],
+        robot_xy: tuple[float, float],
+        target_context: dict[str, Any],
+    ) -> list[BehaviorCandidate]:
+        if not bool(target_context.get("enabled")):
+            return []
+        candidates = []
+        for node in graph.get("nodes") or []:
+            if str(node.get("type") or "") in {"scene", "room", "portal"}:
+                continue
+            if not self._matches_target(node, target_context):
+                continue
+            state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
+            if state_age_sec > self.config.target_max_state_age_sec:
+                continue
+            position = self._node_xy(node)
+            if position is None:
+                continue
+            goal = self._approach_pose(
+                robot_xy,
+                position,
+                float(target_context.get("standoff_m", self.config.target_standoff_m)),
+            )
+            distance_m = math.hypot(goal[0] - robot_xy[0], goal[1] - robot_xy[1])
+            node_id = str(node.get("id") or "")
+            candidates.append(
+                BehaviorCandidate(
+                    candidate_id=f"target:{node_id}",
+                    behavior_type=BEHAVIOR_NAVIGATE,
+                    source="unified_graph_target",
+                    target_id=node_id,
+                    target_name=str(node.get("name") or node.get("label") or node_id),
+                    goal_xyyaw=goal,
+                    features={
+                        "exploration_gain": 0.0,
+                        "visibility_gain": 0.2,
+                        "semantic_gain": 1.0,
+                        "target_relevance": 1.0,
+                        "distance_m": distance_m,
+                        "interaction_cost": 0.0,
+                        "state_age_ratio": min(
+                            1.0,
+                            state_age_sec / max(self.config.target_max_state_age_sec, 1e-6),
+                        ),
+                        "confidence": float(node.get("confidence", 1.0) or 1.0),
+                        "priority": 1.0,
+                    },
+                    metadata={
+                        "target_goal": True,
+                        "target_context": dict(target_context),
+                        "node_type": str(node.get("type") or "object"),
+                        "is_currently_visible": bool(node.get("is_currently_visible")),
+                        "state_age_sec": state_age_sec,
+                        "approach_strategy": "target_radial_standoff",
+                    },
+                )
+            )
+        return candidates
+
+    @staticmethod
+    def _matches_target(node: dict[str, Any], target_context: dict[str, Any]) -> bool:
+        requested = list(target_context.get("object_labels") or [])
+        for key in ("object_label", "target_object", "target_name"):
+            value = target_context.get(key)
+            if value:
+                requested.append(value)
+        requested_tokens = {
+            str(value).strip().casefold() for value in requested if str(value).strip()
+        }
+        if not requested_tokens:
+            return False
+        attributes = node.get("attributes") or {}
+        observed = {
+            str(value).strip().casefold()
+            for value in (
+                node.get("label"),
+                node.get("name"),
+                attributes.get("category"),
+                attributes.get("semantic_name"),
+                attributes.get("source_object_name"),
+            )
+            if str(value or "").strip()
+        }
+        return any(
+            requested == observed_value
+            or requested in observed_value
+            or observed_value in requested
+            for requested in requested_tokens
+            for observed_value in observed
+        )
 
     def _frontier_candidates(self, status: dict[str, Any]) -> list[BehaviorCandidate]:
         clusters = list(status.get("frontier_clusters") or [])

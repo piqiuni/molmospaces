@@ -41,3 +41,12 @@ def test_policy_is_deterministic_and_rewards_continuity() -> None:
     second = candidate("b", "EXPLORE", distance=1.0)
     assert policy.select([second, first]).candidate_id == "a"
     assert policy.select([second, first], current_candidate_id="b").candidate_id == "b"
+
+
+def test_target_candidate_beats_equal_distance_exploration() -> None:
+    policy = RulePolicy()
+    target = candidate("target", "NAVIGATE", distance=2.0, gain=0.0)
+    target.features["target_relevance"] = 1.0
+    target.metadata["target_goal"] = True
+    frontier = candidate("frontier", "EXPLORE", distance=2.0, gain=1.0)
+    assert policy.select([frontier, target]).candidate_id == "target"

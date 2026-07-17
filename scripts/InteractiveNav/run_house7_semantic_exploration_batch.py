@@ -37,7 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=("frontier_only", "interactive_rule"),
+        choices=(
+            "frontier_only",
+            "interactive_rule",
+            "object_goal_rule",
+            "object_goal_model_mock",
+        ),
         default=["frontier_only", "interactive_rule"],
     )
     parser.add_argument("--workers", type=int, default=2)
@@ -184,6 +189,7 @@ def write_summary(output_dir: Path, results: list[dict[str, Any]]) -> None:
         "decision_count",
         "successful_behavior_count",
         "interaction_count",
+        "target_goal_success",
         "valid_step_video",
         "output_dir",
     ]

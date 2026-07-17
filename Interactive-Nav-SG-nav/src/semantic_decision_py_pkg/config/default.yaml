@@ -3,6 +3,8 @@ topics:
   unified_graph: "/semantic_mapping/unified_graph"
   odom: "/odom"
   candidates: "/semantic_decision/candidates"
+  target_context: "/semantic_decision/target"
+  goal_status: "/semantic_decision/goal_status"
   selected_behavior: "/semantic_decision/selected_behavior"
   behavior_feedback: "/semantic_decision/behavior_feedback"
   execution_state: "/semantic_decision/execution_state"
@@ -22,11 +24,15 @@ candidate:
   container_standoff_m: 0.90
   interaction_ready_distance_m: 0.45
   require_current_visibility: true
+  target_standoff_m: 0.90
+  target_max_state_age_sec: 300.0
 
 policy:
+  backend: "rule"
   exploration_gain_weight: 1.0
   visibility_gain_weight: 0.8
   semantic_gain_weight: 0.6
+  target_relevance_weight: 3.0
   confidence_weight: 0.25
   priority_weight: 0.45
   distance_cost_weight: 0.45
@@ -39,6 +45,17 @@ policy:
   minimum_score: -1000000000.0
   failure_cooldown_s: 45.0
   success_cooldown_s: 5.0
+  failure_retry_delay_s: 2.0
+
+model:
+  mode: "disabled"
+  command: ""
+  endpoint: ""
+  api_key_env: "OPENAI_API_KEY"
+  model: ""
+  timeout_s: 20.0
+  max_graph_nodes: 80
+  max_graph_edges: 160
 
 executor:
   map_frame: "tf_frame_map"

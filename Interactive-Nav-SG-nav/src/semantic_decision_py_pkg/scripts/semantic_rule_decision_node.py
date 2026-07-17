@@ -5,6 +5,7 @@ import json
 import time
 
 from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate
+from semantic_decision_py_pkg.model_policy import ModelPolicyClient, ModelPolicyConfig
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.rule_policy import RulePolicy, RulePolicyConfig
 
@@ -19,11 +20,13 @@ class SemanticRuleDecisionNode:
         rospy.init_node("semantic_rule_decision_node")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~policy", {}) or {}
+        model_config = rospy.get_param("~model", {}) or {}
         self.policy = RulePolicy(
             RulePolicyConfig(
                 exploration_gain_weight=float(config.get("exploration_gain_weight", 1.0)),
                 visibility_gain_weight=float(config.get("visibility_gain_weight", 0.8)),
                 semantic_gain_weight=float(config.get("semantic_gain_weight", 0.6)),
+                target_relevance_weight=float(config.get("target_relevance_weight", 3.0)),
                 confidence_weight=float(config.get("confidence_weight", 0.25)),
                 priority_weight=float(config.get("priority_weight", 0.45)),
                 distance_cost_weight=float(config.get("distance_cost_weight", 0.45)),
@@ -38,11 +41,29 @@ class SemanticRuleDecisionNode:
         )
         self.failure_cooldown_s = float(config.get("failure_cooldown_s", 45.0))
         self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
+        self.failure_retry_delay_s = float(config.get("failure_retry_delay_s", 2.0))
+        self.policy_backend = str(config.get("backend", "rule")).casefold()
+        self.model_policy = ModelPolicyClient(
+            ModelPolicyConfig(
+                mode=str(model_config.get("mode", "disabled")),
+                command=str(model_config.get("command", "")),
+                endpoint=str(model_config.get("endpoint", "")),
+                api_key_env=str(model_config.get("api_key_env", "OPENAI_API_KEY")),
+                model=str(model_config.get("model", "")),
+                timeout_s=float(model_config.get("timeout_s", 20.0)),
+                max_graph_nodes=int(model_config.get("max_graph_nodes", 80)),
+                max_graph_edges=int(model_config.get("max_graph_edges", 160)),
+            )
+        )
         self.latest_candidates_payload: dict = {}
         self.active_candidate_id = ""
         self.active_decision_id = ""
         self.active_behavior_type = ""
         self.minimum_candidate_sequence = 0
+        self.next_decision_time = 0.0
+        self.goal_complete = False
+        self.target_context: dict = {}
+        self.active_target_goal = False
         self.cooldown_until: dict[str, float] = {}
         self.decision_index = 0
         self.selected_pub = rospy.Publisher(
@@ -53,6 +74,12 @@ class SemanticRuleDecisionNode:
         )
         self.trace_pub = rospy.Publisher(
             "/semantic_decision/decision_trace", String, queue_size=1, latch=True
+        )
+        self.goal_status_pub = rospy.Publisher(
+            topics.get("goal_status", "/semantic_decision/goal_status"),
+            String,
+            queue_size=2,
+            latch=True,
         )
         rospy.Subscriber(
             topics.get("candidates", "/semantic_decision/candidates"),
@@ -80,7 +107,21 @@ class SemanticRuleDecisionNode:
             self.active_decision_id = ""
             self.active_behavior_type = ""
             self.minimum_candidate_sequence = 0
+            self.next_decision_time = 0.0
+            self.goal_complete = False
+            self.active_target_goal = False
             self.cooldown_until.clear()
+        target_context = payload.get("target_context") or {}
+        target_key = json.dumps(target_context, ensure_ascii=False, sort_keys=True)
+        previous_target_key = json.dumps(
+            self.target_context, ensure_ascii=False, sort_keys=True
+        )
+        if target_key != previous_target_key:
+            self.target_context = dict(target_context)
+            self.goal_complete = False
+            self._publish_goal_status(
+                "ACTIVE" if target_context.get("enabled") else "DISABLED"
+            )
         self.latest_candidates_payload = payload
 
     def _feedback_callback(self, message: String) -> None:
@@ -100,17 +141,27 @@ class SemanticRuleDecisionNode:
                 self.success_cooldown_s if status == "SUCCEEDED" else self.failure_cooldown_s
             )
             self.cooldown_until[candidate_id] = time.monotonic() + cooldown_s
+        if status != "SUCCEEDED":
+            self.next_decision_time = time.monotonic() + self.failure_retry_delay_s
         if status == "SUCCEEDED" and self.active_behavior_type == "INTERACT":
             self.minimum_candidate_sequence = max(
                 self.minimum_candidate_sequence,
                 int(self.latest_candidates_payload.get("sequence", 0) or 0) + 1,
             )
+        if status == "SUCCEEDED" and self.active_target_goal:
+            self.goal_complete = True
+            self._publish_goal_status("SUCCEEDED", detail=payload.get("detail") or {})
         self.active_candidate_id = ""
         self.active_decision_id = ""
         self.active_behavior_type = ""
+        self.active_target_goal = False
 
     def _tick(self, _event) -> None:
         if self.active_candidate_id:
+            return
+        if time.monotonic() < self.next_decision_time:
+            return
+        if self.goal_complete:
             return
         candidate_sequence = int(self.latest_candidates_payload.get("sequence", 0) or 0)
         if candidate_sequence < self.minimum_candidate_sequence:
@@ -134,11 +185,21 @@ class SemanticRuleDecisionNode:
             key=lambda candidate: (-candidate.score, candidate.candidate_id),
             default=None,
         )
+        if self.policy_backend == "model":
+            model_selected = self.model_policy.select(
+                eligible,
+                target_context=self.latest_candidates_payload.get("target_context") or {},
+                graph=self.latest_candidates_payload.get("graph_context") or {},
+            )
+            if model_selected is not None:
+                selected = model_selected
         trace = {
             "timestamp": time.time(),
             "episode_id": self.latest_candidates_payload.get("episode_id", ""),
             "graph_revision": self.latest_candidates_payload.get("graph_revision", 0),
             "active_candidate_id": self.active_candidate_id,
+            "policy_backend": self.policy_backend,
+            "model_error": self.model_policy.last_error,
             "ranked_candidates": [
                 candidate.to_dict()
                 for candidate in sorted(scored, key=lambda item: (-item.score, item.candidate_id))
@@ -158,14 +219,31 @@ class SemanticRuleDecisionNode:
                 "selected_at": time.time(),
                 "episode_id": self.latest_candidates_payload.get("episode_id", ""),
                 "graph_revision": self.latest_candidates_payload.get("graph_revision", 0),
-                "policy_mode": "rule_cost_v1",
+                "policy_mode": (
+                    f"model_{self.model_policy.config.mode}"
+                    if self.policy_backend == "model"
+                    else "rule_cost_v1"
+                ),
             }
         )
         self.active_candidate_id = selected.candidate_id
         self.active_decision_id = decision_id
         self.active_behavior_type = selected.behavior_type
+        self.active_target_goal = bool((selected.metadata or {}).get("target_goal"))
         self.selected_pub.publish(
             String(data=json.dumps(selection, ensure_ascii=False, separators=(",", ":")))
+        )
+
+    def _publish_goal_status(self, status: str, detail: dict | None = None) -> None:
+        payload = {
+            "status": status,
+            "target_context": dict(self.target_context),
+            "decision_id": self.active_decision_id,
+            "timestamp": time.time(),
+            "detail": detail or {},
+        }
+        self.goal_status_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
 
 

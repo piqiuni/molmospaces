@@ -118,3 +118,33 @@ def test_portal_approach_uses_door_aabb_normal() -> None:
     assert math.isclose(candidate.goal_xyyaw[1], 5.0, abs_tol=1e-6)
     assert math.isclose(candidate.goal_xyyaw[2], 0.0, abs_tol=1e-6)
     assert candidate.metadata["approach_strategy"] == "portal_aabb_normal"
+
+
+def test_observed_target_generates_navigation_candidate() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_fridge",
+                "type": "container",
+                "label": "fridge",
+                "name": "refrigerator_asset",
+                "centroid": [4.0, 2.0, 1.0],
+                "confidence": 1.0,
+                "state_age_sec": 2.0,
+                "is_currently_visible": True,
+            }
+        ]
+    }
+    candidates = generator.generate(
+        {},
+        graph,
+        robot_xy=(1.0, 2.0),
+        target_context={"enabled": True, "object_labels": ["fridge"]},
+    )
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.behavior_type == "NAVIGATE"
+    assert candidate.candidate_id == "target:container_fridge"
+    assert candidate.features["target_relevance"] == 1.0
+    assert candidate.metadata["target_goal"] is True

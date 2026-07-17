@@ -8,6 +8,7 @@ from semantic_decision_py_pkg.behavior_candidates import (
     CandidateGenerator,
     CandidateGeneratorConfig,
 )
+from semantic_decision_py_pkg.model_policy import compact_graph
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 
 patch_roslogging_findcaller_for_py311()
@@ -37,10 +38,15 @@ class SemanticCandidateNode:
                 require_current_visibility=bool(
                     config.get("require_current_visibility", False)
                 ),
+                target_standoff_m=float(config.get("target_standoff_m", 0.90)),
+                target_max_state_age_sec=float(
+                    config.get("target_max_state_age_sec", 300.0)
+                ),
             )
         )
         self.explorer_status: dict = {}
         self.graph: dict = {}
+        self.target_context: dict = dict(rospy.get_param("~target", {}) or {})
         self.robot_xy: tuple[float, float] | None = None
         self.sequence = 0
         self.publisher = rospy.Publisher(
@@ -62,6 +68,12 @@ class SemanticCandidateNode:
             queue_size=1,
         )
         rospy.Subscriber(
+            topics.get("target_context", "/semantic_decision/target"),
+            String,
+            self._target_callback,
+            queue_size=2,
+        )
+        rospy.Subscriber(
             topics.get("odom", "/odom"), Odometry, self._odom_callback, queue_size=1
         )
         self.timer = rospy.Timer(rospy.Duration(1.0), self._publish)
@@ -78,6 +90,14 @@ class SemanticCandidateNode:
         except json.JSONDecodeError:
             return
 
+    def _target_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        if isinstance(payload, dict):
+            self.target_context = payload
+
     def _odom_callback(self, message: Odometry) -> None:
         self.robot_xy = (
             float(message.pose.pose.position.x),
@@ -86,7 +106,7 @@ class SemanticCandidateNode:
 
     def _publish(self, _event) -> None:
         candidates = self.generator.generate(
-            self.explorer_status, self.graph, self.robot_xy
+            self.explorer_status, self.graph, self.robot_xy, self.target_context
         )
         self.sequence += 1
         payload = {
@@ -96,6 +116,8 @@ class SemanticCandidateNode:
             "episode_id": self.graph.get("episode_id", ""),
             "graph_revision": self.graph.get("graph_revision", 0),
             "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
+            "target_context": dict(self.target_context),
+            "graph_context": compact_graph(self.graph),
             "candidate_count": len(candidates),
             "candidates": [candidate.to_dict() for candidate in candidates],
         }
