@@ -21,6 +21,7 @@
   <arg name="explore_py_config_override_file" default=""/>
   <arg name="nav_config_override_file" default=""/>
   <arg name="base_local_planner" default="dwa_local_planner/DWAPlannerROS"/>
+  <arg name="global_planner_allow_unknown" default="false"/>
 
   <arg name="robot" default="rby1"/>
   <arg name="scene_dataset" default="procthor-10k"/>
@@ -141,6 +142,7 @@
       <arg name="override_config_file" value="$(arg nav_config_override_file)"/>
       <arg name="base_local_planner" value="$(arg base_local_planner)"/>
       <arg name="global_map_topic" value="$(arg global_map_topic)"/>
+      <arg name="global_planner_allow_unknown" value="$(arg global_planner_allow_unknown)"/>
     </include>
     <param name="/move_base/local_costmap/inflation_layer/inflation_radius"
            value="$(arg local_costmap_inflation_radius)"/>

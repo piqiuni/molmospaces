@@ -837,6 +837,20 @@ MUJOCO_GL=egl python scripts/InteractiveNav/sample_house7_force_routes.py \
 
 继续扩大 seed 范围时可通过 `--reuse-diagnostics <path>` 复用已完成样本，只启动缺失 seed。
 
+运行单条固定路线的完整 ROS 闭环：
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:11431 \
+  scripts/InteractiveNav/run_house7_force_route_ros_test.zsh \
+  outputs/house7_force_route_01 \
+  house7_force_route_01
+```
+
+该固定路线验收单独设置 `global_planner_allow_unknown:=true`，以便开门后进入尚未完成
+occupancy 建图的门后房间；该参数默认仍为 `false`，探索实验不启用。
+
+执行器依次等待 `move_base` 到达门前、验证语义图中的 closed portal、发布力交互原子动作、验证 open portal，再导航到远端目标；事件与最终结果写入 `route_result.json`。
+
 正式 ROS 联调会把机器人固定在目标门前，初始化时直接关闭全部门，第 `OPEN_STEP` 个仿真 step 直接将目标门铰链设为全开。测试同时保存 raw OCC、semantic planning OCC、door clear mask、move_base global costmap、闭/开门图状态和对比图：
 
 ```bash

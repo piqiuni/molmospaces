@@ -3,6 +3,7 @@
     <arg name="override_config_file" default=""/>
     <arg name="base_local_planner" default="dwa_local_planner/DWAPlannerROS"/>
     <arg name="global_map_topic" default="/struct_mapping/occ_map"/>
+    <arg name="global_planner_allow_unknown" default="false"/>
 
     <node pkg="nav_pkg" type="relay_node" name="relay_node" output="screen"/>
 
@@ -19,7 +20,7 @@
         <param name="GlobalPlanner/use_dijkstra" value="true" />
         <param name="GlobalPlanner/use_quadratic" value="true" />
         <param name="GlobalPlanner/use_grid_path" value="false" />
-        <param name="GlobalPlanner/allow_unknown" value="false" />
+        <param name="GlobalPlanner/allow_unknown" value="$(arg global_planner_allow_unknown)" />
         <param name="GlobalPlanner/orientation_window_size" value="8" />
         <param name="GlobalPlanner/path_smoothing_enabled" value="true" />
         <param name="GlobalPlanner/path_smoothing_resample_distance" value="0.05" />
