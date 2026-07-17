@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import time
+
+from semantic_decision_py_pkg.behavior_candidates import (
+    CandidateGenerator,
+    CandidateGeneratorConfig,
+)
+from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
+
+patch_roslogging_findcaller_for_py311()
+
+import rospy
+from nav_msgs.msg import Odometry
+from std_msgs.msg import String
+
+
+class SemanticCandidateNode:
+    def __init__(self) -> None:
+        rospy.init_node("semantic_candidate_node")
+        topics = rospy.get_param("~topics", {}) or {}
+        config = rospy.get_param("~candidate", {}) or {}
+        self.generator = CandidateGenerator(
+            CandidateGeneratorConfig(
+                max_frontier_candidates=int(config.get("max_frontier_candidates", 12)),
+                interaction_types=tuple(config.get("interaction_types", ["portal"])),
+                max_interaction_distance_m=float(config.get("max_interaction_distance_m", 6.0)),
+                max_state_age_sec=float(config.get("max_state_age_sec", 60.0)),
+                min_state_confidence=float(config.get("min_state_confidence", 0.5)),
+                portal_standoff_m=float(config.get("portal_standoff_m", 1.15)),
+                container_standoff_m=float(config.get("container_standoff_m", 0.90)),
+                interaction_ready_distance_m=float(
+                    config.get("interaction_ready_distance_m", 0.45)
+                ),
+                require_current_visibility=bool(
+                    config.get("require_current_visibility", False)
+                ),
+            )
+        )
+        self.explorer_status: dict = {}
+        self.graph: dict = {}
+        self.robot_xy: tuple[float, float] | None = None
+        self.sequence = 0
+        self.publisher = rospy.Publisher(
+            topics.get("candidates", "/semantic_decision/candidates"),
+            String,
+            queue_size=1,
+            latch=True,
+        )
+        rospy.Subscriber(
+            topics.get("explorer_status", "/explore_py/status"),
+            String,
+            self._explorer_callback,
+            queue_size=1,
+        )
+        rospy.Subscriber(
+            topics.get("unified_graph", "/semantic_mapping/unified_graph"),
+            String,
+            self._graph_callback,
+            queue_size=1,
+        )
+        rospy.Subscriber(
+            topics.get("odom", "/odom"), Odometry, self._odom_callback, queue_size=1
+        )
+        self.timer = rospy.Timer(rospy.Duration(1.0), self._publish)
+
+    def _explorer_callback(self, message: String) -> None:
+        try:
+            self.explorer_status = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+
+    def _graph_callback(self, message: String) -> None:
+        try:
+            self.graph = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+
+    def _odom_callback(self, message: Odometry) -> None:
+        self.robot_xy = (
+            float(message.pose.pose.position.x),
+            float(message.pose.pose.position.y),
+        )
+
+    def _publish(self, _event) -> None:
+        candidates = self.generator.generate(
+            self.explorer_status, self.graph, self.robot_xy
+        )
+        self.sequence += 1
+        payload = {
+            "schema_version": 1,
+            "sequence": self.sequence,
+            "timestamp": time.time(),
+            "episode_id": self.graph.get("episode_id", ""),
+            "graph_revision": self.graph.get("graph_revision", 0),
+            "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
+            "candidate_count": len(candidates),
+            "candidates": [candidate.to_dict() for candidate in candidates],
+        }
+        self.publisher.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        )
+
+
+if __name__ == "__main__":
+    SemanticCandidateNode()
+    rospy.spin()

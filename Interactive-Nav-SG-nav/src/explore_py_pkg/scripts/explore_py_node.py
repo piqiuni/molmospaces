@@ -44,7 +44,13 @@ from visualization_msgs.msg import Marker, MarkerArray
 from explore_py_pkg.frontier_core import FrontierConfig, FrontierExplorerCore, GridSpec, OccupancyGridData
 from explore_py_pkg.nav_client import TERMINAL_FAILURE, TERMINAL_SUCCESS, status_name
 from explore_py_pkg.skill_api import ExplorationSkillApi
-from explore_py_pkg.state import ExplorerState, ExplorerStateConfig, SUBGOAL_REACHED, SUBGOAL_WAITING
+from explore_py_pkg.state import (
+    ExplorerState,
+    ExplorerStateConfig,
+    SUBGOAL_REACHED,
+    SUBGOAL_REACHED_POSE_ONLY,
+    SUBGOAL_WAITING,
+)
 from explore_py_pkg.value_maps import ValueMapFusion
 
 
@@ -76,6 +82,11 @@ class ExplorePyNode:
         self.initial_spin_last_yaw = None
         self.initial_spin_accumulated_yaw = 0.0
         self.initial_spin_reason = "disabled" if self.initial_spin_done else "pending"
+        self.external_control_enabled = bool(
+            exploration_cfg.get("external_control_enabled", False)
+        )
+        self.external_command = None
+        self.external_command_started = False
         self.local_plan_watchdog_enabled = bool(exploration_cfg.get("local_plan_watchdog_enabled", True))
         self.local_plan_watchdog_sec = float(exploration_cfg.get("local_plan_watchdog_sec", 12.0))
         self.local_plan_min_poses = int(exploration_cfg.get("local_plan_min_poses", 3))
@@ -228,6 +239,12 @@ class ExplorePyNode:
         self.subgoal_pub = rospy.Publisher(
             self.topics.get("current_subgoal", "/explore_py/current_subgoal"), PointStamped, queue_size=1
         )
+        self.behavior_feedback_pub = rospy.Publisher(
+            self.topics.get("behavior_feedback", "/explore_py/behavior_feedback"),
+            String,
+            queue_size=10,
+            latch=True,
+        )
 
         rospy.Subscriber(self.topics.get("occupancy_grid", "/struct_mapping/occ_map"), OccupancyGrid, self.occupancy_callback, queue_size=1)
         rospy.Subscriber(self.topics.get("odom", "/odom"), Odometry, self.odom_callback, queue_size=1)
@@ -252,6 +269,12 @@ class ExplorePyNode:
             queue_size=1,
         )
         rospy.Subscriber(self.topics.get("reset", "/explore_py/reset"), Empty, self.reset_callback, queue_size=1)
+        rospy.Subscriber(
+            self.topics.get("command", "/explore_py/command"),
+            String,
+            self.external_command_callback,
+            queue_size=10,
+        )
 
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.tick_rate_hz, 1e-3)), self.tick)
         self.initial_spin_cmd_timer = rospy.Timer(
@@ -264,6 +287,10 @@ class ExplorePyNode:
                       self.topics.get("move_base_status", "/move_base/status"))
 
     def reset_callback(self, _msg):
+        if self.external_command_started and self.external_command is not None:
+            self._publish_external_feedback(
+                "CANCELED", False, {"reason": "explorer_reset"}
+            )
         self._cancel_move_base_goal("external_reset")
         self.state = ExplorerState(self.state.config)
         self.value_fusion = ValueMapFusion()
@@ -299,6 +326,8 @@ class ExplorePyNode:
         self.initial_spin_last_yaw = None
         self.initial_spin_accumulated_yaw = 0.0
         self.initial_spin_reason = "disabled" if self.initial_spin_done else "pending"
+        self.external_command = None
+        self.external_command_started = False
         marker = Marker()
         marker.action = Marker.DELETEALL
         self.frontier_pub.publish(MarkerArray(markers=[marker]))
@@ -323,6 +352,75 @@ class ExplorePyNode:
 
     def navigation_hints_callback(self, msg):
         self.value_fusion.set_navigation_hints_json(msg.data)
+
+    def external_command_callback(self, msg):
+        try:
+            command = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if not self.external_control_enabled:
+            self._publish_external_feedback(
+                "REJECTED",
+                False,
+                {"reason": "external_control_disabled"},
+                command=command,
+            )
+            return
+        action = str(command.get("action") or "")
+        if action == "cancel":
+            if self.state.active_goal is not None:
+                self._cancel_move_base_goal("external_cancel")
+                self.state.clear_active_goal("failed", event="external_cancel")
+            self._publish_external_feedback(
+                "CANCELED", False, {"reason": "external_cancel"}, command=command
+            )
+            self.external_command = None
+            self.external_command_started = False
+            return
+        if action != "execute_frontier":
+            self._publish_external_feedback(
+                "REJECTED",
+                False,
+                {"reason": f"unsupported_action:{action}"},
+                command=command,
+            )
+            return
+        if self.state.active_goal is not None or self.external_command_started:
+            self._publish_external_feedback(
+                "REJECTED", False, {"reason": "explorer_busy"}, command=command
+            )
+            return
+        if self.latest_grid is None or self.robot_xy is None:
+            self._publish_external_feedback(
+                "REJECTED", False, {"reason": "explorer_not_ready"}, command=command
+            )
+            return
+        self.compute_next_subgoal(force=True, publish_selection=False)
+        cluster_id = str(command.get("cluster_id") or "")
+        cluster = next(
+            (
+                candidate
+                for candidate in self.latest_clusters
+                if candidate.cluster_id == cluster_id
+            ),
+            None,
+        )
+        if cluster is None:
+            self._publish_external_feedback(
+                "REJECTED",
+                False,
+                {"reason": "frontier_candidate_not_available", "cluster_id": cluster_id},
+                command=command,
+            )
+            return
+        self.external_command = command
+        self.external_command_started = True
+        self._send_goal(cluster)
+        self._publish_external_feedback(
+            "STARTED",
+            None,
+            {"cluster_id": cluster.cluster_id, "goal": list(cluster.subgoal_world)},
+        )
 
     def global_plan_callback(self, msg: NavPath):
         self.latest_global_plan_pose_count = len(msg.poses)
@@ -466,13 +564,14 @@ class ExplorePyNode:
 
         if self.state.active_goal is None:
             cluster = self.compute_next_subgoal(force=True)
-            if cluster is not None:
+            if cluster is not None and not self.external_control_enabled:
                 self._send_goal(cluster)
         else:
             now = time.time()
             if self.goal_republish_interval_sec > 0.0 and now - self.last_goal_publish_time >= self.goal_republish_interval_sec:
                 self._publish_active_goal()
 
+        self._maybe_publish_external_terminal_feedback()
         self._publish_frontiers()
         self._publish_status()
 
@@ -590,6 +689,13 @@ class ExplorePyNode:
                 "navigation_hint_count": len(self.value_fusion.navigation_hints),
                 "has_llm_value_grid": self.value_fusion.llm_value_grid is not None,
                 "strategy_bias": self.value_fusion.strategy_bias,
+            },
+            "external_control": {
+                "enabled": self.external_control_enabled,
+                "command_active": self.external_command_started,
+                "command_id": ""
+                if self.external_command is None
+                else self.external_command.get("command_id", ""),
             },
             "initial_spin": {
                 "enabled": self.initial_spin_enabled,
@@ -796,6 +902,54 @@ class ExplorePyNode:
 
     def _publish_status(self):
         self.status_pub.publish(String(data=json.dumps(self.build_status_payload(), ensure_ascii=False, sort_keys=True)))
+
+    def _maybe_publish_external_terminal_feedback(self):
+        if (
+            not self.external_control_enabled
+            or not self.external_command_started
+            or self.external_command is None
+            or self.state.active_goal is not None
+        ):
+            return
+        event = str(self.state.last_event or "")
+        success_events = {
+            SUBGOAL_REACHED,
+            SUBGOAL_REACHED_POSE_ONLY,
+            "frontier_gone",
+            "frontier_unreachable_after_viewpoint_reached",
+        }
+        success = event in success_events
+        self._publish_external_feedback(
+            "SUCCEEDED" if success else "FAILED",
+            success,
+            {
+                "event": event,
+                "failure_reason": self.state.last_failure_reason,
+                "failure_source": self.state.last_failure_source,
+            },
+        )
+        self.external_command = None
+        self.external_command_started = False
+
+    def _publish_external_feedback(
+        self, status, success, detail, command=None
+    ):
+        payload_command = self.external_command if command is None else command
+        payload_command = payload_command or {}
+        payload = {
+            "command_id": payload_command.get("command_id", ""),
+            "decision_id": payload_command.get("decision_id", ""),
+            "candidate_id": payload_command.get("candidate_id", ""),
+            "cluster_id": payload_command.get("cluster_id", ""),
+            "behavior_type": "EXPLORE",
+            "status": status,
+            "success": success,
+            "detail": detail,
+            "timestamp": time.time(),
+        }
+        self.behavior_feedback_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        )
 
     def _publish_frontiers(self):
         markers = MarkerArray()

@@ -6,6 +6,7 @@
   <arg name="start_mapping" default="true"/>
   <arg name="mapping_mode" default="odom_locked"/>
   <arg name="start_semantic_mapping" default="false"/>
+  <arg name="start_semantic_decision" default="false"/>
   <arg name="semantic_planning_occ_topic" default="/semantic_mapping/planning_occ_map"/>
   <arg name="global_map_topic"
        default="$(eval arg('semantic_planning_occ_topic') if arg('start_semantic_mapping') else '/struct_mapping/occ_map')"/>
@@ -50,6 +51,7 @@
   <arg name="initial_right_arm_qpos" default="0.28,0.0,0.45,-0.64,0.39,-0.26,-0.04"/>
   <arg name="publish_debug_front_camera" default="false"/>
   <arg name="semantic_config_file" default="$(find semantic_mapping_py_pkg)/config/default.yaml"/>
+  <arg name="semantic_decision_config_file" default="$(find semantic_decision_py_pkg)/config/default.yaml"/>
   <arg name="semantic_object_detection_backend" default="yoloe_pf_box3d"/>
   <arg name="semantic_object_detection_provider" default="yoloe_local"/>
   <arg name="semantic_object_detection_model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
@@ -134,6 +136,13 @@
     <include file="$(find explore_py_pkg)/launch/explore_py.launch">
       <arg name="config_file" value="$(arg explore_py_config_file)"/>
       <arg name="override_config_file" value="$(arg explore_py_config_override_file)"/>
+      <arg name="external_control_enabled" value="$(arg start_semantic_decision)"/>
+    </include>
+  </group>
+
+  <group if="$(arg start_semantic_decision)">
+    <include file="$(find semantic_decision_py_pkg)/launch/semantic_decision.launch">
+      <arg name="config_file" value="$(arg semantic_decision_config_file)"/>
     </include>
   </group>
 
