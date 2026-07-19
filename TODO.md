@@ -471,6 +471,8 @@
 
 ### 4.5.1 当前固定评测标准
 
+详细定义见 [`docs/interactive_navigation_metrics.md`](docs/interactive_navigation_metrics.md)。
+
 主评测表保持简洁，只报告 5 个方法无关指标：
 
 | 指标 | 定义 | 备注 |

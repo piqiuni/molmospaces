@@ -281,6 +281,8 @@ c
 
 ### 6.4 当前评测标准
 
+详细定义见 [`docs/interactive_navigation_metrics.md`](docs/interactive_navigation_metrics.md)。
+
 当前交互导航评测采用简洁主指标，避免把调试诊断项全部放入论文主表。主指标固定为：
 
 | 指标 | 含义 |
