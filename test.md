@@ -244,12 +244,29 @@ python scripts/InteractiveNav/collect_interactive_nav.py \
 可独立恢复的阶段为 `manifest`、`seeds`、`light`、`balance` 和 `audit`。正式
 100 条测试按有效 V3 episode 数冻结为 `channel=34`、`container=33`、`mixed=33`；
 不生成 `open_gt_control`，不主动构造错误动作 rollout，mixed 只接收
-`mixed_required_verified`。当前示例配置对应本机已安装的 `train_0..train_99`；
-扩展 house 范围前先安装对应 train scene 资产。每屋抽样上限为
+`mixed_required_verified`。当前示例配置显式限制为 `train_0..train_99`；扩大范围时
+由 scene registry 按配置枚举并按需加载对应资源。每屋抽样上限为
 channel=2、container=2、mixed=3。
 
 2026-07-20 实测审计：100/100 V3 valid、0 validation error、0 placeholder、
 100 unique case ID、39 unique house；三类 house 覆盖为 18/25/13。
+
+source 配置示例：
+
+- `procthor10k_train_100.yaml`：`scene_split/train`，重新采样目标和机器人起点。
+- `procthor10k_scene_val_preferred.yaml`：`scene_split/val`，按目标类别及
+  起点—目标直线距离偏好采样。
+- `procthor10k_nav_benchmark_val.yaml`：`nav_benchmark/val`，保留原始 benchmark
+  的目标和起点；container/mixed 仍先生成 rough catalog 再做 fine。
+
+复用预计算 rough 时可配置：
+
+```yaml
+rough:
+  container_catalog: /path/to/container/rough_catalog.json
+  mixed_catalog: /path/to/mixed/mixed_rough_catalog.json
+  generate_if_missing: false
+```
 
 统一入口相关测试：
 

@@ -11,6 +11,16 @@
 `scripts/InteractiveNav/collect_interactive_nav.py`，它负责从版本化 scene pool 生成 seed
 episode、调用三类现有 builder、按有效 episode 配额冻结均衡数据，并执行统一结构审计。
 
+source 支持两种模式：`kind: scene_split` 从 train/val scene pool 重新采样目标和
+机器人起点，可配置目标类别、目标实例、起点—目标直线距离范围与远近偏好；
+`kind: nav_benchmark` 直接保留原始 NavToObj benchmark 的目标和机器人起点。
+channel 可直接使用 benchmark episode，container 和 mixed 仍必须先生成对应 rough
+catalog，再执行 fine 交互验证。
+
+可通过 `rough.container_catalog` / `rough.mixed_catalog` 复用已有 rough；设置
+`rough.generate_if_missing: false` 时，缺失 rough 会立即报错，不会绕过 rough 阶段
+直接生成 container/mixed fine 数据。
+
 当前正式三类为 `channel`、`container`、`mixed`。统一生产配置不生成
 `open_gt_control`，不主动构造错误动作 rollout；mixed 只接受真实
 `mixed_required_verified` 门到容器因果链。

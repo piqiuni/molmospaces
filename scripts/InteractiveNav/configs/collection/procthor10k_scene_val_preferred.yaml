@@ -1,17 +1,20 @@
 source:
   kind: scene_split
   scene_dataset: procthor-10k
-  data_split: train
+  data_split: val
   houses: all
-  start_house: 0
-  end_house: 100
   variant: base
+  preferred_object_categories: [book, cellphone, cup, remotecontrol]
+  preferred_object_names: []
+  min_start_goal_distance_m: 3.0
+  max_start_goal_distance_m: 15.0
+  prefer_longest_start_goal: true
   seeds_per_house: 4
-  seed_candidate_pool: 1024
+  seed_candidate_pool: 4096
   missing_scene_policy: fail
 
 collection:
-  mode: full
+  mode: light
   schema_version: interactive_nav_v3
   open_gt_control: false
   synthetic_wrong_action_rollout: false
@@ -29,32 +32,16 @@ policy:
   navigation_executor: astar
   channel:
     executor: force
-    target_fraction: 1.0
-    max_steps: 1500
-    tolerance: 0.001
   container:
     executor: force
-    target_fraction: 1.0
-    max_steps: 1500
-    tolerance: 0.001
-
-full:
-  max_episodes: 1
-  domains: [mixed]
-  max_steps: 500
-  max_base_adjustment_steps: 300
-  video_fps: 10.0
-  required_open_fraction: 0.67
-  image_width: 320
-  image_height: 180
 
 runtime:
-  workers: 1
-  seed: 20260720
+  workers: 4
+  seed: 20260721
   resume: true
   mujoco_gl: egl
-  save_images: true
+  save_images: false
   save_plots: false
 
 output:
-  root: scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_train_100
+  root: scripts/InteractiveNav/output/interactive_nav_v3_scene_val_preferred

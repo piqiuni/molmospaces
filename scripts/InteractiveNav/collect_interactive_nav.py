@@ -27,6 +27,7 @@ from scripts.InteractiveNav.collection.scene_source import build_scene_manifest
 from scripts.InteractiveNav.collection.seed_builder import (
     build_house_seed_episodes,
     load_template_episode,
+    write_nav_benchmark_source,
 )
 from scripts.InteractiveNav.collection.full_rollout_recorder import validate_full_rollout
 
@@ -58,6 +59,12 @@ def output_root(config: CollectionConfig) -> Path:
     root = config.output.root
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def source_benchmark_path(config: CollectionConfig) -> Path:
+    if config.source.kind == "nav_benchmark":
+        return output_root(config) / "source" / "benchmark.json"
+    return output_root(config) / "seeds" / "benchmark.json"
 
 
 def save_resolved_config(config: CollectionConfig) -> None:
@@ -138,6 +145,11 @@ def run_seed_worker(config: CollectionConfig, house_indices: list[int], output_p
                 seeds_per_house=config.source.seeds_per_house,
                 candidate_pool=config.source.seed_candidate_pool,
                 template=template,
+                preferred_object_categories=config.source.preferred_object_categories,
+                preferred_object_names=config.source.preferred_object_names,
+                min_start_goal_distance_m=config.source.min_start_goal_distance_m,
+                max_start_goal_distance_m=config.source.max_start_goal_distance_m,
+                prefer_longest_start_goal=config.source.prefer_longest_start_goal,
             )
             episodes.extend(generated)
             failures.extend(failed)
@@ -160,6 +172,8 @@ def run_seed_worker(config: CollectionConfig, house_indices: list[int], output_p
 
 
 def build_seed_benchmark(config: CollectionConfig) -> Path:
+    if config.source.kind == "nav_benchmark":
+        return write_nav_benchmark_source(config.source, output_root(config))
     manifest_path = output_root(config) / "scene_manifest.json"
     # Re-resolve from the current config so a changed house range cannot
     # silently reuse a stale scene selection.
@@ -242,13 +256,19 @@ def run_light_collectors(config: CollectionConfig, seed_benchmark: Path) -> dict
     common_env.setdefault("MPLCONFIGDIR", str(root / "matplotlib-cache"))
     targets = config.balance.target_counts()
     run_door_parallel(config, seed_episodes, root, common_env)
-    rough = root / "container_rough" / "rough_catalog.json"
-    if not (config.runtime.resume and rough.exists()):
+    rough = config.rough.container_catalog or (
+        root / "container_rough" / "rough_catalog.json"
+    )
+    if not rough.exists():
+        if not config.rough.generate_if_missing:
+            raise FileNotFoundError(
+                f"Container fine collection requires a precomputed rough catalog: {rough}"
+            )
         container_rough_command = [
             PYTHON,
             "scripts/InteractiveNav/collect_container_rough_catalog_parallel.py",
             "--benchmark_dir", str(seed_benchmark),
-            "--output_dir", str(root / "container_rough"),
+            "--output_dir", str(rough.parent),
             "--workers", str(config.runtime.workers),
             "--mujoco_gl", config.runtime.mujoco_gl,
         ]
@@ -310,7 +330,9 @@ def run_light_collectors(config: CollectionConfig, seed_benchmark: Path) -> dict
         run_command(container_fine_command, log_path=root / "container.log", env=common_env)
     if not container_benchmark.exists():
         raise RuntimeError(f"container benchmark was not produced: {container_benchmark}")
-    mixed_rough = root / "mixed_rough" / "mixed_rough_catalog.json"
+    mixed_rough = config.rough.mixed_catalog or (
+        root / "mixed_rough" / "mixed_rough_catalog.json"
+    )
     resumed_mixed_candidates: list[dict[str, Any]] = []
     resumed_mixed_houses: list[dict[str, Any]] = []
     resumed_mixed_failures: list[dict[str, Any]] = []
@@ -362,13 +384,17 @@ def run_light_collectors(config: CollectionConfig, seed_benchmark: Path) -> dict
                     "shards": [],
                 },
             )
-    if not (config.runtime.resume and mixed_rough.exists()):
+    if not mixed_rough.exists():
+        if not config.rough.generate_if_missing:
+            raise FileNotFoundError(
+                f"Mixed fine collection requires a precomputed rough catalog: {mixed_rough}"
+            )
         mixed_rough_command = [
             PYTHON,
             "scripts/InteractiveNav/collect_mixed_rough_catalog.py",
             "--container_rough_catalog", str(rough),
             "--benchmark_dir", str(seed_benchmark),
-            "--output_dir", str(root / "mixed_rough"),
+            "--output_dir", str(mixed_rough.parent),
             "--workers", str(config.runtime.workers),
             "--mujoco_gl", config.runtime.mujoco_gl,
         ]
@@ -1204,7 +1230,11 @@ def main() -> int:
     if config.collection.mode == "full" and args.stage in {"light", "all"}:
         raise ValueError("Use --stage full when collection.mode=full")
     if args.stage == "manifest":
-        print(write_manifest(config))
+        if config.source.kind == "nav_benchmark":
+            benchmark = write_nav_benchmark_source(config.source, output_root(config))
+            print(benchmark.with_name("benchmark_manifest.json"))
+        else:
+            print(write_manifest(config))
         return 0
     if args.stage == "seed-worker":
         if not args.worker_houses or args.worker_output is None:
@@ -1214,7 +1244,7 @@ def main() -> int:
     if args.stage in {"seeds", "all"}:
         seed_benchmark = build_seed_benchmark(config)
     else:
-        seed_benchmark = output_root(config) / "seeds" / "benchmark.json"
+        seed_benchmark = source_benchmark_path(config)
     if args.stage == "seeds":
         print(seed_benchmark)
         return 0

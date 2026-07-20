@@ -41,6 +41,94 @@ def load_template_episode(path: Path = DEFAULT_TEMPLATE_BENCHMARK) -> dict[str, 
     return template
 
 
+def load_benchmark_episodes(path: Path) -> list[dict[str, Any]]:
+    benchmark_path = path / "benchmark.json" if path.is_dir() else path
+    payload = json.loads(benchmark_path.read_text())
+    episodes = payload.get("episodes", payload) if isinstance(payload, dict) else payload
+    if isinstance(episodes, dict):
+        episodes = list(episodes.values())
+    if not isinstance(episodes, list):
+        raise ValueError(f"Unsupported benchmark payload in {benchmark_path}")
+    return [copy.deepcopy(episode) for episode in episodes]
+
+
+def _benchmark_house_filter(config: SourceConfig, episodes: list[dict[str, Any]]) -> set[int]:
+    available = sorted({int(episode["house_index"]) for episode in episodes})
+    if config.houses != "all":
+        allowed = {int(index) for index in config.houses}
+        available = [index for index in available if index in allowed]
+    available = [
+        index
+        for index in available
+        if index >= config.start_house
+        and (config.end_house is None or index < config.end_house)
+    ]
+    if config.max_houses is not None:
+        available = available[: config.max_houses]
+    return set(available)
+
+
+def load_nav_benchmark_source(
+    config: SourceConfig,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    path = config.benchmark_path or DEFAULT_TEMPLATE_BENCHMARK
+    episodes = load_benchmark_episodes(path)
+    indexed_split_episodes = [
+        (episode_index, episode)
+        for episode_index, episode in enumerate(episodes)
+        if not episode.get("data_split")
+        or episode.get("data_split") == config.data_split
+    ]
+    if not indexed_split_episodes:
+        raise RuntimeError(
+            f"No episodes with data_split={config.data_split!r} found in {path}"
+        )
+    split_episodes = [episode for _, episode in indexed_split_episodes]
+    house_indices = _benchmark_house_filter(config, split_episodes)
+    selected = []
+    for source_episode_index, episode in indexed_split_episodes:
+        if int(episode["house_index"]) not in house_indices:
+            continue
+        selected_episode = copy.deepcopy(episode)
+        selected_episode["seed_generation"] = {
+            "schema_version": "interactive_nav_benchmark_source_v1",
+            "source_benchmark": str(path),
+            "source_episode_index": source_episode_index,
+            "start_goal_policy": "preserve_original_nav_benchmark_episode",
+        }
+        selected.append(selected_episode)
+    if not selected:
+        raise RuntimeError(f"No benchmark episodes selected from {path}")
+    manifest = {
+        "schema_version": "interactive_nav_benchmark_source_manifest_v1",
+        "source_kind": "nav_benchmark",
+        "benchmark_path": str(path),
+        "data_split": config.data_split,
+        "selected_episode_count": len(selected),
+        "selected_house_count": len(
+            {int(episode["house_index"]) for episode in selected}
+        ),
+        "selected_house_indices": sorted(
+            {int(episode["house_index"]) for episode in selected}
+        ),
+    }
+    return selected, manifest
+
+
+def write_nav_benchmark_source(config: SourceConfig, output_root: Path) -> Path:
+    episodes, manifest = load_nav_benchmark_source(config)
+    source_root = output_root / "source"
+    source_root.mkdir(parents=True, exist_ok=True)
+    (source_root / "benchmark_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+    )
+    benchmark_path = source_root / "benchmark.json"
+    benchmark_path.write_text(
+        json.dumps(episodes, indent=2, ensure_ascii=False) + "\n"
+    )
+    return benchmark_path
+
+
 def _target_center(record: dict[str, Any]) -> np.ndarray:
     value = record.get("aabb_center", record.get("position"))
     return np.asarray(value, dtype=float)[:3]
@@ -54,6 +142,9 @@ def _candidate_start_pose(
     rng: np.random.Generator,
     candidate_pool: int,
     component_labels: np.ndarray,
+    min_distance_m: float = 0.0,
+    max_distance_m: float | None = None,
+    prefer_longest: bool = True,
 ) -> np.ndarray | None:
     if len(free_points) == 0:
         return None
@@ -73,7 +164,17 @@ def _candidate_start_pose(
     sampled = sampled[same_component]
     if len(sampled) == 0:
         return None
-    order = np.argsort(np.linalg.norm(sampled[:, :2] - target_xy[None, :2], axis=1))[::-1]
+    distances = np.linalg.norm(sampled[:, :2] - target_xy[None, :2], axis=1)
+    valid_distance = distances >= float(min_distance_m)
+    if max_distance_m is not None:
+        valid_distance &= distances <= float(max_distance_m)
+    sampled = sampled[valid_distance]
+    distances = distances[valid_distance]
+    if len(sampled) == 0:
+        return None
+    order = np.argsort(distances)
+    if prefer_longest:
+        order = order[::-1]
     robot_view = ctx.env.current_robot.robot_view
     for index in order[: min(32, len(order))]:
         xy = np.asarray(sampled[index, :2], dtype=float)
@@ -96,6 +197,11 @@ def build_house_seed_episodes(
     seeds_per_house: int,
     candidate_pool: int,
     template: dict[str, Any] | None = None,
+    preferred_object_categories: list[str] | None = None,
+    preferred_object_names: list[str] | None = None,
+    min_start_goal_distance_m: float = 0.0,
+    max_start_goal_distance_m: float | None = None,
+    prefer_longest_start_goal: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     template = copy.deepcopy(template or load_template_episode())
     args = argparse.Namespace(
@@ -117,6 +223,15 @@ def build_house_seed_episodes(
         rng = np.random.default_rng(seed + house_index * 1009)
         targets.sort(key=lambda record: (str(record.get("category", "")), record["name"]))
         rng.shuffle(targets)
+        preferred_categories = {
+            str(value).lower() for value in (preferred_object_categories or [])
+        }
+        preferred_names = {str(value) for value in (preferred_object_names or [])}
+        targets.sort(
+            key=lambda record: int(record["name"] in preferred_names) * 2
+            + int(str(record.get("category", "")).lower() in preferred_categories),
+            reverse=True,
+        )
         scene_map = ctx.env.get_thormap(
             agent_radius=ctx.cfg.task_sampler_config.robot_safety_radius
         )
@@ -146,6 +261,9 @@ def build_house_seed_episodes(
                 rng,
                 candidate_pool,
                 component_labels,
+                min_distance_m=min_start_goal_distance_m,
+                max_distance_m=max_start_goal_distance_m,
+                prefer_longest=prefer_longest_start_goal,
             )
             if pose is None:
                 failures.append(
@@ -187,7 +305,17 @@ def build_house_seed_episodes(
                 "schema_version": "interactive_nav_train_seed_v1",
                 "target_center": target_center.astype(float).tolist(),
                 "goal_xy": np.asarray(nearest_goal, dtype=float).tolist(),
-                "strategy": "farthest_collision_free_reachable_point",
+                "straight_line_distance_m": float(
+                    np.linalg.norm(pose[:2, 3] - np.asarray(nearest_goal, dtype=float)[:2])
+                ),
+                "preferred_object_name_match": record["name"] in preferred_names,
+                "preferred_object_category_match": category.lower()
+                in preferred_categories,
+                "strategy": (
+                    "longest_collision_free_reachable_point"
+                    if prefer_longest_start_goal
+                    else "shortest_collision_free_reachable_point"
+                ),
             }
             EpisodeSpec.model_validate(episode)
             episodes.append(episode)

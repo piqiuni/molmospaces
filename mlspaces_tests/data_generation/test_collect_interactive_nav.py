@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -18,6 +19,10 @@ from scripts.InteractiveNav.collection.full_rollout_recorder import (
     validate_full_rollout,
 )
 from scripts.InteractiveNav.collection.scene_source import build_scene_manifest
+from scripts.InteractiveNav.collection.seed_builder import (
+    _candidate_start_pose,
+    load_nav_benchmark_source,
+)
 
 
 def config_payload(output_root: Path, *, total_samples: int = 10) -> dict:
@@ -104,6 +109,176 @@ def test_full_config_accepts_all_three_domains(tmp_path: Path) -> None:
     config = CollectionConfig.model_validate(payload)
 
     assert config.full.domains == ["channel", "container", "mixed"]
+
+
+def test_source_config_exposes_scene_preferences(tmp_path: Path) -> None:
+    payload = config_payload(tmp_path)
+    payload["source"].update(
+        {
+            "kind": "scene_split",
+            "preferred_object_categories": ["book", "cellphone"],
+            "preferred_object_names": ["book_instance_1"],
+            "min_start_goal_distance_m": 3.0,
+            "max_start_goal_distance_m": 12.0,
+            "prefer_longest_start_goal": False,
+        }
+    )
+
+    config = CollectionConfig.model_validate(payload)
+
+    assert config.source.kind == "scene_split"
+    assert config.source.preferred_object_categories == ["book", "cellphone"]
+    assert config.source.min_start_goal_distance_m == 3.0
+    assert config.source.max_start_goal_distance_m == 12.0
+    assert config.source.prefer_longest_start_goal is False
+
+
+def test_scene_start_sampler_enforces_straight_line_distance_preferences() -> None:
+    class FakeSceneMap:
+        @staticmethod
+        def pos_m_to_px(values):
+            array = np.asarray(values)
+            return np.rint(array[..., :2]).astype(int)
+
+    class FakeEnv:
+        current_robot = SimpleNamespace(
+            robot_view=SimpleNamespace(base=SimpleNamespace(pose=np.eye(4)))
+        )
+
+        @staticmethod
+        def check_if_robot_collision_at_base_pose(_robot_view, _pose):
+            return False
+
+    pose = _candidate_start_pose(
+        SimpleNamespace(env=FakeEnv()),
+        FakeSceneMap(),
+        np.asarray([[1.0, 0.0, 0.0], [4.0, 0.0, 0.0], [8.0, 0.0, 0.0]]),
+        np.asarray([0.0, 0.0]),
+        np.random.default_rng(0),
+        candidate_pool=3,
+        component_labels=np.ones((10, 10), dtype=int),
+        min_distance_m=3.0,
+        max_distance_m=5.0,
+        prefer_longest=True,
+    )
+
+    assert pose is not None
+    assert np.allclose(pose[:2, 3], [4.0, 0.0])
+
+
+def test_nav_benchmark_source_preserves_original_target_and_start(tmp_path: Path) -> None:
+    benchmark = tmp_path / "nav_benchmark.json"
+    episodes = [
+        {
+            "house_index": 3,
+            "scene_dataset": "procthor-10k",
+            "data_split": "val",
+            "seed": 11,
+            "task": {
+                "pickup_obj_name": "book_1",
+                "robot_base_pose": [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            },
+        },
+        {
+            "house_index": 4,
+            "scene_dataset": "procthor-10k",
+            "data_split": "train",
+            "seed": 12,
+            "task": {
+                "pickup_obj_name": "lamp_1",
+                "robot_base_pose": [3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            },
+        },
+    ]
+    write_json(benchmark, episodes)
+    payload = config_payload(tmp_path)
+    payload["source"].update(
+        {
+            "kind": "nav_benchmark",
+            "benchmark_path": str(benchmark),
+            "data_split": "val",
+            "houses": [3],
+        }
+    )
+    config = CollectionConfig.model_validate(payload)
+
+    selected, manifest = load_nav_benchmark_source(config.source)
+
+    assert len(selected) == 1
+    assert selected[0]["task"]["pickup_obj_name"] == "book_1"
+    assert selected[0]["task"]["robot_base_pose"] == episodes[0]["task"]["robot_base_pose"]
+    assert selected[0]["seed_generation"]["start_goal_policy"] == (
+        "preserve_original_nav_benchmark_episode"
+    )
+    assert manifest["selected_house_indices"] == [3]
+
+
+def test_nav_benchmark_source_rejects_missing_split(tmp_path: Path) -> None:
+    benchmark = tmp_path / "nav_benchmark.json"
+    write_json(
+        benchmark,
+        [
+            {
+                "house_index": 0,
+                "data_split": "val",
+                "task": {"pickup_obj_name": "book", "robot_base_pose": []},
+            }
+        ],
+    )
+    payload = config_payload(tmp_path)
+    payload["source"].update(
+        {"kind": "nav_benchmark", "benchmark_path": str(benchmark), "data_split": "train"}
+    )
+    config = CollectionConfig.model_validate(payload)
+
+    with pytest.raises(RuntimeError, match="No episodes with data_split"):
+        load_nav_benchmark_source(config.source)
+
+
+def test_build_seed_benchmark_uses_nav_source_without_resampling(tmp_path: Path) -> None:
+    benchmark = tmp_path / "nav_benchmark.json"
+    original = {
+        "house_index": 2,
+        "scene_dataset": "procthor-10k",
+        "data_split": "val",
+        "seed": 3,
+        "task": {
+            "pickup_obj_name": "target_1",
+            "robot_base_pose": [1.0, 5.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        },
+    }
+    write_json(benchmark, [original])
+    payload = config_payload(tmp_path)
+    payload["source"].update(
+        {
+            "kind": "nav_benchmark",
+            "benchmark_path": str(benchmark),
+            "data_split": "val",
+            "houses": "all",
+        }
+    )
+    config = CollectionConfig.model_validate(payload)
+
+    source_path = collector.build_seed_benchmark(config)
+    selected = json.loads(source_path.read_text())
+
+    assert source_path == tmp_path / "source" / "benchmark.json"
+    assert selected[0]["task"] == original["task"]
+    assert (tmp_path / "source" / "benchmark_manifest.json").exists()
+
+
+def test_container_and_mixed_fine_require_rough_catalogs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = config_payload(tmp_path)
+    payload["rough"] = {"generate_if_missing": False}
+    config = CollectionConfig.model_validate(payload)
+    seed_benchmark = tmp_path / "seeds" / "benchmark.json"
+    write_json(seed_benchmark, [])
+    monkeypatch.setattr(collector, "run_door_parallel", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(FileNotFoundError, match="precomputed rough catalog"):
+        collector.run_light_collectors(config, seed_benchmark)
 
 
 def test_train_scene_manifest_uses_requested_house_subset(tmp_path: Path) -> None:

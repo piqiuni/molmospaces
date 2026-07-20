@@ -1,4 +1,5 @@
 source:
+  kind: scene_split
   scene_dataset: procthor-10k
   data_split: train
   houses: all

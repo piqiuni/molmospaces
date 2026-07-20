@@ -1,14 +1,10 @@
 source:
-  kind: scene_split
+  kind: nav_benchmark
   scene_dataset: procthor-10k
-  data_split: train
+  data_split: val
+  benchmark_path: assets/benchmarks/molmospaces-bench-v2/procthor-10k/NavToObjDataGenConfig/NavToObjProcthor10kBench_20260112_json_benchmark/benchmark.json
   houses: all
-  start_house: 0
-  # This smoke intentionally limits the 10k train registry to houses 0..99.
-  end_house: 100
   variant: base
-  seeds_per_house: 4
-  seed_candidate_pool: 1024
   missing_scene_policy: fail
 
 collection:
@@ -30,22 +26,16 @@ policy:
   navigation_executor: astar
   channel:
     executor: force
-    target_fraction: 1.0
-    max_steps: 1500
-    tolerance: 0.001
   container:
     executor: force
-    target_fraction: 1.0
-    max_steps: 1500
-    tolerance: 0.001
 
 runtime:
   workers: 4
-  seed: 20260720
+  seed: 20260721
   resume: true
   mujoco_gl: egl
   save_images: false
   save_plots: false
 
 output:
-  root: scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_train_100
+  root: scripts/InteractiveNav/output/interactive_nav_v3_nav_benchmark_val

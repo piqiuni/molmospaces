@@ -58,6 +58,7 @@ def build_scene_manifest(config: SourceConfig) -> dict[str, Any]:
         )
     return {
         "schema_version": "interactive_nav_scene_manifest_v1",
+        "source_kind": "scene_split",
         "scene_dataset": config.scene_dataset,
         "data_split": config.data_split,
         "asset_version": version,
