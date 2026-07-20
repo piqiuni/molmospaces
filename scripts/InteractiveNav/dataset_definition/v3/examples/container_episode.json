@@ -139,7 +139,7 @@
           "joint_name": "refrigerator_5_0_joint0",
           "joint_index": 0,
           "target_fraction": 1.0,
-          "control_mode": "direct",
+          "control_mode": "force",
           "reason": "reveal_target_object"
         },
         {
@@ -172,7 +172,7 @@
             "joint_name": "refrigerator_5_0_joint0",
             "joint_index": 0,
             "target_fraction": 1.0,
-            "control_mode": "direct",
+            "control_mode": "force",
             "reason": "reveal_target_object"
           },
           {

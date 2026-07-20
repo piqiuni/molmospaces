@@ -1083,78 +1083,144 @@ def drive_joint_to_value_with_force(
     tolerance: float = FORCE_DRIVE_TOLERANCE,
 ) -> dict[str, Any]:
     """Move a 1-DoF articulation joint by external body force/torque instead of writing qpos."""
-    model = env.current_model
-    data = env.current_data
-    joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-    if joint_id < 0:
-        raise ValueError(f"Joint not found: {joint_name}")
-    joint_type = int(model.jnt_type[joint_id])
-    if joint_type not in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
-        raise ValueError(f"Force drive only supports hinge/slide joints, got type={joint_type}")
-
-    qpos_addr = int(model.jnt_qposadr[joint_id])
-    dof_addr = int(model.jnt_dofadr[joint_id])
-    body_id = int(model.jnt_bodyid[joint_id])
-    local_axis = np.asarray(model.jnt_axis[joint_id], dtype=float)
-    joint_range = [float(v) for v in model.jnt_range[joint_id]]
-    lo, hi = min(joint_range), max(joint_range)
-    target = float(np.clip(target_value, lo, hi))
-    is_slide = joint_type == mujoco.mjtJoint.mjJNT_SLIDE
-    kp = 600.0 if is_slide else 90.0
-    kd = 80.0 if is_slide else 12.0
-    max_force = 160.0 if is_slide else 45.0
-    stable_steps = 0
-    reached = False
-
+    controller = ForceJointController(
+        env,
+        joint_name,
+        target_value,
+        tolerance=tolerance,
+    )
     try:
-        for step in range(int(max_steps)):
-            current = float(data.qpos[qpos_addr])
-            velocity = float(data.qvel[dof_addr])
-            error = target - current
-            effort = float(np.clip(kp * error - kd * velocity, -max_force, max_force))
-            world_axis = data.xmat[body_id].reshape(3, 3) @ local_axis
-            if is_slide:
-                data.xfrc_applied[body_id, :3] = world_axis * effort
-            else:
-                data.xfrc_applied[body_id, 3:] = world_axis * effort
-            mujoco.mj_step(model, data)
-            if abs(error) <= tolerance and abs(velocity) <= tolerance:
-                stable_steps += 1
-                if stable_steps >= 8:
-                    reached = True
-                    break
-            else:
-                stable_steps = 0
+        for _ in range(int(max_steps)):
+            controller.step()
+            if controller.reached:
+                break
     finally:
-        data.xfrc_applied[body_id, :] = 0.0
-        data.qvel[dof_addr] = 0.0
-        mujoco.mj_forward(model, data)
-
-    final_value = float(data.qpos[qpos_addr])
-    final_error = float(target - final_value)
-    reached = reached or abs(final_error) <= tolerance
+        controller.finish()
+    result = controller.result()
+    final_value = result["final_value"]
+    final_error = result["final_error"]
+    reached = result["reached"]
     if not reached:
         log.warning(
             "Force drive did not fully converge for %s: target=%.4f final=%.4f error=%.4f",
             joint_name,
-            target,
+            result["target_value"],
             final_value,
             final_error,
         )
-    return {
-        "method": "xfrc_applied_pd",
-        "force_application": "xfrc_applied_body_force_or_torque",
-        "joint_name": joint_name,
-        "joint_type": "slide" if is_slide else "hinge",
-        "body_id": body_id,
-        "joint_range": joint_range,
-        "target_value": target,
-        "final_value": final_value,
-        "final_error": final_error,
-        "steps": step + 1,
-        "reached": reached,
-        "tolerance": float(tolerance),
-    }
+    return result
+
+
+class ForceJointController:
+    """Incremental external-force joint controller used by light and full collection."""
+
+    def __init__(
+        self,
+        env,
+        joint_name: str,
+        target_value: float,
+        *,
+        tolerance: float = FORCE_DRIVE_TOLERANCE,
+    ) -> None:
+        self.env = env
+        self.model = env.current_model
+        self.data = env.current_data
+        self.joint_name = joint_name
+        self.tolerance = float(tolerance)
+        self.joint_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
+        )
+        if self.joint_id < 0:
+            raise ValueError(f"Joint not found: {joint_name}")
+        self.joint_type_id = int(self.model.jnt_type[self.joint_id])
+        if self.joint_type_id not in (
+            mujoco.mjtJoint.mjJNT_HINGE,
+            mujoco.mjtJoint.mjJNT_SLIDE,
+        ):
+            raise ValueError(
+                "Force drive only supports hinge/slide joints, "
+                f"got type={self.joint_type_id}"
+            )
+        self.qpos_addr = int(self.model.jnt_qposadr[self.joint_id])
+        self.dof_addr = int(self.model.jnt_dofadr[self.joint_id])
+        self.body_id = int(self.model.jnt_bodyid[self.joint_id])
+        self.local_axis = np.asarray(self.model.jnt_axis[self.joint_id], dtype=float)
+        self.joint_range = [float(value) for value in self.model.jnt_range[self.joint_id]]
+        lo, hi = min(self.joint_range), max(self.joint_range)
+        self.target_value = float(np.clip(target_value, lo, hi))
+        self.is_slide = self.joint_type_id == mujoco.mjtJoint.mjJNT_SLIDE
+        self.kp = 600.0 if self.is_slide else 90.0
+        self.kd = 80.0 if self.is_slide else 12.0
+        self.max_force = 160.0 if self.is_slide else 45.0
+        self.stable_steps = 0
+        self.steps = 0
+        self.reached = False
+        self.finished = False
+        self.last_effort = 0.0
+
+    def step(self) -> dict[str, Any]:
+        if self.finished:
+            raise RuntimeError("ForceJointController has already been finished")
+        current = float(self.data.qpos[self.qpos_addr])
+        velocity = float(self.data.qvel[self.dof_addr])
+        error = self.target_value - current
+        effort = float(
+            np.clip(self.kp * error - self.kd * velocity, -self.max_force, self.max_force)
+        )
+        world_axis = self.data.xmat[self.body_id].reshape(3, 3) @ self.local_axis
+        self.data.xfrc_applied[self.body_id, :] = 0.0
+        if self.is_slide:
+            self.data.xfrc_applied[self.body_id, :3] = world_axis * effort
+        else:
+            self.data.xfrc_applied[self.body_id, 3:] = world_axis * effort
+        mujoco.mj_step(self.model, self.data)
+        self.steps += 1
+        self.last_effort = effort
+        current_after = float(self.data.qpos[self.qpos_addr])
+        velocity_after = float(self.data.qvel[self.dof_addr])
+        error_after = self.target_value - current_after
+        if abs(error_after) <= self.tolerance and abs(velocity_after) <= self.tolerance:
+            self.stable_steps += 1
+            self.reached = self.stable_steps >= 8
+        else:
+            self.stable_steps = 0
+        return {
+            "step": self.steps,
+            "joint_value": current_after,
+            "joint_velocity": velocity_after,
+            "target_value": self.target_value,
+            "error": error_after,
+            "effort": effort,
+            "world_axis": world_axis.astype(float).tolist(),
+            "reached": self.reached,
+        }
+
+    def finish(self) -> None:
+        if self.finished:
+            return
+        self.data.xfrc_applied[self.body_id, :] = 0.0
+        self.data.qvel[self.dof_addr] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+        self.finished = True
+
+    def result(self) -> dict[str, Any]:
+        final_value = float(self.data.qpos[self.qpos_addr])
+        final_error = float(self.target_value - final_value)
+        reached = bool(self.reached or abs(final_error) <= self.tolerance)
+        return {
+            "method": "xfrc_applied_pd",
+            "force_application": "xfrc_applied_body_force_or_torque",
+            "joint_name": self.joint_name,
+            "joint_type": "slide" if self.is_slide else "hinge",
+            "body_id": self.body_id,
+            "joint_range": self.joint_range,
+            "target_value": self.target_value,
+            "final_value": final_value,
+            "final_error": final_error,
+            "steps": self.steps,
+            "reached": reached,
+            "tolerance": self.tolerance,
+        }
 
 
 def drive_articulation_state_by_record(
@@ -4226,6 +4292,8 @@ def execute_rby1_whole_body_interaction(
     initial_articulation_overrides: dict[str, float] | None = None,
     initial_robot_state: dict[str, Any] | None = None,
     frame_callback: Any | None = None,
+    step_callback: Any | None = None,
+    interaction_executor: str = "policy",
     hold_base_during_policy: bool | None = None,
     allow_force_fallback: bool = False,
     force_fallback_target_fraction: float = 1.0,
@@ -4238,6 +4306,10 @@ def execute_rby1_whole_body_interaction(
     """
     if interaction_kind not in {"container", "door"}:
         raise ValueError(f"Unsupported interaction kind: {interaction_kind}")
+    if interaction_executor not in {"policy", "force"}:
+        raise ValueError(
+            f"Unsupported interaction executor {interaction_executor!r}; expected policy/force"
+        )
     if hold_base_during_policy is None:
         # Container articulation should not let contact dynamics push the
         # navigation base away from the planned grasp stance.  Door opening
@@ -4256,11 +4328,16 @@ def execute_rby1_whole_body_interaction(
         task = sampler.sample_task(house_index=episode_spec.house_index, variant=variant)
         if task is None:
             raise RuntimeError("The RBY1 interaction task sampler returned no task.")
-        if cfg.policy_config is None or cfg.policy_config.policy_cls is None:
+        if (
+            interaction_executor == "policy"
+            and (cfg.policy_config is None or cfg.policy_config.policy_cls is None)
+        ):
             raise RuntimeError("The RBY1 interaction policy config was not initialized.")
 
-        policy = cfg.policy_config.policy_cls(cfg, task)
-        task.register_policy(policy)
+        policy = None
+        if interaction_executor == "policy":
+            policy = cfg.policy_config.policy_cls(cfg, task)
+            task.register_policy(policy)
         observation, _info = task.reset()
         initial_joint_position_before_enforcement = _read_interaction_joint(
             task, interaction_kind
@@ -4299,12 +4376,23 @@ def execute_rby1_whole_body_interaction(
             raise RuntimeError(f"None of the requested cameras are available: {camera_names}")
         frames: dict[str, list[np.ndarray]] = {name: [] for name in selected_cameras}
 
-        def capture(obs: list[dict[str, Any]], phase: str | None = None) -> None:
+        def capture(
+            obs: list[dict[str, Any]],
+            phase: str | None = None,
+            *,
+            action: dict[str, Any] | None = None,
+            reward: float = 0.0,
+            terminal: bool = False,
+            truncated: bool = False,
+            infos: Any | None = None,
+        ) -> None:
+            synchronized_frames: dict[str, np.ndarray] = {}
             for camera_name in selected_cameras:
                 frame = obs[0].get(camera_name)
                 if frame is None:
                     frame = task.env.render_rgb_frame(camera_name)
                 frame_uint8 = _frame_to_uint8(frame)
+                synchronized_frames[camera_name] = frame_uint8.copy()
                 frames[camera_name].append(frame_uint8)
                 if frame_callback is not None:
                     frame_callback(
@@ -4316,6 +4404,45 @@ def execute_rby1_whole_body_interaction(
                             "interaction_kind": interaction_kind,
                         },
                     )
+            if step_callback is not None:
+                components = {}
+                vector_parts = []
+                action_type = str((action or {}).get("__action_type__", "robot_control"))
+                for key, value in (action or {}).items():
+                    if str(key).startswith("__"):
+                        continue
+                    try:
+                        values = np.asarray(value, dtype=np.float32).reshape(-1)
+                    except (TypeError, ValueError):
+                        continue
+                    components[str(key)] = values.astype(float).tolist()
+                    vector_parts.append(values)
+                action_payload = {
+                    "type": "initial" if action is None else action_type,
+                    "vector": (
+                        np.concatenate(vector_parts).astype(float).tolist()
+                        if vector_parts
+                        else []
+                    ),
+                    "components": components,
+                }
+                step_callback(
+                    images=synchronized_frames,
+                    action=action_payload,
+                    state={
+                        "qpos": np.asarray(task.env.current_data.qpos, dtype=float).tolist(),
+                        "qvel": np.asarray(task.env.current_data.qvel, dtype=float).tolist(),
+                    },
+                    metadata={
+                        "phase": phase or _phase_name(policy),
+                        "task_step": int(task.episode_step_count),
+                        "interaction_kind": interaction_kind,
+                        "reward": float(reward),
+                        "terminal": bool(terminal),
+                        "truncated": bool(truncated),
+                        "infos": to_jsonable(infos),
+                    },
+                )
 
         capture(observation, phase="INITIAL")
         phase_trace: list[str] = []
@@ -4381,7 +4508,15 @@ def execute_rby1_whole_body_interaction(
                     max_base_adjustment_translation_per_step,
                     adjustment_translation,
                 )
-                capture(observation, phase="BASE_ADJUSTMENT")
+                capture(
+                    observation,
+                    phase="BASE_ADJUSTMENT",
+                    action=action_cmd,
+                    reward=float(np.asarray(_reward).reshape(-1)[0]),
+                    terminal=bool(np.asarray(_terminal).reshape(-1)[0]),
+                    truncated=bool(np.asarray(_truncated).reshape(-1)[0]),
+                    infos=_infos,
+                )
                 if task.env.check_robot_collision_in_current_pose():
                     base_adjustment_error = "Robot collided during continuous base adjustment."
                     break
@@ -4395,14 +4530,17 @@ def execute_rby1_whole_body_interaction(
                 log.error(base_adjustment_error)
             else:
                 try:
-                    policy.reset()
+                    if policy is not None:
+                        policy.reset()
                 except TypeError:
                     policy.reset(reset_retries=True)
                 observation = task.get_observations()
                 capture(observation, phase="BASE_ADJUSTMENT_COMPLETE")
             base_position_after_adjustment = robot_base.pose[:3, 3].copy()
 
-        phase_trace.append(_phase_name(policy))
+        phase_trace.append(
+            "FORCE_OPEN" if interaction_executor == "force" else _phase_name(policy)
+        )
         step_limit = int(max_steps if max_steps is not None else (cfg.task_horizon or 400))
         error_message = base_adjustment_error
         previous_base_position = robot_base.pose[:3, 3].copy()
@@ -4416,7 +4554,9 @@ def execute_rby1_whole_body_interaction(
         )
         max_base_translation_per_step = 0.0
         max_base_translation_step = 0
-        for _step in range(step_limit if base_adjustment_completed else 0):
+        for _step in range(
+            step_limit if base_adjustment_completed and interaction_executor == "policy" else 0
+        ):
             if bool(np.all(task.is_done())):
                 break
             try:
@@ -4445,10 +4585,26 @@ def execute_rby1_whole_body_interaction(
                     "aborting an invalid collision-driven rollout."
                 )
                 log.error(error_message)
-                capture(observation, phase=_phase_name(policy))
+                capture(
+                    observation,
+                    phase=_phase_name(policy),
+                    action=action_cmd,
+                    reward=float(np.asarray(_reward).reshape(-1)[0]),
+                    terminal=bool(np.asarray(_terminal).reshape(-1)[0]),
+                    truncated=bool(np.asarray(_truncated).reshape(-1)[0]),
+                    infos=_infos,
+                )
                 break
             current_phase = _phase_name(policy)
-            capture(observation, phase=current_phase)
+            capture(
+                observation,
+                phase=current_phase,
+                action=action_cmd,
+                reward=float(np.asarray(_reward).reshape(-1)[0]),
+                terminal=bool(np.asarray(_terminal).reshape(-1)[0]),
+                truncated=bool(np.asarray(_truncated).reshape(-1)[0]),
+                infos=_infos,
+            )
             if current_phase != phase_trace[-1]:
                 phase_trace.append(current_phase)
             if (_step + 1) % 50 == 0:
@@ -4466,7 +4622,54 @@ def execute_rby1_whole_body_interaction(
                     float(live_fraction),
                 )
 
-        policy_success = bool(task.judge_success())
+        force_executor_meta: dict[str, Any] | None = None
+        if base_adjustment_completed and interaction_executor == "force":
+            if interaction_kind == "door":
+                joint_obj = task.door_object
+                force_joint_index = joint_obj.get_hinge_joint_index()
+                force_joint_name = joint_obj.joint_names[force_joint_index]
+                force_closed_value = float(
+                    task.exp_config.task_config.articulated_joint_reset_state[0]
+                )
+                force_open_value = float(
+                    max(task.exp_config.task_config.articulated_joint_range)
+                )
+            else:
+                joint_obj = task.articulation_objects[0][0]
+                force_joint_index = int(task.config.task_config.joint_index)
+                force_joint_name = joint_obj.joint_names[force_joint_index]
+                force_closed_value = float(
+                    task.exp_config.task_config.joint_start_position[0]
+                )
+                force_open_value = float(task.exp_config.task_config.joint_goal_position)
+            force_target = force_closed_value + float(force_fallback_target_fraction) * (
+                force_open_value - force_closed_value
+            )
+            controller = ForceJointController(task.env, force_joint_name, force_target)
+            try:
+                for _force_step in range(int(force_fallback_max_steps)):
+                    force_action = controller.step()
+                    observation = task.get_observations()
+                    capture(
+                        observation,
+                        phase="FORCE_OPEN",
+                        action={
+                            "__action_type__": "force_joint",
+                            "effort": [force_action["effort"]],
+                            "target_value": [force_action["target_value"]],
+                            "joint_value": [force_action["joint_value"]],
+                        },
+                        terminal=bool(force_action["reached"]),
+                        infos=force_action,
+                    )
+                    if force_action["reached"]:
+                        break
+            finally:
+                controller.finish()
+            force_executor_meta = controller.result()
+            policy_success = bool(force_executor_meta["reached"])
+        else:
+            policy_success = bool(task.judge_success())
         force_fallback_meta: dict[str, Any] | None = None
         current_fraction = semantic_open_fraction(
             _read_interaction_joint(task, interaction_kind),
@@ -4489,6 +4692,7 @@ def execute_rby1_whole_body_interaction(
         if (
             allow_force_fallback
             and has_contact_phase
+            and interaction_executor == "policy"
             and current_fraction < float(force_fallback_target_fraction)
         ):
             if interaction_kind == "door":
@@ -4560,11 +4764,16 @@ def execute_rby1_whole_body_interaction(
             semantic_open_value,
         )
         result = {
-            "success": bool(task.judge_success()),
+            "success": bool(
+                task.judge_success()
+                or (force_executor_meta is not None and force_executor_meta["reached"])
+            ),
             "policy_success": policy_success,
             "success_source": "policy_plus_force_fallback"
             if force_fallback_meta is not None
-            else "policy",
+            else interaction_executor,
+            "interaction_executor": interaction_executor,
+            "force_executor": force_executor_meta,
             "force_fallback": force_fallback_meta
             if force_fallback_meta is not None
             else {"used": False},
@@ -4584,7 +4793,9 @@ def execute_rby1_whole_body_interaction(
             "policy_dt_ms": float(cfg.policy_dt_ms),
             "simulated_seconds": float(task.episode_step_count * cfg.policy_dt_ms / 1000.0),
             "phase_trace": phase_trace,
-            "final_phase": _phase_name(policy),
+            "final_phase": (
+                "FORCE_OPEN" if interaction_executor == "force" else _phase_name(policy)
+            ),
             "final_joint_position": final_joint_position,
             "initial_joint_position_before_enforcement": float(
                 initial_joint_position_before_enforcement
@@ -4839,21 +5050,27 @@ def build_rby1_interaction_config(args: argparse.Namespace) -> Any:
             "head": None,
             "torso": "height",
         }
-        cfg.policy_config.server_urls = (
-            [args.curobo_server_url] if args.curobo_server_url else []
-        )
-        cfg.policy_config.policy_cls = stable_rby1_container_policy_cls(
-            args.container_arm,
-            max_steps_per_waypoint=args.container_max_steps_per_waypoint,
-            max_batch_plan_attempts=args.container_max_batch_plan_attempts,
-            max_planning_reattempts=args.container_max_planning_reattempts,
-            pregrasp_tolerance=getattr(args, "container_pregrasp_tolerance", 0.04),
-        )
-        cfg.policy_config.batch_size = 8
-        cfg.policy_config.max_batch_plan_attempts = args.container_max_batch_plan_attempts
-        cfg.policy_config.max_planning_reattempts = args.container_max_planning_reattempts
-        cfg.policy_config.max_height_adjustment_steps = 40
-        cfg.policy_config.max_steps_per_waypoint = args.container_max_steps_per_waypoint
+        if cfg.policy_config is not None:
+            cfg.policy_config.server_urls = (
+                [args.curobo_server_url] if args.curobo_server_url else []
+            )
+        if (
+            getattr(args, "interaction_executor", "policy") == "policy"
+            and cfg.policy_config is not None
+        ):
+            cfg.policy_config.policy_cls = stable_rby1_container_policy_cls(
+                args.container_arm,
+                max_steps_per_waypoint=args.container_max_steps_per_waypoint,
+                max_batch_plan_attempts=args.container_max_batch_plan_attempts,
+                max_planning_reattempts=args.container_max_planning_reattempts,
+                pregrasp_tolerance=getattr(args, "container_pregrasp_tolerance", 0.04),
+            )
+        if cfg.policy_config is not None:
+            cfg.policy_config.batch_size = 8
+            cfg.policy_config.max_batch_plan_attempts = args.container_max_batch_plan_attempts
+            cfg.policy_config.max_planning_reattempts = args.container_max_planning_reattempts
+            cfg.policy_config.max_height_adjustment_steps = 40
+            cfg.policy_config.max_steps_per_waypoint = args.container_max_steps_per_waypoint
     else:
         from molmo_spaces.data_generation.config.door_opening_configs import (
             DoorOpeningDataGenConfig,
@@ -4861,12 +5078,17 @@ def build_rby1_interaction_config(args: argparse.Namespace) -> Any:
 
         cfg = DoorOpeningDataGenConfig()
         cfg.task_config.additional_tcp_offset_distance = args.door_tcp_offset
-        cfg.policy_config.policy_cls = stable_rby1_door_policy_cls(args.door_arm)
-        cfg.policy_config.max_steps_per_waypoint = args.door_max_steps_per_waypoint
-        cfg.policy_config.joint_position_tolerance = args.door_joint_position_tolerance
-        cfg.policy_config.articulation_deltas = [
-            float(np.deg2rad(args.door_articulation_delta_deg))
-        ]
+        if (
+            getattr(args, "interaction_executor", "policy") == "policy"
+            and cfg.policy_config is not None
+        ):
+            cfg.policy_config.policy_cls = stable_rby1_door_policy_cls(args.door_arm)
+        if cfg.policy_config is not None:
+            cfg.policy_config.max_steps_per_waypoint = args.door_max_steps_per_waypoint
+            cfg.policy_config.joint_position_tolerance = args.door_joint_position_tolerance
+            cfg.policy_config.articulation_deltas = [
+                float(np.deg2rad(args.door_articulation_delta_deg))
+            ]
 
     cfg.seed = args.seed
     cfg.scene_dataset = args.scene_dataset
@@ -4926,6 +5148,7 @@ def _rby1_request_to_args(request: RBY1InteractionRequest) -> argparse.Namespace
         seed=int(request.seed),
         robot="rby1",
         curobo_server_url=request.curobo_server_url,
+        interaction_executor=getattr(request, "interaction_executor", "policy"),
     )
 
 

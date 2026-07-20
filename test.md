@@ -230,6 +230,62 @@ python scripts/InteractiveNav/build_mixed_interaction_benchmark.py \
   --output_dir scripts/InteractiveNav/output/mixed_interaction_v3_smoke10
 ```
 
+统一 ProcTHOR-10K train 三类采集入口：
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-interactive-nav-unified
+python scripts/InteractiveNav/collect_interactive_nav.py \
+  --config scripts/InteractiveNav/configs/collection/procthor10k_train_100.yaml \
+  --stage all
+```
+
+可独立恢复的阶段为 `manifest`、`seeds`、`light`、`balance` 和 `audit`。正式
+100 条测试按有效 V3 episode 数冻结为 `channel=34`、`container=33`、`mixed=33`；
+不生成 `open_gt_control`，不主动构造错误动作 rollout，mixed 只接收
+`mixed_required_verified`。当前示例配置对应本机已安装的 `train_0..train_99`；
+扩展 house 范围前先安装对应 train scene 资产。每屋抽样上限为
+channel=2、container=2、mixed=3。
+
+2026-07-20 实测审计：100/100 V3 valid、0 validation error、0 placeholder、
+100 unique case ID、39 unique house；三类 house 覆盖为 18/25/13。
+
+统一入口相关测试：
+
+```bash
+python -m pytest -q \
+  mlspaces_tests/data_generation/test_collect_interactive_nav.py \
+  mlspaces_tests/data_generation/test_container_interaction_benchmark.py \
+  mlspaces_tests/data_generation/test_mixed_interaction_benchmark.py
+```
+
+主要输出位于配置的 `output.root`：
+
+- `scene_manifest.json`：版本化 train house 清单
+- `seeds/benchmark.json`：真实 train scene 生成的 NavToObj seed episode
+- `raw/{channel,container,mixed}/benchmark.json`：三类 fine 原始 V3 数据
+- `balanced/benchmark.json`：最终严格均衡 benchmark
+- `balanced/audit.json`、`balanced/structure_report.md`：字段、类别、recipe、house 与占位值审计
+
+full step 级采集使用同一入口；`full.max_episodes` 表示每个
+`full.domains` 中各采集的 episode 数。先运行单个 mixed smoke：
+
+```bash
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-interactive-full
+python scripts/InteractiveNav/collect_interactive_nav.py \
+  --config scripts/InteractiveNav/configs/collection/procthor10k_train_full_smoke.yaml \
+  --stage full
+```
+
+三类各采一个 smoke 可改用
+`scripts/InteractiveNav/configs/collection/procthor10k_train_full_3domain_smoke.yaml`。
+
+full 输出位于 `output.root/full/`：每个 run 包含 `trajectory.h5`、`manifest.json`、
+交互结果和日志。只有 `returncode=0`、H5 对齐校验通过且 `success=true` 的 run 才会
+进入 `valid_trajectory_count`；导航或操作失败不会被当成 rollout 负轨迹。
+
 相关单元测试：
 
 ```bash

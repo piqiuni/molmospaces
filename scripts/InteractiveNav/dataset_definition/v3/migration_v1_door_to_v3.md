@@ -340,7 +340,7 @@ door v1 只保存 required door root 列表和路径长度，没有门前机器�
       "joint_name": "leaf_joint_name",
       "joint_index": 0,
       "target_fraction": 1.0,
-      "control_mode": "direct",
+      "control_mode": "force",
       "reason": "restore_reachability"
     },
     {

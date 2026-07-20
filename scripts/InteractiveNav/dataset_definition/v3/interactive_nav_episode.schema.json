@@ -442,7 +442,7 @@
           "exclusiveMinimum": 0.0,
           "maximum": 1.0
         },
-        "control_mode": {"enum": ["direct", "force"]},
+        "control_mode": {"const": "force"},
         "reason": {"$ref": "#/$defs/oracleReason"}
       },
       "additionalProperties": false

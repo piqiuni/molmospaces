@@ -139,7 +139,7 @@
           "joint_name": "door_19_0_joint0",
           "joint_index": 0,
           "target_fraction": 1.0,
-          "control_mode": "direct",
+          "control_mode": "force",
           "reason": "restore_reachability"
         },
         {
@@ -181,7 +181,7 @@
             "joint_name": "door_19_0_joint0",
             "joint_index": 0,
             "target_fraction": 1.0,
-            "control_mode": "direct",
+            "control_mode": "force",
             "reason": "restore_reachability"
           },
           {

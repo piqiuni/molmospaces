@@ -168,7 +168,7 @@ def build_mixed_oracle_plan(
             "joint_name": channel_interaction["joint_name"],
             "joint_index": channel_interaction["joint_index"],
             "target_fraction": channel_interaction["target_state"]["joint_fraction"],
-            "control_mode": "direct",
+            "control_mode": "force",
             "reason": (
                 "restore_reachability"
                 if interaction_requirement == "required"
@@ -207,12 +207,7 @@ def build_mixed_oracle_plan(
                 "joint_name": joint["joint_name"],
                 "joint_index": int(joint_index),
                 "target_fraction": 1.0,
-                "control_mode": (
-                    "force"
-                    if int(joint_index) == controlling_joint_index
-                    and selected.get("joint_type") == "slide"
-                    else "direct"
-                ),
+                "control_mode": "force",
                 "reason": (
                     "reveal_target_object"
                     if sequence_index == len(selected["joint_sequence"]) - 1

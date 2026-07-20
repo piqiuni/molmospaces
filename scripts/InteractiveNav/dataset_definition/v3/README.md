@@ -7,7 +7,45 @@
 - 混合交互：同一 episode 中依次执行通道和容器交互。
 - Instruction 导航：保持 `language.task_description` 作为 policy-facing Instruction。
 
-当前 v3 是数据格式规范，不代表现有 door/container builder 已全部迁移。现有容器采集使用 `interactive_nav_v2`，现有门数据使用 `door_interaction_nav_v1`；后续 builder 应统一输出本目录定义的 `interactive_nav_v3`。
+当前 door、container 和 mixed fine builder 均已输出 `interactive_nav_v3`。统一采集入口为
+`scripts/InteractiveNav/collect_interactive_nav.py`，它负责从版本化 scene pool 生成 seed
+episode、调用三类现有 builder、按有效 episode 配额冻结均衡数据，并执行统一结构审计。
+
+当前正式三类为 `channel`、`container`、`mixed`。统一生产配置不生成
+`open_gt_control`，不主动构造错误动作 rollout；mixed 只接受真实
+`mixed_required_verified` 门到容器因果链。
+
+ProcTHOR-10K train 的 100 条均衡测试配置：
+
+```bash
+python scripts/InteractiveNav/collect_interactive_nav.py \
+  --config scripts/InteractiveNav/configs/collection/procthor10k_train_100.yaml \
+  --stage all
+```
+
+100 不能被 3 整除，因此默认目标为 `channel=34`、`container=33`、`mixed=33`。
+示例配置按当前本机已安装资产使用 `train_0..train_99`；统一入口支持任意 train
+house 范围，但扩大范围前必须先安装对应 ProcTHOR scene 资产。为兼顾稀有 mixed
+链的容量与场景多样性，默认每屋上限为 channel=2、container=2、mixed=3。
+
+2026-07-20 的 100 条轻量采集验证结果为：100/100 通过 V3 校验、三类
+34/33/33、100 个唯一 case ID、39 个唯一 house、0 个占位值。三类分别覆盖
+18/25/13 个 house；完整报告见配置输出目录下的
+`balanced/structure_report.md`。
+
+统一入口支持两种采集模式：
+
+- `mode: light`：只保存 V3 metadata、oracle plan 和交互状态，适合大规模
+  benchmark/评估数据。
+- `mode: full`：调用指定 policy/executor，逐 step 保存相机图像、动作类型与向量、
+  qpos/qvel、phase、reward、terminal/truncated 和 readback。输出为
+  `interactive_nav_full_rollout_v1` H5；失败或未完成 rollout 只作为诊断文件，
+  不计入训练有效样本。
+
+full 模式目前对 channel、container、mixed 均有统一调度入口；默认
+`policy.channel.executor=force`、`policy.container.executor=force`，直接复用现有
+力控制器。executor 仍通过接口注册，可替换为已有 policy 或后续策略。生产配置仍
+不生成 `open_gt_control`，也不构造错误动作负轨迹。
 
 ## 示例真实性
 

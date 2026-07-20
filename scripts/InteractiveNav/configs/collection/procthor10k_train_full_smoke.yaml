@@ -1,0 +1,59 @@
+source:
+  scene_dataset: procthor-10k
+  data_split: train
+  houses: all
+  start_house: 0
+  end_house: 100
+  variant: base
+  seeds_per_house: 4
+  seed_candidate_pool: 1024
+  missing_scene_policy: fail
+
+collection:
+  mode: full
+  schema_version: interactive_nav_v3
+  open_gt_control: false
+  synthetic_wrong_action_rollout: false
+
+balance:
+  strategy: strict_valid_episode_count
+  total_samples: 100
+  domain_order: [channel, container, mixed]
+  max_samples_per_house:
+    channel: 2
+    container: 2
+    mixed: 3
+
+policy:
+  navigation_executor: astar
+  channel:
+    executor: force
+    target_fraction: 1.0
+    max_steps: 1500
+    tolerance: 0.001
+  container:
+    executor: force
+    target_fraction: 1.0
+    max_steps: 1500
+    tolerance: 0.001
+
+full:
+  max_episodes: 1
+  domains: [mixed]
+  max_steps: 500
+  max_base_adjustment_steps: 300
+  video_fps: 10.0
+  required_open_fraction: 0.67
+  image_width: 320
+  image_height: 180
+
+runtime:
+  workers: 1
+  seed: 20260720
+  resume: true
+  mujoco_gl: egl
+  save_images: true
+  save_plots: false
+
+output:
+  root: scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_train_100

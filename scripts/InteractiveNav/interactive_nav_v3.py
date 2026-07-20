@@ -726,6 +726,26 @@ def _serialize_and_validate_v3(episode: dict[str, Any]) -> dict[str, Any]:
     validated["interactive_nav"]["generation_validation"][
         "minimal_plan_verified"
     ] = minimal_value
+    source_prefixes = (
+        episode.get("interactive_nav", {})
+        .get("generation_validation", {})
+        .get("oracle_prefixes", [])
+    )
+    validated_prefixes = (
+        validated.get("interactive_nav", {})
+        .get("generation_validation", {})
+        .get("oracle_prefixes", [])
+    )
+    required_nullable_prefix_keys = {
+        "robot_reachable_to_next_goal",
+        "target_distance_passed",
+        "target_visibility_fraction",
+        "task_success",
+    }
+    for source, destination in zip(source_prefixes, validated_prefixes, strict=False):
+        for key in required_nullable_prefix_keys:
+            if key in source and source[key] is None:
+                destination[key] = None
     try:
         from jsonschema import Draft202012Validator
     except ImportError:

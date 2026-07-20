@@ -513,7 +513,7 @@ def build_v3_oracle_plan(
                     "joint_name": interaction["joint_name"],
                     "joint_index": interaction["joint_index"],
                     "target_fraction": 1.0,
-                    "control_mode": "direct",
+                    "control_mode": "force",
                     "reason": "restore_reachability",
                 }
             )

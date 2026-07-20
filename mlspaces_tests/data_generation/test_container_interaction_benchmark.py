@@ -205,7 +205,7 @@ def test_slide_controlling_joint_uses_force_control() -> None:
     plan = build_oracle_plan(container, selected, "target", 1e-4)
     open_steps = [step for step in plan["steps"] if step["type"] == "open_joint"]
 
-    assert [step["control_mode"] for step in open_steps] == ["direct", "force"]
+    assert [step["control_mode"] for step in open_steps] == ["force", "force"]
 
 
 def test_interactive_nav_schema_supports_multiple_oracles() -> None:

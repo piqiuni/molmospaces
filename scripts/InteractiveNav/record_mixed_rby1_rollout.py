@@ -1,14 +1,16 @@
-"""Record a mixed V3 door -> fridge rollout with the real RBY1 policies.
+"""Record a mixed V3 door -> fridge rollout with synchronized image/action steps.
 
 The runner keeps the V3 scene/object state as the source of truth, uses the
 existing RBY1 door/container policy executor for the two manipulation phases,
 and hands semantic robot/articulation state between the task-specific runners.
-It intentionally does not fall back to MuJoCo force-drive when a policy fails.
+The interaction executor is configurable; the unified full collector defaults to
+the existing external-force joint controller for both channel and container.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import copy
 import json
 import logging
@@ -20,6 +22,7 @@ from typing import Any
 
 import mujoco
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -31,6 +34,10 @@ from scripts.InteractiveNav import capture_mixed_gt_storyboard as storyboard
 from scripts.InteractiveNav import container_scene_probe as probe
 from scripts.InteractiveNav import explore_molmo_interactions as emi
 from scripts.InteractiveNav import visualize_mixed_interaction_benchmark as mixed_viz
+from scripts.InteractiveNav.collection.full_rollout_recorder import (
+    H5StepRolloutRecorder,
+    validate_full_rollout,
+)
 
 
 log = logging.getLogger(__name__)
@@ -76,6 +83,33 @@ class FrameCollector:
                     **probe.to_jsonable(metadata),
                     "frame_index": len(self.frames[camera_name]) - 1,
                 }
+            )
+
+        return _callback
+
+
+class StepCollector:
+    def __init__(self, recorder: H5StepRolloutRecorder) -> None:
+        self.recorder = recorder
+
+    def callback(self, segment_name: str):
+        def _callback(
+            *,
+            images: dict[str, np.ndarray],
+            action: dict[str, Any],
+            state: dict[str, Any],
+            metadata: dict[str, Any],
+        ) -> None:
+            self.recorder.record_step(
+                images=images,
+                action=action,
+                state=state,
+                segment=segment_name,
+                phase=str(metadata.get("phase", "unknown")),
+                reward=float(metadata.get("reward", 0.0)),
+                terminal=bool(metadata.get("terminal", False)),
+                truncated=bool(metadata.get("truncated", False)),
+                info=metadata,
             )
 
         return _callback
@@ -137,7 +171,9 @@ def request_args(
         variant=args.variant,
         seed=args.seed,
     )
-    return probe._rby1_request_to_args(request)
+    operation_args = probe._rby1_request_to_args(request)
+    operation_args.interaction_executor = args.interaction_executor
+    return operation_args
 
 
 def prepare_operation_spec(
@@ -148,6 +184,7 @@ def prepare_operation_spec(
     target_name: str,
     joint_index: int,
     start_pose: list[float],
+    operation_pose_override: list[float] | None,
     args: argparse.Namespace,
 ) -> tuple[EpisodeSpec, dict[str, Any], list[float]]:
     """Build a policy episode, replacing only its semantic initial state/pose."""
@@ -160,7 +197,10 @@ def prepare_operation_spec(
     )
     episode_spec, target_meta = probe.prepare_rby1_interaction_episode(operation_args)
     payload = episode_spec.model_dump(mode="json")
+    payload["img_resolution"] = [int(args.img_width), int(args.img_height)]
     operation_pose = list(payload["task"]["robot_base_pose"])
+    if operation_pose_override is not None:
+        operation_pose = list(operation_pose_override)
     payload["task"]["robot_base_pose"] = list(start_pose)
     payload["scene_modifications"] = copy.deepcopy(episode.get("scene_modifications", {}))
 
@@ -174,6 +214,31 @@ def prepare_operation_spec(
         if target_pose is not None:
             payload["task"]["pickup_obj_start_pose"] = list(target_pose)
     return EpisodeSpec.model_validate(payload), target_meta, operation_pose
+
+
+def oracle_operation_pose(
+    episode: dict[str, Any], interaction_id: str
+) -> list[float] | None:
+    plans = episode.get("interactive_nav", {}).get("oracle_plans", [])
+    for plan in plans:
+        for step in plan.get("steps", []):
+            if step.get("type") != "navigate":
+                continue
+            if step.get("interaction_id") != interaction_id:
+                continue
+            goal = list(step["goal_point"])
+            yaw = float(step.get("goal_yaw", 0.0))
+            quat = R.from_euler("Z", yaw).as_quat()
+            return [
+                float(goal[0]),
+                float(goal[1]),
+                float(goal[2]),
+                float(quat[0]),
+                float(quat[1]),
+                float(quat[2]),
+                float(quat[3]),
+            ]
+    return None
 
 
 def pose_for_xy(xy: np.ndarray, next_xy: np.ndarray) -> np.ndarray:
@@ -327,6 +392,9 @@ def run(args: argparse.Namespace) -> int:
         target_name=door_name,
         joint_index=int(door_interaction["joint_index"]),
         start_pose=start_pose,
+        operation_pose_override=oracle_operation_pose(
+            episode, str(door_interaction["interaction_id"])
+        ),
         args=args,
     )
     door_operation_pose_array = np.asarray(door_operation_pose, dtype=float)
@@ -346,6 +414,9 @@ def run(args: argparse.Namespace) -> int:
             target_name=container_name,
             joint_index=int(container_interaction["joint_index"]),
             start_pose=door_operation_pose,
+            operation_pose_override=oracle_operation_pose(
+                episode, str(container_interaction["interaction_id"])
+            ),
             args=args,
         )
         del fridge_spec
@@ -376,6 +447,26 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     collector = FrameCollector()
+    trajectory_path = run_dir / "trajectory.h5"
+    rollout_recorder = H5StepRolloutRecorder(
+        trajectory_path,
+        episode_id=str(annotations["case_id"]),
+        camera_names=CAMERAS,
+        metadata={
+            "schema_version": SCHEMA_VERSION,
+            "benchmark": str(args.benchmark),
+            "episode_index": episode_index,
+            "house_index": annotations["house_index"],
+            "interaction_domains": ["channel", "container"],
+        },
+    )
+    step_collector = StepCollector(rollout_recorder)
+
+    def abort_unfinished_rollout() -> None:
+        if not rollout_recorder.closed:
+            rollout_recorder.abort("process_exited_before_rollout_finalize")
+
+    atexit.register(abort_unfinished_rollout)
     door_output = run_dir / "door"
     door_result = probe.execute_rby1_whole_body_interaction(
         probe.build_rby1_interaction_config(request_args(
@@ -393,9 +484,13 @@ def run(args: argparse.Namespace) -> int:
         max_steps=args.max_steps,
         video_fps=args.video_fps,
         base_adjustment_path=door_path,
-        max_base_adjustment_steps=args.max_base_adjustment_steps,
+        max_base_adjustment_steps=max(
+            args.max_base_adjustment_steps, 5 * len(door_path) + 10
+        ),
         initial_state_episode=episode,
         frame_callback=collector.callback("nav_to_door_and_open"),
+        step_callback=step_collector.callback("nav_to_door_and_open"),
+        interaction_executor=args.interaction_executor,
         allow_force_fallback=args.allow_force_fallback,
         force_fallback_target_fraction=args.force_fallback_target_fraction,
         force_fallback_max_steps=args.force_fallback_max_steps,
@@ -416,6 +511,9 @@ def run(args: argparse.Namespace) -> int:
         target_name=container_name,
         joint_index=int(container_interaction["joint_index"]),
         start_pose=fridge_start_pose,
+        operation_pose_override=oracle_operation_pose(
+            episode, str(container_interaction["interaction_id"])
+        ),
         args=args,
     )
     fridge_operation_pose_array = np.asarray(fridge_operation_pose, dtype=float)
@@ -446,11 +544,15 @@ def run(args: argparse.Namespace) -> int:
         max_steps=args.max_steps,
         video_fps=args.video_fps,
         base_adjustment_path=fridge_path,
-        max_base_adjustment_steps=args.max_base_adjustment_steps,
+        max_base_adjustment_steps=max(
+            args.max_base_adjustment_steps, 5 * len(fridge_path) + 10
+        ),
         initial_state_episode=episode,
         initial_articulation_overrides={door_joint_name: door_open_value},
         initial_robot_state=final_robot_state,
         frame_callback=collector.callback("nav_to_fridge_and_open"),
+        step_callback=step_collector.callback("nav_to_fridge_and_open"),
+        interaction_executor=args.interaction_executor,
         hold_base_during_policy=True,
         allow_force_fallback=args.allow_force_fallback,
         force_fallback_target_fraction=args.force_fallback_target_fraction,
@@ -464,6 +566,13 @@ def run(args: argparse.Namespace) -> int:
         )
 
     video_paths = save_combined_videos(run_dir, collector, args.video_fps)
+    rollout_recorder.finalize(
+        success=True,
+        terminal_reason="door_and_container_completed",
+        result={"door": door_result, "container": fridge_result},
+    )
+    atexit.unregister(abort_unfinished_rollout)
+    rollout_audit = validate_full_rollout(trajectory_path)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "benchmark": str(args.benchmark),
@@ -514,6 +623,8 @@ def run(args: argparse.Namespace) -> int:
         "video_paths": video_paths,
         "frame_event_count": len(collector.events),
         "frame_events": collector.events,
+        "trajectory_path": str(trajectory_path),
+        "trajectory_audit": rollout_audit,
     }
     write_json(run_dir / "manifest.json", manifest)
     print(json.dumps({"output_dir": str(run_dir), "video_paths": video_paths}, ensure_ascii=False))
@@ -544,6 +655,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--door_joint_position_tolerance", type=float, default=0.10)
     parser.add_argument("--door_articulation_delta_deg", type=float, default=7.0)
     parser.add_argument("--allow_force_fallback", action="store_true")
+    parser.add_argument(
+        "--interaction_executor",
+        choices=["force", "policy"],
+        default="force",
+    )
     parser.add_argument("--force_fallback_target_fraction", type=float, default=1.0)
     parser.add_argument("--force_fallback_max_steps", type=int, default=1500)
     parser.add_argument("--container_max_steps_per_waypoint", type=int, default=80)
@@ -552,6 +668,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--success_threshold", type=float, default=0.67)
     parser.add_argument("--required_open_fraction", type=float, default=0.67)
     parser.add_argument("--video_fps", type=float, default=10.0)
+    parser.add_argument("--img_width", type=int, default=320)
+    parser.add_argument("--img_height", type=int, default=180)
     parser.add_argument("--px_per_m", type=float, default=100.0)
     parser.add_argument("--open_threshold", type=float, default=0.67)
     parser.add_argument("--nav_waypoint_spacing_m", type=float, default=0.12)

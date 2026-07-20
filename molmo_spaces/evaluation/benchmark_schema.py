@@ -131,7 +131,7 @@ class OpenJointOracleStepSpec(BaseModel):
     joint_name: str
     joint_index: int
     target_fraction: float = 1.0
-    control_mode: Literal["direct", "force"] = "direct"
+    control_mode: Literal["force"] = "force"
     reason: str
 
 
@@ -243,7 +243,7 @@ class OpenJointOracleStepV3Spec(BaseModel):
     joint_name: str
     joint_index: int = Field(..., ge=0)
     target_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
-    control_mode: Literal["direct", "force"] = "direct"
+    control_mode: Literal["force"] = "force"
     reason: OracleReason
 
 
