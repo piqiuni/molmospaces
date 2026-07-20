@@ -41,6 +41,7 @@ policy:
 full:
   max_episodes: 1
   domains: [mixed]
+  selection_strategy: shortest_validated_path
   max_steps: 500
   max_base_adjustment_steps: 300
   video_fps: 10.0

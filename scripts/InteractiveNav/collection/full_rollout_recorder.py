@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -255,6 +256,10 @@ def validate_full_rollout(path: Path) -> dict[str, Any]:
             raise ValueError(f"Full rollout step arrays are misaligned: {sorted(lengths)}")
         if not steps["images"]:
             raise ValueError("Full rollout contains no camera images")
+        decode = lambda value: value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        action_type_counts = Counter(decode(value) for value in steps["actions/type"][:])
+        segment_counts = Counter(decode(value) for value in steps["segment"][:])
+        terminal_step_count = int(np.count_nonzero(steps["terminal"][:]))
         return {
             "schema_version": SCHEMA_VERSION,
             "episode_id": str(handle.attrs["episode_id"]),
@@ -262,4 +267,7 @@ def validate_full_rollout(path: Path) -> dict[str, Any]:
             "success": bool(handle.attrs.get("success", False)),
             "terminal_reason": str(handle.attrs.get("terminal_reason", "")),
             "camera_names": sorted(steps["images"].keys()),
+            "action_type_counts": dict(action_type_counts),
+            "segment_counts": dict(segment_counts),
+            "terminal_step_count": terminal_step_count,
         }

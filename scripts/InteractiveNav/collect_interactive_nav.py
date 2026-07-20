@@ -1093,12 +1093,49 @@ def run_full_collectors(config: CollectionConfig) -> Path:
     }
     selected: list[tuple[str, dict[str, Any]]] = []
     for domain in config.full.domains:
+        interaction_prefix = {
+            "channel": "channel_",
+            "container": "container_",
+            "mixed": None,
+        }[domain]
         candidates = [
             episode
             for episode in episodes
             if episode.get("interactive_nav", {}).get("interaction_domains")
             == expected_domains[domain]
-        ][: config.full.max_episodes]
+            and (
+                interaction_prefix is None
+                or any(
+                    str(interaction.get("type", "")).startswith(interaction_prefix)
+                    for interaction in episode.get("interactive_nav", {}).get(
+                        "interactions", []
+                    )
+                )
+            )
+        ]
+        if config.full.selection_strategy == "shortest_validated_path":
+            def validated_path_cost(episode: dict[str, Any]) -> float:
+                validation = episode.get("interactive_nav", {}).get(
+                    "generation_validation", {}
+                ).get("navigation_validation", {})
+                keys = {
+                    "channel": ["all_open_path_length_m"],
+                    "container": ["path_length_m"],
+                    "mixed": ["approach_path_length_m", "oracle_restored_path_length_m"],
+                }[domain]
+                values = [validation.get(key) for key in keys]
+                if any(value is None for value in values):
+                    return float("inf")
+                return float(sum(float(value) for value in values))
+
+            candidates.sort(
+                key=lambda episode: (
+                    validated_path_cost(episode),
+                    int(episode["house_index"]),
+                    str(episode["interactive_nav"]["case_id"]),
+                )
+            )
+        candidates = candidates[: config.full.max_episodes]
         if len(candidates) < config.full.max_episodes:
             raise RuntimeError(
                 f"Requested {config.full.max_episodes} full {domain} episodes, "
@@ -1164,8 +1201,35 @@ def run_full_collectors(config: CollectionConfig) -> Path:
         audit = None
         if trajectory is not None and trajectory.exists():
             audit = validate_full_rollout(trajectory)
+        required_segments = {
+            "channel": {
+                "nav_to_door",
+                "force_open_door",
+                "nav_to_target",
+                "terminal_observation",
+            },
+            "container": {
+                "nav_to_container",
+                "force_open_container",
+                "terminal_observation",
+            },
+            "mixed": {
+                "nav_to_door",
+                "force_open_door",
+                "nav_to_container",
+                "force_open_container",
+                "terminal_observation",
+            },
+        }[domain]
+        observed_segments = set((audit or {}).get("segment_counts", {}))
+        force_step_count = int((audit or {}).get("action_type_counts", {}).get("force_joint", 0))
         training_eligible = bool(
-            returncode == 0 and audit is not None and audit.get("success") is True
+            returncode == 0
+            and audit is not None
+            and audit.get("success") is True
+            and required_segments.issubset(observed_segments)
+            and int(audit.get("terminal_step_count", 0)) >= 1
+            and (executor != "force" or force_step_count >= 1)
         )
         runs.append(
             {

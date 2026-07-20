@@ -259,6 +259,35 @@ source 配置示例：
 - `procthor10k_nav_benchmark_val.yaml`：`nav_benchmark/val`，保留原始 benchmark
   的目标和起点；container/mixed 仍先生成 rough catalog 再做 fine。
 
+### 4.5.2 Full 逐步采集与 smoke
+
+`mode: full` 不生成错误动作负轨迹，也不生成 `open_gt_control`。它按指定
+executor 执行连续导航和交互，并将每个 step 的第一视角图像、动作、qpos/qvel、
+phase、segment、reward、terminal 和 info 写入 `trajectory.h5`；同时为每个相机
+写出同一 step 序列的 MP4。force 模式的交互 step 使用
+`force effort -> mujoco.mj_step() -> joint readback`，不会直接写 qpos。
+
+统一 full smoke 配置：
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-interactive-full
+python scripts/InteractiveNav/collect_interactive_nav.py \
+  --config scripts/InteractiveNav/configs/collection/procthor10k_train_full_3domain_smoke.yaml \
+  --stage full
+```
+
+full 训练资格要求：
+
+- channel：`nav_to_door`、`force_open_door`、`nav_to_target`、`terminal_observation`
+- container：`nav_to_container`、`force_open_container`、`terminal_observation`
+- mixed：上述两组交互 segment 和 `terminal_observation`
+- H5 数组（图像、动作、状态）长度完全对齐，且至少有一个 `force_joint` step 和
+  一个 terminal step
+- 失败 rollout 仅保留在 `full/runs` 供诊断，不计入训练数据；汇总见
+  `full/summary.json`
+
 复用预计算 rough 时可配置：
 
 ```yaml

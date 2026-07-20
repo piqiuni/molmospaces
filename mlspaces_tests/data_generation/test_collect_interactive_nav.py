@@ -45,6 +45,11 @@ def config_payload(output_root: Path, *, total_samples: int = 10) -> dict:
 
 def fake_episode(domain: str, house: int, case_id: str, recipe: str = "") -> dict:
     domains = ["channel", "container"] if domain == "mixed" else [domain]
+    interactions = []
+    if domain in {"channel", "mixed"}:
+        interactions.append({"type": "channel_hinged_door"})
+    if domain in {"container", "mixed"}:
+        interactions.append({"type": "container_hinged_door"})
     return {
         "house_index": house,
         "interactive_nav": {
@@ -53,6 +58,7 @@ def fake_episode(domain: str, house: int, case_id: str, recipe: str = "") -> dic
             "interaction_requirement": (
                 "unnecessary" if recipe == "distractor_doors_closed" else "required"
             ),
+            "interactions": interactions,
             "legacy_case_type": recipe,
         },
     }
@@ -443,6 +449,9 @@ def test_full_rollout_recorder_aligns_images_actions_and_state(tmp_path: Path) -
         "success": True,
         "terminal_reason": "completed",
         "camera_names": ["camera_follower", "head_camera"],
+        "action_type_counts": {"force_joint": 3},
+        "segment_counts": {"container_open": 3},
+        "terminal_step_count": 1,
     }
 
 
@@ -478,11 +487,38 @@ def test_full_stage_dispatches_all_domains_and_requires_success(
         return 0
 
     monkeypatch.setattr(collector, "run_command", fake_run)
-    monkeypatch.setattr(
-        collector,
-        "validate_full_rollout",
-        lambda _path: {"success": True, "step_count": 3},
-    )
+    def fake_validate(path: Path) -> dict:
+        text = str(path)
+        if "channel-case" in text:
+            segments = {
+                "nav_to_door": 1,
+                "force_open_door": 1,
+                "nav_to_target": 1,
+                "terminal_observation": 1,
+            }
+        elif "container-case" in text:
+            segments = {
+                "nav_to_container": 1,
+                "force_open_container": 1,
+                "terminal_observation": 1,
+            }
+        else:
+            segments = {
+                "nav_to_door": 1,
+                "force_open_door": 1,
+                "nav_to_container": 1,
+                "force_open_container": 1,
+                "terminal_observation": 1,
+            }
+        return {
+            "success": True,
+            "step_count": sum(segments.values()),
+            "action_type_counts": {"force_joint": 2},
+            "segment_counts": segments,
+            "terminal_step_count": 1,
+        }
+
+    monkeypatch.setattr(collector, "validate_full_rollout", fake_validate)
 
     summary_path = collector.run_full_collectors(config)
     summary = json.loads(summary_path.read_text())

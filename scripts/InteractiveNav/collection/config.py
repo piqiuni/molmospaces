@@ -175,6 +175,9 @@ class FullRolloutConfig(BaseModel):
     required_open_fraction: float = Field(default=0.67, ge=0.0, le=1.0)
     image_width: int = Field(default=320, ge=64)
     image_height: int = Field(default=180, ge=64)
+    selection_strategy: Literal["shortest_validated_path", "benchmark_order"] = (
+        "shortest_validated_path"
+    )
 
 
 class OutputConfig(BaseModel):

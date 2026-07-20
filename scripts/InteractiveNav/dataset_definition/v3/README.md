@@ -57,6 +57,20 @@ full 模式目前对 channel、container、mixed 均有统一调度入口；默�
 力控制器。executor 仍通过接口注册，可替换为已有 policy 或后续策略。生产配置仍
 不生成 `open_gt_control`，也不构造错误动作负轨迹。
 
+full rollout 的 segment 顺序按领域固定：channel 为
+`initial → nav_to_door → force_open_door → nav_to_target → terminal_observation`，
+container 为 `initial → nav_to_container → force_open_container →
+terminal_observation`，mixed 则依次包含两组导航/force segment。每个 segment 的
+每一步都同步写入 `steps/images/*`、`steps/actions/{type,vector,json}`、
+`steps/states/{json,qpos,qvel}`、`phase`、`reward`、`terminal` 和 `info_json`。
+force step 的 action type 为 `force_joint`，包含 effort、target value 和 joint
+readback；terminal observation 使用 `observe` action type。相机帧按同一 step
+索引写入 MP4，因而可以直接重建完整第一视角视频。
+
+`full/summary.json` 只将成功且 segment、terminal、force step 均完整的 rollout 标记
+为 `training_eligible=true`。导航碰撞、force 未达到目标或后续导航未完成的 rollout
+仍保留完整诊断 H5/视频，但不会混入模型训练集。
+
 ## 示例真实性
 
 `examples/` 下四个 episode 是为说明和校验 v3 字段而手工构造的 synthetic examples，不是由现有 benchmark builder 或 MuJoCo 仿真生成。示例中的 house、对象 ID、joint、pose、路径长度、可见像素和验证结果仅用于展示结构，未经过真实门/容器几何、碰撞、路径或 head-camera 可见性判断，不应作为 benchmark 样本或实验结果使用。

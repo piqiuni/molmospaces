@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.InteractiveNav import capture_mixed_gt_storyboard as storyboard
+from scripts.InteractiveNav import interactive_nav_v3
 from scripts.InteractiveNav import record_mixed_rby1_rollout as mixed
 from scripts.InteractiveNav import visualize_mixed_interaction_benchmark as mixed_viz
 from scripts.InteractiveNav.collection.full_rollout_recorder import (
@@ -54,10 +55,60 @@ def _single_annotation(episode: dict, domain: str) -> dict:
     }
 
 
+def _choose_episode(
+    episodes: list[dict], *, episode_index: int | None, case_id: str | None, domain: str
+) -> tuple[int, dict, dict]:
+    """Select and validate a standalone channel/container episode."""
+    validator = {
+        "channel": interactive_nav_v3.validate_channel_v3_episode,
+        "container": interactive_nav_v3.validate_container_v3_episode,
+    }[domain]
+    if episode_index is not None:
+        if not 0 <= episode_index < len(episodes):
+            raise ValueError(f"Episode index out of range: {episode_index}")
+        episode = episodes[episode_index]
+        validator(episode)
+        return episode_index, episode, {"selection_mode": "explicit_episode_index"}
+    if case_id is not None:
+        for index, episode in enumerate(episodes):
+            if episode.get("interactive_nav", {}).get("case_id") == case_id:
+                validator(episode)
+                return index, episode, {"selection_mode": "explicit_case_id"}
+        raise ValueError(f"{domain} case_id not found: {case_id}")
+    raise ValueError("Standalone full rollout requires --case_id or --episode_index")
+
+
+def _post_navigation_goal(episode: dict, interaction_id: str) -> list[float] | None:
+    plans = episode.get("interactive_nav", {}).get("oracle_plans", [])
+    for plan in plans:
+        opened = False
+        for step in plan.get("steps", []):
+            if step.get("type") == "open_joint" and step.get("interaction_id") == interaction_id:
+                opened = True
+                continue
+            if opened and step.get("type") == "navigate" and step.get("interaction_id") is None:
+                goal = list(step["goal_point"])
+                yaw = float(step.get("goal_yaw", 0.0))
+                quat = mixed.R.from_euler("Z", yaw).as_quat(scalar_first=True)
+                return [
+                    float(goal[0]),
+                    float(goal[1]),
+                    float(goal[2]),
+                    float(quat[0]),
+                    float(quat[1]),
+                    float(quat[2]),
+                    float(quat[3]),
+                ]
+    return None
+
+
 def run(args: argparse.Namespace) -> int:
     episodes = storyboard.load_episodes(args.benchmark)
-    episode_index, episode, selection = storyboard.choose_episode(
-        episodes, episode_index=args.episode_index, case_id=args.case_id
+    episode_index, episode, selection = _choose_episode(
+        episodes,
+        episode_index=args.episode_index,
+        case_id=args.case_id,
+        domain=args.domain,
     )
     domains = episode["interactive_nav"]["interaction_domains"]
     if domains != [args.domain]:
@@ -89,6 +140,21 @@ def run(args: argparse.Namespace) -> int:
         required_door_root=spec["door_root"],
         args=args,
     )
+    if path:
+        path[-1] = mixed.pos_quat_to_pose_mat(operation_pose)
+    post_path: list[np.ndarray] = []
+    post_goal = _post_navigation_goal(episode, spec["interaction_id"])
+    if post_goal is not None:
+        post_path, _post_path_length = mixed.compute_navigation_path(
+            episode,
+            start_xy=np.asarray(operation_pose[:2], dtype=float),
+            goal_xy=np.asarray(post_goal[:2], dtype=float),
+            door_state="open" if spec["kind"] == "door" else "closed",
+            required_door_root=spec["door_root"],
+            args=args,
+        )
+        if post_path:
+            post_path[-1] = mixed.pos_quat_to_pose_mat(post_goal)
 
     recorder = H5StepRolloutRecorder(
         run_dir / "trajectory.h5",
@@ -133,6 +199,8 @@ def run(args: argparse.Namespace) -> int:
             max_base_adjustment_steps=max(
                 args.max_base_adjustment_steps, 5 * len(path) + 10
             ),
+            post_interaction_path=post_path,
+            max_post_interaction_steps=max(args.max_steps, 5 * len(post_path) + 10),
             initial_state_episode=episode,
             step_callback=step_collector.callback(f"nav_to_{args.domain}_and_open"),
             interaction_executor=args.interaction_executor,

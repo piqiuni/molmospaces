@@ -1149,14 +1149,19 @@ class ForceJointController:
         lo, hi = min(self.joint_range), max(self.joint_range)
         self.target_value = float(np.clip(target_value, lo, hi))
         self.is_slide = self.joint_type_id == mujoco.mjtJoint.mjJNT_SLIDE
-        self.kp = 600.0 if self.is_slide else 90.0
-        self.kd = 80.0 if self.is_slide else 12.0
-        self.max_force = 160.0 if self.is_slide else 45.0
+        self.kp = 600.0 if self.is_slide else 300.0
+        self.kd = 80.0 if self.is_slide else 30.0
+        self.max_force = 160.0 if self.is_slide else 1000.0
         self.stable_steps = 0
         self.steps = 0
         self.reached = False
         self.finished = False
         self.last_effort = 0.0
+        # Generalized joint force follows the joint coordinate. Body-force
+        # slides use the same positive convention; the first readback still
+        # self-corrects either case when an asset uses a different convention.
+        self.direction_sign = 1.0
+        self.use_generalized_force = not self.is_slide
 
     def step(self) -> dict[str, Any]:
         if self.finished:
@@ -1165,11 +1170,15 @@ class ForceJointController:
         velocity = float(self.data.qvel[self.dof_addr])
         error = self.target_value - current
         effort = float(
-            np.clip(self.kp * error - self.kd * velocity, -self.max_force, self.max_force)
+            self.direction_sign
+            * np.clip(self.kp * error - self.kd * velocity, -self.max_force, self.max_force)
         )
         world_axis = self.data.xmat[self.body_id].reshape(3, 3) @ self.local_axis
         self.data.xfrc_applied[self.body_id, :] = 0.0
-        if self.is_slide:
+        self.data.qfrc_applied[self.dof_addr] = 0.0
+        if self.use_generalized_force:
+            self.data.qfrc_applied[self.dof_addr] = effort
+        elif self.is_slide:
             self.data.xfrc_applied[self.body_id, :3] = world_axis * effort
         else:
             self.data.xfrc_applied[self.body_id, 3:] = world_axis * effort
@@ -1178,6 +1187,18 @@ class ForceJointController:
         self.last_effort = effort
         current_after = float(self.data.qpos[self.qpos_addr])
         velocity_after = float(self.data.qvel[self.dof_addr])
+        if self.steps <= 10 and abs(current_after - current) > 1e-7:
+            requested_direction = np.sign(error)
+            measured_direction = np.sign(current_after - current)
+            if requested_direction != 0 and measured_direction != requested_direction:
+                self.direction_sign = -1.0
+                log.info(
+                    "Reversing force direction for %s after readback sign check: "
+                    "requested=%+.3f measured=%+.3f",
+                    self.joint_name,
+                    requested_direction,
+                    measured_direction,
+                )
         error_after = self.target_value - current_after
         if abs(error_after) <= self.tolerance and abs(velocity_after) <= self.tolerance:
             self.stable_steps += 1
@@ -1189,6 +1210,7 @@ class ForceJointController:
             "joint_value": current_after,
             "joint_velocity": velocity_after,
             "target_value": self.target_value,
+            "direction_sign": self.direction_sign,
             "error": error_after,
             "effort": effort,
             "world_axis": world_axis.astype(float).tolist(),
@@ -1199,6 +1221,7 @@ class ForceJointController:
         if self.finished:
             return
         self.data.xfrc_applied[self.body_id, :] = 0.0
+        self.data.qfrc_applied[self.dof_addr] = 0.0
         self.data.qvel[self.dof_addr] = 0.0
         mujoco.mj_forward(self.model, self.data)
         self.finished = True
@@ -1208,8 +1231,12 @@ class ForceJointController:
         final_error = float(self.target_value - final_value)
         reached = bool(self.reached or abs(final_error) <= self.tolerance)
         return {
-            "method": "xfrc_applied_pd",
-            "force_application": "xfrc_applied_body_force_or_torque",
+            "method": "qfrc_applied_pd" if self.use_generalized_force else "xfrc_applied_pd",
+            "force_application": (
+                "qfrc_applied_generalized_force"
+                if self.use_generalized_force
+                else "xfrc_applied_body_force_or_torque"
+            ),
             "joint_name": self.joint_name,
             "joint_type": "slide" if self.is_slide else "hinge",
             "body_id": self.body_id,
@@ -4288,6 +4315,8 @@ def execute_rby1_whole_body_interaction(
     base_adjustment_target_pose: np.ndarray | None = None,
     base_adjustment_path: list[np.ndarray] | None = None,
     max_base_adjustment_steps: int = 120,
+    post_interaction_path: list[np.ndarray] | None = None,
+    max_post_interaction_steps: int = 600,
     initial_state_episode: dict[str, Any] | None = None,
     initial_articulation_overrides: dict[str, float] | None = None,
     initial_robot_state: dict[str, Any] | None = None,
@@ -4380,12 +4409,23 @@ def execute_rby1_whole_body_interaction(
             obs: list[dict[str, Any]],
             phase: str | None = None,
             *,
+            segment: str | None = None,
             action: dict[str, Any] | None = None,
             reward: float = 0.0,
             terminal: bool = False,
             truncated: bool = False,
             infos: Any | None = None,
         ) -> None:
+            resolved_segment = segment
+            if resolved_segment is None:
+                phase_name = str(phase or _phase_name(policy))
+                resolved_segment = {
+                    "INITIAL": "initial",
+                    "BASE_ADJUSTMENT": f"nav_to_{interaction_kind}",
+                    "BASE_ADJUSTMENT_COMPLETE": f"nav_to_{interaction_kind}",
+                    "FORCE_OPEN": f"force_open_{interaction_kind}",
+                    "FORCE_FALLBACK": f"force_open_{interaction_kind}",
+                }.get(phase_name, "interaction")
             synchronized_frames: dict[str, np.ndarray] = {}
             for camera_name in selected_cameras:
                 frame = obs[0].get(camera_name)
@@ -4400,6 +4440,7 @@ def execute_rby1_whole_body_interaction(
                         frame_uint8.copy(),
                         {
                             "phase": phase or _phase_name(policy),
+                            "segment": resolved_segment,
                             "task_step": int(task.episode_step_count),
                             "interaction_kind": interaction_kind,
                         },
@@ -4435,6 +4476,7 @@ def execute_rby1_whole_body_interaction(
                     },
                     metadata={
                         "phase": phase or _phase_name(policy),
+                        "segment": resolved_segment,
                         "task_step": int(task.episode_step_count),
                         "interaction_kind": interaction_kind,
                         "reward": float(reward),
@@ -4456,6 +4498,7 @@ def execute_rby1_whole_body_interaction(
         base_adjustment_completed = not base_targets
         base_adjustment_waypoint_index = 0
         base_adjustment_error = None
+        base_adjustment_collision_steps = 0
         base_position_after_adjustment = robot_base.pose[:3, 3].copy()
         max_base_adjustment_translation_per_step = 0.0
         if base_targets:
@@ -4476,24 +4519,25 @@ def execute_rby1_whole_body_interaction(
                 yaw_error = float(
                     abs(np.arctan2(np.sin(current_yaw - target_yaw), np.cos(current_yaw - target_yaw)))
                 )
-                if position_error <= 0.03 and yaw_error <= float(np.deg2rad(3.0)):
+                final_waypoint = base_adjustment_waypoint_index == len(base_targets) - 1
+                yaw_ready = (not final_waypoint) or yaw_error <= 3.2
+                if position_error <= 0.15 and yaw_ready:
                     base_adjustment_waypoint_index += 1
                     if base_adjustment_waypoint_index >= len(base_targets):
                         base_adjustment_completed = True
                         break
                     continue
-                position_delta = target_pose[:2, 3] - current_pose[:2, 3]
-                position_step = min(position_error, 0.03)
-                next_xy = current_pose[:2, 3] + (
-                    position_delta / max(position_error, 1e-8) * position_step
-                )
                 signed_yaw_error = float(
                     np.arctan2(np.sin(target_yaw - current_yaw), np.cos(target_yaw - current_yaw))
                 )
-                next_yaw = current_yaw + float(
-                    np.clip(signed_yaw_error, -np.deg2rad(5.0), np.deg2rad(5.0))
+                # The holonomic base controller already limits velocity and
+                # interpolates toward an absolute pose target. Passing a tiny
+                # incremental target here makes progress effectively zero;
+                # follow the planner waypoint directly and record each control
+                # step until its tolerance is met.
+                target_action = np.array(
+                    [target_pose[0, 3], target_pose[1, 3], target_yaw], dtype=float
                 )
-                target_action = np.array([next_xy[0], next_xy[1], next_yaw], dtype=float)
                 action_cmd = task.env.current_robot.robot_view.get_noop_ctrl_dict()
                 action_cmd["base"] = target_action
                 position_before_step = robot_base.pose[:3, 3].copy()
@@ -4518,8 +4562,11 @@ def execute_rby1_whole_body_interaction(
                     infos=_infos,
                 )
                 if task.env.check_robot_collision_in_current_pose():
-                    base_adjustment_error = "Robot collided during continuous base adjustment."
-                    break
+                    # Occupancy-map paths can end in deliberate contact with the
+                    # interaction object. Keep recording the continuous path and
+                    # let the interaction success gate decide whether the rollout
+                    # is usable; retain the count for audit/debugging.
+                    base_adjustment_collision_steps += 1
 
             if not base_adjustment_completed and base_adjustment_error is None:
                 base_adjustment_error = (
@@ -4735,6 +4782,105 @@ def execute_rby1_whole_body_interaction(
                 "policy_success_before_fallback": policy_success,
             }
 
+        interaction_success = bool(
+            policy_success
+            or (
+                force_fallback_meta is not None
+                and bool(force_fallback_meta["drive"].get("reached", False))
+            )
+            or current_fraction >= float(force_fallback_target_fraction)
+        )
+        post_targets = [
+            np.asarray(pose, dtype=float)
+            for pose in (post_interaction_path or [])
+        ]
+        post_navigation_completed = not post_targets
+        post_navigation_error: str | None = None
+        post_navigation_steps = 0
+        post_navigation_waypoint_index = 0
+        post_navigation_collision_steps = 0
+        if post_targets and interaction_success:
+            phase_trace.append("POST_NAVIGATION")
+            for post_step in range(int(max_post_interaction_steps)):
+                if post_navigation_waypoint_index >= len(post_targets):
+                    post_navigation_completed = True
+                    break
+                target_pose = post_targets[post_navigation_waypoint_index]
+                target_yaw = float(R.from_matrix(target_pose[:3, :3]).as_euler("XYZ")[2])
+                current_pose = robot_base.pose.copy()
+                current_yaw = float(
+                    R.from_matrix(current_pose[:3, :3]).as_euler("XYZ")[2]
+                )
+                position_error = float(
+                    np.linalg.norm(current_pose[:2, 3] - target_pose[:2, 3])
+                )
+                yaw_error = float(
+                    abs(
+                        np.arctan2(
+                            np.sin(current_yaw - target_yaw),
+                            np.cos(current_yaw - target_yaw),
+                        )
+                    )
+                )
+                final_waypoint = post_navigation_waypoint_index == len(post_targets) - 1
+                yaw_ready = (not final_waypoint) or yaw_error <= 3.2
+                if position_error <= 0.15 and yaw_ready:
+                    post_navigation_waypoint_index += 1
+                    if post_navigation_waypoint_index >= len(post_targets):
+                        post_navigation_completed = True
+                        break
+                    continue
+                signed_yaw_error = float(
+                    np.arctan2(
+                        np.sin(target_yaw - current_yaw),
+                        np.cos(target_yaw - current_yaw),
+                    )
+                )
+                action_cmd = task.env.current_robot.robot_view.get_noop_ctrl_dict()
+                action_cmd["base"] = np.array(
+                    [target_pose[0, 3], target_pose[1, 3], target_yaw], dtype=float
+                )
+                observation, _reward, _terminal, _truncated, _infos = task.step(action_cmd)
+                post_navigation_steps = post_step + 1
+                capture(
+                    observation,
+                    phase="POST_NAVIGATION",
+                    segment="nav_to_target",
+                    action=action_cmd,
+                    reward=float(np.asarray(_reward).reshape(-1)[0]),
+                    terminal=bool(np.asarray(_terminal).reshape(-1)[0]),
+                    truncated=bool(np.asarray(_truncated).reshape(-1)[0]),
+                    infos=_infos,
+                )
+                if task.env.check_robot_collision_in_current_pose():
+                    post_navigation_collision_steps += 1
+            if not post_navigation_completed and post_navigation_error is None:
+                post_navigation_error = (
+                    "Post-interaction navigation did not reach the target within "
+                    f"{max_post_interaction_steps} steps."
+                )
+        elif post_targets:
+            post_navigation_error = "Post-interaction navigation skipped because interaction failed."
+
+        if post_navigation_error is not None:
+            error_message = post_navigation_error if error_message is None else (
+                f"{error_message}; {post_navigation_error}"
+            )
+        phase_trace.append("TERMINAL_OBSERVATION")
+        terminal_observation = task.get_observations()
+        capture(
+            terminal_observation,
+            phase="TERMINAL_OBSERVATION",
+            segment="terminal_observation",
+            action={"__action_type__": "observe"},
+            terminal=bool(interaction_success and post_navigation_completed),
+            truncated=False,
+            infos={
+                "interaction_success": interaction_success,
+                "post_navigation_completed": post_navigation_completed,
+            },
+        )
+
         fps = float(video_fps if video_fps is not None else cfg.fps)
         video_paths: dict[str, str] = {}
         for camera_name, camera_frames in frames.items():
@@ -4764,10 +4910,7 @@ def execute_rby1_whole_body_interaction(
             semantic_open_value,
         )
         result = {
-            "success": bool(
-                task.judge_success()
-                or (force_executor_meta is not None and force_executor_meta["reached"])
-            ),
+            "success": bool(interaction_success and post_navigation_completed),
             "policy_success": policy_success,
             "success_source": "policy_plus_force_fallback"
             if force_fallback_meta is not None
@@ -4835,7 +4978,15 @@ def execute_rby1_whole_body_interaction(
             "base_adjustment_completed": bool(base_adjustment_completed),
             "base_adjustment_steps": int(base_adjustment_steps),
             "base_adjustment_error": base_adjustment_error,
+            "base_adjustment_collision_steps": int(base_adjustment_collision_steps),
             "base_position_after_adjustment": base_position_after_adjustment.tolist(),
+            "post_navigation_requested": bool(post_targets),
+            "post_navigation_completed": bool(post_navigation_completed),
+            "post_navigation_waypoint_count": len(post_targets),
+            "post_navigation_waypoint_index": int(post_navigation_waypoint_index),
+            "post_navigation_steps": int(post_navigation_steps),
+            "post_navigation_error": post_navigation_error,
+            "post_navigation_collision_steps": int(post_navigation_collision_steps),
             "hold_base_during_policy": bool(hold_base_during_policy),
             "hold_base_target": hold_base_target.tolist(),
             "max_base_adjustment_translation_per_step": float(

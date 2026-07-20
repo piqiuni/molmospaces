@@ -104,7 +104,7 @@ class StepCollector:
                 images=images,
                 action=action,
                 state=state,
-                segment=segment_name,
+                segment=str(metadata.get("segment", segment_name)),
                 phase=str(metadata.get("phase", "unknown")),
                 reward=float(metadata.get("reward", 0.0)),
                 terminal=bool(metadata.get("terminal", False)),
@@ -228,7 +228,7 @@ def oracle_operation_pose(
                 continue
             goal = list(step["goal_point"])
             yaw = float(step.get("goal_yaw", 0.0))
-            quat = R.from_euler("Z", yaw).as_quat()
+            quat = R.from_euler("Z", yaw).as_quat(scalar_first=True)
             return [
                 float(goal[0]),
                 float(goal[1]),
@@ -238,6 +238,32 @@ def oracle_operation_pose(
                 float(quat[2]),
                 float(quat[3]),
             ]
+    return None
+
+
+def oracle_post_navigation_pose(
+    episode: dict[str, Any], interaction_id: str
+) -> list[float] | None:
+    plans = episode.get("interactive_nav", {}).get("oracle_plans", [])
+    for plan in plans:
+        opened = False
+        for step in plan.get("steps", []):
+            if step.get("type") == "open_joint" and step.get("interaction_id") == interaction_id:
+                opened = True
+                continue
+            if opened and step.get("type") == "navigate" and step.get("interaction_id") is None:
+                goal = list(step["goal_point"])
+                yaw = float(step.get("goal_yaw", 0.0))
+                quat = R.from_euler("Z", yaw).as_quat(scalar_first=True)
+                return [
+                    float(goal[0]),
+                    float(goal[1]),
+                    float(goal[2]),
+                    float(quat[0]),
+                    float(quat[1]),
+                    float(quat[2]),
+                    float(quat[3]),
+                ]
     return None
 
 
@@ -406,6 +432,8 @@ def run(args: argparse.Namespace) -> int:
         required_door_root=door_root,
         args=args,
     )
+    if door_path:
+        door_path[-1] = pos_quat_to_pose_mat(door_operation_pose)
     if args.plan_only:
         fridge_spec, fridge_meta, fridge_operation_pose = prepare_operation_spec(
             episode,
@@ -428,6 +456,8 @@ def run(args: argparse.Namespace) -> int:
             required_door_root=door_root,
             args=args,
         )
+        if fridge_path:
+            fridge_path[-1] = pos_quat_to_pose_mat(fridge_operation_pose)
         plan_payload = {
             "schema_version": SCHEMA_VERSION,
             "episode_index": episode_index,
@@ -525,6 +555,23 @@ def run(args: argparse.Namespace) -> int:
         required_door_root=door_root,
         args=args,
     )
+    if fridge_path:
+        fridge_path[-1] = pos_quat_to_pose_mat(fridge_operation_pose)
+    post_path: list[np.ndarray] = []
+    post_goal = oracle_post_navigation_pose(
+        episode, str(container_interaction["interaction_id"])
+    )
+    if post_goal is not None:
+        post_path, _post_path_length = compute_navigation_path(
+            episode,
+            start_xy=np.asarray(fridge_operation_pose[:2], dtype=float),
+            goal_xy=np.asarray(post_goal[:2], dtype=float),
+            door_state="open",
+            required_door_root=door_root,
+            args=args,
+        )
+        if post_path:
+            post_path[-1] = pos_quat_to_pose_mat(post_goal)
     door_joint_name = door_meta["joint_name"]
     door_open_value = target_joint_open_value(door_meta)
     fridge_output = run_dir / "fridge"
@@ -547,6 +594,8 @@ def run(args: argparse.Namespace) -> int:
         max_base_adjustment_steps=max(
             args.max_base_adjustment_steps, 5 * len(fridge_path) + 10
         ),
+        post_interaction_path=post_path,
+        max_post_interaction_steps=max(args.max_steps, 5 * len(post_path) + 10),
         initial_state_episode=episode,
         initial_articulation_overrides={door_joint_name: door_open_value},
         initial_robot_state=final_robot_state,
