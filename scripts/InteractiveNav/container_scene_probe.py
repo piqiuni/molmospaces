@@ -4736,6 +4736,9 @@ def execute_rby1_whole_body_interaction(
                 )
 
         force_executor_meta: dict[str, Any] | None = None
+        force_success_threshold = float(
+            getattr(getattr(cfg, "task_config", None), "task_success_threshold", 0.67)
+        )
         if base_adjustment_completed and interaction_executor == "force":
             if interaction_kind == "door":
                 joint_obj = task.door_object
@@ -4772,6 +4775,8 @@ def execute_rby1_whole_body_interaction(
             force_upper_body_targets: dict[str, np.ndarray] = {}
             force_upper_body_hold_qpos: dict[str, np.ndarray] = {}
             force_upper_body_hold_qvel: dict[str, np.ndarray] = {}
+            force_task_completion_reached = False
+            force_termination_reason = "max_steps"
             for group_name in (
                 "left_arm",
                 "right_arm",
@@ -4815,6 +4820,14 @@ def execute_rby1_whole_body_interaction(
                         apply_force_upper_body_lock()
                         mujoco.mj_forward(task.env.current_model, task.env.current_data)
                     force_action = controller.step()
+                    force_fraction = semantic_open_fraction(
+                        float(force_action["joint_value"]),
+                        force_closed_value,
+                        force_open_value,
+                    )
+                    force_task_completion_reached = (
+                        force_fraction >= force_success_threshold
+                    )
                     current_base = robot_base.pose
                     force_base_max_drift = max(
                         force_base_max_drift,
@@ -4843,14 +4856,21 @@ def execute_rby1_whole_body_interaction(
                         observation,
                         phase="FORCE_OPEN",
                         action=force_action_payload,
-                        terminal=bool(force_action["reached"]),
+                        terminal=bool(
+                            force_action["reached"] or force_task_completion_reached
+                        ),
                         infos=force_action,
                         record_video_frame=(
                             _force_step % force_video_stride == 0
                             or bool(force_action["reached"])
+                            or force_task_completion_reached
                         ),
                     )
                     if force_action["reached"]:
+                        force_termination_reason = "control_target_reached"
+                        break
+                    if force_task_completion_reached:
+                        force_termination_reason = "task_success_threshold_reached"
                         break
             finally:
                 controller.finish()
@@ -4860,6 +4880,11 @@ def execute_rby1_whole_body_interaction(
             force_executor_meta["base_max_xy_drift"] = float(force_base_max_drift)
             force_executor_meta["upper_body_lock_enabled"] = bool(lock_base_during_force)
             force_executor_meta["upper_body_lock_groups"] = sorted(force_upper_body_targets)
+            force_executor_meta["task_success_threshold"] = float(force_success_threshold)
+            force_executor_meta["task_success_threshold_reached"] = bool(
+                force_task_completion_reached
+            )
+            force_executor_meta["termination_reason"] = force_termination_reason
             policy_success = bool(force_executor_meta["reached"])
         else:
             policy_success = bool(task.judge_success())
@@ -4928,9 +4953,6 @@ def execute_rby1_whole_body_interaction(
                 "policy_success_before_fallback": policy_success,
             }
 
-        force_success_threshold = float(
-            getattr(getattr(cfg, "task_config", None), "task_success_threshold", 0.67)
-        )
         interaction_success = bool(
             policy_success
             or (
