@@ -12,6 +12,7 @@ OUTPUT_DIR=${1:-${REPO_ROOT}/outputs/${ROUTE_ID}_$(date +%Y%m%d_%H%M%S)}
 ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.zsh}
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11431}
 TASK_HORIZON=${TASK_HORIZON:-1000}
+INITIAL_DOOR_STATE=${INITIAL_DOOR_STATE:-closed}
 ROUTE_READY_TIMEOUT_S=${ROUTE_READY_TIMEOUT_S:-60}
 ROUTE_NAVIGATION_TIMEOUT_S=${ROUTE_NAVIGATION_TIMEOUT_S:-180}
 ROUTE_INTERACTION_TIMEOUT_S=${ROUTE_INTERACTION_TIMEOUT_S:-30}
@@ -71,7 +72,6 @@ fi
 
 PYTHONUNBUFFERED=1 python -u "${RECORDER_SCRIPT}" \
   --output-dir "${OUTPUT_DIR}/debug" \
-  --video-step-sync-topic /molmo_spaces/step_sync \
   --first-person-video-capture-mode step \
   --semantic-video \
   --first-person-video-with-map \
@@ -84,7 +84,7 @@ PYTHONUNBUFFERED=1 python -u "${RECORDER_SCRIPT}" \
 RECORDER_PID=$!
 sleep 1
 
-SIM_EXTRA_ARGS="--seed ${ROUTE_SEED} --fixed_robot_xyyaw ${ROBOT_XYYAW} --enable_force_interaction true --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval 1 --realtime_gt_min_visible_pixels 4 --realtime_gt_max_distance_m 6.0 --map_warmup_skip_frames 3 --observation_queue_size 0 --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+SIM_EXTRA_ARGS="--seed ${ROUTE_SEED} --fixed_robot_xyyaw ${ROBOT_XYYAW} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval 1 --realtime_gt_min_visible_pixels 4 --realtime_gt_max_distance_m 6.0 --map_warmup_skip_frames 3 --observation_queue_size 0 --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -97,7 +97,6 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   start_explore:=false \
   start_explore_py:=false \
   nav_config_override_file:="${ROUTE_NAV_CONFIG}" \
-  global_planner_allow_unknown:=true \
   manual_control:=true \
   exploration_only:=true \
   randomize_camera:=false \

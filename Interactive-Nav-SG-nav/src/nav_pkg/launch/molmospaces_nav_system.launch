@@ -16,6 +16,18 @@
   <arg name="semantic_use_gt" default="false"/>
   <arg name="semantic_source" default="detector"/>
   <arg name="publish_realtime_gt" default="false"/>
+  <arg name="initial_door_state" default="keep"/>
+  <arg name="enable_force_interaction" default="false"/>
+  <arg name="force_interaction_command_topic" default="/semantic_decision/interaction_command"/>
+  <arg name="force_interaction_result_topic" default="/semantic_mapping/interaction_result"/>
+  <arg name="force_interaction_feedback_topic" default="/semantic_decision/interaction_action_feedback"/>
+  <arg name="force_interaction_log_path" default=""/>
+  <arg name="force_interaction_close_all_containers_on_prepare" default="false"/>
+  <arg name="force_interaction_max_physics_substeps" default="3000"/>
+  <arg name="force_interaction_open_fraction_threshold" default="0.95"/>
+  <arg name="start_semantic_decision" default="false"/>
+  <arg name="semantic_decision_config_file" default="$(find semantic_decision_py_pkg)/config/default.yaml"/>
+  <arg name="semantic_decision_config_override_file" default=""/>
   <arg name="local_costmap_inflation_radius" default="0.20"/>
   <arg name="explore_py_config_file" default="$(find explore_py_pkg)/config/explore_py.yaml"/>
   <arg name="explore_py_config_override_file" default=""/>
@@ -70,7 +82,14 @@
           name="molmospaces_nav_ros_sim"
           output="screen"
           required="true"
-          args="--robot $(arg robot) --scene_dataset $(arg scene_dataset) --data_split $(arg data_split) --house_ind $(arg house_ind) --house_inds $(arg house_inds) --target_types $(arg target_types) --exploration_only $(arg exploration_only) --task_horizon $(arg task_horizon) --scene_timeout_s $(arg scene_timeout_s) --max_scene_attempts $(arg max_scene_attempts) --max_consecutive_action_timeouts $(arg max_consecutive_action_timeouts) --output_dir=$(arg output_dir) --randomize_camera $(arg randomize_camera) --lidar_calib_x_m $(arg lidar_calib_x_m) --lidar_calib_y_m $(arg lidar_calib_y_m) --lidar_calib_z_m $(arg lidar_calib_z_m) --lidar_calib_roll_deg $(arg lidar_calib_roll_deg) --lidar_calib_pitch_deg $(arg lidar_calib_pitch_deg) --lidar_calib_yaw_deg $(arg lidar_calib_yaw_deg) --allow_static_lidar_tf_fallback $(arg allow_static_lidar_tf_fallback) --initial_arm_qpos $(arg initial_arm_qpos) --initial_left_arm_qpos $(arg initial_left_arm_qpos) --initial_right_arm_qpos $(arg initial_right_arm_qpos) --publish_debug_front_camera $(arg publish_debug_front_camera) --publish_realtime_gt $(arg publish_realtime_gt) $(arg sim_extra_args)"/>
+          args="--robot $(arg robot) --scene_dataset $(arg scene_dataset) --data_split $(arg data_split) --house_ind $(arg house_ind) --house_inds $(arg house_inds) --target_types $(arg target_types) --exploration_only $(arg exploration_only) --task_horizon $(arg task_horizon) --scene_timeout_s $(arg scene_timeout_s) --max_scene_attempts $(arg max_scene_attempts) --max_consecutive_action_timeouts $(arg max_consecutive_action_timeouts) --output_dir=$(arg output_dir) --randomize_camera $(arg randomize_camera) --lidar_calib_x_m $(arg lidar_calib_x_m) --lidar_calib_y_m $(arg lidar_calib_y_m) --lidar_calib_z_m $(arg lidar_calib_z_m) --allow_static_lidar_tf_fallback $(arg allow_static_lidar_tf_fallback) --initial_arm_qpos $(arg initial_arm_qpos) --initial_left_arm_qpos $(arg initial_left_arm_qpos) --initial_right_arm_qpos $(arg initial_right_arm_qpos) --publish_debug_front_camera $(arg publish_debug_front_camera) --publish_realtime_gt $(arg publish_realtime_gt) --initial_door_state $(arg initial_door_state) --enable_force_interaction $(arg enable_force_interaction) --force_interaction_command_topic $(arg force_interaction_command_topic) --force_interaction_result_topic $(arg force_interaction_result_topic) --force_interaction_feedback_topic $(arg force_interaction_feedback_topic) --force_interaction_log_path=$(arg force_interaction_log_path) --force_interaction_close_all_containers_on_prepare $(arg force_interaction_close_all_containers_on_prepare) --force_interaction_max_physics_substeps $(arg force_interaction_max_physics_substeps) --force_interaction_open_fraction_threshold $(arg force_interaction_open_fraction_threshold) $(arg sim_extra_args)"/>
+  </group>
+
+  <group if="$(arg start_semantic_decision)">
+    <include file="$(find semantic_decision_py_pkg)/launch/semantic_decision.launch">
+      <arg name="config_file" value="$(arg semantic_decision_config_file)"/>
+      <arg name="override_config_file" value="$(arg semantic_decision_config_override_file)"/>
+    </include>
   </group>
 
   <group if="$(arg start_mapping)">

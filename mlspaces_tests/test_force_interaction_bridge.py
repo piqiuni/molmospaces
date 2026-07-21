@@ -17,21 +17,30 @@ def test_controller_emits_success_result_and_behavior_feedback(monkeypatch) -> N
     controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
     published = []
     monkeypatch.setattr(
-        "scripts.InteractiveNav.force_interaction_bridge.open_door_root_with_force",
-        lambda _env, root_name, config: {
-            "root_body_name": root_name,
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, root_name, **_kwargs: {
+            "group": {"root_body_name": root_name},
+            "targets": {"left_hinge": 1.0},
+            "selected_joint_names": ["left_hinge"],
+            "closed_joint_names": [],
+            "pre_joint_infos": [],
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.drive_joint_group_to_targets",
+        lambda _model, _data, _targets, config: {"physics_substeps": 123},
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.complete_articulation_force",
+        lambda _env, _plan, config: {
             "pre_state": "closed",
             "post_state": "open",
-            "joint_infos": [
-                {
-                    "joint_name": "left_hinge",
-                    "joint_type": "hinge",
-                    "joint_range": [0.0, 1.0],
-                    "joint_value": 0.99,
-                    "open_fraction": 0.99,
-                }
-            ],
+            "joint_infos": [],
+            "selected_joint_names": ["left_hinge"],
+            "closed_joint_names": [],
+            "success": True,
             "physics_substeps": 123,
+            "task_steps_consumed": 1,
         },
     )
     monkeypatch.setattr(controller, "_publish", lambda publisher, payload: published.append(payload))
@@ -45,7 +54,9 @@ def test_controller_emits_success_result_and_behavior_feedback(monkeypatch) -> N
             "action": "open",
         }
     )
-    result = controller.before_step(SimpleNamespace(env=object()), step=17)
+    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+    assert controller.before_step(task, step=17) is None
+    result = controller.after_step(task, step=17)
 
     assert result is not None
     assert result["success"] is True

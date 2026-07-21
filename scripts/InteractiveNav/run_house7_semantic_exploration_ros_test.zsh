@@ -159,8 +159,6 @@ fi
 PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
   --output-dir "${OUTPUT_DIR}/debug" \
   --occupancy-grid-topic /semantic_mapping/planning_occ_map \
-  --room-segment-grid-topic /semantic_mapping/scene_id_grid \
-  --video-step-sync-topic /molmo_spaces/step_sync \
   --first-person-video-capture-mode step \
   --semantic-video \
   --first-person-video-with-map \
@@ -179,7 +177,7 @@ PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py
 RECORDER_PID=$!
 sleep 1
 
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --realtime_gt_roi_x_min_ratio ${GT_ROI_X_MIN_RATIO} --realtime_gt_roi_x_max_ratio ${GT_ROI_X_MAX_RATIO} --realtime_gt_min_forward_cosine ${GT_MIN_FORWARD_COSINE} --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --no-retain_task_history --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -195,7 +193,6 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   semantic_decision_config_file:="${SEMANTIC_DECISION_CONFIG}" \
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
   nav_config_override_file:="${ROUTE_NAV_CONFIG}" \
-  global_planner_allow_unknown:=false \
   local_costmap_inflation_radius:="${LOCAL_COSTMAP_INFLATION_RADIUS}" \
   exploration_only:=true \
   randomize_camera:=false \

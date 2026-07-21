@@ -12,6 +12,7 @@ from force_interaction_runtime import (
     complete_articulation_force,
     drive_joint_group_to_targets,
     prepare_articulation_force,
+    open_door_root_with_force,
     set_all_articulations_closed,
     set_all_door_roots_closed,
 )
