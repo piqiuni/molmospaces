@@ -172,7 +172,8 @@ class FullRolloutConfig(BaseModel):
     max_steps: int = Field(default=500, ge=1)
     max_base_adjustment_steps: int = Field(default=300, ge=1)
     video_fps: float = Field(default=10.0, gt=0.0)
-    required_open_fraction: float = Field(default=0.67, ge=0.0, le=1.0)
+    required_open_fraction: float = Field(default=0.8, ge=0.0, le=1.0)
+    completion_hold_seconds: float = Field(default=0.4, ge=0.0)
     image_width: int = Field(default=320, ge=64)
     image_height: int = Field(default=180, ge=64)
     selection_strategy: Literal["shortest_validated_path", "benchmark_order"] = (

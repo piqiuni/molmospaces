@@ -566,6 +566,7 @@ def run(args: argparse.Namespace) -> int:
         allow_force_fallback=args.allow_force_fallback,
         force_fallback_target_fraction=force_target_fraction(args, "door"),
         force_fallback_max_steps=force_max_steps(args, "door"),
+        completion_hold_seconds=args.completion_hold_seconds,
     )
     write_json(door_output / "result.json", door_result)
     if not door_result["success"] or semantic_fraction(door_result) < args.required_open_fraction:
@@ -649,6 +650,7 @@ def run(args: argparse.Namespace) -> int:
         allow_force_fallback=args.allow_force_fallback,
         force_fallback_target_fraction=force_target_fraction(args, "container"),
         force_fallback_max_steps=force_max_steps(args, "container"),
+        completion_hold_seconds=args.completion_hold_seconds,
     )
     write_json(fridge_output / "result.json", fridge_result)
     if not fridge_result["success"] or semantic_fraction(fridge_result) < args.required_open_fraction:
@@ -762,8 +764,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--container_max_steps_per_waypoint", type=int, default=80)
     parser.add_argument("--container_max_batch_plan_attempts", type=int, default=16)
     parser.add_argument("--container_max_planning_reattempts", type=int, default=8)
-    parser.add_argument("--success_threshold", type=float, default=0.67)
-    parser.add_argument("--required_open_fraction", type=float, default=0.67)
+    parser.add_argument("--success_threshold", type=float, default=0.8)
+    parser.add_argument("--required_open_fraction", type=float, default=0.8)
+    parser.add_argument("--completion_hold_seconds", type=float, default=0.4)
     parser.add_argument("--video_fps", type=float, default=10.0)
     parser.add_argument("--img_width", type=int, default=320)
     parser.add_argument("--img_height", type=int, default=180)

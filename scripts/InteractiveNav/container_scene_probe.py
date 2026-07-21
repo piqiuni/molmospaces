@@ -183,7 +183,7 @@ class RBY1InteractionRequest:
     # RBY1 scenes currently use a 2 ms MuJoCo timestep. 1000 force steps
     # therefore represent the intended ~2 s continuous interaction window.
     force_fallback_max_steps: int = 1000
-    success_threshold: float = 0.67
+    success_threshold: float = 0.8
     max_steps: int = 400
     container_max_steps_per_waypoint: int = 30
     container_max_batch_plan_attempts: int = 8
@@ -4330,6 +4330,7 @@ def execute_rby1_whole_body_interaction(
     allow_force_fallback: bool = False,
     force_fallback_target_fraction: float = 1.0,
     force_fallback_max_steps: int = 1000,
+    completion_hold_seconds: float = 0.4,
 ) -> dict[str, Any]:
     """Execute an official RBY1 manipulation policy and record its camera streams.
 
@@ -4479,6 +4480,7 @@ def execute_rby1_whole_body_interaction(
             truncated: bool = False,
             infos: Any | None = None,
             record_video_frame: bool = True,
+            record_step: bool = True,
         ) -> None:
             resolved_segment = segment
             if resolved_segment is None:
@@ -4510,7 +4512,7 @@ def execute_rby1_whole_body_interaction(
                             "interaction_kind": interaction_kind,
                         },
                     )
-            if step_callback is not None:
+            if record_step and step_callback is not None:
                 components = {}
                 vector_parts = []
                 action_type = str((action or {}).get("__action_type__", "robot_control"))
@@ -4872,6 +4874,23 @@ def execute_rby1_whole_body_interaction(
                     if force_task_completion_reached:
                         force_termination_reason = "task_success_threshold_reached"
                         break
+                if force_task_completion_reached and completion_hold_seconds > 0.0:
+                    hold_frame_count = max(
+                        1, int(round(float(capture_video_fps) * float(completion_hold_seconds)))
+                    )
+                    for _hold_frame in range(hold_frame_count):
+                        task.env.camera_manager.registry.update_all_cameras(task.env)
+                        hold_observation = task.get_observations()
+                        capture(
+                            hold_observation,
+                            phase="FORCE_OPEN_COMPLETE_HOLD",
+                            segment=f"force_open_{interaction_kind}",
+                            action={"__action_type__": "observe"},
+                            terminal=False,
+                            infos={"completion_hold": True},
+                            record_video_frame=True,
+                            record_step=False,
+                        )
             finally:
                 controller.finish()
             force_executor_meta = controller.result()
@@ -4885,6 +4904,7 @@ def execute_rby1_whole_body_interaction(
                 force_task_completion_reached
             )
             force_executor_meta["termination_reason"] = force_termination_reason
+            force_executor_meta["completion_hold_seconds"] = float(completion_hold_seconds)
             policy_success = bool(force_executor_meta["reached"])
         else:
             policy_success = bool(task.judge_success())
@@ -6199,7 +6219,8 @@ def build_parser() -> argparse.ArgumentParser:
             "or preserve it when safe and otherwise fall back to a nearby stance."
         ),
     )
-    rby1_parser.add_argument("--success_threshold", type=float, default=0.67)
+    rby1_parser.add_argument("--success_threshold", type=float, default=0.8)
+    rby1_parser.add_argument("--completion_hold_seconds", type=float, default=0.4)
     rby1_parser.add_argument("--max_steps", type=int, default=400)
     rby1_parser.add_argument("--door_max_steps_per_waypoint", type=int, default=35)
     rby1_parser.add_argument("--door_max_planning_reattempts", type=int, default=5)

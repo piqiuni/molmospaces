@@ -212,6 +212,7 @@ def run(args: argparse.Namespace) -> int:
             force_fallback_max_steps=mixed.force_max_steps(
                 args, "door" if spec["kind"] == "door" else "container"
             ),
+            completion_hold_seconds=args.completion_hold_seconds,
         )
         write_json(output / "result.json", result)
         success = bool(result.get("success")) and mixed.semantic_fraction(result) >= args.required_open_fraction

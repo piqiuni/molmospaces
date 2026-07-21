@@ -302,8 +302,8 @@ policy step 理论上对应 100ms；force recorder 每个 `force_joint` step 对
 12cm waypoint 间距对应约 143ms。冰箱门若按 2s 完成，需要约 1000 个 sim steps、
 100 个 control steps 或 20 个 policy steps。MP4 会按 sim dt
 下采样到视频 fps，避免把每个 2ms force step 以 10fps 全部播放而造成视频变慢。
-full force 段在达到任务 `success_threshold` 后立即结束；`max_steps` 只是保护上限，
-不是必须完整执行的固定长度。
+full force 段在达到任务 `success_threshold`（当前 0.8）后停止物理推进，并默认额外
+保留 0.4 秒完成保持视频；`max_steps` 只是保护上限，不是必须完整执行的固定长度。
 
 复用预计算 rough 时可配置：
 

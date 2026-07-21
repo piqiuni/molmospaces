@@ -1184,6 +1184,8 @@ def run_full_collectors(config: CollectionConfig) -> Path:
             str(config.full.video_fps),
             "--required_open_fraction",
             str(config.full.required_open_fraction),
+            "--completion_hold_seconds",
+            str(config.full.completion_hold_seconds),
             "--img_width",
             str(config.full.image_width),
             "--img_height",

@@ -77,7 +77,8 @@ readback；terminal observation 使用 `observe` action type。相机帧按同�
 target；force 阶段还会硬锁 base pose，并记录锁定组和实际最大漂移量。force H5
 仍保存每个 2ms sim step，但 MP4 按目标 fps 下采样；因此视频播放时间与仿真时间
 一致。默认最多 1000 个 force steps 对应约 2 秒连续交互；一旦达到任务
-`success_threshold`（当前 0.67），force 段立即终止，不再记录无效后续步骤。控制
+`success_threshold`（当前 0.8），force 段停止物理推进并额外保留短暂完成保持帧，
+然后终止视频，不再记录无效后续步骤。控制
 目标仍可设为 1.0，训练有效性按任务阈值和 full `required_open_fraction` 判定，避免
 物理几何限位使有效开门轨迹被误判失败。
 
