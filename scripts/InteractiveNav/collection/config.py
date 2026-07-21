@@ -125,7 +125,7 @@ class BalanceConfig(BaseModel):
 class ExecutorConfig(BaseModel):
     executor: str = "force"
     target_fraction: float = Field(default=1.0, ge=0.0, le=1.0)
-    max_steps: int = Field(default=1500, ge=1)
+    max_steps: int = Field(default=1000, ge=1)
     tolerance: float = Field(default=1e-3, gt=0.0)
 
 
@@ -178,6 +178,7 @@ class FullRolloutConfig(BaseModel):
     selection_strategy: Literal["shortest_validated_path", "benchmark_order"] = (
         "shortest_validated_path"
     )
+    lock_base_during_force: bool = True
 
 
 class OutputConfig(BaseModel):

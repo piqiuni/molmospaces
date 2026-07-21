@@ -288,6 +288,21 @@ full 训练资格要求：
 - 失败 rollout 仅保留在 `full/runs` 供诊断，不计入训练数据；汇总见
   `full/summary.json`
 
+full 导航使用平滑后的 waypoint 作为 RBY1 holonomic base 的绝对 position target，
+由 MuJoCo actuator 逐步跟踪。导航和 force 阶段会保持初始 head、左右臂、夹爪和
+torso 的 qpos/qvel/position target；`lock_base_during_force: true` 还会在每个 force
+step 前后恢复 base 的 x/y/yaw pose，避免交互把机器人推离操作位或让机械臂下落，
+并在 force metadata 中记录锁定组和最大漂移。
+
+时间基准：当前 full smoke 实测 MuJoCo `sim_dt=2ms`、control dt=20ms、policy
+dt=100ms。导航每个
+policy step 理论上对应 100ms；force recorder 每个 `force_joint` step 对应一个
+2ms sim step。按人类步行速度 1.4m/s 的 60%（0.84m/s）计算，100ms 导航步对应
+约 8.4cm，20ms control step 对应约 1.68cm，2ms sim step 对应约 1.68mm；当前
+12cm waypoint 间距对应约 143ms。冰箱门若按 2s 完成，需要约 1000 个 sim steps、
+100 个 control steps 或 20 个 policy steps。MP4 会按 sim dt
+下采样到视频 fps，避免把每个 2ms force step 以 10fps 全部播放而造成视频变慢。
+
 复用预计算 rough 时可配置：
 
 ```yaml

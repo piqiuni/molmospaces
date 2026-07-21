@@ -1190,7 +1190,30 @@ def run_full_collectors(config: CollectionConfig) -> Path:
             str(config.full.image_height),
             "--force_fallback_max_steps",
             str(max(config.policy.channel.max_steps, config.policy.container.max_steps)),
+            "--force_fallback_target_fraction",
+            str(
+                min(
+                    config.policy.channel.target_fraction,
+                    config.policy.container.target_fraction,
+                )
+                if domain == "mixed"
+                else (
+                    config.policy.channel.target_fraction
+                    if domain == "channel"
+                    else config.policy.container.target_fraction
+                )
+            ),
+            "--door_force_target_fraction",
+            str(config.policy.channel.target_fraction),
+            "--container_force_target_fraction",
+            str(config.policy.container.target_fraction),
+            "--door_force_max_steps",
+            str(config.policy.channel.max_steps),
+            "--container_force_max_steps",
+            str(config.policy.container.max_steps),
         ]
+        if config.full.lock_base_during_force:
+            command.append("--lock_base_during_force")
         if domain != "mixed":
             command.extend(["--domain", domain])
         log_path = full_root / "logs" / f"{domain}__{case_id}.log"

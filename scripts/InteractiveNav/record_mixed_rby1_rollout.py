@@ -172,7 +172,7 @@ def request_args(
         seed=args.seed,
     )
     operation_args = probe._rby1_request_to_args(request)
-    operation_args.interaction_executor = args.interaction_executor
+    operation_args.interaction_executor = getattr(args, "interaction_executor", "force")
     return operation_args
 
 
@@ -301,6 +301,38 @@ def compress_path(path: np.ndarray, spacing_m: float = 0.12) -> np.ndarray:
     return np.asarray(selected, dtype=float)
 
 
+def smooth_navigation_poses(path: np.ndarray) -> list[np.ndarray]:
+    """Smooth interior waypoints and unwrap yaw without moving the endpoints."""
+    points = np.asarray(path, dtype=float).copy()
+    if len(points) >= 3:
+        original = points.copy()
+        points[1:-1] = (
+            0.25 * original[:-2]
+            + 0.50 * original[1:-1]
+            + 0.25 * original[2:]
+        )
+    if len(points) == 1:
+        yaws = np.zeros(1, dtype=float)
+    else:
+        deltas = np.diff(points, axis=0)
+        segment_yaws = np.unwrap(np.arctan2(deltas[:, 1], deltas[:, 0]))
+        yaws = np.concatenate([segment_yaws, segment_yaws[-1:]])
+        if len(yaws) >= 3:
+            original_yaws = yaws.copy()
+            yaws[1:-1] = (
+                0.25 * original_yaws[:-2]
+                + 0.50 * original_yaws[1:-1]
+                + 0.25 * original_yaws[2:]
+            )
+    poses: list[np.ndarray] = []
+    for point, yaw in zip(points, yaws, strict=True):
+        pose = np.eye(4, dtype=float)
+        pose[:3, :3] = R.from_euler("Z", float(yaw)).as_matrix()
+        pose[:2, 3] = point
+        poses.append(pose)
+    return poses
+
+
 def compute_navigation_path(
     episode: dict[str, Any],
     *,
@@ -354,10 +386,7 @@ def compute_navigation_path(
                 f"No {door_state} navigation path from {start_xy.tolist()} to {goal_xy.tolist()}"
             )
         path = compress_path(path, spacing_m=args.nav_waypoint_spacing_m)
-        poses = [
-            pose_for_xy(path[index], path[min(index + 1, len(path) - 1)])
-            for index in range(len(path))
-        ]
+        poses = smooth_navigation_poses(path)
         return poses, float(emi.path_length(path))
     finally:
         probe.close_context(ctx)
@@ -374,6 +403,18 @@ def semantic_fraction(result: dict[str, Any]) -> float:
     opened = float(result.get("semantic_open_value", 1.0))
     value = float(result.get("final_joint_position", closed))
     return probe.semantic_open_fraction(value, closed, opened)
+
+
+def force_target_fraction(args: argparse.Namespace, interaction_kind: str) -> float:
+    specific = getattr(args, f"{interaction_kind}_force_target_fraction", None)
+    return float(
+        args.force_fallback_target_fraction if specific is None else specific
+    )
+
+
+def force_max_steps(args: argparse.Namespace, interaction_kind: str) -> int:
+    specific = getattr(args, f"{interaction_kind}_force_max_steps", None)
+    return int(args.force_fallback_max_steps if specific is None else specific)
 
 
 def save_combined_videos(output_dir: Path, collector: FrameCollector, fps: float) -> dict[str, str]:
@@ -517,13 +558,14 @@ def run(args: argparse.Namespace) -> int:
         max_base_adjustment_steps=max(
             args.max_base_adjustment_steps, 5 * len(door_path) + 10
         ),
+        lock_base_during_force=args.lock_base_during_force,
         initial_state_episode=episode,
         frame_callback=collector.callback("nav_to_door_and_open"),
         step_callback=step_collector.callback("nav_to_door_and_open"),
         interaction_executor=args.interaction_executor,
         allow_force_fallback=args.allow_force_fallback,
-        force_fallback_target_fraction=args.force_fallback_target_fraction,
-        force_fallback_max_steps=args.force_fallback_max_steps,
+        force_fallback_target_fraction=force_target_fraction(args, "door"),
+        force_fallback_max_steps=force_max_steps(args, "door"),
     )
     write_json(door_output / "result.json", door_result)
     if not door_result["success"] or semantic_fraction(door_result) < args.required_open_fraction:
@@ -596,6 +638,7 @@ def run(args: argparse.Namespace) -> int:
         ),
         post_interaction_path=post_path,
         max_post_interaction_steps=max(args.max_steps, 5 * len(post_path) + 10),
+        lock_base_during_force=args.lock_base_during_force,
         initial_state_episode=episode,
         initial_articulation_overrides={door_joint_name: door_open_value},
         initial_robot_state=final_robot_state,
@@ -604,8 +647,8 @@ def run(args: argparse.Namespace) -> int:
         interaction_executor=args.interaction_executor,
         hold_base_during_policy=True,
         allow_force_fallback=args.allow_force_fallback,
-        force_fallback_target_fraction=args.force_fallback_target_fraction,
-        force_fallback_max_steps=args.force_fallback_max_steps,
+        force_fallback_target_fraction=force_target_fraction(args, "container"),
+        force_fallback_max_steps=force_max_steps(args, "container"),
     )
     write_json(fridge_output / "result.json", fridge_result)
     if not fridge_result["success"] or semantic_fraction(fridge_result) < args.required_open_fraction:
@@ -710,7 +753,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="force",
     )
     parser.add_argument("--force_fallback_target_fraction", type=float, default=1.0)
-    parser.add_argument("--force_fallback_max_steps", type=int, default=1500)
+    parser.add_argument("--force_fallback_max_steps", type=int, default=1000)
+    parser.add_argument("--door_force_target_fraction", type=float)
+    parser.add_argument("--container_force_target_fraction", type=float)
+    parser.add_argument("--door_force_max_steps", type=int)
+    parser.add_argument("--container_force_max_steps", type=int)
+    parser.add_argument("--lock_base_during_force", action="store_true")
     parser.add_argument("--container_max_steps_per_waypoint", type=int, default=80)
     parser.add_argument("--container_max_batch_plan_attempts", type=int, default=16)
     parser.add_argument("--container_max_planning_reattempts", type=int, default=8)

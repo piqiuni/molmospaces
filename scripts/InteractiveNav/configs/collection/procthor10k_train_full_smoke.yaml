@@ -35,7 +35,7 @@ policy:
   container:
     executor: force
     target_fraction: 1.0
-    max_steps: 1500
+    max_steps: 1000
     tolerance: 0.001
 
 full:
@@ -48,6 +48,7 @@ full:
   required_open_fraction: 0.67
   image_width: 320
   image_height: 180
+  lock_base_during_force: true
 
 runtime:
   workers: 1

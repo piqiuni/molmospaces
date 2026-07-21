@@ -201,12 +201,17 @@ def run(args: argparse.Namespace) -> int:
             ),
             post_interaction_path=post_path,
             max_post_interaction_steps=max(args.max_steps, 5 * len(post_path) + 10),
+            lock_base_during_force=args.lock_base_during_force,
             initial_state_episode=episode,
             step_callback=step_collector.callback(f"nav_to_{args.domain}_and_open"),
             interaction_executor=args.interaction_executor,
             allow_force_fallback=args.allow_force_fallback,
-            force_fallback_target_fraction=args.force_fallback_target_fraction,
-            force_fallback_max_steps=args.force_fallback_max_steps,
+            force_fallback_target_fraction=mixed.force_target_fraction(
+                args, "door" if spec["kind"] == "door" else "container"
+            ),
+            force_fallback_max_steps=mixed.force_max_steps(
+                args, "door" if spec["kind"] == "door" else "container"
+            ),
         )
         write_json(output / "result.json", result)
         success = bool(result.get("success")) and mixed.semantic_fraction(result) >= args.required_open_fraction

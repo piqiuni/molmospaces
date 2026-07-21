@@ -180,7 +180,9 @@ class RBY1InteractionRequest:
     door_articulation_delta_deg: float = 7.0
     allow_force_fallback: bool = False
     force_fallback_target_fraction: float = 1.0
-    force_fallback_max_steps: int = 1500
+    # RBY1 scenes currently use a 2 ms MuJoCo timestep. 1000 force steps
+    # therefore represent the intended ~2 s continuous interaction window.
+    force_fallback_max_steps: int = 1000
     success_threshold: float = 0.67
     max_steps: int = 400
     container_max_steps_per_waypoint: int = 30
@@ -4317,6 +4319,7 @@ def execute_rby1_whole_body_interaction(
     max_base_adjustment_steps: int = 120,
     post_interaction_path: list[np.ndarray] | None = None,
     max_post_interaction_steps: int = 600,
+    lock_base_during_force: bool = True,
     initial_state_episode: dict[str, Any] | None = None,
     initial_articulation_overrides: dict[str, float] | None = None,
     initial_robot_state: dict[str, Any] | None = None,
@@ -4326,7 +4329,7 @@ def execute_rby1_whole_body_interaction(
     hold_base_during_policy: bool | None = None,
     allow_force_fallback: bool = False,
     force_fallback_target_fraction: float = 1.0,
-    force_fallback_max_steps: int = 1500,
+    force_fallback_max_steps: int = 1000,
 ) -> dict[str, Any]:
     """Execute an official RBY1 manipulation policy and record its camera streams.
 
@@ -4398,12 +4401,72 @@ def execute_rby1_whole_body_interaction(
                 "Selected RBY1 interaction pose is colliding after JSON task initialization."
             )
 
+        robot_view = task.env.current_robot.robot_view
+        upper_body_hold_groups = tuple(
+            group_name
+            for group_name in (
+                "left_arm",
+                "right_arm",
+                "left_gripper",
+                "right_gripper",
+                "torso",
+                "head",
+            )
+            if group_name in robot_view.move_group_ids()
+        )
+        upper_body_hold_qpos = {
+            group_name: np.asarray(
+                robot_view.get_move_group(group_name).joint_pos, dtype=float
+            ).copy()
+            for group_name in upper_body_hold_groups
+        }
+        upper_body_hold_ctrl = {
+            group_name: np.asarray(
+                robot_view.get_move_group(group_name).noop_ctrl, dtype=float
+            ).copy()
+            for group_name in upper_body_hold_groups
+        }
+
+        def restore_upper_body_pose() -> None:
+            for group_name in upper_body_hold_groups:
+                group = robot_view.get_move_group(group_name)
+                group.joint_pos = upper_body_hold_qpos[group_name].copy()
+                group.joint_vel = np.zeros_like(group.joint_vel)
+                group.ctrl = upper_body_hold_ctrl[group_name].copy()
+
+        def execute_navigation_step(
+            target_pose: np.ndarray,
+            target_action: np.ndarray,
+        ) -> tuple[list[dict[str, Any]], float, bool, bool, Any]:
+            action_cmd = {
+                group_name: target.copy()
+                for group_name, target in upper_body_hold_ctrl.items()
+            }
+            action_cmd["base"] = target_action
+            observation, reward, terminal, truncated, infos = task.step(action_cmd)
+            restore_upper_body_pose()
+            mujoco.mj_forward(task.env.current_model, task.env.current_data)
+            task.env.camera_manager.registry.update_all_cameras(task.env)
+            observation = task.get_observations()
+            return (
+                observation,
+                float(np.asarray(reward).reshape(-1)[0]),
+                bool(np.asarray(terminal).reshape(-1)[0]),
+                bool(np.asarray(truncated).reshape(-1)[0]),
+                infos,
+            )
+
         selected_cameras = tuple(
             name for name in camera_names if name in task.env.camera_manager.registry
         )
         if not selected_cameras:
             raise RuntimeError(f"None of the requested cameras are available: {camera_names}")
         frames: dict[str, list[np.ndarray]] = {name: [] for name in selected_cameras}
+        capture_video_fps = float(video_fps if video_fps is not None else cfg.fps)
+        sim_dt_seconds = float(task.env.current_model.opt.timestep)
+        force_video_stride = max(
+            1, int(round(1.0 / max(capture_video_fps * sim_dt_seconds, 1e-8)))
+        )
 
         def capture(
             obs: list[dict[str, Any]],
@@ -4415,6 +4478,7 @@ def execute_rby1_whole_body_interaction(
             terminal: bool = False,
             truncated: bool = False,
             infos: Any | None = None,
+            record_video_frame: bool = True,
         ) -> None:
             resolved_segment = segment
             if resolved_segment is None:
@@ -4433,8 +4497,9 @@ def execute_rby1_whole_body_interaction(
                     frame = task.env.render_rgb_frame(camera_name)
                 frame_uint8 = _frame_to_uint8(frame)
                 synchronized_frames[camera_name] = frame_uint8.copy()
-                frames[camera_name].append(frame_uint8)
-                if frame_callback is not None:
+                if record_video_frame:
+                    frames[camera_name].append(frame_uint8)
+                if record_video_frame and frame_callback is not None:
                     frame_callback(
                         camera_name,
                         frame_uint8.copy(),
@@ -4538,10 +4603,11 @@ def execute_rby1_whole_body_interaction(
                 target_action = np.array(
                     [target_pose[0, 3], target_pose[1, 3], target_yaw], dtype=float
                 )
-                action_cmd = task.env.current_robot.robot_view.get_noop_ctrl_dict()
-                action_cmd["base"] = target_action
+                action_cmd = {"base": target_action}
                 position_before_step = robot_base.pose[:3, 3].copy()
-                observation, _reward, _terminal, _truncated, _infos = task.step(action_cmd)
+                observation, _reward, _terminal, _truncated, _infos = execute_navigation_step(
+                    target_pose, target_action
+                )
                 base_adjustment_steps = adjustment_step + 1
                 adjustment_translation = float(
                     np.linalg.norm(
@@ -4693,27 +4759,107 @@ def execute_rby1_whole_body_interaction(
                 force_open_value - force_closed_value
             )
             controller = ForceJointController(task.env, force_joint_name, force_target)
+            force_base_hold_target = np.array(
+                [
+                    float(robot_base.pose[0, 3]),
+                    float(robot_base.pose[1, 3]),
+                    float(R.from_matrix(robot_base.pose[:3, :3]).as_euler("XYZ")[2]),
+                ],
+                dtype=float,
+            )
+            force_base_hold_pose = robot_base.pose.copy()
+            force_base_max_drift = 0.0
+            force_upper_body_targets: dict[str, np.ndarray] = {}
+            force_upper_body_hold_qpos: dict[str, np.ndarray] = {}
+            force_upper_body_hold_qvel: dict[str, np.ndarray] = {}
+            for group_name in (
+                "left_arm",
+                "right_arm",
+                "left_gripper",
+                "right_gripper",
+                "torso",
+                "head",
+            ):
+                if group_name in robot_view.move_group_ids():
+                    group = robot_view.get_move_group(group_name)
+                    force_upper_body_targets[group_name] = np.asarray(
+                        group.noop_ctrl, dtype=float
+                    ).copy()
+                    force_upper_body_hold_qpos[group_name] = np.asarray(
+                        group.joint_pos, dtype=float
+                    ).copy()
+                    force_upper_body_hold_qvel[group_name] = np.zeros_like(
+                        np.asarray(group.joint_vel, dtype=float)
+                    )
+
+            def apply_force_upper_body_lock() -> None:
+                if not lock_base_during_force:
+                    return
+                for group_name, target in force_upper_body_targets.items():
+                    group = robot_view.get_move_group(group_name)
+                    # The position actuators alone are not strong enough to
+                    # counter reaction forces from a force-driven articulation.
+                    # Restore both state and actuator target so the arm/torso
+                    # cannot sag during an oracle force interaction.
+                    group.joint_pos = force_upper_body_hold_qpos[group_name].copy()
+                    group.joint_vel = force_upper_body_hold_qvel[group_name].copy()
+                    group.ctrl = target.copy()
+
             try:
                 for _force_step in range(int(force_fallback_max_steps)):
+                    if lock_base_during_force:
+                        robot_base.pose = force_base_hold_pose
+                        robot_base.joint_vel = np.zeros_like(robot_base.joint_vel)
+                        mujoco.mj_forward(task.env.current_model, task.env.current_data)
+                        robot_base.ctrl = force_base_hold_target.copy()
+                        apply_force_upper_body_lock()
+                        mujoco.mj_forward(task.env.current_model, task.env.current_data)
                     force_action = controller.step()
+                    current_base = robot_base.pose
+                    force_base_max_drift = max(
+                        force_base_max_drift,
+                        float(
+                            np.linalg.norm(
+                                current_base[:2, 3] - force_base_hold_target[:2]
+                            )
+                        ),
+                    )
+                    if lock_base_during_force:
+                        robot_base.pose = force_base_hold_pose
+                        robot_base.joint_vel = np.zeros_like(robot_base.joint_vel)
+                        apply_force_upper_body_lock()
+                        mujoco.mj_forward(task.env.current_model, task.env.current_data)
+                    task.env.camera_manager.registry.update_all_cameras(task.env)
                     observation = task.get_observations()
+                    force_action_payload = {
+                        "__action_type__": "force_joint",
+                        "effort": [force_action["effort"]],
+                        "target_value": [force_action["target_value"]],
+                        "joint_value": [force_action["joint_value"]],
+                    }
+                    if lock_base_during_force:
+                        force_action_payload["base_hold"] = force_base_hold_target.tolist()
                     capture(
                         observation,
                         phase="FORCE_OPEN",
-                        action={
-                            "__action_type__": "force_joint",
-                            "effort": [force_action["effort"]],
-                            "target_value": [force_action["target_value"]],
-                            "joint_value": [force_action["joint_value"]],
-                        },
+                        action=force_action_payload,
                         terminal=bool(force_action["reached"]),
                         infos=force_action,
+                        record_video_frame=(
+                            _force_step % force_video_stride == 0
+                            or bool(force_action["reached"])
+                        ),
                     )
                     if force_action["reached"]:
                         break
             finally:
                 controller.finish()
             force_executor_meta = controller.result()
+            force_executor_meta["base_lock_enabled"] = bool(lock_base_during_force)
+            force_executor_meta["base_hold_target"] = force_base_hold_target.tolist()
+            force_executor_meta["base_max_xy_drift"] = float(force_base_max_drift)
+            force_executor_meta["upper_body_lock_enabled"] = bool(lock_base_during_force)
+            force_executor_meta["upper_body_lock_groups"] = sorted(force_upper_body_targets)
             policy_success = bool(force_executor_meta["reached"])
         else:
             policy_success = bool(task.judge_success())
@@ -4782,6 +4928,9 @@ def execute_rby1_whole_body_interaction(
                 "policy_success_before_fallback": policy_success,
             }
 
+        force_success_threshold = float(
+            getattr(getattr(cfg, "task_config", None), "task_success_threshold", 0.67)
+        )
         interaction_success = bool(
             policy_success
             or (
@@ -4789,6 +4938,10 @@ def execute_rby1_whole_body_interaction(
                 and bool(force_fallback_meta["drive"].get("reached", False))
             )
             or current_fraction >= float(force_fallback_target_fraction)
+            or (
+                interaction_executor == "force"
+                and current_fraction >= force_success_threshold
+            )
         )
         post_targets = [
             np.asarray(pose, dtype=float)
@@ -4836,11 +4989,13 @@ def execute_rby1_whole_body_interaction(
                         np.cos(target_yaw - current_yaw),
                     )
                 )
-                action_cmd = task.env.current_robot.robot_view.get_noop_ctrl_dict()
-                action_cmd["base"] = np.array(
+                target_action = np.array(
                     [target_pose[0, 3], target_pose[1, 3], target_yaw], dtype=float
                 )
-                observation, _reward, _terminal, _truncated, _infos = task.step(action_cmd)
+                action_cmd = {"base": target_action}
+                observation, _reward, _terminal, _truncated, _infos = execute_navigation_step(
+                    target_pose, target_action
+                )
                 post_navigation_steps = post_step + 1
                 capture(
                     observation,
@@ -4881,7 +5036,7 @@ def execute_rby1_whole_body_interaction(
             },
         )
 
-        fps = float(video_fps if video_fps is not None else cfg.fps)
+        fps = capture_video_fps
         video_paths: dict[str, str] = {}
         for camera_name, camera_frames in frames.items():
             path = output_dir / f"{camera_name}.mp4"
@@ -4916,6 +5071,7 @@ def execute_rby1_whole_body_interaction(
             if force_fallback_meta is not None
             else interaction_executor,
             "interaction_executor": interaction_executor,
+            "lock_base_during_force": bool(lock_base_during_force),
             "force_executor": force_executor_meta,
             "force_fallback": force_fallback_meta
             if force_fallback_meta is not None
@@ -4947,6 +5103,11 @@ def execute_rby1_whole_body_interaction(
             "final_joint_range": final_joint_range,
             "joint_open_fraction": float(joint_open_fraction),
             "semantic_open_fraction": float(semantic_fraction),
+            "force_success_threshold": float(force_success_threshold),
+            "force_success_threshold_met": bool(
+                interaction_executor == "force"
+                and semantic_fraction >= force_success_threshold
+            ),
             "semantic_closed_value": semantic_closed_value,
             "semantic_open_value": semantic_open_value,
             "policy_done": bool(getattr(policy, "is_done", False)),
@@ -4993,6 +5154,8 @@ def execute_rby1_whole_body_interaction(
                 max_base_adjustment_translation_per_step
             ),
             "video_fps": fps,
+            "force_video_stride": int(force_video_stride),
+            "sim_dt_seconds": float(sim_dt_seconds),
             "video_paths": video_paths,
         }
         write_json(output_dir / "result.json", result)
@@ -6036,7 +6199,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="After a contact phase, optionally finish the joint with explicit force-drive; recorded separately.",
     )
     rby1_parser.add_argument("--force_fallback_target_fraction", type=float, default=1.0)
-    rby1_parser.add_argument("--force_fallback_max_steps", type=int, default=1500)
+    rby1_parser.add_argument("--force_fallback_max_steps", type=int, default=1000)
     rby1_parser.add_argument("--container_max_steps_per_waypoint", type=int, default=30)
     rby1_parser.add_argument("--container_max_batch_plan_attempts", type=int, default=8)
     rby1_parser.add_argument("--container_max_planning_reattempts", type=int, default=8)

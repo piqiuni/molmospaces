@@ -822,8 +822,11 @@ def render_candidate_figure(
     )
 
     replay_status = "" if reachability_matches_catalog else " | CATALOG/REPLAY MISMATCH"
+    candidate_type_label = str(annotations.get("rough_candidate_type", "unknown")).replace(
+        "_", " "
+    )
     fig.suptitle(
-        f"Mixed rough crossing-only{replay_status} | sample {annotations['sample_rank']:02d} | "
+        f"Mixed rough {candidate_type_label}{replay_status} | sample {annotations['sample_rank']:02d} | "
         f"candidate {annotations['candidate_index']} | house {annotations['house_index']}\n"
         f"{annotations['target_category']} in {annotations['container_category']} | "
         f"selected door={annotations['selected_door_root']}",
@@ -831,17 +834,24 @@ def render_candidate_figure(
         y=0.985,
     )
     if reachability_matches_catalog:
-        caveat = (
-            "Why this is in 1609-917: the all-open GT planner path crosses an interactive door, "
-            "but closing that crossed door does not causally block navigation to the rough container goal. "
-            "This is rough evidence only: the goal is nearest free space to the container AABB, and target "
-            "visibility/reveal plus manipulation-valid poses are not yet V3 fine-data truth."
-        )
+        if annotations.get("rough_candidate_type") == "mixed_shortcut_verified":
+            caveat = (
+                "Why this is a mixed shortcut sample: the all-open GT planner path crosses an interactive door, "
+                "and closing that door still leaves a route to the rough container goal, but the route is longer. "
+                "This is rough evidence only: the goal is nearest free space to the container AABB, and target "
+                "visibility/reveal plus manipulation-valid poses are not yet V3 fine-data truth."
+            )
+        else:
+            caveat = (
+                "Why this is a mixed crossing sample: the all-open GT planner path crosses an interactive door. "
+                "This is rough evidence only: the goal is nearest free space to the container AABB, and target "
+                "visibility/reveal plus manipulation-valid poses are not yet V3 fine-data truth."
+            )
     else:
         caveat = (
             "REVALIDATION WARNING: the rough catalog recorded the selected-door closed path as found, "
             "but the current independent replay produced different reachability. Treat this sample as an "
-            "unstable rough-map boundary case and rescan it before using the crossing-only label."
+            "unstable rough-map boundary case and rescan it before using the candidate label."
         )
     fig.text(
         0.5,
@@ -1067,6 +1077,7 @@ def render_one_candidate(
             "selected_door_root": selected_door_root,
             "crossed_door_roots": recomputed_crossed_names,
             "catalog_crossed_door_roots": list(candidate["crossed_door_roots"]),
+            "rough_candidate_type": candidate.get("rough_candidate_type", "unknown"),
         }
         plot_ids, object_catalog = build_object_catalog(
             open_records, closed_records, annotations
@@ -1180,6 +1191,7 @@ def render_one_candidate(
             "house_index": int(candidate["house_index"]),
             "target_category": candidate["target_category"],
             "container_category": candidate["container_category"],
+            "rough_candidate_type": candidate.get("rough_candidate_type", "unknown"),
             "path_length_bin": path_length_bin(open_length_m),
             "crossed_door_count": len(candidate["crossed_door_roots"]),
             "selected_door_root": selected_door_root,
@@ -1328,8 +1340,12 @@ def make_contact_sheets(
             ax.axis("off")
         for ax in axes_array[len(selected) :]:
             ax.axis("off")
+        candidate_types = sorted(
+            {str(row.get("rough_candidate_type", "unknown")).replace("_", " ") for row in selected}
+        )
+        candidate_type_label = ", ".join(candidate_types)
         fig.suptitle(
-            "1609 - 917 crossing-only rough candidates: all-open GT route vs closed-door replan",
+            f"Mixed rough {candidate_type_label}: all-open GT route vs closed-door replan",
             fontsize=14,
         )
         fig.tight_layout(rect=(0, 0, 1, 0.97))
@@ -1366,7 +1382,7 @@ def write_html_index(output_path: Path, rows: list[dict[str, Any]]) -> None:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mixed rough crossing-only top-down gallery</title>
+  <title>Mixed rough top-down gallery</title>
   <style>
     body {{ margin: 0; padding: 24px; background: #f1f5f9; color: #0f172a; font: 14px/1.45 system-ui, sans-serif; }}
     h1 {{ margin-top: 0; }}
@@ -1380,8 +1396,8 @@ def write_html_index(output_path: Path, rows: list[dict[str, Any]]) -> None:
   </style>
 </head>
 <body>
-  <h1>1609 - 917 crossing-only rough candidates</h1>
-  <p class="note">These samples have an all-open GT planner path that crosses an interactive door, but the selected crossed door is not causally required: after it is closed, another path still reaches the rough container goal. Geometric length deltas can be negative because occupancy and clearance-weighted planning costs change after the door state changes. These are not final V3 mixed episodes.</p>
+  <h1>Mixed rough candidates</h1>
+  <p class="note">These views compare the all-open GT planner path with a replan after closing the selected crossed door. They are rough evidence only: the goal is nearest free space to the container AABB, and target visibility/reveal plus manipulation-valid poses are not yet V3 fine-data truth.</p>
   <main class="grid">{''.join(cards)}</main>
 </body>
 </html>

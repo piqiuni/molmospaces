@@ -71,6 +71,15 @@ readback；terminal observation 使用 `observe` action type。相机帧按同�
 为 `training_eligible=true`。导航碰撞、force 未达到目标或后续导航未完成的 rollout
 仍保留完整诊断 H5/视频，但不会混入模型训练集。
 
+导航 waypoint 在进入 full runner 前会进行轻量位置和 yaw 平滑，以减少相邻 waypoint
+导致的左右摆动。导航仍使用 position-control 物理跟踪。
+导航和 force 阶段默认保持初始 head、左右臂、夹爪和 torso 的 qpos/qvel/position
+target；force 阶段还会硬锁 base pose，并记录锁定组和实际最大漂移量。force H5
+仍保存每个 2ms sim step，但 MP4 按目标 fps 下采样；因此视频播放时间与仿真时间
+一致。默认 1000 个 force steps 对应约 2 秒连续交互。控制目标仍可设为 1.0，训练
+有效性按任务 `success_threshold`（当前 0.67）和 full `required_open_fraction` 判定，
+避免物理几何限位使有效开门轨迹被误判失败。
+
 ## 示例真实性
 
 `examples/` 下四个 episode 是为说明和校验 v3 字段而手工构造的 synthetic examples，不是由现有 benchmark builder 或 MuJoCo 仿真生成。示例中的 house、对象 ID、joint、pose、路径长度、可见像素和验证结果仅用于展示结构，未经过真实门/容器几何、碰撞、路径或 head-camera 可见性判断，不应作为 benchmark 样本或实验结果使用。
