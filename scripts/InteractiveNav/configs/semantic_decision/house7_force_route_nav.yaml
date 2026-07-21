@@ -1,0 +1,8 @@
+GlobalPlanner:
+  allow_unknown: false
+
+global_costmap:
+  transform_tolerance: 3.0
+
+local_costmap:
+  transform_tolerance: 3.0

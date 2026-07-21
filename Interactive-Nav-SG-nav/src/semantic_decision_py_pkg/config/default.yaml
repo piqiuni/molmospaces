@@ -1,0 +1,83 @@
+topics:
+  explorer_status: "/explore_py/status"
+  explorer_proposals: "/explore_py/proposals"
+  unified_graph: "/semantic_mapping/unified_graph"
+  odom: "/odom"
+  candidates: "/semantic_decision/candidates"
+  target_context: "/semantic_decision/target"
+  goal_status: "/semantic_decision/goal_status"
+  selected_behavior: "/semantic_decision/selected_behavior"
+  behavior_feedback: "/semantic_decision/behavior_feedback"
+  execution_state: "/semantic_decision/execution_state"
+  explore_command: "/explore_py/command"
+  explore_feedback: "/explore_py/behavior_feedback"
+  interaction_command: "/semantic_decision/interaction_command"
+  interaction_result: "/semantic_mapping/interaction_result"
+  move_base: "/move_base"
+
+candidate:
+  max_frontier_candidates: 12
+  interaction_types: ["portal", "container"]
+  container_require_same_room: false
+  container_allow_connected_room: false
+  max_state_age_sec: 300.0
+  min_state_confidence: 0.5
+  portal_standoff_m: 1.0
+  container_standoff_m: 1.0
+  drawer_standoff_m: 0.60
+  interaction_safety_margin_m: 0.25
+  interaction_ready_distance_m: 0.45
+  require_current_visibility: false
+  target_standoff_m: 1.0
+  target_max_state_age_sec: 300.0
+  target_require_current_visibility: false
+  target_require_same_room: false
+  target_allow_connected_room: false
+  open_fraction_threshold: 0.67
+  target_require_visibility_verification: true
+  target_min_visible_pixels: 16
+
+policy:
+  backend: "rule"
+  exploration_gain_weight: 1.0
+  visibility_gain_weight: 0.8
+  semantic_gain_weight: 0.6
+  target_relevance_weight: 3.0
+  confidence_weight: 0.25
+  priority_weight: 0.45
+  distance_cost_weight: 0.45
+  distance_normalization_m: 6.0
+  interaction_cost_weight: 0.30
+  staleness_cost_weight: 0.35
+  portal_bonus: 0.55
+  container_bonus: 1.0
+  continuity_bonus: 0.25
+  nearby_interaction_radius_m: 1.5
+  nearby_interaction_bonus: 1.5
+  minimum_score: -1000000000.0
+  failure_cooldown_s: 45.0
+  success_cooldown_s: 5.0
+  failure_retry_delay_s: 2.0
+
+model:
+  mode: "disabled"
+  command: ""
+  endpoint: ""
+  api_key_env: "OPENAI_API_KEY"
+  model: ""
+  timeout_s: 20.0
+  max_graph_nodes: 80
+  max_graph_edges: 160
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+
+executor:
+  map_frame: "tf_frame_map"
+  navigation_timeout_s: 180.0
+  interaction_timeout_s: 30.0
+  verification_timeout_s: 30.0
+  explore_prepare_timeout_s: 10.0
+  explore_finalize_timeout_s: 10.0
+  graph_poll_rate_hz: 5.0

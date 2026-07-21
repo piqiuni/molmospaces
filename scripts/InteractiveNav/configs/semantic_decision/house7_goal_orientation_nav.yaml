@@ -1,0 +1,12 @@
+GlobalPlanner:
+  allow_unknown: true
+  orientation_mode: 3
+  orientation_window_size: 8
+
+DWAPlannerROS:
+  yaw_goal_tolerance: 0.25
+  latch_xy_goal_tolerance: true
+
+OrientedGlobalPlanner:
+  preserve_goal_orientation: true
+  terminal_orientation_window_size: 8
