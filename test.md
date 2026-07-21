@@ -844,6 +844,31 @@ rosparam get /move_base/global_costmap/static_layer/map_topic
 注意：当前 GT 快速版依赖“首次有效门板关节观测发生在交互前、门处于闭合状态”的任务约束；真实场景中的门关节/转轴提取尚未实现。
 
 
+### 8.5.1 House 7 冰箱内物体 Obj-goal 图像采集
+
+House 7 的冰箱对象为 `refrigerator_4d8cd69ca487b76cae801cfb0248a055_1_0_6`，此前 GT 语义图中确认其内部有 `potato`、`apple` 和 `lettuce`。下面以 `apple` 为目标，初始固定在 `house7_force_route_01` 的起点，门和容器关闭，由规则语义决策自主探索、开门、打开冰箱并导航到苹果。
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:12835 \
+METHOD=object_goal_rule \
+HOUSE_IND=7 \
+USE_FIXED_ROUTE=true \
+ROUTE_ID=house7_force_route_01 \
+TASK_HORIZON=1000 \
+INITIAL_DOOR_STATE=closed \
+SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/object_goal_apple.yaml \
+GT_STEP_INTERVAL=1 \
+GT_MAX_DISTANCE_M=6.0 \
+VIDEO_FPS=15 \
+VIDEO_PANEL_WIDTH_PX=640 \
+CLEAN_INTERMEDIATE=false \
+SIM_TIMEOUT_S=1800 \
+  scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/house7_object_goal_apple_route01
+```
+
+主要输出：`videos/overview_6panel.mp4`、`debug/semantic_keyframes/`、`debug/graph/` 和 `semantic_exploration_result.json`。
+
 ## 8.6 Room分割测试
 
 python /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/room_segmentation_debug_tool.py live \
