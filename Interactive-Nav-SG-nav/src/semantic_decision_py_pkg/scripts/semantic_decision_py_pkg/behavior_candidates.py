@@ -91,8 +91,8 @@ class CandidateGeneratorConfig:
     min_state_confidence: float = 0.5
     portal_standoff_m: float = 1.0
     container_standoff_m: float = 1.0
-    drawer_standoff_m: float = 0.60
-    interaction_safety_margin_m: float = 0.25
+    drawer_standoff_m: float = 1.0
+    interaction_safety_margin_m: float = 0.0
     interaction_ready_distance_m: float = 0.45
     require_current_visibility: bool = False
     target_standoff_m: float = 1.0
@@ -630,6 +630,7 @@ class CandidateGenerator:
                             ),
                             "requires_low_view": view_profile == "drawer_low_view",
                             "interaction_standoff_m": group_standoff,
+                            "interaction_safety_margin_m": self.config.interaction_safety_margin_m,
                             "interaction_group_already_explored": group_id
                             in completed_groups,
                             "target_enabled": bool(target_context.get("enabled")),

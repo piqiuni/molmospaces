@@ -68,7 +68,7 @@ def test_generator_combines_frontiers_and_closed_portals() -> None:
     assert [candidate.behavior_type for candidate in candidates] == ["EXPLORE", "INTERACT"]
     interaction = next(candidate for candidate in candidates if candidate.behavior_type == "INTERACT")
     assert interaction.target_name == "double_door_root"
-    assert math.isclose(interaction.goal_xyyaw[0], 0.60, abs_tol=1e-6)
+    assert math.isclose(interaction.goal_xyyaw[0], 0.85, abs_tol=1e-6)
     assert interaction.metadata["requires_approach"] is True
 
 
@@ -255,8 +255,8 @@ def test_multi_drawer_container_emits_one_candidate_per_closed_joint_group() -> 
         "drawer_bottom"
     ]
     assert candidates[0].interaction_command["view_profile"] == "drawer_low_view"
-    assert math.isclose(candidates[0].goal_xyyaw[0], 0.15, abs_tol=1e-6)
-    assert candidates[0].metadata["interaction_standoff_m"] == 0.85
+    assert math.isclose(candidates[0].goal_xyyaw[0], 0.0, abs_tol=1e-6)
+    assert candidates[0].metadata["interaction_standoff_m"] == 1.0
 
 
 def test_completed_drawer_group_is_not_reopened_during_exploration() -> None:
@@ -362,7 +362,7 @@ def test_portal_approach_uses_door_aabb_normal() -> None:
         ]
     }
     candidate = generator.generate({}, graph, robot_xy=(2.0, 3.0))[0]
-    assert math.isclose(candidate.goal_xyyaw[0], 3.50, abs_tol=1e-6)
+    assert math.isclose(candidate.goal_xyyaw[0], 3.75, abs_tol=1e-6)
     assert math.isclose(candidate.goal_xyyaw[1], 5.0, abs_tol=1e-6)
     assert math.isclose(candidate.goal_xyyaw[2], 0.0, abs_tol=1e-6)
     assert candidate.metadata["approach_strategy"] == "portal_aabb_normal"
@@ -459,7 +459,7 @@ def test_container_front_axis_overrides_nearest_radial_side() -> None:
     ).generate({}, {"nodes": [node]}, robot_xy=(4.0, 4.0))[0]
 
     for candidate in (target, interaction):
-        expected_y = 0.0 if candidate.behavior_type == "NAVIGATE" else -0.25
+        expected_y = 0.0
         assert math.isclose(candidate.goal_xyyaw[0], 4.0, abs_tol=1e-6)
         assert math.isclose(candidate.goal_xyyaw[1], expected_y, abs_tol=1e-6)
         assert math.isclose(candidate.goal_xyyaw[2], math.pi / 2.0, abs_tol=1e-6)

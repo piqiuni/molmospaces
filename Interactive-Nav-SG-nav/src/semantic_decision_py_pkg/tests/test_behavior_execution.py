@@ -1,6 +1,7 @@
 from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
+    STATE_APPROACH_INTERACTION,
     STATE_FINALIZING_EXPLORE,
     STATE_INTERACTING,
     STATE_NAVIGATING,
@@ -116,6 +117,18 @@ def test_explore_navigation_timeout_requests_frontier_finalization() -> None:
     assert machine.state == STATE_FINALIZING_EXPLORE
     assert commands[0]["kind"] == "finalize_frontier"
     assert commands[0]["success"] is False
+
+
+def test_interaction_approach_uses_short_navigation_timeout() -> None:
+    machine = BehaviorExecutionStateMachine(
+        ExecutionConfig(
+            navigation_timeout_s=180.0,
+            interaction_navigation_timeout_s=2.0,
+        )
+    )
+    machine.start(interaction_candidate(), now=0.0)
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert machine.timeout_reason(now=2.1) == "interaction_navigation_timeout"
 
 
 def test_target_navigation_waits_for_visibility_verification() -> None:

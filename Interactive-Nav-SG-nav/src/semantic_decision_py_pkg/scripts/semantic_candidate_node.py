@@ -41,7 +41,7 @@ class SemanticCandidateNode:
                 container_standoff_m=float(config.get("container_standoff_m", 1.0)),
                 drawer_standoff_m=float(config.get("drawer_standoff_m", 0.60)),
                 interaction_safety_margin_m=float(
-                    config.get("interaction_safety_margin_m", 0.25)
+                    config.get("interaction_safety_margin_m", 0.0)
                 ),
                 interaction_ready_distance_m=float(
                     config.get("interaction_ready_distance_m", 0.45)

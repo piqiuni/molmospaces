@@ -23,6 +23,7 @@ class RulePolicyConfig:
     continuity_bonus: float = 0.25
     nearby_interaction_radius_m: float = 1.5
     nearby_interaction_bonus: float = 1.5
+    interaction_priority_bonus: float = 0.0
     minimum_score: float = -1e9
 
 
@@ -62,6 +63,11 @@ class RulePolicy:
                 else 0.0
             ),
             "nearby_interaction": self._nearby_interaction_bonus(candidate),
+            "interaction_priority": (
+                self.config.interaction_priority_bonus
+                if candidate.behavior_type == "INTERACT"
+                else 0.0
+            ),
         }
         candidate.score_terms = terms
         candidate.score = sum(terms.values())

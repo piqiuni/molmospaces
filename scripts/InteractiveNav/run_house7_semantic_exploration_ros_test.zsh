@@ -35,7 +35,6 @@ GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
 LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.25}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
-RECORDER_DRAIN_TIMEOUT_S=${RECORDER_DRAIN_TIMEOUT_S:-900}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/house7_force_route_nav.yaml}
 SEMANTIC_DECISION_CONFIG=${SEMANTIC_DECISION_CONFIG:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/config/default.yaml}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-}
@@ -58,6 +57,7 @@ case "${METHOD}" in
     START_SEMANTIC_DECISION=true
     COMPLETION_MODE=semantic
     FORCE_CLOSE_CONTAINERS=true
+    SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/interactive_exploration.yaml}
     ;;
   object_goal_rule)
     START_SEMANTIC_DECISION=true
@@ -127,7 +127,7 @@ cleanup_process() {
 
 cleanup() {
   cleanup_process "${LAUNCH_PID:-}" 20
-  cleanup_process "${RECORDER_PID:-}" 180
+  cleanup_process "${RECORDER_PID:-}" 20
   cleanup_process "${ROSCORE_PID:-}" 10
 }
 
@@ -235,24 +235,7 @@ if [[ "${LAUNCH_EXIT}" -ne 0 ]] && [[ "${LAUNCH_EXIT}" -ne 130 ]]; then
   exit "${LAUNCH_EXIT}"
 fi
 
-RECORDER_WAITED=0
-EXPECTED_RECORDER_FRAMES=${TASK_HORIZON}
-if [[ -f "${OUTPUT_DIR}/completion_status.json" ]]; then
-  COMPLETED_STEPS=$(python -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("completed_steps", 0) or 0))' "${OUTPUT_DIR}/completion_status.json" 2>/dev/null || print 0)
-  if (( COMPLETED_STEPS > 0 )); then
-    EXPECTED_RECORDER_FRAMES=${COMPLETED_STEPS}
-  fi
-fi
-while (( RECORDER_WAITED < RECORDER_DRAIN_TIMEOUT_S )); do
-  RECORDER_FRAMES=0
-  [[ -f "${OUTPUT_DIR}/debug/video_frames.csv" ]] && RECORDER_FRAMES=$(( $(wc -l < "${OUTPUT_DIR}/debug/video_frames.csv") - 1 ))
-  if (( RECORDER_FRAMES >= EXPECTED_RECORDER_FRAMES )); then
-    break
-  fi
-  sleep 1
-  RECORDER_WAITED=$((RECORDER_WAITED + 1))
-done
-cleanup_process "${RECORDER_PID}" 180
+cleanup_process "${RECORDER_PID}" 20
 RECORDER_PID=""
 
 python "${VIDEO_BUILDER}" \
@@ -292,8 +275,17 @@ def read_json(path):
         return {}
 
 debug_summary = read_json(output_dir / "debug" / "summary.json")
-sim_frames = int(debug_summary.get("step_sync_count", 0) or 0)
-video_frames = int(debug_summary.get("first_person_video_frame_count", 0) or 0)
+offline_video_summary = read_json(output_dir / "debug" / "offline_video_summary.json")
+sim_frames = int(
+    offline_video_summary.get("sim_frame_count", debug_summary.get("step_sync_count", 0))
+    or 0
+)
+video_frames = int(
+    offline_video_summary.get(
+        "output_frame_count", debug_summary.get("first_person_video_frame_count", 0)
+    )
+    or 0
+)
 video_path = output_dir / "videos" / "overview_6panel.mp4"
 video = {
     "output_frame_count": video_frames,

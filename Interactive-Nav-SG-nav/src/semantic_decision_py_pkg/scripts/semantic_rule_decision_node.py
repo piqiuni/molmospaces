@@ -51,6 +51,9 @@ class SemanticRuleDecisionNode:
                 nearby_interaction_bonus=float(
                     config.get("nearby_interaction_bonus", 1.5)
                 ),
+                interaction_priority_bonus=float(
+                    config.get("interaction_priority_bonus", 0.0)
+                ),
                 minimum_score=float(config.get("minimum_score", -1e9)),
             )
         )

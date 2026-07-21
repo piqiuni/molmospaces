@@ -44,6 +44,9 @@ class SemanticBehaviorExecutor:
         self.machine = BehaviorExecutionStateMachine(
             ExecutionConfig(
                 navigation_timeout_s=float(config.get("navigation_timeout_s", 180.0)),
+                interaction_navigation_timeout_s=float(
+                    config.get("interaction_navigation_timeout_s", 45.0)
+                ),
                 interaction_timeout_s=float(config.get("interaction_timeout_s", 30.0)),
                 verification_timeout_s=float(config.get("verification_timeout_s", 30.0)),
                 explore_prepare_timeout_s=float(
@@ -372,7 +375,12 @@ class SemanticBehaviorExecutor:
         goal.target_pose.pose.orientation.z = math.sin(0.5 * yaw)
         goal.target_pose.pose.orientation.w = math.cos(0.5 * yaw)
         self.move_base.send_goal(goal)
-        deadline = time.monotonic() + self.machine.config.navigation_timeout_s
+        navigation_timeout_s = (
+            self.machine.config.interaction_navigation_timeout_s
+            if str(candidate.get("behavior_type") or "") == "INTERACT"
+            else self.machine.config.navigation_timeout_s
+        )
+        deadline = time.monotonic() + navigation_timeout_s
         state = int(self.move_base.get_state())
         while (
             not rospy.is_shutdown()

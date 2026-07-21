@@ -1,0 +1,31 @@
+target:
+  enabled: false
+
+candidate:
+  interaction_types: ["portal", "container"]
+  require_current_visibility: false
+  max_state_age_sec: 3600.0
+  container_require_same_room: true
+  container_allow_connected_room: true
+  portal_standoff_m: 1.0
+  container_standoff_m: 1.0
+  drawer_standoff_m: 1.0
+  interaction_safety_margin_m: 0.0
+
+policy:
+  backend: "rule"
+  portal_bonus: 0.55
+  container_bonus: 1.0
+  interaction_cost_weight: 0.30
+  nearby_interaction_radius_m: 1.5
+  nearby_interaction_bonus: 1.5
+  interaction_priority_bonus: 2.0
+  failure_cooldown_s: 5.0
+  failure_retry_delay_s: 1.0
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+
+executor:
+  interaction_navigation_timeout_s: 45.0

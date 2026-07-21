@@ -21,6 +21,7 @@ STATE_FAILED = "FAILED"
 @dataclass
 class ExecutionConfig:
     navigation_timeout_s: float = 180.0
+    interaction_navigation_timeout_s: float = 45.0
     interaction_timeout_s: float = 30.0
     verification_timeout_s: float = 30.0
     explore_prepare_timeout_s: float = 10.0
@@ -189,8 +190,14 @@ class BehaviorExecutionStateMachine:
                 if elapsed > self.config.explore_prepare_timeout_s
                 else ""
             )
-        if self.state in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}:
+        if self.state == STATE_NAVIGATING:
             return "navigation_timeout" if elapsed > self.config.navigation_timeout_s else ""
+        if self.state == STATE_APPROACH_INTERACTION:
+            return (
+                "interaction_navigation_timeout"
+                if elapsed > self.config.interaction_navigation_timeout_s
+                else ""
+            )
         if self.state == STATE_FINALIZING_EXPLORE:
             return (
                 "explore_finalize_timeout"

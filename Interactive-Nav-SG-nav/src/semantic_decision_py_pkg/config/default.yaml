@@ -24,8 +24,8 @@ candidate:
   min_state_confidence: 0.5
   portal_standoff_m: 1.0
   container_standoff_m: 1.0
-  drawer_standoff_m: 0.60
-  interaction_safety_margin_m: 0.25
+  drawer_standoff_m: 1.0
+  interaction_safety_margin_m: 0.0
   interaction_ready_distance_m: 0.45
   require_current_visibility: false
   target_standoff_m: 1.0
@@ -54,6 +54,7 @@ policy:
   continuity_bonus: 0.25
   nearby_interaction_radius_m: 1.5
   nearby_interaction_bonus: 1.5
+  interaction_priority_bonus: 0.0
   minimum_score: -1000000000.0
   failure_cooldown_s: 45.0
   success_cooldown_s: 5.0
@@ -76,6 +77,7 @@ completion:
 executor:
   map_frame: "tf_frame_map"
   navigation_timeout_s: 180.0
+  interaction_navigation_timeout_s: 45.0
   interaction_timeout_s: 30.0
   verification_timeout_s: 30.0
   explore_prepare_timeout_s: 10.0
