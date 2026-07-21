@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=${0:A:h}
 REPO_ROOT=${SCRIPT_DIR:h:h}
 ROUTE_CONFIG=${ROUTE_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/house7_force_routes.yaml}
+VIDEO_BUILDER=${VIDEO_BUILDER:-${SCRIPT_DIR}/build_semantic_video_offline.py}
 ROUTE_ID=${2:-${ROUTE_ID:-house7_force_route_01}}
 HOUSE_IND=${HOUSE_IND:-7}
 USE_FIXED_ROUTE=${USE_FIXED_ROUTE:-true}
@@ -177,7 +178,7 @@ PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py
 RECORDER_PID=$!
 sleep 1
 
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -253,6 +254,13 @@ while (( RECORDER_WAITED < RECORDER_DRAIN_TIMEOUT_S )); do
 done
 cleanup_process "${RECORDER_PID}" 180
 RECORDER_PID=""
+
+python "${VIDEO_BUILDER}" \
+  --scene-dir "${OUTPUT_DIR}" \
+  --debug-dir "${OUTPUT_DIR}/debug" \
+  --fps "${VIDEO_FPS}" \
+  --output-stem overview_6panel \
+  >"${OUTPUT_DIR}/offline_video.log" 2>&1
 
 if [[ -f "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" ]]; then
   mv "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" "${OUTPUT_DIR}/videos/overview_6panel.mp4"

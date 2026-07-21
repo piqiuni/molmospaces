@@ -82,13 +82,20 @@ def draw_gt(frame, payload: dict | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scene-dir", required=True)
+    parser.add_argument("--debug-dir", default="")
+    parser.add_argument("--route-result", default="")
     parser.add_argument("--fps", type=float, default=15.0)
     parser.add_argument("--output-stem", default="")
     args = parser.parse_args()
 
     scene_dir = Path(args.scene_dir).expanduser().resolve()
+    debug_dir = (
+        Path(args.debug_dir).expanduser().resolve()
+        if args.debug_dir
+        else scene_dir / "debug"
+    )
     sim_records = load_jsonl(scene_dir / "sim_step_frames" / "manifest.jsonl")
-    recorder_records = load_recorder_frames(scene_dir / "video_frames.csv")
+    recorder_records = load_recorder_frames(debug_dir / "video_frames.csv")
     if not sim_records:
         raise RuntimeError("No simulator step frames found")
     if not recorder_records:
@@ -101,11 +108,13 @@ def main() -> None:
     output_height, output_width = first_state.shape[:2]
     panel_columns = 3 if output_width >= output_height * 2.4 else 2
     output_stem = args.output_stem or ("overview_6panel" if panel_columns == 3 else "overview_4panel")
-    output_dir = scene_dir / "videos" / "offline_composite_frames"
+    video_dir = debug_dir / "videos"
+    output_dir = video_dir / "offline_composite_frames"
     output_dir.mkdir(parents=True, exist_ok=True)
-    raw_video = scene_dir / "videos" / f"{output_stem}_offline_raw.mp4"
-    final_video = scene_dir / "videos" / f"{output_stem}.mp4"
-    sync_csv = scene_dir / "offline_video_sync.csv"
+    raw_video = video_dir / f"{output_stem}_offline_raw.mp4"
+    temp_h264 = video_dir / f"{output_stem}_offline_h264_tmp.mp4"
+    final_video = video_dir / f"{output_stem}.mp4"
+    sync_csv = debug_dir / "offline_video_sync.csv"
     panel_width = output_width // panel_columns
     panel_height = output_height // 2
     writer = cv2.VideoWriter(
@@ -180,7 +189,7 @@ def main() -> None:
         writer_csv.writeheader()
         writer_csv.writerows(sync_rows)
 
-    ffmpeg_log = scene_dir / "videos" / f"{output_stem}_offline_ffmpeg.log"
+    ffmpeg_log = video_dir / f"{output_stem}_offline_ffmpeg.log"
     command = [
         "ffmpeg",
         "-y",
@@ -195,21 +204,46 @@ def main() -> None:
         "23",
         "-preset",
         "veryfast",
-        str(final_video),
+        "-movflags",
+        "+faststart",
+        str(temp_h264),
     ]
     with ffmpeg_log.open("w", encoding="utf-8") as handle:
         completed = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, check=False)
-    if completed.returncode != 0:
-        raw_video.replace(final_video)
+    if completed.returncode != 0 or not temp_h264.exists() or temp_h264.stat().st_size <= 0:
+        raise RuntimeError(f"Offline H264 encoding failed; see {ffmpeg_log}")
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(temp_h264),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != "h264":
+        raise RuntimeError(f"Offline video codec verification failed: {probe.stdout.strip()!r}")
+    temp_h264.replace(final_video)
+    raw_video.unlink(missing_ok=True)
     summary = {
         "sim_frame_count": len(sim_records),
         "state_frame_count": len(recorder_records),
         "output_frame_count": len(sync_rows),
         "fps": float(args.fps),
+        "codec": "h264",
         "video": str(final_video),
         "sync_csv": str(sync_csv),
+        "route_result": str(Path(args.route_result).expanduser().resolve()) if args.route_result else "",
     }
-    (scene_dir / "offline_video_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (debug_dir / "offline_video_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary))
 
 
