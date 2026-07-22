@@ -9,7 +9,7 @@ import time
 
 import base64
 import cv2
-from cv_bridge import CvBridge
+import numpy as np
 from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
@@ -151,7 +151,6 @@ class SemanticBehaviorExecutor:
         self.lock = threading.RLock()
         self.selection: dict | None = None
         self.latest_graph: dict = {}
-        self.bridge = CvBridge()
         self.latest_image_data = ""
         self.latest_image_sequence = 0
         self.pre_interaction_image_data = ""
@@ -300,7 +299,7 @@ class SemanticBehaviorExecutor:
 
     def _image_callback(self, message: Image) -> None:
         try:
-            image = self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
+            image = self._decode_ros_image(message)
             ok, encoded = cv2.imencode(
                 ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 75]
             )
@@ -314,6 +313,33 @@ class SemanticBehaviorExecutor:
         with self.lock:
             self.latest_image_data = image_data
             self.latest_image_sequence += 1
+
+    @staticmethod
+    def _decode_ros_image(message: Image):
+        channels_by_encoding = {
+            "bgr8": 3,
+            "rgb8": 3,
+            "bgra8": 4,
+            "rgba8": 4,
+        }
+        encoding = str(message.encoding or "").casefold()
+        channels = channels_by_encoding.get(encoding)
+        if channels is None or message.height <= 0 or message.width <= 0:
+            raise ValueError(f"unsupported image encoding: {message.encoding}")
+        row_width = int(message.step or message.width * channels)
+        raw = np.frombuffer(message.data, dtype=np.uint8).reshape(
+            int(message.height), row_width
+        )
+        image = raw[:, : int(message.width) * channels].reshape(
+            int(message.height), int(message.width), channels
+        )
+        if encoding == "rgb8":
+            return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        if encoding == "rgba8":
+            return cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+        if encoding == "bgra8":
+            return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        return image
 
     def _graph_callback(self, message: String) -> None:
         try:
