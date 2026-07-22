@@ -55,7 +55,9 @@ def apply_model_env_overrides(
         "endpoint": "SEMANTIC_MODEL_ENDPOINT",
         "api_key_env": "SEMANTIC_MODEL_API_KEY_ENV",
         "model": "SEMANTIC_MODEL_NAME",
+        "protocol": "SEMANTIC_MODEL_PROTOCOL",
         "timeout_s": "SEMANTIC_MODEL_TIMEOUT_S",
+        "metrics_path": "SEMANTIC_MODEL_METRICS_PATH",
     }
     for config_key, env_key in env_map.items():
         value = os.environ.get(env_key)

@@ -5,9 +5,8 @@ import json
 import shlex
 import subprocess
 from typing import Any, Iterable
-from urllib import request
-
 from .behavior_candidates import BehaviorCandidate
+from semantic_mllm_py_pkg.client import MLLMClient, MLLMClientConfig
 
 
 @dataclass
@@ -17,9 +16,11 @@ class ModelPolicyConfig:
     endpoint: str = ""
     api_key_env: str = "OPENAI_API_KEY"
     model: str = ""
+    protocol: str = "openai_responses"
     timeout_s: float = 20.0
     max_graph_nodes: int = 80
     max_graph_edges: int = 160
+    metrics_path: str = ""
 
 
 def compact_graph(graph: dict[str, Any], max_nodes: int = 80, max_edges: int = 160) -> dict[str, Any]:
@@ -66,17 +67,35 @@ class ModelPolicyClient:
     def __init__(self, config: ModelPolicyConfig | None = None) -> None:
         self.config = config or ModelPolicyConfig()
         self.last_error = ""
+        self._mllm_client = MLLMClient(
+            MLLMClientConfig(
+                mode=self.config.mode,
+                command=self.config.command,
+                endpoint=self.config.endpoint,
+                api_key_env=self.config.api_key_env,
+                model=self.config.model,
+                protocol=self.config.protocol,
+                timeout_s=self.config.timeout_s,
+                metrics_path=self.config.metrics_path,
+            )
+        )
 
     def select(
         self,
         candidates: Iterable[BehaviorCandidate],
         target_context: dict[str, Any] | None = None,
         graph: dict[str, Any] | None = None,
+        robot_context: dict[str, Any] | None = None,
     ) -> BehaviorCandidate | None:
         candidates = list(candidates)
         if not candidates:
             return None
-        payload = self.build_request(candidates, target_context or {}, graph or {})
+        payload = self.build_request(
+            candidates,
+            target_context or {},
+            graph or {},
+            robot_context or {},
+        )
         response = self._request(payload)
         if response is None:
             return None
@@ -97,6 +116,7 @@ class ModelPolicyClient:
         candidates: list[BehaviorCandidate],
         target_context: dict[str, Any],
         graph: dict[str, Any],
+        robot_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
             "schema_version": 1,
@@ -106,6 +126,7 @@ class ModelPolicyClient:
                 "visibility gain, interaction cost, and current state. Return candidate_id or scores."
             ),
             "target_context": dict(target_context),
+            "robot_context": dict(robot_context or {}),
             "graph": compact_graph(
                 graph,
                 max_nodes=self.config.max_graph_nodes,
@@ -159,22 +180,18 @@ class ModelPolicyClient:
         return response
 
     def _request_http(self, payload: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        api_key = ""
-        if self.config.api_key_env:
-            import os
-
-            api_key = os.environ.get(self.config.api_key_env, "")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        if self.config.model:
-            payload = dict(payload)
-            payload["model"] = self.config.model
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = request.Request(self.config.endpoint, data=body, headers=headers, method="POST")
-        with request.urlopen(req, timeout=self.config.timeout_s) as response:
-            value = json.loads(response.read().decode("utf-8"))
-        if not isinstance(value, dict):
+        response = self._mllm_client.request_json(
+            role="subgoal_selection",
+            instruction=str(payload.get("instruction") or ""),
+            context={
+                "target_context": payload.get("target_context") or {},
+                "robot_context": payload.get("robot_context") or {},
+                "graph": payload.get("graph") or {},
+                "candidates": payload.get("candidates") or [],
+            },
+        )
+        if response.error:
+            raise ValueError(response.error)
+        if not isinstance(response.payload, dict):
             raise ValueError("model HTTP response must be a JSON object")
-        return value
+        return response.payload

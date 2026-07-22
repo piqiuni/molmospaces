@@ -15,6 +15,7 @@ from semantic_decision_py_pkg.mission_completion import (
 from semantic_decision_py_pkg.model_policy import ModelPolicyClient, ModelPolicyConfig
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.rule_policy import RulePolicy, RulePolicyConfig
+from semantic_mllm_py_pkg.ablation import AblationConfig
 
 patch_roslogging_findcaller_for_py311()
 
@@ -28,6 +29,12 @@ class SemanticRuleDecisionNode:
         rospy.init_node("semantic_rule_decision_node")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~policy", {}) or {}
+        ablation_config = rospy.get_param("~ablation", {}) or {}
+        self.ablation = AblationConfig(
+            module1=str(ablation_config.get("module1", "dynamic_rule")),
+            module2=str(ablation_config.get("module2", "rule_cost")),
+            module3=str(ablation_config.get("module3", "rule_verified")),
+        )
         model_config = apply_model_env_overrides(rospy.get_param("~model", {}) or {})
         completion_config = rospy.get_param("~completion", {}) or {}
         self.policy = RulePolicy(
@@ -60,7 +67,14 @@ class SemanticRuleDecisionNode:
         self.failure_cooldown_s = float(config.get("failure_cooldown_s", 45.0))
         self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
         self.failure_retry_delay_s = float(config.get("failure_retry_delay_s", 2.0))
-        self.policy_backend = str(config.get("backend", "rule")).casefold()
+        configured_backend = str(config.get("backend", "rule")).casefold()
+        self.policy_backend = (
+            "model"
+            if self.ablation.module2 == "mllm_score"
+            else "rule"
+            if self.ablation.module2 == "rule_cost"
+            else configured_backend
+        )
         self.model_policy = ModelPolicyClient(
             ModelPolicyConfig(
                 mode=str(model_config.get("mode", "disabled")),
@@ -68,9 +82,11 @@ class SemanticRuleDecisionNode:
                 endpoint=str(model_config.get("endpoint", "")),
                 api_key_env=str(model_config.get("api_key_env", "OPENAI_API_KEY")),
                 model=str(model_config.get("model", "")),
+                protocol=str(model_config.get("protocol", "openai_responses")),
                 timeout_s=float(model_config.get("timeout_s", 20.0)),
                 max_graph_nodes=int(model_config.get("max_graph_nodes", 80)),
                 max_graph_edges=int(model_config.get("max_graph_edges", 160)),
+                metrics_path=str(model_config.get("metrics_path", "")),
             )
         )
         self.completion_tracker = MissionCompletionTracker(
@@ -274,6 +290,13 @@ class SemanticRuleDecisionNode:
                 eligible,
                 target_context=self.latest_candidates_payload.get("target_context") or {},
                 graph=self.latest_candidates_payload.get("graph_context") or {},
+                robot_context={
+                    "robot_xy": self.latest_candidates_payload.get("robot_xy"),
+                    "exploration_context": self.latest_candidates_payload.get(
+                        "exploration_context"
+                    ),
+                    "active_candidate_id": self.active_candidate_id,
+                },
             )
             if model_selected is not None:
                 selected = model_selected
@@ -283,6 +306,7 @@ class SemanticRuleDecisionNode:
             "graph_revision": self.latest_candidates_payload.get("graph_revision", 0),
             "active_candidate_id": self.active_candidate_id,
             "policy_backend": self.policy_backend,
+            "ablation": self.ablation.to_dict(),
             "model_error": self.model_policy.last_error,
             "ranked_candidates": [
                 candidate.to_dict()

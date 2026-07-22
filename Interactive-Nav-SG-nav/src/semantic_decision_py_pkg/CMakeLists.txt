@@ -4,10 +4,13 @@ project(semantic_decision_py_pkg)
 find_package(catkin REQUIRED COMPONENTS
   actionlib
   actionlib_msgs
+  cv_bridge
   geometry_msgs
   move_base_msgs
   nav_msgs
   rospy
+  semantic_mllm_py_pkg
+  sensor_msgs
   std_msgs
 )
 
