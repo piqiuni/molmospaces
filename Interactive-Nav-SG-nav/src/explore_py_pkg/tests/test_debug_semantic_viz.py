@@ -39,7 +39,7 @@ def test_candidate_overlays_prefers_unified_semantic_candidates():
             "target_name": "door",
             "goal_xyyaw": [1.0, 2.0, 0.5],
             "frame_id": "",
-            "color": (205, 75, 220),
+            "color": (255, 140, 0),
             "source": "semantic_decision",
         }
     ]
@@ -62,6 +62,7 @@ def test_candidate_overlays_falls_back_to_explore_proposals():
     assert overlays[0]["candidate_id"] == "frontier:frontier_1"
     assert overlays[0]["behavior_type"] == "EXPLORE"
     assert overlays[0]["frame_id"] == "tf_frame_map"
+    assert overlays[0]["color"] == (230, 40, 40)
 
 
 def test_topology_edge_styles_keep_semantic_relations_distinct():

@@ -13,6 +13,7 @@ topics:
   occupancy_grid: "/struct_mapping/occ_map"
   room_context: "/semantic_mapping/room_context"
   gt_observations: "/semantic_mapping/gt_observations"
+  interaction_command: "/semantic_decision/interaction_command"
   interaction_result: "/semantic_mapping/interaction_result"
   planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
   planning_occupancy_grid_updates: "/semantic_mapping/planning_occ_map_updates"
@@ -25,6 +26,7 @@ topics:
   object_markers: "/semantic_mapping/object_semantic_map_markers"
   scene_id_grid: "/semantic_mapping/scene_id_grid"
   scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
+  room_segment_grid: "/semantic_mapping/room_segment_grid"
   unified_graph: "/semantic_mapping/unified_graph"
   unified_graph_markers: "/semantic_mapping/unified_graph_markers"
   unified_graph_markers_lifted: "/semantic_mapping/unified_graph_markers_lifted"
@@ -165,7 +167,7 @@ interaction_graph:
 semantic_occ_overlay:
   enabled: true
   clear_padding_m: 0.10
-  open_states: ["open"]
+  open_states: ["ajar", "open"]
 
 scene_types:
   unknown_id: -1

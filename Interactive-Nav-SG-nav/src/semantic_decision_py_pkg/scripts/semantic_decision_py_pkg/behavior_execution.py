@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import time
 from typing import Any
 
@@ -16,6 +17,46 @@ STATE_INTERACTING = "INTERACTING"
 STATE_VERIFYING = "VERIFYING"
 STATE_SUCCEEDED = "SUCCEEDED"
 STATE_FAILED = "FAILED"
+
+
+def normalize_angle(angle: float) -> float:
+    return math.atan2(math.sin(float(angle)), math.cos(float(angle)))
+
+
+def committed_turn_sign(
+    angular_error: float,
+    pi_tie_tolerance_rad: float = 0.20,
+    pi_tie_turn_sign: int = -1,
+) -> int:
+    error = normalize_angle(angular_error)
+    if abs(abs(error) - math.pi) <= max(0.0, float(pi_tie_tolerance_rad)):
+        return 1 if int(pi_tie_turn_sign) >= 0 else -1
+    return 1 if error >= 0.0 else -1
+
+
+def path_lookahead_point(
+    start_xy: tuple[float, float],
+    path_xy: list[tuple[float, float]],
+    lookahead_m: float,
+) -> tuple[float, float] | None:
+    if not path_xy:
+        return None
+    previous = (float(start_xy[0]), float(start_xy[1]))
+    traveled = 0.0
+    target_distance = max(0.0, float(lookahead_m))
+    for point in path_xy:
+        current = (float(point[0]), float(point[1]))
+        segment = math.hypot(current[0] - previous[0], current[1] - previous[1])
+        traveled += segment
+        if traveled >= target_distance and math.hypot(
+            current[0] - start_xy[0], current[1] - start_xy[1]
+        ) > 1e-3:
+            return current
+        previous = current
+    endpoint = path_xy[-1]
+    if math.hypot(endpoint[0] - start_xy[0], endpoint[1] - start_xy[1]) <= 1e-3:
+        return None
+    return float(endpoint[0]), float(endpoint[1])
 
 
 @dataclass

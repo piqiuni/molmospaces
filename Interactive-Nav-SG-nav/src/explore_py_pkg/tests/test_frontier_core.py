@@ -171,6 +171,20 @@ def test_subgoal_rejects_candidate_without_free_footprint():
     assert subgoal is None
 
 
+def test_footprint_rejects_unknown_cells_around_known_free_viewpoint():
+    width = height = 9
+    data = [-1] * (width * height)
+    data[4 * width + 4] = 0
+    grid = OccupancyGridData(GridSpec(width, height, 0.1, 0.0, 0.0, "map"), data)
+    core = FrontierExplorerCore(
+        FrontierConfig(
+            footprint_unknown_is_free=False,
+        )
+    )
+
+    assert core._footprint_is_free(grid, (4, 4), radius_cells=1) is False
+
+
 def test_subgoal_rejects_candidate_without_turning_clearance():
     width, height = 7, 5
     data = [-1] * (width * height)

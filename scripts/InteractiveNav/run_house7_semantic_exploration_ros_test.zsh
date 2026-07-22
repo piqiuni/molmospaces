@@ -24,18 +24,21 @@ if [[ -z "${VIDEO_PANEL_WIDTH_PX:-}" ]]; then
 fi
 VIDEO_FRAME_JOB_QUEUE_SIZE=${VIDEO_FRAME_JOB_QUEUE_SIZE:-4}
 ARTIFACT_WRITE_QUEUE_SIZE=${ARTIFACT_WRITE_QUEUE_SIZE:-4}
-VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-64}
-IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-64}
+VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-16}
+IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-4}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
 GT_STEP_INTERVAL=${GT_STEP_INTERVAL:-3}
 GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-6.0}
 GT_MIN_VISIBLE_PIXELS=${GT_MIN_VISIBLE_PIXELS:-16}
+GT_MIN_VISIBLE_FRACTION=${GT_MIN_VISIBLE_FRACTION:-0.20}
+GT_REQUIRED_CONSECUTIVE_OBSERVATIONS=${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS:-2}
 GT_ROI_X_MIN_RATIO=${GT_ROI_X_MIN_RATIO:-0.10}
 GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
-LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.25}
+LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.30}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
-ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/house7_force_route_nav.yaml}
+ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
+EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-}
 SEMANTIC_DECISION_CONFIG=${SEMANTIC_DECISION_CONFIG:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/config/default.yaml}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-}
 COMPLETION_CONFIRMATIONS=${COMPLETION_CONFIRMATIONS:-3}
@@ -52,12 +55,14 @@ case "${METHOD}" in
   interactive_rule)
     START_SEMANTIC_DECISION=true
     COMPLETION_MODE=semantic
+    EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
   container_exploration)
     START_SEMANTIC_DECISION=true
     COMPLETION_MODE=semantic
     FORCE_CLOSE_CONTAINERS=true
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/interactive_exploration.yaml}
+    EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
   object_goal_rule)
     START_SEMANTIC_DECISION=true
@@ -65,6 +70,7 @@ case "${METHOD}" in
     FORCE_CLOSE_CONTAINERS=true
     COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-30}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_fridge.yaml}
+    EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
   object_goal_model_mock)
     START_SEMANTIC_DECISION=true
@@ -72,6 +78,7 @@ case "${METHOD}" in
     FORCE_CLOSE_CONTAINERS=true
     COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-30}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_fridge_model_mock.yaml}
+    EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
   *)
     print -u2 -- "Unsupported METHOD=${METHOD}; use frontier_only, interactive_rule, object_goal_rule, or object_goal_model_mock"
@@ -169,6 +176,7 @@ PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py
   --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
   --video-history-size "${VIDEO_HISTORY_SIZE}" \
   --image-queue-size "${IMAGE_QUEUE_SIZE}" \
+  --video-global-panel-scale 1.8 \
   --runtime-video-encode \
   --first-person-video-h264-preset "${VIDEO_ENCODER_PRESET}" \
   --no-external-video \
@@ -178,7 +186,7 @@ PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py
 RECORDER_PID=$!
 sleep 1
 
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_frame_queue_size 4 --no-retain_task_history --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -190,6 +198,7 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   start_nav:=true \
   start_explore:=false \
   start_explore_py:=true \
+  explore_py_config_override_file:="${EXPLORE_PY_CONFIG_OVERRIDE}" \
   start_semantic_decision:="${START_SEMANTIC_DECISION}" \
   semantic_decision_config_file:="${SEMANTIC_DECISION_CONFIG}" \
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
@@ -197,7 +206,7 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   local_costmap_inflation_radius:="${LOCAL_COSTMAP_INFLATION_RADIUS}" \
   exploration_only:=true \
   randomize_camera:=false \
-  publish_debug_front_camera:=true \
+  publish_debug_front_camera:=false \
   robot:=rby1 \
   scene_dataset:=procthor-10k \
   data_split:=train \

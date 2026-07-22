@@ -4,9 +4,9 @@ from typing import Any
 
 
 CANDIDATE_COLORS = {
-    "EXPLORE": (45, 190, 55),
-    "INTERACT": (205, 75, 220),
-    "NAVIGATE": (225, 125, 35),
+    "EXPLORE": (230, 40, 40),
+    "INTERACT": (255, 140, 0),
+    "NAVIGATE": (230, 40, 40),
 }
 
 

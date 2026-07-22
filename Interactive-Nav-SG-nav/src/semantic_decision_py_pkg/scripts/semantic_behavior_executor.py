@@ -13,6 +13,9 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_IDLE,
     STATE_NAVIGATING,
     STATE_VERIFYING,
+    committed_turn_sign,
+    normalize_angle,
+    path_lookahead_point,
 )
 from semantic_decision_py_pkg.behavior_candidates import interaction_group_reached
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
@@ -21,8 +24,11 @@ patch_roslogging_findcaller_for_py311()
 
 import actionlib
 import rospy
+import tf
 from actionlib_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped, Twist
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from nav_msgs.srv import GetPlan
 from std_msgs.msg import String
 
 
@@ -45,7 +51,7 @@ class SemanticBehaviorExecutor:
             ExecutionConfig(
                 navigation_timeout_s=float(config.get("navigation_timeout_s", 180.0)),
                 interaction_navigation_timeout_s=float(
-                    config.get("interaction_navigation_timeout_s", 45.0)
+                    config.get("interaction_navigation_timeout_s", 60.0)
                 ),
                 interaction_timeout_s=float(config.get("interaction_timeout_s", 30.0)),
                 verification_timeout_s=float(config.get("verification_timeout_s", 30.0)),
@@ -58,6 +64,65 @@ class SemanticBehaviorExecutor:
             )
         )
         self.map_frame = str(config.get("map_frame", "tf_frame_map"))
+        self.base_frame = str(config.get("base_frame", "tf_frame_base_link"))
+        self.rear_goal_prerotate_enabled = bool(
+            config.get("rear_goal_prerotate_enabled", True)
+        )
+        self.rear_goal_enter_angle_rad = float(
+            config.get("rear_goal_enter_angle_rad", 1.75)
+        )
+        self.rear_goal_exit_angle_rad = float(
+            config.get("rear_goal_exit_angle_rad", 0.65)
+        )
+        self.rear_goal_rotate_speed_rad_s = float(
+            config.get("rear_goal_rotate_speed_rad_s", 0.35)
+        )
+        self.rear_goal_prerotate_timeout_s = float(
+            config.get("rear_goal_prerotate_timeout_s", 12.0)
+        )
+        self.rear_goal_lookahead_m = float(
+            config.get("rear_goal_lookahead_m", 0.75)
+        )
+        self.rear_goal_pi_tie_tolerance_rad = float(
+            config.get("rear_goal_pi_tie_tolerance_rad", 0.20)
+        )
+        self.rear_goal_pi_turn_sign = int(
+            config.get("rear_goal_pi_turn_sign", -1)
+        )
+        self.interaction_final_align_enabled = bool(
+            config.get("interaction_final_align_enabled", True)
+        )
+        self.interaction_final_align_max_distance_m = float(
+            config.get("interaction_final_align_max_distance_m", 0.12)
+        )
+        self.interaction_final_align_yaw_tolerance_rad = float(
+            config.get("interaction_final_align_yaw_tolerance_rad", 0.15)
+        )
+        self.interaction_final_align_rotate_speed_rad_s = float(
+            config.get("interaction_final_align_rotate_speed_rad_s", 0.30)
+        )
+        self.interaction_final_align_trigger_delay_s = float(
+            config.get("interaction_final_align_trigger_delay_s", 2.0)
+        )
+        self.interaction_final_align_timeout_s = float(
+            config.get("interaction_final_align_timeout_s", 15.0)
+        )
+        self.make_plan_preflight_enabled = bool(
+            config.get("make_plan_preflight_enabled", True)
+        )
+        self.make_plan_service = str(
+            config.get("make_plan_service", "/move_base/make_plan")
+        )
+        self.make_plan_service_wait_sec = float(
+            config.get("make_plan_service_wait_sec", 2.0)
+        )
+        self.make_plan_tolerance_m = float(
+            config.get("make_plan_tolerance_m", 0.20)
+        )
+        self.make_plan_endpoint_tolerance_m = float(
+            config.get("make_plan_endpoint_tolerance_m", 0.60)
+        )
+        self.make_plan_fail_open = bool(config.get("make_plan_fail_open", True))
         self.lock = threading.RLock()
         self.selection: dict | None = None
         self.latest_graph: dict = {}
@@ -85,9 +150,14 @@ class SemanticBehaviorExecutor:
             queue_size=4,
             latch=True,
         )
+        self.cmd_vel_pub = rospy.Publisher(
+            topics.get("cmd_vel", "/cmd_vel"), Twist, queue_size=2
+        )
+        self.tf_listener = tf.TransformListener()
         self.move_base = actionlib.SimpleActionClient(
             topics.get("move_base", "/move_base"), MoveBaseAction
         )
+        self.make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
         rospy.Subscriber(
             topics.get("selected_behavior", "/semantic_decision/selected_behavior"),
             String,
@@ -352,6 +422,124 @@ class SemanticBehaviorExecutor:
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
 
+    def _current_pose(self, frame_id: str) -> tuple[float, float, float] | None:
+        try:
+            translation, rotation = self.tf_listener.lookupTransform(
+                frame_id,
+                self.base_frame,
+                rospy.Time(0),
+            )
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            return None
+        yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+        return float(translation[0]), float(translation[1]), float(yaw)
+
+    def _publish_rotation(self, angular_z: float) -> None:
+        command = Twist()
+        command.angular.z = float(angular_z)
+        self.cmd_vel_pub.publish(command)
+
+    def _rotate_to_yaw(
+        self,
+        decision_id: str,
+        frame_id: str,
+        target_yaw: float,
+        tolerance_rad: float,
+        speed_rad_s: float,
+        timeout_s: float,
+        turn_sign: int | None = None,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        committed_sign = turn_sign
+        try:
+            while (
+                not rospy.is_shutdown()
+                and self._navigation_is_current(decision_id)
+                and time.monotonic() < deadline
+            ):
+                pose = self._current_pose(frame_id)
+                if pose is None:
+                    time.sleep(0.05)
+                    continue
+                error = normalize_angle(float(target_yaw) - pose[2])
+                if abs(error) <= max(0.0, float(tolerance_rad)):
+                    return True
+                if committed_sign is None:
+                    committed_sign = committed_turn_sign(
+                        error,
+                        self.rear_goal_pi_tie_tolerance_rad,
+                        self.rear_goal_pi_turn_sign,
+                    )
+                self._publish_rotation(
+                    float(committed_sign) * abs(float(speed_rad_s))
+                )
+                time.sleep(0.05)
+        finally:
+            self._publish_rotation(0.0)
+        return False
+
+    def _prerotate_for_rear_goal(
+        self,
+        decision_id: str,
+        frame_id: str,
+        goal_x: float,
+        goal_y: float,
+        heading_target_xy: tuple[float, float] | None = None,
+    ) -> bool:
+        if not self.rear_goal_prerotate_enabled:
+            return True
+        pose = self._current_pose(frame_id)
+        if pose is None:
+            return True
+        heading_x, heading_y = heading_target_xy or (goal_x, goal_y)
+        target_yaw = math.atan2(heading_y - pose[1], heading_x - pose[0])
+        error = normalize_angle(target_yaw - pose[2])
+        if abs(error) < self.rear_goal_enter_angle_rad:
+            return True
+        turn_sign = committed_turn_sign(
+            error,
+            self.rear_goal_pi_tie_tolerance_rad,
+            self.rear_goal_pi_turn_sign,
+        )
+        return self._rotate_to_yaw(
+            decision_id,
+            frame_id,
+            target_yaw,
+            self.rear_goal_exit_angle_rad,
+            self.rear_goal_rotate_speed_rad_s,
+            self.rear_goal_prerotate_timeout_s,
+            turn_sign=turn_sign,
+        )
+
+    def _final_align_interaction_goal(
+        self,
+        decision_id: str,
+        frame_id: str,
+        goal_x: float,
+        goal_y: float,
+        goal_yaw: float,
+    ) -> bool | None:
+        if not self.interaction_final_align_enabled:
+            return None
+        pose = self._current_pose(frame_id)
+        if pose is None:
+            return None
+        distance = math.hypot(goal_x - pose[0], goal_y - pose[1])
+        if distance > self.interaction_final_align_max_distance_m:
+            return None
+        if abs(normalize_angle(goal_yaw - pose[2])) <= self.interaction_final_align_yaw_tolerance_rad:
+            return True
+        self.move_base.cancel_goal()
+        time.sleep(0.15)
+        return self._rotate_to_yaw(
+            decision_id,
+            frame_id,
+            goal_yaw,
+            self.interaction_final_align_yaw_tolerance_rad,
+            self.interaction_final_align_rotate_speed_rad_s,
+            self.interaction_final_align_timeout_s,
+        )
+
     def _run_navigation(self, decision_id: str, candidate: dict) -> None:
         ready = self.move_base.wait_for_server(rospy.Duration(30.0))
         if not ready:
@@ -369,6 +557,26 @@ class SemanticBehaviorExecutor:
         goal.target_pose.header.frame_id = str(
             (candidate.get("metadata") or {}).get("frame_id") or self.map_frame
         )
+        goal_frame = goal.target_pose.header.frame_id
+        plan_reachable, path_lookahead = self._preflight_navigation_plan(
+            goal_frame, x, y, yaw
+        )
+        if not plan_reachable:
+            self._handle_navigation_result(
+                decision_id,
+                False,
+                {"reason": "make_plan_unreachable"},
+            )
+            return
+        self._prerotate_for_rear_goal(
+            decision_id,
+            goal_frame,
+            x,
+            y,
+            heading_target_xy=path_lookahead,
+        )
+        if not self._navigation_is_current(decision_id):
+            return
         goal.target_pose.header.stamp = rospy.Time.now()
         goal.target_pose.pose.position.x = x
         goal.target_pose.pose.position.y = y
@@ -381,6 +589,8 @@ class SemanticBehaviorExecutor:
             else self.machine.config.navigation_timeout_s
         )
         deadline = time.monotonic() + navigation_timeout_s
+        near_goal_since = None
+        interaction_navigation = str(candidate.get("behavior_type") or "") == "INTERACT"
         state = int(self.move_base.get_state())
         while (
             not rospy.is_shutdown()
@@ -390,10 +600,61 @@ class SemanticBehaviorExecutor:
         ):
             time.sleep(0.10)
             state = int(self.move_base.get_state())
+            if interaction_navigation:
+                pose = self._current_pose(goal_frame)
+                if pose is None:
+                    near_goal_since = None
+                    continue
+                distance = math.hypot(x - pose[0], y - pose[1])
+                yaw_error = abs(normalize_angle(yaw - pose[2]))
+                if (
+                    distance <= self.interaction_final_align_max_distance_m
+                    and yaw_error > self.interaction_final_align_yaw_tolerance_rad
+                ):
+                    if near_goal_since is None:
+                        near_goal_since = time.monotonic()
+                    elif (
+                        time.monotonic() - near_goal_since
+                        >= self.interaction_final_align_trigger_delay_s
+                    ):
+                        aligned = self._final_align_interaction_goal(
+                            decision_id,
+                            goal_frame,
+                            x,
+                            y,
+                            yaw,
+                        )
+                        self._handle_navigation_result(
+                            decision_id,
+                            bool(aligned),
+                            {
+                                "reason": "direct_final_yaw_alignment",
+                                "position_error_m": distance,
+                                "yaw_error_rad": yaw_error,
+                            },
+                        )
+                        return
+                else:
+                    near_goal_since = None
         if not self._navigation_is_current(decision_id):
             return
         if state not in TERMINAL_STATES:
             self.move_base.cancel_goal()
+            if interaction_navigation:
+                aligned = self._final_align_interaction_goal(
+                    decision_id,
+                    goal_frame,
+                    x,
+                    y,
+                    yaw,
+                )
+                if aligned is not None:
+                    self._handle_navigation_result(
+                        decision_id,
+                        bool(aligned),
+                        {"reason": "navigation_timeout_final_alignment"},
+                    )
+                    return
             self._handle_navigation_result(decision_id, False, {"reason": "navigation_timeout"})
             return
         self._handle_navigation_result(
@@ -404,6 +665,69 @@ class SemanticBehaviorExecutor:
                 "status": self.move_base.get_goal_status_text() or str(state),
             },
         )
+
+    def _preflight_navigation_plan(
+        self,
+        frame_id: str,
+        goal_x: float,
+        goal_y: float,
+        goal_yaw: float,
+    ) -> tuple[bool, tuple[float, float] | None]:
+        if not self.make_plan_preflight_enabled:
+            return True, None
+        pose = self._current_pose(frame_id)
+        if pose is None:
+            return self.make_plan_fail_open, None
+        stamp = rospy.Time.now()
+        start = PoseStamped()
+        start.header.frame_id = frame_id
+        start.header.stamp = stamp
+        start.pose.position.x = pose[0]
+        start.pose.position.y = pose[1]
+        start.pose.orientation.z = math.sin(0.5 * pose[2])
+        start.pose.orientation.w = math.cos(0.5 * pose[2])
+        goal = PoseStamped()
+        goal.header.frame_id = frame_id
+        goal.header.stamp = stamp
+        goal.pose.position.x = float(goal_x)
+        goal.pose.position.y = float(goal_y)
+        goal.pose.orientation.z = math.sin(0.5 * float(goal_yaw))
+        goal.pose.orientation.w = math.cos(0.5 * float(goal_yaw))
+        try:
+            rospy.wait_for_service(
+                self.make_plan_service,
+                timeout=max(0.0, self.make_plan_service_wait_sec),
+            )
+            response = self.make_plan_client(
+                start=start,
+                goal=goal,
+                tolerance=max(0.0, self.make_plan_tolerance_m),
+            )
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            rospy.logwarn_throttle(
+                5.0,
+                "[semantic_behavior_executor] make_plan preflight unavailable: %s",
+                exc,
+            )
+            return self.make_plan_fail_open, None
+        poses = list(response.plan.poses or [])
+        if not poses:
+            return False, None
+        endpoint = poses[-1].pose.position
+        reachable = math.hypot(
+            float(endpoint.x) - float(goal_x),
+            float(endpoint.y) - float(goal_y),
+        ) <= max(self.make_plan_endpoint_tolerance_m, self.make_plan_tolerance_m)
+        path_xy = [
+            (float(path_pose.pose.position.x), float(path_pose.pose.position.y))
+            for path_pose in poses
+        ]
+        lookahead = path_lookahead_point(
+            (pose[0], pose[1]),
+            path_xy,
+            self.rear_goal_lookahead_m,
+        )
+        return reachable, lookahead
 
     def _handle_navigation_result(
         self, decision_id: str, success: bool, detail: dict

@@ -1,3 +1,5 @@
+import math
+
 from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
@@ -8,6 +10,9 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_PREPARING_EXPLORE,
     STATE_SUCCEEDED,
     STATE_VERIFYING,
+    committed_turn_sign,
+    normalize_angle,
+    path_lookahead_point,
 )
 
 
@@ -19,6 +24,24 @@ def interaction_candidate(requires_approach=True):
         "interaction_command": {"expected_state": "open"},
         "metadata": {"requires_approach": requires_approach},
     }
+
+
+def test_committed_turn_sign_is_stable_at_pi_boundary() -> None:
+    assert committed_turn_sign(math.pi - 0.05) == -1
+    assert committed_turn_sign(-math.pi + 0.05) == -1
+    assert committed_turn_sign(1.0) == 1
+    assert committed_turn_sign(-1.0) == -1
+    assert math.isclose(normalize_angle(3.0 * math.pi), math.pi, abs_tol=1e-6)
+
+
+def test_path_lookahead_uses_plan_direction_instead_of_final_goal_bearing() -> None:
+    lookahead = path_lookahead_point(
+        (0.0, 0.0),
+        [(0.0, 0.0), (-0.4, 0.0), (-0.8, 0.1), (1.0, 2.0)],
+        0.7,
+    )
+
+    assert lookahead == (-0.8, 0.1)
 
 
 def target_candidate():

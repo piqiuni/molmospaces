@@ -224,6 +224,7 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         end_on_success: bool = False,
     ):
         log.info("Starting task.reset() ...")
+        task.set_history_retention(bool(getattr(policy, "retain_task_history", False)))
         if hasattr(policy, "prepare_episode_reset"):
             policy.prepare_episode_reset()
         observation, _info = task.reset()
@@ -618,6 +619,10 @@ def parse_args():
     parser.add_argument("--realtime_gt_topic", type=str, default="/semantic_mapping/gt_observations")
     parser.add_argument("--realtime_gt_camera_name", type=str, default="head_camera")
     parser.add_argument("--realtime_gt_min_visible_pixels", type=int, default=16)
+    parser.add_argument("--realtime_gt_min_visible_fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--realtime_gt_required_consecutive_observations", type=int, default=2
+    )
     parser.add_argument("--realtime_gt_step_interval", type=int, default=3)
     parser.add_argument("--realtime_gt_max_distance_m", type=float, default=6.0)
     parser.add_argument(
@@ -625,6 +630,18 @@ def parse_args():
         type=str,
         default="",
         help="Optional directory for asynchronous per-step RGB PNGs and a timestamp manifest.",
+    )
+    parser.add_argument(
+        "--step_frame_queue_size",
+        type=int,
+        default=4,
+        help="Bounded blocking queue for lossless per-step PNG writing.",
+    )
+    parser.add_argument(
+        "--retain_task_history",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Retain full task observations/actions; disabled by default for ROS simulation.",
     )
     parser.add_argument("--extra_image_topic", type=str, default="/molmo_spaces/debug_front_camera/image")
     parser.add_argument("--debug_front_camera_name", type=str, default="debug_front_camera")
@@ -924,9 +941,14 @@ def main():
             realtime_gt_topic=args.realtime_gt_topic,
             realtime_gt_camera_name=args.realtime_gt_camera_name,
             realtime_gt_min_visible_pixels=args.realtime_gt_min_visible_pixels,
+            realtime_gt_min_visible_fraction=args.realtime_gt_min_visible_fraction,
+            realtime_gt_required_consecutive_observations=(
+                args.realtime_gt_required_consecutive_observations
+            ),
             realtime_gt_step_interval=args.realtime_gt_step_interval,
             realtime_gt_max_distance_m=args.realtime_gt_max_distance_m,
             step_frame_dir=args.step_frame_dir,
+            step_frame_queue_size=args.step_frame_queue_size,
         )
         arm_qpos = parse_qpos_csv(args.initial_arm_qpos)
         left_arm_qpos = parse_qpos_csv(args.initial_left_arm_qpos)
@@ -941,6 +963,7 @@ def main():
             policy.default_right_arm_qpos = right_arm_qpos.copy()
         policy.scene_timeout_s = args.scene_timeout_s
         policy.max_consecutive_action_timeouts = args.max_consecutive_action_timeouts
+    policy.retain_task_history = bool(args.retain_task_history)
     policy.sim_timing_log_every_n_steps = args.sim_timing_log_every_n_steps
     policy.step_log_every_n_steps = args.step_log_every_n_steps
     policy.debug_snapshot_path = args.debug_snapshot_path

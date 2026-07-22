@@ -635,7 +635,7 @@ class CandidateGenerator:
                             in completed_groups,
                             "target_enabled": bool(target_context.get("enabled")),
                             "target_match": explicit_target_reinteraction,
-                            "requires_approach": approach_distance > self.config.interaction_ready_distance_m,
+                            "requires_approach": True,
                             "approach_strategy": (
                                 "portal_aabb_normal"
                                 if node_type == "portal"
@@ -821,7 +821,19 @@ class CandidateGenerator:
         node: dict[str, Any],
         standoff_m: float,
     ) -> list[float]:
-        size = list(node.get("aabb_size") or [])
+        attributes = node.get("attributes") or {}
+        reference_center = list(
+            attributes.get("interaction_reference_aabb_center")
+            or node.get("aabb_center")
+            or target_xy
+        )
+        if len(reference_center) >= 2:
+            target_xy = float(reference_center[0]), float(reference_center[1])
+        size = list(
+            attributes.get("interaction_reference_aabb_size")
+            or node.get("aabb_size")
+            or []
+        )
         if len(size) < 2:
             return cls._approach_pose(robot_xy, target_xy, standoff_m)
         size_x = max(0.0, float(size[0]))

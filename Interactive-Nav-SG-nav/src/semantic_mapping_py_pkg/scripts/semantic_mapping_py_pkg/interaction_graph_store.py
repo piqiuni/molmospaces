@@ -387,7 +387,19 @@ class InteractionGraphStore:
                 "source": observation.get("source"),
                 "source_object_name": observation.get("source_object_name"),
                 "orientation": list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
+                "interaction_approach_axis_xy": list(
+                    observation.get("interaction_approach_axis_xy") or []
+                ),
                 "visible_pixels": int(observation.get("visible_pixels", 0)),
+                "visible_fraction": float(
+                    observation.get("visible_fraction", 0.0) or 0.0
+                ),
+                "projected_bbox_2d": list(
+                    observation.get("projected_bbox_2d") or []
+                ),
+                "consecutive_observations": int(
+                    observation.get("consecutive_observations", 0) or 0
+                ),
                 "camera_name": observation.get("camera_name"),
                 "frame_index": int(observation.get("frame_index", 0)),
                 "episode_id": observation.get("episode_id"),
@@ -409,6 +421,16 @@ class InteractionGraphStore:
         ):
             node.interaction.update(self.portal_state_tracker.update(node.id, observation))
             state = node.interaction.get("state", "unknown")
+            if (
+                "interaction_reference_aabb_center" not in node.attributes
+                or state == "closed"
+            ):
+                node.attributes["interaction_reference_aabb_center"] = list(
+                    observation["aabb_center"]
+                )
+                node.attributes["interaction_reference_aabb_size"] = list(
+                    observation["aabb_size"]
+                )
             node.interaction["state_confidence"] = float(observation.get("confidence", 0.0) or 0.0)
             node.interaction["traversable"] = state in {"open", "static_open"}
             node.interaction["requires_interaction"] = bool(
@@ -887,7 +909,17 @@ def _object_not_too_high(obj, support):
 
 
 def _container_contains(obj, container):
-    return point_inside_3d(obj.centroid, container.aabb_center, container.aabb_size, margin=0.08)
+    if not point_inside_2d(
+        obj.centroid,
+        container.aabb_center,
+        container.aabb_size,
+        margin=0.05,
+    ):
+        return False
+    center_z = float(container.aabb_center[2])
+    half_height = max(0.0, float(container.aabb_size[2]) * 0.5)
+    object_z = float(obj.centroid[2])
+    return center_z - half_height <= object_z <= center_z + half_height
 
 
 InteractionGraphStore._is_inside_volume = staticmethod(lambda obj, container: _same_room_or_unknown(obj, container) and _container_contains(obj, container))

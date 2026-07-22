@@ -9,7 +9,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from semantic_mapping_py_pkg.gt_observation_provider import build_gt_observation_batches
-from semantic_mapping_py_pkg.graph_rules import observation_from_detection
+from semantic_mapping_py_pkg.graph_rules import infer_interaction_state, observation_from_detection
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore
 
@@ -150,6 +150,55 @@ def test_support_and_container_hierarchy_assignment():
     relations = {(edge["src_id"], edge["relation"], edge["dst_id"]) for edge in graph["edges"]}
     assert ("support_table_1", "supports", "object_apple_1") in relations
     assert ("container_fridge_1", "contains", "object_milk_1") in relations
+
+
+def test_object_above_container_is_not_inferred_as_internal_content():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="dresser_1",
+                semantic_name="dresser",
+                is_receptacle=True,
+                is_articulable=True,
+                position=[0.0, 0.0, 0.35],
+                aabb_center=[0.0, 0.0, 0.35],
+                aabb_size=[0.4, 0.7, 0.7],
+            ),
+            observation(
+                instance_id="phone_1",
+                semantic_name="cellphone",
+                position=[0.0, 0.0, 0.71],
+                aabb_center=[0.0, 0.0, 0.71],
+                aabb_size=[0.1, 0.05, 0.02],
+            ),
+        ]
+    )
+
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_dresser_1", "contains", "object_phone_1") not in relations
+
+
+def test_toilet_receptacle_metadata_does_not_make_it_a_container():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="toilet_1",
+                semantic_name="toilet",
+                is_receptacle=True,
+                is_articulable=True,
+            )
+        ]
+    )
+
+    node = next(
+        node for node in store.as_graph_dict()["nodes"] if node["id"] == "object_toilet_1"
+    )
+    assert node["type"] == "object"
 
 
 def test_existing_instance_updates_instead_of_duplication():
@@ -613,3 +662,45 @@ def test_portal_state_uses_joint_delta_and_ajar_is_not_traversable():
     assert portal["interaction"]["state"] == "open"
     assert portal["interaction"]["traversable"] is True
     assert portal["interaction"]["open_fraction"] == 0.8
+
+
+def test_negative_joint_range_uses_zero_as_closed_endpoint():
+    observation_data = {"is_movable_door": True}
+    assert infer_interaction_state(
+        "container", "hinge", [-2.8, 0.0], -2.8, observation_data
+    ) == "open"
+    assert infer_interaction_state(
+        "container", "hinge", [-2.8, 0.0], 0.0, observation_data
+    ) == "closed"
+
+
+def test_initially_open_multi_joint_box_does_not_require_interaction():
+    store = InteractionGraphStore(scene_id="test_scene")
+    box = observation(
+        instance_id="open_box",
+        semantic_name="box",
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="hinge",
+        joint_range=[-2.8, 0.0],
+        joint_value=-2.8,
+    )
+    box["joint_infos"] = [
+        {
+            "joint_name": "negative_flap",
+            "joint_type": "hinge",
+            "joint_range": [-2.8, 0.0],
+            "joint_value": -2.8,
+        },
+        {
+            "joint_name": "positive_flap",
+            "joint_type": "hinge",
+            "joint_range": [0.0, 2.2],
+            "joint_value": 2.2,
+        },
+    ]
+    store.update_observations([box], source_mode="realtime_gt_observation")
+
+    node = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "container")
+    assert node["interaction"]["state"] == "open"
+    assert node["interaction"]["requires_interaction"] is False

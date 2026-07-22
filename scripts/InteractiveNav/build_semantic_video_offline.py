@@ -11,6 +11,29 @@ from pathlib import Path
 import cv2
 
 
+def draw_outlined_text(frame, text, origin, scale=0.46, thickness=1) -> None:
+    cv2.putText(
+        frame,
+        text,
+        (origin[0] + 1, origin[1] + 1),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (245, 245, 245),
+        thickness + 2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (20, 20, 20),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
 def load_jsonl(path: Path) -> list[dict]:
     records = []
     if not path.exists():
@@ -74,9 +97,12 @@ def draw_gt(frame, payload: dict | None) -> None:
         cv2.rectangle(frame, start, end, color, 2, cv2.LINE_AA)
         label = f"{observation.get('semantic_name', 'obj')} {observation.get('instance_id', '')}"
         cv2.putText(frame, label[:48], (start[0], max(18, start[1] - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
-    cv2.rectangle(frame, (0, max(0, source_height - 28)), (min(source_width - 1, 470), source_height - 1), (255, 255, 255), -1)
     gt_frame = (payload or {}).get("frame_index", "-")
-    cv2.putText(frame, f"GT visible={len(observations)} frame={gt_frame} source=realtime_gt", (8, source_height - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (20, 20, 20), 1, cv2.LINE_AA)
+    draw_outlined_text(
+        frame,
+        f"GT visible={len(observations)} frame={gt_frame} source=realtime_gt",
+        (8, source_height - 9),
+    )
 
 
 def main() -> None:
@@ -143,28 +169,34 @@ def main() -> None:
             state_stamp = float(state_record.get("image_stamp_value") or 0.0)
             state_step = nearest_sim_step(sim_stamps, state_stamp)
             state_age_sec = max(0.0, stamp_sec - state_stamp)
-            cv2.putText(camera_frame, f"SIM STEP={sim_step:04d} STAMP={stamp_sec:.3f}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (15, 15, 15), 2, cv2.LINE_AA)
+            camera_label = f"STEP={sim_step:04d}"
+            camera_size = cv2.getTextSize(
+                camera_label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
+            )[0]
+            draw_outlined_text(
+                camera_frame,
+                camera_label,
+                (panel_width - camera_size[0] - 8, 24),
+                scale=0.55,
+                thickness=2,
+            )
             state_frame[:panel_height, :panel_width] = camera_frame
             sync_label = f"TARGET={sim_step:04d} STATE={state_step:04d} AGE={state_age_sec:.2f}s"
-            panel_names = (
-                (("CAMERA", "OCC"), ("GLOBAL", "LOCAL"))
-                if panel_columns == 2
-                else (("CAMERA", "OCC", "SEMANTIC XY"), ("GLOBAL", "LOCAL", "TOPOLOGY"))
-            )
             for row in range(2):
                 for column in range(panel_columns):
                     if row == 0 and column == 0:
                         continue
                     x0 = column * panel_width
                     y0 = row * panel_height
-                    title = f"{panel_names[row][column]}  STATE<={state_step:04d}  TARGET={sim_step:04d}"
-                    cv2.rectangle(state_frame, (x0, y0), (x0 + panel_width - 1, y0 + 27), (255, 255, 255), -1)
-                    cv2.putText(state_frame, title, (x0 + 8, y0 + 19), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (20, 20, 20), 1, cv2.LINE_AA)
                     text_size = cv2.getTextSize(sync_label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
                     text_x = x0 + panel_width - text_size[0] - 8
                     text_y = y0 + panel_height - 10
-                    cv2.rectangle(state_frame, (text_x - 4, text_y - 15), (x0 + panel_width - 4, text_y + 4), (255, 255, 255), -1)
-                    cv2.putText(state_frame, sync_label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (20, 20, 20), 1, cv2.LINE_AA)
+                    draw_outlined_text(
+                        state_frame,
+                        sync_label,
+                        (text_x, text_y),
+                        scale=0.42,
+                    )
             output_path = output_dir / f"frame_{frame_index:06d}_composite.png"
             cv2.imwrite(str(output_path), state_frame)
             writer.write(state_frame)

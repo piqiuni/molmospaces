@@ -94,6 +94,39 @@ def test_reset_clears_cross_episode_portal_state():
     overlay.reset()
     assert overlay.active_portal_ids == set()
     assert overlay.reference_aabbs == {}
+    assert overlay.pending_portal_ids == set()
+
+
+def test_pending_open_interaction_clears_before_result_and_rolls_back():
+    overlay = SemanticOccupancyOverlay(clear_padding_m=0.0)
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    overlay.update_graph(graph(portal("closed")))
+
+    assert overlay.set_interaction_pending("portal_door", True) is True
+    overlay.update_graph(graph(portal("closed")))
+    pending_data, _mask, pending_stats = overlay.apply(GridInfo(), raw)
+    assert pending_stats["active_portal_ids"] == ["portal_door"]
+    assert pending_data[10 * GridInfo.width + 10] == 0
+
+    assert overlay.set_interaction_pending("portal_door", False) is True
+    overlay.update_graph(graph(portal("closed")))
+    restored, _mask, restored_stats = overlay.apply(GridInfo(), raw)
+    assert restored == raw
+    assert restored_stats["active_portal_ids"] == []
+
+
+def test_ajar_portal_keeps_semantic_clearance():
+    overlay = SemanticOccupancyOverlay(
+        clear_padding_m=0.0,
+        open_states=["ajar", "open"],
+    )
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    overlay.update_graph(graph(portal("closed")))
+    overlay.update_graph(graph(portal("ajar", center=(1.5, 1.5, 1.0))))
+
+    planning, _mask, stats = overlay.apply(GridInfo(), raw)
+    assert stats["active_portal_ids"] == ["portal_door"]
+    assert planning[10 * GridInfo.width + 10] == 0
 
 
 def test_overlay_reports_the_small_door_update_region():

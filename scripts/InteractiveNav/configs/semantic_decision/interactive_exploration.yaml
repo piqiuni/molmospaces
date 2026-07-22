@@ -7,10 +7,10 @@ candidate:
   max_state_age_sec: 3600.0
   container_require_same_room: true
   container_allow_connected_room: true
-  portal_standoff_m: 1.0
+  portal_standoff_m: 0.85
   container_standoff_m: 1.0
   drawer_standoff_m: 1.0
-  interaction_safety_margin_m: 0.0
+  interaction_safety_margin_m: 0.25
 
 policy:
   backend: "rule"

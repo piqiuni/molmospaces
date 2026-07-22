@@ -120,8 +120,14 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "joint_infos": list(observation.get("joint_infos") or []),
         "primary_joint_name": str(observation.get("primary_joint_name") or ""),
         "orientation": list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
+        "interaction_approach_axis_xy": list(observation.get("interaction_approach_axis_xy") or []),
         "source_object_name": str(observation.get("source_object_name") or ""),
         "visible_pixels": int(observation.get("visible_pixels", 0) or 0),
+        "visible_fraction": float(observation.get("visible_fraction", 0.0) or 0.0),
+        "projected_bbox_2d": list(observation.get("projected_bbox_2d") or []),
+        "consecutive_observations": int(
+            observation.get("consecutive_observations", 0) or 0
+        ),
         "camera_name": str(observation.get("camera_name") or ""),
         "frame_index": int(observation.get("frame_index", 0) or 0),
         "episode_id": str(observation.get("episode_id") or ""),
@@ -141,18 +147,21 @@ def point_range(values):
     return [float(vals[0]), float(vals[1])]
 
 
+def joint_closed_open_values(joint_range: list[float]) -> tuple[float, float]:
+    joint_min, joint_max = float(joint_range[0]), float(joint_range[1])
+    closed = 0.0 if joint_min <= 0.0 <= joint_max else min((joint_min, joint_max), key=abs)
+    opened = joint_min if abs(joint_min - closed) >= abs(joint_max - closed) else joint_max
+    return closed, opened
+
+
 def infer_node_type(observation: dict[str, Any]) -> str:
     label = normalize_label(observation.get("semantic_name"))
     if observation.get("is_door") or label in PORTAL_LABELS:
         return "portal"
-    if observation.get("is_receptacle"):
-        if label in SUPPORT_LABELS:
-            return "support"
-        if label in CONTAINER_LABELS:
-            return "container"
-        if observation.get("is_articulable"):
-            return "container"
+    if label in SUPPORT_LABELS:
         return "support"
+    if label in CONTAINER_LABELS:
+        return "container"
     return "object"
 
 
@@ -201,17 +210,17 @@ def infer_interaction_state(node_type: str, joint_type: str, joint_range: list[f
         if node_type == "portal" and not observation.get("is_movable_door", True):
             return "static_open"
         return "unknown"
-    joint_min, joint_max = float(joint_range[0]), float(joint_range[1])
-    span = abs(joint_max - joint_min)
+    closed_value, open_value = joint_closed_open_values(joint_range)
+    span = abs(open_value - closed_value)
     if span <= 1e-6:
         return "unknown"
     value = float(joint_value)
-    lower_dist = abs(value - joint_min)
-    upper_dist = abs(value - joint_max)
+    closed_dist = abs(value - closed_value)
+    open_dist = abs(value - open_value)
     tolerance = max(0.05 * span, 0.02)
-    if lower_dist <= tolerance:
+    if closed_dist <= tolerance:
         return "closed"
-    if upper_dist <= tolerance:
+    if open_dist <= tolerance:
         return "open"
     return "ajar"
 

@@ -44,6 +44,7 @@ _patch_roslogging_findcaller_for_py311()
 
 import rospy
 import tf
+from explore_py_pkg.debug_semantic_viz import candidate_color
 from actionlib_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
 from map_msgs.msg import OccupancyGridUpdate
@@ -902,7 +903,7 @@ class ExploreDebugRecorder:
         self.latest_pose: tuple[float, float, float] | None = None
         self.latest_pose_stamp = 0.0
         self.pose_history = deque(maxlen=2000)
-        self.active_goal_video_history = deque(maxlen=max(64, history_size))
+        self.active_goal_video_history = deque(maxlen=history_size)
         self.latest_pose_step = 0
         self.latest_global_plan: dict | None = None
         self.latest_local_global_plan: dict | None = None
@@ -913,6 +914,20 @@ class ExploreDebugRecorder:
         self.latest_unified_graph: dict = {}
         self.previous_unified_graph: dict = {}
         self.semantic_events: list[dict] = []
+        self.latest_semantic_candidates: dict = {}
+        self.latest_semantic_selection: dict = {}
+        self.latest_semantic_execution_state: dict = {}
+        self.latest_semantic_behavior_feedback: dict = {}
+        self.semantic_decision_event_count = 0
+        self.last_semantic_execution_key = None
+        self.latest_scene_id_grid = None
+        self.latest_scene_id_grid_rgb = None
+        self.latest_scene_id_grid_stamp = 0.0
+        self.latest_scene_id_grid_step = 0
+        self.scene_id_grid_history = deque(maxlen=history_size)
+        self.room_segment_callback_count = 0
+        self.latest_room_segment_valid_cell_count = 0
+        self.latest_room_segment_unique_ids: list[int] = []
         self.pending_semantic_keyframe_revision = -1
         self.last_semantic_keyframe_revision = -1
         self.topology_slots: dict[str, tuple[int, int]] = {}
@@ -1150,6 +1165,50 @@ class ExploreDebugRecorder:
         self.subscribers.append(rospy.Subscriber(args.explore_status_topic, String, self.explore_status_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.gt_observations_topic, String, self.gt_observations_callback, queue_size=2))
         self.subscribers.append(rospy.Subscriber(args.unified_graph_topic, String, self.unified_graph_callback, queue_size=2))
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.scene_id_grid_topic,
+                OccupancyGrid,
+                self.scene_id_grid_callback,
+                queue_size=1,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.semantic_candidates_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("semantic_decision_candidates", "latest_semantic_candidates"),
+                queue_size=10,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.semantic_selected_behavior_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("semantic_decision_selected", "latest_semantic_selection"),
+                queue_size=10,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.semantic_execution_state_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("semantic_decision_execution", "latest_semantic_execution_state"),
+                queue_size=10,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.semantic_behavior_feedback_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("semantic_decision_feedback", "latest_semantic_behavior_feedback"),
+                queue_size=20,
+            )
+        )
         self.subscribers.append(rospy.Subscriber(args.cmd_vel_topic, Twist, self.cmd_vel_callback, callback_args=args.cmd_vel_topic, queue_size=50))
         self.subscribers.append(rospy.Subscriber(args.global_plan_topic, NavPath, self.plan_callback, callback_args=("global", args.global_plan_topic), queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.local_global_plan_topic, NavPath, self.plan_callback, callback_args=("local_global", args.local_global_plan_topic), queue_size=20))
@@ -1202,6 +1261,11 @@ class ExploreDebugRecorder:
                 self.observed_instance_ids.clear()
                 self.topology_slots.clear()
                 self.topology_next_slot = {"room": 0, "portal": 0, "container": 0, "object": 0}
+                self.latest_semantic_candidates = {}
+                self.latest_semantic_selection = {}
+                self.latest_semantic_execution_state = {}
+                self.latest_semantic_behavior_feedback = {}
+                self.last_semantic_execution_key = None
             for observation in payload.get("observations") or []:
                 instance_id = str(observation.get("instance_id") or "")
                 if instance_id:
@@ -1249,6 +1313,67 @@ class ExploreDebugRecorder:
                     int(self.pending_semantic_keyframe_revision),
                 )
             )
+
+    def scene_id_grid_callback(self, msg: OccupancyGrid) -> None:
+        copied = _copy_grid(msg)
+        rgb = self._scene_id_grid_to_rgb(copied)
+        if np is not None:
+            values = np.asarray(copied.data, dtype=np.int32)
+            valid_values = values[values >= 0]
+            valid_cell_count = int(valid_values.size)
+            unique_ids = [int(value) for value in np.unique(valid_values).tolist()]
+        else:
+            valid_values = [int(value) for value in copied.data if int(value) >= 0]
+            valid_cell_count = len(valid_values)
+            unique_ids = sorted(set(valid_values))
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.room_segment_callback_count += 1
+            self.latest_room_segment_valid_cell_count = valid_cell_count
+            self.latest_room_segment_unique_ids = unique_ids
+            self.latest_scene_id_grid = copied
+            self.latest_scene_id_grid_rgb = rgb
+            self.latest_scene_id_grid_stamp = (
+                msg.header.stamp.to_sec() if msg.header.stamp else 0.0
+            )
+            self.latest_scene_id_grid_step = self.debug_step
+            self.scene_id_grid_history.append(
+                (
+                    self.latest_scene_id_grid_stamp,
+                    copied,
+                    rgb,
+                    self.latest_scene_id_grid_step,
+                )
+            )
+
+    def semantic_decision_event_callback(
+        self, msg: String, callback_args: tuple[str, str]
+    ) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        event_type, attribute_name = callback_args
+        with self.lock:
+            if self.shutting_down:
+                return
+            setattr(self, attribute_name, payload)
+            if event_type == "semantic_decision_execution":
+                execution_key = (
+                    payload.get("state"),
+                    payload.get("decision_id"),
+                    payload.get("candidate_id"),
+                    payload.get("behavior_type"),
+                    payload.get("error"),
+                )
+                if execution_key == self.last_semantic_execution_key:
+                    return
+                self.last_semantic_execution_key = execution_key
+            self.semantic_decision_event_count += 1
+            self._write_event(event_type, {"payload": payload})
 
     @staticmethod
     def _semantic_graph_delta(previous: dict, current: dict) -> list[dict]:
@@ -1503,6 +1628,15 @@ class ExploreDebugRecorder:
                 int(self.pending_semantic_keyframe_revision),
             ),
         )
+        scene_id_record = causal(
+            self.scene_id_grid_history,
+            (
+                self.latest_scene_id_grid_stamp,
+                self.latest_scene_id_grid,
+                self.latest_scene_id_grid_rgb,
+                self.latest_scene_id_grid_step,
+            ),
+        )
         goal_record = causal(
             self.active_goal_video_history,
             (0.0, 0, None, None),
@@ -1555,6 +1689,13 @@ class ExploreDebugRecorder:
             "semantic_events": graph_record[2],
             "observed_instance_ids": gt_record[2],
             "pending_semantic_keyframe_revision": int(graph_record[3]),
+            "scene_id_grid": scene_id_record[1],
+            "scene_id_grid_rgb": scene_id_record[2],
+            "scene_id_grid_step": int(scene_id_record[3]),
+            "semantic_candidates": dict(self.latest_semantic_candidates),
+            "semantic_selection": dict(self.latest_semantic_selection),
+            "semantic_execution_state": dict(self.latest_semantic_execution_state),
+            "semantic_behavior_feedback": dict(self.latest_semantic_behavior_feedback),
         }
 
     def _run_video_frame_renderer(self) -> None:
@@ -1631,10 +1772,22 @@ class ExploreDebugRecorder:
                 label += f" q={float(joint_value):.2f}"
             label_y = max(18, start[1] - 5)
             cv2.putText(frame, label[:48], (start[0], label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
-        cv2.rectangle(frame, (0, max(0, frame.shape[0] - 28)), (min(frame.shape[1] - 1, 420), frame.shape[0] - 1), (255, 255, 255), -1)
+        status_text = (
+            f"GT visible={len(observations)} frame={gt_observations.get('frame_index', '-')} source=realtime_gt"
+        )
         cv2.putText(
             frame,
-            f"GT visible={len(observations)} frame={gt_observations.get('frame_index', '-')} source=realtime_gt",
+            status_text,
+            (9, frame.shape[0] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (245, 245, 245),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            status_text,
             (8, frame.shape[0] - 9),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.46,
@@ -1690,6 +1843,7 @@ class ExploreDebugRecorder:
         occupancy_rgb=None,
         graph: dict | None = None,
         observed_instance_ids: set[str] | None = None,
+        image_step: int | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
@@ -1702,9 +1856,9 @@ class ExploreDebugRecorder:
         positions = [position for position in positions if position is not None]
         if pose is not None:
             positions.append((float(pose[0]), float(pose[1])))
-        cv2.putText(panel, f"SEMANTIC XY rev={graph.get('graph_revision', 0)} nodes={len(nodes)}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (20, 20, 20), 2, cv2.LINE_AA)
         if not positions:
             cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, panel_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
+            self._draw_panel_title(panel, "SEMANTIC XY", image_step)
             return panel
         min_x = min(position[0] for position in positions)
         max_x = max(position[0] for position in positions)
@@ -1722,7 +1876,10 @@ class ExploreDebugRecorder:
         margin = 38
         span_x = max(2.0, max_x - min_x)
         span_y = max(2.0, max_y - min_y)
-        scale = min((panel_width - margin * 2) / span_x, (panel_height - margin * 2 - 20) / span_y)
+        scale = 1.30 * min(
+            (panel_width - margin * 2) / span_x,
+            (panel_height - margin * 2 - 20) / span_y,
+        )
         center_x = (min_x + max_x) * 0.5
         center_y = (min_y + max_y) * 0.5
 
@@ -1818,6 +1975,174 @@ class ExploreDebugRecorder:
         if pose is not None:
             center = to_px(float(pose[0]), float(pose[1]))
             self._draw_cv_robot_arrow(panel, center, float(pose[2]), 14)
+        self._draw_panel_title(panel, "SEMANTIC XY", image_step)
+        return panel
+
+    def _render_room_segment_panel_locked(
+        self,
+        panel_width: int,
+        panel_height: int,
+        pose,
+        occupancy_grid: OccupancyGrid | None = None,
+        occupancy_rgb=None,
+        scene_grid: OccupancyGrid | None = None,
+        scene_rgb=None,
+        graph: dict | None = None,
+        observed_instance_ids: set[str] | None = None,
+        image_step: int | None = None,
+    ):
+        panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
+        graph = self.latest_unified_graph if graph is None else graph
+        reference_grid = occupancy_grid or scene_grid
+        if reference_grid is None:
+            self._draw_panel_title(panel, "ROOM SEGMENTS", image_step)
+            return panel
+
+        grid_width = int(reference_grid.info.width)
+        grid_height = int(reference_grid.info.height)
+        resolution = float(reference_grid.info.resolution)
+        origin = reference_grid.info.origin
+        origin_yaw = math.atan2(
+            2.0 * (origin.orientation.w * origin.orientation.z + origin.orientation.x * origin.orientation.y),
+            1.0 - 2.0 * (origin.orientation.y * origin.orientation.y + origin.orientation.z * origin.orientation.z),
+        )
+        cos_yaw = math.cos(origin_yaw)
+        sin_yaw = math.sin(origin_yaw)
+
+        def world_from_cell(cell_x: float, cell_y: float) -> tuple[float, float]:
+            return (
+                float(origin.position.x) + cos_yaw * cell_x * resolution - sin_yaw * cell_y * resolution,
+                float(origin.position.y) + sin_yaw * cell_x * resolution + cos_yaw * cell_y * resolution,
+            )
+
+        cell_min_x = 0.0
+        cell_min_y = 0.0
+        cell_max_x = float(grid_width)
+        cell_max_y = float(grid_height)
+        if np is not None:
+            reference_values = np.asarray(reference_grid.data, dtype=np.int16).reshape(
+                (grid_height, grid_width)
+            )
+            known_rows, known_cols = np.where(reference_values >= 0)
+            if known_rows.size > 0 and known_cols.size > 0:
+                cell_min_x = float(np.min(known_cols))
+                cell_min_y = float(np.min(known_rows))
+                cell_max_x = float(np.max(known_cols) + 1)
+                cell_max_y = float(np.max(known_rows) + 1)
+        corners = [
+            world_from_cell(cell_min_x, cell_min_y),
+            world_from_cell(cell_max_x, cell_min_y),
+            world_from_cell(cell_min_x, cell_max_y),
+            world_from_cell(cell_max_x, cell_max_y),
+        ]
+        min_x = min(point[0] for point in corners)
+        max_x = max(point[0] for point in corners)
+        min_y = min(point[1] for point in corners)
+        max_y = max(point[1] for point in corners)
+        margin = 18
+        scale = min(
+            (panel_width - 2 * margin) / max(max_x - min_x, 1e-6),
+            (panel_height - 2 * margin) / max(max_y - min_y, 1e-6),
+        )
+
+        def to_px(x: float, y: float) -> tuple[int, int]:
+            return (
+                int(round(margin + (x - min_x) * scale)),
+                int(round(panel_height - margin - (y - min_y) * scale)),
+            )
+
+        def warp_grid(grid, rgb):
+            if grid is None or rgb is None:
+                return None
+            width = int(grid.info.width)
+            height = int(grid.info.height)
+            grid_origin = grid.info.origin
+            grid_yaw = math.atan2(
+                2.0 * (grid_origin.orientation.w * grid_origin.orientation.z + grid_origin.orientation.x * grid_origin.orientation.y),
+                1.0 - 2.0 * (grid_origin.orientation.y * grid_origin.orientation.y + grid_origin.orientation.z * grid_origin.orientation.z),
+            )
+            cos_grid = math.cos(grid_yaw)
+            sin_grid = math.sin(grid_yaw)
+            grid_resolution = float(grid.info.resolution)
+
+            def grid_world(cx: float, cy: float) -> tuple[float, float]:
+                return (
+                    float(grid_origin.position.x) + cos_grid * cx * grid_resolution - sin_grid * cy * grid_resolution,
+                    float(grid_origin.position.y) + sin_grid * cx * grid_resolution + cos_grid * cy * grid_resolution,
+                )
+
+            source = np.float32(
+                [[0.0, height - 1.0], [width - 1.0, height - 1.0], [0.0, 0.0]]
+            )
+            destination = np.float32(
+                [
+                    to_px(*grid_world(0.0, 0.0)),
+                    to_px(*grid_world(width - 1.0, 0.0)),
+                    to_px(*grid_world(0.0, height - 1.0)),
+                ]
+            )
+            transform = cv2.getAffineTransform(source, destination)
+            return cv2.warpAffine(
+                rgb,
+                transform,
+                (panel_width, panel_height),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(246, 246, 246),
+            )
+
+        occupancy_layer = warp_grid(occupancy_grid, occupancy_rgb)
+        if occupancy_layer is not None:
+            panel = cv2.addWeighted(occupancy_layer, 0.72, panel, 0.28, 0.0)
+        segment_layer = warp_grid(scene_grid, scene_rgb)
+        if segment_layer is not None:
+            panel = cv2.addWeighted(segment_layer, 0.38, panel, 0.62, 0.0)
+
+        nodes = [
+            node
+            for node in graph.get("nodes") or []
+            if node.get("type") in {"portal", "container"}
+            and self._node_observed_in_recording(node, observed_instance_ids)
+        ]
+        for node in nodes:
+            center = self._node_xy(node)
+            size = list(node.get("aabb_size") or [])
+            if center is None or len(size) < 2:
+                continue
+            center_px = to_px(center[0], center[1])
+            half_w = max(3, int(abs(float(size[0])) * scale * 0.5))
+            half_h = max(3, int(abs(float(size[1])) * scale * 0.5))
+            color = self._semantic_node_color(node)
+            cv2.rectangle(
+                panel,
+                (center_px[0] - half_w, center_px[1] - half_h),
+                (center_px[0] + half_w, center_px[1] + half_h),
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                panel,
+                f"{self._short_node_id(node)} {node.get('label', node.get('type', ''))}",
+                (center_px[0] + 3, center_px[1] - half_h - 3),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.30,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        if pose is not None:
+            self._draw_cv_robot_arrow(
+                panel,
+                to_px(float(pose[0]), float(pose[1])),
+                float(pose[2]),
+                14,
+            )
+        self._draw_panel_title(
+            panel,
+            "ROOM SEGMENTS + INTERACTION",
+            image_step,
+        )
         return panel
 
     def _render_semantic_topology_panel_locked(
@@ -1827,10 +2152,29 @@ class ExploreDebugRecorder:
         graph: dict | None = None,
         semantic_events: list[dict] | None = None,
         observed_instance_ids: set[str] | None = None,
+        semantic_selection: dict | None = None,
+        semantic_execution_state: dict | None = None,
+        semantic_behavior_feedback: dict | None = None,
+        image_step: int | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 250, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
         semantic_events = self.semantic_events if semantic_events is None else semantic_events
+        semantic_selection = (
+            self.latest_semantic_selection
+            if semantic_selection is None
+            else semantic_selection
+        )
+        semantic_execution_state = (
+            self.latest_semantic_execution_state
+            if semantic_execution_state is None
+            else semantic_execution_state
+        )
+        semantic_behavior_feedback = (
+            self.latest_semantic_behavior_feedback
+            if semantic_behavior_feedback is None
+            else semantic_behavior_feedback
+        )
         all_nodes = [
             node
             for node in graph.get("nodes") or []
@@ -1845,10 +2189,10 @@ class ExploreDebugRecorder:
             if node.get("type") in {"room", "portal", "container"} or node.get("id") in contained_ids
         ]
         slot_rows = {
-            "room": (int(panel_height * 0.18), 5),
-            "portal": (int(panel_height * 0.40), 7),
+            "room": (int(panel_height * 0.22), 5),
+            "portal": (int(panel_height * 0.43), 7),
             "container": (int(panel_height * 0.62), 6),
-            "object": (int(panel_height * 0.78), 8),
+            "object": (int(panel_height * 0.82), 8),
         }
         positions = {}
         for node in sorted(selected, key=lambda item: str(item.get("id"))):
@@ -1869,9 +2213,19 @@ class ExploreDebugRecorder:
             src = positions.get(edge.get("src_id"))
             dst = positions.get(edge.get("dst_id"))
             relation = edge.get("relation")
-            if src is None or dst is None or relation not in {"connects", "adjacent_via", "contains"}:
+            if src is None or dst is None:
                 continue
-            color = (220, 85, 45) if relation in {"connects", "adjacent_via"} else (170, 75, 210) if relation == "contains" else (90, 130, 190)
+            src_type = str((node_lookup.get(edge.get("src_id")) or {}).get("type") or "")
+            dst_type = str((node_lookup.get(edge.get("dst_id")) or {}).get("type") or "")
+            endpoint_types = {src_type, dst_type}
+            if relation in {"connects", "adjacent_via"}:
+                color = (220, 85, 45)
+            elif relation == "contains":
+                color = (170, 75, 210)
+            elif relation in {"has_child", "in_room"} and endpoint_types == {"room", "container"}:
+                color = (60, 135, 220)
+            else:
+                continue
             cv2.line(panel, src, dst, color, 2, cv2.LINE_AA)
         for node in selected:
             center = positions.get(node.get("id"))
@@ -1879,20 +2233,69 @@ class ExploreDebugRecorder:
                 continue
             color = self._semantic_node_color(node)
             cv2.circle(panel, center, 13 if node.get("type") == "room" else 9, color, -1, cv2.LINE_AA)
+            if str(node.get("id") or "") == str(semantic_selection.get("target_id") or ""):
+                cv2.circle(
+                    panel,
+                    center,
+                    17 if node.get("type") == "room" else 13,
+                    (20, 20, 20),
+                    2,
+                    cv2.LINE_AA,
+                )
             state = str((node.get("interaction") or {}).get("state", ""))
             label = f"{self._short_node_id(node)} {node.get('label', node.get('type', ''))}"
-            if state and state != "unknown":
+            if node.get("type") in {"portal", "container"} and state and state != "unknown":
                 label += f"[{state}]"
             cv2.putText(panel, label[:18], (center[0] - 24, center[1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (30, 30, 30), 1, cv2.LINE_AA)
         revision = int(graph.get("graph_revision", 0) or 0)
-        cv2.putText(panel, f"INTERACTION TOPOLOGY rev={revision}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (20, 20, 20), 2, cv2.LINE_AA)
         legend = "ROOM -- PORTAL -- ROOM    CONTAINER --contains--> OBJECT"
-        cv2.putText(panel, legend, (10, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (75, 75, 75), 1, cv2.LINE_AA)
-        event_y = panel_height - 62
-        cv2.rectangle(panel, (6, event_y - 20), (panel_width - 6, panel_height - 6), (238, 238, 238), -1)
-        for index, event in enumerate(semantic_events[-3:]):
-            text = f"r{event.get('graph_revision', 0)} {event.get('event', '')} {event.get('node_id') or event.get('relation', '')}"
-            cv2.putText(panel, text[:58], (12, event_y + index * 17), cv2.FONT_HERSHEY_SIMPLEX, 0.31, (45, 45, 45), 1, cv2.LINE_AA)
+        cv2.putText(panel, legend, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (75, 75, 75), 1, cv2.LINE_AA)
+        box_x = int(panel_width * 0.52)
+        box_y = 34
+        box_h = 82
+        overlay = panel.copy()
+        cv2.rectangle(overlay, (box_x, box_y), (panel_width - 6, box_y + box_h), (232, 232, 232), -1)
+        panel = cv2.addWeighted(overlay, 0.78, panel, 0.22, 0.0)
+        execution_state = str(semantic_execution_state.get("state") or "IDLE")
+        behavior_type = str(semantic_selection.get("behavior_type") or "-")
+        target_name = str(
+            semantic_selection.get("target_name")
+            or semantic_selection.get("target_id")
+            or "-"
+        )
+        feedback_status = str(semantic_behavior_feedback.get("status") or "-")
+        lines = [
+            f"{execution_state}  {behavior_type}",
+            f"target={target_name}",
+            f"feedback={feedback_status}",
+        ]
+        for index, text in enumerate(lines):
+            cv2.putText(
+                panel,
+                text[:38],
+                (box_x + 6, box_y + 18 + index * 17),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.31,
+                (25, 25, 25),
+                1,
+                cv2.LINE_AA,
+            )
+        if semantic_events:
+            event = semantic_events[-1]
+            event_name = str(event.get("event") or "")
+            event_color = (35, 150, 45) if event_name == "STATE_CHANGED" else (45, 45, 45)
+            event_text = f"r{event.get('graph_revision', 0)} {event_name} {event.get('node_id') or event.get('relation', '')}"
+            cv2.putText(
+                panel,
+                event_text[:42],
+                (box_x + 6, box_y + 72),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.30,
+                event_color,
+                1,
+                cv2.LINE_AA,
+            )
+        self._draw_panel_title(panel, f"TOPOLOGY r{revision}", image_step)
         return panel
 
     def _record_first_person_video_frame_locked(
@@ -1950,8 +2353,27 @@ class ExploreDebugRecorder:
                 gt_observations = snapshot["gt_observations"]
                 semantic_events = snapshot["semantic_events"]
                 observed_instance_ids = snapshot["observed_instance_ids"]
+                scene_id_grid = snapshot["scene_id_grid"]
+                scene_id_grid_rgb = snapshot["scene_id_grid_rgb"]
+                semantic_candidates = snapshot["semantic_candidates"]
+                semantic_selection = snapshot["semantic_selection"]
+                semantic_execution_state = snapshot["semantic_execution_state"]
+                semantic_behavior_feedback = snapshot["semantic_behavior_feedback"]
                 graph_revision = int(graph.get("graph_revision", 0) or 0)
                 pending_semantic_keyframe_revision = int(snapshot["pending_semantic_keyframe_revision"])
+            selected_goal_values = list(semantic_selection.get("goal_xyyaw") or [])
+            selected_goal = (
+                (
+                    float(selected_goal_values[0]),
+                    float(selected_goal_values[1]),
+                    float(selected_goal_values[2]) if len(selected_goal_values) > 2 else 0.0,
+                )
+                if len(selected_goal_values) >= 2
+                else None
+            )
+            if selected_goal is not None:
+                active_goal = selected_goal[:2]
+                active_goal_yaw = selected_goal[2]
             stamp_delta = abs(image_stamp - map_stamp) if image_stamp > 0.0 and map_stamp > 0.0 else float("inf")
             map_available = map_grid is not None and map_base is not None
             map_age = (
@@ -1972,6 +2394,8 @@ class ExploreDebugRecorder:
             occ_panel = None
             global_costmap_panel = None
             local_costmap_panel = None
+            costmap_panel = None
+            room_segment_panel = None
             semantic_spatial_panel = None
             semantic_topology_panel = None
             if self.args.first_person_video_with_map:
@@ -1989,9 +2413,14 @@ class ExploreDebugRecorder:
                     local_plan=local_plan,
                     image_step=image_step,
                     crop_margin_px=int(self.args.video_occ_crop_margin_px),
+                    semantic_candidates=semantic_candidates,
+                    semantic_selection=semantic_selection,
+                    draw_semantic_candidates=True,
                 )
+                costmap_left_width = max(1, frame_width // 2)
+                costmap_right_width = max(1, frame_width - costmap_left_width)
                 global_costmap_panel = self._render_video_map_panel_locked(
-                    frame_width,
+                    costmap_left_width,
                     frame_height,
                     grid=global_costmap,
                     base=global_costmap_base,
@@ -2008,9 +2437,14 @@ class ExploreDebugRecorder:
                     trajectory=trajectory,
                     global_plan=global_plan,
                     image_step=image_step,
+                    semantic_selection=semantic_selection,
+                )
+                global_costmap_panel = self._zoom_panel_image(
+                    global_costmap_panel,
+                    float(self.args.video_global_panel_scale),
                 )
                 local_costmap_panel = self._render_video_map_panel_locked(
-                    frame_width,
+                    costmap_right_width,
                     frame_height,
                     grid=local_costmap,
                     base=local_costmap_base,
@@ -2020,7 +2454,7 @@ class ExploreDebugRecorder:
                     draw_global_plan=False,
                     draw_local_global_plan=True,
                     draw_local_plan=True,
-                    draw_goal=False,
+                    draw_goal=True,
                     pose=pose,
                     goal_xy=active_goal,
                     goal_yaw=active_goal_yaw,
@@ -2028,8 +2462,25 @@ class ExploreDebugRecorder:
                     local_global_plan=local_global_plan,
                     local_plan=local_plan,
                     image_step=image_step,
+                    semantic_selection=semantic_selection,
                 )
+                if global_costmap_panel is not None and local_costmap_panel is not None:
+                    costmap_panel = np.concatenate(
+                        [global_costmap_panel, local_costmap_panel], axis=1
+                    )
             if self.args.semantic_video:
+                room_segment_panel = self._render_room_segment_panel_locked(
+                    frame_width,
+                    frame_height,
+                    pose,
+                    occupancy_grid=map_grid,
+                    occupancy_rgb=map_base,
+                    scene_grid=scene_id_grid,
+                    scene_rgb=scene_id_grid_rgb,
+                    graph=graph,
+                    observed_instance_ids=observed_instance_ids,
+                    image_step=image_step,
+                )
                 semantic_spatial_panel = self._render_semantic_spatial_panel_locked(
                     frame_width,
                     frame_height,
@@ -2038,6 +2489,7 @@ class ExploreDebugRecorder:
                     occupancy_rgb=map_base,
                     graph=graph,
                     observed_instance_ids=observed_instance_ids,
+                    image_step=image_step,
                 )
                 semantic_topology_panel = self._render_semantic_topology_panel_locked(
                     frame_width,
@@ -2045,12 +2497,29 @@ class ExploreDebugRecorder:
                     graph=graph,
                     semantic_events=semantic_events,
                     observed_instance_ids=observed_instance_ids,
+                    semantic_selection=semantic_selection,
+                    semantic_execution_state=semantic_execution_state,
+                    semantic_behavior_feedback=semantic_behavior_feedback,
+                    image_step=image_step,
                 )
+            dist_to_goal = (
+                math.hypot(
+                    float(pose[0]) - float(active_goal[0]),
+                    float(pose[1]) - float(active_goal[1]),
+                )
+                if pose is not None and active_goal is not None
+                else float("inf")
+            )
+            dist_to_goal_text = "-" if not math.isfinite(dist_to_goal) else f"{dist_to_goal:.2f}m"
+            self._draw_panel_title(
+                camera_frame,
+                f"STEP={_step4(image_step)}  dist={distance_m:.2f}m  dist_to_goal={dist_to_goal_text}",
+            )
             video_size = (frame_width, frame_height)
             if (
                 occ_panel is not None
-                and global_costmap_panel is not None
-                and local_costmap_panel is not None
+                and room_segment_panel is not None
+                and costmap_panel is not None
                 and semantic_spatial_panel is not None
                 and semantic_topology_panel is not None
             ):
@@ -2062,16 +2531,16 @@ class ExploreDebugRecorder:
             target_size = self.first_person_video_size or (frame_width, frame_height)
             if (
                 occ_panel is not None
-                and global_costmap_panel is not None
-                and local_costmap_panel is not None
+                and room_segment_panel is not None
+                and costmap_panel is not None
                 and semantic_spatial_panel is not None
                 and semantic_topology_panel is not None
                 and target_size == (frame_width * 3, frame_height * 2)
             ):
                 frame = np.vstack(
                     [
-                        np.concatenate([camera_frame, occ_panel, semantic_spatial_panel], axis=1),
-                        np.concatenate([global_costmap_panel, local_costmap_panel, semantic_topology_panel], axis=1),
+                        np.concatenate([camera_frame, occ_panel, room_segment_panel], axis=1),
+                        np.concatenate([costmap_panel, semantic_spatial_panel, semantic_topology_panel], axis=1),
                     ]
                 )
             elif (
@@ -2090,31 +2559,8 @@ class ExploreDebugRecorder:
                 frame = cv2.resize(camera_frame, target_size, interpolation=cv2.INTER_AREA)
             else:
                 frame = camera_frame
-            step_gap = abs(int(image_step) - int(map_step))
-            desync = f"  MAP_GAP={step_gap}" if step_gap > int(self.args.video_map_desync_step_warn) else ""
-            map_age_text = "inf" if not math.isfinite(map_age) else f"{map_age:.2f}s"
-            stamp_delta_text = "inf" if not math.isfinite(stamp_delta) else f"{stamp_delta:.3f}s"
-            active_flag = 1 if active_goal is not None else 0
-            label = (
-                f"SIM STEP={_step4(image_step)} OCC_SRC={_step4(map_step)} "
-                f"G_SRC={_step4(global_costmap_step)} L_SRC={_step4(local_costmap_step)}{desync}"
-            )
-            label2 = (
-                f"dist={distance_m:.2f}m goal=#{goal_count:03d} active={active_flag} "
-                f"occ_age={map_age_text} fresh={int(map_fresh)} hdr_dT={stamp_delta_text}"
-            )
-            stuck_label = (
-                f"STUCK_TEST={stuck['state']} dur={stuck['duration_sec']:.1f}s "
-                f"move={stuck['moved_m']:.2f}m yaw_net={stuck['yaw_delta_rad']:.2f} "
-                f"yaw_sum={stuck['yaw_motion_rad']:.2f}rad"
-            )
-            text_right = min(frame_width - 8, 620)
-            cv2.rectangle(frame, (8, 8), (text_right, 88), (255, 255, 255), -1)
-            cv2.putText(frame, label, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (15, 15, 15), 1, cv2.LINE_AA)
             self.first_person_video_frame_count += 1
             frame_index = self.first_person_video_frame_count
-            cv2.putText(frame, label2, (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (15, 15, 15), 1, cv2.LINE_AA)
-            cv2.putText(frame, stuck_label, (18, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (15, 15, 15), 1, cv2.LINE_AA)
             camera_path = self.video_camera_frame_dir / f"frame_{frame_index:06d}_camera.png"
             map_path = self.video_map_frame_dir / f"frame_{frame_index:06d}_map.png"
             global_costmap_path = self.video_global_costmap_frame_dir / f"frame_{frame_index:06d}_global_costmap.png"
@@ -2707,6 +3153,67 @@ class ExploreDebugRecorder:
         rgb[values >= 100] = (128, 20, 28)      # Raw lethal obstacle
         return rgb
 
+    @staticmethod
+    def _scene_id_grid_to_rgb(grid: OccupancyGrid):
+        if np is None:
+            return None
+        width = int(grid.info.width)
+        height = int(grid.info.height)
+        if width <= 0 or height <= 0:
+            return None
+        values = np.flipud(
+            np.asarray(grid.data, dtype=np.int32).reshape((height, width))
+        )
+        rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        valid = values >= 0
+        room_ids = np.unique(values[valid]) if np.any(valid) else []
+        palette = (
+            (255, 185, 185),
+            (185, 220, 255),
+            (195, 245, 195),
+            (245, 220, 170),
+            (225, 195, 245),
+            (175, 235, 230),
+            (245, 195, 225),
+            (220, 220, 170),
+        )
+        for room_id in room_ids:
+            rgb[values == int(room_id)] = palette[int(room_id) % len(palette)]
+        return rgb
+
+    @staticmethod
+    def _draw_panel_title(panel, title: str, step: int | None = None) -> None:
+        if cv2 is None:
+            return
+        text = title if step is None else f"{title}  STEP={_step4(step)}"
+        font_scale = 0.46 if panel.shape[1] < 700 else 0.58
+        thickness = 1 if panel.shape[1] < 700 else 2
+        text_size = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )[0]
+        x = max(6, panel.shape[1] - text_size[0] - 8)
+        y = max(text_size[1] + 5, 22)
+        cv2.putText(
+            panel,
+            text,
+            (x + 1, y + 1),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (245, 245, 245),
+            thickness + 2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel,
+            text,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (25, 25, 25),
+            thickness,
+            cv2.LINE_AA,
+        )
+
     def _render_video_map_panel_locked(
         self,
         panel_width: int,
@@ -2729,6 +3236,9 @@ class ExploreDebugRecorder:
         local_plan: dict | None = None,
         image_step: int | None = None,
         crop_margin_px: int | None = None,
+        semantic_candidates: dict | None = None,
+        semantic_selection: dict | None = None,
+        draw_semantic_candidates: bool = False,
     ):
         if cv2 is None or np is None:
             return None
@@ -2925,21 +3435,62 @@ class ExploreDebugRecorder:
         if draw_local_plan and local_plan_poses:
             plan_points = [to_panel(world_to_px(float(p[0]), float(p[1]))) for p in local_plan_poses]
             self._draw_cv_polyline(panel, [p for p in plan_points if p is not None], (240, 150, 20), 3)
+        if draw_semantic_candidates:
+            semantic_candidates = semantic_candidates or {}
+            semantic_selection = semantic_selection or {}
+            selected_candidate_id = str(
+                semantic_selection.get("candidate_id") or ""
+            )
+            for candidate in semantic_candidates.get("candidates") or []:
+                goal_values = list(candidate.get("goal_xyyaw") or [])
+                if len(goal_values) < 2:
+                    continue
+                candidate_yaw = float(goal_values[2]) if len(goal_values) > 2 else 0.0
+                transformed = self._transform_xy_yaw_to_frame(
+                    float(goal_values[0]),
+                    float(goal_values[1]),
+                    candidate_yaw,
+                    self.args.map_frame,
+                    grid_frame,
+                )
+                if transformed is None:
+                    continue
+                candidate_px = to_panel(world_to_px(transformed[0], transformed[1]))
+                if candidate_px is None:
+                    continue
+                behavior_type = str(candidate.get("behavior_type") or "EXPLORE")
+                color = candidate_color(behavior_type)
+                if str(candidate.get("candidate_id") or "") == selected_candidate_id:
+                    self._draw_cv_goal_arrow(
+                        panel,
+                        candidate_px,
+                        transformed[2],
+                        max(9, int(9 * scale)),
+                        color=color,
+                    )
+                else:
+                    cv2.circle(
+                        panel,
+                        candidate_px,
+                        max(2, int(round(max(scale, 1.0) * 0.8))),
+                        color,
+                        -1,
+                        cv2.LINE_AA,
+                    )
         if goal_in_grid is not None:
             goal_px = to_panel(world_to_px(goal_in_grid[0], goal_in_grid[1]))
             if goal_px is not None:
-                self._draw_cv_goal_arrow(panel, goal_px, goal_in_grid[2], max(9, int(9 * scale)))
-        cv2.rectangle(panel, (0, 0), (min(panel.shape[1] - 1, 680), 32), (255, 255, 255), -1)
-        cv2.putText(
-            panel,
-            f"{title}  SIM STEP={_step4(image_step)}",
-            (10, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50 if panel_width < 700 else 0.65,
-            (20, 20, 20),
-            1 if panel_width < 700 else 2,
-            cv2.LINE_AA,
-        )
+                goal_color = candidate_color(
+                    str((semantic_selection or {}).get("behavior_type") or "NAVIGATE")
+                )
+                self._draw_cv_goal_arrow(
+                    panel,
+                    goal_px,
+                    goal_in_grid[2],
+                    max(9, int(9 * scale)),
+                    color=goal_color,
+                )
+        self._draw_panel_title(panel, title, image_step)
         if "COSTMAP" in title.upper():
             legend = (
                 ("LETHAL", (128, 20, 28)),
@@ -2972,6 +3523,25 @@ class ExploreDebugRecorder:
         return panel
 
     @staticmethod
+    def _zoom_panel_image(panel, scale_factor: float):
+        if panel is None or cv2 is None or np is None:
+            return panel
+        scale_factor = max(1.0, float(scale_factor))
+        if scale_factor <= 1.0 + 1e-6:
+            return panel
+        height, width = panel.shape[:2]
+        scaled_width = max(width, int(round(width * scale_factor)))
+        scaled_height = max(height, int(round(height * scale_factor)))
+        enlarged = cv2.resize(
+            panel,
+            (scaled_width, scaled_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        offset_x = max(0, (scaled_width - width) // 2)
+        offset_y = max(0, (scaled_height - height) // 2)
+        return enlarged[offset_y : offset_y + height, offset_x : offset_x + width].copy()
+
+    @staticmethod
     def _draw_cv_polyline(image, points: list[tuple[int, int]], color: tuple[int, int, int], thickness: int) -> None:
         if len(points) < 2 or cv2 is None or np is None:
             return
@@ -2998,7 +3568,13 @@ class ExploreDebugRecorder:
         cv2.polylines(image, [pts], True, (0, 35, 160), 2, cv2.LINE_AA)
 
     @staticmethod
-    def _draw_cv_goal_arrow(image, center: tuple[int, int], yaw: float, length: int) -> None:
+    def _draw_cv_goal_arrow(
+        image,
+        center: tuple[int, int],
+        yaw: float,
+        length: int,
+        color: tuple[int, int, int] = (230, 30, 45),
+    ) -> None:
         if cv2 is None or np is None:
             return
         cx, cy = center
@@ -3014,12 +3590,12 @@ class ExploreDebugRecorder:
             image,
             tuple(start.astype(np.int32)),
             tuple(end.astype(np.int32)),
-            (230, 30, 45),
+            color,
             4,
             cv2.LINE_AA,
             tipLength=0.45,
         )
-        cv2.circle(image, (cx, cy), max(4, length // 4), (230, 30, 45), -1, cv2.LINE_AA)
+        cv2.circle(image, (cx, cy), max(4, length // 4), color, -1, cv2.LINE_AA)
 
     def odom_callback(self, msg: Odometry) -> None:
         if self.shutting_down:
@@ -4590,6 +5166,9 @@ class ExploreDebugRecorder:
                 "final_image_step": self.latest_image_step,
                 "image_callback_count": self.image_callback_count,
                 "step_sync_count": self.step_sync_count,
+                "room_segment_callback_count": self.room_segment_callback_count,
+                "room_segment_valid_cell_count": self.latest_room_segment_valid_cell_count,
+                "room_segment_unique_ids": self.latest_room_segment_unique_ids,
                 "distance_m": self.distance_m,
                 "trajectory_samples": len(self.trajectory),
                 "subgoal_count": self.goal_count,
@@ -4652,6 +5231,9 @@ class ExploreDebugRecorder:
                 "final_image_step": self.latest_image_step,
                 "image_callback_count": self.image_callback_count,
                 "step_sync_count": self.step_sync_count,
+                "room_segment_callback_count": self.room_segment_callback_count,
+                "room_segment_valid_cell_count": self.latest_room_segment_valid_cell_count,
+                "room_segment_unique_ids": self.latest_room_segment_unique_ids,
                 "distance_m": self.distance_m,
                 "trajectory_samples": len(self.trajectory),
                 "subgoal_count": self.goal_count,
@@ -4697,6 +5279,11 @@ class ExploreDebugRecorder:
                 "first_person_video_map_mode": "causal_state_snapshot_on_image_callback_offline_encode",
                 "semantic_video": bool(self.args.semantic_video),
                 "semantic_summary": self._semantic_summary(),
+                "semantic_decision_event_count": self.semantic_decision_event_count,
+                "semantic_decision_candidates": self.latest_semantic_candidates,
+                "semantic_decision_selection": self.latest_semantic_selection,
+                "semantic_decision_execution_state": self.latest_semantic_execution_state,
+                "semantic_decision_behavior_feedback": self.latest_semantic_behavior_feedback,
                 "semantic_graph_final": graph_final,
                 "semantic_events_jsonl": str(self.graph_dir / "graph_revision_events.jsonl"),
                 "semantic_keyframes": str(self.semantic_keyframe_dir),
@@ -4759,6 +5346,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--explore-status-topic", default="/explore_py/status")
     parser.add_argument("--gt-observations-topic", default="/semantic_mapping/gt_observations")
     parser.add_argument("--unified-graph-topic", default="/semantic_mapping/unified_graph")
+    parser.add_argument("--scene-id-grid-topic", default="/semantic_mapping/room_segment_grid")
+    parser.add_argument(
+        "--semantic-candidates-topic",
+        default="/semantic_decision/candidates",
+    )
+    parser.add_argument(
+        "--semantic-selected-behavior-topic",
+        default="/semantic_decision/selected_behavior",
+    )
+    parser.add_argument(
+        "--semantic-execution-state-topic",
+        default="/semantic_decision/execution_state",
+    )
+    parser.add_argument(
+        "--semantic-behavior-feedback-topic",
+        default="/semantic_decision/behavior_feedback",
+    )
     parser.add_argument("--global-plan-topic", default="/move_base/GlobalPlanner/plan")
     parser.add_argument("--local-global-plan-topic", default="/move_base/DWAPlannerROS/global_plan")
     parser.add_argument("--local-plan-topic", default="/move_base/DWAPlannerROS/local_plan")
@@ -4847,6 +5451,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--artifact-write-queue-size", type=int, default=512)
     parser.add_argument("--video-map-crop-margin-px", type=int, default=90)
     parser.add_argument("--video-occ-crop-margin-px", type=int, default=25)
+    parser.add_argument("--video-global-panel-scale", type=float, default=1.0)
     parser.add_argument("--video-map-desync-step-warn", type=int, default=3)
     parser.add_argument("--video-map-max-age-sec", type=float, default=2.0)
     parser.add_argument("--video-sync-max-delta-sec", type=float, default=0.05)

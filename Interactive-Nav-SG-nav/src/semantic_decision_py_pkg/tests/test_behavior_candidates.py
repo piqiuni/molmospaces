@@ -72,6 +72,73 @@ def test_generator_combines_frontiers_and_closed_portals() -> None:
     assert interaction.metadata["requires_approach"] is True
 
 
+def test_portal_approach_uses_stable_closed_reference_geometry() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_standoff_m=1.0,
+            interaction_safety_margin_m=0.0,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_1",
+                "type": "portal",
+                "centroid": [2.0, 0.0, 1.0],
+                "aabb_center": [2.0, 0.5, 1.0],
+                "aabb_size": [1.0, 1.0, 2.0],
+                "state_age_sec": 0.0,
+                "attributes": {
+                    "interaction_reference_aabb_center": [2.0, 0.0, 1.0],
+                    "interaction_reference_aabb_size": [0.1, 1.0, 2.0],
+                },
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "ajar",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    candidate = generator.generate({}, graph, robot_xy=(0.0, 0.0))[0]
+
+    assert math.isclose(candidate.goal_xyyaw[0], 0.95, abs_tol=1e-6)
+    assert math.isclose(candidate.goal_xyyaw[1], 0.0, abs_tol=1e-6)
+    assert math.isclose(candidate.goal_xyyaw[2], 0.0, abs_tol=1e-6)
+
+
+def test_interaction_always_requires_navigation_to_pose() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_standoff_m=1.0,
+            interaction_safety_margin_m=0.0,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_1",
+                "type": "portal",
+                "centroid": [1.0, 0.0, 1.0],
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    candidate = generator.generate({}, graph, robot_xy=(0.0, 0.0))[0]
+
+    assert candidate.metadata["requires_approach"] is True
+
+
 def test_raw_frontier_proposals_do_not_reuse_explorer_score_as_semantics() -> None:
     generator = CandidateGenerator()
     explorer_proposals = {

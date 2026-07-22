@@ -4,8 +4,11 @@ GlobalPlanner:
   orientation_window_size: 8
 
 DWAPlannerROS:
-  yaw_goal_tolerance: 0.25
+  xy_goal_tolerance: 0.10
+  yaw_goal_tolerance: 0.15
   latch_xy_goal_tolerance: true
+  heading_scoring: true
+  heading_scoring_timestep: 0.8
 
 global_costmap:
   transform_tolerance: 3.0
