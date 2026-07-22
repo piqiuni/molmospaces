@@ -156,6 +156,8 @@ class SemanticBehaviorExecutor:
         self.pre_interaction_image_data = ""
         self.pre_interaction_image_sequence = 0
         self.active_skill_plan: dict = {}
+        self.pending_skill_actions: list[dict] = []
+        self.interaction_command_sequence = 0
         self.verification_retries = 0
         self.feedback_pub = rospy.Publisher(
             topics.get("behavior_feedback", "/semantic_decision/behavior_feedback"),
@@ -232,6 +234,8 @@ class SemanticBehaviorExecutor:
                 return
             self.selection = selection
             self.active_skill_plan = {}
+            self.pending_skill_actions = []
+            self.interaction_command_sequence = 0
             self.verification_retries = 0
             commands = self.machine.start(selection)
             self._publish_feedback(selection, "STARTED", None, {})
@@ -267,9 +271,21 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if not self._matches_active(payload):
                 return
-            commands = self.machine.on_interaction_result(
-                bool(payload.get("success")), detail=payload
-            )
+            if (
+                self.ablation.module3 == "mllm_skill_verified"
+                and bool(payload.get("success"))
+                and self.pending_skill_actions
+            ):
+                next_action = self.pending_skill_actions.pop(0)
+                next_candidate = self._candidate_for_skill_action(
+                    dict(self.selection or {}), next_action
+                )
+                commands = []
+            else:
+                next_candidate = None
+                commands = self.machine.on_interaction_result(
+                    bool(payload.get("success")), detail=payload
+                )
             if (
                 self.machine.state == STATE_VERIFYING
                 and self.ablation.module3 == "direct_atomic"
@@ -295,7 +311,10 @@ class SemanticBehaviorExecutor:
                     args=(decision_id, payload),
                     daemon=True,
                 ).start()
-        self._dispatch(commands)
+        if next_candidate is not None:
+            self._publish_interaction_command(next_candidate)
+        else:
+            self._dispatch(commands)
 
     def _image_callback(self, message: Image) -> None:
         try:
@@ -512,11 +531,14 @@ class SemanticBehaviorExecutor:
 
     def _publish_interaction_command(self, candidate: dict) -> None:
         interaction = candidate.get("interaction_command") or {}
+        with self.lock:
+            self.interaction_command_sequence += 1
+            interaction_sequence = self.interaction_command_sequence
         payload = {
             "command_id": self._command_id(candidate),
             "decision_id": candidate.get("decision_id", ""),
             "candidate_id": candidate.get("candidate_id", ""),
-            "event_id": f"{candidate.get('decision_id', 'decision')}_interaction",
+            "event_id": f"{candidate.get('decision_id', 'decision')}_interaction_{interaction_sequence:03d}",
             "node_id": interaction.get("node_id", candidate.get("target_id", "")),
             "source_object_name": interaction.get(
                 "source_object_name", candidate.get("target_name", "")
@@ -573,27 +595,59 @@ class SemanticBehaviorExecutor:
                 plan = validate_skill_plan(
                     response.payload, str(candidate.get("target_id") or "")
                 )
-                first_action = plan["subactions"][0]
-                interaction = dict(planned_candidate.get("interaction_command") or {})
-                interaction["action"] = (
-                    "close"
-                    if first_action["skill"] == "close_part"
-                    else "open"
-                )
-                if first_action.get("part_id"):
-                    interaction["interaction_group_id"] = first_action["part_id"]
-                interaction["view_profile"] = first_action.get(
-                    "view_profile", interaction.get("view_profile", "default")
-                )
-                planned_candidate["interaction_command"] = interaction
+                executable_actions = [
+                    action
+                    for action in plan["subactions"]
+                    if action.get("skill") in {"open_part", "close_part"}
+                ]
+                if executable_actions:
+                    planned_candidate = self._candidate_for_skill_action(
+                        planned_candidate, executable_actions[0]
+                    )
                 with self.lock:
                     self.active_skill_plan = plan
+                    self.pending_skill_actions = executable_actions[1:]
             except ValueError:
                 pass
         with self.lock:
             if not self._interaction_is_current(decision_id):
                 return
         self._publish_interaction_command(planned_candidate)
+
+    def _candidate_for_skill_action(self, candidate: dict, action: dict) -> dict:
+        planned = dict(candidate)
+        interaction = dict(planned.get("interaction_command") or {})
+        interaction["action"] = (
+            "close" if action.get("skill") == "close_part" else "open"
+        )
+        part_id = str(action.get("part_id") or "")
+        if part_id:
+            interaction["interaction_group_id"] = part_id
+        interaction["view_profile"] = str(
+            action.get("view_profile") or interaction.get("view_profile") or "default"
+        )
+        node = self._selected_graph_node_locked(planned)
+        groups = (node.get("attributes") or {}).get("interaction_groups") or []
+        group = next(
+            (
+                item
+                for item in groups
+                if str(item.get("group_id") or "") == part_id
+            ),
+            None,
+        )
+        if isinstance(group, dict):
+            interaction["joint_names"] = list(
+                group.get("target_joint_names") or group.get("joint_names") or []
+            )
+            interaction["close_other_joint_names"] = list(
+                group.get("close_other_joint_names") or []
+            )
+            interaction["close_other_joints"] = bool(
+                group.get("close_other_joints", False)
+            )
+        planned["interaction_command"] = interaction
+        return planned
 
     def _run_visual_verification(self, decision_id: str, backend_payload: dict) -> None:
         deadline = time.monotonic() + 1.0
