@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "description": "Small role-specific MLLM benchmark. Run the collector to bind scene frames.",
+  "cases": [
+    {
+      "id": "attribute_closed_fridge",
+      "module": "module1",
+      "role": "attribute_inference",
+      "instruction": "Infer visible interaction attributes for this refrigerator.",
+      "context": {"object_id": "fridge_1", "name": "fridge", "category": "container"},
+      "requires_image": true,
+      "image_paths": [],
+      "expected": {"interactable": true, "interaction_class": "container", "coarse_state": "closed", "min_part_count": 2, "min_confidence": 0.5}
+    },
+    {
+      "id": "attribute_open_portal",
+      "module": "module1",
+      "role": "attribute_inference",
+      "instruction": "Infer whether the visible doorway is an interactable portal and whether it is open.",
+      "context": {"object_id": "door_2", "name": "door", "category": "door"},
+      "requires_image": true,
+      "image_paths": [],
+      "expected": {"interactable": true, "interaction_class": "portal", "coarse_state": "open", "min_confidence": 0.5}
+    },
+    {
+      "id": "select_open_nearby_portal",
+      "module": "module2",
+      "role": "subgoal_selection",
+      "instruction": "Select the valid candidate with the best combined progress and information gain.",
+      "context": {
+        "target_context": {"enabled": false},
+        "robot_context": {"robot_xy": [0.0, 0.0]},
+        "candidates": [
+          {"candidate_id": "frontier:far", "behavior_type": "EXPLORE", "features": {"distance_m": 5.0, "visibility_gain": 0.3}},
+          {"candidate_id": "interaction:door_2:open", "behavior_type": "INTERACT", "features": {"distance_m": 1.0, "semantic_gain": 1.0, "exploration_gain": 1.0}}
+        ]
+      },
+      "requires_image": false,
+      "image_paths": [],
+      "expected": {"candidate_id": "interaction:door_2:open"}
+    },
+    {
+      "id": "plan_open_lower_drawer",
+      "module": "module3",
+      "role": "skill_planning",
+      "instruction": "Plan the next executable semantic skill for the selected container. The top drawer is already open, so open the closed drawer_bottom before inspecting contents.",
+      "context": {
+        "object_id": "dresser_1",
+        "allowed_skills": ["open_part", "inspect_contents"],
+        "graph_node": {"id": "container_dresser_1", "type": "container", "attributes": {"interaction_parts": [{"part_id": "drawer_top", "type": "drawer", "state": "open"}, {"part_id": "drawer_bottom", "type": "drawer", "state": "closed"}]}}
+      },
+      "requires_image": false,
+      "image_paths": [],
+      "expected": {"object_id": "dresser_1", "required_skill": "open_part", "required_part_id": "drawer_bottom"}
+    },
+    {
+      "id": "verify_fridge_opened",
+      "module": "module3",
+      "role": "visual_verification",
+      "instruction": "Compare before and after images and verify whether the refrigerator opened.",
+      "context": {"object_id": "fridge_1", "expected_state": "open"},
+      "requires_image": true,
+      "image_count": 2,
+      "image_paths": [],
+      "expected": {"success": true, "min_confidence": 0.5}
+    }
+  ]
+}

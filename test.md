@@ -1009,3 +1009,64 @@ roslaunch nav_pkg molmospaces_nav_system.launch \
 - 历史讨论内容归档
 
 这些内容分别由 `readme_pi.md`、`TODO.md` 与 `AGENTS.md` 维护。
+
+---
+
+## 11. MLLM 模块化交互导航
+
+三模块消融配置位于：
+
+```text
+scripts/InteractiveNav/configs/semantic_decision/ablations/
+```
+
+模式定义：
+
+- 模块一：`static_semantic` / `dynamic_rule` / `dynamic_mllm`
+- 模块二：`rule_cost` / `mllm_score`
+- 模块三：`direct_atomic` / `rule_verified` / `mllm_skill_verified`
+
+House 7 规则基线示例：
+
+```bash
+roslaunch nav_pkg semantic_interactive_ablation.launch \
+  house_ind:=7 \
+  task_horizon:=1000 \
+  ablation_config:=$(rospack find semantic_decision_py_pkg)/../../../scripts/InteractiveNav/configs/semantic_decision/ablations/current_rule_baseline.yaml
+```
+
+完整 MLLM 示例需要同时启动属性推理：
+
+```bash
+roslaunch nav_pkg semantic_interactive_ablation.launch \
+  house_ind:=7 \
+  task_horizon:=1000 \
+  enable_attribute_inference:=true \
+  model_name:=<MODEL_NAME> \
+  ablation_config:=<REPO>/scripts/InteractiveNav/configs/semantic_decision/ablations/full_mllm.yaml
+```
+
+题库绑定 House 场景图像：
+
+```bash
+python scripts/InteractiveNav/collect_mllm_benchmark_samples.py \
+  --question-bank scripts/InteractiveNav/mllm_benchmark/question_bank.json \
+  --source-dir <IMAGE_DIR> \
+  --output-dir <BOUND_QUESTION_DIR> \
+  --bind attribute_closed_fridge=<CLOSED_FRIDGE_IMAGE> \
+  --bind attribute_open_portal=<OPEN_PORTAL_IMAGE> \
+  --bind verify_fridge_opened=<CLOSED_FRIDGE_IMAGE>,<OPEN_FRIDGE_IMAGE>
+```
+
+运行指定四模型评测：
+
+```bash
+PYTHONPATH="Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts" \
+python scripts/InteractiveNav/evaluate_mllm_question_bank.py \
+  --env-file .env \
+  --question-bank <BOUND_QUESTION_DIR>/question_bank_bound.json \
+  --models gpt-5.3-codex-spark qwen3.6-flash qwen3.5-35b-a3b deepseek-v4-flash \
+  --output <OUTPUT_DIR>/model_comparison.json
+```
+
+输出包含整体及各角色的准确率、有效响应率、平均响应耗时和有效输出 TPS，并同时生成 CSV。
