@@ -1,9 +1,13 @@
 <?xml version="1.0"?>
 <launch>
   <arg name="config_file" default="$(find semantic_mapping_py_pkg)/config/default.yaml"/>
+  <arg name="override_config_file" default=""/>
   <arg name="start_object_detection" default="true"/>
   <arg name="start_room_attribute" default="true"/>
   <arg name="start_semantic_mapping" default="true"/>
+  <arg name="start_attribute_inference" default="false"/>
+  <arg name="attribute_model_name" default=""/>
+  <arg name="attribute_min_interval_s" default="2.0"/>
   <arg name="object_detection_backend" default="mock_empty"/>
   <arg name="object_detection_provider" default="external_http"/>
   <arg name="object_detection_model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
@@ -24,6 +28,7 @@
           output="screen"
           respawn="true">
       <rosparam file="$(arg config_file)" command="load"/>
+      <rosparam if="$(eval arg('override_config_file') != '')" file="$(arg override_config_file)" command="load"/>
       <param name="object_detection/backend" value="$(arg object_detection_backend)"/>
       <param name="object_detection/provider" value="$(arg object_detection_provider)"/>
       <param name="object_detection/model_path" value="$(arg object_detection_model_path)"/>
@@ -45,6 +50,7 @@
           output="screen"
           respawn="true">
       <rosparam file="$(arg config_file)" command="load"/>
+      <rosparam if="$(eval arg('override_config_file') != '')" file="$(arg override_config_file)" command="load"/>
       <param name="room_inference/backend" value="$(arg room_inference_backend)"/>
     </node>
   </group>
@@ -56,6 +62,20 @@
           output="screen"
           respawn="true">
       <rosparam file="$(arg config_file)" command="load"/>
+      <rosparam if="$(eval arg('override_config_file') != '')" file="$(arg override_config_file)" command="load"/>
+    </node>
+  </group>
+
+  <group if="$(arg start_attribute_inference)">
+    <node name="interaction_attribute_inference"
+          pkg="semantic_mapping_py_pkg"
+          type="interaction_attribute_inference_node.py"
+          output="screen"
+          respawn="true">
+      <rosparam file="$(arg config_file)" command="load"/>
+      <rosparam if="$(eval arg('override_config_file') != '')" file="$(arg override_config_file)" command="load"/>
+      <param name="model_name" value="$(arg attribute_model_name)"/>
+      <param name="min_interval_s" value="$(arg attribute_min_interval_s)"/>
     </node>
   </group>
 </launch>

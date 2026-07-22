@@ -200,6 +200,79 @@ class InteractionGraphStore:
         self._bump_revision()
         return True
 
+    def apply_attribute_patch(self, patch, stamp=None):
+        object_id = str(patch.get("object_id") or "")
+        node = self.nodes.get(object_id)
+        if node is None:
+            node = next(
+                (
+                    candidate
+                    for candidate in self.nodes.values()
+                    if str(candidate.attributes.get("instance_id") or "") == object_id
+                ),
+                None,
+            )
+        if node is None:
+            return False
+        confidence = float(patch.get("confidence", 0.0) or 0.0)
+        interaction_class = normalize_label(patch.get("interaction_class"))
+        if confidence >= 0.5 and interaction_class in {"portal", "container", "support", "object"}:
+            node.type = interaction_class
+        parts = list(patch.get("interaction_parts") or [])
+        node.attributes.update(
+            {
+                "attribute_source": str(patch.get("source") or "mllm"),
+                "attribute_model": str(patch.get("model_name") or ""),
+                "attribute_confidence": confidence,
+                "evidence_frame_ids": list(patch.get("evidence_frame_ids") or []),
+                "affordances": list(patch.get("affordances") or []),
+                "interaction_parts": parts,
+                "interaction_groups": [
+                    {
+                        "group_id": str(part.get("part_id") or f"part_{index}"),
+                        "target_joint_names": [],
+                        "close_other_joint_names": [],
+                        "close_other_joints": False,
+                        "mode": "open_close",
+                        "view_profile": "drawer_low_view"
+                        if str(part.get("type") or "") == "drawer"
+                        else "default",
+                    }
+                    for index, part in enumerate(parts)
+                ],
+            }
+        )
+        previous_history = list(node.interaction.get("operation_history") or [])
+        node.interaction.update(
+            {
+                "is_interactable": bool(patch.get("interactable", False)),
+                "state": str(patch.get("coarse_state") or node.interaction.get("state") or "unknown"),
+                "state_source": str(patch.get("source") or "mllm_attribute_inference"),
+                "state_confidence": confidence,
+                "expected_effect": str(
+                    patch.get("expected_effect")
+                    or ("unlock_connectivity" if node.type == "portal" else "reveal_contents")
+                ),
+                "operation_history": previous_history,
+            }
+        )
+        if node.type == "portal":
+            node.interaction["requires_interaction"] = node.interaction["state"] not in {
+                "open",
+                "static_open",
+            }
+            node.interaction["traversable"] = (
+                True
+                if node.interaction["state"] in {"open", "static_open"}
+                else False
+                if node.interaction["state"] == "closed"
+                else None
+            )
+        node.last_seen = float(stamp if stamp is not None else time.time())
+        self._rebuild_relations(now=node.last_seen)
+        self._bump_revision()
+        return True
+
     def as_graph_bundle(self, stamp=None):
         now = float(stamp if stamp is not None else time.time())
         for node in self.nodes.values():

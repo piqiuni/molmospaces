@@ -15,6 +15,7 @@ topics:
   gt_observations: "/semantic_mapping/gt_observations"
   interaction_command: "/semantic_decision/interaction_command"
   interaction_result: "/semantic_mapping/interaction_result"
+  attribute_updates: "/semantic_mapping/attribute_updates"
   planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
   planning_occupancy_grid_updates: "/semantic_mapping/planning_occ_map_updates"
   door_clear_mask: "/semantic_mapping/door_clear_mask"
@@ -33,6 +34,11 @@ topics:
   navigation_hints: "/semantic_mapping/navigation_hints"
   scene_colored_pointcloud: "/semantic_mapping/scene_semantic_map/colored_pointcloud"
   scene_legend: "/semantic_mapping/scene_semantic_map/legend"
+
+ablation:
+  module1: "dynamic_rule"
+  module2: "rule_cost"
+  module3: "rule_verified"
 
 object_detection:
   backend: "mock_empty"       # no_detection | mock_empty | external_http | yolo_world_center_projection | yolo_world_sam_box3d | sam3_box3d | yoloe_pf_box3d
