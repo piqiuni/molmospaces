@@ -260,6 +260,21 @@ class CandidateGenerator:
 
     @staticmethod
     def _matches_target(node: dict[str, Any], target_context: dict[str, Any]) -> bool:
+        attributes = node.get("attributes") or {}
+        requested_instance_id = str(target_context.get("target_instance_id") or "").strip().casefold()
+        observed_instance_id = str(
+            attributes.get("instance_id") or node.get("id") or ""
+        ).strip().casefold()
+        if requested_instance_id:
+            return requested_instance_id == observed_instance_id
+        requested_source_name = str(
+            target_context.get("target_source_object_name") or ""
+        ).strip().casefold()
+        observed_source_name = str(
+            attributes.get("source_object_name") or node.get("name") or ""
+        ).strip().casefold()
+        if requested_source_name:
+            return requested_source_name == observed_source_name
         requested = list(target_context.get("object_labels") or [])
         for key in ("object_label", "target_object", "target_name"):
             value = target_context.get(key)
@@ -270,7 +285,56 @@ class CandidateGenerator:
         }
         if not requested_tokens:
             return False
+        observed = {
+            str(value).strip().casefold()
+            for value in (
+                node.get("label"),
+                node.get("name"),
+                attributes.get("category"),
+                attributes.get("semantic_name"),
+                attributes.get("source_object_name"),
+            )
+            if str(value or "").strip()
+        }
+        return any(
+            requested == observed_value
+            or requested in observed_value
+            or observed_value in requested
+            for requested in requested_tokens
+            for observed_value in observed
+        )
+
+    @classmethod
+    def _matches_interaction_target(
+        cls, node: dict[str, Any], target_context: dict[str, Any]
+    ) -> bool:
+        if cls._matches_target(node, target_context):
+            return True
+        if not bool(target_context.get("require_interaction")):
+            return False
         attributes = node.get("attributes") or {}
+        requested_instance_id = str(
+            target_context.get("target_container_instance_id") or ""
+        ).strip().casefold()
+        observed_instance_id = str(
+            attributes.get("instance_id") or node.get("id") or ""
+        ).strip().casefold()
+        if requested_instance_id:
+            return requested_instance_id == observed_instance_id
+        requested_source_name = str(
+            target_context.get("target_container_source_object_name") or ""
+        ).strip().casefold()
+        observed_source_name = str(
+            attributes.get("source_object_name") or node.get("name") or ""
+        ).strip().casefold()
+        if requested_source_name:
+            return requested_source_name == observed_source_name
+        requested_labels = list(target_context.get("target_container_labels") or [])
+        if target_context.get("target_container_name"):
+            requested_labels.append(target_context["target_container_name"])
+        requested_tokens = {
+            str(value).strip().casefold() for value in requested_labels if str(value).strip()
+        }
         observed = {
             str(value).strip().casefold()
             for value in (
@@ -495,7 +559,7 @@ class CandidateGenerator:
             explicit_target_reinteraction = bool(
                 target_context.get("enabled")
                 and target_context.get("require_interaction")
-                and self._matches_target(node, target_context)
+                and self._matches_interaction_target(node, target_context)
             )
             if node_type == "portal":
                 interaction_groups = [
@@ -600,6 +664,7 @@ class CandidateGenerator:
                             "exploration_gain": exploration_gain,
                             "visibility_gain": 1.0 if node_type == "portal" else 0.80,
                             "semantic_gain": 1.0 if node_type == "portal" else 0.75,
+                            "target_relevance": 1.0 if explicit_target_reinteraction else 0.0,
                             "distance_m": approach_distance,
                             "interaction_cost": float(
                                 interaction.get("interaction_cost", interaction.get("cost", 1.0)) or 1.0

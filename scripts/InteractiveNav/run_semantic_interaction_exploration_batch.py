@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--base-master-port", type=int, default=12420)
     parser.add_argument("--task-horizon", type=int, default=1000)
+    parser.add_argument(
+        "--method",
+        choices=["container_exploration", "object_goal_runtime"],
+        default="object_goal_runtime",
+    )
     parser.add_argument("--scene-timeout-s", type=float, default=1500.0)
     parser.add_argument("--memory-sample-interval-s", type=float, default=2.0)
     parser.add_argument("--runner", type=Path, default=DEFAULT_RUNNER)
@@ -243,7 +248,7 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
     environment = os.environ.copy()
     environment.update(
         {
-            "METHOD": "container_exploration",
+            "METHOD": args.method,
             "HOUSE_IND": str(house_ind),
             "ROUTE_ID": scene_id,
             "USE_FIXED_ROUTE": "false",
@@ -302,6 +307,7 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
             monitor_thread.join(timeout=max(5.0, args.memory_sample_interval_s + 1.0))
     result = read_json(result_path)
     memory_summary = summarize_scene_memory(scene_dir / "memory_by_step.csv")
+    step_timing = result.get("step_timing") or {}
     result.update(
         {
             "worker_id": worker_id,
@@ -311,6 +317,9 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
             "exit_code": exit_code,
             "elapsed_sec": time.monotonic() - started,
             "resumed": False,
+            "step_timing_loop_ms_avg": step_timing.get("loop_ms_avg"),
+            "step_timing_policy_ms_avg": step_timing.get("policy_ms_avg"),
+            "step_timing_task_ms_avg": step_timing.get("task_ms_avg"),
             **memory_summary,
         }
     )
@@ -333,6 +342,58 @@ def write_summary(output_dir: Path, results: list[dict[str, Any]]) -> None:
         json.dumps(results, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    selected_results = [
+        row
+        for row in results
+        if (row.get("target_selection") or {}).get("target_context", {}).get("enabled")
+    ]
+
+    def mean_numeric(key: str) -> float | None:
+        values = [float(row[key]) for row in results if row.get(key) is not None]
+        return sum(values) / len(values) if values else None
+
+    aggregate = {
+        "scene_count": len(results),
+        "completed_scene_count": sum(bool(row.get("overall_success")) for row in results),
+        "overall_success_rate": (
+            sum(bool(row.get("overall_success")) for row in results) / len(results)
+            if results else 0.0
+        ),
+        "target_selected_count": len(selected_results),
+        "target_container_interaction_success_rate": (
+            sum(bool(row.get("target_container_interaction_success")) for row in selected_results)
+            / len(selected_results)
+            if selected_results else 0.0
+        ),
+        "target_object_visible_navigation_success_rate": (
+            sum(bool(row.get("target_object_visible_navigation_success")) for row in selected_results)
+            / len(selected_results)
+            if selected_results else 0.0
+        ),
+        "target_goal_success_rate": (
+            sum(bool(row.get("target_goal_success")) for row in selected_results)
+            / len(selected_results)
+            if selected_results else 0.0
+        ),
+        "mean_coverage_ratio": mean_numeric("coverage_ratio"),
+        "mean_mapped_free_coverage_ratio": mean_numeric("mapped_free_coverage_ratio"),
+        "mean_elapsed_sec": mean_numeric("elapsed_sec"),
+        "mean_offline_video_elapsed_sec": mean_numeric("offline_video_elapsed_sec"),
+        "mean_offline_analysis_elapsed_sec": mean_numeric("offline_analysis_elapsed_sec"),
+        "mean_loop_ms": mean_numeric("step_timing_loop_ms_avg"),
+        "peak_worker_rss_mb": max(
+            (float(row["peak_worker_rss_mb"]) for row in results if row.get("peak_worker_rss_mb") is not None),
+            default=None,
+        ),
+        "peak_simulator_rss_mb": max(
+            (float(row["peak_simulator_rss_mb"]) for row in results if row.get("peak_simulator_rss_mb") is not None),
+            default=None,
+        ),
+    }
+    (output_dir / "aggregate_metrics.json").write_text(
+        json.dumps(aggregate, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     fields = [
         "house_ind",
         "worker_id",
@@ -349,6 +410,15 @@ def write_summary(output_dir: Path, results: list[dict[str, Any]]) -> None:
         "interaction_count",
         "contains_edge_count",
         "container_with_children_count",
+        "target_goal_success",
+        "overall_success",
+        "target_container_interaction_success",
+        "target_object_visible_navigation_success",
+        "offline_video_elapsed_sec",
+        "offline_analysis_elapsed_sec",
+        "step_timing_loop_ms_avg",
+        "step_timing_policy_ms_avg",
+        "step_timing_task_ms_avg",
         "valid_step_video",
         "memory_samples",
         "memory_final_step",

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 import struct
 import time
+from typing import Any
 import zlib
 
 import mujoco
@@ -31,6 +32,7 @@ from molmo_spaces.policy.learned_policy.left_arm_keyboard_debug_policy import (
 from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.profiler_utils import Profiler
+from runtime_target_selection import select_far_container_target
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -204,6 +206,44 @@ def lookat_forward_up(camera_pos: list[float], target_pos: list[float]) -> tuple
     return forward.tolist(), up.tolist()
 
 
+class RuntimeTargetPublisher:
+    def __init__(self, rospy_module, string_message_type, output_path: str, top_k: int) -> None:
+        self._rospy = rospy_module
+        self._String = string_message_type
+        self._output_path = Path(output_path).expanduser().resolve() if output_path else None
+        self._top_k = max(1, int(top_k))
+        self._publisher = rospy_module.Publisher(
+            "/semantic_decision/target",
+            string_message_type,
+            queue_size=1,
+            latch=True,
+        )
+
+    def publish(self, task, selection_seed: int) -> dict[str, Any]:
+        import json
+
+        context, selection = select_far_container_target(
+            task,
+            selection_seed=int(selection_seed),
+            top_k=self._top_k,
+        )
+        gt_publisher = getattr(getattr(task, "policy", None), "_realtime_gt_publisher", None)
+        if not getattr(gt_publisher, "episode_id", ""):
+            context.setdefault("episode_id_hint", f"episode_seed_{int(selection_seed)}")
+        else:
+            context["episode_id"] = str(gt_publisher.episode_id)
+        self._publisher.publish(
+            self._String(data=json.dumps(context, ensure_ascii=False, separators=(",", ":")))
+        )
+        if self._output_path is not None:
+            self._output_path.parent.mkdir(parents=True, exist_ok=True)
+            self._output_path.write_text(
+                json.dumps(selection, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        return selection
+
+
 class NavRosRolloutRunner(ParallelRolloutRunner):
     @staticmethod
     def patch_config(frozen_config, data=None, exp_config=None):
@@ -247,6 +287,15 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             observation = task.get_observations()
             if task.observation_cache:
                 task.observation_cache[0] = observation
+        runtime_target_publisher = getattr(policy, "runtime_target_publisher", None)
+        if runtime_target_publisher is not None:
+            policy.runtime_target_selection = runtime_target_publisher.publish(
+                task,
+                selection_seed=int(getattr(policy, "runtime_target_seed", episode_seed)),
+            )
+        completion_monitor = getattr(policy, "completion_monitor", None)
+        if completion_monitor is not None:
+            completion_monitor.prepare()
         maybe_save_debug_snapshot(policy, observation)
 
         try:
@@ -275,6 +324,8 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         while not task.is_done():
             if shutdown_event is not None and shutdown_event.is_set():
                 return False
+            if completion_monitor is not None and completion_monitor.should_stop(step_idx):
+                break
             elapsed_s = time.monotonic() - episode_started_mono
             if scene_timeout_s > 0.0 and elapsed_s >= scene_timeout_s:
                 raise SceneExecutionTimeout(
@@ -379,6 +430,8 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         force_interaction_controller = getattr(policy, "force_interaction_controller", None)
         if force_interaction_controller is not None:
             force_interaction_controller.finalize(step_idx)
+        if completion_monitor is not None:
+            completion_monitor.finalize(step_idx)
         success = task.judge_success() if hasattr(task, "judge_success") else success
         return success
 
@@ -666,6 +719,22 @@ def parse_args():
     parser.add_argument("--force_interaction_close_all_containers_on_prepare", type=str_to_bool, nargs="?", const=True, default=False)
     parser.add_argument("--force_interaction_max_physics_substeps", type=int, default=3000)
     parser.add_argument("--force_interaction_open_fraction_threshold", type=float, default=0.95)
+    parser.add_argument(
+        "--completion_mode",
+        choices=["disabled", "frontier", "semantic"],
+        default="disabled",
+    )
+    parser.add_argument("--completion_confirmations", type=int, default=3)
+    parser.add_argument("--completion_post_hold_steps", type=int, default=0)
+    parser.add_argument("--completion_status_path", type=str, default="")
+    parser.add_argument(
+        "--runtime_target_selection_mode",
+        type=str,
+        default="none",
+        choices=["none", "random_far_container_object"],
+    )
+    parser.add_argument("--runtime_target_selection_top_k", type=int, default=3)
+    parser.add_argument("--runtime_target_selection_path", type=str, default="")
     parser.add_argument("--door_occ_test_root_name", type=str, default="")
     parser.add_argument(
         "--door_occ_test_open_step",
@@ -990,6 +1059,29 @@ def main():
             close_all_doors_on_prepare=args.initial_door_state == "closed",
             close_all_containers_on_prepare=args.force_interaction_close_all_containers_on_prepare,
         )
+    if args.runtime_target_selection_mode != "none":
+        from std_msgs.msg import String
+        import rospy
+
+        policy.runtime_target_publisher = RuntimeTargetPublisher(
+            rospy,
+            String,
+            args.runtime_target_selection_path,
+            args.runtime_target_selection_top_k,
+        )
+        policy.runtime_target_seed = int(args.seed)
+        policy.runtime_target_selection = {}
+    if args.completion_mode != "disabled":
+        from ros_completion_monitor import CompletionMonitorConfig, RosCompletionMonitor
+
+        policy.completion_monitor = RosCompletionMonitor(
+            CompletionMonitorConfig(
+                mode=args.completion_mode,
+                frontier_confirmations=max(1, int(args.completion_confirmations)),
+                post_completion_hold_steps=max(0, int(args.completion_post_hold_steps)),
+            ),
+            output_path=args.completion_status_path or exp_config.output_dir / "completion_status.json",
+        )
     if args.door_occ_test_pose_sequence:
         transition_path = (
             Path(args.door_occ_test_transition_path).expanduser().resolve()
@@ -1022,6 +1114,9 @@ def main():
         force_interaction_controller = getattr(policy, "force_interaction_controller", None)
         if force_interaction_controller is not None:
             force_interaction_controller.close()
+        completion_monitor = getattr(policy, "completion_monitor", None)
+        if completion_monitor is not None:
+            completion_monitor.close()
         print("Closing policy ...")
         if hasattr(policy, "close"):
             policy.close()

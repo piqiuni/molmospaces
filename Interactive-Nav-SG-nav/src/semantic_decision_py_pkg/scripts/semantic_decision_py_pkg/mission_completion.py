@@ -111,6 +111,11 @@ class TargetMissionTracker:
     ) -> bool:
         if not bool(target_context.get("enabled", True)):
             return False
+        if self.matches_target_container_interaction(
+            target_context=target_context,
+            feedback=feedback,
+        ):
+            return True
         target_id = self._normalized(
             feedback.get("target_id") or feedback.get("node_id")
         )
@@ -139,6 +144,33 @@ class TargetMissionTracker:
             for label in labels
         )
 
+    def matches_target_container_interaction(
+        self,
+        *,
+        target_context: dict[str, Any],
+        feedback: dict[str, Any],
+    ) -> bool:
+        requested_source = self._normalized(
+            target_context.get("target_container_source_object_name")
+        )
+        requested_instance = self._normalized(
+            target_context.get("target_container_instance_id")
+        )
+        feedback_source = self._normalized(
+            feedback.get("source_object_name")
+            or feedback.get("target_name")
+            or (feedback.get("interaction_result") or {}).get("source_object_name")
+        )
+        feedback_instance = self._normalized(
+            feedback.get("instance_id")
+            or (feedback.get("interaction_result") or {}).get("instance_id")
+        )
+        if requested_source and requested_source == feedback_source:
+            return True
+        if requested_instance and requested_instance == feedback_instance:
+            return True
+        return False
+
     def on_behavior_succeeded(
         self,
         *,
@@ -151,7 +183,23 @@ class TargetMissionTracker:
         if not active_target_goal:
             return {"phase": "none"}
         require_interaction = bool(target_context.get("require_interaction", False))
-        if str(behavior_type) == "NAVIGATE" and require_interaction:
+        if str(behavior_type) == "INTERACT" and self.matches_target_container_interaction(
+            target_context=target_context,
+            feedback=feedback,
+        ):
+            return {
+                "phase": "container_opened",
+                "detail": {
+                    **(feedback.get("detail") or {}),
+                    "target_container_interaction_complete": True,
+                    "next_phase": "NAVIGATE_TARGET_OBJECT",
+                },
+            }
+        if (
+            str(behavior_type) == "NAVIGATE"
+            and require_interaction
+            and not target_context.get("target_container_source_object_name")
+        ):
             self.pending_interaction = {
                 "target_id": str(feedback.get("target_id") or ""),
                 "target_name": str(feedback.get("target_name") or ""),
@@ -165,6 +213,11 @@ class TargetMissionTracker:
                 },
             }
         detail = dict(feedback.get("detail") or {})
+        if (
+            str(behavior_type) == "NAVIGATE"
+            and target_context.get("target_container_source_object_name")
+        ):
+            detail["target_object_navigation_complete"] = True
         if str(behavior_type) == "INTERACT":
             detail["target_interaction_complete"] = True
             self.pending_interaction = None

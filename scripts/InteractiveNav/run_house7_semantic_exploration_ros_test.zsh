@@ -80,8 +80,16 @@ case "${METHOD}" in
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_fridge_model_mock.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
+  object_goal_runtime)
+    START_SEMANTIC_DECISION=true
+    COMPLETION_MODE=semantic
+    FORCE_CLOSE_CONTAINERS=true
+    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-30}
+    SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_runtime.yaml}
+    EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
+    ;;
   *)
-    print -u2 -- "Unsupported METHOD=${METHOD}; use frontier_only, interactive_rule, object_goal_rule, or object_goal_model_mock"
+    print -u2 -- "Unsupported METHOD=${METHOD}; use frontier_only, interactive_rule, container_exploration, object_goal_rule, object_goal_model_mock, or object_goal_runtime"
     exit 2
     ;;
 esac
@@ -186,7 +194,11 @@ PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py
 RECORDER_PID=$!
 sleep 1
 
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_frame_queue_size 4 --no-retain_task_history --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+RUNTIME_TARGET_MODE=none
+if [[ "${METHOD}" == object_goal_runtime ]]; then
+  RUNTIME_TARGET_MODE=random_far_container_object
+fi
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_frame_queue_size 4 --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -247,17 +259,26 @@ fi
 cleanup_process "${RECORDER_PID}" 20
 RECORDER_PID=""
 
+OFFLINE_VIDEO_START=$(python -c 'import time; print(time.perf_counter())')
 python "${VIDEO_BUILDER}" \
   --scene-dir "${OUTPUT_DIR}" \
   --debug-dir "${OUTPUT_DIR}/debug" \
   --fps "${VIDEO_FPS}" \
   --output-stem overview_6panel \
   >"${OUTPUT_DIR}/offline_video.log" 2>&1
+OFFLINE_VIDEO_ELAPSED_SEC=$(python - "${OFFLINE_VIDEO_START}" <<'PY'
+import sys
+import time
+print(max(0.0, time.perf_counter() - float(sys.argv[1])))
+PY
+)
+print -r -- "${OFFLINE_VIDEO_ELAPSED_SEC}" >"${OUTPUT_DIR}/offline_video_elapsed_sec.txt"
 
 if [[ -f "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" ]]; then
   mv "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" "${OUTPUT_DIR}/videos/overview_6panel.mp4"
 fi
 
+ANALYSIS_START=$(python -c 'import time; print(time.perf_counter())')
 python "${SCRIPT_DIR}/evaluate_exploration_coverage.py" \
   --run-dir "${OUTPUT_DIR}/debug" \
   --robot rby1 \
@@ -266,9 +287,17 @@ python "${SCRIPT_DIR}/evaluate_exploration_coverage.py" \
   --house-ind "${HOUSE_IND}" \
   --gt-agent-radius-m 0.10 \
   >"${OUTPUT_DIR}/coverage.log" 2>&1 || true
+ANALYSIS_ELAPSED_SEC=$(python - "${ANALYSIS_START}" <<'PY'
+import sys
+import time
+print(max(0.0, time.perf_counter() - float(sys.argv[1])))
+PY
+)
+print -r -- "${ANALYSIS_ELAPSED_SEC}" >"${OUTPUT_DIR}/analysis_elapsed_sec.txt"
 
 python - "${OUTPUT_DIR}" "${METHOD}" "${ROUTE_ID}" "${TASK_HORIZON}" "${HOUSE_IND}" <<'PY'
 import json
+import re
 from pathlib import Path
 import sys
 
@@ -304,6 +333,29 @@ coverage = read_json(output_dir / "debug" / "exploration_coverage.json")
 semantic_summary = read_json(output_dir / "debug" / "summary.json").get("semantic_summary", {})
 force = read_json(output_dir / "force_interaction_events.json")
 completion = read_json(output_dir / "completion_status.json")
+timing_pattern = re.compile(
+    r"SimLoop timing over (?P<count>\d+) steps: policy=(?P<policy>[0-9.]+)ms, "
+    r"task=(?P<task>[0-9.]+)ms \(physics=(?P<physics>[0-9.]+)ms sensors=(?P<sensors>[0-9.]+)ms\), "
+    r"loop=(?P<loop>[0-9.]+)ms, simulated_dt=(?P<dt>[0-9.]+)s"
+)
+timing_windows = []
+roslaunch_log = output_dir / "roslaunch.log"
+if roslaunch_log.exists():
+    for line in roslaunch_log.read_text(errors="replace").splitlines():
+        match = timing_pattern.search(line)
+        if match:
+            row = {key: float(value) for key, value in match.groupdict().items()}
+            row["count"] = int(row["count"])
+            timing_windows.append(row)
+step_timing = {
+    "timing_window_count": len(timing_windows),
+    "policy_ms_avg": sum(row["policy"] for row in timing_windows) / len(timing_windows) if timing_windows else None,
+    "task_ms_avg": sum(row["task"] for row in timing_windows) / len(timing_windows) if timing_windows else None,
+    "physics_ms_avg": sum(row["physics"] for row in timing_windows) / len(timing_windows) if timing_windows else None,
+    "sensors_ms_avg": sum(row["sensors"] for row in timing_windows) / len(timing_windows) if timing_windows else None,
+    "loop_ms_avg": sum(row["loop"] for row in timing_windows) / len(timing_windows) if timing_windows else None,
+    "simulated_dt_s": timing_windows[-1]["dt"] if timing_windows else None,
+}
 interaction_results = [event.get("result") or {} for event in force.get("events", [])]
 debug_events = []
 events_path = output_dir / "debug" / "events.jsonl"
@@ -360,8 +412,41 @@ result = {
     ),
     "target_goal_success": bool(
         completion.get("requested")
-        and (completion.get("detail") or {}).get("target_interaction_complete")
+        and (
+            (completion.get("detail") or {}).get("target_interaction_complete")
+            or (completion.get("detail") or {}).get("target_object_navigation_complete")
+        )
     ) or (target_navigation_succeeded and not target_requires_interaction),
+    "target_selection": read_json(output_dir / "target_selection.json"),
+    "target_container_interaction_success": any(
+        bool(event.get("result", {}).get("success"))
+        and event.get("result", {}).get("source_object_name")
+        == read_json(output_dir / "target_selection.json").get("container_name")
+        for event in force.get("events", [])
+    ),
+    "target_object_visible_navigation_success": bool(
+        target_navigation_succeeded
+        and any(
+            (event.get("payload") or {}).get("status") == "SUCCEEDED"
+            and (event.get("payload") or {}).get("behavior_type") == "NAVIGATE"
+            and str((event.get("payload") or {}).get("candidate_id") or "").startswith("target:")
+            for event in feedback_rows
+        )
+    ),
+    "overall_success": bool(
+        completion.get("requested")
+        and (
+            (completion.get("detail") or {}).get("target_object_navigation_complete")
+            or (completion.get("detail") or {}).get("target_interaction_complete")
+        )
+    ),
+    "offline_video_elapsed_sec": float(
+        (output_dir / "offline_video_elapsed_sec.txt").read_text().strip()
+    ) if (output_dir / "offline_video_elapsed_sec.txt").exists() else None,
+    "offline_analysis_elapsed_sec": float(
+        (output_dir / "analysis_elapsed_sec.txt").read_text().strip()
+    ) if (output_dir / "analysis_elapsed_sec.txt").exists() else None,
+    "step_timing": step_timing,
     "valid_step_video": sim_frames > 0 and video.get("output_frame_count") == sim_frames,
     "step_sync_image_match_count": debug_summary.get("step_sync_image_match_count", 0),
     "step_sync_image_reuse_count": debug_summary.get("step_sync_image_reuse_count", 0),

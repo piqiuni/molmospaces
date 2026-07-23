@@ -213,6 +213,11 @@ class SemanticRuleDecisionNode:
                     "TARGET_REACHED",
                     detail=transition["detail"],
                 )
+            elif transition["phase"] == "container_opened":
+                self._publish_goal_status(
+                    "TARGET_CONTAINER_INTERACTED",
+                    detail=transition["detail"],
+                )
             elif transition["phase"] == "complete":
                 self.goal_complete = True
                 detail = dict(transition["detail"])
