@@ -105,12 +105,16 @@ def main() -> None:
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS)
     parser.add_argument("--output", required=True)
     parser.add_argument("--env-file", default="")
+    parser.add_argument("--timeout-s", type=float, default=0.0)
     args = parser.parse_args()
     load_env_file(args.env_file or None)
     bank = json.loads(Path(args.question_bank).read_text(encoding="utf-8"))
     report = {"models": {}, "created_at": time.time()}
     for model in args.models:
-        client = MLLMClient(client_config_from_env(model=model))
+        client_config = client_config_from_env(model=model)
+        if args.timeout_s > 0.0:
+            client_config.timeout_s = float(args.timeout_s)
+        client = MLLMClient(client_config)
         rows = []
         for case in bank.get("cases") or []:
             response = client.request_json(
@@ -131,7 +135,17 @@ def main() -> None:
                     correct, detail = score_case(case, response.payload)
                 except (ValueError, TypeError, KeyError) as exc:
                     detail = {"validation_error": str(exc)}
-            rows.append({"case_id": case["id"], "role": case["role"], "correct": correct, "metrics": response.metrics(), "detail": detail, "error": response.error})
+            rows.append(
+                {
+                    "case_id": case["id"],
+                    "role": case["role"],
+                    "correct": correct,
+                    "metrics": response.metrics(),
+                    "response": response.payload,
+                    "detail": detail,
+                    "error": response.error,
+                }
+            )
         per_role = {}
         for role in sorted({str(row["role"]) for row in rows}):
             per_role[role] = aggregate_rows(

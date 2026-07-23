@@ -103,7 +103,15 @@ def validate_visual_verification(value: Any) -> dict[str, Any]:
     result = parse_json_object(value)
     result["success"] = bool(result.get("success", False))
     result["confidence"] = _confidence(result.get("confidence"), 0.0)
-    result["observed_states"] = dict(result.get("observed_states") or {})
+    observed_states = result.get("observed_states") or {}
+    if isinstance(observed_states, dict):
+        result["observed_states"] = dict(observed_states)
+    elif isinstance(observed_states, list):
+        result["observed_states"] = {
+            f"observation_{index}": item for index, item in enumerate(observed_states)
+        }
+    else:
+        result["observed_states"] = {"summary": str(observed_states)}
     result["new_contents_visible"] = bool(result.get("new_contents_visible", False))
     result["retry_action"] = str(result.get("retry_action") or "none")
     result["reason"] = str(result.get("reason") or "")
