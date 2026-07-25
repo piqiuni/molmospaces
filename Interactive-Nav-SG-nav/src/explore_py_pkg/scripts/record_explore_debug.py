@@ -1266,11 +1266,10 @@ class ExploreDebugRecorder:
                 self.latest_semantic_execution_state = {}
                 self.latest_semantic_behavior_feedback = {}
                 self.last_semantic_execution_key = None
-            self.observed_instance_ids = {
-                str(observation.get("instance_id") or "")
-                for observation in payload.get("observations") or []
-                if str(observation.get("instance_id") or "")
-            }
+            for observation in payload.get("observations") or []:
+                instance_id = str(observation.get("instance_id") or "")
+                if instance_id:
+                    self.observed_instance_ids.add(instance_id)
             self.latest_gt_observations = payload
             self.gt_observation_history.append(
                 (float(payload.get("stamp_sec", 0.0) or 0.0), payload, set(self.observed_instance_ids))
