@@ -264,6 +264,7 @@ class _ObjectSpec:
     is_receptacle: bool
     is_articulable: bool
     is_pickup_candidate: bool
+    parent_source_name: str = ""
 
 
 class RealtimeGTObservationPublisher:
@@ -519,6 +520,20 @@ class RealtimeGTObservationPublisher:
                     break
                 body_id = parent_id
         self._specs = specs
+        body_to_source = {spec.body_id: spec.source_name for spec in specs}
+        for spec in self._specs:
+            parent_body_id = int(model.body_parentid[spec.body_id])
+            visited = {spec.body_id}
+            while parent_body_id >= 0 and parent_body_id not in visited:
+                visited.add(parent_body_id)
+                parent_source_name = body_to_source.get(parent_body_id)
+                if parent_source_name:
+                    spec.parent_source_name = parent_source_name
+                    break
+                next_parent_body_id = int(model.body_parentid[parent_body_id])
+                if next_parent_body_id == parent_body_id:
+                    break
+                parent_body_id = next_parent_body_id
         self._geom_to_spec = geom_to_spec
         self._cache_model_identity = id(model)
 
@@ -617,6 +632,7 @@ class RealtimeGTObservationPublisher:
             "asset_id": metadata.get("asset_id"),
             "semantic_name": str(category),
             "category": str(category),
+            "parent": spec.parent_source_name or None,
             "confidence": 1.0,
             "position": [float(value) for value in data.xpos[spec.body_id]],
             "orientation": _quat_xyzw(data.xmat[spec.body_id]),

@@ -48,6 +48,21 @@ FORCE_CLOSE_CONTAINERS=${FORCE_CLOSE_CONTAINERS:-false}
 CLEAN_INTERMEDIATE=${CLEAN_INTERMEDIATE:-false}
 
 case "${METHOD}" in
+  semantic_interaction_exploration)
+    START_SEMANTIC_DECISION=true
+    COMPLETION_MODE=semantic
+    FORCE_CLOSE_CONTAINERS=true
+    SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/interactive_exploration.yaml}
+    EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
+    ;;
+  semantic_interaction_object_goal)
+    START_SEMANTIC_DECISION=true
+    COMPLETION_MODE=semantic
+    FORCE_CLOSE_CONTAINERS=true
+    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-30}
+    SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_runtime.yaml}
+    EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
+    ;;
   frontier_only)
     START_SEMANTIC_DECISION=false
     COMPLETION_MODE=frontier
@@ -89,7 +104,7 @@ case "${METHOD}" in
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
   *)
-    print -u2 -- "Unsupported METHOD=${METHOD}; use frontier_only, interactive_rule, container_exploration, object_goal_rule, object_goal_model_mock, or object_goal_runtime"
+    print -u2 -- "Unsupported METHOD=${METHOD}; use semantic_interaction_exploration, semantic_interaction_object_goal, frontier_only, interactive_rule, container_exploration, object_goal_rule, object_goal_model_mock, or object_goal_runtime"
     exit 2
     ;;
 esac
@@ -195,7 +210,7 @@ RECORDER_PID=$!
 sleep 1
 
 RUNTIME_TARGET_MODE=none
-if [[ "${METHOD}" == object_goal_runtime ]]; then
+if [[ "${METHOD}" == object_goal_runtime || "${METHOD}" == semantic_interaction_object_goal ]]; then
   RUNTIME_TARGET_MODE=random_far_container_object
 fi
 SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_frame_queue_size 4 --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
@@ -372,11 +387,6 @@ terminal_feedback = [
     for event in feedback_rows
     if (event.get("payload") or {}).get("status") in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}
 ]
-target_requires_interaction = any(
-    bool((((event.get("payload") or {}).get("metadata") or {}).get("target_context") or {}).get("require_interaction"))
-    for event in decision_rows
-    if str((event.get("payload") or {}).get("candidate_id") or "").startswith("target:")
-)
 target_navigation_succeeded = any(
     payload.get("status") == "SUCCEEDED"
     and payload.get("behavior_type") == "NAVIGATE"
@@ -411,12 +421,8 @@ result = {
         (event.get("payload") or {}).get("status") == "SUCCEEDED" for event in feedback_rows
     ),
     "target_goal_success": bool(
-        completion.get("requested")
-        and (
-            (completion.get("detail") or {}).get("target_interaction_complete")
-            or (completion.get("detail") or {}).get("target_object_navigation_complete")
-        )
-    ) or (target_navigation_succeeded and not target_requires_interaction),
+        completion.get("target_goal_succeeded", False)
+    ) or target_navigation_succeeded,
     "target_selection": read_json(output_dir / "target_selection.json"),
     "target_container_interaction_success": any(
         bool(event.get("result", {}).get("success"))
@@ -434,12 +440,8 @@ result = {
         )
     ),
     "overall_success": bool(
-        completion.get("requested")
-        and (
-            (completion.get("detail") or {}).get("target_object_navigation_complete")
-            or (completion.get("detail") or {}).get("target_interaction_complete")
-        )
-    ),
+        completion.get("target_goal_succeeded", False)
+    ) or target_navigation_succeeded,
     "offline_video_elapsed_sec": float(
         (output_dir / "offline_video_elapsed_sec.txt").read_text().strip()
     ) if (output_dir / "offline_video_elapsed_sec.txt").exists() else None,

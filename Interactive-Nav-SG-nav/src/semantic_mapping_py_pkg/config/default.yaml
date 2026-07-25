@@ -144,6 +144,9 @@ semantic_map:
   room_portal_hint_merge_distance_m: 0.6
   room_portal_min_width_m: 0.5
   room_portal_max_width_m: 2.5
+  room_id_overlap_ratio: 0.25
+  room_merge_confirmations: 3
+  room_geometry_stability_frames: 3
   lifted_graph_frame: "tf_frame_map_graph"
   lifted_graph_z_offset: 10.0
   graph_save_path: ""

@@ -32,6 +32,8 @@ class InteractionGraphStore:
         self.room_id_to_name = dict(room_id_to_name or {})
         self.room_box_height = float(room_box_height)
         self.room_geometries = {}
+        self.room_geometry_candidates = {}
+        self.room_redirects = {}
         self.nodes = {}
         self.edges = {}
         self.next_node_index = 1
@@ -52,6 +54,8 @@ class InteractionGraphStore:
         if source_mode:
             self.source_mode = str(source_mode)
         self.room_geometries = {}
+        self.room_geometry_candidates = {}
+        self.room_redirects = {}
         self.nodes = {}
         self.edges = {}
         self.next_node_index = 1
@@ -62,7 +66,15 @@ class InteractionGraphStore:
         self.portal_state_tracker.reset()
         self._ensure_scene_node()
 
-    def update_room_grid(self, grid_info, scene_data, confidence_data=None, room_id_to_name=None):
+    def update_room_grid(
+        self,
+        grid_info,
+        scene_data,
+        confidence_data=None,
+        room_id_to_name=None,
+        room_merges=None,
+        geometry_stability_frames=1,
+    ):
         if room_id_to_name:
             self.room_id_to_name.update({int(k): str(v) for k, v in room_id_to_name.items()})
         self.room_grid = {
@@ -70,7 +82,10 @@ class InteractionGraphStore:
             "scene_data": list(scene_data or []),
             "confidence_data": list(confidence_data or []),
         }
-        self._refresh_room_nodes_from_grid()
+        self._apply_room_merges(room_merges or {})
+        self._refresh_room_nodes_from_grid(
+            geometry_stability_frames=geometry_stability_frames
+        )
         self._rebuild_relations()
         self._bump_revision()
 
@@ -368,6 +383,18 @@ class InteractionGraphStore:
             node.first_seen = now
         node.last_seen = now
         node.is_currently_visible = True
+        max_visible_pixels = max(
+            int(node.attributes.get("max_visible_pixels", 0) or 0),
+            int(observation.get("visible_pixels", 0) or 0),
+        )
+        max_visible_fraction = max(
+            float(node.attributes.get("max_visible_fraction", 0.0) or 0.0),
+            float(observation.get("visible_fraction", 0.0) or 0.0),
+        )
+        max_consecutive_observations = max(
+            int(node.attributes.get("max_consecutive_observations", 0) or 0),
+            int(observation.get("consecutive_observations", 0) or 0),
+        )
         node.attributes.update(
             {
                 "instance_id": observation.get("instance_id") or node.attributes.get("instance_id") or "",
@@ -391,15 +418,18 @@ class InteractionGraphStore:
                     observation.get("interaction_approach_axis_xy") or []
                 ),
                 "visible_pixels": int(observation.get("visible_pixels", 0)),
+                "max_visible_pixels": max_visible_pixels,
                 "visible_fraction": float(
                     observation.get("visible_fraction", 0.0) or 0.0
                 ),
+                "max_visible_fraction": max_visible_fraction,
                 "projected_bbox_2d": list(
                     observation.get("projected_bbox_2d") or []
                 ),
                 "consecutive_observations": int(
                     observation.get("consecutive_observations", 0) or 0
                 ),
+                "max_consecutive_observations": max_consecutive_observations,
                 "camera_name": observation.get("camera_name"),
                 "frame_index": int(observation.get("frame_index", 0)),
                 "episode_id": observation.get("episode_id"),
@@ -451,7 +481,7 @@ class InteractionGraphStore:
                         node.interaction[key] = interaction_state_override[key]
         node.interaction["operation_history"] = previous_history
 
-    def _refresh_room_nodes_from_grid(self):
+    def _refresh_room_nodes_from_grid(self, geometry_stability_frames=1):
         if not self.room_grid:
             return
         grid_info = self.room_grid["info"]
@@ -474,6 +504,7 @@ class InteractionGraphStore:
             if idx < len(confidence_data):
                 room_conf[scene_id].append(float(confidence_data[idx]))
         for room_id, points in room_points.items():
+            room_id = self._resolve_room_id(room_id)
             node = self._ensure_room_node(room_id)
             xs = [point[0] for point in points]
             ys = [point[1] for point in points]
@@ -483,11 +514,67 @@ class InteractionGraphStore:
                 (max(ys) - min(ys)) if len(ys) > 1 else float(grid_info.resolution),
                 self.room_box_height,
             ]
-            node.centroid = center
-            node.aabb_center = center
-            node.aabb_size = size
+            if self._accept_room_geometry(
+                room_id, center, size, geometry_stability_frames
+            ):
+                node.centroid = center
+                node.aabb_center = center
+                node.aabb_size = size
             node.confidence = max(node.confidence, sum(room_conf[room_id]) / max(len(room_conf[room_id]), 1) / 100.0)
             node.attributes["cell_count"] = len(points)
+            node.attributes["active"] = True
+
+    def _accept_room_geometry(self, room_id, center, size, stability_frames):
+        candidate = self.room_geometry_candidates.get(room_id)
+        geometry = (list(center), list(size))
+        if candidate is not None and self._room_geometry_close(
+            candidate["center"], candidate["size"], center, size
+        ):
+            candidate["count"] += 1
+        else:
+            candidate = {"center": list(center), "size": list(size), "count": 1}
+        self.room_geometry_candidates[room_id] = candidate
+        return candidate["count"] >= max(1, int(stability_frames))
+
+    @staticmethod
+    def _room_geometry_close(old_center, old_size, center, size):
+        center_delta = math.hypot(
+            float(old_center[0]) - float(center[0]),
+            float(old_center[1]) - float(center[1]),
+        )
+        size_delta = max(
+            abs(float(old_size[0]) - float(size[0])),
+            abs(float(old_size[1]) - float(size[1])),
+        )
+        return center_delta <= 0.40 and size_delta <= 0.60
+
+    def _resolve_room_id(self, room_id):
+        room_id = int(room_id)
+        seen = set()
+        while room_id in self.room_redirects and room_id not in seen:
+            seen.add(room_id)
+            room_id = int(self.room_redirects[room_id])
+        return room_id
+
+    def _apply_room_merges(self, merges):
+        for secondary, primary in merges.items():
+            secondary = self._resolve_room_id(secondary)
+            primary = self._resolve_room_id(primary)
+            if secondary == primary:
+                continue
+            self.room_redirects[secondary] = primary
+            old_node = self.nodes.get(f"room_{secondary}")
+            if old_node is not None:
+                old_node.attributes["active"] = False
+                old_node.attributes["merged_into"] = f"room_{primary}"
+            for node in self.nodes.values():
+                if node.type != "room" and node.room_id == secondary:
+                    node.room_id = primary
+                if node.type == "portal":
+                    room_ids = node.attributes.get("connected_room_ids") or []
+                    node.attributes["connected_room_ids"] = sorted(
+                        {self._resolve_room_id(room_id) for room_id in room_ids}
+                    )
 
     def _refresh_missing_room_nodes_from_observations(self):
         room_to_nodes = defaultdict(list)
@@ -616,8 +703,16 @@ class InteractionGraphStore:
         scene_node = self._ensure_scene_node()
         scene_node.attributes["source_mode"] = self.source_mode
         scene_node.attributes["episode_id"] = self.episode_id
-        rooms = {node.id: node for node in self.nodes.values() if node.type == "room"}
-        for room_node in rooms.values():
+        rooms = {
+            node.id: node
+            for node in self.nodes.values()
+            if node.type == "room" and node.attributes.get("active", True)
+        }
+        for room_node in (
+            node
+            for node in self.nodes.values()
+            if node.type == "room" and node.attributes.get("active", True)
+        ):
             room_node.parent_id = scene_node.id
             self._upsert_edge(scene_node.id, "has_room", room_node.id, now=now)
         non_rooms = [node for node in self.nodes.values() if node.type not in {"scene", "room"}]
@@ -630,6 +725,8 @@ class InteractionGraphStore:
                 room_id = self._infer_room_id_from_node(node)
                 node.room_id = room_id
             if room_id is not None:
+                room_id = self._resolve_room_id(room_id)
+                node.room_id = room_id
                 room_node = self._ensure_room_node(room_id)
                 if node.type != "portal":
                     node.parent_id = room_node.id
@@ -641,7 +738,12 @@ class InteractionGraphStore:
                 connected_room_ids = list(node.attributes.get("connected_room_ids") or [])
                 if not connected_room_ids:
                     connected_room_ids = self._infer_portal_room_ids(node)
-                    node.attributes["connected_room_ids"] = connected_room_ids
+                connected_room_ids = [
+                    self._resolve_room_id(room_id)
+                    for room_id in connected_room_ids
+                    if room_id is not None
+                ]
+                node.attributes["connected_room_ids"] = connected_room_ids
                 node.attributes["connectivity_status"] = (
                     "connected" if len(connected_room_ids) >= 2 else "partial" if len(connected_room_ids) == 1 else "unknown"
                 )
@@ -673,8 +775,17 @@ class InteractionGraphStore:
         }
 
         for obj in object_nodes:
+            previous_parent_id = obj.parent_id
             obj.parent_id = None
-            parent = self._find_parent_node(obj, support_nodes, container_nodes, id_lookup, name_lookup, instance_lookup)
+            parent = self._find_parent_node(
+                obj,
+                support_nodes,
+                container_nodes,
+                id_lookup,
+                name_lookup,
+                instance_lookup,
+                previous_parent_id=previous_parent_id,
+            )
             if parent is None:
                 if obj.room_id is not None:
                     obj.parent_id = self._ensure_room_node(obj.room_id).id
@@ -685,11 +796,24 @@ class InteractionGraphStore:
             elif parent.type == "container":
                 self._upsert_edge(parent.id, "contains", obj.id, now=now)
 
-        for room_node in (node for node in self.nodes.values() if node.type == "room"):
+        for room_node in (
+            node
+            for node in self.nodes.values()
+            if node.type == "room" and node.attributes.get("active", True)
+        ):
             room_node.parent_id = scene_node.id
             self._upsert_edge(scene_node.id, "has_room", room_node.id, now=now)
 
-    def _find_parent_node(self, obj, support_nodes, container_nodes, id_lookup, name_lookup, instance_lookup):
+    def _find_parent_node(
+        self,
+        obj,
+        support_nodes,
+        container_nodes,
+        id_lookup,
+        name_lookup,
+        instance_lookup,
+        previous_parent_id=None,
+    ):
         parent_name = obj.attributes.get("parent")
         for lookup in (instance_lookup, name_lookup, id_lookup):
             if parent_name and parent_name in lookup:
@@ -697,13 +821,25 @@ class InteractionGraphStore:
                 if candidate.type in {"support", "container"}:
                     return candidate
 
-        same_room_containers = [node for node in container_nodes if node.room_id == obj.room_id]
-        containing = [node for node in same_room_containers if self._is_inside_volume(obj, node)]
+        containing = [node for node in container_nodes if self._is_inside_volume(obj, node)]
         if containing:
             return sorted(containing, key=lambda node: volume(node.aabb_size))[0]
 
-        same_room_supports = [node for node in support_nodes if node.room_id == obj.room_id]
-        supporting = [node for node in same_room_supports if self._is_on_support(obj, node)]
+        if obj.is_currently_visible:
+            revealed = [
+                node
+                for node in container_nodes
+                if str(node.interaction.get("state") or "") in {"open", "ajar"}
+                and _container_contains(obj, node, xy_margin=0.45)
+            ]
+            if revealed:
+                return sorted(revealed, key=lambda node: volume(node.aabb_size))[0]
+        elif previous_parent_id:
+            previous_parent = id_lookup.get(str(previous_parent_id))
+            if previous_parent is not None and previous_parent.type == "container":
+                return previous_parent
+
+        supporting = [node for node in support_nodes if self._is_on_support(obj, node)]
         if supporting:
             return sorted(supporting, key=lambda node: abs(top_surface_z(node) - obj.centroid[2]))[0]
         return None
@@ -791,7 +927,7 @@ class InteractionGraphStore:
         hints = []
         counter = 1
         for node in sorted(self.nodes.values(), key=lambda item: item.id):
-            if node.type == "room":
+            if node.type == "room" and node.attributes.get("active", True):
                 hints.append(
                     self._make_hint(counter, "room_center", node, False, node.id, "none", "known_room_center")
                 )
@@ -908,12 +1044,12 @@ def _object_not_too_high(obj, support):
     return _vertical_gap(obj, support) <= _support_height_limit(support)
 
 
-def _container_contains(obj, container):
+def _container_contains(obj, container, xy_margin=0.05):
     if not point_inside_2d(
         obj.centroid,
         container.aabb_center,
         container.aabb_size,
-        margin=0.05,
+        margin=xy_margin,
     ):
         return False
     center_z = float(container.aabb_center[2])
@@ -922,7 +1058,7 @@ def _container_contains(obj, container):
     return center_z - half_height <= object_z <= center_z + half_height
 
 
-InteractionGraphStore._is_inside_volume = staticmethod(lambda obj, container: _same_room_or_unknown(obj, container) and _container_contains(obj, container))
+InteractionGraphStore._is_inside_volume = staticmethod(_container_contains)
 InteractionGraphStore._is_on_support = staticmethod(
     lambda obj, support: _same_room_or_unknown(obj, support)
     and _support_xy_match(obj, support)

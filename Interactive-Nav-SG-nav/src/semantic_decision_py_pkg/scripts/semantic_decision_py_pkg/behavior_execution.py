@@ -146,6 +146,8 @@ class BehaviorExecutionStateMachine:
     ) -> list[dict[str, Any]]:
         if self._behavior_type() != BEHAVIOR_EXPLORE:
             return []
+        if self.state == STATE_NAVIGATING:
+            return self._finish(success, detail or {}, now)
         if self.state not in {STATE_PREPARING_EXPLORE, STATE_FINALIZING_EXPLORE}:
             return []
         return self._finish(success, detail or {}, now)

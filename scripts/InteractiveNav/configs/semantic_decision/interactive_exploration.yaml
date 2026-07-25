@@ -1,3 +1,6 @@
+mission:
+  mode: "semantic_interaction_exploration"
+
 target:
   enabled: false
 

@@ -71,6 +71,12 @@ class SemanticCandidateNode:
                 target_min_visible_pixels=int(
                     config.get("target_min_visible_pixels", 16)
                 ),
+                target_min_visible_fraction=float(
+                    config.get("target_min_visible_fraction", 0.2)
+                ),
+                target_min_consecutive_observations=int(
+                    config.get("target_min_consecutive_observations", 2)
+                ),
             )
         )
         self.explorer_status: dict = {}
@@ -162,6 +168,36 @@ class SemanticCandidateNode:
         candidates = self.generator.generate(
             explorer_input, self.graph, self.robot_xy, self.target_context
         )
+        navigation_frontiers = [
+            candidate for candidate in candidates if candidate.behavior_type == "EXPLORE"
+        ]
+        interaction_frontiers = [
+            candidate
+            for candidate in candidates
+            if candidate.behavior_type == "INTERACT"
+            and not bool(
+                (candidate.metadata or {}).get("interaction_group_already_explored")
+            )
+        ]
+        ready = bool(explorer_input.get("ready", False))
+        initial_scan_complete = bool(
+            explorer_input.get("initial_scan_complete", True)
+        )
+        explorer_state = explorer_input.get("state") or {}
+        active_navigation_frontier = bool(
+            explorer_input.get("active_proposal_id")
+            or explorer_state.get("active_goal")
+        )
+        navigation_frontier_exhausted = bool(
+            ready
+            and initial_scan_complete
+            and not active_navigation_frontier
+            and not navigation_frontiers
+        )
+        interaction_frontier_exhausted = not interaction_frontiers
+        combined_frontier_exhausted = bool(
+            navigation_frontier_exhausted and interaction_frontier_exhausted
+        )
         self.sequence += 1
         payload = {
             "schema_version": 1,
@@ -172,11 +208,16 @@ class SemanticCandidateNode:
             "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
             "target_context": dict(self.target_context),
             "exploration_context": {
-                "ready": bool(explorer_input.get("ready", False)),
-                "initial_scan_complete": bool(
-                    explorer_input.get("initial_scan_complete", True)
-                ),
-                "frontier_exhausted": bool(
+                "ready": ready,
+                "initial_scan_complete": initial_scan_complete,
+                "frontier_exhausted": combined_frontier_exhausted,
+                "navigation_frontier_exhausted": navigation_frontier_exhausted,
+                "navigation_frontier_count": len(navigation_frontiers),
+                "interaction_frontier_exhausted": interaction_frontier_exhausted,
+                "interaction_frontier_count": len(interaction_frontiers),
+                "combined_frontier_count": len(navigation_frontiers)
+                + len(interaction_frontiers),
+                "source_frontier_exhausted": bool(
                     explorer_input.get("frontier_exhausted", False)
                 ),
                 "proposal_count": int(explorer_input.get("proposal_count", 0) or 0),

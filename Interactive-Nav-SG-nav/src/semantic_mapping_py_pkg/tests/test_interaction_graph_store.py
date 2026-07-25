@@ -704,3 +704,98 @@ def test_initially_open_multi_joint_box_does_not_require_interaction():
     node = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "container")
     assert node["interaction"]["state"] == "open"
     assert node["interaction"]["requires_interaction"] is False
+
+
+def test_room_merge_retires_secondary_room_and_migrates_children() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [observation(instance_id="cup_1", semantic_name="cup", room_id=2)]
+    )
+    info = type("Info", (), {"width": 2, "resolution": 1.0})()
+    info.origin = type("Origin", (), {"position": type("Position", (), {"x": 0.0, "y": 0.0})()})()
+
+    store.update_room_grid(
+        info,
+        [1, 2],
+        [100, 100],
+        room_merges={2: 1},
+        geometry_stability_frames=1,
+    )
+    graph = store.as_graph_dict()
+    cup = next(node for node in graph["nodes"] if node["id"] == "object_cup_1")
+    room_two = next(node for node in graph["nodes"] if node["id"] == "room_2")
+    assert cup["room_id"] == 1
+    assert room_two["attributes"]["active"] is False
+    assert not any(
+        edge["src_id"] == "scene_test_scene" and edge["dst_id"] == "room_2"
+        for edge in graph["edges"]
+    )
+
+
+def test_parent_container_relation_overrides_room_id_mismatch() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="dresser_1",
+                semantic_name="dresser",
+                room_id=1,
+                is_receptacle=True,
+                is_articulable=True,
+                aabb_center=[1.0, 1.0, 0.5],
+                aabb_size=[1.0, 1.0, 1.0],
+                name="dresser_root",
+            ),
+            observation(
+                instance_id="pencil_1",
+                semantic_name="pencil",
+                room_id=2,
+                parent="dresser_root",
+                aabb_center=[1.8, 1.0, 0.5],
+                aabb_size=[0.05, 0.05, 0.05],
+            ),
+        ]
+    )
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_dresser_1", "contains", "object_pencil_1") in relations
+
+
+def test_open_drawer_expansion_reveals_and_retains_content_when_hidden() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    drawer = observation(
+        instance_id="drawer_1",
+        semantic_name="drawer",
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="slide",
+        joint_range=[0.0, 1.0],
+        joint_value=1.0,
+        aabb_center=[1.0, 1.0, 0.5],
+        aabb_size=[1.0, 1.0, 1.0],
+    )
+    pencil = observation(
+        instance_id="pencil_1",
+        semantic_name="pencil",
+        position=[1.85, 1.0, 0.5],
+        aabb_center=[1.85, 1.0, 0.5],
+        aabb_size=[0.05, 0.05, 0.05],
+    )
+    store.update_observations([drawer, pencil], source_mode="realtime_gt_observation")
+    assert any(
+        edge["src_id"] == "container_drawer_1"
+        and edge["relation"] == "contains"
+        and edge["dst_id"] == "object_pencil_1"
+        for edge in store.as_graph_dict()["edges"]
+    )
+
+    drawer["joint_value"] = 0.0
+    store.update_observations([drawer], source_mode="realtime_gt_observation")
+    assert any(
+        edge["src_id"] == "container_drawer_1"
+        and edge["relation"] == "contains"
+        and edge["dst_id"] == "object_pencil_1"
+        for edge in store.as_graph_dict()["edges"]
+    )

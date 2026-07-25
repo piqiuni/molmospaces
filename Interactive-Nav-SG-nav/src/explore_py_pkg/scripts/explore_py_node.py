@@ -486,6 +486,7 @@ class ExplorePyNode:
 
         if self.external_behavior_control:
             self.compute_next_subgoal(force=False, publish_selection=False)
+            self._tick_external_navigation_progress()
             self._publish_frontiers()
             self._publish_status()
             return
@@ -566,20 +567,55 @@ class ExplorePyNode:
         if not global_available or local_available:
             self.local_plan_bad_since = 0.0
             return
+        goal = self.state.active_goal
+        translation_stalled = (
+            goal is not None
+            and now - goal.last_progress_at >= self.local_plan_watchdog_sec
+        )
+        rotation_dominant = (
+            goal is not None
+            and goal.last_yaw_progress_at >= goal.last_progress_at
+        )
+        if not translation_stalled or not rotation_dominant:
+            self.local_plan_bad_since = 0.0
+            return
         if self.local_plan_bad_since <= 0.0:
             self.local_plan_bad_since = now
             return
         bad_duration = now - self.local_plan_bad_since
         if bad_duration >= self.local_plan_watchdog_sec:
             rospy.logwarn(
-                "[explore_py] local plan watchdog failed active goal: global_poses=%d local_poses=%d local_len=%.2fm bad_duration=%.1fs",
+                "[explore_py] local plan watchdog failed active goal after rotation-dominant no-translation: global_poses=%d local_poses=%d local_len=%.2fm bad_duration=%.1fs",
                 self.latest_global_plan_pose_count,
                 self.latest_local_plan_pose_count,
                 self.latest_local_plan_length_m,
                 bad_duration,
             )
-            self.state.mark_active_failed("local_plan_degenerate", source="explorer")
+            self.state.mark_active_failed(
+                "local_plan_degenerate_no_translation", source="explorer"
+            )
             self.local_plan_bad_since = 0.0
+
+    def _tick_external_navigation_progress(self):
+        command = self.external_reserved_command
+        if command is None or self.state.active_goal is None:
+            return
+        if not self.core.is_free_world(self.latest_grid, self.state.active_goal.point):
+            self.state.fail_active_if_goal_not_free(False)
+        else:
+            self.state.update_goal_progress(self.robot_xy, robot_yaw=self.robot_yaw)
+            if self.state.active_goal is not None:
+                self._fail_if_global_plan_not_current_goal()
+            if self.state.active_goal is not None:
+                self._fail_if_local_plan_missing()
+        if self.state.active_goal is None:
+            detail = {
+                "reason": self.state.last_failure_reason or self.state.last_event,
+                "source": self.state.last_failure_source or "explorer",
+            }
+            self.external_reserved_cluster = None
+            self.external_reserved_command = None
+            self._publish_behavior_feedback(command, "FAILED", False, detail)
 
     def _fail_if_global_plan_not_current_goal(self):
         if not self.global_plan_current_goal_check_enabled or self.state.active_goal is None:
@@ -712,6 +748,13 @@ class ExplorePyNode:
         self.external_reserved_cluster = cluster
         self.external_reserved_command = dict(command)
         self.last_selected_cluster = cluster
+        if self.robot_xy is not None:
+            self.state.start_goal(
+                cluster,
+                self.robot_xy,
+                robot_yaw=self.robot_yaw,
+                goal_id=str(cluster.cluster_id),
+            )
         point_msg = PointStamped()
         point_msg.header.stamp = rospy.Time.now()
         point_msg.header.frame_id = self.map_frame
@@ -736,12 +779,13 @@ class ExplorePyNode:
         cluster = self.external_reserved_cluster
         success = bool(command.get("success"))
         if cluster is not None and self.robot_xy is not None:
-            self.state.start_goal(
-                cluster,
-                self.robot_xy,
-                robot_yaw=self.robot_yaw,
-                goal_id=str(cluster.cluster_id),
-            )
+            if self.state.active_goal is None:
+                self.state.start_goal(
+                    cluster,
+                    self.robot_xy,
+                    robot_yaw=self.robot_yaw,
+                    goal_id=str(cluster.cluster_id),
+                )
             if success:
                 has_frontier = self.core.has_frontier_near(
                     self.latest_grid,

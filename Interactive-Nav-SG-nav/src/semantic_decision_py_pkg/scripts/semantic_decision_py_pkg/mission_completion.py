@@ -54,27 +54,76 @@ class MissionCompletionTracker:
         self.stalled = False
         exploration = candidates_payload.get("exploration_context") or {}
         initial_scan_complete = bool(exploration.get("initial_scan_complete", True))
-        exhausted = bool(exploration.get("frontier_exhausted", False))
-        candidate_count = int(
-            candidates_payload.get(
-                "candidate_count",
-                len(candidates_payload.get("candidates") or []),
+        candidates = list(candidates_payload.get("candidates") or [])
+        fallback_navigation_count = sum(
+            str(candidate.get("behavior_type") or "") == "EXPLORE"
+            for candidate in candidates
+        )
+        fallback_interaction_count = sum(
+            str(candidate.get("behavior_type") or "") == "INTERACT"
+            and not bool(
+                (candidate.get("metadata") or {}).get(
+                    "interaction_group_already_explored"
+                )
+            )
+            for candidate in candidates
+        )
+        fallback_candidate_count = int(
+            candidates_payload.get("candidate_count", len(candidates)) or 0
+        )
+        navigation_frontier_count = int(
+            exploration.get(
+                "navigation_frontier_count",
+                fallback_navigation_count
+                if candidates
+                else fallback_candidate_count,
             )
             or 0
         )
+        interaction_frontier_count = int(
+            exploration.get(
+                "interaction_frontier_count", fallback_interaction_count
+            )
+            or 0
+        )
+        combined_frontier_count = int(
+            exploration.get(
+                "combined_frontier_count",
+                navigation_frontier_count + interaction_frontier_count,
+            )
+            or 0
+        )
+        navigation_frontier_exhausted = bool(
+            exploration.get(
+                "navigation_frontier_exhausted",
+                exploration.get("frontier_exhausted", False),
+            )
+        )
+        interaction_frontier_exhausted = bool(
+            exploration.get(
+                "interaction_frontier_exhausted",
+                interaction_frontier_count == 0,
+            )
+        )
+        exhausted = bool(
+            exploration.get(
+                "frontier_exhausted",
+                navigation_frontier_exhausted and interaction_frontier_exhausted,
+            )
+        )
         ready_to_complete = (
-            not target_enabled
-            and not has_active_behavior
+            not has_active_behavior
             and initial_scan_complete
             and exhausted
-            and candidate_count == 0
+            and navigation_frontier_exhausted
+            and interaction_frontier_exhausted
+            and combined_frontier_count == 0
         )
         stagnated = (
-            not target_enabled
-            and not has_active_behavior
+            not has_active_behavior
             and int(self.config.stagnation_failure_limit) > 0
             and self.failure_streak >= int(self.config.stagnation_failure_limit)
-            and candidate_count > 0
+            and combined_frontier_count > 0
         )
         if stagnated:
             self.reason = "exploration_stalled_recovery"
@@ -87,7 +136,7 @@ class MissionCompletionTracker:
             1, int(self.config.empty_candidate_confirmations)
         )
         if self.complete:
-            self.reason = "exploration_exhausted"
+            self.reason = "navigation_and_interaction_frontiers_exhausted"
         return self.complete
 
 

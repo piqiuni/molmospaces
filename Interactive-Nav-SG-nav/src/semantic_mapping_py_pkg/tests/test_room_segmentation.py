@@ -92,3 +92,29 @@ def test_detector_portal_hint_requires_stable_confirmations_and_freezes_anchor()
 
     room_ids_after, _ = segmenter.segment(grid)
     assert _room_count(room_ids_after) == 2
+
+
+def test_room_merge_requires_stable_confirmations_before_report() -> None:
+    grid = _grid()
+    grid.data = [0] * (grid.info.width * grid.info.height)
+    segmenter = _segmenter(
+        room_merge_confirmations=2,
+        room_id_overlap_ratio=0.20,
+    )
+
+    split = np.asarray(grid.data, dtype=np.int8).reshape(grid.info.height, grid.info.width)
+    split[:, grid.info.width // 2] = 100
+    grid.data = split.reshape(-1).tolist()
+    room_ids, _ = segmenter.segment(grid)
+    assert _room_count(room_ids) == 2
+
+    split[:, grid.info.width // 2] = 0
+    grid.data = split.reshape(-1).tolist()
+    segmenter.segment(grid)
+    assert segmenter.consume_confirmed_merges() == {}
+
+    segmenter.segment(grid)
+    merges = segmenter.consume_confirmed_merges()
+    assert len(merges) == 1
+    secondary, primary = next(iter(merges.items()))
+    assert secondary != primary

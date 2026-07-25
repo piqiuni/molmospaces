@@ -268,12 +268,28 @@ class SemanticBehaviorExecutor:
                 target_visible = bool(node.get("is_currently_visible")) and (
                     visible_pixels >= min_visible_pixels
                 )
+                visible_fraction = float(
+                    attributes.get("visible_fraction", 1.0) or 0.0
+                )
+                consecutive_observations = int(
+                    attributes.get("consecutive_observations", 2) or 0
+                )
+                target_visible = target_visible and (
+                    visible_fraction >= float(
+                        metadata.get("target_min_visible_fraction", 0.2) or 0.2
+                    )
+                    and consecutive_observations >= int(
+                        metadata.get("target_min_consecutive_observations", 2) or 2
+                    )
+                )
                 return self.machine.on_target_visibility(
                     target_visible,
                     detail={
                         "node_id": node.get("id"),
                         "target_visible": target_visible,
                         "visible_pixels": visible_pixels,
+                        "visible_fraction": visible_fraction,
+                        "consecutive_observations": consecutive_observations,
                         "min_visible_pixels": min_visible_pixels,
                         "graph_revision": self.latest_graph.get(
                             "graph_revision", 0
@@ -751,11 +767,17 @@ class SemanticBehaviorExecutor:
     def _finish_terminal(self, command: dict) -> None:
         with self.lock:
             selection = dict(self.selection or {})
+            was_navigating = self.machine.state in {
+                STATE_NAVIGATING,
+                STATE_APPROACH_INTERACTION,
+            }
             status = "SUCCEEDED" if command.get("success") else "FAILED"
             detail = dict(command.get("detail") or {})
             self._publish_feedback(selection, status, bool(command.get("success")), detail)
             self.selection = None
             self.machine.reset()
+        if was_navigating:
+            self.move_base.cancel_goal()
 
     def _publish_feedback(
         self, selection: dict, status: str, success: bool | None, detail: dict

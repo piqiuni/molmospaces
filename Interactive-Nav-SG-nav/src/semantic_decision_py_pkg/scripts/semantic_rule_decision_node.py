@@ -28,6 +28,7 @@ class SemanticRuleDecisionNode:
         rospy.init_node("semantic_rule_decision_node")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~policy", {}) or {}
+        mission_config = rospy.get_param("~mission", {}) or {}
         model_config = apply_model_env_overrides(rospy.get_param("~model", {}) or {})
         completion_config = rospy.get_param("~completion", {}) or {}
         self.policy = RulePolicy(
@@ -60,6 +61,9 @@ class SemanticRuleDecisionNode:
         self.failure_cooldown_s = float(config.get("failure_cooldown_s", 45.0))
         self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
         self.failure_retry_delay_s = float(config.get("failure_retry_delay_s", 2.0))
+        self.mission_mode = self._normalize_mission_mode(
+            mission_config.get("mode", "semantic_interaction_exploration")
+        )
         self.policy_backend = str(config.get("backend", "rule")).casefold()
         self.model_policy = ModelPolicyClient(
             ModelPolicyConfig(
@@ -91,6 +95,7 @@ class SemanticRuleDecisionNode:
         self.minimum_candidate_sequence = 0
         self.next_decision_time = 0.0
         self.goal_complete = False
+        self.target_goal_complete = False
         self.target_context: dict = {}
         self.active_target_goal = False
         self.cooldown_until: dict[str, float] = {}
@@ -138,6 +143,7 @@ class SemanticRuleDecisionNode:
             self.minimum_candidate_sequence = 0
             self.next_decision_time = 0.0
             self.goal_complete = False
+            self.target_goal_complete = False
             self.active_target_goal = False
             self.target_mission.reset()
             self.cooldown_until.clear()
@@ -150,6 +156,7 @@ class SemanticRuleDecisionNode:
         if target_key != previous_target_key:
             self.target_context = dict(target_context)
             self.goal_complete = False
+            self.target_goal_complete = False
             self.target_mission.reset()
             self._publish_goal_status(
                 "ACTIVE" if target_context.get("enabled") else "DISABLED"
@@ -219,11 +226,14 @@ class SemanticRuleDecisionNode:
                     detail=transition["detail"],
                 )
             elif transition["phase"] == "complete":
-                self.goal_complete = True
+                self.target_goal_complete = True
                 detail = dict(transition["detail"])
+                detail["reason"] = "target_goal_succeeded"
                 if target_interaction_succeeded and not self.active_target_goal:
                     detail["target_interaction_source"] = "autonomous_interaction"
                 self._publish_goal_status("SUCCEEDED", detail=detail)
+                if self.mission_mode == "semantic_interaction_object_goal":
+                    self.goal_complete = True
         self.active_candidate_id = ""
         self.active_decision_id = ""
         self.active_behavior_type = ""
@@ -240,18 +250,33 @@ class SemanticRuleDecisionNode:
         if candidate_sequence < self.minimum_candidate_sequence:
             return
         self.minimum_candidate_sequence = 0
+        if self.mission_mode == "semantic_interaction_object_goal" and self.target_goal_complete:
+            self.goal_complete = True
+            return
         if self.completion_tracker.update(
             self.latest_candidates_payload,
             has_active_behavior=bool(self.active_candidate_id),
             target_enabled=bool(self.target_context.get("enabled")),
         ):
+            exploration_context = (
+                self.latest_candidates_payload.get("exploration_context") or {}
+            )
             self.goal_complete = True
             self._publish_goal_status(
-                "SUCCEEDED",
+                "EXPLORATION_EXHAUSTED",
                 detail={
-                    "reason": self.completion_tracker.reason or "exploration_exhausted",
+                    "reason": self.completion_tracker.reason
+                    or "navigation_and_interaction_frontiers_exhausted",
                     "completion_confirmations": self.completion_tracker.confirmations,
                     "candidate_sequence": candidate_sequence,
+                    "target_goal_succeeded": self.target_goal_complete,
+                    "navigation_frontier_count": int(
+                        exploration_context.get("navigation_frontier_count", 0) or 0
+                    ),
+                    "interaction_frontier_count": int(
+                        exploration_context.get("interaction_frontier_count", 0)
+                        or 0
+                    ),
                 },
             )
             return
@@ -260,6 +285,12 @@ class SemanticRuleDecisionNode:
         for payload in self.latest_candidates_payload.get("candidates") or []:
             candidate_id = str(payload.get("candidate_id") or "")
             if now < self.cooldown_until.get(candidate_id, 0.0):
+                continue
+            metadata = payload.get("metadata") or {}
+            if self.target_goal_complete and (
+                bool(metadata.get("target_goal"))
+                or bool(metadata.get("target_match"))
+            ):
                 continue
             candidates.append(BehaviorCandidate(**payload))
         scored = [self.policy.score(candidate) for candidate in candidates]
@@ -329,6 +360,7 @@ class SemanticRuleDecisionNode:
     def _publish_goal_status(self, status: str, detail: dict | None = None) -> None:
         payload = {
             "status": status,
+            "mission_mode": self.mission_mode,
             "target_context": dict(self.target_context),
             "decision_id": self.active_decision_id,
             "timestamp": time.time(),
@@ -337,6 +369,13 @@ class SemanticRuleDecisionNode:
         self.goal_status_pub.publish(
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
+
+    @staticmethod
+    def _normalize_mission_mode(value: object) -> str:
+        normalized = str(value or "").strip().casefold().replace("-", "_")
+        if normalized in {"object_goal", "semantic_interaction_object_goal"}:
+            return "semantic_interaction_object_goal"
+        return "semantic_interaction_exploration"
 
 
 if __name__ == "__main__":

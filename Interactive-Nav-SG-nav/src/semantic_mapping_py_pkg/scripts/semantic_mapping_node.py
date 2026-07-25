@@ -114,6 +114,11 @@ class SemanticMappingNode:
         )
         self.room_portal_min_width_m = float(config.get("room_portal_min_width_m", 0.5))
         self.room_portal_max_width_m = float(config.get("room_portal_max_width_m", 2.5))
+        self.room_id_overlap_ratio = float(config.get("room_id_overlap_ratio", 0.25))
+        self.room_merge_confirmations = int(config.get("room_merge_confirmations", 3))
+        self.room_geometry_stability_frames = int(
+            config.get("room_geometry_stability_frames", 3)
+        )
         self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
         self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
         self.graph_min_observations = max(1, int(config.get("graph_min_observations", 1)))
@@ -184,6 +189,8 @@ class SemanticMappingNode:
             room_portal_hint_merge_distance_m=self.room_portal_hint_merge_distance_m,
             room_portal_min_width_m=self.room_portal_min_width_m,
             room_portal_max_width_m=self.room_portal_max_width_m,
+            room_id_overlap_ratio=self.room_id_overlap_ratio,
+            room_merge_confirmations=self.room_merge_confirmations,
             state=RoomSegmentationState(),
         )
         self.tf_listener = tf.TransformListener()
@@ -372,12 +379,15 @@ class SemanticMappingNode:
         if self.latest_occupancy_grid is None:
             return
         room_ids, room_conf = self._segment_rooms_from_occupancy(self.latest_occupancy_grid)
+        room_merges = self.room_segmenter.consume_confirmed_merges()
         self.latest_room_segment_grid = self._build_cropped_room_segment_grid(room_ids)
         self.graph_store.update_room_grid(
             self.latest_occupancy_grid.info,
             room_ids,
             room_conf,
             room_id_to_name=self.id_to_class,
+            room_merges=room_merges,
+            geometry_stability_frames=self.room_geometry_stability_frames,
         )
 
     def publish_callback(self, _event):

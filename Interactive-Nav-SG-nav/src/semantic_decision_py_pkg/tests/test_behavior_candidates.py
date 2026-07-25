@@ -469,6 +469,70 @@ def test_observed_target_generates_navigation_candidate() -> None:
     assert candidate.metadata["target_min_visible_pixels"] == 16
 
 
+def test_weak_target_observation_is_not_verified_as_visible() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            target_min_visible_pixels=128,
+            target_min_visible_fraction=0.2,
+            target_min_consecutive_observations=2,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "object_pencil",
+                "type": "object",
+                "label": "pencil",
+                "centroid": [2.0, 0.0, 0.5],
+                "is_currently_visible": True,
+                "attributes": {
+                    "visible_pixels": 24,
+                    "visible_fraction": 0.08,
+                    "consecutive_observations": 1,
+                },
+            }
+        ]
+    }
+    candidates = generator.generate(
+        {}, graph, robot_xy=(0.0, 0.0), target_context={"enabled": True, "object_labels": ["pencil"]}
+    )
+    assert candidates == []
+
+
+def test_reliably_observed_target_remains_candidate_after_leaving_view() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            target_min_visible_pixels=128,
+            target_min_visible_fraction=0.2,
+            target_min_consecutive_observations=2,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "object_pencil",
+                "type": "object",
+                "label": "pencil",
+                "centroid": [2.0, 0.0, 0.5],
+                "is_currently_visible": False,
+                "attributes": {
+                    "visible_pixels": 0,
+                    "visible_fraction": 0.0,
+                    "consecutive_observations": 0,
+                    "max_visible_pixels": 256,
+                    "max_visible_fraction": 0.4,
+                    "max_consecutive_observations": 3,
+                },
+            }
+        ]
+    }
+    candidates = generator.generate(
+        {}, graph, robot_xy=(0.0, 0.0), target_context={"enabled": True, "object_labels": ["pencil"]}
+    )
+    assert [candidate.candidate_id for candidate in candidates] == ["target:object_pencil"]
+    assert candidates[0].metadata["target_visible_now"] is False
+
+
 def test_aabb_approach_standoff_is_outside_container_box() -> None:
     generator = CandidateGenerator()
     graph = {

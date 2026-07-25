@@ -16,6 +16,9 @@ topics:
   move_base: "/move_base"
   cmd_vel: "/cmd_vel"
 
+mission:
+  mode: "semantic_interaction_exploration"
+
 candidate:
   max_frontier_candidates: 12
   interaction_types: ["portal", "container"]
@@ -36,7 +39,9 @@ candidate:
   target_allow_connected_room: false
   open_fraction_threshold: 0.67
   target_require_visibility_verification: true
-  target_min_visible_pixels: 16
+  target_min_visible_pixels: 128
+  target_min_visible_fraction: 0.2
+  target_min_consecutive_observations: 2
 
 policy:
   backend: "rule"

@@ -1,3 +1,6 @@
+mission:
+  mode: "semantic_interaction_object_goal"
+
 target:
   enabled: false
   object_labels: []
@@ -8,8 +11,9 @@ candidate:
   target_require_current_visibility: false
   target_require_same_room: false
   target_allow_connected_room: true
-  target_min_visible_pixels: 16
+  target_min_visible_pixels: 128
+  target_min_visible_fraction: 0.2
+  target_min_consecutive_observations: 2
 
 policy:
   target_relevance_weight: 3.0
-

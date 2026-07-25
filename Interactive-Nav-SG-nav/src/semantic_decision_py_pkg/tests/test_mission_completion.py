@@ -36,7 +36,7 @@ def test_completion_requires_distinct_stable_empty_sequences() -> None:
     ) is True
 
 
-def test_completion_is_blocked_by_targets_actions_or_candidates() -> None:
+def test_completion_uses_navigation_and_interaction_frontiers_with_target_enabled() -> None:
     tracker = MissionCompletionTracker(
         MissionCompletionConfig(empty_candidate_confirmations=1)
     )
@@ -45,15 +45,38 @@ def test_completion_is_blocked_by_targets_actions_or_candidates() -> None:
         payload(1, exhausted=True, candidate_count=0),
         has_active_behavior=False,
         target_enabled=True,
-    ) is False
+    ) is True
+
+
+def test_completion_is_blocked_by_actions_or_interaction_frontiers() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(empty_candidate_confirmations=1)
+    )
 
     assert tracker.update(
-        payload(2, exhausted=True, candidate_count=0),
+        payload(1, exhausted=True, candidate_count=0),
         has_active_behavior=True,
         target_enabled=False,
     ) is False
     assert tracker.update(
-        payload(3, exhausted=True, candidate_count=1),
+        {
+            "sequence": 2,
+            "candidate_count": 1,
+            "candidates": [
+                {
+                    "behavior_type": "INTERACT",
+                    "metadata": {"interaction_group_already_explored": False},
+                }
+            ],
+            "exploration_context": {
+                "frontier_exhausted": False,
+                "navigation_frontier_exhausted": True,
+                "navigation_frontier_count": 0,
+                "interaction_frontier_exhausted": False,
+                "interaction_frontier_count": 1,
+                "combined_frontier_count": 1,
+            },
+        },
         has_active_behavior=False,
         target_enabled=False,
     ) is False

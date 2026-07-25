@@ -25,6 +25,9 @@ class CompletionState:
         self.requested = False
         self.reason = ""
         self.detail: dict[str, Any] = {}
+        self.last_semantic_status = ""
+        self.target_goal_succeeded = False
+        self.target_detail: dict[str, Any] = {}
         self.requested_at_wall_time = 0.0
         self.requested_at_step: int | None = None
 
@@ -54,9 +57,32 @@ class CompletionState:
     def update_semantic(self, payload: dict[str, Any]) -> bool:
         if self.requested or str(self.config.mode) != "semantic":
             return self.requested
-        if str(payload.get("status") or "").upper() == "SUCCEEDED":
-            detail = dict(payload.get("detail") or {})
-            self.request(str(detail.get("reason") or "semantic_goal_succeeded"), detail)
+        status = str(payload.get("status") or "").upper()
+        detail = dict(payload.get("detail") or {})
+        reason = str(detail.get("reason") or "")
+        self.last_semantic_status = status
+        mission_mode = str(payload.get("mission_mode") or "").casefold()
+        if status == "SUCCEEDED" and reason == "target_goal_succeeded":
+            self.target_goal_succeeded = True
+            self.target_detail = detail
+            if mission_mode in {"object_goal", "semantic_interaction_object_goal"}:
+                self.request("target_goal_succeeded", detail)
+                return self.requested
+        if status == "EXPLORATION_EXHAUSTED" or (
+            status == "SUCCEEDED"
+            and reason
+            in {
+                "exploration_exhausted",
+                "navigation_and_interaction_frontiers_exhausted",
+            }
+        ):
+            detail.setdefault("target_goal_succeeded", self.target_goal_succeeded)
+            if self.target_detail:
+                detail.setdefault("target_detail", dict(self.target_detail))
+            self.request(
+                reason or "navigation_and_interaction_frontiers_exhausted",
+                detail,
+            )
         return self.requested
 
     def request(self, reason: str, detail: dict[str, Any] | None = None) -> None:
@@ -85,6 +111,9 @@ class CompletionState:
             "requested": self.requested,
             "reason": self.reason,
             "detail": dict(self.detail),
+            "last_semantic_status": self.last_semantic_status,
+            "target_goal_succeeded": self.target_goal_succeeded,
+            "target_detail": dict(self.target_detail),
             "frontier_confirmations": self.frontier_confirmations,
             "requested_at_wall_time": self.requested_at_wall_time,
             "requested_at_step": self.requested_at_step,

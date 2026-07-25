@@ -103,6 +103,8 @@ class CandidateGeneratorConfig:
     open_fraction_threshold: float = 0.67
     target_require_visibility_verification: bool = True
     target_min_visible_pixels: int = 16
+    target_min_visible_fraction: float = 0.2
+    target_min_consecutive_observations: int = 2
 
 
 class CandidateGenerator:
@@ -190,9 +192,47 @@ class CandidateGenerator:
                     self.config.target_min_visible_pixels,
                 )
             )
-            target_visible_now = bool(node.get("is_currently_visible")) and (
-                visible_pixels >= target_min_visible_pixels
+            visible_fraction = float(
+                attributes.get("visible_fraction", 1.0) or 0.0
             )
+            consecutive_observations = int(
+                attributes.get("consecutive_observations", 2) or 0
+            )
+            target_min_visible_fraction = float(
+                target_context.get(
+                    "min_visible_fraction",
+                    self.config.target_min_visible_fraction,
+                )
+            )
+            target_min_consecutive_observations = int(
+                target_context.get(
+                    "min_consecutive_observations",
+                    self.config.target_min_consecutive_observations,
+                )
+            )
+            target_visible_now = (
+                bool(node.get("is_currently_visible"))
+                and visible_pixels >= target_min_visible_pixels
+                and visible_fraction >= target_min_visible_fraction
+                and consecutive_observations >= target_min_consecutive_observations
+            )
+            max_visible_pixels = int(
+                attributes.get("max_visible_pixels", visible_pixels) or 0
+            )
+            max_visible_fraction = float(
+                attributes.get("max_visible_fraction", visible_fraction) or 0.0
+            )
+            max_consecutive_observations = int(
+                attributes.get("max_consecutive_observations", consecutive_observations)
+                or 0
+            )
+            reliably_observed = (
+                max_visible_pixels >= target_min_visible_pixels
+                and max_visible_fraction >= target_min_visible_fraction
+                and max_consecutive_observations >= target_min_consecutive_observations
+            )
+            if not reliably_observed:
+                continue
             require_current_visibility = bool(
                 target_context.get(
                     "require_current_visibility",
@@ -244,6 +284,14 @@ class CandidateGenerator:
                         "room_hops": room_hops,
                         "room_reachable": room_hops is not None,
                         "target_visible_pixels": visible_pixels,
+                        "target_max_visible_pixels": max_visible_pixels,
+                        "target_visible_fraction": visible_fraction,
+                        "target_max_visible_fraction": max_visible_fraction,
+                        "target_consecutive_observations": consecutive_observations,
+                        "target_max_consecutive_observations": max_consecutive_observations,
+                        "target_reliably_observed": reliably_observed,
+                        "target_min_visible_fraction": target_min_visible_fraction,
+                        "target_min_consecutive_observations": target_min_consecutive_observations,
                         "verify_target_visibility": verify_visibility,
                         "target_min_visible_pixels": target_min_visible_pixels,
                         "state_age_sec": state_age_sec,
