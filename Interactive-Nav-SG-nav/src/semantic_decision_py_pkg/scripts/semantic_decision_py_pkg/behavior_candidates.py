@@ -536,6 +536,8 @@ class CandidateGenerator:
             interaction = node.get("interaction") or {}
             if not bool(interaction.get("is_interactable", False)):
                 continue
+            if node_type == "container" and not self._is_openable_container(node):
+                continue
             node_state = str(interaction.get("state") or "unknown")
             if node_type == "portal" and (
                 not bool(interaction.get("requires_interaction"))
@@ -763,6 +765,36 @@ class CandidateGenerator:
                     )
                 )
         return candidates
+
+    @staticmethod
+    def _is_openable_container(node: dict[str, Any]) -> bool:
+        attributes = node.get("attributes") or {}
+        labels = (
+            node.get("label"),
+            node.get("name"),
+            attributes.get("semantic_name"),
+            attributes.get("category"),
+            attributes.get("source_object_name"),
+        )
+        if any(
+            str(label or "").strip().casefold() in {"box", "storage_bin"}
+            for label in labels
+        ):
+            return False
+        interaction = node.get("interaction") or {}
+        mode = str(interaction.get("interaction_mode") or "")
+        if mode and mode not in {"open_close", "slide"}:
+            return False
+        joint_infos = list(
+            attributes.get("joint_infos")
+            or (attributes.get("observation_evidence") or {}).get("joint_infos")
+            or []
+        )
+        return not joint_infos or any(
+            str(info.get("joint_type") or "").casefold() in {"hinge", "slide"}
+            or info.get("open_fraction") is not None
+            for info in joint_infos
+        )
 
     @staticmethod
     def _node_xy(

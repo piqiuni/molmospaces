@@ -173,7 +173,10 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
     if node_type == "portal":
         interaction_mode = "slide" if joint_type == "slide" else "open_close"
     elif node_type == "container":
-        if observation.get("is_articulable"):
+        label = normalize_label(observation.get("semantic_name"))
+        if label in {"box", "storage_bin"}:
+            interaction_mode = "none"
+        elif observation.get("is_articulable"):
             interaction_mode = "slide" if joint_type == "slide" else "open_close"
         else:
             interaction_mode = "place_in"

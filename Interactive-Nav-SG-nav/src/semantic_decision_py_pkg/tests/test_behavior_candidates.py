@@ -648,7 +648,7 @@ def test_observed_target_candidate_persists_after_leaving_view() -> None:
     assert candidates[0].metadata["target_visible_now"] is False
 
 
-def test_observed_container_remains_candidate_when_far_away() -> None:
+def test_generic_storage_box_is_not_an_interaction_candidate() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(
             interaction_types=("container",),
@@ -672,10 +672,7 @@ def test_observed_container_remains_candidate_when_far_away() -> None:
         ]
     }
     candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
-    assert len(candidates) == 1
-    assert candidates[0].target_id == "container_1"
-    assert candidates[0].features["distance_m"] > 0.0
-    assert candidates[0].metadata["requires_approach"] is True
+    assert candidates == []
 
 
 def test_container_interaction_can_require_same_room() -> None:

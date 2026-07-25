@@ -116,6 +116,9 @@ class SemanticMappingNode:
         self.room_portal_max_width_m = float(config.get("room_portal_max_width_m", 2.5))
         self.room_id_overlap_ratio = float(config.get("room_id_overlap_ratio", 0.25))
         self.room_merge_confirmations = int(config.get("room_merge_confirmations", 3))
+        self.room_grid_stability_frames = int(
+            config.get("room_grid_stability_frames", 3)
+        )
         self.room_geometry_stability_frames = int(
             config.get("room_geometry_stability_frames", 3)
         )
@@ -191,6 +194,7 @@ class SemanticMappingNode:
             room_portal_max_width_m=self.room_portal_max_width_m,
             room_id_overlap_ratio=self.room_id_overlap_ratio,
             room_merge_confirmations=self.room_merge_confirmations,
+            room_grid_stability_frames=self.room_grid_stability_frames,
             state=RoomSegmentationState(),
         )
         self.tf_listener = tf.TransformListener()

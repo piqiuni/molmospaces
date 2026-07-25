@@ -1266,10 +1266,11 @@ class ExploreDebugRecorder:
                 self.latest_semantic_execution_state = {}
                 self.latest_semantic_behavior_feedback = {}
                 self.last_semantic_execution_key = None
-            for observation in payload.get("observations") or []:
-                instance_id = str(observation.get("instance_id") or "")
-                if instance_id:
-                    self.observed_instance_ids.add(instance_id)
+            self.observed_instance_ids = {
+                str(observation.get("instance_id") or "")
+                for observation in payload.get("observations") or []
+                if str(observation.get("instance_id") or "")
+            }
             self.latest_gt_observations = payload
             self.gt_observation_history.append(
                 (float(payload.get("stamp_sec", 0.0) or 0.0), payload, set(self.observed_instance_ids))
@@ -1760,13 +1761,31 @@ class ExploreDebugRecorder:
             bbox_scale_x = float(frame.shape[1]) / max(1, int(image_size[0]))
             bbox_scale_y = float(frame.shape[0]) / max(1, int(image_size[1]))
             x0, y0, x1, y1 = [int(value) for value in bbox]
-            start = (int(x0 * bbox_scale_x), int(y0 * bbox_scale_y))
-            end = (int(x1 * bbox_scale_x), int(y1 * bbox_scale_y))
+            start = (
+                max(0, min(frame.shape[1] - 1, int(x0 * bbox_scale_x))),
+                max(0, min(frame.shape[0] - 1, int(y0 * bbox_scale_y))),
+            )
+            end = (
+                max(0, min(frame.shape[1] - 1, int((x1 + 1) * bbox_scale_x) - 1)),
+                max(0, min(frame.shape[0] - 1, int((y1 + 1) * bbox_scale_y) - 1)),
+            )
+            if end[0] <= start[0] or end[1] <= start[1]:
+                continue
             is_door = bool(observation.get("is_door"))
-            is_container = bool(observation.get("is_receptacle"))
+            is_container = bool(
+                observation.get("is_receptacle")
+                and observation.get("is_articulable")
+                and observation.get("joint_infos")
+            )
             color = (238, 80, 50) if is_door else (170, 70, 220) if is_container else (20, 210, 210)
             cv2.rectangle(frame, start, end, color, 2, cv2.LINE_AA)
-            label = f"{observation.get('semantic_name', 'obj')} {observation.get('instance_id', '')}"
+            instance_id = str(observation.get("instance_id") or "")
+            suffix = instance_id.rsplit("_", 1)[-1]
+            try:
+                display_id = f"#{int(suffix)}"
+            except ValueError:
+                display_id = f"#{suffix[-6:]}"
+            label = f"{display_id} {observation.get('semantic_name', 'obj')}"
             joint_value = observation.get("joint_value")
             if joint_value is not None and observation.get("primary_joint_name"):
                 label += f" q={float(joint_value):.2f}"
@@ -1805,7 +1824,7 @@ class ExploreDebugRecorder:
 
     def _node_observed_in_recording(self, node: dict, observed_instance_ids: set[str] | None = None) -> bool:
         if node.get("type") == "room":
-            return True
+            return bool((node.get("attributes") or {}).get("active", True))
         instance_id = str((node.get("attributes") or {}).get("instance_id") or "")
         observed_instance_ids = self.observed_instance_ids if observed_instance_ids is None else observed_instance_ids
         return bool(instance_id and instance_id in observed_instance_ids)

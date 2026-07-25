@@ -92,6 +92,9 @@ class ExplorePyNode:
         self.global_plan_current_goal_grace_sec = float(
             exploration_cfg.get("global_plan_current_goal_grace_sec", 4.0)
         )
+        self.external_navigation_plan_grace_sec = float(
+            exploration_cfg.get("external_navigation_plan_grace_sec", 16.0)
+        )
         self.global_plan_goal_tolerance_m = float(exploration_cfg.get("global_plan_goal_tolerance_m", 0.6))
         self.make_plan_preflight_enabled = bool(
             exploration_cfg.get("make_plan_preflight_enabled", True)
@@ -624,7 +627,10 @@ class ExplorePyNode:
         # A forced same-goal replan has a new publication time even though the
         # exploration goal keeps its original lifetime and timeout budget.
         goal_age = now - max(self.state.active_goal.sent_at, self.active_goal_publish_wall_time)
-        if goal_age < self.global_plan_current_goal_grace_sec:
+        grace_sec = self.global_plan_current_goal_grace_sec
+        if self.external_behavior_control and self.external_reserved_command is not None:
+            grace_sec = max(grace_sec, self.external_navigation_plan_grace_sec)
+        if goal_age < grace_sec:
             return
         fresh_after_goal = self.latest_global_plan_time >= self.active_goal_publish_wall_time
         plan_available = fresh_after_goal and self.latest_global_plan_pose_count >= self.global_plan_min_poses
@@ -748,6 +754,7 @@ class ExplorePyNode:
         self.external_reserved_cluster = cluster
         self.external_reserved_command = dict(command)
         self.last_selected_cluster = cluster
+        self.active_goal_publish_wall_time = time.time()
         if self.robot_xy is not None:
             self.state.start_goal(
                 cluster,

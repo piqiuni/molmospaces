@@ -77,6 +77,7 @@ exploration:
   plan_freshness_sec: 4.0
   global_plan_current_goal_check_enabled: true
   global_plan_current_goal_grace_sec: 4.0
+  external_navigation_plan_grace_sec: 16.0
   global_plan_goal_tolerance_m: 0.6
   make_plan_preflight_enabled: true
   make_plan_service: "/move_base/make_plan"

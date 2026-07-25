@@ -99,7 +99,7 @@ executor:
   rear_goal_pi_tie_tolerance_rad: 0.20
   rear_goal_pi_turn_sign: -1
   interaction_final_align_enabled: true
-  interaction_final_align_max_distance_m: 0.12
+  interaction_final_align_max_distance_m: 0.35
   interaction_final_align_yaw_tolerance_rad: 0.15
   interaction_final_align_rotate_speed_rad_s: 0.30
   interaction_final_align_trigger_delay_s: 2.0

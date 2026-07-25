@@ -584,13 +584,19 @@ class SemanticBehaviorExecutor:
                 {"reason": "make_plan_unreachable"},
             )
             return
-        self._prerotate_for_rear_goal(
+        if not self._prerotate_for_rear_goal(
             decision_id,
             goal_frame,
             x,
             y,
             heading_target_xy=path_lookahead,
-        )
+        ):
+            self._handle_navigation_result(
+                decision_id,
+                False,
+                {"reason": "rear_goal_prerotate_timeout"},
+            )
+            return
         if not self._navigation_is_current(decision_id):
             return
         goal.target_pose.header.stamp = rospy.Time.now()
@@ -673,14 +679,25 @@ class SemanticBehaviorExecutor:
                     return
             self._handle_navigation_result(decision_id, False, {"reason": "navigation_timeout"})
             return
-        self._handle_navigation_result(
-            decision_id,
-            state == GoalStatus.SUCCEEDED,
-            {
-                "status_code": state,
-                "status": self.move_base.get_goal_status_text() or str(state),
-            },
-        )
+        success = state == GoalStatus.SUCCEEDED
+        detail = {
+            "status_code": state,
+            "status": self.move_base.get_goal_status_text() or str(state),
+        }
+        if success and interaction_navigation:
+            aligned = self._final_align_interaction_goal(
+                decision_id,
+                goal_frame,
+                x,
+                y,
+                yaw,
+            )
+            if aligned is False:
+                success = False
+                detail["reason"] = "interaction_final_yaw_alignment_failed"
+            elif aligned is True:
+                detail["reason"] = "interaction_final_yaw_alignment"
+        self._handle_navigation_result(decision_id, success, detail)
 
     def _preflight_navigation_plan(
         self,

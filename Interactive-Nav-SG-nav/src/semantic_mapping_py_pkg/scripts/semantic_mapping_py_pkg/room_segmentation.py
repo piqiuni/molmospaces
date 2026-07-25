@@ -11,6 +11,10 @@ class RoomSegmentationState:
         self.prev_room_ids = None
         self.stable_room_grid_signature = None
         self.stable_room_ids = None
+        self.stable_room_conf = None
+        self.candidate_room_ids = None
+        self.candidate_room_conf = None
+        self.candidate_room_count = 0
         self.next_room_segment_id = 1
         self.portal_hints = {}
         self.pending_merges = {}
@@ -46,6 +50,7 @@ class RoomSegmenter:
         room_portal_max_width_m=2.5,
         room_id_overlap_ratio=0.25,
         room_merge_confirmations=3,
+        room_grid_stability_frames=1,
         state=None,
     ):
         self.room_free_threshold = int(room_free_threshold)
@@ -86,6 +91,7 @@ class RoomSegmenter:
         )
         self.room_id_overlap_ratio = min(1.0, max(0.0, float(room_id_overlap_ratio)))
         self.room_merge_confirmations = max(1, int(room_merge_confirmations))
+        self.room_grid_stability_frames = max(1, int(room_grid_stability_frames))
         self.state = state if state is not None else RoomSegmentationState()
 
     def update_portal_hints(self, observations, source_mode="detector_online"):
@@ -303,14 +309,43 @@ class RoomSegmenter:
         signature = self._grid_signature(occ_grid.info)
         self.state.prev_room_grid_signature = signature
         self.state.prev_room_ids = list(room_ids)
-        if self.state.stable_room_grid_signature != signature:
+        return self._stabilize_room_grid(signature, room_ids, room_conf)
+
+    def _stabilize_room_grid(self, signature, room_ids, room_conf):
+        if self.state.stable_room_grid_signature != signature or self.state.stable_room_ids is None:
             self.state.stable_room_grid_signature = signature
             self.state.stable_room_ids = list(room_ids)
-        elif not self.state.pending_merges and not self.state.last_confirmed_merges:
+            self.state.stable_room_conf = list(room_conf)
+            self.state.candidate_room_ids = list(room_ids)
+            self.state.candidate_room_conf = list(room_conf)
+            self.state.candidate_room_count = self.room_grid_stability_frames
+            return list(room_ids), list(room_conf)
+
+        candidate_ids = self.state.candidate_room_ids
+        if candidate_ids is not None and self._room_grids_compatible(candidate_ids, room_ids):
+            self.state.candidate_room_count += 1
+        else:
+            self.state.candidate_room_count = 1
+        self.state.candidate_room_ids = list(room_ids)
+        self.state.candidate_room_conf = list(room_conf)
+        if (
+            self.state.candidate_room_count >= self.room_grid_stability_frames
+            and not self.state.pending_merges
+        ):
             self.state.stable_room_ids = list(room_ids)
-        elif self.state.last_confirmed_merges:
-            self.state.stable_room_ids = list(room_ids)
-        return room_ids, room_conf
+            self.state.stable_room_conf = list(room_conf)
+        return list(self.state.stable_room_ids), list(self.state.stable_room_conf or room_conf)
+
+    @staticmethod
+    def _room_grids_compatible(previous_ids, current_ids):
+        if len(previous_ids) != len(current_ids):
+            return False
+        previous = np.asarray(previous_ids, dtype=np.int32)
+        current = np.asarray(current_ids, dtype=np.int32)
+        common = (previous >= 0) & (current >= 0)
+        if not np.any(common):
+            return False
+        return float(np.mean(previous[common] == current[common])) >= 0.97
 
     def consume_confirmed_merges(self):
         merges = dict(self.state.last_confirmed_merges)

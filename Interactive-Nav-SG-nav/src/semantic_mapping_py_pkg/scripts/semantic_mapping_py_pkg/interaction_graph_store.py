@@ -514,12 +514,14 @@ class InteractionGraphStore:
                 (max(ys) - min(ys)) if len(ys) > 1 else float(grid_info.resolution),
                 self.room_box_height,
             ]
-            if self._accept_room_geometry(
+            stable_geometry = self._accept_room_geometry(
                 room_id, center, size, geometry_stability_frames
-            ):
-                node.centroid = center
-                node.aabb_center = center
-                node.aabb_size = size
+            )
+            if stable_geometry is not None:
+                stable_center, stable_size = stable_geometry
+                node.centroid = stable_center
+                node.aabb_center = stable_center
+                node.aabb_size = stable_size
             node.confidence = max(node.confidence, sum(room_conf[room_id]) / max(len(room_conf[room_id]), 1) / 100.0)
             node.attributes["cell_count"] = len(points)
             node.attributes["active"] = True
@@ -534,7 +536,9 @@ class InteractionGraphStore:
         else:
             candidate = {"center": list(center), "size": list(size), "count": 1}
         self.room_geometry_candidates[room_id] = candidate
-        return candidate["count"] >= max(1, int(stability_frames))
+        if candidate["count"] < max(1, int(stability_frames)):
+            return None
+        return list(candidate["center"]), list(candidate["size"])
 
     @staticmethod
     def _room_geometry_close(old_center, old_size, center, size):
