@@ -697,6 +697,11 @@ class ExplorePyNode:
             "ready": self.latest_grid is not None and self.robot_xy is not None,
             "external_behavior_control": self.external_behavior_control,
             "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
+            "map_resolution": (
+                float(self.latest_grid.spec.resolution)
+                if self.latest_grid is not None
+                else None
+            ),
             "frontier_count": len(self.latest_clusters),
             "frontier_debug": self.core.last_debug_stats,
             "frontier_clusters": [
@@ -1114,9 +1119,9 @@ class ExplorePyNode:
         msg.pose.position.x = goal.point[0]
         msg.pose.position.y = goal.point[1]
         msg.pose.position.z = 0.0
-        # Keep move_base position-only for exploration. The observation yaw is
-        # tracked in explorer state/debug output and can be executed separately.
-        msg.pose.orientation.w = 1.0
+        qz, qw = self._quaternion_z_w_from_yaw(goal.yaw)
+        msg.pose.orientation.z = qz
+        msg.pose.orientation.w = qw
         self.active_goal_publish_ros_time = msg.header.stamp.to_sec()
         self.active_goal_publish_wall_time = time.time()
         self.goal_pub.publish(msg)

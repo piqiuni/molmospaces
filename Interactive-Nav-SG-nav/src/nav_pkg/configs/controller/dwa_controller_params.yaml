@@ -22,9 +22,9 @@ DWAPlannerROS:
 
   # Goal Tolerance Parameters
   xy_goal_tolerance: 0.2
-  # Exploration goals are position-only; frontier observation yaw is handled separately.
-  yaw_goal_tolerance: 3.14
-  latch_xy_goal_tolerance: false
+  # Latch position first, then let DWA's stop/rotate controller satisfy terminal yaw.
+  yaw_goal_tolerance: 0.2
+  latch_xy_goal_tolerance: true
   prune_plan: true
 
   # Forward Simulation Parameters

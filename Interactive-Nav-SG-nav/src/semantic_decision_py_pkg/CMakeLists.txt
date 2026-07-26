@@ -8,6 +8,8 @@ find_package(catkin REQUIRED COMPONENTS
   move_base_msgs
   nav_msgs
   rospy
+  semantic_mllm_py_pkg
+  sensor_msgs
   std_msgs
 )
 

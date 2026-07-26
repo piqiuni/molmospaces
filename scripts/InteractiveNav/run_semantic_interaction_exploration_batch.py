@@ -34,7 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-horizon", type=int, default=1000)
     parser.add_argument(
         "--method",
-        choices=["container_exploration", "object_goal_runtime"],
+        choices=[
+            "container_exploration",
+            "object_goal_runtime",
+            "full_mllm_exploration",
+        ],
         default="object_goal_runtime",
     )
     parser.add_argument("--scene-timeout-s", type=float, default=1500.0)

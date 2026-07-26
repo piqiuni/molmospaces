@@ -1,0 +1,50 @@
+ablation:
+  module1: "dynamic_mllm"
+  module2: "mllm_score"
+  module3: "mllm_skill_verified"
+
+target:
+  enabled: false
+
+candidate:
+  interaction_types: ["portal", "container"]
+  require_current_visibility: false
+  max_state_age_sec: 3600.0
+  container_require_same_room: true
+  container_allow_connected_room: true
+  portal_standoff_m: 0.85
+  container_standoff_m: 1.0
+  drawer_standoff_m: 1.0
+  interaction_safety_margin_m: 0.25
+
+policy:
+  backend: "model"
+  portal_bonus: 0.55
+  container_bonus: 1.0
+  interaction_cost_weight: 0.30
+  nearby_interaction_radius_m: 1.5
+  nearby_interaction_bonus: 1.5
+  interaction_priority_bonus: 2.0
+  failure_cooldown_s: 5.0
+  interaction_target_failure_cooldown_s: 60.0
+  failure_retry_delay_s: 1.0
+  repeat_guard_enabled: true
+  repeat_guard_low_gain_limit: 2
+  repeat_guard_min_frontier_shrink_m: 0.15
+
+model:
+  timeout_s: 3.0
+  max_tokens: 256
+  consecutive_timeout_limit: 2
+  timeout_cooldown_s: 60.0
+  skill_timeout_s: 4.0
+  skill_max_output_tokens: 64
+  verification_timeout_s: 4.0
+  verification_max_output_tokens: 160
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+
+executor:
+  interaction_navigation_timeout_s: 180.0

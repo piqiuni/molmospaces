@@ -20,7 +20,7 @@ from semantic_decision_py_pkg.behavior_execution import (
 )
 
 
-def test_navigation_progress_watchdog_requires_translation_and_resets_on_progress() -> None:
+def test_navigation_progress_watchdog_resets_on_translation_or_rotation() -> None:
     watchdog = NavigationProgressWatchdog(timeout_s=12.0, min_displacement_m=0.10)
     watchdog.reset((0.0, 0.0), now=0.0)
     assert not watchdog.observe((0.01, 0.0), now=11.9)
@@ -28,6 +28,9 @@ def test_navigation_progress_watchdog_requires_translation_and_resets_on_progres
     watchdog.reset((0.0, 0.0), now=0.0)
     assert not watchdog.observe((0.11, 0.0), now=11.0)
     assert not watchdog.observe((0.12, 0.0), now=22.0)
+    watchdog.reset((0.0, 0.0, 0.0), now=0.0)
+    assert not watchdog.observe((0.0, 0.0, 0.16), now=11.0)
+    assert not watchdog.observe((0.0, 0.0, 0.17), now=22.0)
 
 
 def test_stuck_recovery_requires_explicit_stagnation_or_oscillation() -> None:

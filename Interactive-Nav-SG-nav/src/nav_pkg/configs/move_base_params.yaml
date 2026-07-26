@@ -12,7 +12,7 @@ global_replan_min_changed_cells: 300
 global_replan_min_changed_ratio: 0.05
 planner_patience: 5.0
 
-oscillation_timeout: 12.0
+oscillation_timeout: 0.0
 oscillation_distance: 0.10
 
 recovery_behavior_enabled: false

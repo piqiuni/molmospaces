@@ -224,6 +224,9 @@ class SemanticCandidateNode:
                     explorer_input.get("frontier_exhausted", False)
                 ),
                 "proposal_count": int(explorer_input.get("proposal_count", 0) or 0),
+                "map_resolution": float(
+                    explorer_input.get("map_resolution", 0.0) or 0.0
+                ),
                 "observation_step": self.graph.get("capture_step"),
                 "source": "explore_py_proposals"
                 if self.has_proposal_stream

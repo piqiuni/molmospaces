@@ -1,4 +1,5 @@
 Interactive-Nav-SG-nav/ai2thor_demo_output/*
+.env
 Interactive-Nav-SG-nav/semantic_ws/data
 Interactive-Nav-SG-nav/GLIP
 Interactive-Nav-SG-nav/GroundingDINO

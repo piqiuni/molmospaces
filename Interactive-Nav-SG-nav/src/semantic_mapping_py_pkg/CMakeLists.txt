@@ -2,11 +2,11 @@ cmake_minimum_required(VERSION 3.0.2)
 project(semantic_mapping_py_pkg)
 
 find_package(catkin REQUIRED COMPONENTS
-  cv_bridge
   geometry_msgs
   map_msgs
   nav_msgs
   rospy
+  semantic_mllm_py_pkg
   sensor_msgs
   std_msgs
   std_srvs
@@ -20,6 +20,7 @@ catkin_package()
 catkin_install_python(PROGRAMS
   scripts/object_detection_visual_test.py
   scripts/object_detection_node.py
+  scripts/interaction_attribute_inference_node.py
   scripts/room_attribute_node.py
   scripts/semantic_mapping_gt_replay.py
   scripts/semantic_mapping_node.py

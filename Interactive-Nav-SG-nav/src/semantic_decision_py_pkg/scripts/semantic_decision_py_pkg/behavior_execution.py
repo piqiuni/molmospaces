@@ -153,25 +153,36 @@ def safe_grid_motion_distance(
 class NavigationProgressWatchdog:
     timeout_s: float = 12.0
     min_displacement_m: float = 0.10
+    min_yaw_change_rad: float = 0.15
     reference_xy: tuple[float, float] | None = None
+    reference_yaw: float | None = None
     last_progress_at: float | None = None
 
-    def reset(self, pose_xy: tuple[float, float] | None, now: float) -> None:
-        self.reference_xy = pose_xy
-        self.last_progress_at = float(now) if pose_xy is not None else None
+    def reset(self, pose: tuple[float, ...] | None, now: float) -> None:
+        self.reference_xy = None if pose is None else (float(pose[0]), float(pose[1]))
+        self.reference_yaw = (
+            float(pose[2]) if pose is not None and len(pose) >= 3 else None
+        )
+        self.last_progress_at = float(now) if pose is not None else None
 
-    def observe(self, pose_xy: tuple[float, float] | None, now: float) -> bool:
-        if self.timeout_s <= 0.0 or pose_xy is None:
+    def observe(self, pose: tuple[float, ...] | None, now: float) -> bool:
+        if self.timeout_s <= 0.0 or pose is None:
             return False
         if self.reference_xy is None or self.last_progress_at is None:
-            self.reset(pose_xy, now)
+            self.reset(pose, now)
             return False
         displacement = math.hypot(
-            float(pose_xy[0]) - float(self.reference_xy[0]),
-            float(pose_xy[1]) - float(self.reference_xy[1]),
+            float(pose[0]) - float(self.reference_xy[0]),
+            float(pose[1]) - float(self.reference_xy[1]),
         )
-        if displacement >= self.min_displacement_m:
-            self.reset(pose_xy, now)
+        yaw_change = 0.0
+        if len(pose) >= 3 and self.reference_yaw is not None:
+            yaw_change = abs(normalize_angle(float(pose[2]) - self.reference_yaw))
+        if (
+            displacement >= self.min_displacement_m
+            or yaw_change >= self.min_yaw_change_rad
+        ):
+            self.reset(pose, now)
             return False
         return float(now) - self.last_progress_at >= self.timeout_s
 
@@ -179,7 +190,7 @@ class NavigationProgressWatchdog:
 @dataclass
 class ExecutionConfig:
     navigation_timeout_s: float = 180.0
-    interaction_navigation_timeout_s: float = 45.0
+    interaction_navigation_timeout_s: float = 180.0
     interaction_timeout_s: float = 30.0
     verification_timeout_s: float = 30.0
     explore_prepare_timeout_s: float = 10.0
@@ -319,6 +330,26 @@ class BehaviorExecutionStateMachine:
         if str(state) != expected:
             return []
         return self._finish(True, detail or {"state": state}, now)
+
+    def on_verification_result(
+        self,
+        success: bool,
+        detail: dict[str, Any] | None = None,
+        retry: bool = False,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.state != STATE_VERIFYING or self.candidate is None:
+            return []
+        now = time.monotonic() if now is None else float(now)
+        if success:
+            return self._finish(True, detail or {"verified": True}, now)
+        if retry:
+            return self._transition(
+                STATE_INTERACTING,
+                now,
+                {"kind": "interact", "candidate": self.candidate, "retry": True},
+            )
+        return self._finish(False, detail or {"reason": "verification_failed"}, now)
 
     def on_target_visibility(
         self,
