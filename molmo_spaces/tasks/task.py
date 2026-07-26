@@ -78,6 +78,7 @@ class BaseMujocoTask(ABC):
         self.terminal_cache: list[list[bool]] = []
         self.truncated_cache: list[list[bool]] = []
         self.success_cache: list[list[bool]] = []
+        self.retain_history = True
 
         # Policy completion tracking
         self._policy_done = False
@@ -208,11 +209,11 @@ class BaseMujocoTask(ABC):
         success = np.full(terminated.shape, fill_value=self.judge_success())
 
         # cache the inputs and outputs
-        self.observation_cache.append(observation)
-        self.reward_cache.append(reward)
-        self.terminal_cache.append(terminated)
-        self.truncated_cache.append(truncated)
-        self.success_cache.append(success)
+        self._cache_latest_or_append(self.observation_cache, observation)
+        self._cache_latest_or_append(self.reward_cache, reward)
+        self._cache_latest_or_append(self.terminal_cache, terminated)
+        self._cache_latest_or_append(self.truncated_cache, truncated)
+        self._cache_latest_or_append(self.success_cache, success)
 
         return observation, reward, terminated, truncated, info
 
@@ -375,9 +376,30 @@ class BaseMujocoTask(ABC):
         self._num_steps_taken += np.where(done, 0, 1)
 
         # Cache the action for history tracking
-        self.action_cache.append(self.last_action)
+        self._cache_latest_or_append(self.action_cache, self.last_action)
 
         return observation, reward, terminated, truncated, info
+
+    def set_history_retention(self, retain_history: bool) -> None:
+        self.retain_history = bool(retain_history)
+        if self.retain_history:
+            return
+        for cache in (
+            self.action_cache,
+            self.observation_cache,
+            self.reward_cache,
+            self.terminal_cache,
+            self.truncated_cache,
+            self.success_cache,
+        ):
+            if len(cache) > 1:
+                cache[:] = cache[-1:]
+
+    def _cache_latest_or_append(self, cache: list, value: Any) -> None:
+        if self.retain_history or not cache:
+            cache.append(value)
+        else:
+            cache[0] = value
 
     def is_done(self) -> NDArray[bool]:
         return np.logical_or(self.is_terminal(), self.is_timed_out())

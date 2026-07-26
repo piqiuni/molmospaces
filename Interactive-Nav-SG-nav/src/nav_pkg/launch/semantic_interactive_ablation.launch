@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="house_ind" default="7"/>
+  <arg name="task_horizon" default="1000"/>
+  <arg name="output_dir" default=""/>
+  <arg name="ablation_config" default="$(find semantic_decision_py_pkg)/config/default.yaml"/>
+  <arg name="enable_attribute_inference" default="false"/>
+  <arg name="model_name" default=""/>
+  <arg name="initial_door_state" default="closed"/>
+
+  <include file="$(find nav_pkg)/launch/molmospaces_nav_system.launch">
+    <arg name="house_ind" value="$(arg house_ind)"/>
+    <arg name="task_horizon" value="$(arg task_horizon)"/>
+    <arg name="output_dir" value="$(arg output_dir)"/>
+    <arg name="start_semantic_mapping" value="true"/>
+    <arg name="semantic_source" value="realtime_gt"/>
+    <arg name="publish_realtime_gt" value="true"/>
+    <arg name="start_explore_py" value="true"/>
+    <arg name="start_explore" value="false"/>
+    <arg name="start_semantic_decision" value="true"/>
+    <arg name="enable_force_interaction" value="true"/>
+    <arg name="initial_door_state" value="$(arg initial_door_state)"/>
+    <arg name="semantic_config_override_file" value="$(arg ablation_config)"/>
+    <arg name="semantic_decision_config_override_file" value="$(arg ablation_config)"/>
+    <arg name="semantic_attribute_inference" value="$(arg enable_attribute_inference)"/>
+    <arg name="semantic_attribute_model_name" value="$(arg model_name)"/>
+  </include>
+</launch>

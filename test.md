@@ -930,6 +930,31 @@ rosparam get /move_base/global_costmap/static_layer/map_topic
 注意：当前 GT 快速版依赖“首次有效门板关节观测发生在交互前、门处于闭合状态”的任务约束；真实场景中的门关节/转轴提取尚未实现。
 
 
+### 8.5.1 House 7 冰箱内物体 Obj-goal 图像采集
+
+House 7 的冰箱对象为 `refrigerator_4d8cd69ca487b76cae801cfb0248a055_1_0_6`，此前 GT 语义图中确认其内部有 `potato`、`apple` 和 `lettuce`。下面以 `apple` 为目标，初始固定在 `house7_force_route_01` 的起点，门和容器关闭，由规则语义决策自主探索、开门、打开冰箱并导航到苹果。
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:12835 \
+METHOD=object_goal_rule \
+HOUSE_IND=7 \
+USE_FIXED_ROUTE=true \
+ROUTE_ID=house7_force_route_01 \
+TASK_HORIZON=1000 \
+INITIAL_DOOR_STATE=closed \
+SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/object_goal_apple.yaml \
+GT_STEP_INTERVAL=1 \
+GT_MAX_DISTANCE_M=6.0 \
+VIDEO_FPS=15 \
+VIDEO_PANEL_WIDTH_PX=640 \
+CLEAN_INTERMEDIATE=false \
+SIM_TIMEOUT_S=1800 \
+  scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/house7_object_goal_apple_route01
+```
+
+主要输出：`videos/overview_6panel.mp4`、`debug/semantic_keyframes/`、`debug/graph/` 和 `semantic_exploration_result.json`。
+
 ## 8.6 Room分割测试
 
 python /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/room_segmentation_debug_tool.py live \
@@ -1070,3 +1095,74 @@ roslaunch nav_pkg molmospaces_nav_system.launch \
 - 历史讨论内容归档
 
 这些内容分别由 `readme_pi.md`、`TODO.md` 与 `AGENTS.md` 维护。
+
+---
+
+## 11. MLLM 模块化交互导航
+
+三模块消融配置位于：
+
+```text
+scripts/InteractiveNav/configs/semantic_decision/ablations/
+```
+
+模式定义：
+
+- 模块一：`static_semantic` / `dynamic_rule` / `dynamic_mllm`
+- 模块二：`rule_cost` / `mllm_score`
+- 模块三：`direct_atomic` / `rule_verified` / `mllm_skill_verified`
+
+House 7 规则基线示例：
+
+```bash
+roslaunch nav_pkg semantic_interactive_ablation.launch \
+  house_ind:=7 \
+  task_horizon:=1000 \
+  ablation_config:=$(rospack find semantic_decision_py_pkg)/../../../scripts/InteractiveNav/configs/semantic_decision/ablations/current_rule_baseline.yaml
+```
+
+完整 MLLM 示例需要同时启动属性推理：
+
+```bash
+roslaunch nav_pkg semantic_interactive_ablation.launch \
+  house_ind:=7 \
+  task_horizon:=1000 \
+  enable_attribute_inference:=true \
+  model_name:=<MODEL_NAME> \
+  ablation_config:=<REPO>/scripts/InteractiveNav/configs/semantic_decision/ablations/full_mllm.yaml
+```
+
+题库绑定 House 场景图像：
+
+```bash
+python scripts/InteractiveNav/collect_mllm_benchmark_samples.py \
+  --question-bank scripts/InteractiveNav/mllm_benchmark/question_bank.json \
+  --source-dir <IMAGE_DIR> \
+  --output-dir <BOUND_QUESTION_DIR> \
+  --bind attribute_closed_fridge=<CLOSED_FRIDGE_IMAGE> \
+  --bind attribute_open_portal=<OPEN_PORTAL_IMAGE> \
+  --bind verify_fridge_opened=<OPEN_FRIDGE_IMAGE> \
+  --bbox attribute_closed_fridge=<X0,Y0,X1,Y1> \
+  --bbox attribute_open_portal=<X0,Y0,X1,Y1> \
+  --bbox verify_fridge_opened=<X0,Y0,X1,Y1>
+```
+
+运行指定四模型评测：
+
+```bash
+PYTHONPATH="Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts" \
+python scripts/InteractiveNav/evaluate_mllm_question_bank.py \
+  --env-file .env \
+  --question-bank <BOUND_QUESTION_DIR>/question_bank_bound.json \
+  --models gpt-5.3-codex-spark qwen3.6-flash qwen3.5-35b-a3b deepseek-v4-flash \
+  --timeout-s 15 \
+  --reasoning-effort low \
+  --image-detail low \
+  --crop-margin-ratio 0.10 \
+  --crop-max-side-px 512 \
+  --output <OUTPUT_DIR>/model_comparison.json
+```
+
+默认按角色限制输出预算：属性 `384`、Subgoal `128`、技能规划 `192`、视觉验证 `192`。
+输出包含整体及各角色的准确率、有效响应率、逐题耗时、token、reasoning token、可见输出 TPS，并同时生成 CSV。
+视觉属性和交互反馈只输入目标 `2D bbox` 裁切；交互反馈只使用交互后的单张目标图。

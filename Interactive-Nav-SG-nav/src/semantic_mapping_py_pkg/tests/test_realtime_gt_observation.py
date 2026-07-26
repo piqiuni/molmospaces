@@ -64,7 +64,7 @@ class FakeModel:
 
 
 class FakeData:
-    xpos = np.asarray([[0.0, 0.0, 0.0], [1.0, 2.0, 0.5], [12.0, 0.0, 0.8]])
+    xpos = np.asarray([[0.0, 0.0, 0.0], [2.0, 0.0, 0.5], [12.0, 0.0, 0.8]])
     xmat = np.asarray([np.eye(3).reshape(-1), np.eye(3).reshape(-1), np.eye(3).reshape(-1)])
 
 
@@ -136,6 +136,74 @@ def test_numeric_mujoco_joint_types_are_normalized():
     assert realtime_gt._joint_type_name(np.asarray([int(mujoco.mjtJoint.mjJNT_HINGE)])) == "hinge"
 
 
+def test_slide_joint_open_direction_defines_container_front_axis():
+    class JointModel:
+        jnt_bodyid = np.asarray([1])
+
+        @staticmethod
+        def joint(_name):
+            return FakeNamedElement(0, "drawer_slide")
+
+    class JointData:
+        xaxis = np.asarray([[0.0, -1.0, 0.0]])
+
+    axis = realtime_gt._interaction_approach_axis_xy(
+        JointModel(),
+        JointData(),
+        [
+            {
+                "joint_name": "drawer_slide",
+                "joint_type": "slide",
+                "joint_range": [0.0, 0.5],
+                "joint_value": 0.0,
+            }
+        ],
+    )
+
+    assert axis == [0.0, -1.0]
+
+
+def test_visible_fraction_rejects_small_observed_extent():
+    camera_position = np.asarray([0.0, 0.0, 0.0])
+    camera_forward = np.asarray([1.0, 0.0, 0.0])
+    camera_up = np.asarray([0.0, 0.0, 1.0])
+    center = np.asarray([3.0, 0.0, 0.0])
+    size = np.asarray([1.0, 1.0, 1.0])
+    projected = realtime_gt._project_aabb_bbox(
+        camera_position,
+        camera_forward,
+        camera_up,
+        70.0,
+        [100, 100],
+        center,
+        size,
+    )
+    assert projected is not None
+    full_bbox = [int(value) for value in projected]
+    full_fraction, _ = realtime_gt._visible_fraction(
+        full_bbox,
+        camera_position,
+        camera_forward,
+        camera_up,
+        70.0,
+        [100, 100],
+        center,
+        size,
+    )
+    small_fraction, _ = realtime_gt._visible_fraction(
+        [48, 48, 51, 51],
+        camera_position,
+        camera_forward,
+        camera_up,
+        70.0,
+        [100, 100],
+        center,
+        size,
+    )
+    assert full_fraction > 0.8
+    assert small_fraction < 0.2
+
+
 def test_articulated_doorway_root_is_the_canonical_gt_spec():
     model = type("DoorModel", (), {"body_rootid": np.asarray([0, 1, 1, 3])})()
     specs = [
@@ -146,12 +214,38 @@ def test_articulated_doorway_root_is_the_canonical_gt_spec():
     assert realtime_gt.RealtimeGTObservationPublisher._canonical_door_root_specs(model, specs) == {1: 0}
 
 
+def test_door_geom_mapping_excludes_unrelated_sibling_under_same_root():
+    model = type(
+        "DoorModel",
+        (),
+        {
+            "body_parentid": np.asarray([0, 0, 1, 1]),
+        },
+    )()
+    mapping = {2: 7}
+
+    assert (
+        realtime_gt.RealtimeGTObservationPublisher._door_spec_for_body(
+            model, 2, mapping
+        )
+        == 7
+    )
+    assert (
+        realtime_gt.RealtimeGTObservationPublisher._door_spec_for_body(
+            model, 3, mapping
+        )
+        is None
+    )
+
+
 def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
     fake_rospy = FakeRospy()
     publisher = realtime_gt.RealtimeGTObservationPublisher(
         fake_rospy,
         FakeString,
         min_visible_pixels=4,
+        min_visible_fraction=0.0,
+        required_consecutive_observations=1,
         max_distance_m=8.0,
         step_interval=3,
         async_processing=False,
@@ -189,6 +283,44 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
         assert third["episode_id"] == "episode_000002"
         assert third["episode_reset"] is True
         assert third["observations"][0]["instance_id"] == "gt_000001"
+    finally:
+        realtime_gt.body_aabb = original_aabb
+        publisher.close()
+
+
+def test_reliable_observation_requires_two_consecutive_qualified_frames():
+    fake_rospy = FakeRospy()
+    publisher = realtime_gt.RealtimeGTObservationPublisher(
+        fake_rospy,
+        FakeString,
+        min_visible_pixels=4,
+        min_visible_fraction=0.0,
+        required_consecutive_observations=2,
+        max_distance_m=8.0,
+        step_interval=3,
+        async_processing=False,
+    )
+    original_aabb = realtime_gt.body_aabb
+
+    def fake_aabb(_model, data, body_id, visual_only=True):
+        assert visual_only is True
+        return data.xpos[body_id].copy(), np.asarray([0.5, 0.5, 1.0])
+
+    realtime_gt.body_aabb = fake_aabb
+    try:
+        publisher.reset()
+        _set_geom_pixels([0] * 6)
+        first = publisher.publish(FakeTask(), step_index=0)
+        second = publisher.publish(FakeTask(), step_index=3)
+        assert first["observations"] == []
+        assert len(second["observations"]) == 1
+        assert second["observations"][0]["consecutive_observations"] == 2
+
+        _set_geom_pixels([])
+        publisher.publish(FakeTask(), step_index=6)
+        _set_geom_pixels([0] * 6)
+        after_gap = publisher.publish(FakeTask(), step_index=9)
+        assert after_gap["observations"] == []
     finally:
         realtime_gt.body_aabb = original_aabb
         publisher.close()

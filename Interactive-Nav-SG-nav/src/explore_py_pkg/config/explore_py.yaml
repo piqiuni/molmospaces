@@ -13,6 +13,8 @@ topics:
   status: "/explore_py/status"
   frontiers: "/explore_py/frontiers"
   current_subgoal: "/explore_py/current_subgoal"
+  behavior_command: "/explore_py/command"
+  behavior_feedback: "/explore_py/behavior_feedback"
   reset: "/explore_py/reset"
   llm_value_grid: "/explore_py/llm_value_grid"
   strategy_bias: "/explore_py/strategy_bias"
@@ -23,6 +25,7 @@ topics:
   navigation_hints: "/semantic_mapping/navigation_hints"
 
 exploration:
+  external_behavior_control: false
   tick_rate_hz: 1.0
   goal_republish_interval_sec: 0.0
   goal_reach_tolerance_m: 0.35
@@ -49,7 +52,7 @@ exploration:
   frontier_match_distance_m: 1.0
   frontier_gone_confirm_ticks: 3
   frontier_gone_min_goal_age_sec: 8.0
-  failed_point_soft_blacklist_sec: 45.0
+  failed_point_soft_blacklist_sec: 10.0
   failed_point_blacklist_sec: 180.0
   failed_point_blacklist_radius_m: 1.25
   reached_point_blacklist_sec: 5.0
@@ -74,7 +77,14 @@ exploration:
   plan_freshness_sec: 4.0
   global_plan_current_goal_check_enabled: true
   global_plan_current_goal_grace_sec: 4.0
+  external_navigation_plan_grace_sec: 16.0
   global_plan_goal_tolerance_m: 0.6
+  make_plan_preflight_enabled: true
+  make_plan_service: "/move_base/make_plan"
+  make_plan_service_wait_sec: 2.0
+  make_plan_tolerance_m: 0.20
+  make_plan_endpoint_tolerance_m: 0.60
+  make_plan_fail_open: true
   initial_local_goal_count: 3
 
 frontier:
@@ -103,7 +113,7 @@ frontier:
   robot_radius_m: 0.30
   footprint_safety_margin_m: 0.15
   require_footprint_free: true
-  footprint_unknown_is_free: true
+  footprint_unknown_is_free: false
   turning_safety_margin_m: 0.0
   require_turning_clearance: true
   near_frontier_relax_distance_m: 1.5

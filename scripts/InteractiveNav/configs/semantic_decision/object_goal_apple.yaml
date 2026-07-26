@@ -1,0 +1,20 @@
+target:
+  enabled: true
+  target_name: "apple"
+  object_labels: ["apple"]
+  standoff_m: 0.75
+  require_interaction: false
+  require_current_visibility: false
+  completion_requires_visibility: true
+  min_visible_pixels: 16
+
+candidate:
+  interaction_types: ["portal", "container"]
+  target_require_current_visibility: false
+  target_require_same_room: true
+  target_allow_connected_room: true
+  target_min_visible_pixels: 16
+
+policy:
+  target_relevance_weight: 3.0
+  container_bonus: 1.25

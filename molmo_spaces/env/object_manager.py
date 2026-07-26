@@ -732,11 +732,12 @@ class ObjectManager:
         else return False
         """
         body_id = self.model.body(object_name).id
+        root_id = self.model.body(body_id).rootid[0]
 
         # go through all joints
         for joint_id in range(self.model.njnt):
             # if root body is same as the body_id, then joint is part of object
-            if self.model.body(self.model.joint(joint_id).bodyid[0]).rootid[0] == body_id:
+            if self.model.body(self.model.joint(joint_id).bodyid[0]).rootid[0] == root_id:
                 if self.model.joint(joint_id).type in [
                     mujoco.mjtJoint.mjJNT_HINGE,
                     mujoco.mjtJoint.mjJNT_SLIDE,
@@ -795,15 +796,34 @@ class ObjectManager:
             List of door body names found in the scene.
         """
         door_body_names = []
+        seen_root_ids = set()
         for key, value in self.scene_metadata["objects"].items():
             if "doorway" in key:
                 name_map = value.get("name_map", {})
                 bodies = name_map.get("bodies", {})
-                for k, v in bodies.items():
-                    if "_door_" in v:
-                        door_object = Door(k, self.data)
-                        if door_object.njoints > 0:
-                            door_body_names.append(k)
+                joints = name_map.get("joints", {})
+                candidates = []
+                for joint_name in joints:
+                    try:
+                        joint_id = int(self.model.joint(joint_name).id)
+                    except KeyError:
+                        continue
+                    joint_body_id = int(self.model.jnt_bodyid[joint_id])
+                    joint_body_name = self.model.body(joint_body_id).name
+                    if joint_body_name:
+                        candidates.append(str(joint_body_name))
+                candidates.extend(str(body_name) for body_name in bodies)
+                for body_name in candidates:
+                    try:
+                        door_object = Door(body_name, self.data)
+                        body_id = int(self.model.body(body_name).id)
+                    except (KeyError, ValueError):
+                        continue
+                    root_id = int(self.model.body_rootid[body_id])
+                    if root_id in seen_root_ids or door_object.njoints <= 0:
+                        continue
+                    seen_root_ids.add(root_id)
+                    door_body_names.append(body_name)
         return door_body_names
 
     def summarize_top_level_bodies(

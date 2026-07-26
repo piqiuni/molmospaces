@@ -9,8 +9,16 @@ class RoomSegmentationState:
     def __init__(self):
         self.prev_room_grid_signature = None
         self.prev_room_ids = None
+        self.stable_room_grid_signature = None
+        self.stable_room_ids = None
+        self.stable_room_conf = None
+        self.candidate_room_ids = None
+        self.candidate_room_conf = None
+        self.candidate_room_count = 0
         self.next_room_segment_id = 1
         self.portal_hints = {}
+        self.pending_merges = {}
+        self.last_confirmed_merges = {}
 
 
 class RoomSegmenter:
@@ -40,6 +48,9 @@ class RoomSegmenter:
         room_portal_hint_merge_distance_m=0.6,
         room_portal_min_width_m=0.5,
         room_portal_max_width_m=2.5,
+        room_id_overlap_ratio=0.25,
+        room_merge_confirmations=3,
+        room_grid_stability_frames=1,
         state=None,
     ):
         self.room_free_threshold = int(room_free_threshold)
@@ -78,6 +89,9 @@ class RoomSegmenter:
             self.room_portal_min_width_m,
             float(room_portal_max_width_m),
         )
+        self.room_id_overlap_ratio = min(1.0, max(0.0, float(room_id_overlap_ratio)))
+        self.room_merge_confirmations = max(1, int(room_merge_confirmations))
+        self.room_grid_stability_frames = max(1, int(room_grid_stability_frames))
         self.state = state if state is not None else RoomSegmentationState()
 
     def update_portal_hints(self, observations, source_mode="detector_online"):
@@ -295,7 +309,48 @@ class RoomSegmenter:
         signature = self._grid_signature(occ_grid.info)
         self.state.prev_room_grid_signature = signature
         self.state.prev_room_ids = list(room_ids)
-        return room_ids, room_conf
+        return self._stabilize_room_grid(signature, room_ids, room_conf)
+
+    def _stabilize_room_grid(self, signature, room_ids, room_conf):
+        if self.state.stable_room_grid_signature != signature or self.state.stable_room_ids is None:
+            self.state.stable_room_grid_signature = signature
+            self.state.stable_room_ids = list(room_ids)
+            self.state.stable_room_conf = list(room_conf)
+            self.state.candidate_room_ids = list(room_ids)
+            self.state.candidate_room_conf = list(room_conf)
+            self.state.candidate_room_count = self.room_grid_stability_frames
+            return list(room_ids), list(room_conf)
+
+        candidate_ids = self.state.candidate_room_ids
+        if candidate_ids is not None and self._room_grids_compatible(candidate_ids, room_ids):
+            self.state.candidate_room_count += 1
+        else:
+            self.state.candidate_room_count = 1
+        self.state.candidate_room_ids = list(room_ids)
+        self.state.candidate_room_conf = list(room_conf)
+        if (
+            self.state.candidate_room_count >= self.room_grid_stability_frames
+            and not self.state.pending_merges
+        ):
+            self.state.stable_room_ids = list(room_ids)
+            self.state.stable_room_conf = list(room_conf)
+        return list(self.state.stable_room_ids), list(self.state.stable_room_conf or room_conf)
+
+    @staticmethod
+    def _room_grids_compatible(previous_ids, current_ids):
+        if len(previous_ids) != len(current_ids):
+            return False
+        previous = np.asarray(previous_ids, dtype=np.int32)
+        current = np.asarray(current_ids, dtype=np.int32)
+        common = (previous >= 0) & (current >= 0)
+        if not np.any(common):
+            return False
+        return float(np.mean(previous[common] == current[common])) >= 0.97
+
+    def consume_confirmed_merges(self):
+        merges = dict(self.state.last_confirmed_merges)
+        self.state.last_confirmed_merges.clear()
+        return merges
 
     def _apply_portal_cuts(self, segmentation_free, grid_info, cv2):
         resolution = float(grid_info.resolution)
@@ -476,9 +531,15 @@ class RoomSegmenter:
     def _remap_room_component_ids(self, component_cells, grid_info):
         remapped = {}
         used_previous = set()
+        observed_merges = {}
         previous_ids = None
         signature = self._grid_signature(grid_info)
-        if self.state.prev_room_grid_signature == signature and self.state.prev_room_ids:
+        if (
+            self.state.stable_room_grid_signature == signature
+            and self.state.stable_room_ids
+        ):
+            previous_ids = self.state.stable_room_ids
+        elif self.state.prev_room_grid_signature == signature and self.state.prev_room_ids:
             previous_ids = self.state.prev_room_ids
 
         for temp_room_id, component in sorted(component_cells.items(), key=lambda item: -len(item[1])):
@@ -488,7 +549,7 @@ class RoomSegmenter:
                 overlap_counts = {}
                 for idx in component:
                     prev_room_id = int(previous_ids[idx])
-                    if prev_room_id < 0 or prev_room_id in used_previous:
+                    if prev_room_id < 0:
                         continue
                     overlap_counts[prev_room_id] = overlap_counts.get(prev_room_id, 0) + 1
                 if overlap_counts:
@@ -496,13 +557,35 @@ class RoomSegmenter:
                         sorted(overlap_counts.items()),
                         key=lambda item: item[1],
                     )
-            if best_prev_room_id is not None and best_overlap > 0:
+            if (
+                best_prev_room_id is not None
+                and best_overlap / max(len(component), 1) >= self.room_id_overlap_ratio
+                and best_prev_room_id not in used_previous
+            ):
                 remapped[temp_room_id] = best_prev_room_id
                 used_previous.add(best_prev_room_id)
+                for previous_room_id, overlap in overlap_counts.items():
+                    if previous_room_id == best_prev_room_id:
+                        continue
+                    if overlap / max(len(component), 1) >= self.room_id_overlap_ratio:
+                        observed_merges[int(previous_room_id)] = int(best_prev_room_id)
             else:
                 remapped[temp_room_id] = self.state.next_room_segment_id
                 self.state.next_room_segment_id += 1
+        self._update_merge_confirmations(observed_merges)
         return remapped
+
+    def _update_merge_confirmations(self, observed_merges):
+        next_pending = {}
+        for secondary, primary in observed_merges.items():
+            key = (int(secondary), int(primary))
+            count = int(self.state.pending_merges.get(key, 0)) + 1
+            if count >= self.room_merge_confirmations:
+                self.state.last_confirmed_merges[int(secondary)] = int(primary)
+                self.state.pending_merges.pop(key, None)
+                continue
+            next_pending[key] = count
+        self.state.pending_merges = next_pending
 
     @staticmethod
     def _grid_signature(grid_info):

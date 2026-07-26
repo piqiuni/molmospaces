@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import json
 import math
 import os
@@ -19,6 +20,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping_py_pkg.geometry_utils import normalize_label, transform_point_best_effort
 from semantic_mapping_py_pkg.graph_rules import observation_from_detection
+from semantic_mapping_py_pkg.graph_ablation import apply_module1_ablation
 from semantic_mapping_py_pkg.interaction_graph_viz import build_graph_marker_array
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text
@@ -27,6 +29,7 @@ from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param, get_topics
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore, SceneGridStore
 from semantic_mapping_py_pkg.semantic_occ_overlay import OverlayUpdateRegionTracker, SemanticOccupancyOverlay
+from semantic_mllm_py_pkg.ablation import AblationConfig
 
 
 class SemanticMappingNode:
@@ -36,6 +39,12 @@ class SemanticMappingNode:
         topics = get_topics(rospy)
         frames = get_frames(rospy)
         config = get_nested_param(rospy, "semantic_map", {}) or {}
+        ablation_config = get_nested_param(rospy, "ablation", {}) or {}
+        self.ablation = AblationConfig(
+            module1=str(ablation_config.get("module1", "dynamic_rule")),
+            module2=str(ablation_config.get("module2", "rule_cost")),
+            module3=str(ablation_config.get("module3", "rule_verified")),
+        )
         scene_types = get_nested_param(rospy, "scene_types", {}) or {}
 
         self.world_frame = frames.get("world_frame", "tf_frame_map")
@@ -45,7 +54,13 @@ class SemanticMappingNode:
         self.occupancy_grid_topic = topics.get("occupancy_grid", "/struct_mapping/occ_map")
         self.room_context_topic = topics.get("room_context", "/semantic_mapping/room_context")
         self.gt_observations_topic = topics.get("gt_observations", "/semantic_mapping/gt_observations")
+        self.interaction_command_topic = topics.get(
+            "interaction_command", "/semantic_decision/interaction_command"
+        )
         self.interaction_result_topic = topics.get("interaction_result", "/semantic_mapping/interaction_result")
+        self.attribute_updates_topic = topics.get(
+            "attribute_updates", "/semantic_mapping/attribute_updates"
+        )
         self.planning_occupancy_grid_topic = topics.get(
             "planning_occupancy_grid", "/semantic_mapping/planning_occ_map"
         )
@@ -58,6 +73,9 @@ class SemanticMappingNode:
         self.object_markers_topic = topics.get("object_markers", "/semantic_mapping/object_semantic_map_markers")
         self.scene_id_grid_topic = topics.get("scene_id_grid", "/semantic_mapping/scene_id_grid")
         self.scene_confidence_grid_topic = topics.get("scene_confidence_grid", "/semantic_mapping/scene_confidence_grid")
+        self.room_segment_grid_topic = topics.get(
+            "room_segment_grid", "/semantic_mapping/room_segment_grid"
+        )
         self.unified_graph_topic = topics.get("unified_graph", "/semantic_mapping/unified_graph")
         self.navigation_hints_topic = topics.get("navigation_hints", "/semantic_mapping/navigation_hints")
         self.unified_graph_markers_topic = topics.get(
@@ -107,6 +125,14 @@ class SemanticMappingNode:
         )
         self.room_portal_min_width_m = float(config.get("room_portal_min_width_m", 0.5))
         self.room_portal_max_width_m = float(config.get("room_portal_max_width_m", 2.5))
+        self.room_id_overlap_ratio = float(config.get("room_id_overlap_ratio", 0.25))
+        self.room_merge_confirmations = int(config.get("room_merge_confirmations", 3))
+        self.room_grid_stability_frames = int(
+            config.get("room_grid_stability_frames", 3)
+        )
+        self.room_geometry_stability_frames = int(
+            config.get("room_geometry_stability_frames", 5)
+        )
         self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
         self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
         self.graph_min_observations = max(1, int(config.get("graph_min_observations", 1)))
@@ -155,6 +181,7 @@ class SemanticMappingNode:
         self.latest_cloud = None
         self.latest_scene = None
         self.latest_occupancy_grid = None
+        self.latest_room_segment_grid = None
         self.room_segmenter = RoomSegmenter(
             room_free_threshold=self.room_free_threshold,
             room_unknown_id=self.room_unknown_id,
@@ -176,6 +203,9 @@ class SemanticMappingNode:
             room_portal_hint_merge_distance_m=self.room_portal_hint_merge_distance_m,
             room_portal_min_width_m=self.room_portal_min_width_m,
             room_portal_max_width_m=self.room_portal_max_width_m,
+            room_id_overlap_ratio=self.room_id_overlap_ratio,
+            room_merge_confirmations=self.room_merge_confirmations,
+            room_grid_stability_frames=self.room_grid_stability_frames,
             state=RoomSegmentationState(),
         )
         self.tf_listener = tf.TransformListener()
@@ -188,14 +218,23 @@ class SemanticMappingNode:
         self.gt_observation_sub = rospy.Subscriber(
             self.gt_observations_topic, String, self.gt_observation_callback, queue_size=2
         )
+        self.interaction_command_sub = rospy.Subscriber(
+            self.interaction_command_topic, String, self.interaction_command_callback, queue_size=2
+        )
         self.interaction_result_sub = rospy.Subscriber(
             self.interaction_result_topic, String, self.interaction_result_callback, queue_size=2
+        )
+        self.attribute_updates_sub = rospy.Subscriber(
+            self.attribute_updates_topic, String, self.attribute_updates_callback, queue_size=2
         )
 
         self.object_pub = rospy.Publisher(self.object_map_topic, String, queue_size=1)
         self.marker_pub = rospy.Publisher(self.object_markers_topic, MarkerArray, queue_size=1)
         self.scene_id_pub = rospy.Publisher(self.scene_id_grid_topic, OccupancyGrid, queue_size=1, latch=True)
         self.scene_conf_pub = rospy.Publisher(self.scene_confidence_grid_topic, OccupancyGrid, queue_size=1, latch=True)
+        self.room_segment_pub = rospy.Publisher(
+            self.room_segment_grid_topic, OccupancyGrid, queue_size=1, latch=True
+        )
         self.unified_graph_pub = rospy.Publisher(self.unified_graph_topic, String, queue_size=1, latch=True)
         self.navigation_hints_pub = rospy.Publisher(self.navigation_hints_topic, String, queue_size=1, latch=True)
         self.planning_occupancy_grid_pub = rospy.Publisher(
@@ -297,15 +336,52 @@ class SemanticMappingNode:
                 observations,
                 stamp=stamp,
                 source_mode="realtime_gt_observation",
+                capture_step=parsed.get("capture_step"),
             )
             publish_bundle = self._collect_publish_bundle_locked()
         self._safe_publish_bundle(publish_bundle)
+
+    def interaction_command_callback(self, msg):
+        parsed = parse_json_object_or_text(msg.data)
+        if str(parsed.get("action") or "").casefold() != "open":
+            return
+        with self.lock:
+            changed = self.semantic_occ_overlay.set_interaction_pending(
+                parsed.get("node_id"), True
+            )
+            publish_bundle = self._collect_publish_bundle_locked() if changed else None
+        if publish_bundle is not None:
+            self._safe_publish_bundle(publish_bundle)
 
     def interaction_result_callback(self, msg):
         parsed = parse_json_object_or_text(msg.data)
         stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
         with self.lock:
+            pending_changed = self.semantic_occ_overlay.set_interaction_pending(
+                parsed.get("node_id"), False
+            )
             changed = self.graph_store.update_interaction_result(parsed, stamp=stamp)
+            publish_bundle = (
+                self._collect_publish_bundle_locked()
+                if changed or pending_changed
+                else None
+            )
+        if publish_bundle is not None:
+            self._safe_publish_bundle(publish_bundle)
+
+    def attribute_updates_callback(self, msg):
+        if self.ablation.module1 != "dynamic_mllm":
+            return
+        parsed = parse_json_object_or_text(msg.data)
+        episode_id = str(parsed.get("episode_id") or "")
+        if episode_id and self.graph_store.episode_id and episode_id != self.graph_store.episode_id:
+            return
+        stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
+        changed = False
+        with self.lock:
+            for patch in parsed.get("updates") or []:
+                if isinstance(patch, dict):
+                    changed = self.graph_store.apply_attribute_patch(patch, stamp=stamp) or changed
             publish_bundle = self._collect_publish_bundle_locked() if changed else None
         if publish_bundle is not None:
             self._safe_publish_bundle(publish_bundle)
@@ -339,11 +415,15 @@ class SemanticMappingNode:
         if self.latest_occupancy_grid is None:
             return
         room_ids, room_conf = self._segment_rooms_from_occupancy(self.latest_occupancy_grid)
+        room_merges = self.room_segmenter.consume_confirmed_merges()
+        self.latest_room_segment_grid = self._build_cropped_room_segment_grid(room_ids)
         self.graph_store.update_room_grid(
             self.latest_occupancy_grid.info,
             room_ids,
             room_conf,
             room_id_to_name=self.id_to_class,
+            room_merges=room_merges,
+            geometry_stability_frames=self.room_geometry_stability_frames,
         )
 
     def publish_callback(self, _event):
@@ -400,7 +480,10 @@ class SemanticMappingNode:
         scene_info_ready = self.enable_scene_mapping and self.scene_store.info is not None
         scene_grid = self._build_grid(self.scene_store.scene_data) if scene_info_ready else None
         scene_conf_grid = self._build_grid(self.scene_store.confidence_data) if scene_info_ready else None
-        graph_payload = self.graph_store.as_graph_dict()
+        room_segment_grid = self.latest_room_segment_grid
+        graph_payload = apply_module1_ablation(
+            self.graph_store.as_graph_dict(), self.ablation.module1
+        )
         self.semantic_occ_overlay.update_graph(graph_payload)
         planning_grid = None
         planning_update = None
@@ -431,6 +514,7 @@ class SemanticMappingNode:
             "obj_map": obj_map,
             "scene_grid": scene_grid,
             "scene_conf_grid": scene_conf_grid,
+            "room_segment_grid": room_segment_grid,
             "graph_payload": graph_payload,
             "planning_grid": planning_grid,
             "planning_update": planning_update,
@@ -442,6 +526,7 @@ class SemanticMappingNode:
         obj_map = bundle["obj_map"]
         scene_grid = bundle["scene_grid"]
         scene_conf_grid = bundle["scene_conf_grid"]
+        room_segment_grid = bundle["room_segment_grid"]
         graph_payload = bundle["graph_payload"]
         planning_grid = bundle["planning_grid"]
         planning_update = bundle["planning_update"]
@@ -452,6 +537,8 @@ class SemanticMappingNode:
         if scene_grid is not None and scene_conf_grid is not None:
             self.scene_id_pub.publish(scene_grid)
             self.scene_conf_pub.publish(scene_conf_grid)
+        if room_segment_grid is not None:
+            self.room_segment_pub.publish(room_segment_grid)
         if planning_grid is not None and door_clear_mask is not None:
             self.planning_occupancy_grid_pub.publish(planning_grid)
             self.door_clear_mask_pub.publish(door_clear_mask)
@@ -478,6 +565,52 @@ class SemanticMappingNode:
         grid.header.frame_id = raw.header.frame_id or self.world_frame
         grid.info = raw.info
         grid.data = [int(value) for value in data]
+        return grid
+
+    def _build_cropped_room_segment_grid(self, room_ids):
+        raw = self.latest_occupancy_grid
+        width = int(raw.info.width)
+        height = int(raw.info.height)
+        values = room_ids
+        valid_indices = [index for index, room_id in enumerate(values) if int(room_id) >= 0]
+
+        if valid_indices:
+            rows = [index // width for index in valid_indices]
+            cols = [index % width for index in valid_indices]
+            row_min = min(rows)
+            row_max = max(rows) + 1
+            col_min = min(cols)
+            col_max = max(cols) + 1
+        else:
+            row_min = 0
+            row_max = 1
+            col_min = 0
+            col_max = 1
+
+        cropped = []
+        for row in range(row_min, row_max):
+            start = row * width + col_min
+            cropped.extend(values[start : start + (col_max - col_min)])
+
+        grid = OccupancyGrid()
+        grid.header.seq = raw.header.seq
+        grid.header.stamp = raw.header.stamp
+        grid.header.frame_id = raw.header.frame_id or self.world_frame
+        grid.info = copy.deepcopy(raw.info)
+        grid.info.width = col_max - col_min
+        grid.info.height = row_max - row_min
+
+        origin = grid.info.origin
+        yaw = math.atan2(
+            2.0 * (origin.orientation.w * origin.orientation.z + origin.orientation.x * origin.orientation.y),
+            1.0 - 2.0 * (origin.orientation.y * origin.orientation.y + origin.orientation.z * origin.orientation.z),
+        )
+        resolution = float(grid.info.resolution)
+        offset_x = float(col_min) * resolution
+        offset_y = float(row_min) * resolution
+        origin.position.x += math.cos(yaw) * offset_x - math.sin(yaw) * offset_y
+        origin.position.y += math.sin(yaw) * offset_x + math.cos(yaw) * offset_y
+        grid.data = [int(value) for value in cropped]
         return grid
 
     @staticmethod

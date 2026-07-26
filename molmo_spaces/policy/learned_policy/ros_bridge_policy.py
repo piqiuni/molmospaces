@@ -77,9 +77,12 @@ class RosBridgePolicy(BasePolicy):
         realtime_gt_topic: str = "/semantic_mapping/gt_observations",
         realtime_gt_camera_name: str = "head_camera",
         realtime_gt_min_visible_pixels: int = 16,
+        realtime_gt_min_visible_fraction: float = 0.2,
+        realtime_gt_required_consecutive_observations: int = 2,
         realtime_gt_step_interval: int = 3,
         realtime_gt_max_distance_m: float = 6.0,
         step_frame_dir: str = "",
+        step_frame_queue_size: int = 4,
         step_sync_topic: str = "/molmo_spaces/step_sync",
     ) -> None:
         super().__init__(config, task)
@@ -136,7 +139,9 @@ class RosBridgePolicy(BasePolicy):
         self.extra_image_camera_name = extra_image_camera_name
         self.step_frame_dir = Path(step_frame_dir).expanduser().resolve() if step_frame_dir else None
         self.step_sync_topic = str(step_sync_topic)
-        self._step_frame_queue: queue.Queue = queue.Queue()
+        self._step_frame_queue: queue.Queue = queue.Queue(
+            maxsize=max(1, int(step_frame_queue_size))
+        )
         self._step_frame_thread = None
         self._latest_gt_payload = None
         self.publish_realtime_gt = bool(publish_realtime_gt)
@@ -261,6 +266,8 @@ class RosBridgePolicy(BasePolicy):
                 topic=realtime_gt_topic,
                 camera_name=realtime_gt_camera_name,
                 min_visible_pixels=realtime_gt_min_visible_pixels,
+                min_visible_fraction=realtime_gt_min_visible_fraction,
+                required_consecutive_observations=realtime_gt_required_consecutive_observations,
                 step_interval=realtime_gt_step_interval,
                 max_distance_m=realtime_gt_max_distance_m,
                 queue_size=self.queue_size,

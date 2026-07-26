@@ -219,15 +219,17 @@ def save_house_trajectories(
         if datagen_profiler is not None:
             datagen_profiler.start("save_batch_prep")
 
+        save_videos = bool(getattr(exp_config, "record_videos", True))
         house_trajectory_data = []
         for idx, episode_info in enumerate(house_raw_histories):
             prepared_episode = prepare_episode_for_saving(
                 episode_info["history"],
                 episode_info["sensor_suite"],
                 fps=exp_config.fps,
-                save_dir=house_output_dir,
+                save_dir=house_output_dir if save_videos else None,
                 episode_idx=idx,
                 save_file_suffix=batch_suffix,
+                remove_camera_sensors=True,
             )
             if prepared_episode is not None:
                 house_trajectory_data.append(prepared_episode)
@@ -246,7 +248,7 @@ def save_house_trajectories(
             save_dir=house_output_dir,
             fps=exp_config.fps,
             save_file_suffix=batch_suffix,
-            save_mp4s=True,
+            save_mp4s=save_videos,
             logger=worker_logger,
         )
         if datagen_profiler is not None:

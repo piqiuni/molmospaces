@@ -120,10 +120,23 @@ class SemanticOccupancyOverlay:
         self.open_states = set(open_states or ["open"])
         self.reference_aabbs: dict[str, tuple[list[float], list[float]]] = {}
         self.active_portal_ids: set[str] = set()
+        self.pending_portal_ids: set[str] = set()
 
     def reset(self) -> None:
         self.reference_aabbs.clear()
         self.active_portal_ids.clear()
+        self.pending_portal_ids.clear()
+
+    def set_interaction_pending(self, node_id: str, pending: bool) -> bool:
+        node_id = str(node_id or "")
+        if not node_id:
+            return False
+        before = set(self.pending_portal_ids)
+        if pending:
+            self.pending_portal_ids.add(node_id)
+        else:
+            self.pending_portal_ids.discard(node_id)
+        return before != self.pending_portal_ids
 
     def update_graph(self, graph_payload: dict[str, Any]) -> None:
         active = set()
@@ -140,7 +153,7 @@ class SemanticOccupancyOverlay:
                 self.reference_aabbs[node_id] = (center, size)
             if state in self.open_states and node_id in self.reference_aabbs:
                 active.add(node_id)
-        self.active_portal_ids = active
+        self.active_portal_ids = active | self.pending_portal_ids
 
     def apply(self, grid_info: Any, raw_data: list[int]) -> tuple[list[int], list[int], dict[str, Any]]:
         width = int(grid_info.width)

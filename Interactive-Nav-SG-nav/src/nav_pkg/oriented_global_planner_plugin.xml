@@ -1,0 +1,7 @@
+<library path="lib/liboriented_global_planner">
+  <class name="nav_pkg/OrientedGlobalPlanner"
+         type="nav_pkg::OrientedGlobalPlanner"
+         base_class_type="nav_core::BaseGlobalPlanner">
+    <description>GlobalPlanner wrapper that preserves the commanded terminal yaw.</description>
+  </class>
+</library>

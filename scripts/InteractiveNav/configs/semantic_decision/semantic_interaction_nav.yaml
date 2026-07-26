@@ -1,0 +1,17 @@
+GlobalPlanner:
+  allow_unknown: false
+  orientation_mode: 3
+  orientation_window_size: 8
+
+DWAPlannerROS:
+  xy_goal_tolerance: 0.30
+  yaw_goal_tolerance: 0.20
+  latch_xy_goal_tolerance: true
+  heading_scoring: true
+  heading_scoring_timestep: 0.8
+
+global_costmap:
+  transform_tolerance: 3.0
+
+local_costmap:
+  transform_tolerance: 3.0

@@ -77,7 +77,7 @@ class ExplorerStateConfig:
     frontier_match_distance_m: float = 1.0
     frontier_gone_confirm_ticks: int = 3
     frontier_gone_min_goal_age_sec: float = 8.0
-    failed_point_soft_blacklist_sec: float = 45.0
+    failed_point_soft_blacklist_sec: float = 10.0
     failed_point_blacklist_sec: float = 180.0
     failed_point_blacklist_radius_m: float = 1.25
     reached_point_blacklist_sec: float = 90.0

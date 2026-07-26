@@ -13,7 +13,9 @@ topics:
   occupancy_grid: "/struct_mapping/occ_map"
   room_context: "/semantic_mapping/room_context"
   gt_observations: "/semantic_mapping/gt_observations"
+  interaction_command: "/semantic_decision/interaction_command"
   interaction_result: "/semantic_mapping/interaction_result"
+  attribute_updates: "/semantic_mapping/attribute_updates"
   planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
   planning_occupancy_grid_updates: "/semantic_mapping/planning_occ_map_updates"
   door_clear_mask: "/semantic_mapping/door_clear_mask"
@@ -25,12 +27,18 @@ topics:
   object_markers: "/semantic_mapping/object_semantic_map_markers"
   scene_id_grid: "/semantic_mapping/scene_id_grid"
   scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
+  room_segment_grid: "/semantic_mapping/room_segment_grid"
   unified_graph: "/semantic_mapping/unified_graph"
   unified_graph_markers: "/semantic_mapping/unified_graph_markers"
   unified_graph_markers_lifted: "/semantic_mapping/unified_graph_markers_lifted"
   navigation_hints: "/semantic_mapping/navigation_hints"
   scene_colored_pointcloud: "/semantic_mapping/scene_semantic_map/colored_pointcloud"
   scene_legend: "/semantic_mapping/scene_semantic_map/legend"
+
+ablation:
+  module1: "dynamic_rule"
+  module2: "rule_cost"
+  module3: "rule_verified"
 
 object_detection:
   backend: "mock_empty"       # no_detection | mock_empty | external_http | yolo_world_center_projection | yolo_world_sam_box3d | sam3_box3d | yoloe_pf_box3d
@@ -142,6 +150,10 @@ semantic_map:
   room_portal_hint_merge_distance_m: 0.6
   room_portal_min_width_m: 0.5
   room_portal_max_width_m: 2.5
+  room_id_overlap_ratio: 0.25
+  room_merge_confirmations: 3
+  room_grid_stability_frames: 3
+  room_geometry_stability_frames: 5
   lifted_graph_frame: "tf_frame_map_graph"
   lifted_graph_z_offset: 10.0
   graph_save_path: ""
@@ -165,7 +177,7 @@ interaction_graph:
 semantic_occ_overlay:
   enabled: true
   clear_padding_m: 0.10
-  open_states: ["open"]
+  open_states: ["ajar", "open"]
 
 scene_types:
   unknown_id: -1

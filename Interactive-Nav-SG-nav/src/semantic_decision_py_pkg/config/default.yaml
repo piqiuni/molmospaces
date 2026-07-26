@@ -1,0 +1,138 @@
+topics:
+  explorer_status: "/explore_py/status"
+  explorer_proposals: "/explore_py/proposals"
+  unified_graph: "/semantic_mapping/unified_graph"
+  odom: "/odom"
+  candidates: "/semantic_decision/candidates"
+  target_context: "/semantic_decision/target"
+  goal_status: "/semantic_decision/goal_status"
+  selected_behavior: "/semantic_decision/selected_behavior"
+  behavior_feedback: "/semantic_decision/behavior_feedback"
+  execution_state: "/semantic_decision/execution_state"
+  explore_command: "/explore_py/command"
+  explore_feedback: "/explore_py/behavior_feedback"
+  interaction_command: "/semantic_decision/interaction_command"
+  interaction_result: "/semantic_mapping/interaction_result"
+  move_base: "/move_base"
+  cmd_vel: "/cmd_vel"
+  occupancy: "/move_base/local_costmap/costmap"
+
+mission:
+  mode: "semantic_interaction_exploration"
+
+ablation:
+  module1: "dynamic_rule"
+  module2: "rule_cost"
+  module3: "rule_verified"
+
+candidate:
+  max_frontier_candidates: 12
+  interaction_types: ["portal", "container"]
+  container_require_same_room: false
+  container_allow_connected_room: false
+  max_state_age_sec: 300.0
+  min_state_confidence: 0.5
+  portal_standoff_m: 0.85
+  container_standoff_m: 0.5
+  drawer_standoff_m: 0.25
+  interaction_safety_margin_m: 0.25
+  interaction_ready_distance_m: 0.45
+  require_current_visibility: false
+  target_standoff_m: 1.0
+  target_max_state_age_sec: 300.0
+  target_require_current_visibility: false
+  target_require_same_room: false
+  target_allow_connected_room: false
+  open_fraction_threshold: 0.67
+  target_require_visibility_verification: true
+  target_min_visible_pixels: 128
+  target_min_visible_fraction: 0.2
+  target_min_consecutive_observations: 2
+  drawer_sequence_enabled: true
+
+policy:
+  backend: "rule"
+  exploration_gain_weight: 1.0
+  visibility_gain_weight: 0.8
+  semantic_gain_weight: 0.6
+  target_relevance_weight: 3.0
+  confidence_weight: 0.25
+  priority_weight: 0.45
+  distance_cost_weight: 0.45
+  distance_normalization_m: 6.0
+  interaction_cost_weight: 0.30
+  staleness_cost_weight: 0.35
+  portal_bonus: 0.55
+  container_bonus: 1.0
+  continuity_bonus: 0.25
+  nearby_interaction_radius_m: 1.5
+  nearby_interaction_bonus: 1.5
+  interaction_priority_bonus: 0.0
+  minimum_score: -1000000000.0
+  failure_cooldown_s: 30.0
+  failure_cooldown_schedule_s: [30.0, 60.0, 180.0]
+  success_cooldown_s: 5.0
+  failure_retry_delay_s: 2.0
+
+model:
+  mode: "disabled"
+  command: ""
+  endpoint: ""
+  api_key_env: "OPENAI_API_KEY"
+  model: "qwen3.6-35b-a3b"
+  protocol: "openai_chat"
+  timeout_s: 3.0
+  reasoning_effort: "off"
+  metrics_path: ""
+  max_graph_nodes: 80
+  max_graph_edges: 160
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+
+executor:
+  map_frame: "tf_frame_map"
+  base_frame: "tf_frame_base_link"
+  navigation_timeout_s: 180.0
+  interaction_navigation_timeout_s: 60.0
+  interaction_timeout_s: 30.0
+  verification_timeout_s: 30.0
+  explore_prepare_timeout_s: 3.0
+  explore_finalize_timeout_s: 10.0
+  explore_reservation_retry_sec: 0.25
+  graph_poll_rate_hz: 5.0
+  rear_goal_prerotate_enabled: true
+  rear_goal_enter_angle_rad: 1.75
+  rear_goal_exit_angle_rad: 0.34
+  rear_goal_rotate_speed_rad_s: 1.25
+  rear_goal_prerotate_timeout_s: 12.0
+  rear_goal_lookahead_m: 0.75
+  rear_goal_pi_tie_tolerance_rad: 0.20
+  rear_goal_pi_turn_sign: -1
+  final_align_enabled: false
+  interaction_final_align_enabled: false
+  interaction_final_align_max_distance_m: 0.35
+  interaction_final_align_yaw_tolerance_rad: 0.15
+  interaction_final_align_rotate_speed_rad_s: 0.30
+  interaction_final_align_trigger_delay_s: 2.0
+  interaction_final_align_timeout_s: 15.0
+  final_align_cancel_wait_s: 1.0
+  make_plan_preflight_enabled: true
+  make_plan_service: "/move_base/make_plan"
+  make_plan_service_wait_sec: 2.0
+  make_plan_tolerance_m: 0.20
+  make_plan_endpoint_tolerance_m: 0.60
+  make_plan_fail_open: true
+  navigation_stagnation_timeout_s: 12.0
+  navigation_stagnation_distance_m: 0.10
+  stuck_recovery_enabled: true
+  stuck_recovery_subgoal_failures: 3
+  stuck_recovery_min_displacement_m: 0.10
+  stuck_recovery_backoff_distance_m: 0.20
+  stuck_recovery_speed_mps: 0.12
+  stuck_recovery_timeout_s: 8.0
+  stuck_recovery_obstacle_escape_distance_m: 0.35
+  stuck_recovery_robot_radius_m: 0.30
+  stuck_recovery_safety_margin_m: 0.05
+  stuck_recovery_unknown_is_blocked: true
