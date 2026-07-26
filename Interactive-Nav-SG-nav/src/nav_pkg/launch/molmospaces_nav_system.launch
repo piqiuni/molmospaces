@@ -28,7 +28,7 @@
   <arg name="start_semantic_decision" default="false"/>
   <arg name="semantic_decision_config_file" default="$(find semantic_decision_py_pkg)/config/default.yaml"/>
   <arg name="semantic_decision_config_override_file" default=""/>
-  <arg name="local_costmap_inflation_radius" default="0.20"/>
+  <arg name="local_costmap_inflation_radius" default="0.30"/>
   <arg name="explore_py_config_file" default="$(find explore_py_pkg)/config/explore_py.yaml"/>
   <arg name="explore_py_config_override_file" default=""/>
   <arg name="nav_config_override_file" default=""/>

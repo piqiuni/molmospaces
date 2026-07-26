@@ -261,6 +261,51 @@ def test_multi_drawer_observation_generates_single_joint_groups():
     assert groups[0]["view_profile"] == "drawer_low_view"
 
 
+def test_fridge_with_slide_joint_opens_all_joints_without_drawer_scan():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_1",
+                semantic_name="fridge",
+                category="Fridge",
+                is_receptacle=True,
+                is_articulable=True,
+                joint_infos=[
+                    {
+                        "joint_name": "fridge_door_left",
+                        "joint_type": "hinge",
+                        "joint_range": [0.0, 1.57],
+                        "joint_value": 0.0,
+                    },
+                    {
+                        "joint_name": "fridge_inner_slide",
+                        "joint_type": "slide",
+                        "joint_range": [0.0, 0.4],
+                        "joint_value": 0.0,
+                    },
+                ],
+            )
+        ]
+    )
+
+    node = next(
+        node
+        for node in store.as_graph_dict()["nodes"]
+        if node["id"] == "container_fridge_1"
+    )
+    assert node["attributes"]["interaction_groups"] == [
+        {
+            "group_id": "all_joints",
+            "target_joint_names": ["fridge_door_left", "fridge_inner_slide"],
+            "close_other_joint_names": [],
+            "close_other_joints": False,
+            "mode": "open_close",
+            "view_profile": "default",
+        }
+    ]
+
+
 def test_toilet_receptacle_metadata_does_not_make_it_a_container():
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
@@ -563,6 +608,76 @@ def test_portal_room_connections_are_inferred_from_room_ring():
     assert {edge["dst_id"] for edge in connects} == {"room_1", "room_2"}
     assert all(edge["attributes"]["traversable"] is False for edge in connects)
     assert all(edge["attributes"]["requires_interaction"] is True for edge in connects)
+
+
+def test_portal_room_ring_does_not_reach_distant_room():
+    class WideGridInfo(FakeGridInfo):
+        width = 12
+
+    scene_data = []
+    for _y in range(WideGridInfo.height):
+        scene_data.extend([2] * 7 + [-1] + [1] * 4)
+    store = InteractionGraphStore(
+        scene_id="test_scene", portal_room_max_radius_m=1.0
+    )
+    store.update_room_grid(WideGridInfo(), scene_data, [100] * len(scene_data))
+    store.update_observations(
+        [
+            observation(
+                instance_id="door_near_room_2",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=0.0,
+                position=[5.0, 4.0, 1.0],
+                aabb_center=[5.0, 4.0, 1.0],
+                aabb_size=[1.0, 2.0, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert portal["attributes"]["connected_room_ids"] == [2]
+    assert portal["attributes"]["connectivity_status"] == "partial"
+
+
+def test_container_room_assignment_uses_nearest_segment_ring():
+    scene_data = [1] * (FakeGridInfo.width * FakeGridInfo.height)
+    for y in range(3, 5):
+        for x in range(3, 5):
+            scene_data[y * FakeGridInfo.width + x] = -1
+    store = InteractionGraphStore(
+        scene_id="test_scene",
+        object_room_search_margin_m=0.75,
+    )
+    store.update_room_grid(FakeGridInfo(), scene_data, [100] * len(scene_data))
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_ring",
+                semantic_name="fridge",
+                category="Fridge",
+                is_receptacle=True,
+                is_articulable=True,
+                position=[4.0, 4.0, 1.0],
+                aabb_center=[4.0, 4.0, 1.0],
+                aabb_size=[2.0, 2.0, 2.0],
+            )
+        ]
+    )
+
+    fridge = next(
+        node
+        for node in store.as_graph_dict()["nodes"]
+        if node["id"] == "container_fridge_ring"
+    )
+    assert fridge["room_id"] == 1
+    assert fridge["parent_id"] == "room_1"
 
 
 def test_container_relation_persists_while_child_is_unobserved_and_clears_after_move():

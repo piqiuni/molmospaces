@@ -77,6 +77,80 @@ def test_controller_deduplicates_command_ids() -> None:
     assert not controller.enqueue_command(command)
 
 
+def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
+    monkeypatch,
+) -> None:
+    advances = []
+    view_profiles = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, root_name, **_kwargs: {
+            "group": {"root_body_name": root_name, "joints": []},
+            "targets": {"hinge": 1.0},
+            "selected_joint_names": ["hinge"],
+            "closed_joint_names": [],
+            "pre_joint_infos": [{"joint_name": "hinge", "joint_value": 0.0}],
+        },
+    )
+
+    def advance(_env, _plan, progress, **_kwargs):
+        advances.append(progress)
+        return {
+            "progress": progress,
+            "physics_substeps": 2,
+            "fallback": False,
+        }
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.advance_articulation_force",
+        advance,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.finalize_articulation_force_transition",
+        lambda _env, _plan, **kwargs: {
+            "pre_state": "closed",
+            "post_state": "open",
+            "joint_infos": [],
+            "selected_joint_names": ["hinge"],
+            "closed_joint_names": [],
+            "success": True,
+            "physics_substeps": kwargs["physics_substeps"],
+            "task_steps_consumed": kwargs["task_steps_consumed"],
+        },
+    )
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        interaction_execution_mode="smooth",
+        interaction_transition_steps=3,
+    )
+    controller._head_view_controller.command = (
+        lambda _env, profile, **_kwargs: view_profiles.append(profile) or {"applied": True}
+    )
+    controller._publish = lambda *_args, **_kwargs: None
+    assert controller.enqueue_command(
+        {
+            "command_id": "smooth_fridge",
+            "source_object_name": "fridge_root",
+            "action": "open",
+            "view_profile": "default",
+        }
+    )
+    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+
+    result = None
+    for step in range(3):
+        controller.before_step(task, step=step)
+        result = controller.after_step(task, step=step)
+
+    assert result is not None
+    assert advances == [1.0 / 3.0, 2.0 / 3.0, 1.0]
+    assert view_profiles == ["default"]
+    assert result["interaction_execution_mode"] == "smooth"
+    assert result["interaction_transition_steps"] == 3
+    assert result["task_steps_consumed"] == 3
+    assert result["source"] == "force_smooth_interaction"
+
+
 def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch) -> None:
     state = {"drawer_top": 0.0, "drawer_bottom": 0.0}
     published = []

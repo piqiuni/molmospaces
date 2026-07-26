@@ -12,6 +12,7 @@ from force_interaction_runtime import (
     advance_articulation_force,
     articulation_joint_infos,
     complete_articulation_force,
+    finalize_articulation_force_transition,
     prepare_articulation_force,
     prepare_articulation_state_force,
     open_door_root_with_force,
@@ -30,8 +31,10 @@ class AtomicForceInteractionController:
         force_config: ForceDriveConfig | None = None,
         close_all_doors_on_prepare: bool = True,
         close_all_containers_on_prepare: bool = False,
-        drawer_execution_mode: str = "fast",
-        drawer_transition_steps: int = 5,
+        interaction_execution_mode: str | None = None,
+        interaction_transition_steps: int | None = None,
+        drawer_execution_mode: str | None = None,
+        drawer_transition_steps: int | None = None,
         drawer_observation_steps: int = 1,
     ) -> None:
         self.command_topic = str(command_topic)
@@ -41,12 +44,16 @@ class AtomicForceInteractionController:
         self.force_config = force_config or ForceDriveConfig()
         self.close_all_doors_on_prepare = bool(close_all_doors_on_prepare)
         self.close_all_containers_on_prepare = bool(close_all_containers_on_prepare)
-        self.drawer_execution_mode = str(drawer_execution_mode).strip().lower()
-        if self.drawer_execution_mode not in {"fast", "smooth"}:
+        requested_mode = interaction_execution_mode or drawer_execution_mode or "fast"
+        self.interaction_execution_mode = str(requested_mode).strip().lower()
+        if self.interaction_execution_mode not in {"fast", "smooth"}:
             raise ValueError(
-                f"Unsupported drawer execution mode: {drawer_execution_mode}"
+                f"Unsupported interaction execution mode: {requested_mode}"
             )
-        self.drawer_transition_steps = max(1, int(drawer_transition_steps))
+        requested_steps = interaction_transition_steps or drawer_transition_steps or 5
+        self.interaction_transition_steps = max(1, int(requested_steps))
+        self.drawer_execution_mode = self.interaction_execution_mode
+        self.drawer_transition_steps = self.interaction_transition_steps
         self.drawer_observation_steps = max(1, int(drawer_observation_steps))
         self._commands: queue.Queue[dict[str, Any]] = queue.Queue()
         self._seen_command_ids: set[str] = set()
@@ -126,6 +133,8 @@ class AtomicForceInteractionController:
         if self._pending is not None:
             if self._pending.get("kind") == "drawer_sequence":
                 self._advance_drawer_sequence_before_step(task)
+            elif self._pending.get("kind") == "articulation_sequence":
+                self._advance_articulation_sequence_before_step(task, step)
             return None
         if self._restore_view_pending:
             self._restore_view_pending = False
@@ -170,6 +179,12 @@ class AtomicForceInteractionController:
                 ),
                 close_other_joints=bool(command.get("close_other_joints", False)),
             )
+            execution_mode = str(
+                command.get("interaction_execution_mode")
+                or self.interaction_execution_mode
+            ).strip().lower()
+            if execution_mode not in {"fast", "smooth"}:
+                raise ValueError(f"Unsupported interaction execution mode: {execution_mode}")
             self._pending = {
                 "command": command,
                 "plan": plan,
@@ -182,7 +197,38 @@ class AtomicForceInteractionController:
                 "remaining_post_interaction_hold_steps": max(
                     0, int(command.get("post_interaction_hold_task_steps", 0) or 0)
                 ),
+                "execution_mode": execution_mode,
+                "transition_steps": max(
+                    1,
+                    int(
+                        command.get(
+                            "interaction_transition_steps",
+                            self.interaction_transition_steps,
+                        )
+                    ),
+                ),
             }
+            if execution_mode == "smooth":
+                self._pending.update(
+                    {
+                        "kind": "articulation_sequence",
+                        "phase": (
+                            "pre_interaction_hold"
+                            if self._pending["remaining_view_hold_steps"] > 0
+                            else "interaction_transition"
+                        ),
+                        "transition_step": 0,
+                        "transition_start_values": {
+                            str(info["joint_name"]): float(info["joint_value"])
+                            for info in plan["pre_joint_infos"]
+                            if str(info.get("joint_name") or "") in plan["targets"]
+                        },
+                        "transition_log": [],
+                        "physics_substeps": 0,
+                        "atomic_fallback": False,
+                    }
+                )
+                self._advance_articulation_sequence_before_step(task, step)
             self._pause_navigation = True
             if view_profile == "drawer_low_view":
                 self._force_observation_requested = True
@@ -202,9 +248,34 @@ class AtomicForceInteractionController:
         ) > 0:
             pending["remaining_view_hold_steps"] -= 1
             self._force_observation_requested = True
+            if (
+                pending.get("kind") == "articulation_sequence"
+                and int(pending["remaining_view_hold_steps"]) <= 0
+            ):
+                pending["phase"] = "interaction_transition"
             return None
         command = pending["command"]
-        if pending.get("phase") == "pre_interaction_hold":
+        if (
+            pending.get("kind") == "articulation_sequence"
+            and pending.get("phase") == "interaction_transition"
+        ):
+            if int(pending["transition_step"]) < int(pending["transition_steps"]):
+                return None
+            force_result = finalize_articulation_force_transition(
+                task.env,
+                pending["plan"],
+                physics_substeps=int(pending["physics_substeps"]),
+                task_steps_consumed=int(pending["transition_steps"]),
+                atomic_fallback=bool(pending["atomic_fallback"]),
+                transition_log=list(pending["transition_log"]),
+                config=self.force_config,
+            )
+            pending["force_result"] = force_result
+            pending["phase"] = "post_interaction_hold"
+            self._force_observation_requested = True
+            if int(pending.get("remaining_post_interaction_hold_steps", 0)) > 0:
+                return None
+        elif pending.get("phase") == "pre_interaction_hold":
             force_result = complete_articulation_force(
                 task.env,
                 pending["plan"],
@@ -260,14 +331,24 @@ class AtomicForceInteractionController:
                 "status": "SUCCEEDED" if force_result["success"] else "FAILED",
                 "confidence": 1.0,
                 "execution_cost": 1.0,
-                "sim_steps_consumed": 1,
+                "sim_steps_consumed": int(step) - int(pending["step"]) + 1,
                 "physics_substeps": int(force_result["physics_substeps"]),
                 "task_steps_consumed": int(force_result["task_steps_consumed"]),
                 "force_applied_step": int(
                     pending.get("force_applied_step", pending["step"])
                 ),
                 "result_published_step": int(step),
-                "source": "force_atomic_interaction",
+                "interaction_execution_mode": str(
+                    pending.get("execution_mode") or "fast"
+                ),
+                "interaction_transition_steps": int(
+                    pending.get("transition_steps") or 1
+                ),
+                "source": (
+                    "force_smooth_interaction"
+                    if pending.get("execution_mode") == "smooth"
+                    else "force_atomic_interaction"
+                ),
                 "verification_source": "mujoco_joint_readback",
                 "step": int(pending["step"]),
                 "stamp_sec": stamp_sec,
@@ -299,6 +380,43 @@ class AtomicForceInteractionController:
             return result
         finally:
             self._commands.task_done()
+
+    def _advance_articulation_sequence_before_step(self, task, step: int) -> None:
+        pending = self._pending
+        if (
+            pending is None
+            or pending.get("kind") != "articulation_sequence"
+            or pending.get("phase") != "interaction_transition"
+        ):
+            return
+        transition_steps = int(pending["transition_steps"])
+        if int(pending["transition_step"]) >= transition_steps:
+            return
+        next_step = int(pending["transition_step"]) + 1
+        transition = advance_articulation_force(
+            task.env,
+            pending["plan"],
+            progress=float(next_step) / float(transition_steps),
+            start_values=pending["transition_start_values"],
+            transition_steps=transition_steps,
+            config=self.force_config,
+        )
+        pending["transition_step"] = next_step
+        pending["physics_substeps"] += int(transition.get("physics_substeps", 0))
+        pending["atomic_fallback"] = bool(
+            pending["atomic_fallback"] or transition.get("fallback", False)
+        )
+        pending["transition_log"].append(
+            {
+                "task_step": int(step),
+                "task_step_index": next_step,
+                "progress": float(transition.get("progress", next_step / transition_steps)),
+                "fallback": bool(transition.get("fallback", False)),
+                "physics_substeps": int(transition.get("physics_substeps", 0)),
+            }
+        )
+        pending.setdefault("force_applied_step", int(step))
+        self._force_observation_requested = True
 
     def _start_drawer_sequence(self, task, command: dict[str, Any], step: int) -> None:
         groups = []
@@ -355,7 +473,7 @@ class AtomicForceInteractionController:
         groups = pending["groups"]
         group_index = int(pending["group_index"])
         current_group = groups[group_index]
-        mode = self.drawer_execution_mode
+        mode = self.interaction_execution_mode
         transition_steps = int(pending["transition_steps"]) if mode == "smooth" else 1
         if pending.get("phase_plan") is None:
             if phase == "open":
@@ -439,7 +557,7 @@ class AtomicForceInteractionController:
         if pending is None:
             return None
         phase = str(pending["phase"])
-        mode = self.drawer_execution_mode
+        mode = self.interaction_execution_mode
         transition_steps = int(pending["transition_steps"]) if mode == "smooth" else 1
         if phase in {"open", "close"} and int(pending["phase_step"]) < transition_steps:
             return None
@@ -547,7 +665,9 @@ class AtomicForceInteractionController:
             "view_profile": "drawer_low_view",
             "view_profile_result": pending["view_result"],
             "view_restore_result": pending["view_restore_result"],
-            "drawer_execution_mode": self.drawer_execution_mode,
+            "interaction_execution_mode": self.interaction_execution_mode,
+            "interaction_transition_steps": int(pending["transition_steps"]),
+            "drawer_execution_mode": self.interaction_execution_mode,
             "drawer_transition_steps": int(pending["transition_steps"]),
             "drawer_observation_steps": int(pending["observation_steps"]),
             "transition_log": list(pending["transition_log"]),

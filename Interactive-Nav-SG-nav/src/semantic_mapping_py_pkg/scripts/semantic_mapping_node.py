@@ -38,6 +38,8 @@ class SemanticMappingNode:
         frames = get_frames(rospy)
         config = get_nested_param(rospy, "semantic_map", {}) or {}
         scene_types = get_nested_param(rospy, "scene_types", {}) or {}
+        object_room_priors = get_nested_param(rospy, "object_room_priors", {}) or {}
+        room_inference_config = get_nested_param(rospy, "room_inference", {}) or {}
 
         self.world_frame = frames.get("world_frame", "tf_frame_map")
         self.object_detection_topic = topics.get("object_detections", "/semantic_mapping/object_detections")
@@ -154,10 +156,20 @@ class SemanticMappingNode:
         self.graph_store = InteractionGraphStore(
             scene_id=graph_config.get("scene_id", rospy.get_name().strip("/") or "semantic_mapping_scene"),
             match_distance=graph_config.get("match_distance", config.get("object_match_distance", 0.5)),
-            room_id_to_name=self.id_to_class,
+            room_id_to_name={},
             room_box_height=self.room_box_height,
             portal_closed_threshold=graph_config.get("portal_closed_threshold", 0.10),
             portal_open_threshold=graph_config.get("portal_open_threshold", 0.67),
+            portal_room_max_radius_m=graph_config.get(
+                "portal_room_max_radius_m", 1.0
+            ),
+            object_room_search_margin_m=graph_config.get(
+                "object_room_search_margin_m", 0.75
+            ),
+            object_room_priors=object_room_priors,
+            room_attribute_min_confidence=room_inference_config.get(
+                "min_confidence", 0.2
+            ),
         )
         self.semantic_occ_overlay = SemanticOccupancyOverlay(
             enabled=overlay_config.get("enabled", True),
@@ -367,11 +379,12 @@ class SemanticMappingNode:
             return
         with self.lock:
             if isinstance(room_id_to_name, dict):
-                for room_id, room_name in room_id_to_name.items():
-                    try:
-                        self.id_to_class[int(room_id)] = normalize_label(room_name)
-                    except (TypeError, ValueError):
-                        continue
+                self.graph_store.room_id_to_name.update(
+                    {
+                        int(room_id): normalize_label(room_name)
+                        for room_id, room_name in room_id_to_name.items()
+                    }
+                )
             self.graph_store.set_room_geometries(rooms)
 
     def occupancy_callback(self, msg):
@@ -390,7 +403,6 @@ class SemanticMappingNode:
             self.latest_occupancy_grid.info,
             room_ids,
             room_conf,
-            room_id_to_name=self.id_to_class,
             room_merges=room_merges,
             geometry_stability_frames=self.room_geometry_stability_frames,
         )

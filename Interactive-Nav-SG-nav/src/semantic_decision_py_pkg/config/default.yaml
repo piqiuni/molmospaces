@@ -96,7 +96,7 @@ executor:
   graph_poll_rate_hz: 5.0
   rear_goal_prerotate_enabled: true
   rear_goal_enter_angle_rad: 1.75
-  rear_goal_exit_angle_rad: 0.34
+  rear_goal_exit_angle_rad: 0.20
   rear_goal_rotate_speed_rad_s: 1.25
   rear_goal_prerotate_timeout_s: 12.0
   rear_goal_lookahead_m: 0.75

@@ -742,6 +742,12 @@ def parse_args():
     parser.add_argument("--force_interaction_max_physics_substeps", type=int, default=3000)
     parser.add_argument("--force_interaction_open_fraction_threshold", type=float, default=0.95)
     parser.add_argument(
+        "--force_interaction_execution_mode",
+        choices=["fast", "smooth"],
+        default=None,
+    )
+    parser.add_argument("--force_interaction_transition_steps", type=int, default=None)
+    parser.add_argument(
         "--force_interaction_drawer_execution_mode",
         choices=["fast", "smooth"],
         default="fast",
@@ -1087,6 +1093,8 @@ def main():
             ),
             close_all_doors_on_prepare=args.initial_door_state == "closed",
             close_all_containers_on_prepare=args.force_interaction_close_all_containers_on_prepare,
+            interaction_execution_mode=args.force_interaction_execution_mode,
+            interaction_transition_steps=args.force_interaction_transition_steps,
             drawer_execution_mode=args.force_interaction_drawer_execution_mode,
             drawer_transition_steps=args.force_interaction_drawer_transition_steps,
             drawer_observation_steps=args.force_interaction_drawer_observation_steps,

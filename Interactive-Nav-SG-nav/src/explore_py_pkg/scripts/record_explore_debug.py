@@ -957,6 +957,7 @@ class ExploreDebugRecorder:
         self.video_map_bbox: tuple[int, int, int, int] | None = None
         self.video_global_costmap_bbox: tuple[int, int, int, int] | None = None
         self.video_local_costmap_bbox: tuple[int, int, int, int] | None = None
+        self.video_occupancy_world_bounds: tuple[float, float, float, float] | None = None
         self.first_person_video_error = ""
         self.first_person_video_codec_name = "h264" if args.first_person_video_h264 else str(args.first_person_video_codec)
         self.external_video_path = str(self.video_dir / "external_camera.mp4")
@@ -1245,6 +1246,8 @@ class ExploreDebugRecorder:
                 self.observed_instance_ids.clear()
                 self.topology_slots.clear()
                 self.topology_next_slot = {"room": 0, "portal": 0, "container": 0, "object": 0}
+                self.video_map_bbox = None
+                self.video_occupancy_world_bounds = None
                 self.latest_semantic_candidates = {}
                 self.latest_semantic_selection = {}
                 self.latest_semantic_execution_state = {}
@@ -1836,6 +1839,81 @@ class ExploreDebugRecorder:
             return (50, 125, 220)
         return (30, 190, 195) if node.get("is_currently_visible") else (145, 145, 145)
 
+    @staticmethod
+    def _known_occupancy_world_bounds(
+        grid: OccupancyGrid | None,
+    ) -> tuple[float, float, float, float] | None:
+        if grid is None or np is None:
+            return None
+        width = int(grid.info.width)
+        height = int(grid.info.height)
+        resolution = float(grid.info.resolution)
+        if width <= 0 or height <= 0 or resolution <= 0.0:
+            return None
+        values = np.asarray(grid.data, dtype=np.int16).reshape((height, width))
+        known_rows, known_cols = np.where(values >= 0)
+        if known_rows.size == 0 or known_cols.size == 0:
+            return None
+        origin = grid.info.origin
+        origin_yaw = math.atan2(
+            2.0 * (
+                origin.orientation.w * origin.orientation.z
+                + origin.orientation.x * origin.orientation.y
+            ),
+            1.0
+            - 2.0
+            * (
+                origin.orientation.y * origin.orientation.y
+                + origin.orientation.z * origin.orientation.z
+            ),
+        )
+        cos_yaw = math.cos(origin_yaw)
+        sin_yaw = math.sin(origin_yaw)
+
+        def world_from_cell(cell_x: float, cell_y: float) -> tuple[float, float]:
+            local_x = cell_x * resolution
+            local_y = cell_y * resolution
+            return (
+                float(origin.position.x) + cos_yaw * local_x - sin_yaw * local_y,
+                float(origin.position.y) + sin_yaw * local_x + cos_yaw * local_y,
+            )
+
+        min_cell_x = float(np.min(known_cols))
+        min_cell_y = float(np.min(known_rows))
+        max_cell_x = float(np.max(known_cols) + 1)
+        max_cell_y = float(np.max(known_rows) + 1)
+        corners = [
+            world_from_cell(min_cell_x, min_cell_y),
+            world_from_cell(max_cell_x, min_cell_y),
+            world_from_cell(min_cell_x, max_cell_y),
+            world_from_cell(max_cell_x, max_cell_y),
+        ]
+        return (
+            min(point[0] for point in corners),
+            min(point[1] for point in corners),
+            max(point[0] for point in corners),
+            max(point[1] for point in corners),
+        )
+
+    def _update_video_occupancy_world_bounds_locked(
+        self,
+        grid: OccupancyGrid | None,
+    ) -> tuple[float, float, float, float] | None:
+        current = self._known_occupancy_world_bounds(grid)
+        if current is None:
+            return self.video_occupancy_world_bounds
+        previous = self.video_occupancy_world_bounds
+        if previous is None:
+            self.video_occupancy_world_bounds = current
+        else:
+            self.video_occupancy_world_bounds = (
+                min(previous[0], current[0]),
+                min(previous[1], current[1]),
+                max(previous[2], current[2]),
+                max(previous[3], current[3]),
+            )
+        return self.video_occupancy_world_bounds
+
     def _render_semantic_spatial_panel_locked(
         self,
         panel_width: int,
@@ -1846,6 +1924,7 @@ class ExploreDebugRecorder:
         graph: dict | None = None,
         observed_instance_ids: set[str] | None = None,
         image_step: int | None = None,
+        world_bounds: tuple[float, float, float, float] | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
@@ -1862,23 +1941,26 @@ class ExploreDebugRecorder:
             cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, panel_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
             self._draw_panel_title(panel, "SEMANTIC XY", image_step)
             return panel
-        min_x = min(position[0] for position in positions)
-        max_x = max(position[0] for position in positions)
-        min_y = min(position[1] for position in positions)
-        max_y = max(position[1] for position in positions)
-        for node in nodes:
-            position = self._node_xy(node)
-            size = node.get("aabb_size") or [0.0, 0.0, 0.0]
-            if position is None or len(size) < 2:
-                continue
-            min_x = min(min_x, position[0] - float(size[0]) * 0.5)
-            max_x = max(max_x, position[0] + float(size[0]) * 0.5)
-            min_y = min(min_y, position[1] - float(size[1]) * 0.5)
-            max_y = max(max_y, position[1] + float(size[1]) * 0.5)
+        if world_bounds is None:
+            min_x = min(position[0] for position in positions)
+            max_x = max(position[0] for position in positions)
+            min_y = min(position[1] for position in positions)
+            max_y = max(position[1] for position in positions)
+            for node in nodes:
+                position = self._node_xy(node)
+                size = node.get("aabb_size") or [0.0, 0.0, 0.0]
+                if position is None or len(size) < 2:
+                    continue
+                min_x = min(min_x, position[0] - float(size[0]) * 0.5)
+                max_x = max(max_x, position[0] + float(size[0]) * 0.5)
+                min_y = min(min_y, position[1] - float(size[1]) * 0.5)
+                max_y = max(max_y, position[1] + float(size[1]) * 0.5)
+        else:
+            min_x, min_y, max_x, max_y = world_bounds
         margin = 38
         span_x = max(2.0, max_x - min_x)
         span_y = max(2.0, max_y - min_y)
-        scale = 1.30 * min(
+        scale = min(
             (panel_width - margin * 2) / span_x,
             (panel_height - margin * 2 - 20) / span_y,
         )
@@ -1992,6 +2074,7 @@ class ExploreDebugRecorder:
         graph: dict | None = None,
         observed_instance_ids: set[str] | None = None,
         image_step: int | None = None,
+        world_bounds: tuple[float, float, float, float] | None = None,
     ):
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
@@ -2031,16 +2114,19 @@ class ExploreDebugRecorder:
                 cell_min_y = float(np.min(known_rows))
                 cell_max_x = float(np.max(known_cols) + 1)
                 cell_max_y = float(np.max(known_rows) + 1)
-        corners = [
-            world_from_cell(cell_min_x, cell_min_y),
-            world_from_cell(cell_max_x, cell_min_y),
-            world_from_cell(cell_min_x, cell_max_y),
-            world_from_cell(cell_max_x, cell_max_y),
-        ]
-        min_x = min(point[0] for point in corners)
-        max_x = max(point[0] for point in corners)
-        min_y = min(point[1] for point in corners)
-        max_y = max(point[1] for point in corners)
+        if world_bounds is None:
+            corners = [
+                world_from_cell(cell_min_x, cell_min_y),
+                world_from_cell(cell_max_x, cell_min_y),
+                world_from_cell(cell_min_x, cell_max_y),
+                world_from_cell(cell_max_x, cell_max_y),
+            ]
+            min_x = min(point[0] for point in corners)
+            max_x = max(point[0] for point in corners)
+            min_y = min(point[1] for point in corners)
+            max_y = max(point[1] for point in corners)
+        else:
+            min_x, min_y, max_x, max_y = world_bounds
         margin = 18
         scale = min(
             (panel_width - 2 * margin) / max(max_x - min_x, 1e-6),
@@ -2400,6 +2486,9 @@ class ExploreDebugRecorder:
             room_segment_panel = None
             semantic_spatial_panel = None
             semantic_topology_panel = None
+            occupancy_world_bounds = self._update_video_occupancy_world_bounds_locked(
+                map_grid
+            )
             if self.args.first_person_video_with_map:
                 occ_panel = self._render_video_map_panel_locked(
                     frame_width,
@@ -2418,6 +2507,7 @@ class ExploreDebugRecorder:
                     semantic_candidates=semantic_candidates,
                     semantic_selection=semantic_selection,
                     draw_semantic_candidates=True,
+                    world_bounds=occupancy_world_bounds,
                 )
                 costmap_left_width = max(1, frame_width // 2)
                 costmap_right_width = max(1, frame_width - costmap_left_width)
@@ -2482,6 +2572,7 @@ class ExploreDebugRecorder:
                     graph=graph,
                     observed_instance_ids=observed_instance_ids,
                     image_step=image_step,
+                    world_bounds=occupancy_world_bounds,
                 )
                 semantic_spatial_panel = self._render_semantic_spatial_panel_locked(
                     frame_width,
@@ -2492,6 +2583,7 @@ class ExploreDebugRecorder:
                     graph=graph,
                     observed_instance_ids=observed_instance_ids,
                     image_step=image_step,
+                    world_bounds=occupancy_world_bounds,
                 )
                 semantic_topology_panel = self._render_semantic_topology_panel_locked(
                     frame_width,
@@ -3241,6 +3333,7 @@ class ExploreDebugRecorder:
         semantic_candidates: dict | None = None,
         semantic_selection: dict | None = None,
         draw_semantic_candidates: bool = False,
+        world_bounds: tuple[float, float, float, float] | None = None,
     ):
         if cv2 is None or np is None:
             return None
@@ -3336,7 +3429,37 @@ class ExploreDebugRecorder:
                     px = world_to_px(float(pose[0]), float(pose[1]))
                     if px is not None:
                         points.append(px)
-        if points:
+        if world_bounds is not None:
+            bound_points = []
+            min_world_x, min_world_y, max_world_x, max_world_y = world_bounds
+            for world_x, world_y in (
+                (min_world_x, min_world_y),
+                (max_world_x, min_world_y),
+                (min_world_x, max_world_y),
+                (max_world_x, max_world_y),
+            ):
+                px = world_to_px(world_x, world_y)
+                if px is not None:
+                    bound_points.append(px)
+            if bound_points:
+                xs = [point[0] for point in bound_points]
+                ys = [point[1] for point in bound_points]
+                margin = max(
+                    8,
+                    int(
+                        self.args.video_map_crop_margin_px
+                        if crop_margin_px is None
+                        else crop_margin_px
+                    ),
+                )
+                min_x = max(0, min(xs) - margin)
+                min_y = max(0, min(ys) - margin)
+                max_x = min(width - 1, max(xs) + margin)
+                max_y = min(height - 1, max(ys) + margin)
+                setattr(self, bbox_attr, (min_x, min_y, max_x, max_y))
+            else:
+                min_x, min_y, max_x, max_y = 0, 0, width - 1, height - 1
+        elif points:
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
             margin = max(

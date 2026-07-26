@@ -1,6 +1,7 @@
 from force_interaction_runtime import (
     build_articulation_targets,
     joint_open_fraction,
+    merge_door_leaf_joint_records,
 )
 
 
@@ -53,3 +54,45 @@ def test_drawer_style_command_opens_one_slide_and_closes_other_slides():
 def test_open_fraction_uses_closed_endpoint_for_slide():
     assert joint_open_fraction(0.0, [0.0, 0.45]) == 0.0
     assert joint_open_fraction(0.45, [0.0, 0.45]) == 1.0
+
+
+def test_double_door_merges_missing_leaf_and_excludes_handle():
+    leaves = merge_door_leaf_joint_records(
+        [
+            {
+                "leaf_body_name": "door_leaf_left",
+                "hinge_joint_index": 0,
+                "hinge_joint_name": "door_left_joint",
+                "joint_range": [0.0, 1.57],
+                "joint_id": 1,
+            }
+        ],
+        [
+            {
+                "joint_name": "door_left_joint",
+                "joint_type": "hinge",
+                "joint_range": [0.0, 1.57],
+                "joint_id": 1,
+                "body_name": "door_leaf_left",
+            },
+            {
+                "joint_name": "door_right_joint",
+                "joint_type": "hinge",
+                "joint_range": [0.0, 1.57],
+                "joint_id": 2,
+                "body_name": "door_leaf_right",
+            },
+            {
+                "joint_name": "door_handle_joint",
+                "joint_type": "hinge",
+                "joint_range": [0.0, 1.57],
+                "joint_id": 3,
+                "body_name": "door_handle",
+            },
+        ],
+    )
+
+    assert [leaf["hinge_joint_name"] for leaf in leaves] == [
+        "door_left_joint",
+        "door_right_joint",
+    ]

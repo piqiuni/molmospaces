@@ -15,6 +15,7 @@ from .graph_rules import (
 )
 from .graph_schema import NavigationHint, SceneGraphBundle, SceneGraphEdge, SceneGraphNode
 from .portal_state_tracker import PortalStateTracker
+from .room_inference_backends import WeightedRoomAttributeInferencer
 
 
 class InteractionGraphStore:
@@ -26,11 +27,23 @@ class InteractionGraphStore:
         room_box_height=0.2,
         portal_closed_threshold=0.10,
         portal_open_threshold=0.67,
+        portal_room_max_radius_m=1.0,
+        object_room_search_margin_m=0.75,
+        object_room_priors=None,
+        room_attribute_min_confidence=0.2,
     ):
         self.scene_id = str(scene_id or "scene")
         self.match_distance = float(match_distance)
         self.room_id_to_name = dict(room_id_to_name or {})
         self.room_box_height = float(room_box_height)
+        self.portal_room_max_radius_m = max(0.1, float(portal_room_max_radius_m))
+        self.object_room_search_margin_m = max(
+            0.1, float(object_room_search_margin_m)
+        )
+        self.room_attribute_inferencer = WeightedRoomAttributeInferencer(
+            object_room_priors or {},
+            min_confidence=room_attribute_min_confidence,
+        )
         self.room_geometries = {}
         self.room_geometry_candidates = {}
         self.room_geometry_stability_frames = 5
@@ -546,7 +559,10 @@ class InteractionGraphStore:
                 ),
                 "joint_infos": list(observation.get("joint_infos") or []),
                 "interaction_groups": _interaction_groups(
-                    node.type, list(observation.get("joint_infos") or [])
+                    node.type,
+                    list(observation.get("joint_infos") or []),
+                    semantic_name=observation.get("semantic_name"),
+                    category=observation.get("category"),
                 ),
                 "visible_pixels": int(observation.get("visible_pixels", 0)),
                 "max_visible_pixels": max_visible_pixels,
@@ -906,7 +922,7 @@ class InteractionGraphStore:
         for node in non_rooms:
             if node.type == "portal":
                 connected_room_ids = list(node.attributes.get("connected_room_ids") or [])
-                if not connected_room_ids:
+                if self.source_mode != "gt_replay" or not connected_room_ids:
                     connected_room_ids = self._infer_portal_room_ids(node)
                 connected_room_ids = [
                     self._resolve_room_id(room_id)
@@ -914,6 +930,11 @@ class InteractionGraphStore:
                     if room_id is not None
                 ]
                 node.attributes["connected_room_ids"] = connected_room_ids
+                node.attributes["connectivity_source"] = (
+                    "observation"
+                    if self.source_mode == "gt_replay" and connected_room_ids
+                    else "room_segment_ring"
+                )
                 node.attributes["connectivity_status"] = (
                     "connected" if len(connected_room_ids) >= 2 else "partial" if len(connected_room_ids) == 1 else "unknown"
                 )
@@ -937,6 +958,9 @@ class InteractionGraphStore:
         container_nodes = [node for node in non_rooms if node.type == "container"]
         object_nodes = [node for node in non_rooms if node.type == "object"]
         id_lookup = {node.id: node for node in non_rooms}
+        for container in container_nodes:
+            container.attributes["inferred_child_ids"] = []
+            container.attributes["inferred_child_count"] = 0
 
         for obj in object_nodes:
             previous_parent_id = obj.parent_id
@@ -957,6 +981,12 @@ class InteractionGraphStore:
                 self._upsert_edge(parent.id, "supports", obj.id, now=now)
             elif parent.type == "container":
                 self._upsert_edge(parent.id, "contains", obj.id, now=now)
+                parent.attributes["inferred_child_ids"].append(obj.id)
+
+        for container in container_nodes:
+            child_ids = sorted(set(container.attributes["inferred_child_ids"]))
+            container.attributes["inferred_child_ids"] = child_ids
+            container.attributes["inferred_child_count"] = len(child_ids)
 
         for room_node in (
             node
@@ -965,6 +995,7 @@ class InteractionGraphStore:
         ):
             room_node.parent_id = scene_node.id
             self._upsert_edge(scene_node.id, "has_room", room_node.id, now=now)
+        self._refresh_room_attributes()
 
     def _find_parent_node(
         self,
@@ -1036,6 +1067,41 @@ class InteractionGraphStore:
                 candidates[room_id] += 1
         if candidates:
             return max(sorted(candidates.keys()), key=lambda room_id: candidates[room_id])
+        resolution = max(float(getattr(grid_info, "resolution", 0.05)), 0.01)
+        margins = []
+        margin = max(0.10, resolution * 2.0)
+        while margin < self.object_room_search_margin_m:
+            margins.append(margin)
+            margin *= 2.0
+        margins.append(self.object_room_search_margin_m)
+        for margin in sorted(set(round(value, 6) for value in margins)):
+            ring_candidates = defaultdict(int)
+            expanded_half_x = max(float(size[0]) * 0.5 + margin, margin)
+            expanded_half_y = max(float(size[1]) * 0.5 + margin, margin)
+            for index in range(8):
+                ratio = float(index) / 7.0
+                x = float(center[0]) - expanded_half_x + 2.0 * expanded_half_x * ratio
+                y = float(center[1]) - expanded_half_y + 2.0 * expanded_half_y * ratio
+                perimeter_points = (
+                    (x, float(center[1]) - expanded_half_y),
+                    (x, float(center[1]) + expanded_half_y),
+                    (float(center[0]) - expanded_half_x, y),
+                    (float(center[0]) + expanded_half_x, y),
+                )
+                for px, py in perimeter_points:
+                    coords = world_to_grid(px, py, grid_info)
+                    if coords is None:
+                        continue
+                    idx = grid_index(coords[0], coords[1], grid_info.width)
+                    if 0 <= idx < len(scene_data):
+                        room_id = int(scene_data[idx])
+                        if room_id >= 0:
+                            ring_candidates[room_id] += 1
+            if ring_candidates:
+                return max(
+                    sorted(ring_candidates.keys()),
+                    key=lambda room_id: ring_candidates[room_id],
+                )
         return None
 
     def _infer_portal_room_ids(self, node):
@@ -1047,9 +1113,15 @@ class InteractionGraphStore:
             return [node.room_id] if node.room_id is not None else []
         counts = defaultdict(int)
         center_x, center_y = float(node.aabb_center[0]), float(node.aabb_center[1])
-        half_extent = max(float(node.aabb_size[0]), float(node.aabb_size[1])) * 0.5
-        for radius_offset, weight in ((0.30, 3), (0.60, 2), (0.90, 1)):
-            radius = half_extent + radius_offset
+        radii = sorted(
+            {
+                min(self.portal_room_max_radius_m, radius)
+                for radius in (0.25, 0.50, 0.75, self.portal_room_max_radius_m)
+                if radius > 0.0
+            }
+        )
+        for radius_index, radius in enumerate(radii):
+            weight = len(radii) - radius_index
             for index in range(48):
                 angle = 2.0 * math.pi * float(index) / 48.0
                 coords = world_to_grid(
@@ -1066,6 +1138,41 @@ class InteractionGraphStore:
                         counts[room_id] += weight
         ranked = sorted(counts, key=lambda room_id: (-counts[room_id], room_id))
         return ranked[:2]
+
+    def _refresh_room_attributes(self):
+        room_nodes = {
+            int(node.room_id): node
+            for node in self.nodes.values()
+            if node.type == "room"
+            and node.room_id is not None
+            and node.attributes.get("active", True)
+        }
+        evidence_by_room = defaultdict(list)
+        for node in self.nodes.values():
+            if node.type in {"scene", "room", "portal"} or node.room_id is None:
+                continue
+            room_id = self._resolve_room_id(node.room_id)
+            evidence_by_room[room_id].append(
+                {
+                    "node_id": node.id,
+                    "semantic_name": node.label,
+                    "category": node.attributes.get("category"),
+                    "confidence": node.confidence,
+                }
+            )
+        for room_id, room_node in room_nodes.items():
+            result = self.room_attribute_inferencer.infer(
+                evidence_by_room.get(room_id, [])
+            )
+            room_node.attributes.update(
+                {
+                    "room_attribute": result["room_attribute"],
+                    "room_attribute_confidence": float(result["confidence"]),
+                    "room_attribute_scores": dict(result["scores"]),
+                    "room_attribute_evidence": list(result["evidence"]),
+                    "room_attribute_source": "weighted_object_types",
+                }
+            )
 
     def _bump_revision(self):
         self.graph_revision += 1
@@ -1222,7 +1329,7 @@ def _is_plausible_container_content(obj, container):
     return container_volume > 1e-6 and object_volume <= min(0.10, 0.10 * container_volume)
 
 
-def _interaction_groups(node_type, joint_infos):
+def _interaction_groups(node_type, joint_infos, semantic_name=None, category=None):
     joints = [
         dict(info)
         for info in joint_infos or []
@@ -1230,6 +1337,21 @@ def _interaction_groups(node_type, joint_infos):
     ]
     if node_type != "container" or not joints:
         return []
+    semantic_tokens = {
+        normalize_label(semantic_name),
+        normalize_label(category),
+    }
+    if semantic_tokens.intersection({"fridge", "refrigerator"}):
+        return [
+            {
+                "group_id": "all_joints",
+                "target_joint_names": [str(info["joint_name"]) for info in joints],
+                "close_other_joint_names": [],
+                "close_other_joints": False,
+                "mode": "open_close",
+                "view_profile": "default",
+            }
+        ]
     slide_joints = [
         str(info["joint_name"])
         for info in joints

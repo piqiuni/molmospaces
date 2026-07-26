@@ -55,10 +55,10 @@ DWAPlannerROS:
   # collision-checked turn direction until the path is in the forward sector.
   rear_path_prerotate_enabled: true
   rear_path_enter_angle: 1.75
-  # Do not release forward motion while the rear path is still ~46 deg away.
+  # Do not release forward motion while the rear path is still ~11.5 deg away.
   # A tighter exit angle keeps narrow-door turns in the collision-checked
   # in-place rotation phase until the base is substantially path-aligned.
-  rear_path_exit_angle: 0.34
+  rear_path_exit_angle: 0.20
   rear_path_lookahead_dist: 0.45
   rear_path_rotate_speed: 1.25
   # Near exactly pi, the shortest-angle sign is noise-sensitive. Prefer a

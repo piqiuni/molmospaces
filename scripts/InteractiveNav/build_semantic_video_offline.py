@@ -28,8 +28,11 @@ def load_recorder_frames(path: Path) -> list[dict]:
     with path.open(newline="", encoding="utf-8") as handle:
         records = list(csv.DictReader(handle))
     for record in records:
-        record["source_step_value"] = int(
-            record.get("source_seq") or record.get("step_id") or 0
+        source_seq = record.get("source_seq")
+        record["source_step_value"] = (
+            max(0, int(source_seq) - 1)
+            if source_seq not in {None, ""}
+            else max(0, int(record.get("step_id") or 1) - 1)
         )
         record["image_stamp_value"] = float(record.get("image_stamp") or 0.0)
     return records
@@ -68,6 +71,26 @@ def align_exact_sim_records(
         if int(record.get("step_index", index)) <= last_recorder_step
     ]
     return aligned, missing_steps
+
+
+def align_latest_recorder_frames(
+    sim_records: list[dict], recorder_by_step: dict[int, dict]
+) -> dict[int, dict]:
+    recorder_steps = sorted(recorder_by_step)
+    if not recorder_steps:
+        return {}
+    aligned = {}
+    recorder_index = 0
+    for index, sim_record in enumerate(sim_records):
+        sim_step = int(sim_record.get("step_index", index))
+        while (
+            recorder_index + 1 < len(recorder_steps)
+            and recorder_steps[recorder_index + 1] <= sim_step
+        ):
+            recorder_index += 1
+        state_step = recorder_steps[recorder_index]
+        aligned[sim_step] = recorder_by_step[state_step]
+    return aligned
 
 
 def resolve_path(value: str | Path, base_dir: Path) -> Path:
@@ -192,6 +215,11 @@ def main() -> None:
     parser.add_argument("--route-result", default="")
     parser.add_argument("--fps", type=float, default=15.0)
     parser.add_argument("--max-stamp-delta-sec", type=float, default=0.20)
+    parser.add_argument(
+        "--state-alignment",
+        choices=["exact", "latest"],
+        default="exact",
+    )
     parser.add_argument("--output-stem", default="overview_6panel")
     args = parser.parse_args()
 
@@ -211,12 +239,24 @@ def main() -> None:
 
     original_sim_frame_count = len(sim_records)
     recorder_by_step = index_recorder_frames(recorder_records)
-    sim_records, trimmed_trailing_steps = align_exact_sim_records(sim_records, recorder_by_step)
+    if args.state_alignment == "exact":
+        sim_records, trimmed_trailing_steps = align_exact_sim_records(
+            sim_records, recorder_by_step
+        )
+        state_by_sim_step = {
+            int(record.get("step_index", index)): recorder_by_step[
+                int(record.get("step_index", index))
+            ]
+            for index, record in enumerate(sim_records)
+        }
+    else:
+        trimmed_trailing_steps = []
+        state_by_sim_step = align_latest_recorder_frames(sim_records, recorder_by_step)
     sim_steps = [int(record.get("step_index", index)) for index, record in enumerate(sim_records)]
 
     route_path = Path(args.route_result).expanduser().resolve() if args.route_result else scene_dir / "route_result.json"
     route_events = load_route_events(route_path)
-    first_record = recorder_by_step[sim_steps[0]]
+    first_record = state_by_sim_step[sim_steps[0]]
     first_state = cv2.imread(
         str(resolve_path(first_record["composite_frame"], debug_dir)), cv2.IMREAD_COLOR
     )
@@ -248,11 +288,16 @@ def main() -> None:
     try:
         for frame_index, sim_record in enumerate(sim_records, start=1):
             sim_step_index = int(sim_record.get("step_index", frame_index - 1))
-            state_record = recorder_by_step[sim_step_index]
+            state_record = state_by_sim_step[sim_step_index]
             stamp_sec = float(sim_record.get("stamp_sec") or 0.0)
             state_stamp = float(state_record.get("image_stamp_value") or 0.0)
             stamp_delta = abs(stamp_sec - state_stamp) if stamp_sec and state_stamp else 0.0
-            if stamp_delta > max(0.0, float(args.max_stamp_delta_sec)):
+            state_step_index = int(state_record.get("source_step_value", sim_step_index))
+            exact_state_match = state_step_index == sim_step_index
+            if (
+                args.state_alignment == "exact"
+                and stamp_delta > max(0.0, float(args.max_stamp_delta_sec))
+            ):
                 raise RuntimeError(
                     f"Simulator/recorder stamp mismatch at step {sim_step_index}: {stamp_delta:.6f}s"
                 )
@@ -270,7 +315,7 @@ def main() -> None:
             draw_gt(camera_frame, sim_record.get("gt_observations"))
             draw_route_event(camera_frame, route_event_at_stamp(route_events, stamp_sec))
             sim_step = sim_step_index + 1
-            state_step = int(state_record.get("source_step_value", sim_step_index)) + 1
+            state_step = state_step_index + 1
             cv2.putText(
                 camera_frame,
                 f"SIM STEP={sim_step:04d} STAMP={stamp_sec:.3f}",
@@ -340,7 +385,7 @@ def main() -> None:
                     "sim_stamp": f"{stamp_sec:.9f}",
                     "state_stamp": f"{state_stamp:.9f}",
                     "stamp_delta_sec": f"{stamp_delta:.9f}",
-                    "match_mode": "exact_step",
+                    "match_mode": "exact_step" if exact_state_match else "latest_state",
                     "route_event": (route_event_at_stamp(route_events, stamp_sec) or {}).get("event", ""),
                     "output_frame": str(output_path),
                 }
@@ -402,7 +447,13 @@ def main() -> None:
         "aligned_sim_frame_count": len(sim_records),
         "state_frame_count": len(recorder_records),
         "output_frame_count": len(sync_rows),
-        "exact_step_match_count": len(sync_rows),
+        "exact_step_match_count": sum(
+            row["match_mode"] == "exact_step" for row in sync_rows
+        ),
+        "latest_state_match_count": sum(
+            row["match_mode"] == "latest_state" for row in sync_rows
+        ),
+        "state_alignment": args.state_alignment,
         "trimmed_trailing_sim_steps": trimmed_trailing_steps,
         "max_stamp_delta_sec": max(float(row["stamp_delta_sec"]) for row in sync_rows),
         "fps": float(args.fps),

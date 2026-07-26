@@ -1,6 +1,6 @@
 # 交互导航开发测试手册
 
-最后更新：2026-07-16
+最后更新：2026-07-26
 
 ## 1. 文档定位
 
@@ -482,6 +482,135 @@ worker_NNN/debug/
 - `recorder.log`：独立recorder日志
 
 `--recorder-extra-args` 可继续传递 `record_explore_debug.py` 参数。调度器结束仿真后会先给recorder最多120秒完成异步写盘与视频编码，再关闭ROS Master。
+
+## 5.3.2 语义交互导航与并行批测
+
+完整交互导航优先通过统一封装脚本启动，不建议直接调用 `run_nav_ros_sim.py`：
+
+```text
+scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh
+```
+
+虽然脚本名包含 `house7`，但可通过 `HOUSE_IND` 运行其他场景。脚本会统一启动仿真、实时 GT 感知、动态语义交互图、`explore_py`、语义候选与规则决策、行为执行器、`move_base`、力交互 backend，以及可选的六联图录制。运行链路为：
+
+```text
+run_nav_ros_sim.py
+→ realtime GT observation
+→ dynamic semantic interaction graph
+→ explore_py navigation frontiers
+→ semantic navigation/interaction candidates
+→ semantic rule decision
+→ behavior executor
+→ move_base navigation / force interaction
+→ interaction_result updates graph
+```
+
+推荐任务模式：
+
+- `semantic_interaction_exploration`：自主耗尽导航 frontier 与交互 frontier。
+- `semantic_interaction_object_goal`：运行时选择远处容器/物体目标，执行交互式 Obj-goal。
+- `object_goal_rule`：使用配置文件指定固定目标，例如冰箱。
+- `frontier_only`：关闭语义决策和交互的纯 frontier 对照组。
+
+单场景完整交互探索：
+
+```bash
+cd /home/user/ldl/molmospaces-semantic-decision
+conda activate mlspaces
+
+ROS_MASTER_URI=http://127.0.0.1:11521 \
+HOUSE_IND=7 \
+SCENE_SEED=7 \
+METHOD=semantic_interaction_exploration \
+USE_FIXED_ROUTE=false \
+TASK_HORIZON=1000 \
+ENABLE_RECORDING=true \
+INITIAL_DOOR_STATE=closed \
+  zsh scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/house7_semantic_interaction_exploration
+```
+
+单场景运行时 Obj-goal：
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:11522 \
+HOUSE_IND=7 \
+SCENE_SEED=7 \
+METHOD=semantic_interaction_object_goal \
+USE_FIXED_ROUTE=false \
+TASK_HORIZON=1000 \
+ENABLE_RECORDING=true \
+INITIAL_DOOR_STATE=closed \
+  zsh scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/house7_object_goal_runtime
+```
+
+固定冰箱目标使用 `METHOD=object_goal_rule`；纯 frontier 对照使用 `METHOD=frontier_only`。常用配置位于：
+
+```text
+scripts/InteractiveNav/configs/semantic_decision/interactive_exploration.yaml
+scripts/InteractiveNav/configs/semantic_decision/semantic_controlled_explore.yaml
+scripts/InteractiveNav/configs/semantic_decision/semantic_interaction_nav.yaml
+scripts/InteractiveNav/configs/semantic_decision/object_goal_runtime.yaml
+scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge.yaml
+```
+
+多场景交互实验使用专用批处理脚本。每个 worker 是独立子进程，拥有独立 `ROS_MASTER_URI`；场景按 round-robin 分片，worker 内部串行运行分到的场景：
+
+```bash
+python scripts/InteractiveNav/run_semantic_interaction_exploration_batch.py \
+  --output-dir outputs/interaction_explore_houses_0_9 \
+  --house-inds 0 1 2 3 4 5 6 7 8 9 \
+  --workers 2 \
+  --base-master-port 12420 \
+  --task-horizon 1000 \
+  --method container_exploration \
+  --scene-timeout-s 1500
+```
+
+当前批处理脚本中的 `container_exploration` 对应完整语义交互探索配置；运行时 Obj-goal 使用：
+
+```bash
+python scripts/InteractiveNav/run_semantic_interaction_exploration_batch.py \
+  --output-dir outputs/object_goal_houses_0_9 \
+  --house-inds 0 1 2 3 4 5 6 7 8 9 \
+  --workers 2 \
+  --base-master-port 12520 \
+  --task-horizon 1000 \
+  --method object_goal_runtime \
+  --scene-timeout-s 1500
+```
+
+例如 10 个场景和 2 个 worker 的分配为：
+
+```text
+worker 0: House 0, 2, 4, 6, 8
+worker 1: House 1, 3, 5, 7, 9
+```
+
+批量实验可通过环境变量控制录制。完整六联图实验使用 `ENABLE_RECORDING=true`；只统计成功率、覆盖率和耗时的快速实验使用：
+
+```bash
+ENABLE_RECORDING=false \
+python scripts/InteractiveNav/run_semantic_interaction_exploration_batch.py \
+  --output-dir outputs/fast_houses_0_9 \
+  --house-inds 0 1 2 3 4 5 6 7 8 9 \
+  --workers 2 \
+  --task-horizon 1000 \
+  --method container_exploration
+```
+
+批处理常用参数：
+
+- `--resume`：复用已有有效结果，跳过已完成场景。
+- `--allow-failures`：允许部分场景失败而不让批处理整体返回非零状态。
+- `--dry-run`：只输出分片、端口和命令，不启动仿真。
+- `--memory-sample-interval-s`：资源采样间隔，默认 `2s`。
+- `--base-master-port`：worker 端口起点，第 `N` 个 worker 使用 `base + N`。
+
+主要输出包括每个 `house_NNNN/` 下的 `batch_task.log`、`memory_by_step.csv`、`semantic_exploration_result.json` 和可选的 `videos/overview_6panel.mp4`，以及批次根目录的 `summary.json`、`summary.csv` 和 `aggregate_metrics.json`。
+
+内存建议：保存六联图时优先使用最多 `2 workers`；关闭录制后可从 `2 workers` 开始逐步增加。不要直接以 CPU 核数决定 worker 数量，应以 simulator、recorder 和主机可用内存的实测峰值为准。
 
 ## 5.4 语义地图调试启动
 

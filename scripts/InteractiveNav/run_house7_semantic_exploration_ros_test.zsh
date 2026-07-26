@@ -35,7 +35,7 @@ GT_REQUIRED_CONSECUTIVE_OBSERVATIONS=${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS:-2}
 GT_ROI_X_MIN_RATIO=${GT_ROI_X_MIN_RATIO:-0.10}
 GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
-LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.25}
+LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.30}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-}
@@ -47,14 +47,24 @@ INITIAL_DOOR_STATE=${INITIAL_DOOR_STATE:-closed}
 FORCE_CLOSE_CONTAINERS=${FORCE_CLOSE_CONTAINERS:-false}
 CLEAN_INTERMEDIATE=${CLEAN_INTERMEDIATE:-false}
 ENABLE_RECORDING=${ENABLE_RECORDING:-true}
-if [[ -z "${DRAWER_EXECUTION_MODE:-}" ]]; then
-  if [[ "${ENABLE_RECORDING}" == true ]]; then
-    DRAWER_EXECUTION_MODE=smooth
+if [[ -z "${INTERACTION_EXECUTION_MODE:-}" ]]; then
+  if [[ -n "${DRAWER_EXECUTION_MODE:-}" ]]; then
+    INTERACTION_EXECUTION_MODE=${DRAWER_EXECUTION_MODE}
+  elif [[ "${ENABLE_RECORDING}" == true ]]; then
+    INTERACTION_EXECUTION_MODE=smooth
   else
-    DRAWER_EXECUTION_MODE=fast
+    INTERACTION_EXECUTION_MODE=fast
   fi
 fi
-DRAWER_TRANSITION_STEPS=${DRAWER_TRANSITION_STEPS:-5}
+if [[ -z "${DRAWER_EXECUTION_MODE:-}" ]]; then
+  DRAWER_EXECUTION_MODE=${INTERACTION_EXECUTION_MODE}
+fi
+if [[ -z "${INTERACTION_TRANSITION_STEPS:-}" ]]; then
+  INTERACTION_TRANSITION_STEPS=${DRAWER_TRANSITION_STEPS:-5}
+fi
+if [[ -z "${DRAWER_TRANSITION_STEPS:-}" ]]; then
+  DRAWER_TRANSITION_STEPS=${INTERACTION_TRANSITION_STEPS}
+fi
 DRAWER_OBSERVATION_STEPS=${DRAWER_OBSERVATION_STEPS:-1}
 
 case "${METHOD}" in
@@ -242,7 +252,7 @@ if [[ "${ENABLE_RECORDING}" == true ]]; then
 else
   SIM_CAPTURE_ARGS="--observation_queue_size 1"
 fi
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 ${SIM_CAPTURE_ARGS} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 ${SIM_CAPTURE_ARGS} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -309,6 +319,7 @@ if [[ "${ENABLE_RECORDING}" == true ]]; then
     --scene-dir "${OUTPUT_DIR}" \
     --debug-dir "${OUTPUT_DIR}/debug" \
     --fps "${VIDEO_FPS}" \
+    --state-alignment latest \
     --output-stem overview_6panel \
     >"${OUTPUT_DIR}/offline_video.log" 2>&1
   OFFLINE_VIDEO_ELAPSED_SEC=$(python - "${OFFLINE_VIDEO_START}" <<'PY'

@@ -162,6 +162,8 @@ interaction_graph:
   match_distance: 0.5
   portal_closed_threshold: 0.10
   portal_open_threshold: 0.67
+  portal_room_max_radius_m: 1.0
+  object_room_search_margin_m: 0.75
   gt_replay:
     enable: false
     shuffle: false
@@ -213,8 +215,8 @@ object_room_priors:
     stove: 1.0
     oven: 0.9
     microwave: 0.8
-    refrigerator: 0.9
-    fridge: 0.9
+    refrigerator: 2.0
+    fridge: 2.0
     sink: 0.4
     cabinet: 0.3
   bedroom:
