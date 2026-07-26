@@ -152,6 +152,7 @@
     <include file="$(find explore_py_pkg)/launch/explore_py.launch">
       <arg name="config_file" value="$(arg explore_py_config_file)"/>
       <arg name="override_config_file" value="$(arg explore_py_config_override_file)"/>
+      <arg name="external_control_enabled" value="$(arg start_semantic_decision)"/>
     </include>
   </group>
 

@@ -92,6 +92,9 @@ mujoco = [
 mujoco-filament = [
     "mujoco-filament",
 ]
+rosbridge = [
+    "roslibpy>=2.0.0",
+]
 
 [build-system]
 requires = ["setuptools", "wheel"]

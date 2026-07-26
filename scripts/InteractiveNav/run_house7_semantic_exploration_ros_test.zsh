@@ -322,10 +322,6 @@ else
 fi
 print -r -- "${OFFLINE_VIDEO_ELAPSED_SEC}" >"${OUTPUT_DIR}/offline_video_elapsed_sec.txt"
 
-if [[ -f "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" ]]; then
-  mv "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" "${OUTPUT_DIR}/videos/overview_6panel.mp4"
-fi
-
 ANALYSIS_START=$(python -c 'import time; print(time.perf_counter())')
 python "${SCRIPT_DIR}/evaluate_exploration_coverage.py" \
   --run-dir "${OUTPUT_DIR}/debug" \
@@ -361,9 +357,12 @@ def read_json(path):
         return {}
 
 debug_summary = read_json(output_dir / "debug" / "summary.json")
-offline_video_summary = read_json(output_dir / "debug" / "offline_video_summary.json")
+offline_video_summary = read_json(output_dir / "offline_video_summary.json")
 sim_frames = int(
-    offline_video_summary.get("sim_frame_count", debug_summary.get("step_sync_count", 0))
+    offline_video_summary.get(
+        "aligned_sim_frame_count",
+        offline_video_summary.get("sim_frame_count", debug_summary.get("step_sync_count", 0)),
+    )
     or 0
 )
 video_frames = int(

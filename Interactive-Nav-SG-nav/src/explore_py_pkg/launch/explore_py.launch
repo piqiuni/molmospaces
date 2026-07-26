@@ -2,6 +2,7 @@
 <launch>
   <arg name="config_file" default="$(find explore_py_pkg)/config/explore_py.yaml"/>
   <arg name="override_config_file" default=""/>
+  <arg name="external_control_enabled" default="false"/>
 
   <node name="explore_py"
         pkg="explore_py_pkg"
@@ -12,5 +13,7 @@
     <rosparam if="$(eval arg('override_config_file') != '')"
               file="$(arg override_config_file)"
               command="load"/>
+    <param name="exploration/external_control_enabled"
+           value="$(arg external_control_enabled)"/>
   </node>
 </launch>
