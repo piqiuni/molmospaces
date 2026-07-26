@@ -28,10 +28,13 @@ policy:
   failure_cooldown_s: 5.0
   interaction_target_failure_cooldown_s: 60.0
   failure_retry_delay_s: 1.0
+  repeat_guard_enabled: true
+  repeat_guard_low_gain_limit: 2
+  repeat_guard_min_frontier_shrink_m: 0.15
 
 model:
   timeout_s: 3.0
-  max_tokens: 128
+  max_tokens: 256
   consecutive_timeout_limit: 2
   timeout_cooldown_s: 60.0
   skill_timeout_s: 4.0
@@ -44,4 +47,4 @@ completion:
   stagnation_failure_limit: 8
 
 executor:
-  interaction_navigation_timeout_s: 45.0
+  interaction_navigation_timeout_s: 180.0

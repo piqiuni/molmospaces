@@ -448,6 +448,7 @@ class CandidateGenerator:
             )
             raw_information.append(max(0.0, float(value or 0.0)))
         max_information = max(raw_information) if raw_information else 1.0
+        map_resolution = max(0.0, float(status.get("map_resolution", 0.0) or 0.0))
         candidates = []
         for proposal, information_gain in zip(proposals, raw_information):
             cluster_id = str(
@@ -510,6 +511,7 @@ class CandidateGenerator:
                                 "frontier_cell_count", proposal.get("cell_count", 0)
                             )
                         ),
+                        "map_resolution": map_resolution,
                         "explorer_score": explorer_score,
                         "explorer_score_terms": explorer_score_terms,
                         "proposal_source": str(proposal.get("source") or "explore_py"),

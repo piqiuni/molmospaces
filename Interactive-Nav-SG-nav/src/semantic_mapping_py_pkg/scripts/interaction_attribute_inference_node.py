@@ -92,7 +92,7 @@ class InteractionAttributeInferenceNode:
         )
         self.max_output_tokens = max(
             32,
-            int(rospy.get_param("~max_output_tokens", min(self.client.config.max_tokens, 96))),
+            int(rospy.get_param("~max_output_tokens", min(self.client.config.max_tokens, 160))),
         )
         self.crop_margin_ratio = max(
             0.0, float(rospy.get_param("~crop_margin_ratio", 0.08))

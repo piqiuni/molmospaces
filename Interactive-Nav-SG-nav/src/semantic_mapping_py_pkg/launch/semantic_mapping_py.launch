@@ -7,7 +7,7 @@
   <arg name="start_semantic_mapping" default="true"/>
   <arg name="start_attribute_inference" default="false"/>
   <arg name="attribute_model_name" default=""/>
-  <arg name="attribute_max_output_tokens" default="96"/>
+  <arg name="attribute_max_output_tokens" default="160"/>
   <arg name="attribute_request_timeout_s" default="8.0"/>
   <arg name="attribute_min_interval_s" default="2.0"/>
   <arg name="attribute_worker_count" default="1"/>

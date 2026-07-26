@@ -62,15 +62,30 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
 
 def validate_subgoal_selection(value: Any, candidate_ids: set[str]) -> dict[str, Any]:
     result = parse_json_object(value)
-    candidate_id = str(result.get("candidate_id") or "")
-    if candidate_id not in candidate_ids:
-        raise ValueError(f"model selected unknown candidate: {candidate_id}")
+    ranked_ids = result.get("ranked_ids") or []
+    if not isinstance(ranked_ids, list):
+        raise ValueError("ranked_ids must be a list")
+    if not ranked_ids and result.get("candidate_id"):
+        ranked_ids = [result.get("candidate_id")]
+    normalized_ranked_ids = []
+    for value in ranked_ids:
+        candidate_id = str(value or "")
+        if candidate_id not in candidate_ids:
+            raise ValueError(f"model selected unknown candidate: {candidate_id}")
+        if candidate_id not in normalized_ranked_ids:
+            normalized_ranked_ids.append(candidate_id)
+    if not normalized_ranked_ids:
+        raise ValueError("model response requires at least one ranked candidate")
+    candidate_id = normalized_ranked_ids[0]
     scores = result.get("scores") or {}
     if not isinstance(scores, dict):
         raise ValueError("scores must be an object")
     result["candidate_id"] = candidate_id
+    result["ranked_ids"] = normalized_ranked_ids[:3]
     result["scores"] = {str(key): float(score) for key, score in scores.items()}
-    result["reason_tags"] = [str(item) for item in result.get("reason_tags") or []]
+    result["reason"] = str(result.get("reason") or "NO_SEMANTIC_PREFERENCE").upper()
+    confidence = str(result.get("confidence") or "medium").casefold()
+    result["confidence"] = confidence if confidence in {"low", "medium", "high"} else "medium"
     return result
 
 

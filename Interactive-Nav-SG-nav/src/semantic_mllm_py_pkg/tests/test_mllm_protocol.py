@@ -29,6 +29,22 @@ def test_schema_validation_rejects_unknown_candidate() -> None:
         validate_subgoal_selection({"candidate_id": "bad"}, {"good"})
 
 
+def test_subgoal_selection_accepts_ranked_ids() -> None:
+    result = validate_subgoal_selection(
+        {
+            "ranked_ids": ["door", "frontier", "door"],
+            "reason": "target_room",
+            "confidence": "high",
+        },
+        {"door", "frontier"},
+    )
+
+    assert result["candidate_id"] == "door"
+    assert result["ranked_ids"] == ["door", "frontier"]
+    assert result["reason"] == "TARGET_ROOM"
+    assert result["confidence"] == "high"
+
+
 def test_role_schemas_normalize_outputs() -> None:
     attribute = validate_attribute_patch(
         {

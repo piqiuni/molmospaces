@@ -102,7 +102,7 @@ class SemanticBehaviorExecutor:
             ExecutionConfig(
                 navigation_timeout_s=float(config.get("navigation_timeout_s", 180.0)),
                 interaction_navigation_timeout_s=float(
-                    config.get("interaction_navigation_timeout_s", 60.0)
+                    config.get("interaction_navigation_timeout_s", 180.0)
                 ),
                 interaction_timeout_s=float(config.get("interaction_timeout_s", 30.0)),
                 verification_timeout_s=float(config.get("verification_timeout_s", 30.0)),
@@ -211,6 +211,9 @@ class SemanticBehaviorExecutor:
         )
         self.navigation_stagnation_distance_m = float(
             config.get("navigation_stagnation_distance_m", 0.10)
+        )
+        self.navigation_stagnation_yaw_rad = float(
+            config.get("navigation_stagnation_yaw_rad", 0.15)
         )
         self.lock = threading.RLock()
         self.selection: dict | None = None
@@ -580,6 +583,8 @@ class SemanticBehaviorExecutor:
         reservation_retry = None
         with self.lock:
             reason = self.machine.timeout_reason()
+            if reason in {"navigation_timeout", "interaction_navigation_timeout"}:
+                reason = ""
             cancel_navigation = bool(reason) and self.machine.state in {
                 STATE_NAVIGATING,
                 STATE_APPROACH_INTERACTION,
@@ -1265,9 +1270,10 @@ class SemanticBehaviorExecutor:
         progress_watchdog = NavigationProgressWatchdog(
             timeout_s=self.navigation_stagnation_timeout_s,
             min_displacement_m=self.navigation_stagnation_distance_m,
+            min_yaw_change_rad=self.navigation_stagnation_yaw_rad,
         )
         progress_watchdog.reset(
-            None if start_pose is None else (start_pose[0], start_pose[1]),
+            start_pose,
             time.monotonic(),
         )
         navigation_timeout_s = (
@@ -1295,7 +1301,7 @@ class SemanticBehaviorExecutor:
                 <= self.final_align_max_distance_m
             )
             if not near_final_yaw_alignment and progress_watchdog.observe(
-                None if pose is None else (pose[0], pose[1]),
+                pose,
                 time.monotonic(),
             ):
                 self.move_base.cancel_goal()
@@ -1306,6 +1312,7 @@ class SemanticBehaviorExecutor:
                         "reason": "navigation_stagnation",
                         "stagnation_timeout_s": self.navigation_stagnation_timeout_s,
                         "stagnation_distance_m": self.navigation_stagnation_distance_m,
+                        "stagnation_yaw_rad": self.navigation_stagnation_yaw_rad,
                     },
                 )
                 return

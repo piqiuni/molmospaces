@@ -17,7 +17,7 @@
   <arg name="semantic_source" default="detector"/>
   <arg name="semantic_attribute_inference" default="false"/>
   <arg name="semantic_attribute_model_name" default=""/>
-  <arg name="semantic_attribute_max_output_tokens" default="96"/>
+  <arg name="semantic_attribute_max_output_tokens" default="160"/>
   <arg name="semantic_attribute_request_timeout_s" default="8.0"/>
   <arg name="semantic_attribute_worker_count" default="1"/>
   <arg name="semantic_attribute_max_queue_size" default="8"/>
@@ -41,7 +41,7 @@
   <arg name="start_semantic_decision" default="false"/>
   <arg name="semantic_decision_config_file" default="$(find semantic_decision_py_pkg)/config/default.yaml"/>
   <arg name="semantic_decision_config_override_file" default=""/>
-  <arg name="local_costmap_inflation_radius" default="0.20"/>
+  <arg name="local_costmap_inflation_radius" default="0.30"/>
   <arg name="explore_py_config_file" default="$(find explore_py_pkg)/config/explore_py.yaml"/>
   <arg name="explore_py_config_override_file" default=""/>
   <arg name="nav_config_override_file" default=""/>
@@ -195,6 +195,7 @@
     <include file="$(find explore_py_pkg)/launch/explore_py.launch">
       <arg name="config_file" value="$(arg explore_py_config_file)"/>
       <arg name="override_config_file" value="$(arg explore_py_config_override_file)"/>
+      <arg name="external_control_enabled" value="$(arg start_semantic_decision)"/>
     </include>
   </group>
 

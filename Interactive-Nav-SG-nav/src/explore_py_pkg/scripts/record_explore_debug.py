@@ -902,6 +902,7 @@ class ExploreDebugRecorder:
         self.latest_semantic_selection: dict = {}
         self.latest_semantic_execution_state: dict = {}
         self.latest_semantic_behavior_feedback: dict = {}
+        self.latest_semantic_decision_trace: dict = {}
         self.semantic_decision_event_count = 0
         self.last_semantic_execution_key = None
         self.latest_scene_id_grid = None
@@ -1177,6 +1178,15 @@ class ExploreDebugRecorder:
         )
         self.subscribers.append(
             rospy.Subscriber(
+                args.semantic_decision_trace_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("semantic_decision_trace", "latest_semantic_decision_trace"),
+                queue_size=10,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
                 args.semantic_execution_state_topic,
                 String,
                 self.semantic_decision_event_callback,
@@ -1249,6 +1259,7 @@ class ExploreDebugRecorder:
                 self.latest_semantic_selection = {}
                 self.latest_semantic_execution_state = {}
                 self.latest_semantic_behavior_feedback = {}
+                self.latest_semantic_decision_trace = {}
                 self.last_semantic_execution_key = None
             for observation in payload.get("observations") or []:
                 instance_id = str(observation.get("instance_id") or "")
@@ -1680,6 +1691,7 @@ class ExploreDebugRecorder:
             "semantic_selection": dict(self.latest_semantic_selection),
             "semantic_execution_state": dict(self.latest_semantic_execution_state),
             "semantic_behavior_feedback": dict(self.latest_semantic_behavior_feedback),
+            "semantic_decision_trace": dict(self.latest_semantic_decision_trace),
         }
 
     def _run_video_frame_renderer(self) -> None:
@@ -2157,6 +2169,7 @@ class ExploreDebugRecorder:
         semantic_selection: dict | None = None,
         semantic_execution_state: dict | None = None,
         semantic_behavior_feedback: dict | None = None,
+        semantic_decision_trace: dict | None = None,
         image_step: int | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 250, dtype=np.uint8)
@@ -2176,6 +2189,11 @@ class ExploreDebugRecorder:
             self.latest_semantic_behavior_feedback
             if semantic_behavior_feedback is None
             else semantic_behavior_feedback
+        )
+        semantic_decision_trace = (
+            self.latest_semantic_decision_trace
+            if semantic_decision_trace is None
+            else semantic_decision_trace
         )
         all_nodes = [
             node
@@ -2235,6 +2253,31 @@ class ExploreDebugRecorder:
                 continue
             color = self._semantic_node_color(node)
             cv2.circle(panel, center, 13 if node.get("type") == "room" else 9, color, -1, cv2.LINE_AA)
+            ranked_group_ids = list(
+                semantic_decision_trace.get("model_ranked_group_ids") or []
+            )
+            candidate_groups = {
+                str(item.get("id") or ""): item
+                for item in semantic_decision_trace.get("candidate_groups") or []
+            }
+            ranked_node_ids = []
+            for group_id in ranked_group_ids[:3]:
+                group = candidate_groups.get(str(group_id)) or {}
+                ranked_node_ids.append(
+                    str(group.get("subject_id") or "")
+                )
+            node_id = str(node.get("id") or "")
+            if node_id in ranked_node_ids:
+                rank = ranked_node_ids.index(node_id)
+                rank_colors = [(0, 205, 255), (255, 150, 40), (150, 150, 150)]
+                cv2.circle(
+                    panel,
+                    center,
+                    (19 if node.get("type") == "room" else 15) + rank,
+                    rank_colors[rank],
+                    2,
+                    cv2.LINE_AA,
+                )
             if str(node.get("id") or "") == str(semantic_selection.get("target_id") or ""):
                 cv2.circle(
                     panel,
@@ -2266,18 +2309,43 @@ class ExploreDebugRecorder:
             or "-"
         )
         feedback_status = str(semantic_behavior_feedback.get("status") or "-")
+        ranked_group_ids = list(
+            semantic_decision_trace.get("model_ranked_group_ids") or []
+        )
+        executed_group_id = str(
+            semantic_decision_trace.get("executed_group_id") or "-"
+        )
+        model_reason = str(semantic_decision_trace.get("model_reason") or "-")
+        candidate_groups = {
+            str(item.get("id") or ""): item
+            for item in semantic_decision_trace.get("candidate_groups") or []
+        }
+        executed_group = candidate_groups.get(executed_group_id) or {}
+        frontier_length = executed_group.get("frontier_length_m")
+        repeat_count = int(
+            ((executed_group.get("history") or {}).get("low_gain_repeat_count", 0))
+            or 0
+        )
+        model_latency = float(
+            (semantic_decision_trace.get("model_metrics") or {}).get(
+                "latency_sec", 0.0
+            )
+            or 0.0
+        )
         lines = [
             f"{execution_state}  {behavior_type}",
-            f"target={target_name}",
-            f"feedback={feedback_status}",
+            f"model={' > '.join(str(value) for value in ranked_group_ids[:3]) or '-'}",
+            f"exec={executed_group_id}  target={target_name}",
+            f"reason={model_reason}  feedback={feedback_status}",
+            f"frontier={frontier_length if frontier_length is not None else '-'}m repeat={repeat_count} t={model_latency:.2f}s",
         ]
         for index, text in enumerate(lines):
             cv2.putText(
                 panel,
                 text[:38],
-                (box_x + 6, box_y + 18 + index * 17),
+                (box_x + 6, box_y + 16 + index * 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.31,
+                0.27,
                 (25, 25, 25),
                 1,
                 cv2.LINE_AA,
@@ -2361,6 +2429,7 @@ class ExploreDebugRecorder:
                 semantic_selection = snapshot["semantic_selection"]
                 semantic_execution_state = snapshot["semantic_execution_state"]
                 semantic_behavior_feedback = snapshot["semantic_behavior_feedback"]
+                semantic_decision_trace = snapshot["semantic_decision_trace"]
                 graph_revision = int(graph.get("graph_revision", 0) or 0)
                 pending_semantic_keyframe_revision = int(snapshot["pending_semantic_keyframe_revision"])
             selected_goal_values = list(semantic_selection.get("goal_xyyaw") or [])
@@ -2502,6 +2571,7 @@ class ExploreDebugRecorder:
                     semantic_selection=semantic_selection,
                     semantic_execution_state=semantic_execution_state,
                     semantic_behavior_feedback=semantic_behavior_feedback,
+                    semantic_decision_trace=semantic_decision_trace,
                     image_step=image_step,
                 )
             dist_to_goal = (
@@ -5286,6 +5356,7 @@ class ExploreDebugRecorder:
                 "semantic_decision_selection": self.latest_semantic_selection,
                 "semantic_decision_execution_state": self.latest_semantic_execution_state,
                 "semantic_decision_behavior_feedback": self.latest_semantic_behavior_feedback,
+                "semantic_decision_trace": self.latest_semantic_decision_trace,
                 "semantic_graph_final": graph_final,
                 "semantic_events_jsonl": str(self.graph_dir / "graph_revision_events.jsonl"),
                 "semantic_keyframes": str(self.semantic_keyframe_dir),
@@ -5356,6 +5427,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--semantic-selected-behavior-topic",
         default="/semantic_decision/selected_behavior",
+    )
+    parser.add_argument(
+        "--semantic-decision-trace-topic",
+        default="/semantic_decision/decision_trace",
     )
     parser.add_argument(
         "--semantic-execution-state-topic",

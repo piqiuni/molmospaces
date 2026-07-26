@@ -35,7 +35,7 @@ GT_REQUIRED_CONSECUTIVE_OBSERVATIONS=${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS:-2}
 GT_ROI_X_MIN_RATIO=${GT_ROI_X_MIN_RATIO:-0.10}
 GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
-LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.25}
+LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.30}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-}
@@ -160,6 +160,18 @@ set -u
 source "${ROS_SETUP}"
 export ROS_PACKAGE_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src:/opt/ros/noetic/share"
 export PYTHONPATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:${PYTHONPATH:-}"
+
+ROS_DEVEL_ROOT=${ROS_SETUP:h}
+for ROS_EXECUTABLE in \
+  struct_mapping_pkg/slam_gmapping \
+  struct_mapping_pkg/voronoi_mapping_node \
+  nav_pkg/relay_node; do
+  if [[ ! -x "${ROS_DEVEL_ROOT}/lib/${ROS_EXECUTABLE}" ]]; then
+    print -u2 -- "Missing ROS executable: ${ROS_DEVEL_ROOT}/lib/${ROS_EXECUTABLE}"
+    print -u2 -- "Build the workspace first: cd ${REPO_ROOT}/Interactive-Nav-SG-nav && catkin_make --pkg struct_mapping_pkg nav_pkg"
+    exit 3
+  fi
+done
 
 FIXED_ROUTE_ARGS=""
 if [[ "${USE_FIXED_ROUTE}" == true ]]; then
