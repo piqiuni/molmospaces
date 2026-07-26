@@ -2,23 +2,28 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
+import random
 import re
+import signal
 import sys
 import time
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import mujoco
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from molmo_spaces.utils.pose import pose_mat_to_7d
+from molmo_spaces.utils.pose import pose_mat_to_7d, pos_quat_to_pose_mat
 from scripts.InteractiveNav import benchmark_door_state_scan as door_scan
 from scripts.InteractiveNav import build_container_interaction_benchmark as container_builder
 from scripts.InteractiveNav import build_door_interaction_benchmark as door_builder
@@ -41,6 +46,40 @@ def write_json(path: Path, payload: Any) -> None:
     temporary.write_text(json.dumps(probe.to_jsonable(payload), indent=2, ensure_ascii=False) + "\n")
     temporary.chmod(0o644)
     temporary.replace(path)
+
+
+class MixedCandidateRejected(ValueError):
+    def __init__(self, message: str, *, diagnostics: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
+
+
+@contextmanager
+def candidate_timeout(seconds: float | None):
+    if not seconds or seconds <= 0 or not hasattr(signal, "setitimer"):
+        yield
+        return
+
+    def handle_timeout(_signum, _frame):
+        raise TimeoutError(f"mixed candidate exceeded {seconds:g}s timeout")
+
+    previous = signal.signal(signal.SIGALRM, handle_timeout)
+    signal.setitimer(signal.ITIMER_REAL, float(seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def candidate_plan_key(candidate: dict[str, Any]) -> str:
+    source_index = candidate.get("_preferred_source_episode_index")
+    return f"{candidate['case_id']}::src{'' if source_index is None else int(source_index)}"
+
+
+def candidate_seed(base_seed: int, candidate: dict[str, Any]) -> int:
+    payload = f"{int(base_seed)}::{candidate_plan_key(candidate)}".encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big")
 
 
 def safe_slug(value: str, max_len: int = 80) -> str:
@@ -401,6 +440,122 @@ def candidate_sources(
     return ordered
 
 
+def _container_cache_key(
+    house_index: int, container_name: str, object_name: str
+) -> tuple[int, str, str]:
+    return int(house_index), str(container_name), str(object_name)
+
+
+def load_container_validation_cache(
+    path: Path | None,
+) -> dict[tuple[int, str, str], list[dict[str, Any]]]:
+    """Load reusable Container visibility traces from finalized V3 episodes."""
+    if path is None or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    rows = payload.get("episodes", payload) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return {}
+    cache: dict[tuple[int, str, str], list[dict[str, Any]]] = {}
+    for episode in rows:
+        if not isinstance(episode, dict):
+            continue
+        interactive = episode.get("interactive_nav", {})
+        target = interactive.get("target", {})
+        container_name = target.get("container_name")
+        object_name = target.get("selected_instance")
+        if not container_name or not object_name:
+            continue
+        source_index = interactive.get("parent_benchmark_episode_index")
+        validations = interactive.get("generation_validation", {}).get(
+            "interaction_validations", []
+        )
+        if not isinstance(validations, list):
+            continue
+        key = _container_cache_key(
+            int(episode["house_index"]), str(container_name), str(object_name)
+        )
+        for validation in validations:
+            if not isinstance(validation, dict) or not validation.get("visibility_trace"):
+                continue
+            cache.setdefault(key, []).append(
+                {
+                    "joint_index": int(validation["controlling_joint_index"]),
+                    "joint_sequence": [
+                        int(value) for value in validation.get("joint_sequence", [])
+                    ],
+                    "interaction_pose": validation.get("interaction_pose"),
+                    "interaction_pose_meta": validation.get("interaction_pose_meta", {}),
+                    "view_profile": validation.get("view_profile", "default"),
+                    "visibility_trace": validation["visibility_trace"],
+                    "binding": validation.get("object_binding"),
+                    "start_validation": validation.get("start_validation"),
+                    "source_episode_index": source_index,
+                    "source_case_id": interactive.get("case_id"),
+                }
+            )
+    return cache
+
+
+def cached_container_candidates(
+    ctx: probe.LoadedContext,
+    container: dict[str, Any],
+    object_record: dict[str, Any],
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    joints_by_index = {int(row["joint_index"]): row for row in container["joints"]}
+    candidates = []
+    for entry in entries:
+        joint_index = int(entry["joint_index"])
+        sequence = [int(value) for value in entry["joint_sequence"]]
+        pose_7d = entry.get("interaction_pose")
+        if (
+            joint_index not in joints_by_index
+            or not sequence
+            or any(value not in joints_by_index for value in sequence)
+            or not isinstance(pose_7d, list)
+            or len(pose_7d) != 7
+        ):
+            continue
+        view_profile = str(entry.get("view_profile", "default"))
+        qpos_before = ctx.env.current_data.qpos.copy()
+        head_before = probe.get_head_joint_position(ctx.env)
+        torso_before = probe.get_torso_joint_position(ctx.env)
+        try:
+            view_state = probe.apply_container_view_profile(ctx, view_profile)
+        finally:
+            ctx.env.current_data.qpos[:] = qpos_before
+            mujoco.mj_forward(ctx.env.current_model, ctx.env.current_data)
+            if torso_before is not None:
+                probe.set_torso_joint_position(ctx.env, torso_before)
+            if head_before is not None:
+                probe.set_head_joint_position(ctx.env, head_before)
+        joint = joints_by_index[joint_index]
+        candidates.append(
+            {
+                "joint": joint,
+                "joint_sequence": sequence,
+                "robot_pose": pos_quat_to_pose_mat(pose_7d),
+                "pose_meta": dict(entry.get("interaction_pose_meta") or {}),
+                "view_profile": view_profile,
+                "view_state": view_state,
+                "visibility_trace": entry["visibility_trace"],
+                "joint_type": probe.joint_mujoco_type_name(ctx.env, joint),
+                "force_slide_joints": probe.joint_mujoco_type_name(ctx.env, joint) == "slide",
+                "binding": entry.get("binding"),
+                "containment": None,
+                "start_validation": entry.get("start_validation"),
+                "_reuse_visibility_trace": True,
+                "_reuse_source_episode_index": entry.get("source_episode_index"),
+                "_reuse_source_case_id": entry.get("source_case_id"),
+            }
+        )
+    return candidates
+
+
 def measured_mixed_path_candidate(
     args: argparse.Namespace,
     *,
@@ -429,15 +584,23 @@ def measured_mixed_path_candidate(
     for source_index, source_episode in source_options:
         start_xy = np.asarray(source_episode["task"]["robot_base_pose"][:2], dtype=float)
         for selected in selected_candidates:
-            start_validation = container_builder.source_start_validation(
-                ctx,
-                container,
-                object_record["name"],
-                source_episode,
-                open_map,
-                selected["robot_pose"],
-                args.visibility_threshold,
-            )
+            cached_start = selected.get("start_validation")
+            if (
+                cached_start is not None
+                and selected.get("_reuse_source_episode_index") is not None
+                and int(selected["_reuse_source_episode_index"]) == int(source_index)
+            ):
+                start_validation = cached_start
+            else:
+                start_validation = container_builder.source_start_validation(
+                    ctx,
+                    container,
+                    object_record["name"],
+                    source_episode,
+                    open_map,
+                    selected["robot_pose"],
+                    args.visibility_threshold,
+                )
             if not start_validation["valid"]:
                 continue
             goal_xy = np.asarray(selected["robot_pose"][:2, 3], dtype=float)
@@ -778,6 +941,7 @@ def collect_candidate(
     ctx: probe.LoadedContext,
     rough_candidate: dict[str, Any],
     episodes_by_index: dict[int, dict[str, Any]],
+    container_validation_cache: dict[tuple[int, str, str], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     container_builder.open_all_available_doors(ctx)
     _, initial_containers = probe.collect_scene_records(ctx)
@@ -807,6 +971,17 @@ def collect_candidate(
         return_doorway_analysis=True,
     )
     source_options = candidate_sources(rough_candidate, episodes_by_index)
+    cached_candidates = cached_container_candidates(
+        ctx,
+        container,
+        object_record,
+        (container_validation_cache or {}).get(
+            _container_cache_key(
+                int(rough_candidate["house_index"]), container["name"], object_record["name"]
+            ),
+            [],
+        ),
+    )
     doors_by_name = {
         row["name"]: row
         for row in emi.collect_interactive_door_root_object_records(
@@ -858,10 +1033,15 @@ def collect_candidate(
         dependencies,
         rough_candidate["case_id"],
         candidate_acceptor=accept_mixed_candidate,
+        prevalidated_candidates=cached_candidates,
     )
     if not analysis["valid"]:
-        raise ValueError(
-            f"No measured mixed container visibility unlock: {analysis['reason']}"
+        raise MixedCandidateRejected(
+            f"No measured mixed container visibility unlock: {analysis['reason']}",
+            diagnostics={
+                "analysis_reason": analysis.get("reason"),
+                "joint_failures": analysis.get("joint_failures", []),
+            },
         )
     selected = analysis["selected"]
 
@@ -897,15 +1077,27 @@ def collect_candidate(
     if requested_requirement == "beneficial" and initial_path is None:
         raise ValueError("Initial closed-door state lacks a shortcut comparison path")
     selected["approach_path"] = approach_path
-    source_pose = container_builder.robot_pose_from_episode(selected["source_episode"])
-    initial_start_trace = probe.container_visibility_trace(
-        ctx,
-        container,
-        object_record["name"],
-        [],
-        source_pose,
-        view_profile="default",
-    )["trace"][0]
+    if (
+        selected.get("_reuse_visibility_trace")
+        and selected.get("start_validation") is not None
+        and int(selected.get("_reuse_source_episode_index", -1))
+        == int(selected["source_episode_index"])
+    ):
+        initial_start_trace = {
+            "visibility_fraction": float(selected["start_validation"]["start_visibility_fraction"]),
+            "visible_pixels": int(selected["start_validation"]["start_visible_pixels"]),
+            "reused_container_validation": True,
+        }
+    else:
+        source_pose = container_builder.robot_pose_from_episode(selected["source_episode"])
+        initial_start_trace = probe.container_visibility_trace(
+            ctx,
+            container,
+            object_record["name"],
+            [],
+            source_pose,
+            view_profile="default",
+        )["trace"][0]
     if (
         float(initial_start_trace["visibility_fraction"]) > 0.0
         or int(initial_start_trace["visible_pixels"]) > 0
@@ -963,20 +1155,26 @@ def collect_candidate(
         raise ValueError(
             "Opening beneficial door did not pass the measured shortcut thresholds"
         )
-    trace_result = probe.container_visibility_trace(
-        ctx,
-        container,
-        object_record["name"],
-        selected["joint_sequence"],
-        selected["robot_pose"],
-        view_profile=selected["view_profile"],
-        force_slide_joints=selected.get("force_slide_joints", False),
-        output_dir=(
-            args.output_dir / "evidence" / rough_candidate["case_id"]
-            if args.save_images
-            else None
-        ),
-    )
+    if selected.get("_reuse_visibility_trace") and not args.save_images:
+        trace_result = {
+            "trace": selected["visibility_trace"],
+            "view_state": selected["view_state"],
+        }
+    else:
+        trace_result = probe.container_visibility_trace(
+            ctx,
+            container,
+            object_record["name"],
+            selected["joint_sequence"],
+            selected["robot_pose"],
+            view_profile=selected["view_profile"],
+            force_slide_joints=selected.get("force_slide_joints", False),
+            output_dir=(
+                args.output_dir / "evidence" / rough_candidate["case_id"]
+                if args.save_images
+                else None
+            ),
+        )
     selected["visibility_trace"] = trace_result["trace"]
     selected["view_state"] = trace_result["view_state"]
     container_interactions, container_ids = v3.build_container_interactions(
@@ -1049,6 +1247,7 @@ def collect_candidate(
 
 
 def run(args: argparse.Namespace) -> int:
+    np.random.seed(int(args.seed))
     rough_paths = [args.mixed_rough_catalog] + list(
         args.additional_mixed_rough_catalog or []
     )
@@ -1060,7 +1259,15 @@ def run(args: argparse.Namespace) -> int:
         for candidate in rough_payload.get("candidates", []):
             candidates_by_case.setdefault(candidate["case_id"], candidate)
     episodes = container_builder.load_benchmark_episodes(args.benchmark_dir)
-    episodes_by_index = dict(enumerate(episodes))
+    episodes_by_index = {}
+    for local_index, episode in enumerate(episodes):
+        source_index = episode.get("seed_generation", {}).get(
+            "source_episode_index", local_index
+        )
+        episodes_by_index[int(source_index)] = episode
+    container_validation_cache = load_container_validation_cache(
+        args.container_benchmark
+    )
     candidates = list(candidates_by_case.values())
     allowed_rough_types = {
         value.strip()
@@ -1121,8 +1328,19 @@ def run(args: argparse.Namespace) -> int:
             ),
             int(row["estimated_total_interaction_count"]),
             row["case_id"],
+            int(row.get("_preferred_source_episode_index", -1)),
         )
     )
+    if args.candidate_plan is not None:
+        plan_payload = json.loads(args.candidate_plan.read_text())
+        plan_rows = plan_payload.get("candidates", plan_payload)
+        plan_order = {
+            str(row["candidate_key"]): index for index, row in enumerate(plan_rows)
+        }
+        candidates = [
+            row for row in candidates if candidate_plan_key(row) in plan_order
+        ]
+        candidates.sort(key=lambda row: plan_order[candidate_plan_key(row)])
     args.output_dir.mkdir(parents=True, exist_ok=True)
     benchmark = []
     valid = []
@@ -1145,24 +1363,61 @@ def run(args: argparse.Namespace) -> int:
                     probe.close_context(ctx)
                 source_indices = candidate.get("source_episode_indices", [])
                 if not source_indices:
-                    rejected.append({**candidate, "reason": "no_source_episode_indices"})
+                    rejected.append(
+                        {
+                            **candidate,
+                            "candidate_key": candidate_plan_key(candidate),
+                            "reason": "no_source_episode_indices",
+                        }
+                    )
+                    write_json(args.output_dir / "rejected.partial.json", rejected)
                     continue
-                template_episode = episodes_by_index[int(source_indices[0])]
+                available_source = next(
+                    (
+                        int(value)
+                        for value in source_indices
+                        if int(value) in episodes_by_index
+                    ),
+                    None,
+                )
+                if available_source is None:
+                    rejected.append(
+                        {
+                            "case_id": candidate["case_id"],
+                            "candidate_key": candidate_plan_key(candidate),
+                            "house_index": house_index,
+                            "container_name": candidate["container_name"],
+                            "object_name": candidate["object_name"],
+                            "source_episode_index": candidate.get(
+                                "_preferred_source_episode_index"
+                            ),
+                            "reason": "no_available_source_episode",
+                        }
+                    )
+                    write_json(args.output_dir / "rejected.partial.json", rejected)
+                    continue
+                template_episode = episodes_by_index[available_source]
                 ctx = container_builder.load_episode_context(args, template_episode)
                 current_house = house_index
             candidate_started = time.perf_counter()
             try:
-                episode = collect_candidate(
-                    args,
-                    ctx=ctx,
-                    rough_candidate=candidate,
-                    episodes_by_index=episodes_by_index,
-                )
+                per_candidate_seed = candidate_seed(args.seed, candidate)
+                np.random.seed(per_candidate_seed)
+                random.seed(per_candidate_seed)
+                with candidate_timeout(args.candidate_timeout_seconds):
+                    episode = collect_candidate(
+                        args,
+                        ctx=ctx,
+                        rough_candidate=candidate,
+                        episodes_by_index=episodes_by_index,
+                        container_validation_cache=container_validation_cache,
+                    )
                 benchmark.append(episode)
                 collected_houses.add(house_index)
                 valid.append(
                     {
                         "case_id": episode["interactive_nav"]["case_id"],
+                        "candidate_key": candidate_plan_key(candidate),
                         "house_index": house_index,
                         "source_episode_index": episode["interactive_nav"][
                             "parent_benchmark_episode_index"
@@ -1193,11 +1448,16 @@ def run(args: argparse.Namespace) -> int:
                 rejected.append(
                     {
                         "case_id": candidate["case_id"],
+                        "candidate_key": candidate_plan_key(candidate),
                         "house_index": house_index,
                         "container_name": candidate["container_name"],
                         "object_name": candidate["object_name"],
+                        "source_episode_index": candidate.get(
+                            "_preferred_source_episode_index"
+                        ),
                         "reason": reason,
                         "error": str(exc),
+                        "diagnostics": getattr(exc, "diagnostics", {}),
                         "elapsed_sec": time.perf_counter() - candidate_started,
                     }
                 )
@@ -1258,6 +1518,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional mixed_rough_catalog_v1 files to merge by case_id before collection.",
     )
     parser.add_argument("--benchmark_dir", type=Path, default=container_builder.DEFAULT_BENCHMARK_DIR)
+    parser.add_argument(
+        "--container_benchmark",
+        type=Path,
+        help="Optional finalized Container V3 benchmark whose visibility traces may be reused.",
+    )
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--max_samples", type=int, default=10)
     parser.add_argument(
@@ -1276,9 +1541,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Collect up to this many measured source-start variants per rough pair.",
     )
     parser.add_argument("--house_indices")
+    parser.add_argument(
+        "--candidate_plan",
+        type=Path,
+        help="Deterministic candidate-key plan produced by the unified collector.",
+    )
     parser.add_argument("--robot", default="rby1")
     parser.add_argument("--variant", default="base")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--candidate_timeout_seconds",
+        type=float,
+        default=600.0,
+        help="Wall-clock timeout for one fine mixed candidate; <=0 disables it.",
+    )
     parser.add_argument("--visibility_threshold", type=float, default=1e-4)
     parser.add_argument("--interaction_distance", type=float, default=0.8)
     parser.add_argument("--max_poses_per_joint", type=int, default=4)

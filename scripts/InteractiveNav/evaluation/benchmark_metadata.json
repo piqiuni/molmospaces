@@ -1,0 +1,16 @@
+{
+  "schema_version": "interactive_nav_v3_eval_metadata_v1",
+  "benchmark_relative_path": "scripts/InteractiveNav/output/interactive_nav_v3_nav_benchmark_val_light_3000_manifest_v3/balanced/benchmark.json",
+  "episode_count": 3000,
+  "domain_counts": {
+    "channel": 1000,
+    "container": 1000,
+    "mixed": 1000
+  },
+  "robot": "rby1",
+  "scene_dataset": "procthor-10k",
+  "data_split": "val",
+  "default_policy_dt_ms": 200.0,
+  "force_success_fraction": 0.8,
+  "policy_gt_boundary": "interactive_nav is evaluator-only except scripted_oracle"
+}

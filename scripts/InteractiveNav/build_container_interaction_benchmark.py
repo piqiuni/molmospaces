@@ -391,9 +391,40 @@ def analyze_object_pair(
     dependency_rows: list[dict[str, Any]],
     case_id: str,
     candidate_acceptor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    prevalidated_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    # Mixed collection can reuse a Container candidate already validated in the
+    # same frozen scene.  Its path-specific acceptor still runs below; only the
+    # repeated pose search and visibility rendering are skipped.
+    if prevalidated_candidates:
+        cached_failures = []
+        for candidate in prevalidated_candidates:
+            accepted = candidate
+            if candidate_acceptor is not None:
+                acceptance = candidate_acceptor(candidate)
+                if not acceptance.get("accepted", False):
+                    cached_failures.append(
+                        {
+                            "joint_index": int(candidate["joint"]["joint_index"]),
+                            "reason": acceptance.get(
+                                "reason", "cached_candidate_rejected_by_acceptor"
+                            ),
+                        }
+                    )
+                    continue
+                accepted = {**candidate, **acceptance.get("metadata", {})}
+            return {
+                "valid": True,
+                "selected": accepted,
+                "candidate_joint_indices": [int(accepted["joint"]["joint_index"])],
+                "candidate_joint_results": [accepted],
+                "binding": accepted.get("binding"),
+                "multi_oracle": False,
+                "reused_container_validation": True,
+            }
+
     valid_joint_candidates: list[dict[str, Any]] = []
-    joint_failures: list[dict[str, Any]] = []
+    joint_failures: list[dict[str, Any]] = cached_failures if prevalidated_candidates else []
     dependencies_by_index = {
         int(row["joint_index"]): row for row in dependency_rows
     }

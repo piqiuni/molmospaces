@@ -166,6 +166,8 @@ def run(args: argparse.Namespace) -> int:
             "episode_index": episode_index,
             "house_index": int(episode["house_index"]),
             "interaction_domains": [args.domain],
+            "collection_hz": float(args.collection_hz),
+            "dt_seconds": 1.0 / float(args.collection_hz),
         },
     )
     step_collector = mixed.StepCollector(recorder)
@@ -194,7 +196,8 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output,
             camera_names=mixed.CAMERAS,
             max_steps=args.max_steps,
-            video_fps=args.video_fps,
+            collection_hz=args.collection_hz,
+            navigation_speed_mps=args.navigation_speed_mps,
             base_adjustment_path=path,
             max_base_adjustment_steps=max(
                 args.max_base_adjustment_steps, 5 * len(path) + 10
@@ -212,7 +215,9 @@ def run(args: argparse.Namespace) -> int:
             force_fallback_max_steps=mixed.force_max_steps(
                 args, "door" if spec["kind"] == "door" else "container"
             ),
-            completion_hold_seconds=args.completion_hold_seconds,
+            force_duration_seconds=mixed.force_duration_seconds(
+                args, "door" if spec["kind"] == "door" else "container"
+            ),
         )
         write_json(output / "result.json", result)
         success = bool(result.get("success")) and mixed.semantic_fraction(result) >= args.required_open_fraction
@@ -235,6 +240,8 @@ def run(args: argparse.Namespace) -> int:
                 "target_meta": target_meta,
                 "path_length_m": path_length,
                 "waypoint_count": len(path),
+                "collection_hz": args.collection_hz,
+                "dt_seconds": 1.0 / args.collection_hz,
                 "result": result,
                 "trajectory_path": str(run_dir / "trajectory.h5"),
                 "trajectory_audit": audit,

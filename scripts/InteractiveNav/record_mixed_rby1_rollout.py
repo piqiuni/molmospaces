@@ -100,6 +100,7 @@ class StepCollector:
             state: dict[str, Any],
             metadata: dict[str, Any],
         ) -> None:
+            dt_seconds = float(metadata.get("dt_seconds", 1.0))
             self.recorder.record_step(
                 images=images,
                 action=action,
@@ -110,6 +111,8 @@ class StepCollector:
                 terminal=bool(metadata.get("terminal", False)),
                 truncated=bool(metadata.get("truncated", False)),
                 info=metadata,
+                timestamp_seconds=float(self.recorder.count * dt_seconds),
+                dt_seconds=dt_seconds,
             )
 
         return _callback
@@ -333,6 +336,40 @@ def smooth_navigation_poses(path: np.ndarray) -> list[np.ndarray]:
     return poses
 
 
+def resample_navigation_poses(
+    poses: list[np.ndarray], *, speed_mps: float, sample_hz: float
+) -> list[np.ndarray]:
+    """Resample a smoothed path at the fixed full-data collection interval."""
+    if not poses:
+        return []
+    if len(poses) == 1:
+        return [np.asarray(poses[0], dtype=float)]
+    points = np.asarray([pose[:2, 3] for pose in poses], dtype=float)
+    yaws = np.unwrap(
+        np.asarray(
+            [R.from_matrix(pose[:3, :3]).as_euler("XYZ")[2] for pose in poses],
+            dtype=float,
+        )
+    )
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    total_length = float(cumulative[-1])
+    spacing = float(speed_mps) / float(sample_hz)
+    sample_count = max(1, int(math.ceil(total_length / max(spacing, 1e-8))))
+    distances = np.minimum(np.arange(1, sample_count + 1, dtype=float) * spacing, total_length)
+    sampled_points = np.column_stack(
+        [np.interp(distances, cumulative, points[:, axis]) for axis in range(2)]
+    )
+    sampled_yaws = np.interp(distances, cumulative, yaws)
+    sampled: list[np.ndarray] = []
+    for point, yaw in zip(sampled_points, sampled_yaws, strict=True):
+        pose = np.eye(4, dtype=float)
+        pose[:3, :3] = R.from_euler("Z", float(yaw)).as_matrix()
+        pose[:2, 3] = point
+        sampled.append(pose)
+    return sampled
+
+
 def compute_navigation_path(
     episode: dict[str, Any],
     *,
@@ -386,7 +423,11 @@ def compute_navigation_path(
                 f"No {door_state} navigation path from {start_xy.tolist()} to {goal_xy.tolist()}"
             )
         path = compress_path(path, spacing_m=args.nav_waypoint_spacing_m)
-        poses = smooth_navigation_poses(path)
+        poses = resample_navigation_poses(
+            smooth_navigation_poses(path),
+            speed_mps=float(getattr(args, "navigation_speed_mps", 0.84)),
+            sample_hz=float(getattr(args, "collection_hz", 5.0)),
+        )
         return poses, float(emi.path_length(path))
     finally:
         probe.close_context(ctx)
@@ -417,6 +458,11 @@ def force_max_steps(args: argparse.Namespace, interaction_kind: str) -> int:
     return int(args.force_fallback_max_steps if specific is None else specific)
 
 
+def force_duration_seconds(args: argparse.Namespace, interaction_kind: str) -> float:
+    specific = getattr(args, f"{interaction_kind}_force_duration_seconds", None)
+    return float(2.0 if specific is None else specific)
+
+
 def save_combined_videos(output_dir: Path, collector: FrameCollector, fps: float) -> dict[str, str]:
     output_paths = {}
     for camera_name, frames in collector.frames.items():
@@ -429,6 +475,12 @@ def save_combined_videos(output_dir: Path, collector: FrameCollector, fps: float
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.collection_hz <= 0.0:
+        raise ValueError("collection_hz must be positive")
+    if args.video_fps is not None and not math.isclose(
+        float(args.video_fps), float(args.collection_hz), rel_tol=0.0, abs_tol=1e-9
+    ):
+        raise ValueError("Full rollout video_fps must equal collection_hz")
     episode_index, episode, selection = load_episode(
         args.benchmark,
         args.episode_index,
@@ -529,6 +581,8 @@ def run(args: argparse.Namespace) -> int:
             "episode_index": episode_index,
             "house_index": annotations["house_index"],
             "interaction_domains": ["channel", "container"],
+            "collection_hz": float(args.collection_hz),
+            "dt_seconds": 1.0 / float(args.collection_hz),
         },
     )
     step_collector = StepCollector(rollout_recorder)
@@ -553,7 +607,8 @@ def run(args: argparse.Namespace) -> int:
         output_dir=door_output,
         camera_names=CAMERAS,
         max_steps=args.max_steps,
-        video_fps=args.video_fps,
+        collection_hz=args.collection_hz,
+        navigation_speed_mps=args.navigation_speed_mps,
         base_adjustment_path=door_path,
         max_base_adjustment_steps=max(
             args.max_base_adjustment_steps, 5 * len(door_path) + 10
@@ -566,7 +621,7 @@ def run(args: argparse.Namespace) -> int:
         allow_force_fallback=args.allow_force_fallback,
         force_fallback_target_fraction=force_target_fraction(args, "door"),
         force_fallback_max_steps=force_max_steps(args, "door"),
-        completion_hold_seconds=args.completion_hold_seconds,
+        force_duration_seconds=force_duration_seconds(args, "door"),
     )
     write_json(door_output / "result.json", door_result)
     if not door_result["success"] or semantic_fraction(door_result) < args.required_open_fraction:
@@ -632,7 +687,8 @@ def run(args: argparse.Namespace) -> int:
         output_dir=fridge_output,
         camera_names=CAMERAS,
         max_steps=args.max_steps,
-        video_fps=args.video_fps,
+        collection_hz=args.collection_hz,
+        navigation_speed_mps=args.navigation_speed_mps,
         base_adjustment_path=fridge_path,
         max_base_adjustment_steps=max(
             args.max_base_adjustment_steps, 5 * len(fridge_path) + 10
@@ -650,7 +706,7 @@ def run(args: argparse.Namespace) -> int:
         allow_force_fallback=args.allow_force_fallback,
         force_fallback_target_fraction=force_target_fraction(args, "container"),
         force_fallback_max_steps=force_max_steps(args, "container"),
-        completion_hold_seconds=args.completion_hold_seconds,
+        force_duration_seconds=force_duration_seconds(args, "container"),
     )
     write_json(fridge_output / "result.json", fridge_result)
     if not fridge_result["success"] or semantic_fraction(fridge_result) < args.required_open_fraction:
@@ -659,7 +715,7 @@ def run(args: argparse.Namespace) -> int:
             f"success={fridge_result['success']} fraction={semantic_fraction(fridge_result):.3f}"
         )
 
-    video_paths = save_combined_videos(run_dir, collector, args.video_fps)
+    video_paths = save_combined_videos(run_dir, collector, args.collection_hz)
     rollout_recorder.finalize(
         success=True,
         terminal_reason="door_and_container_completed",
@@ -713,7 +769,9 @@ def run(args: argparse.Namespace) -> int:
             )
             | {"result": fridge_result},
         ],
-        "video_fps": args.video_fps,
+        "collection_hz": args.collection_hz,
+        "dt_seconds": 1.0 / args.collection_hz,
+        "video_fps": args.collection_hz,
         "video_paths": video_paths,
         "frame_event_count": len(collector.events),
         "frame_events": collector.events,
@@ -760,14 +818,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--container_force_target_fraction", type=float)
     parser.add_argument("--door_force_max_steps", type=int)
     parser.add_argument("--container_force_max_steps", type=int)
+    parser.add_argument("--door_force_duration_seconds", type=float, default=2.0)
+    parser.add_argument("--container_force_duration_seconds", type=float, default=2.0)
     parser.add_argument("--lock_base_during_force", action="store_true")
     parser.add_argument("--container_max_steps_per_waypoint", type=int, default=80)
     parser.add_argument("--container_max_batch_plan_attempts", type=int, default=16)
     parser.add_argument("--container_max_planning_reattempts", type=int, default=8)
     parser.add_argument("--success_threshold", type=float, default=0.8)
     parser.add_argument("--required_open_fraction", type=float, default=0.8)
-    parser.add_argument("--completion_hold_seconds", type=float, default=0.4)
-    parser.add_argument("--video_fps", type=float, default=10.0)
+    parser.add_argument("--collection_hz", type=float, default=5.0)
+    parser.add_argument("--navigation_speed_mps", type=float, default=0.84)
+    parser.add_argument("--video_fps", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--img_width", type=int, default=320)
     parser.add_argument("--img_height", type=int, default=180)
     parser.add_argument("--px_per_m", type=float, default=100.0)

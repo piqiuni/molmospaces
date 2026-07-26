@@ -25,24 +25,6 @@ catalog，再执行 fine 交互验证。
 `open_gt_control`，不主动构造错误动作 rollout；mixed 只接受真实
 `mixed_required_verified` 门到容器因果链。
 
-ProcTHOR-10K train 的 100 条均衡测试配置：
-
-```bash
-python scripts/InteractiveNav/collect_interactive_nav.py \
-  --config scripts/InteractiveNav/configs/collection/procthor10k_train_100.yaml \
-  --stage all
-```
-
-100 不能被 3 整除，因此默认目标为 `channel=34`、`container=33`、`mixed=33`。
-示例配置按当前本机已安装资产使用 `train_0..train_99`；统一入口支持任意 train
-house 范围，但扩大范围前必须先安装对应 ProcTHOR scene 资产。为兼顾稀有 mixed
-链的容量与场景多样性，默认每屋上限为 channel=2、container=2、mixed=3。
-
-2026-07-20 的 100 条轻量采集验证结果为：100/100 通过 V3 校验、三类
-34/33/33、100 个唯一 case ID、39 个唯一 house、0 个占位值。三类分别覆盖
-18/25/13 个 house；完整报告见配置输出目录下的
-`balanced/structure_report.md`。
-
 统一入口支持两种采集模式：
 
 - `mode: light`：只保存 V3 metadata、oracle plan 和交互状态，适合大规模
@@ -74,13 +56,11 @@ readback；terminal observation 使用 `observe` action type。相机帧按同�
 导航 waypoint 在进入 full runner 前会进行轻量位置和 yaw 平滑，以减少相邻 waypoint
 导致的左右摆动。导航仍使用 position-control 物理跟踪。
 导航和 force 阶段默认保持初始 head、左右臂、夹爪和 torso 的 qpos/qvel/position
-target；force 阶段还会硬锁 base pose，并记录锁定组和实际最大漂移量。force H5
-仍保存每个 2ms sim step，但 MP4 按目标 fps 下采样；因此视频播放时间与仿真时间
-一致。默认最多 1000 个 force steps 对应约 2 秒连续交互；一旦达到任务
-`success_threshold`（当前 0.8），force 段停止物理推进并额外保留短暂完成保持帧，
-然后终止视频，不再记录无效后续步骤。控制
-目标仍可设为 1.0，训练有效性按任务阈值和 full `required_open_fraction` 判定，避免
-物理几何限位使有效开门轨迹被误判失败。
+target；force 阶段还会硬锁 base pose，并记录锁定组和实际最大漂移量。full 数据默认
+以 `collection_hz=5` 采样，H5 与 MP4 都使用 `dt=0.2s`，视频 fps 强制等于采集频率。
+内部 MuJoCo/controller 只负责在两个采样边界之间连续执行，不直接写入训练数据。
+冰箱门默认 2 秒生成 10 个连续交互 step，目标开度从 0% 递增到 100%；`success_threshold`
+（当前 0.8）只记录成功事件，不会提前终止这段 2 秒轨迹。
 
 ## 示例真实性
 

@@ -31,22 +31,25 @@ policy:
     executor: force
     target_fraction: 1.0
     max_steps: 1500
+    duration_seconds: 2.0
     tolerance: 0.001
   container:
     executor: force
     target_fraction: 1.0
     max_steps: 1000
+    duration_seconds: 2.0
     tolerance: 0.001
 
 full:
   max_episodes: 1
+  max_candidate_attempts_per_domain: 5
   domains: [channel, container, mixed]
   selection_strategy: shortest_validated_path
   max_steps: 500
   max_base_adjustment_steps: 300
-  video_fps: 10.0
+  collection_hz: 5.0
+  navigation_speed_mps: 0.84
   required_open_fraction: 0.8
-  completion_hold_seconds: 0.4
   image_width: 320
   image_height: 180
   lock_base_during_force: true

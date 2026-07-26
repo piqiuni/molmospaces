@@ -59,6 +59,12 @@ class H5StepRolloutRecorder:
         self.step_index = self.steps.create_dataset(
             "step_index", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=True
         )
+        self.timestamp_seconds = self.steps.create_dataset(
+            "timestamp_seconds", shape=(0,), maxshape=(None,), dtype=np.float64, chunks=True
+        )
+        self.dt_seconds = self.steps.create_dataset(
+            "dt_seconds", shape=(0,), maxshape=(None,), dtype=np.float32, chunks=True
+        )
         self.segment = self.steps.create_dataset(
             "segment", shape=(0,), maxshape=(None,), dtype=text_dtype, chunks=True
         )
@@ -138,6 +144,8 @@ class H5StepRolloutRecorder:
         terminal: bool = False,
         truncated: bool = False,
         info: dict[str, Any] | None = None,
+        timestamp_seconds: float | None = None,
+        dt_seconds: float | None = None,
     ) -> None:
         if self.closed:
             raise RuntimeError("Cannot append to a finalized rollout recorder")
@@ -147,6 +155,8 @@ class H5StepRolloutRecorder:
         next_size = self.count + 1
         scalar_datasets = [
             self.step_index,
+            self.timestamp_seconds,
+            self.dt_seconds,
             self.segment,
             self.phase,
             self.action_type,
@@ -171,6 +181,10 @@ class H5StepRolloutRecorder:
         state = _jsonable(state or {})
         vector = np.asarray(action.get("vector", []), dtype=np.float32).reshape(-1)
         self.step_index[self.count] = self.count
+        self.timestamp_seconds[self.count] = float(
+            self.count if timestamp_seconds is None else timestamp_seconds
+        )
+        self.dt_seconds[self.count] = float(1.0 if dt_seconds is None else dt_seconds)
         self.segment[self.count] = str(segment)
         self.phase[self.count] = str(phase)
         self.action_type[self.count] = str(action.get("type", "unknown"))
@@ -242,6 +256,8 @@ def validate_full_rollout(path: Path) -> dict[str, Any]:
         steps = handle["steps"]
         required = [
             steps["step_index"],
+            steps["timestamp_seconds"],
+            steps["dt_seconds"],
             steps["segment"],
             steps["phase"],
             steps["actions/type"],
@@ -260,6 +276,9 @@ def validate_full_rollout(path: Path) -> dict[str, Any]:
         action_type_counts = Counter(decode(value) for value in steps["actions/type"][:])
         segment_counts = Counter(decode(value) for value in steps["segment"][:])
         terminal_step_count = int(np.count_nonzero(steps["terminal"][:]))
+        dt_values = np.asarray(steps["dt_seconds"][:], dtype=float)
+        if not np.allclose(dt_values, dt_values[0], rtol=0.0, atol=1e-7):
+            raise ValueError("Full rollout contains non-uniform training dt values")
         return {
             "schema_version": SCHEMA_VERSION,
             "episode_id": str(handle.attrs["episode_id"]),

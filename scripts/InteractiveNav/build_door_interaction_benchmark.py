@@ -93,10 +93,17 @@ def build_episode_args(args: argparse.Namespace, episode: dict[str, Any], output
     )
 
 
-def group_episodes(episodes: list[dict[str, Any]], start_idx: int, max_episodes: int | None) -> dict[int, list[tuple[int, dict[str, Any]]]]:
+def group_episodes(
+    episodes: list[dict[str, Any]],
+    start_idx: int,
+    max_episodes: int | None,
+    *,
+    episode_index_offset: int = 0,
+) -> dict[int, list[tuple[int, dict[str, Any]]]]:
     end_idx = len(episodes) if max_episodes is None else min(len(episodes), start_idx + max_episodes)
     grouped: dict[int, list[tuple[int, dict[str, Any]]]] = {}
-    for episode_index, episode in enumerate(episodes[start_idx:end_idx], start=start_idx):
+    for local_index, episode in enumerate(episodes[start_idx:end_idx], start=start_idx):
+        episode_index = episode_index_offset + local_index
         grouped.setdefault(int(episode["house_index"]), []).append((episode_index, episode))
     return grouped
 
@@ -1740,6 +1747,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input_mode", choices=["original", "existing"], default="original")
     parser.add_argument("--mode", choices=["critical-preview", "build"], default="critical-preview")
     parser.add_argument("--start_idx", type=int, default=0)
+    parser.add_argument(
+        "--episode_index_offset",
+        type=int,
+        default=0,
+        help="Stable case-id offset for manifest-dispatched single-episode tasks.",
+    )
     parser.add_argument("--max_episodes", type=int, default=30)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--variant", default="ceiling")
@@ -1758,6 +1771,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distractor_k_min", type=int, default=1)
     parser.add_argument("--distractor_k_max", type=int, default=5)
     parser.add_argument("--sampling_seed", type=int, default=20260708)
+    parser.add_argument(
+        "--case_type_filter",
+        help="Optional comma-separated channel case types to retain in benchmark.json.",
+    )
+    parser.add_argument(
+        "--max_output_samples_per_house",
+        type=int,
+        help="Optional final-output cap; diagnostic case files are still retained.",
+    )
     parser.add_argument("--save_plots", action="store_true")
     parser.add_argument("--plot_positive_only", action="store_true")
     return parser
@@ -1768,7 +1790,12 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     episodes = emi.load_benchmark_episodes(args.benchmark_dir)
-    grouped = group_episodes(episodes, args.start_idx, args.max_episodes)
+    grouped = group_episodes(
+        episodes,
+        args.start_idx,
+        args.max_episodes,
+        episode_index_offset=args.episode_index_offset,
+    )
     total_episode_count = sum(len(indexed_episodes) for indexed_episodes in grouped.values())
 
     results = []
@@ -1894,6 +1921,31 @@ def main() -> None:
                 missing_sample_paths.append(str(sample_path))
                 continue
             benchmark_samples.append(json.loads(sample_path.read_text()))
+
+    if args.case_type_filter:
+        allowed_case_types = {
+            value.strip() for value in args.case_type_filter.split(",") if value.strip()
+        }
+        benchmark_samples = [
+            sample
+            for sample in benchmark_samples
+            if sample.get("interactive_nav", {}).get("legacy_case_type")
+            in allowed_case_types
+        ]
+    if args.max_output_samples_per_house is not None:
+        if args.max_output_samples_per_house < 1:
+            raise ValueError("max_output_samples_per_house must be positive")
+        grouped_samples: dict[int, list[dict[str, Any]]] = {}
+        for sample in benchmark_samples:
+            grouped_samples.setdefault(int(sample["house_index"]), []).append(sample)
+        benchmark_samples = [
+            sample
+            for house_index in sorted(grouped_samples)
+            for sample in sorted(
+                grouped_samples[house_index],
+                key=lambda value: str(value["interactive_nav"]["case_id"]),
+            )[: args.max_output_samples_per_house]
+        ]
 
     summary = {
         "schema_version": "door_interaction_benchmark_build_summary_v3",

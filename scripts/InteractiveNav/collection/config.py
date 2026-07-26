@@ -71,6 +71,7 @@ class MixedRecipes(BaseModel):
     distractor_door_k_min: int = Field(default=1, ge=1)
     distractor_door_k_max: int = Field(default=2, ge=1)
     candidate_types: list[str] = Field(default_factory=lambda: ["mixed_required_verified"])
+    source_variants_per_pair: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def validate_ratios(self) -> "MixedRecipes":
@@ -113,6 +114,42 @@ class BalanceConfig(BaseModel):
     max_samples_per_house: dict[str, int] = Field(
         default_factory=lambda: {"channel": 2, "container": 2, "mixed": 1}
     )
+    raw_oversample_factors: dict[str, float] = Field(
+        default_factory=lambda: {"channel": 1.0, "container": 1.0, "mixed": 1.0}
+    )
+    enforce_max_samples_per_house: bool = True
+    enforce_three_way_balance: bool = False
+    balance_target_categories: Literal["none", "equal"] = "none"
+    balance_path_lengths: Literal["none", "equal"] = "none"
+    relax_house_cap_if_needed: bool = False
+    path_length_bins_m: list[float] = Field(
+        default_factory=lambda: [0.0, 3.0, 5.0, 8.0, 12.0, 20.0]
+    )
+
+    @model_validator(mode="after")
+    def validate_balance_policy(self) -> "BalanceConfig":
+        if self.enforce_three_way_balance:
+            if len(self.domain_order) != 3 or set(self.domain_order) != {
+                "channel",
+                "container",
+                "mixed",
+            }:
+                raise ValueError(
+                    "enforce_three_way_balance requires channel, container, and mixed "
+                    "exactly once in domain_order"
+                )
+            if self.total_samples % 3 != 0:
+                raise ValueError(
+                    "total_samples must be divisible by 3 for strict three-way balance"
+                )
+        if len(self.path_length_bins_m) < 2 or any(
+            right <= left
+            for left, right in zip(self.path_length_bins_m, self.path_length_bins_m[1:])
+        ):
+            raise ValueError("path_length_bins_m must be strictly increasing")
+        if any(value < 1.0 for value in self.raw_oversample_factors.values()):
+            raise ValueError("raw_oversample_factors must be >= 1.0")
+        return self
 
     def target_counts(self) -> dict[str, int]:
         base, remainder = divmod(self.total_samples, len(self.domain_order))
@@ -126,6 +163,7 @@ class ExecutorConfig(BaseModel):
     executor: str = "force"
     target_fraction: float = Field(default=1.0, ge=0.0, le=1.0)
     max_steps: int = Field(default=1000, ge=1)
+    duration_seconds: float = Field(default=2.0, gt=0.0)
     tolerance: float = Field(default=1e-3, gt=0.0)
 
 
@@ -136,12 +174,32 @@ class PolicyConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
+    # Total simulator-worker budget.  `domain_parallel` assigns this budget
+    # across the three independent Channel/Container/Mixed queues; it is not a
+    # per-domain multiplier.
     workers: int = Field(default=4, ge=1)
+    light_scheduler: Literal[
+        "sequential",
+        "domain_parallel",
+        "manifest_parallel",
+        "house_batch_parallel",
+    ] = "domain_parallel"
+    domain_wave_items_per_worker: int = Field(default=4, ge=1)
     seed: int = 20260720
     resume: bool = True
+    candidate_timeout_seconds: float = Field(default=600.0, ge=0.0)
     mujoco_gl: str = "egl"
     save_images: bool = False
     save_plots: bool = False
+
+    @model_validator(mode="after")
+    def validate_domain_parallel_budget(self) -> "RuntimeConfig":
+        if self.light_scheduler == "domain_parallel" and self.workers < 3:
+            raise ValueError(
+                "domain_parallel requires at least three total workers: one "
+                "for each of channel, container, and mixed"
+            )
+        return self
 
 
 class RoughConfig(BaseModel):
@@ -166,20 +224,29 @@ class RoughConfig(BaseModel):
 
 class FullRolloutConfig(BaseModel):
     max_episodes: int = Field(default=1, ge=1)
+    max_candidate_attempts_per_domain: int = Field(default=5, ge=1)
     domains: list[Literal["channel", "container", "mixed"]] = Field(
         default_factory=lambda: ["channel", "container", "mixed"]
     )
     max_steps: int = Field(default=500, ge=1)
     max_base_adjustment_steps: int = Field(default=300, ge=1)
-    video_fps: float = Field(default=10.0, gt=0.0)
+    collection_hz: float = Field(default=5.0, gt=0.0)
+    navigation_speed_mps: float = Field(default=0.84, gt=0.0)
     required_open_fraction: float = Field(default=0.8, ge=0.0, le=1.0)
-    completion_hold_seconds: float = Field(default=0.4, ge=0.0)
     image_width: int = Field(default=320, ge=64)
     image_height: int = Field(default=180, ge=64)
     selection_strategy: Literal["shortest_validated_path", "benchmark_order"] = (
         "shortest_validated_path"
     )
     lock_base_during_force: bool = True
+
+    @model_validator(mode="after")
+    def validate_candidate_attempts(self) -> "FullRolloutConfig":
+        if self.max_candidate_attempts_per_domain < self.max_episodes:
+            raise ValueError(
+                "max_candidate_attempts_per_domain must be >= max_episodes"
+            )
+        return self
 
 
 class OutputConfig(BaseModel):

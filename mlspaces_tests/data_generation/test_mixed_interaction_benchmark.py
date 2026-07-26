@@ -10,6 +10,7 @@ from scripts.InteractiveNav.build_mixed_interaction_benchmark import (
     build_channel_interaction,
     build_minimal_plan_validation,
     candidate_sources,
+    load_container_validation_cache,
     rejection_reason,
 )
 from scripts.InteractiveNav.collect_mixed_rough_catalog import (
@@ -191,6 +192,52 @@ def test_candidate_sources_can_pin_a_measured_source_variant() -> None:
     }
 
     assert candidate_sources(candidate, episodes) == [(4, {"episode": 4})]
+
+
+def test_container_validation_cache_indexes_reusable_trace(tmp_path: Path) -> None:
+    benchmark = tmp_path / "container_benchmark.json"
+    benchmark.write_text(
+        json.dumps(
+            [
+                {
+                    "house_index": 7,
+                    "interactive_nav": {
+                        "case_id": "container-case",
+                        "parent_benchmark_episode_index": 13,
+                        "target": {
+                            "container_name": "drawer_a",
+                            "selected_instance": "apple_a",
+                        },
+                        "generation_validation": {
+                            "interaction_validations": [
+                                {
+                                    "controlling_joint_index": 2,
+                                    "joint_sequence": [1, 2],
+                                    "interaction_pose": [
+                                        1.0, 2.0, 0.0, 1.0, 0.0, 0.0, 0.0
+                                    ],
+                                    "view_profile": "drawer_low_view",
+                                    "visibility_trace": [
+                                        {"visible_pixels": 0},
+                                        {"visible_pixels": 4},
+                                    ],
+                                    "start_validation": {"valid": True},
+                                }
+                            ]
+                        },
+                    },
+                }
+            ]
+        )
+    )
+
+    cache = load_container_validation_cache(benchmark)
+
+    rows = cache[(7, "drawer_a", "apple_a")]
+    assert len(rows) == 1
+    assert rows[0]["joint_sequence"] == [1, 2]
+    assert rows[0]["source_episode_index"] == 13
+    assert rows[0]["source_case_id"] == "container-case"
 
 
 def test_rejection_reason_keeps_actionable_failure_category() -> None:

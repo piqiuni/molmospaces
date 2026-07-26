@@ -78,7 +78,10 @@ PORTABLE_PREFERRED_TOKENS = (
 )
 DEFAULT_LEFT_ARM_QPOS = np.array([0.5, 0.0, 0.0, -2.3, 0.0, -0.5, 0.0], dtype=np.float32)
 DEFAULT_RIGHT_ARM_QPOS = np.array([0.5, 0.0, 0.0, -2.3, 0.0, -0.5, 0.0], dtype=np.float32)
-DEFAULT_HEAD_QPOS = np.array([0.0, 0.6], dtype=np.float32)
+# Keep the head camera level, matching the navigation ROS simulator.  The
+# second RBY1 head joint is the pitch/tilt joint (radians); zero is the
+# navigation sensor pose (0 degrees pitch).
+DEFAULT_HEAD_QPOS = np.array([0.0, 0.0], dtype=np.float32)
 FORCE_DRIVE_TOLERANCE = 0.01
 DEFAULT_RBY1_INTERACTION_CAMERAS = ("head_camera", "wrist_camera_l", "wrist_camera_r", "camera_follower")
 
@@ -138,7 +141,7 @@ def default_rby1_episode_qpos() -> dict[str, list[float]]:
         "right_arm": DEFAULT_RIGHT_ARM_QPOS.astype(float).tolist(),
         "left_gripper": [-0.05, 0.05],
         "right_gripper": [-0.05, 0.05],
-        "head": [0.0, 0.6],
+        "head": DEFAULT_HEAD_QPOS.astype(float).tolist(),
     }
 
 
@@ -183,6 +186,7 @@ class RBY1InteractionRequest:
     # RBY1 scenes currently use a 2 ms MuJoCo timestep. 1000 force steps
     # therefore represent the intended ~2 s continuous interaction window.
     force_fallback_max_steps: int = 1000
+    force_duration_seconds: float = 2.0
     success_threshold: float = 0.8
     max_steps: int = 400
     container_max_steps_per_waypoint: int = 30
@@ -247,6 +251,11 @@ def build_scene_config(args: argparse.Namespace) -> NavToObjBaseConfig:
         cfg.camera_config.img_resolution = (320, 240)
     elif args.robot == "rby1":
         cfg.robot_config = RBY1MOpenCloseConfig()
+        # Navigation and full-rollout observations use a level head camera.
+        # Disable initialization noise as well so every replay starts at 0°
+        # pitch rather than inheriting the robot config's 0.6-rad tilt.
+        cfg.robot_config.init_qpos["head"] = DEFAULT_HEAD_QPOS.copy()
+        cfg.robot_config.init_qpos_noise_range["head"] = np.zeros(2, dtype=float)
         cfg.camera_config = RBY1GoProD455CameraSystem()
     elif args.robot == "rum":
         cfg.robot_config = FloatingRUMRobotConfig()
@@ -284,7 +293,10 @@ def load_scene_context(args: argparse.Namespace, house_ind: int) -> LoadedContex
         env = sampler.env
         if env.current_scene_metadata is None:
             env._scene_metadata = get_scene_metadata(scene_path) or get_scene_metadata(original_scene_path)
-        initial_head_qpos = get_head_joint_position(env)
+        # Enforce the navigation reference pose after scene reset too.  This
+        # guards against samplers/models that restore the robot's class-level
+        # default (0.6 rad pitch) during initialization.
+        initial_head_qpos = set_head_joint_position(env, DEFAULT_HEAD_QPOS)
         initial_torso_qpos = get_torso_joint_position(env)
         apply_default_torso_pose(env, initial_torso_qpos)
         apply_default_arm_pose(env)
@@ -3437,6 +3449,78 @@ def object_visibility_measurement(
     return fraction, pixels, segmentation, mask
 
 
+def visibility_measurements_from_segmentation(
+    env,
+    segmentation: np.ndarray,
+    object_names: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Extract several body masks from one already-rendered segmentation frame."""
+    measurements: dict[str, dict[str, Any]] = {}
+    for object_name in dict.fromkeys(object_names):
+        body_id = env.current_model.body(object_name).id
+        mask = get_geom_seg_mask(env.current_model, segmentation[..., :2], body_id)
+        measurements[object_name] = {
+            "visibility_fraction": float(mask.mean()),
+            "visible_pixels": int(mask.sum()),
+            "mask": mask,
+        }
+    return measurements
+
+
+def _aabb_corners(center: np.ndarray, size: np.ndarray) -> np.ndarray:
+    offsets = np.asarray(
+        [[sx, sy, sz] for sx in (-0.5, 0.5) for sy in (-0.5, 0.5) for sz in (-0.5, 0.5)],
+        dtype=float,
+    )
+    return np.asarray(center, dtype=float)[None, :] + offsets * np.asarray(size, dtype=float)[None, :]
+
+
+def object_may_be_in_camera_frustum(
+    env,
+    object_name: str,
+    camera_name: str = "head_camera",
+    *,
+    fov_margin: float = 1.5,
+) -> dict[str, Any]:
+    """Conservatively reject objects wholly outside a camera frustum without rendering.
+
+    This is only a prefilter: occlusion is deliberately not inferred here.  A
+    positive result still requires segmentation validation; a negative result
+    means every target AABB corner is behind or well outside the wide frustum.
+    """
+    model = env.current_model
+    data = env.current_data
+    camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    if camera_id < 0:
+        return {"possibly_visible": True, "reason": "camera_not_found"}
+    try:
+        body_id = model.body(object_name).id
+        center, size = safe_body_aabb(model, data, body_id)
+    except Exception as exc:
+        return {"possibly_visible": True, "reason": f"aabb_unavailable:{exc}"}
+
+    camera_position = np.asarray(data.cam_xpos[camera_id], dtype=float)
+    camera_rotation = np.asarray(data.cam_xmat[camera_id], dtype=float).reshape(3, 3)
+    # MuJoCo camera coordinates look along local -Z.  xmat has local axes as
+    # world-space columns, so a row-vector world offset is transformed by xmat.
+    local = (_aabb_corners(center, size) - camera_position[None, :]) @ camera_rotation
+    depth = -local[:, 2]
+    half_vertical_fov = np.deg2rad(float(model.cam_fovy[camera_id])) * 0.5
+    tangent = np.tan(half_vertical_fov) * max(float(fov_margin), 1.0)
+    # The head cameras are near-square in the collection configs.  Reusing the
+    # widened vertical FOV horizontally makes this deliberately conservative.
+    inside = (
+        (depth > 1e-5)
+        & (np.abs(local[:, 0]) <= depth * tangent)
+        & (np.abs(local[:, 1]) <= depth * tangent)
+    )
+    return {
+        "possibly_visible": bool(np.any(inside)),
+        "reason": "aabb_intersects_wide_frustum" if np.any(inside) else "aabb_outside_frustum",
+        "camera_name": camera_name,
+    }
+
+
 def valid_robot_poses_for_joint_sequence(
     ctx: LoadedContext,
     container_rec: dict[str, Any],
@@ -3589,10 +3673,26 @@ def container_visibility_trace(
             mujoco.mj_forward(env.current_model, env.current_data)
             view_state = apply_container_view_profile(ctx, view_profile)
             env.camera_manager.registry.update_all_cameras(env)
-            fraction, pixels, segmentation, mask = object_visibility_measurement(env, object_name)
-            container_fraction, container_pixels, _, _ = object_visibility_measurement(
-                env, container_rec["name"]
-            )
+            frustum = object_may_be_in_camera_frustum(env, object_name)
+            segmentation = None
+            mask = None
+            if frustum["possibly_visible"] or output_dir is not None:
+                segmentation = env.render_segmentation_frame("head_camera")
+                measurements = visibility_measurements_from_segmentation(
+                    env, segmentation, [object_name, container_rec["name"]]
+                )
+                fraction = float(measurements[object_name]["visibility_fraction"])
+                pixels = int(measurements[object_name]["visible_pixels"])
+                mask = measurements[object_name]["mask"]
+                container_fraction = float(
+                    measurements[container_rec["name"]]["visibility_fraction"]
+                )
+                container_pixels = int(measurements[container_rec["name"]]["visible_pixels"])
+            else:
+                fraction = 0.0
+                pixels = 0
+                container_fraction = 0.0
+                container_pixels = 0
             object_body_id = env.current_model.body(object_name).id
             object_center, object_size = safe_body_aabb(
                 env.current_model, env.current_data, object_body_id
@@ -3607,6 +3707,7 @@ def container_visibility_trace(
                 "visible_pixels": pixels,
                 "container_visibility_fraction": container_fraction,
                 "container_visible_pixels": container_pixels,
+                "geometric_visibility_prefilter": frustum,
                 "object_position": env.current_data.xpos[object_body_id].copy().tolist(),
                 "object_aabb": {
                     "center": object_center.tolist(),
@@ -3622,7 +3723,12 @@ def container_visibility_trace(
                     "center": np.asarray(joint_center, dtype=float).tolist(),
                     "size": np.asarray(joint_size, dtype=float).tolist(),
                 }
-            if output_dir is not None and prefix_length in {0, len(joint_sequence)}:
+            if (
+                output_dir is not None
+                and segmentation is not None
+                and mask is not None
+                and prefix_length in {0, len(joint_sequence)}
+            ):
                 tag = "closed" if prefix_length == 0 else "final"
                 rgb_path = output_dir / f"{tag}_rgb.png"
                 seg_path = output_dir / f"{tag}_seg.png"
@@ -4313,7 +4419,9 @@ def execute_rby1_whole_body_interaction(
     output_dir: Path,
     camera_names: tuple[str, ...] = DEFAULT_RBY1_INTERACTION_CAMERAS,
     max_steps: int | None = None,
+    collection_hz: float | None = None,
     video_fps: float | None = None,
+    navigation_speed_mps: float = 0.84,
     base_adjustment_target_pose: np.ndarray | None = None,
     base_adjustment_path: list[np.ndarray] | None = None,
     max_base_adjustment_steps: int = 120,
@@ -4330,7 +4438,7 @@ def execute_rby1_whole_body_interaction(
     allow_force_fallback: bool = False,
     force_fallback_target_fraction: float = 1.0,
     force_fallback_max_steps: int = 1000,
-    completion_hold_seconds: float = 0.4,
+    force_duration_seconds: float = 2.0,
 ) -> dict[str, Any]:
     """Execute an official RBY1 manipulation policy and record its camera streams.
 
@@ -4343,6 +4451,21 @@ def execute_rby1_whole_body_interaction(
         raise ValueError(
             f"Unsupported interaction executor {interaction_executor!r}; expected policy/force"
         )
+    resolved_collection_hz = float(
+        collection_hz
+        if collection_hz is not None
+        else (video_fps if video_fps is not None else 5.0)
+    )
+    if resolved_collection_hz <= 0.0:
+        raise ValueError("collection_hz must be positive")
+    if video_fps is not None and not np.isclose(
+        float(video_fps), resolved_collection_hz, rtol=0.0, atol=1e-9
+    ):
+        raise ValueError("Full rollout video_fps must equal collection_hz")
+    if force_duration_seconds <= 0.0:
+        raise ValueError("force_duration_seconds must be positive")
+    if navigation_speed_mps <= 0.0:
+        raise ValueError("navigation_speed_mps must be positive")
     if hold_base_during_policy is None:
         # Container articulation should not let contact dynamics push the
         # navigation base away from the planned grasp stance.  Door opening
@@ -4439,6 +4562,10 @@ def execute_rby1_whole_body_interaction(
             target_pose: np.ndarray,
             target_action: np.ndarray,
         ) -> tuple[list[dict[str, Any]], float, bool, bool, Any]:
+            # Reset residual holonomic-joint velocity before each low-level
+            # update so fixed-rate position targets do not accumulate the
+            # oscillation seen with sparse absolute waypoints.
+            robot_base.joint_vel = np.zeros_like(robot_base.joint_vel)
             action_cmd = {
                 group_name: target.copy()
                 for group_name, target in upper_body_hold_ctrl.items()
@@ -4463,11 +4590,58 @@ def execute_rby1_whole_body_interaction(
         if not selected_cameras:
             raise RuntimeError(f"None of the requested cameras are available: {camera_names}")
         frames: dict[str, list[np.ndarray]] = {name: [] for name in selected_cameras}
-        capture_video_fps = float(video_fps if video_fps is not None else cfg.fps)
+        capture_video_fps = resolved_collection_hz
+        collection_dt_seconds = 1.0 / resolved_collection_hz
         sim_dt_seconds = float(task.env.current_model.opt.timestep)
-        force_video_stride = max(
-            1, int(round(1.0 / max(capture_video_fps * sim_dt_seconds, 1e-8)))
+        task_step_hz = float(getattr(cfg, "fps", 10.0))
+        navigation_internal_steps_per_sample = max(
+            1, int(round(task_step_hz / resolved_collection_hz))
         )
+        navigation_physics_steps_per_sample = max(
+            1, int(round(collection_dt_seconds / sim_dt_seconds))
+        )
+        recorded_sample_count = 0
+
+        def execute_fixed_rate_navigation_sample(
+            target_pose: np.ndarray,
+            target_action: np.ndarray,
+            *,
+            linear_speed_mps: float = navigation_speed_mps,
+            angular_speed_rad_s: float = 1.5,
+        ) -> tuple[list[dict[str, Any]], float, bool, bool, Any]:
+            robot_base.joint_vel = np.zeros_like(robot_base.joint_vel)
+            for _physics_step in range(navigation_physics_steps_per_sample):
+                restore_upper_body_pose()
+                robot_base.ctrl = target_action.copy()
+                velocity = np.asarray(robot_base.joint_vel, dtype=float).copy()
+                current_xy = robot_base.pose[:2, 3]
+                remaining = target_pose[:2, 3] - current_xy
+                remaining_norm = float(np.linalg.norm(remaining))
+                if remaining_norm > 1e-8:
+                    direction = remaining / remaining_norm
+                    along = float(np.dot(velocity[:2], direction))
+                    velocity[:2] = direction * np.clip(
+                        along, 0.0, float(linear_speed_mps)
+                    )
+                else:
+                    velocity[:2] = 0.0
+                velocity[2] = float(
+                    np.clip(
+                        velocity[2],
+                        -float(angular_speed_rad_s),
+                        float(angular_speed_rad_s),
+                    )
+                )
+                robot_base.joint_vel = velocity
+                mujoco.mj_step(task.env.current_model, task.env.current_data)
+            restore_upper_body_pose()
+            mujoco.mj_forward(task.env.current_model, task.env.current_data)
+            task.env.camera_manager.registry.update_all_cameras(task.env)
+            return task.get_observations(), 0.0, False, False, {
+                "physics_steps": navigation_physics_steps_per_sample,
+                "linear_speed_mps": float(linear_speed_mps),
+                "angular_speed_rad_s": float(angular_speed_rad_s),
+            }
 
         def capture(
             obs: list[dict[str, Any]],
@@ -4482,6 +4656,7 @@ def execute_rby1_whole_body_interaction(
             record_video_frame: bool = True,
             record_step: bool = True,
         ) -> None:
+            nonlocal recorded_sample_count
             resolved_segment = segment
             if resolved_segment is None:
                 phase_name = str(phase or _phase_name(policy))
@@ -4510,6 +4685,11 @@ def execute_rby1_whole_body_interaction(
                             "segment": resolved_segment,
                             "task_step": int(task.episode_step_count),
                             "interaction_kind": interaction_kind,
+                            "timestamp_seconds": float(
+                                recorded_sample_count * collection_dt_seconds
+                            ),
+                            "dt_seconds": float(collection_dt_seconds),
+                            "collection_hz": float(resolved_collection_hz),
                         },
                     )
             if record_step and step_callback is not None:
@@ -4550,8 +4730,15 @@ def execute_rby1_whole_body_interaction(
                         "terminal": bool(terminal),
                         "truncated": bool(truncated),
                         "infos": to_jsonable(infos),
+                        "timestamp_seconds": float(
+                            recorded_sample_count * collection_dt_seconds
+                        ),
+                        "dt_seconds": float(collection_dt_seconds),
+                        "collection_hz": float(resolved_collection_hz),
                     },
                 )
+            if record_step:
+                recorded_sample_count += 1
 
         capture(observation, phase="INITIAL")
         phase_trace: list[str] = []
@@ -4570,47 +4757,26 @@ def execute_rby1_whole_body_interaction(
         max_base_adjustment_translation_per_step = 0.0
         if base_targets:
             phase_trace.append("BASE_ADJUSTMENT")
-            for adjustment_step in range(int(max_base_adjustment_steps)):
-                if base_adjustment_waypoint_index >= len(base_targets):
-                    base_adjustment_completed = True
+            if len(base_targets) > int(max_base_adjustment_steps):
+                base_adjustment_error = (
+                    "Fixed-rate navigation requires "
+                    f"{len(base_targets)} samples, exceeding max_base_adjustment_steps="
+                    f"{max_base_adjustment_steps}."
+                )
+            for adjustment_step, target_pose in enumerate(base_targets):
+                if base_adjustment_error is not None:
                     break
-                target_pose = base_targets[base_adjustment_waypoint_index]
                 target_yaw = float(R.from_matrix(target_pose[:3, :3]).as_euler("XYZ")[2])
-                current_pose = robot_base.pose.copy()
-                current_yaw = float(
-                    R.from_matrix(current_pose[:3, :3]).as_euler("XYZ")[2]
-                )
-                position_error = float(
-                    np.linalg.norm(current_pose[:2, 3] - target_pose[:2, 3])
-                )
-                yaw_error = float(
-                    abs(np.arctan2(np.sin(current_yaw - target_yaw), np.cos(current_yaw - target_yaw)))
-                )
-                final_waypoint = base_adjustment_waypoint_index == len(base_targets) - 1
-                yaw_ready = (not final_waypoint) or yaw_error <= 3.2
-                if position_error <= 0.15 and yaw_ready:
-                    base_adjustment_waypoint_index += 1
-                    if base_adjustment_waypoint_index >= len(base_targets):
-                        base_adjustment_completed = True
-                        break
-                    continue
-                signed_yaw_error = float(
-                    np.arctan2(np.sin(target_yaw - current_yaw), np.cos(target_yaw - current_yaw))
-                )
-                # The holonomic base controller already limits velocity and
-                # interpolates toward an absolute pose target. Passing a tiny
-                # incremental target here makes progress effectively zero;
-                # follow the planner waypoint directly and record each control
-                # step until its tolerance is met.
                 target_action = np.array(
                     [target_pose[0, 3], target_pose[1, 3], target_yaw], dtype=float
                 )
                 action_cmd = {"base": target_action}
                 position_before_step = robot_base.pose[:3, 3].copy()
-                observation, _reward, _terminal, _truncated, _infos = execute_navigation_step(
-                    target_pose, target_action
+                observation, _reward, _terminal, _truncated, _infos = (
+                    execute_fixed_rate_navigation_sample(target_pose, target_action)
                 )
                 base_adjustment_steps = adjustment_step + 1
+                base_adjustment_waypoint_index = adjustment_step + 1
                 adjustment_translation = float(
                     np.linalg.norm(
                         robot_base.pose[:2, 3] - position_before_step[:2]
@@ -4627,7 +4793,12 @@ def execute_rby1_whole_body_interaction(
                     reward=float(np.asarray(_reward).reshape(-1)[0]),
                     terminal=bool(np.asarray(_terminal).reshape(-1)[0]),
                     truncated=bool(np.asarray(_truncated).reshape(-1)[0]),
-                    infos=_infos,
+                    infos={
+                        "env_infos": _infos,
+                        "collection_hz": resolved_collection_hz,
+                        "dt_seconds": collection_dt_seconds,
+                        "internal_physics_steps": navigation_physics_steps_per_sample,
+                    },
                 )
                 if task.env.check_robot_collision_in_current_pose():
                     # Occupancy-map paths can end in deliberate contact with the
@@ -4635,6 +4806,28 @@ def execute_rby1_whole_body_interaction(
                     # let the interaction success gate decide whether the rollout
                     # is usable; retain the count for audit/debugging.
                     base_adjustment_collision_steps += 1
+
+            if base_adjustment_error is None and base_targets:
+                final_target = base_targets[-1]
+                final_target_yaw = float(
+                    R.from_matrix(final_target[:3, :3]).as_euler("XYZ")[2]
+                )
+                final_pose = robot_base.pose.copy()
+                final_yaw = float(R.from_matrix(final_pose[:3, :3]).as_euler("XYZ")[2])
+                final_position_error = float(
+                    np.linalg.norm(final_pose[:2, 3] - final_target[:2, 3])
+                )
+                final_yaw_error = float(
+                    abs(
+                        np.arctan2(
+                            np.sin(final_yaw - final_target_yaw),
+                            np.cos(final_yaw - final_target_yaw),
+                        )
+                    )
+                )
+                base_adjustment_completed = (
+                    final_position_error <= 0.15 and final_yaw_error <= 0.35
+                )
 
             if not base_adjustment_completed and base_adjustment_error is None:
                 base_adjustment_error = (
@@ -4650,7 +4843,6 @@ def execute_rby1_whole_body_interaction(
                 except TypeError:
                     policy.reset(reset_retries=True)
                 observation = task.get_observations()
-                capture(observation, phase="BASE_ADJUSTMENT_COMPLETE")
             base_position_after_adjustment = robot_base.pose[:3, 3].copy()
 
         phase_trace.append(
@@ -4711,15 +4903,25 @@ def execute_rby1_whole_body_interaction(
                 )
                 break
             current_phase = _phase_name(policy)
-            capture(
-                observation,
-                phase=current_phase,
-                action=action_cmd,
-                reward=float(np.asarray(_reward).reshape(-1)[0]),
-                terminal=bool(np.asarray(_terminal).reshape(-1)[0]),
-                truncated=bool(np.asarray(_truncated).reshape(-1)[0]),
-                infos=_infos,
+            should_capture_policy_sample = (
+                (_step + 1) % navigation_internal_steps_per_sample == 0
+                or bool(np.asarray(_terminal).reshape(-1)[0])
+                or bool(np.asarray(_truncated).reshape(-1)[0])
+                or bool(np.all(task.is_done()))
             )
+            if should_capture_policy_sample:
+                capture(
+                    observation,
+                    phase=current_phase,
+                    action=action_cmd,
+                    reward=float(np.asarray(_reward).reshape(-1)[0]),
+                    terminal=bool(np.asarray(_terminal).reshape(-1)[0]),
+                    truncated=bool(np.asarray(_truncated).reshape(-1)[0]),
+                    infos={
+                        "env_infos": _infos,
+                        "internal_task_steps": navigation_internal_steps_per_sample,
+                    },
+                )
             if current_phase != phase_trace[-1]:
                 phase_trace.append(current_phase)
             if (_step + 1) % 50 == 0:
@@ -4778,7 +4980,23 @@ def execute_rby1_whole_body_interaction(
             force_upper_body_hold_qpos: dict[str, np.ndarray] = {}
             force_upper_body_hold_qvel: dict[str, np.ndarray] = {}
             force_task_completion_reached = False
-            force_termination_reason = "max_steps"
+            force_termination_reason = "scheduled_duration_complete"
+            force_dataset_steps = max(
+                1, int(round(float(force_duration_seconds) * resolved_collection_hz))
+            )
+            force_internal_steps_per_sample = max(
+                1, int(round(collection_dt_seconds / sim_dt_seconds))
+            )
+            required_force_internal_steps = (
+                force_dataset_steps * force_internal_steps_per_sample
+            )
+            if required_force_internal_steps > int(force_fallback_max_steps):
+                raise ValueError(
+                    "Scheduled force rollout requires "
+                    f"{required_force_internal_steps} internal steps for "
+                    f"{force_duration_seconds:.3f}s at {resolved_collection_hz:.3f}Hz, "
+                    f"exceeding force_fallback_max_steps={force_fallback_max_steps}."
+                )
             for group_name in (
                 "left_arm",
                 "right_arm",
@@ -4813,44 +5031,65 @@ def execute_rby1_whole_body_interaction(
                     group.ctrl = target.copy()
 
             try:
-                for _force_step in range(int(force_fallback_max_steps)):
-                    if lock_base_during_force:
-                        robot_base.pose = force_base_hold_pose
-                        robot_base.joint_vel = np.zeros_like(robot_base.joint_vel)
-                        mujoco.mj_forward(task.env.current_model, task.env.current_data)
-                        robot_base.ctrl = force_base_hold_target.copy()
-                        apply_force_upper_body_lock()
-                        mujoco.mj_forward(task.env.current_model, task.env.current_data)
-                    force_action = controller.step()
+                force_action: dict[str, Any] | None = None
+                for force_sample_index in range(force_dataset_steps):
+                    sample_efforts: list[float] = []
+                    for internal_index in range(force_internal_steps_per_sample):
+                        global_progress = (
+                            force_sample_index
+                            + (internal_index + 1) / force_internal_steps_per_sample
+                        ) / force_dataset_steps
+                        controller.target_value = force_closed_value + (
+                            float(force_fallback_target_fraction)
+                            * global_progress
+                            * (force_open_value - force_closed_value)
+                        )
+                        if lock_base_during_force:
+                            robot_base.pose = force_base_hold_pose
+                            robot_base.joint_vel = np.zeros_like(robot_base.joint_vel)
+                            robot_base.ctrl = force_base_hold_target.copy()
+                            apply_force_upper_body_lock()
+                            mujoco.mj_forward(task.env.current_model, task.env.current_data)
+                        force_action = controller.step()
+                        sample_efforts.append(float(force_action["effort"]))
+                        current_base = robot_base.pose
+                        force_base_max_drift = max(
+                            force_base_max_drift,
+                            float(
+                                np.linalg.norm(
+                                    current_base[:2, 3] - force_base_hold_target[:2]
+                                )
+                            ),
+                        )
+                        if lock_base_during_force:
+                            robot_base.pose = force_base_hold_pose
+                            robot_base.joint_vel = np.zeros_like(robot_base.joint_vel)
+                            apply_force_upper_body_lock()
+                            mujoco.mj_forward(task.env.current_model, task.env.current_data)
+                    assert force_action is not None
                     force_fraction = semantic_open_fraction(
                         float(force_action["joint_value"]),
                         force_closed_value,
                         force_open_value,
                     )
-                    force_task_completion_reached = (
-                        force_fraction >= force_success_threshold
+                    force_task_completion_reached = bool(
+                        force_task_completion_reached
+                        or force_fraction >= force_success_threshold
                     )
-                    current_base = robot_base.pose
-                    force_base_max_drift = max(
-                        force_base_max_drift,
-                        float(
-                            np.linalg.norm(
-                                current_base[:2, 3] - force_base_hold_target[:2]
-                            )
-                        ),
-                    )
-                    if lock_base_during_force:
-                        robot_base.pose = force_base_hold_pose
-                        robot_base.joint_vel = np.zeros_like(robot_base.joint_vel)
-                        apply_force_upper_body_lock()
-                        mujoco.mj_forward(task.env.current_model, task.env.current_data)
+                    target_fraction = float(force_fallback_target_fraction) * (
+                        force_sample_index + 1
+                    ) / force_dataset_steps
                     task.env.camera_manager.registry.update_all_cameras(task.env)
                     observation = task.get_observations()
                     force_action_payload = {
                         "__action_type__": "force_joint",
                         "effort": [force_action["effort"]],
-                        "target_value": [force_action["target_value"]],
+                        "mean_effort": [float(np.mean(sample_efforts))],
+                        "target_value": [controller.target_value],
                         "joint_value": [force_action["joint_value"]],
+                        "target_fraction": [target_fraction],
+                        "measured_fraction": [force_fraction],
+                        "duration_seconds": [collection_dt_seconds],
                     }
                     if lock_base_during_force:
                         force_action_payload["base_hold"] = force_base_hold_target.tolist()
@@ -4858,39 +5097,17 @@ def execute_rby1_whole_body_interaction(
                         observation,
                         phase="FORCE_OPEN",
                         action=force_action_payload,
-                        terminal=bool(
-                            force_action["reached"] or force_task_completion_reached
-                        ),
-                        infos=force_action,
-                        record_video_frame=(
-                            _force_step % force_video_stride == 0
-                            or bool(force_action["reached"])
-                            or force_task_completion_reached
-                        ),
+                        terminal=False,
+                        infos={
+                            **force_action,
+                            "dataset_step": force_sample_index + 1,
+                            "dataset_step_count": force_dataset_steps,
+                            "target_fraction": target_fraction,
+                            "measured_fraction": force_fraction,
+                            "success_threshold_reached": force_task_completion_reached,
+                            "internal_control_steps": force_internal_steps_per_sample,
+                        },
                     )
-                    if force_action["reached"]:
-                        force_termination_reason = "control_target_reached"
-                        break
-                    if force_task_completion_reached:
-                        force_termination_reason = "task_success_threshold_reached"
-                        break
-                if force_task_completion_reached and completion_hold_seconds > 0.0:
-                    hold_frame_count = max(
-                        1, int(round(float(capture_video_fps) * float(completion_hold_seconds)))
-                    )
-                    for _hold_frame in range(hold_frame_count):
-                        task.env.camera_manager.registry.update_all_cameras(task.env)
-                        hold_observation = task.get_observations()
-                        capture(
-                            hold_observation,
-                            phase="FORCE_OPEN_COMPLETE_HOLD",
-                            segment=f"force_open_{interaction_kind}",
-                            action={"__action_type__": "observe"},
-                            terminal=False,
-                            infos={"completion_hold": True},
-                            record_video_frame=True,
-                            record_step=False,
-                        )
             finally:
                 controller.finish()
             force_executor_meta = controller.result()
@@ -4904,8 +5121,14 @@ def execute_rby1_whole_body_interaction(
                 force_task_completion_reached
             )
             force_executor_meta["termination_reason"] = force_termination_reason
-            force_executor_meta["completion_hold_seconds"] = float(completion_hold_seconds)
-            policy_success = bool(force_executor_meta["reached"])
+            force_executor_meta["dataset_steps"] = int(force_dataset_steps)
+            force_executor_meta["duration_seconds"] = float(force_duration_seconds)
+            force_executor_meta["collection_hz"] = float(resolved_collection_hz)
+            force_executor_meta["dt_seconds"] = float(collection_dt_seconds)
+            force_executor_meta["internal_steps_per_dataset_step"] = int(
+                force_internal_steps_per_sample
+            )
+            policy_success = bool(force_task_completion_reached)
         else:
             policy_success = bool(task.judge_success())
         force_fallback_meta: dict[str, Any] | None = None
@@ -4996,49 +5219,25 @@ def execute_rby1_whole_body_interaction(
         post_navigation_collision_steps = 0
         if post_targets and interaction_success:
             phase_trace.append("POST_NAVIGATION")
-            for post_step in range(int(max_post_interaction_steps)):
-                if post_navigation_waypoint_index >= len(post_targets):
-                    post_navigation_completed = True
+            if len(post_targets) > int(max_post_interaction_steps):
+                post_navigation_error = (
+                    "Fixed-rate post navigation requires "
+                    f"{len(post_targets)} samples, exceeding max_post_interaction_steps="
+                    f"{max_post_interaction_steps}."
+                )
+            for post_step, target_pose in enumerate(post_targets):
+                if post_navigation_error is not None:
                     break
-                target_pose = post_targets[post_navigation_waypoint_index]
                 target_yaw = float(R.from_matrix(target_pose[:3, :3]).as_euler("XYZ")[2])
-                current_pose = robot_base.pose.copy()
-                current_yaw = float(
-                    R.from_matrix(current_pose[:3, :3]).as_euler("XYZ")[2]
-                )
-                position_error = float(
-                    np.linalg.norm(current_pose[:2, 3] - target_pose[:2, 3])
-                )
-                yaw_error = float(
-                    abs(
-                        np.arctan2(
-                            np.sin(current_yaw - target_yaw),
-                            np.cos(current_yaw - target_yaw),
-                        )
-                    )
-                )
-                final_waypoint = post_navigation_waypoint_index == len(post_targets) - 1
-                yaw_ready = (not final_waypoint) or yaw_error <= 3.2
-                if position_error <= 0.15 and yaw_ready:
-                    post_navigation_waypoint_index += 1
-                    if post_navigation_waypoint_index >= len(post_targets):
-                        post_navigation_completed = True
-                        break
-                    continue
-                signed_yaw_error = float(
-                    np.arctan2(
-                        np.sin(target_yaw - current_yaw),
-                        np.cos(target_yaw - current_yaw),
-                    )
-                )
                 target_action = np.array(
                     [target_pose[0, 3], target_pose[1, 3], target_yaw], dtype=float
                 )
                 action_cmd = {"base": target_action}
-                observation, _reward, _terminal, _truncated, _infos = execute_navigation_step(
-                    target_pose, target_action
+                observation, _reward, _terminal, _truncated, _infos = (
+                    execute_fixed_rate_navigation_sample(target_pose, target_action)
                 )
                 post_navigation_steps = post_step + 1
+                post_navigation_waypoint_index = post_step + 1
                 capture(
                     observation,
                     phase="POST_NAVIGATION",
@@ -5047,10 +5246,36 @@ def execute_rby1_whole_body_interaction(
                     reward=float(np.asarray(_reward).reshape(-1)[0]),
                     terminal=bool(np.asarray(_terminal).reshape(-1)[0]),
                     truncated=bool(np.asarray(_truncated).reshape(-1)[0]),
-                    infos=_infos,
+                    infos={
+                        "env_infos": _infos,
+                        "collection_hz": resolved_collection_hz,
+                        "dt_seconds": collection_dt_seconds,
+                        "internal_physics_steps": navigation_physics_steps_per_sample,
+                    },
                 )
                 if task.env.check_robot_collision_in_current_pose():
                     post_navigation_collision_steps += 1
+            if post_navigation_error is None and post_targets:
+                final_target = post_targets[-1]
+                final_target_yaw = float(
+                    R.from_matrix(final_target[:3, :3]).as_euler("XYZ")[2]
+                )
+                final_pose = robot_base.pose.copy()
+                final_yaw = float(R.from_matrix(final_pose[:3, :3]).as_euler("XYZ")[2])
+                final_position_error = float(
+                    np.linalg.norm(final_pose[:2, 3] - final_target[:2, 3])
+                )
+                final_yaw_error = float(
+                    abs(
+                        np.arctan2(
+                            np.sin(final_yaw - final_target_yaw),
+                            np.cos(final_yaw - final_target_yaw),
+                        )
+                    )
+                )
+                post_navigation_completed = (
+                    final_position_error <= 0.15 and final_yaw_error <= 0.35
+                )
             if not post_navigation_completed and post_navigation_error is None:
                 post_navigation_error = (
                     "Post-interaction navigation did not reach the target within "
@@ -5196,7 +5421,15 @@ def execute_rby1_whole_body_interaction(
                 max_base_adjustment_translation_per_step
             ),
             "video_fps": fps,
-            "force_video_stride": int(force_video_stride),
+            "collection_hz": float(resolved_collection_hz),
+            "dt_seconds": float(collection_dt_seconds),
+            "task_step_hz": float(task_step_hz),
+            "navigation_internal_steps_per_sample": int(
+                navigation_internal_steps_per_sample
+            ),
+            "navigation_physics_steps_per_sample": int(
+                navigation_physics_steps_per_sample
+            ),
             "sim_dt_seconds": float(sim_dt_seconds),
             "video_paths": video_paths,
         }
@@ -5488,6 +5721,7 @@ def _rby1_request_to_args(request: RBY1InteractionRequest) -> argparse.Namespace
         allow_force_fallback=bool(request.allow_force_fallback),
         force_fallback_target_fraction=float(request.force_fallback_target_fraction),
         force_fallback_max_steps=int(request.force_fallback_max_steps),
+        force_duration_seconds=float(request.force_duration_seconds),
         success_threshold=float(request.success_threshold),
         max_steps=int(request.max_steps),
         container_arm=request.container_arm,
@@ -5545,6 +5779,7 @@ def open_articulation_with_rby1(request: RBY1InteractionRequest) -> dict[str, An
         allow_force_fallback=args.allow_force_fallback,
         force_fallback_target_fraction=args.force_fallback_target_fraction,
         force_fallback_max_steps=args.force_fallback_max_steps,
+        force_duration_seconds=args.force_duration_seconds,
     )
     result["robot_pose_mode"] = request.robot_pose_mode
     result["robot_pose_meta"] = target_meta["robot_pose_meta"]
@@ -5579,6 +5814,7 @@ def command_run_rby1_interaction(args: argparse.Namespace) -> int:
         allow_force_fallback=args.allow_force_fallback,
         force_fallback_target_fraction=args.force_fallback_target_fraction,
         force_fallback_max_steps=args.force_fallback_max_steps,
+        force_duration_seconds=args.force_duration_seconds,
         success_threshold=args.success_threshold,
         max_steps=args.max_steps,
         container_max_steps_per_waypoint=args.container_max_steps_per_waypoint,
@@ -6220,7 +6456,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rby1_parser.add_argument("--success_threshold", type=float, default=0.8)
-    rby1_parser.add_argument("--completion_hold_seconds", type=float, default=0.4)
+    rby1_parser.add_argument("--force_duration_seconds", type=float, default=2.0)
     rby1_parser.add_argument("--max_steps", type=int, default=400)
     rby1_parser.add_argument("--door_max_steps_per_waypoint", type=int, default=35)
     rby1_parser.add_argument("--door_max_planning_reattempts", type=int, default=5)

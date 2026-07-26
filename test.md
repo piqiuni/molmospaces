@@ -230,35 +230,6 @@ python scripts/InteractiveNav/build_mixed_interaction_benchmark.py \
   --output_dir scripts/InteractiveNav/output/mixed_interaction_v3_smoke10
 ```
 
-统一 ProcTHOR-10K train 三类采集入口：
-
-```bash
-conda activate mlspaces
-export MUJOCO_GL=egl
-export MPLCONFIGDIR=/tmp/matplotlib-interactive-nav-unified
-python scripts/InteractiveNav/collect_interactive_nav.py \
-  --config scripts/InteractiveNav/configs/collection/procthor10k_train_100.yaml \
-  --stage all
-```
-
-可独立恢复的阶段为 `manifest`、`seeds`、`light`、`balance` 和 `audit`。正式
-100 条测试按有效 V3 episode 数冻结为 `channel=34`、`container=33`、`mixed=33`；
-不生成 `open_gt_control`，不主动构造错误动作 rollout，mixed 只接收
-`mixed_required_verified`。当前示例配置显式限制为 `train_0..train_99`；扩大范围时
-由 scene registry 按配置枚举并按需加载对应资源。每屋抽样上限为
-channel=2、container=2、mixed=3。
-
-2026-07-20 实测审计：100/100 V3 valid、0 validation error、0 placeholder、
-100 unique case ID、39 unique house；三类 house 覆盖为 18/25/13。
-
-source 配置示例：
-
-- `procthor10k_train_100.yaml`：`scene_split/train`，重新采样目标和机器人起点。
-- `procthor10k_scene_val_preferred.yaml`：`scene_split/val`，按目标类别及
-  起点—目标直线距离偏好采样。
-- `procthor10k_nav_benchmark_val.yaml`：`nav_benchmark/val`，保留原始 benchmark
-  的目标和起点；container/mixed 仍先生成 rough catalog 再做 fine。
-
 ### 4.5.2 Full 逐步采集与 smoke
 
 `mode: full` 不生成错误动作负轨迹，也不生成 `open_gt_control`。它按指定
@@ -294,16 +265,12 @@ torso 的 qpos/qvel/position target；`lock_base_during_force: true` 还会在�
 step 前后恢复 base 的 x/y/yaw pose，避免交互把机器人推离操作位或让机械臂下落，
 并在 force metadata 中记录锁定组和最大漂移。
 
-时间基准：当前 full smoke 实测 MuJoCo `sim_dt=2ms`、control dt=20ms、policy
-dt=100ms。导航每个
-policy step 理论上对应 100ms；force recorder 每个 `force_joint` step 对应一个
-2ms sim step。按人类步行速度 1.4m/s 的 60%（0.84m/s）计算，100ms 导航步对应
-约 8.4cm，20ms control step 对应约 1.68cm，2ms sim step 对应约 1.68mm；当前
-12cm waypoint 间距对应约 143ms。冰箱门若按 2s 完成，需要约 1000 个 sim steps、
-100 个 control steps 或 20 个 policy steps。MP4 会按 sim dt
-下采样到视频 fps，避免把每个 2ms force step 以 10fps 全部播放而造成视频变慢。
-full force 段在达到任务 `success_threshold`（当前 0.8）后停止物理推进，并默认额外
-保留 0.4 秒完成保持视频；`max_steps` 只是保护上限，不是必须完整执行的固定长度。
+full 数据时间基准默认是 `collection_hz=5`，即 `dt=0.2s`；H5 训练 step 与 MP4
+视频帧使用同一频率。内部 MuJoCo/controller 可以使用更高频率，但只在每个 0.2s
+采样边界保存一次。按人类步行速度 1.4m/s 的 60%（0.84m/s）计算，每个导航
+采样间隔对应约 0.168m；当前场景实际导航距离约 4.666m，对应约 28 个导航 step。
+冰箱门 2s 连续打开对应 10 个交互 step，目标开度从 0% 递增到100%。任务
+`success_threshold`（当前 0.8）只记录成功事件，不提前结束2s交互轨迹。
 
 复用预计算 rough 时可配置：
 

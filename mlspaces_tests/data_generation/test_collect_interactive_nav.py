@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from scripts.InteractiveNav import collect_interactive_nav as collector
+from scripts.InteractiveNav import build_mixed_interaction_benchmark as mixed_builder
 from scripts.InteractiveNav import interactive_nav_v3
 from scripts.InteractiveNav.collection.config import CollectionConfig
 from scripts.InteractiveNav.collection.interaction_executors import (
@@ -18,6 +19,7 @@ from scripts.InteractiveNav.collection.full_rollout_recorder import (
     H5StepRolloutRecorder,
     validate_full_rollout,
 )
+from scripts.InteractiveNav.collection.progress_reporter import _active_batch, snapshot
 from scripts.InteractiveNav.collection.scene_source import build_scene_manifest
 from scripts.InteractiveNav.collection.seed_builder import (
     _candidate_start_pose,
@@ -137,6 +139,115 @@ def test_source_config_exposes_scene_preferences(tmp_path: Path) -> None:
     assert config.source.min_start_goal_distance_m == 3.0
     assert config.source.max_start_goal_distance_m == 12.0
     assert config.source.prefer_longest_start_goal is False
+
+
+def test_strict_three_way_3000_config_has_1000_per_domain(tmp_path: Path) -> None:
+    payload = config_payload(tmp_path, total_samples=3000)
+    payload["balance"].update(
+        {
+            "enforce_three_way_balance": True,
+            "domain_order": ["channel", "container", "mixed"],
+            "balance_target_categories": "equal",
+            "balance_path_lengths": "equal",
+        }
+    )
+    config = CollectionConfig.model_validate(payload)
+    assert config.balance.target_counts() == {
+        "channel": 1000,
+        "container": 1000,
+        "mixed": 1000,
+    }
+
+
+def test_strict_three_way_rejects_non_divisible_total(tmp_path: Path) -> None:
+    payload = config_payload(tmp_path, total_samples=10)
+    payload["balance"]["enforce_three_way_balance"] = True
+    with pytest.raises(ValueError, match="divisible by 3"):
+        CollectionConfig.model_validate(payload)
+
+
+def test_seed_resume_fingerprint_changes_with_seed_capacity(tmp_path: Path) -> None:
+    first = CollectionConfig.model_validate(config_payload(tmp_path))
+    payload = config_payload(tmp_path)
+    payload["source"]["seeds_per_house"] = first.source.seeds_per_house + 1
+    second = CollectionConfig.model_validate(payload)
+    assert collector._seed_generation_config(first) != collector._seed_generation_config(
+        second
+    )
+
+
+def test_collection_fingerprint_ignores_execution_parallelism_but_not_seed(
+    tmp_path: Path,
+) -> None:
+    seed_benchmark = tmp_path / "benchmark.json"
+    container_rough = tmp_path / "rough_catalog.json"
+    mixed_rough = tmp_path / "mixed_rough_catalog.json"
+    write_json(seed_benchmark, [{"house_index": 1}])
+    write_json(container_rough, {"schema_version": "container_rough_catalog_v1"})
+    write_json(mixed_rough, {"schema_version": "mixed_rough_catalog_v1"})
+    payload = config_payload(tmp_path)
+    payload["runtime"] = {
+        "workers": 1,
+        "light_scheduler": "sequential",
+        "seed": 7,
+    }
+    single = CollectionConfig.model_validate(payload)
+    payload["runtime"] = {
+        "workers": 4,
+        "light_scheduler": "domain_parallel",
+        "seed": 7,
+    }
+    parallel = CollectionConfig.model_validate(payload)
+    payload["runtime"] = {"workers": 4, "seed": 8}
+    changed_seed = CollectionConfig.model_validate(payload)
+    payload = config_payload(tmp_path)
+    payload["runtime"] = {
+        "workers": 4,
+        "light_scheduler": "domain_parallel",
+        "seed": 7,
+    }
+    payload["balance"]["enforce_max_samples_per_house"] = False
+    unrestricted_balance = CollectionConfig.model_validate(payload)
+
+    rough_paths = [container_rough, mixed_rough]
+    single_fingerprint = collector._collection_fingerprint(
+        single,
+        seed_benchmark=seed_benchmark,
+        rough_paths=rough_paths,
+    )
+    parallel_fingerprint = collector._collection_fingerprint(
+        parallel,
+        seed_benchmark=seed_benchmark,
+        rough_paths=rough_paths,
+    )
+    changed_seed_fingerprint = collector._collection_fingerprint(
+        changed_seed,
+        seed_benchmark=seed_benchmark,
+        rough_paths=rough_paths,
+    )
+    unrestricted_balance_fingerprint = collector._collection_fingerprint(
+        unrestricted_balance,
+        seed_benchmark=seed_benchmark,
+        rough_paths=rough_paths,
+    )
+
+    assert single_fingerprint == parallel_fingerprint
+    assert single_fingerprint == unrestricted_balance_fingerprint
+    assert single_fingerprint != changed_seed_fingerprint
+
+
+def test_mixed_candidate_seed_is_key_stable() -> None:
+    candidate = {
+        "case_id": "mixed-case",
+        "_preferred_source_episode_index": 17,
+    }
+    assert mixed_builder.candidate_seed(123, candidate) == mixed_builder.candidate_seed(
+        123, dict(candidate)
+    )
+    assert mixed_builder.candidate_seed(123, candidate) != mixed_builder.candidate_seed(
+        123,
+        {**candidate, "_preferred_source_episode_index": 18},
+    )
 
 
 def test_scene_start_sampler_enforces_straight_line_distance_preferences() -> None:
@@ -285,6 +396,87 @@ def test_container_and_mixed_fine_require_rough_catalogs(
 
     with pytest.raises(FileNotFoundError, match="precomputed rough catalog"):
         collector.run_light_collectors(config, seed_benchmark)
+
+
+def test_domain_parallel_scheduler_launches_three_independent_queues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = config_payload(tmp_path, total_samples=9)
+    payload["runtime"] = {"workers": 3, "light_scheduler": "domain_parallel"}
+    payload["rough"] = {
+        "container_catalog": str(tmp_path / "rough_catalog.json"),
+        "mixed_catalog": str(tmp_path / "mixed_rough_catalog.json"),
+        "generate_if_missing": False,
+    }
+    config = CollectionConfig.model_validate(payload)
+    seed_benchmark = tmp_path / "seeds" / "benchmark.json"
+    write_json(seed_benchmark, [{"house_index": 0}])
+    write_json(
+        config.rough.container_catalog,
+        {"houses": [{"house_index": 0, "strict_pair_count": 1}]},
+    )
+    write_json(
+        config.rough.mixed_catalog,
+        {
+            "candidates": [
+                {
+                    "house_index": 0,
+                    "rough_candidate_type": "mixed_required_verified",
+                    "mixed_required_verified": True,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(collector, "_ensure_collection_fingerprint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(collector, "_write_or_validate_house_plan", lambda *_args, **_kwargs: None)
+
+    calls: list[str] = []
+
+    def fake_queue(domain: str):
+        def run(*_args, **_kwargs):
+            calls.append(domain)
+            path = tmp_path / "raw" / domain / "benchmark.json"
+            recipe = "single_path_door_closed" if domain == "channel" else ""
+            write_json(path, [fake_episode(domain, 0, f"{domain}-case", recipe)])
+            return path
+
+        return run
+
+    monkeypatch.setattr(collector, "run_container_fine_collection", fake_queue("container"))
+    monkeypatch.setattr(collector, "run_door_parallel", fake_queue("channel"))
+    monkeypatch.setattr(collector, "run_mixed_fine_parallel", fake_queue("mixed"))
+
+    paths = collector.run_light_collectors(
+        config,
+        seed_benchmark,
+        targets={"channel": 1, "container": 1, "mixed": 1},
+    )
+
+    assert set(calls) == {"channel", "container", "mixed"}
+    assert set(paths) == {"channel", "container", "mixed"}
+    ledger = json.loads((tmp_path / "raw" / "domain_scheduler.ledger.json").read_text())
+    assert ledger["workers_total"] == 3
+    assert ledger["rounds"][0]["worker_allocation"] == {
+        "channel": 1,
+        "container": 1,
+        "mixed": 1,
+    }
+    assert ledger["maximum_simulation_count"] == 3
+
+
+def test_domain_worker_allocation_hands_released_slots_to_mixed() -> None:
+    assert collector._domain_worker_allocation(
+        3,
+        ["container", "mixed"],
+        current_counts={"container": 900, "mixed": 100},
+        targets={"container": 1000, "mixed": 1000},
+    ) == {"container": 1, "mixed": 2}
+    assert collector._domain_worker_allocation(
+        3,
+        ["mixed"],
+        current_counts={"mixed": 100},
+        targets={"mixed": 1000},
+    ) == {"mixed": 3}
 
 
 def test_train_scene_manifest_uses_requested_house_subset(tmp_path: Path) -> None:
@@ -534,3 +726,132 @@ def test_full_stage_dispatches_all_domains_and_requires_success(
     command_text = [" ".join(command) for command in commands]
     assert any("record_interactive_nav_rby1_rollout.py" in command for command in command_text)
     assert any("record_mixed_rby1_rollout.py" in command for command in command_text)
+
+
+def test_full_stage_retries_candidates_until_each_domain_has_a_valid_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = config_payload(tmp_path)
+    payload["collection"]["mode"] = "full"
+    payload["full"] = {
+        "max_episodes": 1,
+        "max_candidate_attempts_per_domain": 2,
+        "domains": ["channel", "container", "mixed"],
+    }
+    config = CollectionConfig.model_validate(payload)
+    benchmark = tmp_path / "balanced" / "benchmark.json"
+    write_json(
+        benchmark,
+        [
+            fake_episode("channel", 0, "channel-case-a"),
+            fake_episode("channel", 1, "channel-case-b"),
+            fake_episode("container", 0, "container-case"),
+            fake_episode("mixed", 0, "mixed-case"),
+        ],
+    )
+
+    def fake_run(command: list[str], *, log_path: Path, env: dict[str, str]) -> int:
+        del log_path, env
+        case_id = command[command.index("--case_id") + 1]
+        if case_id == "channel-case-a":
+            return 1
+        output_dir = Path(command[command.index("--output_dir") + 1])
+        run_dir = output_dir / f"run_{case_id[:48]}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "trajectory.h5").touch()
+        return 0
+
+    def fake_validate(path: Path) -> dict:
+        text = str(path)
+        if "channel-case" in text:
+            segments = {
+                "nav_to_door": 1,
+                "force_open_door": 1,
+                "nav_to_target": 1,
+                "terminal_observation": 1,
+            }
+        elif "container-case" in text:
+            segments = {
+                "nav_to_container": 1,
+                "force_open_container": 1,
+                "terminal_observation": 1,
+            }
+        else:
+            segments = {
+                "nav_to_door": 1,
+                "force_open_door": 1,
+                "nav_to_container": 1,
+                "force_open_container": 1,
+                "terminal_observation": 1,
+            }
+        return {
+            "success": True,
+            "action_type_counts": {"force_joint": 2},
+            "segment_counts": segments,
+            "terminal_step_count": 1,
+        }
+
+    monkeypatch.setattr(collector, "run_command", fake_run)
+    monkeypatch.setattr(collector, "validate_full_rollout", fake_validate)
+
+    summary = json.loads(collector.run_full_collectors(config).read_text())
+
+    assert summary["attempted_trajectory_count"] == 4
+    assert summary["valid_trajectory_count"] == 3
+    assert summary["valid_trajectory_count_by_domain"] == {
+        "channel": 1,
+        "container": 1,
+        "mixed": 1,
+    }
+    assert summary["runs"][0]["case_id"] == "channel-case-a"
+    assert summary["runs"][0]["training_eligible"] is False
+    assert summary["runs"][1]["case_id"] == "channel-case-b"
+    assert summary["runs"][1]["training_eligible"] is True
+
+
+def test_file_based_progress_snapshot_reports_container_eta_inputs(tmp_path: Path) -> None:
+    batch = tmp_path / "raw" / "container_batches" / "batch_003"
+    shard = batch / "shards" / "shard_000"
+    write_json(
+        shard / "collection_plan.json",
+        {"selection": {"selected_house_count": 5}},
+    )
+    write_json(
+        shard / "benchmark" / "house_catalog.partial.json",
+        [{"house_index": 1}, {"house_index": 2}],
+    )
+    write_json(
+        shard / "benchmark" / "benchmark.partial.json",
+        [fake_episode("container", 1, "container-1")],
+    )
+
+    line = snapshot(
+        tmp_path,
+        global_target=3000,
+        domain_targets={"channel": 300, "container": 300, "mixed": 300},
+    )
+
+    assert "stage=container" in line
+    assert "batch=batch_003" in line
+    assert "batch_progress=2/5" in line
+    assert "batch_valid=1" in line
+    assert "workers=1" in line
+    assert "worker_loads=5" in line
+    assert "domains=channel:0/300,container:1/300,mixed:0/300" in line
+    assert "checkpoint_progress=1/900" in line
+    assert "checkpoint_remaining=899" in line
+    assert "eta=" in line
+    assert "time=" in line
+    assert "global_raw_valid=" in line
+    assert "global_balanced=" in line
+    assert "global_eta=" in line
+
+
+def test_progress_reporter_ignores_stale_unfinalized_batch(tmp_path: Path) -> None:
+    stale = tmp_path / "raw" / "container_batches" / "batch_006"
+    stale.mkdir(parents=True)
+    write_json(stale / "benchmark.partial.json", [])
+    completed = tmp_path / "raw" / "container_batches" / "batch_008"
+    write_json(completed / "batch_meta.json", {"batch_index": 8})
+
+    assert _active_batch(tmp_path, "raw/container_batches/batch_*") is None

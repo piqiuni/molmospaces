@@ -239,13 +239,25 @@ def build_house_seed_episodes(
         component_labels, _component_count = connected_components(
             np.asarray(scene_map.occupancy, dtype=bool)
         )
-        used_categories: set[str] = set()
+        # Prefer one instance per category first, then use remaining instances
+        # to reach the requested seed count.  The old single-pass filter could
+        # silently return far fewer than ``seeds_per_house`` when a scene had
+        # fewer unique categories than the requested count.
+        seen_categories: set[str] = set()
+        diverse_targets: list[dict[str, Any]] = []
+        repeated_targets: list[dict[str, Any]] = []
         for record in targets:
+            category = str(record.get("category") or record["name"].split("_", 1)[0])
+            if category in seen_categories:
+                repeated_targets.append(record)
+            else:
+                seen_categories.add(category)
+                diverse_targets.append(record)
+        ordered_targets = diverse_targets + repeated_targets
+        for record in ordered_targets:
             if len(episodes) >= seeds_per_house:
                 break
             category = str(record.get("category") or record["name"].split("_", 1)[0])
-            if category in used_categories and len(targets) >= seeds_per_house:
-                continue
             target_center = _target_center(record)
             nearest_goal = emi.nearest_free_point_xy(scene_map, target_center[:2])
             if nearest_goal is None:
@@ -319,7 +331,6 @@ def build_house_seed_episodes(
             }
             EpisodeSpec.model_validate(episode)
             episodes.append(episode)
-            used_categories.add(category)
     finally:
         ctx.sampler.close()
     return episodes, failures

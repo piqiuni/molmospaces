@@ -155,8 +155,13 @@ def sample_nav_goal_for_episode(
     scene_map,
     episode: dict[str, Any],
 ) -> tuple[np.ndarray, str, str | None, str, list[str]]:
-    nav_objects, resolved_candidates, target_name = episode_nav_objects(env, episode)
+    nav_objects, resolved_candidates, _source_target_name = episode_nav_objects(env, episode)
     target_obj = nearest_nav_object(env, nav_objects)
+    # The sampled goal belongs to the nearest eligible candidate, not
+    # necessarily the source task's first/canonical candidate.  Callers use
+    # this returned name as the V3 specific instance, so it must stay coupled
+    # to ``target_obj`` for every sampler/fallback branch below.
+    selected_target_name = target_obj.name
     sampler = NavGoalSampler(scene_map, check_target_in_view=False, camera_name="head_camera")
     sampler.set_target(target_obj)
     sampler.set_robot_view(env.current_robot.robot_view)
@@ -166,7 +171,7 @@ def sample_nav_goal_for_episode(
             emi.normalize_point3d(goal),
             "nav_goal_sampler",
             None,
-            target_name,
+            selected_target_name,
             resolved_candidates,
         )
 
@@ -181,7 +186,7 @@ def sample_nav_goal_for_episode(
             fallback_goal,
             "nearest_free_point_fallback",
             "Failed to sample a nav goal near target object",
-            target_name,
+            selected_target_name,
             resolved_candidates,
         )
 
@@ -189,7 +194,7 @@ def sample_nav_goal_for_episode(
         target_pos,
         "target_object_center_fallback",
         "Failed to sample a nav goal and nearest free fallback",
-        target_name,
+        selected_target_name,
         resolved_candidates,
     )
 
@@ -230,7 +235,7 @@ def run_single_episode(
         )
         path_len = emi.path_length(path)
         euclidean_distance = float(np.linalg.norm(np.asarray(start_xy) - np.asarray(nav_goal[:2])))
-        target_object = ctx.task.config.task_config.pickup_obj_name
+        target_object = ctx.task.get_nearest_nav_object(ctx.env.current_batch_index).name
         target_candidates = ctx.task.config.task_config.pickup_obj_candidates
         interactive_door_names = emi.interactive_door_root_names(doorway_analysis)
         plot_path = episode_dir / "open_gt_path.png"
