@@ -116,6 +116,7 @@ class SceneGraphBundle:
     source_mode: str
     graph_revision: int
     timestamp: float
+    capture_step: int | None
     nodes: list[SceneGraphNode]
     edges: list[SceneGraphEdge]
     semantic_node_ids: list[str]
@@ -133,6 +134,7 @@ class SceneGraphBundle:
             "source_mode": self.source_mode,
             "graph_revision": int(self.graph_revision),
             "timestamp": float(self.timestamp),
+            "capture_step": self.capture_step,
             "nodes": [node.to_dict() for node in self.nodes],
             "edges": [edge.to_dict() for edge in self.edges],
             "views": {

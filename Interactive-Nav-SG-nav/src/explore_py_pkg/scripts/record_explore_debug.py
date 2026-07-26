@@ -162,6 +162,7 @@ def _write_png(path: Path, width: int, height: int, rgb: bytearray) -> None:
     data += _chunk(b"IHDR", header)
     data += _chunk(b"IDAT", zlib.compress(payload, 6))
     data += _chunk(b"IEND", b"")
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
 
 
@@ -298,6 +299,7 @@ def _write_grid_pgm_yaml(prefix: Path, grid: OccupancyGrid) -> None:
     height = int(grid.info.height)
     pgm_path = prefix.with_suffix(".pgm")
     yaml_path = prefix.with_suffix(".yaml")
+    prefix.parent.mkdir(parents=True, exist_ok=True)
     raw = bytearray(width * height)
     for y in range(height):
         for x in range(width):
@@ -837,25 +839,7 @@ class ExploreDebugRecorder:
         self.panel_dir = output_dir / "subgoal_panels"
         self.uniform_panel_dir = output_dir / "subgoal_panels_uniform_crop"
         self.stall_snapshot_dir = output_dir / "stall_snapshots"
-        self.overlay_dir.mkdir(parents=True, exist_ok=True)
-        self.uniform_overlay_dir.mkdir(parents=True, exist_ok=True)
-        self.uniform_overlay_titled_dir.mkdir(parents=True, exist_ok=True)
-        self.first_person_dir.mkdir(parents=True, exist_ok=True)
-        self.external_dir.mkdir(parents=True, exist_ok=True)
-        self.video_dir.mkdir(parents=True, exist_ok=True)
-        self.video_camera_frame_dir.mkdir(parents=True, exist_ok=True)
-        self.video_map_frame_dir.mkdir(parents=True, exist_ok=True)
-        self.video_global_costmap_frame_dir.mkdir(parents=True, exist_ok=True)
-        self.video_local_costmap_frame_dir.mkdir(parents=True, exist_ok=True)
-        self.video_semantic_spatial_frame_dir.mkdir(parents=True, exist_ok=True)
-        self.video_semantic_topology_frame_dir.mkdir(parents=True, exist_ok=True)
-        self.video_composite_frame_dir.mkdir(parents=True, exist_ok=True)
-        self.video_external_frame_dir.mkdir(parents=True, exist_ok=True)
-        self.semantic_keyframe_dir.mkdir(parents=True, exist_ok=True)
         self.graph_dir.mkdir(parents=True, exist_ok=True)
-        self.panel_dir.mkdir(parents=True, exist_ok=True)
-        self.uniform_panel_dir.mkdir(parents=True, exist_ok=True)
-        self.stall_snapshot_dir.mkdir(parents=True, exist_ok=True)
 
         self.args = args
         self.tf_listener = tf.TransformListener()
@@ -3746,11 +3730,11 @@ class ExploreDebugRecorder:
                     f"L={0 if local_plan is None else len(local_plan.get('poses', []))}",
                 ],
             )
-        if image_snapshot is not None:
+        if self.args.first_person_video and image_snapshot is not None:
             first_person_stamp, image_width, image_height, image_rgb = image_snapshot
             first_person_path = str(self.first_person_dir / f"subgoal_{goal_index:04d}_first_person.png")
             _write_png(Path(first_person_path), image_width, image_height, image_rgb)
-        if external_snapshot is not None:
+        if self.args.external_video and external_snapshot is not None:
             _external_stamp, external_width, external_height, external_rgb = external_snapshot
             external_path = str(self.external_dir / f"subgoal_{goal_index:04d}_external.png")
             _write_png(Path(external_path), external_width, external_height, external_rgb)
@@ -5137,12 +5121,12 @@ class ExploreDebugRecorder:
             final_overlay_crop = ""
             final_first_person = ""
             final_external = ""
-            if self.latest_image is not None:
+            if self.args.first_person_video and self.latest_image is not None:
                 image_stamp, image_width, image_height, image_rgb = self.latest_image
                 final_first_person = str(self.first_person_dir / "final_first_person.png")
                 _write_png(Path(final_first_person), image_width, image_height, image_rgb)
                 self.final_first_person_path = final_first_person
-            if self.latest_external_image is not None:
+            if self.args.external_video and self.latest_external_image is not None:
                 _external_stamp, external_width, external_height, external_rgb = self.latest_external_image
                 final_external = str(self.external_dir / "final_external_camera.png")
                 _write_png(Path(final_external), external_width, external_height, external_rgb)

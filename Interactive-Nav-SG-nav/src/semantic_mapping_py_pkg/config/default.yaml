@@ -147,7 +147,7 @@ semantic_map:
   room_id_overlap_ratio: 0.25
   room_merge_confirmations: 3
   room_grid_stability_frames: 3
-  room_geometry_stability_frames: 3
+  room_geometry_stability_frames: 5
   lifted_graph_frame: "tf_frame_map_graph"
   lifted_graph_z_offset: 10.0
   graph_save_path: ""

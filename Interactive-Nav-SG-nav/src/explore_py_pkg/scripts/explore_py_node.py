@@ -223,7 +223,7 @@ class ExplorePyNode:
             frontier_match_distance_m=float(exploration_cfg.get("frontier_match_distance_m", 1.0)),
             frontier_gone_confirm_ticks=self.frontier_gone_confirm_ticks,
             frontier_gone_min_goal_age_sec=self.frontier_gone_min_goal_age_sec,
-            failed_point_soft_blacklist_sec=float(exploration_cfg.get("failed_point_soft_blacklist_sec", 45.0)),
+            failed_point_soft_blacklist_sec=float(exploration_cfg.get("failed_point_soft_blacklist_sec", 10.0)),
             failed_point_blacklist_sec=float(exploration_cfg.get("failed_point_blacklist_sec", 180.0)),
             failed_point_blacklist_radius_m=float(exploration_cfg.get("failed_point_blacklist_radius_m", 1.25)),
             reached_point_blacklist_sec=float(exploration_cfg.get("reached_point_blacklist_sec", 90.0)),
@@ -247,6 +247,13 @@ class ExplorePyNode:
         self.last_selected_cluster = None
         self.external_reserved_cluster = None
         self.external_reserved_command = None
+        self.external_reservation_ack_cache = {}
+        self.external_reservation_received_count = 0
+        self.external_reservation_replay_count = 0
+        self.external_reservation_last_command_id = ""
+        self.external_reservation_last_cluster_id = ""
+        self.external_reservation_last_status = ""
+        self.external_reservation_last_detail = {}
 
         self.goal_pub = rospy.Publisher(self.topics.get("goal", "/move_base_simple/goal"), PoseStamped, queue_size=1)
         self.cancel_pub = rospy.Publisher(self.topics.get("move_base_cancel", "/move_base/cancel"), GoalID, queue_size=1)
@@ -315,6 +322,13 @@ class ExplorePyNode:
         self.last_selected_cluster = None
         self.external_reserved_cluster = None
         self.external_reserved_command = None
+        self.external_reservation_ack_cache.clear()
+        self.external_reservation_received_count = 0
+        self.external_reservation_replay_count = 0
+        self.external_reservation_last_command_id = ""
+        self.external_reservation_last_cluster_id = ""
+        self.external_reservation_last_status = ""
+        self.external_reservation_last_detail = {}
         self.latest_global_plan_pose_count = 0
         self.latest_global_plan_length_m = 0.0
         self.latest_global_plan_time = 0.0
@@ -373,7 +387,22 @@ class ExplorePyNode:
             return
         action = str(command.get("action") or "")
         if action == "reserve_frontier":
-            self._reserve_external_frontier(command)
+            try:
+                self._reserve_external_frontier(command)
+            except Exception as error:
+                command_id = str(command.get("command_id") or "")
+                detail = {"reason": "reservation_exception", "error": str(error)}
+                self.external_reservation_last_command_id = command_id
+                self.external_reservation_last_cluster_id = str(command.get("cluster_id") or "")
+                self.external_reservation_last_status = "FAILED"
+                self.external_reservation_last_detail = detail
+                self.external_reservation_ack_cache[command_id] = {
+                    "status": "FAILED",
+                    "success": False,
+                    "detail": detail,
+                }
+                rospy.logerr("[explore_py] external frontier reservation failed: command=%s error=%s", command_id, error)
+                self._publish_behavior_feedback(command, "FAILED", False, detail)
         elif action == "finalize_frontier":
             self._finalize_external_frontier(command)
 
@@ -415,6 +444,8 @@ class ExplorePyNode:
         return total
 
     def move_base_status_callback(self, msg):
+        if self.external_behavior_control:
+            return
         statuses = list(getattr(msg, "status_list", []) or [])
         has_active_goal = self.state.active_goal is not None
 
@@ -600,25 +631,15 @@ class ExplorePyNode:
             self.local_plan_bad_since = 0.0
 
     def _tick_external_navigation_progress(self):
-        command = self.external_reserved_command
-        if command is None or self.state.active_goal is None:
+        """Keep an externally reserved frontier alive until the executor finalizes it.
+
+        In semantic-control mode the executor owns make_plan, rear-goal rotation,
+        move_base completion, and final yaw alignment.  Applying the legacy
+        explorer position/plan watchdogs here races that state machine: a goal
+        can be erased while the executor is still planning or rotating.
+        """
+        if self.external_reserved_command is None or self.state.active_goal is None:
             return
-        if not self.core.is_free_world(self.latest_grid, self.state.active_goal.point):
-            self.state.fail_active_if_goal_not_free(False)
-        else:
-            self.state.update_goal_progress(self.robot_xy, robot_yaw=self.robot_yaw)
-            if self.state.active_goal is not None:
-                self._fail_if_global_plan_not_current_goal()
-            if self.state.active_goal is not None:
-                self._fail_if_local_plan_missing()
-        if self.state.active_goal is None:
-            detail = {
-                "reason": self.state.last_failure_reason or self.state.last_event,
-                "source": self.state.last_failure_source or "explorer",
-            }
-            self.external_reserved_cluster = None
-            self.external_reserved_command = None
-            self._publish_behavior_feedback(command, "FAILED", False, detail)
 
     def _fail_if_global_plan_not_current_goal(self):
         if not self.global_plan_current_goal_check_enabled or self.state.active_goal is None:
@@ -717,6 +738,15 @@ class ExplorePyNode:
                 "sample_count": len(self.rotation_replan_samples),
                 "last_metrics": self.rotation_replan_last_metrics,
             },
+            "external_reservation": {
+                "received_count": self.external_reservation_received_count,
+                "replay_count": self.external_reservation_replay_count,
+                "cache_size": len(self.external_reservation_ack_cache),
+                "last_command_id": self.external_reservation_last_command_id,
+                "last_cluster_id": self.external_reservation_last_cluster_id,
+                "last_status": self.external_reservation_last_status,
+                "last_detail": dict(self.external_reservation_last_detail),
+            },
         }
         if self.state.active_goal is not None:
             payload["active_goal_distance"] = self._active_goal_distance()
@@ -733,8 +763,24 @@ class ExplorePyNode:
                 {"reason": "external_behavior_control_disabled"},
             )
             return
-        self.compute_next_subgoal(force=False, publish_selection=False)
+        command_id = str(command.get("command_id") or "")
         cluster_id = str(command.get("cluster_id") or "")
+        self.external_reservation_received_count += 1
+        self.external_reservation_last_command_id = command_id
+        self.external_reservation_last_cluster_id = cluster_id
+        cached_ack = self.external_reservation_ack_cache.get(command_id)
+        if cached_ack is not None:
+            self.external_reservation_replay_count += 1
+            self.external_reservation_last_status = str(cached_ack["status"])
+            self.external_reservation_last_detail = dict(cached_ack["detail"])
+            rospy.loginfo("[explore_py] replaying reservation ACK: command=%s status=%s", command_id, cached_ack["status"])
+            self._publish_behavior_feedback(
+                command,
+                cached_ack["status"],
+                cached_ack["success"],
+                cached_ack["detail"],
+            )
+            return
         cluster = next(
             (
                 candidate
@@ -744,11 +790,20 @@ class ExplorePyNode:
             None,
         )
         if cluster is None:
+            detail = {"reason": "frontier_not_available", "cluster_id": cluster_id}
+            self.external_reservation_ack_cache[command_id] = {
+                "status": "FAILED",
+                "success": False,
+                "detail": detail,
+            }
+            self.external_reservation_last_status = "FAILED"
+            self.external_reservation_last_detail = detail
+            rospy.logwarn("[explore_py] reservation rejected: command=%s cluster=%s latest_clusters=%d", command_id, cluster_id, len(self.latest_clusters))
             self._publish_behavior_feedback(
                 command,
                 "FAILED",
                 False,
-                {"reason": "frontier_not_available", "cluster_id": cluster_id},
+                detail,
             )
             return
         self.external_reserved_cluster = cluster
@@ -767,20 +822,24 @@ class ExplorePyNode:
         point_msg.header.frame_id = self.map_frame
         point_msg.point = Point(cluster.subgoal_world[0], cluster.subgoal_world[1], 0.0)
         self.subgoal_pub.publish(point_msg)
-        self._publish_behavior_feedback(
-            command,
-            "READY",
-            None,
-            {
-                "cluster_id": cluster.cluster_id,
-                "goal_xyyaw": [
-                    float(cluster.subgoal_world[0]),
-                    float(cluster.subgoal_world[1]),
-                    float(cluster.subgoal_yaw),
-                ],
-                "frame_id": self.map_frame,
-            },
-        )
+        detail = {
+            "cluster_id": cluster.cluster_id,
+            "goal_xyyaw": [
+                float(cluster.subgoal_world[0]),
+                float(cluster.subgoal_world[1]),
+                float(cluster.subgoal_yaw),
+            ],
+            "frame_id": self.map_frame,
+        }
+        self.external_reservation_ack_cache[command_id] = {
+            "status": "READY",
+            "success": None,
+            "detail": detail,
+        }
+        self.external_reservation_last_status = "READY"
+        self.external_reservation_last_detail = detail
+        rospy.loginfo("[explore_py] reservation ready: command=%s cluster=%s", command_id, cluster_id)
+        self._publish_behavior_feedback(command, "READY", None, detail)
 
     def _finalize_external_frontier(self, command):
         cluster = self.external_reserved_cluster

@@ -27,10 +27,6 @@ def test_controller_emits_success_result_and_behavior_feedback(monkeypatch) -> N
         },
     )
     monkeypatch.setattr(
-        "scripts.InteractiveNav.force_interaction_bridge.drive_joint_group_to_targets",
-        lambda _model, _data, _targets, config: {"physics_substeps": 123},
-    )
-    monkeypatch.setattr(
         "scripts.InteractiveNav.force_interaction_bridge.complete_articulation_force",
         lambda _env, _plan, config: {
             "pre_state": "closed",
@@ -79,3 +75,154 @@ def test_controller_deduplicates_command_ids() -> None:
     }
     assert controller.enqueue_command(command)
     assert not controller.enqueue_command(command)
+
+
+def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch) -> None:
+    state = {"drawer_top": 0.0, "drawer_bottom": 0.0}
+    published = []
+
+    def prepare(_env, _root, open_joint_names=None, close_joint_names=None):
+        targets = {
+            name: 1.0 for name in open_joint_names or []
+        }
+        targets.update({name: 0.0 for name in close_joint_names or []})
+        return {
+            "group": {"joints": []},
+            "targets": targets,
+            "selected_joint_names": list(open_joint_names or []),
+            "closed_joint_names": list(close_joint_names or []),
+            "pre_joint_infos": [
+                {"joint_name": name, "joint_value": state[name]}
+                for name in targets
+            ],
+        }
+
+    def advance(_env, plan, **_kwargs):
+        state.update(plan["targets"])
+        return {"physics_substeps": 1, "fallback": False}
+
+    def infos(_env, _root):
+        return [
+            {"joint_name": name, "open_fraction": value, "joint_value": value}
+            for name, value in state.items()
+        ]
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_state_force",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.advance_articulation_force",
+        advance,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.articulation_joint_infos",
+        infos,
+    )
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        drawer_execution_mode="fast",
+    )
+    controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    monkeypatch.setattr(controller, "_publish", lambda _publisher, payload: published.append(payload))
+    command = {
+        "command_id": "drawer_scan_fast",
+        "candidate_id": "drawer_scan",
+        "decision_id": "decision_1",
+        "source_object_name": "dresser_root",
+        "action": "scan",
+        "sequence_type": "drawer_scan",
+        "interaction_groups": [
+            {"group_id": "top", "joint_names": ["drawer_top"]},
+            {"group_id": "bottom", "joint_names": ["drawer_bottom"]},
+        ],
+    }
+    assert controller.enqueue_command(command)
+    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+
+    for step in range(3):
+        controller.before_step(task, step=step)
+        result = controller.after_step(task, step=step)
+
+    assert result is not None
+    assert result["success"] is True
+    assert result["task_steps_consumed"] == 3
+    assert result["drawer_execution_mode"] == "fast"
+    assert [item["observation_step"] for item in result["interaction_group_results"]] == [0, 1]
+    assert result["source"] == "force_container_sequence"
+    assert len(published) == 2
+
+
+def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -> None:
+    state = {"drawer_top": 0.0, "drawer_bottom": 0.0}
+
+    def prepare(_env, _root, open_joint_names=None, close_joint_names=None):
+        targets = {name: 1.0 for name in open_joint_names or []}
+        targets.update({name: 0.0 for name in close_joint_names or []})
+        return {
+            "group": {"joints": []},
+            "targets": targets,
+            "selected_joint_names": list(open_joint_names or []),
+            "closed_joint_names": list(close_joint_names or []),
+            "pre_joint_infos": [
+                {"joint_name": name, "joint_value": state[name]}
+                for name in targets
+            ],
+        }
+
+    def advance(_env, plan, progress, **_kwargs):
+        for name, target in plan["targets"].items():
+            state[name] = target if progress >= 1.0 else state[name]
+        return {"physics_substeps": 1, "fallback": False}
+
+    def infos(_env, _root):
+        return [
+            {"joint_name": name, "open_fraction": value, "joint_value": value}
+            for name, value in state.items()
+        ]
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_state_force",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.advance_articulation_force",
+        advance,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.articulation_joint_infos",
+        infos,
+    )
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        drawer_execution_mode="smooth",
+        drawer_transition_steps=3,
+    )
+    controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    controller._publish = lambda *_args, **_kwargs: None
+    assert controller.enqueue_command(
+        {
+            "command_id": "drawer_scan_smooth",
+            "source_object_name": "dresser_root",
+            "action": "scan",
+            "sequence_type": "drawer_scan",
+            "interaction_groups": [
+                {"group_id": "top", "joint_names": ["drawer_top"]},
+                {"group_id": "bottom", "joint_names": ["drawer_bottom"]},
+            ],
+        }
+    )
+    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+    result = None
+    for step in range(30):
+        controller.before_step(task, step=step)
+        result = controller.after_step(task, step=step)
+        if result is not None:
+            break
+
+    assert result is not None
+    assert result["success"] is True
+    assert result["drawer_transition_steps"] == 3
+    assert result["task_steps_consumed"] == 14

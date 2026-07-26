@@ -120,7 +120,7 @@ class SemanticMappingNode:
             config.get("room_grid_stability_frames", 3)
         )
         self.room_geometry_stability_frames = int(
-            config.get("room_geometry_stability_frames", 3)
+            config.get("room_geometry_stability_frames", 5)
         )
         self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
         self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
@@ -322,6 +322,7 @@ class SemanticMappingNode:
                 observations,
                 stamp=stamp,
                 source_mode="realtime_gt_observation",
+                capture_step=parsed.get("capture_step"),
             )
             publish_bundle = self._collect_publish_bundle_locked()
         self._safe_publish_bundle(publish_bundle)

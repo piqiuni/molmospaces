@@ -205,6 +205,10 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
         "traversable": traversable,
         "expected_effect": "unlock_connectivity" if node_type == "portal" else "reveal_contents" if node_type == "container" else "none",
         "operation_history": [],
+        "completed_interaction_groups": [],
+        "failed_interaction_groups": [],
+        "joint_interaction_states": {},
+        "all_joints_opened_once": False,
     }
 
 

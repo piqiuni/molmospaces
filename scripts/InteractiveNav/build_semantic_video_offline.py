@@ -49,9 +49,16 @@ def load_recorder_frames(path: Path) -> list[dict]:
         return []
     with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
+    records = []
     for row in rows:
-        row["image_stamp_value"] = float(row.get("image_stamp") or 0.0)
-    return sorted(rows, key=lambda row: row["image_stamp_value"])
+        try:
+            row["image_stamp_value"] = float(row.get("image_stamp") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not row.get("composite_frame"):
+            continue
+        records.append(row)
+    return sorted(records, key=lambda row: row["image_stamp_value"])
 
 
 def causal_recorder_frame(records: list[dict], stamp_sec: float) -> dict | None:

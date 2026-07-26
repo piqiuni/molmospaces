@@ -105,6 +105,7 @@ class CandidateGeneratorConfig:
     target_min_visible_pixels: int = 16
     target_min_visible_fraction: float = 0.2
     target_min_consecutive_observations: int = 2
+    drawer_sequence_enabled: bool = True
 
 
 class CandidateGenerator:
@@ -599,6 +600,10 @@ class CandidateGenerator:
                 str(group_id)
                 for group_id in interaction.get("completed_interaction_groups") or []
             }
+            failed_groups = {
+                str(group_id)
+                for group_id in interaction.get("failed_interaction_groups") or []
+            }
             if not completed_groups:
                 completed_groups = {
                     str(entry.get("interaction_group_id") or "")
@@ -633,6 +638,141 @@ class CandidateGenerator:
                         "view_profile": "default",
                     }
                 ]
+            if node_type == "container" and self.config.drawer_sequence_enabled:
+                drawer_groups = []
+                for raw_group in interaction_groups:
+                    group = dict(raw_group or {})
+                    group_id = str(group.get("group_id") or "all_joints")
+                    target_joint_names = list(
+                        group.get("target_joint_names")
+                        or group.get("joint_names")
+                        or []
+                    )
+                    if (
+                        str(group.get("view_profile") or "default")
+                        != "drawer_low_view"
+                        or not target_joint_names
+                        or group_id in completed_groups
+                        or group_id in failed_groups
+                    ):
+                        continue
+                    if joint_infos and interaction_group_reached(
+                        joint_infos,
+                        target_joint_names,
+                        threshold=self.config.open_fraction_threshold,
+                    ) is True:
+                        continue
+                    drawer_groups.append(
+                        {
+                            "group_id": group_id,
+                            "joint_names": target_joint_names,
+                        }
+                    )
+                if drawer_groups:
+                    group_standoff = (
+                        self.config.drawer_standoff_m
+                        + self.config.interaction_safety_margin_m
+                    )
+                    goal_candidates = self._approach_candidates(
+                        robot_xy,
+                        position,
+                        node,
+                        group_standoff,
+                        node_type,
+                    )
+                    approach = goal_candidates[0]
+                    approach_distance = math.hypot(
+                        approach[0] - robot_xy[0], approach[1] - robot_xy[1]
+                    )
+                    joint_names = [
+                        name for group in drawer_groups for name in group["joint_names"]
+                    ]
+                    interaction_command = {
+                        "node_id": node_id,
+                        "source_object_name": source_object_name,
+                        "action": "scan",
+                        "interaction_mode": "drawer_scan",
+                        "sequence_type": "drawer_scan",
+                        "expected_state": "completed",
+                        "interaction_group_id": "drawer_scan",
+                        "interaction_groups": drawer_groups,
+                        "joint_names": joint_names,
+                        "close_other_joint_names": [],
+                        "close_other_joints": False,
+                        "view_profile": "drawer_low_view",
+                        "view_tilt_rad": 0.30,
+                        "view_torso_pitch_rad": 0.35,
+                        "restore_view_after": False,
+                        "open_fraction_threshold": float(
+                            self.config.open_fraction_threshold
+                        ),
+                    }
+                    candidates.append(
+                        BehaviorCandidate(
+                            candidate_id=f"interaction:{node_id}:drawer_scan",
+                            behavior_type=BEHAVIOR_INTERACT,
+                            source="unified_graph",
+                            target_id=node_id,
+                            target_name=source_object_name,
+                            goal_xyyaw=approach,
+                            interaction_command=interaction_command,
+                            features={
+                                "exploration_gain": exploration_gain,
+                                "visibility_gain": 0.80,
+                                "semantic_gain": 0.75,
+                                "target_relevance": (
+                                    1.0 if explicit_target_reinteraction else 0.0
+                                ),
+                                "distance_m": approach_distance,
+                                "interaction_cost": float(
+                                    interaction.get(
+                                        "interaction_cost",
+                                        interaction.get("cost", 1.0),
+                                    )
+                                    or 1.0
+                                ),
+                                "state_age_ratio": min(
+                                    1.0,
+                                    state_age_sec
+                                    / max(self.config.max_state_age_sec, 1e-6),
+                                ),
+                                "confidence": confidence,
+                                "priority": 0.75,
+                            },
+                            metadata={
+                                "node_type": node_type,
+                                "state": node_state,
+                                "expected_effect": expected_effect,
+                                "is_currently_visible": bool(
+                                    node.get("is_currently_visible")
+                                ),
+                                "state_age_sec": state_age_sec,
+                                "object_distance_m": object_distance,
+                                "robot_room_id": robot_room_id,
+                                "target_room_id": node_room_id,
+                                "interaction_group_id": "drawer_scan",
+                                "interaction_group_count": len(drawer_groups),
+                                "requires_low_view": True,
+                                "interaction_standoff_m": group_standoff,
+                                "interaction_safety_margin_m": (
+                                    self.config.interaction_safety_margin_m
+                                ),
+                                "target_enabled": bool(target_context.get("enabled")),
+                                "target_match": explicit_target_reinteraction,
+                                "requires_approach": True,
+                                "approach_strategy": (
+                                    "container_front_axis"
+                                    if self._container_approach_axis(node) is not None
+                                    else "radial_standoff"
+                                ),
+                                "interaction_approach_axis_xy": (
+                                    self._container_approach_axis(node)
+                                ),
+                                "goal_xyyaw_candidates": goal_candidates,
+                            },
+                        )
+                    )
+                    continue
             for group in interaction_groups:
                 group = dict(group or {})
                 target_joint_names = list(
@@ -651,7 +791,9 @@ class CandidateGenerator:
                 }:
                     continue
                 group_id = str(group.get("group_id") or "all_joints")
-                if group_id in completed_groups and not explicit_target_reinteraction:
+                if group_id in completed_groups:
+                    continue
+                if group_id in failed_groups:
                     continue
                 group_token = group_id.replace(":", "_").replace("/", "_")
                 view_profile = str(group.get("view_profile") or "default")
@@ -661,24 +803,20 @@ class CandidateGenerator:
                     and view_profile == "drawer_low_view"
                     else standoff
                 ) + self.config.interaction_safety_margin_m
-                approach = (
-                    self._portal_approach_pose(
-                        robot_xy, position, node, group_standoff
-                    )
-                    if node_type == "portal"
-                    else self._approach_pose(
-                        robot_xy,
-                        position,
-                        group_standoff,
-                        node=node,
-                        fixed_axis=self._container_approach_axis(node),
-                    )
+                goal_candidates = self._approach_candidates(
+                    robot_xy,
+                    position,
+                    node,
+                    group_standoff,
+                    node_type,
                 )
+                approach = goal_candidates[0]
                 approach_distance = math.hypot(
                     approach[0] - robot_xy[0], approach[1] - robot_xy[1]
                 )
                 candidate_suffix = "open" if group_id == "all_joints" else group_token
                 candidate_id = f"interaction:{node_id}:{candidate_suffix}"
+                low_view = view_profile == "drawer_low_view"
                 interaction_command = {
                     "node_id": node_id,
                     "source_object_name": source_object_name,
@@ -696,7 +834,18 @@ class CandidateGenerator:
                     ),
                     "close_other_joints": bool(group.get("close_other_joints", False)),
                     "view_profile": view_profile,
-                    "view_tilt_rad": float(group.get("view_tilt_rad", 0.55) or 0.55),
+                    "view_tilt_rad": float(
+                        group.get("view_tilt_rad", 0.30 if low_view else 0.55)
+                        or (0.30 if low_view else 0.55)
+                    ),
+                    "view_torso_pitch_rad": (
+                        float(group.get("view_torso_pitch_rad", 0.35) or 0.35)
+                        if low_view
+                        else None
+                    ),
+                    "view_hold_task_steps": 1 if low_view else 0,
+                    "post_interaction_hold_task_steps": 5 if low_view else 0,
+                    "restore_view_after": low_view,
                     "open_fraction_threshold": float(
                         self.config.open_fraction_threshold
                     ),
@@ -748,6 +897,8 @@ class CandidateGenerator:
                             "interaction_safety_margin_m": self.config.interaction_safety_margin_m,
                             "interaction_group_already_explored": group_id
                             in completed_groups,
+                            "interaction_group_previously_failed": group_id
+                            in failed_groups,
                             "target_enabled": bool(target_context.get("enabled")),
                             "target_match": explicit_target_reinteraction,
                             "requires_approach": True,
@@ -761,9 +912,48 @@ class CandidateGenerator:
                                 )
                             ),
                             "interaction_approach_axis_xy": self._container_approach_axis(node),
+                            "goal_xyyaw_candidates": goal_candidates,
                         },
                     )
                 )
+        return candidates
+
+    @classmethod
+    def _approach_candidates(
+        cls,
+        robot_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+        node: dict[str, Any],
+        standoff_m: float,
+        node_type: str,
+    ) -> list[list[float]]:
+        candidates: list[list[float]] = []
+        for extra_standoff in (0.0, 0.25, 0.50):
+            candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
+            if node_type == "portal":
+                pose = cls._portal_approach_pose(
+                    robot_xy, target_xy, node, candidate_standoff
+                )
+            else:
+                pose = cls._approach_pose(
+                    robot_xy,
+                    target_xy,
+                    candidate_standoff,
+                    node=node,
+                    fixed_axis=cls._container_approach_axis(node),
+                )
+            if not any(
+                math.hypot(pose[0] - previous[0], pose[1] - previous[1]) <= 1e-6
+                and abs(
+                    math.atan2(
+                        math.sin(pose[2] - previous[2]),
+                        math.cos(pose[2] - previous[2]),
+                    )
+                )
+                <= 1e-6
+                for previous in candidates
+            ):
+                candidates.append(pose)
         return candidates
 
     @staticmethod

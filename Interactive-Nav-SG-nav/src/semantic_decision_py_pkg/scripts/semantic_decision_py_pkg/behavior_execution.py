@@ -59,6 +59,123 @@ def path_lookahead_point(
     return float(endpoint[0]), float(endpoint[1])
 
 
+def navigation_goal_options(candidate: dict[str, Any]) -> list[tuple[float, float, float]]:
+    raw_options = [candidate.get("goal_xyyaw")]
+    raw_options.extend(
+        list((candidate.get("metadata") or {}).get("goal_xyyaw_candidates") or [])
+    )
+    options: list[tuple[float, float, float]] = []
+    for raw_option in raw_options:
+        values = list(raw_option or [])
+        if len(values) < 2:
+            continue
+        option = (
+            float(values[0]),
+            float(values[1]),
+            float(values[2]) if len(values) > 2 else 0.0,
+        )
+        if any(
+            math.hypot(option[0] - previous[0], option[1] - previous[1]) <= 1e-6
+            and abs(normalize_angle(option[2] - previous[2])) <= 1e-6
+            for previous in options
+        ):
+            continue
+        options.append(option)
+    return options
+
+
+def is_stuck_recovery_failure(detail: dict[str, Any]) -> bool:
+    reason = str(detail.get("reason") or "").lower()
+    status = str(detail.get("status") or "").lower()
+    return reason == "navigation_stagnation" or "oscillat" in status
+
+
+def safe_grid_motion_distance(
+    data: list[int] | tuple[int, ...],
+    width: int,
+    height: int,
+    resolution: float,
+    origin_xy: tuple[float, float],
+    start_xyyaw: tuple[float, float, float],
+    direction_sign: float,
+    requested_distance_m: float,
+    robot_radius_m: float,
+    safety_margin_m: float,
+    occupied_threshold: int = 50,
+    unknown_is_blocked: bool = True,
+) -> float:
+    width = int(width)
+    height = int(height)
+    resolution = float(resolution)
+    requested = max(0.0, float(requested_distance_m))
+    if width <= 0 or height <= 0 or resolution <= 0.0 or requested <= 0.0:
+        return 0.0
+    if len(data) < width * height:
+        return 0.0
+    clearance = max(0.0, float(robot_radius_m) + float(safety_margin_m))
+    footprint_cells = int(math.ceil(clearance / resolution))
+    sample_step = max(0.02, 0.5 * resolution)
+    direction = 1.0 if float(direction_sign) >= 0.0 else -1.0
+    start_x, start_y, yaw = (float(value) for value in start_xyyaw)
+    origin_x, origin_y = (float(value) for value in origin_xy)
+
+    def footprint_is_clear(center_x: float, center_y: float) -> bool:
+        center_col = int(math.floor((center_x - origin_x) / resolution))
+        center_row = int(math.floor((center_y - origin_y) / resolution))
+        for row in range(center_row - footprint_cells, center_row + footprint_cells + 1):
+            for col in range(center_col - footprint_cells, center_col + footprint_cells + 1):
+                cell_x = origin_x + (col + 0.5) * resolution
+                cell_y = origin_y + (row + 0.5) * resolution
+                if math.hypot(cell_x - center_x, cell_y - center_y) > clearance:
+                    continue
+                if col < 0 or row < 0 or col >= width or row >= height:
+                    return False
+                value = int(data[row * width + col])
+                if value >= int(occupied_threshold) or (unknown_is_blocked and value < 0):
+                    return False
+        return True
+
+    safe_distance = 0.0
+    distance = min(sample_step, requested)
+    while distance <= requested + 1e-9:
+        center_x = start_x + direction * distance * math.cos(yaw)
+        center_y = start_y + direction * distance * math.sin(yaw)
+        if not footprint_is_clear(center_x, center_y):
+            break
+        safe_distance = min(distance, requested)
+        if safe_distance >= requested:
+            break
+        distance = min(requested, distance + sample_step)
+    return safe_distance
+
+
+@dataclass
+class NavigationProgressWatchdog:
+    timeout_s: float = 12.0
+    min_displacement_m: float = 0.10
+    reference_xy: tuple[float, float] | None = None
+    last_progress_at: float | None = None
+
+    def reset(self, pose_xy: tuple[float, float] | None, now: float) -> None:
+        self.reference_xy = pose_xy
+        self.last_progress_at = float(now) if pose_xy is not None else None
+
+    def observe(self, pose_xy: tuple[float, float] | None, now: float) -> bool:
+        if self.timeout_s <= 0.0 or pose_xy is None:
+            return False
+        if self.reference_xy is None or self.last_progress_at is None:
+            self.reset(pose_xy, now)
+            return False
+        displacement = math.hypot(
+            float(pose_xy[0]) - float(self.reference_xy[0]),
+            float(pose_xy[1]) - float(self.reference_xy[1]),
+        )
+        if displacement >= self.min_displacement_m:
+            self.reset(pose_xy, now)
+            return False
+        return float(now) - self.last_progress_at >= self.timeout_s
+
+
 @dataclass
 class ExecutionConfig:
     navigation_timeout_s: float = 180.0
@@ -146,8 +263,6 @@ class BehaviorExecutionStateMachine:
     ) -> list[dict[str, Any]]:
         if self._behavior_type() != BEHAVIOR_EXPLORE:
             return []
-        if self.state == STATE_NAVIGATING:
-            return self._finish(success, detail or {}, now)
         if self.state not in {STATE_PREPARING_EXPLORE, STATE_FINALIZING_EXPLORE}:
             return []
         return self._finish(success, detail or {}, now)

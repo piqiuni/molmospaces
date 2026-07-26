@@ -124,6 +124,33 @@ def test_completion_waits_for_initial_scan() -> None:
     ) is False
 
 
+def test_completion_requires_fifty_observation_steps_after_frontiers_empty() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(
+            empty_candidate_confirmations=1,
+            empty_candidate_min_steps=50,
+        )
+    )
+
+    first = payload(1, exhausted=True, candidate_count=0)
+    first["exploration_context"]["observation_step"] = 100
+    assert tracker.update(
+        first, has_active_behavior=False, target_enabled=False
+    ) is False
+
+    before_limit = payload(2, exhausted=True, candidate_count=0)
+    before_limit["exploration_context"]["observation_step"] = 149
+    assert tracker.update(
+        before_limit, has_active_behavior=False, target_enabled=False
+    ) is False
+
+    at_limit = payload(3, exhausted=True, candidate_count=0)
+    at_limit["exploration_context"]["observation_step"] = 150
+    assert tracker.update(
+        at_limit, has_active_behavior=False, target_enabled=False
+    ) is True
+
+
 def test_target_mission_requires_matching_interaction_after_navigation() -> None:
     tracker = TargetMissionTracker()
     transition = tracker.on_behavior_succeeded(

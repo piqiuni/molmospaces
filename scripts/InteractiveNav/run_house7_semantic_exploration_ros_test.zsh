@@ -35,7 +35,7 @@ GT_REQUIRED_CONSECUTIVE_OBSERVATIONS=${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS:-2}
 GT_ROI_X_MIN_RATIO=${GT_ROI_X_MIN_RATIO:-0.10}
 GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
-LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.30}
+LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.25}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-}
@@ -46,6 +46,16 @@ COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-}
 INITIAL_DOOR_STATE=${INITIAL_DOOR_STATE:-closed}
 FORCE_CLOSE_CONTAINERS=${FORCE_CLOSE_CONTAINERS:-false}
 CLEAN_INTERMEDIATE=${CLEAN_INTERMEDIATE:-false}
+ENABLE_RECORDING=${ENABLE_RECORDING:-true}
+if [[ -z "${DRAWER_EXECUTION_MODE:-}" ]]; then
+  if [[ "${ENABLE_RECORDING}" == true ]]; then
+    DRAWER_EXECUTION_MODE=smooth
+  else
+    DRAWER_EXECUTION_MODE=fast
+  fi
+fi
+DRAWER_TRANSITION_STEPS=${DRAWER_TRANSITION_STEPS:-5}
+DRAWER_OBSERVATION_STEPS=${DRAWER_OBSERVATION_STEPS:-1}
 
 case "${METHOD}" in
   semantic_interaction_exploration)
@@ -59,7 +69,7 @@ case "${METHOD}" in
     START_SEMANTIC_DECISION=true
     COMPLETION_MODE=semantic
     FORCE_CLOSE_CONTAINERS=true
-    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-30}
+    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_runtime.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
@@ -83,7 +93,7 @@ case "${METHOD}" in
     START_SEMANTIC_DECISION=true
     COMPLETION_MODE=semantic
     FORCE_CLOSE_CONTAINERS=true
-    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-30}
+    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_fridge.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
@@ -91,7 +101,7 @@ case "${METHOD}" in
     START_SEMANTIC_DECISION=true
     COMPLETION_MODE=semantic
     FORCE_CLOSE_CONTAINERS=true
-    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-30}
+    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_fridge_model_mock.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
@@ -99,7 +109,7 @@ case "${METHOD}" in
     START_SEMANTIC_DECISION=true
     COMPLETION_MODE=semantic
     FORCE_CLOSE_CONTAINERS=true
-    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-30}
+    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_runtime.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
@@ -111,7 +121,10 @@ esac
 
 COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-0}
 
-mkdir -p "${OUTPUT_DIR}/sim" "${OUTPUT_DIR}/debug" "${OUTPUT_DIR}/videos" "${OUTPUT_DIR}/ros_home/log"
+mkdir -p "${OUTPUT_DIR}/sim" "${OUTPUT_DIR}/ros_home/log"
+if [[ "${ENABLE_RECORDING}" == true ]]; then
+  mkdir -p "${OUTPUT_DIR}/videos"
+fi
 export ROS_MASTER_URI
 export ROS_IP=${ROS_IP:-127.0.0.1}
 export ROS_HOSTNAME=${ROS_HOSTNAME:-127.0.0.1}
@@ -187,25 +200,36 @@ if [[ "${MASTER_READY}" != true ]]; then
   exit 3
 fi
 
-PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
-  --output-dir "${OUTPUT_DIR}/debug" \
-  --occupancy-grid-topic /semantic_mapping/planning_occ_map \
-  --first-person-video-capture-mode step \
-  --semantic-video \
-  --first-person-video-with-map \
-  --first-person-video-fps "${VIDEO_FPS}" \
-  --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
-  --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
-  --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
-  --video-history-size "${VIDEO_HISTORY_SIZE}" \
-  --image-queue-size "${IMAGE_QUEUE_SIZE}" \
-  --video-global-panel-scale 1.8 \
-  --runtime-video-encode \
-  --first-person-video-h264-preset "${VIDEO_ENCODER_PRESET}" \
-  --no-external-video \
-  --no-video-save-panel-frames \
-  --no-first-person-video-h264 \
-  >"${OUTPUT_DIR}/recorder.log" 2>&1 &
+if [[ "${ENABLE_RECORDING}" == true ]]; then
+  PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
+    --output-dir "${OUTPUT_DIR}/debug" \
+    --occupancy-grid-topic /semantic_mapping/planning_occ_map \
+    --first-person-video-capture-mode step \
+    --semantic-video \
+    --first-person-video-with-map \
+    --first-person-video-fps "${VIDEO_FPS}" \
+    --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
+    --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
+    --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
+    --video-history-size "${VIDEO_HISTORY_SIZE}" \
+    --image-queue-size "${IMAGE_QUEUE_SIZE}" \
+    --video-global-panel-scale 1.8 \
+    --runtime-video-encode \
+    --first-person-video-h264-preset "${VIDEO_ENCODER_PRESET}" \
+    --no-external-video \
+    --no-video-save-panel-frames \
+    --no-first-person-video-h264 \
+    >"${OUTPUT_DIR}/recorder.log" 2>&1 &
+else
+  PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
+    --output-dir "${OUTPUT_DIR}/debug" \
+    --occupancy-grid-topic /semantic_mapping/planning_occ_map \
+    --no-first-person-video \
+    --no-first-person-video-with-map \
+    --no-semantic-video \
+    --no-external-video \
+    >"${OUTPUT_DIR}/recorder.log" 2>&1 &
+fi
 RECORDER_PID=$!
 sleep 1
 
@@ -213,7 +237,12 @@ RUNTIME_TARGET_MODE=none
 if [[ "${METHOD}" == object_goal_runtime || "${METHOD}" == semantic_interaction_object_goal ]]; then
   RUNTIME_TARGET_MODE=random_far_container_object
 fi
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 --observation_queue_size 0 --require_move_base_active_for_cmd_vel false --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_frame_queue_size 4 --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+if [[ "${ENABLE_RECORDING}" == true ]]; then
+  SIM_CAPTURE_ARGS="--observation_queue_size 0 --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_frame_queue_size 4"
+else
+  SIM_CAPTURE_ARGS="--observation_queue_size 1"
+fi
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 ${SIM_CAPTURE_ARGS} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -274,19 +303,23 @@ fi
 cleanup_process "${RECORDER_PID}" 20
 RECORDER_PID=""
 
-OFFLINE_VIDEO_START=$(python -c 'import time; print(time.perf_counter())')
-python "${VIDEO_BUILDER}" \
-  --scene-dir "${OUTPUT_DIR}" \
-  --debug-dir "${OUTPUT_DIR}/debug" \
-  --fps "${VIDEO_FPS}" \
-  --output-stem overview_6panel \
-  >"${OUTPUT_DIR}/offline_video.log" 2>&1
-OFFLINE_VIDEO_ELAPSED_SEC=$(python - "${OFFLINE_VIDEO_START}" <<'PY'
+if [[ "${ENABLE_RECORDING}" == true ]]; then
+  OFFLINE_VIDEO_START=$(python -c 'import time; print(time.perf_counter())')
+  python "${VIDEO_BUILDER}" \
+    --scene-dir "${OUTPUT_DIR}" \
+    --debug-dir "${OUTPUT_DIR}/debug" \
+    --fps "${VIDEO_FPS}" \
+    --output-stem overview_6panel \
+    >"${OUTPUT_DIR}/offline_video.log" 2>&1
+  OFFLINE_VIDEO_ELAPSED_SEC=$(python - "${OFFLINE_VIDEO_START}" <<'PY'
 import sys
 import time
 print(max(0.0, time.perf_counter() - float(sys.argv[1])))
 PY
-)
+  )
+else
+  OFFLINE_VIDEO_ELAPSED_SEC=0.0
+fi
 print -r -- "${OFFLINE_VIDEO_ELAPSED_SEC}" >"${OUTPUT_DIR}/offline_video_elapsed_sec.txt"
 
 if [[ -f "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" ]]; then
@@ -348,6 +381,8 @@ coverage = read_json(output_dir / "debug" / "exploration_coverage.json")
 semantic_summary = read_json(output_dir / "debug" / "summary.json").get("semantic_summary", {})
 force = read_json(output_dir / "force_interaction_events.json")
 completion = read_json(output_dir / "completion_status.json")
+if sim_frames <= 0:
+    sim_frames = int(completion.get("completed_steps", 0) or 0)
 timing_pattern = re.compile(
     r"SimLoop timing over (?P<count>\d+) steps: policy=(?P<policy>[0-9.]+)ms, "
     r"task=(?P<task>[0-9.]+)ms \(physics=(?P<physics>[0-9.]+)ms sensors=(?P<sensors>[0-9.]+)ms\), "
@@ -395,6 +430,7 @@ target_navigation_succeeded = any(
 )
 result = {
     "method": method,
+    "recording_enabled": bool(video_path.exists()),
     "route_id": route_id,
     "house_ind": house_ind,
     "task_horizon": task_horizon,

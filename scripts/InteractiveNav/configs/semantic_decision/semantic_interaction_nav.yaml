@@ -5,8 +5,8 @@ GlobalPlanner:
 
 DWAPlannerROS:
   xy_goal_tolerance: 0.30
-  yaw_goal_tolerance: 3.14
-  latch_xy_goal_tolerance: false
+  yaw_goal_tolerance: 0.20
+  latch_xy_goal_tolerance: true
   heading_scoring: true
   heading_scoring_timestep: 0.8
 

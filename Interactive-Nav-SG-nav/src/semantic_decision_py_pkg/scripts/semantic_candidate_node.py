@@ -77,6 +77,9 @@ class SemanticCandidateNode:
                 target_min_consecutive_observations=int(
                     config.get("target_min_consecutive_observations", 2)
                 ),
+                drawer_sequence_enabled=bool(
+                    config.get("drawer_sequence_enabled", True)
+                ),
             )
         )
         self.explorer_status: dict = {}
@@ -221,6 +224,7 @@ class SemanticCandidateNode:
                     explorer_input.get("frontier_exhausted", False)
                 ),
                 "proposal_count": int(explorer_input.get("proposal_count", 0) or 0),
+                "observation_step": self.graph.get("capture_step"),
                 "source": "explore_py_proposals"
                 if self.has_proposal_stream
                 else "explore_py_status_compatibility",

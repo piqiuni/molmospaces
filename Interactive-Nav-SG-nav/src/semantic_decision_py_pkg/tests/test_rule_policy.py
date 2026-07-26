@@ -1,5 +1,13 @@
 from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate
-from semantic_decision_py_pkg.rule_policy import RulePolicy
+from semantic_decision_py_pkg.rule_policy import RulePolicy, progressive_failure_cooldown
+
+
+def test_progressive_failure_cooldown_saturates_at_last_value():
+    schedule = [30.0, 60.0, 180.0]
+    assert progressive_failure_cooldown(schedule, 1) == 30.0
+    assert progressive_failure_cooldown(schedule, 2) == 60.0
+    assert progressive_failure_cooldown(schedule, 3) == 180.0
+    assert progressive_failure_cooldown(schedule, 4) == 180.0
 
 
 def candidate(candidate_id, behavior_type, distance, node_type="", gain=1.0):

@@ -250,7 +250,7 @@ def test_container_candidates_can_be_enabled_without_changing_portal_logic() -> 
     assert candidates[0].metadata["node_type"] == "container"
 
 
-def test_multi_drawer_container_emits_one_candidate_per_closed_joint_group() -> None:
+def test_multi_drawer_container_emits_single_scan_candidate() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(
             interaction_types=("container",),
@@ -314,14 +314,21 @@ def test_multi_drawer_container_emits_one_candidate_per_closed_joint_group() -> 
     candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
 
     assert [candidate.candidate_id for candidate in candidates] == [
-        "interaction:container_drawers:drawer_1",
-        "interaction:container_drawers:drawer_2",
+        "interaction:container_drawers:drawer_scan"
     ]
-    assert candidates[0].interaction_command["joint_names"] == ["drawer_top"]
-    assert candidates[0].interaction_command["close_other_joint_names"] == [
-        "drawer_bottom"
+    assert candidates[0].interaction_command["sequence_type"] == "drawer_scan"
+    assert candidates[0].interaction_command["joint_names"] == [
+        "drawer_top",
+        "drawer_bottom",
+    ]
+    assert candidates[0].interaction_command["interaction_groups"] == [
+        {"group_id": "drawer_1", "joint_names": ["drawer_top"]},
+        {"group_id": "drawer_2", "joint_names": ["drawer_bottom"]},
     ]
     assert candidates[0].interaction_command["view_profile"] == "drawer_low_view"
+    assert candidates[0].interaction_command["view_tilt_rad"] == 0.30
+    assert candidates[0].interaction_command["view_torso_pitch_rad"] == 0.35
+    assert candidates[0].interaction_command["restore_view_after"] is False
     assert math.isclose(candidates[0].goal_xyyaw[0], 0.0, abs_tol=1e-6)
     assert candidates[0].metadata["interaction_standoff_m"] == 1.0
 
@@ -365,7 +372,10 @@ def test_completed_drawer_group_is_not_reopened_during_exploration() -> None:
 
     candidates = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0))
     assert [candidate.candidate_id for candidate in candidates] == [
-        "interaction:container_drawers:drawer_2"
+        "interaction:container_drawers:drawer_scan"
+    ]
+    assert candidates[0].interaction_command["interaction_groups"] == [
+        {"group_id": "drawer_2", "joint_names": ["bottom"]}
     ]
 
     target_candidates = generator.generate(
@@ -383,10 +393,70 @@ def test_completed_drawer_group_is_not_reopened_during_exploration() -> None:
         for candidate in target_candidates
         if candidate.behavior_type == "INTERACT"
     ]
-    assert interaction_ids == [
-        "interaction:container_drawers:drawer_1",
-        "interaction:container_drawers:drawer_2",
+    assert interaction_ids == ["interaction:container_drawers:drawer_scan"]
+
+
+def test_failed_drawer_group_is_not_retried_without_explicit_retry_policy() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("container",))
+    )
+    node = {
+        "id": "container_drawers",
+        "type": "container",
+        "centroid": [1.0, 0.0, 0.5],
+        "state_age_sec": 0.0,
+        "attributes": {
+            "interaction_groups": [
+                {"group_id": "drawer_1", "target_joint_names": ["top"]},
+                {"group_id": "drawer_2", "target_joint_names": ["bottom"]},
+            ],
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "ajar",
+            "state_confidence": 1.0,
+            "failed_interaction_groups": ["drawer_1"],
+        },
+    }
+
+    candidates = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0))
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "interaction:container_drawers:drawer_2"
     ]
+
+
+def test_portal_approach_ignores_unstable_body_orientation() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("portal",), portal_standoff_m=1.0)
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_1",
+                "type": "portal",
+                "centroid": [0.0, 0.0, 1.0],
+                "aabb_size": [0.1, 1.0, 2.0],
+                "state_age_sec": 0.0,
+                "attributes": {
+                    "interaction_reference_aabb_center": [0.0, 0.0, 1.0],
+                    "interaction_reference_aabb_size": [0.1, 1.0, 2.0],
+                    "interaction_reference_orientation": [0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5)],
+                },
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    candidate = generator.generate({}, graph, robot_xy=(0.0, -2.0))[0]
+    assert math.isclose(candidate.goal_xyyaw[0], 1.05, abs_tol=1e-6)
+    assert math.isclose(candidate.goal_xyyaw[1], 0.0, abs_tol=1e-6)
+    assert math.isclose(candidate.goal_xyyaw[2], math.pi, abs_tol=1e-6)
 
 
 def test_interaction_group_verification_checks_opened_and_closed_drawers() -> None:
@@ -433,6 +503,10 @@ def test_portal_approach_uses_door_aabb_normal() -> None:
     assert math.isclose(candidate.goal_xyyaw[1], 5.0, abs_tol=1e-6)
     assert math.isclose(candidate.goal_xyyaw[2], 0.0, abs_tol=1e-6)
     assert candidate.metadata["approach_strategy"] == "portal_aabb_normal"
+    assert len(candidate.metadata["goal_xyyaw_candidates"]) == 3
+    assert math.isclose(
+        candidate.metadata["goal_xyyaw_candidates"][1][0], 3.50, abs_tol=1e-6
+    )
 
 
 def test_observed_target_generates_navigation_candidate() -> None:

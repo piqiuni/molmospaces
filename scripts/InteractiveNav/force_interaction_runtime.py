@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+import math
 import math
 from typing import Any, Mapping
 
@@ -51,6 +52,9 @@ def joint_open_fraction(value: float, joint_range) -> float:
 def collect_door_root_groups(env) -> dict[str, dict[str, Any]]:
     model = env.current_model
     data = env.current_data
+    qpos_before = np.array(data.qpos, copy=True)
+    qvel_before = np.array(data.qvel, copy=True)
+    ctrl_before_values = np.array(data.ctrl, copy=True)
     object_manager = env.object_managers[env.current_batch_index]
     groups: dict[int, dict[str, Any]] = {}
     for door_name in object_manager.find_door_names():
@@ -386,6 +390,56 @@ def prepare_articulation_force(
     }
 
 
+def prepare_articulation_state_force(
+    env,
+    object_name: str,
+    open_joint_names: list[str] | None = None,
+    close_joint_names: list[str] | None = None,
+) -> dict[str, Any]:
+    groups = collect_articulation_groups(env)
+    group = groups.get(str(object_name))
+    if group is None:
+        raise ValueError(
+            f"Articulated object not found: {object_name}; available={sorted(groups)}"
+        )
+    available = {
+        str(joint["joint_name"]): joint for joint in list(group["joints"])
+    }
+    selected = [str(name) for name in (open_joint_names or [])]
+    closed = [str(name) for name in (close_joint_names or [])]
+    unknown = sorted((set(selected) | set(closed)) - set(available))
+    if unknown:
+        raise ValueError(f"Unknown articulation joints: {unknown}")
+    targets = {}
+    for name in selected:
+        _closed, opened = joint_closed_open_values(available[name]["joint_range"])
+        targets[name] = opened
+    for name in closed:
+        closed_value, _opened = joint_closed_open_values(available[name]["joint_range"])
+        targets[name] = closed_value
+    if not targets:
+        raise ValueError("Articulation state transition requires at least one joint")
+    return {
+        "group": group,
+        "targets": targets,
+        "selected_joint_names": selected,
+        "closed_joint_names": closed,
+        "pre_joint_infos": _joint_infos_for_group(
+            env.current_model, env.current_data, list(group["joints"])
+        ),
+    }
+
+
+def articulation_joint_infos(env, object_name: str) -> list[dict[str, Any]]:
+    groups = collect_articulation_groups(env)
+    group = groups.get(str(object_name))
+    if group is None:
+        raise ValueError(
+            f"Articulated object not found: {object_name}; available={sorted(groups)}"
+        )
+    return _joint_infos_for_group(env.current_model, env.current_data, list(group["joints"]))
+
+
 def _build_force_specs(model, joint_targets: Mapping[str, float]) -> list[dict[str, Any]]:
     specs = []
     for joint_name, target_value in joint_targets.items():
@@ -492,10 +546,14 @@ def complete_articulation_force(
     config = config or ForceDriveConfig()
     model = env.current_model
     data = env.current_data
-    data.xfrc_applied[:, :] = 0.0
-    for spec in plan.get("force_specs", []):
-        data.qvel[spec["dof_addr"]] = 0.0
-    mujoco.mj_forward(model, data)
+    drive_result = drive_joint_group_to_targets(
+        model,
+        data,
+        plan["targets"],
+        config=config,
+    )
+    plan["drive"] = drive_result
+    plan["force_specs"] = _build_force_specs(model, plan["targets"])
     post_infos = _joint_infos_for_group(model, data, list(plan["group"]["joints"]))
     selected = set(plan["selected_joint_names"])
     closed = set(plan["closed_joint_names"])
@@ -521,8 +579,32 @@ def complete_articulation_force(
         default=0.0,
     )
     physical_success = bool(open_success and close_success)
-    drive_result = dict(plan.get("drive") or {})
-    success = bool(physical_success)
+    atomic_fallback = False
+    if not physical_success:
+        atomic_fallback = True
+        for spec in plan["force_specs"]:
+            data.qpos[spec["qpos_addr"]] = spec["target_value"]
+            data.qvel[spec["dof_addr"]] = 0.0
+        mujoco.mj_forward(model, data)
+        post_infos = _joint_infos_for_group(model, data, list(plan["group"]["joints"]))
+        open_success = bool(selected) and all(
+            float(info["open_fraction"]) >= float(config.open_fraction_threshold)
+            for info in post_infos
+            if info["joint_name"] in selected
+        )
+        close_success = all(
+            float(info["open_fraction"]) <= 1.0 - float(config.open_fraction_threshold)
+            for info in post_infos
+            if info["joint_name"] in closed
+        )
+        post_selected = [
+            info for info in post_infos if info["joint_name"] in selected
+        ]
+        post_min = min(
+            (float(info["open_fraction"]) for info in post_selected),
+            default=0.0,
+        )
+    success = bool(open_success and close_success)
     joints = []
     for spec in plan.get("force_specs", []):
         info = next(item for item in post_infos if item["joint_name"] == spec["joint_name"])
@@ -540,7 +622,7 @@ def complete_articulation_force(
         "method": "xfrc_applied_group_pd",
         "success": success,
         "physical_success": physical_success,
-        "atomic_fallback": False,
+        "atomic_fallback": atomic_fallback,
         "physics_substeps": int(drive_result.get("physics_substeps", 0)),
         "task_steps_consumed": 1,
         "stable_substeps": int(drive_result.get("stable_substeps", 0)),
@@ -553,6 +635,58 @@ def complete_articulation_force(
         "pre_state": "closed" if pre_max <= 0.10 else "ajar",
         "post_state": "open" if post_min >= float(config.open_fraction_threshold) else "ajar",
         "config": asdict(config),
+    }
+
+
+def advance_articulation_force(
+    env,
+    plan: dict[str, Any],
+    progress: float,
+    start_values: Mapping[str, float],
+    transition_steps: int,
+    config: ForceDriveConfig | None = None,
+) -> dict[str, Any]:
+    """Advance an articulation toward a target over one task step."""
+    config = config or ForceDriveConfig()
+    alpha = float(np.clip(float(progress), 0.0, 1.0))
+    eased = alpha * alpha * (3.0 - 2.0 * alpha)
+    targets = {
+        name: float(start_values.get(name, value))
+        + (float(value) - float(start_values.get(name, value))) * eased
+        for name, value in plan["targets"].items()
+    }
+    step_config = replace(
+        config,
+        max_physics_substeps=max(
+            1,
+            int(math.ceil(float(config.max_physics_substeps) / max(1, int(transition_steps)))),
+        ),
+        assume_success=False,
+    )
+    drive = drive_joint_group_to_targets(
+        env.current_model,
+        env.current_data,
+        targets,
+        config=step_config,
+    )
+    fallback = False
+    if not drive.get("success"):
+        specs = _build_force_specs(env.current_model, targets)
+        for spec in specs:
+            env.current_data.qpos[spec["qpos_addr"]] = spec["target_value"]
+            env.current_data.qvel[spec["dof_addr"]] = 0.0
+        mujoco.mj_forward(env.current_model, env.current_data)
+        fallback = True
+    return {
+        "success": True,
+        "progress": alpha,
+        "eased_progress": eased,
+        "targets": targets,
+        "physics_substeps": int(drive.get("physics_substeps", 0)),
+        "fallback": fallback,
+        "joint_infos": _joint_infos_for_group(
+            env.current_model, env.current_data, list(plan["group"]["joints"])
+        ),
     }
 
 
@@ -587,12 +721,20 @@ def set_all_articulations_closed(env, include_doors: bool = True) -> list[dict[s
     return transitions
 
 
-def apply_view_profile(env, profile: str, tilt_rad: float = 0.55) -> dict[str, Any]:
-    """Apply an oracle head-camera profile for drawer visibility in simulation."""
+def apply_view_profile(
+    env,
+    profile: str,
+    tilt_rad: float = 0.55,
+    restore_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Command the head position actuators without teleporting joint state."""
     normalized = str(profile or "default").strip().lower()
     desired_tilt = 0.0 if normalized in {"", "default", "level"} else float(tilt_rad)
     model = env.current_model
     data = env.current_data
+    qpos_before = np.array(data.qpos, copy=True)
+    qvel_before = np.array(data.qvel, copy=True)
+    ctrl_before_values = np.array(data.ctrl, copy=True)
     head_joint_ids = []
     for joint_id in range(int(model.njnt)):
         name = str(model.joint(joint_id).name or "")
@@ -601,23 +743,157 @@ def apply_view_profile(env, profile: str, tilt_rad: float = 0.55) -> dict[str, A
     head_joint_ids.sort(key=lambda item: item[0])
     before = []
     after = []
+    restore_values = {
+        str(item.get("joint_name")): item
+        for item in (restore_state or {}).get("joints", [])
+        if item.get("joint_name")
+    }
     for index, (name, joint_id) in enumerate(head_joint_ids[:2]):
         qpos_addr = int(model.jnt_qposadr[joint_id])
+        dof_addr = int(model.jnt_dofadr[joint_id])
         old_value = float(data.qpos[qpos_addr])
+        old_velocity = float(data.qvel[dof_addr])
+        restored = restore_values.get(name)
         target = 0.0 if index == 0 else desired_tilt
         lower, upper = [float(value) for value in model.jnt_range[joint_id]]
         target = float(np.clip(target, min(lower, upper), max(lower, upper)))
-        data.qpos[qpos_addr] = target
-        before.append({"joint_name": name, "joint_value": old_value})
-        after.append({"joint_name": name, "joint_value": target})
-    if head_joint_ids:
-        mujoco.mj_forward(model, data)
+        actuator_name = f"{name}_act"
+        actuator_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_name
+        )
+        ctrl_previous = None
+        ctrl_target = None
+        if actuator_id >= 0:
+            ctrl_previous = float(data.ctrl[actuator_id])
+            ctrl_target = (
+                float(restored.get("ctrl"))
+                if restored is not None and restored.get("ctrl") is not None
+                else target
+            )
+            data.ctrl[actuator_id] = ctrl_target
+        before.append(
+            {
+                "joint_name": name,
+                "qpos": old_value,
+                "qvel": old_velocity,
+                "ctrl": ctrl_previous,
+            }
+        )
+        after.append(
+            {
+                "joint_name": name,
+                "qpos": float(data.qpos[qpos_addr]),
+                "qvel": float(data.qvel[dof_addr]),
+                "ctrl": ctrl_target,
+            }
+        )
+    head_qpos_addrs = {int(model.jnt_qposadr[joint_id]) for _, joint_id in head_joint_ids[:2]}
+    head_dof_addrs = {int(model.jnt_dofadr[joint_id]) for _, joint_id in head_joint_ids[:2]}
+    changed_qpos = [
+        int(index)
+        for index, value in enumerate(data.qpos)
+        if index not in head_qpos_addrs and not np.isclose(value, qpos_before[index])
+    ]
+    changed_qvel = [
+        int(index)
+        for index, value in enumerate(data.qvel)
+        if index not in head_dof_addrs and not np.isclose(value, qvel_before[index])
+    ]
+    head_actuator_ids = {
+        int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{name}_act"))
+        for name, _ in head_joint_ids[:2]
+    }
+    changed_ctrl = [
+        int(index)
+        for index, value in enumerate(data.ctrl)
+        if index not in head_actuator_ids and not np.isclose(value, ctrl_before_values[index])
+    ]
     return {
         "profile": normalized or "default",
+        "control_mode": "head_position_actuator",
         "applied": bool(head_joint_ids),
         "before": before,
         "after": after,
+        "snapshot": {"joints": before},
+        "non_head_state_changed": bool(changed_qpos or changed_qvel or changed_ctrl),
+        "non_head_changed_qpos_indices": changed_qpos,
+        "non_head_changed_qvel_indices": changed_qvel,
+        "non_head_changed_ctrl_indices": changed_ctrl,
     }
+
+
+class HeadViewController:
+    def __init__(self) -> None:
+        self._restore_state: dict[str, Any] | None = None
+        self._torso_target: np.ndarray | None = None
+        self._torso_restore_target: np.ndarray | None = None
+        self._torso_home_target: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self._restore_state = None
+        self._torso_target = None
+        self._torso_restore_target = None
+        self._torso_home_target = None
+
+    def command(
+        self,
+        env,
+        profile: str,
+        tilt_rad: float = 0.55,
+        torso_pitch_rad: float | None = None,
+    ) -> dict[str, Any]:
+        torso_controller = getattr(env.current_robot, "controllers", {}).get("torso")
+        torso_target = getattr(torso_controller, "target", None)
+        torso_target_values = (
+            None
+            if torso_target is None
+            else np.asarray(torso_target, dtype=float).reshape(-1).copy()
+        )
+        if self._torso_home_target is None and torso_target_values is not None:
+            self._torso_home_target = torso_target_values.copy()
+        self._torso_restore_target = (
+            None if self._torso_home_target is None else self._torso_home_target.copy()
+        )
+        result = apply_view_profile(env, profile, tilt_rad=tilt_rad)
+        normalized = str(profile or "default").strip().lower()
+        if normalized in {"", "default", "level"} or self._restore_state is None:
+            self._restore_state = dict(result.get("snapshot") or {})
+        if (
+            normalized == "drawer_low_view"
+            and torso_pitch_rad is not None
+            and self._torso_home_target is not None
+            and self._torso_home_target.size > 0
+        ):
+            self._torso_target = self._torso_home_target.copy()
+            pitch_index = 1 if self._torso_target.size > 1 else 0
+            self._torso_target[pitch_index] += float(torso_pitch_rad)
+        else:
+            self._torso_target = None
+        result["torso_control_mode"] = (
+            "joint_position_controller" if self._torso_target is not None else None
+        )
+        result["torso_target"] = (
+            None if self._torso_target is None else self._torso_target.tolist()
+        )
+        result["torso_restore_target"] = (
+            None
+            if self._torso_restore_target is None
+            else self._torso_restore_target.tolist()
+        )
+        return result
+
+    def restore(self, env) -> dict[str, Any]:
+        result = apply_view_profile(
+            env,
+            "default",
+            restore_state=self._restore_state,
+        )
+        self._torso_target = self._torso_restore_target
+        self._restore_state = None
+        return result
+
+    def torso_target(self) -> list[float] | None:
+        return None if self._torso_target is None else self._torso_target.tolist()
 
 
 def drive_joint_group_to_targets(

@@ -14,7 +14,11 @@ from semantic_decision_py_pkg.mission_completion import (
 )
 from semantic_decision_py_pkg.model_policy import ModelPolicyClient, ModelPolicyConfig
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
-from semantic_decision_py_pkg.rule_policy import RulePolicy, RulePolicyConfig
+from semantic_decision_py_pkg.rule_policy import (
+    RulePolicy,
+    RulePolicyConfig,
+    progressive_failure_cooldown,
+)
 
 patch_roslogging_findcaller_for_py311()
 
@@ -58,7 +62,16 @@ class SemanticRuleDecisionNode:
                 minimum_score=float(config.get("minimum_score", -1e9)),
             )
         )
-        self.failure_cooldown_s = float(config.get("failure_cooldown_s", 45.0))
+        self.failure_cooldown_s = float(config.get("failure_cooldown_s", 30.0))
+        configured_failure_schedule = config.get("failure_cooldown_schedule_s")
+        self.failure_cooldown_schedule_s = tuple(
+            float(value)
+            for value in (
+                configured_failure_schedule
+                if isinstance(configured_failure_schedule, (list, tuple))
+                else [self.failure_cooldown_s]
+            )
+        )
         self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
         self.failure_retry_delay_s = float(config.get("failure_retry_delay_s", 2.0))
         self.mission_mode = self._normalize_mission_mode(
@@ -82,6 +95,9 @@ class SemanticRuleDecisionNode:
                 empty_candidate_confirmations=int(
                     completion_config.get("empty_candidate_confirmations", 3)
                 ),
+                empty_candidate_min_steps=int(
+                    completion_config.get("empty_candidate_min_steps", 50)
+                ),
                 stagnation_failure_limit=int(
                     completion_config.get("stagnation_failure_limit", 0)
                 ),
@@ -99,6 +115,7 @@ class SemanticRuleDecisionNode:
         self.target_context: dict = {}
         self.active_target_goal = False
         self.cooldown_until: dict[str, float] = {}
+        self.failure_counts: dict[str, int] = {}
         self.decision_index = 0
         self.selected_pub = rospy.Publisher(
             topics.get("selected_behavior", "/semantic_decision/selected_behavior"),
@@ -147,6 +164,7 @@ class SemanticRuleDecisionNode:
             self.active_target_goal = False
             self.target_mission.reset()
             self.cooldown_until.clear()
+            self.failure_counts.clear()
             self.completion_tracker.reset()
         target_context = payload.get("target_context") or {}
         target_key = json.dumps(target_context, ensure_ascii=False, sort_keys=True)
@@ -177,9 +195,16 @@ class SemanticRuleDecisionNode:
             return
         self.completion_tracker.note_feedback(payload)
         if candidate_id:
-            cooldown_s = (
-                self.success_cooldown_s if status == "SUCCEEDED" else self.failure_cooldown_s
-            )
+            if status == "SUCCEEDED":
+                self.failure_counts.pop(candidate_id, None)
+                cooldown_s = self.success_cooldown_s
+            else:
+                failure_count = self.failure_counts.get(candidate_id, 0) + 1
+                self.failure_counts[candidate_id] = failure_count
+                cooldown_s = progressive_failure_cooldown(
+                    self.failure_cooldown_schedule_s,
+                    failure_count,
+                )
             self.cooldown_until[candidate_id] = time.monotonic() + cooldown_s
         if status != "SUCCEEDED":
             self.next_decision_time = time.monotonic() + self.failure_retry_delay_s

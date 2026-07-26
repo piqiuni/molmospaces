@@ -182,6 +182,85 @@ def test_object_above_container_is_not_inferred_as_internal_content():
     assert ("container_dresser_1", "contains", "object_phone_1") not in relations
 
 
+def test_open_drawer_does_not_attach_visible_non_pickup_plant_by_proximity():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="drawer_1",
+                semantic_name="drawer",
+                is_receptacle=True,
+                is_articulable=True,
+                joint_type="slide",
+                joint_range=[0.0, 0.4],
+                joint_value=0.4,
+                position=[0.0, 0.0, 0.4],
+                aabb_center=[0.0, 0.0, 0.4],
+                aabb_size=[0.8, 0.6, 0.5],
+            ),
+            observation(
+                instance_id="houseplant_1",
+                semantic_name="houseplant",
+                position=[0.15, 0.0, 0.45],
+                aabb_center=[0.15, 0.0, 0.45],
+                aabb_size=[0.25, 0.25, 0.60],
+                is_pickup_candidate=False,
+            ),
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_drawer_1", "contains", "object_houseplant_1") not in relations
+
+
+def test_multi_drawer_observation_generates_single_joint_groups():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="dresser_1",
+                semantic_name="dresser",
+                is_receptacle=True,
+                is_articulable=True,
+                joint_type="slide",
+                joint_range=[0.0, 0.4],
+                joint_value=0.0,
+                joint_infos=[
+                    {
+                        "joint_name": "drawer_top",
+                        "joint_type": "slide",
+                        "joint_range": [0.0, 0.4],
+                        "joint_value": 0.0,
+                    },
+                    {
+                        "joint_name": "drawer_bottom",
+                        "joint_type": "slide",
+                        "joint_range": [0.0, 0.4],
+                        "joint_value": 0.0,
+                    },
+                ],
+            )
+        ]
+    )
+
+    node = next(
+        node
+        for node in store.as_graph_dict()["nodes"]
+        if node["id"] == "container_dresser_1"
+    )
+    groups = node["attributes"]["interaction_groups"]
+    assert [group["target_joint_names"] for group in groups] == [
+        ["drawer_top"],
+        ["drawer_bottom"],
+    ]
+    assert groups[0]["close_other_joint_names"] == ["drawer_bottom"]
+    assert groups[0]["view_profile"] == "drawer_low_view"
+
+
 def test_toilet_receptacle_metadata_does_not_make_it_a_container():
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
@@ -732,7 +811,7 @@ def test_room_merge_retires_secondary_room_and_migrates_children() -> None:
     )
 
 
-def test_parent_container_relation_overrides_room_id_mismatch() -> None:
+def test_declared_parent_does_not_override_geometric_container_relation() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
         [
@@ -760,10 +839,42 @@ def test_parent_container_relation_overrides_room_id_mismatch() -> None:
         (edge["src_id"], edge["relation"], edge["dst_id"])
         for edge in store.as_graph_dict()["edges"]
     }
-    assert ("container_dresser_1", "contains", "object_pencil_1") in relations
+    assert ("container_dresser_1", "contains", "object_pencil_1") not in relations
 
 
-def test_open_drawer_expansion_reveals_and_retains_content_when_hidden() -> None:
+def test_open_drawer_does_not_contain_object_resting_on_top() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="dresser_1",
+                semantic_name="dresser",
+                is_receptacle=True,
+                is_articulable=True,
+                joint_type="slide",
+                joint_range=[0.0, 1.0],
+                joint_value=1.0,
+                aabb_center=[1.0, 1.0, 0.35],
+                aabb_size=[0.6, 0.5, 0.7],
+            ),
+            observation(
+                instance_id="pencil_1",
+                semantic_name="pencil",
+                position=[1.0, 1.0, 0.705],
+                aabb_center=[1.0, 1.0, 0.705],
+                aabb_size=[0.02, 0.15, 0.02],
+            ),
+        ],
+        source_mode="realtime_gt_observation",
+    )
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_dresser_1", "contains", "object_pencil_1") not in relations
+
+
+def test_open_drawer_live_aabb_contains_and_retains_hidden_content() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     drawer = observation(
         instance_id="drawer_1",
@@ -773,14 +884,14 @@ def test_open_drawer_expansion_reveals_and_retains_content_when_hidden() -> None
         joint_type="slide",
         joint_range=[0.0, 1.0],
         joint_value=1.0,
-        aabb_center=[1.0, 1.0, 0.5],
-        aabb_size=[1.0, 1.0, 1.0],
+        aabb_center=[1.0, 1.3, 0.5],
+        aabb_size=[1.0, 1.6, 1.0],
     )
     pencil = observation(
         instance_id="pencil_1",
         semantic_name="pencil",
-        position=[1.85, 1.0, 0.5],
-        aabb_center=[1.85, 1.0, 0.5],
+        position=[1.0, 1.85, 0.5],
+        aabb_center=[1.0, 1.85, 0.5],
         aabb_size=[0.05, 0.05, 0.05],
     )
     store.update_observations([drawer, pencil], source_mode="realtime_gt_observation")
@@ -790,7 +901,6 @@ def test_open_drawer_expansion_reveals_and_retains_content_when_hidden() -> None
         and edge["dst_id"] == "object_pencil_1"
         for edge in store.as_graph_dict()["edges"]
     )
-
     drawer["joint_value"] = 0.0
     store.update_observations([drawer], source_mode="realtime_gt_observation")
     assert any(
@@ -799,3 +909,103 @@ def test_open_drawer_expansion_reveals_and_retains_content_when_hidden() -> None
         and edge["dst_id"] == "object_pencil_1"
         for edge in store.as_graph_dict()["edges"]
     )
+
+
+def test_house2_dresser_does_not_contain_pencil_on_top() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="dresser_1",
+                semantic_name="dresser",
+                is_receptacle=True,
+                is_articulable=True,
+                joint_type="slide",
+                joint_range=[0.0, 0.213],
+                joint_value=0.213,
+                aabb_center=[2.905994996767497, 0.2881095037307979, 0.3492059886203346],
+                aabb_size=[0.6197699904441833, 0.5209470056486065, 0.6984999723109293],
+            ),
+            observation(
+                instance_id="pencil_1",
+                semantic_name="pencil",
+                position=[3.0611600037425593, 0.14212999982194482, 0.7051813530875322],
+                aabb_center=[3.061191923838525, 0.1397641560319149, 0.7049824030053934],
+                aabb_size=[0.00872475984339438, 0.18825023621644954, 0.008829840175350157],
+            ),
+        ],
+        source_mode="realtime_gt_observation",
+    )
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_dresser_1", "contains", "object_pencil_1") not in relations
+
+
+def test_container_joint_interaction_memory_survives_later_observations() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    dresser = observation(
+        instance_id="dresser_1",
+        semantic_name="dresser",
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="slide",
+        joint_range=[0.0, 0.4],
+        joint_value=0.0,
+        joint_infos=[
+            {"joint_name": "top", "joint_type": "slide", "joint_range": [0.0, 0.4], "joint_value": 0.0},
+            {"joint_name": "bottom", "joint_type": "slide", "joint_range": [0.0, 0.4], "joint_value": 0.0},
+        ],
+    )
+    store.update_observations([dresser], source_mode="realtime_gt_observation")
+    node_id = "container_dresser_1"
+    assert store.update_interaction_result(
+        {
+            "node_id": node_id,
+            "event_id": "open_top",
+            "interaction_group_id": "drawer:top",
+            "joint_names": ["top"],
+            "joint_infos": [
+                {"joint_name": "top", "joint_range": [0.0, 0.4], "joint_value": 0.4},
+                {"joint_name": "bottom", "joint_range": [0.0, 0.4], "joint_value": 0.0},
+            ],
+            "success": True,
+        }
+    )
+    store.update_observations([dresser], source_mode="realtime_gt_observation")
+    node = next(node for node in store.as_graph_dict()["nodes"] if node["id"] == node_id)
+    assert node["interaction"]["completed_interaction_groups"] == ["drawer:top"]
+    assert node["interaction"]["joint_interaction_states"]["top"]["status"] == "opened"
+    assert node["interaction"]["state"] == "ajar"
+
+    assert store.update_interaction_result(
+        {
+            "node_id": node_id,
+            "event_id": "open_bottom",
+            "interaction_group_id": "drawer:bottom",
+            "joint_names": ["bottom"],
+            "joint_infos": [
+                {"joint_name": "top", "joint_range": [0.0, 0.4], "joint_value": 0.0},
+                {"joint_name": "bottom", "joint_range": [0.0, 0.4], "joint_value": 0.4},
+            ],
+            "success": True,
+        }
+    )
+    node = next(node for node in store.as_graph_dict()["nodes"] if node["id"] == node_id)
+    assert node["interaction"]["all_joints_opened_once"] is True
+    assert node["interaction"]["state"] == "open"
+
+
+def test_room_geometry_does_not_shrink_after_confirmed_observation() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    info = type("Info", (), {"width": 3, "resolution": 1.0})()
+    info.origin = type("Origin", (), {"position": type("Position", (), {"x": 0.0, "y": 0.0})()})()
+    store.update_room_grid(info, [1, 1, -1], [100, 100, 0], geometry_stability_frames=1)
+    initial = next(node for node in store.as_graph_dict()["nodes"] if node["id"] == "room_1")
+    initial_center = list(initial["aabb_center"])
+    initial_size = list(initial["aabb_size"])
+    store.update_room_grid(info, [1, -1, -1], [100, 0, 0], geometry_stability_frames=1)
+    updated = next(node for node in store.as_graph_dict()["nodes"] if node["id"] == "room_1")
+    assert updated["aabb_center"] == initial_center
+    assert updated["aabb_size"] == initial_size

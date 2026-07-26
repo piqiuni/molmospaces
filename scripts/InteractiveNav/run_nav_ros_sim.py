@@ -338,7 +338,11 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             force_interaction_controller = getattr(policy, "force_interaction_controller", None)
             if force_interaction_controller is not None:
                 interaction_result = force_interaction_controller.before_step(task, step_idx)
-                if interaction_result is not None:
+                force_observation = bool(
+                    interaction_result is not None
+                    or force_interaction_controller.consume_force_observation_request()
+                )
+                if force_observation:
                     observation = task.get_observations()
                     if task.observation_cache:
                         task.observation_cache[0] = observation
@@ -370,20 +374,38 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                 )
             if action_cmd is None:
                 break
+            if (
+                force_interaction_controller is not None
+                and force_interaction_controller.should_pause_navigation()
+            ):
+                action_cmd = dict(action_cmd)
+                action_cmd.pop("base", None)
+                torso_target = force_interaction_controller.view_torso_target()
+                if torso_target is not None:
+                    action_cmd["torso"] = np.asarray(torso_target, dtype=float)
 
             if step_log_every > 0 and (step_idx < 5 or step_idx % step_log_every == 0):
-                print(f"Step: {step_idx} Action command[base]: {action_cmd['base']}", flush=True)
+                print(
+                    f"Step: {step_idx} Action command[base]: "
+                    f"{action_cmd.get('base', '<hold-current-pose>')}",
+                    flush=True,
+                )
 
             task_t0 = time.perf_counter()
             observation, reward, terminal, truncated, infos = task.step(action_cmd)
             if force_interaction_controller is not None:
                 interaction_result = force_interaction_controller.after_step(task, step_idx)
-                if interaction_result is not None:
+                force_observation = bool(
+                    interaction_result is not None
+                    or force_interaction_controller.consume_force_observation_request()
+                )
+                if force_observation:
                     observation = task.get_observations()
                     if task.observation_cache:
                         task.observation_cache[0] = observation
                     if hasattr(policy, "publish_realtime_gt_now"):
                         policy.publish_realtime_gt_now(step_index=step_idx)
+                force_interaction_controller.after_task_step()
             task_ms = (time.perf_counter() - task_t0) * 1000.0
             loop_ms = (time.perf_counter() - loop_t0) * 1000.0
             task_timing = getattr(task, "last_step_timing_ms", {})
@@ -719,6 +741,13 @@ def parse_args():
     parser.add_argument("--force_interaction_close_all_containers_on_prepare", type=str_to_bool, nargs="?", const=True, default=False)
     parser.add_argument("--force_interaction_max_physics_substeps", type=int, default=3000)
     parser.add_argument("--force_interaction_open_fraction_threshold", type=float, default=0.95)
+    parser.add_argument(
+        "--force_interaction_drawer_execution_mode",
+        choices=["fast", "smooth"],
+        default="fast",
+    )
+    parser.add_argument("--force_interaction_drawer_transition_steps", type=int, default=5)
+    parser.add_argument("--force_interaction_drawer_observation_steps", type=int, default=1)
     parser.add_argument(
         "--completion_mode",
         choices=["disabled", "frontier", "semantic"],
@@ -1058,6 +1087,9 @@ def main():
             ),
             close_all_doors_on_prepare=args.initial_door_state == "closed",
             close_all_containers_on_prepare=args.force_interaction_close_all_containers_on_prepare,
+            drawer_execution_mode=args.force_interaction_drawer_execution_mode,
+            drawer_transition_steps=args.force_interaction_drawer_transition_steps,
+            drawer_observation_steps=args.force_interaction_drawer_observation_steps,
         )
     if args.runtime_target_selection_mode != "none":
         from std_msgs.msg import String

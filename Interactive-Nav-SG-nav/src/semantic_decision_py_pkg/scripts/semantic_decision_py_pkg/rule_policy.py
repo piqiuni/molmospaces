@@ -6,6 +6,16 @@ from typing import Iterable
 from .behavior_candidates import BehaviorCandidate
 
 
+def progressive_failure_cooldown(
+    schedule_s: Iterable[float], failure_count: int
+) -> float:
+    schedule = tuple(max(0.0, float(value)) for value in schedule_s)
+    if not schedule:
+        return 0.0
+    index = min(max(1, int(failure_count)) - 1, len(schedule) - 1)
+    return schedule[index]
+
+
 @dataclass
 class RulePolicyConfig:
     exploration_gain_weight: float = 1.0

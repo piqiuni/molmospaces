@@ -3,6 +3,7 @@ import math
 from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
+    NavigationProgressWatchdog,
     STATE_APPROACH_INTERACTION,
     STATE_FINALIZING_EXPLORE,
     STATE_INTERACTING,
@@ -11,9 +12,72 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_SUCCEEDED,
     STATE_VERIFYING,
     committed_turn_sign,
+    navigation_goal_options,
     normalize_angle,
     path_lookahead_point,
+    is_stuck_recovery_failure,
+    safe_grid_motion_distance,
 )
+
+
+def test_navigation_progress_watchdog_requires_translation_and_resets_on_progress() -> None:
+    watchdog = NavigationProgressWatchdog(timeout_s=12.0, min_displacement_m=0.10)
+    watchdog.reset((0.0, 0.0), now=0.0)
+    assert not watchdog.observe((0.01, 0.0), now=11.9)
+    assert watchdog.observe((0.01, 0.0), now=12.0)
+    watchdog.reset((0.0, 0.0), now=0.0)
+    assert not watchdog.observe((0.11, 0.0), now=11.0)
+    assert not watchdog.observe((0.12, 0.0), now=22.0)
+
+
+def test_stuck_recovery_requires_explicit_stagnation_or_oscillation() -> None:
+    assert is_stuck_recovery_failure({"reason": "navigation_stagnation"})
+    assert is_stuck_recovery_failure({"status": "Robot appears to be oscillating"})
+    assert not is_stuck_recovery_failure({"reason": "make_plan_unreachable"})
+    assert not is_stuck_recovery_failure({"reason": "final_yaw_alignment_failed"})
+    assert not is_stuck_recovery_failure({"status_code": 4, "status": "ABORTED"})
+
+
+def test_safe_grid_motion_distance_stops_before_rear_obstacle() -> None:
+    width = height = 20
+    resolution = 0.1
+    data = [0] * (width * height)
+    data[10 * width + 7] = 100
+
+    safe = safe_grid_motion_distance(
+        data,
+        width,
+        height,
+        resolution,
+        (0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        -1.0,
+        0.5,
+        robot_radius_m=0.1,
+        safety_margin_m=0.0,
+    )
+
+    assert 0.0 < safe < 0.5
+
+
+def test_safe_grid_motion_distance_blocks_unknown_space() -> None:
+    width = height = 20
+    resolution = 0.1
+    data = [0] * (width * height)
+    data[10 * width + 7] = -1
+
+    assert safe_grid_motion_distance(
+        data,
+        width,
+        height,
+        resolution,
+        (0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        -1.0,
+        0.5,
+        robot_radius_m=0.1,
+        safety_margin_m=0.0,
+    ) < 0.5
 
 
 def interaction_candidate(requires_approach=True):
@@ -42,6 +106,25 @@ def test_path_lookahead_uses_plan_direction_instead_of_final_goal_bearing() -> N
     )
 
     assert lookahead == (-0.8, 0.1)
+
+
+def test_navigation_goal_options_preserve_nearest_first_and_remove_duplicates() -> None:
+    candidate = {
+        "goal_xyyaw": [1.0, 2.0, 0.0],
+        "metadata": {
+            "goal_xyyaw_candidates": [
+                [1.0, 2.0, 0.0],
+                [1.25, 2.0, 0.0],
+                [1.50, 2.0, math.pi],
+            ]
+        },
+    }
+
+    assert navigation_goal_options(candidate) == [
+        (1.0, 2.0, 0.0),
+        (1.25, 2.0, 0.0),
+        (1.50, 2.0, math.pi),
+    ]
 
 
 def target_candidate():
@@ -120,6 +203,22 @@ def test_explore_reservation_failure_finishes_without_navigation() -> None:
     )
     assert terminal[0]["kind"] == "terminal"
     assert terminal[0]["success"] is False
+
+
+def test_explore_ignores_terminal_feedback_until_finalization() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(
+        {
+            "candidate_id": "frontier_1",
+            "behavior_type": "EXPLORE",
+            "metadata": {"cluster_id": "cluster_1"},
+        },
+        now=0.0,
+    )
+    machine.on_explore_ready({"goal_xyyaw": [1.0, 2.0, 0.0]}, now=1.0)
+
+    assert machine.on_explore_result(False, {"reason": "stale_move_base_status"}, now=2.0) == []
+    assert machine.state == STATE_NAVIGATING
 
 
 def test_explore_navigation_timeout_requests_frontier_finalization() -> None:

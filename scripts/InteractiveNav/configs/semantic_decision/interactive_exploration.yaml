@@ -11,8 +11,8 @@ candidate:
   container_require_same_room: true
   container_allow_connected_room: true
   portal_standoff_m: 0.85
-  container_standoff_m: 1.0
-  drawer_standoff_m: 1.0
+  container_standoff_m: 0.5
+  drawer_standoff_m: 0.25
   interaction_safety_margin_m: 0.25
 
 policy:
@@ -23,7 +23,8 @@ policy:
   nearby_interaction_radius_m: 1.5
   nearby_interaction_bonus: 1.5
   interaction_priority_bonus: 2.0
-  failure_cooldown_s: 5.0
+  failure_cooldown_s: 30.0
+  failure_cooldown_schedule_s: [30.0, 60.0, 180.0]
   failure_retry_delay_s: 1.0
 
 completion:

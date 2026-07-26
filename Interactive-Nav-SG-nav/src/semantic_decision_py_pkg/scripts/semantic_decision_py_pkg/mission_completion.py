@@ -9,6 +9,7 @@ from .behavior_candidates import BehaviorCandidate
 @dataclass
 class MissionCompletionConfig:
     empty_candidate_confirmations: int = 3
+    empty_candidate_min_steps: int = 50
     stagnation_failure_limit: int = 0
 
 
@@ -24,6 +25,7 @@ class MissionCompletionTracker:
         self.reason = ""
         self.failure_streak = 0
         self.stalled = False
+        self.empty_since_step: int | None = None
 
     def note_feedback(self, feedback: dict[str, Any]) -> None:
         status = str(feedback.get("status") or "")
@@ -119,6 +121,11 @@ class MissionCompletionTracker:
             and interaction_frontier_exhausted
             and combined_frontier_count == 0
         )
+        observation_step = exploration.get("observation_step")
+        try:
+            observation_step = int(observation_step)
+        except (TypeError, ValueError):
+            observation_step = None
         stagnated = (
             not has_active_behavior
             and int(self.config.stagnation_failure_limit) > 0
@@ -131,10 +138,22 @@ class MissionCompletionTracker:
             self.failure_streak = 0
             self.confirmations = 0
             return False
-        self.confirmations = self.confirmations + 1 if ready_to_complete else 0
-        self.complete = self.confirmations >= max(
-            1, int(self.config.empty_candidate_confirmations)
-        )
+        if not ready_to_complete:
+            self.confirmations = 0
+            self.empty_since_step = None
+            return False
+        self.confirmations += 1
+        if observation_step is not None:
+            if self.empty_since_step is None:
+                self.empty_since_step = observation_step
+            elapsed_empty_steps = observation_step - self.empty_since_step
+            self.complete = elapsed_empty_steps >= max(
+                0, int(self.config.empty_candidate_min_steps)
+            )
+        else:
+            self.complete = self.confirmations >= max(
+                1, int(self.config.empty_candidate_confirmations)
+            )
         if self.complete:
             self.reason = "navigation_and_interaction_frontiers_exhausted"
         return self.complete

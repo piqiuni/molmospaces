@@ -503,12 +503,25 @@ class RealtimeGTObservationPublisher:
 
         geom_to_spec = np.full(int(model.ngeom), -1, dtype=np.int32)
         canonical_door_specs = self._canonical_door_root_specs(model, specs)
+        door_body_to_spec = {}
+        for door_name in door_names:
+            try:
+                door_body_id = int(model.body(door_name).id)
+            except KeyError:
+                continue
+            root_id = int(model.body_rootid[door_body_id])
+            spec_index = canonical_door_specs.get(root_id)
+            if spec_index is None:
+                spec_index = body_to_spec.get(door_body_id)
+            if spec_index is not None:
+                door_body_to_spec[door_body_id] = int(spec_index)
         for geom_id in range(int(model.ngeom)):
             body_id = int(model.geom_bodyid[geom_id])
-            root_id = int(model.body_rootid[body_id])
-            canonical_door_spec = canonical_door_specs.get(root_id)
-            if canonical_door_spec is not None:
-                geom_to_spec[geom_id] = canonical_door_spec
+            door_spec = self._door_spec_for_body(
+                model, body_id, door_body_to_spec
+            )
+            if door_spec is not None:
+                geom_to_spec[geom_id] = door_spec
                 continue
             while body_id >= 0:
                 spec_index = body_to_spec.get(body_id)
@@ -550,6 +563,25 @@ class RealtimeGTObservationPublisher:
             ):
                 result[root_id] = int(spec_index)
         return result
+
+    @staticmethod
+    def _door_spec_for_body(model, body_id: int, door_body_to_spec: dict[int, int]):
+        """Return the door spec only for an explicit door body hierarchy.
+
+        A MuJoCo articulated root can contain non-door siblings.  Mapping every
+        geom sharing that root to the door inflated door masks across rooms.
+        """
+        current = int(body_id)
+        visited = set()
+        while current >= 0 and current not in visited:
+            if current in door_body_to_spec:
+                return int(door_body_to_spec[current])
+            visited.add(current)
+            parent = int(model.body_parentid[current])
+            if parent == current:
+                break
+            current = parent
+        return None
 
     def _visible_instances(self, segmentation: np.ndarray) -> list[tuple[int, int, list[int]]]:
         if not self._specs or self._geom_to_spec.size == 0:

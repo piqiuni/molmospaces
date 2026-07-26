@@ -52,7 +52,7 @@ exploration:
   frontier_match_distance_m: 1.0
   frontier_gone_confirm_ticks: 3
   frontier_gone_min_goal_age_sec: 8.0
-  failed_point_soft_blacklist_sec: 45.0
+  failed_point_soft_blacklist_sec: 10.0
   failed_point_blacklist_sec: 180.0
   failed_point_blacklist_radius_m: 1.25
   reached_point_blacklist_sec: 5.0

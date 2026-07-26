@@ -214,6 +214,30 @@ def test_articulated_doorway_root_is_the_canonical_gt_spec():
     assert realtime_gt.RealtimeGTObservationPublisher._canonical_door_root_specs(model, specs) == {1: 0}
 
 
+def test_door_geom_mapping_excludes_unrelated_sibling_under_same_root():
+    model = type(
+        "DoorModel",
+        (),
+        {
+            "body_parentid": np.asarray([0, 0, 1, 1]),
+        },
+    )()
+    mapping = {2: 7}
+
+    assert (
+        realtime_gt.RealtimeGTObservationPublisher._door_spec_for_body(
+            model, 2, mapping
+        )
+        == 7
+    )
+    assert (
+        realtime_gt.RealtimeGTObservationPublisher._door_spec_for_body(
+            model, 3, mapping
+        )
+        is None
+    )
+
+
 def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
     fake_rospy = FakeRospy()
     publisher = realtime_gt.RealtimeGTObservationPublisher(
