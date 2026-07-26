@@ -99,6 +99,20 @@ def validate_skill_plan(value: Any, object_id: str) -> dict[str, Any]:
     return result
 
 
+def validate_skill_action(
+    value: Any, allowed_part_ids: set[str], requested_action: str = "open"
+) -> dict[str, str]:
+    """Validate the single atomic action supported by the current interaction backend."""
+    result = parse_json_object(value)
+    action = str(result.get("action") or requested_action).casefold()
+    if action not in {"open", "close"}:
+        raise ValueError("skill action must be open or close")
+    part_id = str(result.get("part_id") or "")
+    if part_id and part_id not in allowed_part_ids:
+        raise ValueError("skill action selected an unknown part_id")
+    return {"action": action, "part_id": part_id}
+
+
 def validate_visual_verification(value: Any) -> dict[str, Any]:
     result = parse_json_object(value)
     result["success"] = bool(result.get("success", False))

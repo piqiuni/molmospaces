@@ -20,6 +20,13 @@ def main() -> None:
         metavar="CASE_ID=PATH[,PATH]",
         help="Bind one case to explicit source image paths.",
     )
+    parser.add_argument(
+        "--bbox",
+        action="append",
+        default=[],
+        metavar="CASE_ID=X0,Y0,X1,Y1[;X0,Y0,X1,Y1]",
+        help="Attach one target bbox per bound image for request-time object cropping.",
+    )
     args = parser.parse_args()
 
     bank_path = Path(args.question_bank).expanduser().resolve()
@@ -39,6 +46,18 @@ def main() -> None:
         if not separator:
             raise SystemExit(f"invalid --bind value: {item}")
         bindings[case_id] = [Path(value).expanduser().resolve() for value in values.split(",")]
+    bbox_bindings = {}
+    for item in args.bbox:
+        case_id, separator, values = item.partition("=")
+        if not separator:
+            raise SystemExit(f"invalid --bbox value: {item}")
+        parsed = []
+        for box_text in values.split(";"):
+            coordinates = [int(value.strip()) for value in box_text.split(",")]
+            if len(coordinates) != 4:
+                raise SystemExit(f"invalid bbox coordinates: {box_text}")
+            parsed.append(coordinates)
+        bbox_bindings[case_id] = parsed
     cursor = 0
     for index, case in enumerate(bank.get("cases") or []):
         if not bool(case.get("requires_image", False)):
@@ -57,6 +76,13 @@ def main() -> None:
             shutil.copy2(source, target)
             copied.append(str(target))
         case["image_paths"] = copied
+        if case["id"] in bbox_bindings:
+            boxes = bbox_bindings[case["id"]]
+            if len(boxes) != len(copied):
+                raise SystemExit(
+                    f"bbox count for {case['id']} must match image count {len(copied)}"
+                )
+            case["image_bboxes"] = boxes
     output_bank = output_dir / "question_bank_bound.json"
     output_bank.write_text(json.dumps(bank, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(output_bank)

@@ -1,9 +1,13 @@
+import json
+
 import pytest
 
+from semantic_mllm_py_pkg import client as client_module
 from semantic_mllm_py_pkg.ablation import AblationConfig
 from semantic_mllm_py_pkg.client import MLLMClient, MLLMClientConfig
 from semantic_mllm_py_pkg.schemas import (
     validate_attribute_patch,
+    validate_skill_action,
     validate_skill_plan,
     validate_subgoal_selection,
     validate_visual_verification,
@@ -40,6 +44,9 @@ def test_role_schemas_normalize_outputs() -> None:
         {"subactions": [{"skill": "open_part", "part_id": "top"}]}, "drawer_1"
     )
     assert skill["subactions"][0]["skill"] == "open_part"
+    assert validate_skill_action(
+        {"part_id": "top", "action": "open"}, {"top"}
+    ) == {"part_id": "top", "action": "open"}
     verification = validate_visual_verification({"success": True})
     assert verification["success"] is True
 
@@ -61,3 +68,125 @@ def test_openai_base_endpoint_is_resolved() -> None:
     assert client._resolved_endpoint("openai_chat") == (
         "http://localhost:8317/v1/chat/completions"
     )
+
+
+def test_reasoning_off_is_explicit_and_raw_http_response_is_retained(monkeypatch) -> None:
+    captured = {}
+    raw_response = (
+        '{"output":[{"type":"message","content":[{"type":"output_text",'
+        '"text":"{\\"candidate_id\\":\\"candidate_1\\"}"}]}],'
+        '"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8,'
+        '"output_tokens_details":{"reasoning_tokens":0}}}'
+    )
+
+    class FakeResponse:
+        def read(self):
+            return raw_response.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request_object, timeout):
+        captured["payload"] = json.loads(request_object.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(client_module.request, "urlopen", fake_urlopen)
+    client = MLLMClient(
+        MLLMClientConfig(
+            mode="http",
+            endpoint="http://localhost:8317/v1",
+            model="vision-model",
+            protocol="openai_responses",
+            reasoning_effort="off",
+        )
+    )
+    response = client.request_json(
+        role="subgoal_selection",
+        instruction="select",
+        context={"candidates": [{"candidate_id": "candidate_1"}]},
+    )
+
+    assert captured["payload"]["reasoning"] == {"effort": "none"}
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "/no_think" in captured["payload"]["input"][0]["content"][0]["text"]
+    assert response.payload == {"candidate_id": "candidate_1"}
+    assert response.raw_http_response == raw_response
+    assert response.usage["output_tokens"] == 5
+
+
+def test_invalid_http_json_keeps_raw_text_and_usage(monkeypatch) -> None:
+    raw_response = json.dumps(
+        {
+            "choices": [{"message": {"content": '{"part_id":"drawer_1"'}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+        }
+    )
+
+    class FakeResponse:
+        def read(self):
+            return raw_response.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(client_module.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    response = MLLMClient(
+        MLLMClientConfig(mode="http", endpoint="http://localhost:8317/v1")
+    ).request_json(role="skill_planning", instruction="plan", context={})
+
+    assert response.payload is None
+    assert "invalid JSON response" in response.error
+    assert response.raw_text == '{"part_id":"drawer_1"'
+    assert response.completion_tokens == 5
+
+
+def test_openai_chat_reasoning_off_uses_enable_thinking(monkeypatch) -> None:
+    captured = {}
+    raw_response = (
+        '{"choices":[{"message":{"content":"{\\"candidate_id\\":\\"candidate_1\\"}"}}],'
+        '"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}'
+    )
+
+    class FakeResponse:
+        def read(self):
+            return raw_response.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request_object, timeout):
+        captured["payload"] = json.loads(request_object.data.decode("utf-8"))
+        captured["endpoint"] = request_object.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(client_module.request, "urlopen", fake_urlopen)
+    client = MLLMClient(
+        MLLMClientConfig(
+            mode="http",
+            endpoint="http://localhost:8317/v1",
+            model="vision-model",
+            protocol="openai_chat",
+            reasoning_effort="off",
+        )
+    )
+    response = client.request_json(
+        role="subgoal_selection",
+        instruction="select",
+        context={"candidates": [{"candidate_id": "candidate_1"}]},
+    )
+
+    assert captured["endpoint"] == "http://localhost:8317/v1/chat/completions"
+    assert captured["payload"]["enable_thinking"] is False
+    assert captured["payload"]["reasoning_effort"] == "none"
+    assert "/no_think" in captured["payload"]["messages"][1]["content"][0]["text"]
+    assert response.payload == {"candidate_id": "candidate_1"}

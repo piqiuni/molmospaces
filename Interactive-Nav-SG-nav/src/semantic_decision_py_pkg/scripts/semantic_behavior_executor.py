@@ -27,7 +27,7 @@ from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_
 from semantic_mllm_py_pkg.ablation import AblationConfig
 from semantic_mllm_py_pkg.client import MLLMClient
 from semantic_mllm_py_pkg.env import client_config_from_env, load_env_file
-from semantic_mllm_py_pkg.schemas import validate_skill_plan, validate_visual_verification
+from semantic_mllm_py_pkg.schemas import validate_skill_action, validate_visual_verification
 
 patch_roslogging_findcaller_for_py311()
 
@@ -71,6 +71,26 @@ class SemanticBehaviorExecutor:
                 model=model_name or None,
                 metrics_path=str(model_config.get("metrics_path", "") or "") or None,
             )
+        )
+        self.skill_max_output_tokens = max(
+            32,
+            int(model_config.get("skill_max_output_tokens", min(self.mllm_client.config.max_tokens, 64))),
+        )
+        self.verification_max_output_tokens = max(
+            64,
+            int(model_config.get("verification_max_output_tokens", min(self.mllm_client.config.max_tokens, 192))),
+        )
+        self.skill_timeout_s = max(
+            0.1, float(model_config.get("skill_timeout_s", 4.0))
+        )
+        self.verification_timeout_s = max(
+            0.1, float(model_config.get("verification_timeout_s", 4.0))
+        )
+        self.mllm_crop_margin_ratio = max(
+            0.0, float(model_config.get("crop_margin_ratio", 0.10))
+        )
+        self.mllm_crop_max_side_px = max(
+            128, int(model_config.get("crop_max_side_px", 512))
         )
         self.machine = BehaviorExecutionStateMachine(
             ExecutionConfig(
@@ -151,14 +171,14 @@ class SemanticBehaviorExecutor:
         self.lock = threading.RLock()
         self.selection: dict | None = None
         self.latest_graph: dict = {}
-        self.latest_image_data = ""
+        self.latest_image = None
         self.latest_image_sequence = 0
-        self.pre_interaction_image_data = ""
         self.pre_interaction_image_sequence = 0
         self.active_skill_plan: dict = {}
         self.pending_skill_actions: list[dict] = []
         self.interaction_command_sequence = 0
         self.verification_retries = 0
+        self.model_events: list[dict] = []
         self.feedback_pub = rospy.Publisher(
             topics.get("behavior_feedback", "/semantic_decision/behavior_feedback"),
             String,
@@ -237,6 +257,7 @@ class SemanticBehaviorExecutor:
             self.pending_skill_actions = []
             self.interaction_command_sequence = 0
             self.verification_retries = 0
+            self.model_events = []
             commands = self.machine.start(selection)
             self._publish_feedback(selection, "STARTED", None, {})
         self._dispatch(commands)
@@ -319,18 +340,10 @@ class SemanticBehaviorExecutor:
     def _image_callback(self, message: Image) -> None:
         try:
             image = self._decode_ros_image(message)
-            ok, encoded = cv2.imencode(
-                ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 75]
-            )
         except Exception:
             return
-        if not ok:
-            return
-        image_data = "data:image/jpeg;base64," + base64.b64encode(encoded).decode(
-            "ascii"
-        )
         with self.lock:
-            self.latest_image_data = image_data
+            self.latest_image = image.copy()
             self.latest_image_sequence += 1
 
     @staticmethod
@@ -560,7 +573,6 @@ class SemanticBehaviorExecutor:
             ),
         }
         with self.lock:
-            self.pre_interaction_image_data = self.latest_image_data
             self.pre_interaction_image_sequence = self.latest_image_sequence
         self.interaction_command_pub.publish(
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -571,44 +583,67 @@ class SemanticBehaviorExecutor:
             if not self._interaction_is_current(decision_id):
                 return
             node = self._selected_graph_node_locked(candidate)
-            image_data = self.latest_image_data
+            image_data = self._object_crop_data_locked(node)
+        interaction = dict(candidate.get("interaction_command") or {})
+        requested_action = str(interaction.get("action") or "open").casefold()
+        if requested_action not in {"open", "close"}:
+            requested_action = "open"
+        valid_part_ids = self._valid_interaction_group_ids(node, candidate)
         context = {
             "object_id": str(candidate.get("target_id") or ""),
             "object_name": str(candidate.get("target_name") or ""),
-            "selected_candidate": candidate,
-            "graph_node": node,
-            "allowed_skills": ["open_part", "close_part", "inspect_contents"],
+            "object_type": str(candidate.get("interaction_type") or "unknown"),
+            "requested_action": requested_action,
+            "allowed_part_ids": sorted(valid_part_ids),
         }
         response = self.mllm_client.request_json(
             role="skill_planning",
             instruction=(
-                "Plan a short semantic interaction skill sequence using only allowed_skills. "
-                "Refer to known part_id values and do not output forces, trajectories, or joint axes. "
-                "Return JSON fields object_id, subactions, and max_retries."
+                "Choose exactly one atomic interaction for the selected object. "
+                "Return exactly one single-line JSON object: {\"part_id\":\"\",\"action\":\"open\"}. "
+                "part_id must be empty or one allowed_part_ids value; action must be open or close. "
+                "No markdown, explanation, extra keys, forces, trajectories, or joint data."
             ),
             context=context,
             images=[image_data] if image_data else [],
+            timeout_s=self.skill_timeout_s,
+            max_tokens=self.skill_max_output_tokens,
+            metrics_context=self._model_metrics_context(
+                "skill_planning", decision_id, candidate
+            ),
         )
         planned_candidate = dict(candidate)
+        result_source = "rule_fallback_model_error"
         if response.payload is not None and not response.error:
             try:
-                plan = validate_skill_plan(
-                    response.payload, str(candidate.get("target_id") or "")
+                action = validate_skill_action(
+                    response.payload, valid_part_ids, requested_action
                 )
-                executable_actions = [
-                    action
-                    for action in plan["subactions"]
-                    if action.get("skill") in {"open_part", "close_part"}
-                ]
-                if executable_actions:
+                if action:
                     planned_candidate = self._candidate_for_skill_action(
-                        planned_candidate, executable_actions[0]
+                        planned_candidate,
+                        {
+                            "skill": "close_part" if action["action"] == "close" else "open_part",
+                            "part_id": action["part_id"],
+                        },
                     )
+                    result_source = "model"
                 with self.lock:
-                    self.active_skill_plan = plan
-                    self.pending_skill_actions = executable_actions[1:]
+                    self.active_skill_plan = {
+                        "subactions": [action],
+                        "max_retries": 0,
+                    }
+                    self.pending_skill_actions = []
             except ValueError:
-                pass
+                result_source = "rule_fallback_invalid_response"
+        with self.lock:
+            self._append_model_event_locked(
+                "skill_planning",
+                response,
+                decision_id,
+                candidate,
+                result_source,
+            )
         with self.lock:
             if not self._interaction_is_current(decision_id):
                 return
@@ -637,9 +672,20 @@ class SemanticBehaviorExecutor:
             None,
         )
         if isinstance(group, dict):
-            interaction["joint_names"] = list(
-                group.get("target_joint_names") or group.get("joint_names") or []
-            )
+            original_joint_names = {
+                str(name)
+                for name in interaction.get("joint_names") or []
+                if str(name)
+            }
+            selected_joint_names = [
+                str(name)
+                for name in (
+                    group.get("target_joint_names") or group.get("joint_names") or []
+                )
+                if str(name) in original_joint_names
+            ]
+            if selected_joint_names:
+                interaction["joint_names"] = selected_joint_names
             interaction["close_other_joint_names"] = list(
                 group.get("close_other_joint_names") or []
             )
@@ -659,58 +705,153 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if not self._interaction_is_current(decision_id):
                 return
-            before = self.pre_interaction_image_data
-            after = self.latest_image_data
             selection = dict(self.selection or {})
             node = self._selected_graph_node_locked(selection)
+            after = self._object_crop_data_locked(node)
             max_retries = int(self.active_skill_plan.get("max_retries", 1) or 0)
         response = self.mllm_client.request_json(
             role="visual_verification",
             instruction=(
-                "Compare the before and after images and determine whether the requested "
-                "interaction visibly succeeded. Return JSON with success, confidence, reason, "
-                "observed_states, new_contents_visible, and retry_action."
+                "Inspect the current cropped image of the interaction target after execution. "
+                "Determine whether it now matches the requested state using the expected action "
+                "and visible evidence only. Return exactly one compact JSON object with success, "
+                "confidence, reason, observed_states, new_contents_visible, and retry_action. "
+                "Use a reason no longer than twelve words; do not output markdown or extra fields."
             ),
             context={
-                "selected_candidate": selection,
-                "skill_plan": self.active_skill_plan,
-                "backend_result": backend_payload,
-                "latest_graph_node": node,
+                "target": {
+                    "id": str(selection.get("target_id") or ""),
+                    "name": str(selection.get("target_name") or ""),
+                    "expected_action": str(
+                        (selection.get("interaction_command") or {}).get("action")
+                        or "open"
+                    ),
+                    "expected_state": str(
+                        (selection.get("interaction_command") or {}).get("expected_state")
+                        or "open"
+                    ),
+                    "interaction_part": str(
+                        (selection.get("interaction_command") or {}).get("interaction_group_id")
+                        or ""
+                    ),
+                },
+                "pre_interaction_skill": {
+                    "subactions": list(self.active_skill_plan.get("subactions") or []),
+                },
             },
-            images=[item for item in (before, after) if item],
+            images=[after] if after else [],
+            timeout_s=self.verification_timeout_s,
+            max_tokens=self.verification_max_output_tokens,
+            metrics_context=self._model_metrics_context(
+                "visual_verification", decision_id, selection
+            ),
         )
         commands = []
         with self.lock:
             if not self._interaction_is_current(decision_id):
                 return
             if response.payload is None or response.error:
-                commands = self._verify_graph_locked()
+                result_source = "model_error"
+                commands = self.machine.on_verification_result(
+                    False,
+                    detail={
+                        "verification_mode": "mllm_visual_unavailable",
+                        "reason": str(response.error or "empty_model_response"),
+                        "model_metrics": response.metrics(),
+                    },
+                )
             else:
                 try:
                     verification = validate_visual_verification(response.payload)
                 except ValueError as exc:
-                    verification = {
-                        "success": False,
-                        "reason": str(exc),
-                        "retry_action": "none",
-                    }
-                retry = (
-                    not verification["success"]
-                    and verification.get("retry_action") not in {"", "none"}
-                    and self.verification_retries < max_retries
-                )
-                if retry:
-                    self.verification_retries += 1
-                commands = self.machine.on_verification_result(
-                    bool(verification["success"]),
-                    detail={
-                        **verification,
-                        "verification_mode": "mllm_visual",
-                        "model_metrics": response.metrics(),
-                    },
-                    retry=retry,
-                )
+                    result_source = "model_invalid_response"
+                    commands = self.machine.on_verification_result(
+                        False,
+                        detail={
+                            "verification_mode": "mllm_visual_invalid",
+                            "reason": f"invalid_model_response: {exc}",
+                            "model_metrics": response.metrics(),
+                        },
+                    )
+                else:
+                    result_source = "model"
+                    retry = (
+                        not verification["success"]
+                        and verification.get("retry_action") not in {"", "none"}
+                        and self.verification_retries < max_retries
+                    )
+                    if retry:
+                        self.verification_retries += 1
+                    commands = self.machine.on_verification_result(
+                        bool(verification["success"]),
+                        detail={
+                            **verification,
+                            "verification_mode": "mllm_visual",
+                            "model_metrics": response.metrics(),
+                        },
+                        retry=retry,
+                    )
+            self._append_model_event_locked(
+                "visual_verification",
+                response,
+                decision_id,
+                selection,
+                result_source,
+            )
         self._dispatch(commands)
+
+    @staticmethod
+    def _valid_interaction_group_ids(node: dict, candidate: dict) -> set[str]:
+        valid_joint_names = {
+            str(name)
+            for name in (
+                (candidate.get("interaction_command") or {}).get("joint_names") or []
+            )
+            if str(name)
+        }
+        return {
+            str(group.get("group_id") or "")
+            for group in (node.get("attributes") or {}).get("interaction_groups") or []
+            if isinstance(group, dict)
+            and str(group.get("group_id") or "")
+            and any(
+                str(name) in valid_joint_names
+                for name in (
+                    group.get("target_joint_names") or group.get("joint_names") or []
+                )
+            )
+        }
+
+    def _model_metrics_context(
+        self, role: str, decision_id: str, candidate: dict
+    ) -> dict:
+        return {
+            "decision_id": decision_id,
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "target_id": str(candidate.get("target_id") or ""),
+            "episode_id": str(candidate.get("episode_id") or ""),
+            "graph_revision": int(candidate.get("graph_revision", 0) or 0),
+            "role_context": role,
+        }
+
+    def _append_model_event_locked(
+        self,
+        role: str,
+        response,
+        decision_id: str,
+        candidate: dict,
+        result_source: str,
+    ) -> None:
+        self.model_events.append(
+            {
+                "role": role,
+                "decision_id": decision_id,
+                "candidate_id": str(candidate.get("candidate_id") or ""),
+                "target_id": str(candidate.get("target_id") or ""),
+                "result_source": result_source,
+                "metrics": response.metrics(),
+            }
+        )
 
     def _selected_graph_node_locked(self, candidate: dict) -> dict:
         target_id = str(candidate.get("target_id") or "")
@@ -722,6 +863,50 @@ class SemanticBehaviorExecutor:
             ),
             {},
         )
+
+    def _object_crop_data_locked(self, node: dict) -> str:
+        if self.latest_image is None:
+            return ""
+        attributes = node.get("attributes") or {}
+        box = attributes.get("projected_bbox_2d") or node.get("projected_bbox_2d")
+        if not isinstance(box, (list, tuple)) or len(box) < 4:
+            return ""
+        image = self.latest_image
+        height, width = image.shape[:2]
+        raw_x0, raw_y0, raw_x1, raw_y1 = [
+            int(round(float(value))) for value in box[:4]
+        ]
+        left, right = sorted((raw_x0, raw_x1))
+        top, bottom = sorted((raw_y0, raw_y1))
+        margin_x = int(round((right - left) * self.mllm_crop_margin_ratio))
+        margin_y = int(round((bottom - top) * self.mllm_crop_margin_ratio))
+        left = max(0, min(width - 1, left - margin_x))
+        right = min(width, max(left + 1, right + margin_x))
+        top = max(0, min(height - 1, top - margin_y))
+        bottom = min(height, max(top + 1, bottom + margin_y))
+        crop = image[top:bottom, left:right]
+        if crop.size == 0:
+            return ""
+        crop_height, crop_width = crop.shape[:2]
+        scale = min(
+            1.0,
+            float(self.mllm_crop_max_side_px) / max(crop_width, crop_height),
+        )
+        if scale < 1.0:
+            crop = cv2.resize(
+                crop,
+                (
+                    max(1, int(round(crop_width * scale))),
+                    max(1, int(round(crop_height * scale))),
+                ),
+                interpolation=cv2.INTER_AREA,
+            )
+        ok, encoded = cv2.imencode(
+            ".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+        )
+        if not ok:
+            return ""
+        return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
 
     def _interaction_is_current(self, decision_id: str) -> bool:
         return bool(
@@ -1044,7 +1229,10 @@ class SemanticBehaviorExecutor:
             if self.selection is None or str(self.selection.get("decision_id") or "") != decision_id:
                 return
             commands = self.machine.on_navigation_result(success, detail=detail)
-            if self.machine.state == STATE_VERIFYING:
+            if (
+                self.machine.state == STATE_VERIFYING
+                and self.ablation.module3 == "rule_verified"
+            ):
                 commands.extend(self._verify_graph_locked())
         self._dispatch(commands)
 
@@ -1061,6 +1249,8 @@ class SemanticBehaviorExecutor:
             selection = dict(self.selection or {})
             status = "SUCCEEDED" if command.get("success") else "FAILED"
             detail = dict(command.get("detail") or {})
+            if self.model_events:
+                detail["mllm_events"] = list(self.model_events)
             self._publish_feedback(selection, status, bool(command.get("success")), detail)
             self.selection = None
             self.machine.reset()

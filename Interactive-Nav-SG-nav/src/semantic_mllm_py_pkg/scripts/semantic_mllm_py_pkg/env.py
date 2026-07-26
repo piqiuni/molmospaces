@@ -43,10 +43,14 @@ def client_config_from_env(
         mode=os.environ.get("SEMANTIC_MODEL_MODE", "disabled"),
         endpoint=os.environ.get("SEMANTIC_MODEL_ENDPOINT", ""),
         api_key_env=os.environ.get("SEMANTIC_MODEL_API_KEY_ENV", "OPENAI_API_KEY"),
-        model=model or os.environ.get("SEMANTIC_MODEL_NAME", ""),
-        protocol=os.environ.get("SEMANTIC_MODEL_PROTOCOL", "openai_responses"),
+        model=model or os.environ.get("SEMANTIC_MODEL_NAME", "qwen3.6-35b-a3b"),
+        protocol=os.environ.get("SEMANTIC_MODEL_PROTOCOL", "openai_chat"),
         command=os.environ.get("SEMANTIC_MODEL_COMMAND", ""),
         timeout_s=float(os.environ.get("SEMANTIC_MODEL_TIMEOUT_S", "20") or 20.0),
+        temperature=float(os.environ.get("SEMANTIC_MODEL_TEMPERATURE", "0") or 0.0),
+        max_tokens=int(os.environ.get("SEMANTIC_MODEL_MAX_TOKENS", "384") or 384),
+        reasoning_effort=os.environ.get("SEMANTIC_MODEL_REASONING_EFFORT", "off"),
+        image_detail=os.environ.get("SEMANTIC_MODEL_IMAGE_DETAIL", "low"),
         metrics_path=metrics_path
         if metrics_path is not None
         else os.environ.get("SEMANTIC_MODEL_METRICS_PATH", ""),

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import base64
+import fcntl
 import json
 import mimetypes
 import os
@@ -20,12 +21,14 @@ class MLLMClientConfig:
     mode: str = "disabled"
     endpoint: str = ""
     api_key_env: str = "OPENAI_API_KEY"
-    model: str = ""
-    protocol: str = "openai_responses"
+    model: str = "qwen3.6-35b-a3b"
+    protocol: str = "openai_chat"
     command: str = ""
     timeout_s: float = 20.0
     temperature: float = 0.0
-    max_tokens: int = 1200
+    max_tokens: int = 384
+    reasoning_effort: str = "off"
+    image_detail: str = "low"
     metrics_path: str = ""
 
 
@@ -36,8 +39,11 @@ class MLLMResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    reasoning_tokens: int = 0
     error: str = ""
     raw_text: str = ""
+    raw_http_response: str = ""
+    usage: dict[str, Any] = field(default_factory=dict)
 
     @property
     def tps(self) -> float:
@@ -49,13 +55,23 @@ class MLLMResponse:
         return float(tokens) / self.latency_s
 
     def metrics(self) -> dict[str, Any]:
+        visible_output_tokens = max(0, self.completion_tokens - self.reasoning_tokens)
         return {
             "latency_s": self.latency_s,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "visible_output_tokens": visible_output_tokens,
             "total_tokens": self.total_tokens,
             "tps": self.tps,
+            "visible_output_tps": (
+                float(visible_output_tokens) / self.latency_s
+                if self.latency_s > 0.0
+                else 0.0
+            ),
             "error": self.error,
+            "raw_text_chars": len(self.raw_text),
+            "raw_text": self.raw_text,
         }
 
 
@@ -74,25 +90,38 @@ class MLLMClient:
         context: dict[str, Any],
         images: Iterable[str] | None = None,
         response_schema: dict[str, Any] | None = None,
+        timeout_s: float | None = None,
+        max_tokens: int | None = None,
+        metrics_context: dict[str, Any] | None = None,
     ) -> MLLMResponse:
         started = time.perf_counter()
         images = list(images or [])
+        config = self.config
+        overrides: dict[str, Any] = {}
+        if timeout_s is not None:
+            overrides["timeout_s"] = max(0.1, float(timeout_s))
+        if max_tokens is not None:
+            overrides["max_tokens"] = max(1, int(max_tokens))
+        if overrides:
+            config = replace(config, **overrides)
         try:
-            mode = str(self.config.mode or "disabled").casefold()
+            mode = str(config.mode or "disabled").casefold()
             if mode == "disabled":
                 raise RuntimeError("MLLM client is disabled")
             if mode == "mock":
                 payload = self._mock_response(role, context)
                 response = MLLMResponse(payload=payload, latency_s=time.perf_counter() - started)
             elif mode == "command":
-                payload, raw_text = self._request_command(role, instruction, context, images, response_schema)
+                payload, raw_text = self._request_command(
+                    role, instruction, context, images, response_schema, config
+                )
                 response = MLLMResponse(payload=payload, latency_s=time.perf_counter() - started, raw_text=raw_text)
             elif mode == "http":
                 response = self._request_http(
-                    role, instruction, context, images, response_schema, started
+                    role, instruction, context, images, response_schema, started, config
                 )
             else:
-                raise ValueError(f"unsupported MLLM mode: {self.config.mode}")
+                raise ValueError(f"unsupported MLLM mode: {config.mode}")
         except urllib_error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             message = f"HTTP {exc.code}: {body[:1000]}" if body else str(exc)
@@ -100,10 +129,11 @@ class MLLMClient:
                 payload=None,
                 latency_s=time.perf_counter() - started,
                 error=message,
+                raw_http_response=body,
             )
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
             response = MLLMResponse(payload=None, latency_s=time.perf_counter() - started, error=str(exc))
-        self._record_metrics(role, response)
+        self._record_metrics(role, response, config, metrics_context)
         return response
 
     def _request_http(
@@ -114,62 +144,86 @@ class MLLMClient:
         images: list[str],
         response_schema: dict[str, Any] | None,
         started: float,
+        config: MLLMClientConfig,
     ) -> MLLMResponse:
-        protocol = str(self.config.protocol or "openai_chat").casefold()
+        protocol = str(config.protocol or "openai_chat").casefold()
+        request_instruction = self._instruction_for_request(instruction, config)
         if protocol in {"generic", "interactive_navigation"}:
             body_payload: dict[str, Any] = {
                 "schema_version": 1,
                 "role": role,
-                "instruction": instruction,
+                "instruction": request_instruction,
                 "context": context,
                 "images": images,
                 "response_schema": response_schema or {},
             }
-            if self.config.model:
-                body_payload["model"] = self.config.model
+            if config.model:
+                body_payload["model"] = config.model
         elif protocol in {"openai_responses", "responses"}:
             content: list[dict[str, Any]] = [
                 {
                     "type": "input_text",
-                    "text": instruction + "\n" + json.dumps(context, ensure_ascii=False),
+                    "text": request_instruction + "\n" + json.dumps(context, ensure_ascii=False),
                 }
             ]
             for image in images:
-                content.append({"type": "input_image", "image_url": self._image_url(image)})
+                image_item = {
+                    "type": "input_image",
+                    "image_url": self._image_url(image),
+                }
+                if config.image_detail:
+                    image_item["detail"] = config.image_detail
+                content.append(image_item)
             body_payload = {
-                "model": self.config.model,
-                "max_output_tokens": self.config.max_tokens,
+                "model": config.model,
+                "max_output_tokens": config.max_tokens,
                 "input": [{"role": "user", "content": content}],
             }
+            reasoning_effort = self._reasoning_effort_for_request(config)
+            if reasoning_effort:
+                body_payload["reasoning"] = {"effort": reasoning_effort}
+            if self._thinking_disabled(config):
+                body_payload["chat_template_kwargs"] = {"enable_thinking": False}
         else:
-            content: list[dict[str, Any]] = [{"type": "text", "text": instruction + "\n" + json.dumps(context, ensure_ascii=False)}]
+            content: list[dict[str, Any]] = [{"type": "text", "text": request_instruction + "\n" + json.dumps(context, ensure_ascii=False)}]
             for image in images:
                 content.append({"type": "image_url", "image_url": {"url": self._image_url(image)}})
             body_payload = {
-                "model": self.config.model,
-                "temperature": self.config.temperature,
-                "max_tokens": self.config.max_tokens,
+                "model": config.model,
+                "temperature": config.temperature,
+                "max_tokens": config.max_tokens,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": "Return only a valid JSON object."},
                     {"role": "user", "content": content},
                 ],
             }
+            reasoning_effort = self._reasoning_effort_for_request(config)
+            if reasoning_effort:
+                body_payload["reasoning_effort"] = reasoning_effort
+            if self._thinking_disabled(config):
+                body_payload["enable_thinking"] = False
         body = json.dumps(body_payload, ensure_ascii=False).encode("utf-8")
         headers = {"Content-Type": "application/json"}
-        api_key = os.environ.get(self.config.api_key_env, "") if self.config.api_key_env else ""
+        api_key = os.environ.get(config.api_key_env, "") if config.api_key_env else ""
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        endpoint = self._resolved_endpoint(protocol)
+        endpoint = self._resolved_endpoint(protocol, endpoint=config.endpoint)
         req = request.Request(endpoint, data=body, headers=headers, method="POST")
-        with request.urlopen(req, timeout=self.config.timeout_s) as response_obj:
+        with request.urlopen(req, timeout=config.timeout_s) as response_obj:
             raw = response_obj.read().decode("utf-8")
         envelope = json.loads(raw)
         usage = envelope.get("usage") or {}
+        output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
         raw_text = self._extract_text(envelope)
         if not raw_text:
             raise ValueError("MLLM response contained no output text")
-        payload = self._parse_json(raw_text)
+        try:
+            payload = self._parse_json(raw_text)
+            parse_error = ""
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            payload = None
+            parse_error = f"invalid JSON response: {exc}"
         return MLLMResponse(
             payload=payload,
             latency_s=time.perf_counter() - started,
@@ -180,7 +234,13 @@ class MLLMClient:
                 usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
             ),
             total_tokens=int(usage.get("total_tokens", 0) or 0),
+            reasoning_tokens=int(
+                output_details.get("reasoning_tokens", output_details.get("reasoning", 0)) or 0
+            ),
             raw_text=raw_text,
+            raw_http_response=raw,
+            usage=dict(usage),
+            error=parse_error,
         )
 
     def _request_command(
@@ -190,8 +250,9 @@ class MLLMClient:
         context: dict[str, Any],
         images: list[str],
         response_schema: dict[str, Any] | None,
+        config: MLLMClientConfig,
     ) -> tuple[dict[str, Any], str]:
-        command = shlex.split(self.config.command)
+        command = shlex.split(config.command)
         if not command:
             raise ValueError("MLLM command is empty")
         payload = {
@@ -200,21 +261,21 @@ class MLLMClient:
             "context": context,
             "images": images,
             "response_schema": response_schema or {},
-            "model": self.config.model,
+            "model": config.model,
         }
         completed = subprocess.run(
             command,
             input=json.dumps(payload, ensure_ascii=False),
             text=True,
             capture_output=True,
-            timeout=self.config.timeout_s,
+            timeout=config.timeout_s,
             check=True,
         )
         raw_text = completed.stdout.strip()
         return self._parse_json(raw_text), raw_text
 
-    def _resolved_endpoint(self, protocol: str) -> str:
-        endpoint = str(self.config.endpoint or "").rstrip("/")
+    def _resolved_endpoint(self, protocol: str, endpoint: str | None = None) -> str:
+        endpoint = str(self.config.endpoint if endpoint is None else endpoint or "").rstrip("/")
         if not endpoint:
             raise ValueError("MLLM endpoint is empty")
         if protocol in {"openai_chat", "chat_completions", "openai"} and endpoint.endswith(
@@ -224,6 +285,27 @@ class MLLMClient:
         if protocol in {"openai_responses", "responses"} and endpoint.endswith("/v1"):
             return endpoint + "/responses"
         return endpoint
+
+    def _reasoning_effort_for_request(
+        self, config: MLLMClientConfig | None = None
+    ) -> str:
+        config = config or self.config
+        value = str(config.reasoning_effort or "").strip()
+        if self._thinking_disabled(config):
+            return "none"
+        return value
+
+    def _thinking_disabled(self, config: MLLMClientConfig | None = None) -> bool:
+        config = config or self.config
+        value = str(config.reasoning_effort or "").strip()
+        return value.casefold() in {"off", "none", "false", "0", "disabled"}
+
+    def _instruction_for_request(
+        self, instruction: str, config: MLLMClientConfig | None = None
+    ) -> str:
+        if not self._thinking_disabled(config) or "/no_think" in instruction:
+            return instruction
+        return instruction.rstrip() + "\n/no_think"
 
     def _mock_response(self, role: str, context: dict[str, Any]) -> dict[str, Any]:
         if role == "subgoal_selection":
@@ -240,9 +322,8 @@ class MLLMClient:
             }
         if role == "skill_planning":
             return {
-                "object_id": str(context.get("object_id") or "unknown"),
-                "subactions": [{"skill": "open", "part_id": "all", "desired_state": "open"}],
-                "max_retries": 0,
+                "part_id": "",
+                "action": str(context.get("requested_action") or "open"),
             }
         return {"success": False, "confidence": 0.0, "reason": "mock"}
 
@@ -293,11 +374,32 @@ class MLLMClient:
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
         return f"data:{mime};base64,{encoded}"
 
-    def _record_metrics(self, role: str, response: MLLMResponse) -> None:
-        if not self.config.metrics_path:
+    def _record_metrics(
+        self,
+        role: str,
+        response: MLLMResponse,
+        config: MLLMClientConfig,
+        metrics_context: dict[str, Any] | None,
+    ) -> None:
+        if not config.metrics_path:
             return
-        record = {"timestamp": time.time(), "role": role, "model": self.config.model, **response.metrics()}
-        path = Path(self.config.metrics_path).expanduser()
+        record = {
+            "timestamp": time.time(),
+            "role": role,
+            "model": config.model,
+            "timeout_s": config.timeout_s,
+            "max_output_tokens": config.max_tokens,
+            "protocol": config.protocol,
+            "reasoning_effort": config.reasoning_effort,
+            **(metrics_context or {}),
+            **response.metrics(),
+        }
+        path = Path(config.metrics_path).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._metrics_lock, path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                stream.flush()
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)

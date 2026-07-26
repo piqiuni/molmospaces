@@ -7,7 +7,17 @@
   <arg name="start_semantic_mapping" default="true"/>
   <arg name="start_attribute_inference" default="false"/>
   <arg name="attribute_model_name" default=""/>
+  <arg name="attribute_max_output_tokens" default="96"/>
+  <arg name="attribute_request_timeout_s" default="8.0"/>
   <arg name="attribute_min_interval_s" default="2.0"/>
+  <arg name="attribute_worker_count" default="1"/>
+  <arg name="attribute_max_queue_size" default="8"/>
+  <arg name="attribute_success_refresh_interval_s" default="120.0"/>
+  <arg name="attribute_min_visible_fraction" default="0.20"/>
+  <arg name="attribute_min_visible_pixels" default="64"/>
+  <arg name="attribute_min_bbox_area_px" default="512"/>
+  <arg name="attribute_max_distance_m" default="6.0"/>
+  <arg name="attribute_required_consecutive_observations" default="2"/>
   <arg name="object_detection_backend" default="mock_empty"/>
   <arg name="object_detection_provider" default="external_http"/>
   <arg name="object_detection_model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
@@ -75,7 +85,17 @@
       <rosparam file="$(arg config_file)" command="load"/>
       <rosparam if="$(eval arg('override_config_file') != '')" file="$(arg override_config_file)" command="load"/>
       <param name="model_name" value="$(arg attribute_model_name)"/>
+      <param name="max_output_tokens" value="$(arg attribute_max_output_tokens)"/>
+      <param name="request_timeout_s" value="$(arg attribute_request_timeout_s)"/>
       <param name="min_interval_s" value="$(arg attribute_min_interval_s)"/>
+      <param name="worker_count" value="$(arg attribute_worker_count)"/>
+      <param name="max_queue_size" value="$(arg attribute_max_queue_size)"/>
+      <param name="success_refresh_interval_s" value="$(arg attribute_success_refresh_interval_s)"/>
+      <param name="min_visible_fraction" value="$(arg attribute_min_visible_fraction)"/>
+      <param name="min_visible_pixels" value="$(arg attribute_min_visible_pixels)"/>
+      <param name="min_bbox_area_px" value="$(arg attribute_min_bbox_area_px)"/>
+      <param name="max_distance_m" value="$(arg attribute_max_distance_m)"/>
+      <param name="required_consecutive_observations" value="$(arg attribute_required_consecutive_observations)"/>
     </node>
   </group>
 </launch>

@@ -214,11 +214,70 @@ class InteractionGraphStore:
             )
         if node is None:
             return False
+        attribute_status = str(patch.get("attribute_status") or "ready")
+        patch_stamp = float(stamp if stamp is not None else time.time())
+        request_sequence = int(patch.get("request_sequence", 0) or 0)
+        latest_request_sequence = int(
+            node.attributes.get("attribute_request_sequence", 0) or 0
+        )
+        if request_sequence and latest_request_sequence and request_sequence < latest_request_sequence:
+            return False
+        patch_frame_index = patch.get("observation_frame_index")
+        current_frame_index = node.attributes.get("last_observation_frame_index")
+        try:
+            patch_frame_index = int(patch_frame_index)
+            current_frame_index = int(current_frame_index)
+        except (TypeError, ValueError):
+            patch_frame_index = None
+            current_frame_index = None
+        if (
+            patch_frame_index is not None
+            and current_frame_index is not None
+            and patch_frame_index < current_frame_index
+        ):
+            node.attributes.update(
+                {
+                    "attribute_status": "stale",
+                    "attribute_request_sequence": max(
+                        latest_request_sequence, request_sequence
+                    ),
+                    "attribute_error": "observation_version_superseded",
+                }
+            )
+            self._bump_revision()
+            return True
+        node.attributes.update(
+            {
+                "attribute_status": attribute_status,
+                "attribute_request_sequence": max(latest_request_sequence, request_sequence),
+                "attribute_response_lag_sec": float(
+                    patch.get("response_lag_sec", 0.0) or 0.0
+                ),
+                "attribute_queue_lag_sec": float(patch.get("queue_lag_sec", 0.0) or 0.0),
+                "attribute_total_lag_sec": float(patch.get("total_lag_sec", 0.0) or 0.0),
+                "attribute_error": str(patch.get("error") or ""),
+                "attribute_observation_stamp_sec": float(
+                    patch.get("observation_stamp_sec", patch_stamp) or patch_stamp
+                ),
+                "attribute_observation_frame_index": patch_frame_index,
+                "attribute_observation_signature": str(
+                    patch.get("observation_signature") or ""
+                ),
+            }
+        )
+        if attribute_status in {"pending", "failed", "stale"}:
+            self._bump_revision()
+            return True
         confidence = float(patch.get("confidence", 0.0) or 0.0)
         interaction_class = normalize_label(patch.get("interaction_class"))
         if confidence >= 0.5 and interaction_class in {"portal", "container", "support", "object"}:
             node.type = interaction_class
         parts = list(patch.get("interaction_parts") or [])
+        existing_groups = list(node.attributes.get("interaction_groups") or [])
+        if not existing_groups:
+            existing_groups = self._gt_interaction_groups(
+                list((node.attributes.get("observation_evidence") or {}).get("joint_infos") or [])
+            )
         node.attributes.update(
             {
                 "attribute_source": str(patch.get("source") or "mllm"),
@@ -227,35 +286,50 @@ class InteractionGraphStore:
                 "evidence_frame_ids": list(patch.get("evidence_frame_ids") or []),
                 "affordances": list(patch.get("affordances") or []),
                 "interaction_parts": parts,
-                "interaction_groups": [
-                    {
-                        "group_id": str(part.get("part_id") or f"part_{index}"),
-                        "target_joint_names": [],
-                        "close_other_joint_names": [],
-                        "close_other_joints": False,
-                        "mode": "open_close",
-                        "view_profile": "drawer_low_view"
-                        if str(part.get("type") or "") == "drawer"
-                        else "default",
-                    }
-                    for index, part in enumerate(parts)
-                ],
+                "mllm_interaction_parts": parts,
+                "interaction_groups": existing_groups,
+                "interaction_group_source": (
+                    node.attributes.get("interaction_group_source")
+                    or ("realtime_gt_joints" if existing_groups else "none")
+                ),
             }
         )
         previous_history = list(node.interaction.get("operation_history") or [])
-        node.interaction.update(
-            {
-                "is_interactable": bool(patch.get("interactable", False)),
-                "state": str(patch.get("coarse_state") or node.interaction.get("state") or "unknown"),
-                "state_source": str(patch.get("source") or "mllm_attribute_inference"),
-                "state_confidence": confidence,
-                "expected_effect": str(
-                    patch.get("expected_effect")
-                    or ("unlock_connectivity" if node.type == "portal" else "reveal_contents")
-                ),
-                "operation_history": previous_history,
-            }
+        latest_operation_stamp = max(
+            [
+                float(item.get("timestamp", 0.0) or 0.0)
+                for item in previous_history
+                if isinstance(item, dict)
+            ],
+            default=0.0,
         )
+        observation_evidence = node.attributes.get("observation_evidence") or {}
+        has_gt_joint_observation = bool(observation_evidence.get("joint_infos")) or (
+            str(observation_evidence.get("joint_type") or "none") != "none"
+            and observation_evidence.get("joint_value") is not None
+        )
+        if latest_operation_stamp <= patch_stamp and not has_gt_joint_observation:
+            node.interaction.update(
+                {
+                    "is_interactable": bool(patch.get("interactable", False)),
+                    "state": str(
+                        patch.get("coarse_state")
+                        or node.interaction.get("state")
+                        or "unknown"
+                    ),
+                    "state_source": str(patch.get("source") or "mllm_attribute_inference"),
+                    "state_confidence": confidence,
+                    "expected_effect": str(
+                        patch.get("expected_effect")
+                        or (
+                            "unlock_connectivity"
+                            if node.type == "portal"
+                            else "reveal_contents"
+                        )
+                    ),
+                    "operation_history": previous_history,
+                }
+            )
         if node.type == "portal":
             node.interaction["requires_interaction"] = node.interaction["state"] not in {
                 "open",
@@ -268,8 +342,8 @@ class InteractionGraphStore:
                 if node.interaction["state"] == "closed"
                 else None
             )
-        node.last_seen = float(stamp if stamp is not None else time.time())
-        self._rebuild_relations(now=node.last_seen)
+        node.attributes["attribute_updated_at"] = patch_stamp
+        self._rebuild_relations(now=patch_stamp)
         self._bump_revision()
         return True
 
@@ -441,6 +515,7 @@ class InteractionGraphStore:
             node.first_seen = now
         node.last_seen = now
         node.is_currently_visible = True
+        joint_infos = list(observation.get("joint_infos") or [])
         node.attributes.update(
             {
                 "instance_id": observation.get("instance_id") or node.attributes.get("instance_id") or "",
@@ -475,9 +550,12 @@ class InteractionGraphStore:
                 ),
                 "camera_name": observation.get("camera_name"),
                 "frame_index": int(observation.get("frame_index", 0)),
+                "last_observation_frame_index": int(
+                    observation.get("frame_index", 0) or 0
+                ),
                 "episode_id": observation.get("episode_id"),
                 "observation_evidence": {
-                    "joint_infos": list(observation.get("joint_infos") or []),
+                    "joint_infos": joint_infos,
                     "primary_joint_name": observation.get("primary_joint_name"),
                     "joint_type": observation.get("joint_type"),
                     "joint_range": list(observation.get("joint_range") or [0.0, 0.0]),
@@ -487,6 +565,10 @@ class InteractionGraphStore:
                 "viz_aabb_size": list(observation.get("viz_aabb_size") or observation["aabb_size"]),
             }
         )
+        gt_groups = self._gt_interaction_groups(joint_infos)
+        if gt_groups:
+            node.attributes["interaction_groups"] = gt_groups
+            node.attributes["interaction_group_source"] = "realtime_gt_joints"
         previous_history = list(node.interaction.get("operation_history") or [])
         node.interaction = default_interaction_payload(node.type, observation)
         if node.type == "portal" and bool(
@@ -523,6 +605,32 @@ class InteractionGraphStore:
                     if key in interaction_state_override:
                         node.interaction[key] = interaction_state_override[key]
         node.interaction["operation_history"] = previous_history
+
+    @staticmethod
+    def _gt_interaction_groups(joint_infos):
+        groups = []
+        for index, joint in enumerate(joint_infos or []):
+            if not isinstance(joint, dict):
+                continue
+            joint_name = str(joint.get("joint_name") or "")
+            if not joint_name:
+                continue
+            joint_type = str(joint.get("joint_type") or "unknown")
+            groups.append(
+                {
+                    "group_id": joint_name,
+                    "target_joint_names": [joint_name],
+                    "close_other_joint_names": [],
+                    "close_other_joints": False,
+                    "mode": "open_close",
+                    "view_profile": (
+                        "drawer_low_view" if joint_type == "slide" else "default"
+                    ),
+                    "joint_type": joint_type,
+                    "source": "realtime_gt_joints",
+                }
+            )
+        return groups
 
     def _refresh_room_nodes_from_grid(self):
         if not self.room_grid:

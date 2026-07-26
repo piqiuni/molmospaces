@@ -1055,7 +1055,10 @@ python scripts/InteractiveNav/collect_mllm_benchmark_samples.py \
   --output-dir <BOUND_QUESTION_DIR> \
   --bind attribute_closed_fridge=<CLOSED_FRIDGE_IMAGE> \
   --bind attribute_open_portal=<OPEN_PORTAL_IMAGE> \
-  --bind verify_fridge_opened=<CLOSED_FRIDGE_IMAGE>,<OPEN_FRIDGE_IMAGE>
+  --bind verify_fridge_opened=<OPEN_FRIDGE_IMAGE> \
+  --bbox attribute_closed_fridge=<X0,Y0,X1,Y1> \
+  --bbox attribute_open_portal=<X0,Y0,X1,Y1> \
+  --bbox verify_fridge_opened=<X0,Y0,X1,Y1>
 ```
 
 运行指定四模型评测：
@@ -1066,7 +1069,14 @@ python scripts/InteractiveNav/evaluate_mllm_question_bank.py \
   --env-file .env \
   --question-bank <BOUND_QUESTION_DIR>/question_bank_bound.json \
   --models gpt-5.3-codex-spark qwen3.6-flash qwen3.5-35b-a3b deepseek-v4-flash \
+  --timeout-s 15 \
+  --reasoning-effort low \
+  --image-detail low \
+  --crop-margin-ratio 0.10 \
+  --crop-max-side-px 512 \
   --output <OUTPUT_DIR>/model_comparison.json
 ```
 
-输出包含整体及各角色的准确率、有效响应率、平均响应耗时和有效输出 TPS，并同时生成 CSV。
+默认按角色限制输出预算：属性 `384`、Subgoal `128`、技能规划 `192`、视觉验证 `192`。
+输出包含整体及各角色的准确率、有效响应率、逐题耗时、token、reasoning token、可见输出 TPS，并同时生成 CSV。
+视觉属性和交互反馈只输入目标 `2D bbox` 裁切；交互反馈只使用交互后的单张目标图。

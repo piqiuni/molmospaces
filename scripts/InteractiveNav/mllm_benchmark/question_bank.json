@@ -57,10 +57,10 @@
       "id": "verify_fridge_opened",
       "module": "module3",
       "role": "visual_verification",
-      "instruction": "Compare before and after images and verify whether the refrigerator opened.",
-      "context": {"object_id": "fridge_1", "expected_state": "open"},
+      "instruction": "Inspect the current refrigerator crop after interaction and verify whether it is open.",
+      "context": {"object_id": "fridge_1", "previous_state": "closed", "expected_state": "open", "requested_action": "open"},
       "requires_image": true,
-      "image_count": 2,
+      "image_count": 1,
       "image_paths": [],
       "expected": {"success": true, "min_confidence": 0.5}
     }

@@ -17,6 +17,17 @@
   <arg name="semantic_source" default="detector"/>
   <arg name="semantic_attribute_inference" default="false"/>
   <arg name="semantic_attribute_model_name" default=""/>
+  <arg name="semantic_attribute_max_output_tokens" default="96"/>
+  <arg name="semantic_attribute_request_timeout_s" default="8.0"/>
+  <arg name="semantic_attribute_worker_count" default="1"/>
+  <arg name="semantic_attribute_max_queue_size" default="8"/>
+  <arg name="semantic_attribute_min_interval_s" default="5.0"/>
+  <arg name="semantic_attribute_success_refresh_interval_s" default="120.0"/>
+  <arg name="semantic_attribute_min_visible_fraction" default="0.20"/>
+  <arg name="semantic_attribute_min_visible_pixels" default="64"/>
+  <arg name="semantic_attribute_min_bbox_area_px" default="512"/>
+  <arg name="semantic_attribute_max_distance_m" default="6.0"/>
+  <arg name="semantic_attribute_required_consecutive_observations" default="2"/>
   <arg name="publish_realtime_gt" default="false"/>
   <arg name="initial_door_state" default="keep"/>
   <arg name="enable_force_interaction" default="false"/>
@@ -120,6 +131,17 @@
       <arg name="room_inference_backend" value="$(arg semantic_room_inference_backend)"/>
       <arg name="start_attribute_inference" value="$(arg semantic_attribute_inference)"/>
       <arg name="attribute_model_name" value="$(arg semantic_attribute_model_name)"/>
+      <arg name="attribute_max_output_tokens" value="$(arg semantic_attribute_max_output_tokens)"/>
+      <arg name="attribute_request_timeout_s" value="$(arg semantic_attribute_request_timeout_s)"/>
+      <arg name="attribute_worker_count" value="$(arg semantic_attribute_worker_count)"/>
+      <arg name="attribute_max_queue_size" value="$(arg semantic_attribute_max_queue_size)"/>
+      <arg name="attribute_min_interval_s" value="$(arg semantic_attribute_min_interval_s)"/>
+      <arg name="attribute_success_refresh_interval_s" value="$(arg semantic_attribute_success_refresh_interval_s)"/>
+      <arg name="attribute_min_visible_fraction" value="$(arg semantic_attribute_min_visible_fraction)"/>
+      <arg name="attribute_min_visible_pixels" value="$(arg semantic_attribute_min_visible_pixels)"/>
+      <arg name="attribute_min_bbox_area_px" value="$(arg semantic_attribute_min_bbox_area_px)"/>
+      <arg name="attribute_max_distance_m" value="$(arg semantic_attribute_max_distance_m)"/>
+      <arg name="attribute_required_consecutive_observations" value="$(arg semantic_attribute_required_consecutive_observations)"/>
     </include>
   </group>
 
@@ -130,6 +152,19 @@
       <arg name="start_object_detection" value="false"/>
       <arg name="start_room_attribute" value="false"/>
       <arg name="start_semantic_mapping" value="true"/>
+      <arg name="start_attribute_inference" value="$(arg semantic_attribute_inference)"/>
+      <arg name="attribute_model_name" value="$(arg semantic_attribute_model_name)"/>
+      <arg name="attribute_max_output_tokens" value="$(arg semantic_attribute_max_output_tokens)"/>
+      <arg name="attribute_request_timeout_s" value="$(arg semantic_attribute_request_timeout_s)"/>
+      <arg name="attribute_worker_count" value="$(arg semantic_attribute_worker_count)"/>
+      <arg name="attribute_max_queue_size" value="$(arg semantic_attribute_max_queue_size)"/>
+      <arg name="attribute_min_interval_s" value="$(arg semantic_attribute_min_interval_s)"/>
+      <arg name="attribute_success_refresh_interval_s" value="$(arg semantic_attribute_success_refresh_interval_s)"/>
+      <arg name="attribute_min_visible_fraction" value="$(arg semantic_attribute_min_visible_fraction)"/>
+      <arg name="attribute_min_visible_pixels" value="$(arg semantic_attribute_min_visible_pixels)"/>
+      <arg name="attribute_min_bbox_area_px" value="$(arg semantic_attribute_min_bbox_area_px)"/>
+      <arg name="attribute_max_distance_m" value="$(arg semantic_attribute_max_distance_m)"/>
+      <arg name="attribute_required_consecutive_observations" value="$(arg semantic_attribute_required_consecutive_observations)"/>
     </include>
   </group>
 

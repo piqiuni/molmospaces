@@ -664,6 +664,40 @@ def test_portal_state_uses_joint_delta_and_ajar_is_not_traversable():
     assert portal["interaction"]["open_fraction"] == 0.8
 
 
+def test_late_attribute_patch_does_not_override_interaction_state():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [observation(instance_id="gt_000001", semantic_name="door", is_door=True)],
+        source_mode="realtime_gt_observation",
+        stamp=1.0,
+    )
+    assert store.update_interaction_result(
+        {
+            "instance_id": "gt_000001",
+            "state": "open",
+            "source": "direct_joint_readback",
+            "event_id": "interaction_001",
+        },
+        stamp=10.0,
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "gt_000001",
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.9,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=5.0,
+    )
+    portal = next(node for node in store.as_graph_dict(stamp=11.0)["nodes"] if node["type"] == "portal")
+    assert portal["interaction"]["state"] == "open"
+    assert portal["attributes"]["attribute_status"] == "ready"
+
+
 def test_negative_joint_range_uses_zero_as_closed_endpoint():
     observation_data = {"is_movable_door": True}
     assert infer_interaction_state(
@@ -704,3 +738,78 @@ def test_initially_open_multi_joint_box_does_not_require_interaction():
     node = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "container")
     assert node["interaction"]["state"] == "open"
     assert node["interaction"]["requires_interaction"] is False
+
+
+def test_attribute_patch_preserves_gt_joint_state_and_last_seen():
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="gt_000001",
+        semantic_name="door",
+        is_door=True,
+        is_articulable=True,
+        joint_type="hinge",
+        joint_range=[0.0, 1.0],
+        joint_value=0.0,
+        frame_index=7,
+    )
+    store.update_observations([door], stamp=10.0, source_mode="realtime_gt_observation")
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "gt_000001",
+            "attribute_status": "ready",
+            "request_sequence": 3,
+            "observation_frame_index": 7,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "confidence": 0.9,
+            "interaction_parts": [{"part_id": "door", "type": "door"}],
+        },
+        stamp=20.0,
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict(stamp=21.0)["nodes"] if node["type"] == "portal"
+    )
+    assert portal["interaction"]["state"] == "closed"
+    assert portal["last_seen"] == 10.0
+    assert portal["attributes"]["attribute_updated_at"] == 20.0
+
+
+def test_superseded_attribute_frame_is_marked_stale_without_state_change():
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="gt_000001",
+        semantic_name="door",
+        is_door=True,
+        is_articulable=True,
+        joint_type="hinge",
+        joint_range=[0.0, 1.0],
+        joint_value=0.0,
+        frame_index=8,
+    )
+    store.update_observations([door], stamp=8.0, source_mode="realtime_gt_observation")
+    reopened = dict(door)
+    reopened["joint_value"] = 1.0
+    reopened["frame_index"] = 9
+    store.update_observations([reopened], stamp=9.0, source_mode="realtime_gt_observation")
+
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "gt_000001",
+            "attribute_status": "ready",
+            "request_sequence": 4,
+            "observation_frame_index": 8,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.9,
+        },
+        stamp=12.0,
+    )
+    portal = next(
+        node for node in store.as_graph_dict(stamp=12.0)["nodes"] if node["type"] == "portal"
+    )
+    assert portal["attributes"]["attribute_status"] == "stale"
+    assert portal["attributes"]["attribute_error"] == "observation_version_superseded"
+    assert portal["interaction"]["state"] == "open"

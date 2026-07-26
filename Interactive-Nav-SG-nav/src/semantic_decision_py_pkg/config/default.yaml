@@ -71,9 +71,10 @@ model:
   command: ""
   endpoint: ""
   api_key_env: "OPENAI_API_KEY"
-  model: ""
-  protocol: "openai_responses"
-  timeout_s: 20.0
+  model: "qwen3.6-35b-a3b"
+  protocol: "openai_chat"
+  timeout_s: 3.0
+  reasoning_effort: "off"
   metrics_path: ""
   max_graph_nodes: 80
   max_graph_edges: 160
