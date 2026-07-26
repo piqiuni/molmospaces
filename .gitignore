@@ -9,8 +9,12 @@ detection_models/outputs/*
 detection_models/yoloe/outputs/*
 scripts/InteractiveNav/output/
 outputs/
+output/
 scripts/InteractiveNav/dataset_definition/v1/benchmark.json
 scripts/InteractiveNav/dataset_definition/v2/benchmark.json
+*.env
+
+
 
 # ignore nfs files
 *.nfs*
