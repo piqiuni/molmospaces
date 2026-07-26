@@ -117,6 +117,20 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "joint_type": normalize_joint_type(observation.get("joint_type")),
         "joint_range": point_range(observation.get("joint_range")),
         "joint_value": float(observation["joint_value"]) if observation.get("joint_value") is not None else None,
+        "joint_infos": list(observation.get("joint_infos") or []),
+        "primary_joint_name": str(observation.get("primary_joint_name") or ""),
+        "orientation": list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
+        "interaction_approach_axis_xy": list(observation.get("interaction_approach_axis_xy") or []),
+        "source_object_name": str(observation.get("source_object_name") or ""),
+        "visible_pixels": int(observation.get("visible_pixels", 0) or 0),
+        "visible_fraction": float(observation.get("visible_fraction", 0.0) or 0.0),
+        "projected_bbox_2d": list(observation.get("projected_bbox_2d") or []),
+        "consecutive_observations": int(
+            observation.get("consecutive_observations", 0) or 0
+        ),
+        "camera_name": str(observation.get("camera_name") or ""),
+        "frame_index": int(observation.get("frame_index", 0) or 0),
+        "episode_id": str(observation.get("episode_id") or ""),
         "source": str(observation.get("source") or "detector"),
         "name": str(observation.get("name") or observation.get("object_name") or semantic_name or "object"),
         "asset_id": observation.get("asset_id"),
@@ -133,18 +147,21 @@ def point_range(values):
     return [float(vals[0]), float(vals[1])]
 
 
+def joint_closed_open_values(joint_range: list[float]) -> tuple[float, float]:
+    joint_min, joint_max = float(joint_range[0]), float(joint_range[1])
+    closed = 0.0 if joint_min <= 0.0 <= joint_max else min((joint_min, joint_max), key=abs)
+    opened = joint_min if abs(joint_min - closed) >= abs(joint_max - closed) else joint_max
+    return closed, opened
+
+
 def infer_node_type(observation: dict[str, Any]) -> str:
     label = normalize_label(observation.get("semantic_name"))
     if observation.get("is_door") or label in PORTAL_LABELS:
         return "portal"
-    if observation.get("is_receptacle"):
-        if label in SUPPORT_LABELS:
-            return "support"
-        if label in CONTAINER_LABELS:
-            return "container"
-        if observation.get("is_articulable"):
-            return "container"
+    if label in SUPPORT_LABELS:
         return "support"
+    if label in CONTAINER_LABELS:
+        return "container"
     return "object"
 
 
@@ -156,7 +173,10 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
     if node_type == "portal":
         interaction_mode = "slide" if joint_type == "slide" else "open_close"
     elif node_type == "container":
-        if observation.get("is_articulable"):
+        label = normalize_label(observation.get("semantic_name"))
+        if label in {"box", "storage_bin"}:
+            interaction_mode = "none"
+        elif observation.get("is_articulable"):
             interaction_mode = "slide" if joint_type == "slide" else "open_close"
         else:
             interaction_mode = "place_in"
@@ -166,16 +186,29 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
         interaction_mode = "pickup"
     state = infer_interaction_state(node_type, joint_type, joint_range, joint_value, observation)
     is_interactable = interaction_mode != "none"
+    if node_type == "portal":
+        requires_interaction = bool(is_interactable and state not in {"open", "static_open"})
+        traversable = state in {"open", "static_open"}
+    else:
+        requires_interaction = bool(is_interactable and state in {"closed", "unknown"})
+        traversable = True if state in {"open", "ajar", "static_open"} else False if state == "closed" else None
     return {
         "is_interactable": is_interactable,
         "interaction_mode": interaction_mode,
-        "joint_type": joint_type,
-        "joint_range": joint_range,
-        "joint_value": joint_value,
         "state": state,
         "cost": 1.0,
         "confidence": float(observation.get("confidence", 0.0) or 0.0),
         "state_source": str(observation.get("source") or "detector_rule"),
+        "state_confidence": float(observation.get("confidence", 0.0) or 0.0),
+        "interaction_cost": 1.0,
+        "requires_interaction": requires_interaction,
+        "traversable": traversable,
+        "expected_effect": "unlock_connectivity" if node_type == "portal" else "reveal_contents" if node_type == "container" else "none",
+        "operation_history": [],
+        "completed_interaction_groups": [],
+        "failed_interaction_groups": [],
+        "joint_interaction_states": {},
+        "all_joints_opened_once": False,
     }
 
 
@@ -184,17 +217,17 @@ def infer_interaction_state(node_type: str, joint_type: str, joint_range: list[f
         if node_type == "portal" and not observation.get("is_movable_door", True):
             return "static_open"
         return "unknown"
-    joint_min, joint_max = float(joint_range[0]), float(joint_range[1])
-    span = abs(joint_max - joint_min)
+    closed_value, open_value = joint_closed_open_values(joint_range)
+    span = abs(open_value - closed_value)
     if span <= 1e-6:
         return "unknown"
     value = float(joint_value)
-    lower_dist = abs(value - joint_min)
-    upper_dist = abs(value - joint_max)
+    closed_dist = abs(value - closed_value)
+    open_dist = abs(value - open_value)
     tolerance = max(0.05 * span, 0.02)
-    if lower_dist <= tolerance:
+    if closed_dist <= tolerance:
         return "closed"
-    if upper_dist <= tolerance:
+    if open_dist <= tolerance:
         return "open"
     return "ajar"
 

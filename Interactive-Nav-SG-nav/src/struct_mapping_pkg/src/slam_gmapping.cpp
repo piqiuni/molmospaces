@@ -288,6 +288,25 @@ void SlamGMapping::init()
     filter_height_tolerance_ = 0.5;  // 默认保留±0.5米范围
   if(!private_nh_.getParam("filter_height_frame", filter_height_frame_))
     filter_height_frame_ = base_frame_;
+  private_nh_.param("pointcloud_scan_range_max", pointcloud_scan_range_max_, 8.0);
+  private_nh_.param("pointcloud_scan_angle_increment_deg", pointcloud_scan_angle_increment_deg_, 1.0);
+  private_nh_.param("pointcloud_scan_height_min", pointcloud_scan_height_min_, 0.05);
+  private_nh_.param("pointcloud_scan_height_max", pointcloud_scan_height_max_, 1.10);
+  private_nh_.param("pointcloud_scan_min_points_per_beam", pointcloud_scan_min_points_per_beam_, 3);
+  private_nh_.param("pointcloud_scan_support_bins", pointcloud_scan_support_bins_, 2);
+  private_nh_.param("pointcloud_scan_min_support_neighbors", pointcloud_scan_min_support_neighbors_, 1);
+  private_nh_.param("pointcloud_scan_support_range_tolerance", pointcloud_scan_support_range_tolerance_, 0.40);
+  private_nh_.param("pointcloud_scan_neighbor_bins", pointcloud_scan_neighbor_bins_, 1);
+  private_nh_.param("pointcloud_scan_max_range_jump", pointcloud_scan_max_range_jump_, 0.75);
+  pointcloud_scan_range_max_ = std::max(1.0, pointcloud_scan_range_max_);
+  pointcloud_scan_angle_increment_deg_ = std::max(0.1, pointcloud_scan_angle_increment_deg_);
+  pointcloud_scan_height_max_ = std::max(pointcloud_scan_height_min_, pointcloud_scan_height_max_);
+  pointcloud_scan_min_points_per_beam_ = std::max(1, pointcloud_scan_min_points_per_beam_);
+  pointcloud_scan_support_bins_ = std::max(0, pointcloud_scan_support_bins_);
+  pointcloud_scan_min_support_neighbors_ = std::max(0, pointcloud_scan_min_support_neighbors_);
+  pointcloud_scan_support_range_tolerance_ = std::max(0.0, pointcloud_scan_support_range_tolerance_);
+  pointcloud_scan_neighbor_bins_ = std::max(0, pointcloud_scan_neighbor_bins_);
+  pointcloud_scan_max_range_jump_ = std::max(0.0, pointcloud_scan_max_range_jump_);
   
   // 障碍物膨胀参数
   if(!private_nh_.getParam("enable_obstacle_inflation", enable_obstacle_inflation_))
@@ -1149,19 +1168,22 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
   scan.header = cloud->header;
   scan.header.frame_id = cloud->header.frame_id;
   
-  // Set scan parameters (these should be configurable)
+  // Project the RGB-D cloud conservatively into a planar scan. A bounded range
+  // and angular edge guard prevent sparse far returns from clearing through a
+  // thin wall or furniture edge.
   scan.angle_min = -M_PI;
   scan.angle_max = M_PI;
-  scan.angle_increment = M_PI / 180.0; // 1 degree resolution
+  scan.angle_increment = pointcloud_scan_angle_increment_deg_ * M_PI / 180.0;
   scan.time_increment = 0.0;
   scan.scan_time = 0.1; // 10 Hz
   scan.range_min = 0.1;
-  scan.range_max = 30.0;
+  scan.range_max = pointcloud_scan_range_max_;
   
   // Calculate number of beams
   int num_beams = (scan.angle_max - scan.angle_min) / scan.angle_increment + 1;
   scan.ranges.resize(num_beams);
   scan.intensities.resize(num_beams);
+  std::vector<unsigned int> beam_point_counts(num_beams, 0);
   
   // Initialize all ranges to max range (unknown)
   std::fill(scan.ranges.begin(), scan.ranges.end(), scan.range_max);
@@ -1176,6 +1198,11 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
   {
     // Skip invalid points
     if (std::isnan(*iter_x) || std::isnan(*iter_y) || std::isnan(*iter_z))
+      continue;
+
+    // OCC represents base traversability. Do not let a return seen through a
+    // high window opening clear the wall footprint in the planar map.
+    if (*iter_z < pointcloud_scan_height_min_ || *iter_z > pointcloud_scan_height_max_)
       continue;
       
     // Calculate range and angle
@@ -1192,13 +1219,80 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     // Clamp beam index to valid range
     if (beam_index < 0) beam_index = 0;
     if (beam_index >= num_beams) beam_index = num_beams - 1;
+
+    ++beam_point_counts[beam_index];
     
     // Update range if this is closer
     if (range < scan.ranges[beam_index])
     {
       scan.ranges[beam_index] = range;
-      scan.intensities[beam_index] = 1.0; // Simple intensity
     }
+  }
+
+  std::vector<float> raw_ranges = scan.ranges;
+  std::vector<uint8_t> observed(num_beams, 0);
+  for (int i = 0; i < num_beams; ++i)
+  {
+    if (beam_point_counts[i] >= static_cast<unsigned int>(pointcloud_scan_min_points_per_beam_) &&
+        std::isfinite(raw_ranges[i]) && raw_ranges[i] < scan.range_max)
+    {
+      observed[i] = 1;
+    }
+    else
+    {
+      scan.ranges[i] = scan.range_max;
+    }
+  }
+
+  // Reject isolated angular returns. Real surfaces occupy neighboring bearings,
+  // while depth-edge leakage typically appears as a sparse far beam between
+  // nearer wall returns.
+  if (pointcloud_scan_min_support_neighbors_ > 0)
+  {
+    const std::vector<uint8_t> initially_observed = observed;
+    for (int i = 0; i < num_beams; ++i)
+    {
+      if (!initially_observed[i])
+        continue;
+      int support_count = 0;
+      for (int offset = -pointcloud_scan_support_bins_; offset <= pointcloud_scan_support_bins_; ++offset)
+      {
+        if (offset == 0)
+          continue;
+        const int neighbor = i + offset;
+        if (neighbor < 0 || neighbor >= num_beams || !initially_observed[neighbor])
+          continue;
+        if (std::abs(raw_ranges[neighbor] - raw_ranges[i]) <= pointcloud_scan_support_range_tolerance_)
+          ++support_count;
+      }
+      if (support_count < pointcloud_scan_min_support_neighbors_)
+      {
+        observed[i] = 0;
+        scan.ranges[i] = scan.range_max;
+      }
+    }
+  }
+
+  // At depth discontinuities, a background return can occupy the adjacent
+  // angular bin even though the nearer wall edge should occlude it. Clamp only
+  // large jumps to a supported near neighbor; normal smooth surfaces and real
+  // openings wider than the guard remain unchanged.
+  for (int i = 0; i < num_beams; ++i)
+  {
+    if (!observed[i])
+      continue;
+
+    float conservative_range = raw_ranges[i];
+    for (int offset = -pointcloud_scan_neighbor_bins_; offset <= pointcloud_scan_neighbor_bins_; ++offset)
+    {
+      const int neighbor = i + offset;
+      if (neighbor < 0 || neighbor >= num_beams || !observed[neighbor])
+        continue;
+      if (raw_ranges[neighbor] + pointcloud_scan_max_range_jump_ < conservative_range)
+        conservative_range = raw_ranges[neighbor];
+    }
+    scan.ranges[i] = conservative_range;
+    scan.intensities[i] = 1.0;
   }
   
   return true;

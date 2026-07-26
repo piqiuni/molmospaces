@@ -187,6 +187,18 @@ class SlamGMapping
     double filter_height_center_;
     double filter_height_tolerance_;
     std::string filter_height_frame_;
+
+    // Conservative PointCloud2 -> planar scan projection parameters.
+    double pointcloud_scan_range_max_;
+    double pointcloud_scan_angle_increment_deg_;
+    double pointcloud_scan_height_min_;
+    double pointcloud_scan_height_max_;
+    int pointcloud_scan_min_points_per_beam_;
+    int pointcloud_scan_support_bins_;
+    int pointcloud_scan_min_support_neighbors_;
+    double pointcloud_scan_support_range_tolerance_;
+    int pointcloud_scan_neighbor_bins_;
+    double pointcloud_scan_max_range_jump_;
     
     // 障碍物膨胀参数
     bool enable_obstacle_inflation_;

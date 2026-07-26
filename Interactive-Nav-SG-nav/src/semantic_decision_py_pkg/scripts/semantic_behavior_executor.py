@@ -1,0 +1,1176 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import math
+import threading
+import time
+
+from semantic_decision_py_pkg.behavior_execution import (
+    BehaviorExecutionStateMachine,
+    ExecutionConfig,
+    NavigationProgressWatchdog,
+    STATE_APPROACH_INTERACTION,
+    STATE_IDLE,
+    STATE_NAVIGATING,
+    STATE_PREPARING_EXPLORE,
+    STATE_VERIFYING,
+    committed_turn_sign,
+    navigation_goal_options,
+    normalize_angle,
+    path_lookahead_point,
+    is_stuck_recovery_failure,
+    safe_grid_motion_distance,
+)
+from semantic_decision_py_pkg.behavior_candidates import interaction_group_reached
+from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
+
+patch_roslogging_findcaller_for_py311()
+
+import actionlib
+import rospy
+import tf
+from actionlib_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped, Twist
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from nav_msgs.msg import OccupancyGrid
+from nav_msgs.srv import GetPlan
+from std_msgs.msg import String
+
+
+TERMINAL_STATES = {
+    GoalStatus.PREEMPTED,
+    GoalStatus.SUCCEEDED,
+    GoalStatus.ABORTED,
+    GoalStatus.REJECTED,
+    GoalStatus.RECALLED,
+    GoalStatus.LOST,
+}
+
+
+class SemanticBehaviorExecutor:
+    def __init__(self) -> None:
+        rospy.init_node("semantic_behavior_executor")
+        topics = rospy.get_param("~topics", {}) or {}
+        config = rospy.get_param("~executor", {}) or {}
+        self.machine = BehaviorExecutionStateMachine(
+            ExecutionConfig(
+                navigation_timeout_s=float(config.get("navigation_timeout_s", 180.0)),
+                interaction_navigation_timeout_s=float(
+                    config.get("interaction_navigation_timeout_s", 60.0)
+                ),
+                interaction_timeout_s=float(config.get("interaction_timeout_s", 30.0)),
+                verification_timeout_s=float(config.get("verification_timeout_s", 30.0)),
+                explore_prepare_timeout_s=float(
+                    config.get("explore_prepare_timeout_s", 10.0)
+                ),
+                explore_finalize_timeout_s=float(
+                    config.get("explore_finalize_timeout_s", 10.0)
+                ),
+            )
+        )
+        self.map_frame = str(config.get("map_frame", "tf_frame_map"))
+        self.base_frame = str(config.get("base_frame", "tf_frame_base_link"))
+        self.rear_goal_prerotate_enabled = bool(
+            config.get("rear_goal_prerotate_enabled", True)
+        )
+        self.rear_goal_enter_angle_rad = float(
+            config.get("rear_goal_enter_angle_rad", 1.75)
+        )
+        self.rear_goal_exit_angle_rad = float(
+            config.get("rear_goal_exit_angle_rad", 0.34)
+        )
+        self.rear_goal_rotate_speed_rad_s = float(
+            config.get("rear_goal_rotate_speed_rad_s", 1.25)
+        )
+        self.rear_goal_prerotate_timeout_s = float(
+            config.get("rear_goal_prerotate_timeout_s", 12.0)
+        )
+        self.rear_goal_lookahead_m = float(
+            config.get("rear_goal_lookahead_m", 0.75)
+        )
+        self.rear_goal_pi_tie_tolerance_rad = float(
+            config.get("rear_goal_pi_tie_tolerance_rad", 0.20)
+        )
+        self.rear_goal_pi_turn_sign = int(
+            config.get("rear_goal_pi_turn_sign", -1)
+        )
+        self.final_align_enabled = bool(config.get("final_align_enabled", True))
+        self.final_align_max_distance_m = float(
+            config.get("final_align_max_distance_m", config.get("interaction_final_align_max_distance_m", 0.12))
+        )
+        self.final_align_yaw_tolerance_rad = float(
+            config.get("final_align_yaw_tolerance_rad", config.get("interaction_final_align_yaw_tolerance_rad", 0.15))
+        )
+        self.final_align_rotate_speed_rad_s = float(
+            config.get("final_align_rotate_speed_rad_s", config.get("interaction_final_align_rotate_speed_rad_s", 0.30))
+        )
+        self.final_align_trigger_delay_s = float(
+            config.get("final_align_trigger_delay_s", config.get("interaction_final_align_trigger_delay_s", 2.0))
+        )
+        self.final_align_timeout_s = float(
+            config.get("final_align_timeout_s", config.get("interaction_final_align_timeout_s", 15.0))
+        )
+        self.make_plan_preflight_enabled = bool(
+            config.get("make_plan_preflight_enabled", True)
+        )
+        self.make_plan_service = str(
+            config.get("make_plan_service", "/move_base/make_plan")
+        )
+        self.make_plan_service_wait_sec = float(
+            config.get("make_plan_service_wait_sec", 2.0)
+        )
+        self.make_plan_tolerance_m = float(
+            config.get("make_plan_tolerance_m", 0.20)
+        )
+        self.make_plan_endpoint_tolerance_m = float(
+            config.get("make_plan_endpoint_tolerance_m", 0.60)
+        )
+        self.make_plan_fail_open = bool(config.get("make_plan_fail_open", True))
+        self.explore_reservation_retry_sec = float(
+            config.get("explore_reservation_retry_sec", 0.25)
+        )
+        self.final_align_cancel_wait_s = float(
+            config.get("final_align_cancel_wait_s", 1.0)
+        )
+        self.stuck_recovery_enabled = bool(config.get("stuck_recovery_enabled", True))
+        self.stuck_recovery_subgoal_failures = max(
+            1, int(config.get("stuck_recovery_subgoal_failures", 3))
+        )
+        self.stuck_recovery_min_displacement_m = float(
+            config.get("stuck_recovery_min_displacement_m", 0.10)
+        )
+        self.stuck_recovery_backoff_distance_m = float(
+            config.get("stuck_recovery_backoff_distance_m", 0.20)
+        )
+        self.stuck_recovery_speed_mps = float(
+            config.get("stuck_recovery_speed_mps", 0.12)
+        )
+        self.stuck_recovery_timeout_s = float(
+            config.get("stuck_recovery_timeout_s", 8.0)
+        )
+        self.stuck_recovery_obstacle_escape_distance_m = float(
+            config.get("stuck_recovery_obstacle_escape_distance_m", 0.35)
+        )
+        self.stuck_recovery_robot_radius_m = float(
+            config.get("stuck_recovery_robot_radius_m", 0.30)
+        )
+        self.stuck_recovery_safety_margin_m = float(
+            config.get("stuck_recovery_safety_margin_m", 0.05)
+        )
+        self.stuck_recovery_unknown_is_blocked = bool(
+            config.get("stuck_recovery_unknown_is_blocked", True)
+        )
+        self.navigation_stagnation_timeout_s = float(
+            config.get("navigation_stagnation_timeout_s", 12.0)
+        )
+        self.navigation_stagnation_distance_m = float(
+            config.get("navigation_stagnation_distance_m", 0.10)
+        )
+        self.lock = threading.RLock()
+        self.selection: dict | None = None
+        self.latest_graph: dict = {}
+        self._last_explore_reservation_publish_at = 0.0
+        self._explore_reservation_publish_count = 0
+        self._explore_feedback_received_count = 0
+        self._explore_feedback_matched_count = 0
+        self._explore_feedback_ignored_count = 0
+        self._last_explore_feedback = {}
+        self._stuck_failure_origin_xy: tuple[float, float] | None = None
+        self._stuck_failure_candidate_ids: set[str] = set()
+        self._latest_occupancy: OccupancyGrid | None = None
+        self.feedback_pub = rospy.Publisher(
+            topics.get("behavior_feedback", "/semantic_decision/behavior_feedback"),
+            String,
+            queue_size=10,
+            latch=True,
+        )
+        self.state_pub = rospy.Publisher(
+            topics.get("execution_state", "/semantic_decision/execution_state"),
+            String,
+            queue_size=1,
+            latch=True,
+        )
+        self.explore_command_pub = rospy.Publisher(
+            topics.get("explore_command", "/explore_py/command"),
+            String,
+            queue_size=4,
+            latch=True,
+        )
+        self.interaction_command_pub = rospy.Publisher(
+            topics.get("interaction_command", "/semantic_decision/interaction_command"),
+            String,
+            queue_size=4,
+            latch=True,
+        )
+        self.cmd_vel_pub = rospy.Publisher(
+            topics.get("cmd_vel", "/cmd_vel"), Twist, queue_size=2
+        )
+        self.tf_listener = tf.TransformListener()
+        self.move_base = actionlib.SimpleActionClient(
+            topics.get("move_base", "/move_base"), MoveBaseAction
+        )
+        self.make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
+        rospy.Subscriber(
+            topics.get("selected_behavior", "/semantic_decision/selected_behavior"),
+            String,
+            self._selection_callback,
+            queue_size=4,
+        )
+        rospy.Subscriber(
+            topics.get("explore_feedback", "/explore_py/behavior_feedback"),
+            String,
+            self._explore_feedback_callback,
+            queue_size=10,
+        )
+        rospy.Subscriber(
+            topics.get("interaction_result", "/semantic_mapping/interaction_result"),
+            String,
+            self._interaction_result_callback,
+            queue_size=10,
+        )
+        rospy.Subscriber(
+            topics.get("unified_graph", "/semantic_mapping/unified_graph"),
+            String,
+            self._graph_callback,
+            queue_size=2,
+        )
+        rospy.Subscriber(
+            topics.get("occupancy", "/move_base/local_costmap/costmap"),
+            OccupancyGrid,
+            self._occupancy_callback,
+            queue_size=1,
+        )
+        self.timer = rospy.Timer(rospy.Duration(0.2), self._tick)
+
+    def _selection_callback(self, message: String) -> None:
+        try:
+            selection = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        with self.lock:
+            if self.machine.state != STATE_IDLE or self.selection is not None:
+                self._publish_feedback(selection, "REJECTED", False, {"reason": "executor_busy"})
+                return
+            self.selection = selection
+            commands = self.machine.start(selection)
+            self._last_explore_reservation_publish_at = 0.0
+            self._explore_reservation_publish_count = 0
+            self._publish_feedback(selection, "STARTED", None, {})
+        self._dispatch(commands)
+
+    def _explore_feedback_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        commands = []
+        with self.lock:
+            self._explore_feedback_received_count += 1
+            self._last_explore_feedback = dict(payload)
+            if not self._matches_active(payload):
+                self._explore_feedback_ignored_count += 1
+                rospy.logwarn("[semantic_behavior_executor] ignored explore feedback: active=%s command=%s candidate=%s", self._command_id(self.selection) if self.selection else "", payload.get("command_id", ""), payload.get("candidate_id", ""))
+                return
+            self._explore_feedback_matched_count += 1
+            status = str(payload.get("status") or "")
+            rospy.loginfo("[semantic_behavior_executor] matched explore feedback: command=%s status=%s", payload.get("command_id", ""), status)
+            if status == "READY":
+                self._last_explore_reservation_publish_at = 0.0
+                commands = self.machine.on_explore_ready(
+                    detail=payload.get("detail") or {}
+                )
+            elif status in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
+                commands = self.machine.on_explore_result(
+                    status == "SUCCEEDED", detail=payload
+                )
+            else:
+                return
+        self._dispatch(commands)
+
+    def _interaction_result_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        with self.lock:
+            if not self._matches_active(payload):
+                return
+            commands = self.machine.on_interaction_result(
+                bool(payload.get("success")), detail=payload
+            )
+            if self.machine.state == STATE_VERIFYING:
+                commands.extend(self._verify_graph_locked())
+        self._dispatch(commands)
+
+    def _graph_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        with self.lock:
+            self.latest_graph = payload
+            commands = self._verify_graph_locked()
+        self._dispatch(commands)
+
+    def _occupancy_callback(self, message: OccupancyGrid) -> None:
+        with self.lock:
+            self._latest_occupancy = message
+
+    def _verify_graph_locked(self) -> list[dict]:
+        if self.machine.state != STATE_VERIFYING or self.selection is None:
+            return []
+        target_id = str(self.selection.get("target_id") or "")
+        target_name = str(self.selection.get("target_name") or "")
+        for node in self.latest_graph.get("nodes") or []:
+            attributes = node.get("attributes") or {}
+            if str(node.get("id") or "") != target_id and str(
+                attributes.get("source_object_name") or node.get("name") or ""
+            ) != target_name:
+                continue
+            metadata = self.selection.get("metadata") or {}
+            if (
+                str(self.selection.get("behavior_type") or "") == "NAVIGATE"
+                and bool(metadata.get("target_goal"))
+            ):
+                visible_pixels = int(attributes.get("visible_pixels", 0) or 0)
+                min_visible_pixels = int(
+                    metadata.get("target_min_visible_pixels", 1) or 1
+                )
+                target_visible = bool(node.get("is_currently_visible")) and (
+                    visible_pixels >= min_visible_pixels
+                )
+                visible_fraction = float(
+                    attributes.get("visible_fraction", 1.0) or 0.0
+                )
+                consecutive_observations = int(
+                    attributes.get("consecutive_observations", 2) or 0
+                )
+                target_visible = target_visible and (
+                    visible_fraction >= float(
+                        metadata.get("target_min_visible_fraction", 0.2) or 0.2
+                    )
+                    and consecutive_observations >= int(
+                        metadata.get("target_min_consecutive_observations", 2) or 2
+                    )
+                )
+                return self.machine.on_target_visibility(
+                    target_visible,
+                    detail={
+                        "node_id": node.get("id"),
+                        "target_visible": target_visible,
+                        "visible_pixels": visible_pixels,
+                        "visible_fraction": visible_fraction,
+                        "consecutive_observations": consecutive_observations,
+                        "min_visible_pixels": min_visible_pixels,
+                        "graph_revision": self.latest_graph.get(
+                            "graph_revision", 0
+                        ),
+                    },
+                )
+            interaction = node.get("interaction") or {}
+            interaction_command = self.selection.get("interaction_command") or {}
+            if str(interaction_command.get("sequence_type") or "") == "drawer_scan":
+                required_groups = {
+                    str(group.get("group_id") or "")
+                    for group in interaction_command.get("interaction_groups") or []
+                }
+                completed_groups = {
+                    str(group_id)
+                    for group_id in interaction.get("completed_interaction_groups") or []
+                }
+                sequence_complete = bool(required_groups) and required_groups.issubset(
+                    completed_groups
+                )
+                return self.machine.on_graph_state(
+                    "completed" if sequence_complete else "unknown",
+                    detail={
+                        "node_id": node.get("id"),
+                        "state": interaction.get("state"),
+                        "sequence_type": "drawer_scan",
+                        "required_groups": sorted(required_groups),
+                        "completed_groups": sorted(completed_groups),
+                        "sequence_complete": sequence_complete,
+                        "graph_revision": self.latest_graph.get(
+                            "graph_revision", 0
+                        ),
+                    },
+                )
+            target_joint_names = list(interaction_command.get("joint_names") or [])
+            if target_joint_names:
+                group_reached = interaction_group_reached(
+                    list(attributes.get("joint_infos") or []),
+                    target_joint_names,
+                    list(interaction_command.get("close_other_joint_names") or []),
+                    float(
+                        interaction_command.get("open_fraction_threshold", 0.67)
+                        or 0.67
+                    ),
+                )
+                if group_reached is None:
+                    return []
+                return self.machine.on_graph_state(
+                    "open" if group_reached else "unknown",
+                    detail={
+                        "node_id": node.get("id"),
+                        "state": interaction.get("state"),
+                        "interaction_group_id": interaction_command.get(
+                            "interaction_group_id", "all_joints"
+                        ),
+                        "joint_names": target_joint_names,
+                        "group_reached": group_reached,
+                        "graph_revision": self.latest_graph.get(
+                            "graph_revision", 0
+                        ),
+                    },
+                )
+            return self.machine.on_graph_state(
+                str(interaction.get("state") or "unknown"),
+                detail={
+                    "node_id": node.get("id"),
+                    "state": interaction.get("state"),
+                    "graph_revision": self.latest_graph.get("graph_revision", 0),
+                },
+            )
+        return []
+
+    def _tick(self, _event) -> None:
+        reservation_retry = None
+        with self.lock:
+            reason = self.machine.timeout_reason()
+            cancel_navigation = bool(reason) and self.machine.state in {
+                STATE_NAVIGATING,
+                STATE_APPROACH_INTERACTION,
+            }
+            commands = self.machine.fail_timeout(reason) if reason else []
+            if (
+                not reason
+                and self.machine.state == STATE_PREPARING_EXPLORE
+                and self.selection is not None
+                and self.explore_reservation_retry_sec > 0.0
+            ):
+                now = time.monotonic()
+                if now - self._last_explore_reservation_publish_at >= self.explore_reservation_retry_sec:
+                    reservation_retry = dict(self.selection)
+            state_payload = {
+                **self.machine.summary(),
+                "decision_id": "" if self.selection is None else self.selection.get("decision_id", ""),
+                "explore_reservation_publish_count": self._explore_reservation_publish_count,
+                "explore_reservation_waiting_for_ack": self.machine.state
+                == STATE_PREPARING_EXPLORE,
+                "explore_feedback_received_count": self._explore_feedback_received_count,
+                "explore_feedback_matched_count": self._explore_feedback_matched_count,
+                "explore_feedback_ignored_count": self._explore_feedback_ignored_count,
+                "last_explore_feedback": dict(self._last_explore_feedback),
+                "timestamp": time.time(),
+            }
+        self.state_pub.publish(
+            String(data=json.dumps(state_payload, ensure_ascii=False, separators=(",", ":")))
+        )
+        if cancel_navigation:
+            self.move_base.cancel_goal()
+        self._dispatch(commands)
+        if reservation_retry is not None:
+            self._publish_explore_command(reservation_retry, action="reserve_frontier")
+
+    def _dispatch(self, commands: list[dict]) -> None:
+        for command in commands:
+            kind = command.get("kind")
+            if kind == "reserve_frontier":
+                self._publish_explore_command(
+                    command["candidate"], action="reserve_frontier"
+                )
+            elif kind == "finalize_frontier":
+                self._publish_explore_command(
+                    command["candidate"],
+                    action="finalize_frontier",
+                    success=bool(command.get("success")),
+                    detail=command.get("detail") or {},
+                )
+            elif kind == "navigate":
+                candidate = dict(command["candidate"])
+                decision_id = str(candidate.get("decision_id") or "")
+                threading.Thread(
+                    target=self._run_navigation,
+                    args=(decision_id, candidate),
+                    daemon=True,
+                ).start()
+            elif kind == "interact":
+                self._publish_interaction_command(command["candidate"])
+            elif kind == "terminal":
+                self._finish_terminal(command)
+
+    def _publish_explore_command(
+        self,
+        candidate: dict,
+        action: str,
+        success: bool | None = None,
+        detail: dict | None = None,
+    ) -> None:
+        if action == "reserve_frontier":
+            self._last_explore_reservation_publish_at = time.monotonic()
+            self._explore_reservation_publish_count += 1
+        payload = {
+            "command_id": self._command_id(candidate),
+            "decision_id": candidate.get("decision_id", ""),
+            "candidate_id": candidate.get("candidate_id", ""),
+            "action": action,
+            "cluster_id": (candidate.get("metadata") or {}).get(
+                "cluster_id", candidate.get("target_id", "")
+            ),
+        }
+        if success is not None:
+            payload["success"] = bool(success)
+        if detail:
+            payload["detail"] = dict(detail)
+        self.explore_command_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        )
+
+    def _publish_interaction_command(self, candidate: dict) -> None:
+        interaction = candidate.get("interaction_command") or {}
+        payload = {
+            "command_id": self._command_id(candidate),
+            "decision_id": candidate.get("decision_id", ""),
+            "candidate_id": candidate.get("candidate_id", ""),
+            "event_id": f"{candidate.get('decision_id', 'decision')}_interaction",
+            "node_id": interaction.get("node_id", candidate.get("target_id", "")),
+            "source_object_name": interaction.get(
+                "source_object_name", candidate.get("target_name", "")
+            ),
+            "action": interaction.get("action", "open"),
+            "interaction_mode": interaction.get("interaction_mode", "open_close"),
+            "interaction_group_id": interaction.get("interaction_group_id", "all"),
+            "sequence_type": interaction.get("sequence_type", ""),
+            "interaction_groups": list(interaction.get("interaction_groups") or []),
+            "joint_names": list(interaction.get("joint_names") or []),
+            "close_other_joint_names": list(
+                interaction.get("close_other_joint_names") or []
+            ),
+            "close_other_joints": bool(
+                interaction.get("close_other_joints", False)
+            ),
+            "view_profile": interaction.get("view_profile", "default"),
+            "view_tilt_rad": float(
+                interaction.get(
+                    "view_tilt_rad",
+                    0.30 if interaction.get("view_profile") == "drawer_low_view" else 0.55,
+                )
+                or (0.30 if interaction.get("view_profile") == "drawer_low_view" else 0.55)
+            ),
+            "view_torso_pitch_rad": interaction.get("view_torso_pitch_rad"),
+            "view_hold_task_steps": int(
+                interaction.get("view_hold_task_steps", 0) or 0
+            ),
+            "post_interaction_hold_task_steps": int(
+                interaction.get("post_interaction_hold_task_steps", 0) or 0
+            ),
+            "restore_view_after": bool(
+                interaction.get("restore_view_after", False)
+            ),
+            "open_fraction_threshold": float(
+                interaction.get("open_fraction_threshold", 0.67) or 0.67
+            ),
+        }
+        self.interaction_command_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        )
+
+    def _current_pose(self, frame_id: str) -> tuple[float, float, float] | None:
+        try:
+            translation, rotation = self.tf_listener.lookupTransform(
+                frame_id,
+                self.base_frame,
+                rospy.Time(0),
+            )
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            return None
+        yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+        return float(translation[0]), float(translation[1]), float(yaw)
+
+    def _publish_rotation(self, angular_z: float) -> None:
+        command = Twist()
+        command.angular.z = float(angular_z)
+        self.cmd_vel_pub.publish(command)
+
+    def _rotate_to_yaw(
+        self,
+        decision_id: str,
+        frame_id: str,
+        target_yaw: float,
+        tolerance_rad: float,
+        speed_rad_s: float,
+        timeout_s: float,
+        turn_sign: int | None = None,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        committed_sign = turn_sign
+        try:
+            while (
+                not rospy.is_shutdown()
+                and self._navigation_is_current(decision_id)
+                and time.monotonic() < deadline
+            ):
+                pose = self._current_pose(frame_id)
+                if pose is None:
+                    time.sleep(0.05)
+                    continue
+                error = normalize_angle(float(target_yaw) - pose[2])
+                if abs(error) <= max(0.0, float(tolerance_rad)):
+                    return True
+                if committed_sign is None:
+                    committed_sign = committed_turn_sign(
+                        error,
+                        self.rear_goal_pi_tie_tolerance_rad,
+                        self.rear_goal_pi_turn_sign,
+                    )
+                self._publish_rotation(
+                    float(committed_sign) * abs(float(speed_rad_s))
+                )
+                time.sleep(0.05)
+        finally:
+            self._publish_rotation(0.0)
+        return False
+
+    def _prerotate_for_rear_goal(
+        self,
+        decision_id: str,
+        frame_id: str,
+        goal_x: float,
+        goal_y: float,
+        heading_target_xy: tuple[float, float] | None = None,
+    ) -> bool:
+        if not self.rear_goal_prerotate_enabled:
+            return True
+        pose = self._current_pose(frame_id)
+        if pose is None:
+            return True
+        heading_x, heading_y = heading_target_xy or (goal_x, goal_y)
+        target_yaw = math.atan2(heading_y - pose[1], heading_x - pose[0])
+        error = normalize_angle(target_yaw - pose[2])
+        if abs(error) < self.rear_goal_enter_angle_rad:
+            return True
+        turn_sign = committed_turn_sign(
+            error,
+            self.rear_goal_pi_tie_tolerance_rad,
+            self.rear_goal_pi_turn_sign,
+        )
+        return self._rotate_to_yaw(
+            decision_id,
+            frame_id,
+            target_yaw,
+            self.rear_goal_exit_angle_rad,
+            self.rear_goal_rotate_speed_rad_s,
+            self.rear_goal_prerotate_timeout_s,
+            turn_sign=turn_sign,
+        )
+
+    def _final_align_goal(
+        self,
+        decision_id: str,
+        frame_id: str,
+        goal_x: float,
+        goal_y: float,
+        goal_yaw: float,
+    ) -> bool | None:
+        if not self.final_align_enabled:
+            return None
+        pose = self._current_pose(frame_id)
+        if pose is None:
+            return None
+        distance = math.hypot(goal_x - pose[0], goal_y - pose[1])
+        if distance > self.final_align_max_distance_m:
+            return None
+        if abs(normalize_angle(goal_yaw - pose[2])) <= self.final_align_yaw_tolerance_rad:
+            return True
+        self.move_base.cancel_goal()
+        self.move_base.wait_for_result(
+            rospy.Duration(max(0.0, self.final_align_cancel_wait_s))
+        )
+        return self._rotate_to_yaw(
+            decision_id,
+            frame_id,
+            goal_yaw,
+            self.final_align_yaw_tolerance_rad,
+            self.final_align_rotate_speed_rad_s,
+            self.final_align_timeout_s,
+        )
+
+    def _run_navigation(self, decision_id: str, candidate: dict) -> None:
+        ready = self.move_base.wait_for_server(rospy.Duration(30.0))
+        if not ready:
+            self._handle_navigation_result(decision_id, False, {"reason": "move_base_unavailable"})
+            return
+        if not self._navigation_is_current(decision_id):
+            return
+        primary_goal_values = list(candidate.get("goal_xyyaw") or [])
+        goal_options = navigation_goal_options(candidate)
+        if not goal_options:
+            self._handle_navigation_result(decision_id, False, {"reason": "missing_goal"})
+            return
+        goal = MoveBaseGoal()
+        goal.target_pose.header.frame_id = str(
+            (candidate.get("metadata") or {}).get("frame_id") or self.map_frame
+        )
+        goal_frame = goal.target_pose.header.frame_id
+        selected_goal = None
+        path_lookahead = None
+        attempted_goals = []
+        for option_index, (option_x, option_y, option_yaw) in enumerate(goal_options):
+            plan_reachable, option_lookahead = self._preflight_navigation_plan(
+                goal_frame, option_x, option_y, option_yaw
+            )
+            attempted_goals.append(
+                {
+                    "index": option_index,
+                    "goal_xyyaw": [option_x, option_y, option_yaw],
+                    "reachable": bool(plan_reachable),
+                }
+            )
+            if plan_reachable:
+                selected_goal = option_x, option_y, option_yaw
+                path_lookahead = option_lookahead
+                break
+        if selected_goal is None:
+            self._handle_navigation_result(
+                decision_id,
+                False,
+                {
+                    "reason": "make_plan_unreachable",
+                    "attempted_goal_count": len(attempted_goals),
+                    "attempted_goals": attempted_goals,
+                },
+            )
+            return
+        x, y, yaw = selected_goal
+        if attempted_goals[-1]["index"] > 0:
+            rospy.loginfo(
+                "[semantic_behavior_executor] selected interaction fallback goal %d/%d",
+                attempted_goals[-1]["index"] + 1,
+                len(goal_options),
+            )
+        prerotated = self._prerotate_for_rear_goal(
+            decision_id,
+            goal_frame,
+            x,
+            y,
+            heading_target_xy=path_lookahead,
+        )
+        if not prerotated:
+            rospy.logwarn(
+                "[semantic_behavior_executor] rear-goal prerotation timed out; sending move_base goal"
+            )
+        if not self._navigation_is_current(decision_id):
+            return
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.pose.position.x = x
+        goal.target_pose.pose.position.y = y
+        goal.target_pose.pose.orientation.z = math.sin(0.5 * yaw)
+        goal.target_pose.pose.orientation.w = math.cos(0.5 * yaw)
+        self.move_base.send_goal(goal)
+        start_pose = self._current_pose(goal_frame)
+        progress_watchdog = NavigationProgressWatchdog(
+            timeout_s=self.navigation_stagnation_timeout_s,
+            min_displacement_m=self.navigation_stagnation_distance_m,
+        )
+        progress_watchdog.reset(
+            None if start_pose is None else (start_pose[0], start_pose[1]),
+            time.monotonic(),
+        )
+        navigation_timeout_s = (
+            self.machine.config.interaction_navigation_timeout_s
+            if str(candidate.get("behavior_type") or "") == "INTERACT"
+            else self.machine.config.navigation_timeout_s
+        )
+        deadline = time.monotonic() + navigation_timeout_s
+        near_goal_since = None
+        require_final_yaw = self.final_align_enabled and len(primary_goal_values) > 2
+        state = int(self.move_base.get_state())
+        while (
+            not rospy.is_shutdown()
+            and self._navigation_is_current(decision_id)
+            and state not in TERMINAL_STATES
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.10)
+            state = int(self.move_base.get_state())
+            pose = self._current_pose(goal_frame)
+            near_final_yaw_alignment = bool(
+                pose is not None
+                and require_final_yaw
+                and math.hypot(x - pose[0], y - pose[1])
+                <= self.final_align_max_distance_m
+            )
+            if not near_final_yaw_alignment and progress_watchdog.observe(
+                None if pose is None else (pose[0], pose[1]),
+                time.monotonic(),
+            ):
+                self.move_base.cancel_goal()
+                self._handle_navigation_result(
+                    decision_id,
+                    False,
+                    {
+                        "reason": "navigation_stagnation",
+                        "stagnation_timeout_s": self.navigation_stagnation_timeout_s,
+                        "stagnation_distance_m": self.navigation_stagnation_distance_m,
+                    },
+                )
+                return
+            if require_final_yaw:
+                if pose is None:
+                    near_goal_since = None
+                    continue
+                distance = math.hypot(x - pose[0], y - pose[1])
+                yaw_error = abs(normalize_angle(yaw - pose[2]))
+                if (
+                    distance <= self.final_align_max_distance_m
+                    and yaw_error > self.final_align_yaw_tolerance_rad
+                ):
+                    if near_goal_since is None:
+                        near_goal_since = time.monotonic()
+                    elif (
+                        time.monotonic() - near_goal_since
+                        >= self.final_align_trigger_delay_s
+                    ):
+                        aligned = self._final_align_goal(
+                            decision_id,
+                            goal_frame,
+                            x,
+                            y,
+                            yaw,
+                        )
+                        self._handle_navigation_result(
+                            decision_id,
+                            bool(aligned),
+                            {
+                                "reason": "direct_final_yaw_alignment",
+                                "position_error_m": distance,
+                                "yaw_error_rad": yaw_error,
+                            },
+                        )
+                        return
+                else:
+                    near_goal_since = None
+        if not self._navigation_is_current(decision_id):
+            return
+        if state not in TERMINAL_STATES:
+            self.move_base.cancel_goal()
+            if require_final_yaw:
+                aligned = self._final_align_goal(
+                    decision_id,
+                    goal_frame,
+                    x,
+                    y,
+                    yaw,
+                )
+                if aligned is not None:
+                    self._handle_navigation_result(
+                        decision_id,
+                        bool(aligned),
+                        {"reason": "navigation_timeout_final_alignment"},
+                    )
+                    return
+            self._handle_navigation_result(decision_id, False, {"reason": "navigation_timeout"})
+            return
+        success = state == GoalStatus.SUCCEEDED
+        detail = {
+            "status_code": state,
+            "status": self.move_base.get_goal_status_text() or str(state),
+        }
+        if success and require_final_yaw:
+            aligned = self._final_align_goal(
+                decision_id,
+                goal_frame,
+                x,
+                y,
+                yaw,
+            )
+            if aligned is False:
+                success = False
+                detail["reason"] = "final_yaw_alignment_failed"
+            elif aligned is True:
+                detail["reason"] = "final_yaw_alignment"
+        self._handle_navigation_result(decision_id, success, detail)
+
+    def _preflight_navigation_plan(
+        self,
+        frame_id: str,
+        goal_x: float,
+        goal_y: float,
+        goal_yaw: float,
+    ) -> tuple[bool, tuple[float, float] | None]:
+        if not self.make_plan_preflight_enabled:
+            return True, None
+        pose = self._current_pose(frame_id)
+        if pose is None:
+            return self.make_plan_fail_open, None
+        stamp = rospy.Time.now()
+        start = PoseStamped()
+        start.header.frame_id = frame_id
+        start.header.stamp = stamp
+        start.pose.position.x = pose[0]
+        start.pose.position.y = pose[1]
+        start.pose.orientation.z = math.sin(0.5 * pose[2])
+        start.pose.orientation.w = math.cos(0.5 * pose[2])
+        goal = PoseStamped()
+        goal.header.frame_id = frame_id
+        goal.header.stamp = stamp
+        goal.pose.position.x = float(goal_x)
+        goal.pose.position.y = float(goal_y)
+        goal.pose.orientation.z = math.sin(0.5 * float(goal_yaw))
+        goal.pose.orientation.w = math.cos(0.5 * float(goal_yaw))
+        try:
+            rospy.wait_for_service(
+                self.make_plan_service,
+                timeout=max(0.0, self.make_plan_service_wait_sec),
+            )
+            response = self.make_plan_client(
+                start=start,
+                goal=goal,
+                tolerance=max(0.0, self.make_plan_tolerance_m),
+            )
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            rospy.logwarn_throttle(
+                5.0,
+                "[semantic_behavior_executor] make_plan preflight unavailable: %s",
+                exc,
+            )
+            return self.make_plan_fail_open, None
+        poses = list(response.plan.poses or [])
+        if not poses:
+            return False, None
+        endpoint = poses[-1].pose.position
+        reachable = math.hypot(
+            float(endpoint.x) - float(goal_x),
+            float(endpoint.y) - float(goal_y),
+        ) <= max(self.make_plan_endpoint_tolerance_m, self.make_plan_tolerance_m)
+        path_xy = [
+            (float(path_pose.pose.position.x), float(path_pose.pose.position.y))
+            for path_pose in poses
+        ]
+        lookahead = path_lookahead_point(
+            (pose[0], pose[1]),
+            path_xy,
+            self.rear_goal_lookahead_m,
+        )
+        return reachable, lookahead
+
+    def _handle_navigation_result(
+        self, decision_id: str, success: bool, detail: dict
+    ) -> None:
+        recovery_detail = self._maybe_run_stuck_recovery(decision_id, success, detail)
+        if recovery_detail:
+            detail = {**detail, **recovery_detail}
+        with self.lock:
+            if self.selection is None or str(self.selection.get("decision_id") or "") != decision_id:
+                return
+            commands = self.machine.on_navigation_result(success, detail=detail)
+            if self.machine.state == STATE_VERIFYING:
+                commands.extend(self._verify_graph_locked())
+        self._dispatch(commands)
+
+    def _maybe_run_stuck_recovery(
+        self, decision_id: str, success: bool, detail: dict
+    ) -> dict:
+        if success:
+            self._reset_stuck_failures()
+            return {}
+        if not self.stuck_recovery_enabled:
+            return {}
+        if not is_stuck_recovery_failure(detail):
+            self._reset_stuck_failures()
+            return {}
+        pose = self._current_pose(self.map_frame)
+        if pose is None:
+            return {}
+        candidate_id = ""
+        with self.lock:
+            if self.selection is not None:
+                candidate_id = str(self.selection.get("candidate_id") or "")
+        if self._stuck_failure_origin_xy is None:
+            self._stuck_failure_origin_xy = (pose[0], pose[1])
+            self._stuck_failure_candidate_ids = {candidate_id} if candidate_id else set()
+            return {}
+        displacement = math.hypot(
+            pose[0] - self._stuck_failure_origin_xy[0],
+            pose[1] - self._stuck_failure_origin_xy[1],
+        )
+        if displacement >= self.stuck_recovery_min_displacement_m:
+            self._stuck_failure_origin_xy = (pose[0], pose[1])
+            self._stuck_failure_candidate_ids = {candidate_id} if candidate_id else set()
+            return {}
+        if candidate_id:
+            self._stuck_failure_candidate_ids.add(candidate_id)
+        if len(self._stuck_failure_candidate_ids) < self.stuck_recovery_subgoal_failures:
+            return {}
+        backed_off = self._drive_linear_recovery(
+            decision_id, -abs(self.stuck_recovery_speed_mps), self.stuck_recovery_backoff_distance_m
+        )
+        escaped = False
+        if not backed_off:
+            escaped = self._escape_nearest_obstacle(decision_id)
+        self._reset_stuck_failures()
+        return {
+            "stuck_recovery": "backoff" if backed_off else "obstacle_escape" if escaped else "failed",
+            "stuck_failure_count": self.stuck_recovery_subgoal_failures,
+        }
+
+    def _reset_stuck_failures(self) -> None:
+        self._stuck_failure_origin_xy = None
+        self._stuck_failure_candidate_ids.clear()
+
+    def _drive_linear_recovery(
+        self, decision_id: str, linear_x: float, distance_m: float
+    ) -> bool:
+        start = self._current_pose(self.map_frame)
+        if start is None:
+            return False
+        target_distance = self._safe_recovery_distance(start, linear_x, distance_m)
+        if target_distance < self.stuck_recovery_min_displacement_m:
+            return False
+        deadline = time.monotonic() + self.stuck_recovery_timeout_s
+        try:
+            while (
+                not rospy.is_shutdown()
+                and self._navigation_is_current(decision_id)
+                and time.monotonic() < deadline
+            ):
+                pose = self._current_pose(self.map_frame)
+                traveled = 0.0 if pose is None else math.hypot(
+                    pose[0] - start[0], pose[1] - start[1]
+                )
+                if traveled >= max(0.0, target_distance - 0.02):
+                    return True
+                remaining = target_distance - traveled
+                if pose is None or (
+                    remaining > 0.05
+                    and self._safe_recovery_distance(pose, linear_x, remaining) < 0.05
+                ):
+                    return False
+                command = Twist()
+                command.linear.x = float(linear_x)
+                self.cmd_vel_pub.publish(command)
+                time.sleep(0.05)
+        finally:
+            self.cmd_vel_pub.publish(Twist())
+        pose = self._current_pose(self.map_frame)
+        return bool(
+            pose is not None
+            and math.hypot(pose[0] - start[0], pose[1] - start[1])
+            >= max(0.0, target_distance - 0.02)
+        )
+
+    def _safe_recovery_distance(
+        self, pose: tuple[float, float, float], linear_x: float, requested_distance_m: float
+    ) -> float:
+        with self.lock:
+            occupancy = self._latest_occupancy
+        if occupancy is None or not occupancy.data:
+            return 0.0
+        info = occupancy.info
+        return safe_grid_motion_distance(
+            occupancy.data,
+            int(info.width),
+            int(info.height),
+            float(info.resolution),
+            (float(info.origin.position.x), float(info.origin.position.y)),
+            pose,
+            1.0 if float(linear_x) >= 0.0 else -1.0,
+            requested_distance_m,
+            self.stuck_recovery_robot_radius_m,
+            self.stuck_recovery_safety_margin_m,
+            unknown_is_blocked=self.stuck_recovery_unknown_is_blocked,
+        )
+
+    def _escape_nearest_obstacle(self, decision_id: str) -> bool:
+        pose = self._current_pose(self.map_frame)
+        with self.lock:
+            occupancy = self._latest_occupancy
+        if pose is None or occupancy is None or not occupancy.data:
+            return False
+        info = occupancy.info
+        resolution = float(info.resolution)
+        if resolution <= 0.0:
+            return False
+        nearest = None
+        for index, value in enumerate(occupancy.data):
+            if int(value) < 50:
+                continue
+            column, row = index % int(info.width), index // int(info.width)
+            x = float(info.origin.position.x) + (column + 0.5) * resolution
+            y = float(info.origin.position.y) + (row + 0.5) * resolution
+            distance = math.hypot(x - pose[0], y - pose[1])
+            if nearest is None or distance < nearest[0]:
+                nearest = (distance, x, y)
+        if nearest is None:
+            return False
+        away_yaw = math.atan2(pose[1] - nearest[2], pose[0] - nearest[1])
+        if not self._rotate_to_yaw(
+            decision_id, self.map_frame, away_yaw, 0.20,
+            self.rear_goal_rotate_speed_rad_s, self.stuck_recovery_timeout_s,
+        ):
+            return False
+        return self._drive_linear_recovery(
+            decision_id, abs(self.stuck_recovery_speed_mps),
+            self.stuck_recovery_obstacle_escape_distance_m,
+        )
+
+    def _navigation_is_current(self, decision_id: str) -> bool:
+        with self.lock:
+            return bool(
+                self.selection is not None
+                and str(self.selection.get("decision_id") or "") == decision_id
+                and self.machine.state in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}
+            )
+
+    def _finish_terminal(self, command: dict) -> None:
+        with self.lock:
+            selection = dict(self.selection or {})
+            was_navigating = self.machine.state in {
+                STATE_NAVIGATING,
+                STATE_APPROACH_INTERACTION,
+            }
+            status = "SUCCEEDED" if command.get("success") else "FAILED"
+            detail = dict(command.get("detail") or {})
+            self._publish_feedback(selection, status, bool(command.get("success")), detail)
+            self.selection = None
+            self.machine.reset()
+        if was_navigating:
+            self.move_base.cancel_goal()
+
+    def _publish_feedback(
+        self, selection: dict, status: str, success: bool | None, detail: dict
+    ) -> None:
+        payload = {
+            "decision_id": selection.get("decision_id", ""),
+            "candidate_id": selection.get("candidate_id", ""),
+            "behavior_type": selection.get("behavior_type", ""),
+            "target_id": selection.get("target_id", ""),
+            "target_name": selection.get("target_name", ""),
+            "command_id": self._command_id(selection),
+            "status": status,
+            "success": success,
+            "detail": detail,
+            "timestamp": time.time(),
+        }
+        self.feedback_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        )
+
+    def _matches_active(self, payload: dict) -> bool:
+        if self.selection is None:
+            return False
+        command_id = str(payload.get("command_id") or "")
+        candidate_id = str(payload.get("candidate_id") or "")
+        return command_id == self._command_id(self.selection) or (
+            candidate_id and candidate_id == str(self.selection.get("candidate_id") or "")
+        )
+
+    @staticmethod
+    def _command_id(candidate: dict) -> str:
+        return f"{candidate.get('decision_id', 'decision')}:{candidate.get('candidate_id', 'candidate')}"
+
+
+if __name__ == "__main__":
+    SemanticBehaviorExecutor()
+    rospy.spin()

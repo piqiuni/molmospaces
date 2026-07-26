@@ -35,7 +35,7 @@ Task horizons:
 import copy
 import logging
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Any, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -83,6 +83,16 @@ class ExocentricCameraSpec(BaseModel):
 CameraSpec = RobotMountedCameraSpec | ExocentricCameraSpec
 
 
+class ArticulationJointStateSpec(BaseModel):
+    """Initial value for a named one-DoF articulation joint."""
+
+    object_name: str
+    joint_name: str
+    joint_index: int | None = None
+    position: float
+    open_fraction: float | None = None
+
+
 class SceneModificationsSpec(BaseModel):
     """Scene modifications required for this episode.
 
@@ -101,6 +111,295 @@ class SceneModificationsSpec(BaseModel):
     # Objects to remove from the base scene: list of object names
     # These objects will be removed from the scene spec before adding auxiliary objects
     removed_objects: list[str] = Field(default_factory=list)
+
+    # Articulation joint values applied after object poses are restored.
+    articulation_states: list[ArticulationJointStateSpec] = Field(default_factory=list)
+
+
+class NavigateOracleStepSpec(BaseModel):
+    type: Literal["navigate"] = "navigate"
+    goal_point: list[float] = Field(..., min_length=3, max_length=3)
+    goal_yaw: float
+    position_tolerance_m: float = 0.25
+    yaw_tolerance_rad: float = 0.35
+    reason: str
+
+
+class OpenJointOracleStepSpec(BaseModel):
+    type: Literal["open_joint"] = "open_joint"
+    object_name: str
+    joint_name: str
+    joint_index: int
+    target_fraction: float = 1.0
+    control_mode: Literal["direct", "force"] = "direct"
+    reason: str
+
+
+class SetViewOracleStepSpec(BaseModel):
+    type: Literal["set_view"] = "set_view"
+    view_profile: str
+    head_qpos: list[float] | None = None
+    torso_qpos: list[float] | None = None
+    reason: str
+
+
+class ObserveTargetOracleStepSpec(BaseModel):
+    type: Literal["observe_target"] = "observe_target"
+    object_name: str
+    visibility_threshold: float = 1e-4
+    reason: str
+
+
+OraclePlanStepSpec = Annotated[
+    NavigateOracleStepSpec
+    | OpenJointOracleStepSpec
+    | SetViewOracleStepSpec
+    | ObserveTargetOracleStepSpec,
+    Field(discriminator="type"),
+]
+
+
+class OraclePlanSpec(BaseModel):
+    steps: list[OraclePlanStepSpec] = Field(default_factory=list)
+
+
+class InteractiveNavSpec(BaseModel):
+    """Legacy v2 GT interaction metadata."""
+
+    schema_version: Literal["interactive_nav_v2"] = "interactive_nav_v2"
+    interaction_domain: Literal["container", "door"]
+    case_id: str
+    parent_benchmark_episode_index: int | None = None
+    target: dict[str, Any]
+    initial_state: dict[str, Any]
+    oracle_plan: OraclePlanSpec
+    oracle_plans: list[OraclePlanSpec] = Field(default_factory=list)
+    generation_validation: dict[str, Any] = Field(default_factory=dict)
+
+
+class InteractionPrerequisiteSpec(BaseModel):
+    interaction_id: str
+    type: Literal["mechanical", "reachability", "visibility"]
+
+
+class InteractionStateSpec(BaseModel):
+    joint_fraction: float = Field(..., ge=0.0, le=1.0)
+    semantic_state: Literal["closed", "open"]
+
+
+class InteractionSpec(BaseModel):
+    interaction_id: str
+    type: Literal[
+        "channel_hinged_door",
+        "channel_sliding_door",
+        "container_hinged_door",
+        "container_sliding_drawer",
+    ]
+    object_name: str
+    object_category: str
+    joint_name: str
+    joint_index: int = Field(..., ge=0)
+    effect_types: list[
+        Literal[
+            "restore_reachability",
+            "reduce_navigation_cost",
+            "enable_interaction",
+            "reveal_target_object",
+        ]
+    ]
+    prerequisites: list[InteractionPrerequisiteSpec] = Field(default_factory=list)
+    initial_state: InteractionStateSpec
+    target_state: InteractionStateSpec
+
+
+OracleReason = Literal[
+    "approach_channel_interaction",
+    "restore_reachability",
+    "reduce_navigation_cost",
+    "traverse_open_channel",
+    "approach_container_interaction",
+    "improve_target_visibility",
+    "prerequisite_for_interaction",
+    "reveal_target_object",
+    "satisfy_nav_to_obj_success",
+    "verify_target_visible",
+]
+
+
+class NavigateOracleStepV3Spec(BaseModel):
+    type: Literal["navigate"] = "navigate"
+    interaction_id: str | None = None
+    goal_point: list[float] = Field(..., min_length=3, max_length=3)
+    goal_yaw: float
+    position_tolerance_m: float = Field(default=0.25, ge=0.0)
+    yaw_tolerance_rad: float = Field(default=0.35, ge=0.0)
+    reason: OracleReason
+
+
+class OpenJointOracleStepV3Spec(BaseModel):
+    type: Literal["open_joint"] = "open_joint"
+    interaction_id: str
+    object_name: str
+    joint_name: str
+    joint_index: int = Field(..., ge=0)
+    target_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
+    control_mode: Literal["direct", "force"] = "direct"
+    reason: OracleReason
+
+
+class SetViewOracleStepV3Spec(BaseModel):
+    type: Literal["set_view"] = "set_view"
+    view_profile: str
+    head_qpos: list[float] | None = None
+    torso_qpos: list[float] | None = None
+    reason: Literal["improve_target_visibility"]
+
+
+class ObserveTargetOracleStepV3Spec(BaseModel):
+    type: Literal["observe_target"] = "observe_target"
+    object_name: str
+    camera_name: Literal["head_camera"] = "head_camera"
+    visibility_threshold: Literal[0.0] = 0.0
+    reason: Literal["verify_target_visible"]
+
+
+OraclePlanStepV3Spec = Annotated[
+    NavigateOracleStepV3Spec
+    | OpenJointOracleStepV3Spec
+    | SetViewOracleStepV3Spec
+    | ObserveTargetOracleStepV3Spec,
+    Field(discriminator="type"),
+]
+
+
+class OraclePlanV3Spec(BaseModel):
+    plan_id: str
+    required_interaction_ids: list[str] = Field(default_factory=list)
+    steps: list[OraclePlanStepV3Spec] = Field(default_factory=list)
+
+
+class TargetGroundingSpec(BaseModel):
+    unique: bool | None = None
+    matching_instance_count: int | None = Field(default=None, ge=0)
+    description: str | None = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class InteractiveNavTargetSpec(BaseModel):
+    selection_mode: Literal["specific_instance", "any_candidate"]
+    category: str
+    selected_instance: str | None
+    instruction_consistent_candidates: list[str]
+    container_name: str | None = None
+    container_category: str | None = None
+    grounding: TargetGroundingSpec
+
+    class Config:
+        extra = "allow"
+
+
+class SuccessDistanceSpec(BaseModel):
+    metric: Literal["planar_robot_base_to_object"]
+    threshold_m: float = Field(..., gt=0.0)
+    comparison: Literal["strictly_less"]
+
+
+class SuccessVisibilitySpec(BaseModel):
+    camera_name: Literal["head_camera"]
+    metric: Literal["visibility_fraction"]
+    threshold: Literal[0.0]
+    comparison: Literal["strictly_greater"]
+
+
+class NavToObjSuccessCriteriaSpec(BaseModel):
+    type: Literal["nav_to_obj"]
+    target_selection: Literal["specific_instance", "any_candidate"]
+    distance: SuccessDistanceSpec
+    visibility: SuccessVisibilitySpec
+    combination: Literal["all"]
+
+
+class InitialInteractionStateSpec(BaseModel):
+    interaction_id: str
+    joint_fraction: float = Field(..., ge=0.0, le=1.0)
+    semantic_state: Literal["closed", "open"]
+
+
+class InteractiveNavInitialStateSpec(BaseModel):
+    interaction_states: list[InitialInteractionStateSpec]
+
+    class Config:
+        extra = "allow"
+
+
+class OraclePrefixSpec(BaseModel):
+    plan_id: str
+    completed_step_count: int = Field(..., ge=0)
+    robot_reachable_to_next_goal: bool | None = None
+    target_distance_passed: bool | None = None
+    target_visibility_fraction: float | None = Field(default=None, ge=0.0)
+    target_visible_pixels: int | None = Field(default=None, ge=0)
+    task_success: bool | None = None
+    opened_interaction_ids: list[str] = Field(default_factory=list)
+
+    class Config:
+        extra = "allow"
+
+
+class SuccessEvidenceSpec(BaseModel):
+    status: Literal["passed", "failed", "not_executed"]
+    validation_mode: Literal[
+        "simulated_terminal_state", "oracle_rollout", "path_feasibility_only"
+    ]
+    target_object_name: str | None = None
+    planar_distance_m: float | None = Field(default=None, ge=0.0)
+    distance_threshold_m: float | None = Field(default=None, gt=0.0)
+    camera_name: str | None = None
+    visibility_fraction: float | None = Field(default=None, ge=0.0)
+    visible_pixels: int | None = Field(default=None, ge=0)
+    distance_passed: bool | None = None
+    visibility_passed: bool | None = None
+    expected_task_success: bool | None = None
+
+
+class GenerationValidationV3Spec(BaseModel):
+    navigation_validation: dict[str, Any]
+    interaction_validations: list[dict[str, Any]]
+    oracle_prefixes: list[OraclePrefixSpec]
+    compartment_evidence: dict[str, Any] | None = None
+    success_evidence: SuccessEvidenceSpec
+    minimal_plan_verified: bool | None = None
+
+    class Config:
+        extra = "allow"
+
+
+class InteractiveNavV3Spec(BaseModel):
+    """Unified v3 interactive-navigation GT payload."""
+
+    schema_version: Literal["interactive_nav_v3"] = "interactive_nav_v3"
+    case_id: str
+    parent_benchmark_episode_index: int | None = None
+    interaction_domains: list[Literal["channel", "container"]]
+    interaction_requirement: Literal[
+        "required", "beneficial", "unnecessary", "unknown"
+    ]
+    target: InteractiveNavTargetSpec
+    success_criteria: NavToObjSuccessCriteriaSpec
+    initial_state: InteractiveNavInitialStateSpec
+    interactions: list[InteractionSpec]
+    oracle_plan: OraclePlanV3Spec
+    oracle_plans: list[OraclePlanV3Spec]
+    generation_validation: GenerationValidationV3Spec
+
+    class Config:
+        extra = "allow"
+
+
+InteractiveNavPayloadSpec = Annotated[
+    InteractiveNavSpec | InteractiveNavV3Spec,
+    Field(discriminator="schema_version"),
+]
 
 
 class BaseTaskSpec(BaseModel):
@@ -183,6 +482,8 @@ class NavToObjTaskSpec(BaseTaskSpec):
 
     pickup_obj_name: str  # Target object instance name
     pickup_obj_candidates: list[str] | None = None  # All candidate instances
+    # Legacy benchmarks use nearest/any-candidate semantics unless explicitly overridden.
+    selection_mode: Literal["specific_instance", "any_candidate"] = "any_candidate"
     pickup_obj_start_pose: list[float] | None = Field(default=None, min_length=7, max_length=7)
     receptacle_name: str | None = None
 
@@ -245,6 +546,14 @@ class LanguageSpec(BaseModel):
     """Natural language task specification."""
 
     task_description: str
+    instruction_type: Literal[
+        "object_goal",
+        "route_instruction",
+        "interaction_instruction",
+        "route_interaction_instruction",
+    ] | None = None
+    locale: str | None = None
+    interaction_disclosure: Literal["hidden", "partial", "explicit"] | None = None
 
     # Semantic referral expressions for objects
     # e.g. {"pickup_name": "red mug", "place_name": "white bowl"}
@@ -319,6 +628,10 @@ class EpisodeSpec(BaseModel):
 
     # === Language specification ===
     language: LanguageSpec
+
+    # === Optional interactive-navigation supervision ===
+    # Stored as benchmark GT and must not be exposed to the evaluated policy.
+    interactive_nav: InteractiveNavPayloadSpec | None = None
 
     class Config:
         # Allow extra fields for forward compatibility

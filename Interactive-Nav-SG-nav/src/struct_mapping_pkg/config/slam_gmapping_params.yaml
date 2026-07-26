@@ -11,7 +11,7 @@ use_odom_pose_for_mapping: true  # 仿真 odom 为真值；禁止 scan matching 
 # successive scans into different map orientations.
 scan_matching_lock_yaw_to_odom: true
 scan_matching_max_translation_correction: 0.15
-maxUrange: 20.0 #激光扫描最大距离
+maxUrange: 7.9 # RGB-D伪激光的可靠二维清除距离
 sigma: 0.05
 kernelSize: 1
 lstep: 0.05
@@ -55,6 +55,16 @@ enable_height_filter: true
 filter_height_center: 0.95
 filter_height_tolerance: 0.9
 filter_height_frame: tf_frame_base_link
+pointcloud_scan_range_max: 8.0
+pointcloud_scan_angle_increment_deg: 1.0
+pointcloud_scan_height_min: 0.05
+pointcloud_scan_height_max: 1.85
+pointcloud_scan_min_points_per_beam: 3
+pointcloud_scan_support_bins: 2
+pointcloud_scan_min_support_neighbors: 1
+pointcloud_scan_support_range_tolerance: 0.40
+pointcloud_scan_neighbor_bins: 1
+pointcloud_scan_max_range_jump: 0.75
 
 # 障碍物膨胀参数
 enable_obstacle_inflation: true

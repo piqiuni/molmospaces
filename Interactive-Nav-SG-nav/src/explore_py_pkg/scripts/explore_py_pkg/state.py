@@ -9,6 +9,7 @@ CLUSTER_ACTIVE = "active"
 CLUSTER_COVERED = "covered"
 CLUSTER_FAILED = "failed"
 CLUSTER_BLACKLISTED = "blacklisted"
+CLUSTER_UNREACHABLE = "unreachable"
 
 SUBGOAL_IDLE = "idle"
 SUBGOAL_SENT = "sent"
@@ -23,6 +24,12 @@ SUBGOAL_STALLED = "stalled"
 class BlockedGoalPoint:
     point: tuple[float, float]
     expire_time: float
+    radius_m: float
+
+
+@dataclass
+class UnreachableFrontier:
+    point: tuple[float, float]
     radius_m: float
 
 
@@ -43,6 +50,7 @@ class ClusterRecord:
 class ActiveGoal:
     cluster_id: str
     point: tuple[float, float]
+    frontier_point: tuple[float, float]
     yaw: float
     sent_at: float
     last_progress_at: float
@@ -56,7 +64,7 @@ class ActiveGoal:
 
 @dataclass
 class ExplorerStateConfig:
-    goal_reach_tolerance_m: float = 0.75
+    goal_reach_tolerance_m: float = 0.35
     goal_timeout_sec: float = 90.0
     stall_timeout_sec: float = 30.0
     stall_distance_m: float = 0.15
@@ -69,11 +77,14 @@ class ExplorerStateConfig:
     frontier_match_distance_m: float = 1.0
     frontier_gone_confirm_ticks: int = 3
     frontier_gone_min_goal_age_sec: float = 8.0
-    failed_point_soft_blacklist_sec: float = 45.0
+    failed_point_soft_blacklist_sec: float = 10.0
     failed_point_blacklist_sec: float = 180.0
     failed_point_blacklist_radius_m: float = 1.25
     reached_point_blacklist_sec: float = 90.0
     reached_point_blacklist_radius_m: float = 0.75
+    visit_viewpoint_once: bool = False
+    visited_viewpoint_radius_m: float = 0.50
+    unreachable_frontier_radius_m: float = 1.0
 
 
 @dataclass
@@ -82,6 +93,8 @@ class ExplorerState:
     records: dict[str, ClusterRecord] = field(default_factory=dict)
     active_goal: ActiveGoal | None = None
     blocked_goal_points: list[BlockedGoalPoint] = field(default_factory=list)
+    visited_viewpoints: list[tuple[float, float]] = field(default_factory=list)
+    unreachable_frontiers: list[UnreachableFrontier] = field(default_factory=list)
     last_event: str = ""
     last_failure_reason: str = ""
     last_failure_source: str = ""
@@ -107,10 +120,14 @@ class ExplorerState:
 
     def is_cluster_available(self, cluster, now: float | None = None) -> bool:
         now = self._now(now)
+        if self.is_frontier_unreachable(cluster.centroid_world):
+            return False
         record = self.records.get(cluster.cluster_id)
         if record is None:
             return True
         if record.status == CLUSTER_COVERED:
+            return False
+        if record.status == CLUSTER_UNREACHABLE:
             return False
         if record.status in (CLUSTER_FAILED, CLUSTER_BLACKLISTED) and now < record.blacklist_until:
             return False
@@ -128,6 +145,7 @@ class ExplorerState:
         self.active_goal = ActiveGoal(
             cluster_id=cluster.cluster_id,
             point=cluster.subgoal_world,
+            frontier_point=cluster.centroid_world,
             yaw=float(getattr(cluster, "subgoal_yaw", 0.0)),
             sent_at=now,
             last_progress_at=now,
@@ -154,10 +172,12 @@ class ExplorerState:
         self.active_goal = None
         self.last_event = status if event is None else event
 
-    def mark_active_reached(self, now: float | None = None) -> None:
+    def mark_active_reached(self, now: float | None = None, record_viewpoint: bool = True) -> None:
         now = self._now(now)
         if self.active_goal is None:
             return
+        if record_viewpoint:
+            self.mark_viewpoint_visited(self.active_goal.point)
         record = self._record_for(self.active_goal.cluster_id)
         record.status = CLUSTER_COVERED
         record.updated_at = now
@@ -167,6 +187,7 @@ class ExplorerState:
         now = self._now(now)
         if self.active_goal is None:
             return
+        self.mark_viewpoint_visited(self.active_goal.point)
         self.block_goal_point(
             self.active_goal.point,
             duration_sec=self.config.reached_point_blacklist_sec,
@@ -177,6 +198,35 @@ class ExplorerState:
         record.status = CLUSTER_ACTIVE
         record.updated_at = now
         self.clear_active_goal(SUBGOAL_REACHED_POSE_ONLY, now)
+
+    def mark_active_frontier_unreachable(self, now: float | None = None) -> None:
+        """Permanently suppress a frontier that remained after reaching its viewpoint."""
+        now = self._now(now)
+        if self.active_goal is None:
+            return
+        frontier_point = self.active_goal.frontier_point
+        self.mark_viewpoint_visited(self.active_goal.point)
+        if not self.is_frontier_unreachable(frontier_point):
+            self.unreachable_frontiers.append(
+                UnreachableFrontier(
+                    point=frontier_point,
+                    radius_m=self.config.unreachable_frontier_radius_m,
+                )
+            )
+        self.block_goal_point(
+            self.active_goal.point,
+            duration_sec=self.config.reached_point_blacklist_sec,
+            radius_m=self.config.reached_point_blacklist_radius_m,
+            now=now,
+        )
+        record = self._record_for(self.active_goal.cluster_id)
+        record.status = CLUSTER_UNREACHABLE
+        record.updated_at = now
+        self.clear_active_goal(
+            SUBGOAL_REACHED_POSE_ONLY,
+            now,
+            event="frontier_unreachable_after_viewpoint_reached",
+        )
 
     def mark_active_failed(self, reason: str, now: float | None = None, source: str = "explorer") -> None:
         now = self._now(now)
@@ -232,8 +282,6 @@ class ExplorerState:
         goal_age = now - goal.sent_at
         dist_to_goal = hypot(goal.point[0] - robot_xy[0], goal.point[1] - robot_xy[1])
         if dist_to_goal <= self.config.goal_reach_tolerance_m:
-            if goal_age < self.config.min_goal_lifetime_sec:
-                return SUBGOAL_WAITING
             return SUBGOAL_REACHED
         if goal_age > self.config.goal_timeout_sec:
             self.mark_active_failed("goal_timeout", now, source="explorer")
@@ -296,7 +344,7 @@ class ExplorerState:
             radius_m=self.config.reached_point_blacklist_radius_m,
             now=now,
         )
-        self.mark_active_reached(now)
+        self.mark_active_reached(now, record_viewpoint=False)
         self.last_event = "frontier_gone"
         return True
 
@@ -326,7 +374,31 @@ class ExplorerState:
     def is_goal_point_blocked(self, point: tuple[float, float], now: float | None = None) -> bool:
         now = self._now(now)
         self._purge_blocked_goal_points(now)
+        if self.is_viewpoint_visited(point):
+            return True
         for item in self.blocked_goal_points:
+            if hypot(point[0] - item.point[0], point[1] - item.point[1]) <= item.radius_m:
+                return True
+        return False
+
+    def mark_viewpoint_visited(self, point: tuple[float, float]) -> None:
+        if not self.config.visit_viewpoint_once:
+            return
+        if self.is_viewpoint_visited(point):
+            return
+        self.visited_viewpoints.append((float(point[0]), float(point[1])))
+
+    def is_viewpoint_visited(self, point: tuple[float, float]) -> bool:
+        if not self.config.visit_viewpoint_once:
+            return False
+        radius_m = max(0.0, self.config.visited_viewpoint_radius_m)
+        return any(
+            hypot(point[0] - visited[0], point[1] - visited[1]) <= radius_m + 1e-6
+            for visited in self.visited_viewpoints
+        )
+
+    def is_frontier_unreachable(self, point: tuple[float, float]) -> bool:
+        for item in self.unreachable_frontiers:
             if hypot(point[0] - item.point[0], point[1] - item.point[1]) <= item.radius_m:
                 return True
         return False
@@ -352,6 +424,7 @@ class ExplorerState:
             active = {
                 "cluster_id": self.active_goal.cluster_id,
                 "point": list(self.active_goal.point),
+                "frontier_point": list(self.active_goal.frontier_point),
                 "yaw": self.active_goal.yaw,
                 "status": self.active_goal.status,
                 "age_sec": max(0.0, time.time() - self.active_goal.sent_at),
@@ -361,6 +434,8 @@ class ExplorerState:
             "cluster_counts": counts,
             "active_goal": active,
             "blocked_goal_points": len(self.blocked_goal_points),
+            "visited_viewpoints": [list(point) for point in self.visited_viewpoints],
+            "unreachable_frontiers": len(self.unreachable_frontiers),
             "last_subgoal_world": None if self.last_subgoal_world is None else list(self.last_subgoal_world),
             "last_event": self.last_event,
             "last_failure_reason": self.last_failure_reason,

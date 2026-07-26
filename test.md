@@ -1,6 +1,6 @@
 # 交互导航开发测试手册
 
-最后更新：2026-07-06
+最后更新：2026-07-16
 
 ## 1. 文档定位
 
@@ -118,6 +118,192 @@ source ~/miniconda3/etc/profile.d/conda.sh && conda activate mlspaces && for i i
 注意：该命令较重，不应在普通文档修改后顺手执行。
 
 ---
+
+## 4.4 开关门 GT path获取
+
+
+测试
+```bash
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MLSPACES_CACHE_DIR=/tmp/molmo-spaces-cache-proxy MLSPACES_ASSETS_DIR=/tmp/molmo-spaces-assets-proxy /home/user/miniconda3/envs/mlspaces/bin/python scripts/InteractiveNav/explore_molmo_interactions.py door-path-study --house_ind 10 --variant ceiling --target_types fridge --close_doors_on_path 0 --output_json scripts/InteractiveNav/output/door-path-study_procthor-10k_train_10_fridge
+```
+
+## 4.5 mixed 数据粗筛与 V3 精采集
+
+适用场景：
+
+- 从现有 `container_rough_catalog_v1` 二次生产 GT path 穿门的 crossing rough 候选
+- 将单门关闭阻断容器交互目标、门前几何 path-backoff 提示仍可达记录为 `mixed_required_verified` 子集标签，而不是 rough 输入门槛
+- 直接生成带真实 joint/readback、路径、可见性、成功证据和最小性证据的 `interactive_nav_v3`
+
+正式 mixed rough 输入范围固定为 container rough 中全部有 strict pair 的 house 和全部 strict pair；禁止使用 door-only `door-required house` 结果预筛。当前全集为 712 house、2603 pair。rough 的门前点只是导航级几何提示，不是 manipulation-validated 开门位姿。
+
+三类 rough smoke（crossing-only、required、无穿门路径）：
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-mixed-rough
+python scripts/InteractiveNav/collect_mixed_rough_catalog.py \
+  --house_indices 0,101,103 \
+  --workers 3 \
+  --output_dir scripts/InteractiveNav/output/mixed_rough_catalog_crossing_smoke_v1
+```
+
+全量 all-strict rough 扫描：
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-mixed-rough-all-crossing
+python scripts/InteractiveNav/collect_mixed_rough_catalog.py \
+  --workers 8 \
+  --resume \
+  --output_dir scripts/InteractiveNav/output/mixed_rough_catalog_all_crossing_v1
+```
+
+全量结果必须满足 `summary.json` 中：
+
+- `selection_scope=all_container_rough_houses_with_strict_pairs`
+- `candidate_selection=all_open_gt_path_crosses_interactive_door`
+- `mixed_required_role=verified_subset_annotation_not_rough_input_gate`
+- `door_required_house_prefilter_used=false`
+- `expected_strict_house_count=712`
+- `expected_strict_pair_count=2603`
+- `pair_coverage_complete=true`
+
+2026-07-15 crossing/required 拆分后的全量实测结果：
+
+- 完成 712/712 个 strict-pair house、解析 2603/2603 个 strict pair，失败 0，`pair_coverage_complete=true`
+- crossing rough：1609 pair、覆盖 456 house，pair 命中率 61.81%；真正没有任何穿门 pair 的 house 为 256 个
+- required 子集：917 pair、覆盖 262 house；与旧 required-only catalog 的 917 个 `case_id` 完全一致
+- crossing-only：692 pair；另有 194 个 house 有 crossing pair、但没有任何 rough required pair
+- 非 crossing pair：762 对存在开放路径但不穿 interactive door，232 对所有 source start 均无开放路径
+- 共检查 6087 个 source start：5513 条开放路径，其中 2895 条穿门；穿门路径中 1511 条通过 required 验证、1384 条为 crossing-only
+- crossing 容器类别：Fridge 821，Dresser 788；最短 crossing 路径中位数 9.61 m、均值 10.40 m、范围 0.48--30.05 m
+- required 子集路径统计保持原结果：中位数 11.19 m、均值 12.03 m
+- 旧 443-house door-required 集合中只有 369 个 house 含 container crossing，另有 87 个 crossing house 位于旧集合外；旧集合只能作为历史对照
+
+### 4.5.1 crossing-only rough 标注俯视图
+
+用于直接检查 `1609 - 917 = 692` 个 crossing-only pair：左图为全开状态的 rough GT planner path，右图为关闭所穿门后的重新规划路径；同时标出起点、门前几何提示、粗容器目标、容器/目标/所穿门以及全部 scene object AABB。
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-mixed-rough-viz
+python scripts/InteractiveNav/visualize_mixed_rough_catalog.py \
+  scripts/InteractiveNav/output/mixed_rough_catalog_all_crossing_v1/mixed_rough_catalog.json \
+  --candidate_type door_crossing_only \
+  --max_samples 24 \
+  --workers 4 \
+  --output_dir scripts/InteractiveNav/output/mixed_rough_catalog_all_crossing_v1/crossing_only_visualizations
+```
+
+默认按 Fridge/Dresser、路径长度和穿门数量分层抽样，并优先使用不同 house。输出包括逐样本双面板 PNG、含完整路径点和 Oxxx 对照的 JSON、`contact_sheet_*.png`、`index.html` 与 `manifest.json`。
+
+需要检查某个粗门前几何提示的机器人第一视角时，可指定单个 `case_id` 并增加 `--render_first_person`；输出会同时给出该门全开/关闭的 `head_camera` 对比图：
+
+```bash
+python scripts/InteractiveNav/visualize_mixed_rough_catalog.py \
+  --case_id <MIXED_ROUGH_CASE_ID> \
+  --max_samples 1 \
+  --workers 1 \
+  --render_first_person \
+  --output_dir scripts/InteractiveNav/output/mixed_rough_first_person
+```
+
+2026-07-16 的 24-house 图册重放结果：24/24 成功出图、全开路径长度均与 catalog 一致；其中 house 351/candidate 427 的闭门可达性与 catalog 不一致，已在图和 sidecar 中标记 `CATALOG/REPLAY MISMATCH`，应作为粗地图边界不稳定样本复扫，而不是直接进入 fine 生产。
+
+10 条 V3 fine smoke：
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-mixed-fine
+python scripts/InteractiveNav/build_mixed_interaction_benchmark.py \
+  --mixed_rough_catalog scripts/InteractiveNav/output/mixed_rough_catalog_crossing_smoke_v1/mixed_rough_catalog.json \
+  --source_variants_per_pair 2 \
+  --max_samples 10 \
+  --max_samples_per_house 8 \
+  --px_per_m 50 \
+  --max_poses_per_joint 2 \
+  --output_dir scripts/InteractiveNav/output/mixed_interaction_v3_smoke10
+```
+
+相关单元测试：
+
+```bash
+conda activate mlspaces
+python -m pytest \
+  mlspaces_tests/data_generation/test_mixed_interaction_benchmark.py \
+  mlspaces_tests/data_generation/test_container_interaction_benchmark.py \
+  mlspaces_tests/data_generation/test_visualize_mixed_interaction_benchmark.py \
+  mlspaces_tests/data_generation/test_capture_mixed_gt_storyboard.py \
+  -q
+```
+
+主要输出：
+
+- rough：`mixed_rough_catalog.json`、`summary.json`、`shards/*/run.log`；支持按成功 house 断点续扫
+- fine：`benchmark.json`、`valid.json`、`rejected.json`、`summary.json`
+- fine builder 接收 crossing rough 后，会在真实容器交互位姿重新验证 required；crossing-only rough 不会被直接视为正式 mixed episode
+- fine episode 必须通过 `validate_mixed_v3_episode`，且 `minimal_plan_verified=true`
+
+## 4.6 mixed V3 标注俯视图
+
+适用场景：
+
+- 重放 mixed V3 中冻结的物体位姿、门/容器关节初态
+- 对比 required door 关闭的初态与开门后的 GT 导航状态
+- 标出起点、朝向、门前位姿、容器交互位姿、目标、交互对象及全部 scene object AABB
+- 输出逐 episode PNG、Oxxx 物体标注 JSON、联系图和 HTML 图册
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-mixed-viz
+python scripts/InteractiveNav/visualize_mixed_interaction_benchmark.py \
+  scripts/InteractiveNav/output/mixed_interaction_v3_smoke10/benchmark.json \
+  --output_dir scripts/InteractiveNav/output/mixed_interaction_v3_smoke10/visualizations \
+  --px_per_m 100
+```
+
+仅展示部分 episode：
+
+```bash
+python scripts/InteractiveNav/visualize_mixed_interaction_benchmark.py \
+  scripts/InteractiveNav/output/mixed_interaction_v3_smoke10/benchmark.json \
+  --episode_indices 0,8 \
+  --max_episodes 2
+```
+
+默认会校验：初态到容器交互位姿不可达、门前位姿可达、开门后 GT path 可达，以及重算长度满足 `0.35 m` 绝对误差或 `10%` 相对误差。中断后可显式加 `--reuse_existing` 复用已有 PNG/JSON。
+
+## 4.7 mixed GT 五步 storyboard
+
+用于从 mixed V3 benchmark 自动选择一个“单 required door + 单 Fridge + 单容器交互”的代表场景，并以独立 step 重放以下五个 GT 状态：起点（门关、冰箱关）、门前（门关）、同一门前位姿（门开）、冰箱前（冰箱关）、同一冰箱位姿（冰箱开）。每一步都先重放 episode 冻结初态，再应用目标状态并保存实际关节读回。
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-mixed-story
+python scripts/InteractiveNav/capture_mixed_gt_storyboard.py
+```
+
+默认相机固定在机器人右肩后上方，并朝机器人前方观察。输出目录包含五张原始 RGB、五份 step sidecar、`story_steps.json`、`storyboard.png`、`pathpoints_topdown.png` 与汇总 `manifest.json`。可固定 episode 或调整镜头：
+
+```bash
+python scripts/InteractiveNav/capture_mixed_gt_storyboard.py \
+  --episode_index 1 \
+  --camera_behind_m 0.72 \
+  --camera_right_m 0.34 \
+  --camera_height_m 1.72 \
+  --camera_lookahead_m 1.75
+```
+
+脚本以 `StoryStep` 和逐步 `apply state -> place robot -> place camera -> capture` 循环组织；后续连续视频采集可在相邻 step 之间插值机器人 pathpoint，并将门/冰箱关节状态替换为连续轨迹。
+
+
 
 ## 5. 导航仿真与 ROS 联调
 
@@ -542,8 +728,148 @@ python Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/semantic_mappi
   --publish-rate 1.0
 ```
 
+## 8.4 实时 GT 语义交互图
 
-## 8.4 Room分割测试
+只使用当前 `head_camera` segmentation 中可见对象作为 GT observation：
+
+```bash
+conda activate mlspaces
+source ./Interactive-Nav-SG-nav/devel/setup.zsh
+roslaunch nav_pkg molmospaces_nav_system.launch \
+  start_semantic_mapping:=true \
+  semantic_source:=realtime_gt \
+  publish_realtime_gt:=true \
+  start_explore_py:=true
+```
+
+检查实时输入与动态图：
+
+```bash
+rostopic echo -n 1 /semantic_mapping/gt_observations
+rostopic echo -n 1 /semantic_mapping/unified_graph
+rosservice call /semantic_mapping/save_graph
+```
+
+实时 GT 默认每 `3` 个仿真 step 采样一次，单次扫描 segmentation 中的 geom ID，最大观测距离默认 `6m`。
+三场景完整验收默认每场景录制 `600s`：
+
+```bash
+scripts/InteractiveNav/run_semantic_gt_three_scene_test.zsh outputs/semantic_gt_three_scene_10min
+```
+
+六联图在线以 `1 FPS` 合成关键帧，最终每张关键帧只写入一次并编码为 `15 FPS`。因此 `600s` 测试约产生 `600` 个关键帧，合成视频约 `40s`，即约 `15` 倍加速播放，同时避免 15 Hz 在线绘图阻塞 ROS 与仿真。
+
+前期短测可覆盖运行时间和场景：
+
+```bash
+HOUSE_INDS="4" RECORD_SEC=60 TASK_HORIZON=800 \
+  scripts/InteractiveNav/run_semantic_gt_three_scene_test.zsh outputs/semantic_gt_debug_short
+```
+
+开启 semantic mapping 后，global costmap 自动改读 `/semantic_mapping/planning_occ_map`；semantic 节点仍从原始 `/struct_mapping/occ_map` 构建房间与语义信息，避免处理后的地图反馈回自身。门状态达到 `open` 后，semantic 层会在每一帧原始 OCC 上持续清空缓存的闭合门整体 AABB，并同时发布 `/semantic_mapping/door_clear_mask`。为了让 move_base 的 static layer 立即消费门洞变化，还会持续发布小范围 `/semantic_mapping/planning_occ_map_updates`；门关闭后，原门区恢复值会短期重复发布，覆盖 global costmap 的低频更新周期。已确认的交互关节读回状态优先于后续不稳定的视觉 GT 状态，直到下一次交互结果更新。
+
+## 8.5 门状态与语义 OCC 快速测试
+
+定向单测：
+
+```bash
+conda activate mlspaces
+pytest -q \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_portal_state_tracker.py \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_semantic_occ_overlay.py \
+  Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_interaction_graph_store.py
+```
+
+7 号场景检查会读取实际 MuJoCo 门关节和 root AABB，分别设置闭合与完全打开状态，并验证单门、双开门的图状态和 OCC 清空结果：
+
+```bash
+conda activate mlspaces
+python scripts/InteractiveNav/test_semantic_door_occ_house7.py \
+  --house-ind 7 \
+  --output /tmp/semantic_door_occ_house7.json
+```
+
+正式 ROS 联调会把机器人固定在目标门前，初始化时直接关闭全部门，第 `OPEN_STEP` 个仿真 step 直接将目标门铰链设为全开。测试同时保存 raw OCC、semantic planning OCC、door clear mask、move_base global costmap、闭/开门图状态和对比图：
+
+```bash
+conda activate mlspaces
+OPEN_STEP=100 \
+  scripts/InteractiveNav/run_semantic_door_occ_house7_ros_test.zsh \
+  outputs/semantic_door_occ_house7_ros
+```
+
+测试 House 7 中相邻的双开门（两块门板同时关闭/打开）：
+
+```bash
+OPEN_STEP=100 \
+TARGET_ROOT=doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4 \
+ROBOT_XYYAW=4.20,4.881,0.0 \
+  scripts/InteractiveNav/run_semantic_door_occ_house7_ros_test.zsh \
+  outputs/semantic_door_occ_house7_double_ros
+```
+
+双开门 5 位姿开门、穿门、回头关门测试。这里直接设置机器人 base 位姿，从而同步改变相机、odom 和 TF，而不是只修改渲染相机：
+
+```bash
+TARGET_ROOT=doorway_ada234694d8669f8c477500ae8f01b1a_1_0_4 \
+ROBOT_XYYAW=4.05,4.881,0.0 \
+POSE_SEQUENCE='0:4.05,4.881,0.0,closed,left_far/75:4.35,4.881,0.0,open,left_near/150:4.99,4.881,0.0,open,doorway/225:5.55,4.881,0.0,open,right_forward/300:5.85,4.881,3.1415926536,closed,right_turnback' \
+EXPECTED_PHASES=5 \
+  scripts/InteractiveNav/run_semantic_door_occ_house7_ros_test.zsh \
+  outputs/semantic_door_occ_house7_double_pose5
+```
+
+该模式只有在每个位姿的关节状态、语义图状态、机器人位姿、raw/planning OCC 和 global costmap 均满足条件并稳定发布后才截取。输出包括 `occ/phase_*.npz`、每阶段图 JSON、`occ/pose_sequence_summary.json` 和 `occ/pose_sequence_occ_comparison.png`。
+
+验收条件：
+
+- 关门时 raw OCC 与 planning OCC 在门区域一致，clear mask 为空。
+- 开门时 clear mask 非空，mask 内 planning OCC 全部为 free。
+- raw OCC 仍允许保留静态门板痕迹，证明清空来自 semantic overlay，而不是 GMapping 自行更新。
+- move_base global costmap 的门区域收到增量更新，至少产生可通行 free 单元且不再含 lethal 单元。
+
+2026-07-16 的 House 7 正式回归结果：门洞 mask 为 `65` 个栅格；raw OCC 仍有 `16` 个 occupied 和 `6` 个 unknown；planning OCC 的 `65/65` 个栅格均为 free；global costmap 有 `57` 个门洞栅格发生变化，最终为 `53` 个 free、`12` 个 inflation/inscribed、`0` 个 lethal。完整结果见输出目录中的 `occ/summary.json` 与 `occ/door_occ_comparison.png`。
+
+同日双开门 5 位姿严格回归通过：开门后 `115/115` 个 mask 栅格在 planning OCC 中均为 free；左侧近门位姿的 global costmap 为 `107` free、`8` inflation、`0` lethal、`0` unknown；门洞内和右侧位姿均为 `101` free、`14` inflation、`0` lethal、`0` unknown。最终在右侧回头并关门后，clear mask 恢复为 `0`，planning OCC 在参考门区恢复 `31` 个 non-free 栅格，global costmap 恢复 `25` 个 lethal 栅格。
+
+运行中的 ROS 话题检查：
+
+```bash
+rostopic echo -n 1 /semantic_mapping/planning_occ_map/info
+rostopic echo -n 1 /semantic_mapping/planning_occ_map_updates
+rostopic echo -n 1 /semantic_mapping/door_clear_mask/info
+rosparam get /move_base/global_costmap/static_layer/map_topic
+```
+
+注意：当前 GT 快速版依赖“首次有效门板关节观测发生在交互前、门处于闭合状态”的任务约束；真实场景中的门关节/转轴提取尚未实现。
+
+
+### 8.5.1 House 7 冰箱内物体 Obj-goal 图像采集
+
+House 7 的冰箱对象为 `refrigerator_4d8cd69ca487b76cae801cfb0248a055_1_0_6`，此前 GT 语义图中确认其内部有 `potato`、`apple` 和 `lettuce`。下面以 `apple` 为目标，初始固定在 `house7_force_route_01` 的起点，门和容器关闭，由规则语义决策自主探索、开门、打开冰箱并导航到苹果。
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:12835 \
+METHOD=object_goal_rule \
+HOUSE_IND=7 \
+USE_FIXED_ROUTE=true \
+ROUTE_ID=house7_force_route_01 \
+TASK_HORIZON=1000 \
+INITIAL_DOOR_STATE=closed \
+SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/object_goal_apple.yaml \
+GT_STEP_INTERVAL=1 \
+GT_MAX_DISTANCE_M=6.0 \
+VIDEO_FPS=15 \
+VIDEO_PANEL_WIDTH_PX=640 \
+CLEAN_INTERMEDIATE=false \
+SIM_TIMEOUT_S=1800 \
+  scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/house7_object_goal_apple_route01
+```
+
+主要输出：`videos/overview_6panel.mp4`、`debug/semantic_keyframes/`、`debug/graph/` 和 `semantic_exploration_result.json`。
+
+## 8.6 Room分割测试
 
 python /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/room_segmentation_debug_tool.py live \
   --output-dir /home/user/ldl/molmospaces/scripts/InteractiveNav/output/room_occ_snaps

@@ -12,6 +12,12 @@ topics:
   pointcloud: "/registered_scan"
   occupancy_grid: "/struct_mapping/occ_map"
   room_context: "/semantic_mapping/room_context"
+  gt_observations: "/semantic_mapping/gt_observations"
+  interaction_command: "/semantic_decision/interaction_command"
+  interaction_result: "/semantic_mapping/interaction_result"
+  planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
+  planning_occupancy_grid_updates: "/semantic_mapping/planning_occ_map_updates"
+  door_clear_mask: "/semantic_mapping/door_clear_mask"
 
   object_detections: "/semantic_mapping/object_detections"
   scene_attribute: "/semantic_mapping/scene_attribute"
@@ -20,6 +26,7 @@ topics:
   object_markers: "/semantic_mapping/object_semantic_map_markers"
   scene_id_grid: "/semantic_mapping/scene_id_grid"
   scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
+  room_segment_grid: "/semantic_mapping/room_segment_grid"
   unified_graph: "/semantic_mapping/unified_graph"
   unified_graph_markers: "/semantic_mapping/unified_graph_markers"
   unified_graph_markers_lifted: "/semantic_mapping/unified_graph_markers_lifted"
@@ -129,9 +136,22 @@ semantic_map:
   room_enclosed_occupied_max_aspect: 2.5
   room_enclosed_occupied_known_ring_ratio: 0.95
   room_enclosed_occupied_free_ring_ratio: 0.45
+  room_portal_cut_enabled: true
+  room_portal_cut_margin_m: 0.15
+  room_portal_cut_thickness_cells: 2
+  room_portal_detector_min_confirmations: 3
+  room_portal_detector_max_center_jump_m: 0.4
+  room_portal_hint_merge_distance_m: 0.6
+  room_portal_min_width_m: 0.5
+  room_portal_max_width_m: 2.5
+  room_id_overlap_ratio: 0.25
+  room_merge_confirmations: 3
+  room_grid_stability_frames: 3
+  room_geometry_stability_frames: 5
   lifted_graph_frame: "tf_frame_map_graph"
   lifted_graph_z_offset: 10.0
   graph_save_path: ""
+  graph_save_dir: ""
   graph_save_pretty: true
   scene_max_range: 3.0
   scene_min_range: 0.1
@@ -140,11 +160,18 @@ semantic_map:
 interaction_graph:
   scene_id: "semantic_mapping_scene"
   match_distance: 0.5
+  portal_closed_threshold: 0.10
+  portal_open_threshold: 0.67
   gt_replay:
     enable: false
     shuffle: false
     batch_count: 1
     seed: 0
+
+semantic_occ_overlay:
+  enabled: true
+  clear_padding_m: 0.10
+  open_states: ["ajar", "open"]
 
 scene_types:
   unknown_id: -1

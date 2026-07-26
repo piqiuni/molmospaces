@@ -11,5 +11,4 @@ __pycache__/
 # 忽略系统临时文件
 *.swp
 *.swo
-src/openslam_gmapping/
 # 忽略其他不需要的目录（根据你的项目补充）

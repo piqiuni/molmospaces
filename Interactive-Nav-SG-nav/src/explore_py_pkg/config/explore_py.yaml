@@ -13,6 +13,8 @@ topics:
   status: "/explore_py/status"
   frontiers: "/explore_py/frontiers"
   current_subgoal: "/explore_py/current_subgoal"
+  behavior_command: "/explore_py/command"
+  behavior_feedback: "/explore_py/behavior_feedback"
   reset: "/explore_py/reset"
   llm_value_grid: "/explore_py/llm_value_grid"
   strategy_bias: "/explore_py/strategy_bias"
@@ -23,26 +25,43 @@ topics:
   navigation_hints: "/semantic_mapping/navigation_hints"
 
 exploration:
+  external_behavior_control: false
   tick_rate_hz: 1.0
   goal_republish_interval_sec: 0.0
-  goal_reach_tolerance_m: 0.45
+  goal_reach_tolerance_m: 0.35
   goal_timeout_sec: 90.0
   stall_timeout_sec: 30.0
   stall_distance_m: 0.15
   min_goal_lifetime_sec: 8.0
   stall_yaw_progress_rad: 0.20
   rotation_stall_timeout_sec: 45.0
+  # Event-only global replan fallback for left/right rotation oscillation.
+  rotation_replan_enabled: true
+  rotation_replan_window_sec: 10.0
+  rotation_replan_min_duration_sec: 8.0
+  rotation_replan_max_translation_m: 0.05
+  rotation_replan_min_yaw_sum_rad: 0.80
+  rotation_replan_max_net_yaw_rad: 0.30
+  rotation_replan_min_direction_changes: 3
+  rotation_replan_min_yaw_step_rad: 0.03
+  rotation_replan_max_per_goal: 1
+  rotation_replan_cooldown_sec: 20.0
   blacklist_duration_sec: 25.0
   failed_cluster_retry_sec: 120.0
   failed_cluster_max_failures: 3
   frontier_match_distance_m: 1.0
   frontier_gone_confirm_ticks: 3
   frontier_gone_min_goal_age_sec: 8.0
-  failed_point_soft_blacklist_sec: 45.0
+  failed_point_soft_blacklist_sec: 10.0
   failed_point_blacklist_sec: 180.0
   failed_point_blacklist_radius_m: 1.25
-  reached_point_blacklist_sec: 90.0
-  reached_point_blacklist_radius_m: 0.75
+  reached_point_blacklist_sec: 5.0
+  reached_point_blacklist_radius_m: 0.50
+  visit_viewpoint_once: true
+  visited_viewpoint_radius_m: 0.50
+  # Reaching a viewpoint without clearing its frontier means that frontier is
+  # not observable from the navigable free space. Suppress nearby re-clusters.
+  unreachable_frontier_radius_m: 0.50
   active_goal_frontier_min_cells: 3
   initial_spin_enabled: false
   initial_spin_angle_rad: 6.283185307179586
@@ -58,7 +77,14 @@ exploration:
   plan_freshness_sec: 4.0
   global_plan_current_goal_check_enabled: true
   global_plan_current_goal_grace_sec: 4.0
+  external_navigation_plan_grace_sec: 16.0
   global_plan_goal_tolerance_m: 0.6
+  make_plan_preflight_enabled: true
+  make_plan_service: "/move_base/make_plan"
+  make_plan_service_wait_sec: 2.0
+  make_plan_tolerance_m: 0.20
+  make_plan_endpoint_tolerance_m: 0.60
+  make_plan_fail_open: true
   initial_local_goal_count: 3
 
 frontier:
@@ -71,6 +97,7 @@ frontier:
   sensor_range_m: 5.0
   subgoal_search_radius_cells: 18
   min_subgoal_distance_m: 1.00
+  hard_min_subgoal_distance_m: 0.50
   target_frontier_offset_m: 1.0
   use_voronoi_viewpoints: true
   min_viewpoint_frontier_distance_m: 0.8
@@ -86,7 +113,7 @@ frontier:
   robot_radius_m: 0.30
   footprint_safety_margin_m: 0.15
   require_footprint_free: true
-  footprint_unknown_is_free: true
+  footprint_unknown_is_free: false
   turning_safety_margin_m: 0.0
   require_turning_clearance: true
   near_frontier_relax_distance_m: 1.5

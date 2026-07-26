@@ -2,6 +2,8 @@ DWAPlannerROS:
 
 # Robot Configuration Parameters
   max_vel_x: 0.46
+  # Normal exploration samples only stationary/forward trajectories. Reverse
+  # is opened temporarily by the conditional escape logic below.
   min_vel_x: 0.00
 
   max_vel_y: 0.0
@@ -9,10 +11,10 @@ DWAPlannerROS:
 
   # The velocity when robot is moving in a straight line
   max_vel_trans: 0.5
-  min_vel_trans: 0.0
+  min_vel_trans: 0.02
 
-  max_vel_theta: 0.35
-  min_vel_theta: 0.10
+  max_vel_theta: 1.25
+  min_vel_theta: 0.18
 
   acc_lim_x: 2.5
   acc_lim_y: 0.0
@@ -20,8 +22,10 @@ DWAPlannerROS:
 
   # Goal Tolerance Parameters
   xy_goal_tolerance: 0.2
-  yaw_goal_tolerance: 0.5
+  # Exploration goals are position-only; frontier observation yaw is handled separately.
+  yaw_goal_tolerance: 3.14
   latch_xy_goal_tolerance: false
+  prune_plan: true
 
   # Forward Simulation Parameters
   sim_time: 2.0
@@ -31,10 +35,15 @@ DWAPlannerROS:
   controller_frequency: 5.0
 
   # Trajectory Scoring Parameters
-  path_distance_bias: 32.0
+  path_distance_bias: 20.0
   goal_distance_bias: 20.0
   occdist_scale: 0.08
-  forward_point_distance: 0.325
+  forward_point_distance: 0.25
+  # Select the local target by walking this far along the remaining global path.
+  path_lookahead_dist: 0.50
+  trim_path_to_nearest: true
+  twirling_scale: 0.3
+  oscillation_reset_angle: 0.60
   stop_time_buffer: 0.2
   scaling_speed: 0.25
   max_scaling_factor: 0.2
@@ -45,10 +54,30 @@ DWAPlannerROS:
   # A path directly behind the robot is symmetric for DWA. Commit to one
   # collision-checked turn direction until the path is in the forward sector.
   rear_path_prerotate_enabled: true
-  rear_path_enter_angle: 2.2
-  rear_path_exit_angle: 0.9
+  rear_path_enter_angle: 1.75
+  # Do not release forward motion while the rear path is still ~46 deg away.
+  # A tighter exit angle keeps narrow-door turns in the collision-checked
+  # in-place rotation phase until the base is substantially path-aligned.
+  rear_path_exit_angle: 0.34
   rear_path_lookahead_dist: 0.45
-  rear_path_rotate_speed: 0.22
+  rear_path_rotate_speed: 1.25
+  # Near exactly pi, the shortest-angle sign is noise-sensitive. Prefer a
+  # deterministic right turn, then fall back to the opposite side if invalid.
+  rear_path_pi_tie_tolerance: 0.10
+  rear_path_pi_tie_turn_sign: -1
+
+  # Never report a near-zero command as a valid local trajectory while a
+  # non-empty global path is still active.
+  reject_degenerate_cmd_enabled: true
+  degenerate_cmd_min_trans: 0.02
+  degenerate_cmd_min_rot: 0.08
+
+  # Temporarily extend the DWA velocity window after repeated local-planner
+  # failures or when an in-place rear-path turn is collision-invalid.
+  conditional_reverse_enabled: true
+  conditional_reverse_min_vel_x: -0.10
+  conditional_reverse_failure_count: 3
+  conditional_reverse_duration_sec: 1.0
 
   # Debugging
   publish_traj_pc: true

@@ -33,6 +33,8 @@ def observation_from_gt_record(record: dict[str, Any], observation_id: str, sour
             "joint_type": normalize_joint_type(primary_joint.get("joint_type")),
             "joint_range": list(primary_joint.get("joint_range") or [0.0, 0.0]),
             "joint_value": primary_joint.get("joint_value"),
+            "joint_infos": joint_infos,
+            "primary_joint_name": primary_joint.get("joint_name", ""),
             "source": source,
             "name": record.get("name") or record.get("object_id") or record.get("category") or "object",
             "asset_id": record.get("asset_id"),

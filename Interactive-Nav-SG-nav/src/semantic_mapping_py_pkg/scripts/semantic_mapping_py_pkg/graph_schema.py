@@ -26,7 +26,11 @@ class SceneGraphNode:
     interaction: dict[str, Any] = field(default_factory=dict)
     confidence: float = 0.0
     observation_count: int = 0
+    first_seen: float | None = None
     last_seen: float | None = None
+    is_currently_visible: bool = False
+    state_age_sec: float = 0.0
+    graph_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,7 +47,11 @@ class SceneGraphNode:
             "interaction": dict(self.interaction),
             "confidence": float(self.confidence),
             "observation_count": int(self.observation_count),
+            "first_seen": None if self.first_seen is None else float(self.first_seen),
             "last_seen": None if self.last_seen is None else float(self.last_seen),
+            "is_currently_visible": bool(self.is_currently_visible),
+            "state_age_sec": float(self.state_age_sec),
+            "graph_revision": int(self.graph_revision),
         }
 
 
@@ -104,8 +112,11 @@ class NavigationHint:
 @dataclass
 class SceneGraphBundle:
     scene_id: str
+    episode_id: str
     source_mode: str
+    graph_revision: int
     timestamp: float
+    capture_step: int | None
     nodes: list[SceneGraphNode]
     edges: list[SceneGraphEdge]
     semantic_node_ids: list[str]
@@ -119,8 +130,11 @@ class SceneGraphBundle:
     def to_dict(self) -> dict[str, Any]:
         return {
             "scene_id": self.scene_id,
+            "episode_id": self.episode_id,
             "source_mode": self.source_mode,
+            "graph_revision": int(self.graph_revision),
             "timestamp": float(self.timestamp),
+            "capture_step": self.capture_step,
             "nodes": [node.to_dict() for node in self.nodes],
             "edges": [edge.to_dict() for edge in self.edges],
             "views": {
