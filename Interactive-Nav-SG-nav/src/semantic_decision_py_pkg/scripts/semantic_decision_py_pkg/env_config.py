@@ -55,15 +55,26 @@ def apply_model_env_overrides(
         "endpoint": "SEMANTIC_MODEL_ENDPOINT",
         "api_key_env": "SEMANTIC_MODEL_API_KEY_ENV",
         "model": "SEMANTIC_MODEL_NAME",
+        "protocol": "SEMANTIC_MODEL_PROTOCOL",
         "timeout_s": "SEMANTIC_MODEL_TIMEOUT_S",
+        "temperature": "SEMANTIC_MODEL_TEMPERATURE",
+        "max_tokens": "SEMANTIC_MODEL_MAX_TOKENS",
+        "reasoning_effort": "SEMANTIC_MODEL_REASONING_EFFORT",
+        "image_detail": "SEMANTIC_MODEL_IMAGE_DETAIL",
+        "metrics_path": "SEMANTIC_MODEL_METRICS_PATH",
     }
     for config_key, env_key in env_map.items():
         value = os.environ.get(env_key)
         if value is None or value == "":
             continue
-        if config_key == "timeout_s":
+        if config_key in {"timeout_s", "temperature"}:
             try:
                 result[config_key] = float(value)
+            except ValueError:
+                continue
+        elif config_key == "max_tokens":
+            try:
+                result[config_key] = int(value)
             except ValueError:
                 continue
         else:

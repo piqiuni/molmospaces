@@ -20,6 +20,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping_py_pkg.geometry_utils import normalize_label, transform_point_best_effort
 from semantic_mapping_py_pkg.graph_rules import observation_from_detection
+from semantic_mapping_py_pkg.graph_ablation import apply_module1_ablation
 from semantic_mapping_py_pkg.interaction_graph_viz import build_graph_marker_array
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text
@@ -28,6 +29,7 @@ from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param, get_topics
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore, SceneGridStore
 from semantic_mapping_py_pkg.semantic_occ_overlay import OverlayUpdateRegionTracker, SemanticOccupancyOverlay
+from semantic_mllm_py_pkg.ablation import AblationConfig
 
 
 class SemanticMappingNode:
@@ -37,6 +39,12 @@ class SemanticMappingNode:
         topics = get_topics(rospy)
         frames = get_frames(rospy)
         config = get_nested_param(rospy, "semantic_map", {}) or {}
+        ablation_config = get_nested_param(rospy, "ablation", {}) or {}
+        self.ablation = AblationConfig(
+            module1=str(ablation_config.get("module1", "dynamic_rule")),
+            module2=str(ablation_config.get("module2", "rule_cost")),
+            module3=str(ablation_config.get("module3", "rule_verified")),
+        )
         scene_types = get_nested_param(rospy, "scene_types", {}) or {}
 
         self.world_frame = frames.get("world_frame", "tf_frame_map")
@@ -50,6 +58,9 @@ class SemanticMappingNode:
             "interaction_command", "/semantic_decision/interaction_command"
         )
         self.interaction_result_topic = topics.get("interaction_result", "/semantic_mapping/interaction_result")
+        self.attribute_updates_topic = topics.get(
+            "attribute_updates", "/semantic_mapping/attribute_updates"
+        )
         self.planning_occupancy_grid_topic = topics.get(
             "planning_occupancy_grid", "/semantic_mapping/planning_occ_map"
         )
@@ -213,6 +224,9 @@ class SemanticMappingNode:
         self.interaction_result_sub = rospy.Subscriber(
             self.interaction_result_topic, String, self.interaction_result_callback, queue_size=2
         )
+        self.attribute_updates_sub = rospy.Subscriber(
+            self.attribute_updates_topic, String, self.attribute_updates_callback, queue_size=2
+        )
 
         self.object_pub = rospy.Publisher(self.object_map_topic, String, queue_size=1)
         self.marker_pub = rospy.Publisher(self.object_markers_topic, MarkerArray, queue_size=1)
@@ -355,6 +369,23 @@ class SemanticMappingNode:
         if publish_bundle is not None:
             self._safe_publish_bundle(publish_bundle)
 
+    def attribute_updates_callback(self, msg):
+        if self.ablation.module1 != "dynamic_mllm":
+            return
+        parsed = parse_json_object_or_text(msg.data)
+        episode_id = str(parsed.get("episode_id") or "")
+        if episode_id and self.graph_store.episode_id and episode_id != self.graph_store.episode_id:
+            return
+        stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
+        changed = False
+        with self.lock:
+            for patch in parsed.get("updates") or []:
+                if isinstance(patch, dict):
+                    changed = self.graph_store.apply_attribute_patch(patch, stamp=stamp) or changed
+            publish_bundle = self._collect_publish_bundle_locked() if changed else None
+        if publish_bundle is not None:
+            self._safe_publish_bundle(publish_bundle)
+
     def pointcloud_callback(self, msg):
         with self.lock:
             self.latest_cloud = msg
@@ -450,7 +481,9 @@ class SemanticMappingNode:
         scene_grid = self._build_grid(self.scene_store.scene_data) if scene_info_ready else None
         scene_conf_grid = self._build_grid(self.scene_store.confidence_data) if scene_info_ready else None
         room_segment_grid = self.latest_room_segment_grid
-        graph_payload = self.graph_store.as_graph_dict()
+        graph_payload = apply_module1_ablation(
+            self.graph_store.as_graph_dict(), self.ablation.module1
+        )
         self.semantic_occ_overlay.update_graph(graph_payload)
         planning_grid = None
         planning_update = None

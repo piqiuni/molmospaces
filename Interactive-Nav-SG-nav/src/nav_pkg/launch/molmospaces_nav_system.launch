@@ -15,6 +15,19 @@
   <arg name="start_nav" default="$(eval 'false' if arg('manual_control') else 'true')"/>
   <arg name="semantic_use_gt" default="false"/>
   <arg name="semantic_source" default="detector"/>
+  <arg name="semantic_attribute_inference" default="false"/>
+  <arg name="semantic_attribute_model_name" default=""/>
+  <arg name="semantic_attribute_max_output_tokens" default="96"/>
+  <arg name="semantic_attribute_request_timeout_s" default="8.0"/>
+  <arg name="semantic_attribute_worker_count" default="1"/>
+  <arg name="semantic_attribute_max_queue_size" default="8"/>
+  <arg name="semantic_attribute_min_interval_s" default="5.0"/>
+  <arg name="semantic_attribute_success_refresh_interval_s" default="120.0"/>
+  <arg name="semantic_attribute_min_visible_fraction" default="0.20"/>
+  <arg name="semantic_attribute_min_visible_pixels" default="64"/>
+  <arg name="semantic_attribute_min_bbox_area_px" default="512"/>
+  <arg name="semantic_attribute_max_distance_m" default="6.0"/>
+  <arg name="semantic_attribute_required_consecutive_observations" default="2"/>
   <arg name="publish_realtime_gt" default="false"/>
   <arg name="initial_door_state" default="keep"/>
   <arg name="enable_force_interaction" default="false"/>
@@ -61,6 +74,7 @@
   <arg name="initial_right_arm_qpos" default="0.28,0.0,0.45,-0.64,0.39,-0.26,-0.04"/>
   <arg name="publish_debug_front_camera" default="false"/>
   <arg name="semantic_config_file" default="$(find semantic_mapping_py_pkg)/config/default.yaml"/>
+  <arg name="semantic_config_override_file" default=""/>
   <arg name="semantic_object_detection_backend" default="yoloe_pf_box3d"/>
   <arg name="semantic_object_detection_provider" default="yoloe_local"/>
   <arg name="semantic_object_detection_model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
@@ -101,6 +115,7 @@
   <group if="$(eval arg('start_semantic_mapping') and arg('semantic_source') == 'detector' and not arg('semantic_use_gt'))">
     <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
       <arg name="config_file" value="$(arg semantic_config_file)"/>
+      <arg name="override_config_file" value="$(arg semantic_config_override_file)"/>
       <arg name="start_object_detection" value="true"/>
       <arg name="start_room_attribute" value="true"/>
       <arg name="start_semantic_mapping" value="true"/>
@@ -114,21 +129,49 @@
       <arg name="publish_debug_segmented_cloud" value="$(arg semantic_publish_debug_segmented_cloud)"/>
       <arg name="publish_debug_detection_image" value="$(arg semantic_publish_debug_detection_image)"/>
       <arg name="room_inference_backend" value="$(arg semantic_room_inference_backend)"/>
+      <arg name="start_attribute_inference" value="$(arg semantic_attribute_inference)"/>
+      <arg name="attribute_model_name" value="$(arg semantic_attribute_model_name)"/>
+      <arg name="attribute_max_output_tokens" value="$(arg semantic_attribute_max_output_tokens)"/>
+      <arg name="attribute_request_timeout_s" value="$(arg semantic_attribute_request_timeout_s)"/>
+      <arg name="attribute_worker_count" value="$(arg semantic_attribute_worker_count)"/>
+      <arg name="attribute_max_queue_size" value="$(arg semantic_attribute_max_queue_size)"/>
+      <arg name="attribute_min_interval_s" value="$(arg semantic_attribute_min_interval_s)"/>
+      <arg name="attribute_success_refresh_interval_s" value="$(arg semantic_attribute_success_refresh_interval_s)"/>
+      <arg name="attribute_min_visible_fraction" value="$(arg semantic_attribute_min_visible_fraction)"/>
+      <arg name="attribute_min_visible_pixels" value="$(arg semantic_attribute_min_visible_pixels)"/>
+      <arg name="attribute_min_bbox_area_px" value="$(arg semantic_attribute_min_bbox_area_px)"/>
+      <arg name="attribute_max_distance_m" value="$(arg semantic_attribute_max_distance_m)"/>
+      <arg name="attribute_required_consecutive_observations" value="$(arg semantic_attribute_required_consecutive_observations)"/>
     </include>
   </group>
 
   <group if="$(eval arg('start_semantic_mapping') and arg('semantic_source') == 'realtime_gt')">
     <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
       <arg name="config_file" value="$(arg semantic_config_file)"/>
+      <arg name="override_config_file" value="$(arg semantic_config_override_file)"/>
       <arg name="start_object_detection" value="false"/>
       <arg name="start_room_attribute" value="false"/>
       <arg name="start_semantic_mapping" value="true"/>
+      <arg name="start_attribute_inference" value="$(arg semantic_attribute_inference)"/>
+      <arg name="attribute_model_name" value="$(arg semantic_attribute_model_name)"/>
+      <arg name="attribute_max_output_tokens" value="$(arg semantic_attribute_max_output_tokens)"/>
+      <arg name="attribute_request_timeout_s" value="$(arg semantic_attribute_request_timeout_s)"/>
+      <arg name="attribute_worker_count" value="$(arg semantic_attribute_worker_count)"/>
+      <arg name="attribute_max_queue_size" value="$(arg semantic_attribute_max_queue_size)"/>
+      <arg name="attribute_min_interval_s" value="$(arg semantic_attribute_min_interval_s)"/>
+      <arg name="attribute_success_refresh_interval_s" value="$(arg semantic_attribute_success_refresh_interval_s)"/>
+      <arg name="attribute_min_visible_fraction" value="$(arg semantic_attribute_min_visible_fraction)"/>
+      <arg name="attribute_min_visible_pixels" value="$(arg semantic_attribute_min_visible_pixels)"/>
+      <arg name="attribute_min_bbox_area_px" value="$(arg semantic_attribute_min_bbox_area_px)"/>
+      <arg name="attribute_max_distance_m" value="$(arg semantic_attribute_max_distance_m)"/>
+      <arg name="attribute_required_consecutive_observations" value="$(arg semantic_attribute_required_consecutive_observations)"/>
     </include>
   </group>
 
   <group if="$(eval arg('start_semantic_mapping') and (arg('semantic_source') == 'offline_gt' or arg('semantic_use_gt')))">
     <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
       <arg name="config_file" value="$(arg semantic_config_file)"/>
+      <arg name="override_config_file" value="$(arg semantic_config_override_file)"/>
       <arg name="start_object_detection" value="false"/>
       <arg name="start_room_attribute" value="true"/>
       <arg name="start_semantic_mapping" value="true"/>

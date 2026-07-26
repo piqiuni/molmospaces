@@ -12,13 +12,18 @@ from semantic_decision_py_pkg.mission_completion import (
     MissionCompletionTracker,
     TargetMissionTracker,
 )
-from semantic_decision_py_pkg.model_policy import ModelPolicyClient, ModelPolicyConfig
+from semantic_decision_py_pkg.model_policy import (
+    ModelCircuitBreaker,
+    ModelPolicyClient,
+    ModelPolicyConfig,
+)
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.rule_policy import (
     RulePolicy,
     RulePolicyConfig,
     progressive_failure_cooldown,
 )
+from semantic_mllm_py_pkg.ablation import AblationConfig
 
 patch_roslogging_findcaller_for_py311()
 
@@ -33,6 +38,12 @@ class SemanticRuleDecisionNode:
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~policy", {}) or {}
         mission_config = rospy.get_param("~mission", {}) or {}
+        ablation_config = rospy.get_param("~ablation", {}) or {}
+        self.ablation = AblationConfig(
+            module1=str(ablation_config.get("module1", "dynamic_rule")),
+            module2=str(ablation_config.get("module2", "rule_cost")),
+            module3=str(ablation_config.get("module3", "rule_verified")),
+        )
         model_config = apply_model_env_overrides(rospy.get_param("~model", {}) or {})
         completion_config = rospy.get_param("~completion", {}) or {}
         self.policy = RulePolicy(
@@ -72,23 +83,45 @@ class SemanticRuleDecisionNode:
                 else [self.failure_cooldown_s]
             )
         )
+        self.interaction_target_failure_cooldown_s = float(
+            config.get("interaction_target_failure_cooldown_s", self.failure_cooldown_s)
+        )
         self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
         self.failure_retry_delay_s = float(config.get("failure_retry_delay_s", 2.0))
         self.mission_mode = self._normalize_mission_mode(
             mission_config.get("mode", "semantic_interaction_exploration")
         )
-        self.policy_backend = str(config.get("backend", "rule")).casefold()
+        configured_backend = str(config.get("backend", "rule")).casefold()
+        self.policy_backend = (
+            "model"
+            if self.ablation.module2 == "mllm_score"
+            else "rule"
+            if self.ablation.module2 == "rule_cost"
+            else configured_backend
+        )
         self.model_policy = ModelPolicyClient(
             ModelPolicyConfig(
                 mode=str(model_config.get("mode", "disabled")),
                 command=str(model_config.get("command", "")),
                 endpoint=str(model_config.get("endpoint", "")),
                 api_key_env=str(model_config.get("api_key_env", "OPENAI_API_KEY")),
-                model=str(model_config.get("model", "")),
-                timeout_s=float(model_config.get("timeout_s", 20.0)),
+                model=str(model_config.get("model", "qwen3.6-35b-a3b")),
+                protocol=str(model_config.get("protocol", "openai_chat")),
+                timeout_s=float(model_config.get("timeout_s", 3.0)),
+                temperature=float(model_config.get("temperature", 0.0)),
+                max_tokens=int(model_config.get("max_tokens", 128)),
+                reasoning_effort=str(model_config.get("reasoning_effort", "off")),
+                image_detail=str(model_config.get("image_detail", "low")),
                 max_graph_nodes=int(model_config.get("max_graph_nodes", 80)),
                 max_graph_edges=int(model_config.get("max_graph_edges", 160)),
+                metrics_path=str(model_config.get("metrics_path", "")),
             )
+        )
+        self.model_circuit_breaker = ModelCircuitBreaker(
+            consecutive_timeout_limit=int(
+                model_config.get("consecutive_timeout_limit", 2)
+            ),
+            cooldown_s=float(model_config.get("timeout_cooldown_s", 60.0)),
         )
         self.completion_tracker = MissionCompletionTracker(
             MissionCompletionConfig(
@@ -165,6 +198,10 @@ class SemanticRuleDecisionNode:
             self.target_mission.reset()
             self.cooldown_until.clear()
             self.failure_counts.clear()
+            self.model_circuit_breaker = ModelCircuitBreaker(
+                consecutive_timeout_limit=self.model_circuit_breaker.consecutive_timeout_limit,
+                cooldown_s=self.model_circuit_breaker.cooldown_s,
+            )
             self.completion_tracker.reset()
         target_context = payload.get("target_context") or {}
         target_key = json.dumps(target_context, ensure_ascii=False, sort_keys=True)
@@ -206,6 +243,12 @@ class SemanticRuleDecisionNode:
                     failure_count,
                 )
             self.cooldown_until[candidate_id] = time.monotonic() + cooldown_s
+        if status != "SUCCEEDED" and self.active_behavior_type == "INTERACT":
+            target_id = self._interaction_target_id(candidate_id)
+            if target_id:
+                self.cooldown_until[target_id] = time.monotonic() + max(
+                    0.0, self.interaction_target_failure_cooldown_s
+                )
         if status != "SUCCEEDED":
             self.next_decision_time = time.monotonic() + self.failure_retry_delay_s
         if status == "SUCCEEDED" and self.active_behavior_type == "INTERACT":
@@ -309,7 +352,11 @@ class SemanticRuleDecisionNode:
         candidates = []
         for payload in self.latest_candidates_payload.get("candidates") or []:
             candidate_id = str(payload.get("candidate_id") or "")
-            if now < self.cooldown_until.get(candidate_id, 0.0):
+            target_cooldown_key = self._interaction_target_id(candidate_id)
+            if (
+                now < self.cooldown_until.get(candidate_id, 0.0)
+                or (target_cooldown_key and now < self.cooldown_until.get(target_cooldown_key, 0.0))
+            ):
                 continue
             metadata = payload.get("metadata") or {}
             if self.target_goal_complete and (
@@ -330,21 +377,48 @@ class SemanticRuleDecisionNode:
             key=lambda candidate: (-candidate.score, candidate.candidate_id),
             default=None,
         )
-        if self.policy_backend == "model":
+        model_circuit_open = not self.model_circuit_breaker.allow_request(now)
+        if self.policy_backend == "model" and not model_circuit_open:
             model_selected = self.model_policy.select(
                 eligible,
                 target_context=self.latest_candidates_payload.get("target_context") or {},
                 graph=self.latest_candidates_payload.get("graph_context") or {},
+                robot_context={
+                    "robot_xy": self.latest_candidates_payload.get("robot_xy"),
+                    "exploration_context": self.latest_candidates_payload.get(
+                        "exploration_context"
+                    ),
+                    "active_candidate_id": self.active_candidate_id,
+                },
+                metrics_context={
+                    "episode_id": self.latest_candidates_payload.get("episode_id", ""),
+                    "graph_revision": self.latest_candidates_payload.get("graph_revision", 0),
+                    "candidate_sequence": candidate_sequence,
+                    "candidate_ids": [candidate.candidate_id for candidate in eligible],
+                },
             )
             if model_selected is not None:
                 selected = model_selected
+                self.model_circuit_breaker.record_success()
+            elif self.model_policy.last_error:
+                self.model_circuit_breaker.record_failure(self.model_policy.last_error, now)
+        elif self.policy_backend == "model":
+            self.model_policy.last_error = "model_circuit_open_after_consecutive_timeouts"
+            self.model_policy.last_result_source = "rule_fallback_circuit_open"
+            self.model_policy.last_metrics = {}
         trace = {
             "timestamp": time.time(),
             "episode_id": self.latest_candidates_payload.get("episode_id", ""),
             "graph_revision": self.latest_candidates_payload.get("graph_revision", 0),
             "active_candidate_id": self.active_candidate_id,
             "policy_backend": self.policy_backend,
+            "ablation": self.ablation.to_dict(),
             "model_error": self.model_policy.last_error,
+            "model_result_source": self.model_policy.last_result_source,
+            "model_metrics": dict(self.model_policy.last_metrics),
+            "model_circuit_open": model_circuit_open,
+            "model_circuit_open_until": self.model_circuit_breaker.open_until,
+            "model_consecutive_timeouts": self.model_circuit_breaker.consecutive_timeouts,
             "ranked_candidates": [
                 candidate.to_dict()
                 for candidate in sorted(scored, key=lambda item: (-item.score, item.candidate_id))
@@ -381,6 +455,13 @@ class SemanticRuleDecisionNode:
         self.selected_pub.publish(
             String(data=json.dumps(selection, ensure_ascii=False, separators=(",", ":")))
         )
+
+    @staticmethod
+    def _interaction_target_id(candidate_id: str) -> str:
+        parts = str(candidate_id or "").split(":", 2)
+        if len(parts) >= 2 and parts[0] == "interaction" and parts[1]:
+            return f"interaction_target:{parts[1]}"
+        return ""
 
     def _publish_goal_status(self, status: str, detail: dict | None = None) -> None:
         payload = {

@@ -320,6 +320,26 @@ class BehaviorExecutionStateMachine:
             return []
         return self._finish(True, detail or {"state": state}, now)
 
+    def on_verification_result(
+        self,
+        success: bool,
+        detail: dict[str, Any] | None = None,
+        retry: bool = False,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.state != STATE_VERIFYING or self.candidate is None:
+            return []
+        now = time.monotonic() if now is None else float(now)
+        if success:
+            return self._finish(True, detail or {"verified": True}, now)
+        if retry:
+            return self._transition(
+                STATE_INTERACTING,
+                now,
+                {"kind": "interact", "candidate": self.candidate, "retry": True},
+            )
+        return self._finish(False, detail or {"reason": "verification_failed"}, now)
+
     def on_target_visibility(
         self,
         visible: bool,
