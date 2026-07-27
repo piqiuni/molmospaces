@@ -43,6 +43,9 @@ def parse_args() -> argparse.Namespace:
             "container_exploration",
             "object_goal_rule",
             "object_goal_model_mock",
+            "full_mllm_exploration",
+            "full_mllm_object_goal",
+            "full_mllm_object_goal_apple",
         ),
         default=["frontier_only", "interactive_rule"],
     )

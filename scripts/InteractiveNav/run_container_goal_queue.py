@@ -27,15 +27,6 @@ from runtime_target_selection import select_far_container_target
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RUNNER = SCRIPT_DIR / "run_house7_semantic_exploration_ros_test.zsh"
-DEFAULT_DECISION_OVERRIDE = (
-    SCRIPT_DIR
-    / "configs"
-    / "semantic_decision"
-    / "full_mllm_object_goal_runtime.yaml"
-)
-DEFAULT_MAPPING_OVERRIDE = (
-    SCRIPT_DIR / "configs" / "semantic_decision" / "full_mllm_mapping.yaml"
-)
 STOP = object()
 
 
@@ -64,10 +55,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-split", default="train")
     parser.add_argument("--robot", default="rby1", choices=["rby1", "droid", "rum"])
     parser.add_argument("--variant", default="base")
-    parser.add_argument("--method", default="semantic_interaction_object_goal")
+    parser.add_argument("--method", default="full_mllm_object_goal")
     parser.add_argument("--runner", type=Path, default=DEFAULT_RUNNER)
-    parser.add_argument("--decision-override", type=Path, default=DEFAULT_DECISION_OVERRIDE)
-    parser.add_argument("--mapping-override", type=Path, default=DEFAULT_MAPPING_OVERRIDE)
+    parser.add_argument("--decision-override", type=Path)
+    parser.add_argument("--mapping-override", type=Path)
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--attribute-model-name", default="qwen3.6-35b-a3b")
     parser.add_argument("--recording", action=argparse.BooleanOptionalAction, default=True)
@@ -88,22 +79,6 @@ def write_json(path: Path, payload: Any) -> None:
     temporary.replace(path)
 
 
-def hidden_target_context(context: dict[str, Any]) -> dict[str, Any]:
-    public_context = dict(context)
-    for key in (
-        "target_container_name",
-        "target_container_labels",
-        "target_container_source_object_name",
-        "target_container_instance_id",
-        "target_container_requires_interaction",
-    ):
-        public_context.pop(key, None)
-    public_context["selection_mode"] = "queued_hidden_container_object"
-    public_context["require_interaction"] = False
-    public_context["completion_requires_visibility"] = True
-    return public_context
-
-
 def discover_goal(args: argparse.Namespace, house_ind: int) -> dict[str, Any]:
     scan_args = argparse.Namespace(
         seed=int(house_ind),
@@ -120,17 +95,14 @@ def discover_goal(args: argparse.Namespace, house_ind: int) -> dict[str, Any]:
             SimpleNamespace(env=context.env),
             selection_seed=int(house_ind),
             top_k=args.selection_top_k,
+            reveal_container_context=bool(args.reveal_container_context),
         )
     finally:
         close_context(context)
     selection = dict(selection)
     selection["house_ind"] = int(house_ind)
     selection["scan_elapsed_sec"] = time.monotonic() - started
-    selection["target_context"] = (
-        dict(target_context)
-        if args.reveal_container_context
-        else hidden_target_context(target_context)
-    )
+    selection["target_context"] = dict(target_context)
     return selection
 
 
@@ -177,9 +149,6 @@ def run_task(
             "FORCE_CLOSE_CONTAINERS": "true",
             "RUNTIME_TARGET_MODE": "fixed_container_object",
             "RUNTIME_TARGET_SELECTION_INPUT_PATH": str(selection_input_path),
-            "SEMANTIC_DECISION_OVERRIDE": str(args.decision_override),
-            "SEMANTIC_MAPPING_OVERRIDE": str(args.mapping_override),
-            "ENABLE_ATTRIBUTE_INFERENCE": "true",
             "SEMANTIC_ATTRIBUTE_MODEL_NAME": args.attribute_model_name,
             "SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S": "8.0",
             "SEMANTIC_MODEL_TIMEOUT_S": "3.0",
@@ -197,6 +166,14 @@ def run_task(
             "PYTHONUNBUFFERED": "1",
         }
     )
+    if args.decision_override is not None:
+        environment["SEMANTIC_DECISION_OVERRIDE"] = str(args.decision_override)
+    else:
+        environment.pop("SEMANTIC_DECISION_OVERRIDE", None)
+    if args.mapping_override is not None:
+        environment["SEMANTIC_MAPPING_OVERRIDE"] = str(args.mapping_override)
+    else:
+        environment.pop("SEMANTIC_MAPPING_OVERRIDE", None)
     if args.env_file is not None:
         environment["SEMANTIC_MODEL_ENV_FILE"] = str(args.env_file)
     command = ["zsh", str(args.runner), str(scene_dir), run_id]

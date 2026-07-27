@@ -1,0 +1,13 @@
+ablation:
+  module1: "dynamic_mllm"
+  module2: "mllm_score"
+  module3: "mllm_skill_verified"
+
+interaction_graph:
+  geometry_overrides:
+    refrigerator_4d8cd69ca487b76cae801cfb0248a055_1_0_6:
+      interaction_approach_axis_xy: [1.0, 0.0]
+      interaction_approach_pose_xyyaw: [8.254459, 1.053060, 3.141593]
+      interaction_reference_aabb_center: [7.093688, 1.053060, 0.763265]
+      interaction_reference_aabb_size: [0.821541, 0.878605, 1.527632]
+      source: "house7_articulation_front_calibration"

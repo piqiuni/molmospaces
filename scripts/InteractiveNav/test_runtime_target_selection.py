@@ -2,7 +2,11 @@ import json
 
 import pytest
 
-from runtime_target_selection import _is_inside, load_fixed_container_target
+from runtime_target_selection import (
+    _is_inside,
+    load_fixed_container_target,
+    public_object_goal_context,
+)
 
 
 def test_load_fixed_container_target(tmp_path):
@@ -15,7 +19,10 @@ def test_load_fixed_container_target(tmp_path):
                 "target_context": {
                     "enabled": True,
                     "target_name": "apple",
-                    "object_labels": ["apple"],
+                    "object_labels": ["apple", "apple_instance"],
+                    "target_container_name": "refrigerator",
+                    "target_container_source_object_name": "fridge_instance",
+                    "require_interaction": True,
                 },
             }
         ),
@@ -25,7 +32,12 @@ def test_load_fixed_container_target(tmp_path):
     context, selection = load_fixed_container_target(path)
 
     assert context["target_name"] == "apple"
+    assert context["object_labels"] == ["apple"]
+    assert context["require_interaction"] is False
+    assert "target_container_name" not in context
+    assert "target_container_source_object_name" not in context
     assert selection["target_name"] == "apple_instance"
+    assert selection["private_target_context"]["target_container_name"] == "refrigerator"
     assert selection["selection_mode"] == "fixed_container_object"
     assert selection["selection_input_path"] == str(path.resolve())
 
@@ -36,6 +48,33 @@ def test_load_fixed_container_target_rejects_disabled_context(tmp_path):
 
     with pytest.raises(ValueError, match="not enabled"):
         load_fixed_container_target(path)
+
+
+def test_public_object_goal_context_hides_container_and_instance_details():
+    context = public_object_goal_context(
+        {
+            "enabled": True,
+            "selection_mode": "random_far_container_object",
+            "target_name": "apple",
+            "object_labels": ["apple", "apple_instance"],
+            "target_source_object_name": "apple_instance",
+            "target_container_name": "refrigerator",
+            "target_container_source_object_name": "fridge_instance",
+            "target_container_requires_interaction": True,
+            "require_interaction": True,
+            "completion_requires_visibility": True,
+            "target_min_visible_pixels": 16,
+        }
+    )
+
+    assert context == {
+        "enabled": True,
+        "target_name": "apple",
+        "object_labels": ["apple"],
+        "require_interaction": False,
+        "completion_requires_visibility": True,
+        "target_min_visible_pixels": 16,
+    }
 
 
 def test_strict_containment_rejects_object_on_container_top():

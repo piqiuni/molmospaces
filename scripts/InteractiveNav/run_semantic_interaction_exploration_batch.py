@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
             "container_exploration",
             "object_goal_runtime",
             "full_mllm_exploration",
+            "full_mllm_object_goal",
         ],
         default="object_goal_runtime",
     )
