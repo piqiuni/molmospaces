@@ -46,6 +46,109 @@ def test_minimal_gt_is_normalized_from_only_allowed_fields() -> None:
     assert normalized["minimal_gt_observation"] is True
 
 
+def test_minimal_gt_adapter_discards_legacy_graph_metadata() -> None:
+    raw = minimal_observation(
+        "chair_1", "Chair", [1.0, 2.0, 0.5], [0.5, 0.5, 1.0]
+    )
+    raw.update(
+        {
+            "semantic_name": "door",
+            "category": "Door",
+            "instance_id": "wrong_instance",
+            "position": [99.0, 99.0, 99.0],
+            "aabb_center": [99.0, 99.0, 99.0],
+            "aabb_size": [9.0, 9.0, 9.0],
+            "confidence": 0.01,
+            "visible_pixels": 1,
+            "parent": "cabinet_root",
+            "children": ["chair_child"],
+            "is_receptacle": True,
+            "is_pickup_candidate": True,
+            "is_articulable": True,
+            "is_door": True,
+            "is_movable_door": True,
+            "joint_type": "hinge",
+            "joint_range": [0.0, 1.0],
+            "joint_value": 1.0,
+            "joint_infos": [{"joint_name": "forbidden_hinge"}],
+            "room_id": 7,
+            "connected_room_ids": [7, 8],
+        }
+    )
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["instance_id"] == "chair_1"
+    assert normalized["semantic_name"] == "chair"
+    assert normalized["category"] == "chair"
+    assert normalized["position"] == [1.0, 2.0, 0.5]
+    assert normalized["aabb_center"] == [1.0, 2.0, 0.5]
+    assert normalized["aabb_size"] == [0.5, 0.5, 1.0]
+    assert normalized["viz_aabb_center"] == [1.0, 2.0, 0.5]
+    assert normalized["viz_aabb_size"] == [0.5, 0.5, 1.0]
+    assert normalized["confidence"] == 1.0
+    assert normalized["visible_pixels"] == 100
+    assert normalized["parent"] is None
+    assert normalized["children"] == []
+    assert normalized["is_receptacle"] is False
+    assert normalized["is_pickup_candidate"] is False
+    assert normalized["is_articulable"] is False
+    assert normalized["is_door"] is False
+    assert normalized["is_movable_door"] is False
+    assert normalized["joint_type"] == "none"
+    assert normalized["joint_range"] == [0.0, 0.0]
+    assert normalized["joint_value"] is None
+    assert normalized["joint_infos"] == []
+    assert normalized["room_id"] is None
+    assert normalized["connected_room_ids"] == []
+
+
+def test_graph_ignores_legacy_flags_parent_and_joint_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    chair = minimal_observation(
+        "chair_1", "Chair", [1.0, 2.0, 0.5], [0.5, 0.5, 1.0]
+    )
+    chair.update(
+        {
+            "parent": "cabinet_root",
+            "is_articulable": True,
+            "is_door": True,
+            "joint_type": "hinge",
+            "joint_range": [0.0, 1.0],
+            "joint_value": 1.0,
+        }
+    )
+    door = minimal_observation(
+        "door_1", "Door", [2.0, 2.0, 1.0], [0.2, 1.0, 2.0]
+    )
+    door.update(
+        {
+            "parent": "wall_root",
+            "is_door": False,
+            "is_articulable": False,
+            "joint_type": "hinge",
+            "joint_range": [0.0, 1.0],
+            "joint_value": 1.0,
+        }
+    )
+
+    store.update_observations(
+        [chair, door], stamp=1.0, source_mode="realtime_gt_observation"
+    )
+    graph = store.as_graph_dict(stamp=1.0)
+    chair_node = next(node for node in graph["nodes"] if node["id"] == "object_chair_1")
+    door_node = next(node for node in graph["nodes"] if node["id"] == "portal_door_1")
+
+    assert chair_node["type"] == "object"
+    assert chair_node["interaction"]["is_interactable"] is False
+    assert door_node["type"] == "portal"
+    assert door_node["interaction"]["state"] == "unknown"
+    assert door_node["interaction"]["requires_interaction"] is True
+    forbidden = {"parent", "is_door", "is_articulable", "joint_infos"}
+    assert forbidden.isdisjoint(chair_node["attributes"])
+    assert forbidden.isdisjoint(door_node["attributes"])
+
+
 def test_minimal_gt_builds_interactive_portal_without_joint_metadata() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     observation = minimal_observation(
@@ -113,7 +216,7 @@ def test_minimal_gt_container_relation_is_inferred_from_3d_boxes() -> None:
     )
 
 
-def test_executor_joint_readback_is_reduced_to_semantic_result() -> None:
+def test_executor_semantic_result_updates_graph_by_object_id() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     observation = minimal_observation(
         "double_door_root", "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0]
@@ -121,9 +224,37 @@ def test_executor_joint_readback_is_reduced_to_semantic_result() -> None:
     store.update_observations([observation], source_mode="realtime_gt_observation")
     assert store.update_interaction_result(
         {
-            "node_id": "portal_double_door_root",
-            "interaction_group_id": "all_joints",
+            "object_id": "double_door_root",
             "state": "open",
+            "success": True,
+            "verification_source": "executor_state_verification",
+        }
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert portal["interaction"]["state"] == "open"
+    assert portal["interaction"]["completed_interaction_groups"] == []
+    assert "joint_infos" not in portal["attributes"]
+    assert "joint_interaction_states" not in portal["interaction"]
+    assert "joint_open_fractions" not in portal["interaction"]
+
+
+def test_joint_only_executor_result_cannot_infer_graph_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            minimal_observation(
+                "door_1", "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0]
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_1",
             "success": True,
             "joint_infos": [
                 {
@@ -140,11 +271,9 @@ def test_executor_joint_readback_is_reduced_to_semantic_result() -> None:
     portal = next(
         node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
     )
-    assert portal["interaction"]["state"] == "open"
-    assert portal["interaction"]["completed_interaction_groups"] == ["all_joints"]
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["interaction"]["state_source"] == "semantic_graph_default"
     assert "joint_infos" not in portal["attributes"]
-    assert "joint_interaction_states" not in portal["interaction"]
-    assert "joint_open_fractions" not in portal["interaction"]
 
 
 def test_minimal_gt_id_routes_mllm_attribute_patch() -> None:

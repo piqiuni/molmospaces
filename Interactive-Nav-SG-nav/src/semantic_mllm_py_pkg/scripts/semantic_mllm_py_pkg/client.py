@@ -321,9 +321,26 @@ class MLLMClient:
                 "confidence": 0.0,
             }
         if role == "skill_planning":
+            expected_type = str(context.get("expected_target_type") or "unknown")
+            if expected_type == "drawer_container":
+                return {
+                    "target_type": "drawer_container",
+                    "action": "scan",
+                    "operation_method": "pull",
+                    "open_regions": [
+                        {"center": [0.5, 0.25], "confidence": 0.5},
+                        {"center": [0.5, 0.75], "confidence": 0.5},
+                    ],
+                    "confidence": 0.5,
+                    "reason": "mock drawer regions",
+                }
             return {
-                "part_id": "",
+                "target_type": "door" if expected_type == "door" else expected_type,
                 "action": str(context.get("requested_action") or "open"),
+                "operation_method": "hinged_unknown" if expected_type == "door" else "unknown",
+                "open_regions": [],
+                "confidence": 0.5,
+                "reason": "mock operation plan",
             }
         return {"success": False, "confidence": 0.0, "reason": "mock"}
 

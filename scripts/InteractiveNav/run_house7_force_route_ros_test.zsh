@@ -17,8 +17,11 @@ ROUTE_READY_TIMEOUT_S=${ROUTE_READY_TIMEOUT_S:-60}
 ROUTE_NAVIGATION_TIMEOUT_S=${ROUTE_NAVIGATION_TIMEOUT_S:-180}
 ROUTE_INTERACTION_TIMEOUT_S=${ROUTE_INTERACTION_TIMEOUT_S:-30}
 ROUTE_GRAPH_TIMEOUT_S=${ROUTE_GRAPH_TIMEOUT_S:-30}
+ROUTE_MAP_SETTLE_UPDATES=${ROUTE_MAP_SETTLE_UPDATES:-4}
+ROUTE_MAP_SETTLE_TIMEOUT_S=${ROUTE_MAP_SETTLE_TIMEOUT_S:-30}
 VIDEO_FPS=${VIDEO_FPS:-15}
 VIDEO_PANEL_WIDTH_PX=${VIDEO_PANEL_WIDTH_PX:-640}
+GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-4.0}
 
 mkdir -p "${OUTPUT_DIR}/sim" "${OUTPUT_DIR}/debug" "${OUTPUT_DIR}/ros_home/log"
 export ROS_MASTER_URI
@@ -32,6 +35,7 @@ conda activate mlspaces
 set -u
 source "${ROS_SETUP}"
 export ROS_PACKAGE_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src:/opt/ros/noetic/share"
+export PYTHONPATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:${PYTHONPATH:-}"
 rospack profile >/dev/null
 
 ROUTE_FIELDS=$(python -c 'import sys,yaml; p=yaml.safe_load(open(sys.argv[1])); r=next(x for x in p["routes"] if x["route_id"]==sys.argv[2]); print("{}\t{}".format(r["seed"], ",".join(str(v) for v in r["start_xyyaw"])))' "${ROUTE_CONFIG}" "${ROUTE_ID}")
@@ -72,6 +76,7 @@ fi
 
 PYTHONUNBUFFERED=1 python -u "${RECORDER_SCRIPT}" \
   --output-dir "${OUTPUT_DIR}/debug" \
+  --occupancy-grid-topic /semantic_mapping/planning_occ_map \
   --first-person-video-capture-mode step \
   --semantic-video \
   --first-person-video-with-map \
@@ -84,7 +89,7 @@ PYTHONUNBUFFERED=1 python -u "${RECORDER_SCRIPT}" \
 RECORDER_PID=$!
 sleep 1
 
-SIM_EXTRA_ARGS="--seed ${ROUTE_SEED} --fixed_robot_xyyaw ${ROBOT_XYYAW} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval 1 --realtime_gt_min_visible_pixels 4 --realtime_gt_max_distance_m 6.0 --map_warmup_skip_frames 3 --observation_queue_size 0 --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+SIM_EXTRA_ARGS="--seed ${ROUTE_SEED} --fixed_robot_xyyaw ${ROBOT_XYYAW} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --realtime_gt_step_interval 1 --realtime_gt_min_visible_pixels 4 --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --map_warmup_skip_frames 3 --observation_queue_size 0 --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -121,7 +126,9 @@ PYTHONUNBUFFERED=1 python -u "${SCRIPT_DIR}/run_house7_force_route.py" \
   --ready-timeout-s "${ROUTE_READY_TIMEOUT_S}" \
   --navigation-timeout-s "${ROUTE_NAVIGATION_TIMEOUT_S}" \
   --interaction-timeout-s "${ROUTE_INTERACTION_TIMEOUT_S}" \
-  --graph-timeout-s "${ROUTE_GRAPH_TIMEOUT_S}"
+  --graph-timeout-s "${ROUTE_GRAPH_TIMEOUT_S}" \
+  --map-settle-updates "${ROUTE_MAP_SETTLE_UPDATES}" \
+  --map-settle-timeout-s "${ROUTE_MAP_SETTLE_TIMEOUT_S}"
 ROUTE_EXIT=$?
 set -e
 
@@ -142,6 +149,7 @@ python "${VIDEO_BUILDER}" \
   --debug-dir "${OUTPUT_DIR}/debug" \
   --route-result "${OUTPUT_DIR}/route_result.json" \
   --fps "${VIDEO_FPS}" \
+  --state-alignment timestamp \
   --output-stem overview_6panel \
   >"${OUTPUT_DIR}/offline_video.log" 2>&1
 VIDEO_EXIT=$?

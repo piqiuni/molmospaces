@@ -166,8 +166,6 @@ semantic_map:
 interaction_graph:
   scene_id: "semantic_mapping_scene"
   match_distance: 0.5
-  portal_closed_threshold: 0.10
-  portal_open_threshold: 0.67
   portal_room_max_radius_m: 1.0
   object_room_search_margin_m: 0.75
   gt_replay:

@@ -699,7 +699,7 @@ def parse_args():
         "--realtime_gt_required_consecutive_observations", type=int, default=2
     )
     parser.add_argument("--realtime_gt_step_interval", type=int, default=3)
-    parser.add_argument("--realtime_gt_max_distance_m", type=float, default=6.0)
+    parser.add_argument("--realtime_gt_max_distance_m", type=float, default=4.0)
     parser.add_argument(
         "--step_frame_dir",
         type=str,

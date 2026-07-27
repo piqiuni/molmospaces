@@ -45,8 +45,16 @@ def test_minimal_gt_portal_generates_id_only_interaction_command() -> None:
     )
     interaction = next(candidate for candidate in candidates if candidate.behavior_type == "INTERACT")
     command = interaction.interaction_command or {}
-    assert command["source_object_name"] == "double_door_root"
+    assert command["object_id"] == "double_door_root"
     assert command["action"] == "open"
+    assert set(command) == {
+        "node_id",
+        "object_id",
+        "action",
+        "interaction_mode",
+        "expected_state",
+    }
+
     assert "joint_names" not in command
     assert "close_other_joint_names" not in command
     assert "close_other_joints" not in command

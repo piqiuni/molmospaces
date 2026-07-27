@@ -128,6 +128,141 @@ def validate_skill_action(
     return {"action": action, "part_id": part_id}
 
 
+_TARGET_TYPE_ALIASES = {
+    "door": "door",
+    "portal": "door",
+    "drawer": "drawer_container",
+    "drawers": "drawer_container",
+    "dresser": "drawer_container",
+    "chest_of_drawers": "drawer_container",
+    "drawer_container": "drawer_container",
+    "cabinet": "other_container",
+    "fridge": "other_container",
+    "refrigerator": "other_container",
+    "container": "other_container",
+    "other_container": "other_container",
+    "unknown": "unknown",
+}
+
+_OPERATION_METHOD_ALIASES = {
+    "push": "hinged_push",
+    "hinged_push": "hinged_push",
+    "pull": "pull",
+    "hinged_pull": "hinged_pull",
+    "hinged": "hinged_unknown",
+    "hinged_unknown": "hinged_unknown",
+    "hinged_unknown_direction": "hinged_unknown",
+    "double": "double_hinged",
+    "double_door": "double_hinged",
+    "double_hinged": "double_hinged",
+    "slide_left": "slide_left",
+    "sliding_left": "slide_left",
+    "slide_right": "slide_right",
+    "sliding_right": "slide_right",
+    "sliding": "unknown",
+    "unknown": "unknown",
+}
+
+
+def _normalized_center(value: Any) -> list[float] | None:
+    if isinstance(value, dict):
+        if "center" in value:
+            value = value["center"]
+        elif "point" in value:
+            value = value["point"]
+        elif "x" in value and "y" in value:
+            value = [value["x"], value["y"]]
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        x, y = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+        return None
+    return [round(x, 4), round(y, 4)]
+
+
+def validate_visual_interaction_plan(
+    value: Any,
+    *,
+    expected_target_type: str = "unknown",
+    requested_action: str = "open",
+    max_regions: int = 12,
+) -> dict[str, Any]:
+    """Normalize a post-arrival visual operation plan without exposing simulator joints."""
+    result = parse_json_object(value)
+    raw_target_type = str(result.get("target_type") or expected_target_type or "unknown")
+    target_type = _TARGET_TYPE_ALIASES.get(raw_target_type.strip().casefold(), "unknown")
+    expected = _TARGET_TYPE_ALIASES.get(
+        str(expected_target_type or "unknown").strip().casefold(), "unknown"
+    )
+    if expected == "door" and target_type not in {"door", "unknown"}:
+        raise ValueError("visual interaction plan target_type conflicts with door target")
+    if expected == "drawer_container" and target_type not in {
+        "drawer_container",
+        "unknown",
+    }:
+        raise ValueError("visual interaction plan target_type conflicts with drawer target")
+    if expected in {"drawer_container", "other_container"} and target_type == "door":
+        raise ValueError("visual interaction plan target_type conflicts with container target")
+    if target_type == "unknown" and expected != "unknown":
+        target_type = expected
+
+    action = str(result.get("action") or requested_action or "open").strip().casefold()
+    if action not in {"open", "scan"}:
+        raise ValueError("visual interaction plan action must be open or scan")
+    if target_type == "drawer_container":
+        action = "scan"
+
+    raw_method = str(result.get("operation_method") or "unknown").strip().casefold()
+    operation_method = _OPERATION_METHOD_ALIASES.get(raw_method, "unknown")
+    if target_type == "drawer_container":
+        operation_method = "pull"
+    elif target_type == "door" and operation_method == "pull":
+        operation_method = "hinged_pull"
+
+    raw_regions = (
+        result.get("open_regions")
+        or result.get("interaction_points")
+        or result.get("centers")
+        or []
+    )
+    if not isinstance(raw_regions, list):
+        raise ValueError("visual interaction plan open_regions must be a list")
+    normalized_regions: list[dict[str, Any]] = []
+    for raw_region in raw_regions:
+        center = _normalized_center(raw_region)
+        if center is None:
+            continue
+        if any(
+            (center[0] - item["center"][0]) ** 2
+            + (center[1] - item["center"][1]) ** 2
+            < 0.0016
+            for item in normalized_regions
+        ):
+            continue
+        confidence = (
+            _confidence(raw_region.get("confidence"), _confidence(result.get("confidence")))
+            if isinstance(raw_region, dict)
+            else _confidence(result.get("confidence"))
+        )
+        normalized_regions.append({"center": center, "confidence": confidence})
+        if len(normalized_regions) >= max(1, int(max_regions)):
+            break
+    normalized_regions.sort(key=lambda item: (item["center"][1], item["center"][0]))
+
+    return {
+        "target_type": target_type,
+        "action": action,
+        "operation_method": operation_method,
+        "open_regions": normalized_regions,
+        "confidence": _confidence(result.get("confidence"), 0.0),
+        "reason": str(result.get("reason") or "")[:160],
+        "coordinate_frame": "normalized_target_crop",
+    }
+
+
 def validate_visual_verification(value: Any) -> dict[str, Any]:
     result = parse_json_object(value)
     result["success"] = bool(result.get("success", False))

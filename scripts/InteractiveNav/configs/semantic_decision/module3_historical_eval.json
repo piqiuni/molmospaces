@@ -1,0 +1,30 @@
+{
+  "cases": [
+    {
+      "name": "house7_double_door",
+      "image": "outputs/20260722_house7_goal_alignment_colors_1000_rerun/debug/videos/composite_frames/frame_000038_composite.png",
+      "crop": [0, 0, 640, 270],
+      "object_id": "historical_house7_door",
+      "object_name": "Door",
+      "expected_target_type": "door",
+      "requested_action": "open",
+      "accepted_operation_methods": [
+        "double_hinged",
+        "hinged_push",
+        "hinged_pull",
+        "hinged_unknown"
+      ]
+    },
+    {
+      "name": "house2_three_drawer_dresser",
+      "image": "outputs/house2_drawer_sequence_smooth_500_fixed_20260726_115539/sim_step_frames/step_000089.png",
+      "crop": [736, 344, 1024, 576],
+      "object_id": "historical_house2_dresser",
+      "object_name": "Dresser",
+      "expected_target_type": "drawer_container",
+      "requested_action": "open",
+      "expected_region_count": 3,
+      "accepted_operation_methods": ["pull"]
+    }
+  ]
+}

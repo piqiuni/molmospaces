@@ -5,7 +5,6 @@ import math
 from semantic_decision_py_pkg.behavior_candidates import (
     CandidateGenerator,
     CandidateGeneratorConfig,
-    interaction_group_reached,
 )
 
 
@@ -391,7 +390,7 @@ def test_container_candidates_can_be_enabled_without_changing_portal_logic() -> 
     assert candidates[0].metadata["node_type"] == "container"
 
 
-def test_multi_drawer_container_emits_single_scan_candidate() -> None:
+def test_multi_drawer_metadata_emits_id_only_open_candidate() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(
             interaction_types=("container",),
@@ -455,26 +454,19 @@ def test_multi_drawer_container_emits_single_scan_candidate() -> None:
     candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
 
     assert [candidate.candidate_id for candidate in candidates] == [
-        "interaction:container_drawers:drawer_scan"
+        "interaction:container_drawers:open"
     ]
-    assert candidates[0].interaction_command["sequence_type"] == "drawer_scan"
-    assert candidates[0].interaction_command["joint_names"] == [
-        "drawer_top",
-        "drawer_bottom",
-    ]
-    assert candidates[0].interaction_command["interaction_groups"] == [
-        {"group_id": "drawer_1", "joint_names": ["drawer_top"]},
-        {"group_id": "drawer_2", "joint_names": ["drawer_bottom"]},
-    ]
-    assert candidates[0].interaction_command["view_profile"] == "drawer_low_view"
-    assert candidates[0].interaction_command["view_tilt_rad"] == 0.30
-    assert candidates[0].interaction_command["view_torso_pitch_rad"] == 0.35
-    assert candidates[0].interaction_command["restore_view_after"] is False
+    command = candidates[0].interaction_command
+    assert command["object_id"] == "dresser_1"
+    assert command["action"] == "open"
+    assert "joint_names" not in command
+    assert "interaction_groups" not in command
+    assert "sequence_type" not in command
     assert math.isclose(candidates[0].goal_xyyaw[0], 0.0, abs_tol=1e-6)
     assert candidates[0].metadata["interaction_standoff_m"] == 1.0
 
 
-def test_completed_drawer_group_is_not_reopened_during_exploration() -> None:
+def test_legacy_completed_drawer_groups_do_not_shape_planner_command() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(interaction_types=("container",))
     )
@@ -513,11 +505,10 @@ def test_completed_drawer_group_is_not_reopened_during_exploration() -> None:
 
     candidates = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0))
     assert [candidate.candidate_id for candidate in candidates] == [
-        "interaction:container_drawers:drawer_scan"
+        "interaction:container_drawers:open"
     ]
-    assert candidates[0].interaction_command["interaction_groups"] == [
-        {"group_id": "drawer_2", "joint_names": ["bottom"]}
-    ]
+    assert candidates[0].interaction_command["object_id"] == "dresser"
+    assert "interaction_groups" not in candidates[0].interaction_command
 
     target_candidates = generator.generate(
         {},
@@ -534,10 +525,10 @@ def test_completed_drawer_group_is_not_reopened_during_exploration() -> None:
         for candidate in target_candidates
         if candidate.behavior_type == "INTERACT"
     ]
-    assert interaction_ids == ["interaction:container_drawers:drawer_scan"]
+    assert interaction_ids == ["interaction:container_drawers:open"]
 
 
-def test_failed_drawer_group_is_not_retried_without_explicit_retry_policy() -> None:
+def test_legacy_failed_drawer_groups_do_not_split_candidates() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(interaction_types=("container",))
     )
@@ -563,7 +554,7 @@ def test_failed_drawer_group_is_not_retried_without_explicit_retry_policy() -> N
 
     candidates = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0))
     assert [candidate.candidate_id for candidate in candidates] == [
-        "interaction:container_drawers:drawer_2"
+        "interaction:container_drawers:open"
     ]
 
 
@@ -598,25 +589,6 @@ def test_portal_approach_ignores_unstable_body_orientation() -> None:
     assert math.isclose(candidate.goal_xyyaw[0], 1.05, abs_tol=1e-6)
     assert math.isclose(candidate.goal_xyyaw[1], 0.0, abs_tol=1e-6)
     assert math.isclose(candidate.goal_xyyaw[2], math.pi, abs_tol=1e-6)
-
-
-def test_interaction_group_verification_checks_opened_and_closed_drawers() -> None:
-    joint_infos = [
-        {"joint_name": "drawer_top", "open_fraction": 0.85},
-        {"joint_name": "drawer_bottom", "open_fraction": 0.05},
-    ]
-
-    assert interaction_group_reached(
-        joint_infos,
-        ["drawer_top"],
-        ["drawer_bottom"],
-    ) is True
-    assert interaction_group_reached(
-        joint_infos,
-        ["drawer_bottom"],
-        ["drawer_top"],
-    ) is False
-    assert interaction_group_reached(joint_infos, ["missing_joint"]) is None
 
 
 def test_portal_approach_uses_door_aabb_normal() -> None:

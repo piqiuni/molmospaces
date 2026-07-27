@@ -4,28 +4,39 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts" / "InteractiveNav"
 for path in (REPO_ROOT, SCRIPT_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from scripts.InteractiveNav.force_interaction_bridge import AtomicForceInteractionController
 from scripts.InteractiveNav import force_interaction_runtime
+from scripts.InteractiveNav.force_interaction_bridge import (
+    AtomicForceInteractionController,
+    ground_drawer_open_regions,
+)
 
 
 def test_controller_emits_success_result_and_behavior_feedback(monkeypatch) -> None:
     controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
     published = []
-    monkeypatch.setattr(
-        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
-        lambda _env, root_name, **_kwargs: {
+    prepare_calls = []
+
+    def prepare(_env, root_name, **kwargs):
+        prepare_calls.append((root_name, kwargs))
+        return {
             "group": {"root_body_name": root_name},
             "targets": {"left_hinge": 1.0},
             "selected_joint_names": ["left_hinge"],
             "closed_joint_names": [],
             "pre_joint_infos": [],
-        },
+        }
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        prepare,
     )
     monkeypatch.setattr(
         "scripts.InteractiveNav.force_interaction_bridge.complete_articulation_force",
@@ -47,8 +58,10 @@ def test_controller_emits_success_result_and_behavior_feedback(monkeypatch) -> N
             "command_id": "command_1",
             "candidate_id": "portal_1",
             "decision_id": "decision_1",
-            "source_object_name": "double_door_root",
+            "object_id": "double_door_root",
             "action": "open",
+            "joint_names": ["planner_must_not_select_this"],
+            "interaction_groups": [{"group_id": "forbidden"}],
         }
     )
     task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
@@ -60,7 +73,11 @@ def test_controller_emits_success_result_and_behavior_feedback(monkeypatch) -> N
     assert result["status"] == "SUCCEEDED"
     assert result["sim_steps_consumed"] == 1
     assert result["physics_substeps"] == 123
-    assert result["source_object_name"] == "double_door_root"
+    assert result["object_id"] == "double_door_root"
+    assert prepare_calls == [("double_door_root", {})]
+    assert "joint_names" not in result
+    assert "joint_infos" not in result
+    assert "force_result" not in result
     assert len(published) == 2
     assert published[0]["source"] == "force_atomic_interaction"
     assert published[1]["behavior_type"] == "INTERACT"
@@ -71,7 +88,7 @@ def test_controller_deduplicates_command_ids() -> None:
     controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
     command = {
         "command_id": "same_command",
-        "source_object_name": "door_root",
+        "object_id": "door_root",
         "action": "open",
     }
     assert controller.enqueue_command(command)
@@ -100,7 +117,7 @@ def test_non_articulated_object_returns_static_failure_without_crashing(
             "command_id": "static_doorframe",
             "candidate_id": "portal_doorframe",
             "node_id": "portal_doorframe",
-            "source_object_name": "doorframe_static_1",
+            "object_id": "doorframe_static_1",
             "action": "open",
         }
     )
@@ -135,6 +152,82 @@ def test_prepare_articulation_force_reports_missing_group_as_static(monkeypatch)
         "available_object_names": [],
     }
 
+def test_controller_requires_canonical_object_id() -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    with pytest.raises(ValueError, match="requires object_id"):
+        controller.enqueue_command(
+            {"command_id": "legacy", "source_object_name": "door_root"}
+        )
+
+
+def test_visual_drawer_regions_are_grounded_to_slide_joints_by_height() -> None:
+    groups = ground_drawer_open_regions(
+        [
+            {"joint_name": "middle", "joint_type": "slide"},
+            {"joint_name": "door_hinge", "joint_type": "hinge"},
+            {"joint_name": "bottom", "joint_type": "slide"},
+            {"joint_name": "top", "joint_type": "slide"},
+        ],
+        [
+            {"center": [0.51, 0.82], "confidence": 0.9},
+            {"center": [0.49, 0.18], "confidence": 0.8},
+        ],
+        {"top": 1.0, "middle": 0.6, "bottom": 0.2},
+    )
+
+    assert [group["joint_names"] for group in groups] == [["top"], ["bottom"]]
+    assert [group["open_region"]["center"][1] for group in groups] == [0.18, 0.82]
+    assert all(group["grounding_source"] == "visual_region_vertical_order" for group in groups)
+
+
+def test_empty_visual_regions_fall_back_to_all_slide_joints() -> None:
+    groups = ground_drawer_open_regions(
+        [
+            {"joint_name": "bottom", "joint_type": "slide"},
+            {"joint_name": "top", "joint_type": "slide"},
+        ],
+        [],
+        {"top": 1.0, "bottom": 0.2},
+    )
+
+    assert [group["joint_names"] for group in groups] == [["top"], ["bottom"]]
+    assert all(group["grounding_source"] == "simulator_all_slide_joints" for group in groups)
+
+
+def test_controller_discovers_drawer_joints_for_visual_plan(monkeypatch) -> None:
+    joints = [
+        {"joint_name": "bottom", "joint_type": "slide", "joint_id": 0},
+        {"joint_name": "top", "joint_type": "slide", "joint_id": 1},
+        {"joint_name": "middle", "joint_type": "slide", "joint_id": 2},
+    ]
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.collect_articulation_groups",
+        lambda _env: {"dresser_root": {"joints": joints}},
+    )
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    model = SimpleNamespace(jnt_bodyid=[0, 1, 2])
+    data = SimpleNamespace(xpos=[[0.0, 0.0, 0.2], [0.0, 0.0, 1.0], [0.0, 0.0, 0.6]])
+    task = SimpleNamespace(env=SimpleNamespace(current_model=model, current_data=data))
+    command = {
+        "command_id": "visual_drawer_scan",
+        "object_id": "dresser_root",
+        "action": "scan",
+        "sequence_type": "drawer_scan",
+        "open_regions": [
+            {"center": [0.5, 0.18], "confidence": 0.9},
+            {"center": [0.5, 0.52], "confidence": 0.8},
+            {"center": [0.5, 0.83], "confidence": 0.9},
+        ],
+    }
+
+    controller._start_drawer_sequence(task, command, step=12)
+
+    assert [group["joint_names"] for group in controller._pending["groups"]] == [
+        ["top"],
+        ["middle"],
+        ["bottom"],
+    ]
+    assert controller._pending["all_joint_names"] == ["top", "middle", "bottom"]
 
 def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
     monkeypatch,
@@ -189,7 +282,7 @@ def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
     assert controller.enqueue_command(
         {
             "command_id": "smooth_fridge",
-            "source_object_name": "fridge_root",
+            "object_id": "fridge_root",
             "action": "open",
             "view_profile": "default",
         }
@@ -213,6 +306,10 @@ def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
 def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch) -> None:
     state = {"drawer_top": 0.0, "drawer_bottom": 0.0}
     published = []
+    joints = [
+        {"joint_name": "drawer_top", "joint_type": "slide", "joint_id": 0},
+        {"joint_name": "drawer_bottom", "joint_type": "slide", "joint_id": 1},
+    ]
 
     def prepare(_env, _root, open_joint_names=None, close_joint_names=None):
         targets = {
@@ -252,6 +349,10 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
         "scripts.InteractiveNav.force_interaction_bridge.articulation_joint_infos",
         infos,
     )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.collect_articulation_groups",
+        lambda _env: {"dresser_root": {"joints": joints}},
+    )
     controller = AtomicForceInteractionController(
         close_all_doors_on_prepare=False,
         drawer_execution_mode="fast",
@@ -263,16 +364,17 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
         "command_id": "drawer_scan_fast",
         "candidate_id": "drawer_scan",
         "decision_id": "decision_1",
-        "source_object_name": "dresser_root",
+        "object_id": "dresser_root",
         "action": "scan",
         "sequence_type": "drawer_scan",
         "interaction_groups": [
-            {"group_id": "top", "joint_names": ["drawer_top"]},
-            {"group_id": "bottom", "joint_names": ["drawer_bottom"]},
+            {"group_id": "bad", "joint_names": ["planner_must_not_select_this"]},
         ],
     }
     assert controller.enqueue_command(command)
-    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+    model = SimpleNamespace(jnt_bodyid=[0, 1])
+    data = SimpleNamespace(xpos=[[0.0, 0.0, 1.0], [0.0, 0.0, 0.2]])
+    task = SimpleNamespace(env=SimpleNamespace(current_model=model, current_data=data))
 
     for step in range(3):
         controller.before_step(task, step=step)
@@ -282,13 +384,20 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     assert result["success"] is True
     assert result["task_steps_consumed"] == 3
     assert result["drawer_execution_mode"] == "fast"
-    assert [item["observation_step"] for item in result["interaction_group_results"]] == [0, 1]
+    assert [item["observation_step"] for item in result["region_results"]] == [0, 1]
+    assert "interaction_group_results" not in result
+    assert "joint_names" not in result
+    assert "joint_infos" not in result
     assert result["source"] == "force_container_sequence"
     assert len(published) == 2
 
 
 def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -> None:
     state = {"drawer_top": 0.0, "drawer_bottom": 0.0}
+    joints = [
+        {"joint_name": "drawer_top", "joint_type": "slide", "joint_id": 0},
+        {"joint_name": "drawer_bottom", "joint_type": "slide", "joint_id": 1},
+    ]
 
     def prepare(_env, _root, open_joint_names=None, close_joint_names=None):
         targets = {name: 1.0 for name in open_joint_names or []}
@@ -327,6 +436,10 @@ def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -
         "scripts.InteractiveNav.force_interaction_bridge.articulation_joint_infos",
         infos,
     )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.collect_articulation_groups",
+        lambda _env: {"dresser_root": {"joints": joints}},
+    )
     controller = AtomicForceInteractionController(
         close_all_doors_on_prepare=False,
         drawer_execution_mode="smooth",
@@ -338,16 +451,14 @@ def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -
     assert controller.enqueue_command(
         {
             "command_id": "drawer_scan_smooth",
-            "source_object_name": "dresser_root",
+            "object_id": "dresser_root",
             "action": "scan",
             "sequence_type": "drawer_scan",
-            "interaction_groups": [
-                {"group_id": "top", "joint_names": ["drawer_top"]},
-                {"group_id": "bottom", "joint_names": ["drawer_bottom"]},
-            ],
         }
     )
-    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+    model = SimpleNamespace(jnt_bodyid=[0, 1])
+    data = SimpleNamespace(xpos=[[0.0, 0.0, 1.0], [0.0, 0.0, 0.2]])
+    task = SimpleNamespace(env=SimpleNamespace(current_model=model, current_data=data))
     result = None
     for step in range(30):
         controller.before_step(task, step=step)

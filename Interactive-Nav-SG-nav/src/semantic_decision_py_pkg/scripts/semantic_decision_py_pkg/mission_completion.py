@@ -189,6 +189,7 @@ class TargetMissionTracker:
         )
         target_name = self._normalized(
             feedback.get("target_name")
+            or feedback.get("object_id")
             or feedback.get("source_object_name")
             or feedback.get("object_name")
         )
@@ -225,8 +226,10 @@ class TargetMissionTracker:
             target_context.get("target_container_instance_id")
         )
         feedback_source = self._normalized(
-            feedback.get("source_object_name")
+            feedback.get("object_id")
+            or feedback.get("source_object_name")
             or feedback.get("target_name")
+            or (feedback.get("interaction_result") or {}).get("object_id")
             or (feedback.get("interaction_result") or {}).get("source_object_name")
         )
         feedback_instance = self._normalized(

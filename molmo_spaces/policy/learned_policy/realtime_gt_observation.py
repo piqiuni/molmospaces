@@ -277,7 +277,7 @@ class RealtimeGTObservationPublisher:
         min_visible_pixels: int = 16,
         min_visible_fraction: float = 0.2,
         required_consecutive_observations: int = 2,
-        max_distance_m: float = 6.0,
+        max_distance_m: float = 4.0,
         step_interval: int = 3,
         queue_size: int = 1,
         async_processing: bool = True,

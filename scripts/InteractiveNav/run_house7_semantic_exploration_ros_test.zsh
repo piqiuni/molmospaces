@@ -28,7 +28,7 @@ VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-16}
 IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-4}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
 GT_STEP_INTERVAL=${GT_STEP_INTERVAL:-3}
-GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-6.0}
+GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-4.0}
 GT_MIN_VISIBLE_PIXELS=${GT_MIN_VISIBLE_PIXELS:-16}
 GT_MIN_VISIBLE_FRACTION=${GT_MIN_VISIBLE_FRACTION:-0.20}
 GT_REQUIRED_CONSECUTIVE_OBSERVATIONS=${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS:-2}
@@ -551,7 +551,7 @@ result = {
     "coverage_ratio": coverage.get("exploration_coverage_ratio"),
     "mapped_free_coverage_ratio": coverage.get("mapped_free_coverage_ratio"),
     "interaction_count": len(interaction_results),
-    "interaction_roots": [event.get("source_object_name", "") for event in interaction_results],
+    "interaction_roots": [event.get("object_id", "") for event in interaction_results],
     "interaction_steps": [event.get("step") for event in interaction_results],
     "contains_edge_count": semantic_summary.get("contains_edge_count", 0),
     "container_with_children_count": semantic_summary.get("container_with_children_count", 0),
@@ -569,7 +569,7 @@ result = {
     "target_selection": read_json(output_dir / "target_selection.json"),
     "target_container_interaction_success": any(
         bool(event.get("result", {}).get("success"))
-        and event.get("result", {}).get("source_object_name")
+        and event.get("result", {}).get("object_id")
         == read_json(output_dir / "target_selection.json").get("container_name")
         for event in force.get("events", [])
     ),

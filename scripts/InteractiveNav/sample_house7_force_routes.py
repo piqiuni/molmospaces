@@ -468,6 +468,7 @@ def sample_route_for_seed(spec: dict[str, Any]) -> dict[str, Any]:
                     selected_far["xy"][1],
                     far_yaw,
                 ],
+                "post_interaction_path_xy": selected_far["path"],
                 "target_root": spec["target_root"],
                 "portal_center_xy": portal_center,
                 "portal_normal_xy": portal["portal_normal_xy"],
@@ -517,6 +518,7 @@ def build_route_config(spec: dict[str, Any], routes: list[dict[str, Any]]) -> di
                 "portal_normal_xy": route["portal_normal_xy"],
                 "portal_half_width_m": route["portal_half_width_m"],
                 "far_goal_xyyaw": route["far_goal_xyyaw"],
+                "post_interaction_path_xy": route.get("post_interaction_path_xy", []),
                 "interaction": {
                     "backend": "force",
                     "action": "open",

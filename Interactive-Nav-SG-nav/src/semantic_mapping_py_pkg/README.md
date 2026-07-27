@@ -196,12 +196,18 @@ GT observations do not publish simulator articulation metadata, room IDs, contai
 interaction flags, object state, joint names/ranges/values, approach axes, or parent/child links.
 The mapping pipeline derives node type from the normalized name, computes visibility evidence from
 the mask, associates objects with rooms geometrically, infers portal connectivity and containment
-from the 3D boxes, and keeps interaction state `unknown` until visual/geometry inference or an
-execution result supplies evidence.
+from the 3D boxes, and keeps interaction state `unknown` until semantic attribute inference or an
+executor result explicitly supplies `state`/`post_state`.
+
+For realtime GT records, normalization is allowlist-based: even if a legacy producer accidentally
+includes flags, parent/child links, room IDs, poses, confidence, or joint metadata, those values are
+discarded and cannot affect graph type, relations, or interaction state.
 
 Joint readback may be used privately inside an oracle interaction executor. Downstream graph and
-decision messages retain only the semantic result (`state`, success, cost, and interaction-group
-completion), not the raw joint metadata.
+decision messages retain only semantic commands/results (`object_id`, action, optional visual open
+regions, `state`/`post_state`, success, and cost), not raw joint metadata. The simulator executor
+maps `object_id` to its articulation and, for drawer scans, maps visual regions to slide joints.
+
 
 ### Unified graph JSON
 
@@ -284,5 +290,6 @@ So `semantic_mapping_node.py` and RViz can consume GT replay exactly like the on
 
 Current limitation:
 
-- GT replay carries stronger room and joint metadata than detector-only observations.
+- The legacy full-scene replay format may carry room and joint metadata, but the interaction graph
+  does not use parent links, interaction flags, or joints for graph construction or state inference.
 - Support/container assignment from detector-only observations is still heuristic.
