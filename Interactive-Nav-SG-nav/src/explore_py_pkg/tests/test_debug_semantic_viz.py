@@ -9,6 +9,7 @@ from explore_py_pkg.debug_semantic_viz import (
     topology_edge_visible,
     topology_hierarchy_layout,
     topology_node_style,
+    topology_order_rooms,
 )
 
 
@@ -149,6 +150,29 @@ def test_connected_portal_is_positioned_between_its_rooms():
         [],
         {"room_1": (100, 120), "room_2": (300, 120)},
     ) == {"door": (200, 120)}
+
+    assert portal_positions_between_rooms(
+        portals,
+        [],
+        {"room_1": (100, 120), "room_2": (300, 120)},
+        vertical_offset_y=35,
+    ) == {"door": (200, 155)}
+
+
+def test_topology_room_order_places_two_connection_hub_in_middle():
+    rooms = [
+        {"id": "room_1", "type": "room", "aabb_center": [0.0, 0.0, 0.0]},
+        {"id": "room_3", "type": "room", "aabb_center": [1.0, 0.0, 0.0]},
+        {"id": "room_2", "type": "room", "aabb_center": [2.0, 0.0, 0.0]},
+    ]
+    portals = [
+        {"id": "door_12", "attributes": {"connected_room_ids": [1, 2]}},
+        {"id": "door_23", "attributes": {"connected_room_ids": [2, 3]}},
+    ]
+
+    ordered = topology_order_rooms(rooms, portals)
+
+    assert [room["id"] for room in ordered] == ["room_1", "room_2", "room_3"]
 
 
 def test_room_style_labels_include_unknown_and_confidence():

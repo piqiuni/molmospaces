@@ -135,6 +135,44 @@ def test_non_articulated_object_returns_static_failure_without_crashing(
     assert published[1]["interaction_result"] == result
 
 
+def test_non_articulated_portal_is_marked_static_open_from_graph_type(
+    monkeypatch,
+) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    published = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, root_name, **_kwargs: {
+            "supported": False,
+            "reason": "non_articulated",
+            "interaction_capability": "static",
+            "object_name": root_name,
+        },
+    )
+    monkeypatch.setattr(
+        controller, "_publish", lambda _publisher, payload: published.append(payload)
+    )
+    assert controller.enqueue_command(
+        {
+            "command_id": "static_portal",
+            "candidate_id": "portal_candidate",
+            "node_id": "graph_node_17",
+            "node_type": "portal",
+            "object_id": "visual_instance_17",
+            "action": "open",
+        }
+    )
+
+    result = controller.before_step(SimpleNamespace(env=SimpleNamespace()), step=10)
+
+    assert result is not None
+    assert result["status"] == "SUCCEEDED"
+    assert result["success"] is True
+    assert result["post_state"] == "static_open"
+    assert result["source"] == "executor_static_portal"
+    assert published[1]["status"] == "SUCCEEDED"
+
+
 def test_prepare_articulation_force_reports_missing_group_as_static(monkeypatch) -> None:
     monkeypatch.setattr(
         force_interaction_runtime, "collect_articulation_groups", lambda _env: {}
@@ -158,6 +196,92 @@ def test_controller_requires_canonical_object_id() -> None:
         controller.enqueue_command(
             {"command_id": "legacy", "source_object_name": "door_root"}
         )
+
+
+def test_missing_portal_articulation_is_marked_static_open(monkeypatch) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    published = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, object_id: (_ for _ in ()).throw(
+            ValueError(f"Articulated object not found: {object_id}")
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_publish",
+        lambda _publisher, payload: published.append(payload),
+    )
+    controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    assert controller.enqueue_command(
+        {
+            "command_id": "missing_door",
+            "candidate_id": "interaction:missing_door:open",
+            "decision_id": "decision_missing",
+            "node_id": "portal_doorframe_without_joint",
+            "object_id": "doorframe_without_joint",
+            "node_type": "portal",
+            "action": "open",
+        }
+    )
+    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+
+    result = controller.before_step(task, step=210)
+
+    assert result is not None
+    assert result["status"] == "SUCCEEDED"
+    assert result["success"] is True
+    assert result["post_state"] == "static_open"
+    assert result["source"] == "executor_static_portal"
+    assert result["verification_source"] == "simulator_no_articulation"
+    assert result["object_id"] == "doorframe_without_joint"
+    assert controller.should_pause_navigation() is False
+    assert controller.after_step(task, step=210) is None
+    assert len(published) == 2
+    assert published[1]["behavior_type"] == "INTERACT"
+    assert published[1]["status"] == "SUCCEEDED"
+
+
+def test_missing_container_articulation_remains_a_recoverable_failure(monkeypatch) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    published = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, object_id: (_ for _ in ()).throw(
+            ValueError(f"Articulated object not found: {object_id}")
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_publish",
+        lambda _publisher, payload: published.append(payload),
+    )
+    controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    assert controller.enqueue_command(
+        {
+            "command_id": "missing_container",
+            "candidate_id": "interaction:missing_container:open",
+            "decision_id": "decision_missing_container",
+            "node_id": "container_missing",
+            "object_id": "cabinet_without_joint",
+            "node_type": "container",
+            "action": "open",
+        }
+    )
+    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+
+    result = controller.before_step(task, step=211)
+
+    assert result is not None
+    assert result["status"] == "FAILED"
+    assert result["success"] is False
+    assert result["post_state"] == "unknown"
+    assert result["failure_reason"] == "articulation_resolution_failed"
+    assert result["verification_source"] == "executor_resolution_failure"
+    assert controller.should_pause_navigation() is False
+    assert len(published) == 2
 
 
 def test_visual_drawer_regions_are_grounded_to_slide_joints_by_height() -> None:

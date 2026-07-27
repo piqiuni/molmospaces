@@ -711,6 +711,7 @@ class SemanticBehaviorExecutor:
 
     def _publish_interaction_command(self, candidate: dict) -> None:
         interaction = candidate.get("interaction_command") or {}
+        metadata = candidate.get("metadata") or {}
         with self.lock:
             self.interaction_command_sequence += 1
             interaction_sequence = self.interaction_command_sequence
@@ -721,6 +722,9 @@ class SemanticBehaviorExecutor:
             "event_id": f"{candidate.get('decision_id', 'decision')}_interaction_{interaction_sequence:03d}",
             "node_id": interaction.get("node_id", candidate.get("target_id", "")),
             "object_id": interaction.get("object_id", candidate.get("target_name", "")),
+            "node_type": str(
+                interaction.get("node_type") or metadata.get("node_type") or ""
+            ).casefold(),
             "action": interaction.get("action", "open"),
             "interaction_mode": interaction.get("interaction_mode", "open_close"),
             "sequence_type": interaction.get("sequence_type", ""),
@@ -729,6 +733,18 @@ class SemanticBehaviorExecutor:
             "approach_goal_xyyaw": list(candidate.get("goal_xyyaw") or []),
             "visual_operation_plan": dict(
                 interaction.get("visual_operation_plan") or {}
+            ),
+            "interaction_approach_pose_xyyaw": list(
+                interaction.get("interaction_approach_pose_xyyaw") or []
+            ),
+            "interaction_approach_axis_xy": list(
+                interaction.get("interaction_approach_axis_xy") or []
+            ),
+            "interaction_ready_distance_m": float(
+                interaction.get("interaction_ready_distance_m", 0.45) or 0.45
+            ),
+            "interaction_ready_yaw_tolerance_rad": float(
+                interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
             ),
         }
         with self.lock:
@@ -1157,6 +1173,46 @@ class SemanticBehaviorExecutor:
         if not goal_options:
             self._handle_navigation_result(decision_id, False, {"reason": "missing_goal"})
             return
+        behavior_type = str(candidate.get("behavior_type") or "")
+        metadata = candidate.get("metadata") or {}
+        interaction = candidate.get("interaction_command") or {}
+        if behavior_type == "INTERACT":
+            direct_distance_tolerance = float(
+                interaction.get("interaction_ready_distance_m", 0.45) or 0.45
+            )
+            direct_yaw_tolerance = float(
+                interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+            )
+        else:
+            direct_distance_tolerance = float(
+                metadata.get("direct_goal_tolerance_m", 0.0) or 0.0
+            )
+            direct_yaw_tolerance = float(
+                metadata.get("direct_goal_yaw_tolerance_rad", 0.0) or 0.0
+            )
+        if direct_distance_tolerance > 0.0:
+            current_pose = self._current_pose(
+                str(metadata.get("frame_id") or self.map_frame)
+            )
+            primary_x, primary_y, primary_yaw = goal_options[0]
+            if current_pose is not None:
+                position_error = math.hypot(
+                    primary_x - current_pose[0], primary_y - current_pose[1]
+                )
+                yaw_error = abs(normalize_angle(primary_yaw - current_pose[2]))
+                if position_error <= direct_distance_tolerance and (
+                    direct_yaw_tolerance <= 0.0 or yaw_error <= direct_yaw_tolerance
+                ):
+                    self._handle_navigation_result(
+                        decision_id,
+                        True,
+                        {
+                            "reason": "already_at_verified_approach_pose",
+                            "position_error_m": position_error,
+                            "yaw_error_rad": yaw_error,
+                        },
+                    )
+                    return
         goal = MoveBaseGoal()
         goal.target_pose.header.frame_id = str(
             (candidate.get("metadata") or {}).get("frame_id") or self.map_frame

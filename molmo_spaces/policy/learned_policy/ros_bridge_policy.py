@@ -34,6 +34,7 @@ class RosBridgePolicy(BasePolicy):
         blocking_republish_pointcloud: bool = False,
         queue_size: int = 1,
         observation_queue_size: int = 1,
+        extra_image_queue_size: int = 16,
         publish_pointcloud: bool = True,
         publish_camera_info: bool = True,
         depth_camera_name: str = "head_camera",
@@ -99,6 +100,7 @@ class RosBridgePolicy(BasePolicy):
         self.blocking_republish_pointcloud = bool(blocking_republish_pointcloud)
         self.queue_size = queue_size
         self.observation_queue_size = int(observation_queue_size)
+        self.extra_image_queue_size = int(extra_image_queue_size)
         self.publish_pointcloud = publish_pointcloud
         self.publish_camera_info = publish_camera_info
         self.depth_camera_name = depth_camera_name
@@ -182,6 +184,14 @@ class RosBridgePolicy(BasePolicy):
         self._timing_acc_ms: dict[str, float] = {
             "total": 0.0,
             "odom_tf": 0.0,
+            "realtime_gt": 0.0,
+            "rgb_extract": 0.0,
+            "rgb_encode": 0.0,
+            "rgb_ros_publish": 0.0,
+            "step_frame_enqueue": 0.0,
+            "extra_rgb_extract": 0.0,
+            "extra_rgb_encode": 0.0,
+            "extra_rgb_ros_publish": 0.0,
             "rgb_publish": 0.0,
             "depth_extract_intrinsics": 0.0,
             "depth_msg_publish": 0.0,
@@ -191,7 +201,14 @@ class RosBridgePolicy(BasePolicy):
             "blocking_republish": 0.0,
             "action_wait": 0.0,
             "postprocess_action": 0.0,
+            "step_sync_publish": 0.0,
         }
+        self._timing_samples_ms: dict[str, list[float]] = {
+            key: [] for key in self._timing_acc_ms
+        }
+        self.last_timing_ms: dict[str, float] = {}
+        self.last_action_source: str = ""
+        self._step_frame_queue_peak: int = 0
         self._lock = threading.Lock()
 
         self._patch_rosgraph_logger_for_py311()
@@ -236,10 +253,13 @@ class RosBridgePolicy(BasePolicy):
         )
         self._extra_image_pub = None
         if self.extra_image_topic and self.extra_image_camera_name:
+            extra_image_queue_size = (
+                None if self.extra_image_queue_size <= 0 else self.extra_image_queue_size
+            )
             self._extra_image_pub = rospy.Publisher(
                 self.extra_image_topic,
                 Image,
-                queue_size=observation_queue_size,
+                queue_size=extra_image_queue_size,
             )
         self._depth_pub = rospy.Publisher(self.depth_topic, Image, queue_size=self.queue_size)
         self._pointcloud_pub = rospy.Publisher(self.pointcloud_topic, PointCloud2, queue_size=self.queue_size)
@@ -270,7 +290,9 @@ class RosBridgePolicy(BasePolicy):
                 required_consecutive_observations=realtime_gt_required_consecutive_observations,
                 step_interval=realtime_gt_step_interval,
                 max_distance_m=realtime_gt_max_distance_m,
-                queue_size=self.queue_size,
+                # GT is a latest-state stream.  A deep ROS queue makes newly
+                # revealed container contents wait behind stale observations.
+                queue_size=1,
             )
         if self.step_frame_dir is not None:
             self.step_frame_dir.mkdir(parents=True, exist_ok=True)
@@ -657,41 +679,81 @@ class RosBridgePolicy(BasePolicy):
         self._rospy.sleep(1.0)
 
     def _record_timing(self, stage_ms: dict[str, float]) -> None:
+        self.last_timing_ms = {
+            key: float(stage_ms.get(key, 0.0)) for key in self._timing_acc_ms
+        }
         if self.timing_log_every_n_frames <= 0:
             return
         self._timing_frame_count += 1
         for key in self._timing_acc_ms:
-            self._timing_acc_ms[key] += float(stage_ms.get(key, 0.0))
+            value = float(stage_ms.get(key, 0.0))
+            self._timing_acc_ms[key] += value
+            self._timing_samples_ms[key].append(value)
 
-        if self._timing_frame_count % self.timing_log_every_n_frames != 0:
+        if self._timing_frame_count < self.timing_log_every_n_frames:
             return
 
         n = float(self._timing_frame_count)
         avg = {k: self._timing_acc_ms[k] / n for k in self._timing_acc_ms}
+        p95 = {
+            key: float(np.percentile(values, 95)) if values else 0.0
+            for key, values in self._timing_samples_ms.items()
+        }
+        max_values = {
+            key: max(values) if values else 0.0
+            for key, values in self._timing_samples_ms.items()
+        }
         avg_total = max(avg["total"], 1e-6)
         fps = 1000.0 / avg_total
+        queue_size = self._step_frame_queue.qsize() if self._step_frame_queue is not None else 0
+        queue_capacity = self._step_frame_queue.maxsize if self._step_frame_queue is not None else 0
         self._rospy.loginfo(
             (
-                "RosBridgePolicy timing avg over %d frames: total=%.2fms (%.2fHz), "
-                "odom_tf=%.2fms, rgb_pub=%.2fms, depth_extract_intrinsics=%.2fms, "
-                "depth_msg_pub=%.2fms, pcd_convert=%.2fms, pcd_pub=%.2fms, "
-                "camera_info_pub=%.2fms, blocking_republish=%.2fms, "
-                "action_wait=%.2fms, postprocess=%.2fms"
+                "RosBridgePolicy timing window=%d: total avg/p95/max=%.2f/%.2f/%.2fms "
+                "(%.2fHz), action_wait=%.2f/%.2f/%.2fms, gt=%.2f/%.2fms, "
+                "rgb_total=%.2f/%.2fms [extract=%.2f encode=%.2f ros_pub=%.2f "
+                "frame_enqueue=%.2f/%.2f], extra_rgb=%.2fms, "
+                "depth+pcd=%.2fms, odom_tf=%.2fms, republish=%.2fms, "
+                "postprocess=%.2fms, step_sync=%.2fms, frame_queue=%d/%d peak=%d, "
+                "action_source=%s timeout=%s"
             ),
             int(n),
             avg["total"],
+            p95["total"],
+            max_values["total"],
             fps,
-            avg["odom_tf"],
-            avg["rgb_publish"],
-            avg["depth_extract_intrinsics"],
-            avg["depth_msg_publish"],
-            avg["pointcloud_convert"],
-            avg["pointcloud_publish"],
-            avg["camera_info_publish"],
-            avg["blocking_republish"],
             avg["action_wait"],
+            p95["action_wait"],
+            max_values["action_wait"],
+            avg["realtime_gt"],
+            p95["realtime_gt"],
+            avg["rgb_publish"],
+            p95["rgb_publish"],
+            avg["rgb_extract"],
+            avg["rgb_encode"],
+            avg["rgb_ros_publish"],
+            avg["step_frame_enqueue"],
+            p95["step_frame_enqueue"],
+            avg["extra_rgb_extract"] + avg["extra_rgb_encode"] + avg["extra_rgb_ros_publish"],
+            avg["depth_extract_intrinsics"]
+            + avg["depth_msg_publish"]
+            + avg["pointcloud_convert"]
+            + avg["pointcloud_publish"]
+            + avg["camera_info_publish"],
+            avg["odom_tf"],
+            avg["blocking_republish"],
             avg["postprocess_action"],
+            avg["step_sync_publish"],
+            queue_size,
+            queue_capacity,
+            self._step_frame_queue_peak,
+            self.last_action_source or "unknown",
+            self.last_action_timed_out,
         )
+        self._timing_frame_count = 0
+        for key in self._timing_acc_ms:
+            self._timing_acc_ms[key] = 0.0
+            self._timing_samples_ms[key].clear()
 
     def _action_callback(self, msg):
         try:
@@ -1281,11 +1343,10 @@ class RosBridgePolicy(BasePolicy):
         stamp = self._next_common_stamp()
         self._publish_odom_and_tf(observation, stamp)
 
-        topic_messages = [
-            (self._obs_pub, messages.get("rgb")),
-            (self._extra_image_pub, messages.get("extra_rgb")),
-            (self._depth_pub, messages.get("depth")),
-        ]
+        # RGB topics are recording-only in the realtime-GT ROS pipeline. Do not
+        # duplicate them while waiting for a fresh navigation command; repeated
+        # large images create recorder backlog without adding mapping evidence.
+        topic_messages = [(self._depth_pub, messages.get("depth"))]
         if self.blocking_republish_pointcloud:
             topic_messages.append((self._pointcloud_pub, messages.get("pointcloud")))
         for publisher, message in topic_messages:
@@ -1353,6 +1414,7 @@ class RosBridgePolicy(BasePolicy):
 
     def get_action(self, observation):
         self.last_action_timed_out = False
+        self.last_action_source = ""
         frame_t0 = time.perf_counter()
         stage_ms = {k: 0.0 for k in self._timing_acc_ms}
         published_messages: dict[str, Any] = {}
@@ -1360,7 +1422,9 @@ class RosBridgePolicy(BasePolicy):
         t0 = time.perf_counter()
         common_stamp = self._next_common_stamp()
         tf_ready = self._publish_odom_and_tf(observation, common_stamp)
+        stage_ms["odom_tf"] = (time.perf_counter() - t0) * 1000.0
         if self._realtime_gt_publisher is not None:
+            t0 = time.perf_counter()
             gt_payload = self._realtime_gt_publisher.publish(
                 self.task,
                 stamp=common_stamp,
@@ -1368,7 +1432,7 @@ class RosBridgePolicy(BasePolicy):
             )
             if gt_payload is not None:
                 self._latest_gt_payload = gt_payload
-        stage_ms["odom_tf"] = (time.perf_counter() - t0) * 1000.0
+            stage_ms["realtime_gt"] = (time.perf_counter() - t0) * 1000.0
 
         skip_mapping_observation = self._step_idx < self.map_warmup_skip_frames or (not tf_ready)
         if skip_mapping_observation:
@@ -1385,14 +1449,25 @@ class RosBridgePolicy(BasePolicy):
                     "RosBridgePolicy: odom/tf not ready this frame, skip depth/pointcloud publish to keep timestamps aligned.",
                 )
 
+        rgb_block_t0 = time.perf_counter()
         t0 = time.perf_counter()
         frame = self._extract_image_from_observation(observation)
+        stage_ms["rgb_extract"] = (time.perf_counter() - t0) * 1000.0
         if frame is not None:
+            t0 = time.perf_counter()
             msg = self._to_image_msg(frame, stamp=common_stamp, seq=self._step_idx)
+            stage_ms["rgb_encode"] = (time.perf_counter() - t0) * 1000.0
             if msg is not None:
+                t0 = time.perf_counter()
                 self._obs_pub.publish(msg)
+                stage_ms["rgb_ros_publish"] = (time.perf_counter() - t0) * 1000.0
                 published_messages["rgb"] = msg
+                t0 = time.perf_counter()
                 self._enqueue_step_frame(msg, common_stamp, self._step_idx)
+                stage_ms["step_frame_enqueue"] = (time.perf_counter() - t0) * 1000.0
+                self._step_frame_queue_peak = max(
+                    self._step_frame_queue_peak, self._step_frame_queue.qsize()
+                )
             else:
                 self._rospy.logwarn_throttle(2.0, "RosBridgePolicy: failed to encode image.")
         else:
@@ -1401,17 +1476,25 @@ class RosBridgePolicy(BasePolicy):
                 "RosBridgePolicy: no image-like tensor found in observation."
             )
         if self._extra_image_pub is not None:
+            t0 = time.perf_counter()
             extra_frame = self._extract_named_image_from_observation(observation, self.extra_image_camera_name)
+            stage_ms["extra_rgb_extract"] = (time.perf_counter() - t0) * 1000.0
             if extra_frame is not None:
+                t0 = time.perf_counter()
                 extra_msg = self._to_image_msg(
                     extra_frame,
                     stamp=common_stamp,
                     seq=self._step_idx,
                 )
+                stage_ms["extra_rgb_encode"] = (time.perf_counter() - t0) * 1000.0
                 if extra_msg is not None:
+                    t0 = time.perf_counter()
                     self._extra_image_pub.publish(extra_msg)
+                    stage_ms["extra_rgb_ros_publish"] = (
+                        time.perf_counter() - t0
+                    ) * 1000.0
                     published_messages["extra_rgb"] = extra_msg
-        stage_ms["rgb_publish"] = (time.perf_counter() - t0) * 1000.0
+        stage_ms["rgb_publish"] = (time.perf_counter() - rgb_block_t0) * 1000.0
 
         if self.publish_pointcloud and not skip_mapping_observation:
             t0_depth_extract = time.perf_counter()
@@ -1500,9 +1583,12 @@ class RosBridgePolicy(BasePolicy):
             if isinstance(chosen_action, dict):
                 chosen_action.setdefault("done", False)
             stage_ms["postprocess_action"] = (time.perf_counter() - t0_post) * 1000.0
+            self.last_action_source = "immediate_noop"
+            t0_sync = time.perf_counter()
+            self._publish_step_sync(common_stamp)
+            stage_ms["step_sync_publish"] = (time.perf_counter() - t0_sync) * 1000.0
             stage_ms["total"] = (time.perf_counter() - frame_t0) * 1000.0
             self._record_timing(stage_ms)
-            self._publish_step_sync(common_stamp)
             self._step_idx += 1
             return chosen_action
 
@@ -1533,6 +1619,7 @@ class RosBridgePolicy(BasePolicy):
                     if self._latest_action_step < 0 and action_is_fresh:
                         # Allow action payloads without explicit step field.
                         chosen_action = self._latest_action
+                        self.last_action_source = "action_topic"
                         self._last_consumed_action_step += 1
                         break
                     if (
@@ -1540,6 +1627,7 @@ class RosBridgePolicy(BasePolicy):
                         and action_is_fresh
                     ):
                         chosen_action = self._latest_action
+                        self.last_action_source = "action_topic"
                         self._last_consumed_action_step = self._latest_action_step
                         break
                 cmd_vel = self._latest_cmd_vel
@@ -1555,6 +1643,7 @@ class RosBridgePolicy(BasePolicy):
                 cmd_action = self._cmd_vel_to_base_action(cmd_vel, observation)
                 if cmd_action is not None:
                     chosen_action = cmd_action
+                    self.last_action_source = "cmd_vel"
                     break
 
             if next_republish_mono is not None and now_mono >= next_republish_mono:
@@ -1573,12 +1662,14 @@ class RosBridgePolicy(BasePolicy):
 
         if chosen_action is None:
             if self._rospy.is_shutdown():
+                self.last_action_source = "ros_shutdown"
                 stage_ms["total"] = (time.perf_counter() - frame_t0) * 1000.0
                 self._record_timing(stage_ms)
                 return None
             chosen_action = self._build_noop_action()
             if deadline is not None:
                 self.last_action_timed_out = True
+                self.last_action_source = "timeout_noop"
                 self._rospy.logwarn_throttle(
                     2.0, "RosBridgePolicy: action timeout, using noop action."
                 )
@@ -1623,10 +1714,14 @@ class RosBridgePolicy(BasePolicy):
                         )
                         chosen_action["right_arm"] = noop_right
         stage_ms["postprocess_action"] = (time.perf_counter() - t0_post) * 1000.0
+        if not self.last_action_source:
+            self.last_action_source = "fallback_noop"
+        t0_sync = time.perf_counter()
+        self._publish_step_sync(common_stamp)
+        stage_ms["step_sync_publish"] = (time.perf_counter() - t0_sync) * 1000.0
         stage_ms["total"] = (time.perf_counter() - frame_t0) * 1000.0
         self._record_timing(stage_ms)
 
-        self._publish_step_sync(common_stamp)
         self._step_idx += 1
         return chosen_action
 

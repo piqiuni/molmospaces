@@ -28,6 +28,7 @@ class InteractionGraphStore:
         object_room_search_margin_m=0.75,
         object_room_priors=None,
         room_attribute_min_confidence=0.2,
+        interaction_geometry_overrides=None,
     ):
         self.scene_id = str(scene_id or "scene")
         self.match_distance = float(match_distance)
@@ -41,6 +42,10 @@ class InteractionGraphStore:
             object_room_priors or {},
             min_confidence=room_attribute_min_confidence,
         )
+        self.interaction_geometry_overrides = {
+            str(key): dict(value or {})
+            for key, value in (interaction_geometry_overrides or {}).items()
+        }
         self.room_geometries = {}
         self.room_geometry_candidates = {}
         self.room_geometry_stability_frames = 5
@@ -724,6 +729,28 @@ class InteractionGraphStore:
                 }
             )
         node.attributes.update(observation_attributes)
+        source_object_name = str(
+            observation.get("source_object_name")
+            or observation.get("instance_id")
+            or node.name
+            or ""
+        )
+        geometry_override = self.interaction_geometry_overrides.get(
+            source_object_name
+        )
+        if geometry_override:
+            for key in (
+                "interaction_approach_axis_xy",
+                "interaction_approach_pose_xyyaw",
+                "interaction_reference_aabb_center",
+                "interaction_reference_aabb_size",
+            ):
+                values = list(geometry_override.get(key) or [])
+                if values:
+                    node.attributes[key] = values
+            node.attributes["interaction_geometry_source"] = str(
+                geometry_override.get("source") or "configured_override"
+            )
         for deprecated_key in (
             "parent",
             "children",

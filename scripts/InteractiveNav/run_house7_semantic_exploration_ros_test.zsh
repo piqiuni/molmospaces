@@ -26,7 +26,13 @@ VIDEO_FRAME_JOB_QUEUE_SIZE=${VIDEO_FRAME_JOB_QUEUE_SIZE:-4}
 ARTIFACT_WRITE_QUEUE_SIZE=${ARTIFACT_WRITE_QUEUE_SIZE:-4}
 VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-16}
 IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-4}
+OBSERVATION_QUEUE_SIZE=${OBSERVATION_QUEUE_SIZE:-16}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
+EXTERNAL_VIDEO_WIDTH_PX=${EXTERNAL_VIDEO_WIDTH_PX:-1024}
+EXTRA_IMAGE_QUEUE_SIZE=${EXTRA_IMAGE_QUEUE_SIZE:-16}
+TIMING_LOG_EVERY_N_STEPS=${TIMING_LOG_EVERY_N_STEPS:-50}
+RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES=${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES:-50}
+RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-180}
 GT_STEP_INTERVAL=${GT_STEP_INTERVAL:-3}
 GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-4.0}
 GT_MIN_VISIBLE_PIXELS=${GT_MIN_VISIBLE_PIXELS:-16}
@@ -48,6 +54,11 @@ INITIAL_DOOR_STATE=${INITIAL_DOOR_STATE:-closed}
 FORCE_CLOSE_CONTAINERS=${FORCE_CLOSE_CONTAINERS:-false}
 CLEAN_INTERMEDIATE=${CLEAN_INTERMEDIATE:-false}
 ENABLE_RECORDING=${ENABLE_RECORDING:-true}
+ENABLE_EXTERNAL_VIDEO=${ENABLE_EXTERNAL_VIDEO:-false}
+EXTERNAL_IMAGE_TOPIC=${EXTERNAL_IMAGE_TOPIC:-/molmo_spaces/debug_front_camera/image}
+DEBUG_FOLLOW_CAMERA_OFFSET=${DEBUG_FOLLOW_CAMERA_OFFSET:--0.779295308248162,0.9640243904369644,1.600000023841858}
+DEBUG_FOLLOW_CAMERA_LOOKAT_OFFSET=${DEBUG_FOLLOW_CAMERA_LOOKAT_OFFSET:-0.010510587056107079,0.4165302897166183,1.3234916922873792}
+DEBUG_FOLLOW_CAMERA_FOV_DEG=${DEBUG_FOLLOW_CAMERA_FOV_DEG:-65.0}
 if [[ -z "${INTERACTION_EXECUTION_MODE:-}" ]]; then
   if [[ -n "${DRAWER_EXECUTION_MODE:-}" ]]; then
     INTERACTION_EXECUTION_MODE=${DRAWER_EXECUTION_MODE}
@@ -114,6 +125,7 @@ case "${METHOD}" in
     FORCE_CLOSE_CONTAINERS=true
     COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_fridge.yaml}
+    SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/house7_interaction_geometry.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
   object_goal_model_mock)
@@ -249,6 +261,10 @@ fi
 RECORDER_PID=""
 if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
   if [[ "${ENABLE_RECORDING}" == true ]]; then
+    EXTERNAL_VIDEO_ARGS=(--no-external-video)
+    if [[ "${ENABLE_EXTERNAL_VIDEO}" == true ]]; then
+      EXTERNAL_VIDEO_ARGS=(--external-image-topic "${EXTERNAL_IMAGE_TOPIC}" --external-video)
+    fi
     PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
       --output-dir "${OUTPUT_DIR}/debug" \
       --occupancy-grid-topic /semantic_mapping/planning_occ_map \
@@ -257,15 +273,17 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       --first-person-video-with-map \
       --first-person-video-fps "${VIDEO_FPS}" \
       --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
+      --external-video-width-px "${EXTERNAL_VIDEO_WIDTH_PX}" \
       --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
       --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
+      --performance-log-every-n-frames "${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES}" \
       --video-history-size "${VIDEO_HISTORY_SIZE}" \
       --image-queue-size "${IMAGE_QUEUE_SIZE}" \
       --video-global-panel-scale 1.8 \
       --runtime-video-encode \
       --first-person-video-h264-preset "${VIDEO_ENCODER_PRESET}" \
-      --no-external-video \
-      --no-video-save-panel-frames \
+      "${EXTERNAL_VIDEO_ARGS[@]}" \
+      --video-save-panel-frames \
       --no-first-person-video-h264 \
       >"${OUTPUT_DIR}/recorder.log" 2>&1 &
   else
@@ -294,11 +312,17 @@ if [[ -n "${RUNTIME_TARGET_SELECTION_INPUT_PATH}" ]]; then
   RUNTIME_TARGET_SELECTION_INPUT_ARGS="--runtime_target_selection_input_path ${RUNTIME_TARGET_SELECTION_INPUT_PATH}"
 fi
 if [[ "${ENABLE_RECORDING}" == true ]]; then
-  SIM_CAPTURE_ARGS="--observation_queue_size 0 --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_frame_queue_size 4"
+  SIM_CAPTURE_ARGS="--observation_queue_size ${OBSERVATION_QUEUE_SIZE} --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_frame_queue_size 4"
 else
   SIM_CAPTURE_ARGS="--observation_queue_size 1"
 fi
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames ${MAP_WARMUP_SKIP_FRAMES} ${SIM_CAPTURE_ARGS} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json ${RUNTIME_TARGET_SELECTION_INPUT_ARGS} --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+PUBLISH_DEBUG_FRONT_CAMERA=false
+DEBUG_CAMERA_ARGS=""
+if [[ "${ENABLE_EXTERNAL_VIDEO}" == true ]]; then
+  PUBLISH_DEBUG_FRONT_CAMERA=true
+  DEBUG_CAMERA_ARGS="--debug_front_camera_offset=${DEBUG_FOLLOW_CAMERA_OFFSET} --debug_front_camera_lookat_offset=${DEBUG_FOLLOW_CAMERA_LOOKAT_OFFSET} --debug_front_camera_fov_deg=${DEBUG_FOLLOW_CAMERA_FOV_DEG}"
+fi
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames ${MAP_WARMUP_SKIP_FRAMES} ${SIM_CAPTURE_ARGS} ${DEBUG_CAMERA_ARGS} --extra_image_queue_size ${EXTRA_IMAGE_QUEUE_SIZE} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json ${RUNTIME_TARGET_SELECTION_INPUT_ARGS} --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS} --timing_log_every_n_frames ${TIMING_LOG_EVERY_N_STEPS} --sim_timing_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS}"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -322,7 +346,7 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   local_costmap_inflation_radius:="${LOCAL_COSTMAP_INFLATION_RADIUS}" \
   exploration_only:=true \
   randomize_camera:=false \
-  publish_debug_front_camera:=false \
+  publish_debug_front_camera:="${PUBLISH_DEBUG_FRONT_CAMERA}" \
   robot:=rby1 \
   scene_dataset:=procthor-10k \
   data_split:=train \
@@ -361,7 +385,7 @@ if [[ "${LAUNCH_EXIT}" -ne 0 ]] && [[ "${LAUNCH_EXIT}" -ne 130 ]]; then
 fi
 
 if [[ -n "${RECORDER_PID}" ]]; then
-  cleanup_process "${RECORDER_PID}" 20
+  cleanup_process "${RECORDER_PID}" "${RECORDER_SHUTDOWN_GRACE_S}"
   RECORDER_PID=""
 fi
 
@@ -494,6 +518,12 @@ if events_path.exists():
             pass
 decision_rows = [event for event in debug_events if event.get("type") == "semantic_decision_selected"]
 feedback_rows = [event for event in debug_events if event.get("type") == "semantic_decision_feedback"]
+target_container_candidate_ids = {
+    str((event.get("payload") or {}).get("candidate_id") or "")
+    for event in decision_rows
+    if (event.get("payload") or {}).get("behavior_type") == "INTERACT"
+    and bool(((event.get("payload") or {}).get("metadata") or {}).get("target_match"))
+}
 terminal_feedback = [
     event.get("payload") or {}
     for event in feedback_rows
@@ -574,10 +604,9 @@ result = {
     ) or target_navigation_succeeded,
     "target_selection": read_json(output_dir / "target_selection.json"),
     "target_container_interaction_success": any(
-        bool(event.get("result", {}).get("success"))
-        and event.get("result", {}).get("object_id")
-        == read_json(output_dir / "target_selection.json").get("container_name")
-        for event in force.get("events", [])
+        payload.get("status") == "SUCCEEDED"
+        and str(payload.get("candidate_id") or "") in target_container_candidate_ids
+        for payload in terminal_feedback
     ),
     "target_object_visible_navigation_success": bool(
         target_navigation_succeeded

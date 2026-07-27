@@ -289,12 +289,20 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
         assert first["capture_step"] == 0
         assert first["image_size"] == [5, 5]
         observation = first["observations"][0]
-        assert set(observation) == {"id", "name", "bbox_2d", "visible_pixels", "box_3d"}
+        assert set(observation) == {
+            "id",
+            "name",
+            "bbox_2d",
+            "visible_pixels",
+            "visible_fraction",
+            "box_3d",
+        }
         assert observation["id"] == "chair_body"
         assert observation["name"] == "Chair"
         assert observation["bbox_2d"] == [0, 0, 4, 1]
         assert observation["visible_pixels"] == 6
         assert "segmentation" not in observation
+        assert observation["visible_fraction"] == 0.6
         assert observation["box_3d"] == {
             "center": [2.0, 0.0, 0.5],
             "size": [0.5, 0.5, 1.0],
@@ -359,7 +367,7 @@ def test_raw_gt_publisher_does_not_add_temporal_reliability_fields():
         assert len(first["observations"]) == 1
         assert len(second["observations"]) == 1
         assert "consecutive_observations" not in first["observations"][0]
-        assert "visible_fraction" not in first["observations"][0]
+        assert first["observations"][0]["visible_fraction"] == 0.6
 
         _set_geom_pixels([])
         publisher.publish(FakeTask(), step_index=6)

@@ -152,13 +152,70 @@ def portal_room_node_ids(
     return sorted(room_ids)
 
 
+def topology_order_rooms(
+    rooms: list[dict[str, Any]],
+    portals: list[dict[str, Any]],
+    edges: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Order rooms horizontally with a well-connected room in the center.
+
+    World-space x/y remains the stable fallback and tie-breaker. When the
+    portal graph has a room connected to at least two other rooms, that room
+    is inserted into the middle column so a circulation hub is not rendered
+    at an outer edge of the topology figure.
+    """
+
+    def world_key(room: dict[str, Any]) -> tuple[int, float, float, str]:
+        center = room.get("aabb_center") or room.get("centroid") or []
+        if len(center) < 2:
+            return (1, 0.0, 0.0, str(room.get("id") or ""))
+        return (0, float(center[0]), float(center[1]), str(room.get("id") or ""))
+
+    ordered = sorted(rooms, key=world_key)
+    if len(ordered) < 3:
+        return ordered
+
+    room_by_id = {str(room.get("id") or ""): room for room in ordered}
+    adjacency = {room_id: set() for room_id in room_by_id}
+    for portal in portals:
+        connected = [
+            room_id
+            for room_id in portal_room_node_ids(portal, edges)
+            if room_id in room_by_id
+        ]
+        for index, first in enumerate(connected):
+            for second in connected[index + 1 :]:
+                adjacency[first].add(second)
+                adjacency[second].add(first)
+
+    max_degree = max((len(neighbors) for neighbors in adjacency.values()), default=0)
+    if max_degree < 2:
+        return ordered
+
+    spatial_index = {str(room.get("id") or ""): index for index, room in enumerate(ordered)}
+    middle_index = len(ordered) // 2
+    center_id = min(
+        (room_id for room_id, neighbors in adjacency.items() if len(neighbors) == max_degree),
+        key=lambda room_id: (
+            abs(spatial_index[room_id] - middle_index),
+            spatial_index[room_id],
+            room_id,
+        ),
+    )
+    center_room = room_by_id[center_id]
+    outer_rooms = [room for room in ordered if str(room.get("id") or "") != center_id]
+    outer_rooms.insert(middle_index, center_room)
+    return outer_rooms
+
+
 def portal_positions_between_rooms(
     portals: list[dict[str, Any]],
     edges: list[dict[str, Any]] | None,
     room_positions: dict[str, tuple[int, int]],
     spacing: float = 24.0,
+    vertical_offset_y: float = 0.0,
 ) -> dict[str, tuple[int, int]]:
-    """Place connected portals on the line between their two room nodes."""
+    """Place connected portals between rooms, optionally half a level lower."""
     portals_by_room_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for portal in portals:
         connected_rooms = [
@@ -176,7 +233,7 @@ def portal_positions_between_rooms(
         first = room_positions[room_pair[0]]
         second = room_positions[room_pair[1]]
         midpoint_x = (first[0] + second[0]) * 0.5
-        midpoint_y = (first[1] + second[1]) * 0.5
+        midpoint_y = (first[1] + second[1]) * 0.5 + float(vertical_offset_y)
         delta_x = float(second[0] - first[0])
         delta_y = float(second[1] - first[1])
         length = max(1.0, (delta_x * delta_x + delta_y * delta_y) ** 0.5)

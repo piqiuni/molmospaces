@@ -589,6 +589,15 @@ class RealtimeGTObservationPublisher:
             "name": str(category),
             "bbox_2d": list(bbox_2d),
             "visible_pixels": max(0, int(visible_pixels)),
+            "visible_fraction": min(
+                1.0,
+                float(max(0, int(visible_pixels)))
+                / max(
+                    1.0,
+                    float(bbox_2d[2] - bbox_2d[0] + 1)
+                    * float(bbox_2d[3] - bbox_2d[1] + 1),
+                ),
+            ),
             "box_3d": {
                 "center": [float(value) for value in center],
                 "size": [float(value) for value in size],

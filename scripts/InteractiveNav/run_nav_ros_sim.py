@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import json
 import logging
 from pathlib import Path
 import struct
@@ -119,6 +120,100 @@ def configure_run_file_logging(output_dir: Path) -> Path:
     )
     root_logger.addHandler(file_handler)
     return log_path
+
+
+class StepTimingDiagnostics:
+    """Persist per-step timings and emit compact percentile summaries."""
+
+    def __init__(self, path: str | Path, window_size: int):
+        self.path = Path(path).expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(exist_ok=True)
+        self.window_size = max(1, int(window_size))
+        self._records: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _stats(records: list[dict[str, Any]], key: str) -> tuple[float, float, float, float]:
+        values = [float(record.get(key, 0.0)) for record in records]
+        if not values:
+            return 0.0, 0.0, 0.0, 0.0
+        return (
+            float(np.mean(values)),
+            float(np.percentile(values, 50)),
+            float(np.percentile(values, 95)),
+            float(np.max(values)),
+        )
+
+    def record(self, step_index: int, metrics: dict[str, float], metadata: dict[str, Any]) -> None:
+        record = {
+            "step_index": int(step_index),
+            "wall_time": time.time(),
+            **{key: float(value) for key, value in metrics.items()},
+            **metadata,
+        }
+        self._records.append(record)
+        if len(self._records) >= self.window_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._records:
+            return
+        with self.path.open("a", encoding="utf-8") as handle:
+            for record in self._records:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+        total = self._stats(self._records, "full_step_ms")
+        policy = self._stats(self._records, "policy_ms")
+        wait = self._stats(self._records, "policy_action_wait_ms")
+        enqueue = self._stats(self._records, "policy_step_frame_enqueue_ms")
+        gt = self._stats(self._records, "policy_realtime_gt_ms")
+        rgb = self._stats(self._records, "policy_rgb_publish_ms")
+        task = self._stats(self._records, "task_core_ms")
+        physics = self._stats(self._records, "task_physics_step_ms")
+        sensors = self._stats(self._records, "task_sensor_polling_ms")
+        slowest = sorted(
+            self._records, key=lambda record: float(record.get("full_step_ms", 0.0)), reverse=True
+        )[:3]
+        timeout_count = sum(bool(record.get("action_timed_out")) for record in self._records)
+        queue_peak = max(int(record.get("step_frame_queue_size", 0)) for record in self._records)
+        queue_capacity = max(int(record.get("step_frame_queue_capacity", 0)) for record in self._records)
+        log.info(
+            "StepTiming window steps=%d-%d n=%d: full avg/p50/p95/max=%.1f/%.1f/%.1f/%.1fms; "
+            "policy=%.1f/%.1f/%.1f/%.1fms [wait avg/p95=%.1f/%.1f, "
+            "frame_enqueue=%.1f/%.1f, gt=%.1f/%.1f, rgb=%.1f/%.1f]; "
+            "task=%.1f/%.1fms [physics=%.1f/%.1f sensors=%.1f/%.1f]; "
+            "frame_queue_peak=%d/%d timeouts=%d; slowest=%s",
+            int(self._records[0]["step_index"]),
+            int(self._records[-1]["step_index"]),
+            len(self._records),
+            *total,
+            *policy,
+            wait[0],
+            wait[2],
+            enqueue[0],
+            enqueue[2],
+            gt[0],
+            gt[2],
+            rgb[0],
+            rgb[2],
+            task[0],
+            task[2],
+            physics[0],
+            physics[2],
+            sensors[0],
+            sensors[2],
+            queue_peak,
+            queue_capacity,
+            timeout_count,
+            ",".join(
+                f"{int(record['step_index'])}:{float(record.get('full_step_ms', 0.0)):.1f}ms"
+                for record in slowest
+            ),
+        )
+        self._records.clear()
+
+    def close(self) -> None:
+        self.flush()
 
 
 def ensure_head_camera_exists(camera_system) -> None:
@@ -339,8 +434,16 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         }
         timing_log_every = max(0, int(getattr(policy, "sim_timing_log_every_n_steps", 20)))
         step_log_every = max(0, int(getattr(policy, "step_log_every_n_steps", 10)))
+        timing_path = str(getattr(policy, "sim_timing_path", "") or "")
+        timing_diagnostics = (
+            StepTimingDiagnostics(timing_path, timing_log_every or 20)
+            if timing_path
+            else None
+        )
         while not task.is_done():
             if shutdown_event is not None and shutdown_event.is_set():
+                if timing_diagnostics is not None:
+                    timing_diagnostics.close()
                 return False
             if completion_monitor is not None and completion_monitor.should_stop(step_idx):
                 break
@@ -351,22 +454,42 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                     f"after {step_idx} completed steps"
                 )
 
-            if door_occ_controller is not None and door_occ_controller.before_step(task, step_idx):
+            full_step_t0 = time.perf_counter()
+            pre_controller_ms = 0.0
+            pre_observation_ms = 0.0
+            pre_gt_ms = 0.0
+            t0 = time.perf_counter()
+            door_state_changed = bool(
+                door_occ_controller is not None
+                and door_occ_controller.before_step(task, step_idx)
+            )
+            pre_controller_ms += (time.perf_counter() - t0) * 1000.0
+            if door_state_changed:
+                t0 = time.perf_counter()
                 observation = task.get_observations()
+                pre_observation_ms += (time.perf_counter() - t0) * 1000.0
             force_interaction_controller = getattr(policy, "force_interaction_controller", None)
             if force_interaction_controller is not None:
+                t0 = time.perf_counter()
                 interaction_result = force_interaction_controller.before_step(task, step_idx)
+                pre_controller_ms += (time.perf_counter() - t0) * 1000.0
                 force_observation = bool(
                     interaction_result is not None
                     or force_interaction_controller.consume_force_observation_request()
                 )
                 if force_observation:
+                    t0 = time.perf_counter()
                     observation = task.get_observations()
+                    pre_observation_ms += (time.perf_counter() - t0) * 1000.0
                     if task.observation_cache:
                         task.observation_cache[0] = observation
                     if hasattr(policy, "publish_realtime_gt_now"):
+                        t0 = time.perf_counter()
                         policy.publish_realtime_gt_now(step_index=step_idx)
+                        pre_gt_ms += (time.perf_counter() - t0) * 1000.0
+            snapshot_t0 = time.perf_counter()
             maybe_save_debug_snapshot(policy, observation)
+            debug_snapshot_ms = (time.perf_counter() - snapshot_t0) * 1000.0
             loop_t0 = time.perf_counter()
             policy_t0 = time.perf_counter()
             action_cmd = policy.get_action(observation)
@@ -410,20 +533,33 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                 )
 
             task_t0 = time.perf_counter()
+            task_core_t0 = time.perf_counter()
             observation, reward, terminal, truncated, infos = task.step(action_cmd)
+            task_core_ms = (time.perf_counter() - task_core_t0) * 1000.0
+            post_controller_ms = 0.0
+            post_observation_ms = 0.0
+            post_gt_ms = 0.0
             if force_interaction_controller is not None:
+                t0 = time.perf_counter()
                 interaction_result = force_interaction_controller.after_step(task, step_idx)
+                post_controller_ms += (time.perf_counter() - t0) * 1000.0
                 force_observation = bool(
                     interaction_result is not None
                     or force_interaction_controller.consume_force_observation_request()
                 )
                 if force_observation:
+                    t0 = time.perf_counter()
                     observation = task.get_observations()
+                    post_observation_ms += (time.perf_counter() - t0) * 1000.0
                     if task.observation_cache:
                         task.observation_cache[0] = observation
                     if hasattr(policy, "publish_realtime_gt_now"):
+                        t0 = time.perf_counter()
                         policy.publish_realtime_gt_now(step_index=step_idx)
+                        post_gt_ms += (time.perf_counter() - t0) * 1000.0
+                t0 = time.perf_counter()
                 force_interaction_controller.after_task_step()
+                post_controller_ms += (time.perf_counter() - t0) * 1000.0
             task_ms = (time.perf_counter() - task_t0) * 1000.0
             loop_ms = (time.perf_counter() - loop_t0) * 1000.0
             task_timing = getattr(task, "last_step_timing_ms", {})
@@ -447,18 +583,57 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                 timing_count = 0
                 for key in timing_sums_ms:
                     timing_sums_ms[key] = 0.0
-            step_idx += 1
             # print(f"Observation: {observation}", flush=True)
             # print(f"Reward: {reward}", flush=True)
             # print(f"Terminal: {terminal}", flush=True)
             # print(f"Truncated: {truncated}", flush=True)
             # print(f"Infos: {infos}", flush=True)
+            viewer_ms = 0.0
+            if viewer is not None:
+                viewer_t0 = time.perf_counter()
+                viewer.sync()
+                viewer_ms = (time.perf_counter() - viewer_t0) * 1000.0
+
+            full_step_ms = (time.perf_counter() - full_step_t0) * 1000.0
+            if timing_diagnostics is not None:
+                policy_timing = dict(getattr(policy, "last_timing_ms", {}) or {})
+                metrics = {
+                    "full_step_ms": full_step_ms,
+                    "pre_controller_ms": pre_controller_ms,
+                    "pre_observation_ms": pre_observation_ms,
+                    "pre_gt_ms": pre_gt_ms,
+                    "debug_snapshot_ms": debug_snapshot_ms,
+                    "policy_ms": policy_ms,
+                    "task_ms": task_ms,
+                    "task_core_ms": task_core_ms,
+                    "post_controller_ms": post_controller_ms,
+                    "post_observation_ms": post_observation_ms,
+                    "post_gt_ms": post_gt_ms,
+                    "viewer_ms": viewer_ms,
+                    **{
+                        f"task_{key}_ms": float(value)
+                        for key, value in task_timing.items()
+                    },
+                    **{
+                        f"policy_{key}_ms": float(value)
+                        for key, value in policy_timing.items()
+                    },
+                }
+                step_frame_queue = getattr(policy, "_step_frame_queue", None)
+                timing_diagnostics.record(
+                    step_idx,
+                    metrics,
+                    {
+                        "action_source": str(getattr(policy, "last_action_source", "")),
+                        "action_timed_out": bool(getattr(policy, "last_action_timed_out", False)),
+                        "step_frame_queue_size": 0 if step_frame_queue is None else step_frame_queue.qsize(),
+                        "step_frame_queue_capacity": 0 if step_frame_queue is None else step_frame_queue.maxsize,
+                    },
+                )
+            step_idx += 1
             if end_on_success and "success" in infos[0] and infos[0]["success"]:
                 success = True
                 break
-
-            if viewer is not None:
-                viewer.sync()
 
         try:
             task.env.current_model.opt.enableflags &= ~int(mujoco.mjtEnableBit.mjENBL_SLEEP)
@@ -472,6 +647,8 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             force_interaction_controller.finalize(step_idx)
         if completion_monitor is not None:
             completion_monitor.finalize(step_idx)
+        if timing_diagnostics is not None:
+            timing_diagnostics.close()
         success = task.judge_success() if hasattr(task, "judge_success") else success
         return success
 
@@ -573,7 +750,7 @@ def build_nav_config(args) -> NavToObjBaseConfig:
                         pos=fixed_camera_pos,
                         forward=forward,
                         up=up,
-                        fov=75.0,
+                        fov=float(args.debug_front_camera_fov_deg),
                         skip_erosion=True,
                     )
                 )
@@ -584,11 +761,11 @@ def build_nav_config(args) -> NavToObjBaseConfig:
                     RobotMountedCameraConfig(
                         name=args.debug_front_camera_name,
                         reference_body_names=["robot_0/base", "base"],
-                        camera_offset=debug_camera_offset or [-1.4, 0.0, 1.35],
-                        lookat_offset=debug_camera_lookat_offset or [0.0, 0.0, 0.35],
+                        camera_offset=debug_camera_offset or [-1.08, 0.62, 1.60],
+                        lookat_offset=debug_camera_lookat_offset or [0.4, 0.0, 0.95],
                         camera_quaternion=[0.5, 0.5, -0.5, -0.5],
                         up_axis="z",
-                        fov=75.0,
+                        fov=float(args.debug_front_camera_fov_deg),
                         skip_erosion=True,
                     )
                 )
@@ -704,6 +881,12 @@ def parse_args():
         default=1,
         help="ROS RGB publisher queue; use 0 for synchronous per-step debug recording.",
     )
+    parser.add_argument(
+        "--extra_image_queue_size",
+        type=int,
+        default=16,
+        help="External/debug camera ROS publisher queue; positive values keep large images off the simulation thread.",
+    )
     parser.add_argument("--depth_topic", type=str, default="/molmo_spaces/head_camera/depth")
     parser.add_argument("--action_topic", type=str, default="/molmo_spaces/action")
     parser.add_argument("--pointcloud_topic", type=str, default="/registered_scan")
@@ -805,8 +988,17 @@ def parse_args():
     )
     parser.add_argument("--fixed_debug_camera_pos", type=str, default="")
     parser.add_argument("--fixed_debug_camera_target", type=str, default="")
-    parser.add_argument("--debug_front_camera_offset", type=str, default="-1.4,0.0,1.35")
-    parser.add_argument("--debug_front_camera_lookat_offset", type=str, default="0.0,0.0,0.35")
+    parser.add_argument(
+        "--debug_front_camera_offset",
+        type=str,
+        default="-0.779295308248162,0.9640243904369644,1.600000023841858",
+    )
+    parser.add_argument(
+        "--debug_front_camera_lookat_offset",
+        type=str,
+        default="0.010510587056107079,0.4165302897166183,1.3234916922873792",
+    )
+    parser.add_argument("--debug_front_camera_fov_deg", type=float, default=65.0)
     parser.add_argument("--depth_camera_name", type=str, default="head_camera")
     parser.add_argument("--pointcloud_frame_id", type=str, default="tf_frame_lidar")
     parser.add_argument("--pointcloud_stride", type=int, default=2)
@@ -956,6 +1148,12 @@ def parse_args():
         help="Log policy wait, physics, sensor, and full task timing every N simulation steps.",
     )
     parser.add_argument(
+        "--sim_timing_path",
+        type=str,
+        default="",
+        help="Per-step JSONL timing output; defaults to <output_dir>/step_timing.jsonl.",
+    )
+    parser.add_argument(
         "--step_log_every_n_steps",
         type=int,
         default=10,
@@ -1029,6 +1227,7 @@ def main():
             task=None,
             observation_topic=args.observation_topic,
             observation_queue_size=args.observation_queue_size,
+            extra_image_queue_size=args.extra_image_queue_size,
             action_topic=args.action_topic,
             pointcloud_topic=args.pointcloud_topic,
             camera_info_topic=args.camera_info_topic,
@@ -1088,6 +1287,7 @@ def main():
         policy.max_consecutive_action_timeouts = args.max_consecutive_action_timeouts
     policy.retain_task_history = bool(args.retain_task_history)
     policy.sim_timing_log_every_n_steps = args.sim_timing_log_every_n_steps
+    policy.sim_timing_path = args.sim_timing_path or str(exp_config.output_dir / "step_timing.jsonl")
     policy.step_log_every_n_steps = args.step_log_every_n_steps
     policy.debug_snapshot_path = args.debug_snapshot_path
     policy.debug_snapshot_camera_name = args.debug_snapshot_camera_name

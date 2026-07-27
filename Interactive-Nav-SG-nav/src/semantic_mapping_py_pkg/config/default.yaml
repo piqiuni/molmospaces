@@ -168,6 +168,7 @@ interaction_graph:
   match_distance: 0.5
   portal_room_max_radius_m: 1.0
   object_room_search_margin_m: 0.75
+  geometry_overrides: {}
   gt_replay:
     enable: false
     shuffle: false

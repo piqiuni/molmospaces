@@ -50,6 +50,8 @@ from explore_py_pkg.debug_semantic_viz import (
     topology_edge_visible,
     topology_hierarchy_layout,
     topology_node_style,
+    portal_room_node_ids,
+    topology_order_rooms,
 )
 from actionlib_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
@@ -215,25 +217,58 @@ class _AsyncArtifactWriter:
         self.process_sizes: dict[str, tuple[int, int]] = {}
         self.errors: list[str] = []
         self.dropped_jobs = 0
+        self.submitted_png_jobs = 0
+        self.submitted_video_jobs = 0
+        self.written_png_jobs = 0
+        self.written_video_jobs = 0
+        self.png_queue_peak = 0
+        self.video_queue_peak = 0
+        self.png_write_ms_total = 0.0
+        self.png_write_ms_max = 0.0
+        self.video_write_ms_total = 0.0
+        self.video_write_ms_max = 0.0
         self.thread = threading.Thread(target=self._run, name="explore-artifact-writer", daemon=True)
         self.video_thread = threading.Thread(target=self._run_video, name="explore-video-writer", daemon=True)
         self.thread.start()
         self.video_thread.start()
 
     def submit_png(self, path: Path, frame) -> None:
+        self.submitted_png_jobs += 1
         self._submit(("png", Path(path), frame.copy()))
 
     def submit_video(self, stream: str, path: Path, frame) -> None:
+        self.submitted_video_jobs += 1
         try:
             self.video_jobs.put_nowait((str(stream), Path(path), frame.copy()))
+            self.video_queue_peak = max(self.video_queue_peak, self.video_jobs.qsize())
         except queue.Full:
             self.dropped_jobs += 1
 
     def _submit(self, job) -> None:
         try:
             self.jobs.put_nowait(job)
+            self.png_queue_peak = max(self.png_queue_peak, self.jobs.qsize())
         except queue.Full:
             self.dropped_jobs += 1
+
+    def stats_snapshot(self) -> dict[str, float | int]:
+        return {
+            "png_queue_size": self.jobs.qsize(),
+            "png_queue_capacity": self.jobs.maxsize,
+            "png_queue_peak": self.png_queue_peak,
+            "video_queue_size": self.video_jobs.qsize(),
+            "video_queue_capacity": self.video_jobs.maxsize,
+            "video_queue_peak": self.video_queue_peak,
+            "submitted_png_jobs": self.submitted_png_jobs,
+            "submitted_video_jobs": self.submitted_video_jobs,
+            "written_png_jobs": self.written_png_jobs,
+            "written_video_jobs": self.written_video_jobs,
+            "png_write_ms_avg": self.png_write_ms_total / max(1, self.written_png_jobs),
+            "png_write_ms_max": self.png_write_ms_max,
+            "video_write_ms_avg": self.video_write_ms_total / max(1, self.written_video_jobs),
+            "video_write_ms_max": self.video_write_ms_max,
+            "dropped_jobs": self.dropped_jobs,
+        }
 
     def _open_video(self, stream: str, path: Path, width: int, height: int):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +306,7 @@ class _AsyncArtifactWriter:
                 if job is None:
                     return
                 _kind, path, frame = job
+                write_t0 = time.perf_counter()
                 path.parent.mkdir(parents=True, exist_ok=True)
                 ok = cv2.imwrite(
                     str(path),
@@ -279,6 +315,10 @@ class _AsyncArtifactWriter:
                 )
                 if not ok:
                     raise RuntimeError(f"failed to write {path}")
+                write_ms = (time.perf_counter() - write_t0) * 1000.0
+                self.written_png_jobs += 1
+                self.png_write_ms_total += write_ms
+                self.png_write_ms_max = max(self.png_write_ms_max, write_ms)
             except Exception as exc:  # pragma: no cover - debug artifact best effort
                 self.errors.append(f"{type(exc).__name__}: {exc}")
             finally:
@@ -291,7 +331,12 @@ class _AsyncArtifactWriter:
                 if job is None:
                     return
                 stream, path, frame = job
+                write_t0 = time.perf_counter()
                 self._write_video(stream, path, frame)
+                write_ms = (time.perf_counter() - write_t0) * 1000.0
+                self.written_video_jobs += 1
+                self.video_write_ms_total += write_ms
+                self.video_write_ms_max = max(self.video_write_ms_max, write_ms)
             except Exception as exc:  # pragma: no cover - debug artifact best effort
                 self.errors.append(f"{type(exc).__name__}: {exc}")
             finally:
@@ -868,10 +913,12 @@ class ExploreDebugRecorder:
         self.video_map_frame_dir = self.video_dir / "map_frames"
         self.video_global_costmap_frame_dir = self.video_dir / "global_costmap_frames"
         self.video_local_costmap_frame_dir = self.video_dir / "local_costmap_frames"
+        self.video_room_interaction_frame_dir = self.video_dir / "room_interaction_frames"
         self.video_semantic_spatial_frame_dir = self.video_dir / "semantic_spatial_frames"
         self.video_semantic_topology_frame_dir = self.video_dir / "semantic_topology_frames"
         self.video_composite_frame_dir = self.video_dir / "composite_frames"
         self.video_external_frame_dir = self.video_dir / "external_camera_frames"
+        self.video_external_raw_frame_dir = self.video_dir / "external_camera_raw_frames"
         self.semantic_keyframe_dir = output_dir / "semantic_keyframes"
         self.graph_dir = output_dir / "graph"
         self.panel_dir = output_dir / "subgoal_panels"
@@ -883,6 +930,7 @@ class ExploreDebugRecorder:
         self.tf_listener = tf.TransformListener()
         self.lock = threading.RLock()
         self.video_lock = threading.RLock()
+        self.external_video_lock = threading.RLock()
         self.shutting_down = False
         self.start_wall_time = time.time()
         self.latest_grid: OccupancyGrid | None = None
@@ -1015,6 +1063,10 @@ class ExploreDebugRecorder:
             maxsize=max(1, int(args.video_frame_job_queue_size))
         )
         self.video_frame_jobs_dropped = 0
+        self.recording_timing_windows: dict[str, list[float]] = {
+            "six_panel_render": [],
+            "external_frame_callback": [],
+        }
         self.video_frame_thread = threading.Thread(
             target=self._run_video_frame_renderer,
             name="explore-video-frame-renderer",
@@ -1150,6 +1202,7 @@ class ExploreDebugRecorder:
                 "local_costmap_step",
                 "global_costmap_frame",
                 "local_costmap_frame",
+                "room_interaction_frame",
                 "semantic_spatial_frame",
                 "semantic_topology_frame",
                 "composite_frame",
@@ -1186,7 +1239,14 @@ class ExploreDebugRecorder:
                 )
             )
         if args.external_image_topic:
-            self.subscribers.append(rospy.Subscriber(args.external_image_topic, Image, self.external_image_callback, queue_size=1))
+            self.subscribers.append(
+                rospy.Subscriber(
+                    args.external_image_topic,
+                    Image,
+                    self.external_image_callback,
+                    queue_size=max(1, int(args.image_queue_size)),
+                )
+            )
         self.subscribers.append(rospy.Subscriber(args.odom_topic, Odometry, self.odom_callback, queue_size=50))
         self.subscribers.append(rospy.Subscriber(args.goal_topic, PoseStamped, self.goal_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.current_subgoal_topic, PointStamped, self.current_subgoal_callback, queue_size=20))
@@ -1840,7 +1900,7 @@ class ExploreDebugRecorder:
                 return
             self.latest_external_image = (stamp, width, height, rgb)
             self.latest_external_image_step = self.debug_step
-        with self.video_lock:
+        with self.external_video_lock:
             if self.shutting_down:
                 return
             self._record_external_video_frame_locked(width, height, rgb, stamp)
@@ -2836,15 +2896,23 @@ class ExploreDebugRecorder:
         node_lookup = {node.get("id"): node for node in all_nodes}
         contains_edges = [edge for edge in graph.get("edges") or [] if edge.get("relation") == "contains"]
         contained_ids = {edge.get("dst_id") for edge in contains_edges}
+        # The paper topology intentionally omits ordinary room objects. Only
+        # objects reached through a container "contains" edge are displayed.
+        direct_room_object_ids: set[str] = set()
         selected = [
             node
             for node in all_nodes
-            if node.get("type") in {"room", "portal", "container"} or node.get("id") in contained_ids
+            if node.get("type") in {"room", "portal", "container"}
+            or node.get("id") in contained_ids
         ]
+        # Fixed five-level paper layout, top to bottom:
+        # L5 room, L4 portal, L3 container, L2 reserved, L1 contained object.
         room_row = max(126, int(panel_height * 0.28))
-        portal_row = max(room_row + 66, int(panel_height * 0.48))
-        container_row = max(portal_row + 62, int(panel_height * 0.68))
-        object_row = min(panel_height - 48, max(container_row + 58, int(panel_height * 0.86)))
+        object_row = max(room_row + 4, panel_height - 48)
+        level_gap = max(1, (object_row - room_row) / 4.0)
+        portal_row = int(round(room_row + level_gap))
+        container_row = int(round(room_row + level_gap * 2.0))
+        reserved_row = int(round(room_row + level_gap * 3.0))
         slot_rows = {
             "room": (room_row, 5),
             "portal": (portal_row, 7),
@@ -2852,9 +2920,10 @@ class ExploreDebugRecorder:
             "object": (object_row, 8),
         }
         positions = {}
-        rooms = sorted(
-            (node for node in selected if node.get("type") == "room"),
-            key=lambda item: str(item.get("id")),
+        rooms = topology_order_rooms(
+            [node for node in selected if node.get("type") == "room"],
+            [node for node in selected if node.get("type") == "portal"],
+            graph.get("edges") or [],
         )
         for index, node in enumerate(rooms):
             positions[str(node.get("id"))] = (
@@ -2881,21 +2950,71 @@ class ExploreDebugRecorder:
             y = min(panel_height - 74, row_y + extra_row * 34)
             positions[node_id] = (x, y)
 
-        connected_portal_positions = portal_positions_between_rooms(
-            [node for node in regular_nodes if node.get("type") == "portal"],
-            graph.get("edges") or [],
-            {
-                node_id: position
-                for node_id, position in positions.items()
-                if str((node_lookup.get(node_id) or {}).get("type")) == "room"
-            },
-        )
-        for node_id, (x, y) in connected_portal_positions.items():
-            positions[node_id] = (
-                max(20, min(panel_width - 20, x)),
-                max(124, min(panel_height - 74, y)),
+        portals_by_room_pair: dict[tuple[str, str], list[dict]] = {}
+        for portal in (node for node in regular_nodes if node.get("type") == "portal"):
+            connected_rooms = [
+                room_id
+                for room_id in portal_room_node_ids(portal, graph.get("edges") or [])
+                if room_id in positions
+            ]
+            if len(connected_rooms) < 2:
+                continue
+            room_pair = tuple(
+                sorted(connected_rooms[:2], key=lambda room_id: positions[room_id][0])
             )
+            portals_by_room_pair.setdefault(room_pair, []).append(portal)
+        connected_portal_positions = {}
+        for room_pair, paired_portals in portals_by_room_pair.items():
+            midpoint_x = int(round((positions[room_pair[0]][0] + positions[room_pair[1]][0]) * 0.5))
+            ordered_portals = sorted(paired_portals, key=lambda item: str(item.get("id")))
+            for index, portal in enumerate(ordered_portals):
+                offset = int(round((index - (len(ordered_portals) - 1) * 0.5) * 38.0))
+                portal_id = str(portal.get("id"))
+                connected_portal_positions[portal_id] = (
+                    max(20, min(panel_width - 20, midpoint_x + offset)),
+                    portal_row,
+                )
+        positions.update(connected_portal_positions)
         connected_portal_ids = set(connected_portal_positions)
+
+        room_world_points = [self._node_xy(node) for node in rooms]
+        valid_room_world_points = [point for point in room_world_points if point is not None]
+        house_center_x = (
+            sum(float(point[0]) for point in valid_room_world_points) / len(valid_room_world_points)
+            if valid_room_world_points
+            else None
+        )
+        room_screen_spacing = float(panel_width) / max(2, len(rooms) + 1)
+        single_room_portal_offset = max(28, min(64, int(room_screen_spacing * 0.34)))
+        for portal in (node for node in regular_nodes if node.get("type") == "portal"):
+            portal_id = str(portal.get("id"))
+            if portal_id in connected_portal_ids:
+                continue
+            connected_rooms = [
+                room_id
+                for room_id in portal_room_node_ids(portal, graph.get("edges") or [])
+                if room_id in positions
+            ]
+            if len(connected_rooms) != 1:
+                continue
+            room_id = connected_rooms[0]
+            room_position = positions[room_id]
+            room_node = node_lookup.get(room_id) or {}
+            portal_xy = self._node_xy(portal)
+            room_xy = self._node_xy(room_node)
+            side_delta = 0.0
+            if portal_xy is not None and room_xy is not None:
+                side_delta = float(portal_xy[0]) - float(room_xy[0])
+            if abs(side_delta) < 0.10 and room_xy is not None and house_center_x is not None:
+                side_delta = float(room_xy[0]) - float(house_center_x)
+            if abs(side_delta) < 0.10:
+                portal_x = room_position[0]
+            else:
+                portal_x = room_position[0] + (single_room_portal_offset if side_delta > 0.0 else -single_room_portal_offset)
+            positions[portal_id] = (
+                max(20, min(panel_width - 20, int(portal_x))),
+                portal_row,
+            )
 
         containers_by_room: dict[str, list[dict]] = {}
         for node in selected:
@@ -2916,6 +3035,52 @@ class ExploreDebugRecorder:
                     max(24, min(panel_width - 24, x)),
                     slot_rows["container"][0],
                 )
+
+        direct_objects_by_room: dict[str, list[dict]] = {}
+        direct_object_rows: dict[str, dict[int, list[str]]] = {}
+        for node in selected:
+            if node.get("id") not in direct_room_object_ids:
+                continue
+            room_id = node.get("room_id")
+            parent_room_id = (
+                f"room_{int(room_id)}"
+                if room_id is not None
+                else str(node.get("parent_id") or "")
+            )
+            direct_objects_by_room.setdefault(parent_room_id, []).append(node)
+        ordered_room_ids = [str(node.get("id")) for node in rooms]
+        for room_index, room_node_id in enumerate(ordered_room_ids):
+            objects = sorted(
+                direct_objects_by_room.get(room_node_id, []),
+                key=lambda item: str(item.get("id")),
+            )
+            if not objects:
+                continue
+            room_x = positions[room_node_id][0]
+            left_x = (
+                8
+                if room_index == 0
+                else (positions[ordered_room_ids[room_index - 1]][0] + room_x) // 2
+            )
+            right_x = (
+                panel_width - 8
+                if room_index + 1 == len(ordered_room_ids)
+                else (room_x + positions[ordered_room_ids[room_index + 1]][0]) // 2
+            )
+            usable_width = max(40, right_x - left_x - 12)
+            columns = max(1, min(4, usable_width // 44))
+            for index, node in enumerate(objects):
+                row = index // columns
+                column = index % columns
+                row_count = min(columns, len(objects) - row * columns)
+                x = int(left_x + (column + 1) * (right_x - left_x) / (row_count + 1))
+                y = min(panel_height - 28, object_row + row * 28)
+                node_id = str(node.get("id"))
+                positions[node_id] = (
+                    max(20, min(panel_width - 20, x)),
+                    y,
+                )
+                direct_object_rows.setdefault(room_node_id, {}).setdefault(y, []).append(node_id)
 
         container_for_object = {
             str(edge.get("dst_id")): str(edge.get("src_id"))
@@ -2956,6 +3121,40 @@ class ExploreDebugRecorder:
                 )
             )
         }
+        for room_node_id, rows in direct_object_rows.items():
+            room_position = positions.get(room_node_id)
+            if room_position is None or not rows:
+                continue
+            bus_rows = sorted(rows)
+            cv2.line(
+                panel,
+                room_position,
+                (room_position[0], bus_rows[-1] - 10),
+                (175, 175, 175),
+                1,
+                cv2.LINE_AA,
+            )
+            for row_y in bus_rows:
+                object_positions = [
+                    positions[node_id]
+                    for node_id in rows[row_y]
+                    if node_id in positions
+                ]
+                if not object_positions:
+                    continue
+                bus_y = row_y - 10
+                min_x = min(room_position[0], *(position[0] for position in object_positions))
+                max_x = max(room_position[0], *(position[0] for position in object_positions))
+                cv2.line(panel, (min_x, bus_y), (max_x, bus_y), (175, 175, 175), 1, cv2.LINE_AA)
+                for object_position in object_positions:
+                    cv2.line(
+                        panel,
+                        (object_position[0], bus_y),
+                        object_position,
+                        (175, 175, 175),
+                        1,
+                        cv2.LINE_AA,
+                    )
         for edge in graph.get("edges") or []:
             src = positions.get(edge.get("src_id"))
             dst = positions.get(edge.get("dst_id"))
@@ -2979,7 +3178,9 @@ class ExploreDebugRecorder:
             if center is None:
                 continue
             color = self._semantic_node_color(node)
-            cv2.circle(panel, center, 13 if node.get("type") == "room" else 9, color, -1, cv2.LINE_AA)
+            node_type = str(node.get("type") or "object")
+            radius = 13 if node_type == "room" else 6 if node_type == "object" else 9
+            cv2.circle(panel, center, radius, color, -1, cv2.LINE_AA)
             ranked_group_ids = list(
                 semantic_decision_trace.get("model_ranked_group_ids") or []
             )
@@ -3015,96 +3216,88 @@ class ExploreDebugRecorder:
                     cv2.LINE_AA,
                 )
             state = str((node.get("interaction") or {}).get("state") or "unknown")
+            state_label = {
+                "static_open": "open",
+                "static_closed": "closed",
+            }.get(state, state)
             display_label = self._semantic_node_display_label(node)
             if node.get("type") == "room":
                 label = display_label
             else:
                 label = f"{display_ids.get(node_id, self._short_node_id(node))} {display_label}"
             if node.get("type") in {"portal", "container"}:
-                label += f"[{state}]"
+                label += f"[{state_label}]"
             label_y = center[1] + 20
-            if node.get("type") == "portal":
-                label_y += (
-                    18
-                    if node_id in connected_portal_ids
-                    else 13 * portal_label_rows.get(node_id, 0)
-                )
-            cv2.putText(panel, label[:24], (center[0] - 30, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.26, (30, 30, 30), 1, cv2.LINE_AA)
+            if node.get("type") == "portal" and node_id in connected_portal_ids:
+                label_y = center[1] + 17 + 13 * portal_label_rows.get(node_id, 0)
+            elif node.get("type") == "portal":
+                label_y += 13 * portal_label_rows.get(node_id, 0)
+            if node_type == "object":
+                label = display_ids.get(node_id, self._short_node_id(node))
+                label_x = center[0] - 9
+                label_y = center[1] + 13
+                font_scale = 0.20
+            else:
+                label_x = center[0] - 30
+                font_scale = 0.26
+            cv2.putText(
+                panel,
+                label[:24],
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (30, 30, 30),
+                1,
+                cv2.LINE_AA,
+            )
         revision = int(graph.get("graph_revision", 0) or 0)
-        legend = "ROOM -- PORTAL -- ROOM    CONTAINER --contains--> OBJECT"
+        legend = "L5 ROOM  L4 PORTAL  L3 CONTAINER  L2 RESERVED  L1 CONTAINED OBJECT"
         cv2.putText(panel, legend, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (75, 75, 75), 1, cv2.LINE_AA)
-        box_x = int(panel_width * 0.52)
-        box_y = 34
-        box_h = 82
-        overlay = panel.copy()
-        cv2.rectangle(overlay, (box_x, box_y), (panel_width - 6, box_y + box_h), (232, 232, 232), -1)
-        panel = cv2.addWeighted(overlay, 0.78, panel, 0.22, 0.0)
-        execution_state = str(semantic_execution_state.get("state") or "IDLE")
-        behavior_type = str(semantic_selection.get("behavior_type") or "-")
-        target_name = str(
-            semantic_selection.get("target_name")
-            or selected_target_id
-            or "-"
-        )
-        feedback_status = str(semantic_behavior_feedback.get("status") or "-")
-        ranked_group_ids = list(
-            semantic_decision_trace.get("model_ranked_group_ids") or []
-        )
-        executed_group_id = str(
-            semantic_decision_trace.get("executed_group_id") or "-"
-        )
-        model_reason = str(semantic_decision_trace.get("model_reason") or "-")
-        candidate_groups = {
-            str(item.get("id") or ""): item
-            for item in semantic_decision_trace.get("candidate_groups") or []
-        }
-        executed_group = candidate_groups.get(executed_group_id) or {}
-        frontier_length = executed_group.get("frontier_length_m")
-        repeat_count = int(
-            ((executed_group.get("history") or {}).get("low_gain_repeat_count", 0))
-            or 0
-        )
-        model_latency = float(
-            (semantic_decision_trace.get("model_metrics") or {}).get(
-                "latency_sec", 0.0
-            )
-            or 0.0
-        )
-        lines = [
-            f"{execution_state}  {behavior_type}",
-            f"model={' > '.join(str(value) for value in ranked_group_ids[:3]) or '-'}",
-            f"exec={executed_group_id}  target={target_name}",
-            f"reason={model_reason}  feedback={feedback_status}",
-            f"frontier={frontier_length if frontier_length is not None else '-'}m repeat={repeat_count} t={model_latency:.2f}s",
-        ]
-        for index, text in enumerate(lines):
-            cv2.putText(
-                panel,
-                text[:38],
-                (box_x + 6, box_y + 16 + index * 14),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.27,
-                (25, 25, 25),
-                1,
-                cv2.LINE_AA,
-            )
-        if semantic_events:
-            event = semantic_events[-1]
-            event_name = str(event.get("event") or "")
-            event_color = (35, 150, 45) if event_name == "STATE_CHANGED" else (45, 45, 45)
-            event_text = f"r{event.get('graph_revision', 0)} {event_name} {event.get('node_id') or event.get('relation', '')}"
-            cv2.putText(
-                panel,
-                event_text[:42],
-                (box_x + 6, box_y + 72),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.30,
-                event_color,
-                1,
-                cv2.LINE_AA,
-            )
         self._draw_panel_title(panel, f"TOPOLOGY r{revision}", image_step)
         return panel
+
+    def _record_recording_performance(self, kind: str, elapsed_ms: float) -> None:
+        values = self.recording_timing_windows.setdefault(str(kind), [])
+        values.append(float(elapsed_ms))
+        interval = max(1, int(self.args.performance_log_every_n_frames))
+        if len(values) < interval:
+            return
+        writer_stats = (
+            self.artifact_writer.stats_snapshot()
+            if self.artifact_writer is not None
+            else {}
+        )
+        rospy.loginfo(
+            (
+                "RecorderTiming kind=%s n=%d avg/p50/p95/max=%.1f/%.1f/%.1f/%.1fms; "
+                "render_queue=%d/%d dropped_render=%d; png_queue=%d/%d peak=%d "
+                "write_avg/max=%.1f/%.1fms submitted/written=%d/%d; "
+                "video_queue=%d/%d peak=%d write_avg/max=%.1f/%.1fms; dropped_artifacts=%d"
+            ),
+            kind,
+            len(values),
+            float(np.mean(values)),
+            float(np.percentile(values, 50)),
+            float(np.percentile(values, 95)),
+            float(np.max(values)),
+            self.video_frame_jobs.qsize(),
+            self.video_frame_jobs.maxsize,
+            self.video_frame_jobs_dropped,
+            int(writer_stats.get("png_queue_size", 0)),
+            int(writer_stats.get("png_queue_capacity", 0)),
+            int(writer_stats.get("png_queue_peak", 0)),
+            float(writer_stats.get("png_write_ms_avg", 0.0)),
+            float(writer_stats.get("png_write_ms_max", 0.0)),
+            int(writer_stats.get("submitted_png_jobs", 0)),
+            int(writer_stats.get("written_png_jobs", 0)),
+            int(writer_stats.get("video_queue_size", 0)),
+            int(writer_stats.get("video_queue_capacity", 0)),
+            int(writer_stats.get("video_queue_peak", 0)),
+            float(writer_stats.get("video_write_ms_avg", 0.0)),
+            float(writer_stats.get("video_write_ms_max", 0.0)),
+            int(writer_stats.get("dropped_jobs", 0)),
+        )
+        values.clear()
 
     def _record_first_person_video_frame_locked(
         self,
@@ -3122,6 +3315,7 @@ class ExploreDebugRecorder:
             capture_fps = max(0.1, float(self.args.first_person_video_capture_fps))
             if self.last_first_person_video_frame_time > 0.0 and now - self.last_first_person_video_frame_time < 1.0 / capture_fps:
                 return
+        performance_t0 = time.perf_counter()
         try:
             if snapshot is None:
                 with self.lock:
@@ -3238,6 +3432,11 @@ class ExploreDebugRecorder:
                     route_plan=route_plan,
                     draw_route_plan=True,
                     world_bounds=occupancy_world_bounds,
+                )
+                self._draw_task_subgoal_header(
+                    occ_panel,
+                    semantic_candidates=semantic_candidates,
+                    semantic_selection=semantic_selection,
                 )
                 costmap_left_width = max(1, frame_width // 2)
                 costmap_right_width = max(1, frame_width - costmap_left_width)
@@ -3392,6 +3591,7 @@ class ExploreDebugRecorder:
             map_path = self.video_map_frame_dir / f"frame_{frame_index:06d}_map.png"
             global_costmap_path = self.video_global_costmap_frame_dir / f"frame_{frame_index:06d}_global_costmap.png"
             local_costmap_path = self.video_local_costmap_frame_dir / f"frame_{frame_index:06d}_local_costmap.png"
+            room_interaction_path = self.video_room_interaction_frame_dir / f"frame_{frame_index:06d}_room_interaction.png"
             semantic_spatial_path = self.video_semantic_spatial_frame_dir / f"frame_{frame_index:06d}_semantic_spatial.png"
             semantic_topology_path = self.video_semantic_topology_frame_dir / f"frame_{frame_index:06d}_semantic_topology.png"
             composite_path = self.video_composite_frame_dir / f"frame_{frame_index:06d}_composite.png"
@@ -3411,6 +3611,8 @@ class ExploreDebugRecorder:
                         self.artifact_writer.submit_png(global_costmap_path, global_costmap_panel)
                     if local_costmap_panel is not None:
                         self.artifact_writer.submit_png(local_costmap_path, local_costmap_panel)
+                    if room_segment_panel is not None:
+                        self.artifact_writer.submit_png(room_interaction_path, room_segment_panel)
                     if semantic_spatial_panel is not None:
                         self.artifact_writer.submit_png(semantic_spatial_path, semantic_spatial_panel)
                     if semantic_topology_panel is not None:
@@ -3437,6 +3639,13 @@ class ExploreDebugRecorder:
                         int(local_costmap_panel.shape[1]),
                         int(local_costmap_panel.shape[0]),
                         bytearray(local_costmap_panel.tobytes()),
+                    )
+                if room_segment_panel is not None:
+                    _write_png(
+                        room_interaction_path,
+                        int(room_segment_panel.shape[1]),
+                        int(room_segment_panel.shape[0]),
+                        bytearray(room_segment_panel.tobytes()),
                     )
                 if semantic_spatial_panel is not None:
                     _write_png(
@@ -3483,6 +3692,9 @@ class ExploreDebugRecorder:
                 "map_frame": str(map_path) if occ_panel is not None else "",
                 "global_costmap_frame": str(global_costmap_path) if global_costmap_panel is not None else "",
                 "local_costmap_frame": str(local_costmap_path) if local_costmap_panel is not None else "",
+                "room_interaction_frame": str(room_interaction_path)
+                if self.args.video_save_panel_frames and room_segment_panel is not None
+                else "",
                 "semantic_spatial_frame": str(semantic_spatial_path) if semantic_spatial_panel is not None else "",
                 "semantic_topology_frame": str(semantic_topology_path) if semantic_topology_panel is not None else "",
                 "graph_revision": graph_revision,
@@ -3521,12 +3733,18 @@ class ExploreDebugRecorder:
                     "local_costmap_step": local_costmap_step,
                     "global_costmap_frame": str(global_costmap_path) if global_costmap_panel is not None else "",
                     "local_costmap_frame": str(local_costmap_path) if local_costmap_panel is not None else "",
+                    "room_interaction_frame": str(room_interaction_path)
+                    if self.args.video_save_panel_frames and room_segment_panel is not None
+                    else "",
                     "semantic_spatial_frame": str(semantic_spatial_path) if semantic_spatial_panel is not None else "",
                     "semantic_topology_frame": str(semantic_topology_path) if semantic_topology_panel is not None else "",
                     "composite_frame": str(composite_path),
                 }
             )
             self.last_first_person_video_frame_time = now
+            self._record_recording_performance(
+                "six_panel_render", (time.perf_counter() - performance_t0) * 1000.0
+            )
         except Exception as exc:  # pragma: no cover - debug recorder should not crash ROS
             self.first_person_video_error = f"{type(exc).__name__}: {exc}"
 
@@ -3537,13 +3755,16 @@ class ExploreDebugRecorder:
         fps = max(0.1, float(self.args.first_person_video_fps))
         if self.last_external_video_frame_time > 0.0 and now - self.last_external_video_frame_time < 1.0 / fps:
             return
+        performance_t0 = time.perf_counter()
         try:
-            frame_width = int(self.args.first_person_video_width_px)
+            frame_width = int(self.args.external_video_width_px)
+            if frame_width <= 0:
+                frame_width = int(self.args.first_person_video_width_px)
             frame_height = int(round(height * frame_width / max(width, 1)))
             frame_width = max(1, frame_width)
             frame_height = max(1, frame_height)
-            frame = np.frombuffer(bytes(rgb), dtype=np.uint8).reshape((height, width, 3))
-            frame = cv2.resize(frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
+            raw_frame = np.frombuffer(bytes(rgb), dtype=np.uint8).reshape((height, width, 3))
+            frame = cv2.resize(raw_frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
             stuck = self._stuck_test_locked(now)
             active_goal = self._active_goal_xy_locked()
             active_flag = 1 if active_goal is not None else 0
@@ -3562,11 +3783,14 @@ class ExploreDebugRecorder:
             self.external_video_frame_count += 1
             frame_index = self.external_video_frame_count
             frame_path = self.video_external_frame_dir / f"frame_{frame_index:06d}_external.png"
+            raw_frame_path = self.video_external_raw_frame_dir / f"frame_{frame_index:06d}_external_raw.png"
             if self.artifact_writer is not None:
+                self.artifact_writer.submit_png(raw_frame_path, raw_frame)
                 self.artifact_writer.submit_png(frame_path, frame)
                 if self.args.runtime_video_encode:
                     self.artifact_writer.submit_video("external", Path(self.external_video_path), frame)
             else:
+                _write_png(raw_frame_path, width, height, bytearray(raw_frame.tobytes()))
                 _write_png(frame_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
             self.external_video_frames.append(
                 {
@@ -3579,9 +3803,13 @@ class ExploreDebugRecorder:
                     "active_goal": list(active_goal) if active_goal is not None else None,
                     "stuck": stuck,
                     "frame": str(frame_path),
+                    "raw_frame": str(raw_frame_path),
                 }
             )
             self.last_external_video_frame_time = now
+            self._record_recording_performance(
+                "external_frame_callback", (time.perf_counter() - performance_t0) * 1000.0
+            )
         except Exception as exc:  # pragma: no cover - debug recorder should not crash ROS
             self.external_video_error = f"{type(exc).__name__}: {exc}"
 
@@ -4007,6 +4235,48 @@ class ExploreDebugRecorder:
         for room_id in room_ids:
             rgb[values == int(room_id)] = palette[int(room_id) % len(palette)]
         return rgb
+
+    @staticmethod
+    def _draw_task_subgoal_header(
+        panel,
+        *,
+        semantic_candidates: dict,
+        semantic_selection: dict,
+    ) -> None:
+        if panel is None or cv2 is None:
+            return
+        target_context = semantic_candidates.get("target_context") or {}
+        target_name = str(
+            target_context.get("target_name")
+            or target_context.get("target_source_object_name")
+            or "-"
+        )
+        behavior_type = str(semantic_selection.get("behavior_type") or "-")
+        subgoal_name = str(
+            semantic_selection.get("target_name")
+            or semantic_selection.get("target_id")
+            or semantic_selection.get("candidate_id")
+            or "-"
+        )
+        max_chars = max(24, int(panel.shape[1] / 10))
+        if len(subgoal_name) > max_chars:
+            subgoal_name = subgoal_name[: max_chars - 3] + "..."
+        lines = [
+            f"TASK TARGET: {target_name}",
+            f"MODULE2 SUBGOAL: {behavior_type} {subgoal_name}",
+        ]
+        cv2.rectangle(panel, (4, 4), (min(panel.shape[1] - 4, 460), 49), (255, 255, 255), -1)
+        for index, line in enumerate(lines):
+            cv2.putText(
+                panel,
+                line,
+                (9, 20 + index * 21),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (30, 30, 30),
+                1,
+                cv2.LINE_AA,
+            )
 
     @staticmethod
     def _draw_panel_title(panel, title: str, step: int | None = None) -> None:
@@ -6047,6 +6317,7 @@ class ExploreDebugRecorder:
             self.first_person_video_error = "video_frame_renderer_shutdown_timeout"
 
         self.video_lock.acquire()
+        self.external_video_lock.acquire()
         with self.lock:
             final_overlay = ""
             final_overlay_crop = ""
@@ -6228,6 +6499,9 @@ class ExploreDebugRecorder:
                 "first_person_video_map_frames": str(self.video_map_frame_dir),
                 "first_person_video_global_costmap_frames": str(self.video_global_costmap_frame_dir),
                 "first_person_video_local_costmap_frames": str(self.video_local_costmap_frame_dir),
+                "first_person_video_room_interaction_frames": str(self.video_room_interaction_frame_dir),
+                "first_person_video_semantic_spatial_frames": str(self.video_semantic_spatial_frame_dir),
+                "first_person_video_semantic_topology_frames": str(self.video_semantic_topology_frame_dir),
                 "first_person_video_composite_frames": str(self.video_composite_frame_dir),
                 "external_video": self.external_video_path
                 if self.external_video_frame_count > 0
@@ -6239,6 +6513,7 @@ class ExploreDebugRecorder:
                 "external_video_codec": self.external_video_codec_name,
                 "external_video_error": self.external_video_error,
                 "external_video_frames": str(self.video_external_frame_dir),
+                "external_video_raw_frames": str(self.video_external_raw_frame_dir),
                 "refreshed_subgoal_overlays": refreshed_subgoal_overlays,
                 "uniform_subgoal_crop": uniform_subgoal_crop,
                 "subgoal_contact_sheet": subgoal_contact_sheet,
@@ -6264,6 +6539,7 @@ class ExploreDebugRecorder:
                 self.semantic_events_file,
             ]:
                 handle.close()
+        self.external_video_lock.release()
         self.video_lock.release()
 
 
@@ -6371,6 +6647,12 @@ def _parse_args() -> argparse.Namespace:
         help="Online six-panel render rate; captured frames are each written once at --first-person-video-fps.",
     )
     parser.add_argument("--first-person-video-width-px", type=int, default=960)
+    parser.add_argument(
+        "--external-video-width-px",
+        type=int,
+        default=0,
+        help="External video width; zero reuses --first-person-video-width-px. Raw external PNGs keep source resolution.",
+    )
     parser.add_argument("--image-queue-size", type=int, default=1)
     parser.add_argument(
         "--video-frame-job-queue-size",
@@ -6399,6 +6681,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime-video-encode", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--async-artifact-writes", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--artifact-write-queue-size", type=int, default=512)
+    parser.add_argument(
+        "--performance-log-every-n-frames",
+        type=int,
+        default=50,
+        help="Log six-panel render, external callback, encoder, and PNG queue timing every N frames.",
+    )
     parser.add_argument("--video-map-crop-margin-px", type=int, default=90)
     parser.add_argument("--video-occ-crop-margin-px", type=int, default=25)
     parser.add_argument("--video-global-panel-scale", type=float, default=1.0)

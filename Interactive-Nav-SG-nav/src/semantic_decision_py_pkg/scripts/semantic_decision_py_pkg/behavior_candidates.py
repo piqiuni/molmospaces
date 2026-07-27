@@ -163,7 +163,12 @@ class CandidateGenerator:
             previous_interaction_goal = self._successful_interaction_approach(
                 navigation_anchor
             )
-            goal = previous_interaction_goal or self._approach_pose(
+            configured_interaction_goal = (
+                self._container_approach_pose(navigation_anchor)
+                if navigation_anchor is not node
+                else None
+            )
+            goal = previous_interaction_goal or configured_interaction_goal or self._approach_pose(
                 robot_xy,
                 position,
                 float(target_context.get("standoff_m", self.config.target_standoff_m)),
@@ -181,6 +186,12 @@ class CandidateGenerator:
                 ),
             )
             node_id = str(node.get("id") or "")
+            containing_container = (
+                navigation_anchor
+                if navigation_anchor is not node
+                and str(navigation_anchor.get("type") or "") == "container"
+                else None
+            )
             attributes = node.get("attributes") or {}
             visible_pixels = int(attributes.get("visible_pixels", 0) or 0)
             target_min_visible_pixels = int(
@@ -306,6 +317,8 @@ class CandidateGenerator:
                         "approach_strategy": (
                             "target_last_successful_interaction_pose"
                             if previous_interaction_goal is not None
+                            else "target_containing_container_pose"
+                            if configured_interaction_goal is not None
                             else "target_container_front_axis"
                             if navigation_anchor is not node
                             and self._container_approach_axis(navigation_anchor) is not None
@@ -318,10 +331,43 @@ class CandidateGenerator:
                         "interaction_approach_axis_xy": self._container_approach_axis(
                             navigation_anchor
                         ),
+                        "containing_container_id": (
+                            str(containing_container.get("id") or "")
+                            if containing_container is not None
+                            else ""
+                        ),
+                        "direct_goal_tolerance_m": (
+                            0.45 if containing_container is not None else 0.0
+                        ),
+                        "direct_goal_yaw_tolerance_rad": (
+                            0.65 if containing_container is not None else 0.0
+                        ),
                     },
                 )
             )
         return candidates
+
+    @staticmethod
+    def _containing_container_node(
+        graph: dict[str, Any], target_node_id: str
+    ) -> dict[str, Any] | None:
+        container_ids = {
+            str(edge.get("src_id") or "")
+            for edge in graph.get("edges") or []
+            if str(edge.get("relation") or "") == "contains"
+            and str(edge.get("dst_id") or "") == str(target_node_id)
+        }
+        if not container_ids:
+            return None
+        return next(
+            (
+                node
+                for node in graph.get("nodes") or []
+                if str(node.get("id") or "") in container_ids
+                and str(node.get("type") or "") == "container"
+            ),
+            None,
+        )
 
     @staticmethod
     def _matches_target(node: dict[str, Any], target_context: dict[str, Any]) -> bool:
@@ -375,8 +421,6 @@ class CandidateGenerator:
     ) -> bool:
         if cls._matches_target(node, target_context):
             return True
-        if not bool(target_context.get("require_interaction")):
-            return False
         attributes = node.get("attributes") or {}
         requested_instance_id = str(
             target_context.get("target_container_instance_id") or ""
@@ -394,6 +438,8 @@ class CandidateGenerator:
         ).strip().casefold()
         if requested_source_name:
             return requested_source_name == observed_source_name
+        if not bool(target_context.get("require_interaction")):
+            return False
         requested_labels = list(target_context.get("target_container_labels") or [])
         if target_context.get("target_container_name"):
             requested_labels.append(target_context["target_container_name"])
@@ -749,7 +795,6 @@ class CandidateGenerator:
 
             explicit_target_reinteraction = bool(
                 target_context.get("enabled")
-                and target_context.get("require_interaction")
                 and self._matches_interaction_target(node, target_context)
             )
             if node_type == "container" and node_state in {"open", "static_open"}:
@@ -777,6 +822,12 @@ class CandidateGenerator:
                     interaction.get("interaction_mode") or "open_close"
                 ),
                 "expected_state": "open",
+                "interaction_approach_pose_xyyaw": list(approach),
+                "interaction_approach_axis_xy": list(
+                    self._container_approach_axis(node) or []
+                ),
+                "interaction_ready_distance_m": self.config.interaction_ready_distance_m,
+                "interaction_ready_yaw_tolerance_rad": 0.55,
             }
             candidates.append(
                 BehaviorCandidate(
@@ -838,9 +889,13 @@ class CandidateGenerator:
                             "portal_aabb_normal"
                             if node_type == "portal"
                             else (
-                                "container_front_axis"
-                                if self._container_approach_axis(node) is not None
-                                else "radial_standoff"
+                                "container_explicit_pose"
+                                if self._container_approach_pose(node) is not None
+                                else (
+                                    "container_front_axis"
+                                    if self._container_approach_axis(node) is not None
+                                    else "radial_standoff"
+                                )
                             )
                         ),
                         "interaction_approach_axis_xy": self._container_approach_axis(
@@ -870,13 +925,27 @@ class CandidateGenerator:
                     robot_xy, target_xy, node, candidate_standoff
                 )
             else:
-                pose = cls._approach_pose(
-                    robot_xy,
-                    target_xy,
-                    candidate_standoff,
-                    node=node,
-                    fixed_axis=cls._container_approach_axis(node),
-                )
+                explicit_pose = cls._container_approach_pose(node)
+                if explicit_pose is not None:
+                    axis = cls._container_approach_axis(node)
+                    if axis is None:
+                        axis = (
+                            math.cos(float(explicit_pose[2]) + math.pi),
+                            math.sin(float(explicit_pose[2]) + math.pi),
+                        )
+                    pose = [
+                        float(explicit_pose[0]) + axis[0] * extra_standoff,
+                        float(explicit_pose[1]) + axis[1] * extra_standoff,
+                        float(explicit_pose[2]),
+                    ]
+                else:
+                    pose = cls._approach_pose(
+                        robot_xy,
+                        target_xy,
+                        candidate_standoff,
+                        node=node,
+                        fixed_axis=cls._container_approach_axis(node),
+                    )
             if not any(
                 math.hypot(pose[0] - previous[0], pose[1] - previous[1]) <= 1e-6
                 and abs(
@@ -1011,6 +1080,18 @@ class CandidateGenerator:
         if norm <= 1e-6:
             return None
         return float(values[0]) / norm, float(values[1]) / norm
+
+    @staticmethod
+    def _container_approach_pose(node: dict[str, Any]) -> list[float] | None:
+        attributes = node.get("attributes") or {}
+        values = list(
+            attributes.get("interaction_approach_pose_xyyaw")
+            or node.get("interaction_approach_pose_xyyaw")
+            or []
+        )
+        if len(values) < 3:
+            return None
+        return [float(values[0]), float(values[1]), float(values[2])]
 
     @staticmethod
     def _room_id_for_xy(
