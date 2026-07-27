@@ -80,7 +80,7 @@ class RosBridgePolicy(BasePolicy):
         realtime_gt_min_visible_fraction: float = 0.2,
         realtime_gt_required_consecutive_observations: int = 2,
         realtime_gt_step_interval: int = 3,
-        realtime_gt_max_distance_m: float = 6.0,
+        realtime_gt_max_distance_m: float = 4.0,
         step_frame_dir: str = "",
         step_frame_queue_size: int = 4,
         step_sync_topic: str = "/molmo_spaces/step_sync",

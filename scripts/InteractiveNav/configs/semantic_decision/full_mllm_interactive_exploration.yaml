@@ -38,7 +38,7 @@ model:
   consecutive_timeout_limit: 2
   timeout_cooldown_s: 60.0
   skill_timeout_s: 4.0
-  skill_max_output_tokens: 64
+  skill_max_output_tokens: 256
   verification_timeout_s: 4.0
   verification_max_output_tokens: 160
 

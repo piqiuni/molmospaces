@@ -264,17 +264,37 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
         assert first["episode_reset"] is True
         assert first["capture_step"] == 0
         assert first["image_size"] == [5, 5]
-        assert [item["source_object_name"] for item in first["observations"]] == ["chair_body"]
-        assert first["observations"][0]["visible_pixels"] == 6
-        assert first["observations"][0]["instance_id"] == "gt_000001"
-        assert first["observations"][0]["bbox_2d"] == [0, 0, 4, 1]
+        observation = first["observations"][0]
+        assert set(observation) == {"id", "name", "bbox_2d", "segmentation", "box_3d"}
+        assert observation["id"] == "chair_body"
+        assert observation["name"] == "Chair"
+        assert observation["bbox_2d"] == [0, 0, 4, 1]
+        assert len(observation["segmentation"]["rows"]) == 6
+        assert len(observation["segmentation"]["cols"]) == 6
+        assert observation["box_3d"] == {
+            "center": [2.0, 0.0, 0.5],
+            "size": [0.5, 0.5, 1.0],
+            "frame_id": "world",
+        }
+        forbidden = {
+            "joint_infos",
+            "joint_type",
+            "joint_range",
+            "joint_value",
+            "parent",
+            "is_door",
+            "is_receptacle",
+            "is_articulable",
+            "orientation",
+            "interaction_approach_axis_xy",
+        }
+        assert forbidden.isdisjoint(observation)
         assert publisher.publish(FakeTask(), step_index=1) is None
         assert publisher.publish(FakeTask(), step_index=2) is None
 
         _set_geom_pixels([2] * 5 + [0] * 4)
         second = publisher.publish(FakeTask(), step_index=3)
-        assert [item["source_object_name"] for item in second["observations"]] == ["chair_body"]
-        assert second["observations"][0]["instance_id"] == "gt_000001"
+        assert [item["id"] for item in second["observations"]] == ["chair_body"]
         assert len(fake_rospy.publisher.messages) == 2
         assert json.loads(fake_rospy.publisher.messages[-1].data)["frame_index"] == 1
 
@@ -282,13 +302,13 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
         third = publisher.publish(FakeTask(), step_index=0)
         assert third["episode_id"] == "episode_000002"
         assert third["episode_reset"] is True
-        assert third["observations"][0]["instance_id"] == "gt_000001"
+        assert third["observations"][0]["id"] == "chair_body"
     finally:
         realtime_gt.body_aabb = original_aabb
         publisher.close()
 
 
-def test_reliable_observation_requires_two_consecutive_qualified_frames():
+def test_raw_gt_publisher_does_not_add_temporal_reliability_fields():
     fake_rospy = FakeRospy()
     publisher = realtime_gt.RealtimeGTObservationPublisher(
         fake_rospy,
@@ -312,15 +332,16 @@ def test_reliable_observation_requires_two_consecutive_qualified_frames():
         _set_geom_pixels([0] * 6)
         first = publisher.publish(FakeTask(), step_index=0)
         second = publisher.publish(FakeTask(), step_index=3)
-        assert first["observations"] == []
+        assert len(first["observations"]) == 1
         assert len(second["observations"]) == 1
-        assert second["observations"][0]["consecutive_observations"] == 2
+        assert "consecutive_observations" not in first["observations"][0]
+        assert "visible_fraction" not in first["observations"][0]
 
         _set_geom_pixels([])
         publisher.publish(FakeTask(), step_index=6)
         _set_geom_pixels([0] * 6)
         after_gap = publisher.publish(FakeTask(), step_index=9)
-        assert after_gap["observations"] == []
+        assert len(after_gap["observations"]) == 1
     finally:
         realtime_gt.body_aabb = original_aabb
         publisher.close()

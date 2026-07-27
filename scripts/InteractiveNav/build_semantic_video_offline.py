@@ -93,6 +93,30 @@ def align_latest_recorder_frames(
     return aligned
 
 
+def align_nearest_timestamp_recorder_frames(
+    sim_records: list[dict], recorder_records: list[dict]
+) -> dict[int, dict]:
+    timestamped = sorted(
+        (record for record in recorder_records if float(record.get("image_stamp_value") or 0.0) > 0.0),
+        key=lambda record: float(record["image_stamp_value"]),
+    )
+    if not timestamped:
+        return {}
+    aligned = {}
+    recorder_index = 0
+    for index, sim_record in enumerate(sim_records):
+        sim_step = int(sim_record.get("step_index", index))
+        sim_stamp = float(sim_record.get("stamp_sec") or 0.0)
+        while recorder_index + 1 < len(timestamped):
+            current_delta = abs(float(timestamped[recorder_index]["image_stamp_value"]) - sim_stamp)
+            next_delta = abs(float(timestamped[recorder_index + 1]["image_stamp_value"]) - sim_stamp)
+            if next_delta > current_delta:
+                break
+            recorder_index += 1
+        aligned[sim_step] = timestamped[recorder_index]
+    return aligned
+
+
 def resolve_path(value: str | Path, base_dir: Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else base_dir / path
@@ -114,33 +138,99 @@ def route_event_at_stamp(events: list[dict], stamp_sec: float) -> dict | None:
     return selected
 
 
-def draw_gt(frame, payload: dict | None) -> None:
+def route_target_at_stamp(events: list[dict], stamp_sec: float) -> str:
+    target_id = ""
+    for event in events:
+        if float(event.get("wall_time", 0.0)) > stamp_sec:
+            break
+        command = event.get("command") or {}
+        result = event.get("result") or {}
+        portal = event.get("portal") or {}
+        target_id = str(
+            command.get("object_id")
+            or result.get("object_id")
+            or portal.get("object_id")
+            or event.get("target_root")
+            or target_id
+            or ""
+        )
+    return target_id
+
+
+def gt_draw_spec(
+    frame_shape: tuple[int, ...],
+    payload: dict,
+    observation: dict,
+    target_object_id: str = "",
+) -> dict | None:
+    bbox = observation.get("bbox_2d") or []
+    image_size = observation.get("image_size") or payload.get("image_size") or []
+    if len(bbox) != 4 or len(image_size) != 2:
+        return None
+    frame_height, frame_width = frame_shape[:2]
+    scale_x = float(frame_width) / max(1, int(image_size[0]))
+    scale_y = float(frame_height) / max(1, int(image_size[1]))
+    x0, y0, x1, y1 = [int(value) for value in bbox]
+    start = (
+        max(0, min(frame_width - 1, int(x0 * scale_x))),
+        max(0, min(frame_height - 1, int(y0 * scale_y))),
+    )
+    end = (
+        max(0, min(frame_width - 1, int((x1 + 1) * scale_x) - 1)),
+        max(0, min(frame_height - 1, int((y1 + 1) * scale_y) - 1)),
+    )
+    if end[0] <= start[0] or end[1] <= start[1]:
+        return None
+    object_id = str(observation.get("id") or observation.get("instance_id") or "")
+    name = str(observation.get("name") or observation.get("semantic_name") or "object")
+    normalized_name = name.lower()
+    is_target = bool(target_object_id and object_id == target_object_id)
+    is_door = "door" in normalized_name
+    is_container = any(
+        token in normalized_name
+        for token in ("drawer", "cabinet", "fridge", "refrigerator", "wardrobe", "cupboard")
+    )
+    color = (
+        (235, 35, 210)
+        if is_target
+        else (238, 80, 50)
+        if is_door
+        else (170, 70, 220)
+        if is_container
+        else (20, 210, 210)
+    )
+    return {
+        "start": start,
+        "end": end,
+        "color": color,
+        "thickness": 4 if is_target else 2,
+        "label": " ".join(
+            value
+            for value in (
+                "INTERACT" if is_target else "",
+                name,
+                object_id if object_id.startswith("gt_") else "",
+            )
+            if value
+        ),
+    }
+
+
+def draw_gt(frame, payload: dict | None, target_object_id: str = "") -> None:
     if not payload:
         return
     observations = list(payload.get("observations") or [])
     source_height, source_width = frame.shape[:2]
     for observation in observations:
-        bbox = observation.get("bbox_2d") or []
-        image_size = observation.get("image_size") or [source_width, source_height]
-        if len(bbox) != 4 or len(image_size) != 2:
+        spec = gt_draw_spec(frame.shape, payload, observation, target_object_id)
+        if spec is None:
             continue
-        scale_x = float(source_width) / max(1, int(image_size[0]))
-        scale_y = float(source_height) / max(1, int(image_size[1]))
-        x0, y0, x1, y1 = [int(value) for value in bbox]
-        start = (int(x0 * scale_x), int(y0 * scale_y))
-        end = (int(x1 * scale_x), int(y1 * scale_y))
-        color = (
-            (50, 80, 238)
-            if observation.get("is_door")
-            else (220, 70, 170)
-            if observation.get("is_receptacle")
-            else (210, 210, 20)
-        )
-        cv2.rectangle(frame, start, end, color, 2, cv2.LINE_AA)
-        label = f"{observation.get('semantic_name', 'obj')} {observation.get('instance_id', '')}"
+        start = spec["start"]
+        color = spec["color"]
+        cv2.rectangle(frame, start, spec["end"], color, spec["thickness"], cv2.LINE_AA)
         cv2.putText(
             frame,
-            label[:48],
+            spec["label"][:48],
             (start[0], max(18, start[1] - 5)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.42,
@@ -181,6 +271,8 @@ def draw_route_event(frame, event: dict | None) -> None:
         "interaction_started": "ROUTE: INTERACT OPEN",
         "interaction_succeeded": "ROUTE: INTERACT OK",
         "open_portal_verified": "ROUTE: OPEN PORTAL",
+        "navigation_map_settle_started": "ROUTE: UPDATE MAP",
+        "navigation_map_settled": "ROUTE: MAP READY",
         "route_succeeded": "ROUTE: COMPLETE",
         "route_failed": "ROUTE: FAILED",
     }
@@ -217,7 +309,7 @@ def main() -> None:
     parser.add_argument("--max-stamp-delta-sec", type=float, default=0.20)
     parser.add_argument(
         "--state-alignment",
-        choices=["exact", "latest"],
+        choices=["exact", "latest", "timestamp"],
         default="exact",
     )
     parser.add_argument("--output-stem", default="overview_6panel")
@@ -249,9 +341,12 @@ def main() -> None:
             ]
             for index, record in enumerate(sim_records)
         }
-    else:
+    elif args.state_alignment == "latest":
         trimmed_trailing_steps = []
         state_by_sim_step = align_latest_recorder_frames(sim_records, recorder_by_step)
+    else:
+        trimmed_trailing_steps = []
+        state_by_sim_step = align_nearest_timestamp_recorder_frames(sim_records, recorder_records)
     sim_steps = [int(record.get("step_index", index)) for index, record in enumerate(sim_records)]
 
     route_path = Path(args.route_result).expanduser().resolve() if args.route_result else scene_dir / "route_result.json"
@@ -312,7 +407,11 @@ def main() -> None:
             if state_frame.shape[:2] != (output_height, output_width):
                 state_frame = cv2.resize(state_frame, (output_width, output_height), interpolation=cv2.INTER_AREA)
             camera_frame = cv2.resize(camera_frame, (panel_width, panel_height), interpolation=cv2.INTER_AREA)
-            draw_gt(camera_frame, sim_record.get("gt_observations"))
+            draw_gt(
+                camera_frame,
+                sim_record.get("gt_observations"),
+                route_target_at_stamp(route_events, stamp_sec),
+            )
             draw_route_event(camera_frame, route_event_at_stamp(route_events, stamp_sec))
             sim_step = sim_step_index + 1
             state_step = state_step_index + 1
@@ -327,14 +426,14 @@ def main() -> None:
                 cv2.LINE_AA,
             )
             state_frame[:panel_height, :panel_width] = camera_frame
-            sync_label = f"TARGET={sim_step:04d} STATE={state_step:04d} dT={stamp_delta:.3f}s"
+            sync_label = f"SIM={sim_step:04d} SRC={state_step:04d} dT={stamp_delta:.3f}s"
             for row in range(2):
                 for column in range(panel_columns):
                     if row == 0 and column == 0:
                         continue
                     x0 = column * panel_width
                     y0 = row * panel_height
-                    title = f"{titles[row][column]}  STEP={state_step:04d}"
+                    title = f"{titles[row][column]}  STEP={sim_step:04d}"
                     cv2.rectangle(
                         state_frame,
                         (x0, y0),
@@ -385,7 +484,13 @@ def main() -> None:
                     "sim_stamp": f"{stamp_sec:.9f}",
                     "state_stamp": f"{state_stamp:.9f}",
                     "stamp_delta_sec": f"{stamp_delta:.9f}",
-                    "match_mode": "exact_step" if exact_state_match else "latest_state",
+                    "match_mode": (
+                        "timestamp_nearest"
+                        if args.state_alignment == "timestamp"
+                        else "exact_step"
+                        if exact_state_match
+                        else "latest_state"
+                    ),
                     "route_event": (route_event_at_stamp(route_events, stamp_sec) or {}).get("event", ""),
                     "output_frame": str(output_path),
                 }
@@ -452,6 +557,9 @@ def main() -> None:
         ),
         "latest_state_match_count": sum(
             row["match_mode"] == "latest_state" for row in sync_rows
+        ),
+        "timestamp_nearest_match_count": sum(
+            row["match_mode"] == "timestamp_nearest" for row in sync_rows
         ),
         "state_alignment": args.state_alignment,
         "trimmed_trailing_sim_steps": trimmed_trailing_steps,

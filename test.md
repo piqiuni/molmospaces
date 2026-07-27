@@ -909,7 +909,8 @@ pytest -q \
   Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/tests/test_interaction_graph_store.py
 ```
 
-7 号场景检查会读取实际 MuJoCo 门关节和 root AABB，分别设置闭合与完全打开状态，并验证单门、双开门的图状态和 OCC 清空结果：
+7 号场景检查会在 MuJoCo 内部设置真实门关节，但只向 graph 发布最小 GT 五字段；
+随后以 executor 语义结果 `object_id + state` 回写闭合/打开状态，并验证门图状态和 OCC 清空结果：
 
 ```bash
 conda activate mlspaces
@@ -1209,3 +1210,16 @@ python scripts/InteractiveNav/evaluate_mllm_question_bank.py \
 默认按角色限制输出预算：属性 `384`、Subgoal `128`、技能规划 `192`、视觉验证 `192`。
 输出包含整体及各角色的准确率、有效响应率、逐题耗时、token、reasoning token、可见输出 TPS，并同时生成 CSV。
 视觉属性和交互反馈只输入目标 `2D bbox` 裁切；交互反馈只使用交互后的单张目标图。
+
+### 模块 3：历史图像视觉操作规划
+
+使用运行时同一提示词与输出 schema，测试门操作方式和多抽屉中心点：
+
+```bash
+conda run -n mlspaces python scripts/InteractiveNav/evaluate_module3_visual_planning.py \
+  --manifest scripts/InteractiveNav/configs/semantic_decision/module3_historical_eval.json \
+  --env-file .env \
+  --output outputs/module3_visual_planning_eval.json
+```
+
+无可用视觉模型时可用 `--mode mock --model mock-module3` 检查裁图、协议、schema 和评分链路；mock 结果不能作为视觉能力结论。

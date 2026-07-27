@@ -169,8 +169,6 @@ class SemanticMappingNode:
             match_distance=graph_config.get("match_distance", config.get("object_match_distance", 0.5)),
             room_id_to_name={},
             room_box_height=self.room_box_height,
-            portal_closed_threshold=graph_config.get("portal_closed_threshold", 0.10),
-            portal_open_threshold=graph_config.get("portal_open_threshold", 0.67),
             portal_room_max_radius_m=graph_config.get(
                 "portal_room_max_radius_m", 1.0
             ),

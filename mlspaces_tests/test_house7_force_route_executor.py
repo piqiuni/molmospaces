@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
 
@@ -11,7 +12,12 @@ for path in (REPO_ROOT, SCRIPT_ROOT):
 
 from scripts.InteractiveNav.run_house7_force_route import (
     StagedRouteExecutor,
+    RosRouteBackend,
+    door_exit_goal,
+    post_interaction_goals,
     portal_snapshot,
+    portal_state_matches,
+    route_visualization_plan,
 )
 
 
@@ -35,8 +41,12 @@ class FakeBackend:
         return {"state": state, "room_count": 1 if state == "closed" else 2}
 
     def interact(self, command):
-        self.calls.append(("interact", command["source_object_name"]))
+        self.calls.append(("interact", command["object_id"]))
         return {"success": self.interaction_success, "status": "SUCCEEDED"}
+
+    def wait_for_navigation_map(self):
+        self.calls.append(("map_settle",))
+        return {"raw_map_updates": 2}
 
     def latest_graph_summary(self, root):
         return {"state": "open", "room_count": 2, "root": root}
@@ -46,8 +56,11 @@ def route_fixture():
     return {
         "route_id": "route_01",
         "door_approach_xyyaw": [1.0, 2.0, 0.0],
+        "start_xyyaw": [0.0, 2.0, 0.0],
+        "portal_center_xy": [3.0, 2.0],
+        "portal_normal_xy": [-1.0, 0.0],
         "far_goal_xyyaw": [6.0, 2.0, 0.0],
-        "interaction": {"source_object_name": "double_door"},
+        "interaction": {"object_id": "double_door"},
     }
 
 
@@ -62,6 +75,9 @@ def test_executor_orders_navigation_interaction_and_final_navigation(tmp_path) -
         ("portal", "closed", "double_door"),
         ("interact", "double_door"),
         ("portal", "open", "double_door"),
+        ("map_settle",),
+        ("navigate", "crossing", [3.8, 2.0, -0.0]),
+        ("map_settle",),
         ("navigate", "final", [6.0, 2.0, 0.0]),
     ]
     assert (tmp_path / "result.json").exists()
@@ -98,3 +114,53 @@ def test_portal_snapshot_matches_source_object_name_and_summarizes_rooms() -> No
     assert snapshot["state"] == "open"
     assert snapshot["room_count"] == 2
     assert snapshot["graph_revision"] == 9
+
+
+def test_unknown_blocked_portal_satisfies_closed_route_precondition() -> None:
+    snapshot = {
+        "state": "unknown",
+        "traversable": False,
+        "requires_interaction": True,
+    }
+    assert portal_state_matches(snapshot, "closed") is True
+    assert portal_state_matches(snapshot, "open") is False
+
+
+def test_door_exit_goal_is_on_opposite_side_from_start() -> None:
+    goal = door_exit_goal(route_fixture())
+    assert goal == [3.8, 2.0, -0.0]
+
+
+def test_post_interaction_goals_keep_turning_waypoints_and_exclude_final_goal() -> None:
+    route = route_fixture()
+    route["post_interaction_path_xy"] = [
+        [1.0, 2.0],
+        [3.8, 2.0],
+        [4.5, 2.0],
+        [5.0, 2.5],
+        [6.0, 2.0],
+    ]
+    goals = post_interaction_goals(route)
+    assert [goal[:2] for goal in goals] == [[3.8, 2.0], [4.5, 2.0], [5.0, 2.5]]
+
+
+def test_route_visualization_plan_contains_all_goals_and_interaction_goal() -> None:
+    route = route_fixture()
+    route["post_interaction_path_xy"] = [[4.5, 2.0], [5.0, 2.5]]
+    plan = route_visualization_plan(route)
+    assert [item["segment"] for item in plan["subgoals"]] == [
+        "approach",
+        "crossing",
+        "post_interaction_01",
+        "post_interaction_02",
+        "final",
+    ]
+    assert plan["interaction_goal_xyyaw"] == [1.0, 2.0, 0.0]
+    assert plan["interaction_object_id"] == "double_door"
+
+
+def test_route_backend_defaults_to_four_map_settle_updates() -> None:
+    default = inspect.signature(RosRouteBackend.__init__).parameters[
+        "map_settle_updates"
+    ].default
+    assert default == 4
