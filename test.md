@@ -1130,20 +1130,37 @@ METHOD=object_goal_rule \
 HOUSE_IND=7 \
 USE_FIXED_ROUTE=true \
 ROUTE_ID=house7_force_route_01 \
-TASK_HORIZON=1000 \
+TASK_HORIZON=800 \
 INITIAL_DOOR_STATE=closed \
 SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/object_goal_apple.yaml \
+SEMANTIC_MAPPING_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/house7_interaction_geometry.yaml \
 GT_STEP_INTERVAL=1 \
 GT_MAX_DISTANCE_M=6.0 \
 VIDEO_FPS=15 \
 VIDEO_PANEL_WIDTH_PX=640 \
+EXTERNAL_VIDEO_WIDTH_PX=1024 \
+ENABLE_EXTERNAL_VIDEO=true \
+VIDEO_FRAME_JOB_QUEUE_SIZE=128 \
+ARTIFACT_WRITE_QUEUE_SIZE=1024 \
+VIDEO_HISTORY_SIZE=128 \
+IMAGE_QUEUE_SIZE=16 \
 CLEAN_INTERMEDIATE=false \
 SIM_TIMEOUT_S=1800 \
   scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
-  outputs/house7_object_goal_apple_route01
+  outputs/house7_object_goal_apple_route01_close_left_low_near_frontgate_paper_800_20260727_v2
 ```
 
 主要输出：`videos/overview_6panel.mp4`、`debug/semantic_keyframes/`、`debug/graph/` 和 `semantic_exploration_result.json`。
+
+2026-07-27 回归：冰箱物理正面轴校准为 `+X`，节点图记录固定交互位姿
+`[8.254459, 1.053060, 3.141593]`。本次机器人实际交互位姿为
+`[8.535121, 1.075141, -2.944551]`，位置误差 `0.282 m`、朝向误差
+`0.197 rad`，通过执行端位姿门控并成功从 `closed` 切换到 `open`。后续外部相机默认
+offset 调整为 `[-1.08, 0.62, 1.60]`，保持约 `1.24 m` 水平距离并位于机器人
+左后方约 `30 deg`；look-at offset 为 `[0.4, 0.0, 0.95]`，提高相机同时增加
+向下俯视角。原始外部相机 PNG 与视频均为 `1024x576`。节点图右侧决策文字框已移除，
+room 横向排列优先依据 portal-room 拓扑连接度，将 House 7 的 livingroom 放在
+bedroom 与 kitchen 之间。
 
 ## 8.6 Room分割测试
 

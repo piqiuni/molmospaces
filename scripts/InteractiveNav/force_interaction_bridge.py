@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 from pathlib import Path
 import time
@@ -218,6 +219,9 @@ class AtomicForceInteractionController:
         except queue.Empty:
             return None
         try:
+            command["interaction_pose_validation"] = self._validate_interaction_pose(
+                task, command
+            )
             if str(command.get("sequence_type") or "") == "drawer_scan":
                 self._start_drawer_sequence(task, command, step)
                 self._advance_drawer_sequence_before_step(task)
@@ -419,6 +423,9 @@ class AtomicForceInteractionController:
                     else "force_atomic_interaction"
                 ),
                 "verification_source": "executor_state_verification",
+                "interaction_pose_validation": dict(
+                    command.get("interaction_pose_validation") or {}
+                ),
                 "step": int(pending["step"]),
                 "stamp_sec": stamp_sec,
             }
@@ -817,6 +824,61 @@ class AtomicForceInteractionController:
         if self._pending is None and not self._restore_view_pending:
             self._pause_navigation = False
 
+    @staticmethod
+    def _validate_interaction_pose(task, command: dict[str, Any]) -> dict[str, Any]:
+        expected = list(command.get("interaction_approach_pose_xyyaw") or [])
+        if len(expected) < 3:
+            return {"checked": False, "reason": "no_expected_approach_pose"}
+        base_pose = task.env.current_robot.robot_view.base.pose
+        actual = [
+            float(base_pose[0, 3]),
+            float(base_pose[1, 3]),
+            math.atan2(float(base_pose[1, 0]), float(base_pose[0, 0])),
+        ]
+        position_error_m = math.hypot(
+            actual[0] - float(expected[0]), actual[1] - float(expected[1])
+        )
+        yaw_error_rad = abs(
+            math.atan2(
+                math.sin(actual[2] - float(expected[2])),
+                math.cos(actual[2] - float(expected[2])),
+            )
+        )
+        distance_tolerance_m = max(
+            0.05, float(command.get("interaction_ready_distance_m", 0.45) or 0.45)
+        )
+        yaw_tolerance_rad = max(
+            0.05,
+            float(
+                command.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+            ),
+        )
+        valid = (
+            position_error_m <= distance_tolerance_m
+            and yaw_error_rad <= yaw_tolerance_rad
+        )
+        result = {
+            "checked": True,
+            "valid": valid,
+            "expected_pose_xyyaw": [float(value) for value in expected[:3]],
+            "actual_pose_xyyaw": actual,
+            "position_error_m": position_error_m,
+            "yaw_error_rad": yaw_error_rad,
+            "distance_tolerance_m": distance_tolerance_m,
+            "yaw_tolerance_rad": yaw_tolerance_rad,
+            "approach_axis_xy": list(
+                command.get("interaction_approach_axis_xy") or []
+            ),
+        }
+        if not valid:
+            command["interaction_pose_validation"] = result
+            raise ValueError(
+                "Interaction pose invalid: "
+                f"position_error_m={position_error_m:.3f} "
+                f"yaw_error_rad={yaw_error_rad:.3f}"
+            )
+        return result
+
     def _publish_command_failure(
         self,
         task,
@@ -831,6 +893,7 @@ class AtomicForceInteractionController:
         object_id = str(command.get("object_id") or "")
         node_id = str(command.get("node_id") or "")
         missing_articulation = str(exc).startswith("Articulated object not found:")
+        invalid_interaction_pose = str(exc).startswith("Interaction pose invalid:")
         static_portal = missing_articulation and (
             node_id.startswith("portal_")
             or "doorframe" in object_id.casefold()
@@ -879,10 +942,23 @@ class AtomicForceInteractionController:
             "verification_source": (
                 "simulator_no_articulation"
                 if static_portal
-                else "executor_resolution_failure"
+                else (
+                    "executor_pose_precondition"
+                    if invalid_interaction_pose
+                    else "executor_resolution_failure"
+                )
             ),
             "failure_reason": (
-                "" if static_portal else "articulation_resolution_failed"
+                ""
+                if static_portal
+                else (
+                    "interaction_pose_invalid"
+                    if invalid_interaction_pose
+                    else "articulation_resolution_failed"
+                )
+            ),
+            "interaction_pose_validation": dict(
+                command.get("interaction_pose_validation") or {}
             ),
             "error_type": type(exc).__name__,
             "error": str(exc),

@@ -658,6 +658,18 @@ class SemanticBehaviorExecutor:
             "visual_operation_plan": dict(
                 interaction.get("visual_operation_plan") or {}
             ),
+            "interaction_approach_pose_xyyaw": list(
+                interaction.get("interaction_approach_pose_xyyaw") or []
+            ),
+            "interaction_approach_axis_xy": list(
+                interaction.get("interaction_approach_axis_xy") or []
+            ),
+            "interaction_ready_distance_m": float(
+                interaction.get("interaction_ready_distance_m", 0.45) or 0.45
+            ),
+            "interaction_ready_yaw_tolerance_rad": float(
+                interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+            ),
         }
         with self.lock:
             self.pre_interaction_image_sequence = self.latest_image_sequence
