@@ -9,7 +9,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from semantic_mapping_py_pkg.gt_observation_provider import build_gt_observation_batches
-from semantic_mapping_py_pkg.graph_rules import infer_interaction_state, observation_from_detection
+from semantic_mapping_py_pkg.graph_rules import observation_from_detection
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore
 
@@ -217,7 +217,7 @@ def test_open_drawer_does_not_attach_visible_non_pickup_plant_by_proximity():
     assert ("container_drawer_1", "contains", "object_houseplant_1") not in relations
 
 
-def test_multi_drawer_observation_generates_single_joint_groups():
+def test_multi_drawer_joint_metadata_is_not_stored_or_grouped():
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
         [
@@ -252,13 +252,49 @@ def test_multi_drawer_observation_generates_single_joint_groups():
         for node in store.as_graph_dict()["nodes"]
         if node["id"] == "container_dresser_1"
     )
-    groups = node["attributes"]["interaction_groups"]
-    assert [group["target_joint_names"] for group in groups] == [
-        ["drawer_top"],
-        ["drawer_bottom"],
-    ]
-    assert groups[0]["close_other_joint_names"] == ["drawer_bottom"]
-    assert groups[0]["view_profile"] == "drawer_low_view"
+    assert node["interaction"]["interaction_mode"] == "slide"
+    assert node["interaction"]["state"] == "unknown"
+    assert "joint_infos" not in node["attributes"]
+    assert "interaction_groups" not in node["attributes"]
+
+
+def test_fridge_joint_metadata_does_not_define_graph_interaction_groups():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_1",
+                semantic_name="fridge",
+                category="Fridge",
+                is_receptacle=True,
+                is_articulable=True,
+                joint_infos=[
+                    {
+                        "joint_name": "fridge_door_left",
+                        "joint_type": "hinge",
+                        "joint_range": [0.0, 1.57],
+                        "joint_value": 0.0,
+                    },
+                    {
+                        "joint_name": "fridge_inner_slide",
+                        "joint_type": "slide",
+                        "joint_range": [0.0, 0.4],
+                        "joint_value": 0.0,
+                    },
+                ],
+            )
+        ]
+    )
+
+    node = next(
+        node
+        for node in store.as_graph_dict()["nodes"]
+        if node["id"] == "container_fridge_1"
+    )
+    assert node["interaction"]["interaction_mode"] == "open_close"
+    assert node["interaction"]["state"] == "unknown"
+    assert "joint_infos" not in node["attributes"]
+    assert "interaction_groups" not in node["attributes"]
 
 
 def test_toilet_receptacle_metadata_does_not_make_it_a_container():
@@ -519,7 +555,7 @@ def test_realtime_visibility_age_and_episode_reset():
     portal = next(node for node in graph["nodes"] if node["type"] == "portal")
     assert portal["is_currently_visible"] is False
     assert portal["state_age_sec"] == 3.0
-    assert portal["interaction"]["state"] == "closed"
+    assert portal["interaction"]["state"] == "unknown"
     assert graph["episode_id"] == "episode_000001"
     assert graph["graph_revision"] == 2
 
@@ -563,6 +599,76 @@ def test_portal_room_connections_are_inferred_from_room_ring():
     assert {edge["dst_id"] for edge in connects} == {"room_1", "room_2"}
     assert all(edge["attributes"]["traversable"] is False for edge in connects)
     assert all(edge["attributes"]["requires_interaction"] is True for edge in connects)
+
+
+def test_portal_room_ring_does_not_reach_distant_room():
+    class WideGridInfo(FakeGridInfo):
+        width = 12
+
+    scene_data = []
+    for _y in range(WideGridInfo.height):
+        scene_data.extend([2] * 7 + [-1] + [1] * 4)
+    store = InteractionGraphStore(
+        scene_id="test_scene", portal_room_max_radius_m=1.0
+    )
+    store.update_room_grid(WideGridInfo(), scene_data, [100] * len(scene_data))
+    store.update_observations(
+        [
+            observation(
+                instance_id="door_near_room_2",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=0.0,
+                position=[5.0, 4.0, 1.0],
+                aabb_center=[5.0, 4.0, 1.0],
+                aabb_size=[1.0, 2.0, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert portal["attributes"]["connected_room_ids"] == [2]
+    assert portal["attributes"]["connectivity_status"] == "partial"
+
+
+def test_container_room_assignment_uses_nearest_segment_ring():
+    scene_data = [1] * (FakeGridInfo.width * FakeGridInfo.height)
+    for y in range(3, 5):
+        for x in range(3, 5):
+            scene_data[y * FakeGridInfo.width + x] = -1
+    store = InteractionGraphStore(
+        scene_id="test_scene",
+        object_room_search_margin_m=0.75,
+    )
+    store.update_room_grid(FakeGridInfo(), scene_data, [100] * len(scene_data))
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_ring",
+                semantic_name="fridge",
+                category="Fridge",
+                is_receptacle=True,
+                is_articulable=True,
+                position=[4.0, 4.0, 1.0],
+                aabb_center=[4.0, 4.0, 1.0],
+                aabb_size=[2.0, 2.0, 2.0],
+            )
+        ]
+    )
+
+    fridge = next(
+        node
+        for node in store.as_graph_dict()["nodes"]
+        if node["id"] == "container_fridge_ring"
+    )
+    assert fridge["room_id"] == 1
+    assert fridge["parent_id"] == "room_1"
 
 
 def test_container_relation_persists_while_child_is_unobserved_and_clears_after_move():
@@ -630,7 +736,7 @@ def test_interaction_result_updates_planner_fields():
             "event_id": "interaction_000001",
             "action": "unknown",
             "timestamp": 20.0,
-            "pre_state": "closed",
+            "pre_state": "unknown",
             "post_state": "open",
             "success": True,
             "execution_cost": 1.0,
@@ -639,7 +745,7 @@ def test_interaction_result_updates_planner_fields():
     ]
     assert "joints" not in portal["attributes"]
     assert "primary_joint_name" not in portal["attributes"]
-    assert "observation_evidence" in portal["attributes"]
+    assert "observation_evidence" not in portal["attributes"]
     connects_edges = [
         edge for edge in store.as_graph_dict(stamp=20.0)["edges"]
         if edge["relation"] == "connects" and edge["src_id"] == portal["id"]
@@ -682,6 +788,7 @@ def test_interaction_result_can_match_source_name_and_is_idempotent_by_event_id(
     result = {
         "source_object_name": "double_door_root",
         "event_id": "phase_04_close",
+        "state": "closed",
         "joint_infos": [
             {
                 "joint_name": "left_hinge",
@@ -712,7 +819,7 @@ def test_interaction_result_can_match_source_name_and_is_idempotent_by_event_id(
     ]
 
 
-def test_portal_state_uses_joint_delta_and_ajar_is_not_traversable():
+def test_portal_state_ignores_joint_delta_until_semantic_result_arrives():
     store = InteractionGraphStore(scene_id="test_scene")
     closed = observation(
         instance_id="negative_hinge_door",
@@ -730,7 +837,7 @@ def test_portal_state_uses_joint_delta_and_ajar_is_not_traversable():
     ajar["joint_value"] = -0.4
     store.update_observations([ajar], source_mode="realtime_gt_observation")
     portal = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal")
-    assert portal["interaction"]["state"] == "ajar"
+    assert portal["interaction"]["state"] == "unknown"
     assert portal["interaction"]["traversable"] is False
     assert portal["interaction"]["requires_interaction"] is True
 
@@ -738,9 +845,9 @@ def test_portal_state_uses_joint_delta_and_ajar_is_not_traversable():
     opened["joint_value"] = -0.8
     store.update_observations([opened], source_mode="realtime_gt_observation")
     portal = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal")
-    assert portal["interaction"]["state"] == "open"
-    assert portal["interaction"]["traversable"] is True
-    assert portal["interaction"]["open_fraction"] == 0.8
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["interaction"]["traversable"] is False
+    assert "open_fraction" not in portal["interaction"]
 
 
 def test_late_attribute_patch_does_not_override_interaction_state():
@@ -777,17 +884,7 @@ def test_late_attribute_patch_does_not_override_interaction_state():
     assert portal["attributes"]["attribute_status"] == "ready"
 
 
-def test_negative_joint_range_uses_zero_as_closed_endpoint():
-    observation_data = {"is_movable_door": True}
-    assert infer_interaction_state(
-        "container", "hinge", [-2.8, 0.0], -2.8, observation_data
-    ) == "open"
-    assert infer_interaction_state(
-        "container", "hinge", [-2.8, 0.0], 0.0, observation_data
-    ) == "closed"
-
-
-def test_initially_open_multi_joint_box_does_not_require_interaction():
+def test_joint_values_do_not_make_plain_box_interactable_or_open():
     store = InteractionGraphStore(scene_id="test_scene")
     box = observation(
         instance_id="open_box",
@@ -815,7 +912,8 @@ def test_initially_open_multi_joint_box_does_not_require_interaction():
     store.update_observations([box], source_mode="realtime_gt_observation")
 
     node = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "container")
-    assert node["interaction"]["state"] == "open"
+    assert node["interaction"]["state"] == "unknown"
+    assert node["interaction"]["is_interactable"] is False
     assert node["interaction"]["requires_interaction"] is False
 
 
@@ -977,7 +1075,7 @@ def test_house2_dresser_does_not_contain_pencil_on_top() -> None:
     assert ("container_dresser_1", "contains", "object_pencil_1") not in relations
 
 
-def test_container_joint_interaction_memory_survives_later_observations() -> None:
+def test_container_semantic_interaction_state_survives_later_observations() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     dresser = observation(
         instance_id="dresser_1",
@@ -998,36 +1096,32 @@ def test_container_joint_interaction_memory_survives_later_observations() -> Non
         {
             "node_id": node_id,
             "event_id": "open_top",
-            "interaction_group_id": "drawer:top",
-            "joint_names": ["top"],
-            "joint_infos": [
-                {"joint_name": "top", "joint_range": [0.0, 0.4], "joint_value": 0.4},
-                {"joint_name": "bottom", "joint_range": [0.0, 0.4], "joint_value": 0.0},
-            ],
+            "interaction_group_id": "region:top",
+            "post_state": "ajar",
             "success": True,
         }
     )
     store.update_observations([dresser], source_mode="realtime_gt_observation")
     node = next(node for node in store.as_graph_dict()["nodes"] if node["id"] == node_id)
-    assert node["interaction"]["completed_interaction_groups"] == ["drawer:top"]
-    assert node["interaction"]["joint_interaction_states"]["top"]["status"] == "opened"
+    assert node["interaction"]["completed_interaction_groups"] == ["region:top"]
+    assert "joint_interaction_states" not in node["interaction"]
     assert node["interaction"]["state"] == "ajar"
 
     assert store.update_interaction_result(
         {
             "node_id": node_id,
             "event_id": "open_bottom",
-            "interaction_group_id": "drawer:bottom",
-            "joint_names": ["bottom"],
-            "joint_infos": [
-                {"joint_name": "top", "joint_range": [0.0, 0.4], "joint_value": 0.0},
-                {"joint_name": "bottom", "joint_range": [0.0, 0.4], "joint_value": 0.4},
-            ],
+            "interaction_group_id": "region:bottom",
+            "post_state": "open",
             "success": True,
         }
     )
     node = next(node for node in store.as_graph_dict()["nodes"] if node["id"] == node_id)
-    assert node["interaction"]["all_joints_opened_once"] is True
+    assert node["interaction"]["completed_interaction_groups"] == [
+        "region:bottom",
+        "region:top",
+    ]
+    assert "all_interaction_groups_completed" not in node["interaction"]
     assert node["interaction"]["state"] == "open"
 
 
@@ -1045,7 +1139,7 @@ def test_room_geometry_does_not_shrink_after_confirmed_observation() -> None:
     assert updated["aabb_size"] == initial_size
 
 
-def test_attribute_patch_preserves_gt_joint_state_and_last_seen():
+def test_attribute_patch_sets_semantic_state_and_preserves_last_seen():
     store = InteractionGraphStore(scene_id="test_scene")
     door = observation(
         instance_id="gt_000001",
@@ -1076,7 +1170,9 @@ def test_attribute_patch_preserves_gt_joint_state_and_last_seen():
     portal = next(
         node for node in store.as_graph_dict(stamp=21.0)["nodes"] if node["type"] == "portal"
     )
-    assert portal["interaction"]["state"] == "closed"
+    assert portal["interaction"]["state"] == "open"
+    assert portal["interaction"]["state_source"] == "mllm_attribute_inference"
+    assert "observation_evidence" not in portal["attributes"]
     assert portal["last_seen"] == 10.0
     assert portal["attributes"]["attribute_updated_at"] == 20.0
 
@@ -1098,6 +1194,15 @@ def test_superseded_attribute_frame_is_marked_stale_without_state_change():
     reopened["joint_value"] = 1.0
     reopened["frame_index"] = 9
     store.update_observations([reopened], stamp=9.0, source_mode="realtime_gt_observation")
+    assert store.update_interaction_result(
+        {
+            "instance_id": "gt_000001",
+            "event_id": "executor_opened_door",
+            "state": "open",
+            "source": "executor_verification",
+        },
+        stamp=10.0,
+    )
 
     assert store.apply_attribute_patch(
         {

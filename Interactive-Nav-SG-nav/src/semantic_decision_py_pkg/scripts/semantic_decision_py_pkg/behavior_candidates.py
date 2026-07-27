@@ -10,59 +10,6 @@ BEHAVIOR_INTERACT = "INTERACT"
 BEHAVIOR_NAVIGATE = "NAVIGATE"
 
 
-def joint_closed_open_values(joint_range: list[float]) -> tuple[float, float]:
-    lower, upper = float(joint_range[0]), float(joint_range[1])
-    closed = 0.0 if lower <= 0.0 <= upper else min((lower, upper), key=abs)
-    opened = lower if abs(lower - closed) >= abs(upper - closed) else upper
-    return closed, opened
-
-
-def joint_open_fraction(joint_info: dict[str, Any]) -> float | None:
-    if joint_info.get("open_fraction") is not None:
-        return float(joint_info.get("open_fraction") or 0.0)
-    joint_range = list(joint_info.get("joint_range") or [0.0, 0.0])
-    value = joint_info.get("joint_value")
-    if value is None or len(joint_range) < 2:
-        return None
-    closed, opened = joint_closed_open_values(joint_range)
-    span = abs(opened - closed)
-    if span <= 1e-8:
-        return 0.0
-    return min(1.0, abs(float(value) - closed) / span)
-
-
-def interaction_group_reached(
-    joint_infos: list[dict[str, Any]],
-    target_joint_names: list[str],
-    close_other_joint_names: list[str] | None = None,
-    threshold: float = 0.67,
-) -> bool | None:
-    if not target_joint_names:
-        return None
-    by_name = {str(info.get("joint_name")): info for info in joint_infos}
-    target_fractions = []
-    for name in target_joint_names:
-        info = by_name.get(str(name))
-        if info is None:
-            return None
-        fraction = joint_open_fraction(info)
-        if fraction is None:
-            return None
-        target_fractions.append(fraction)
-    closed_fractions = []
-    for name in close_other_joint_names or []:
-        info = by_name.get(str(name))
-        if info is None:
-            return None
-        fraction = joint_open_fraction(info)
-        if fraction is None:
-            return None
-        closed_fractions.append(fraction)
-    return all(value >= float(threshold) for value in target_fractions) and all(
-        value <= 1.0 - float(threshold) for value in closed_fractions
-    )
-
-
 @dataclass
 class BehaviorCandidate:
     candidate_id: str
@@ -100,12 +47,10 @@ class CandidateGeneratorConfig:
     target_require_current_visibility: bool = False
     target_require_same_room: bool = False
     target_allow_connected_room: bool = False
-    open_fraction_threshold: float = 0.67
     target_require_visibility_verification: bool = True
     target_min_visible_pixels: int = 16
     target_min_visible_fraction: float = 0.2
     target_min_consecutive_observations: int = 2
-    drawer_sequence_enabled: bool = True
 
 
 class CandidateGenerator:
@@ -448,6 +393,7 @@ class CandidateGenerator:
             )
             raw_information.append(max(0.0, float(value or 0.0)))
         max_information = max(raw_information) if raw_information else 1.0
+        map_resolution = max(0.0, float(status.get("map_resolution", 0.0) or 0.0))
         candidates = []
         for proposal, information_gain in zip(proposals, raw_information):
             cluster_id = str(
@@ -510,6 +456,7 @@ class CandidateGenerator:
                                 "frontier_cell_count", proposal.get("cell_count", 0)
                             )
                         ),
+                        "map_resolution": map_resolution,
                         "explorer_score": explorer_score,
                         "explorer_score_terms": explorer_score_terms,
                         "proposal_source": str(proposal.get("source") or "explore_py"),
@@ -590,332 +537,102 @@ class CandidateGenerator:
             exploration_gain = 1.0 if node_type == "portal" else 0.65
             if node_type == "portal" and len(connected_room_ids) < 2:
                 exploration_gain = 1.10
-            joint_infos = list(
-                attributes.get("joint_infos")
-                or (attributes.get("observation_evidence") or {}).get("joint_infos")
-                or []
-            )
-            interaction_groups = list(attributes.get("interaction_groups") or [])
-            completed_groups = {
-                str(group_id)
-                for group_id in interaction.get("completed_interaction_groups") or []
-            }
-            failed_groups = {
-                str(group_id)
-                for group_id in interaction.get("failed_interaction_groups") or []
-            }
-            if not completed_groups:
-                completed_groups = {
-                    str(entry.get("interaction_group_id") or "")
-                    for entry in interaction.get("operation_history") or []
-                    if bool(entry.get("success", False))
-                    and str(entry.get("interaction_group_id") or "")
-                }
             explicit_target_reinteraction = bool(
                 target_context.get("enabled")
                 and target_context.get("require_interaction")
                 and self._matches_interaction_target(node, target_context)
             )
-            if node_type == "portal":
-                interaction_groups = [
-                    {
-                        "group_id": "all_joints",
-                        "target_joint_names": [],
-                        "close_other_joint_names": [],
-                        "close_other_joints": False,
-                        "mode": str(interaction.get("interaction_mode") or "open_close"),
-                        "view_profile": "default",
-                    }
-                ]
-            elif not interaction_groups:
-                interaction_groups = [
-                    {
-                        "group_id": "all_joints",
-                        "target_joint_names": [],
-                        "close_other_joint_names": [],
-                        "close_other_joints": False,
-                        "mode": str(interaction.get("interaction_mode") or "open_close"),
-                        "view_profile": "default",
-                    }
-                ]
-            if node_type == "container" and self.config.drawer_sequence_enabled:
-                drawer_groups = []
-                for raw_group in interaction_groups:
-                    group = dict(raw_group or {})
-                    group_id = str(group.get("group_id") or "all_joints")
-                    target_joint_names = list(
-                        group.get("target_joint_names")
-                        or group.get("joint_names")
-                        or []
-                    )
-                    if (
-                        str(group.get("view_profile") or "default")
-                        != "drawer_low_view"
-                        or not target_joint_names
-                        or group_id in completed_groups
-                        or group_id in failed_groups
-                    ):
-                        continue
-                    if joint_infos and interaction_group_reached(
-                        joint_infos,
-                        target_joint_names,
-                        threshold=self.config.open_fraction_threshold,
-                    ) is True:
-                        continue
-                    drawer_groups.append(
-                        {
-                            "group_id": group_id,
-                            "joint_names": target_joint_names,
-                        }
-                    )
-                if drawer_groups:
-                    group_standoff = (
-                        self.config.drawer_standoff_m
-                        + self.config.interaction_safety_margin_m
-                    )
-                    goal_candidates = self._approach_candidates(
-                        robot_xy,
-                        position,
-                        node,
-                        group_standoff,
-                        node_type,
-                    )
-                    approach = goal_candidates[0]
-                    approach_distance = math.hypot(
-                        approach[0] - robot_xy[0], approach[1] - robot_xy[1]
-                    )
-                    joint_names = [
-                        name for group in drawer_groups for name in group["joint_names"]
-                    ]
-                    interaction_command = {
-                        "node_id": node_id,
-                        "source_object_name": source_object_name,
-                        "action": "scan",
-                        "interaction_mode": "drawer_scan",
-                        "sequence_type": "drawer_scan",
-                        "expected_state": "completed",
-                        "interaction_group_id": "drawer_scan",
-                        "interaction_groups": drawer_groups,
-                        "joint_names": joint_names,
-                        "close_other_joint_names": [],
-                        "close_other_joints": False,
-                        "view_profile": "drawer_low_view",
-                        "view_tilt_rad": 0.30,
-                        "view_torso_pitch_rad": 0.35,
-                        "restore_view_after": False,
-                        "open_fraction_threshold": float(
-                            self.config.open_fraction_threshold
+            if node_type == "container" and node_state in {"open", "static_open"}:
+                continue
+            object_id = str(
+                attributes.get("instance_id") or source_object_name or node_id
+            )
+            interaction_standoff = standoff + self.config.interaction_safety_margin_m
+            goal_candidates = self._approach_candidates(
+                robot_xy,
+                position,
+                node,
+                interaction_standoff,
+                node_type,
+            )
+            approach = goal_candidates[0]
+            approach_distance = math.hypot(
+                approach[0] - robot_xy[0], approach[1] - robot_xy[1]
+            )
+            interaction_command = {
+                "node_id": node_id,
+                "object_id": object_id,
+                "action": "open",
+                "interaction_mode": str(
+                    interaction.get("interaction_mode") or "open_close"
+                ),
+                "expected_state": "open",
+            }
+            candidates.append(
+                BehaviorCandidate(
+                    candidate_id=f"interaction:{node_id}:open",
+                    behavior_type=BEHAVIOR_INTERACT,
+                    source="unified_graph",
+                    target_id=node_id,
+                    target_name=source_object_name,
+                    goal_xyyaw=approach,
+                    interaction_command=interaction_command,
+                    features={
+                        "exploration_gain": exploration_gain,
+                        "visibility_gain": 1.0 if node_type == "portal" else 0.80,
+                        "semantic_gain": 1.0 if node_type == "portal" else 0.75,
+                        "target_relevance": 1.0 if explicit_target_reinteraction else 0.0,
+                        "distance_m": approach_distance,
+                        "interaction_cost": float(
+                            interaction.get(
+                                "interaction_cost", interaction.get("cost", 1.0)
+                            )
+                            or 1.0
                         ),
-                    }
-                    candidates.append(
-                        BehaviorCandidate(
-                            candidate_id=f"interaction:{node_id}:drawer_scan",
-                            behavior_type=BEHAVIOR_INTERACT,
-                            source="unified_graph",
-                            target_id=node_id,
-                            target_name=source_object_name,
-                            goal_xyyaw=approach,
-                            interaction_command=interaction_command,
-                            features={
-                                "exploration_gain": exploration_gain,
-                                "visibility_gain": 0.80,
-                                "semantic_gain": 0.75,
-                                "target_relevance": (
-                                    1.0 if explicit_target_reinteraction else 0.0
-                                ),
-                                "distance_m": approach_distance,
-                                "interaction_cost": float(
-                                    interaction.get(
-                                        "interaction_cost",
-                                        interaction.get("cost", 1.0),
-                                    )
-                                    or 1.0
-                                ),
-                                "state_age_ratio": min(
-                                    1.0,
-                                    state_age_sec
-                                    / max(self.config.max_state_age_sec, 1e-6),
-                                ),
-                                "confidence": confidence,
-                                "priority": 0.75,
-                            },
-                            metadata={
-                                "node_type": node_type,
-                                "state": node_state,
-                                "expected_effect": expected_effect,
-                                "is_currently_visible": bool(
-                                    node.get("is_currently_visible")
-                                ),
-                                "state_age_sec": state_age_sec,
-                                "object_distance_m": object_distance,
-                                "robot_room_id": robot_room_id,
-                                "target_room_id": node_room_id,
-                                "interaction_group_id": "drawer_scan",
-                                "interaction_group_count": len(drawer_groups),
-                                "requires_low_view": True,
-                                "interaction_standoff_m": group_standoff,
-                                "interaction_safety_margin_m": (
-                                    self.config.interaction_safety_margin_m
-                                ),
-                                "target_enabled": bool(target_context.get("enabled")),
-                                "target_match": explicit_target_reinteraction,
-                                "requires_approach": True,
-                                "approach_strategy": (
-                                    "container_front_axis"
-                                    if self._container_approach_axis(node) is not None
-                                    else "radial_standoff"
-                                ),
-                                "interaction_approach_axis_xy": (
-                                    self._container_approach_axis(node)
-                                ),
-                                "goal_xyyaw_candidates": goal_candidates,
-                            },
-                        )
-                    )
-                    continue
-            for group in interaction_groups:
-                group = dict(group or {})
-                target_joint_names = list(
-                    group.get("target_joint_names") or group.get("joint_names") or []
+                        "state_age_ratio": min(
+                            1.0,
+                            state_age_sec / max(self.config.max_state_age_sec, 1e-6),
+                        ),
+                        "confidence": confidence,
+                        "priority": 1.0 if node_type == "portal" else 0.75,
+                    },
+                    metadata={
+                        "node_type": node_type,
+                        "state": node_state,
+                        "expected_effect": expected_effect,
+                        "connected_room_ids": connected_room_ids,
+                        "connectivity_status": attributes.get(
+                            "connectivity_status", "unknown"
+                        ),
+                        "is_currently_visible": bool(node.get("is_currently_visible")),
+                        "state_age_sec": state_age_sec,
+                        "object_distance_m": object_distance,
+                        "robot_room_id": robot_room_id,
+                        "target_room_id": node_room_id,
+                        "room_transition_required": room_hops not in {None, 0},
+                        "room_hops": room_hops,
+                        "room_reachable": room_hops is not None,
+                        "interaction_standoff_m": interaction_standoff,
+                        "interaction_safety_margin_m": self.config.interaction_safety_margin_m,
+                        "target_enabled": bool(target_context.get("enabled")),
+                        "target_match": explicit_target_reinteraction,
+                        "requires_approach": True,
+                        "approach_strategy": (
+                            "portal_aabb_normal"
+                            if node_type == "portal"
+                            else (
+                                "container_front_axis"
+                                if self._container_approach_axis(node) is not None
+                                else "radial_standoff"
+                            )
+                        ),
+                        "interaction_approach_axis_xy": self._container_approach_axis(
+                            node
+                        ),
+                        "goal_xyyaw_candidates": goal_candidates,
+                    },
                 )
-                if node_type == "container" and target_joint_names and joint_infos:
-                    if interaction_group_reached(
-                        joint_infos,
-                        target_joint_names,
-                        threshold=self.config.open_fraction_threshold,
-                    ) is True:
-                        continue
-                elif node_type == "container" and not target_joint_names and node_state in {
-                    "open",
-                    "static_open",
-                }:
-                    continue
-                group_id = str(group.get("group_id") or "all_joints")
-                if group_id in completed_groups:
-                    continue
-                if group_id in failed_groups:
-                    continue
-                group_token = group_id.replace(":", "_").replace("/", "_")
-                view_profile = str(group.get("view_profile") or "default")
-                group_standoff = (
-                    self.config.drawer_standoff_m
-                    if node_type == "container"
-                    and view_profile == "drawer_low_view"
-                    else standoff
-                ) + self.config.interaction_safety_margin_m
-                goal_candidates = self._approach_candidates(
-                    robot_xy,
-                    position,
-                    node,
-                    group_standoff,
-                    node_type,
-                )
-                approach = goal_candidates[0]
-                approach_distance = math.hypot(
-                    approach[0] - robot_xy[0], approach[1] - robot_xy[1]
-                )
-                candidate_suffix = "open" if group_id == "all_joints" else group_token
-                candidate_id = f"interaction:{node_id}:{candidate_suffix}"
-                low_view = view_profile == "drawer_low_view"
-                interaction_command = {
-                    "node_id": node_id,
-                    "source_object_name": source_object_name,
-                    "action": "open",
-                    "interaction_mode": str(
-                        group.get("mode")
-                        or interaction.get("interaction_mode")
-                        or "open_close"
-                    ),
-                    "expected_state": "open",
-                    "interaction_group_id": group_id,
-                    "joint_names": target_joint_names,
-                    "close_other_joint_names": list(
-                        group.get("close_other_joint_names") or []
-                    ),
-                    "close_other_joints": bool(group.get("close_other_joints", False)),
-                    "view_profile": view_profile,
-                    "view_tilt_rad": float(
-                        group.get("view_tilt_rad", 0.30 if low_view else 0.55)
-                        or (0.30 if low_view else 0.55)
-                    ),
-                    "view_torso_pitch_rad": (
-                        float(group.get("view_torso_pitch_rad", 0.35) or 0.35)
-                        if low_view
-                        else None
-                    ),
-                    "view_hold_task_steps": 1 if low_view else 0,
-                    "post_interaction_hold_task_steps": 5 if low_view else 0,
-                    "restore_view_after": low_view,
-                    "open_fraction_threshold": float(
-                        self.config.open_fraction_threshold
-                    ),
-                }
-                candidates.append(
-                    BehaviorCandidate(
-                        candidate_id=candidate_id,
-                        behavior_type=BEHAVIOR_INTERACT,
-                        source="unified_graph",
-                        target_id=node_id,
-                        target_name=source_object_name,
-                        goal_xyyaw=approach,
-                        interaction_command=interaction_command,
-                        features={
-                            "exploration_gain": exploration_gain,
-                            "visibility_gain": 1.0 if node_type == "portal" else 0.80,
-                            "semantic_gain": 1.0 if node_type == "portal" else 0.75,
-                            "target_relevance": 1.0 if explicit_target_reinteraction else 0.0,
-                            "distance_m": approach_distance,
-                            "interaction_cost": float(
-                                interaction.get("interaction_cost", interaction.get("cost", 1.0)) or 1.0
-                            ),
-                            "state_age_ratio": min(
-                                1.0, state_age_sec / max(self.config.max_state_age_sec, 1e-6)
-                            ),
-                            "confidence": confidence,
-                            "priority": 1.0 if node_type == "portal" else 0.75,
-                        },
-                        metadata={
-                            "node_type": node_type,
-                            "state": node_state,
-                            "expected_effect": expected_effect,
-                            "connected_room_ids": connected_room_ids,
-                            "connectivity_status": attributes.get("connectivity_status", "unknown"),
-                            "is_currently_visible": bool(node.get("is_currently_visible")),
-                            "state_age_sec": state_age_sec,
-                            "object_distance_m": object_distance,
-                            "robot_room_id": robot_room_id,
-                            "target_room_id": node_room_id,
-                            "room_transition_required": room_hops not in {None, 0},
-                            "room_hops": room_hops,
-                            "room_reachable": room_hops is not None,
-                            "interaction_group_id": group_id,
-                            "open_fraction_threshold": float(
-                                self.config.open_fraction_threshold
-                            ),
-                            "requires_low_view": view_profile == "drawer_low_view",
-                            "interaction_standoff_m": group_standoff,
-                            "interaction_safety_margin_m": self.config.interaction_safety_margin_m,
-                            "interaction_group_already_explored": group_id
-                            in completed_groups,
-                            "interaction_group_previously_failed": group_id
-                            in failed_groups,
-                            "target_enabled": bool(target_context.get("enabled")),
-                            "target_match": explicit_target_reinteraction,
-                            "requires_approach": True,
-                            "approach_strategy": (
-                                "portal_aabb_normal"
-                                if node_type == "portal"
-                                else (
-                                    "container_front_axis"
-                                    if self._container_approach_axis(node) is not None
-                                    else "radial_standoff"
-                                )
-                            ),
-                            "interaction_approach_axis_xy": self._container_approach_axis(node),
-                            "goal_xyyaw_candidates": goal_candidates,
-                        },
-                    )
-                )
+            )
         return candidates
 
     @classmethod
@@ -975,16 +692,7 @@ class CandidateGenerator:
         mode = str(interaction.get("interaction_mode") or "")
         if mode and mode not in {"open_close", "slide"}:
             return False
-        joint_infos = list(
-            attributes.get("joint_infos")
-            or (attributes.get("observation_evidence") or {}).get("joint_infos")
-            or []
-        )
-        return not joint_infos or any(
-            str(info.get("joint_type") or "").casefold() in {"hinge", "slide"}
-            or info.get("open_fraction") is not None
-            for info in joint_infos
-        )
+        return True
 
     @staticmethod
     def _node_xy(

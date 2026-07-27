@@ -43,12 +43,10 @@ candidate:
   target_require_current_visibility: false
   target_require_same_room: false
   target_allow_connected_room: false
-  open_fraction_threshold: 0.67
   target_require_visibility_verification: true
   target_min_visible_pixels: 128
   target_min_visible_fraction: 0.2
   target_min_consecutive_observations: 2
-  drawer_sequence_enabled: true
 
 policy:
   backend: "rule"
@@ -73,6 +71,9 @@ policy:
   failure_cooldown_schedule_s: [30.0, 60.0, 180.0]
   success_cooldown_s: 5.0
   failure_retry_delay_s: 2.0
+  repeat_guard_enabled: true
+  repeat_guard_low_gain_limit: 2
+  repeat_guard_min_frontier_shrink_m: 0.15
 
 model:
   mode: "disabled"
@@ -86,6 +87,7 @@ model:
   metrics_path: ""
   max_graph_nodes: 80
   max_graph_edges: 160
+  max_tokens: 256
 
 completion:
   empty_candidate_confirmations: 3
@@ -95,7 +97,7 @@ executor:
   map_frame: "tf_frame_map"
   base_frame: "tf_frame_base_link"
   navigation_timeout_s: 180.0
-  interaction_navigation_timeout_s: 60.0
+  interaction_navigation_timeout_s: 180.0
   interaction_timeout_s: 30.0
   verification_timeout_s: 30.0
   explore_prepare_timeout_s: 3.0
@@ -104,7 +106,7 @@ executor:
   graph_poll_rate_hz: 5.0
   rear_goal_prerotate_enabled: true
   rear_goal_enter_angle_rad: 1.75
-  rear_goal_exit_angle_rad: 0.34
+  rear_goal_exit_angle_rad: 0.20
   rear_goal_rotate_speed_rad_s: 1.25
   rear_goal_prerotate_timeout_s: 12.0
   rear_goal_lookahead_m: 0.75
@@ -126,6 +128,7 @@ executor:
   make_plan_fail_open: true
   navigation_stagnation_timeout_s: 12.0
   navigation_stagnation_distance_m: 0.10
+  navigation_stagnation_yaw_rad: 0.15
   stuck_recovery_enabled: true
   stuck_recovery_subgoal_failures: 3
   stuck_recovery_min_displacement_m: 0.10

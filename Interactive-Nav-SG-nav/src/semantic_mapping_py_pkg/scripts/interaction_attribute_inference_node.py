@@ -22,6 +22,7 @@ from semantic_mapping_py_pkg.attribute_filter import (
     is_interaction_attribute_candidate,
 )
 from semantic_mapping_py_pkg.attribute_inference_queue import LatestPriorityRequestQueue
+from semantic_mapping_py_pkg.graph_rules import bbox_area, segmentation_pixel_count
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 
 
@@ -92,7 +93,7 @@ class InteractionAttributeInferenceNode:
         )
         self.max_output_tokens = max(
             32,
-            int(rospy.get_param("~max_output_tokens", min(self.client.config.max_tokens, 96))),
+            int(rospy.get_param("~max_output_tokens", min(self.client.config.max_tokens, 160))),
         )
         self.crop_margin_ratio = max(
             0.0, float(rospy.get_param("~crop_margin_ratio", 0.08))
@@ -250,6 +251,7 @@ class InteractionAttributeInferenceNode:
                 self.filter_counts["eligible"] += 1
             object_id = str(
                 detection.get("instance_id")
+                or detection.get("id")
                 or detection.get("object_id")
                 or detection.get("source_object_name")
                 or detection.get("name")
@@ -358,6 +360,7 @@ class InteractionAttributeInferenceNode:
             return
         aliases = {
             object_id,
+            str(detection.get("id") or ""),
             str(detection.get("instance_id") or ""),
             str(detection.get("object_id") or ""),
             str(detection.get("source_object_name") or ""),
@@ -423,19 +426,37 @@ class InteractionAttributeInferenceNode:
             detection, self.include_keywords, self.exclude_keywords
         ):
             return False
-        visible_fraction = float(detection.get("visible_fraction", 0.0) or 0.0)
+        box = detection.get("bbox_2d") or detection.get("projected_bbox_2d") or detection.get("bbox")
+        visible_pixels = int(
+            detection.get(
+                "visible_pixels",
+                segmentation_pixel_count(
+                    detection.get("segmentation")
+                    if detection.get("segmentation") is not None
+                    else detection.get("mask")
+                ),
+            )
+            or 0
+        )
+        visible_fraction = detection.get("visible_fraction")
+        if visible_fraction is None:
+            area = bbox_area(box)
+            visible_fraction = min(1.0, visible_pixels / area) if area > 0.0 else 0.0
+        visible_fraction = float(visible_fraction or 0.0)
         if visible_fraction < self.min_visible_fraction:
             return False
-        visible_pixels = int(detection.get("visible_pixels", 0) or 0)
         if visible_pixels < self.min_visible_pixels:
             return False
-        distance_m = float(detection.get("distance_m", 0.0) or 0.0)
-        if self.max_distance_m > 0.0 and distance_m > self.max_distance_m:
+        distance_m = detection.get("distance_m")
+        if (
+            distance_m is not None
+            and self.max_distance_m > 0.0
+            and float(distance_m) > self.max_distance_m
+        ):
             return False
         consecutive = int(detection.get("consecutive_observations", 0) or 0)
         if consecutive and consecutive < self.required_consecutive_observations:
             return False
-        box = detection.get("bbox_2d") or detection.get("projected_bbox_2d") or detection.get("bbox")
         if not isinstance(box, (list, tuple)) or len(box) < 4:
             return False
         x0, y0, x1, y1 = [float(value) for value in box[:4]]
@@ -443,19 +464,20 @@ class InteractionAttributeInferenceNode:
 
     @staticmethod
     def _state_signature(detection: dict) -> str:
-        joint_names = sorted(
-            str(info.get("joint_name") or "")
-            for info in detection.get("joint_infos") or []
-            if isinstance(info, dict) and str(info.get("joint_name") or "")
-        )
         return "|".join(
             (
-                str(detection.get("semantic_name") or detection.get("category") or ""),
-                str(bool(detection.get("is_door"))),
-                str(bool(detection.get("is_receptacle"))),
-                str(bool(detection.get("is_articulable"))),
-                str(detection.get("primary_joint_name") or ""),
-                ",".join(joint_names),
+                str(
+                    detection.get("semantic_name")
+                    or detection.get("category")
+                    or detection.get("name")
+                    or ""
+                ).casefold(),
+                str(
+                    detection.get("instance_id")
+                    or detection.get("id")
+                    or detection.get("object_id")
+                    or ""
+                ),
             )
         )
 
@@ -464,8 +486,17 @@ class InteractionAttributeInferenceNode:
         visible_fraction = max(
             0.0, float(detection.get("visible_fraction", 0.0) or 0.0)
         )
-        score = 10.0 * float(bool(detection.get("is_door")))
-        score += 6.0 * float(bool(detection.get("is_receptacle")))
+        semantic_text = " ".join(
+            str(detection.get(key) or "").casefold()
+            for key in ("semantic_name", "category", "name")
+        )
+        score = 10.0 * float(any(token in semantic_text for token in ("door", "gate", "barrier")))
+        score += 6.0 * float(
+            any(
+                token in semantic_text
+                for token in ("fridge", "cabinet", "drawer", "dresser", "wardrobe", "closet")
+            )
+        )
         score += 8.0 * float(bool(detection.get("target_relevant")))
         score += 4.0 * visible_fraction
         score += max(0.0, self.max_distance_m - distance_m)
@@ -585,8 +616,10 @@ class InteractionAttributeInferenceNode:
                     "name": detection.get("name") or detection.get("semantic_name"),
                     "category": detection.get("category"),
                     "geometry": {
-                        "position": detection.get("position"),
-                        "aabb_size": detection.get("aabb_size"),
+                        "position": detection.get("position")
+                        or (detection.get("box_3d") or {}).get("center"),
+                        "aabb_size": detection.get("aabb_size")
+                        or (detection.get("box_3d") or {}).get("size"),
                     },
                     "episode_id": episode_id,
                     "frame_id": frame_id,

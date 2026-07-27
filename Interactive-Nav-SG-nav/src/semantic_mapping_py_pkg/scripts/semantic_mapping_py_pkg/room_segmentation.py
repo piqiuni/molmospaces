@@ -102,8 +102,17 @@ class RoomSegmenter:
         for observation in observations or []:
             if not self._is_portal_observation(observation):
                 continue
-            center = self._point3(observation.get("aabb_center") or observation.get("position"))
-            size = self._point3(observation.get("aabb_size"))
+            box_3d = observation.get("box_3d") or {}
+            if not isinstance(box_3d, dict):
+                box_3d = {}
+            center = self._point3(
+                observation.get("aabb_center")
+                or observation.get("position")
+                or box_3d.get("center")
+            )
+            size = self._point3(
+                observation.get("aabb_size") or box_3d.get("size")
+            )
             if center is None or size is None:
                 continue
             span = max(float(size[0]), float(size[1]))
@@ -394,10 +403,11 @@ class RoomSegmenter:
 
     def _portal_hint_key(self, observation, center):
         explicit = (
-            observation.get("source_object_name")
-            or observation.get("name")
-            or observation.get("object_id")
+            observation.get("id")
             or observation.get("instance_id")
+            or observation.get("source_object_name")
+            or observation.get("object_id")
+            or observation.get("name")
         )
         if explicit not in (None, ""):
             return str(explicit)

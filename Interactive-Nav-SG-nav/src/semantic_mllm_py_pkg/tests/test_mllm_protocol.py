@@ -10,6 +10,7 @@ from semantic_mllm_py_pkg.schemas import (
     validate_skill_action,
     validate_skill_plan,
     validate_subgoal_selection,
+    validate_visual_interaction_plan,
     validate_visual_verification,
 )
 
@@ -27,6 +28,22 @@ def test_ablation_modes_are_independent() -> None:
 def test_schema_validation_rejects_unknown_candidate() -> None:
     with pytest.raises(ValueError):
         validate_subgoal_selection({"candidate_id": "bad"}, {"good"})
+
+
+def test_subgoal_selection_accepts_ranked_ids() -> None:
+    result = validate_subgoal_selection(
+        {
+            "ranked_ids": ["door", "frontier", "door"],
+            "reason": "target_room",
+            "confidence": "high",
+        },
+        {"door", "frontier"},
+    )
+
+    assert result["candidate_id"] == "door"
+    assert result["ranked_ids"] == ["door", "frontier"]
+    assert result["reason"] == "TARGET_ROOM"
+    assert result["confidence"] == "high"
 
 
 def test_role_schemas_normalize_outputs() -> None:
@@ -61,6 +78,46 @@ def test_mock_client_returns_role_payload() -> None:
     assert response.error == ""
     assert response.payload == {"candidate_id": "candidate_1"}
     assert response.tps >= 0.0
+
+
+def test_visual_interaction_plan_normalizes_and_sorts_drawer_regions() -> None:
+    plan = validate_visual_interaction_plan(
+        {
+            "target_type": "drawer",
+            "action": "open",
+            "operation_method": "pull",
+            "open_regions": [
+                {"center": [0.55, 0.78], "confidence": 1.4},
+                {"x": 0.52, "y": 0.21, "confidence": 0.8},
+                {"center": [0.53, 0.22], "confidence": 0.6},
+                {"center": [2.0, 0.5], "confidence": 0.9},
+            ],
+            "confidence": 0.9,
+        },
+        expected_target_type="drawer_container",
+    )
+
+    assert plan["target_type"] == "drawer_container"
+    assert plan["action"] == "scan"
+    assert plan["operation_method"] == "pull"
+    assert plan["open_regions"] == [
+        {"center": [0.52, 0.21], "confidence": 0.8},
+        {"center": [0.55, 0.78], "confidence": 1.0},
+    ]
+
+
+def test_visual_interaction_plan_uses_expected_type_when_image_is_ambiguous() -> None:
+    plan = validate_visual_interaction_plan(
+        {
+            "target_type": "unknown",
+            "operation_method": "unknown",
+            "open_regions": [],
+        },
+        expected_target_type="door",
+    )
+
+    assert plan["target_type"] == "door"
+    assert plan["operation_method"] == "unknown"
 
 
 def test_openai_base_endpoint_is_resolved() -> None:

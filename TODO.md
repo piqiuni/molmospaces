@@ -333,6 +333,8 @@
 - [ ] 明确 ROS 侧交互信息来源：detector-only 为主
 - [ ] 明确“需要交互”的 planner 判定条件
 - [x] 完成 GT 快速版开门状态回写与 OCC 更新：首次有效关节值作为闭合参考，门完全打开后由 semantic 层持续清空闭合门整体 AABB，发布 planning OCC 与门洞增量更新，并由 move_base global costmap 实际消费
+- [x] 暂时将 custom `openslam_gmapping 0.2.1` 纳入仓库跟踪，保留 odometry-locked、scan-matching yaw lock 和单次平移修正限幅接口，避免标准 RoboStack 包缺少 `setUseOdometryPose()` / `setScanMatchingCorrectionLimits()` 导致 `struct_mapping_pkg` 无法编译
+- [ ] 后续将完整 vendored `openslam_gmapping` 收敛为基于 RoboStack `ros-noetic-openslam-gmapping 0.2.1` 的最小三文件补丁或独立 overlay 包，并补充标准包兼容检测与构建测试
 - [ ] 固定一组 `obj-goal` / `point-goal` 的最小验证场景与 episode，不先追求大规模
 - [ ] 明确下个月 AAAI 投稿所需的最小实验包与文档产物
 

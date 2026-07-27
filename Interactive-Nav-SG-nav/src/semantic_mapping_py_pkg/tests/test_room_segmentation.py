@@ -25,11 +25,18 @@ def _grid(width=24, height=16, resolution=0.25):
 
 def _door_observation(instance_id="door_1", center_x=3.0):
     return {
-        "instance_id": instance_id,
-        "semantic_name": "door",
-        "is_door": True,
-        "aabb_center": [center_x, 1.875, 1.0],
-        "aabb_size": [0.15, 1.0, 2.0],
+        "id": instance_id,
+        "name": "door",
+        "bbox_2d": [0, 0, 9, 9],
+        "segmentation": {
+            "rows": [index // 10 for index in range(100)],
+            "cols": [index % 10 for index in range(100)],
+        },
+        "box_3d": {
+            "center": [center_x, 1.875, 1.0],
+            "size": [0.15, 1.0, 2.0],
+            "frame_id": "world",
+        },
     }
 
 

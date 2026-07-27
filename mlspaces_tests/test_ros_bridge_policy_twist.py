@@ -54,3 +54,25 @@ def test_extract_planar_twist_uses_instantaneous_base_qvel() -> None:
     assert math.isclose(vx, 1.0, abs_tol=1e-6)
     assert math.isclose(vy, 0.0, abs_tol=1e-6)
     assert math.isclose(wz, 0.4, abs_tol=1e-6)
+
+
+def test_publish_realtime_gt_now_forces_current_snapshot() -> None:
+    calls = []
+
+    class Publisher:
+        def publish(self, task, *, stamp, step_index, force):
+            calls.append((task, stamp, step_index, force))
+            return {"frame_index": step_index}
+
+    policy = RosBridgePolicy.__new__(RosBridgePolicy)
+    policy.task = object()
+    policy._step_idx = 7
+    policy._realtime_gt_publisher = Publisher()
+    policy._latest_gt_payload = None
+    policy._next_common_stamp = lambda: "stamp"
+
+    payload = policy.publish_realtime_gt_now(step_index=11)
+
+    assert payload == {"frame_index": 11}
+    assert policy._latest_gt_payload == payload
+    assert calls == [(policy.task, "stamp", 11, True)]

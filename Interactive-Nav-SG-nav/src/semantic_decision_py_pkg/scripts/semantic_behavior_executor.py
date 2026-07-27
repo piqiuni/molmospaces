@@ -27,12 +27,22 @@ from semantic_decision_py_pkg.behavior_execution import (
     is_stuck_recovery_failure,
     safe_grid_motion_distance,
 )
-from semantic_decision_py_pkg.behavior_candidates import interaction_group_reached
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
+from semantic_decision_py_pkg.visual_interaction_planning import (
+    candidate_with_visual_operation_plan,
+    infer_visual_interaction_target_type,
+)
 from semantic_mllm_py_pkg.ablation import AblationConfig
 from semantic_mllm_py_pkg.client import MLLMClient
 from semantic_mllm_py_pkg.env import client_config_from_env, load_env_file
-from semantic_mllm_py_pkg.schemas import validate_skill_action, validate_visual_verification
+from semantic_mllm_py_pkg.interaction_prompt import (
+    VISUAL_INTERACTION_PLANNING_INSTRUCTION,
+    visual_interaction_planning_context,
+)
+from semantic_mllm_py_pkg.schemas import (
+    validate_visual_interaction_plan,
+    validate_visual_verification,
+)
 
 patch_roslogging_findcaller_for_py311()
 
@@ -79,8 +89,8 @@ class SemanticBehaviorExecutor:
             )
         )
         self.skill_max_output_tokens = max(
-            32,
-            int(model_config.get("skill_max_output_tokens", min(self.mllm_client.config.max_tokens, 64))),
+            128,
+            int(model_config.get("skill_max_output_tokens", min(self.mllm_client.config.max_tokens, 256))),
         )
         self.verification_max_output_tokens = max(
             64,
@@ -102,7 +112,7 @@ class SemanticBehaviorExecutor:
             ExecutionConfig(
                 navigation_timeout_s=float(config.get("navigation_timeout_s", 180.0)),
                 interaction_navigation_timeout_s=float(
-                    config.get("interaction_navigation_timeout_s", 60.0)
+                    config.get("interaction_navigation_timeout_s", 180.0)
                 ),
                 interaction_timeout_s=float(config.get("interaction_timeout_s", 30.0)),
                 verification_timeout_s=float(config.get("verification_timeout_s", 30.0)),
@@ -211,6 +221,9 @@ class SemanticBehaviorExecutor:
         )
         self.navigation_stagnation_distance_m = float(
             config.get("navigation_stagnation_distance_m", 0.10)
+        )
+        self.navigation_stagnation_yaw_rad = float(
+            config.get("navigation_stagnation_yaw_rad", 0.15)
         )
         self.lock = threading.RLock()
         self.selection: dict | None = None
@@ -511,61 +524,6 @@ class SemanticBehaviorExecutor:
                     },
                 )
             interaction = node.get("interaction") or {}
-            interaction_command = self.selection.get("interaction_command") or {}
-            if str(interaction_command.get("sequence_type") or "") == "drawer_scan":
-                required_groups = {
-                    str(group.get("group_id") or "")
-                    for group in interaction_command.get("interaction_groups") or []
-                }
-                completed_groups = {
-                    str(group_id)
-                    for group_id in interaction.get("completed_interaction_groups") or []
-                }
-                sequence_complete = bool(required_groups) and required_groups.issubset(
-                    completed_groups
-                )
-                return self.machine.on_graph_state(
-                    "completed" if sequence_complete else "unknown",
-                    detail={
-                        "node_id": node.get("id"),
-                        "state": interaction.get("state"),
-                        "sequence_type": "drawer_scan",
-                        "required_groups": sorted(required_groups),
-                        "completed_groups": sorted(completed_groups),
-                        "sequence_complete": sequence_complete,
-                        "graph_revision": self.latest_graph.get(
-                            "graph_revision", 0
-                        ),
-                    },
-                )
-            target_joint_names = list(interaction_command.get("joint_names") or [])
-            if target_joint_names:
-                group_reached = interaction_group_reached(
-                    list(attributes.get("joint_infos") or []),
-                    target_joint_names,
-                    list(interaction_command.get("close_other_joint_names") or []),
-                    float(
-                        interaction_command.get("open_fraction_threshold", 0.67)
-                        or 0.67
-                    ),
-                )
-                if group_reached is None:
-                    return []
-                return self.machine.on_graph_state(
-                    "open" if group_reached else "unknown",
-                    detail={
-                        "node_id": node.get("id"),
-                        "state": interaction.get("state"),
-                        "interaction_group_id": interaction_command.get(
-                            "interaction_group_id", "all_joints"
-                        ),
-                        "joint_names": target_joint_names,
-                        "group_reached": group_reached,
-                        "graph_revision": self.latest_graph.get(
-                            "graph_revision", 0
-                        ),
-                    },
-                )
             return self.machine.on_graph_state(
                 str(interaction.get("state") or "unknown"),
                 detail={
@@ -580,6 +538,8 @@ class SemanticBehaviorExecutor:
         reservation_retry = None
         with self.lock:
             reason = self.machine.timeout_reason()
+            if reason in {"navigation_timeout", "interaction_navigation_timeout"}:
+                reason = ""
             cancel_navigation = bool(reason) and self.machine.state in {
                 STATE_NAVIGATING,
                 STATE_APPROACH_INTERACTION,
@@ -689,41 +649,14 @@ class SemanticBehaviorExecutor:
             "candidate_id": candidate.get("candidate_id", ""),
             "event_id": f"{candidate.get('decision_id', 'decision')}_interaction_{interaction_sequence:03d}",
             "node_id": interaction.get("node_id", candidate.get("target_id", "")),
-            "source_object_name": interaction.get(
-                "source_object_name", candidate.get("target_name", "")
-            ),
+            "object_id": interaction.get("object_id", candidate.get("target_name", "")),
             "action": interaction.get("action", "open"),
             "interaction_mode": interaction.get("interaction_mode", "open_close"),
-            "interaction_group_id": interaction.get("interaction_group_id", "all"),
             "sequence_type": interaction.get("sequence_type", ""),
-            "interaction_groups": list(interaction.get("interaction_groups") or []),
-            "joint_names": list(interaction.get("joint_names") or []),
-            "close_other_joint_names": list(
-                interaction.get("close_other_joint_names") or []
-            ),
-            "close_other_joints": bool(
-                interaction.get("close_other_joints", False)
-            ),
-            "view_profile": interaction.get("view_profile", "default"),
-            "view_tilt_rad": float(
-                interaction.get(
-                    "view_tilt_rad",
-                    0.30 if interaction.get("view_profile") == "drawer_low_view" else 0.55,
-                )
-                or (0.30 if interaction.get("view_profile") == "drawer_low_view" else 0.55)
-            ),
-            "view_torso_pitch_rad": interaction.get("view_torso_pitch_rad"),
-            "view_hold_task_steps": int(
-                interaction.get("view_hold_task_steps", 0) or 0
-            ),
-            "post_interaction_hold_task_steps": int(
-                interaction.get("post_interaction_hold_task_steps", 0) or 0
-            ),
-            "restore_view_after": bool(
-                interaction.get("restore_view_after", False)
-            ),
-            "open_fraction_threshold": float(
-                interaction.get("open_fraction_threshold", 0.67) or 0.67
+            "operation_method": interaction.get("operation_method", "unknown"),
+            "open_regions": list(interaction.get("open_regions") or []),
+            "visual_operation_plan": dict(
+                interaction.get("visual_operation_plan") or {}
             ),
         }
         with self.lock:
@@ -740,24 +673,18 @@ class SemanticBehaviorExecutor:
             image_data = self._object_crop_data_locked(node)
         interaction = dict(candidate.get("interaction_command") or {})
         requested_action = str(interaction.get("action") or "open").casefold()
-        if requested_action not in {"open", "close"}:
+        if requested_action not in {"open", "scan"}:
             requested_action = "open"
-        valid_part_ids = self._valid_interaction_group_ids(node, candidate)
-        context = {
-            "object_id": str(candidate.get("target_id") or ""),
-            "object_name": str(candidate.get("target_name") or ""),
-            "object_type": str(candidate.get("interaction_type") or "unknown"),
-            "requested_action": requested_action,
-            "allowed_part_ids": sorted(valid_part_ids),
-        }
+        expected_target_type = infer_visual_interaction_target_type(candidate, node)
+        context = visual_interaction_planning_context(
+            object_id=str(candidate.get("target_id") or ""),
+            object_name=str(candidate.get("target_name") or ""),
+            expected_target_type=expected_target_type,
+            requested_action=requested_action,
+        )
         response = self.mllm_client.request_json(
             role="skill_planning",
-            instruction=(
-                "Choose exactly one atomic interaction for the selected object. "
-                "Return exactly one single-line JSON object: {\"part_id\":\"\",\"action\":\"open\"}. "
-                "part_id must be empty or one allowed_part_ids value; action must be open or close. "
-                "No markdown, explanation, extra keys, forces, trajectories, or joint data."
-            ),
+            instruction=VISUAL_INTERACTION_PLANNING_INSTRUCTION,
             context=context,
             images=[image_data] if image_data else [],
             timeout_s=self.skill_timeout_s,
@@ -770,21 +697,19 @@ class SemanticBehaviorExecutor:
         result_source = "rule_fallback_model_error"
         if response.payload is not None and not response.error:
             try:
-                action = validate_skill_action(
-                    response.payload, valid_part_ids, requested_action
+                plan = validate_visual_interaction_plan(
+                    response.payload,
+                    expected_target_type=expected_target_type,
+                    requested_action=requested_action,
                 )
-                if action:
-                    planned_candidate = self._candidate_for_skill_action(
-                        planned_candidate,
-                        {
-                            "skill": "close_part" if action["action"] == "close" else "open_part",
-                            "part_id": action["part_id"],
-                        },
-                    )
-                    result_source = "model"
+                planned_candidate = candidate_with_visual_operation_plan(
+                    planned_candidate, plan
+                )
+                result_source = "model"
                 with self.lock:
                     self.active_skill_plan = {
-                        "subactions": [action],
+                        "visual_operation_plan": plan,
+                        "subactions": [],
                         "max_retries": 0,
                     }
                     self.pending_skill_actions = []
@@ -811,41 +736,7 @@ class SemanticBehaviorExecutor:
         )
         part_id = str(action.get("part_id") or "")
         if part_id:
-            interaction["interaction_group_id"] = part_id
-        interaction["view_profile"] = str(
-            action.get("view_profile") or interaction.get("view_profile") or "default"
-        )
-        node = self._selected_graph_node_locked(planned)
-        groups = (node.get("attributes") or {}).get("interaction_groups") or []
-        group = next(
-            (
-                item
-                for item in groups
-                if str(item.get("group_id") or "") == part_id
-            ),
-            None,
-        )
-        if isinstance(group, dict):
-            original_joint_names = {
-                str(name)
-                for name in interaction.get("joint_names") or []
-                if str(name)
-            }
-            selected_joint_names = [
-                str(name)
-                for name in (
-                    group.get("target_joint_names") or group.get("joint_names") or []
-                )
-                if str(name) in original_joint_names
-            ]
-            if selected_joint_names:
-                interaction["joint_names"] = selected_joint_names
-            interaction["close_other_joint_names"] = list(
-                group.get("close_other_joint_names") or []
-            )
-            interaction["close_other_joints"] = bool(
-                group.get("close_other_joints", False)
-            )
+            interaction["region_id"] = part_id
         planned["interaction_command"] = interaction
         return planned
 
@@ -885,7 +776,7 @@ class SemanticBehaviorExecutor:
                         or "open"
                     ),
                     "interaction_part": str(
-                        (selection.get("interaction_command") or {}).get("interaction_group_id")
+                        (selection.get("interaction_command") or {}).get("region_id")
                         or ""
                     ),
                 },
@@ -953,28 +844,6 @@ class SemanticBehaviorExecutor:
                 result_source,
             )
         self._dispatch(commands)
-
-    @staticmethod
-    def _valid_interaction_group_ids(node: dict, candidate: dict) -> set[str]:
-        valid_joint_names = {
-            str(name)
-            for name in (
-                (candidate.get("interaction_command") or {}).get("joint_names") or []
-            )
-            if str(name)
-        }
-        return {
-            str(group.get("group_id") or "")
-            for group in (node.get("attributes") or {}).get("interaction_groups") or []
-            if isinstance(group, dict)
-            and str(group.get("group_id") or "")
-            and any(
-                str(name) in valid_joint_names
-                for name in (
-                    group.get("target_joint_names") or group.get("joint_names") or []
-                )
-            )
-        }
 
     def _model_metrics_context(
         self, role: str, decision_id: str, candidate: dict
@@ -1265,9 +1134,10 @@ class SemanticBehaviorExecutor:
         progress_watchdog = NavigationProgressWatchdog(
             timeout_s=self.navigation_stagnation_timeout_s,
             min_displacement_m=self.navigation_stagnation_distance_m,
+            min_yaw_change_rad=self.navigation_stagnation_yaw_rad,
         )
         progress_watchdog.reset(
-            None if start_pose is None else (start_pose[0], start_pose[1]),
+            start_pose,
             time.monotonic(),
         )
         navigation_timeout_s = (
@@ -1295,7 +1165,7 @@ class SemanticBehaviorExecutor:
                 <= self.final_align_max_distance_m
             )
             if not near_final_yaw_alignment and progress_watchdog.observe(
-                None if pose is None else (pose[0], pose[1]),
+                pose,
                 time.monotonic(),
             ):
                 self.move_base.cancel_goal()
@@ -1306,6 +1176,7 @@ class SemanticBehaviorExecutor:
                         "reason": "navigation_stagnation",
                         "stagnation_timeout_s": self.navigation_stagnation_timeout_s,
                         "stagnation_distance_m": self.navigation_stagnation_distance_m,
+                        "stagnation_yaw_rad": self.navigation_stagnation_yaw_rad,
                     },
                 )
                 return

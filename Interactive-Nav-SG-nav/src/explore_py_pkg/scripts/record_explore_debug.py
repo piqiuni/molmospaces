@@ -44,7 +44,10 @@ _patch_roslogging_findcaller_for_py311()
 
 import rospy
 import tf
-from explore_py_pkg.debug_semantic_viz import candidate_color
+from explore_py_pkg.debug_semantic_viz import (
+    candidate_color,
+    portal_positions_between_rooms,
+)
 from actionlib_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
 from map_msgs.msg import OccupancyGridUpdate
@@ -77,6 +80,38 @@ STATUS_NAMES = {
 
 def _step4(value: int | float | None) -> str:
     return f"{int(value or 0):04d}"
+
+
+def _gt_observation_id(observation: dict) -> str:
+    return str(observation.get("id") or observation.get("instance_id") or "")
+
+
+def _gt_observation_name(observation: dict) -> str:
+    return str(observation.get("name") or observation.get("semantic_name") or "object")
+
+
+def _selection_target_id(selection: dict | None) -> str:
+    selection = selection or {}
+    return str(
+        selection.get("target_id")
+        or selection.get("object_id")
+        or selection.get("candidate_id")
+        or ""
+    )
+
+
+def _interaction_display_selection(selection: dict, command: dict) -> dict:
+    merged = dict(selection or {})
+    if not command:
+        return merged
+    target_id = _selection_target_id(command)
+    if target_id:
+        merged.setdefault("target_id", target_id)
+        merged.setdefault("target_name", target_id)
+    action = str(command.get("action") or "")
+    if action:
+        merged.setdefault("behavior_type", action)
+    return merged
 
 
 def _yaw_from_quaternion(q) -> float:
@@ -902,6 +937,12 @@ class ExploreDebugRecorder:
         self.latest_semantic_selection: dict = {}
         self.latest_semantic_execution_state: dict = {}
         self.latest_semantic_behavior_feedback: dict = {}
+        self.latest_semantic_decision_trace: dict = {}
+        self.latest_interaction_command: dict = {}
+        self.latest_interaction_result: dict = {}
+        self.latest_route_phase: dict = {}
+        self.latest_route_plan: dict = {}
+        self.latest_route_goal: dict = {}
         self.semantic_decision_event_count = 0
         self.last_semantic_execution_key = None
         self.latest_scene_id_grid = None
@@ -957,6 +998,7 @@ class ExploreDebugRecorder:
         self.video_map_bbox: tuple[int, int, int, int] | None = None
         self.video_global_costmap_bbox: tuple[int, int, int, int] | None = None
         self.video_local_costmap_bbox: tuple[int, int, int, int] | None = None
+        self.video_occupancy_world_bounds: tuple[float, float, float, float] | None = None
         self.first_person_video_error = ""
         self.first_person_video_codec_name = "h264" if args.first_person_video_h264 else str(args.first_person_video_codec)
         self.external_video_path = str(self.video_dir / "external_camera.mp4")
@@ -1177,6 +1219,15 @@ class ExploreDebugRecorder:
         )
         self.subscribers.append(
             rospy.Subscriber(
+                args.semantic_decision_trace_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("semantic_decision_trace", "latest_semantic_decision_trace"),
+                queue_size=10,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
                 args.semantic_execution_state_topic,
                 String,
                 self.semantic_decision_event_callback,
@@ -1190,6 +1241,32 @@ class ExploreDebugRecorder:
                 String,
                 self.semantic_decision_event_callback,
                 callback_args=("semantic_decision_feedback", "latest_semantic_behavior_feedback"),
+                queue_size=20,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.interaction_command_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("interaction_command", "latest_interaction_command"),
+                queue_size=10,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.interaction_result_topic,
+                String,
+                self.semantic_decision_event_callback,
+                callback_args=("interaction_result", "latest_interaction_result"),
+                queue_size=20,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.route_phase_topic,
+                String,
+                self.route_phase_callback,
                 queue_size=20,
             )
         )
@@ -1245,13 +1322,18 @@ class ExploreDebugRecorder:
                 self.observed_instance_ids.clear()
                 self.topology_slots.clear()
                 self.topology_next_slot = {"room": 0, "portal": 0, "container": 0, "object": 0}
+                self.video_map_bbox = None
+                self.video_occupancy_world_bounds = None
                 self.latest_semantic_candidates = {}
                 self.latest_semantic_selection = {}
                 self.latest_semantic_execution_state = {}
                 self.latest_semantic_behavior_feedback = {}
+                self.latest_semantic_decision_trace = {}
+                self.latest_interaction_command = {}
+                self.latest_interaction_result = {}
                 self.last_semantic_execution_key = None
             for observation in payload.get("observations") or []:
-                instance_id = str(observation.get("instance_id") or "")
+                instance_id = _gt_observation_id(observation)
                 if instance_id:
                     self.observed_instance_ids.add(instance_id)
             self.latest_gt_observations = payload
@@ -1358,6 +1440,36 @@ class ExploreDebugRecorder:
                 self.last_semantic_execution_key = execution_key
             self.semantic_decision_event_count += 1
             self._write_event(event_type, {"payload": payload})
+
+    def route_phase_callback(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.latest_route_phase = payload
+            event = str(payload.get("event") or "")
+            if event == "route_started":
+                self.latest_route_plan = dict(payload.get("route_plan") or {})
+                self.latest_route_goal = {}
+            elif event == "navigate_started":
+                goal = list(payload.get("goal") or [])
+                if len(goal) >= 2:
+                    self.latest_route_goal = {
+                        "segment": str(payload.get("segment") or "navigate"),
+                        "goal_xyyaw": [
+                            float(goal[0]),
+                            float(goal[1]),
+                            float(goal[2]) if len(goal) > 2 else 0.0,
+                        ],
+                    }
+            elif event in {"route_succeeded", "route_failed"}:
+                self.latest_route_goal = {}
+            self._write_event("route_phase", {"payload": payload})
 
     @staticmethod
     def _semantic_graph_delta(previous: dict, current: dict) -> list[dict]:
@@ -1643,6 +1755,10 @@ class ExploreDebugRecorder:
             trajectory.append((float(pose_stamp), float(x), float(y), float(yaw)))
         active_goal = goal_record[2]
         active_goal_yaw = goal_record[3]
+        route_goal_values = list(self.latest_route_goal.get("goal_xyyaw") or [])
+        if len(route_goal_values) >= 2:
+            active_goal = (float(route_goal_values[0]), float(route_goal_values[1]))
+            active_goal_yaw = float(route_goal_values[2]) if len(route_goal_values) > 2 else 0.0
         stuck = self._stuck_test_at_stamp_locked(image_stamp, goal_record, pose_records)
 
         return {
@@ -1677,9 +1793,16 @@ class ExploreDebugRecorder:
             "scene_id_grid_rgb": scene_id_record[2],
             "scene_id_grid_step": int(scene_id_record[3]),
             "semantic_candidates": dict(self.latest_semantic_candidates),
-            "semantic_selection": dict(self.latest_semantic_selection),
+            "semantic_selection": _interaction_display_selection(
+                self.latest_semantic_selection,
+                self.latest_interaction_command,
+            ),
             "semantic_execution_state": dict(self.latest_semantic_execution_state),
             "semantic_behavior_feedback": dict(self.latest_semantic_behavior_feedback),
+            "semantic_decision_trace": dict(self.latest_semantic_decision_trace),
+            "route_phase": dict(self.latest_route_phase),
+            "route_plan": dict(self.latest_route_plan),
+            "route_goal": dict(self.latest_route_goal),
         }
 
     def _run_video_frame_renderer(self) -> None:
@@ -1731,14 +1854,15 @@ class ExploreDebugRecorder:
         source_width: int,
         source_height: int,
         gt_observations: dict | None = None,
+        semantic_selection: dict | None = None,
     ) -> None:
         gt_observations = self.latest_gt_observations if gt_observations is None else gt_observations
         observations = list(gt_observations.get("observations") or [])
-        scale_x = float(frame.shape[1]) / max(1, source_width)
-        scale_y = float(frame.shape[0]) / max(1, source_height)
+        payload_image_size = gt_observations.get("image_size") or [source_width, source_height]
+        target_id = _selection_target_id(semantic_selection)
         for observation in observations:
             bbox = observation.get("bbox_2d") or []
-            image_size = observation.get("image_size") or [source_width, source_height]
+            image_size = observation.get("image_size") or payload_image_size
             if len(bbox) != 4 or len(image_size) != 2:
                 continue
             bbox_scale_x = float(frame.shape[1]) / max(1, int(image_size[0]))
@@ -1754,24 +1878,28 @@ class ExploreDebugRecorder:
             )
             if end[0] <= start[0] or end[1] <= start[1]:
                 continue
-            is_door = bool(observation.get("is_door"))
-            is_container = bool(
-                observation.get("is_receptacle")
-                and observation.get("is_articulable")
-                and observation.get("joint_infos")
+            instance_id = _gt_observation_id(observation)
+            semantic_name = _gt_observation_name(observation)
+            normalized_name = semantic_name.lower()
+            is_target = bool(target_id and instance_id == target_id)
+            is_door = "door" in normalized_name
+            is_container = any(
+                token in normalized_name
+                for token in ("drawer", "cabinet", "fridge", "refrigerator", "wardrobe", "cupboard")
             )
-            color = (238, 80, 50) if is_door else (170, 70, 220) if is_container else (20, 210, 210)
-            cv2.rectangle(frame, start, end, color, 2, cv2.LINE_AA)
-            instance_id = str(observation.get("instance_id") or "")
-            suffix = instance_id.rsplit("_", 1)[-1]
-            try:
-                display_id = f"#{int(suffix)}"
-            except ValueError:
-                display_id = f"#{suffix[-6:]}"
-            label = f"{display_id} {observation.get('semantic_name', 'obj')}"
-            joint_value = observation.get("joint_value")
-            if joint_value is not None and observation.get("primary_joint_name"):
-                label += f" q={float(joint_value):.2f}"
+            color = (235, 35, 210) if is_target else (238, 80, 50) if is_door else (170, 70, 220) if is_container else (20, 210, 210)
+            thickness = 4 if is_target else 2
+            cv2.rectangle(frame, start, end, color, thickness, cv2.LINE_AA)
+            display_id = instance_id if instance_id.startswith("gt_") else ""
+            label = " ".join(
+                value
+                for value in (
+                    "INTERACT" if is_target else "",
+                    semantic_name,
+                    display_id,
+                )
+                if value
+            )
             label_y = max(18, start[1] - 5)
             cv2.putText(frame, label[:48], (start[0], label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
         status_text = (
@@ -1808,13 +1936,39 @@ class ExploreDebugRecorder:
     def _node_observed_in_recording(self, node: dict, observed_instance_ids: set[str] | None = None) -> bool:
         if node.get("type") == "room":
             return bool((node.get("attributes") or {}).get("active", True))
-        instance_id = str((node.get("attributes") or {}).get("instance_id") or "")
         observed_instance_ids = self.observed_instance_ids if observed_instance_ids is None else observed_instance_ids
-        return bool(instance_id and instance_id in observed_instance_ids)
+        return any(
+            identifier in observed_instance_ids
+            for identifier in self._node_object_ids(node)
+        )
+
+    @staticmethod
+    def _node_object_ids(node: dict) -> set[str]:
+        attributes = node.get("attributes") or {}
+        return {
+            str(value)
+            for value in (
+                attributes.get("object_id"),
+                attributes.get("source_object_name"),
+                attributes.get("instance_id"),
+                node.get("id"),
+            )
+            if value
+        }
+
+    @classmethod
+    def _node_matches_target(cls, node: dict, target_id: str) -> bool:
+        return bool(target_id and target_id in cls._node_object_ids(node))
 
     @staticmethod
     def _short_node_id(node: dict) -> str:
-        instance_id = str((node.get("attributes") or {}).get("instance_id") or "")
+        attributes = node.get("attributes") or {}
+        instance_id = str(
+            attributes.get("object_id")
+            or attributes.get("source_object_name")
+            or attributes.get("instance_id")
+            or ""
+        )
         token = instance_id or str(node.get("id") or "")
         suffix = token.rsplit("_", 1)[-1]
         try:
@@ -1836,6 +1990,92 @@ class ExploreDebugRecorder:
             return (50, 125, 220)
         return (30, 190, 195) if node.get("is_currently_visible") else (145, 145, 145)
 
+    @staticmethod
+    def _semantic_node_display_label(node: dict) -> str:
+        if node.get("type") != "room":
+            return str(node.get("label") or node.get("type") or "object")
+        room_attribute = str(
+            (node.get("attributes") or {}).get("room_attribute") or "unknown"
+        ).strip()
+        if room_attribute == "livingroom":
+            return "living room"
+        return f"{room_attribute} room" if room_attribute != "unknown" else "unknown room"
+
+    @staticmethod
+    def _known_occupancy_world_bounds(
+        grid: OccupancyGrid | None,
+    ) -> tuple[float, float, float, float] | None:
+        if grid is None or np is None:
+            return None
+        width = int(grid.info.width)
+        height = int(grid.info.height)
+        resolution = float(grid.info.resolution)
+        if width <= 0 or height <= 0 or resolution <= 0.0:
+            return None
+        values = np.asarray(grid.data, dtype=np.int16).reshape((height, width))
+        known_rows, known_cols = np.where(values >= 0)
+        if known_rows.size == 0 or known_cols.size == 0:
+            return None
+        origin = grid.info.origin
+        origin_yaw = math.atan2(
+            2.0 * (
+                origin.orientation.w * origin.orientation.z
+                + origin.orientation.x * origin.orientation.y
+            ),
+            1.0
+            - 2.0
+            * (
+                origin.orientation.y * origin.orientation.y
+                + origin.orientation.z * origin.orientation.z
+            ),
+        )
+        cos_yaw = math.cos(origin_yaw)
+        sin_yaw = math.sin(origin_yaw)
+
+        def world_from_cell(cell_x: float, cell_y: float) -> tuple[float, float]:
+            local_x = cell_x * resolution
+            local_y = cell_y * resolution
+            return (
+                float(origin.position.x) + cos_yaw * local_x - sin_yaw * local_y,
+                float(origin.position.y) + sin_yaw * local_x + cos_yaw * local_y,
+            )
+
+        min_cell_x = float(np.min(known_cols))
+        min_cell_y = float(np.min(known_rows))
+        max_cell_x = float(np.max(known_cols) + 1)
+        max_cell_y = float(np.max(known_rows) + 1)
+        corners = [
+            world_from_cell(min_cell_x, min_cell_y),
+            world_from_cell(max_cell_x, min_cell_y),
+            world_from_cell(min_cell_x, max_cell_y),
+            world_from_cell(max_cell_x, max_cell_y),
+        ]
+        return (
+            min(point[0] for point in corners),
+            min(point[1] for point in corners),
+            max(point[0] for point in corners),
+            max(point[1] for point in corners),
+        )
+
+    def _update_video_occupancy_world_bounds_locked(
+        self,
+        grid: OccupancyGrid | None,
+    ) -> tuple[float, float, float, float] | None:
+        current = self._known_occupancy_world_bounds(grid)
+        if current is None:
+            return self.video_occupancy_world_bounds
+        previous = self.video_occupancy_world_bounds
+        if previous is None:
+            self.video_occupancy_world_bounds = current
+        else:
+            self.video_occupancy_world_bounds = (
+                min(previous[0], current[0]),
+                min(previous[1], current[1]),
+                max(previous[2], current[2]),
+                max(previous[3], current[3]),
+            )
+        return self.video_occupancy_world_bounds
+
     def _render_semantic_spatial_panel_locked(
         self,
         panel_width: int,
@@ -1845,10 +2085,13 @@ class ExploreDebugRecorder:
         occupancy_rgb=None,
         graph: dict | None = None,
         observed_instance_ids: set[str] | None = None,
+        semantic_selection: dict | None = None,
         image_step: int | None = None,
+        world_bounds: tuple[float, float, float, float] | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
+        target_id = _selection_target_id(semantic_selection)
         nodes = [
             node
             for node in graph.get("nodes") or []
@@ -1862,23 +2105,26 @@ class ExploreDebugRecorder:
             cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, panel_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
             self._draw_panel_title(panel, "SEMANTIC XY", image_step)
             return panel
-        min_x = min(position[0] for position in positions)
-        max_x = max(position[0] for position in positions)
-        min_y = min(position[1] for position in positions)
-        max_y = max(position[1] for position in positions)
-        for node in nodes:
-            position = self._node_xy(node)
-            size = node.get("aabb_size") or [0.0, 0.0, 0.0]
-            if position is None or len(size) < 2:
-                continue
-            min_x = min(min_x, position[0] - float(size[0]) * 0.5)
-            max_x = max(max_x, position[0] + float(size[0]) * 0.5)
-            min_y = min(min_y, position[1] - float(size[1]) * 0.5)
-            max_y = max(max_y, position[1] + float(size[1]) * 0.5)
+        if world_bounds is None:
+            min_x = min(position[0] for position in positions)
+            max_x = max(position[0] for position in positions)
+            min_y = min(position[1] for position in positions)
+            max_y = max(position[1] for position in positions)
+            for node in nodes:
+                position = self._node_xy(node)
+                size = node.get("aabb_size") or [0.0, 0.0, 0.0]
+                if position is None or len(size) < 2:
+                    continue
+                min_x = min(min_x, position[0] - float(size[0]) * 0.5)
+                max_x = max(max_x, position[0] + float(size[0]) * 0.5)
+                min_y = min(min_y, position[1] - float(size[1]) * 0.5)
+                max_y = max(max_y, position[1] + float(size[1]) * 0.5)
+        else:
+            min_x, min_y, max_x, max_y = world_bounds
         margin = 38
         span_x = max(2.0, max_x - min_x)
         span_y = max(2.0, max_y - min_y)
-        scale = 1.30 * min(
+        scale = min(
             (panel_width - margin * 2) / span_x,
             (panel_height - margin * 2 - 20) / span_y,
         )
@@ -1960,7 +2206,10 @@ class ExploreDebugRecorder:
             half_h = max(3, int(max(0.08, float(size[1]) * 0.5) * scale))
             center = to_px(*position)
             color = self._semantic_node_color(node)
-            thickness = 2 if node.get("is_currently_visible") else 1
+            is_target = self._node_matches_target(node, target_id)
+            if is_target:
+                color = (235, 35, 210)
+            thickness = 4 if is_target else 2 if node.get("is_currently_visible") else 1
             if node.get("type") == "room":
                 overlay = panel.copy()
                 cv2.rectangle(overlay, (center[0] - half_w, center[1] - half_h), (center[0] + half_w, center[1] + half_h), color, -1)
@@ -1969,11 +2218,13 @@ class ExploreDebugRecorder:
             else:
                 cv2.rectangle(panel, (center[0] - half_w, center[1] - half_h), (center[0] + half_w, center[1] + half_h), color, thickness)
             short_id = self._short_node_id(node)
-            if node.get("type") in {"room", "portal", "container"}:
-                label = f"{short_id} {node.get('label', node.get('type', ''))}"[:22]
-            else:
-                label = short_id
-            cv2.putText(panel, label, (center[0] + 3, center[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (35, 35, 35), 1, cv2.LINE_AA)
+            display_label = self._semantic_node_display_label(node)
+            label = (
+                display_label
+                if node.get("type") == "room"
+                else f"{'INTERACT ' if is_target else ''}{short_id} {display_label}"
+            )[:30]
+            cv2.putText(panel, label, (center[0] + 3, center[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.28, color if is_target else (35, 35, 35), 1, cv2.LINE_AA)
         if pose is not None:
             center = to_px(float(pose[0]), float(pose[1]))
             self._draw_cv_robot_arrow(panel, center, float(pose[2]), 14)
@@ -1991,10 +2242,13 @@ class ExploreDebugRecorder:
         scene_rgb=None,
         graph: dict | None = None,
         observed_instance_ids: set[str] | None = None,
+        semantic_selection: dict | None = None,
         image_step: int | None = None,
+        world_bounds: tuple[float, float, float, float] | None = None,
     ):
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
+        target_id = _selection_target_id(semantic_selection)
         reference_grid = occupancy_grid or scene_grid
         if reference_grid is None:
             self._draw_panel_title(panel, "ROOM SEGMENTS", image_step)
@@ -2031,16 +2285,19 @@ class ExploreDebugRecorder:
                 cell_min_y = float(np.min(known_rows))
                 cell_max_x = float(np.max(known_cols) + 1)
                 cell_max_y = float(np.max(known_rows) + 1)
-        corners = [
-            world_from_cell(cell_min_x, cell_min_y),
-            world_from_cell(cell_max_x, cell_min_y),
-            world_from_cell(cell_min_x, cell_max_y),
-            world_from_cell(cell_max_x, cell_max_y),
-        ]
-        min_x = min(point[0] for point in corners)
-        max_x = max(point[0] for point in corners)
-        min_y = min(point[1] for point in corners)
-        max_y = max(point[1] for point in corners)
+        if world_bounds is None:
+            corners = [
+                world_from_cell(cell_min_x, cell_min_y),
+                world_from_cell(cell_max_x, cell_min_y),
+                world_from_cell(cell_min_x, cell_max_y),
+                world_from_cell(cell_max_x, cell_max_y),
+            ]
+            min_x = min(point[0] for point in corners)
+            max_x = max(point[0] for point in corners)
+            min_y = min(point[1] for point in corners)
+            max_y = max(point[1] for point in corners)
+        else:
+            min_x, min_y, max_x, max_y = world_bounds
         margin = 18
         scale = min(
             (panel_width - 2 * margin) / max(max_x - min_x, 1e-6),
@@ -2115,17 +2372,20 @@ class ExploreDebugRecorder:
             half_w = max(3, int(abs(float(size[0])) * scale * 0.5))
             half_h = max(3, int(abs(float(size[1])) * scale * 0.5))
             color = self._semantic_node_color(node)
+            is_target = self._node_matches_target(node, target_id)
+            if is_target:
+                color = (235, 35, 210)
             cv2.rectangle(
                 panel,
                 (center_px[0] - half_w, center_px[1] - half_h),
                 (center_px[0] + half_w, center_px[1] + half_h),
                 color,
-                2,
+                4 if is_target else 2,
                 cv2.LINE_AA,
             )
             cv2.putText(
                 panel,
-                f"{self._short_node_id(node)} {node.get('label', node.get('type', ''))}",
+                f"{'INTERACT ' if is_target else ''}{self._short_node_id(node)} {node.get('label', node.get('type', ''))}",
                 (center_px[0] + 3, center_px[1] - half_h - 3),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.30,
@@ -2157,6 +2417,7 @@ class ExploreDebugRecorder:
         semantic_selection: dict | None = None,
         semantic_execution_state: dict | None = None,
         semantic_behavior_feedback: dict | None = None,
+        semantic_decision_trace: dict | None = None,
         image_step: int | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 250, dtype=np.uint8)
@@ -2167,6 +2428,7 @@ class ExploreDebugRecorder:
             if semantic_selection is None
             else semantic_selection
         )
+        selected_target_id = _selection_target_id(semantic_selection)
         semantic_execution_state = (
             self.latest_semantic_execution_state
             if semantic_execution_state is None
@@ -2177,6 +2439,11 @@ class ExploreDebugRecorder:
             if semantic_behavior_feedback is None
             else semantic_behavior_feedback
         )
+        semantic_decision_trace = (
+            self.latest_semantic_decision_trace
+            if semantic_decision_trace is None
+            else semantic_decision_trace
+        )
         all_nodes = [
             node
             for node in graph.get("nodes") or []
@@ -2185,19 +2452,48 @@ class ExploreDebugRecorder:
         node_lookup = {node.get("id"): node for node in all_nodes}
         contains_edges = [edge for edge in graph.get("edges") or [] if edge.get("relation") == "contains"]
         contained_ids = {edge.get("dst_id") for edge in contains_edges}
+        direct_room_object_ids = {
+            edge.get("dst_id")
+            for edge in graph.get("edges") or []
+            if edge.get("relation") == "has_child"
+            and (node_lookup.get(edge.get("src_id")) or {}).get("type") == "room"
+            and (node_lookup.get(edge.get("dst_id")) or {}).get("type") == "object"
+        } - contained_ids
         selected = [
             node
             for node in all_nodes
-            if node.get("type") in {"room", "portal", "container"} or node.get("id") in contained_ids
+            if node.get("type") in {"room", "portal", "container"}
+            or node.get("id") in contained_ids
+            or node.get("id") in direct_room_object_ids
         ]
+        room_row = max(126, int(panel_height * 0.28))
+        available_hierarchy_height = max(72, panel_height - room_row - 48)
+        hierarchy_level_gap = max(36, min(62, available_hierarchy_height // 2))
+        portal_row = room_row + hierarchy_level_gap // 2
+        container_row = room_row + hierarchy_level_gap
+        object_row = min(panel_height - 48, room_row + hierarchy_level_gap * 2)
         slot_rows = {
-            "room": (int(panel_height * 0.22), 5),
-            "portal": (int(panel_height * 0.43), 7),
-            "container": (int(panel_height * 0.62), 6),
-            "object": (int(panel_height * 0.82), 8),
+            "room": (room_row, 5),
+            "portal": (portal_row, 7),
+            "container": (container_row, 6),
+            "object": (object_row, 8),
         }
         positions = {}
-        for node in sorted(selected, key=lambda item: str(item.get("id"))):
+        rooms = sorted(
+            (node for node in selected if node.get("type") == "room"),
+            key=lambda item: str(item.get("id")),
+        )
+        for index, node in enumerate(rooms):
+            positions[str(node.get("id"))] = (
+                int((index + 1) * panel_width / (len(rooms) + 1)),
+                slot_rows["room"][0],
+            )
+
+        regular_nodes = sorted(
+            (node for node in selected if node.get("type") not in {"room", "container", "object"}),
+            key=lambda item: str(item.get("id")),
+        )
+        for node in regular_nodes:
             node_id = str(node.get("id"))
             node_type = str(node.get("type", "object"))
             if node_id not in self.topology_slots:
@@ -2211,6 +2507,163 @@ class ExploreDebugRecorder:
             x = int((column + 1) * panel_width / (columns + 1))
             y = min(panel_height - 74, row_y + extra_row * 34)
             positions[node_id] = (x, y)
+
+        connected_portal_positions = portal_positions_between_rooms(
+            [node for node in regular_nodes if node.get("type") == "portal"],
+            graph.get("edges") or [],
+            {
+                node_id: position
+                for node_id, position in positions.items()
+                if str((node_lookup.get(node_id) or {}).get("type")) == "room"
+            },
+            vertical_offset_y=portal_row - room_row,
+        )
+        for node_id, (x, y) in connected_portal_positions.items():
+            positions[node_id] = (
+                max(20, min(panel_width - 20, x)),
+                max(124, min(panel_height - 74, y)),
+            )
+        connected_portal_ids = set(connected_portal_positions)
+
+        containers_by_room: dict[str, list[dict]] = {}
+        for node in selected:
+            if node.get("type") != "container":
+                continue
+            room_id = node.get("room_id")
+            parent_room_id = f"room_{int(room_id)}" if room_id is not None else str(node.get("parent_id") or "")
+            containers_by_room.setdefault(parent_room_id, []).append(node)
+        for room_node_id, containers in containers_by_room.items():
+            room_position = positions.get(room_node_id)
+            for index, node in enumerate(sorted(containers, key=lambda item: str(item.get("id")))):
+                if room_position is None:
+                    x = int((index + 1) * panel_width / (len(containers) + 1))
+                else:
+                    offset_index = index - (len(containers) - 1) * 0.5
+                    x = int(room_position[0] + offset_index * 42)
+                positions[str(node.get("id"))] = (
+                    max(24, min(panel_width - 24, x)),
+                    slot_rows["container"][0],
+                )
+
+        direct_objects_by_room: dict[str, list[dict]] = {}
+        direct_object_rows: dict[str, dict[int, list[str]]] = {}
+        for node in selected:
+            if node.get("id") not in direct_room_object_ids:
+                continue
+            room_id = node.get("room_id")
+            parent_room_id = (
+                f"room_{int(room_id)}"
+                if room_id is not None
+                else str(node.get("parent_id") or "")
+            )
+            direct_objects_by_room.setdefault(parent_room_id, []).append(node)
+        ordered_room_ids = [str(node.get("id")) for node in rooms]
+        for room_index, room_node_id in enumerate(ordered_room_ids):
+            objects = sorted(
+                direct_objects_by_room.get(room_node_id, []),
+                key=lambda item: str(item.get("id")),
+            )
+            if not objects:
+                continue
+            room_x = positions[room_node_id][0]
+            left_x = (
+                8
+                if room_index == 0
+                else (positions[ordered_room_ids[room_index - 1]][0] + room_x) // 2
+            )
+            right_x = (
+                panel_width - 8
+                if room_index + 1 == len(ordered_room_ids)
+                else (room_x + positions[ordered_room_ids[room_index + 1]][0]) // 2
+            )
+            usable_width = max(40, right_x - left_x - 12)
+            columns = max(1, min(4, usable_width // 44))
+            for index, node in enumerate(objects):
+                row = index // columns
+                column = index % columns
+                row_count = min(columns, len(objects) - row * columns)
+                x = int(left_x + (column + 1) * (right_x - left_x) / (row_count + 1))
+                y = min(panel_height - 28, object_row + row * 28)
+                node_id = str(node.get("id"))
+                positions[node_id] = (
+                    max(20, min(panel_width - 20, x)),
+                    y,
+                )
+                direct_object_rows.setdefault(room_node_id, {}).setdefault(y, []).append(node_id)
+
+        container_for_object = {
+            str(edge.get("dst_id")): str(edge.get("src_id"))
+            for edge in contains_edges
+        }
+        objects_by_container: dict[str, list[dict]] = {}
+        for node in selected:
+            if node.get("type") != "object":
+                continue
+            objects_by_container.setdefault(
+                container_for_object.get(str(node.get("id")), ""), []
+            ).append(node)
+        for container_id, objects in objects_by_container.items():
+            parent_position = positions.get(container_id)
+            for index, node in enumerate(sorted(objects, key=lambda item: str(item.get("id")))):
+                base_x = parent_position[0] if parent_position is not None else panel_width // 2
+                offset_index = index - (len(objects) - 1) * 0.5
+                positions[str(node.get("id"))] = (
+                    max(20, min(panel_width - 20, int(base_x + offset_index * 34))),
+                    slot_rows["object"][0],
+                )
+
+        display_ids = {}
+        duplicate_groups: dict[tuple[str, str], list[dict]] = {}
+        for node in selected:
+            base_id = self._short_node_id(node)
+            duplicate_groups.setdefault((str(node.get("type")), base_id), []).append(node)
+        for (_node_type, base_id), group in duplicate_groups.items():
+            for index, node in enumerate(sorted(group, key=lambda item: str(item.get("id")))):
+                suffix = chr(ord("a") + index) if len(group) > 1 else ""
+                display_ids[str(node.get("id"))] = f"{base_id}{suffix}"
+        portal_label_rows = {
+            str(node.get("id")): index % 2
+            for index, node in enumerate(
+                sorted(
+                    (node for node in selected if node.get("type") == "portal"),
+                    key=lambda item: positions.get(str(item.get("id")), (0, 0))[0],
+                )
+            )
+        }
+        for room_node_id, rows in direct_object_rows.items():
+            room_position = positions.get(room_node_id)
+            if room_position is None or not rows:
+                continue
+            bus_rows = sorted(rows)
+            cv2.line(
+                panel,
+                room_position,
+                (room_position[0], bus_rows[-1] - 10),
+                (175, 175, 175),
+                1,
+                cv2.LINE_AA,
+            )
+            for row_y in bus_rows:
+                object_positions = [
+                    positions[node_id]
+                    for node_id in rows[row_y]
+                    if node_id in positions
+                ]
+                if not object_positions:
+                    continue
+                bus_y = row_y - 10
+                min_x = min(room_position[0], *(position[0] for position in object_positions))
+                max_x = max(room_position[0], *(position[0] for position in object_positions))
+                cv2.line(panel, (min_x, bus_y), (max_x, bus_y), (175, 175, 175), 1, cv2.LINE_AA)
+                for object_position in object_positions:
+                    cv2.line(
+                        panel,
+                        (object_position[0], bus_y),
+                        object_position,
+                        (175, 175, 175),
+                        1,
+                        cv2.LINE_AA,
+                    )
         for edge in graph.get("edges") or []:
             src = positions.get(edge.get("src_id"))
             dst = positions.get(edge.get("dst_id"))
@@ -2234,21 +2687,74 @@ class ExploreDebugRecorder:
             if center is None:
                 continue
             color = self._semantic_node_color(node)
-            cv2.circle(panel, center, 13 if node.get("type") == "room" else 9, color, -1, cv2.LINE_AA)
-            if str(node.get("id") or "") == str(semantic_selection.get("target_id") or ""):
+            node_type = str(node.get("type") or "object")
+            radius = 13 if node_type == "room" else 6 if node_type == "object" else 9
+            cv2.circle(panel, center, radius, color, -1, cv2.LINE_AA)
+            ranked_group_ids = list(
+                semantic_decision_trace.get("model_ranked_group_ids") or []
+            )
+            candidate_groups = {
+                str(item.get("id") or ""): item
+                for item in semantic_decision_trace.get("candidate_groups") or []
+            }
+            ranked_node_ids = []
+            for group_id in ranked_group_ids[:3]:
+                group = candidate_groups.get(str(group_id)) or {}
+                ranked_node_ids.append(
+                    str(group.get("subject_id") or "")
+                )
+            node_id = str(node.get("id") or "")
+            if node_id in ranked_node_ids:
+                rank = ranked_node_ids.index(node_id)
+                rank_colors = [(0, 205, 255), (255, 150, 40), (150, 150, 150)]
                 cv2.circle(
                     panel,
                     center,
-                    17 if node.get("type") == "room" else 13,
-                    (20, 20, 20),
+                    (19 if node.get("type") == "room" else 15) + rank,
+                    rank_colors[rank],
                     2,
                     cv2.LINE_AA,
                 )
-            state = str((node.get("interaction") or {}).get("state", ""))
-            label = f"{self._short_node_id(node)} {node.get('label', node.get('type', ''))}"
-            if node.get("type") in {"portal", "container"} and state and state != "unknown":
+            if self._node_matches_target(node, selected_target_id):
+                cv2.circle(
+                    panel,
+                    center,
+                    19 if node.get("type") == "room" else 15,
+                    (235, 35, 210),
+                    3,
+                    cv2.LINE_AA,
+                )
+            state = str((node.get("interaction") or {}).get("state") or "unknown")
+            display_label = self._semantic_node_display_label(node)
+            if node.get("type") == "room":
+                label = display_label
+            else:
+                label = f"{display_ids.get(node_id, self._short_node_id(node))} {display_label}"
+            if node.get("type") in {"portal", "container"}:
                 label += f"[{state}]"
-            cv2.putText(panel, label[:18], (center[0] - 24, center[1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (30, 30, 30), 1, cv2.LINE_AA)
+            label_y = center[1] + 20
+            if node.get("type") == "portal" and node_id in connected_portal_ids:
+                label_y = center[1] + 17
+            elif node.get("type") == "portal":
+                label_y += 13 * portal_label_rows.get(node_id, 0)
+            if node_type == "object":
+                label = display_ids.get(node_id, self._short_node_id(node))
+                label_x = center[0] - 9
+                label_y = center[1] + 13
+                font_scale = 0.20
+            else:
+                label_x = center[0] - 30
+                font_scale = 0.26
+            cv2.putText(
+                panel,
+                label[:24],
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (30, 30, 30),
+                1,
+                cv2.LINE_AA,
+            )
         revision = int(graph.get("graph_revision", 0) or 0)
         legend = "ROOM -- PORTAL -- ROOM    CONTAINER --contains--> OBJECT"
         cv2.putText(panel, legend, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (75, 75, 75), 1, cv2.LINE_AA)
@@ -2262,22 +2768,47 @@ class ExploreDebugRecorder:
         behavior_type = str(semantic_selection.get("behavior_type") or "-")
         target_name = str(
             semantic_selection.get("target_name")
-            or semantic_selection.get("target_id")
+            or selected_target_id
             or "-"
         )
         feedback_status = str(semantic_behavior_feedback.get("status") or "-")
+        ranked_group_ids = list(
+            semantic_decision_trace.get("model_ranked_group_ids") or []
+        )
+        executed_group_id = str(
+            semantic_decision_trace.get("executed_group_id") or "-"
+        )
+        model_reason = str(semantic_decision_trace.get("model_reason") or "-")
+        candidate_groups = {
+            str(item.get("id") or ""): item
+            for item in semantic_decision_trace.get("candidate_groups") or []
+        }
+        executed_group = candidate_groups.get(executed_group_id) or {}
+        frontier_length = executed_group.get("frontier_length_m")
+        repeat_count = int(
+            ((executed_group.get("history") or {}).get("low_gain_repeat_count", 0))
+            or 0
+        )
+        model_latency = float(
+            (semantic_decision_trace.get("model_metrics") or {}).get(
+                "latency_sec", 0.0
+            )
+            or 0.0
+        )
         lines = [
             f"{execution_state}  {behavior_type}",
-            f"target={target_name}",
-            f"feedback={feedback_status}",
+            f"model={' > '.join(str(value) for value in ranked_group_ids[:3]) or '-'}",
+            f"exec={executed_group_id}  target={target_name}",
+            f"reason={model_reason}  feedback={feedback_status}",
+            f"frontier={frontier_length if frontier_length is not None else '-'}m repeat={repeat_count} t={model_latency:.2f}s",
         ]
         for index, text in enumerate(lines):
             cv2.putText(
                 panel,
                 text[:38],
-                (box_x + 6, box_y + 18 + index * 17),
+                (box_x + 6, box_y + 16 + index * 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.31,
+                0.27,
                 (25, 25, 25),
                 1,
                 cv2.LINE_AA,
@@ -2361,6 +2892,8 @@ class ExploreDebugRecorder:
                 semantic_selection = snapshot["semantic_selection"]
                 semantic_execution_state = snapshot["semantic_execution_state"]
                 semantic_behavior_feedback = snapshot["semantic_behavior_feedback"]
+                semantic_decision_trace = snapshot["semantic_decision_trace"]
+                route_plan = snapshot["route_plan"]
                 graph_revision = int(graph.get("graph_revision", 0) or 0)
                 pending_semantic_keyframe_revision = int(snapshot["pending_semantic_keyframe_revision"])
             selected_goal_values = list(semantic_selection.get("goal_xyyaw") or [])
@@ -2392,7 +2925,13 @@ class ExploreDebugRecorder:
             camera_frame = np.frombuffer(bytes(rgb), dtype=np.uint8).reshape((height, width, 3))
             camera_frame = cv2.resize(camera_frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
             if self.args.semantic_video:
-                self._draw_gt_observations_locked(camera_frame, width, height, gt_observations)
+                self._draw_gt_observations_locked(
+                    camera_frame,
+                    width,
+                    height,
+                    gt_observations,
+                    semantic_selection,
+                )
             occ_panel = None
             global_costmap_panel = None
             local_costmap_panel = None
@@ -2400,6 +2939,9 @@ class ExploreDebugRecorder:
             room_segment_panel = None
             semantic_spatial_panel = None
             semantic_topology_panel = None
+            occupancy_world_bounds = self._update_video_occupancy_world_bounds_locked(
+                map_grid
+            )
             if self.args.first_person_video_with_map:
                 occ_panel = self._render_video_map_panel_locked(
                     frame_width,
@@ -2418,6 +2960,9 @@ class ExploreDebugRecorder:
                     semantic_candidates=semantic_candidates,
                     semantic_selection=semantic_selection,
                     draw_semantic_candidates=True,
+                    route_plan=route_plan,
+                    draw_route_plan=True,
+                    world_bounds=occupancy_world_bounds,
                 )
                 costmap_left_width = max(1, frame_width // 2)
                 costmap_right_width = max(1, frame_width - costmap_left_width)
@@ -2481,7 +3026,9 @@ class ExploreDebugRecorder:
                     scene_rgb=scene_id_grid_rgb,
                     graph=graph,
                     observed_instance_ids=observed_instance_ids,
+                    semantic_selection=semantic_selection,
                     image_step=image_step,
+                    world_bounds=occupancy_world_bounds,
                 )
                 semantic_spatial_panel = self._render_semantic_spatial_panel_locked(
                     frame_width,
@@ -2491,7 +3038,9 @@ class ExploreDebugRecorder:
                     occupancy_rgb=map_base,
                     graph=graph,
                     observed_instance_ids=observed_instance_ids,
+                    semantic_selection=semantic_selection,
                     image_step=image_step,
+                    world_bounds=occupancy_world_bounds,
                 )
                 semantic_topology_panel = self._render_semantic_topology_panel_locked(
                     frame_width,
@@ -2502,6 +3051,7 @@ class ExploreDebugRecorder:
                     semantic_selection=semantic_selection,
                     semantic_execution_state=semantic_execution_state,
                     semantic_behavior_feedback=semantic_behavior_feedback,
+                    semantic_decision_trace=semantic_decision_trace,
                     image_step=image_step,
                 )
             dist_to_goal = (
@@ -3241,6 +3791,9 @@ class ExploreDebugRecorder:
         semantic_candidates: dict | None = None,
         semantic_selection: dict | None = None,
         draw_semantic_candidates: bool = False,
+        route_plan: dict | None = None,
+        draw_route_plan: bool = False,
+        world_bounds: tuple[float, float, float, float] | None = None,
     ):
         if cv2 is None or np is None:
             return None
@@ -3279,6 +3832,31 @@ class ExploreDebugRecorder:
         global_plan_poses = self._plan_poses_for_grid(grid, global_plan) if draw_global_plan else None
         local_global_plan_poses = self._plan_poses_for_grid(grid, local_global_plan) if draw_local_global_plan else None
         local_plan_poses = self._plan_poses_for_grid(grid, local_plan) if draw_local_plan else None
+        route_plan = route_plan or {}
+
+        def route_goal_in_grid(goal_values) -> tuple[float, float, float] | None:
+            values = list(goal_values or [])
+            if len(values) < 2:
+                return None
+            return self._transform_xy_yaw_to_frame(
+                float(values[0]),
+                float(values[1]),
+                float(values[2]) if len(values) > 2 else 0.0,
+                self.args.map_frame,
+                grid_frame,
+            )
+
+        route_subgoals_grid = []
+        if draw_route_plan:
+            for subgoal in route_plan.get("subgoals") or []:
+                transformed = route_goal_in_grid(subgoal.get("goal_xyyaw"))
+                if transformed is not None:
+                    route_subgoals_grid.append((subgoal, transformed))
+        interaction_goal_grid = (
+            route_goal_in_grid(route_plan.get("interaction_goal_xyyaw"))
+            if draw_route_plan
+            else None
+        )
         if pose_in_grid is not None:
             def prune_to_robot(plan_poses):
                 if not plan_poses:
@@ -3321,6 +3899,14 @@ class ExploreDebugRecorder:
             px = world_to_px(goal_in_grid[0], goal_in_grid[1])
             if px is not None:
                 points.append(px)
+        for _subgoal, route_goal in route_subgoals_grid:
+            px = world_to_px(route_goal[0], route_goal[1])
+            if px is not None:
+                points.append(px)
+        if interaction_goal_grid is not None:
+            px = world_to_px(interaction_goal_grid[0], interaction_goal_grid[1])
+            if px is not None:
+                points.append(px)
         if has_active_goal or draw_global_plan or draw_local_plan:
             plans = []
             if draw_global_plan:
@@ -3336,7 +3922,37 @@ class ExploreDebugRecorder:
                     px = world_to_px(float(pose[0]), float(pose[1]))
                     if px is not None:
                         points.append(px)
-        if points:
+        if world_bounds is not None:
+            bound_points = []
+            min_world_x, min_world_y, max_world_x, max_world_y = world_bounds
+            for world_x, world_y in (
+                (min_world_x, min_world_y),
+                (max_world_x, min_world_y),
+                (min_world_x, max_world_y),
+                (max_world_x, max_world_y),
+            ):
+                px = world_to_px(world_x, world_y)
+                if px is not None:
+                    bound_points.append(px)
+            if bound_points:
+                xs = [point[0] for point in bound_points]
+                ys = [point[1] for point in bound_points]
+                margin = max(
+                    8,
+                    int(
+                        self.args.video_map_crop_margin_px
+                        if crop_margin_px is None
+                        else crop_margin_px
+                    ),
+                )
+                min_x = max(0, min(xs) - margin)
+                min_y = max(0, min(ys) - margin)
+                max_x = min(width - 1, max(xs) + margin)
+                max_y = min(height - 1, max(ys) + margin)
+                setattr(self, bbox_attr, (min_x, min_y, max_x, max_y))
+            else:
+                min_x, min_y, max_x, max_y = 0, 0, width - 1, height - 1
+        elif points:
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
             margin = max(
@@ -3437,6 +4053,45 @@ class ExploreDebugRecorder:
         if draw_local_plan and local_plan_poses:
             plan_points = [to_panel(world_to_px(float(p[0]), float(p[1]))) for p in local_plan_poses]
             self._draw_cv_polyline(panel, [p for p in plan_points if p is not None], (240, 150, 20), 3)
+        if draw_route_plan:
+            for index, (subgoal, route_goal) in enumerate(route_subgoals_grid, start=1):
+                subgoal_px = to_panel(world_to_px(route_goal[0], route_goal[1]))
+                if subgoal_px is None:
+                    continue
+                cv2.circle(panel, subgoal_px, 5, (210, 105, 35), -1, cv2.LINE_AA)
+                cv2.circle(panel, subgoal_px, 7, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(
+                    panel,
+                    str(index),
+                    (subgoal_px[0] + 7, subgoal_px[1] - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.34,
+                    (45, 45, 45),
+                    1,
+                    cv2.LINE_AA,
+                )
+            if interaction_goal_grid is not None:
+                interaction_px = to_panel(
+                    world_to_px(interaction_goal_grid[0], interaction_goal_grid[1])
+                )
+                if interaction_px is not None:
+                    self._draw_cv_goal_arrow(
+                        panel,
+                        interaction_px,
+                        interaction_goal_grid[2],
+                        max(11, int(10 * scale)),
+                        color=(0, 140, 255),
+                    )
+                    cv2.putText(
+                        panel,
+                        "INTERACT",
+                        (interaction_px[0] + 8, interaction_px[1] + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.34,
+                        (0, 105, 220),
+                        1,
+                        cv2.LINE_AA,
+                    )
         if draw_semantic_candidates:
             semantic_candidates = semantic_candidates or {}
             semantic_selection = semantic_selection or {}
@@ -3482,9 +4137,10 @@ class ExploreDebugRecorder:
         if goal_in_grid is not None:
             goal_px = to_panel(world_to_px(goal_in_grid[0], goal_in_grid[1]))
             if goal_px is not None:
-                goal_color = candidate_color(
-                    str((semantic_selection or {}).get("behavior_type") or "NAVIGATE")
-                )
+                goal_behavior = str((semantic_selection or {}).get("behavior_type") or "NAVIGATE").upper()
+                if goal_behavior not in {"EXPLORE", "INTERACT", "NAVIGATE"}:
+                    goal_behavior = "NAVIGATE"
+                goal_color = candidate_color(goal_behavior)
                 self._draw_cv_goal_arrow(
                     panel,
                     goal_px,
@@ -5286,6 +5942,7 @@ class ExploreDebugRecorder:
                 "semantic_decision_selection": self.latest_semantic_selection,
                 "semantic_decision_execution_state": self.latest_semantic_execution_state,
                 "semantic_decision_behavior_feedback": self.latest_semantic_behavior_feedback,
+                "semantic_decision_trace": self.latest_semantic_decision_trace,
                 "semantic_graph_final": graph_final,
                 "semantic_events_jsonl": str(self.graph_dir / "graph_revision_events.jsonl"),
                 "semantic_keyframes": str(self.semantic_keyframe_dir),
@@ -5358,12 +6015,28 @@ def _parse_args() -> argparse.Namespace:
         default="/semantic_decision/selected_behavior",
     )
     parser.add_argument(
+        "--semantic-decision-trace-topic",
+        default="/semantic_decision/decision_trace",
+    )
+    parser.add_argument(
         "--semantic-execution-state-topic",
         default="/semantic_decision/execution_state",
     )
     parser.add_argument(
         "--semantic-behavior-feedback-topic",
         default="/semantic_decision/behavior_feedback",
+    )
+    parser.add_argument(
+        "--interaction-command-topic",
+        default="/semantic_decision/interaction_command",
+    )
+    parser.add_argument(
+        "--interaction-result-topic",
+        default="/semantic_decision/interaction_action_feedback",
+    )
+    parser.add_argument(
+        "--route-phase-topic",
+        default="/semantic_decision/route_phase",
     )
     parser.add_argument("--global-plan-topic", default="/move_base/GlobalPlanner/plan")
     parser.add_argument("--local-global-plan-topic", default="/move_base/DWAPlannerROS/global_plan")

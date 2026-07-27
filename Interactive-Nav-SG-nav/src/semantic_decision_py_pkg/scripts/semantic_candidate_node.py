@@ -62,9 +62,6 @@ class SemanticCandidateNode:
                 target_allow_connected_room=bool(
                     config.get("target_allow_connected_room", False)
                 ),
-                open_fraction_threshold=float(
-                    config.get("open_fraction_threshold", 0.67)
-                ),
                 target_require_visibility_verification=bool(
                     config.get("target_require_visibility_verification", True)
                 ),
@@ -76,9 +73,6 @@ class SemanticCandidateNode:
                 ),
                 target_min_consecutive_observations=int(
                     config.get("target_min_consecutive_observations", 2)
-                ),
-                drawer_sequence_enabled=bool(
-                    config.get("drawer_sequence_enabled", True)
                 ),
             )
         )
@@ -224,6 +218,9 @@ class SemanticCandidateNode:
                     explorer_input.get("frontier_exhausted", False)
                 ),
                 "proposal_count": int(explorer_input.get("proposal_count", 0) or 0),
+                "map_resolution": float(
+                    explorer_input.get("map_resolution", 0.0) or 0.0
+                ),
                 "observation_step": self.graph.get("capture_step"),
                 "source": "explore_py_proposals"
                 if self.has_proposal_stream

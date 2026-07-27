@@ -277,7 +277,7 @@ class RealtimeGTObservationPublisher:
         min_visible_pixels: int = 16,
         min_visible_fraction: float = 0.2,
         required_consecutive_observations: int = 2,
-        max_distance_m: float = 6.0,
+        max_distance_m: float = 4.0,
         step_interval: int = 3,
         queue_size: int = 1,
         async_processing: bool = True,
@@ -299,7 +299,6 @@ class RealtimeGTObservationPublisher:
         self.frame_index = 0
         self.next_instance_index = 1
         self.instance_ids: dict[str, str] = {}
-        self._qualified_streaks: dict[str, int] = {}
         self._episode_reset_pending = True
         self._cache_model_identity: int | None = None
         self._specs: list[_ObjectSpec] = []
@@ -319,7 +318,6 @@ class RealtimeGTObservationPublisher:
         self.frame_index = 0
         self.next_instance_index = 1
         self.instance_ids.clear()
-        self._qualified_streaks.clear()
         self._episode_reset_pending = True
         self._cache_model_identity = None
         self._specs = []
@@ -349,67 +347,34 @@ class RealtimeGTObservationPublisher:
             self._rospy.logwarn_throttle(2.0, "RealtimeGTObservationPublisher: camera %s not found", self.camera_name)
             return None
         self._ensure_cache(env)
-        render_t0 = time.perf_counter()
         try:
             segmentation = np.asarray(env.render_segmentation_frame(self.camera_name))[..., :2]
         except Exception as exc:
             self._rospy.logwarn_throttle(2.0, "Realtime GT segmentation failed: %s", exc)
             return None
-        render_ms = (time.perf_counter() - render_t0) * 1000.0
-
-        snapshot_t0 = time.perf_counter()
         visible = self._visible_instances(segmentation)
         model = env.current_model
         data = env.current_data
         camera = env.camera_manager.registry[self.camera_name]
         camera_position = np.asarray(camera.pos, dtype=np.float64).copy()
-        camera_forward = np.asarray(camera.forward, dtype=np.float64).copy()
-        camera_up = np.asarray(camera.up, dtype=np.float64).copy()
         image_size = [int(segmentation.shape[1]), int(segmentation.shape[0])]
         observations = []
-        qualified_sources = set()
-        for spec_index, visible_pixels, bbox_2d in visible:
+        for spec_index, _visible_pixels, bbox_2d, segmentation_mask in visible:
             spec = self._specs[spec_index]
             position = np.asarray(data.xpos[spec.body_id], dtype=np.float64).copy()
             distance_m = float(np.linalg.norm(position - camera_position))
             if self.max_distance_m > 0.0 and distance_m > self.max_distance_m:
                 continue
             center, size = _safe_body_aabb(model, data, spec.body_id)
-            visible_fraction, projected_bbox_2d = _visible_fraction(
-                bbox_2d,
-                camera_position,
-                camera_forward,
-                camera_up,
-                float(camera.fov),
-                image_size,
-                center,
-                size,
-            )
-            if visible_fraction <= self.min_visible_fraction:
-                continue
-            qualified_sources.add(spec.source_name)
-            streak = self._qualified_streaks.get(spec.source_name, 0) + 1
-            self._qualified_streaks[spec.source_name] = streak
-            if streak < self.required_consecutive_observations:
-                continue
             observations.append(
                 self._build_observation(
-                    env,
                     spec,
-                    visible_pixels,
                     bbox_2d,
-                    image_size,
-                    distance_m,
+                    segmentation_mask,
                     center,
                     size,
-                    visible_fraction,
-                    projected_bbox_2d,
-                    streak,
                 )
             )
-        for source_name in list(self._qualified_streaks):
-            if source_name not in qualified_sources:
-                self._qualified_streaks.pop(source_name, None)
         capture_stamp_sec = (
             float(stamp.to_sec()) if stamp is not None and hasattr(stamp, "to_sec") else time.time()
         )
@@ -419,26 +384,12 @@ class RealtimeGTObservationPublisher:
             "frame_index": int(self.frame_index),
             "capture_step": capture_step,
             "camera_name": self.camera_name,
-            "camera_pose_world": {
-                "position": camera_position.tolist(),
-                "forward": camera_forward.tolist(),
-                "up": camera_up.tolist(),
-                "fov_deg": float(camera.fov),
-            },
             "stamp_sec": capture_stamp_sec,
             "capture_stamp_sec": capture_stamp_sec,
             "source_mode": "realtime_gt_observation",
             "observation_performed": True,
             "image_size": image_size,
             "observations": observations,
-            "performance": {
-                "gt_render_ms": render_ms,
-                "gt_snapshot_ms": (time.perf_counter() - snapshot_t0) * 1000.0,
-                "visible_instance_count": len(visible),
-                "qualified_instance_count": len(qualified_sources),
-                "published_object_count": len(observations),
-                "dropped_payload_count": int(self.dropped_payload_count),
-            },
         }
         self._submit_payload(payload)
         self._episode_reset_pending = False
@@ -583,7 +534,9 @@ class RealtimeGTObservationPublisher:
             current = parent
         return None
 
-    def _visible_instances(self, segmentation: np.ndarray) -> list[tuple[int, int, list[int]]]:
+    def _visible_instances(
+        self, segmentation: np.ndarray
+    ) -> list[tuple[int, int, list[int], dict[str, list[int]]]]:
         if not self._specs or self._geom_to_spec.size == 0:
             return []
         geom_mask = segmentation[..., 1] == int(mujoco.mjtObj.mjOBJ_GEOM)
@@ -612,86 +565,40 @@ class RealtimeGTObservationPublisher:
         np.maximum.at(max_y, spec_indices, ys)
         result = []
         for spec_index in np.flatnonzero(counts >= self.min_visible_pixels):
+            instance_pixels = spec_indices == spec_index
             result.append(
                 (
                     int(spec_index),
                     int(counts[spec_index]),
                     [int(min_x[spec_index]), int(min_y[spec_index]), int(max_x[spec_index]), int(max_y[spec_index])],
+                    {
+                        "rows": ys[instance_pixels].astype(np.int32).tolist(),
+                        "cols": xs[instance_pixels].astype(np.int32).tolist(),
+                    },
                 )
             )
         return result
 
     def _build_observation(
         self,
-        env,
         spec: _ObjectSpec,
-        visible_pixels: int,
         bbox_2d: list[int],
-        image_size: list[int],
-        distance_m: float,
+        segmentation_mask: dict[str, list[int]],
         center: np.ndarray,
         size: np.ndarray,
-        visible_fraction: float,
-        projected_bbox_2d: list[float] | None,
-        consecutive_observations: int,
     ) -> dict[str, Any]:
-        model = env.current_model
-        data = env.current_data
-        joint_infos = self._joint_infos(model, data, spec.joint_names)
-        primary_joint = max(
-            joint_infos,
-            key=lambda item: abs(float(item["joint_range"][1]) - float(item["joint_range"][0])),
-            default={"joint_name": "", "joint_type": "none", "joint_range": [0.0, 0.0], "joint_value": None},
-        )
-        instance_id = self.instance_ids.get(spec.source_name)
-        if instance_id is None:
-            instance_id = f"gt_{self.next_instance_index:06d}"
-            self.next_instance_index += 1
-            self.instance_ids[spec.source_name] = instance_id
         metadata = spec.metadata
         category = "Door" if spec.is_door else metadata.get("category") or spec.source_name
-        interaction_approach_axis_xy = None
-        if spec.is_receptacle and spec.is_articulable:
-            interaction_approach_axis_xy = _interaction_approach_axis_xy(
-                model, data, joint_infos
-            )
         return {
-            "observation_id": f"{self.episode_id}_frame_{self.frame_index:06d}_{instance_id}",
-            "instance_id": instance_id,
-            "source_object_name": spec.source_name,
-            "name": spec.source_name,
-            "object_id": metadata.get("object_id"),
-            "asset_id": metadata.get("asset_id"),
-            "semantic_name": str(category),
-            "category": str(category),
-            "parent": spec.parent_source_name or None,
-            "confidence": 1.0,
-            "position": [float(value) for value in data.xpos[spec.body_id]],
-            "orientation": _quat_xyzw(data.xmat[spec.body_id]),
-            "interaction_approach_axis_xy": interaction_approach_axis_xy,
-            "aabb_center": [float(value) for value in center],
-            "aabb_size": [float(value) for value in size],
-            "distance_m": float(distance_m),
-            "is_door": spec.is_door,
-            "is_movable_door": bool(spec.is_door and spec.is_articulable),
-            "is_receptacle": spec.is_receptacle,
-            "is_articulable": spec.is_articulable,
-            "is_pickup_candidate": spec.is_pickup_candidate,
-            "joint_infos": joint_infos,
-            "primary_joint_name": primary_joint.get("joint_name", ""),
-            "joint_type": primary_joint.get("joint_type", "none"),
-            "joint_range": list(primary_joint.get("joint_range") or [0.0, 0.0]),
-            "joint_value": primary_joint.get("joint_value"),
-            "visible_pixels": int(visible_pixels),
-            "visible_fraction": float(visible_fraction),
-            "projected_bbox_2d": list(projected_bbox_2d or []),
-            "consecutive_observations": int(consecutive_observations),
+            "id": spec.source_name,
+            "name": str(category),
             "bbox_2d": list(bbox_2d),
-            "image_size": list(image_size),
-            "camera_name": self.camera_name,
-            "frame_index": int(self.frame_index),
-            "episode_id": self.episode_id,
-            "source": "realtime_gt",
+            "segmentation": dict(segmentation_mask),
+            "box_3d": {
+                "center": [float(value) for value in center],
+                "size": [float(value) for value in size],
+                "frame_id": "world",
+            },
         }
 
     @staticmethod
@@ -757,7 +664,6 @@ class RealtimeGTObservationPublisher:
         payload["processing_latency_ms"] = max(
             0.0, (payload["publish_stamp_sec"] - float(payload["capture_stamp_sec"])) * 1000.0
         )
-        payload["performance"]["gt_publish_ms"] = (time.perf_counter() - publish_t0) * 1000.0
         self.publisher.publish(self._String(data=json.dumps(payload, separators=(",", ":"))))
 
     def _clear_queue(self) -> None:

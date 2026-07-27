@@ -618,8 +618,8 @@ class RBY1(Robot):
 
         if robot_config.use_holo_base:
             spec.worldbody.add_site(name=f"{prefix}world", pos=[0, 0, 0.005], quat=[1, 0, 0, 0])
-            add_slider_act("base_x_act", 25, 25000, [0, -25000, 0.5], 0)
-            add_slider_act("base_y_act", 25, 25000, [0, -25000, 0.5], 1)
+            add_slider_act("base_x_act", 100, 25000, [0, -25000, 0.5], 0)
+            add_slider_act("base_y_act", 100, 25000, [0, -25000, 0.5], 1)
             add_slider_act("base_theta_act", np.pi, 5000, [0, -5000, 0.5], 5)
 
         # TODO(snehal): don't use bodies in the MJCF, just use visual geoms to render these

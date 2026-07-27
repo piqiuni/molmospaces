@@ -2,6 +2,8 @@ from explore_py_pkg.debug_semantic_viz import (
     candidate_overlays,
     interaction_state_color,
     latest_state_change,
+    portal_positions_between_rooms,
+    portal_room_node_ids,
     room_style_by_id,
     topology_edge_style,
     topology_edge_visible,
@@ -115,6 +117,43 @@ def test_topology_projection_only_keeps_interaction_hierarchy():
     assert not topology_edge_visible(
         {"src_id": "table", "dst_id": "chair", "relation": "supports"}, nodes
     )
+
+
+def test_portal_room_ids_combine_inferred_attributes_and_graph_edges():
+    portal = {
+        "id": "door",
+        "type": "portal",
+        "attributes": {"connected_room_ids": [2]},
+    }
+    edges = [
+        {"src_id": "door", "dst_id": "room_1", "relation": "connects"},
+        {"src_id": "room_2", "dst_id": "door", "relation": "adjacent_via"},
+    ]
+
+    assert portal_room_node_ids(portal, edges) == ["room_1", "room_2"]
+
+
+def test_connected_portal_is_positioned_between_its_rooms():
+    portals = [
+        {
+            "id": "door",
+            "type": "portal",
+            "attributes": {"connected_room_ids": [1, 2]},
+        }
+    ]
+
+    assert portal_positions_between_rooms(
+        portals,
+        [],
+        {"room_1": (100, 120), "room_2": (300, 120)},
+    ) == {"door": (200, 120)}
+
+    assert portal_positions_between_rooms(
+        portals,
+        [],
+        {"room_1": (100, 120), "room_2": (300, 120)},
+        vertical_offset_y=35,
+    ) == {"door": (200, 155)}
 
 
 def test_room_style_labels_include_unknown_and_confidence():

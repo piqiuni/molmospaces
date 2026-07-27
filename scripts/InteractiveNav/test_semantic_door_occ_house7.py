@@ -88,41 +88,16 @@ def root_observation(env, root_id, leaves):
     except Exception:
         center = data.xpos[root_id]
         size = [0.1, 0.1, 0.1]
-    joint_infos = []
-    for _door_name, door, hinge_index in leaves:
-        joint_infos.append(
-            {
-                "joint_name": str(door.joint_names[hinge_index]),
-                "joint_type": "hinge",
-                "joint_range": [float(value) for value in door.get_joint_range(hinge_index)],
-                "joint_value": float(door.get_joint_position(hinge_index)),
-            }
-        )
-    primary = joint_infos[0]
     return {
-        "observation_id": f"house7_{root_name}",
-        "instance_id": root_name,
-        "semantic_name": "door",
-        "category": "Door",
-        "confidence": 1.0,
-        "position": [float(value) for value in center],
-        "aabb_center": [float(value) for value in center],
-        "aabb_size": [float(value) for value in size],
-        "room_id": None,
-        "parent": None,
-        "children": [name for name, _door, _hinge in leaves],
-        "is_receptacle": False,
-        "is_pickup_candidate": False,
-        "is_articulable": True,
-        "is_door": True,
-        "is_movable_door": True,
-        "joint_infos": joint_infos,
-        "primary_joint_name": primary["joint_name"],
-        "joint_type": primary["joint_type"],
-        "joint_range": primary["joint_range"],
-        "joint_value": primary["joint_value"],
-        "source": "house7_integration_test",
-        "name": root_name,
+        "id": root_name,
+        "name": "Door",
+        "bbox_2d": [0, 0, 0, 0],
+        "segmentation": {"rows": [0], "cols": [0]},
+        "box_3d": {
+            "center": [float(value) for value in center],
+            "size": [float(value) for value in size],
+            "frame_id": "world",
+        },
     }
 
 
@@ -158,6 +133,19 @@ def run_group(env, root_id, leaves, args):
         closed_observation = root_observation(env, root_id, leaves)
         store = InteractionGraphStore(scene_id=f"house_{args.house_ind}")
         store.update_observations([closed_observation], source_mode="realtime_gt_observation")
+        initial_portal = next(
+            node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+        )
+        if initial_portal["interaction"]["state"] != "unknown":
+            raise AssertionError("GT observation unexpectedly supplied portal state")
+        store.update_interaction_result(
+            {
+                "object_id": closed_observation["id"],
+                "state": "closed",
+                "success": True,
+                "verification_source": "executor_state_verification",
+            }
+        )
         closed_graph = store.as_graph_dict()
         closed_portal = next(node for node in closed_graph["nodes"] if node["type"] == "portal")
         if closed_portal["interaction"]["state"] != "closed":
@@ -166,8 +154,8 @@ def run_group(env, root_id, leaves, args):
         overlay = SemanticOccupancyOverlay(clear_padding_m=args.clear_padding_m)
         overlay.update_graph(closed_graph)
         grid_info = make_grid_info(
-            closed_observation["aabb_center"],
-            closed_observation["aabb_size"],
+            closed_observation["box_3d"]["center"],
+            closed_observation["box_3d"]["size"],
             args.resolution,
         )
         raw = [100] * (int(grid_info.width) * int(grid_info.height))
@@ -178,6 +166,14 @@ def run_group(env, root_id, leaves, args):
         set_group_state(env, leaves, use_open_state=True)
         open_observation = root_observation(env, root_id, leaves)
         store.update_observations([open_observation], source_mode="realtime_gt_observation")
+        store.update_interaction_result(
+            {
+                "object_id": open_observation["id"],
+                "state": "open",
+                "success": True,
+                "verification_source": "executor_state_verification",
+            }
+        )
         open_graph = store.as_graph_dict()
         open_portal = next(node for node in open_graph["nodes"] if node["type"] == "portal")
         if open_portal["interaction"]["state"] != "open":
@@ -188,17 +184,15 @@ def run_group(env, root_id, leaves, args):
             raise AssertionError("Open portal did not clear its cached closed AABB")
 
         return {
-            "root_body_name": closed_observation["instance_id"],
+            "root_body_name": closed_observation["id"],
             "leaf_body_names": [name for name, _door, _hinge in leaves],
             "leaf_count": len(leaves),
             "closed_state": closed_portal["interaction"]["state"],
             "open_state": open_portal["interaction"]["state"],
-            "open_fraction": open_portal["interaction"].get("open_fraction"),
-            "closed_aabb_center": closed_observation["aabb_center"],
-            "closed_aabb_size": closed_observation["aabb_size"],
+            "closed_aabb_center": closed_observation["box_3d"]["center"],
+            "closed_aabb_size": closed_observation["box_3d"]["size"],
             "cleared_cells": int(open_stats["cleared_cells"]),
-            "joint_infos_closed": closed_observation["joint_infos"],
-            "joint_infos_open": open_observation["joint_infos"],
+            "state_source": open_portal["interaction"].get("state_source"),
         }
     finally:
         for original, (_door_name, door, hinge_index) in zip(originals, leaves):

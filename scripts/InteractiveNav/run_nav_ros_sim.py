@@ -699,7 +699,7 @@ def parse_args():
         "--realtime_gt_required_consecutive_observations", type=int, default=2
     )
     parser.add_argument("--realtime_gt_step_interval", type=int, default=3)
-    parser.add_argument("--realtime_gt_max_distance_m", type=float, default=6.0)
+    parser.add_argument("--realtime_gt_max_distance_m", type=float, default=4.0)
     parser.add_argument(
         "--step_frame_dir",
         type=str,
@@ -741,6 +741,12 @@ def parse_args():
     parser.add_argument("--force_interaction_close_all_containers_on_prepare", type=str_to_bool, nargs="?", const=True, default=False)
     parser.add_argument("--force_interaction_max_physics_substeps", type=int, default=3000)
     parser.add_argument("--force_interaction_open_fraction_threshold", type=float, default=0.95)
+    parser.add_argument(
+        "--force_interaction_execution_mode",
+        choices=["fast", "smooth"],
+        default=None,
+    )
+    parser.add_argument("--force_interaction_transition_steps", type=int, default=None)
     parser.add_argument(
         "--force_interaction_drawer_execution_mode",
         choices=["fast", "smooth"],
@@ -1087,6 +1093,8 @@ def main():
             ),
             close_all_doors_on_prepare=args.initial_door_state == "closed",
             close_all_containers_on_prepare=args.force_interaction_close_all_containers_on_prepare,
+            interaction_execution_mode=args.force_interaction_execution_mode,
+            interaction_transition_steps=args.force_interaction_transition_steps,
             drawer_execution_mode=args.force_interaction_drawer_execution_mode,
             drawer_transition_steps=args.force_interaction_drawer_transition_steps,
             drawer_observation_steps=args.force_interaction_drawer_observation_steps,

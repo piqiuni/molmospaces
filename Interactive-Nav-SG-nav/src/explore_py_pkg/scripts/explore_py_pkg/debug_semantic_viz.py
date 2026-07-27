@@ -129,6 +129,70 @@ def topology_edge_visible(
     return False
 
 
+def portal_room_node_ids(
+    portal: dict[str, Any],
+    edges: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """Return the room node IDs connected to a portal without relying on GT parents."""
+    room_ids: set[str] = set()
+    for room_id in (portal.get("attributes") or {}).get("connected_room_ids") or []:
+        text = str(room_id)
+        room_ids.add(text if text.startswith("room_") else f"room_{text}")
+
+    portal_id = str(portal.get("id") or "")
+    for edge in edges or []:
+        if str(edge.get("relation") or "") not in {"connects", "adjacent_via"}:
+            continue
+        src_id = str(edge.get("src_id") or "")
+        dst_id = str(edge.get("dst_id") or "")
+        if src_id == portal_id and dst_id.startswith("room_"):
+            room_ids.add(dst_id)
+        elif dst_id == portal_id and src_id.startswith("room_"):
+            room_ids.add(src_id)
+    return sorted(room_ids)
+
+
+def portal_positions_between_rooms(
+    portals: list[dict[str, Any]],
+    edges: list[dict[str, Any]] | None,
+    room_positions: dict[str, tuple[int, int]],
+    spacing: float = 24.0,
+    vertical_offset_y: float = 0.0,
+) -> dict[str, tuple[int, int]]:
+    """Place connected portals between rooms, optionally half a level lower."""
+    portals_by_room_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for portal in portals:
+        connected_rooms = [
+            room_id
+            for room_id in portal_room_node_ids(portal, edges)
+            if room_id in room_positions
+        ]
+        if len(connected_rooms) < 2:
+            continue
+        pair = tuple(sorted(connected_rooms[:2]))
+        portals_by_room_pair.setdefault(pair, []).append(portal)
+
+    result = {}
+    for room_pair, paired_portals in portals_by_room_pair.items():
+        first = room_positions[room_pair[0]]
+        second = room_positions[room_pair[1]]
+        midpoint_x = (first[0] + second[0]) * 0.5
+        midpoint_y = (first[1] + second[1]) * 0.5 + float(vertical_offset_y)
+        delta_x = float(second[0] - first[0])
+        delta_y = float(second[1] - first[1])
+        length = max(1.0, (delta_x * delta_x + delta_y * delta_y) ** 0.5)
+        perpendicular_x = -delta_y / length
+        perpendicular_y = delta_x / length
+        ordered_portals = sorted(paired_portals, key=lambda item: str(item.get("id")))
+        for index, portal in enumerate(ordered_portals):
+            offset = (index - (len(ordered_portals) - 1) * 0.5) * float(spacing)
+            result[str(portal.get("id"))] = (
+                int(midpoint_x + perpendicular_x * offset),
+                int(midpoint_y + perpendicular_y * offset),
+            )
+    return result
+
+
 def latest_state_change(events: list[dict[str, Any]] | None) -> dict[str, Any] | None:
     for event in reversed(events or []):
         if str(event.get("event") or "") == "STATE_CHANGED":

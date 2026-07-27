@@ -49,6 +49,35 @@ def joint_open_fraction(value: float, joint_range) -> float:
     return float(np.clip(abs(float(value) - closed) / span, 0.0, 1.0))
 
 
+def merge_door_leaf_joint_records(
+    discovered_leaves: list[dict[str, Any]],
+    root_joints: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    leaves = [dict(leaf) for leaf in discovered_leaves]
+    known_joint_names = {str(leaf["hinge_joint_name"]) for leaf in leaves}
+    for joint in root_joints:
+        joint_name = str(joint["joint_name"])
+        searchable = f"{joint_name} {joint.get('body_name', '')}".casefold()
+        if (
+            joint_name in known_joint_names
+            or "door" not in searchable
+            or "handle" in searchable
+            or "knob" in searchable
+        ):
+            continue
+        leaves.append(
+            {
+                "leaf_body_name": str(joint.get("body_name") or ""),
+                "hinge_joint_index": None,
+                "hinge_joint_name": joint_name,
+                "joint_range": list(joint["joint_range"]),
+                "joint_id": int(joint["joint_id"]),
+            }
+        )
+        known_joint_names.add(joint_name)
+    return leaves
+
+
 def collect_door_root_groups(env) -> dict[str, dict[str, Any]]:
     model = env.current_model
     data = env.current_data
@@ -81,7 +110,17 @@ def collect_door_root_groups(env) -> dict[str, dict[str, Any]]:
                 "hinge_joint_index": hinge_index,
                 "hinge_joint_name": joint_name,
                 "joint_range": joint_range,
+                "joint_id": int(
+                    mujoco.mj_name2id(
+                        model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
+                    )
+                ),
             }
+        )
+    for group in groups.values():
+        group["leaves"] = merge_door_leaf_joint_records(
+            group["leaves"],
+            _root_joint_records(model, int(group["root_body_id"])),
         )
     return {
         str(group["root_body_name"]): group
@@ -98,12 +137,14 @@ def _set_all_door_roots_state(env, state: str) -> list[dict[str, Any]]:
     for root_name, group in groups.items():
         leaf_transitions = []
         for leaf in group["leaves"]:
-            door = Door(leaf["leaf_body_name"], env.current_data)
-            hinge_index = int(leaf["hinge_joint_index"])
-            before = float(door.get_joint_position(hinge_index))
+            joint_id = int(leaf["joint_id"])
+            qpos_addr = int(env.current_model.jnt_qposadr[joint_id])
+            dof_addr = int(env.current_model.jnt_dofadr[joint_id])
+            before = float(env.current_data.qpos[qpos_addr])
             closed, opened = joint_closed_open_values(leaf["joint_range"])
             target = closed if normalized_state == "closed" else opened
-            door.set_joint_position(hinge_index, target)
+            env.current_data.qpos[qpos_addr] = target
+            env.current_data.qvel[dof_addr] = 0.0
             leaf_transitions.append(
                 {
                     **leaf,
@@ -119,6 +160,23 @@ def _set_all_door_roots_state(env, state: str) -> list[dict[str, Any]]:
             }
         )
     mujoco.mj_forward(env.current_model, env.current_data)
+    for transition in transitions:
+        for leaf in transition["leaf_transitions"]:
+            joint_id = int(leaf["joint_id"])
+            qpos_addr = int(env.current_model.jnt_qposadr[joint_id])
+            value = float(env.current_data.qpos[qpos_addr])
+            leaf["after"] = value
+            leaf["open_fraction"] = joint_open_fraction(
+                value, leaf["joint_range"]
+            )
+        transition["state_verified"] = all(
+            (
+                float(leaf["open_fraction"]) <= 0.05
+                if normalized_state == "closed"
+                else float(leaf["open_fraction"]) >= 0.95
+            )
+            for leaf in transition["leaf_transitions"]
+        )
     return transitions
 
 
@@ -183,6 +241,7 @@ def _root_joint_records(model, root_body_id: int) -> list[dict[str, Any]]:
                 "joint_type": "slide" if joint_type == mujoco.mjtJoint.mjJNT_SLIDE else "hinge",
                 "joint_range": [float(value) for value in model.jnt_range[joint_id]],
                 "joint_id": int(joint_id),
+                "body_name": str(model.body(body_id).name or ""),
             }
         )
     return records
@@ -250,7 +309,7 @@ def collect_articulation_groups(env) -> dict[str, dict[str, Any]]:
                 *(str(leaf["leaf_body_name"]) for leaf in door_group["leaves"]),
             }
         )
-        group["joints"] = [
+        discovered_door_joints = [
             {
                 "joint_name": str(leaf["hinge_joint_name"]),
                 "joint_type": "hinge",
@@ -264,6 +323,20 @@ def collect_articulation_groups(env) -> dict[str, dict[str, Any]]:
                 ),
             }
             for leaf in door_group["leaves"]
+        ]
+        existing_joint_names = {
+            str(joint["joint_name"]) for joint in group["joints"]
+        }
+        group["joints"].extend(
+            joint
+            for joint in discovered_door_joints
+            if str(joint["joint_name"]) not in existing_joint_names
+        )
+        group["joints"] = [
+            joint
+            for joint in group["joints"]
+            if "handle" not in str(joint["joint_name"]).casefold()
+            and "knob" not in str(joint["joint_name"]).casefold()
         ]
     result = {}
     for group in groups.values():
@@ -638,6 +711,80 @@ def complete_articulation_force(
     }
 
 
+def finalize_articulation_force_transition(
+    env,
+    plan: dict[str, Any],
+    *,
+    physics_substeps: int,
+    task_steps_consumed: int,
+    atomic_fallback: bool,
+    transition_log: list[dict[str, Any]] | None = None,
+    config: ForceDriveConfig | None = None,
+) -> dict[str, Any]:
+    """Summarize a task-step articulation transition without another force pulse."""
+    config = config or ForceDriveConfig()
+    model = env.current_model
+    data = env.current_data
+    force_specs = _build_force_specs(model, plan["targets"])
+    post_infos = _joint_infos_for_group(model, data, list(plan["group"]["joints"]))
+    selected = set(plan["selected_joint_names"])
+    closed = set(plan["closed_joint_names"])
+    open_success = bool(selected) and all(
+        float(info["open_fraction"]) >= float(config.open_fraction_threshold)
+        for info in post_infos
+        if info["joint_name"] in selected
+    )
+    close_success = all(
+        float(info["open_fraction"]) <= 1.0 - float(config.open_fraction_threshold)
+        for info in post_infos
+        if info["joint_name"] in closed
+    )
+    pre_max = max(
+        (float(info["open_fraction"]) for info in plan["pre_joint_infos"]),
+        default=0.0,
+    )
+    post_selected = [info for info in post_infos if info["joint_name"] in selected]
+    post_min = min(
+        (float(info["open_fraction"]) for info in post_selected),
+        default=0.0,
+    )
+    joints = []
+    for spec in force_specs:
+        info = next(item for item in post_infos if item["joint_name"] == spec["joint_name"])
+        joints.append(
+            {
+                **info,
+                "target_value": float(spec["target_value"]),
+                "final_value": float(info["joint_value"]),
+                "final_error": float(spec["target_value"] - info["joint_value"]),
+                "reached_target": abs(float(spec["target_value"] - info["joint_value"]))
+                <= config.position_tolerance,
+            }
+        )
+    success = bool(open_success and close_success)
+    return {
+        "method": "xfrc_applied_group_pd_task_steps",
+        "success": success,
+        "physical_success": bool(success and not atomic_fallback),
+        "atomic_fallback": bool(atomic_fallback),
+        "physics_substeps": int(physics_substeps),
+        "task_steps_consumed": max(1, int(task_steps_consumed)),
+        "stable_substeps": 0,
+        "drive": {
+            "mode": "task_step_transition",
+            "transitions": list(transition_log or []),
+        },
+        "joints": joints,
+        "pre_joint_infos": plan["pre_joint_infos"],
+        "joint_infos": post_infos,
+        "selected_joint_names": list(plan["selected_joint_names"]),
+        "closed_joint_names": list(plan["closed_joint_names"]),
+        "pre_state": "closed" if pre_max <= 0.10 else "ajar",
+        "post_state": "open" if post_min >= float(config.open_fraction_threshold) else "ajar",
+        "config": asdict(config),
+    }
+
+
 def advance_articulation_force(
     env,
     plan: dict[str, Any],
@@ -706,8 +853,10 @@ def set_all_articulations_closed(env, include_doors: bool = True) -> list[dict[s
         for joint in group["joints"]:
             joint_id = int(joint["joint_id"])
             qpos_addr = int(model.jnt_qposadr[joint_id])
+            dof_addr = int(model.jnt_dofadr[joint_id])
             closed, _opened = joint_closed_open_values(joint["joint_range"])
             data.qpos[qpos_addr] = closed
+            data.qvel[dof_addr] = 0.0
         transitions.append(
             {
                 "root_body_name": str(group["root_body_name"]),
@@ -718,6 +867,28 @@ def set_all_articulations_closed(env, include_doors: bool = True) -> list[dict[s
             }
         )
     mujoco.mj_forward(model, data)
+    groups_by_root = {
+        int(group["root_body_id"]): group for group in groups.values()
+    }
+    for transition in transitions:
+        root_name = str(transition["root_body_name"])
+        group = next(
+            (
+                candidate
+                for candidate in groups_by_root.values()
+                if str(candidate["root_body_name"]) == root_name
+            ),
+            None,
+        )
+        after = (
+            _joint_infos_for_group(model, data, group["joints"])
+            if group is not None
+            else []
+        )
+        transition["after_joint_infos"] = after
+        transition["closed_state_verified"] = bool(after) and all(
+            float(info["open_fraction"]) <= 0.05 for info in after
+        )
     return transitions
 
 
