@@ -780,6 +780,52 @@ def test_interaction_result_updates_planner_fields():
     assert len(portal["interaction"]["operation_history"]) == 1
 
 
+def test_non_articulated_portal_feedback_persists_static_capability() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorframe = observation(
+        instance_id="doorframe_static_1",
+        semantic_name="doorframe",
+        is_door=False,
+        is_articulable=False,
+    )
+    doorframe["source_object_name"] = "doorframe_static_1"
+    store.update_observations(
+        [doorframe], source_mode="realtime_gt_observation", stamp=1.0
+    )
+    assert store.update_interaction_result(
+        {
+            "source_object_name": "doorframe_static_1",
+            "event_id": "static_feedback",
+            "state": "static",
+            "success": False,
+            "reason": "non_articulated",
+            "interaction_capability": "static",
+            "interactable": False,
+        },
+        stamp=2.0,
+    )
+    store.update_observations(
+        [doorframe], source_mode="realtime_gt_observation", stamp=3.0
+    )
+
+    graph = store.as_graph_dict(stamp=3.0)
+    portal = next(
+        node for node in graph["nodes"]
+        if node["id"] == "portal_doorframe_static_1"
+    )
+    assert portal["type"] == "portal"
+    assert portal["interaction"]["state"] == "static"
+    assert portal["interaction"]["is_interactable"] is False
+    assert portal["interaction"]["requires_interaction"] is False
+    assert portal["interaction"]["interaction_mode"] == "none"
+    assert portal["interaction"]["capability"] == "static"
+    navigation_hint = next(
+        hint for hint in graph["views"]["navigation_view"]["hints"]
+        if hint["node_id"] == "portal_doorframe_static_1"
+    )
+    assert navigation_hint["requires_interaction"] is False
+
+
 def test_interaction_result_can_match_source_name_and_is_idempotent_by_event_id():
     store = InteractionGraphStore(scene_id="test_scene")
     closed = observation(
@@ -1092,7 +1138,7 @@ def test_house2_dresser_does_not_contain_pencil_on_top() -> None:
     assert ("container_dresser_1", "contains", "object_pencil_1") not in relations
 
 
-def test_container_joint_interaction_memory_survives_later_observations() -> None:
+def test_container_interaction_group_memory_survives_later_observations() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     dresser = observation(
         instance_id="dresser_1",
@@ -1125,7 +1171,7 @@ def test_container_joint_interaction_memory_survives_later_observations() -> Non
     store.update_observations([dresser], source_mode="realtime_gt_observation")
     node = next(node for node in store.as_graph_dict()["nodes"] if node["id"] == node_id)
     assert node["interaction"]["completed_interaction_groups"] == ["drawer:top"]
-    assert node["interaction"]["joint_interaction_states"]["top"]["status"] == "opened"
+    assert "joint_interaction_states" not in node["interaction"]
     assert node["interaction"]["state"] == "ajar"
 
     assert store.update_interaction_result(
@@ -1142,7 +1188,7 @@ def test_container_joint_interaction_memory_survives_later_observations() -> Non
         }
     )
     node = next(node for node in store.as_graph_dict()["nodes"] if node["id"] == node_id)
-    assert node["interaction"]["all_joints_opened_once"] is True
+    assert node["interaction"]["all_interaction_groups_completed"] is True
     assert node["interaction"]["state"] == "open"
 
 

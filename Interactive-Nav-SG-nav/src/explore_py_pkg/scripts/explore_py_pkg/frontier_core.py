@@ -53,6 +53,7 @@ class FrontierCluster:
     subgoal_yaw: float
     information_gain: float
     distance_to_robot: float
+    unknown_component_area_m2: float = 0.0
     score: float = 0.0
     score_terms: dict[str, float] = field(default_factory=dict)
 
@@ -66,6 +67,7 @@ class FrontierConfig:
     connect_8: bool = True
     candidate_top_k: int = 12
     sensor_range_m: float = 5.0
+    unknown_component_radius_m: float = 5.0
     subgoal_search_radius_cells: int = 8
     min_subgoal_distance_m: float = 0.75
     hard_min_subgoal_distance_m: float = 0.50
@@ -288,7 +290,52 @@ class FrontierExplorerCore:
             subgoal_yaw=subgoal_yaw,
             information_gain=float(len(cells)),
             distance_to_robot=dist,
+            unknown_component_area_m2=self._unknown_component_area_m2(
+                grid, cells, centroid_cell=(cx, cy)
+            ),
         )
+
+    def _unknown_component_area_m2(
+        self,
+        grid: OccupancyGridData,
+        frontier_cells: list[tuple[int, int]],
+        centroid_cell: tuple[float, float],
+    ) -> float:
+        """Measure bounded connected unknown space touching a frontier cluster."""
+        resolution = max(float(grid.spec.resolution), 1e-6)
+        radius_cells = max(
+            1,
+            int(ceil(float(self.config.unknown_component_radius_m) / resolution)),
+        )
+        center_x, center_y = centroid_cell
+
+        def inside_window(cell: tuple[int, int]) -> bool:
+            return hypot(cell[0] - center_x, cell[1] - center_y) <= radius_cells
+
+        seeds = {
+            neighbor
+            for cell in frontier_cells
+            for neighbor in self._neighbors4(*cell)
+            if grid.spec.in_bounds(*neighbor)
+            and inside_window(neighbor)
+            and self._is_unknown(grid.cell(*neighbor))
+        }
+        visited: set[tuple[int, int]] = set()
+        queue = list(seeds)
+        while queue:
+            cell = queue.pop()
+            if cell in visited:
+                continue
+            visited.add(cell)
+            for neighbor in self._neighbors4(*cell):
+                if (
+                    neighbor not in visited
+                    and grid.spec.in_bounds(*neighbor)
+                    and inside_window(neighbor)
+                    and self._is_unknown(grid.cell(*neighbor))
+                ):
+                    queue.append(neighbor)
+        return float(len(visited)) * resolution * resolution
 
     def _choose_subgoal_cell(
         self,

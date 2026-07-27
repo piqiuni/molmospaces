@@ -95,6 +95,7 @@ frontier:
   connect_8: true
   candidate_top_k: 12
   sensor_range_m: 5.0
+  unknown_component_radius_m: 5.0
   subgoal_search_radius_cells: 18
   min_subgoal_distance_m: 1.00
   hard_min_subgoal_distance_m: 0.50

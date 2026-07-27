@@ -179,6 +179,16 @@ class AtomicForceInteractionController:
                 ),
                 close_other_joints=bool(command.get("close_other_joints", False)),
             )
+            if not bool(plan.get("supported", True)):
+                return self._publish_unsupported_interaction(
+                    command,
+                    step=step,
+                    reason=str(plan.get("reason") or "interaction_unsupported"),
+                    interaction_capability=str(
+                        plan.get("interaction_capability") or "unsupported"
+                    ),
+                    view_result=view_result,
+                )
             execution_mode = str(
                 command.get("interaction_execution_mode")
                 or self.interaction_execution_mode
@@ -236,6 +246,73 @@ class AtomicForceInteractionController:
         except Exception:
             self._commands.task_done()
             raise
+
+    def _publish_unsupported_interaction(
+        self,
+        command: dict[str, Any],
+        *,
+        step: int,
+        reason: str,
+        interaction_capability: str,
+        view_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        event_id = str(
+            command.get("event_id") or f"interaction_{self._event_index:06d}"
+        )
+        self._event_index += 1
+        stamp_sec = time.time()
+        result = {
+            "event_id": event_id,
+            "command_id": str(command["command_id"]),
+            "candidate_id": str(command.get("candidate_id") or ""),
+            "decision_id": str(command.get("decision_id") or ""),
+            "node_id": str(command.get("node_id") or ""),
+            "source_object_name": str(command["source_object_name"]),
+            "action": "open",
+            "interaction_mode": "none",
+            "interaction_group_id": str(
+                command.get("interaction_group_id") or "all"
+            ),
+            "interaction_capability": str(interaction_capability),
+            "interactable": False,
+            "state": "static",
+            "success": False,
+            "status": "FAILED",
+            "reason": str(reason),
+            "confidence": 1.0,
+            "execution_cost": 0.0,
+            "sim_steps_consumed": 0,
+            "physics_substeps": 0,
+            "task_steps_consumed": 0,
+            "result_published_step": int(step),
+            "source": "force_interaction_capability_check",
+            "verification_source": "mujoco_articulation_registry",
+            "view_profile": str(command.get("view_profile") or "default"),
+            "view_profile_result": view_result,
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        feedback = {
+            "command_id": result["command_id"],
+            "candidate_id": result["candidate_id"],
+            "decision_id": result["decision_id"],
+            "event_id": event_id,
+            "behavior_type": "INTERACT",
+            "status": "FAILED",
+            "success": False,
+            "reason": str(reason),
+            "interaction_result": result,
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        self._events.append({"result": result, "feedback": feedback})
+        self._force_observation_requested = True
+        self._pause_navigation = False
+        self._publish(self._result_publisher, result)
+        self._publish(self._feedback_publisher, feedback)
+        self._write_snapshot()
+        self._commands.task_done()
+        return result
 
     def after_step(self, task, step: int) -> dict[str, Any] | None:
         pending = self._pending

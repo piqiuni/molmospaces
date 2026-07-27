@@ -11,6 +11,7 @@ for path in (REPO_ROOT, SCRIPT_ROOT):
         sys.path.insert(0, str(path))
 
 from scripts.InteractiveNav.force_interaction_bridge import AtomicForceInteractionController
+from scripts.InteractiveNav import force_interaction_runtime
 
 
 def test_controller_emits_success_result_and_behavior_feedback(monkeypatch) -> None:
@@ -75,6 +76,64 @@ def test_controller_deduplicates_command_ids() -> None:
     }
     assert controller.enqueue_command(command)
     assert not controller.enqueue_command(command)
+
+
+def test_non_articulated_object_returns_static_failure_without_crashing(
+    monkeypatch,
+) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    published = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, root_name, **_kwargs: {
+            "supported": False,
+            "reason": "non_articulated",
+            "interaction_capability": "static",
+            "object_name": root_name,
+        },
+    )
+    monkeypatch.setattr(
+        controller, "_publish", lambda _publisher, payload: published.append(payload)
+    )
+    assert controller.enqueue_command(
+        {
+            "command_id": "static_doorframe",
+            "candidate_id": "portal_doorframe",
+            "node_id": "portal_doorframe",
+            "source_object_name": "doorframe_static_1",
+            "action": "open",
+        }
+    )
+
+    result = controller.before_step(
+        SimpleNamespace(env=SimpleNamespace()), step=9
+    )
+
+    assert result is not None
+    assert result["status"] == "FAILED"
+    assert result["reason"] == "non_articulated"
+    assert result["interaction_capability"] == "static"
+    assert result["interactable"] is False
+    assert len(published) == 2
+    assert published[1]["interaction_result"] == result
+
+
+def test_prepare_articulation_force_reports_missing_group_as_static(monkeypatch) -> None:
+    monkeypatch.setattr(
+        force_interaction_runtime, "collect_articulation_groups", lambda _env: {}
+    )
+
+    plan = force_interaction_runtime.prepare_articulation_force(
+        SimpleNamespace(), "doorframe_static_1"
+    )
+
+    assert plan == {
+        "supported": False,
+        "reason": "non_articulated",
+        "interaction_capability": "static",
+        "object_name": "doorframe_static_1",
+        "available_object_names": [],
+    }
 
 
 def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(

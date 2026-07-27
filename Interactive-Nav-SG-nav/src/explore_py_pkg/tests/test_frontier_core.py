@@ -69,6 +69,26 @@ def test_extracts_frontier_clusters_from_occ_only():
     assert all(grid.cell(*cluster.subgoal_cell) == 0 for cluster in clusters)
 
 
+def test_unknown_component_area_counts_connected_unknown_cells_in_metric_area():
+    width = height = 7
+    data = [100] * (width * height)
+    data[2 * width + 2] = 0
+    for x, y in ((3, 2), (4, 2), (4, 3)):
+        data[y * width + x] = -1
+    grid = OccupancyGridData(
+        GridSpec(width, height, 0.5, 0.0, 0.0, "map"), data
+    )
+    core = FrontierExplorerCore(
+        FrontierConfig(unknown_component_radius_m=4.0)
+    )
+
+    area_m2 = core._unknown_component_area_m2(
+        grid, [(2, 2)], centroid_cell=(2.0, 2.0)
+    )
+
+    assert math.isclose(area_m2, 0.75)
+
+
 def test_subgoal_is_not_robot_current_cell_when_min_distance_is_set():
     grid = make_grid(12, 12, (2, 2, 10, 10))
     core = FrontierExplorerCore(FrontierConfig(min_cluster_cells=2, min_subgoal_distance_m=1.5))

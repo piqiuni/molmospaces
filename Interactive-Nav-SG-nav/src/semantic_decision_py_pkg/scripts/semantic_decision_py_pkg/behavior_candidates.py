@@ -9,6 +9,33 @@ BEHAVIOR_EXPLORE = "EXPLORE"
 BEHAVIOR_INTERACT = "INTERACT"
 BEHAVIOR_NAVIGATE = "NAVIGATE"
 
+SPATIAL_CONTEXT_LABELS = {
+    "bed",
+    "bathtub",
+    "cabinet",
+    "counter",
+    "countertop",
+    "couch",
+    "desk",
+    "dishwasher",
+    "dresser",
+    "fridge",
+    "microwave",
+    "nightstand",
+    "oven",
+    "rack",
+    "refrigerator",
+    "shelf",
+    "shower",
+    "sink",
+    "sofa",
+    "stove",
+    "table",
+    "toilet",
+    "tv",
+    "wardrobe",
+}
+
 
 def joint_closed_open_values(joint_range: list[float]) -> tuple[float, float]:
     lower, upper = float(joint_range[0]), float(joint_range[1])
@@ -131,6 +158,7 @@ class CandidateGenerator:
             candidates.extend(
                 self._target_candidates(graph or {}, robot_xy, target_context or {})
             )
+        self._attach_spatial_context(candidates, graph or {})
         return sorted(candidates, key=lambda candidate: candidate.candidate_id)
 
     def _target_candidates(
@@ -424,6 +452,11 @@ class CandidateGenerator:
                 key=lambda proposal: (
                     -float(
                         (proposal.get("raw_features") or {}).get(
+                            "unknown_component_area_m2", 0.0
+                        )
+                    ),
+                    -float(
+                        (proposal.get("raw_features") or {}).get(
                             "information_gain", 0.0
                         )
                     ),
@@ -435,11 +468,16 @@ class CandidateGenerator:
             )
         else:
             proposals.sort(
-                key=lambda proposal: float(proposal.get("score", 0.0)),
-                reverse=True,
+                key=lambda proposal: (
+                    -float(proposal.get("unknown_component_area_m2", 0.0) or 0.0),
+                    -float(proposal.get("information_gain", 0.0) or 0.0),
+                    float(proposal.get("distance_to_robot", 0.0) or 0.0),
+                    str(proposal.get("cluster_id") or ""),
+                )
             )
         proposals = proposals[: max(0, int(self.config.max_frontier_candidates))]
         raw_information = []
+        raw_unknown_areas = []
         for proposal in proposals:
             value = (
                 (proposal.get("raw_features") or {}).get("information_gain", 0.0)
@@ -447,10 +485,21 @@ class CandidateGenerator:
                 else proposal.get("information_gain", 0.0)
             )
             raw_information.append(max(0.0, float(value or 0.0)))
+            area_value = (
+                (proposal.get("raw_features") or {}).get(
+                    "unknown_component_area_m2", 0.0
+                )
+                if is_raw_proposal_stream
+                else proposal.get("unknown_component_area_m2", 0.0)
+            )
+            raw_unknown_areas.append(max(0.0, float(area_value or 0.0)))
         max_information = max(raw_information) if raw_information else 1.0
+        max_unknown_area = max(raw_unknown_areas) if raw_unknown_areas else 0.0
         map_resolution = max(0.0, float(status.get("map_resolution", 0.0) or 0.0))
         candidates = []
-        for proposal, information_gain in zip(proposals, raw_information):
+        for proposal, information_gain, unknown_area_m2 in zip(
+            proposals, raw_information, raw_unknown_areas
+        ):
             cluster_id = str(
                 proposal.get("proposal_id") or proposal.get("cluster_id") or ""
             )
@@ -485,6 +534,12 @@ class CandidateGenerator:
             information_normalized = (
                 math.log1p(information_gain) / max(math.log1p(max_information), 1e-6)
             )
+            unknown_area_normalized = (
+                math.log1p(unknown_area_m2)
+                / max(math.log1p(max_unknown_area), 1e-6)
+                if max_unknown_area > 0.0
+                else information_normalized
+            )
             candidates.append(
                 BehaviorCandidate(
                     candidate_id=f"frontier:{cluster_id}",
@@ -494,8 +549,8 @@ class CandidateGenerator:
                     target_name=cluster_id,
                     goal_xyyaw=[float(subgoal[0]), float(subgoal[1]), yaw],
                     features={
-                        "exploration_gain": information_normalized,
-                        "visibility_gain": information_normalized,
+                        "exploration_gain": unknown_area_normalized,
+                        "visibility_gain": unknown_area_normalized,
                         "semantic_gain": 0.0,
                         "distance_m": distance_m,
                         "interaction_cost": 0.0,
@@ -511,6 +566,7 @@ class CandidateGenerator:
                                 "frontier_cell_count", proposal.get("cell_count", 0)
                             )
                         ),
+                        "unknown_component_area_m2": unknown_area_m2,
                         "map_resolution": map_resolution,
                         "explorer_score": explorer_score,
                         "explorer_score_terms": explorer_score_terms,
@@ -522,6 +578,64 @@ class CandidateGenerator:
                 )
             )
         return candidates
+
+    @classmethod
+    def _attach_spatial_context(
+        cls,
+        candidates: list[BehaviorCandidate],
+        graph: dict[str, Any],
+        max_distance_m: float = 3.0,
+    ) -> None:
+        semantic_nodes = []
+        for node in graph.get("nodes") or []:
+            node_type = str(node.get("type") or "").casefold()
+            if node_type in {"scene", "room", "portal"}:
+                continue
+            label = str(node.get("label") or node.get("name") or "").strip()
+            normalized_label = label.casefold().replace(" ", "_")
+            if (
+                node_type not in {"container", "support"}
+                and normalized_label not in SPATIAL_CONTEXT_LABELS
+            ):
+                continue
+            position = cls._node_xy(node, prefer_aabb=True)
+            if position is None:
+                continue
+            semantic_nodes.append(
+                {
+                    "id": str(node.get("id") or ""),
+                    "type": node_type,
+                    "label": label or node_type,
+                    "position": position,
+                    "is_currently_visible": bool(node.get("is_currently_visible")),
+                }
+            )
+        for candidate in candidates:
+            goal = list(candidate.goal_xyyaw or [])
+            if len(goal) < 2:
+                continue
+            nearby = []
+            for node in semantic_nodes:
+                distance_m = math.hypot(
+                    float(goal[0]) - node["position"][0],
+                    float(goal[1]) - node["position"][1],
+                )
+                if node["id"] == str(candidate.target_id):
+                    candidate.metadata["goal_to_subject_distance_m"] = distance_m
+                    continue
+                if distance_m <= max_distance_m:
+                    nearby.append(
+                        {
+                            "id": node["id"],
+                            "type": node["type"],
+                            "label": node["label"],
+                            "distance_m": round(distance_m, 2),
+                            "visible": node["is_currently_visible"],
+                        }
+                    )
+            nearby.sort(key=lambda item: (item["distance_m"], item["id"]))
+            if nearby:
+                candidate.metadata["nearby_semantic_nodes"] = nearby[:3]
 
     def _interaction_candidates(
         self,
@@ -592,11 +706,6 @@ class CandidateGenerator:
             exploration_gain = 1.0 if node_type == "portal" else 0.65
             if node_type == "portal" and len(connected_room_ids) < 2:
                 exploration_gain = 1.10
-            joint_infos = list(
-                attributes.get("joint_infos")
-                or (attributes.get("observation_evidence") or {}).get("joint_infos")
-                or []
-            )
             interaction_groups = list(attributes.get("interaction_groups") or [])
             completed_groups = {
                 str(group_id)
@@ -658,12 +767,6 @@ class CandidateGenerator:
                         or group_id in failed_groups
                     ):
                         continue
-                    if joint_infos and interaction_group_reached(
-                        joint_infos,
-                        target_joint_names,
-                        threshold=self.config.open_fraction_threshold,
-                    ) is True:
-                        continue
                     drawer_groups.append(
                         {
                             "group_id": group_id,
@@ -699,8 +802,6 @@ class CandidateGenerator:
                         "interaction_group_id": "drawer_scan",
                         "interaction_groups": drawer_groups,
                         "joint_names": joint_names,
-                        "close_other_joint_names": [],
-                        "close_other_joints": False,
                         "view_profile": "drawer_low_view",
                         "view_tilt_rad": 0.30,
                         "view_torso_pitch_rad": 0.35,
@@ -780,14 +881,7 @@ class CandidateGenerator:
                 target_joint_names = list(
                     group.get("target_joint_names") or group.get("joint_names") or []
                 )
-                if node_type == "container" and target_joint_names and joint_infos:
-                    if interaction_group_reached(
-                        joint_infos,
-                        target_joint_names,
-                        threshold=self.config.open_fraction_threshold,
-                    ) is True:
-                        continue
-                elif node_type == "container" and not target_joint_names and node_state in {
+                if node_type == "container" and node_state in {
                     "open",
                     "static_open",
                 }:
@@ -830,11 +924,7 @@ class CandidateGenerator:
                     ),
                     "expected_state": "open",
                     "interaction_group_id": group_id,
-                    "joint_names": target_joint_names,
-                    "close_other_joint_names": list(
-                        group.get("close_other_joint_names") or []
-                    ),
-                    "close_other_joints": bool(group.get("close_other_joints", False)),
+                    "part_ids": target_joint_names,
                     "view_profile": view_profile,
                     "view_tilt_rad": float(
                         group.get("view_tilt_rad", 0.30 if low_view else 0.55)

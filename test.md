@@ -998,6 +998,30 @@ SIM_TIMEOUT_S=1800 \
 
 主要输出：`videos/overview_6panel.mp4`、`debug/semantic_keyframes/`、`debug/graph/` 和 `semantic_exploration_result.json`。
 
+模块 2 使用 LLM 直接选择具体 `NAVIGATE / INTERACT / EXPLORE` subgoal 时，使用独立配置保留规则基线。模型连接参数继续从仓库 `.env` 或 `SEMANTIC_MODEL_*` 环境变量读取：
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:12835 \
+METHOD=semantic_interaction_object_goal \
+RUNTIME_TARGET_MODE=none \
+HOUSE_IND=7 \
+USE_FIXED_ROUTE=true \
+ROUTE_ID=house7_force_route_01 \
+TASK_HORIZON=1000 \
+INITIAL_DOOR_STATE=closed \
+SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/object_goal_apple_module2_mllm.yaml \
+GT_STEP_INTERVAL=1 \
+GT_MAX_DISTANCE_M=6.0 \
+VIDEO_FPS=15 \
+VIDEO_PANEL_WIDTH_PX=640 \
+CLEAN_INTERMEDIATE=false \
+SIM_TIMEOUT_S=1800 \
+  scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/house7_object_goal_apple_module2_mllm_route01
+```
+
+该配置固定 `mission.mode=semantic_interaction_object_goal`，并用 `RUNTIME_TARGET_MODE=none` 禁止运行时随机容器目标覆盖，避免向模型泄露目标容器或强制交互信息。仅消融模块 2：模块 1 保持 `dynamic_rule`，模块 3 保持 `rule_verified`。决策 trace 中应满足正常模型路径的 `model_selected_candidate_id == executed_candidate_id`；若模型响应期间候选失效，则会记录 `candidate_validation_reason` 和 `stale_fallback_used`。
+
 ## 8.6 Room分割测试
 
 python /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts/room_segmentation_debug_tool.py live \

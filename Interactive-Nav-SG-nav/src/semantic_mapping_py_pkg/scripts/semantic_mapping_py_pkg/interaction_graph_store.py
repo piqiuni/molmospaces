@@ -141,11 +141,16 @@ class InteractionGraphStore:
         if self.source_mode == "realtime_gt_observation":
             for node in self.nodes.values():
                 if node.type not in {"scene", "room"}:
+                    node.attributes["_was_visible_previous_update"] = bool(
+                        node.is_currently_visible
+                    )
                     node.is_currently_visible = False
         for raw_observation in observations:
             observation = normalize_observation(raw_observation)
             node = self._find_or_create_node(observation)
             self._apply_observation(node, observation, now)
+        for node in self.nodes.values():
+            node.attributes.pop("_was_visible_previous_update", None)
         self._refresh_room_nodes_from_grid()
         self._rebuild_relations(now=now)
         self._refresh_missing_room_nodes_from_observations()
@@ -176,20 +181,39 @@ class InteractionGraphStore:
             return False
         now = float(stamp if stamp is not None else time.time())
         pre_state = str(node.interaction.get("state", "unknown"))
-        derived_state = None
-        if node.type == "portal" and (
+        explicit_state = result.get("state") or result.get("post_state")
+        if explicit_state is not None:
+            node.interaction["state"] = str(explicit_state)
+        elif node.type == "portal" and (
             result.get("joint_infos") or result.get("joint_value") is not None
         ):
             derived_state = self.portal_state_tracker.update(node.id, result)
-            node.interaction.update(derived_state)
-        elif result.get("state") is not None:
-            node.interaction["state"] = str(result["state"])
-        if derived_state is None:
-            node.interaction["state_source"] = str(result.get("source") or "interaction_result")
+            node.interaction["state"] = str(derived_state.get("state") or "unknown")
+        node.interaction["state_source"] = str(
+            result.get("source") or result.get("verification_source") or "interaction_result"
+        )
         node.interaction["state_confidence"] = float(result.get("confidence", 1.0))
+        static_capability = bool(
+            str(result.get("interaction_capability") or "").casefold() == "static"
+            or str(result.get("reason") or "").casefold() == "non_articulated"
+            or result.get("interactable") is False
+        )
+        if static_capability:
+            node.interaction.update(
+                {
+                    "is_interactable": False,
+                    "interaction_mode": "none",
+                    "requires_interaction": False,
+                    "capability": "static",
+                    "failure_reason": str(result.get("reason") or "non_articulated"),
+                }
+            )
         state = node.interaction.get("state", "unknown")
         if node.type == "portal":
-            node.interaction["traversable"] = state in {"open", "static_open"}
+            if result.get("traversable") is not None:
+                node.interaction["traversable"] = bool(result.get("traversable"))
+            elif not static_capability:
+                node.interaction["traversable"] = state in {"open", "static_open"}
             node.interaction["requires_interaction"] = bool(
                 node.interaction.get("is_interactable") and state not in {"open", "static_open"}
             )
@@ -218,9 +242,7 @@ class InteractionGraphStore:
                 )
             history.append(history_entry)
         node.interaction["operation_history"] = history
-        if result.get("joint_infos"):
-            node.attributes["joint_infos"] = list(result.get("joint_infos") or [])
-        self._update_joint_interaction_memory(node, result, event_id, now)
+        self._update_interaction_group_memory(node, result)
         if node.type == "container":
             self._refresh_container_interaction_state(node)
         if node.type == "portal":
@@ -228,13 +250,14 @@ class InteractionGraphStore:
                 key: node.interaction.get(key)
                 for key in (
                     "state",
-                    "open_fraction",
-                    "joint_open_fractions",
-                    "joint_closed_references",
                     "state_source",
                     "state_confidence",
                     "traversable",
                     "requires_interaction",
+                    "is_interactable",
+                    "interaction_mode",
+                    "capability",
+                    "failure_reason",
                 )
                 if key in node.interaction
             }
@@ -245,54 +268,15 @@ class InteractionGraphStore:
         self._bump_revision()
         return True
 
-    def _update_joint_interaction_memory(self, node, result, event_id, now):
+    def _update_interaction_group_memory(self, node, result):
         sequence_results = list(result.get("interaction_group_results") or [])
         if sequence_results:
-            for index, group_result in enumerate(sequence_results):
-                group_payload = dict(result)
-                group_payload.pop("interaction_group_results", None)
-                group_payload.update(dict(group_result or {}))
-                group_event_id = f"{event_id}:{group_payload.get('interaction_group_id', index)}"
-                self._update_joint_interaction_memory(
-                    node,
-                    group_payload,
-                    group_event_id,
-                    now,
-                )
+            for group_result in sequence_results:
+                self._update_interaction_group_memory(node, dict(group_result or {}))
             return
         interaction = node.interaction
         group_id = str(result.get("interaction_group_id") or "all_joints")
         success = bool(result.get("success", True))
-        joint_names = {str(name) for name in result.get("joint_names") or []}
-        joint_infos = {
-            str(info.get("joint_name")): dict(info)
-            for info in result.get("joint_infos") or []
-            if str(info.get("joint_name") or "")
-        }
-        if not joint_names:
-            joint_names = set(joint_infos)
-        joint_states = dict(interaction.get("joint_interaction_states") or {})
-        joint_reached = []
-        for joint_name in joint_names:
-            current = dict(joint_states.get(joint_name) or {})
-            info = joint_infos.get(joint_name, {})
-            open_fraction = _joint_open_fraction(info)
-            reached = bool(success)
-            if open_fraction is not None:
-                reached = reached and open_fraction >= 0.67
-            joint_reached.append(reached)
-            current.update(
-                {
-                    "status": "opened" if reached else "failed",
-                    "open_fraction": open_fraction,
-                    "last_event_id": event_id,
-                    "last_attempt_at": now,
-                    "success": reached,
-                    "attempt_count": int(current.get("attempt_count", 0)) + 1,
-                }
-            )
-            joint_states[joint_name] = current
-        interaction["joint_interaction_states"] = joint_states
         completed = {
             str(value)
             for value in interaction.get("completed_interaction_groups") or []
@@ -300,8 +284,7 @@ class InteractionGraphStore:
         failed = {
             str(value) for value in interaction.get("failed_interaction_groups") or []
         }
-        group_completed = bool(success) and all(joint_reached)
-        if group_completed:
+        if success:
             completed.add(group_id)
             failed.discard(group_id)
         else:
@@ -320,9 +303,9 @@ class InteractionGraphStore:
             str(group.get("group_id") or "all_joints")
             for group in groups
         }
-        all_opened_once = bool(all_group_ids) and all_group_ids.issubset(completed)
-        interaction["all_joints_opened_once"] = all_opened_once
-        if all_opened_once:
+        all_groups_completed = bool(all_group_ids) and all_group_ids.issubset(completed)
+        interaction["all_interaction_groups_completed"] = all_groups_completed
+        if all_groups_completed:
             interaction["state"] = "open"
             interaction["requires_interaction"] = False
             interaction["traversable"] = True
@@ -485,10 +468,10 @@ class InteractionGraphStore:
                 }
             )
         if node.type == "portal":
-            node.interaction["requires_interaction"] = node.interaction["state"] not in {
-                "open",
-                "static_open",
-            }
+            node.interaction["requires_interaction"] = bool(
+                node.interaction.get("is_interactable")
+                and node.interaction["state"] not in {"open", "static_open"}
+            )
             node.interaction["traversable"] = (
                 True
                 if node.interaction["state"] in {"open", "static_open"}
@@ -654,6 +637,7 @@ class InteractionGraphStore:
                 return node_id
 
     def _apply_observation(self, node, observation, now):
+        minimal_gt = bool(observation.get("minimal_gt_observation"))
         interaction_state_override = dict(
             node.attributes.get("interaction_state_override") or {}
         )
@@ -678,52 +662,36 @@ class InteractionGraphStore:
             float(node.attributes.get("max_visible_fraction", 0.0) or 0.0),
             float(observation.get("visible_fraction", 0.0) or 0.0),
         )
+        consecutive_observations = int(
+            observation.get("consecutive_observations", 0) or 0
+        )
+        if minimal_gt:
+            consecutive_observations = (
+                int(node.attributes.get("consecutive_observations", 0) or 0) + 1
+                if bool(node.attributes.get("_was_visible_previous_update"))
+                else 1
+            )
         max_consecutive_observations = max(
             int(node.attributes.get("max_consecutive_observations", 0) or 0),
-            int(observation.get("consecutive_observations", 0) or 0),
+            consecutive_observations,
         )
         joint_infos = list(observation.get("joint_infos") or [])
-        node.attributes.update(
-            {
+        observation_attributes = {
                 "instance_id": observation.get("instance_id") or node.attributes.get("instance_id") or "",
                 "category": observation.get("category"),
                 "candidate_labels": list(observation.get("candidate_labels") or []),
                 "label_votes": dict(observation.get("label_votes") or {}),
-                "parent": observation.get("parent"),
-                "children": list(observation.get("children") or []),
-                "is_receptacle": bool(observation.get("is_receptacle", False)),
-                "is_pickup_candidate": bool(observation.get("is_pickup_candidate", False)),
-                "is_articulable": bool(observation.get("is_articulable", False)),
-                "is_door": bool(observation.get("is_door", False)),
-                "is_movable_door": bool(observation.get("is_movable_door", False)),
                 "connected_room_ids": list(observation.get("connected_room_ids") or []),
-                "asset_id": observation.get("asset_id"),
-                "object_id": observation.get("object_id"),
                 "source": observation.get("source"),
                 "source_object_name": observation.get("source_object_name"),
-                "orientation": list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
-                "interaction_approach_axis_xy": list(
-                    observation.get("interaction_approach_axis_xy") or []
-                ),
-                "joint_infos": list(observation.get("joint_infos") or []),
-                "interaction_groups": _interaction_groups(
-                    node.type,
-                    list(observation.get("joint_infos") or []),
-                    semantic_name=observation.get("semantic_name"),
-                    category=observation.get("category"),
-                ),
                 "visible_pixels": int(observation.get("visible_pixels", 0)),
                 "max_visible_pixels": max_visible_pixels,
                 "visible_fraction": float(
                     observation.get("visible_fraction", 0.0) or 0.0
                 ),
                 "max_visible_fraction": max_visible_fraction,
-                "projected_bbox_2d": list(
-                    observation.get("projected_bbox_2d") or []
-                ),
-                "consecutive_observations": int(
-                    observation.get("consecutive_observations", 0) or 0
-                ),
+                "bbox_2d": list(observation.get("bbox_2d") or []),
+                "consecutive_observations": consecutive_observations,
                 "max_consecutive_observations": max_consecutive_observations,
                 "camera_name": observation.get("camera_name"),
                 "frame_index": int(observation.get("frame_index", 0)),
@@ -731,17 +699,46 @@ class InteractionGraphStore:
                     observation.get("frame_index", 0) or 0
                 ),
                 "episode_id": observation.get("episode_id"),
-                "observation_evidence": {
-                    "joint_infos": joint_infos,
-                    "primary_joint_name": observation.get("primary_joint_name"),
-                    "joint_type": observation.get("joint_type"),
-                    "joint_range": list(observation.get("joint_range") or [0.0, 0.0]),
-                    "joint_value": observation.get("joint_value"),
-                },
+                "box_3d_frame_id": observation.get("box_3d_frame_id"),
                 "viz_aabb_center": list(observation.get("viz_aabb_center") or observation["aabb_center"]),
                 "viz_aabb_size": list(observation.get("viz_aabb_size") or observation["aabb_size"]),
             }
-        )
+        if not minimal_gt:
+            observation_attributes.update(
+                {
+                    "parent": observation.get("parent"),
+                    "children": list(observation.get("children") or []),
+                    "is_receptacle": bool(observation.get("is_receptacle", False)),
+                    "is_pickup_candidate": bool(observation.get("is_pickup_candidate", False)),
+                    "is_articulable": bool(observation.get("is_articulable", False)),
+                    "is_door": bool(observation.get("is_door", False)),
+                    "is_movable_door": bool(observation.get("is_movable_door", False)),
+                    "asset_id": observation.get("asset_id"),
+                    "object_id": observation.get("object_id"),
+                    "orientation": list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
+                    "interaction_approach_axis_xy": list(
+                        observation.get("interaction_approach_axis_xy") or []
+                    ),
+                    "joint_infos": joint_infos,
+                    "interaction_groups": _interaction_groups(
+                        node.type,
+                        joint_infos,
+                        semantic_name=observation.get("semantic_name"),
+                        category=observation.get("category"),
+                    ),
+                    "projected_bbox_2d": list(
+                        observation.get("projected_bbox_2d") or []
+                    ),
+                    "observation_evidence": {
+                        "joint_infos": joint_infos,
+                        "primary_joint_name": observation.get("primary_joint_name"),
+                        "joint_type": observation.get("joint_type"),
+                        "joint_range": list(observation.get("joint_range") or [0.0, 0.0]),
+                        "joint_value": observation.get("joint_value"),
+                    },
+                }
+            )
+        node.attributes.update(observation_attributes)
         gt_groups = self._gt_interaction_groups(joint_infos)
         if gt_groups and not node.attributes.get("interaction_groups"):
             node.attributes["interaction_groups"] = gt_groups
@@ -752,8 +749,7 @@ class InteractionGraphStore:
                 "operation_history",
                 "completed_interaction_groups",
                 "failed_interaction_groups",
-                "joint_interaction_states",
-                "all_joints_opened_once",
+                "all_interaction_groups_completed",
             )
             if key in node.interaction
         }
@@ -781,16 +777,25 @@ class InteractionGraphStore:
             node.interaction["requires_interaction"] = bool(
                 node.interaction.get("is_interactable") and state not in {"open", "static_open"}
             )
+        if node.type == "portal":
+            if "interaction_reference_aabb_center" not in node.attributes:
+                node.attributes["interaction_reference_aabb_center"] = list(
+                    observation["aabb_center"]
+                )
+                node.attributes["interaction_reference_aabb_size"] = list(
+                    observation["aabb_size"]
+                )
             if interaction_state_override:
                 for key in (
                     "state",
-                    "open_fraction",
-                    "joint_open_fractions",
-                    "joint_closed_references",
                     "state_source",
                     "state_confidence",
                     "traversable",
                     "requires_interaction",
+                    "is_interactable",
+                    "interaction_mode",
+                    "capability",
+                    "failure_reason",
                 ):
                     if key in interaction_state_override:
                         node.interaction[key] = interaction_state_override[key]
@@ -1380,7 +1385,7 @@ class InteractionGraphStore:
                         counter,
                         "interactive_portal",
                         node,
-                        True,
+                        bool(node.interaction.get("requires_interaction")),
                         node.id,
                         node.interaction.get("interaction_mode", "none"),
                         "door_may_unlock_room",

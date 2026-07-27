@@ -281,9 +281,11 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
   sleep 1
 fi
 
-RUNTIME_TARGET_MODE=none
-if [[ "${METHOD}" == object_goal_runtime || "${METHOD}" == semantic_interaction_object_goal ]]; then
-  RUNTIME_TARGET_MODE=random_far_container_object
+if [[ -z "${RUNTIME_TARGET_MODE:-}" ]]; then
+  RUNTIME_TARGET_MODE=none
+  if [[ "${METHOD}" == object_goal_runtime || "${METHOD}" == semantic_interaction_object_goal ]]; then
+    RUNTIME_TARGET_MODE=random_far_container_object
+  fi
 fi
 if [[ "${ENABLE_RECORDING}" == true ]]; then
   SIM_CAPTURE_ARGS="--observation_queue_size 0 --step_frame_dir ${OUTPUT_DIR}/sim_step_frames --step_frame_queue_size 4"
@@ -372,7 +374,8 @@ import time
 print(max(0.0, time.perf_counter() - float(sys.argv[1])))
 PY
   )
-  if [[ -f "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" ]]; then
+  if [[ ! -f "${OUTPUT_DIR}/videos/overview_6panel.mp4" ]] && \
+     [[ -f "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" ]]; then
     mv "${OUTPUT_DIR}/debug/videos/overview_6panel.mp4" "${OUTPUT_DIR}/videos/overview_6panel.mp4"
   fi
 else

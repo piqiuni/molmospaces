@@ -7,6 +7,7 @@ from .geometry_utils import normalize_label
 
 PORTAL_LABELS = {
     "door",
+    "doorframe",
     "doorway",
     "gate",
     "entrance",
@@ -40,6 +41,7 @@ CONTAINER_LABELS = {
     "box",
     "storage_bin",
 }
+OPENABLE_CONTAINER_LABELS = CONTAINER_LABELS - {"box", "storage_bin"}
 
 HINGE_NAMES = {"hinge", "mjjnthinge"}
 SLIDE_NAMES = {"slide", "mjJNT_SLIDE", "mjjntslide"}
@@ -63,6 +65,31 @@ def point3(values=None):
     return [float(vals[0]), float(vals[1]), float(vals[2])]
 
 
+def segmentation_pixel_count(segmentation: Any) -> int:
+    if isinstance(segmentation, dict):
+        rows = list(segmentation.get("rows") or [])
+        cols = list(segmentation.get("cols") or [])
+        return min(len(rows), len(cols))
+    if isinstance(segmentation, list):
+        return sum(
+            1
+            for row in segmentation
+            if isinstance(row, list)
+            for value in row
+            if bool(value)
+        )
+    return 0
+
+
+def bbox_area(bbox: Any) -> float:
+    values = list(bbox or [])
+    if len(values) < 4:
+        return 0.0
+    return max(0.0, float(values[2]) - float(values[0]) + 1.0) * max(
+        0.0, float(values[3]) - float(values[1]) + 1.0
+    )
+
+
 def normalize_joint_type(value: Any) -> str:
     if value is None:
         return "none"
@@ -78,13 +105,45 @@ def normalize_joint_type(value: Any) -> str:
 
 
 def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    box_3d = observation.get("box_3d") or {}
+    if not isinstance(box_3d, dict):
+        box_3d = {}
     semantic_name = normalize_label(
-        observation.get("semantic_name") or observation.get("semantic_class") or observation.get("class")
+        observation.get("semantic_name")
+        or observation.get("semantic_class")
+        or observation.get("class")
+        or observation.get("name")
     )
     category = str(observation.get("category") or semantic_name or "object")
-    position = point3(observation.get("position") or observation.get("coord") or observation.get("centroid"))
-    aabb_center = point3(observation.get("aabb_center") or observation.get("box3d_center") or position)
-    aabb_size = point3(observation.get("aabb_size") or observation.get("size") or observation.get("box3d_size"))
+    position = point3(
+        observation.get("position")
+        or observation.get("coord")
+        or observation.get("centroid")
+        or box_3d.get("center")
+    )
+    aabb_center = point3(
+        observation.get("aabb_center")
+        or observation.get("box3d_center")
+        or box_3d.get("center")
+        or position
+    )
+    aabb_size = point3(
+        observation.get("aabb_size")
+        or observation.get("size")
+        or observation.get("box3d_size")
+        or box_3d.get("size")
+    )
+    bbox_2d = list(observation.get("bbox_2d") or observation.get("bbox") or [])
+    segmentation = observation.get("segmentation")
+    if segmentation is None:
+        segmentation = observation.get("mask")
+    visible_pixels = int(
+        observation.get("visible_pixels", segmentation_pixel_count(segmentation)) or 0
+    )
+    visible_fraction = observation.get("visible_fraction")
+    if visible_fraction is None:
+        area = bbox_area(bbox_2d)
+        visible_fraction = min(1.0, float(visible_pixels) / area) if area > 0.0 else 0.0
     connected_room_ids = observation.get("connected_room_ids") or []
     room_id = observation.get("room_id")
     if room_id is not None:
@@ -95,13 +154,22 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
     viz_aabb_center = observation.get("viz_aabb_center") or observation.get("world_box3d_center") or observation.get("aabb_center")
     viz_aabb_size = observation.get("viz_aabb_size") or observation.get("world_box3d_size") or observation.get("aabb_size") or observation.get("size")
     return {
-        "observation_id": str(observation.get("observation_id") or ""),
-        "instance_id": str(observation.get("instance_id") or ""),
+        "minimal_gt_observation": bool(
+            observation.get("id") is not None and observation.get("box_3d") is not None
+        ),
+        "observation_id": str(observation.get("observation_id") or observation.get("id") or ""),
+        "instance_id": str(observation.get("instance_id") or observation.get("id") or ""),
         "semantic_name": semantic_name or "object",
         "category": category,
         "candidate_labels": list(observation.get("candidate_labels") or []),
         "label_votes": dict(observation.get("label_votes") or {}),
-        "confidence": float(observation.get("confidence", observation.get("conf", 0.0)) or 0.0),
+        "confidence": float(
+            observation.get(
+                "confidence",
+                observation.get("conf", 1.0 if observation.get("id") else 0.0),
+            )
+            or 0.0
+        ),
         "position": position,
         "aabb_center": aabb_center,
         "aabb_size": aabb_size,
@@ -112,7 +180,7 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "is_receptacle": bool(observation.get("is_receptacle", False)),
         "is_pickup_candidate": bool(observation.get("is_pickup_candidate", False)),
         "is_articulable": bool(observation.get("is_articulable", False)),
-        "is_door": bool(observation.get("is_door", False)),
+        "is_door": bool(observation.get("is_door", semantic_name in PORTAL_LABELS)),
         "is_movable_door": bool(observation.get("is_movable_door", False)),
         "joint_type": normalize_joint_type(observation.get("joint_type")),
         "joint_range": point_range(observation.get("joint_range")),
@@ -121,9 +189,14 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "primary_joint_name": str(observation.get("primary_joint_name") or ""),
         "orientation": list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
         "interaction_approach_axis_xy": list(observation.get("interaction_approach_axis_xy") or []),
-        "source_object_name": str(observation.get("source_object_name") or ""),
-        "visible_pixels": int(observation.get("visible_pixels", 0) or 0),
-        "visible_fraction": float(observation.get("visible_fraction", 0.0) or 0.0),
+        "source_object_name": str(
+            observation.get("source_object_name") or observation.get("id") or ""
+        ),
+        "visible_pixels": visible_pixels,
+        "visible_fraction": float(visible_fraction or 0.0),
+        "bbox_2d": bbox_2d,
+        "segmentation": segmentation,
+        "box_3d_frame_id": str(box_3d.get("frame_id") or ""),
         "projected_bbox_2d": list(observation.get("projected_bbox_2d") or []),
         "consecutive_observations": int(
             observation.get("consecutive_observations", 0) or 0
@@ -176,10 +249,14 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
         label = normalize_label(observation.get("semantic_name"))
         if label in {"box", "storage_bin"}:
             interaction_mode = "none"
+        elif label == "drawer" or joint_type == "slide":
+            interaction_mode = "slide"
+        elif label in OPENABLE_CONTAINER_LABELS:
+            interaction_mode = "open_close"
         elif observation.get("is_articulable"):
-            interaction_mode = "slide" if joint_type == "slide" else "open_close"
+            interaction_mode = "open_close"
         else:
-            interaction_mode = "place_in"
+            interaction_mode = "none"
     elif node_type == "support":
         interaction_mode = "place_on"
     elif observation.get("is_pickup_candidate"):
@@ -207,15 +284,11 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
         "operation_history": [],
         "completed_interaction_groups": [],
         "failed_interaction_groups": [],
-        "joint_interaction_states": {},
-        "all_joints_opened_once": False,
     }
 
 
 def infer_interaction_state(node_type: str, joint_type: str, joint_range: list[float], joint_value: float | None, observation: dict[str, Any]) -> str:
     if joint_type == "none" or joint_value is None:
-        if node_type == "portal" and not observation.get("is_movable_door", True):
-            return "static_open"
         return "unknown"
     closed_value, open_value = joint_closed_open_values(joint_range)
     span = abs(open_value - closed_value)

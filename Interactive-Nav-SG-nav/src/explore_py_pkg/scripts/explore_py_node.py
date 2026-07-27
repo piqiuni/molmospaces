@@ -169,6 +169,12 @@ class ExplorePyNode:
             connect_8=bool(frontier_cfg.get("connect_8", True)),
             candidate_top_k=int(frontier_cfg.get("candidate_top_k", 12)),
             sensor_range_m=float(frontier_cfg.get("sensor_range_m", 5.0)),
+            unknown_component_radius_m=float(
+                frontier_cfg.get(
+                    "unknown_component_radius_m",
+                    frontier_cfg.get("sensor_range_m", 5.0),
+                )
+            ),
             subgoal_search_radius_cells=int(frontier_cfg.get("subgoal_search_radius_cells", 8)),
             min_subgoal_distance_m=float(frontier_cfg.get("min_subgoal_distance_m", 0.75)),
             hard_min_subgoal_distance_m=float(
@@ -1385,6 +1391,9 @@ class ExplorePyNode:
             "centroid_world": list(cluster.centroid_world),
             "information_gain": cluster.information_gain,
             "distance_to_robot": cluster.distance_to_robot,
+            "unknown_component_area_m2": float(
+                getattr(cluster, "unknown_component_area_m2", 0.0) or 0.0
+            ),
             "score": cluster.score,
             "score_terms": cluster.score_terms,
             "cell_count": len(cluster.cells),
