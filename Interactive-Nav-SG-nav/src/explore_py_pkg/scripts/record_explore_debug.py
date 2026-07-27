@@ -3048,6 +3048,11 @@ class ExploreDebugRecorder:
                     draw_route_plan=True,
                     world_bounds=occupancy_world_bounds,
                 )
+                self._draw_task_subgoal_header(
+                    occ_panel,
+                    semantic_candidates=semantic_candidates,
+                    semantic_selection=semantic_selection,
+                )
                 costmap_left_width = max(1, frame_width // 2)
                 costmap_right_width = max(1, frame_width - costmap_left_width)
                 global_costmap_panel = self._render_video_map_panel_locked(
@@ -3845,6 +3850,48 @@ class ExploreDebugRecorder:
         for room_id in room_ids:
             rgb[values == int(room_id)] = palette[int(room_id) % len(palette)]
         return rgb
+
+    @staticmethod
+    def _draw_task_subgoal_header(
+        panel,
+        *,
+        semantic_candidates: dict,
+        semantic_selection: dict,
+    ) -> None:
+        if panel is None or cv2 is None:
+            return
+        target_context = semantic_candidates.get("target_context") or {}
+        target_name = str(
+            target_context.get("target_name")
+            or target_context.get("target_source_object_name")
+            or "-"
+        )
+        behavior_type = str(semantic_selection.get("behavior_type") or "-")
+        subgoal_name = str(
+            semantic_selection.get("target_name")
+            or semantic_selection.get("target_id")
+            or semantic_selection.get("candidate_id")
+            or "-"
+        )
+        max_chars = max(24, int(panel.shape[1] / 10))
+        if len(subgoal_name) > max_chars:
+            subgoal_name = subgoal_name[: max_chars - 3] + "..."
+        lines = [
+            f"TASK TARGET: {target_name}",
+            f"MODULE2 SUBGOAL: {behavior_type} {subgoal_name}",
+        ]
+        cv2.rectangle(panel, (4, 4), (min(panel.shape[1] - 4, 460), 49), (255, 255, 255), -1)
+        for index, line in enumerate(lines):
+            cv2.putText(
+                panel,
+                line,
+                (9, 20 + index * 21),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (30, 30, 30),
+                1,
+                cv2.LINE_AA,
+            )
 
     @staticmethod
     def _draw_panel_title(panel, title: str, step: int | None = None) -> None:

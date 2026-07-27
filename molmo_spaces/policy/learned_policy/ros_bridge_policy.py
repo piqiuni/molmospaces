@@ -290,7 +290,9 @@ class RosBridgePolicy(BasePolicy):
                 required_consecutive_observations=realtime_gt_required_consecutive_observations,
                 step_interval=realtime_gt_step_interval,
                 max_distance_m=realtime_gt_max_distance_m,
-                queue_size=self.queue_size,
+                # GT is a latest-state stream.  A deep ROS queue makes newly
+                # revealed container contents wait behind stale observations.
+                queue_size=1,
             )
         if self.step_frame_dir is not None:
             self.step_frame_dir.mkdir(parents=True, exist_ok=True)

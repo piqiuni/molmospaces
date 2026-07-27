@@ -103,6 +103,9 @@ class SemanticRuleDecisionNode:
         self.mission_mode = self._normalize_mission_mode(
             mission_config.get("mode", "semantic_interaction_exploration")
         )
+        self.post_container_target_wait_s = max(
+            0.0, float(mission_config.get("post_container_target_wait_s", 5.0))
+        )
         configured_backend = str(config.get("backend", "rule")).casefold()
         self.policy_backend = (
             "model"
@@ -164,6 +167,7 @@ class SemanticRuleDecisionNode:
         self.target_goal_complete = False
         self.target_context: dict = {}
         self.active_target_goal = False
+        self.target_observation_wait_until = 0.0
         self.cooldown_until: dict[str, float] = {}
         self.failure_counts: dict[str, int] = {}
         self.decision_index = 0
@@ -213,6 +217,7 @@ class SemanticRuleDecisionNode:
                 self.goal_complete = False
                 self.target_goal_complete = False
                 self.active_target_goal = False
+                self.target_observation_wait_until = 0.0
                 self.target_mission.reset()
                 self.cooldown_until.clear()
                 self.failure_counts.clear()
@@ -233,6 +238,7 @@ class SemanticRuleDecisionNode:
                 self.target_context = dict(target_context)
                 self.goal_complete = False
                 self.target_goal_complete = False
+                self.target_observation_wait_until = 0.0
                 self.target_mission.reset()
                 self._publish_goal_status(
                     "ACTIVE" if target_context.get("enabled") else "DISABLED"
@@ -315,6 +321,9 @@ class SemanticRuleDecisionNode:
                     detail=transition["detail"],
                 )
             elif transition["phase"] == "container_opened":
+                self.target_observation_wait_until = (
+                    time.monotonic() + self.post_container_target_wait_s
+                )
                 self._publish_goal_status(
                     "TARGET_CONTAINER_INTERACTED",
                     detail=transition["detail"],
@@ -408,11 +417,27 @@ class SemanticRuleDecisionNode:
             if candidate.score >= self.policy.config.minimum_score
         ]
         eligible = self.target_mission.filter_candidates(eligible)
+        target_eligible = [
+            candidate
+            for candidate in eligible
+            if bool((candidate.metadata or {}).get("target_goal"))
+            or bool((candidate.metadata or {}).get("target_match"))
+        ]
+        waiting_for_target_observation = bool(
+            self.mission_mode == "semantic_interaction_object_goal"
+            and self.target_observation_wait_until > now
+            and not target_eligible
+        )
+        if self.mission_mode == "semantic_interaction_object_goal" and target_eligible:
+            eligible = target_eligible
+            self.target_observation_wait_until = 0.0
         selected = min(
             eligible,
             key=lambda candidate: (-candidate.score, candidate.candidate_id),
             default=None,
         )
+        if waiting_for_target_observation:
+            selected = None
         model_circuit_open = not self.model_circuit_breaker.allow_request(now)
         decision_history, group_history = self._history_context(candidate_snapshot)
         projected_groups, _ = compact_candidate_groups(
@@ -426,8 +451,16 @@ class SemanticRuleDecisionNode:
         self.model_policy.last_reason = ""
         self.model_policy.last_confidence = ""
         model_selected_group_id = ""
-        selection_override_reason = ""
-        if self.policy_backend == "model" and not model_circuit_open:
+        selection_override_reason = (
+            "waiting_for_stable_target_after_container"
+            if waiting_for_target_observation
+            else ""
+        )
+        if (
+            self.policy_backend == "model"
+            and not model_circuit_open
+            and not waiting_for_target_observation
+        ):
             model_selected = self.model_policy.select(
                 eligible,
                 target_context=candidate_snapshot.get("target_context") or {},
@@ -458,11 +491,12 @@ class SemanticRuleDecisionNode:
             self.model_policy.last_error = "model_circuit_open_after_consecutive_timeouts"
             self.model_policy.last_result_source = "rule_fallback_circuit_open"
             self.model_policy.last_metrics = {}
-        selected, selection_override_reason = self._apply_repeat_guard(
-            selected,
-            eligible,
-            candidate_snapshot.get("graph_context") or {},
-        )
+        if not waiting_for_target_observation:
+            selected, selection_override_reason = self._apply_repeat_guard(
+                selected,
+                eligible,
+                candidate_snapshot.get("graph_context") or {},
+            )
         with self.state_lock:
             latest_sequence = int(self.latest_candidates_payload.get("sequence", 0) or 0)
             latest_revision = int(

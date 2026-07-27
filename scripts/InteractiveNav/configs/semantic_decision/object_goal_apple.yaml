@@ -1,16 +1,22 @@
+mission:
+  mode: "semantic_interaction_object_goal"
+  post_container_target_wait_s: 120.0
+
 target:
   enabled: true
   target_name: "apple"
   object_labels: ["apple"]
+  target_instance_id: "apple_87e4661e0aaedff69f751b5ac78bd93c_1_0_6"
+  target_container_source_object_name: "refrigerator_4d8cd69ca487b76cae801cfb0248a055_1_0_6"
   standoff_m: 0.75
   require_interaction: false
-  require_current_visibility: false
+  require_current_visibility: true
   completion_requires_visibility: true
   min_visible_pixels: 16
 
 candidate:
   interaction_types: ["portal", "container"]
-  target_require_current_visibility: false
+  target_require_current_visibility: true
   target_require_same_room: true
   target_allow_connected_room: true
   target_min_visible_pixels: 16

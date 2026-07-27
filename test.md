@@ -994,12 +994,13 @@ VIDEO_FPS=15 \
 VIDEO_PANEL_WIDTH_PX=640 \
 EXTERNAL_VIDEO_WIDTH_PX=1024 \
 ENABLE_EXTERNAL_VIDEO=true \
-VIDEO_FRAME_JOB_QUEUE_SIZE=128 \
-ARTIFACT_WRITE_QUEUE_SIZE=1024 \
-VIDEO_HISTORY_SIZE=128 \
+VIDEO_FRAME_JOB_QUEUE_SIZE=1024 \
+ARTIFACT_WRITE_QUEUE_SIZE=4096 \
+VIDEO_HISTORY_SIZE=1024 \
 IMAGE_QUEUE_SIZE=16 \
 OBSERVATION_QUEUE_SIZE=16 \
 EXTRA_IMAGE_QUEUE_SIZE=16 \
+RECORDER_SHUTDOWN_GRACE_S=600 \
 CLEAN_INTERMEDIATE=false \
 SIM_TIMEOUT_S=1800 \
   scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
@@ -1012,11 +1013,47 @@ SIM_TIMEOUT_S=1800 \
 `[8.254459, 1.053060, 3.141593]`。本次机器人实际交互位姿为
 `[8.535121, 1.075141, -2.944551]`，位置误差 `0.282 m`、朝向误差
 `0.197 rad`，通过执行端位姿门控并成功从 `closed` 切换到 `open`。后续外部相机默认
-offset 调整为 `[-1.08, 0.62, 1.60]`，保持约 `1.24 m` 水平距离并位于机器人
-左后方约 `30 deg`；look-at offset 为 `[0.4, 0.0, 0.95]`，提高相机同时增加
-向下俯视角。原始外部相机 PNG 与视频均为 `1024x576`。节点图右侧决策文字框已移除，
+采用手动调好的 `CAMERA_REL`：position `[-0.779295308248162, 0.9640243904369644,
+1.600000023841858]`、yaw `-34.729731964609215 deg`、pitch
+`-16.0519210588521 deg`、FOV `65 deg`。运行脚本中的等价 look-at offset 为
+`[0.010510587056107079, 0.4165302897166183, 1.3234916922873792]`。相机水平距离
+约 `1.24 m`。原始外部相机 PNG 与视频均为 `1024x576`。节点图右侧决策文字框已移除，
 room 横向排列优先依据 portal-room 拓扑连接度，将 House 7 的 livingroom 放在
 bedroom 与 kitchen 之间。
+
+#### 手动移动机器人并调外部相机
+
+历史手动可视化工具位于独立实验 worktree：
+
+- `/home/user/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_manual_interactive_nav_test.py`
+- `/home/user/ldl/molmospaces-exp-setting/scripts/InteractiveNav/manual_interactive_nav_camera.py`
+- `/home/user/ldl/molmospaces-exp-setting/scripts/InteractiveNav/manual_interactive_nav_policy.py`
+
+启动 House 7 冰箱内 apple 场景：
+
+```bash
+cd /home/user/ldl/molmospaces-exp-setting
+source /home/user/miniconda3/etc/profile.d/conda.sh
+conda activate mlspaces
+export MPLCONFIGDIR=/tmp/molmospaces-matplotlib
+python scripts/InteractiveNav/run_manual_interactive_nav_test.py \
+  --catalog scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_train_100/raw/mixed_rough/mixed_rough_catalog.json \
+  --case_id 'mixed_h7__refrigerator_4d8cd69ca487b76cae801cfb0248a055_1_0_6__apple_87e4661e0aaedff69f751b5ac78bd93c_1_0_6' \
+  --state_preset visualization \
+  --camera_mode robot_over_shoulder \
+  --camera_position_offset_robot -0.779295308248162 0.9640243904369644 1.600000023841858 \
+  --camera_lookat_offset_robot 0.010510587056107079 0.4165302897166183 1.3234916922873792 \
+  --camera_fov 65 \
+  --camera_translation_step 0.05 \
+  --camera_rotation_step_deg 1.0 \
+  --capture_dir /tmp/house7_manual_camera_tune
+```
+
+控制键：`W/S/A/D` 移动机器人，`I/K/J/L` 平移相机，`;/'` 调 yaw，`./` 调
+pitch，`O/P` 打开/关闭交互对象，`V` 截图，`C` 重置相机，`R` 重置机器人，
+`Esc` 退出。调好后终端打印的 `CAMERA_REL` 可直接记录；yaw/pitch 转成跟随相机
+look-at 时，只需用 `lookat = position + [cos(pitch)cos(yaw), cos(pitch)sin(yaw),
+sin(pitch)]`。
 
 2026-07-27 耗时回归：三路并行 800-step 测试输出位于
 `outputs/house7_perf_parallel3_800_20260727_w{1,2,3}`。三次均完成 800 个 sim step、
@@ -1030,6 +1067,34 @@ bedroom 与 kitchen 之间。
 平均 `0.708 s/step`，外部图像 ROS 发布由 `441 ms` 降至 `1.48 ms`；100 个 sim step
 对应 100 张 sim-step PNG、100 张外部原始 PNG 和 100 张 topology panel PNG，且
 `artifact_write_dropped_jobs=0`、`video_frame_jobs_dropped=0`。
+
+2026-07-27 apple object-goal 修复：原先实时 GT 消息会携带每个实例的完整像素坐标，
+1024x576 下单条 ROS JSON 可达到约 `0.6-1.3 MB`；同时 GT publisher 复用了深度
+为 16 的通用 ROS 队列，导致冰箱打开后的新目标观测排在旧消息后。现在 GT 只发布
+`bbox_2d + visible_pixels + visible_fraction + box_3d`，发布端和语义映射订阅端均改为
+latest-only 队列 1。三路最终测试中，apple 从原始 GT 捕获到节点图 `NEW_NODE` 的
+墙钟延迟降为 `7.8-9.1 s`，此前并行长测为 `29-53 s`。
+
+目标状态机也改为 `semantic_interaction_object_goal`：绑定精确 apple 和 refrigerator，
+冰箱打开后等待当前稳定可见的 apple 候选；一旦出现就强制优先进入最终定位。容器内
+目标复用冰箱节点中已经验证的正面交互位姿，不再根据 apple 几何中心生成可能位于冰箱
+内部或侧面的导航点；机器人已在该位姿时直接进入交互/可见性验证，不再被无位移看门狗
+误判。完成后发布 `target_goal_succeeded` 并触发仿真提前退出。
+
+三路最终并行输出：
+
+- `outputs/house7_apple_latest_parallel3_800_20260727_w1`：step 451 成功，保留 10 step 后在 461 结束。
+- `outputs/house7_apple_latest_parallel3_800_20260727_w2`：step 339 成功，保留 10 step 后在 349 结束。
+- `outputs/house7_apple_latest_parallel3_800_20260727_w3`：step 385 成功，保留 10 step 后在 395 结束。
+
+三路均满足：冰箱交互成功、交互位姿验证通过、apple 当前稳定可见、目标导航成功、
+`target_goal_success=true`、`target_container_interaction_success=true`、
+`overall_success=true`。`sim_step_frames/manifest.jsonl` 与最终 6-panel 视频帧数一一对应，
+且 `video_frame_jobs_dropped=0`、`artifact_write_dropped_jobs=0`、渲染队列覆盖次数为 0。
+外部相机原始帧在 `debug/videos/external_camera_raw_frames/`，图 3 在
+`debug/videos/room_interaction_frames/`，节点图在
+`debug/videos/semantic_topology_frames/`，按 sim step 对齐后的完整 6-panel PNG 在
+`videos/offline_composite_frames/`。
 
 ## 8.6 Room分割测试
 

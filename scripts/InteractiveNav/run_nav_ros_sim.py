@@ -732,7 +732,7 @@ def build_nav_config(args) -> NavToObjBaseConfig:
                         pos=fixed_camera_pos,
                         forward=forward,
                         up=up,
-                        fov=75.0,
+                        fov=float(args.debug_front_camera_fov_deg),
                         skip_erosion=True,
                     )
                 )
@@ -747,7 +747,7 @@ def build_nav_config(args) -> NavToObjBaseConfig:
                         lookat_offset=debug_camera_lookat_offset or [0.4, 0.0, 0.95],
                         camera_quaternion=[0.5, 0.5, -0.5, -0.5],
                         up_axis="z",
-                        fov=75.0,
+                        fov=float(args.debug_front_camera_fov_deg),
                         skip_erosion=True,
                     )
                 )
@@ -969,8 +969,17 @@ def parse_args():
     )
     parser.add_argument("--fixed_debug_camera_pos", type=str, default="")
     parser.add_argument("--fixed_debug_camera_target", type=str, default="")
-    parser.add_argument("--debug_front_camera_offset", type=str, default="-1.08,0.62,1.60")
-    parser.add_argument("--debug_front_camera_lookat_offset", type=str, default="0.4,0.0,0.95")
+    parser.add_argument(
+        "--debug_front_camera_offset",
+        type=str,
+        default="-0.779295308248162,0.9640243904369644,1.600000023841858",
+    )
+    parser.add_argument(
+        "--debug_front_camera_lookat_offset",
+        type=str,
+        default="0.010510587056107079,0.4165302897166183,1.3234916922873792",
+    )
+    parser.add_argument("--debug_front_camera_fov_deg", type=float, default=65.0)
     parser.add_argument("--depth_camera_name", type=str, default="head_camera")
     parser.add_argument("--pointcloud_frame_id", type=str, default="tf_frame_lidar")
     parser.add_argument("--pointcloud_stride", type=int, default=2)

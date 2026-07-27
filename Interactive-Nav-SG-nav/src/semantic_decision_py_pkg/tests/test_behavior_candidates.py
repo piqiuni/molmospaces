@@ -515,6 +515,96 @@ def test_observed_target_generates_navigation_candidate() -> None:
     assert candidate.metadata["target_min_visible_pixels"] == 16
 
 
+def test_contained_target_reuses_container_interaction_pose() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_fridge",
+                "type": "container",
+                "centroid": [4.0, 2.0, 1.0],
+                "attributes": {
+                    "interaction_approach_pose_xyyaw": [3.0, 2.0, 0.0],
+                    "interaction_approach_axis_xy": [-1.0, 0.0],
+                },
+            },
+            {
+                "id": "object_apple",
+                "type": "object",
+                "label": "apple",
+                "centroid": [4.1, 2.0, 1.0],
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "attributes": {
+                    "visible_pixels": 64,
+                    "visible_fraction": 0.5,
+                    "consecutive_observations": 2,
+                },
+            },
+        ],
+        "edges": [
+            {
+                "src_id": "container_fridge",
+                "relation": "contains",
+                "dst_id": "object_apple",
+            }
+        ],
+    }
+
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(2.8, 2.0),
+        target_context={"enabled": True, "object_labels": ["apple"]},
+    )[0]
+
+    assert candidate.goal_xyyaw == [3.0, 2.0, 0.0]
+    assert candidate.metadata["approach_strategy"] == "target_containing_container_pose"
+    assert candidate.metadata["containing_container_id"] == "container_fridge"
+    assert candidate.metadata["direct_goal_tolerance_m"] == 0.45
+
+
+def test_explicit_target_container_is_relevant_without_target_object_interaction() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_fridge",
+                "type": "container",
+                "name": "refrigerator_asset",
+                "centroid": [4.0, 2.0, 1.0],
+                "is_currently_visible": True,
+                "state_age_sec": 0.0,
+                "attributes": {
+                    "instance_id": "refrigerator_asset",
+                    "source_object_name": "refrigerator_asset",
+                },
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(2.0, 2.0),
+        target_context={
+            "enabled": True,
+            "object_labels": ["apple"],
+            "require_interaction": False,
+            "target_container_source_object_name": "refrigerator_asset",
+        },
+    )[0]
+
+    assert candidate.metadata["target_match"] is True
+    assert candidate.features["target_relevance"] == 1.0
+
+
 def test_weak_target_observation_is_not_verified_as_visible() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(

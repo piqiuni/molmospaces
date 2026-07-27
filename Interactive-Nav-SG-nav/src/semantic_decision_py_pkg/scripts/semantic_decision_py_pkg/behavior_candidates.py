@@ -118,18 +118,41 @@ class CandidateGenerator:
             state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
             if state_age_sec > self.config.target_max_state_age_sec:
                 continue
+            node_id = str(node.get("id") or "")
             position = self._node_xy(node, prefer_aabb=True)
             if position is None:
                 continue
-            goal = self._approach_pose(
-                robot_xy,
-                position,
-                float(target_context.get("standoff_m", self.config.target_standoff_m)),
-                node=node,
-                fixed_axis=self._container_approach_axis(node),
+            target_standoff = float(
+                target_context.get("standoff_m", self.config.target_standoff_m)
             )
+            containing_container = self._containing_container_node(graph, node_id)
+            if containing_container is not None:
+                container_position = self._node_xy(containing_container)
+                if container_position is not None:
+                    goal = self._approach_candidates(
+                        robot_xy,
+                        container_position,
+                        containing_container,
+                        target_standoff,
+                        "container",
+                    )[0]
+                else:
+                    goal = self._approach_pose(
+                        robot_xy,
+                        position,
+                        target_standoff,
+                        node=node,
+                        fixed_axis=self._container_approach_axis(node),
+                    )
+            else:
+                goal = self._approach_pose(
+                    robot_xy,
+                    position,
+                    target_standoff,
+                    node=node,
+                    fixed_axis=self._container_approach_axis(node),
+                )
             distance_m = math.hypot(goal[0] - robot_xy[0], goal[1] - robot_xy[1])
-            node_id = str(node.get("id") or "")
             attributes = node.get("attributes") or {}
             visible_pixels = int(attributes.get("visible_pixels", 0) or 0)
             target_min_visible_pixels = int(
@@ -242,15 +265,50 @@ class CandidateGenerator:
                         "target_min_visible_pixels": target_min_visible_pixels,
                         "state_age_sec": state_age_sec,
                         "approach_strategy": (
-                            "target_container_front_axis"
+                            "target_containing_container_pose"
+                            if containing_container is not None
+                            else "target_container_front_axis"
                             if self._container_approach_axis(node) is not None
                             else "target_radial_standoff"
                         ),
                         "interaction_approach_axis_xy": self._container_approach_axis(node),
+                        "containing_container_id": (
+                            str(containing_container.get("id") or "")
+                            if containing_container is not None
+                            else ""
+                        ),
+                        "direct_goal_tolerance_m": (
+                            0.45 if containing_container is not None else 0.0
+                        ),
+                        "direct_goal_yaw_tolerance_rad": (
+                            0.65 if containing_container is not None else 0.0
+                        ),
                     },
                 )
             )
         return candidates
+
+    @staticmethod
+    def _containing_container_node(
+        graph: dict[str, Any], target_node_id: str
+    ) -> dict[str, Any] | None:
+        container_ids = {
+            str(edge.get("src_id") or "")
+            for edge in graph.get("edges") or []
+            if str(edge.get("relation") or "") == "contains"
+            and str(edge.get("dst_id") or "") == str(target_node_id)
+        }
+        if not container_ids:
+            return None
+        return next(
+            (
+                node
+                for node in graph.get("nodes") or []
+                if str(node.get("id") or "") in container_ids
+                and str(node.get("type") or "") == "container"
+            ),
+            None,
+        )
 
     @staticmethod
     def _matches_target(node: dict[str, Any], target_context: dict[str, Any]) -> bool:
@@ -304,8 +362,6 @@ class CandidateGenerator:
     ) -> bool:
         if cls._matches_target(node, target_context):
             return True
-        if not bool(target_context.get("require_interaction")):
-            return False
         attributes = node.get("attributes") or {}
         requested_instance_id = str(
             target_context.get("target_container_instance_id") or ""
@@ -323,6 +379,8 @@ class CandidateGenerator:
         ).strip().casefold()
         if requested_source_name:
             return requested_source_name == observed_source_name
+        if not bool(target_context.get("require_interaction")):
+            return False
         requested_labels = list(target_context.get("target_container_labels") or [])
         if target_context.get("target_container_name"):
             requested_labels.append(target_context["target_container_name"])
@@ -539,7 +597,6 @@ class CandidateGenerator:
                 exploration_gain = 1.10
             explicit_target_reinteraction = bool(
                 target_context.get("enabled")
-                and target_context.get("require_interaction")
                 and self._matches_interaction_target(node, target_context)
             )
             if node_type == "container" and node_state in {"open", "static_open"}:
