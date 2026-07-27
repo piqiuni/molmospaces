@@ -583,15 +583,15 @@ class RealtimeGTObservationPublisher:
         size: np.ndarray,
     ) -> dict[str, Any]:
         metadata = spec.metadata
-        category = "Door" if spec.is_door else metadata.get("category") or spec.source_name
+        category = metadata.get("category") or ("Door" if spec.is_door else spec.source_name)
         return {
             "id": spec.source_name,
             "name": str(category),
             "bbox_2d": list(bbox_2d),
-            "visible_pixels": int(visible_pixels),
+            "visible_pixels": max(0, int(visible_pixels)),
             "visible_fraction": min(
                 1.0,
-                float(visible_pixels)
+                float(max(0, int(visible_pixels)))
                 / max(
                     1.0,
                     float(bbox_2d[2] - bbox_2d[0] + 1)

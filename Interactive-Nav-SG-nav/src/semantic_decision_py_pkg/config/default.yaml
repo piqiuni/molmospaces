@@ -7,6 +7,7 @@ topics:
   target_context: "/semantic_decision/target"
   goal_status: "/semantic_decision/goal_status"
   selected_behavior: "/semantic_decision/selected_behavior"
+  preempt_request: "/semantic_decision/preempt_request"
   behavior_feedback: "/semantic_decision/behavior_feedback"
   execution_state: "/semantic_decision/execution_state"
   explore_command: "/explore_py/command"
@@ -47,6 +48,7 @@ candidate:
   target_min_visible_pixels: 128
   target_min_visible_fraction: 0.2
   target_min_consecutive_observations: 2
+  target_arrival_tolerance_m: 0.35
 
 policy:
   backend: "rule"
@@ -74,6 +76,7 @@ policy:
   repeat_guard_enabled: true
   repeat_guard_low_gain_limit: 2
   repeat_guard_min_frontier_shrink_m: 0.15
+  repeat_guard_min_visible_area_shrink_m2: 0.5
 
 model:
   mode: "disabled"
@@ -88,6 +91,17 @@ model:
   max_graph_nodes: 80
   max_graph_edges: 160
   max_tokens: 256
+  selection_granularity: "candidate"
+  candidate_top_k: 8
+  navigate_quota: 1
+  interaction_quota: 3
+  explore_quota: 4
+  max_frontiers_per_room: 2
+  max_candidates_per_region: 1
+  explore_min_visible_gain_ratio: 0.25
+  history_region_size_m: 1.0
+  stale_goal_position_tolerance_m: 0.35
+  stale_goal_yaw_tolerance_rad: 0.50
 
 completion:
   empty_candidate_confirmations: 3
@@ -126,6 +140,9 @@ executor:
   make_plan_tolerance_m: 0.20
   make_plan_endpoint_tolerance_m: 0.60
   make_plan_fail_open: true
+  make_plan_empty_retry_count: 2
+  make_plan_empty_retry_delay_s: 0.15
+  explore_make_plan_fail_open_after_retries: true
   navigation_stagnation_timeout_s: 12.0
   navigation_stagnation_distance_m: 0.10
   navigation_stagnation_yaw_rad: 0.15

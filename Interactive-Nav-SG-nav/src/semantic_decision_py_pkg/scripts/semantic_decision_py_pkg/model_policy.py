@@ -7,8 +7,37 @@ import subprocess
 import time
 from typing import Any, Iterable
 from .behavior_candidates import BehaviorCandidate
+from .candidate_curator import candidate_history_key
 from semantic_mllm_py_pkg.client import MLLMClient, MLLMClientConfig
 from semantic_mllm_py_pkg.schemas import validate_subgoal_selection
+
+
+ROOM_ANCHOR_LABELS = {
+    "bed",
+    "bathtub",
+    "cabinet",
+    "counter",
+    "countertop",
+    "couch",
+    "desk",
+    "dishwasher",
+    "dresser",
+    "fridge",
+    "microwave",
+    "nightstand",
+    "oven",
+    "rack",
+    "refrigerator",
+    "shelf",
+    "shower",
+    "sink",
+    "sofa",
+    "stove",
+    "table",
+    "toilet",
+    "tv",
+    "wardrobe",
+}
 
 
 @dataclass
@@ -27,6 +56,8 @@ class ModelPolicyConfig:
     max_graph_nodes: int = 80
     max_graph_edges: int = 160
     metrics_path: str = ""
+    selection_granularity: str = "candidate"
+    history_region_size_m: float = 1.0
 
 
 @dataclass
@@ -143,7 +174,35 @@ def compact_semantic_graph(
     rooms = []
     portals = []
     containers = []
-    for node in list(graph.get("nodes") or [])[: max(0, int(max_nodes))]:
+    anchors_by_room: dict[str, list[dict[str, Any]]] = {}
+    unassigned_anchors = []
+    graph_nodes = list(graph.get("nodes") or [])[: max(0, int(max_nodes))]
+    for node in graph_nodes:
+        node_type = str(node.get("type") or "").casefold()
+        if node_type in {"scene", "room", "portal"}:
+            continue
+        label = str(node.get("label") or node.get("name") or node_type).strip()
+        normalized_label = label.casefold().replace(" ", "_")
+        if normalized_label not in ROOM_ANCHOR_LABELS:
+            continue
+        size = list(node.get("aabb_size") or [])
+        footprint_m2 = (
+            abs(float(size[0]) * float(size[1])) if len(size) >= 2 else 0.0
+        )
+        anchor = {
+            "type": label or node_type,
+            "visible": bool(node.get("is_currently_visible")),
+            "_rank": (
+                footprint_m2,
+                float(node.get("confidence", 0.0) or 0.0),
+            ),
+        }
+        room_id = _room_node_id(node.get("room_id"))
+        if room_id:
+            anchors_by_room.setdefault(room_id, []).append(anchor)
+        else:
+            unassigned_anchors.append(anchor)
+    for node in graph_nodes:
         node_type = str(node.get("type") or "").casefold()
         if node_type not in {"room", "portal", "container"}:
             continue
@@ -152,13 +211,46 @@ def compact_semantic_graph(
         node_id = str(node.get("id") or "")
         semantic_name = str(node.get("label") or node.get("name") or node_id)
         if node_type == "room":
-            rooms.append(
-                {
-                    "id": node_id,
-                    "type": semantic_name or "unknown",
-                    "_centroid": list(node.get("centroid") or [])[:2],
-                }
+            inferred_attribute = str(attributes.get("room_attribute") or "").strip()
+            inferred_known = bool(
+                inferred_attribute and inferred_attribute.casefold() != "unknown"
             )
+            room = {
+                "id": node_id,
+                "type": inferred_attribute if inferred_known else semantic_name or "unknown",
+                "_centroid": list(node.get("centroid") or [])[:2],
+            }
+            if inferred_known:
+                if semantic_name and semantic_name.casefold() != inferred_attribute.casefold():
+                    room["observed_type"] = semantic_name
+                room["room_attribute_confidence"] = round(
+                    float(attributes.get("room_attribute_confidence", 0.0) or 0.0),
+                    2,
+                )
+                scores = sorted(
+                    (
+                        (str(key), float(value or 0.0))
+                        for key, value in dict(
+                            attributes.get("room_attribute_scores") or {}
+                        ).items()
+                        if float(value or 0.0) > 0.0
+                    ),
+                    key=lambda item: (-item[1], item[0]),
+                )[:3]
+                if scores:
+                    room["room_attribute_scores"] = {
+                        key: round(value, 2) for key, value in scores
+                    }
+            room_anchors = sorted(
+                anchors_by_room.get(node_id, []),
+                key=lambda item: (-item["_rank"][0], -item["_rank"][1], item["type"]),
+            )[:6]
+            if room_anchors:
+                room["anchor_objects"] = [
+                    {key: value for key, value in anchor.items() if key != "_rank"}
+                    for anchor in room_anchors
+                ]
+            rooms.append(room)
             continue
         item = {
             "id": node_id,
@@ -188,6 +280,14 @@ def compact_semantic_graph(
     for room in rooms:
         room.pop("_centroid", None)
     result = {"rooms": rooms, "portals": portals, "containers": containers}
+    if unassigned_anchors:
+        result["unassigned_anchor_objects"] = [
+            {key: value for key, value in anchor.items() if key != "_rank"}
+            for anchor in sorted(
+                unassigned_anchors,
+                key=lambda item: (-item["_rank"][0], -item["_rank"][1], item["type"]),
+            )[:6]
+        ]
     if current_room:
         result["current_room"] = current_room
     return result
@@ -222,7 +322,31 @@ def compact_robot_context(
     return result
 
 
-def compact_candidate(candidate: BehaviorCandidate) -> dict[str, Any]:
+def _compact_history(history: dict[str, Any] | None) -> dict[str, Any]:
+    history = history or {}
+    if not history:
+        return {}
+    return {
+        "selection_count": int(history.get("selection_count", 0) or 0),
+        "last_selected_steps_ago": int(
+            history.get("last_selected_steps_ago", 0) or 0
+        ),
+        "last_result": str(history.get("last_result") or "UNKNOWN"),
+        "low_gain_repeat_count": int(
+            history.get("low_gain_repeat_count", 0) or 0
+        ),
+        "last_frontier_shrink_m": round(
+            float(history.get("last_frontier_shrink_m", 0.0) or 0.0), 2
+        ),
+    }
+
+
+def compact_candidate(
+    candidate: BehaviorCandidate,
+    *,
+    history: dict[str, Any] | None = None,
+    room_frontier_length_m: float = 0.0,
+) -> dict[str, Any]:
     behavior_type = str(candidate.behavior_type or "").upper()
     metadata = candidate.metadata or {}
     interaction = candidate.interaction_command or {}
@@ -249,9 +373,75 @@ def compact_candidate(candidate: BehaviorCandidate) -> dict[str, Any]:
     }
     if behavior_type != "EXPLORE" and candidate.target_name:
         result["subject_name"] = candidate.target_name
+    semantic_name = str(metadata.get("semantic_name") or "").strip()
+    if behavior_type == "INTERACT" and semantic_name:
+        result["subject_semantic_type"] = semantic_name
     room_id = _room_node_id(metadata.get("target_room_id") or metadata.get("room_id"))
     if room_id:
         result["room_id"] = room_id
+    if behavior_type == "EXPLORE":
+        frontier_cell_count = max(0, int(metadata.get("cell_count", 0) or 0))
+        map_resolution = max(0.0, float(metadata.get("map_resolution", 0.0) or 0.0))
+        if frontier_cell_count:
+            result["frontier_cell_count"] = frontier_cell_count
+        if frontier_cell_count and map_resolution:
+            result["frontier_length_m"] = round(
+                frontier_cell_count * map_resolution, 2
+            )
+        if room_frontier_length_m > 0.0:
+            result["room_frontier_length_m"] = round(room_frontier_length_m, 2)
+        unknown_area_m2 = max(
+            0.0, float(metadata.get("unknown_component_area_m2", 0.0) or 0.0)
+        )
+        if unknown_area_m2 > 0.0:
+            result["unknown_component_area_m2"] = round(unknown_area_m2, 2)
+        expected_visible_area_m2 = max(
+            0.0,
+            float(
+                metadata.get("expected_visible_unknown_area_m2", 0.0) or 0.0
+            ),
+        )
+        if expected_visible_area_m2 > 0.0:
+            result["expected_visible_unknown_area_m2"] = round(
+                expected_visible_area_m2, 2
+            )
+    elif behavior_type == "INTERACT":
+        state = str(metadata.get("state") or "")
+        if state:
+            result["state"] = state
+        connected_rooms = list(metadata.get("connected_room_ids") or [])
+        if connected_rooms:
+            result["connected_room_count"] = len(connected_rooms)
+        if bool(metadata.get("target_match")):
+            result["explicit_target_match"] = True
+        goal_to_subject_distance_m = metadata.get("goal_to_subject_distance_m")
+        if goal_to_subject_distance_m is not None:
+            result["goal_to_subject_distance_m"] = round(
+                max(0.0, float(goal_to_subject_distance_m)), 2
+            )
+        approach_goals = list(metadata.get("goal_xyyaw_candidates") or [])
+        if approach_goals:
+            result["approach_goal_count"] = len(approach_goals)
+        approach_strategy = str(metadata.get("approach_strategy") or "")
+        if approach_strategy:
+            result["approach_strategy"] = approach_strategy
+    elif bool(metadata.get("target_goal")):
+        result["target_visible_now"] = bool(metadata.get("target_visible_now"))
+    nearby_semantic_nodes = list(metadata.get("nearby_semantic_nodes") or [])[:3]
+    if nearby_semantic_nodes:
+        result["nearby_semantic_nodes"] = [
+            {
+                "type": str(item.get("label") or item.get("type") or "object"),
+                "distance_m": round(
+                    max(0.0, float(item.get("distance_m", 0.0) or 0.0)), 2
+                ),
+                "visible": bool(item.get("visible")),
+            }
+            for item in nearby_semantic_nodes
+        ]
+    compact_history = _compact_history(history)
+    if compact_history:
+        result["history"] = compact_history
     return result
 
 
@@ -336,6 +526,36 @@ def compact_candidate_groups(
                 or [0.0]
             )
             item["frontier_cell_count"] = frontier_cell_count
+            item["unknown_component_area_m2"] = round(
+                sum(
+                    max(
+                        0.0,
+                        float(
+                            (member.metadata or {}).get(
+                                "unknown_component_area_m2", 0.0
+                            )
+                            or 0.0
+                        ),
+                    )
+                    for member in members
+                ),
+                2,
+            )
+            item["expected_visible_unknown_area_m2"] = round(
+                sum(
+                    max(
+                        0.0,
+                        float(
+                            (member.metadata or {}).get(
+                                "expected_visible_unknown_area_m2", 0.0
+                            )
+                            or 0.0
+                        ),
+                    )
+                    for member in members
+                ),
+                2,
+            )
             if map_resolution > 0.0:
                 item["frontier_length_m"] = round(
                     frontier_cell_count * map_resolution, 2
@@ -363,6 +583,70 @@ def compact_candidate_groups(
     return projected, grouped
 
 
+def compact_candidate_options(
+    candidates: list[BehaviorCandidate],
+    graph: dict[str, Any],
+    *,
+    selection_granularity: str = "candidate",
+    decision_history: list[dict[str, Any]] | None = None,
+    candidate_history: dict[str, dict[str, Any]] | None = None,
+    history_region_size_m: float = 1.0,
+    room_frontier_lengths: dict[str, float] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, list[BehaviorCandidate]]]:
+    if str(selection_granularity or "candidate").casefold() == "room":
+        return compact_candidate_groups(
+            candidates,
+            graph,
+            decision_history=decision_history,
+        )
+    candidate_history = candidate_history or {}
+    room_frontier_lengths = dict(
+        room_frontier_lengths
+        if room_frontier_lengths is not None
+        else aggregate_room_frontier_lengths(candidates, graph)
+    )
+    lookup: dict[str, list[BehaviorCandidate]] = {}
+    projected = []
+    for candidate in sorted(candidates, key=lambda item: item.candidate_id):
+        candidate_id = candidate.candidate_id
+        lookup[candidate_id] = [candidate]
+        history_key = candidate_history_key(
+            candidate,
+            graph,
+            history_region_size_m,
+        )
+        history = candidate_history.get(candidate_id) or candidate_history.get(history_key)
+        room_id = _candidate_room_id(candidate, graph) or "unknown"
+        item = compact_candidate(
+            candidate,
+            history=history,
+            room_frontier_length_m=room_frontier_lengths.get(room_id, 0.0),
+        )
+        if (
+            str(candidate.behavior_type or "").upper() == "EXPLORE"
+            and room_id != "unknown"
+        ):
+            item["room_id"] = room_id
+        projected.append(item)
+    return projected, lookup
+
+
+def aggregate_room_frontier_lengths(
+    candidates: Iterable[BehaviorCandidate], graph: dict[str, Any]
+) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for candidate in candidates:
+        if str(candidate.behavior_type or "").upper() != "EXPLORE":
+            continue
+        room_id = _candidate_room_id(candidate, graph) or "unknown"
+        metadata = candidate.metadata or {}
+        result[room_id] = result.get(room_id, 0.0) + (
+            max(0, int(metadata.get("cell_count", 0) or 0))
+            * max(0.0, float(metadata.get("map_resolution", 0.0) or 0.0))
+        )
+    return result
+
+
 class ModelPolicyClient:
     def __init__(self, config: ModelPolicyConfig | None = None) -> None:
         self.config = config or ModelPolicyConfig()
@@ -371,6 +655,7 @@ class ModelPolicyClient:
         self.last_result_source = "not_called"
         self.last_ranking_ids: list[str] = []
         self.last_selected_group_id = ""
+        self.last_selected_candidate_id = ""
         self.last_reason = ""
         self.last_confidence = ""
         self.last_candidate_groups: list[dict[str, Any]] = []
@@ -402,6 +687,7 @@ class ModelPolicyClient:
         candidates = list(candidates)
         self.last_ranking_ids = []
         self.last_selected_group_id = ""
+        self.last_selected_candidate_id = ""
         self.last_reason = ""
         self.last_confidence = ""
         if not candidates:
@@ -416,8 +702,18 @@ class ModelPolicyClient:
         if response is None:
             return None
         decision_history = list((robot_context or {}).get("group_history") or [])
-        _, candidate_groups = compact_candidate_groups(
-            candidates, graph or {}, decision_history=decision_history
+        candidate_history = dict((robot_context or {}).get("candidate_history") or {})
+        _, candidate_groups = compact_candidate_options(
+            candidates,
+            graph or {},
+            selection_granularity=self.config.selection_granularity,
+            decision_history=decision_history,
+            candidate_history=candidate_history,
+            history_region_size_m=self.config.history_region_size_m,
+            room_frontier_lengths=dict(
+                (robot_context or {}).get("room_frontier_lengths") or {}
+            )
+            or None,
         )
         try:
             response = validate_subgoal_selection(response, set(candidate_groups))
@@ -428,6 +724,7 @@ class ModelPolicyClient:
         selected_id = response["candidate_id"]
         self.last_ranking_ids = list(response.get("ranked_ids") or [selected_id])
         self.last_selected_group_id = selected_id
+        self.last_selected_candidate_id = candidate_groups[selected_id][0].candidate_id
         self.last_reason = str(response.get("reason") or "")
         self.last_confidence = str(response.get("confidence") or "")
         scores = response["scores"]
@@ -447,27 +744,57 @@ class ModelPolicyClient:
     ) -> dict[str, Any]:
         decision_history = list((robot_context or {}).get("group_history") or [])
         recent_decisions = list((robot_context or {}).get("decision_history") or [])
-        compact_candidates, _ = compact_candidate_groups(
-            candidates, graph, decision_history=decision_history
+        candidate_history = dict((robot_context or {}).get("candidate_history") or {})
+        compact_candidates, _ = compact_candidate_options(
+            candidates,
+            graph,
+            selection_granularity=self.config.selection_granularity,
+            decision_history=decision_history,
+            candidate_history=candidate_history,
+            history_region_size_m=self.config.history_region_size_m,
+            room_frontier_lengths=dict(
+                (robot_context or {}).get("room_frontier_lengths") or {}
+            )
+            or None,
         )
         self.last_candidate_groups = list(compact_candidates)
+        if self.config.selection_granularity.casefold() == "room":
+            instruction = (
+                "Rank the room-level exploration groups and concrete interaction or navigation actions "
+                "by semantic relevance to the mission. Return option IDs unchanged. Use graph semantics, "
+                "distance, room frontier length, and recent room history. Return exactly one compact JSON "
+                "object with ranked_ids containing at most three IDs, a short reason code, and confidence "
+                "set to low, medium, or high. Do not return prose, scores, markdown, or additional keys."
+            )
+        else:
+            instruction = (
+                "Rank the concrete subgoals by semantic relevance to the mission. Each ID "
+                "is a specific navigation, interaction, or frontier action and must be returned unchanged. "
+                "Candidates passed generation checks and will be revalidated before execution. First infer "
+                "likely room function from observed room attributes and anchor objects, then relate that "
+                "function and nearby semantic objects to the target. For object goals, prefer a visible "
+                "target or an interaction likely to reveal it. Do not open a container merely because it is "
+                "available: prefer it only when its type and room are plausible for the target; otherwise "
+                "explore toward a more likely room. Treat container semantics as strong evidence: food and "
+                "drink are plausible in refrigerators or kitchen storage, while personal and bedside items "
+                "such as alarm clocks, keys, and books are plausible in dressers, drawers, desks, or "
+                "nightstands. Rank a semantically conflicting container below a portal or exploration action "
+                "even when that container is closer. Among exploration candidates with comparable "
+                "target relevance, first prefer larger expected_visible_unknown_area_m2 (the unknown area "
+                "likely exposed from this concrete viewpoint); use unknown_component_area_m2 only as "
+                "secondary long-term potential and distance only as a tie-break, "
+                "not as the primary objective. Use interaction effects, current graph state, remaining room "
+                "frontier, and compact history. Do not invent geometry, actions, or candidate IDs. Prefer a different spatial "
+                "region after repeated low-gain attempts unless revisiting is required by the target. "
+                "Return exactly one compact JSON object with ranked_ids containing at most three IDs, "
+                "reason set to TARGET_VISIBLE, REVEAL_TARGET_CONTAINER, UNLOCK_ROUTE, EXPLORE_TARGET_ROOM, "
+                "INFORMATION_GAIN, RECOVERY_DIVERSIFICATION, DISTANCE_TIEBREAK, or "
+                "NO_SEMANTIC_PREFERENCE, and confidence set to low, medium, or high. Do not return prose, "
+                "scores, markdown, or additional keys."
+            )
         return {
-            "schema_version": 2,
-            "instruction": (
-                "Rank candidate actions by semantic relevance to the mission. All candidates are "
-                "already feasible. Use graph semantics and distance, but do not infer geometry, "
-                "navigation cost, information gain, or manipulation difficulty. For object goals, "
-                "prefer actions likely to reveal or reach the target. For exploration, prefer actions "
-                "that reveal new rooms or container contents. Avoid selecting the same room again when "
-                "its recent attempts had low frontier shrink; prefer a different room unless the repeated "
-                "room has the largest remaining frontier, is the only reachable option, or is required by "
-                "the target. Use frontier_length_m as the room-level unknown-boundary signal and history "
-                "only as a repetition/observed-gain signal. Return exactly one compact JSON object "
-                "with ranked_ids containing at most three IDs, reason set to NEW_ROOM, "
-                "REVEAL_CONTENTS, TARGET_RELEVANCE, DISTANCE_TIEBREAK, or "
-                "NO_SEMANTIC_PREFERENCE, and confidence set to low, medium, or high. "
-                "Do not return prose, scores, markdown, or additional keys."
-            ),
+            "schema_version": 3,
+            "instruction": instruction,
             "mission": compact_target_context(target_context),
             "robot": compact_robot_context(graph, robot_context),
             "recent_decisions": recent_decisions[-8:],

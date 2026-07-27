@@ -87,7 +87,15 @@ def test_semantic_graph_keeps_only_rooms_portals_and_containers() -> None:
     )
 
     assert graph == {
-        "rooms": [{"id": "room_1", "type": "kitchen"}],
+        "rooms": [
+            {
+                "id": "room_1",
+                "type": "kitchen",
+                "anchor_objects": [
+                    {"type": "refrigerator", "visible": False}
+                ],
+            }
+        ],
         "portals": [
             {
                 "id": "portal_1",
@@ -110,6 +118,80 @@ def test_semantic_graph_keeps_only_rooms_portals_and_containers() -> None:
     }
 
 
+def test_semantic_graph_exposes_inferred_room_attributes_and_unassigned_anchors() -> None:
+    graph = compact_semantic_graph(
+        {
+            "nodes": [
+                {
+                    "id": "room_1",
+                    "type": "room",
+                    "label": "unknown_room",
+                    "centroid": [0.0, 0.0, 0.0],
+                    "attributes": {
+                        "room_attribute": "kitchen",
+                        "room_attribute_confidence": 0.85,
+                        "room_attribute_scores": {
+                            "kitchen": 2.0,
+                            "livingroom": 0.2,
+                        },
+                    },
+                },
+                {
+                    "id": "container_fridge",
+                    "type": "container",
+                    "label": "refrigerator",
+                    "aabb_size": [1.0, 1.0, 2.0],
+                    "is_currently_visible": True,
+                },
+            ]
+        }
+    )
+
+    assert graph["rooms"][0]["type"] == "kitchen"
+    assert graph["rooms"][0]["observed_type"] == "unknown_room"
+    assert graph["rooms"][0]["room_attribute_scores"] == {
+        "kitchen": 2.0,
+        "livingroom": 0.2,
+    }
+    assert graph["unassigned_anchor_objects"] == [
+        {"type": "refrigerator", "visible": True}
+    ]
+
+
+def test_model_candidate_exposes_unknown_area_and_nearby_semantics() -> None:
+    client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
+    candidate = BehaviorCandidate(
+        candidate_id="frontier:large_kitchen_side",
+        behavior_type="EXPLORE",
+        source="test",
+        target_id="large_kitchen_side",
+        target_name="large_kitchen_side",
+        goal_xyyaw=[2.0, 2.0, 0.0],
+        features={"distance_m": 4.0},
+        metadata={
+            "unknown_component_area_m2": 22.75,
+            "expected_visible_unknown_area_m2": 14.5,
+            "nearby_semantic_nodes": [
+                {
+                    "label": "refrigerator",
+                    "distance_m": 0.8,
+                    "visible": True,
+                }
+            ],
+        },
+    )
+
+    request = client.build_request([candidate], {"enabled": True, "target_name": "apple"}, {})
+
+    assert request["candidates"][0]["unknown_component_area_m2"] == 22.75
+    assert request["candidates"][0]["expected_visible_unknown_area_m2"] == 14.5
+    assert request["candidates"][0]["nearby_semantic_nodes"] == [
+        {"type": "refrigerator", "distance_m": 0.8, "visible": True}
+    ]
+    assert "expected_visible_unknown_area_m2" in request["instruction"]
+    assert "distance only as a tie-break" in request["instruction"]
+
+
 def test_model_request_contains_only_semantic_candidate_fields_and_distance() -> None:
     client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
     interaction = BehaviorCandidate(
@@ -121,7 +203,11 @@ def test_model_request_contains_only_semantic_candidate_fields_and_distance() ->
         goal_xyyaw=[3.0, 4.0, 1.2],
         interaction_command={"action": "open", "joint_names": ["joint_1"]},
         features={"distance_m": 2.345, "visibility_gain": 0.9, "interaction_cost": 1.0},
-        metadata={"node_type": "container", "debug": {"large": "payload"}},
+        metadata={
+            "node_type": "container",
+            "semantic_name": "refrigerator",
+            "debug": {"large": "payload"},
+        },
     )
 
     request = client.build_request(
@@ -145,6 +231,7 @@ def test_model_request_contains_only_semantic_candidate_fields_and_distance() ->
             "effect": "reveal_contents",
             "distance_m": 2.35,
             "subject_name": "refrigerator",
+            "subject_semantic_type": "refrigerator",
         }
     ]
     serialized = str(request)
@@ -154,7 +241,7 @@ def test_model_request_contains_only_semantic_candidate_fields_and_distance() ->
     assert "metadata" not in serialized
 
 
-def test_exploration_candidates_are_grouped_by_nearest_room() -> None:
+def test_exploration_candidates_are_sent_as_concrete_subgoals() -> None:
     client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
     candidates = [
         BehaviorCandidate(
@@ -180,25 +267,82 @@ def test_exploration_candidates_are_grouped_by_nearest_room() -> None:
     request = client.build_request(
         candidates,
         {"enabled": False},
-        {"nodes": [{"id": "room_1", "type": "room", "label": "kitchen", "centroid": [0, 0, 0]}]},
+        {
+            "nodes": [
+                {
+                    "id": "room_1",
+                    "type": "room",
+                    "label": "kitchen",
+                    "centroid": [0, 0, 0],
+                }
+            ]
+        },
     )
 
     assert request["candidates"] == [
         {
-            "id": "explore:room_1",
+            "id": "frontier:a",
             "action": "explore",
-            "subject_id": "room_1",
-            "subject_type": "room",
+            "subject_id": "a",
+            "subject_type": "frontier",
             "effect": "reveal_space",
             "distance_m": 1.0,
-            "member_count": 2,
-            "frontier_cell_count": 0,
-        }
+            "room_id": "room_1",
+        },
+        {
+            "id": "frontier:b",
+            "action": "explore",
+            "subject_id": "b",
+            "subject_type": "frontier",
+            "effect": "reveal_space",
+            "distance_m": 2.0,
+            "room_id": "room_1",
+        },
     ]
 
 
-def test_exploration_room_summary_includes_frontier_length_and_history() -> None:
-    client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
+def test_model_selection_returns_the_exact_frontier_id(monkeypatch) -> None:
+    client = ModelPolicyClient(ModelPolicyConfig(mode="mock"))
+    candidates = [
+        BehaviorCandidate(
+            candidate_id="frontier:a",
+            behavior_type="EXPLORE",
+            source="test",
+            target_id="a",
+            target_name="a",
+            goal_xyyaw=[0.5, 0.0, 0.0],
+            features={"distance_m": 1.0},
+        ),
+        BehaviorCandidate(
+            candidate_id="frontier:b",
+            behavior_type="EXPLORE",
+            source="test",
+            target_id="b",
+            target_name="b",
+            goal_xyyaw=[1.0, 0.0, 0.0],
+            features={"distance_m": 2.0},
+        ),
+    ]
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda payload, metrics_context=None: {
+            "ranked_ids": ["frontier:b", "frontier:a"],
+            "reason": "INFORMATION_GAIN",
+            "confidence": "high",
+        },
+    )
+
+    selected = client.select(candidates, graph={})
+
+    assert selected is candidates[1]
+    assert client.last_selected_candidate_id == "frontier:b"
+
+
+def test_legacy_room_granularity_remains_available_for_ablation() -> None:
+    client = ModelPolicyClient(
+        ModelPolicyConfig(mode="disabled", selection_granularity="room")
+    )
     candidates = [
         BehaviorCandidate(
             candidate_id="frontier:a",
@@ -253,6 +397,50 @@ def test_exploration_room_summary_includes_frontier_length_and_history() -> None
     assert request["candidates"][0]["frontier_length_m"] == 1.0
     assert request["candidates"][0]["history"]["low_gain_repeat_count"] == 2
     assert request["recent_decisions"][0]["candidate_id"] == "frontier:a"
+
+
+def test_candidate_request_includes_spatial_history_without_rule_score() -> None:
+    client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
+    candidate = BehaviorCandidate(
+        candidate_id="frontier:new_cluster",
+        behavior_type="EXPLORE",
+        source="test",
+        target_id="new_cluster",
+        target_name="new_cluster",
+        goal_xyyaw=[1.2, 1.1, 0.0],
+        features={"distance_m": 2.0},
+        metadata={
+            "target_room_id": 1,
+            "frontier_point": [1.2, 1.1],
+            "cell_count": 10,
+            "map_resolution": 0.05,
+        },
+    )
+
+    request = client.build_request(
+        [candidate],
+        {"enabled": True, "target_name": "apple"},
+        {},
+        {
+            "room_frontier_lengths": {"room_1": 2.0},
+            "candidate_history": {
+                "explore_region:room_1:1:1": {
+                    "selection_count": 2,
+                    "last_selected_steps_ago": 15,
+                    "last_result": "SUCCEEDED",
+                    "low_gain_repeat_count": 1,
+                    "last_frontier_shrink_m": 0.05,
+                }
+            }
+        },
+    )
+
+    option = request["candidates"][0]
+    assert option["id"] == "frontier:new_cluster"
+    assert option["frontier_length_m"] == 0.5
+    assert option["room_frontier_length_m"] == 2.0
+    assert option["history"]["selection_count"] == 2
+    assert "rule_score" not in str(request)
 
 
 def test_circuit_breaker_opens_only_after_consecutive_timeouts() -> None:

@@ -208,6 +208,7 @@ decision messages retain only semantic commands/results (`object_id`, action, op
 regions, `state`/`post_state`, success, and cost), not raw joint metadata. The simulator executor
 maps `object_id` to its articulation and, for drawer scans, maps visual regions to slide joints.
 
+
 ### Unified graph JSON
 
 `/semantic_mapping/unified_graph` publishes:

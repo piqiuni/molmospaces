@@ -244,6 +244,16 @@ class AtomicForceInteractionController:
                 task.env,
                 command["object_id"],
             )
+            if not bool(plan.get("supported", True)):
+                return self._publish_unsupported_interaction(
+                    command,
+                    step=step,
+                    reason=str(plan.get("reason") or "interaction_unsupported"),
+                    interaction_capability=str(
+                        plan.get("interaction_capability") or "unsupported"
+                    ),
+                    view_result=view_result,
+                )
             execution_mode = str(
                 command.get("interaction_execution_mode")
                 or self.interaction_execution_mode
@@ -310,6 +320,85 @@ class AtomicForceInteractionController:
         except Exception:
             self._commands.task_done()
             raise
+
+    def _publish_unsupported_interaction(
+        self,
+        command: dict[str, Any],
+        *,
+        step: int,
+        reason: str,
+        interaction_capability: str,
+        view_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        event_id = str(
+            command.get("event_id") or f"interaction_{self._event_index:06d}"
+        )
+        self._event_index += 1
+        stamp_sec = time.time()
+        node_type = str(command.get("node_type") or "").casefold()
+        static_portal = (
+            node_type == "portal"
+            and str(interaction_capability).casefold() == "static"
+        )
+        result = {
+            "event_id": event_id,
+            "command_id": str(command["command_id"]),
+            "candidate_id": str(command.get("candidate_id") or ""),
+            "decision_id": str(command.get("decision_id") or ""),
+            "node_id": str(command.get("node_id") or ""),
+            "object_id": str(command["object_id"]),
+            "node_type": node_type,
+            "action": str(command.get("action") or "open"),
+            "interaction_mode": "none",
+            "interaction_group_id": str(
+                command.get("interaction_group_id") or "all"
+            ),
+            "interaction_capability": str(interaction_capability),
+            "interactable": False,
+            "state": "static_open" if static_portal else "static",
+            "pre_state": "unknown",
+            "post_state": "static_open" if static_portal else "unknown",
+            "success": static_portal,
+            "status": "SUCCEEDED" if static_portal else "FAILED",
+            "reason": "" if static_portal else str(reason),
+            "confidence": 1.0,
+            "execution_cost": 0.0,
+            "sim_steps_consumed": 0,
+            "physics_substeps": 0,
+            "task_steps_consumed": 0,
+            "result_published_step": int(step),
+            "source": (
+                "executor_static_portal"
+                if static_portal
+                else "force_interaction_capability_check"
+            ),
+            "verification_source": "mujoco_articulation_registry",
+            "view_profile": str(command.get("view_profile") or "default"),
+            "view_profile_result": view_result,
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        feedback = {
+            "command_id": result["command_id"],
+            "candidate_id": result["candidate_id"],
+            "decision_id": result["decision_id"],
+            "event_id": event_id,
+            "behavior_type": "INTERACT",
+            "status": result["status"],
+            "success": result["success"],
+            "reason": result["reason"],
+            "interaction_result": result,
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        self._events.append({"result": result, "feedback": feedback})
+        self._force_observation_requested = True
+        self._pause_navigation = False
+        self._publish(self._result_publisher, result)
+        self._publish(self._feedback_publisher, feedback)
+        self._write_snapshot()
+        self._commands.task_done()
+        return result
 
     def after_step(self, task, step: int) -> dict[str, Any] | None:
         pending = self._pending
@@ -385,6 +474,9 @@ class AtomicForceInteractionController:
                 "interaction_mode": str(command.get("interaction_mode") or "open_close"),
                 "operation_method": str(command.get("operation_method") or "unknown"),
                 "open_regions": list(command.get("open_regions") or []),
+                "approach_goal_xyyaw": list(
+                    command.get("approach_goal_xyyaw") or []
+                ),
                 "visual_operation_plan": dict(command.get("visual_operation_plan") or {}),
                 "view_profile": str(command.get("view_profile") or "default"),
                 "view_torso_pitch_rad": command.get("view_torso_pitch_rad"),
@@ -657,6 +749,14 @@ class AtomicForceInteractionController:
         if phase == "open":
             if mode == "fast":
                 self._force_observation_requested = True
+                if int(pending["observation_steps"]) > 1:
+                    pending["phase"] = "observe"
+                    pending["phase_step"] = 0
+                    pending["phase_plan"] = None
+                    pending["remaining_observation_steps"] = int(
+                        pending["observation_steps"]
+                    )
+                    return None
                 self._record_drawer_observation(task, step)
                 if int(pending["group_index"]) + 1 < len(pending["groups"]):
                     pending["group_index"] += 1
@@ -749,6 +849,7 @@ class AtomicForceInteractionController:
             "sequence_type": "drawer_scan",
             "operation_method": str(command.get("operation_method") or "pull"),
             "open_regions": list(command.get("open_regions") or []),
+            "approach_goal_xyyaw": list(command.get("approach_goal_xyyaw") or []),
             "visual_operation_plan": dict(command.get("visual_operation_plan") or {}),
             "grounded_regions": [
                 {
@@ -892,13 +993,10 @@ class AtomicForceInteractionController:
         stamp_sec = time.time()
         object_id = str(command.get("object_id") or "")
         node_id = str(command.get("node_id") or "")
+        node_type = str(command.get("node_type") or "").casefold()
         missing_articulation = str(exc).startswith("Articulated object not found:")
         invalid_interaction_pose = str(exc).startswith("Interaction pose invalid:")
-        static_portal = missing_articulation and (
-            node_id.startswith("portal_")
-            or "doorframe" in object_id.casefold()
-            or "doorway" in object_id.casefold()
-        )
+        static_portal = missing_articulation and node_type == "portal"
         try:
             view_restore_result = self._head_view_controller.restore(task.env)
         except (AttributeError, KeyError, ValueError):
@@ -913,6 +1011,7 @@ class AtomicForceInteractionController:
             "decision_id": str(command.get("decision_id") or ""),
             "node_id": node_id,
             "object_id": object_id,
+            "node_type": node_type,
             "action": str(command.get("action") or "open"),
             "interaction_mode": str(command.get("interaction_mode") or "open_close"),
             "operation_method": str(command.get("operation_method") or "unknown"),

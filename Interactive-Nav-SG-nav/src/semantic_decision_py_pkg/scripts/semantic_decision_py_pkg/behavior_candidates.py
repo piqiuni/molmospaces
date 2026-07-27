@@ -9,6 +9,33 @@ BEHAVIOR_EXPLORE = "EXPLORE"
 BEHAVIOR_INTERACT = "INTERACT"
 BEHAVIOR_NAVIGATE = "NAVIGATE"
 
+SPATIAL_CONTEXT_LABELS = {
+    "bed",
+    "bathtub",
+    "cabinet",
+    "counter",
+    "countertop",
+    "couch",
+    "desk",
+    "dishwasher",
+    "dresser",
+    "fridge",
+    "microwave",
+    "nightstand",
+    "oven",
+    "rack",
+    "refrigerator",
+    "shelf",
+    "shower",
+    "sink",
+    "sofa",
+    "stove",
+    "table",
+    "toilet",
+    "tv",
+    "wardrobe",
+}
+
 
 @dataclass
 class BehaviorCandidate:
@@ -51,6 +78,7 @@ class CandidateGeneratorConfig:
     target_min_visible_pixels: int = 16
     target_min_visible_fraction: float = 0.2
     target_min_consecutive_observations: int = 2
+    target_arrival_tolerance_m: float = 0.35
 
 
 class CandidateGenerator:
@@ -76,6 +104,7 @@ class CandidateGenerator:
             candidates.extend(
                 self._target_candidates(graph or {}, robot_xy, target_context or {})
             )
+        self._attach_spatial_context(candidates, graph or {})
         return sorted(candidates, key=lambda candidate: candidate.candidate_id)
 
     def _target_candidates(
@@ -87,6 +116,11 @@ class CandidateGenerator:
         if not bool(target_context.get("enabled")):
             return []
         candidates = []
+        nodes_by_id = {
+            str(node.get("id") or ""): node
+            for node in graph.get("nodes") or []
+            if str(node.get("id") or "")
+        }
         robot_room_id = self._room_id_for_xy(graph, robot_xy)
         for node in graph.get("nodes") or []:
             if str(node.get("type") or "") in {"scene", "room", "portal"}:
@@ -118,41 +152,46 @@ class CandidateGenerator:
             state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
             if state_age_sec > self.config.target_max_state_age_sec:
                 continue
-            node_id = str(node.get("id") or "")
-            position = self._node_xy(node, prefer_aabb=True)
+            navigation_anchor = self._target_navigation_anchor(
+                node,
+                graph,
+                nodes_by_id,
+            )
+            position = self._node_xy(navigation_anchor, prefer_aabb=True)
             if position is None:
                 continue
-            target_standoff = float(
-                target_context.get("standoff_m", self.config.target_standoff_m)
+            previous_interaction_goal = self._successful_interaction_approach(
+                navigation_anchor
             )
-            containing_container = self._containing_container_node(graph, node_id)
-            if containing_container is not None:
-                container_position = self._node_xy(containing_container)
-                if container_position is not None:
-                    goal = self._approach_candidates(
-                        robot_xy,
-                        container_position,
-                        containing_container,
-                        target_standoff,
-                        "container",
-                    )[0]
-                else:
-                    goal = self._approach_pose(
-                        robot_xy,
-                        position,
-                        target_standoff,
-                        node=node,
-                        fixed_axis=self._container_approach_axis(node),
-                    )
-            else:
-                goal = self._approach_pose(
-                    robot_xy,
-                    position,
-                    target_standoff,
-                    node=node,
-                    fixed_axis=self._container_approach_axis(node),
-                )
+            configured_interaction_goal = (
+                self._container_approach_pose(navigation_anchor)
+                if navigation_anchor is not node
+                else None
+            )
+            goal = previous_interaction_goal or configured_interaction_goal or self._approach_pose(
+                robot_xy,
+                position,
+                float(target_context.get("standoff_m", self.config.target_standoff_m)),
+                node=navigation_anchor,
+                fixed_axis=self._container_approach_axis(navigation_anchor),
+            )
             distance_m = math.hypot(goal[0] - robot_xy[0], goal[1] - robot_xy[1])
+            target_arrival_tolerance_m = max(
+                0.0,
+                float(
+                    target_context.get(
+                        "arrival_tolerance_m",
+                        self.config.target_arrival_tolerance_m,
+                    )
+                ),
+            )
+            node_id = str(node.get("id") or "")
+            containing_container = (
+                navigation_anchor
+                if navigation_anchor is not node
+                and str(navigation_anchor.get("type") or "") == "container"
+                else None
+            )
             attributes = node.get("attributes") or {}
             visible_pixels = int(attributes.get("visible_pixels", 0) or 0)
             target_min_visible_pixels = int(
@@ -242,6 +281,12 @@ class CandidateGenerator:
                         "target_goal": True,
                         "target_context": dict(target_context),
                         "node_type": str(node.get("type") or "object"),
+                        "navigation_anchor_id": str(
+                            navigation_anchor.get("id") or node_id
+                        ),
+                        "navigation_anchor_type": str(
+                            navigation_anchor.get("type") or node.get("type") or "object"
+                        ),
                         "is_currently_visible": bool(node.get("is_currently_visible")),
                         "target_visible_now": target_visible_now,
                         "target_require_current_visibility": require_current_visibility,
@@ -259,19 +304,33 @@ class CandidateGenerator:
                         "target_consecutive_observations": consecutive_observations,
                         "target_max_consecutive_observations": max_consecutive_observations,
                         "target_reliably_observed": reliably_observed,
+                        "target_goal_distance_m": distance_m,
+                        "target_arrival_tolerance_m": target_arrival_tolerance_m,
+                        "target_navigation_required": (
+                            distance_m > target_arrival_tolerance_m
+                        ),
                         "target_min_visible_fraction": target_min_visible_fraction,
                         "target_min_consecutive_observations": target_min_consecutive_observations,
                         "verify_target_visibility": verify_visibility,
                         "target_min_visible_pixels": target_min_visible_pixels,
                         "state_age_sec": state_age_sec,
                         "approach_strategy": (
-                            "target_containing_container_pose"
-                            if containing_container is not None
+                            "target_last_successful_interaction_pose"
+                            if previous_interaction_goal is not None
+                            else "target_containing_container_pose"
+                            if configured_interaction_goal is not None
+                            else "target_container_front_axis"
+                            if navigation_anchor is not node
+                            and self._container_approach_axis(navigation_anchor) is not None
+                            else "target_parent_container_standoff"
+                            if navigation_anchor is not node
                             else "target_container_front_axis"
                             if self._container_approach_axis(node) is not None
                             else "target_radial_standoff"
                         ),
-                        "interaction_approach_axis_xy": self._container_approach_axis(node),
+                        "interaction_approach_axis_xy": self._container_approach_axis(
+                            navigation_anchor
+                        ),
                         "containing_container_id": (
                             str(containing_container.get("id") or "")
                             if containing_container is not None
@@ -427,6 +486,16 @@ class CandidateGenerator:
                 key=lambda proposal: (
                     -float(
                         (proposal.get("raw_features") or {}).get(
+                            "expected_visible_unknown_area_m2", 0.0
+                        )
+                    ),
+                    -float(
+                        (proposal.get("raw_features") or {}).get(
+                            "unknown_component_area_m2", 0.0
+                        )
+                    ),
+                    -float(
+                        (proposal.get("raw_features") or {}).get(
                             "information_gain", 0.0
                         )
                     ),
@@ -438,11 +507,21 @@ class CandidateGenerator:
             )
         else:
             proposals.sort(
-                key=lambda proposal: float(proposal.get("score", 0.0)),
-                reverse=True,
+                key=lambda proposal: (
+                    -float(
+                        proposal.get("expected_visible_unknown_area_m2", 0.0)
+                        or 0.0
+                    ),
+                    -float(proposal.get("unknown_component_area_m2", 0.0) or 0.0),
+                    -float(proposal.get("information_gain", 0.0) or 0.0),
+                    float(proposal.get("distance_to_robot", 0.0) or 0.0),
+                    str(proposal.get("cluster_id") or ""),
+                )
             )
         proposals = proposals[: max(0, int(self.config.max_frontier_candidates))]
         raw_information = []
+        raw_unknown_areas = []
+        raw_expected_visible_areas = []
         for proposal in proposals:
             value = (
                 (proposal.get("raw_features") or {}).get("information_gain", 0.0)
@@ -450,10 +529,49 @@ class CandidateGenerator:
                 else proposal.get("information_gain", 0.0)
             )
             raw_information.append(max(0.0, float(value or 0.0)))
+            area_value = (
+                (proposal.get("raw_features") or {}).get(
+                    "unknown_component_area_m2", 0.0
+                )
+                if is_raw_proposal_stream
+                else proposal.get("unknown_component_area_m2", 0.0)
+            )
+            raw_unknown_areas.append(max(0.0, float(area_value or 0.0)))
+            visible_area_value = (
+                (proposal.get("raw_features") or {}).get(
+                    "expected_visible_unknown_area_m2", 0.0
+                )
+                if is_raw_proposal_stream
+                else proposal.get("expected_visible_unknown_area_m2", 0.0)
+            )
+            if not visible_area_value:
+                frontier_length_m = (
+                    (proposal.get("raw_features") or {}).get(
+                        "frontier_length_m", 0.0
+                    )
+                    if is_raw_proposal_stream
+                    else proposal.get("frontier_length_m", 0.0)
+                )
+                visible_area_value = min(
+                    max(0.0, float(area_value or 0.0)),
+                    max(0.0, float(frontier_length_m or 0.0)) * 5.0,
+                )
+            raw_expected_visible_areas.append(
+                max(0.0, float(visible_area_value or 0.0))
+            )
         max_information = max(raw_information) if raw_information else 1.0
+        max_unknown_area = max(raw_unknown_areas) if raw_unknown_areas else 0.0
+        max_expected_visible_area = (
+            max(raw_expected_visible_areas) if raw_expected_visible_areas else 0.0
+        )
         map_resolution = max(0.0, float(status.get("map_resolution", 0.0) or 0.0))
         candidates = []
-        for proposal, information_gain in zip(proposals, raw_information):
+        for proposal, information_gain, unknown_area_m2, expected_visible_area_m2 in zip(
+            proposals,
+            raw_information,
+            raw_unknown_areas,
+            raw_expected_visible_areas,
+        ):
             cluster_id = str(
                 proposal.get("proposal_id") or proposal.get("cluster_id") or ""
             )
@@ -488,6 +606,18 @@ class CandidateGenerator:
             information_normalized = (
                 math.log1p(information_gain) / max(math.log1p(max_information), 1e-6)
             )
+            unknown_area_normalized = (
+                math.log1p(unknown_area_m2)
+                / max(math.log1p(max_unknown_area), 1e-6)
+                if max_unknown_area > 0.0
+                else information_normalized
+            )
+            expected_visible_area_normalized = (
+                math.log1p(expected_visible_area_m2)
+                / max(math.log1p(max_expected_visible_area), 1e-6)
+                if max_expected_visible_area > 0.0
+                else unknown_area_normalized
+            )
             candidates.append(
                 BehaviorCandidate(
                     candidate_id=f"frontier:{cluster_id}",
@@ -497,8 +627,8 @@ class CandidateGenerator:
                     target_name=cluster_id,
                     goal_xyyaw=[float(subgoal[0]), float(subgoal[1]), yaw],
                     features={
-                        "exploration_gain": information_normalized,
-                        "visibility_gain": information_normalized,
+                        "exploration_gain": expected_visible_area_normalized,
+                        "visibility_gain": expected_visible_area_normalized,
                         "semantic_gain": 0.0,
                         "distance_m": distance_m,
                         "interaction_cost": 0.0,
@@ -514,6 +644,15 @@ class CandidateGenerator:
                                 "frontier_cell_count", proposal.get("cell_count", 0)
                             )
                         ),
+                        "unknown_component_area_m2": unknown_area_m2,
+                        "expected_visible_unknown_area_m2": expected_visible_area_m2,
+                        "frontier_length_m": float(
+                            raw_features.get(
+                                "frontier_length_m",
+                                proposal.get("frontier_length_m", 0.0),
+                            )
+                            or 0.0
+                        ),
                         "map_resolution": map_resolution,
                         "explorer_score": explorer_score,
                         "explorer_score_terms": explorer_score_terms,
@@ -525,6 +664,64 @@ class CandidateGenerator:
                 )
             )
         return candidates
+
+    @classmethod
+    def _attach_spatial_context(
+        cls,
+        candidates: list[BehaviorCandidate],
+        graph: dict[str, Any],
+        max_distance_m: float = 3.0,
+    ) -> None:
+        semantic_nodes = []
+        for node in graph.get("nodes") or []:
+            node_type = str(node.get("type") or "").casefold()
+            if node_type in {"scene", "room", "portal"}:
+                continue
+            label = str(node.get("label") or node.get("name") or "").strip()
+            normalized_label = label.casefold().replace(" ", "_")
+            if (
+                node_type not in {"container", "support"}
+                and normalized_label not in SPATIAL_CONTEXT_LABELS
+            ):
+                continue
+            position = cls._node_xy(node, prefer_aabb=True)
+            if position is None:
+                continue
+            semantic_nodes.append(
+                {
+                    "id": str(node.get("id") or ""),
+                    "type": node_type,
+                    "label": label or node_type,
+                    "position": position,
+                    "is_currently_visible": bool(node.get("is_currently_visible")),
+                }
+            )
+        for candidate in candidates:
+            goal = list(candidate.goal_xyyaw or [])
+            if len(goal) < 2:
+                continue
+            nearby = []
+            for node in semantic_nodes:
+                distance_m = math.hypot(
+                    float(goal[0]) - node["position"][0],
+                    float(goal[1]) - node["position"][1],
+                )
+                if node["id"] == str(candidate.target_id):
+                    candidate.metadata["goal_to_subject_distance_m"] = distance_m
+                    continue
+                if distance_m <= max_distance_m:
+                    nearby.append(
+                        {
+                            "id": node["id"],
+                            "type": node["type"],
+                            "label": node["label"],
+                            "distance_m": round(distance_m, 2),
+                            "visible": node["is_currently_visible"],
+                        }
+                    )
+            nearby.sort(key=lambda item: (item["distance_m"], item["id"]))
+            if nearby:
+                candidate.metadata["nearby_semantic_nodes"] = nearby[:3]
 
     def _interaction_candidates(
         self,
@@ -595,6 +792,7 @@ class CandidateGenerator:
             exploration_gain = 1.0 if node_type == "portal" else 0.65
             if node_type == "portal" and len(connected_room_ids) < 2:
                 exploration_gain = 1.10
+
             explicit_target_reinteraction = bool(
                 target_context.get("enabled")
                 and self._matches_interaction_target(node, target_context)
@@ -661,6 +859,13 @@ class CandidateGenerator:
                     },
                     metadata={
                         "node_type": node_type,
+                        "semantic_name": str(
+                            attributes.get("semantic_name")
+                            or attributes.get("category")
+                            or node.get("label")
+                            or node.get("name")
+                            or node_type
+                        ),
                         "state": node_state,
                         "expected_effect": expected_effect,
                         "connected_room_ids": connected_room_ids,
@@ -698,6 +903,7 @@ class CandidateGenerator:
                         ),
                         "goal_xyyaw_candidates": goal_candidates,
                     },
+
                 )
             )
         return candidates
@@ -788,6 +994,77 @@ class CandidateGenerator:
             values = list(node.get(key) or [])
             if len(values) >= 2:
                 return float(values[0]), float(values[1])
+        return None
+
+    @classmethod
+    def _target_navigation_anchor(
+        cls,
+        node: dict[str, Any],
+        graph: dict[str, Any],
+        nodes_by_id: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        target_id = str(node.get("id") or "")
+        parent_ids = [str(node.get("parent_id") or "")]
+        parent_ids.extend(
+            str(edge.get("src_id") or "")
+            for edge in graph.get("edges") or []
+            if str(edge.get("dst_id") or "") == target_id
+            and str(edge.get("relation") or "").casefold() == "contains"
+        )
+        for parent_id in parent_ids:
+            parent = nodes_by_id.get(parent_id, {})
+            if str(parent.get("type") or "").casefold() == "container":
+                return parent
+
+        target_center = list(node.get("aabb_center") or node.get("centroid") or [])
+        if len(target_center) < 3:
+            return node
+        target_room_id = node.get("room_id")
+        nearby = []
+        margin_m = 0.25
+        for candidate in graph.get("nodes") or []:
+            if str(candidate.get("type") or "").casefold() != "container":
+                continue
+            if (
+                target_room_id is not None
+                and candidate.get("room_id") is not None
+                and int(candidate.get("room_id")) != int(target_room_id)
+            ):
+                continue
+            center = list(candidate.get("aabb_center") or candidate.get("centroid") or [])
+            size = list(candidate.get("aabb_size") or [])
+            if len(center) < 3 or len(size) < 3:
+                continue
+            normalized_distance = 0.0
+            inside_expanded_box = True
+            for axis in range(3):
+                half_extent = 0.5 * abs(float(size[axis]))
+                delta = abs(float(target_center[axis]) - float(center[axis]))
+                if delta > half_extent + margin_m:
+                    inside_expanded_box = False
+                    break
+                normalized_distance += (delta / max(half_extent + margin_m, 1e-6)) ** 2
+            if inside_expanded_box:
+                nearby.append(
+                    (normalized_distance, str(candidate.get("id") or ""), candidate)
+                )
+        return min(nearby, default=(0.0, "", node))[2]
+
+    @staticmethod
+    def _successful_interaction_approach(
+        node: dict[str, Any],
+    ) -> list[float] | None:
+        history = list((node.get("interaction") or {}).get("operation_history") or [])
+        for event in reversed(history):
+            if not bool(event.get("success")):
+                continue
+            values = list(event.get("approach_goal_xyyaw") or [])
+            if len(values) >= 2:
+                return [
+                    float(values[0]),
+                    float(values[1]),
+                    float(values[2]) if len(values) > 2 else 0.0,
+                ]
         return None
 
     @staticmethod

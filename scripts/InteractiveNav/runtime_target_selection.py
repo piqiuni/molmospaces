@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import random
 from typing import Any
 
@@ -23,6 +25,24 @@ CONTAINER_TOKENS = {
     "dishwasher",
     "storage",
 }
+
+
+def load_fixed_container_target(path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    selection_path = Path(path).expanduser().resolve()
+    payload = json.loads(selection_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Fixed target selection must be a JSON object: {selection_path}")
+    raw_context = payload.get("target_context", payload)
+    if not isinstance(raw_context, dict):
+        raise ValueError(f"Fixed target context must be a JSON object: {selection_path}")
+    context = dict(raw_context)
+    if not bool(context.get("enabled")):
+        raise ValueError(f"Fixed target context is not enabled: {selection_path}")
+    selection = dict(payload)
+    selection["target_context"] = context
+    selection["selection_mode"] = "fixed_container_object"
+    selection["selection_input_path"] = str(selection_path)
+    return context, selection
 
 
 def _normalized_tokens(value: Any) -> set[str]:
@@ -53,7 +73,13 @@ def _is_container(object_manager, name: str, metadata: dict[str, Any], door_name
     return articulable and has_receptacle and bool(tokens & CONTAINER_TOKENS)
 
 
-def _is_inside(container_center, container_size, object_center, object_size, margin: float = 0.05) -> tuple[bool, float]:
+def _is_inside(
+    container_center,
+    container_size,
+    object_center,
+    object_size,
+    margin: float = 0.02,
+) -> tuple[bool, float]:
     container_center = np.asarray(container_center, dtype=float)
     container_size = np.maximum(np.asarray(container_size, dtype=float), 1e-4)
     object_center = np.asarray(object_center, dtype=float)
@@ -64,9 +90,16 @@ def _is_inside(container_center, container_size, object_center, object_size, mar
     object_max = object_center + object_size * 0.5
     overlap = np.maximum(0.0, np.minimum(container_max, object_max) - np.maximum(container_min, object_min))
     overlap_ratio = float(np.prod(overlap) / max(float(np.prod(object_size)), 1e-6))
-    center_inside = bool(np.all(object_center >= container_min - margin) and np.all(object_center <= container_max + margin))
-    bounds_inside = bool(np.all(object_min >= container_min - margin) and np.all(object_max <= container_max + margin))
-    return bounds_inside or (center_inside and overlap_ratio >= 0.55), overlap_ratio
+    center_inside_xy = bool(
+        np.all(object_center[:2] >= container_min[:2] - margin)
+        and np.all(object_center[:2] <= container_max[:2] + margin)
+    )
+    vertical_clearance = max(0.01, min(0.05, 0.02 * float(container_size[2])))
+    center_inside_z = bool(
+        object_center[2] >= container_min[2] + vertical_clearance
+        and object_center[2] <= container_max[2] - vertical_clearance
+    )
+    return center_inside_xy and center_inside_z and overlap_ratio >= 0.80, overlap_ratio
 
 
 def _parent_chain(object_manager, name: str) -> list[str]:
@@ -153,7 +186,7 @@ def select_far_container_target(
                 target.get("parent") == container_name
                 or container_name in set(target.get("parent_chain") or [])
             )
-            if not inside and not parent_hit and overlap_ratio < 0.80:
+            if not inside:
                 continue
             relation_score = (4.0 if inside else 0.0) + (2.0 if parent_hit else 0.0) + overlap_ratio
             matches.append((relation_score, float(np.prod(container["size"])), container_name, overlap_ratio, inside, parent_hit))

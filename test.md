@@ -581,6 +581,26 @@ python scripts/InteractiveNav/run_semantic_interaction_exploration_batch.py \
   --scene-timeout-s 1500
 ```
 
+容器内物体交互导航队列使用专用脚本。脚本先顺序扫描场景，发现严格位于可交互容器内部的物体后立即入队；扫描满 5 个场景后才启动 5 个独立 ROS worker。公开目标上下文只包含目标物体，不包含其容器身份或 `require_interaction=true`：
+
+```bash
+python scripts/InteractiveNav/run_container_goal_queue.py \
+  --output-dir outputs/container_object_goal_queue \
+  --house-start 0 \
+  --house-count 10 \
+  --workers 5 \
+  --warmup-scenes 5 \
+  --task-horizon 1000 \
+  --scene-timeout-s 1500 \
+  --gt-step-interval 5 \
+  --gt-max-distance-m 6.0 \
+  --gt-min-visible-pixels 16 \
+  --env-file .env \
+  --allow-failures
+```
+
+每个任务默认启用 `semantic_interaction_object_goal`、模块 1/2/3 的 MLLM 配置、关闭初始门和容器、快速原子交互及六联图录像。批次根目录保存 `scan_results.json`、`queue_state.json`、`aggregate_metrics.json` 和 `summary.csv`；每个任务目录保存目标选择、语义结果、MLLM 指标和 `videos/overview_6panel.mp4`。
+
 例如 10 个场景和 2 个 worker 的分配为：
 
 ```text
@@ -984,10 +1004,9 @@ METHOD=object_goal_rule \
 HOUSE_IND=7 \
 USE_FIXED_ROUTE=true \
 ROUTE_ID=house7_force_route_01 \
-TASK_HORIZON=800 \
+TASK_HORIZON=1000 \
 INITIAL_DOOR_STATE=closed \
 SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/object_goal_apple.yaml \
-SEMANTIC_MAPPING_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/house7_interaction_geometry.yaml \
 GT_STEP_INTERVAL=1 \
 GT_MAX_DISTANCE_M=6.0 \
 VIDEO_FPS=15 \
@@ -1004,10 +1023,34 @@ RECORDER_SHUTDOWN_GRACE_S=600 \
 CLEAN_INTERMEDIATE=false \
 SIM_TIMEOUT_S=1800 \
   scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
-  outputs/house7_object_goal_apple_route01_close_left_low_near_frontgate_paper_800_20260727_v2
+  outputs/house7_object_goal_apple_route01
 ```
 
 主要输出：`videos/overview_6panel.mp4`、`debug/semantic_keyframes/`、`debug/graph/` 和 `semantic_exploration_result.json`。
+
+模块 2 使用 LLM 直接选择具体 `NAVIGATE / INTERACT / EXPLORE` subgoal 时，使用独立配置保留规则基线。模型连接参数继续从仓库 `.env` 或 `SEMANTIC_MODEL_*` 环境变量读取：
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:12835 \
+METHOD=semantic_interaction_object_goal \
+RUNTIME_TARGET_MODE=none \
+HOUSE_IND=7 \
+USE_FIXED_ROUTE=true \
+ROUTE_ID=house7_force_route_01 \
+TASK_HORIZON=1000 \
+INITIAL_DOOR_STATE=closed \
+SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/object_goal_apple_module2_mllm.yaml \
+GT_STEP_INTERVAL=1 \
+GT_MAX_DISTANCE_M=6.0 \
+VIDEO_FPS=15 \
+VIDEO_PANEL_WIDTH_PX=640 \
+CLEAN_INTERMEDIATE=false \
+SIM_TIMEOUT_S=1800 \
+  scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/house7_object_goal_apple_module2_mllm_route01
+```
+
+该配置固定 `mission.mode=semantic_interaction_object_goal`，并用 `RUNTIME_TARGET_MODE=none` 禁止运行时随机容器目标覆盖，避免向模型泄露目标容器或强制交互信息。仅消融模块 2：模块 1 保持 `dynamic_rule`，模块 3 保持 `rule_verified`。决策 trace 中应满足正常模型路径的 `model_selected_candidate_id == executed_candidate_id`；若模型响应期间候选失效，则会记录 `candidate_validation_reason` 和 `stale_fallback_used`。
 
 2026-07-27 回归：冰箱物理正面轴校准为 `+X`，节点图记录固定交互位姿
 `[8.254459, 1.053060, 3.141593]`。本次机器人实际交互位姿为
@@ -1091,11 +1134,11 @@ position 与 look-at 两个机器人系 offset 生成，与遥控脚本保持一
 latest-only 队列 1。三路最终测试中，apple 从原始 GT 捕获到节点图 `NEW_NODE` 的
 墙钟延迟降为 `7.8-9.1 s`，此前并行长测为 `29-53 s`。
 
-目标状态机也改为 `semantic_interaction_object_goal`：绑定精确 apple 和 refrigerator，
-冰箱打开后等待当前稳定可见的 apple 候选；一旦出现就强制优先进入最终定位。容器内
-目标复用冰箱节点中已经验证的正面交互位姿，不再根据 apple 几何中心生成可能位于冰箱
-内部或侧面的导航点；机器人已在该位姿时直接进入交互/可见性验证，不再被无位移看门狗
-误判。完成后发布 `target_goal_succeeded` 并触发仿真提前退出。
+该次回归曾通过精确 apple 与 refrigerator 绑定验证目标状态机。合并后的通用配置仅暴露
+apple 类别，不再向决策模块提供目标容器 ID 或强制交互信息；目标一旦稳定进入图中，便由
+事件驱动优先级抢占探索。容器内目标复用图关系推导出的父容器及其已验证交互位姿，不再
+根据 apple 几何中心生成可能位于冰箱内部或侧面的导航点；机器人已在该位姿时直接进入
+可见性验证，不再被无位移看门狗误判。完成后发布 `target_goal_succeeded` 并触发仿真提前退出。
 
 三路最终并行输出：
 

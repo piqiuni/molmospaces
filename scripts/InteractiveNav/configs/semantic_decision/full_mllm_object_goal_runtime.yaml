@@ -1,0 +1,79 @@
+mission:
+  mode: "semantic_interaction_object_goal"
+
+ablation:
+  module1: "dynamic_mllm"
+  module2: "mllm_score"
+  module3: "mllm_skill_verified"
+
+target:
+  enabled: false
+  object_labels: []
+  require_interaction: false
+  completion_requires_visibility: true
+
+candidate:
+  interaction_types: ["portal", "container"]
+  require_current_visibility: false
+  max_state_age_sec: 3600.0
+  target_require_current_visibility: false
+  target_require_same_room: false
+  target_allow_connected_room: true
+  target_min_visible_pixels: 16
+  target_min_visible_fraction: 0.05
+  target_min_consecutive_observations: 1
+  target_arrival_tolerance_m: 0.35
+  container_require_same_room: true
+  container_allow_connected_room: true
+  portal_standoff_m: 0.85
+  container_standoff_m: 1.0
+  drawer_standoff_m: 1.0
+  interaction_safety_margin_m: 0.25
+
+policy:
+  backend: "model"
+  target_relevance_weight: 3.0
+  portal_bonus: 0.55
+  container_bonus: 1.0
+  interaction_cost_weight: 0.30
+  nearby_interaction_radius_m: 1.5
+  nearby_interaction_bonus: 1.5
+  interaction_priority_bonus: 2.0
+  failure_cooldown_s: 30.0
+  failure_cooldown_schedule_s: [30.0, 60.0, 180.0]
+  failure_retry_delay_s: 1.0
+  repeat_guard_enabled: true
+  repeat_guard_low_gain_limit: 2
+  repeat_guard_min_frontier_shrink_m: 0.15
+  repeat_guard_min_visible_area_shrink_m2: 0.5
+
+model:
+  selection_granularity: "candidate"
+  candidate_top_k: 8
+  navigate_quota: 1
+  interaction_quota: 3
+  explore_quota: 4
+  max_frontiers_per_room: 2
+  max_candidates_per_region: 1
+  explore_min_visible_gain_ratio: 0.25
+  history_region_size_m: 1.0
+  stale_goal_position_tolerance_m: 0.35
+  stale_goal_yaw_tolerance_rad: 0.50
+  timeout_s: 3.0
+  max_tokens: 256
+  consecutive_timeout_limit: 2
+  timeout_cooldown_s: 60.0
+  skill_timeout_s: 4.0
+  skill_max_output_tokens: 256
+  verification_timeout_s: 4.0
+  verification_max_output_tokens: 160
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+
+executor:
+  interaction_navigation_timeout_s: 180.0
+  make_plan_empty_retry_count: 2
+  make_plan_empty_retry_delay_s: 0.15
+  explore_make_plan_fail_open_after_retries: true

@@ -378,9 +378,13 @@ def open_articulation_with_force(
     groups = collect_articulation_groups(env)
     group = groups.get(str(object_name))
     if group is None:
-        raise ValueError(
-            f"Articulated object not found: {object_name}; available={sorted(groups)}"
-        )
+        return {
+            "supported": False,
+            "reason": "non_articulated",
+            "interaction_capability": "static",
+            "object_name": str(object_name),
+            "available_object_names": sorted(groups),
+        }
     model = env.current_model
     data = env.current_data
     joints = list(group["joints"])
@@ -443,9 +447,13 @@ def prepare_articulation_force(
     groups = collect_articulation_groups(env)
     group = groups.get(str(object_name))
     if group is None:
-        raise ValueError(
-            f"Articulated object not found: {object_name}; available={sorted(groups)}"
-        )
+        return {
+            "supported": False,
+            "reason": "non_articulated",
+            "interaction_capability": "static",
+            "object_name": str(object_name),
+            "available_object_names": sorted(groups),
+        }
     targets, selected, close_names = build_articulation_targets(
         list(group["joints"]),
         selected_joint_names=selected_joint_names,
@@ -453,6 +461,7 @@ def prepare_articulation_force(
         close_other_joints=close_other_joints,
     )
     return {
+        "supported": True,
         "group": group,
         "targets": targets,
         "selected_joint_names": selected,

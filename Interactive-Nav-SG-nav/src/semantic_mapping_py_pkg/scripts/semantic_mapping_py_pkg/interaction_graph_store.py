@@ -191,8 +191,32 @@ class InteractionGraphStore:
             node.interaction["state_confidence"] = float(
                 result.get("confidence", 1.0)
             )
+        static_capability = bool(
+            str(result.get("interaction_capability") or "").casefold() == "static"
+            or str(result.get("reason") or "").casefold() == "non_articulated"
+            or result.get("interactable") is False
+        )
+        if static_capability:
+            node.interaction.update(
+                {
+                    "is_interactable": False,
+                    "interaction_mode": "none",
+                    "state": str(explicit_state or "static"),
+                    "state_source": str(
+                        result.get("source")
+                        or result.get("verification_source")
+                        or "interaction_capability_check"
+                    ),
+                    "state_confidence": float(result.get("confidence", 1.0)),
+                    "capability": "static",
+                    "failure_reason": str(
+                        result.get("reason") or "non_articulated"
+                    ),
+                }
+            )
         self._refresh_planner_state_fields(node)
         state = node.interaction.get("state", "unknown")
+
         history = list(node.interaction.get("operation_history") or [])
         event_id = str(result.get("event_id") or f"interaction_{self.interaction_event_counter:06d}")
         if not any(entry.get("event_id") == event_id for entry in history):
@@ -211,10 +235,15 @@ class InteractionGraphStore:
                 history_entry["interaction_group_id"] = str(
                     result["interaction_group_id"]
                 )
+            approach_goal = list(result.get("approach_goal_xyyaw") or [])
+            if len(approach_goal) >= 2:
+                history_entry["approach_goal_xyyaw"] = [
+                    float(value) for value in approach_goal[:3]
+                ]
             history.append(history_entry)
         node.interaction["operation_history"] = history
         self._update_interaction_group_memory(node, result)
-        if explicit_state is not None:
+        if explicit_state is not None or static_capability:
             node.attributes["interaction_state_override"] = {
                 key: node.interaction.get(key)
                 for key in (
@@ -223,6 +252,10 @@ class InteractionGraphStore:
                     "state_confidence",
                     "traversable",
                     "requires_interaction",
+                    "is_interactable",
+                    "interaction_mode",
+                    "capability",
+                    "failure_reason",
                 )
                 if key in node.interaction
             }
@@ -271,6 +304,7 @@ class InteractionGraphStore:
                 interaction.get("is_interactable")
                 and state not in {"open", "static_open"}
             )
+
             return
         interaction["traversable"] = (
             True
@@ -373,9 +407,19 @@ class InteractionGraphStore:
         if attribute_status in {"pending", "failed", "stale"}:
             self._bump_revision()
             return True
+        verified_state_override = dict(
+            node.attributes.get("interaction_state_override") or {}
+        )
+        has_verified_interaction_state = bool(
+            verified_state_override.get("event_id")
+        )
         confidence = float(patch.get("confidence", 0.0) or 0.0)
         interaction_class = normalize_label(patch.get("interaction_class"))
-        if confidence >= 0.5 and interaction_class in {"portal", "container", "support", "object"}:
+        if (
+            not has_verified_interaction_state
+            and confidence >= 0.5
+            and interaction_class in {"portal", "container", "support", "object"}
+        ):
             node.type = interaction_class
         parts = list(patch.get("interaction_parts") or [])
         for deprecated_key in (
@@ -405,7 +449,10 @@ class InteractionGraphStore:
             ],
             default=0.0,
         )
-        state_was_updated = latest_operation_stamp <= patch_stamp
+        state_was_updated = (
+            not has_verified_interaction_state
+            and latest_operation_stamp <= patch_stamp
+        )
         if state_was_updated:
             node.interaction.update(
                 {
@@ -442,6 +489,7 @@ class InteractionGraphStore:
                 if key in node.interaction
             }
             node.attributes["interaction_state_override"]["timestamp"] = patch_stamp
+
         node.attributes["attribute_updated_at"] = patch_stamp
         self._rebuild_relations(now=patch_stamp)
         self._bump_revision()
@@ -638,6 +686,7 @@ class InteractionGraphStore:
             int(node.attributes.get("max_consecutive_observations", 0) or 0),
             consecutive_observations,
         )
+
         observation_attributes = {
                 "instance_id": observation.get("instance_id") or node.attributes.get("instance_id") or "",
                 "category": observation.get("category"),
@@ -716,6 +765,7 @@ class InteractionGraphStore:
             "observation_evidence",
         ):
             node.attributes.pop(deprecated_key, None)
+
         previous_interaction_memory = {
             key: node.interaction.get(key)
             for key in (
@@ -741,9 +791,14 @@ class InteractionGraphStore:
                 "state_confidence",
                 "traversable",
                 "requires_interaction",
+                "is_interactable",
+                "interaction_mode",
+                "capability",
+                "failure_reason",
             ):
                 if key in interaction_state_override:
                     node.interaction[key] = interaction_state_override[key]
+
         node.interaction.update(previous_interaction_memory)
 
     def _refresh_room_nodes_from_grid(self, geometry_stability_frames=None):
@@ -1302,7 +1357,7 @@ class InteractionGraphStore:
                         counter,
                         "interactive_portal",
                         node,
-                        True,
+                        bool(node.interaction.get("requires_interaction")),
                         node.id,
                         node.interaction.get("interaction_mode", "none"),
                         "door_may_unlock_room",

@@ -214,6 +214,30 @@ def test_articulated_doorway_root_is_the_canonical_gt_spec():
     assert realtime_gt.RealtimeGTObservationPublisher._canonical_door_root_specs(model, specs) == {1: 0}
 
 
+def test_minimal_gt_observation_preserves_doorframe_category():
+    spec = realtime_gt._ObjectSpec(
+        "doorframe_static_1",
+        {"category": "Doorframe"},
+        1,
+        (),
+        True,
+        False,
+        False,
+        False,
+    )
+
+    observation = realtime_gt.RealtimeGTObservationPublisher._build_observation(
+        None,
+        spec,
+        [0, 0, 3, 3],
+        1,
+        np.asarray([1.0, 2.0, 1.0]),
+        np.asarray([1.0, 0.2, 2.0]),
+    )
+
+    assert observation["name"] == "Doorframe"
+
+
 def test_door_geom_mapping_excludes_unrelated_sibling_under_same_root():
     model = type(
         "DoorModel",
@@ -277,6 +301,7 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
         assert observation["name"] == "Chair"
         assert observation["bbox_2d"] == [0, 0, 4, 1]
         assert observation["visible_pixels"] == 6
+        assert "segmentation" not in observation
         assert observation["visible_fraction"] == 0.6
         assert observation["box_3d"] == {
             "center": [2.0, 0.0, 0.5],

@@ -24,6 +24,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     navigation_goal_options,
     normalize_angle,
     path_lookahead_point,
+    requires_graph_verification,
     is_stuck_recovery_failure,
     safe_grid_motion_distance,
 )
@@ -182,6 +183,15 @@ class SemanticBehaviorExecutor:
             config.get("make_plan_endpoint_tolerance_m", 0.60)
         )
         self.make_plan_fail_open = bool(config.get("make_plan_fail_open", True))
+        self.make_plan_empty_retry_count = max(
+            0, int(config.get("make_plan_empty_retry_count", 2))
+        )
+        self.make_plan_empty_retry_delay_s = max(
+            0.0, float(config.get("make_plan_empty_retry_delay_s", 0.15))
+        )
+        self.explore_make_plan_fail_open_after_retries = bool(
+            config.get("explore_make_plan_fail_open_after_retries", True)
+        )
         self.explore_reservation_retry_sec = float(
             config.get("explore_reservation_retry_sec", 0.25)
         )
@@ -284,6 +294,12 @@ class SemanticBehaviorExecutor:
             queue_size=4,
         )
         rospy.Subscriber(
+            topics.get("preempt_request", "/semantic_decision/preempt_request"),
+            String,
+            self._preempt_callback,
+            queue_size=4,
+        )
+        rospy.Subscriber(
             topics.get("explore_feedback", "/explore_py/behavior_feedback"),
             String,
             self._explore_feedback_callback,
@@ -331,10 +347,59 @@ class SemanticBehaviorExecutor:
             self.verification_retries = 0
             self.model_events = []
             commands = self.machine.start(selection)
+            if self.machine.state == STATE_VERIFYING and requires_graph_verification(
+                self.ablation.module3, selection
+            ):
+                commands.extend(self._verify_graph_locked())
             self._last_explore_reservation_publish_at = 0.0
             self._explore_reservation_publish_count = 0
             self._publish_feedback(selection, "STARTED", None, {})
         self._dispatch(commands)
+
+    def _preempt_callback(self, message: String) -> None:
+        try:
+            request = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        selection = None
+        cancel_navigation = False
+        finalize_explore = False
+        with self.lock:
+            if self.selection is None:
+                return
+            requested_decision_id = str(request.get("decision_id") or "")
+            active_decision_id = str(self.selection.get("decision_id") or "")
+            if requested_decision_id != active_decision_id:
+                return
+            if str(request.get("reason") or "") != "preempted_by_target":
+                return
+            if str(self.selection.get("behavior_type") or "").upper() != "EXPLORE":
+                return
+            selection = dict(self.selection)
+            cancel_navigation = self.machine.state in {
+                STATE_NAVIGATING,
+                STATE_APPROACH_INTERACTION,
+            }
+            finalize_explore = True
+            self.selection = None
+            self.machine.reset()
+        if cancel_navigation:
+            self.move_base.cancel_goal()
+        detail = {
+            "reason": "preempted_by_target",
+            "replacement_candidate_id": str(
+                request.get("replacement_candidate_id") or ""
+            ),
+        }
+        if finalize_explore and selection is not None:
+            self._publish_explore_command(
+                selection,
+                action="finalize_frontier",
+                success=False,
+                detail=detail,
+            )
+        if selection is not None:
+            self._publish_feedback(selection, "CANCELED", False, detail)
 
     def _explore_feedback_callback(self, message: String) -> None:
         try:
@@ -408,9 +473,10 @@ class SemanticBehaviorExecutor:
                 and self.ablation.module3 == "mllm_skill_verified"
             ):
                 decision_id = str((self.selection or {}).get("decision_id") or "")
+                result_image_sequence = self.latest_image_sequence
                 threading.Thread(
                     target=self._run_visual_verification,
-                    args=(decision_id, payload),
+                    args=(decision_id, payload, result_image_sequence),
                     daemon=True,
                 ).start()
         if next_candidate is not None:
@@ -463,7 +529,9 @@ class SemanticBehaviorExecutor:
             self.latest_graph = payload
             commands = (
                 self._verify_graph_locked()
-                if self.ablation.module3 == "rule_verified"
+                if requires_graph_verification(
+                    self.ablation.module3, self.selection
+                )
                 else []
             )
         self._dispatch(commands)
@@ -629,6 +697,9 @@ class SemanticBehaviorExecutor:
             "cluster_id": (candidate.get("metadata") or {}).get(
                 "cluster_id", candidate.get("target_id", "")
             ),
+            "goal_xyyaw": list(candidate.get("goal_xyyaw") or []),
+            "candidate_sequence": int(candidate.get("candidate_sequence", 0) or 0),
+            "graph_revision": int(candidate.get("graph_revision", 0) or 0),
         }
         if success is not None:
             payload["success"] = bool(success)
@@ -640,6 +711,7 @@ class SemanticBehaviorExecutor:
 
     def _publish_interaction_command(self, candidate: dict) -> None:
         interaction = candidate.get("interaction_command") or {}
+        metadata = candidate.get("metadata") or {}
         with self.lock:
             self.interaction_command_sequence += 1
             interaction_sequence = self.interaction_command_sequence
@@ -650,11 +722,15 @@ class SemanticBehaviorExecutor:
             "event_id": f"{candidate.get('decision_id', 'decision')}_interaction_{interaction_sequence:03d}",
             "node_id": interaction.get("node_id", candidate.get("target_id", "")),
             "object_id": interaction.get("object_id", candidate.get("target_name", "")),
+            "node_type": str(
+                interaction.get("node_type") or metadata.get("node_type") or ""
+            ).casefold(),
             "action": interaction.get("action", "open"),
             "interaction_mode": interaction.get("interaction_mode", "open_close"),
             "sequence_type": interaction.get("sequence_type", ""),
             "operation_method": interaction.get("operation_method", "unknown"),
             "open_regions": list(interaction.get("open_regions") or []),
+            "approach_goal_xyyaw": list(candidate.get("goal_xyyaw") or []),
             "visual_operation_plan": dict(
                 interaction.get("visual_operation_plan") or {}
             ),
@@ -752,11 +828,21 @@ class SemanticBehaviorExecutor:
         planned["interaction_command"] = interaction
         return planned
 
-    def _run_visual_verification(self, decision_id: str, backend_payload: dict) -> None:
-        deadline = time.monotonic() + 1.0
+    def _run_visual_verification(
+        self,
+        decision_id: str,
+        backend_payload: dict,
+        result_image_sequence: int | None = None,
+    ) -> None:
+        required_sequence = (
+            self.pre_interaction_image_sequence
+            if result_image_sequence is None
+            else int(result_image_sequence)
+        )
+        deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline and not rospy.is_shutdown():
             with self.lock:
-                if self.latest_image_sequence > self.pre_interaction_image_sequence:
+                if self.latest_image_sequence > required_sequence:
                     break
             time.sleep(0.05)
         with self.lock:
@@ -903,7 +989,12 @@ class SemanticBehaviorExecutor:
         if self.latest_image is None:
             return ""
         attributes = node.get("attributes") or {}
-        box = attributes.get("projected_bbox_2d") or node.get("projected_bbox_2d")
+        box = (
+            attributes.get("projected_bbox_2d")
+            or node.get("projected_bbox_2d")
+            or attributes.get("bbox_2d")
+            or node.get("bbox_2d")
+        )
         if not isinstance(box, (list, tuple)) or len(box) < 4:
             return ""
         image = self.latest_image
@@ -1130,18 +1221,50 @@ class SemanticBehaviorExecutor:
         selected_goal = None
         path_lookahead = None
         attempted_goals = []
+        is_explore = str(candidate.get("behavior_type") or "").upper() == "EXPLORE"
         for option_index, (option_x, option_y, option_yaw) in enumerate(goal_options):
-            plan_reachable, option_lookahead = self._preflight_navigation_plan(
-                goal_frame, option_x, option_y, option_yaw
+            preflight_attempts = 1 + (
+                self.make_plan_empty_retry_count if is_explore else 0
+            )
+            plan_reachable = False
+            option_lookahead = None
+            preflight_reason = ""
+            actual_attempts = 0
+            for preflight_index in range(preflight_attempts):
+                actual_attempts += 1
+                (
+                    plan_reachable,
+                    option_lookahead,
+                    preflight_reason,
+                ) = self._preflight_navigation_plan(
+                    goal_frame, option_x, option_y, option_yaw
+                )
+                if plan_reachable or preflight_reason != "empty_plan":
+                    break
+                if preflight_index + 1 < preflight_attempts:
+                    time.sleep(self.make_plan_empty_retry_delay_s)
+                    if not self._navigation_is_current(decision_id):
+                        return
+            fail_open_empty_plan = bool(
+                is_explore
+                and not plan_reachable
+                and preflight_reason == "empty_plan"
+                and self.explore_make_plan_fail_open_after_retries
+                and bool((candidate.get("metadata") or {}).get(
+                    "hard_constraints_passed", True
+                ))
             )
             attempted_goals.append(
                 {
                     "index": option_index,
                     "goal_xyyaw": [option_x, option_y, option_yaw],
-                    "reachable": bool(plan_reachable),
+                    "reachable": bool(plan_reachable or fail_open_empty_plan),
+                    "preflight_reason": preflight_reason,
+                    "preflight_attempts": actual_attempts,
+                    "fail_open_after_empty_plan": fail_open_empty_plan,
                 }
             )
-            if plan_reachable:
+            if plan_reachable or fail_open_empty_plan:
                 selected_goal = option_x, option_y, option_yaw
                 path_lookahead = option_lookahead
                 break
@@ -1314,12 +1437,12 @@ class SemanticBehaviorExecutor:
         goal_x: float,
         goal_y: float,
         goal_yaw: float,
-    ) -> tuple[bool, tuple[float, float] | None]:
+    ) -> tuple[bool, tuple[float, float] | None, str]:
         if not self.make_plan_preflight_enabled:
-            return True, None
+            return True, None, "disabled"
         pose = self._current_pose(frame_id)
         if pose is None:
-            return self.make_plan_fail_open, None
+            return self.make_plan_fail_open, None, "pose_unavailable"
         stamp = rospy.Time.now()
         start = PoseStamped()
         start.header.frame_id = frame_id
@@ -1351,10 +1474,10 @@ class SemanticBehaviorExecutor:
                 "[semantic_behavior_executor] make_plan preflight unavailable: %s",
                 exc,
             )
-            return self.make_plan_fail_open, None
+            return self.make_plan_fail_open, None, "service_unavailable"
         poses = list(response.plan.poses or [])
         if not poses:
-            return False, None
+            return False, None, "empty_plan"
         endpoint = poses[-1].pose.position
         reachable = math.hypot(
             float(endpoint.x) - float(goal_x),
@@ -1369,7 +1492,7 @@ class SemanticBehaviorExecutor:
             path_xy,
             self.rear_goal_lookahead_m,
         )
-        return reachable, lookahead
+        return reachable, lookahead, "reachable" if reachable else "endpoint_mismatch"
 
     def _handle_navigation_result(
         self, decision_id: str, success: bool, detail: dict
@@ -1383,7 +1506,9 @@ class SemanticBehaviorExecutor:
             commands = self.machine.on_navigation_result(success, detail=detail)
             if (
                 self.machine.state == STATE_VERIFYING
-                and self.ablation.module3 == "rule_verified"
+                and requires_graph_verification(
+                    self.ablation.module3, self.selection
+                )
             ):
                 commands.extend(self._verify_graph_locked())
         self._dispatch(commands)

@@ -15,6 +15,8 @@ from semantic_decision_py_pkg.behavior_execution import (
     navigation_goal_options,
     normalize_angle,
     path_lookahead_point,
+    requires_graph_verification,
+    target_ready_for_graph_verification,
     is_stuck_recovery_failure,
     safe_grid_motion_distance,
 )
@@ -128,6 +130,15 @@ def test_navigation_goal_options_preserve_nearest_first_and_remove_duplicates() 
         (1.25, 2.0, 0.0),
         (1.50, 2.0, math.pi),
     ]
+
+
+def test_target_navigation_uses_graph_verification_for_mllm_module3() -> None:
+    assert requires_graph_verification("mllm_skill_verified", target_candidate())
+    assert not requires_graph_verification(
+        "mllm_skill_verified",
+        {"behavior_type": "NAVIGATE", "metadata": {"target_goal": False}},
+    )
+    assert requires_graph_verification("rule_verified", interaction_candidate())
 
 
 def target_candidate():
@@ -273,6 +284,63 @@ def test_target_navigation_waits_for_visibility_verification() -> None:
     assert machine.state == STATE_SUCCEEDED
     assert terminal[0]["kind"] == "terminal"
     assert terminal[0]["success"] is True
+
+
+def test_visible_reliable_target_skips_navigation_and_verifies_graph() -> None:
+    candidate = target_candidate()
+    candidate["metadata"].update(
+        {
+            "target_visible_now": True,
+            "target_reliably_observed": True,
+            "target_navigation_required": False,
+        }
+    )
+    assert target_ready_for_graph_verification(candidate)
+
+    machine = BehaviorExecutionStateMachine()
+    assert machine.start(candidate, now=0.0) == []
+    assert machine.state == STATE_VERIFYING
+
+    terminal = machine.on_target_visibility(
+        True,
+        detail={"visible_pixels": 24, "min_visible_pixels": 16},
+        now=0.1,
+    )
+    assert machine.state == STATE_SUCCEEDED
+    assert terminal[0]["success"] is True
+
+
+def test_visible_reliable_target_still_navigates_when_goal_pose_is_not_reached() -> None:
+    candidate = target_candidate()
+    candidate["metadata"].update(
+        {
+            "target_visible_now": True,
+            "target_reliably_observed": True,
+            "target_navigation_required": True,
+        }
+    )
+
+    assert not target_ready_for_graph_verification(candidate)
+    machine = BehaviorExecutionStateMachine()
+    commands = machine.start(candidate, now=0.0)
+    assert machine.state == STATE_NAVIGATING
+    assert commands[0]["kind"] == "navigate"
+
+
+def test_historical_target_observation_does_not_skip_navigation() -> None:
+    candidate = target_candidate()
+    candidate["metadata"].update(
+        {
+            "target_visible_now": False,
+            "target_reliably_observed": True,
+        }
+    )
+    assert not target_ready_for_graph_verification(candidate)
+
+    machine = BehaviorExecutionStateMachine()
+    commands = machine.start(candidate, now=0.0)
+    assert machine.state == STATE_NAVIGATING
+    assert commands[0]["kind"] == "navigate"
 
 
 def test_navigation_without_visibility_requirement_finishes_immediately() -> None:

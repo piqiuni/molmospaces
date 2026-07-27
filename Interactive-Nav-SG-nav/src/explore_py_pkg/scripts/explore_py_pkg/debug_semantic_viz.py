@@ -249,6 +249,156 @@ def portal_positions_between_rooms(
     return result
 
 
+def topology_hierarchy_layout(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]] | None,
+    panel_width: int,
+    panel_height: int,
+) -> dict[str, Any]:
+    """Lay out the interaction hierarchy inside a compact video panel."""
+    width = max(1, int(panel_width))
+    height = max(1, int(panel_height))
+    left_gutter = min(max(48, int(width * 0.12)), max(48, width // 3))
+    x_min = min(width - 2, left_gutter + 4)
+    x_max = max(x_min, width - 8)
+    graph_top = min(height - 8, max(42, int(height * 0.17)))
+    graph_bottom = max(graph_top, height - max(24, int(height * 0.08)))
+    row_span = max(0, graph_bottom - graph_top)
+    row_y = {
+        "room": int(graph_top + row_span * 0.08),
+        "portal": int(graph_top + row_span * 0.36),
+        "container": int(graph_top + row_span * 0.64),
+        "object": int(graph_top + row_span * 0.90),
+    }
+    by_type = {
+        node_type: sorted(
+            [node for node in nodes if str(node.get("type") or "") == node_type],
+            key=lambda item: str(item.get("id") or ""),
+        )
+        for node_type in ("room", "portal", "container", "object")
+    }
+    positions: dict[str, tuple[int, int]] = {}
+
+    def place_row(
+        node_type: str,
+        preferred_x: dict[str, float] | None = None,
+    ) -> None:
+        row_nodes = by_type[node_type]
+        preferred_x = preferred_x or {}
+        ordered = sorted(
+            row_nodes,
+            key=lambda node: (
+                preferred_x.get(str(node.get("id") or ""), float("inf")),
+                str(node.get("id") or ""),
+            ),
+        )
+        for index, node in enumerate(ordered):
+            x = int(x_min + (index + 1) * (x_max - x_min) / (len(ordered) + 1))
+            positions[str(node.get("id") or "")] = (x, row_y[node_type])
+
+    place_row("room")
+    room_positions = {
+        node_id: position
+        for node_id, position in positions.items()
+        if node_id.startswith("room_")
+    }
+    portal_preferred = {}
+    for portal in by_type["portal"]:
+        room_ids = [
+            room_id
+            for room_id in portal_room_node_ids(portal, edges)
+            if room_id in room_positions
+        ]
+        if room_ids:
+            portal_preferred[str(portal.get("id") or "")] = sum(
+                room_positions[room_id][0] for room_id in room_ids
+            ) / len(room_ids)
+    place_row("portal", portal_preferred)
+
+    container_preferred = {}
+    for container in by_type["container"]:
+        room_id = container.get("room_id")
+        parent_id = (
+            f"room_{int(room_id)}"
+            if room_id is not None
+            else str(container.get("parent_id") or "")
+        )
+        if parent_id in room_positions:
+            container_preferred[str(container.get("id") or "")] = room_positions[
+                parent_id
+            ][0]
+    place_row("container", container_preferred)
+
+    object_parent = {
+        str(edge.get("dst_id") or ""): str(edge.get("src_id") or "")
+        for edge in edges or []
+        if str(edge.get("relation") or "") == "contains"
+    }
+    object_preferred = {}
+    for node in by_type["object"]:
+        parent_position = positions.get(object_parent.get(str(node.get("id") or ""), ""))
+        if parent_position is not None:
+            object_preferred[str(node.get("id") or "")] = parent_position[0]
+    place_row("object", object_preferred)
+
+    nominal_sizes = {
+        "room": (104, 34),
+        "portal": (58, 28),
+        "container": (88, 28),
+        "object": (62, 24),
+    }
+    minimum_widths = {"room": 44, "portal": 34, "container": 44, "object": 34}
+    boxes: dict[str, tuple[int, int, int, int]] = {}
+    for node_type, row_nodes in by_type.items():
+        available_per_node = (x_max - x_min) / max(1, len(row_nodes))
+        node_width = int(
+            min(
+                nominal_sizes[node_type][0],
+                max(minimum_widths[node_type], available_per_node - 5),
+            )
+        )
+        node_height = nominal_sizes[node_type][1]
+        for node in row_nodes:
+            node_id = str(node.get("id") or "")
+            center = positions.get(node_id)
+            if center is None:
+                continue
+            x1 = max(x_min, center[0] - node_width // 2)
+            x2 = min(width - 3, center[0] + node_width // 2)
+            y1 = max(graph_top, center[1] - node_height // 2)
+            y2 = min(graph_bottom, center[1] + node_height // 2)
+            boxes[node_id] = (x1, y1, x2, y2)
+            positions[node_id] = ((x1 + x2) // 2, (y1 + y2) // 2)
+    return {
+        "positions": positions,
+        "boxes": boxes,
+        "row_y": row_y,
+        "left_gutter": left_gutter,
+        "graph_top": graph_top,
+        "graph_bottom": graph_bottom,
+    }
+
+
+def topology_node_style(node: dict[str, Any]) -> dict[str, Any]:
+    node_type = str(node.get("type") or "object")
+    state = str((node.get("interaction") or {}).get("state") or "unknown").casefold()
+    if node_type == "room":
+        return {"fill": (235, 238, 248), "border": (45, 45, 45), "dashed": False}
+    if node_type == "portal":
+        if state in {"open", "ajar", "static_open"}:
+            return {"fill": (236, 250, 236), "border": (45, 175, 70), "dashed": False}
+        if state in {"closed", "static_closed"}:
+            return {"fill": (244, 244, 252), "border": (35, 35, 210), "dashed": True}
+        return {"fill": (245, 245, 245), "border": (130, 130, 130), "dashed": True}
+    if node_type == "container":
+        return {
+            "fill": (242, 246, 252),
+            "border": (35, 135, 238),
+            "dashed": state not in {"open", "ajar", "static_open"},
+        }
+    return {"fill": (238, 242, 250), "border": (60, 60, 60), "dashed": False}
+
+
 def latest_state_change(events: list[dict[str, Any]] | None) -> dict[str, Any] | None:
     for event in reversed(events or []):
         if str(event.get("event") or "") == "STATE_CHANGED":

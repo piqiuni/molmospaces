@@ -46,6 +46,21 @@ def test_minimal_gt_is_normalized_from_only_allowed_fields() -> None:
     assert normalized["minimal_gt_observation"] is True
 
 
+def test_compact_minimal_gt_uses_explicit_visible_pixel_count() -> None:
+    observation = minimal_observation(
+        "apple_1", "Apple", [1.0, 2.0, 0.5], [0.1, 0.1, 0.1], pixels=1
+    )
+    observation.pop("segmentation")
+    observation["bbox_2d"] = [0, 0, 9, 9]
+    observation["visible_pixels"] = 64
+
+    normalized = normalize_observation(observation)
+
+    assert normalized["visible_pixels"] == 64
+    assert normalized["visible_fraction"] == 0.64
+    assert normalized["segmentation"] is None
+
+
 def test_compact_minimal_gt_uses_explicit_visibility_summary() -> None:
     observation = minimal_observation(
         "apple_1", "Apple", [1.0, 2.0, 0.8], [0.1, 0.1, 0.1]

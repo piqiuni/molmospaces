@@ -71,6 +71,38 @@ def test_generator_combines_frontiers_and_closed_portals() -> None:
     assert interaction.metadata["requires_approach"] is True
 
 
+def test_generator_does_not_use_object_name_to_reject_portal_fixture() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("portal",))
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_doorframe_1",
+                "type": "portal",
+                "name": "Door",
+                "centroid": [2.0, 0.0, 1.0],
+                "state_age_sec": 1.0,
+                "is_currently_visible": True,
+                "attributes": {
+                    "source_object_name": "doorframe_static_1",
+                    "connected_room_ids": [1, 2],
+                },
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "unknown",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
+    assert len(candidates) == 1
+    assert candidates[0].target_id == "portal_doorframe_1"
+
+
 def test_portal_approach_uses_stable_closed_reference_geometry() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(
@@ -151,6 +183,7 @@ def test_raw_frontier_proposals_do_not_reuse_explorer_score_as_semantics() -> No
                     "frontier_cell_count": 20,
                     "information_gain": 20.0,
                     "distance_m": 2.2,
+                    "unknown_component_area_m2": 18.5,
                 },
                 "geometry": {
                     "proposal_score": 99.0,
@@ -176,6 +209,150 @@ def test_raw_frontier_proposals_do_not_reuse_explorer_score_as_semantics() -> No
     assert candidate.features["semantic_gain"] == 0.0
     assert candidate.features["priority"] == 0.0
     assert candidate.metadata["explorer_score"] == 99.0
+    assert candidate.metadata["unknown_component_area_m2"] == 18.5
+
+
+def test_frontier_top_k_prefers_larger_unknown_component_over_nearer_cluster() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig(max_frontier_candidates=1))
+    candidates = generator.generate(
+        {
+            "proposals": [
+                {
+                    "proposal_id": "near_small",
+                    "goal_xyyaw": [1.0, 0.0, 0.0],
+                    "raw_features": {
+                        "information_gain": 20.0,
+                        "distance_m": 1.0,
+                        "unknown_component_area_m2": 2.0,
+                    },
+                },
+                {
+                    "proposal_id": "far_large",
+                    "goal_xyyaw": [5.0, 0.0, 0.0],
+                    "raw_features": {
+                        "information_gain": 10.0,
+                        "distance_m": 5.0,
+                        "unknown_component_area_m2": 20.0,
+                    },
+                },
+            ]
+        },
+        {},
+        robot_xy=(0.0, 0.0),
+    )
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "frontier:far_large"
+    ]
+
+
+def test_frontier_top_k_prefers_visible_aperture_over_large_hidden_component() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig(max_frontier_candidates=1))
+    candidates = generator.generate(
+        {
+            "proposals": [
+                {
+                    "proposal_id": "narrow_large_component",
+                    "goal_xyyaw": [1.0, 0.0, 0.0],
+                    "raw_features": {
+                        "information_gain": 4.0,
+                        "distance_m": 1.0,
+                        "unknown_component_area_m2": 60.0,
+                        "expected_visible_unknown_area_m2": 2.0,
+                    },
+                },
+                {
+                    "proposal_id": "wide_opening",
+                    "goal_xyyaw": [4.0, 0.0, 0.0],
+                    "raw_features": {
+                        "information_gain": 30.0,
+                        "distance_m": 4.0,
+                        "unknown_component_area_m2": 25.0,
+                        "expected_visible_unknown_area_m2": 18.0,
+                    },
+                },
+            ]
+        },
+        {},
+        robot_xy=(0.0, 0.0),
+    )
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "frontier:wide_opening"
+    ]
+
+
+def test_legacy_frontier_top_k_also_prefers_larger_unknown_component() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig(max_frontier_candidates=1))
+    candidates = generator.generate(
+        {
+            "frontier_clusters": [
+                {
+                    "cluster_id": "near_small",
+                    "subgoal_world": [1.0, 0.0],
+                    "distance_to_robot": 1.0,
+                    "information_gain": 20.0,
+                    "unknown_component_area_m2": 2.0,
+                    "score": 10.0,
+                },
+                {
+                    "cluster_id": "far_large",
+                    "subgoal_world": [5.0, 0.0],
+                    "distance_to_robot": 5.0,
+                    "information_gain": 10.0,
+                    "unknown_component_area_m2": 20.0,
+                    "score": 1.0,
+                },
+            ]
+        },
+        {},
+        robot_xy=(0.0, 0.0),
+    )
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "frontier:far_large"
+    ]
+
+
+def test_frontier_records_nearby_container_semantics() -> None:
+    generator = CandidateGenerator()
+    candidates = generator.generate(
+        {
+            "proposals": [
+                {
+                    "proposal_id": "near_fridge",
+                    "goal_xyyaw": [2.0, 2.0, 0.0],
+                    "raw_features": {
+                        "information_gain": 8.0,
+                        "distance_m": 3.0,
+                        "unknown_component_area_m2": 12.0,
+                    },
+                }
+            ]
+        },
+        {
+            "nodes": [
+                {
+                    "id": "container_fridge",
+                    "type": "container",
+                    "label": "refrigerator",
+                    "aabb_center": [2.5, 2.0, 1.0],
+                    "is_currently_visible": True,
+                }
+            ]
+        },
+        robot_xy=(0.0, 0.0),
+    )
+
+    assert candidates[0].metadata["nearby_semantic_nodes"] == [
+        {
+            "id": "container_fridge",
+            "type": "container",
+            "label": "refrigerator",
+            "distance_m": 0.5,
+            "visible": True,
+        }
+    ]
 
 
 def test_empty_raw_proposal_stream_does_not_fall_back_to_stale_clusters() -> None:
@@ -513,6 +690,124 @@ def test_observed_target_generates_navigation_candidate() -> None:
     assert candidate.metadata["target_visible_now"] is True
     assert candidate.metadata["verify_target_visibility"] is True
     assert candidate.metadata["target_min_visible_pixels"] == 16
+    assert candidate.metadata["target_navigation_required"] is True
+    assert candidate.metadata["target_goal_distance_m"] > 0.35
+
+
+def test_contained_target_navigation_anchors_outside_parent_container() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_fridge",
+                "type": "container",
+                "label": "fridge",
+                "aabb_center": [4.0, 2.0, 1.0],
+                "aabb_size": [1.0, 1.0, 2.0],
+            },
+            {
+                "id": "object_apple",
+                "type": "object",
+                "label": "apple",
+                "parent_id": "container_fridge",
+                "centroid": [4.0, 2.0, 1.0],
+                "confidence": 1.0,
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "attributes": {"visible_pixels": 64},
+            },
+        ]
+    }
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(1.0, 2.0),
+        target_context={"enabled": True, "object_labels": ["apple"]},
+    )[0]
+
+    assert math.isclose(candidate.goal_xyyaw[0], 2.5, abs_tol=1e-6)
+    assert math.isclose(candidate.goal_xyyaw[1], 2.0, abs_tol=1e-6)
+    assert candidate.metadata["navigation_anchor_id"] == "container_fridge"
+    assert candidate.metadata["approach_strategy"] == "target_parent_container_standoff"
+
+
+def test_target_near_container_uses_geometric_anchor_without_contains_edge() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_dresser",
+                "type": "container",
+                "label": "dresser",
+                "room_id": 1,
+                "aabb_center": [4.0, 2.0, 0.5],
+                "aabb_size": [1.0, 1.0, 1.0],
+            },
+            {
+                "id": "object_remote",
+                "type": "object",
+                "label": "remotecontrol",
+                "room_id": 1,
+                "centroid": [4.1, 2.0, 1.05],
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "attributes": {"visible_pixels": 64},
+            },
+        ]
+    }
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(1.0, 2.0),
+        target_context={"enabled": True, "object_labels": ["remotecontrol"]},
+    )[0]
+
+    assert candidate.metadata["navigation_anchor_id"] == "container_dresser"
+    assert candidate.metadata["approach_strategy"] == "target_parent_container_standoff"
+
+
+def test_target_reuses_successful_parent_container_approach_pose() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_fridge",
+                "type": "container",
+                "label": "fridge",
+                "aabb_center": [4.0, 2.0, 1.0],
+                "aabb_size": [2.0, 2.0, 2.0],
+                "interaction": {
+                    "operation_history": [
+                        {
+                            "success": True,
+                            "approach_goal_xyyaw": [3.25, 2.5, 0.75],
+                        }
+                    ]
+                },
+            },
+            {
+                "id": "object_apple",
+                "type": "object",
+                "label": "apple",
+                "parent_id": "container_fridge",
+                "centroid": [4.0, 2.0, 1.0],
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "attributes": {"visible_pixels": 64},
+            },
+        ]
+    }
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(1.0, 2.0),
+        target_context={"enabled": True, "object_labels": ["apple"]},
+    )[0]
+
+    assert candidate.goal_xyyaw == [3.25, 2.5, 0.75]
+    assert candidate.metadata["approach_strategy"] == (
+        "target_last_successful_interaction_pose"
+    )
 
 
 def test_contained_target_reuses_container_interaction_pose() -> None:
