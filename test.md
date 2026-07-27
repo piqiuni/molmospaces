@@ -491,7 +491,7 @@ worker_NNN/debug/
 scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh
 ```
 
-虽然脚本名包含 `house7`，但可通过 `HOUSE_IND` 运行其他场景。脚本会统一启动仿真、实时 GT 感知、动态语义交互图、`explore_py`、语义候选与规则决策、行为执行器、`move_base`、力交互 backend，以及可选的六联图录制。运行链路为：
+虽然脚本名包含 `house7`，但可通过 `HOUSE_IND` 运行其他场景。脚本会统一启动仿真、实时 GT 感知、动态语义交互图、`explore_py`、语义候选与规则或 MLLM 决策、行为执行器、`move_base`、力交互 backend，以及可选的六联图录制。运行链路为：
 
 ```text
 run_nav_ros_sim.py
@@ -499,20 +499,108 @@ run_nav_ros_sim.py
 → dynamic semantic interaction graph
 → explore_py navigation frontiers
 → semantic navigation/interaction candidates
-→ semantic rule decision
+→ semantic rule / MLLM decision
 → behavior executor
 → move_base navigation / force interaction
 → interaction_result updates graph
 ```
 
-推荐任务模式：
+### 5.3.2.1 METHOD 总览
 
-- `semantic_interaction_exploration`：自主耗尽导航 frontier 与交互 frontier。
-- `semantic_interaction_object_goal`：运行时选择远处容器/物体目标，执行交互式 Obj-goal。
-- `object_goal_rule`：使用配置文件指定固定目标，例如冰箱。
-- `frontier_only`：关闭语义决策和交互的纯 frontier 对照组。
+当前交接基线为分支 `codex/semantic-decision`、提交 `c9fe3c8`。最关键的任务区别是：
 
-单场景完整交互探索：
+- **交互探索没有 object goal**。系统在 `EXPLORE / INTERACT` 候选中决策，完成条件是导航 frontier 与交互 frontier 耗尽，或达到停滞恢复条件。
+- **交互目标导航必须额外提供目标来源、目标完成条件和目标优先级**。目标一旦被稳定感知，`NAVIGATE` 目标候选应抢占普通探索；完成条件是到达目标并通过配置的可见性验证。
+- 两类任务使用相同 ROS 入口和底层感知、建图、导航、交互执行链路，区别主要来自 `METHOD`、决策配置和运行时目标上下文。
+
+入口脚本当前支持以下全部 METHOD：
+
+| METHOD | 任务与 mission | 决策模块 | 目标来源与完成条件 | 默认配置及用途 |
+|---|---|---|---|---|
+| `interactive_rule` | 规则交互探索；默认 `semantic_interaction_exploration` | Module 1 `dynamic_rule`；Module 2 `rule_cost`；Module 3 `rule_verified` | 无目标；按交互/导航 frontier 完成 | 不覆盖默认决策配置，适合最小规则链路 smoke test；默认不强制关闭容器 |
+| `semantic_interaction_exploration` | 完整规则交互探索 | 三模块均为规则实现 | `target.enabled=false`；导航和交互候选耗尽后完成 | 自动使用 `interactive_exploration.yaml`，并强制关闭容器 |
+| `container_exploration` | 与 `semantic_interaction_exploration` 相同的规则交互探索 | 三模块均为规则实现 | 无目标；按 frontier 完成 | 面向批处理脚本保留的别名，自动使用 `interactive_exploration.yaml` |
+| `full_mllm_exploration` | 全 MLLM 交互探索 | `dynamic_mllm / mllm_score / mllm_skill_verified` | 无目标；LLM 在具体 `EXPLORE / INTERACT` 候选中选择 | 自动使用 `full_mllm_interactive_exploration.yaml`、`full_mllm_mapping.yaml`，并启用属性推理 |
+| `full_mllm_object_goal` | 全 MLLM 交互目标导航 | `dynamic_mllm / mllm_score / mllm_skill_verified` | 默认运行时注入 `random_far_container_object`，只向决策侧公开目标物体类别；目标到达并通过可见性验证后完成 | 自动使用 `full_mllm_object_goal_runtime.yaml`、`full_mllm_mapping.yaml`，并启用属性推理，不需要外部配置覆盖 |
+| `full_mllm_object_goal_apple` | House 7 固定 apple 的全 MLLM 交互目标导航 | `dynamic_mllm / mllm_score / mllm_skill_verified` | 固定目标仅为 `apple`，默认禁止运行时目标覆盖，不公开冰箱或交互要求 | 自动使用 `full_mllm_object_goal_apple.yaml` 和 `full_mllm_house7_mapping.yaml`，用于 House 7 隐式容器发现回归 |
+| `frontier_only` | 纯导航 frontier 对照 | 不启动 semantic decision | 无目标；以 frontier completion 为准 | 不执行语义候选决策和交互，用于 pure-nav baseline |
+| `semantic_interaction_object_goal` | 规则交互目标导航；`semantic_interaction_object_goal` | 默认 `dynamic_rule / rule_cost / rule_verified` | 默认运行时注入 `random_far_container_object`，决策侧只收到目标物体类别；目标到达并通过可见性验证后完成 | 自动使用 `object_goal_runtime.yaml`，强制关闭容器；可通过显式 override 切换为全 MLLM |
+| `object_goal_runtime` | 与 `semantic_interaction_object_goal` 相同的运行时目标导航 | 默认三模块规则实现 | 默认 `random_far_container_object`，公开上下文隐藏容器关系 | 面向批处理脚本保留的别名，自动使用 `object_goal_runtime.yaml` |
+| `object_goal_rule` | 配置文件固定目标的规则导航 | 三模块均为规则实现 | 默认目标为 fridge/refrigerator；可用 `SEMANTIC_DECISION_OVERRIDE` 替换为 apple 等目标 | 自动使用 `object_goal_fridge.yaml` 和 House 7 交互几何；严格目标完成配置应显式包含 `mission.mode=semantic_interaction_object_goal` |
+| `object_goal_model_mock` | 固定 fridge 目标的模型接口测试 | Module 2 使用 `model.mode=mock`，不请求真实模型 | 固定配置目标 | 自动使用 `object_goal_fridge_model_mock.yaml`，用于验证模型协议、选择和回退链路，不用于真实 MLLM 指标 |
+
+补充约定：
+
+- `semantic_interaction_object_goal`、`object_goal_runtime` 和 `full_mllm_object_goal` 会在未设置 `RUNTIME_TARGET_MODE` 时自动改为 `random_far_container_object`；其余 METHOD 默认是 `none`。
+- 固定目标配置必须显式设置 `RUNTIME_TARGET_MODE=none`，否则运行时目标可能覆盖配置目标。
+- `full_mllm_object_goal_apple` 已在 METHOD 内固定 `RUNTIME_TARGET_MODE=none`，因此 House 7 apple 回归不需要额外设置目标模式或 YAML override。
+- `random_far_container_object` 会用完整容器关系构造任务，但默认通过 `public_object_goal_context()` 只向决策/LLM 发布目标物体类别，并把 `require_interaction` 置为 `false`。容器类别、source name 和真实交互要求保存在 `target_selection.json` 的 `private_target_context` 中，用于任务构造和离线评测；只有显式启用 `reveal_container_context` 时才公开。
+- 每次真实模型运行的延时、token、错误与 TPS 写入 `<output_dir>/mllm_metrics.jsonl`。
+- 多场景脚本 `run_semantic_interaction_exploration_batch.py` 接受 `container_exploration`、`object_goal_runtime`、`full_mllm_exploration` 和 `full_mllm_object_goal`。容器目标队列默认使用 `full_mllm_object_goal`。
+
+### 5.3.2.2 全 LLM 交互探索
+
+该模式不创建 object goal，模块 1、2、3 全部使用 MLLM：
+
+```bash
+cd /home/user/ldl/molmospaces-semantic-decision
+conda activate mlspaces
+
+ROS_MASTER_URI=http://127.0.0.1:12835 \
+SEMANTIC_MODEL_ENV_FILE=$PWD/.env \
+METHOD=full_mllm_exploration \
+HOUSE_IND=7 \
+SCENE_SEED=7 \
+USE_FIXED_ROUTE=false \
+RUNTIME_TARGET_MODE=none \
+TASK_HORIZON=1000 \
+INITIAL_DOOR_STATE=closed \
+ENABLE_RECORDING=true \
+SIM_TIMEOUT_S=1800 \
+zsh scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+outputs/house7_full_mllm_exploration
+```
+
+自动设置：
+
+- 决策配置：`scripts/InteractiveNav/configs/semantic_decision/full_mllm_interactive_exploration.yaml`
+- 映射配置：`scripts/InteractiveNav/configs/semantic_decision/full_mllm_mapping.yaml`
+- `ENABLE_ATTRIBUTE_INFERENCE=true`
+- Module 1 `dynamic_mllm`、Module 2 `mllm_score`、Module 3 `mllm_skill_verified`
+
+注意：`METHOD=semantic_interaction_exploration` 是规则版本，不是全 MLLM 版本。
+
+### 5.3.2.3 全 LLM 运行时交互目标导航
+
+直接使用内置的 `full_mllm_object_goal`。该 METHOD 会自动选择全 MLLM 决策和映射配置、启用属性推理，并在未指定目标模式时采样远距离容器内物体：
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:12836 \
+SEMANTIC_MODEL_ENV_FILE=/home/user/ldl/molmospaces/.env \
+METHOD=full_mllm_object_goal \
+HOUSE_IND=7 \
+SCENE_SEED=7 \
+USE_FIXED_ROUTE=false \
+TASK_HORIZON=1000 \
+INITIAL_DOOR_STATE=closed \
+ENABLE_RECORDING=true \
+SIM_TIMEOUT_S=1800 \
+zsh scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+outputs/house7_full_mllm_object_goal
+```
+
+`full_mllm_object_goal_runtime.yaml` 相比全 LLM 探索配置增加或改变：
+
+- `mission.mode=semantic_interaction_object_goal`
+- 生成并保留 target `NAVIGATE` 候选
+- `target_relevance_weight=3.0`
+- top-K 配额为 1 个 `NAVIGATE`、3 个 `INTERACT`、4 个 `EXPLORE`
+- 使用目标到达、距离容差和可见性作为完成验证
+- 目标稳定出现后允许抢占正在执行的普通探索
+
+### 5.3.2.4 规则模式示例
+
+单场景完整规则交互探索：
 
 ```bash
 cd /home/user/ldl/molmospaces-semantic-decision
@@ -530,7 +618,7 @@ INITIAL_DOOR_STATE=closed \
   outputs/house7_semantic_interaction_exploration
 ```
 
-单场景运行时 Obj-goal：
+单场景规则运行时 Obj-goal：
 
 ```bash
 ROS_MASTER_URI=http://127.0.0.1:11522 \
@@ -545,14 +633,19 @@ INITIAL_DOOR_STATE=closed \
   outputs/house7_object_goal_runtime
 ```
 
-固定冰箱目标使用 `METHOD=object_goal_rule`；纯 frontier 对照使用 `METHOD=frontier_only`。常用配置位于：
+固定冰箱目标使用 `METHOD=object_goal_rule`；模型接口 mock 使用 `METHOD=object_goal_model_mock`；纯 frontier 对照使用 `METHOD=frontier_only`。常用配置位于：
 
 ```text
 scripts/InteractiveNav/configs/semantic_decision/interactive_exploration.yaml
+scripts/InteractiveNav/configs/semantic_decision/full_mllm_interactive_exploration.yaml
+scripts/InteractiveNav/configs/semantic_decision/full_mllm_object_goal_runtime.yaml
+scripts/InteractiveNav/configs/semantic_decision/full_mllm_object_goal_apple.yaml
+scripts/InteractiveNav/configs/semantic_decision/full_mllm_mapping.yaml
 scripts/InteractiveNav/configs/semantic_decision/semantic_controlled_explore.yaml
 scripts/InteractiveNav/configs/semantic_decision/semantic_interaction_nav.yaml
 scripts/InteractiveNav/configs/semantic_decision/object_goal_runtime.yaml
 scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge.yaml
+scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge_model_mock.yaml
 ```
 
 多场景交互实验使用专用批处理脚本。每个 worker 是独立子进程，拥有独立 `ROS_MASTER_URI`；场景按 round-robin 分片，worker 内部串行运行分到的场景：
@@ -1051,6 +1144,26 @@ SIM_TIMEOUT_S=1800 \
 ```
 
 该配置固定 `mission.mode=semantic_interaction_object_goal`，并用 `RUNTIME_TARGET_MODE=none` 禁止运行时随机容器目标覆盖，避免向模型泄露目标容器或强制交互信息。仅消融模块 2：模块 1 保持 `dynamic_rule`，模块 3 保持 `rule_verified`。决策 trace 中应满足正常模型路径的 `model_selected_candidate_id == executed_candidate_id`；若模型响应期间候选失效，则会记录 `candidate_validation_reason` 和 `stale_fallback_used`。
+
+House 7 中仅公开 `apple` 类别、模块 1/2/3 全部使用 MLLM 的隐式容器发现测试使用：
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:12836 \
+SEMANTIC_MODEL_ENV_FILE=/home/user/ldl/molmospaces/.env \
+METHOD=full_mllm_object_goal_apple \
+HOUSE_IND=7 \
+SCENE_SEED=7 \
+USE_FIXED_ROUTE=true \
+ROUTE_ID=house7_force_route_01 \
+TASK_HORIZON=1000 \
+INITIAL_DOOR_STATE=closed \
+ENABLE_RECORDING=true \
+SIM_TIMEOUT_S=1800 \
+  zsh scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/house7_full_mllm_apple_hidden_container
+```
+
+`METHOD=full_mllm_object_goal_apple` 内部选择的 `full_mllm_object_goal_apple.yaml` 不包含 apple 实例 ID、冰箱 ID、容器类别或强制交互提示。内部选择的 `full_mllm_house7_mapping.yaml` 只在执行侧合并全 MLLM ablation 与 House 7 已校准的冰箱正面交互位姿，不把容器关系写入任务目标或 LLM prompt。运行时目标采样同样默认只向 `/semantic_decision/target` 发布目标物体类别；完整容器关系保存在 `target_selection.json` 的 `private_target_context` 和候选记录中，仅用于任务构造与离线评测。只有队列脚本显式传入 `--reveal-container-context` 时才公开容器上下文。
 
 2026-07-27 回归：冰箱物理正面轴校准为 `+X`，节点图记录固定交互位姿
 `[8.254459, 1.053060, 3.141593]`。本次机器人实际交互位姿为

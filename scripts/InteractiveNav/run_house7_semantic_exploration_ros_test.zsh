@@ -157,8 +157,35 @@ case "${METHOD}" in
     SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
+  full_mllm_object_goal)
+    START_SEMANTIC_DECISION=true
+    COMPLETION_MODE=semantic
+    FORCE_CLOSE_CONTAINERS=true
+    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
+    ENABLE_ATTRIBUTE_INFERENCE=true
+    MLLM_DECISION_TIMEOUT_S=${MLLM_DECISION_TIMEOUT_S:-3.0}
+    export SEMANTIC_MODEL_TIMEOUT_S="${MLLM_DECISION_TIMEOUT_S}"
+    SEMANTIC_ATTRIBUTE_MODEL_NAME=${SEMANTIC_ATTRIBUTE_MODEL_NAME:-qwen3.6-35b-a3b}
+    SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_object_goal_runtime.yaml}
+    SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
+    EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
+    ;;
+  full_mllm_object_goal_apple)
+    START_SEMANTIC_DECISION=true
+    COMPLETION_MODE=semantic
+    FORCE_CLOSE_CONTAINERS=true
+    COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
+    ENABLE_ATTRIBUTE_INFERENCE=true
+    MLLM_DECISION_TIMEOUT_S=${MLLM_DECISION_TIMEOUT_S:-3.0}
+    export SEMANTIC_MODEL_TIMEOUT_S="${MLLM_DECISION_TIMEOUT_S}"
+    SEMANTIC_ATTRIBUTE_MODEL_NAME=${SEMANTIC_ATTRIBUTE_MODEL_NAME:-qwen3.6-35b-a3b}
+    SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_object_goal_apple.yaml}
+    SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_house7_mapping.yaml}
+    EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
+    RUNTIME_TARGET_MODE=${RUNTIME_TARGET_MODE:-none}
+    ;;
   *)
-    print -u2 -- "Unsupported METHOD=${METHOD}; use semantic_interaction_exploration, semantic_interaction_object_goal, frontier_only, interactive_rule, container_exploration, object_goal_rule, object_goal_model_mock, object_goal_runtime, or full_mllm_exploration"
+    print -u2 -- "Unsupported METHOD=${METHOD}; use semantic_interaction_exploration, semantic_interaction_object_goal, frontier_only, interactive_rule, container_exploration, object_goal_rule, object_goal_model_mock, object_goal_runtime, full_mllm_exploration, full_mllm_object_goal, or full_mllm_object_goal_apple"
     exit 2
     ;;
 esac
@@ -308,7 +335,7 @@ fi
 
 if [[ -z "${RUNTIME_TARGET_MODE:-}" ]]; then
   RUNTIME_TARGET_MODE=none
-  if [[ "${METHOD}" == object_goal_runtime || "${METHOD}" == semantic_interaction_object_goal ]]; then
+  if [[ "${METHOD}" == object_goal_runtime || "${METHOD}" == semantic_interaction_object_goal || "${METHOD}" == full_mllm_object_goal ]]; then
     RUNTIME_TARGET_MODE=random_far_container_object
   fi
 fi

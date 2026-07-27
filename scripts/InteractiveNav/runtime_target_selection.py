@@ -27,7 +27,40 @@ CONTAINER_TOKENS = {
 }
 
 
-def load_fixed_container_target(path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
+PUBLIC_TARGET_CONTEXT_KEYS = {
+    "enabled",
+    "target_name",
+    "object_labels",
+    "standoff_m",
+    "completion_requires_visibility",
+    "require_current_visibility",
+    "target_min_visible_pixels",
+    "target_min_visible_fraction",
+    "target_min_consecutive_observations",
+    "target_require_same_room",
+    "target_allow_connected_room",
+}
+
+
+def public_object_goal_context(context: dict[str, Any]) -> dict[str, Any]:
+    public = {
+        key: value
+        for key, value in dict(context).items()
+        if key in PUBLIC_TARGET_CONTEXT_KEYS
+    }
+    target_name = str(public.get("target_name") or "").strip()
+    public["enabled"] = bool(public.get("enabled", True))
+    public["target_name"] = target_name
+    public["object_labels"] = [target_name] if target_name else []
+    public["require_interaction"] = False
+    return public
+
+
+def load_fixed_container_target(
+    path: str | Path,
+    *,
+    reveal_container_context: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     selection_path = Path(path).expanduser().resolve()
     payload = json.loads(selection_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -35,11 +68,17 @@ def load_fixed_container_target(path: str | Path) -> tuple[dict[str, Any], dict[
     raw_context = payload.get("target_context", payload)
     if not isinstance(raw_context, dict):
         raise ValueError(f"Fixed target context must be a JSON object: {selection_path}")
-    context = dict(raw_context)
-    if not bool(context.get("enabled")):
+    private_context = dict(payload.get("private_target_context") or raw_context)
+    if not bool(private_context.get("enabled")):
         raise ValueError(f"Fixed target context is not enabled: {selection_path}")
+    context = (
+        private_context
+        if reveal_container_context
+        else public_object_goal_context(private_context)
+    )
     selection = dict(payload)
     selection["target_context"] = context
+    selection["private_target_context"] = private_context
     selection["selection_mode"] = "fixed_container_object"
     selection["selection_input_path"] = str(selection_path)
     return context, selection
@@ -119,6 +158,7 @@ def select_far_container_target(
     *,
     selection_seed: int,
     top_k: int = 3,
+    reveal_container_context: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     env = task.env
     object_manager = env.object_managers[env.current_batch_index]
@@ -230,7 +270,7 @@ def select_far_container_target(
     container_category = str(selected["container_category"])
     target_labels = sorted({target_category, selected["target_name"]})
     container_labels = sorted({container_category, selected["container_name"]})
-    context = {
+    private_context = {
         "enabled": True,
         "selection_mode": "random_far_container_object",
         "selection_seed": int(selection_seed),
@@ -253,7 +293,13 @@ def select_far_container_target(
         "target_require_same_room": False,
         "target_allow_connected_room": True,
     }
+    context = (
+        private_context
+        if reveal_container_context
+        else public_object_goal_context(private_context)
+    )
     selected["target_context"] = context
+    selected["private_target_context"] = private_context
     selected["robot_xy"] = robot_xy.tolist()
     selected["candidate_count"] = len(candidate_rows)
     selected["candidate_rows"] = candidate_rows

@@ -28,7 +28,8 @@ from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller
 
 class InteractionAttributeInferenceNode:
     def __init__(self) -> None:
-        load_env_file(os.environ.get("SEMANTIC_DECISION_ENV_FILE"))
+        env_file = os.environ.get("SEMANTIC_DECISION_ENV_FILE")
+        load_env_file(env_file, override=bool(env_file))
         patch_roslogging_findcaller_for_py311()
         rospy.init_node("interaction_attribute_inference_node")
         topics = rospy.get_param("~topics", {}) or {}
