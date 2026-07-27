@@ -998,6 +998,8 @@ VIDEO_FRAME_JOB_QUEUE_SIZE=128 \
 ARTIFACT_WRITE_QUEUE_SIZE=1024 \
 VIDEO_HISTORY_SIZE=128 \
 IMAGE_QUEUE_SIZE=16 \
+OBSERVATION_QUEUE_SIZE=16 \
+EXTRA_IMAGE_QUEUE_SIZE=16 \
 CLEAN_INTERMEDIATE=false \
 SIM_TIMEOUT_S=1800 \
   scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
@@ -1015,6 +1017,19 @@ offset 调整为 `[-1.08, 0.62, 1.60]`，保持约 `1.24 m` 水平距离并位�
 向下俯视角。原始外部相机 PNG 与视频均为 `1024x576`。节点图右侧决策文字框已移除，
 room 横向排列优先依据 portal-room 拓扑连接度，将 House 7 的 livingroom 放在
 bedroom 与 kitchen 之间。
+
+2026-07-27 耗时回归：三路并行 800-step 测试输出位于
+`outputs/house7_perf_parallel3_800_20260727_w{1,2,3}`。三次均完成 800 个 sim step、
+800 行 `sim/step_timing.jsonl`、800 张 sim-step PNG 和 800 帧 6-panel 视频；主循环
+均值分别为 `1.031`、`1.042`、`1.023 s/step`。合并稳定阶段日志显示，外部相机
+同步 ROS 发布平均占 `510 ms/step`，而 sim-step PNG 队列入队仅占 `0.03 ms/step`。
+
+性能修复后，第一视角和外部相机分别使用独立的异步 ROS publisher queue，外部相机
+回调不再与 6-panel 渲染共用锁，等待导航命令期间也不再重复发布录像 RGB。最终
+100-step 回归位于 `outputs/house7_perf_short_all_async_lossless_100_20260727`：稳定阶段
+平均 `0.708 s/step`，外部图像 ROS 发布由 `441 ms` 降至 `1.48 ms`；100 个 sim step
+对应 100 张 sim-step PNG、100 张外部原始 PNG 和 100 张 topology panel PNG，且
+`artifact_write_dropped_jobs=0`、`video_frame_jobs_dropped=0`。
 
 ## 8.6 Room分割测试
 

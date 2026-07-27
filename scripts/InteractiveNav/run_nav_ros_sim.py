@@ -863,6 +863,12 @@ def parse_args():
         default=1,
         help="ROS RGB publisher queue; use 0 for synchronous per-step debug recording.",
     )
+    parser.add_argument(
+        "--extra_image_queue_size",
+        type=int,
+        default=16,
+        help="External/debug camera ROS publisher queue; positive values keep large images off the simulation thread.",
+    )
     parser.add_argument("--depth_topic", type=str, default="/molmo_spaces/head_camera/depth")
     parser.add_argument("--action_topic", type=str, default="/molmo_spaces/action")
     parser.add_argument("--pointcloud_topic", type=str, default="/registered_scan")
@@ -1193,6 +1199,7 @@ def main():
             task=None,
             observation_topic=args.observation_topic,
             observation_queue_size=args.observation_queue_size,
+            extra_image_queue_size=args.extra_image_queue_size,
             action_topic=args.action_topic,
             pointcloud_topic=args.pointcloud_topic,
             camera_info_topic=args.camera_info_topic,

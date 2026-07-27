@@ -926,6 +926,7 @@ class ExploreDebugRecorder:
         self.tf_listener = tf.TransformListener()
         self.lock = threading.RLock()
         self.video_lock = threading.RLock()
+        self.external_video_lock = threading.RLock()
         self.shutting_down = False
         self.start_wall_time = time.time()
         self.latest_grid: OccupancyGrid | None = None
@@ -1234,7 +1235,14 @@ class ExploreDebugRecorder:
                 )
             )
         if args.external_image_topic:
-            self.subscribers.append(rospy.Subscriber(args.external_image_topic, Image, self.external_image_callback, queue_size=1))
+            self.subscribers.append(
+                rospy.Subscriber(
+                    args.external_image_topic,
+                    Image,
+                    self.external_image_callback,
+                    queue_size=max(1, int(args.image_queue_size)),
+                )
+            )
         self.subscribers.append(rospy.Subscriber(args.odom_topic, Odometry, self.odom_callback, queue_size=50))
         self.subscribers.append(rospy.Subscriber(args.goal_topic, PoseStamped, self.goal_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.current_subgoal_topic, PointStamped, self.current_subgoal_callback, queue_size=20))
@@ -1888,7 +1896,7 @@ class ExploreDebugRecorder:
                 return
             self.latest_external_image = (stamp, width, height, rgb)
             self.latest_external_image_step = self.debug_step
-        with self.video_lock:
+        with self.external_video_lock:
             if self.shutting_down:
                 return
             self._record_external_video_frame_locked(width, height, rgb, stamp)
@@ -5877,6 +5885,7 @@ class ExploreDebugRecorder:
             self.first_person_video_error = "video_frame_renderer_shutdown_timeout"
 
         self.video_lock.acquire()
+        self.external_video_lock.acquire()
         with self.lock:
             final_overlay = ""
             final_overlay_crop = ""
@@ -6098,6 +6107,7 @@ class ExploreDebugRecorder:
                 self.semantic_events_file,
             ]:
                 handle.close()
+        self.external_video_lock.release()
         self.video_lock.release()
 
 
