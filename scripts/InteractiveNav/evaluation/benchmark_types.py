@@ -50,12 +50,12 @@ class PolicyObservation:
 class PolicyAction:
     """Normalized action accepted by the standalone evaluator.
 
-    Non-oracle interaction requests should use ``pixel_xy`` (or
-    ``normalized_pixel_xy``) together with an optional joint index.  The
-    evaluator resolves that image location to a live articulated object with a
-    segmentation render that is never exposed to the policy.  ``object_name``
-    remains available only for an explicitly oracle/debug policy because it is
-    a simulator-internal identifier.
+    Non-oracle interaction requests may use ``pixel_xy`` (or
+    ``normalized_pixel_xy``), or an opaque ``instance_id`` previously supplied
+    by the restricted-GT perception protocol.  The evaluator resolves either
+    selector privately.  ``object_name`` remains available only for an
+    explicitly oracle/debug policy because it is a simulator-internal
+    identifier.
     """
 
     kind: ActionKind
@@ -63,6 +63,7 @@ class PolicyAction:
     camera_name: str = "head_camera"
     pixel_xy: tuple[int, int] | None = None
     normalized_pixel_xy: tuple[float, float] | None = None
+    instance_id: str | None = None
     joint_index: int | None = None
     object_name: str | None = None
     operation: Literal["open"] = "open"
@@ -91,6 +92,9 @@ class InteractionAttempt:
     executor: str | None
     simulated_seconds: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
+    # One object-level skill can internally operate several joints.  This is
+    # evaluator-private V3 bookkeeping and is never sent back to the policy.
+    resolved_interaction_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -111,7 +115,12 @@ class EpisodeResult:
     policy_name: str
     uses_oracle_gt: bool
     status: Literal["complete", "exception"]
+    # ``success`` remains the historical interaction-conditioned V3 score for
+    # compatibility.  These explicit fields separate the task endpoint from
+    # interaction-plan correctness.
     success: bool
+    task_success: bool
+    interaction_conditioned_success: bool
     nav_success: bool
     required_interaction_success: bool
     sequence_success: bool
@@ -138,9 +147,11 @@ class EpisodeResult:
     video_path: str | None = None
     error: str | None = None
     # A run may be technically complete but ineligible for a formal score when
-    # frozen V3 terminal goals do not match the live selected instance.
+    # the frozen V3 record is inconsistent with the live replayed scene.
     scoring_eligible: bool = True
+    scoring_exclusion_reasons: list[str] = field(default_factory=list)
     runtime_goal_consistency: dict[str, Any] | None = None
+    runtime_consistency: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

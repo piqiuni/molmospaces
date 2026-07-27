@@ -10,6 +10,10 @@ import time
 
 from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate
 from semantic_decision_py_pkg.env_config import apply_model_env_overrides, load_env_file
+from semantic_decision_py_pkg.interaction_outcome_beliefs import (
+    InteractionOutcomeBeliefStore,
+    uses_direct_atomic_outcome_beliefs,
+)
 from semantic_decision_py_pkg.mission_completion import (
     MissionCompletionConfig,
     MissionCompletionTracker,
@@ -93,6 +97,9 @@ class SemanticRuleDecisionNode:
         )
         self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
         self.failure_retry_delay_s = float(config.get("failure_retry_delay_s", 2.0))
+        self.direct_atomic_outcome_belief_enabled = bool(
+            config.get("direct_atomic_outcome_belief_enabled", False)
+        )
         self.repeat_guard_enabled = bool(config.get("repeat_guard_enabled", True))
         self.repeat_guard_low_gain_limit = max(
             1, int(config.get("repeat_guard_low_gain_limit", 2))
@@ -158,11 +165,13 @@ class SemanticRuleDecisionNode:
         self.active_candidate_id = ""
         self.active_decision_id = ""
         self.active_behavior_type = ""
+        self.active_interaction_candidate: dict = {}
         self.minimum_candidate_sequence = 0
         self.next_decision_time = 0.0
         self.goal_complete = False
         self.target_goal_complete = False
         self.target_context: dict = {}
+        self.interaction_outcome_beliefs = InteractionOutcomeBeliefStore()
         self.active_target_goal = False
         self.cooldown_until: dict[str, float] = {}
         self.failure_counts: dict[str, int] = {}
@@ -208,12 +217,14 @@ class SemanticRuleDecisionNode:
                 self.active_candidate_id = ""
                 self.active_decision_id = ""
                 self.active_behavior_type = ""
+                self.active_interaction_candidate = {}
                 self.minimum_candidate_sequence = 0
                 self.next_decision_time = 0.0
                 self.goal_complete = False
                 self.target_goal_complete = False
                 self.active_target_goal = False
                 self.target_mission.reset()
+                self.interaction_outcome_beliefs.clear()
                 self.cooldown_until.clear()
                 self.failure_counts.clear()
                 self.decision_history.clear()
@@ -255,6 +266,15 @@ class SemanticRuleDecisionNode:
         status = str(payload.get("status") or "")
         if status not in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
             return
+        if (
+            status == "SUCCEEDED"
+            and self.ablation.module3 == "direct_atomic"
+            and self.direct_atomic_outcome_belief_enabled
+            and self.active_behavior_type == "INTERACT"
+        ):
+            self.interaction_outcome_beliefs.record_success(
+                self.active_interaction_candidate
+            )
         self._record_decision_result(payload)
         self.completion_tracker.note_feedback(payload)
         if candidate_id:
@@ -331,6 +351,7 @@ class SemanticRuleDecisionNode:
         self.active_candidate_id = ""
         self.active_decision_id = ""
         self.active_behavior_type = ""
+        self.active_interaction_candidate = {}
         self.active_target_goal = False
 
     def _tick(self, _event) -> None:
@@ -350,6 +371,69 @@ class SemanticRuleDecisionNode:
                 self.decision_in_flight = False
 
     def _decide_from_snapshot(self, candidate_snapshot: dict) -> None:
+        use_direct_atomic_outcome_beliefs = uses_direct_atomic_outcome_beliefs(
+            self.ablation.module3,
+            self.direct_atomic_outcome_belief_enabled,
+        )
+        if use_direct_atomic_outcome_beliefs:
+            candidate_snapshot["graph_context"] = (
+                self.interaction_outcome_beliefs.overlay_compact_graph(
+                    candidate_snapshot.get("graph_context") or {}
+                )
+            )
+        outcome_belief_suppressed_candidate_ids = []
+        if use_direct_atomic_outcome_beliefs:
+            retained_candidates = []
+            for payload in candidate_snapshot.get("candidates") or []:
+                if self.interaction_outcome_beliefs.candidate_is_satisfied(payload):
+                    outcome_belief_suppressed_candidate_ids.append(
+                        str(payload.get("candidate_id") or "")
+                    )
+                    continue
+                retained_candidates.append(payload)
+            if outcome_belief_suppressed_candidate_ids:
+                candidate_snapshot["candidates"] = retained_candidates
+                candidate_snapshot["candidate_count"] = len(retained_candidates)
+                exploration_context = dict(
+                    candidate_snapshot.get("exploration_context") or {}
+                )
+                interaction_frontier_count = sum(
+                    str(candidate.get("behavior_type") or "") == "INTERACT"
+                    and not bool(
+                        (candidate.get("metadata") or {}).get(
+                            "interaction_group_already_explored"
+                        )
+                    )
+                    for candidate in retained_candidates
+                )
+                fallback_navigation_frontier_count = sum(
+                    str(candidate.get("behavior_type") or "") == "EXPLORE"
+                    for candidate in retained_candidates
+                )
+                navigation_frontier_count = int(
+                    exploration_context.get(
+                        "navigation_frontier_count", fallback_navigation_frontier_count
+                    )
+                    or 0
+                )
+                navigation_frontier_exhausted = bool(
+                    exploration_context.get(
+                        "navigation_frontier_exhausted",
+                        navigation_frontier_count == 0,
+                    )
+                )
+                interaction_frontier_exhausted = interaction_frontier_count == 0
+                exploration_context.update(
+                    {
+                        "interaction_frontier_count": interaction_frontier_count,
+                        "interaction_frontier_exhausted": interaction_frontier_exhausted,
+                        "combined_frontier_count": navigation_frontier_count
+                        + interaction_frontier_count,
+                        "frontier_exhausted": navigation_frontier_exhausted
+                        and interaction_frontier_exhausted,
+                    }
+                )
+                candidate_snapshot["exploration_context"] = exploration_context
         candidate_sequence = int(candidate_snapshot.get("sequence", 0) or 0)
         if candidate_sequence < self.minimum_candidate_sequence:
             return
@@ -497,6 +581,11 @@ class SemanticRuleDecisionNode:
             "model_selected_group_id": model_selected_group_id,
             "model_reason": self.model_policy.last_reason,
             "model_confidence": self.model_policy.last_confidence,
+            "direct_atomic_outcome_belief_enabled": use_direct_atomic_outcome_beliefs,
+            "interaction_outcome_beliefs": self.interaction_outcome_beliefs.as_list()
+            if use_direct_atomic_outcome_beliefs
+            else [],
+            "outcome_belief_suppressed_candidate_ids": outcome_belief_suppressed_candidate_ids,
             "candidate_groups": list(self.model_policy.last_candidate_groups),
             "executed_candidate_id": selected.candidate_id if selected is not None else "",
             "executed_group_id": (
@@ -547,6 +636,17 @@ class SemanticRuleDecisionNode:
             self.active_candidate_id = selected.candidate_id
             self.active_decision_id = decision_id
             self.active_behavior_type = selected.behavior_type
+            self.active_interaction_candidate = (
+                {
+                    "candidate_id": selected.candidate_id,
+                    "behavior_type": selected.behavior_type,
+                    "target_id": selected.target_id,
+                    "decision_id": decision_id,
+                    "interaction_command": dict(selected.interaction_command or {}),
+                }
+                if selected.behavior_type == "INTERACT"
+                else {}
+            )
             self.active_target_goal = bool((selected.metadata or {}).get("target_goal")) or (
                 self.target_mission.pending_interaction is not None
                 and selected.behavior_type == "INTERACT"

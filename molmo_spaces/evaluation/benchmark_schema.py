@@ -222,6 +222,7 @@ OracleReason = Literal[
     "prerequisite_for_interaction",
     "reveal_target_object",
     "satisfy_nav_to_obj_success",
+    "satisfy_nav_to_point_success",
     "verify_target_visible",
 ]
 
@@ -298,6 +299,18 @@ class InteractiveNavTargetSpec(BaseModel):
         extra = "allow"
 
 
+class InteractiveNavPointTargetSpec(BaseModel):
+    target_type: Literal["point"]
+    goal_point: list[float] = Field(..., min_length=3, max_length=3)
+    goal_yaw: float | None = None
+    sampling_source: str
+    clearance_m: float = Field(..., ge=0.0)
+    grounding: TargetGroundingSpec = Field(default_factory=TargetGroundingSpec)
+
+    class Config:
+        extra = "allow"
+
+
 class SuccessDistanceSpec(BaseModel):
     metric: Literal["planar_robot_base_to_object"]
     threshold_m: float = Field(..., gt=0.0)
@@ -317,6 +330,19 @@ class NavToObjSuccessCriteriaSpec(BaseModel):
     distance: SuccessDistanceSpec
     visibility: SuccessVisibilitySpec
     combination: Literal["all"]
+
+
+class PointSuccessDistanceSpec(BaseModel):
+    metric: Literal["planar_robot_base_to_point"]
+    threshold_m: float = Field(..., gt=0.0)
+    comparison: Literal["less_or_equal"]
+
+
+class NavToPointSuccessCriteriaSpec(BaseModel):
+    type: Literal["nav_to_point"]
+    distance: PointSuccessDistanceSpec
+    require_goal_yaw: bool = False
+    yaw_threshold_rad: float | None = Field(default=None, gt=0.0)
 
 
 class InitialInteractionStateSpec(BaseModel):
@@ -384,8 +410,8 @@ class InteractiveNavV3Spec(BaseModel):
     interaction_requirement: Literal[
         "required", "beneficial", "unnecessary", "unknown"
     ]
-    target: InteractiveNavTargetSpec
-    success_criteria: NavToObjSuccessCriteriaSpec
+    target: InteractiveNavTargetSpec | InteractiveNavPointTargetSpec
+    success_criteria: NavToObjSuccessCriteriaSpec | NavToPointSuccessCriteriaSpec
     initial_state: InteractiveNavInitialStateSpec
     interactions: list[InteractionSpec]
     oracle_plan: OraclePlanV3Spec
@@ -491,6 +517,16 @@ class NavToObjTaskSpec(BaseTaskSpec):
     succ_pos_threshold: float = 1.5  # meters
 
 
+class NavToPointTaskSpec(BaseTaskSpec):
+    """Task-specific parameters for navigation to a fixed world-frame point."""
+
+    goal_point: list[float] = Field(..., min_length=3, max_length=3)
+    goal_yaw: float | None = None
+    succ_pos_threshold: float = 0.25
+    require_goal_yaw: bool = False
+    succ_yaw_threshold: float | None = None
+
+
 class DoorOpeningTaskSpec(BaseTaskSpec):
     """Task-specific parameters for door opening tasks."""
 
@@ -509,6 +545,7 @@ TaskSpec = (
     | PickAndPlaceNextToTaskSpec
     | OpenCloseTaskSpec
     | NavToObjTaskSpec
+    | NavToPointTaskSpec
     | DoorOpeningTaskSpec
 )
 
@@ -520,6 +557,7 @@ ALL_TASK_SPEC_CLASSES: list[type[BaseTaskSpec]] = [
     PickAndPlaceColorTaskSpec,
     OpenCloseTaskSpec,
     NavToObjTaskSpec,
+    NavToPointTaskSpec,
     DoorOpeningTaskSpec,
 ]
 
@@ -548,6 +586,7 @@ class LanguageSpec(BaseModel):
     task_description: str
     instruction_type: Literal[
         "object_goal",
+        "point_goal",
         "route_instruction",
         "interaction_instruction",
         "route_interaction_instruction",
@@ -563,6 +602,14 @@ class LanguageSpec(BaseModel):
     # Each entry is [clip_score_diff, clip_score, expression_text]
     # Using list instead of tuple for JSON compatibility
     referral_expressions_priority: dict[str, list[list[float | str]]] = Field(default_factory=dict)
+
+    task_input_mode: Literal["goal_spec", "instruction"] | None = None
+    grounded_entity_ids: list[str] = Field(default_factory=list)
+    grounded_plan_step_indices: list[int] = Field(default_factory=list)
+    generation_mode: str | None = None
+
+    class Config:
+        extra = "allow"
 
 
 class SourceSpec(BaseModel):

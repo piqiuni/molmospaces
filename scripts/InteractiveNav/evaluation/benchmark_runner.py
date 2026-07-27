@@ -58,16 +58,37 @@ from .benchmark_policies import (
     build_ros_bridge_policy,
 )
 from .benchmark_types import EpisodeResult, InteractionAttempt, PolicyAction, PolicyObservation, PublicEpisode
+from .public_goal import build_public_target_context as build_language_target_context
+from .restricted_gt_perception import RestrictedGTPerceptionPublisher
+from .ros_object_goal_adapter import (
+    RosObjectGoalEvaluatorAdapter,
+    build_public_target_context as build_ros_target_context,
+)
+from .trusted_interaction_skill import (
+    JointOpenResult,
+    ObjectInteractionRequest,
+    OpaqueObjectRegistry,
+    OpenPostconditionSpec,
+    TrustedInteractionSkill,
+)
 
 
-PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v2"
+PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v6"
+
+# Established ROS exploration posture.  The asymmetric shoulder roll tucks the
+# arms beside the torso so they neither move after the first navigation action
+# nor enter the head-camera depth map.
+ROS_NAVIGATION_ARM_QPOS: dict[str, tuple[float, ...]] = {
+    "left_arm": (0.28, 0.0, -0.45, -0.64, 0.39, -0.26, -0.04),
+    "right_arm": (0.28, 0.0, 0.45, -0.64, 0.39, -0.26, -0.04),
+}
 
 
 @dataclass
 class BenchmarkEvaluationConfig:
     benchmark: Path
     output_dir: Path
-    policy: Literal["noop", "scripted_oracle", "ros_bridge", "factory"] = "noop"
+    policy: Literal["noop", "scripted_oracle", "ros_bridge", "ros_object_goal_rule", "factory"] = "noop"
     policy_factory: str | None = None
     policy_kwargs: dict[str, Any] = field(default_factory=dict)
     workers: int = 1
@@ -97,6 +118,17 @@ class BenchmarkEvaluationConfig:
     ros_cmd_vel_linear_gain: float = 3.0
     ros_require_move_base_active: bool = True
     ros_map_warmup_skip_frames: int = 0
+    ros_target_topic: str = "/semantic_decision/target"
+    ros_restricted_gt_topic: str = "/semantic_mapping/gt_observations"
+    ros_interaction_command_topic: str = "/semantic_decision/interaction_command"
+    ros_interaction_result_topic: str = "/semantic_mapping/interaction_result"
+    restricted_gt_min_visible_pixels: int = 16
+    quality_gate_only: bool = False
+    runtime_joint_position_tolerance: float = 0.02
+    runtime_joint_fraction_tolerance: float = 0.05
+    runtime_base_position_tolerance_m: float = 0.05
+    runtime_base_yaw_tolerance_rad: float = 0.05
+    progress_every: int = 10
 
     def validate(self) -> None:
         if self.workers < 1:
@@ -107,10 +139,10 @@ class BenchmarkEvaluationConfig:
             raise ValueError("--policy-factory is required with --policy factory")
         if self.policy != "factory" and self.policy_factory:
             raise ValueError("--policy-factory is only valid with --policy factory")
-        if self.policy == "ros_bridge" and self.workers != 1:
-            raise ValueError("ros_bridge requires --workers 1 because a ROS master is stateful")
-        if self.policy == "ros_bridge" and "head_camera" not in self.camera_names:
-            raise ValueError("ros_bridge requires head_camera for RGB/depth and pose publication")
+        if self.policy in {"ros_bridge", "ros_object_goal_rule"} and self.workers != 1:
+            raise ValueError(f"{self.policy} requires --workers 1 because a ROS master is stateful")
+        if self.policy in {"ros_bridge", "ros_object_goal_rule"} and "head_camera" not in self.camera_names:
+            raise ValueError(f"{self.policy} requires head_camera for RGB/depth and pose publication")
         if not self.camera_names:
             raise ValueError("camera_names must not be empty")
         if self.image_resolution is not None and min(self.image_resolution) <= 0:
@@ -130,6 +162,18 @@ class BenchmarkEvaluationConfig:
             raise ValueError("force_target_fraction must be in (0, 1]")
         if self.force_max_internal_steps < 1:
             raise ValueError("force_max_internal_steps must be >= 1")
+        if self.restricted_gt_min_visible_pixels < 1:
+            raise ValueError("restricted_gt_min_visible_pixels must be >= 1")
+        if self.progress_every < 1:
+            raise ValueError("progress_every must be >= 1")
+        for name, value in (
+            ("runtime_joint_position_tolerance", self.runtime_joint_position_tolerance),
+            ("runtime_joint_fraction_tolerance", self.runtime_joint_fraction_tolerance),
+            ("runtime_base_position_tolerance_m", self.runtime_base_position_tolerance_m),
+            ("runtime_base_yaw_tolerance_rad", self.runtime_base_yaw_tolerance_rad),
+        ):
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
         if not math.isclose(self.policy_dt_ms / self.ctrl_dt_ms, round(self.policy_dt_ms / self.ctrl_dt_ms)):
             raise ValueError("policy_dt_ms must be an integer multiple of ctrl_dt_ms")
         if not math.isclose(self.ctrl_dt_ms / self.sim_dt_ms, round(self.ctrl_dt_ms / self.sim_dt_ms)):
@@ -162,6 +206,15 @@ class V3BenchmarkTaskSampler(JsonEvalTaskSampler):
         self._interactive_nav = interactive_nav
         self.runtime_compatibility = {}
         super().__init__(exp_config, episode_spec)
+
+    def set_joint_values(self, env: Any) -> None:
+        # JsonEvalTaskSampler treats every articulated ``pickup_obj_name`` as a
+        # manipulation target and requires a grasp file.  NavToObj reuses that
+        # field only to identify the navigation target; its authoritative joint
+        # state is restored later from ``scene_modifications``.
+        if self.episode_spec.task.get("task_type") == "nav_to_obj":
+            return
+        super().set_joint_values(env)
 
     def randomize_scene(self, env: Any, robot_view: Any) -> None:
         model = env.current_model
@@ -318,6 +371,117 @@ class InteractionCatalog:
         return candidates[0], {"pixel_xy": [u, v], "body_id": body_id, "segmentation_image_size": [width, height]}
 
 
+@dataclass
+class RestrictedRosObjectGoalRuntime:
+    """Evaluator-private state for one restricted-GT ROS episode."""
+
+    perception: RestrictedGTPerceptionPublisher
+    adapter: RosObjectGoalEvaluatorAdapter
+    skill: TrustedInteractionSkill
+    opaque_to_source_name: dict[str, str]
+    opaque_to_joints: dict[str, tuple[RuntimeJoint, ...]]
+
+
+def _build_restricted_ros_object_goal_runtime(
+    *,
+    task: Any,
+    catalog: InteractionCatalog,
+    episode: dict[str, Any],
+    public: PublicEpisode,
+    config: BenchmarkEvaluationConfig,
+    frame_callback: callable | None = None,
+) -> RestrictedRosObjectGoalRuntime:
+    """Create evaluator-owned restricted perception and sealed force skills.
+
+    The external ROS graph sees only the public target language and canonical
+    restricted-GT observations.  The source-name/joint mapping lives entirely
+    in this function's returned private runtime object.
+    """
+
+    perception = RestrictedGTPerceptionPublisher(
+        camera_name="head_camera",
+        min_visible_pixels=int(config.restricted_gt_min_visible_pixels),
+        step_interval=1,
+        frame_id="world",
+    )
+    private_registry = OpaqueObjectRegistry()
+    opaque_to_source_name: dict[str, str] = {}
+    opaque_to_joints: dict[str, tuple[RuntimeJoint, ...]] = {}
+    joints_by_object: dict[str, list[RuntimeJoint]] = {}
+    for joint in catalog.joints:
+        joints_by_object.setdefault(joint.object_name, []).append(joint)
+    for source_name in sorted(joints_by_object):
+        opaque_id = perception.registry.public_id_for(source_name)
+        joints = tuple(sorted(joints_by_object[source_name], key=lambda item: item.joint_index))
+        private_registry.register(
+            opaque_id,
+            joints=joints,
+            object_ref=source_name,
+            open_postcondition=OpenPostconditionSpec(
+                success_fraction=float(SUCCESS_OPEN_FRACTION),
+                minimum_open_joints=1,
+            ),
+        )
+        opaque_to_source_name[opaque_id] = source_name
+        opaque_to_joints[opaque_id] = joints
+
+    def execute_open_joint(joint: RuntimeJoint) -> JointOpenResult:
+        succeeded, metadata, before, after, simulated_seconds = _execute_locked_force(
+            task.env,
+            joint,
+            config,
+            frame_callback=frame_callback,
+        )
+        return JointOpenResult(
+            executor_succeeded=bool(succeeded),
+            open_fraction_before=before,
+            open_fraction_after=after,
+            simulated_seconds=float(simulated_seconds),
+            metadata=metadata,
+        )
+
+    skill = TrustedInteractionSkill(private_registry, execute_open_joint)
+    adapter = RosObjectGoalEvaluatorAdapter(
+        target_topic=config.ros_target_topic,
+        gt_observations_topic=config.ros_restricted_gt_topic,
+        interaction_command_topic=config.ros_interaction_command_topic,
+        interaction_result_topic=config.ros_interaction_result_topic,
+    )
+    language_target = build_language_target_context(
+        episode.get("language") if isinstance(episode.get("language"), dict) else {},
+        public.instruction,
+    )
+    target_name = str(language_target.get("target_name") or public.instruction or "object")
+    adapter.reset(
+        episode_id=perception.episode_id,
+        target_context=build_ros_target_context(
+            episode_id=perception.episode_id,
+            target_name=target_name,
+            instruction=public.instruction,
+            object_labels=list(language_target.get("object_labels") or [target_name]),
+            enabled=bool(language_target.get("enabled", True)),
+            min_visible_pixels=int(config.restricted_gt_min_visible_pixels),
+            min_visible_fraction=0.0,
+            min_consecutive_observations=1,
+            completion_requires_visibility=True,
+            require_current_visibility=False,
+        ),
+        # This mapping is evaluator-private.  The adapter uses its keys only to
+        # validate opaque IDs from ROS interaction commands.
+        private_instances={opaque_id: opaque_id for opaque_id in opaque_to_source_name},
+    )
+    initial_frame = perception.build(task, force=True)
+    if initial_frame is not None:
+        adapter.publish_restricted_gt_frame(initial_frame, capture_step=0)
+    return RestrictedRosObjectGoalRuntime(
+        perception=perception,
+        adapter=adapter,
+        skill=skill,
+        opaque_to_source_name=opaque_to_source_name,
+        opaque_to_joints=opaque_to_joints,
+    )
+
+
 def _safe_json(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _safe_json(item) for key, item in value.items()}
@@ -380,20 +544,38 @@ def _build_replay_config(config: BenchmarkEvaluationConfig, output_dir: Path) ->
     replay.datagen_profiler = False
     replay.filter_for_successful_trajectories = False
     replay.robot_config.action_noise_config = ActionNoiseConfig(enabled=False)
+    if _is_current_ros_policy(config):
+        for group_name, qpos in ROS_NAVIGATION_ARM_QPOS.items():
+            replay.robot_config.init_qpos[group_name] = np.asarray(qpos, dtype=float)
+            replay.robot_config.init_qpos_noise_range[group_name] = np.zeros(len(qpos), dtype=float)
     return replay
+
+
+def _apply_ros_navigation_arm_posture(spec: EpisodeSpec) -> None:
+    """Use the deterministic ROS navigation posture without mutating benchmark JSON."""
+
+    for group_name, qpos in ROS_NAVIGATION_ARM_QPOS.items():
+        if group_name in spec.robot.init_qpos:
+            spec.robot.init_qpos[group_name] = list(qpos)
 
 
 def _is_current_ros_policy(config: BenchmarkEvaluationConfig) -> bool:
     """Whether the policy consumes the repository's RGB/depth ROS bridge."""
 
     return bool(
-        config.policy == "ros_bridge"
+        config.policy in {"ros_bridge", "ros_object_goal_rule"}
         or (
             config.policy == "factory"
             and config.policy_factory
             and "ros_navigation_factory" in config.policy_factory
         )
     )
+
+
+def _is_ros_object_goal_rule(config: BenchmarkEvaluationConfig) -> bool:
+    """Whether this rollout owns restricted-GT and object-skill ROS topics."""
+
+    return config.policy == "ros_object_goal_rule"
 
 
 def _public_episode(episode: dict[str, Any], camera_names: list[str], resolution: tuple[int, int]) -> PublicEpisode:
@@ -416,7 +598,7 @@ def _build_policy(config: BenchmarkEvaluationConfig, public: PublicEpisode) -> B
     if config.policy == "factory":
         assert config.policy_factory is not None
         return build_factory_policy(config.policy_factory, public_episode=public, kwargs=config.policy_kwargs)
-    if config.policy == "ros_bridge":
+    if config.policy in {"ros_bridge", "ros_object_goal_rule"}:
         return build_ros_bridge_policy(
             policy_dt_ms=config.policy_dt_ms,
             observation_topic=config.ros_observation_topic,
@@ -425,6 +607,7 @@ def _build_policy(config: BenchmarkEvaluationConfig, public: PublicEpisode) -> B
             cmd_vel_linear_gain=config.ros_cmd_vel_linear_gain,
             require_move_base_active=config.ros_require_move_base_active,
             map_warmup_skip_frames=config.ros_map_warmup_skip_frames,
+            name=config.policy,
         )
     raise ValueError(f"Unsupported policy: {config.policy}")
 
@@ -445,6 +628,208 @@ def _base_pose_xyyaw(task: Any) -> np.ndarray:
 
 def _wrap_angle(value: float) -> float:
     return float(math.atan2(math.sin(value), math.cos(value)))
+
+
+def _expected_runtime_base_xyyaw(episode: dict[str, Any]) -> np.ndarray:
+    """Return the task-authoritative start pose in planar coordinates."""
+
+    pose = np.asarray(episode.get("task", {}).get("robot_base_pose", []), dtype=float)
+    if pose.shape == (7,):
+        x, y, _z, qw, qx, qy, qz = [float(value) for value in pose]
+        yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+        return np.asarray([x, y, yaw], dtype=float)
+    pose = np.asarray(
+        episode.get("robot", {}).get("init_qpos", {}).get("base", []),
+        dtype=float,
+    )
+    return pose
+
+
+def _runtime_consistency_checks(
+    task: Any,
+    catalog: InteractionCatalog,
+    episode: dict[str, Any],
+    sampler: V3BenchmarkTaskSampler,
+    config: BenchmarkEvaluationConfig,
+) -> dict[str, Any]:
+    """Validate that a frozen episode can be scored in the live scene.
+
+    These checks intentionally stop before any policy action.  They cover the
+    runtime identities and initial state that formal metrics depend on, while
+    leaving navigation and manipulation performance to the evaluated policy.
+    """
+
+    nav = episode["interactive_nav"]
+    reasons: list[str] = []
+    checks: dict[str, Any] = {}
+
+    goal = oracle_terminal_goal_consistency(task, episode)
+    checks["oracle_terminal_goal"] = goal
+    if goal.get("checked") and not goal.get("consistent"):
+        reasons.append("terminal_goal_target_mismatch")
+
+    expected_base = _expected_runtime_base_xyyaw(episode)
+    actual_base = _base_pose_xyyaw(task)
+    if expected_base.shape == (3,):
+        base_position_error = float(np.linalg.norm(actual_base[:2] - expected_base[:2]))
+        base_yaw_error = abs(_wrap_angle(float(actual_base[2] - expected_base[2])))
+        base_passed = bool(
+            base_position_error <= float(config.runtime_base_position_tolerance_m)
+            and base_yaw_error <= float(config.runtime_base_yaw_tolerance_rad)
+        )
+    else:
+        base_position_error = None
+        base_yaw_error = None
+        base_passed = False
+    checks["robot_start_pose"] = {
+        "passed": base_passed,
+        "expected_xyyaw": expected_base.tolist(),
+        "actual_xyyaw": actual_base.tolist(),
+        "position_error_m": base_position_error,
+        "yaw_error_rad": base_yaw_error,
+        "position_tolerance_m": float(config.runtime_base_position_tolerance_m),
+        "yaw_tolerance_rad": float(config.runtime_base_yaw_tolerance_rad),
+    }
+    if not base_passed:
+        reasons.append("robot_start_pose_mismatch")
+
+    articulation_rows: list[dict[str, Any]] = []
+    for expected in episode.get("scene_modifications", {}).get("articulation_states", []):
+        joint_name = str(expected["joint_name"])
+        joint_id = mujoco.mj_name2id(task.env.current_model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if joint_id < 0:
+            articulation_rows.append({
+                "joint_name": joint_name,
+                "passed": False,
+                "reason": "joint_not_found",
+            })
+            continue
+        actual_position = float(probe.joint_value_by_name(task.env, joint_name))
+        expected_position = float(expected["position"])
+        actual_fraction = joint_open_fraction(task.env, {"joint_name": joint_name})
+        expected_fraction = float(expected["open_fraction"])
+        position_error = abs(actual_position - expected_position)
+        fraction_error = abs(actual_fraction - expected_fraction)
+        articulation_rows.append({
+            "object_name": str(expected.get("object_name", "")),
+            "joint_name": joint_name,
+            "expected_position": expected_position,
+            "actual_position": actual_position,
+            "position_error": position_error,
+            "expected_open_fraction": expected_fraction,
+            "actual_open_fraction": actual_fraction,
+            "open_fraction_error": fraction_error,
+            "passed": bool(
+                position_error <= float(config.runtime_joint_position_tolerance)
+                and fraction_error <= float(config.runtime_joint_fraction_tolerance)
+            ),
+        })
+    articulation_passed = bool(articulation_rows) and all(row["passed"] for row in articulation_rows)
+    checks["articulation_state_readback"] = {
+        "passed": articulation_passed,
+        "joint_count": len(articulation_rows),
+        "position_tolerance": float(config.runtime_joint_position_tolerance),
+        "open_fraction_tolerance": float(config.runtime_joint_fraction_tolerance),
+        "failed_joints": [row for row in articulation_rows if not row["passed"]],
+    }
+    if not articulation_passed:
+        reasons.append("articulation_state_mismatch")
+
+    resolution_rows: list[dict[str, Any]] = []
+    for interaction in nav.get("interactions", []):
+        object_name = str(interaction["object_name"])
+        joint_index = int(interaction["joint_index"])
+        expected_joint_name = str(interaction["joint_name"])
+        resolved = catalog.by_name(object_name, joint_index)
+        passed = bool(resolved is not None and resolved.joint_name == expected_joint_name)
+        resolution_rows.append({
+            "interaction_id": str(interaction["interaction_id"]),
+            "object_name": object_name,
+            "joint_index": joint_index,
+            "expected_joint_name": expected_joint_name,
+            "resolved_joint_name": None if resolved is None else resolved.joint_name,
+            "passed": passed,
+        })
+    resolution_passed = all(row["passed"] for row in resolution_rows)
+    checks["interaction_resolution"] = {
+        "passed": resolution_passed,
+        "interaction_count": len(resolution_rows),
+        "failed_interactions": [row for row in resolution_rows if not row["passed"]],
+    }
+    if not resolution_passed:
+        reasons.append("interaction_resolution_mismatch")
+
+    expected_visible = nav.get("initial_state", {}).get("target_visible")
+    if isinstance(expected_visible, bool):
+        criteria = nav.get("success_criteria", {})
+        camera_name = str(criteria.get("visibility", {}).get("camera_name", "head_camera"))
+        target_name = str(nav["target"]["selected_instance"])
+        actual_visibility = float(task.env.check_visibility(camera_name, target_name))
+        actual_visible = actual_visibility > 0.0
+        visibility_passed = actual_visible is expected_visible
+        checks["initial_target_visibility"] = {
+            "applicable": True,
+            "passed": visibility_passed,
+            "camera_name": camera_name,
+            "target_name": target_name,
+            "expected_visible": expected_visible,
+            "actual_visible": actual_visible,
+            "actual_visibility_fraction": actual_visibility,
+        }
+        if not visibility_passed:
+            reasons.append("initial_target_visibility_mismatch")
+    else:
+        checks["initial_target_visibility"] = {"applicable": False, "passed": True}
+
+    checks["scene_runtime_compatibility"] = {
+        "passed": True,
+        **sampler.runtime_compatibility,
+    }
+    return {
+        "schema_version": "interactive_nav_v3_runtime_consistency_v1",
+        "eligible": not reasons,
+        "exclusion_reasons": reasons,
+        "checks": checks,
+    }
+
+
+def _redact_runtime_consistency_for_restricted_policy(
+    runtime_consistency: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Project evaluator-private replay checks into a safe public summary.
+
+    The checks are necessary for formal scoring, but their raw target names,
+    joint names, joint values and poses must not become an accidental side
+    channel in a restricted-GT policy's result directory.
+    """
+
+    if runtime_consistency is None:
+        return None, None
+    checks = runtime_consistency.get("checks") if isinstance(runtime_consistency, dict) else {}
+    checks = checks if isinstance(checks, dict) else {}
+    goal = checks.get("oracle_terminal_goal") if isinstance(checks.get("oracle_terminal_goal"), dict) else {}
+    public_goal = {
+        "checked": bool(goal.get("checked", False)),
+        "consistent": bool(goal.get("consistent", False)),
+    }
+    public_checks: dict[str, Any] = {"oracle_terminal_goal": public_goal}
+    for name, source in checks.items():
+        if name == "oracle_terminal_goal" or not isinstance(source, dict):
+            continue
+        summary: dict[str, Any] = {"passed": bool(source.get("passed", False))}
+        for key in ("applicable", "joint_count", "interaction_count"):
+            if key in source:
+                summary[key] = source[key]
+        public_checks[name] = summary
+    return public_goal, {
+        "schema_version": "interactive_nav_v3_runtime_consistency_public_v1",
+        "eligible": bool(runtime_consistency.get("eligible", False)),
+        "exclusion_reasons": list(runtime_consistency.get("exclusion_reasons", [])),
+        "checks": public_checks,
+    }
 
 
 def _capture_head_frame(task: Any, frames: list[np.ndarray], enabled: bool) -> None:
@@ -696,6 +1081,194 @@ def _check_interaction_access(
     return True, {"distance_m": distance, "visibility": visible}
 
 
+def _resolved_interaction_ids(attempt: dict[str, Any]) -> list[str]:
+    """Return all private V3 IDs credited by one evaluator-side attempt."""
+
+    values = attempt.get("resolved_interaction_ids")
+    if isinstance(values, (list, tuple)):
+        return [str(value) for value in values if value is not None]
+    value = attempt.get("resolved_interaction_id")
+    return [] if value is None else [str(value)]
+
+
+def _successful_object_skill_interaction_ids(
+    *,
+    episode: dict[str, Any],
+    source_name: str,
+    joints: tuple[RuntimeJoint, ...],
+    joint_results: tuple[JointOpenResult, ...],
+) -> list[str]:
+    """Privately map sealed object-skill postconditions to frozen V3 rows.
+
+    The navigation method receives just one opaque ``open(instance_id)`` result.
+    V3's evaluator still needs to know which recorded articulation postconditions
+    are actually satisfied.  This mapping intentionally remains in the runner
+    and considers only final fractions, never controller substeps.
+    """
+
+    rows = list(episode["interactive_nav"].get("interactions", []))
+    resolved: list[str] = []
+    for joint, result in zip(joints, joint_results, strict=False):
+        if result.open_fraction_after is None or float(result.open_fraction_after) < SUCCESS_OPEN_FRACTION:
+            continue
+        for row in rows:
+            if (
+                str(row.get("object_name")) == source_name
+                and int(row.get("joint_index", -1)) == int(joint.joint_index)
+            ):
+                resolved.append(str(row["interaction_id"]))
+    return list(dict.fromkeys(resolved))
+
+
+def _publish_restricted_ros_frame(
+    runtime: RestrictedRosObjectGoalRuntime,
+    task: Any,
+    *,
+    decision_index: int,
+) -> bool:
+    """Render and publish one canonical public perception frame for ROS."""
+
+    payload = runtime.perception.build(task, step_index=int(decision_index), force=True)
+    if payload is None:
+        return False
+    runtime.adapter.publish_restricted_gt_frame(payload, capture_step=int(decision_index))
+    return True
+
+
+def _consume_pending_ros_object_goal_interaction(
+    *,
+    task: Any,
+    runtime: RestrictedRosObjectGoalRuntime,
+    episode: dict[str, Any],
+    private_attempts: list[dict[str, Any]],
+    config: BenchmarkEvaluationConfig,
+    decision_index: int,
+    frames: list[np.ndarray],
+) -> dict[str, Any] | None:
+    """Execute at most one queued opaque object request inside the evaluator.
+
+    The ROS navigation graph can only submit an opaque ID and ``open``.  This
+    function resolves that ID, checks live approach access, and invokes the
+    evaluator-owned force skill.  Its return value intentionally has separate
+    private scoring and public trace projections.
+    """
+
+    request = runtime.adapter.pop_next_interaction_request()
+    if request is None:
+        return None
+    source_name = runtime.opaque_to_source_name.get(request.instance_id)
+    joints = runtime.opaque_to_joints.get(request.instance_id, ())
+    public_request = ObjectInteractionRequest(
+        request_id=request.command_id,
+        instance_id=request.instance_id,
+        operation="open",
+    )
+    access_ok = False
+    access_meta: dict[str, Any] = {"reason": "unknown_opaque_instance"}
+    if source_name is not None and joints:
+        # An object-level skill intentionally checks approach access once.  The
+        # lower force policy may then operate the object's private joint set.
+        access_ok, access_meta = _check_interaction_access(
+            task.env,
+            joints[0],
+            camera_name="head_camera",
+            max_distance_m=config.interaction_max_distance_m,
+            require_visible=config.require_interaction_visible,
+        )
+
+    joint_results: tuple[JointOpenResult, ...] = ()
+    public_result: dict[str, Any]
+    successful_ids: list[str] = []
+    if access_ok:
+        event = runtime.skill.execute_private(public_request)
+        joint_results = event.joint_results
+        successful_ids = _successful_object_skill_interaction_ids(
+            episode=episode,
+            source_name=str(source_name),
+            joints=joints,
+            joint_results=joint_results,
+        )
+        completion = runtime.adapter.complete_interaction(
+            request.command_id,
+            success=event.public_result.completed,
+        )
+        public_result = event.public_result.to_public_dict()
+        simulated_seconds = float(sum(result.simulated_seconds for result in joint_results))
+        skill_completed = bool(event.public_result.completed)
+        postcondition = None if event.postcondition is None else event.postcondition.value
+    else:
+        completion = runtime.adapter.complete_interaction(request.command_id, success=False)
+        public_result = {
+            "request_id": request.command_id,
+            "instance_id": request.instance_id,
+            "operation": "open",
+            "status": "failed",
+        }
+        simulated_seconds = 0.0
+        skill_completed = False
+        postcondition = None
+
+    matching_ids = [
+        str(row["interaction_id"])
+        for row in episode["interactive_nav"].get("interactions", [])
+        if source_name is not None and str(row.get("object_name")) == source_name
+    ]
+    classification = "required_valid" if matching_ids and access_ok else "extra_valid" if access_ok else "invalid"
+    prior_success = {
+        interaction_id
+        for attempt in private_attempts
+        if attempt.get("classification") == "required_valid" and bool(attempt.get("success"))
+        for interaction_id in _resolved_interaction_ids(attempt)
+    }
+    prerequisite_ids = {
+        str(prerequisite["interaction_id"])
+        for row in episode["interactive_nav"].get("interactions", [])
+        if str(row.get("interaction_id")) in successful_ids
+        for prerequisite in row.get("prerequisites", [])
+    }
+    prerequisite_satisfied: bool | None = None
+    if matching_ids:
+        prerequisite_satisfied = prerequisite_ids.issubset(prior_success)
+    private_attempt = InteractionAttempt(
+        requested=public_request.to_public_dict(),
+        classification=classification,  # type: ignore[arg-type]
+        resolved_object_name=source_name,
+        resolved_joint_name=None,
+        resolved_joint_index=None,
+        resolved_interaction_id=successful_ids[0] if successful_ids else None,
+        resolved_interaction_ids=successful_ids,
+        success=skill_completed,
+        joint_fraction_before=None,
+        joint_fraction_after=None,
+        prerequisite_satisfied=prerequisite_satisfied,
+        executor="trusted_object_force" if source_name is not None else None,
+        simulated_seconds=simulated_seconds,
+        metadata={
+            # This private trace is retained only for formal V3 scoring and is
+            # never handed to the ROS method.  It records no controller steps.
+            "access": access_meta,
+            "postcondition": postcondition,
+            "joint_result_count": len(joint_results),
+        },
+    ).to_dict()
+    public_attempt = {
+        **public_result,
+        "decision_step": int(decision_index),
+        "simulated_seconds": simulated_seconds,
+        "result_status": str(completion.get("status") or "FAILED"),
+    }
+    observation = task.get_observations()
+    _capture_head_frame(task, frames, config.record_video)
+    _publish_restricted_ros_frame(runtime, task, decision_index=decision_index)
+    _discard_task_rollout_cache(task)
+    return {
+        "private_attempt": private_attempt,
+        "public_attempt": public_attempt,
+        "observation": observation,
+        "simulated_seconds": simulated_seconds,
+    }
+
+
 def _apply_view(task: Any, action: PolicyAction) -> dict[str, Any]:
     if action.head_qpos is None and action.torso_qpos is None:
         raise ValueError("view action must specify head_qpos and/or torso_qpos")
@@ -777,12 +1350,31 @@ def _episode_result_base(episode_index: int, episode: dict[str, Any], policy_nam
     }
 
 
+def _protocol_implementation_sha256() -> str:
+    digest = hashlib.sha256()
+    for path in (
+        Path(__file__),
+        Path(__file__).with_name("benchmark_metrics.py"),
+        Path(__file__).with_name("benchmark_policies.py"),
+        Path(__file__).with_name("benchmark_types.py"),
+        Path(__file__).with_name("public_goal.py"),
+        Path(__file__).with_name("restricted_gt_perception.py"),
+        Path(__file__).with_name("ros_object_goal_adapter.py"),
+        Path(__file__).with_name("trusted_interaction_skill.py"),
+        Path(interactive_nav_v3.__file__),
+    ):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def _run_signature(config: BenchmarkEvaluationConfig, benchmark_sha256: str, indices: list[int]) -> tuple[str, dict[str, Any]]:
     config_payload = asdict(config)
     for key in ("benchmark", "output_dir", "resume", "workers"):
         config_payload.pop(key, None)
     payload = {
         "protocol_version": PROTOCOL_VERSION,
+        "protocol_implementation_sha256": _protocol_implementation_sha256(),
         "benchmark_sha256": benchmark_sha256,
         "episode_indices": indices,
         "evaluation_config": _safe_json(config_payload),
@@ -813,6 +1405,7 @@ def evaluate_episode(
 
     config.output_dir = Path(config.output_dir)
     nav = episode["interactive_nav"]
+    restricted_public_mode = _is_ros_object_goal_rule(config)
     case_id = str(nav["case_id"])
     episode_dir = config.output_dir / "episodes" / f"{episode_index:04d}_{case_id[:96]}"
     trace_path = episode_dir / "episode_result.json"
@@ -829,6 +1422,8 @@ def evaluate_episode(
     scene_install_module: Any | None = None
     scene_install_original: Any | None = None
     attempts: list[dict[str, Any]] = []
+    public_attempts: list[dict[str, Any]] = []
+    restricted_ros_runtime: RestrictedRosObjectGoalRuntime | None = None
     navigation_steps = 0
     view_actions = 0
     nav_path_length = 0.0
@@ -836,6 +1431,8 @@ def evaluate_episode(
     interaction_sim_seconds = 0.0
     terminal_reason = "max_steps"
     runtime_goal_consistency: dict[str, Any] | None = None
+    runtime_consistency: dict[str, Any] | None = None
+    scoring_exclusion_reasons: list[str] = []
     scoring_eligible = True
     runtime_goal_blocked = False
     started = time.monotonic()
@@ -857,6 +1454,11 @@ def evaluate_episode(
             for camera in spec.cameras:
                 if camera.name == "head_camera":
                     camera.record_depth = True
+            # The stored V3 default was selected for manipulation and puts both
+            # arms in the navigation camera.  This evaluator-only reset posture
+            # is the established ROS navigation configuration; the frozen JSON
+            # on disk remains unchanged.
+            _apply_ros_navigation_arm_posture(spec)
         replay = _build_replay_config(config, episode_dir)
         sampler = V3BenchmarkTaskSampler(replay, spec, nav)
         # Collection and this evaluator use a writable scene mirror.  Do not let
@@ -880,49 +1482,117 @@ def evaluate_episode(
             raise RuntimeError("JsonEvalTaskSampler returned no task")
         observation, _info = task.reset()
         catalog = InteractionCatalog(task.env)
-        runtime_goal_consistency = oracle_terminal_goal_consistency(task, episode)
-        scoring_eligible = bool(runtime_goal_consistency["consistent"])
+        runtime_consistency = _runtime_consistency_checks(task, catalog, episode, sampler, config)
+        runtime_goal_consistency = runtime_consistency["checks"]["oracle_terminal_goal"]
+        scoring_exclusion_reasons = list(runtime_consistency["exclusion_reasons"])
+        scoring_eligible = bool(runtime_consistency["eligible"])
         runtime_goal_blocked = bool(
             config.require_runtime_goal_consistency
-            and runtime_goal_consistency["checked"]
-            and not runtime_goal_consistency["consistent"]
+            and not scoring_eligible
         )
         public = _public_episode(episode, [camera.name for camera in spec.cameras], tuple(spec.img_resolution))
-        if not runtime_goal_blocked:
+        if not runtime_goal_blocked and not config.quality_gate_only:
             policy = _build_policy(config, public)
             policy.reset(public)
             if isinstance(policy, ScriptedOraclePolicy):
                 policy.reset_oracle(list(nav["oracle_plan"]["steps"]))
+            if _is_ros_object_goal_rule(config):
+                restricted_ros_runtime = _build_restricted_ros_object_goal_runtime(
+                    task=task,
+                    catalog=catalog,
+                    episode=episode,
+                    public=public,
+                    config=config,
+                    frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
+                )
             base_data["policy_name"] = str(getattr(policy, "name", config.policy))
             base_data["uses_oracle_gt"] = bool(getattr(policy, "uses_oracle_gt", False))
+        public_runtime_goal_consistency = runtime_goal_consistency
+        public_runtime_consistency = runtime_consistency
+        if restricted_public_mode:
+            public_runtime_goal_consistency, public_runtime_consistency = _redact_runtime_consistency_for_restricted_policy(
+                runtime_consistency
+            )
+        public_runtime_compatibility = sampler.runtime_compatibility
+        if restricted_public_mode:
+            public_runtime_compatibility = {
+                key: value
+                for key, value in sampler.runtime_compatibility.items()
+                if key != "dropped_noncritical_object_pose_names"
+            }
+        runtime_trace: dict[str, Any] = {
+            "runtime_compatibility": public_runtime_compatibility,
+            "oracle_terminal_goal_consistency": public_runtime_goal_consistency,
+            "runtime_consistency": public_runtime_consistency,
+            "runtime_cameras": [camera.name for camera in spec.cameras],
+            "runtime_depth_cameras": [camera.name for camera in spec.cameras if camera.record_depth],
+            "runtime_image_resolution": list(spec.img_resolution),
+            "benchmark_image_resolution": list(episode.get("img_resolution", [])),
+            "interaction_catalog_joint_count": len(catalog.joints),
+        }
+        if _is_current_ros_policy(config):
+            runtime_trace["effective_navigation_arm_qpos"] = {
+                name: list(spec.robot.init_qpos[name])
+                for name in ROS_NAVIGATION_ARM_QPOS
+                if name in spec.robot.init_qpos
+            }
+        if restricted_public_mode:
+            runtime_trace["restricted_gt_protocol"] = {
+                "enabled": True,
+                "camera_name": "head_camera",
+                "minimum_visible_pixels": int(config.restricted_gt_min_visible_pixels),
+                "interaction_endpoint": "opaque_object_open",
+            }
         trace.append(
             {
-                "runtime": {
-                    "runtime_compatibility": sampler.runtime_compatibility,
-                    "oracle_terminal_goal_consistency": runtime_goal_consistency,
-                    "runtime_cameras": [camera.name for camera in spec.cameras],
-                    "runtime_depth_cameras": [camera.name for camera in spec.cameras if camera.record_depth],
-                    "runtime_image_resolution": list(spec.img_resolution),
-                    "benchmark_image_resolution": list(episode.get("img_resolution", [])),
-                    "interaction_catalog_joint_count": len(catalog.joints),
-                }
+                "runtime": runtime_trace
             }
         )
         _capture_head_frame(task, frames, config.record_video)
         previous_action: dict[str, Any] | None = None
 
         if runtime_goal_blocked:
-            terminal_reason = "runtime_goal_inconsistent"
-        for decision_index in range(0 if runtime_goal_blocked else int(config.max_steps)):
+            terminal_reason = "runtime_consistency_ineligible"
+        elif config.quality_gate_only:
+            terminal_reason = "quality_gate_complete"
+        for decision_index in range(
+            0 if runtime_goal_blocked or config.quality_gate_only else int(config.max_steps)
+        ):
             nav_ok, target_distance, target_visibility = target_metrics(task, episode)
             terminal_score = score_interactions(task.env, episode, attempts)
-            requirement = str(nav["interaction_requirement"])
-            if requirement == "unnecessary" and nav_ok and terminal_score.non_interaction_success:
-                terminal_reason = "nav_success_no_interaction"
+            # The task endpoint is deliberately independent from the hidden V3
+            # interaction recipe.  Formal interaction-conditioned success is
+            # evaluated below from private postconditions, but a method that has
+            # reached and sees the actual target finishes its rollout now.
+            if nav_ok:
+                terminal_reason = "target_found"
                 break
-            if requirement != "unnecessary" and nav_ok and terminal_score.required_interaction_success and terminal_score.sequence_success:
-                terminal_reason = "interactive_nav_success"
-                break
+            if restricted_ros_runtime is not None:
+                consumed = _consume_pending_ros_object_goal_interaction(
+                    task=task,
+                    runtime=restricted_ros_runtime,
+                    episode=episode,
+                    private_attempts=attempts,
+                    config=config,
+                    decision_index=decision_index,
+                    frames=frames,
+                )
+                if consumed is not None:
+                    attempts.append(consumed["private_attempt"])
+                    public_attempts.append(consumed["public_attempt"])
+                    interaction_sim_seconds += float(consumed["simulated_seconds"])
+                    observation = consumed["observation"]
+                    previous_action = {
+                        "kind": "interact",
+                        **consumed["public_attempt"],
+                    }
+                    trace.append(
+                        {
+                            "decision_step": decision_index,
+                            "interaction": consumed["public_attempt"],
+                        }
+                    )
+                    continue
             policy_observation = PolicyObservation(
                 observation=observation,
                 instruction=public.instruction,
@@ -932,6 +1602,32 @@ def evaluate_episode(
             )
             action = policy.act(policy_observation)
             event: dict[str, Any] = {"decision_step": decision_index, "action": action.to_dict()}
+            if restricted_ros_runtime is not None:
+                consumed = _consume_pending_ros_object_goal_interaction(
+                    task=task,
+                    runtime=restricted_ros_runtime,
+                    episode=episode,
+                    private_attempts=attempts,
+                    config=config,
+                    decision_index=decision_index,
+                    frames=frames,
+                )
+                if consumed is not None:
+                    attempts.append(consumed["private_attempt"])
+                    public_attempts.append(consumed["public_attempt"])
+                    interaction_sim_seconds += float(consumed["simulated_seconds"])
+                    observation = consumed["observation"]
+                    previous_action = {
+                        "kind": "interact",
+                        **consumed["public_attempt"],
+                    }
+                    trace.append(
+                        {
+                            "decision_step": decision_index,
+                            "interaction": consumed["public_attempt"],
+                        }
+                    )
+                    continue
             if action.kind == "stop":
                 terminal_reason = str(action.metadata.get("reason", "policy_stop"))
                 trace.append(event)
@@ -952,6 +1648,8 @@ def evaluate_episode(
                 nav_sim_seconds += float(config.policy_dt_ms) / 1000.0
                 navigation_steps += 1
                 _capture_head_frame(task, frames, config.record_video)
+                if restricted_ros_runtime is not None:
+                    _publish_restricted_ros_frame(restricted_ros_runtime, task, decision_index=decision_index)
                 _discard_task_rollout_cache(task)
                 previous_action = action.to_dict()
                 trace.append(event)
@@ -963,6 +1661,8 @@ def evaluate_episode(
                 event["view"] = _apply_view(task, action)
                 observation = task.get_observations()
                 _capture_head_frame(task, frames, config.record_video)
+                if restricted_ros_runtime is not None:
+                    _publish_restricted_ros_frame(restricted_ros_runtime, task, decision_index=decision_index)
                 _discard_task_rollout_cache(task)
                 previous_action = action.to_dict()
                 trace.append(event)
@@ -971,12 +1671,19 @@ def evaluate_episode(
                 event["observe"] = {"refreshed": True}
                 observation = task.get_observations()
                 _capture_head_frame(task, frames, config.record_video)
+                if restricted_ros_runtime is not None:
+                    _publish_restricted_ros_frame(restricted_ros_runtime, task, decision_index=decision_index)
                 _discard_task_rollout_cache(task)
                 previous_action = action.to_dict()
                 trace.append(event)
                 continue
             if action.kind != "interact":
                 raise ValueError(f"Unsupported action kind: {action.kind}")
+            if restricted_ros_runtime is not None:
+                raise ValueError(
+                    "ros_object_goal_rule must submit opaque interaction commands on "
+                    f"{config.ros_interaction_command_topic}, not a direct PolicyAction"
+                )
 
             runtime_joint, interaction_id, classification, resolver_meta = _resolve_interaction(
                 env=task.env,
@@ -1045,6 +1752,7 @@ def evaluate_episode(
                 metadata={"resolver": resolver_meta, "executor": executor_meta},
             ).to_dict()
             attempts.append(attempt)
+            public_attempts.append(attempt)
             interaction_sim_seconds += float(simulated_seconds)
             event["interaction"] = attempt
             _capture_head_frame(task, frames, config.record_video)
@@ -1052,13 +1760,14 @@ def evaluate_episode(
             previous_action = action.to_dict()
             trace.append(event)
         else:
-            if not runtime_goal_blocked:
+            if not runtime_goal_blocked and not config.quality_gate_only:
                 terminal_reason = "max_steps"
 
         nav_ok, target_distance, target_visibility = target_metrics(task, episode)
         terminal_score = score_interactions(task.env, episode, attempts)
         requirement = str(nav["interaction_requirement"])
-        overall_success = bool(
+        task_success = bool(nav_ok)
+        interaction_conditioned_success = bool(
             nav_ok
             and terminal_score.required_interaction_success
             and terminal_score.sequence_success
@@ -1076,7 +1785,11 @@ def evaluate_episode(
         result = EpisodeResult(
             **base_data,
             status="complete",
-            success=overall_success,
+            # Preserve ``success`` as the historical formal V3 score while
+            # exposing the visible task endpoint independently.
+            success=interaction_conditioned_success,
+            task_success=task_success,
+            interaction_conditioned_success=interaction_conditioned_success,
             nav_success=nav_ok,
             required_interaction_success=terminal_score.required_interaction_success,
             sequence_success=terminal_score.sequence_success,
@@ -1091,27 +1804,54 @@ def evaluate_episode(
             invalid_interaction_action_count=int(invalid_count),
             navigation_path_length_m=nav_path_length,
             reference_path_length_m=reference,
-            spl=spl(overall_success, reference, nav_path_length),
+            spl=spl(interaction_conditioned_success, reference, nav_path_length),
             navigation_simulated_seconds=nav_sim_seconds,
             interaction_simulated_seconds=interaction_sim_seconds,
             total_simulated_seconds=nav_sim_seconds + interaction_sim_seconds + view_actions * float(config.policy_dt_ms) / 1000.0,
             elapsed_seconds=time.monotonic() - started,
             target_distance_m=target_distance,
             target_visibility_fraction=target_visibility,
-            interaction_attempts=attempts,
+            interaction_attempts=public_attempts if restricted_public_mode else attempts,
             trace_path=str(trace_path),
             video_path=video_path,
             scoring_eligible=scoring_eligible,
-            runtime_goal_consistency=runtime_goal_consistency,
+            scoring_exclusion_reasons=scoring_exclusion_reasons,
+            runtime_goal_consistency=public_runtime_goal_consistency,
+            runtime_consistency=public_runtime_consistency,
         ).to_dict()
-        trace.append({"terminal": {"interaction_score": terminal_score.to_dict(), "success": overall_success}})
+        terminal_trace: dict[str, Any] = {
+            "task_success": task_success,
+            "interaction_conditioned_success": interaction_conditioned_success,
+            "success": interaction_conditioned_success,
+        }
+        if not restricted_public_mode:
+            terminal_trace["interaction_score"] = terminal_score.to_dict()
+        else:
+            # The complete V3 score remains evaluator-private.  Do not write
+            # frozen interaction IDs/fractions into a trace that may be shared
+            # with the method being evaluated.
+            terminal_trace["interaction_score"] = {
+                "required_interaction_success": terminal_score.required_interaction_success,
+                "sequence_success": terminal_score.sequence_success,
+                "non_interaction_success": terminal_score.non_interaction_success,
+            }
+        trace.append({"terminal": terminal_trace})
         status = "complete"
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+        public_runtime_goal_consistency = runtime_goal_consistency
+        public_runtime_consistency = runtime_consistency
+        if restricted_public_mode:
+            public_runtime_goal_consistency, public_runtime_consistency = _redact_runtime_consistency_for_restricted_policy(
+                runtime_consistency
+            )
+            error = "restricted evaluator exception"
         result = EpisodeResult(
             **base_data,
             status="exception",
             success=False,
+            task_success=False,
+            interaction_conditioned_success=False,
             nav_success=False,
             required_interaction_success=False,
             sequence_success=False,
@@ -1133,15 +1873,29 @@ def evaluate_episode(
             elapsed_seconds=time.monotonic() - started,
             target_distance_m=None,
             target_visibility_fraction=None,
-            interaction_attempts=attempts,
+            interaction_attempts=public_attempts if restricted_public_mode else attempts,
             trace_path=str(trace_path),
             error=error,
             scoring_eligible=False,
-            runtime_goal_consistency=runtime_goal_consistency,
+            scoring_exclusion_reasons=(
+                scoring_exclusion_reasons
+                if scoring_exclusion_reasons
+                else ["runtime_exception"]
+            ),
+            runtime_goal_consistency=public_runtime_goal_consistency,
+            runtime_consistency=public_runtime_consistency,
         ).to_dict()
-        trace.append({"exception": error, "traceback": traceback.format_exc()})
+        if restricted_public_mode:
+            trace.append({"exception": error})
+        else:
+            trace.append({"exception": error, "traceback": traceback.format_exc()})
         status = "exception"
     finally:
+        if restricted_ros_runtime is not None:
+            try:
+                restricted_ros_runtime.adapter.close()
+            except Exception:
+                pass
         if policy is not None:
             try:
                 policy.close()
@@ -1169,6 +1923,23 @@ def _worker(payload: tuple[dict[str, Any], int, dict[str, Any], str]) -> dict[st
 def _write_reports(output_dir: Path, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
     _atomic_json(output_dir / "results.json", rows)
     _atomic_json(output_dir / "summary.json", summary)
+    scoring_path = output_dir / "scoring_manifest.jsonl"
+    scoring_tmp = scoring_path.with_name(f".{scoring_path.name}.{os.getpid()}.tmp")
+    with scoring_tmp.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(_safe_json({
+                "schema_version": "interactive_nav_v3_scoring_eligibility_v1",
+                "episode_index": row.get("episode_index"),
+                "case_id": row.get("case_id"),
+                "house_index": row.get("house_index"),
+                "domains": row.get("domains", []),
+                "interaction_requirement": row.get("interaction_requirement"),
+                "status": row.get("status"),
+                "scoring_eligible": bool(row.get("scoring_eligible", False)),
+                "exclusion_reasons": row.get("scoring_exclusion_reasons", []),
+                "runtime_consistency": row.get("runtime_consistency"),
+            }), ensure_ascii=False) + "\n")
+    scoring_tmp.replace(scoring_path)
     if rows:
         columns = sorted({key for row in rows for key in row if key not in {"interaction_attempts"}})
         csv_path = output_dir / "results.csv"
@@ -1194,6 +1965,7 @@ def _write_reports(output_dir: Path, rows: list[dict[str, Any]], summary: dict[s
     for name, values in summary.get("groups", {}).items():
         lines.append(
             f"- `{name}`: n={values['episode_count']}, SR={values['success_rate']}, "
+            f"TaskSR={values['task_success_rate']}, ICS={values['interaction_conditioned_success_rate']}, "
             f"NavSR={values['nav_success_rate']}, ISR={values['required_interaction_success_rate']}, "
             f"IP={values['interaction_precision']}, SPL={values['mean_spl']}"
         )
@@ -1230,9 +2002,42 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
     raw_config["output_dir"] = str(config.output_dir)
     payloads = [(raw_config, index, episodes[index], signature) for index in indices]
     rows: list[dict[str, Any]] = []
+    progress_started = time.monotonic()
+
+    def record_progress(*, force: bool = False) -> None:
+        completed = len(rows)
+        if not force and completed % int(config.progress_every) != 0:
+            return
+        elapsed = max(time.monotonic() - progress_started, 1e-9)
+        rate = completed / elapsed
+        remaining = len(payloads) - completed
+        eta_seconds = None if rate <= 0 else remaining / rate
+        payload = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S%z"),
+            "processed": completed,
+            "total": len(payloads),
+            "progress": 0.0 if not payloads else completed / len(payloads),
+            "eligible": sum(bool(row.get("scoring_eligible")) for row in rows),
+            "ineligible": sum(not bool(row.get("scoring_eligible")) for row in rows),
+            "exceptions": sum(row.get("status") == "exception" for row in rows),
+            "rate_episodes_per_second": rate,
+            "elapsed_seconds": elapsed,
+            "eta_seconds": eta_seconds,
+        }
+        _atomic_json(config.output_dir / "progress.json", payload)
+        print(
+            "[quality-gate-progress] "
+            f"time={payload['time']} processed={completed}/{len(payloads)} "
+            f"eligible={payload['eligible']} ineligible={payload['ineligible']} "
+            f"exceptions={payload['exceptions']} rate={rate:.3f}/s "
+            f"eta_s={'unknown' if eta_seconds is None else int(eta_seconds)}",
+            flush=True,
+        )
+
     if config.workers == 1:
         for payload in payloads:
             rows.append(_worker(payload))
+            record_progress()
     else:
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=config.workers,
@@ -1241,6 +2046,8 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
             futures = [pool.submit(_worker, payload) for payload in payloads]
             for future in concurrent.futures.as_completed(futures):
                 rows.append(future.result())
+                record_progress()
+    record_progress(force=True)
     rows.sort(key=lambda row: int(row["episode_index"]))
     summary = summarise_results(rows)
     summary.update(
@@ -1275,7 +2082,11 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--policy", choices=["noop", "scripted_oracle", "ros_bridge", "factory"], default="noop")
+    parser.add_argument(
+        "--policy",
+        choices=["noop", "scripted_oracle", "ros_bridge", "ros_object_goal_rule", "factory"],
+        default="noop",
+    )
     parser.add_argument("--policy-factory")
     parser.add_argument("--policy-kwargs-json")
     parser.add_argument("--workers", type=int, default=1)
@@ -1295,6 +2106,12 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--force-target-fraction", type=float, default=1.0)
     parser.add_argument("--force-max-internal-steps", type=int, default=1500)
     parser.add_argument("--interaction-max-distance-m", type=float, default=1.75)
+    parser.add_argument(
+        "--require-interaction-visible",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require the evaluator-private interaction target to be visible before sealed force execution.",
+    )
     parser.add_argument(
         "--require-runtime-goal-consistency",
         action=argparse.BooleanOptionalAction,
@@ -1318,6 +2135,21 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--ros-cmd-vel-linear-gain", type=float, default=3.0)
     parser.add_argument("--ros-require-move-base-active", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ros-map-warmup-skip-frames", type=int, default=0)
+    parser.add_argument("--ros-target-topic", default="/semantic_decision/target")
+    parser.add_argument("--ros-restricted-gt-topic", default="/semantic_mapping/gt_observations")
+    parser.add_argument("--ros-interaction-command-topic", default="/semantic_decision/interaction_command")
+    parser.add_argument("--ros-interaction-result-topic", default="/semantic_mapping/interaction_result")
+    parser.add_argument("--restricted-gt-min-visible-pixels", type=int, default=16)
+    parser.add_argument(
+        "--quality-gate-only",
+        action="store_true",
+        help="Load and validate runtime consistency without executing policy actions.",
+    )
+    parser.add_argument("--runtime-joint-position-tolerance", type=float, default=0.02)
+    parser.add_argument("--runtime-joint-fraction-tolerance", type=float, default=0.05)
+    parser.add_argument("--runtime-base-position-tolerance-m", type=float, default=0.05)
+    parser.add_argument("--runtime-base-yaw-tolerance-rad", type=float, default=0.05)
+    parser.add_argument("--progress-every", type=int, default=10)
     args = parser.parse_args()
     return BenchmarkEvaluationConfig(
         benchmark=args.benchmark,
@@ -1342,6 +2174,7 @@ def parse_args() -> BenchmarkEvaluationConfig:
         force_target_fraction=args.force_target_fraction,
         force_max_internal_steps=args.force_max_internal_steps,
         interaction_max_distance_m=args.interaction_max_distance_m,
+        require_interaction_visible=args.require_interaction_visible,
         require_runtime_goal_consistency=args.require_runtime_goal_consistency,
         allow_internal_object_names=args.allow_internal_object_names,
         oracle_navigation_mode=args.oracle_navigation_mode,
@@ -1351,6 +2184,17 @@ def parse_args() -> BenchmarkEvaluationConfig:
         ros_cmd_vel_linear_gain=args.ros_cmd_vel_linear_gain,
         ros_require_move_base_active=args.ros_require_move_base_active,
         ros_map_warmup_skip_frames=args.ros_map_warmup_skip_frames,
+        ros_target_topic=args.ros_target_topic,
+        ros_restricted_gt_topic=args.ros_restricted_gt_topic,
+        ros_interaction_command_topic=args.ros_interaction_command_topic,
+        ros_interaction_result_topic=args.ros_interaction_result_topic,
+        restricted_gt_min_visible_pixels=args.restricted_gt_min_visible_pixels,
+        quality_gate_only=args.quality_gate_only,
+        runtime_joint_position_tolerance=args.runtime_joint_position_tolerance,
+        runtime_joint_fraction_tolerance=args.runtime_joint_fraction_tolerance,
+        runtime_base_position_tolerance_m=args.runtime_base_position_tolerance_m,
+        runtime_base_yaw_tolerance_rad=args.runtime_base_yaw_tolerance_rad,
+        progress_every=args.progress_every,
     )
 
 

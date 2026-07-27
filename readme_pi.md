@@ -51,6 +51,8 @@
 2. 构建能够表达交互状态、交互代价与状态转移的导航表示
 3. 让规划显式考虑导航边、交互触发边与交互后拓扑变化
 4. 用 oracle interaction 或现有 open/close 能力验证交互表示与规划闭环
+5. 证明同一交互导航环境可沿两个正交维度扩展：任务形式从 ObjGoal 扩展到
+   PointGoal / InstructionGoal，采集信息密度从结构化 light 扩展到带视频和状态的 full
 
 换句话说：
 
@@ -63,7 +65,13 @@
 
 ### 4.1 当前主线
 
-c
+- 交互类型主线：通道属性与容器属性，以及二者组成的 mixed 因果链
+- 任务形式主线：ObjGoal、PointGoal、InstructionGoal 直接共享 InteractiveNav V3
+- 数据采集主线：light/full 表示数据丰富度，不作为独立任务类型
+
+这里不设置 `derived_task` 中间数据规范。PointGoal 改写 V3 target/success/oracle
+导航终点，InstructionGoal 改写 policy-facing language 并保留原 V3 交互 GT，因而任务
+扩展与采集方式可以独立组合。
 
 ### 4.2 当前不作为第一阶段主线的内容
 

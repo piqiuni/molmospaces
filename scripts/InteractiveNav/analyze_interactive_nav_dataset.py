@@ -97,19 +97,28 @@ def path_bin(length_m: float | None) -> str:
     return "missing"
 
 
-def gt_path_length(validation: dict[str, Any]) -> tuple[float | None, str]:
-    """Extract the comparable oracle-feasible navigation length.
+def gt_path_length(
+    validation: dict[str, Any], interaction_requirement: str
+) -> tuple[float | None, str]:
+    """Extract the evaluator's frozen reference navigation length.
 
-    Channel and Mixed use the fully opened/oracle-restored path for the task's
-    navigation GT.  Container tasks do not always expose that field and record
-    their validated start-to-interaction path as ``path_length_m``.
+    This ordering intentionally mirrors ``benchmark_metrics.reference_path_length_m``
+    so dataset analysis, path bins, and formal SPL share one definition.
     """
-    for key in (
-        "all_open_path_length_m",
-        "oracle_restored_path_length_m",
-        "path_length_m",
-        "initial_state_path_length_m",
-    ):
+
+    if interaction_requirement == "unnecessary":
+        keys = (
+            "initial_state_path_length_m",
+            "path_length_m",
+            "all_open_path_length_m",
+        )
+    else:
+        keys = (
+            "oracle_restored_path_length_m",
+            "path_length_m",
+            "all_open_path_length_m",
+        )
+    for key in keys:
         result = number(validation.get(key))
         if result is not None:
             return result, key
@@ -122,10 +131,35 @@ def visibility_gain(validation_rows: list[dict[str, Any]]) -> tuple[float | None
     for row in validation_rows:
         before = number(row.get("visibility_fraction_before"))
         after = number(row.get("visibility_fraction_after"))
-        if before is not None and after is not None:
-            gains.append(after - before)
         before_px = row.get("visible_pixels_before")
         after_px = row.get("visible_pixels_after")
+        trace = row.get("visibility_trace")
+        if isinstance(trace, list) and trace:
+            trace_rows = [item for item in trace if isinstance(item, dict)]
+            if trace_rows:
+                before = number(trace_rows[0].get("visibility_fraction"))
+                after_candidates = [
+                    number(item.get("visibility_fraction")) for item in trace_rows
+                ]
+                after_values = [value for value in after_candidates if value is not None]
+                after = max(after_values) if after_values else after
+                before_px = trace_rows[0].get("visible_pixels")
+                after_pixel_values = [
+                    int(item["visible_pixels"])
+                    for item in trace_rows
+                    if isinstance(item.get("visible_pixels"), (int, float))
+                ]
+                after_px = max(after_pixel_values) if after_pixel_values else after_px
+        if before is None:
+            before = number(row.get("start_validation", {}).get("start_visibility_fraction"))
+        if after is None:
+            after = number(row.get("final_visibility_fraction"))
+        if before_px is None:
+            before_px = row.get("start_validation", {}).get("start_visible_pixels")
+        if after_px is None:
+            after_px = row.get("final_visible_pixels")
+        if before is not None and after is not None:
+            gains.append(after - before)
         if isinstance(before_px, (int, float)) and isinstance(after_px, (int, float)):
             pixel_gains.append(int(after_px - before_px))
     return (max(gains) if gains else None, max(pixel_gains) if pixel_gains else None)
@@ -133,6 +167,7 @@ def visibility_gain(validation_rows: list[dict[str, Any]]) -> tuple[float | None
 
 @dataclass
 class FlatEpisode:
+    episode_index: int
     domain: str
     case_id: str
     house_index: int
@@ -149,6 +184,7 @@ class FlatEpisode:
     channel_interaction_count: int
     container_interaction_count: int
     interaction_types: list[str]
+    effect_types: list[str]
     interaction_joint_types: list[str]
     interaction_signature: list[str]
     oracle_plan_count: int
@@ -163,9 +199,18 @@ class FlatEpisode:
     visibility_gain_pixels: int | None
     has_generation_validation: bool
     has_interaction_validations: bool
+    scoring_eligible: bool
+    scoring_exclusion_reasons: list[str]
 
 
-def flatten_episode(domain: str, episode: dict[str, Any]) -> FlatEpisode:
+def flatten_episode(
+    domain: str,
+    episode: dict[str, Any],
+    *,
+    episode_index: int,
+    scoring_eligible: bool = True,
+    scoring_exclusion_reasons: list[str] | None = None,
+) -> FlatEpisode:
     interactive = episode.get("interactive_nav", {})
     target = interactive.get("target", {})
     validation = interactive.get("generation_validation", {})
@@ -174,12 +219,21 @@ def flatten_episode(domain: str, episode: dict[str, Any]) -> FlatEpisode:
     interaction_validations = validation.get("interaction_validations", [])
     if not isinstance(interaction_validations, list):
         interaction_validations = []
-    path_length, source = gt_path_length(navigation if isinstance(navigation, dict) else {})
+    interaction_requirement = text(interactive.get("interaction_requirement"))
+    path_length, source = gt_path_length(
+        navigation if isinstance(navigation, dict) else {}, interaction_requirement
+    )
     visibility_fraction, visibility_pixels = visibility_gain(interaction_validations)
     interaction_domains = interactive.get("interaction_domains", [])
     if not isinstance(interaction_domains, list):
         interaction_domains = []
     interaction_types = [text(row.get("type")) for row in interactions if isinstance(row, dict)]
+    effect_types = sorted({
+        text(effect)
+        for row in interactions
+        if isinstance(row, dict)
+        for effect in row.get("effect_types", [])
+    })
     interaction_signature = sorted(
         "|".join(
             (
@@ -208,19 +262,20 @@ def flatten_episode(domain: str, episode: dict[str, Any]) -> FlatEpisode:
     channel_count = sum(
         1
         for row in interactions
-        if isinstance(row, dict) and str(row.get("interaction_id", "")).startswith("channel::")
+        if isinstance(row, dict) and str(row.get("type", "")).startswith("channel_")
     )
     container_count = sum(
         1
         for row in interactions
-        if isinstance(row, dict) and str(row.get("interaction_id", "")).startswith("container::")
+        if isinstance(row, dict) and str(row.get("type", "")).startswith("container_")
     )
     return FlatEpisode(
+        episode_index=episode_index,
         domain=domain,
         case_id=text(interactive.get("case_id")),
         house_index=int(episode.get("house_index", -1)),
         schema_version=text(interactive.get("schema_version")),
-        interaction_requirement=text(interactive.get("interaction_requirement")),
+        interaction_requirement=interaction_requirement,
         interaction_domains=[text(value) for value in interaction_domains],
         legacy_case_type=(
             text(interactive.get("legacy_case_type"), "") or None
@@ -236,6 +291,7 @@ def flatten_episode(domain: str, episode: dict[str, Any]) -> FlatEpisode:
         channel_interaction_count=channel_count,
         container_interaction_count=container_count,
         interaction_types=interaction_types,
+        effect_types=effect_types,
         interaction_joint_types=interaction_joint_types,
         interaction_signature=interaction_signature,
         oracle_plan_count=len(interactive.get("oracle_plans", [])),
@@ -267,23 +323,97 @@ def flatten_episode(domain: str, episode: dict[str, Any]) -> FlatEpisode:
         visibility_gain_pixels=visibility_pixels,
         has_generation_validation=bool(validation),
         has_interaction_validations=bool(interaction_validations),
+        scoring_eligible=bool(scoring_eligible),
+        scoring_exclusion_reasons=list(scoring_exclusion_reasons or []),
     )
 
 
-def load_rows(dataset_root: Path) -> tuple[list[FlatEpisode], list[dict[str, Any]]]:
+def episode_domain(episode: dict[str, Any]) -> str:
+    domains = episode.get("interactive_nav", {}).get("interaction_domains", [])
+    if domains == ["channel"]:
+        return "channel"
+    if domains == ["container"]:
+        return "container"
+    if domains == ["channel", "container"]:
+        return "mixed"
+    raise ValueError(f"Unsupported interaction_domains: {domains!r}")
+
+
+def read_scoring_manifest(path: Path) -> dict[int, dict[str, Any]]:
+    rows: dict[int, dict[str, Any]] = {}
+    with path.open() as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            index = int(row["episode_index"])
+            if index in rows:
+                raise ValueError(f"Duplicate episode_index={index} in {path}:{line_number}")
+            rows[index] = row
+    return rows
+
+
+def load_rows(
+    benchmark_path: Path,
+    *,
+    scoring_manifest_path: Path | None = None,
+    eligible_only: bool = True,
+) -> tuple[list[FlatEpisode], list[dict[str, Any]], dict[str, Any]]:
+    benchmark_file = benchmark_path / "benchmark.json" if benchmark_path.is_dir() else benchmark_path
+    episodes = read_json(benchmark_file)
+    if isinstance(episodes, dict):
+        episodes = episodes.get("episodes", [])
+    if not isinstance(episodes, list):
+        raise ValueError(f"Expected a JSON episode list in {benchmark_file}")
+    scoring = read_scoring_manifest(scoring_manifest_path) if scoring_manifest_path else {}
+    if scoring and set(scoring) != set(range(len(episodes))):
+        missing = sorted(set(range(len(episodes))) - set(scoring))
+        extra = sorted(set(scoring) - set(range(len(episodes))))
+        raise ValueError(
+            f"Scoring manifest does not exactly cover benchmark: missing={missing[:10]}, extra={extra[:10]}"
+        )
     rows: list[FlatEpisode] = []
-    raw: list[dict[str, Any]] = []
-    for domain in DOMAINS:
-        path = dataset_root / "raw" / domain / "benchmark.json"
-        if not path.exists():
-            raise FileNotFoundError(f"Missing benchmark data: {path}")
-        episodes = read_json(path)
-        if not isinstance(episodes, list):
-            raise ValueError(f"Expected a JSON list in {path}")
-        for episode in episodes:
-            rows.append(flatten_episode(domain, episode))
-            raw.append(episode)
-    return rows, raw
+    selected_episodes: list[dict[str, Any]] = []
+    excluded = 0
+    scoring_ineligible = 0
+    exclusion_reason_counts: Counter[str] = Counter()
+    ineligible_domain_counts: Counter[str] = Counter()
+    for index, episode in enumerate(episodes):
+        score = scoring.get(index, {})
+        eligible = bool(score.get("scoring_eligible", True))
+        exclusion_reasons = list(
+            score.get("scoring_exclusion_reasons", score.get("exclusion_reasons", []))
+        )
+        if score and score.get("case_id") != episode.get("interactive_nav", {}).get("case_id"):
+            raise ValueError(f"Scoring manifest case_id mismatch at episode_index={index}")
+        if score and not eligible:
+            scoring_ineligible += 1
+            exclusion_reason_counts.update(str(reason) for reason in exclusion_reasons)
+            ineligible_domain_counts[episode_domain(episode)] += 1
+        if eligible_only and not eligible:
+            excluded += 1
+            continue
+        rows.append(flatten_episode(
+            episode_domain(episode),
+            episode,
+            episode_index=index,
+            scoring_eligible=eligible,
+            scoring_exclusion_reasons=exclusion_reasons,
+        ))
+        selected_episodes.append(episode)
+    candidate_domain_counts = Counter(episode_domain(episode) for episode in episodes)
+    selected_domain_counts = Counter(row.domain for row in rows)
+    return rows, selected_episodes, {
+        "source_episode_count": len(episodes),
+        "selected_episode_count": len(rows),
+        "excluded_episode_count": excluded,
+        "scoring_eligible_episode_count": len(episodes) - scoring_ineligible,
+        "scoring_ineligible_episode_count": scoring_ineligible,
+        "scoring_exclusion_reason_counts": dict(exclusion_reason_counts),
+        "candidate_domain_counts": dict(candidate_domain_counts),
+        "selected_domain_counts": dict(selected_domain_counts),
+        "scoring_ineligible_domain_counts": dict(ineligible_domain_counts),
+    }
 
 
 def count_by(rows: Iterable[FlatEpisode], key: str) -> Counter[str]:
@@ -577,8 +707,9 @@ def summary_by_domain(rows: list[FlatEpisode]) -> list[dict[str, Any]]:
 
 def house_distribution(rows: list[FlatEpisode]) -> list[dict[str, Any]]:
     output = []
-    for domain in DOMAINS:
-        counts = Counter(row.house_index for row in rows if row.domain == domain)
+    for domain in (*DOMAINS, "all"):
+        subset = rows if domain == "all" else [row for row in rows if row.domain == domain]
+        counts = Counter(row.house_index for row in subset)
         for house_index, count in sorted(counts.items()):
             output.append({
                 "domain": domain,
@@ -586,6 +717,187 @@ def house_distribution(rows: list[FlatEpisode]) -> list[dict[str, Any]]:
                 "episode_count": count,
             })
     return output
+
+
+def gini(values: list[int]) -> float | None:
+    ordered = sorted(int(value) for value in values if value >= 0)
+    if not ordered or sum(ordered) == 0:
+        return None
+    count = len(ordered)
+    return float(
+        sum((2 * index - count - 1) * value for index, value in enumerate(ordered, 1))
+        / (count * sum(ordered))
+    )
+
+
+def dataset_qc_report(
+    rows: list[FlatEpisode], selection: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    requirement_rows: list[dict[str, Any]] = []
+    for domain in (*DOMAINS, "all"):
+        subset = rows if domain == "all" else [row for row in rows if row.domain == domain]
+        counts = Counter(row.interaction_requirement for row in subset)
+        for requirement in sorted(counts):
+            requirement_rows.append({
+                "domain": domain,
+                "interaction_requirement": requirement,
+                "episode_count": counts[requirement],
+                "proportion": counts[requirement] / len(subset) if subset else 0.0,
+            })
+
+    effect_label_counts = Counter(effect for row in rows for effect in row.effect_types)
+    effect_set_counts = Counter(
+        (row.domain, "+".join(row.effect_types) if row.effect_types else "(none)")
+        for row in rows
+    )
+    effect_sets = [
+        {"domain": domain, "effect_set": effect_set, "episode_count": count}
+        for (domain, effect_set), count in sorted(effect_set_counts.items())
+    ]
+
+    house_stats: list[dict[str, Any]] = []
+    for domain in (*DOMAINS, "all"):
+        subset = rows if domain == "all" else [row for row in rows if row.domain == domain]
+        counts = Counter(row.house_index for row in subset)
+        values = sorted(counts.values())
+        p95_index = max(0, math.ceil(0.95 * len(values)) - 1) if values else 0
+        house_stats.append({
+            "domain": domain,
+            "episode_count": len(subset),
+            "house_count": len(counts),
+            "max_episodes_per_house": max(values) if values else 0,
+            "p95_episodes_per_house": values[p95_index] if values else 0,
+            "houses_over_3_episodes": sum(value > 3 for value in values),
+            "houses_at_least_10_episodes": sum(value >= 10 for value in values),
+            "gini": gini(values),
+        })
+
+    short_path_stats: list[dict[str, Any]] = []
+    thresholds = (0.1, 0.5, 1.0, 2.0, 3.0)
+    for domain in (*DOMAINS, "all"):
+        subset = rows if domain == "all" else [row for row in rows if row.domain == domain]
+        values = [row.gt_path_length_m for row in subset if row.gt_path_length_m is not None]
+        short_path_stats.append({
+            "domain": domain,
+            "path_count": len(values),
+            "minimum_m": min(values) if values else None,
+            **{f"below_{str(threshold).replace('.', '_')}m": sum(value < threshold for value in values) for threshold in thresholds},
+        })
+
+    target_counts = Counter(row.target_category for row in rows)
+    target_distribution = [
+        {
+            "target_category": category,
+            "episode_count": count,
+            "proportion": count / len(rows) if rows else 0.0,
+        }
+        for category, count in target_counts.most_common()
+    ]
+    visibility_coverage = [
+        {
+            "domain": domain,
+            "episode_count": len(subset),
+            "visibility_gain_count": sum(row.visibility_gain_fraction is not None for row in subset),
+            "visibility_gain_coverage": (
+                sum(row.visibility_gain_fraction is not None for row in subset) / len(subset)
+                if subset
+                else 0.0
+            ),
+            "visibility_gain_fraction": numeric_summary(
+                [row.visibility_gain_fraction for row in subset]
+            ),
+        }
+        for domain in (*DOMAINS, "all")
+        for subset in [rows if domain == "all" else [row for row in rows if row.domain == domain]]
+    ]
+    return {
+        "schema_version": "interactive_nav_v3_dataset_qc_v1",
+        "episode_count": len(rows),
+        "quality_gate_selection": selection or {},
+        "requirement_by_domain": requirement_rows,
+        "effect_label_counts": dict(effect_label_counts),
+        "effect_sets": effect_sets,
+        "house_statistics": house_stats,
+        "short_path_statistics": short_path_stats,
+        "target_category_distribution": target_distribution,
+        "visibility_gain_coverage": visibility_coverage,
+    }
+
+
+def qc_report_markdown(report: dict[str, Any]) -> str:
+    selection = report.get("quality_gate_selection", {})
+    lines = [
+        "# InteractiveNav V3 quality and distribution audit",
+        "",
+        f"- Scoring episodes analysed: {report['episode_count']}",
+        "",
+    ]
+    if selection:
+        lines.extend([
+            "## Runtime scoring quality gate",
+            "",
+            f"- Candidate episodes: {selection['source_episode_count']}",
+            f"- Scoring-eligible episodes: {selection['scoring_eligible_episode_count']}",
+            f"- Scoring-ineligible episodes: {selection['scoring_ineligible_episode_count']}",
+            f"- Analysis-selected episodes: {selection['selected_episode_count']}",
+            f"- Eligible domain counts: {selection['selected_domain_counts']}",
+            f"- Ineligible domain counts: {selection['scoring_ineligible_domain_counts']}",
+            f"- Exclusion reasons: {selection['scoring_exclusion_reason_counts']}",
+            "",
+        ])
+    lines.extend([
+        "## Interaction requirement by domain",
+        "",
+        "| Domain | Requirement | Episodes | Proportion |",
+        "|---|---|---:|---:|",
+    ])
+    for row in report["requirement_by_domain"]:
+        lines.append(
+            f"| {row['domain']} | {row['interaction_requirement']} | "
+            f"{row['episode_count']} | {row['proportion']:.2%} |"
+        )
+    lines.extend([
+        "",
+        "## House concentration",
+        "",
+        "| Domain | Houses | Max/house | P95/house | Houses >3 | Gini |",
+        "|---|---:|---:|---:|---:|---:|",
+    ])
+    for row in report["house_statistics"]:
+        lines.append(
+            f"| {row['domain']} | {row['house_count']} | {row['max_episodes_per_house']} | "
+            f"{row['p95_episodes_per_house']} | {row['houses_over_3_episodes']} | "
+            f"{row['gini'] if row['gini'] is not None else 'NA'} |"
+        )
+    lines.extend([
+        "",
+        "## Short reference paths",
+        "",
+        "| Domain | Min (m) | <0.1 m | <0.5 m | <1 m | <2 m | <3 m |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in report["short_path_statistics"]:
+        minimum = row["minimum_m"]
+        lines.append(
+            f"| {row['domain']} | {minimum if minimum is not None else 'NA'} | "
+            f"{row['below_0_1m']} | {row['below_0_5m']} | {row['below_1_0m']} | "
+            f"{row['below_2_0m']} | {row['below_3_0m']} |"
+        )
+    lines.extend([
+        "",
+        "## Effect labels",
+        "",
+    ])
+    for label, count in sorted(report["effect_label_counts"].items()):
+        lines.append(f"- `{label}`: {count}")
+    lines.extend(["", "## Visibility-gain coverage", ""])
+    for row in report["visibility_gain_coverage"]:
+        lines.append(
+            f"- {row['domain']}: {row['visibility_gain_count']}/{row['episode_count']} "
+            f"({row['visibility_gain_coverage']:.2%})"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def audit_samples(rows: list[FlatEpisode], issues: list[dict[str, Any]], seed: int) -> list[dict[str, Any]]:
@@ -647,27 +959,54 @@ def report_markdown(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument(
         "--dataset-root",
         type=Path,
-        required=True,
-        help="Collection output root containing raw/channel|container|mixed/benchmark.json.",
+        help="Collection/release root; balanced/benchmark.json is preferred.",
+    )
+    inputs.add_argument(
+        "--benchmark",
+        type=Path,
+        help="Explicit benchmark.json file or directory containing benchmark.json.",
     )
     parser.add_argument(
         "--analysis-dir",
         type=Path,
         help="Default: <dataset-root>/analysis",
     )
+    parser.add_argument(
+        "--scoring-manifest",
+        type=Path,
+        help="Runtime scoring_manifest.jsonl. By default only eligible episodes are analysed.",
+    )
+    parser.add_argument(
+        "--include-ineligible",
+        action="store_true",
+        help="Include scoring-ineligible rows when a scoring manifest is supplied.",
+    )
     parser.add_argument("--seed", type=int, default=20260722)
     args = parser.parse_args()
 
-    dataset_root = args.dataset_root.resolve()
-    analysis_dir = (args.analysis_dir or dataset_root / "analysis").resolve()
+    dataset_root = args.dataset_root.resolve() if args.dataset_root else None
+    if args.benchmark:
+        benchmark_path = args.benchmark.resolve()
+        default_analysis_root = benchmark_path.parent if benchmark_path.is_file() else benchmark_path
+    else:
+        balanced = dataset_root / "balanced" / "benchmark.json"
+        benchmark_path = balanced if balanced.exists() else dataset_root
+        default_analysis_root = dataset_root
+    scoring_manifest = args.scoring_manifest.resolve() if args.scoring_manifest else None
+    analysis_dir = (args.analysis_dir or default_analysis_root / "analysis").resolve()
     figures_dir = analysis_dir / "figures"
     paper_data_dir = analysis_dir / "paper_data"
     setup_plot_style()
 
-    rows, _ = load_rows(dataset_root)
+    rows, _, selection = load_rows(
+        benchmark_path,
+        scoring_manifest_path=scoring_manifest,
+        eligible_only=not args.include_ineligible,
+    )
     flat_rows = [asdict(row) for row in rows]
     write_jsonl(analysis_dir / "episodes_flat.jsonl", flat_rows)
     write_csv(analysis_dir / "episodes_flat.csv", flat_rows)
@@ -675,6 +1014,7 @@ def main() -> None:
     health, issues = health_report(rows)
     domain_summary = summary_by_domain(rows)
     houses = house_distribution(rows)
+    qc = dataset_qc_report(rows, selection)
     interaction_rows = make_interaction_distribution(rows)
     path_rows = make_path_distribution(rows)
     domain_rows = proportions(rows, "domain")
@@ -684,6 +1024,14 @@ def main() -> None:
     )
 
     write_json(analysis_dir / "dataset_health_report.json", health)
+    write_json(analysis_dir / "analysis_manifest.json", {
+        "schema_version": "interactive_nav_v3_analysis_manifest_v1",
+        "benchmark": str(benchmark_path),
+        "scoring_manifest": None if scoring_manifest is None else str(scoring_manifest),
+        "eligible_only": not args.include_ineligible,
+        **selection,
+    })
+    write_json(analysis_dir / "dataset_qc_report.json", qc)
     write_json(analysis_dir / "distribution_summary.json", {
         "domain_summary": domain_summary,
         "domain_proportions": domain_rows,
@@ -695,6 +1043,37 @@ def main() -> None:
     write_jsonl(analysis_dir / "anomalies_and_duplicates.jsonl", issues)
     write_jsonl(analysis_dir / "audit_samples.jsonl", audit_samples(rows, issues, args.seed))
     write_csv(analysis_dir / "house_distribution.csv", houses)
+    write_csv(paper_data_dir / "requirement_by_domain.csv", qc["requirement_by_domain"])
+    write_csv(paper_data_dir / "scoring_quality_gate.csv", [{
+        "source_episode_count": selection["source_episode_count"],
+        "scoring_eligible_episode_count": selection["scoring_eligible_episode_count"],
+        "scoring_ineligible_episode_count": selection["scoring_ineligible_episode_count"],
+        "excluded_from_analysis_count": selection["excluded_episode_count"],
+        **{
+            f"eligible_{domain}": count
+            for domain, count in selection["selected_domain_counts"].items()
+        },
+        **{
+            f"ineligible_{domain}": count
+            for domain, count in selection["scoring_ineligible_domain_counts"].items()
+        },
+    }])
+    write_csv(paper_data_dir / "effect_sets.csv", qc["effect_sets"])
+    write_csv(paper_data_dir / "house_statistics.csv", qc["house_statistics"])
+    write_csv(paper_data_dir / "short_path_statistics.csv", qc["short_path_statistics"])
+    write_csv(paper_data_dir / "visibility_gain_coverage.csv", [
+        {
+            "domain": row["domain"],
+            "episode_count": row["episode_count"],
+            "visibility_gain_count": row["visibility_gain_count"],
+            "visibility_gain_coverage": row["visibility_gain_coverage"],
+            **{
+                f"visibility_gain_{key}": value
+                for key, value in row["visibility_gain_fraction"].items()
+            },
+        }
+        for row in qc["visibility_gain_coverage"]
+    ])
     write_csv(paper_data_dir / "interaction_count_distribution.csv", interaction_rows)
     write_csv(paper_data_dir / "gt_path_length_distribution.csv", path_rows)
     write_csv(paper_data_dir / "gt_path_length_summary.csv", [
@@ -717,8 +1096,12 @@ def main() -> None:
     (analysis_dir / "distribution_report.md").write_text(
         report_markdown(health, domain_summary, domain_rows), encoding="utf-8"
     )
+    (analysis_dir / "dataset_qc_report.md").write_text(
+        qc_report_markdown(qc), encoding="utf-8"
+    )
     print(json.dumps({
         "analysis_dir": str(analysis_dir),
+        **selection,
         "episode_count": len(rows),
         "semantic_issue_count": health["semantic_issue_count"],
     }, indent=2, ensure_ascii=False))

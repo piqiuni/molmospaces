@@ -76,6 +76,25 @@ def _result_row(**overrides: object) -> dict[str, object]:
     return row
 
 
+def test_nav_sampler_skips_pick_only_joint_initialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    sampler = object.__new__(benchmark_runner.V3BenchmarkTaskSampler)
+    sampler.episode_spec = SimpleNamespace(task={"task_type": "nav_to_obj"})
+    calls: list[object] = []
+    monkeypatch.setattr(
+        benchmark_runner.JsonEvalTaskSampler,
+        "set_joint_values",
+        lambda _self, env: calls.append(env),
+    )
+
+    sampler.set_joint_values(object())
+    assert calls == []
+
+    sampler.episode_spec.task["task_type"] = "pick"
+    env = object()
+    sampler.set_joint_values(env)
+    assert calls == [env]
+
+
 def test_normalize_policy_action_accepts_wrapped_visual_interaction() -> None:
     action = normalize_policy_action(
         {
@@ -230,6 +249,7 @@ def test_summary_excludes_runtime_ineligible_rows_from_formal_metrics() -> None:
                 domains=["container"],
                 success=False,
                 scoring_eligible=False,
+                scoring_exclusion_reasons=["terminal_goal_target_mismatch"],
                 terminal_reason="runtime_goal_inconsistent",
             ),
         ]
@@ -238,8 +258,24 @@ def test_summary_excludes_runtime_ineligible_rows_from_formal_metrics() -> None:
     assert summary["total_episode_count"] == 2
     assert summary["scoring_eligible_episode_count"] == 1
     assert summary["runtime_ineligible_episode_count"] == 1
+    assert summary["runtime_ineligible_reason_counts"] == {
+        "terminal_goal_target_mismatch": 1
+    }
     assert summary["groups"]["overall"]["episode_count"] == 1
     assert "domain/container" not in summary["groups"]
+
+
+def test_task_robot_base_pose_is_runtime_authoritative() -> None:
+    episode = {
+        "task": {
+            "robot_base_pose": [5.0, 2.0, 0.0, 0.9950041653, 0.0, 0.0, 0.0998334166]
+        },
+        "robot": {"init_qpos": {"base": [1.0, 1.0, -0.5]}},
+    }
+
+    actual = benchmark_runner._expected_runtime_base_xyyaw(episode)
+
+    assert actual.tolist() == pytest.approx([5.0, 2.0, 0.2])
 
 
 def test_oracle_terminal_goal_consistency_detects_selected_instance_mismatch() -> None:

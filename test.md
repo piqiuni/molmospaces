@@ -316,6 +316,66 @@ full 输出位于 `output.root/full/`：每个 run 包含 `trajectory.h5`、`man
 交互结果和日志。只有 `returncode=0`、H5 对齐校验通过且 `success=true` 的 run 才会
 进入 `valid_trajectory_count`；导航或操作失败不会被当成 rollout 负轨迹。
 
+### 4.5.3 PointGoal / InstructionGoal 数据生成 demo
+
+从现有 InteractiveNav V3 channel benchmark 采一个 interaction-aware PointGoal：
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+python scripts/InteractiveNav/generate_point_goal_v3.py \
+  <V3_BENCHMARK_OR_DIR> \
+  --episode-index 0 \
+  --interaction-aware \
+  --px-per-m 50 \
+  --output-dir scripts/InteractiveNav/output/point_goal_v3_smoke
+```
+
+直接从原始 scene split 采一个普通可达 PointGoal：
+
+```bash
+python scripts/InteractiveNav/generate_point_goal_v3.py \
+  --source-mode scene_split \
+  --house-ind 7 \
+  --output-dir scripts/InteractiveNav/output/point_goal_raw_scene_smoke
+```
+
+基于 V3 oracle plan 规则生成 hidden/partial/explicit 三条 InstructionGoal：
+
+```bash
+python scripts/InteractiveNav/generate_instruction_goal_v3.py \
+  <V3_BENCHMARK_OR_DIR> \
+  --mode rule \
+  --output-dir scripts/InteractiveNav/output/instruction_goal_rule_smoke
+```
+
+如果已有 full rollout，可按 segment 抽取首/中/尾关键帧并调用 VLM；`--graph-json`
+可选传入 unified graph JSON，生成器只保留 GT path 周围指定半径及必需交互实体：
+
+```bash
+python scripts/InteractiveNav/generate_instruction_goal_v3.py \
+  <V3_BENCHMARK_OR_DIR> \
+  --mode vlm \
+  --trajectory-h5 <FULL_RUN>/trajectory.h5 \
+  --graph-json <GRAPH_JSON> \
+  --graph-radius-m 1.0 \
+  --model-mode http \
+  --endpoint <OPENAI_COMPATIBLE_ENDPOINT> \
+  --model <MODEL_NAME> \
+  --output-dir scripts/InteractiveNav/output/instruction_goal_vlm_smoke
+```
+
+只验证 full H5 关键帧和 V3 封装、不访问外部 API 时，将上面的
+`--model-mode http ...` 替换为 `--model-mode mock`。
+
+不访问外部模型的轻量单元测试与 V3 示例校验：
+
+```bash
+conda activate mlspaces
+python -m pytest -q mlspaces_tests/data_generation/test_interactive_nav_task_generation.py
+python scripts/InteractiveNav/dataset_definition/v3/validate_examples.py
+```
+
 相关单元测试：
 
 ```bash

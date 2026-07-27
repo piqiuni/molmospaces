@@ -167,7 +167,7 @@ def normalize_policy_action(value: Any) -> PolicyAction:
                 if key
                 not in {
                     "kind", "pixel_xy", "normalized_pixel_xy", "camera_name", "operation",
-                    "object_name", "joint_index", "head_qpos", "torso_qpos", "done",
+                    "instance_id", "object_name", "joint_index", "head_qpos", "torso_qpos", "done",
                 }
             }
         if not isinstance(base, dict):
@@ -181,6 +181,7 @@ def normalize_policy_action(value: Any) -> PolicyAction:
             camera_name=str(payload.get("camera_name", "head_camera")),
             pixel_xy=_as_pair(pixel, cast=lambda item: int(round(float(item)))),
             normalized_pixel_xy=_as_pair(normalized, cast=float),
+            instance_id=None if payload.get("instance_id") is None else str(payload["instance_id"]),
             joint_index=None if payload.get("joint_index") is None else int(payload["joint_index"]),
             object_name=payload.get("object_name"),
             operation=str(payload.get("operation", "open")),
@@ -369,6 +370,7 @@ def build_ros_bridge_policy(
     cmd_vel_linear_gain: float,
     require_move_base_active: bool,
     map_warmup_skip_frames: int,
+    name: str = "ros_bridge",
 ) -> RosBridgePolicyAdapter:
     """Attach to an already-running ROS graph with no live task reference."""
 
@@ -385,4 +387,4 @@ def build_ros_bridge_policy(
         map_warmup_skip_frames=int(map_warmup_skip_frames),
         publish_realtime_gt=False,
     )
-    return RosBridgePolicyAdapter(policy, name="ros_bridge")
+    return RosBridgePolicyAdapter(policy, name=str(name))

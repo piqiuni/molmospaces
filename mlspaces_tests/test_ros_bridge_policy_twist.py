@@ -1,5 +1,6 @@
 import inspect
 import math
+import threading
 
 import numpy as np
 
@@ -76,3 +77,47 @@ def test_publish_realtime_gt_now_forces_current_snapshot() -> None:
     assert payload == {"frame_index": 11}
     assert policy._latest_gt_payload == payload
     assert calls == [(policy.task, "stamp", 11, True)]
+
+
+def test_missing_navigation_arm_actions_hold_the_current_reset_pose() -> None:
+    left = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+    right = np.array([-0.1, -0.2, -0.3], dtype=np.float32)
+    base = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+
+    class RobotView:
+        def move_group_ids(self):
+            return ["base", "left_arm", "right_arm"]
+
+        def get_noop_ctrl_dict(self, names):
+            values = {"base": base, "left_arm": left, "right_arm": right}
+            return {name: values[name] for name in names}
+
+    action = {"done": False}
+    RosBridgePolicy._fill_missing_navigation_holds(action, RobotView())
+
+    np.testing.assert_array_equal(action["base"], base)
+    np.testing.assert_array_equal(action["left_arm"], left)
+    np.testing.assert_array_equal(action["right_arm"], right)
+    assert action["left_arm"] is not left
+    assert action["right_arm"] is not right
+
+
+def test_tf_keepalive_republishes_only_cached_pose_transforms() -> None:
+    calls = []
+    policy = RosBridgePolicy.__new__(RosBridgePolicy)
+    policy.publish_odom = True
+    policy.base_frame_id = "base"
+    policy.pointcloud_frame_id = "lidar"
+    policy._tf_cache_lock = threading.Lock()
+    policy._latest_odom_tf_state = tuple(float(value) for value in range(10))
+    policy._latest_base_to_lidar_tf = tuple(float(value) for value in range(7))
+    policy._next_common_stamp = lambda: "fresh-stamp"
+    policy._publish_odom_and_base_tf_from_state = lambda state, stamp: calls.append(("odom", state, stamp))
+    policy._publish_base_to_lidar_tf_from_state = lambda state, stamp: calls.append(("lidar", state, stamp))
+
+    policy._tf_keepalive_callback(None)
+
+    assert calls == [
+        ("odom", tuple(float(value) for value in range(10)), "fresh-stamp"),
+        ("lidar", tuple(float(value) for value in range(7)), "fresh-stamp"),
+    ]

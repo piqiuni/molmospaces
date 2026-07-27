@@ -20,71 +20,94 @@ results.
 
 ## Fixed input
 
-The production validation benchmark is the balanced 3000-episode V3 JSON:
+The formal validation input is the runtime-qualified v1.1 release:
 
 ```text
-scripts/InteractiveNav/output/interactive_nav_v3_nav_benchmark_val_light_3000_manifest_v3/balanced/benchmark.json
+scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json
 ```
 
-It contains 1000 Channel, 1000 Container and 1000 Mixed episodes.  The
-evaluator must not modify it.  Each episode's `scene_modifications` is the
-authoritative initial object/articulation state.
+The source candidate contained 3000 episodes.  After the frozen runtime quality
+gate, the formal scoring denominator is 2968: 1000 Channel, 976 Container and
+992 Mixed.  The 32 excluded candidate rows remain in
+`scoring/scoring_manifest.jsonl`; they are not policy failures and must not be
+included in aggregate metrics.  The evaluator must not modify the formal JSON.
+Each episode's `scene_modifications` is the authoritative initial
+object/articulation state.
 
 ### Runtime compatibility gate
 
-Before an episode is formally scored, the evaluator checks every frozen oracle
-terminal waypoint labelled `satisfy_nav_to_obj_success` against the live
-position of the V3 `selected_instance`.  If none can satisfy the recorded
-distance threshold (including waypoint tolerance), the trace is complete but
-`scoring_eligible=false` and no formal metric is aggregated for that row.
+Before formal scoring, protocol v4 checks the live selected target against any
+frozen terminal goal, authoritative robot start pose, every recorded
+articulation state, all interaction object/joint bindings, initial target
+visibility when specified, and critical scene-name compatibility.  A failed
+check records `scoring_eligible=false` and is excluded from formal aggregation.
 
-This catches a currently confirmed construction error in part of the Channel
-benchmark: the path goal was sampled for a nearest same-category candidate,
-while `selected_instance` retained the original source object name.  For
-example, episode 0's frozen terminal goal is 6.60 m from its declared toilet.
-This is neither a policy failure nor an evaluator relaxation opportunity; the
-benchmark records need repairing/rebuilding before those rows can support a
-formal score.  `--no-require-runtime-goal-consistency` permits a diagnostic
-integration rollout, but its row remains scoring-ineligible.
+The repaired candidate changed 344 Channel target identities whose original
+`selected_instance` did not match the path endpoint.  All 1000 repaired Channel
+episodes passed the runtime gate.  The final 32 exclusions are 24 Container and
+8 Mixed episodes whose targets became initially visible in the current runtime,
+violating the strict V3 `visibility_fraction > 0` condition.  The release
+manifest records the candidate hash, formal hash, protocol signature and exact
+exclusion reason counts.
 
 ## Policy-visible information
 
-Policies receive first-person observations, the task language, elapsed time and
-their own action history.  They do not receive `interactive_nav`, selected
-instance identifiers, controlling joints, interaction ids, oracle plans,
-segmentation masks, or validation evidence.  `scripted_oracle` is the only
-exception; all its results are marked `uses_oracle_gt=true` and may only be
-reported as an execution upper bound.
+The ordinary policy interface receives first-person observations, the task
+language, elapsed time and its own action history.  It does not receive
+`interactive_nav`, selected-instance identifiers, controlling joints,
+interaction ids, oracle plans, or validation evidence.  `scripted_oracle` is
+the only exception; all its results are marked `uses_oracle_gt=true` and may
+only be reported as an execution upper bound.
+
+`ros_object_goal_rule` is a separate, explicitly restricted-GT evaluation
+mode for the current ROS object-goal rule stack.  Per ROS frame it receives
+only the compact semantic-minimal record
+`{id, name, bbox_2d, mask_rle, box_3d}`, where `id` is an opaque,
+episode-local token such as `obj_000017`.  The evaluator rejects source object
+names, joint names/indices, joint values, open/closed state, container
+relations, visibility privilege, oracle records, and task-selected instance
+IDs at this boundary.  The RLE remains compact on the ROS wire and semantic
+mapping counts it without materialising a dense mask.
 
 ## Terminal conditions
 
-`overall_success` requires all of:
+The rollout endpoint is `task_success`: the frozen V3 selected instance is
+visible in `head_camera` and its planar base distance is below the recorded
+threshold.  This is checked privately by the benchmark and ends the episode as
+soon as it holds.
 
-1. the V3 selected instance is visible in `head_camera` and its planar base
-   distance is below the recorded threshold;
-2. every interaction in at least one valid oracle plan reaches 0.8 semantic
+`interaction_conditioned_success` requires `task_success` plus all of:
+
+1. every interaction in at least one valid oracle plan reaches 0.8 semantic
    open fraction;
-3. all prerequisite interactions were executed before their dependent action;
-4. for `interaction_requirement=unnecessary`, no interaction action occurred.
+2. all prerequisite interactions were executed before their dependent action;
+3. for `interaction_requirement=unnecessary`, no interaction action occurred.
 
-The evaluator additionally reports navigation success, required interaction
-success, sequence success, wrong interaction count, path length, individual
-interaction readbacks, and terminal reason.
+For backward compatibility, result field `success` is the same as
+`interaction_conditioned_success`.  Reports also expose both rates explicitly,
+along with navigation success, required interaction success, sequence success,
+wrong interaction count, path length, and terminal reason.
 
 Interactions use the existing physical `ForceJointController` with the robot
 base and upper body locked during the force schedule.  Its readback-based
 direction adaptation is preserved; evaluator code must not overwrite the
 controller's selected sign.  A joint that remains below 0.8 after the bounded
-two-second force schedule is honestly reported as a failed interaction.
+two-second force schedule is honestly reported as a failed interaction.  In
+restricted object-goal mode the method sends only `open(opaque_instance_id)`.
+The evaluator privately resolves the object to its force-policy joints, checks
+the generic final open postcondition, and returns only `completed`/`failed`.
+The benchmark does not score controller substeps, but it still checks final V3
+postconditions and prerequisite order for `interaction_conditioned_success`.
 
 ## Reproducibility and parallelism
 
 One episode owns one MuJoCo context.  `--workers N` starts up to N independent
 processes; this is required because MuJoCo renderers and episode state are not
 thread safe.  `--resume` only skips episode directories whose completed trace
-has the identical run signature (benchmark hash plus evaluation configuration).
-A partial, failed, or differently configured trace is rerun.  `ros_bridge` is
-kept single-worker because it attaches to a stateful ROS master.
+has the identical run signature (benchmark hash, evaluation configuration, and
+evaluator protocol implementation).  A partial, failed, or differently
+configured trace is rerun.  `ros_bridge` and `ros_object_goal_rule` are kept
+single-worker because they attach to a stateful ROS master.
 
 ## Required validation order
 
@@ -115,7 +138,7 @@ roslaunch nav_pkg molmospaces_nav_system.launch \
 
 ```bash
 MUJOCO_GL=egl python scripts/InteractiveNav/evaluate_interactive_nav_v3.py \
-  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_nav_benchmark_val_light_3000_manifest_v3/balanced/benchmark.json \
+  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json \
   --output-dir scripts/InteractiveNav/output/v3_eval_current_ros_5x100 \
   --policy ros_bridge --ros-action-timeout-s 1.0 \
   --no-require-runtime-goal-consistency \
@@ -135,3 +158,52 @@ The public evaluator entry point already adds the repository root itself.  For
 the ROS bridge only, the evaluator enables live `head_camera` depth locally so
 the frozen RGB-only light benchmark can publish the point cloud required by the
 navigation graph; the benchmark JSON remains unchanged.
+
+## Current rule object-goal evaluation
+
+The House-7 command's `METHOD=object_goal_rule` identifies the current rule
+algorithm configuration, but it is not the V3 evaluator entry point: that
+script starts its own fixed-house simulator.  For frozen V3 episodes use
+`--policy ros_object_goal_rule`; it creates the simulator from each benchmark
+episode and dynamically publishes the public language goal plus restricted GT.
+
+Start the ROS algorithm without its simulator and without its built-in realtime
+GT publisher:
+
+```bash
+source /home/user/miniconda3/etc/profile.d/conda.sh
+conda activate mlspaces
+export REPO=/home/user/ldl/molmospaces-exp-setting
+source "$REPO/Interactive-Nav-SG-nav/devel/setup.zsh"
+# These ROS Python packages use source-tree imports; append rather than replace
+# PYTHONPATH so conda can still import rospy and the ROS message packages.
+export PYTHONPATH="$REPO/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$REPO/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:$REPO/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:$REPO/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:$PYTHONPATH"
+roslaunch nav_pkg molmospaces_nav_system.launch \
+  start_sim:=false start_mapping:=true start_nav:=true \
+  start_explore:=false start_explore_py:=true \
+  start_semantic_mapping:=true semantic_source:=realtime_gt \
+  publish_realtime_gt:=false start_semantic_decision:=true \
+  semantic_decision_config_override_file:=$REPO/scripts/InteractiveNav/configs/semantic_decision/object_goal_v3_evaluator.yaml
+```
+
+Then run one evaluator process against that ROS master:
+
+```bash
+MUJOCO_GL=egl python scripts/InteractiveNav/evaluate_interactive_nav_v3.py \
+  --benchmark scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json \
+  --output-dir scripts/InteractiveNav/output/v3_eval_object_goal_rule_smoke \
+  --policy ros_object_goal_rule --workers 1 \
+  --ros-action-timeout-s 1.0 --max-steps 500 --max-episodes 5
+```
+
+The evaluator owns `/semantic_decision/target`,
+`/semantic_mapping/gt_observations`, `/semantic_decision/interaction_command`,
+and `/semantic_mapping/interaction_result` for this mode.  Topic names can be
+overridden with the corresponding `--ros-*-topic` options.
+
+The V3 evaluator override uses `module3=direct_atomic`.  The method sends only
+`open(opaque_object_id)` and receives only high-level success/failure from the
+evaluator-owned force skill.  After a successful command, the decision node may
+record an episode-local `command_outcome_belief` from its own requested action;
+this prevents duplicate open commands but is neither a simulator state read nor
+joint feedback.  The default ROS configuration remains `rule_verified`.

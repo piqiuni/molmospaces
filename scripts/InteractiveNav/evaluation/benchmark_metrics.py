@@ -135,13 +135,19 @@ def score_interactions(
     interactions = list(nav.get("interactions", []))
     by_id = {str(row["interaction_id"]): row for row in interactions}
     fractions = {key: joint_open_fraction(env, row) for key, row in by_id.items()}
-    successful_required = [
-        str(row["resolved_interaction_id"])
-        for row in attempts
-        if row.get("classification") == "required_valid"
-        and bool(row.get("success"))
-        and row.get("resolved_interaction_id") is not None
-    ]
+    successful_required: list[str] = []
+    for row in attempts:
+        if row.get("classification") != "required_valid" or not bool(row.get("success")):
+            continue
+        # An evaluator-owned object-level skill may execute a private set of
+        # joints for one public ``open(opaque_id)`` request.  Keep the legacy
+        # singular key for older traces while accepting the private plural form
+        # needed to score the resulting V3 postconditions correctly.
+        resolved_ids = row.get("resolved_interaction_ids")
+        if isinstance(resolved_ids, (list, tuple)):
+            successful_required.extend(str(value) for value in resolved_ids if value is not None)
+        elif row.get("resolved_interaction_id") is not None:
+            successful_required.append(str(row["resolved_interaction_id"]))
     completed: set[str] = set()
     sequence_success = True
     correct_action_count = 0
@@ -241,6 +247,14 @@ def _rate(rows: list[dict[str, Any]], key: str) -> float | None:
     return float(sum(bool(value) for value in values) / len(values))
 
 
+def _rate_with_fallback(rows: list[dict[str, Any]], key: str, fallback_key: str) -> float | None:
+    values = [row.get(key, row.get(fallback_key)) for row in rows]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return float(sum(bool(value) for value in values) / len(values))
+
+
 def _mean(rows: list[dict[str, Any]], key: str) -> float | None:
     values = [float(row[key]) for row in rows if row.get(key) is not None]
     return None if not values else float(np.mean(values))
@@ -252,6 +266,10 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "episode_count": len(rows),
         "success_rate": _rate(rows, "success"),
+        "task_success_rate": _rate_with_fallback(rows, "task_success", "nav_success"),
+        "interaction_conditioned_success_rate": _rate_with_fallback(
+            rows, "interaction_conditioned_success", "success"
+        ),
         "nav_success_rate": _rate(rows, "nav_success"),
         "required_interaction_success_rate": _rate(rows, "required_interaction_success"),
         "sequence_success_rate": _rate(rows, "sequence_success"),
@@ -274,6 +292,12 @@ def summarise_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate overall, task-family and distribution-stratified metrics."""
 
     eligible_rows = [row for row in rows if bool(row.get("scoring_eligible", True))]
+    exclusion_reasons = Counter(
+        str(reason)
+        for row in rows
+        if not bool(row.get("scoring_eligible", True))
+        for reason in row.get("scoring_exclusion_reasons", [])
+    )
     groups: dict[str, list[dict[str, Any]]] = {"overall": list(eligible_rows)}
     for domain in ("channel", "container", "mixed"):
         expected = {"channel", "container"} if domain == "mixed" else {domain}
@@ -295,5 +319,6 @@ def summarise_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_episode_count": len(rows),
         "scoring_eligible_episode_count": len(eligible_rows),
         "runtime_ineligible_episode_count": len(rows) - len(eligible_rows),
+        "runtime_ineligible_reason_counts": dict(exclusion_reasons),
         "groups": {name: _group_summary(values) for name, values in groups.items() if values},
     }

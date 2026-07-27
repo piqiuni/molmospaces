@@ -9,7 +9,10 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 
-from semantic_mapping_py_pkg.graph_rules import normalize_observation
+from semantic_mapping_py_pkg.graph_rules import (
+    normalize_observation,
+    rle_foreground_pixel_count,
+)
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 
 
@@ -32,6 +35,32 @@ def minimal_observation(
     }
 
 
+def compact_rle_observation(
+    instance_id: str = "obj_000001",
+    name: str = "Door",
+    *,
+    rle_field: str = "mask_rle",
+    counts: list[int] | None = None,
+    size: list[int] | None = None,
+) -> dict:
+    image_size = list(size or [4, 5])
+    return {
+        "id": instance_id,
+        "name": name,
+        "bbox_2d": [0, 0, image_size[1] - 1, image_size[0] - 1],
+        rle_field: {
+            "size": image_size,
+            # Foreground occupies the second and fourth alternating runs.
+            "counts": list(counts or [1, 2, 3, 4, 10]),
+        },
+        "box_3d": {
+            "center": [2.0, 1.0, 1.0],
+            "size": [0.2, 1.0, 2.0],
+            "frame_id": "world",
+        },
+    }
+
+
 def test_minimal_gt_is_normalized_from_only_allowed_fields() -> None:
     normalized = normalize_observation(
         minimal_observation("double_door_root", "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0])
@@ -44,6 +73,60 @@ def test_minimal_gt_is_normalized_from_only_allowed_fields() -> None:
     assert normalized["visible_pixels"] == 100
     assert normalized["visible_fraction"] == 1.0
     assert normalized["minimal_gt_observation"] is True
+
+
+def test_compact_mask_rle_is_counted_without_expanding_the_mask() -> None:
+    raw = compact_rle_observation()
+    normalized = normalize_observation(raw)
+
+    assert rle_foreground_pixel_count(raw["mask_rle"]) == 6
+    assert normalized["visible_pixels"] == 6
+    assert normalized["visible_fraction"] == 0.3
+    assert normalized["confidence"] == 1.0
+    assert normalized["source_object_name"] == "obj_000001"
+
+
+def test_compact_segmentation_rle_alias_is_supported() -> None:
+    raw = compact_rle_observation(
+        rle_field="segmentation_rle",
+        counts=[0, 5, 15],
+    )
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["visible_pixels"] == 5
+    assert normalized["visible_fraction"] == 0.25
+
+
+def test_large_rle_visibility_count_does_not_materialize_a_dense_mask() -> None:
+    raw = compact_rle_observation(
+        counts=[0, 100_000_000],
+        size=[10_000, 10_000],
+    )
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["visible_pixels"] == 100_000_000
+    assert normalized["visible_fraction"] == 1.0
+
+
+def test_compact_minimal_gt_discards_private_routing_aliases() -> None:
+    raw = compact_rle_observation()
+    raw.update(
+        {
+            "source_object_name": "private_mujoco_door_body",
+            "visible_pixels": 1,
+            "confidence": 0.01,
+            "joint_infos": [{"joint_name": "private_hinge"}],
+        }
+    )
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["source_object_name"] == "obj_000001"
+    assert normalized["visible_pixels"] == 6
+    assert normalized["confidence"] == 1.0
+    assert normalized["joint_infos"] == []
 
 
 def test_minimal_gt_adapter_discards_legacy_graph_metadata() -> None:
@@ -151,9 +234,7 @@ def test_graph_ignores_legacy_flags_parent_and_joint_state() -> None:
 
 def test_minimal_gt_builds_interactive_portal_without_joint_metadata() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
-    observation = minimal_observation(
-        "double_door_root", "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0]
-    )
+    observation = compact_rle_observation("double_door_root", "Door")
     store.update_observations(
         [observation], stamp=1.0, source_mode="realtime_gt_observation"
     )
@@ -165,9 +246,12 @@ def test_minimal_gt_builds_interactive_portal_without_joint_metadata() -> None:
         node for node in store.as_graph_dict(stamp=2.0)["nodes"] if node["type"] == "portal"
     )
     assert portal["id"] == "portal_double_door_root"
+    assert portal["confidence"] == 1.0
     assert portal["interaction"]["is_interactable"] is True
     assert portal["interaction"]["interaction_mode"] == "open_close"
     assert portal["interaction"]["state"] == "unknown"
+    assert portal["interaction"]["confidence"] == 1.0
+    assert portal["interaction"]["state_confidence"] == 1.0
     assert portal["interaction"]["requires_interaction"] is True
     assert portal["attributes"]["consecutive_observations"] == 2
     forbidden = {

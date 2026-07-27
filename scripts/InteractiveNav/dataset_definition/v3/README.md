@@ -5,7 +5,8 @@
 - 通道交互：开门后恢复空间可达性。
 - 容器交互：打开容器后使目标满足 NavToObj 可见性条件。
 - 混合交互：同一 episode 中依次执行通道和容器交互。
-- Instruction 导航：保持 `language.task_description` 作为 policy-facing Instruction。
+- PointGoal：在机器人膨胀后的 occupancy free cell 上采样目标点并保存 GT path。
+- InstructionGoal：保持 `language.task_description` 作为 policy-facing Instruction。
 
 当前 door、container 和 mixed fine builder 均已输出 `interactive_nav_v3`。统一采集入口为
 `scripts/InteractiveNav/collect_interactive_nav.py`，它负责从版本化 scene pool 生成 seed
@@ -39,6 +40,25 @@ full 模式目前对 channel、container、mixed 均有统一调度入口；默�
 力控制器。executor 仍通过接口注册，可替换为已有 policy 或后续策略。生产配置仍
 不生成 `open_gt_control`，也不构造错误动作负轨迹。
 
+任务形式与采集信息密度是两个正交维度，不引入额外的 `derived_task` schema：
+
+- 任务形式：`ObjGoal`、`PointGoal`、`InstructionGoal` 都直接使用
+  `interactive_nav_v3`；InstructionGoal 只是将 policy-facing 输入切换为自然语言，
+  不复制一套交互状态和 oracle plan。
+- 信息密度：`light` 保存结构化 GT，`full` 在同一 V3 episode 上追加逐 step
+  图像、动作和状态轨迹。`full` 不是新的任务类型。
+
+当前数据生成 demo 位于 `scripts/InteractiveNav/` 外层：
+
+- `generate_point_goal_v3.py`：优先从 V3 channel episode 重放场景，在机器人膨胀
+  occupancy 上采样普通可达或 interaction-aware PointGoal；也支持
+  `--source-mode scene_split --house-ind ...` 直接从原始 scene 随机采样普通可达点对。
+- `interactive_nav_grounded_plan.py`：将 V3 oracle plan、GT path 和交互对象整理为
+  稳定的语言生成输入，并可裁剪路径走廊附近的 graph 子图。
+- `generate_instruction_goal_v3.py`：支持规则生成三种 interaction disclosure，
+  基于结构化 plan/graph 的 LLM 生成，以及从 full H5 按 segment 抽关键帧后的 VLM
+  生成。输出仍是 V3 episode，并记录生成模式、grounding 和视觉证据帧。
+
 full rollout 的 segment 顺序按领域固定：channel 为
 `initial → nav_to_door → force_open_door → nav_to_target → terminal_observation`，
 container 为 `initial → nav_to_container → force_open_container →
@@ -64,7 +84,7 @@ target；force 阶段还会硬锁 base pose，并记录锁定组和实际最大�
 
 ## 示例真实性
 
-`examples/` 下四个 episode 是为说明和校验 v3 字段而手工构造的 synthetic examples，不是由现有 benchmark builder 或 MuJoCo 仿真生成。示例中的 house、对象 ID、joint、pose、路径长度、可见像素和验证结果仅用于展示结构，未经过真实门/容器几何、碰撞、路径或 head-camera 可见性判断，不应作为 benchmark 样本或实验结果使用。
+`examples/` 下五个 episode 是为说明和校验 v3 字段而手工构造的 synthetic examples，不是由现有 benchmark builder 或 MuJoCo 仿真生成。示例中的 house、对象 ID、joint、pose、路径长度、可见像素和验证结果仅用于展示结构，未经过真实门/容器几何、碰撞、路径或 head-camera 可见性判断，不应作为 benchmark 样本或实验结果使用。
 
 真实历史 episode 已原样归档在相邻的 `v1/benchmark.json` 和 `v2/benchmark.json` 中。
 
@@ -83,6 +103,7 @@ scripts/InteractiveNav/dataset_definition/v3/
     container_episode.json
     mixed_episode.json
     no_interaction_episode.json
+    point_goal_episode.json
 ```
 
 `interactive_nav_episode.schema.json` 是 JSON Schema Draft 2020-12 定义。示例只保留说明 v3 所需的关键 EpisodeSpec 字段，允许 MolmoSpaces EpisodeSpec 的其他相机、机器人和 provenance 字段继续存在。
@@ -93,7 +114,10 @@ scripts/InteractiveNav/dataset_definition/v3/
 python scripts/InteractiveNav/dataset_definition/v3/validate_examples.py
 ```
 
-除 JSON Schema 外，该命令还检查 selection mode 和目标实例一致、距离阈值一致、interaction requirement、articulation replay、typed prerequisite 无环、plan-level required interaction IDs、`oracle_plans[0]` 等于 canonical `oracle_plan`，以及 oracle step 引用的 object/joint 与 interaction 定义一致。
+除 JSON Schema 外，该命令还检查 ObjGoal selection mode/目标实例或 PointGoal
+目标坐标的一致性、距离阈值、interaction requirement、articulation replay、typed
+prerequisite 无环、plan-level required interaction IDs、`oracle_plans[0]` 等于
+canonical `oracle_plan`，以及 oracle step 引用的 object/joint 与 interaction 定义一致。
 
 ## 设计原则
 
