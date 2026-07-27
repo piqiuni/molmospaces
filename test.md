@@ -1021,6 +1021,15 @@ SIM_TIMEOUT_S=1800 \
 room 横向排列优先依据 portal-room 拓扑连接度，将 House 7 的 livingroom 放在
 bedroom 与 kitchen 之间。
 
+2026-07-28 House 7 论文首图相机回归：左后上方位姿会让机器人位于画面右侧，
+同时保持冰箱正面和内部物体可见。当前稳定跟随相机配置为
+`position_robot=[-1.45, 1.30, 1.90]`、
+`lookat_offset=[0.05, 0.40, 1.38]`、FOV `65 deg`，由
+`scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh` 默认使用。
+House 7 apple 800-step 回归输出为
+`outputs/house7_apple_rear_left_compromise_800_20260728_v4`，最终 apple 目标成功，
+外部最终 PNG 为 `1024x576`。
+
 #### 手动移动机器人并调外部相机
 
 历史手动可视化工具位于独立实验 worktree：
@@ -1054,6 +1063,13 @@ pitch，`O/P` 打开/关闭交互对象，`V` 截图，`C` 重置相机，`R` �
 `Esc` 退出。调好后终端打印的 `CAMERA_REL` 可直接记录；yaw/pitch 转成跟随相机
 look-at 时，只需用 `lookat = position + [cos(pitch)cos(yaw), cos(pitch)sin(yaw),
 sin(pitch)]`。
+
+注意：跟随相机配置不能同时设置固定 `camera_quaternion`。`RobotMountedCamera` 在
+`camera_quaternion` 非空时会忽略 `lookat_offset`；此前正式仿真仍传入
+`[0.5, 0.5, -0.5, -0.5]`，实际视线因此被固定为机器人坐标系正前方 `[1, 0, 0]`，
+没有使用遥控记录的 yaw/pitch。该覆盖已移除。上述 CAMERA_REL 对应的正确机器人系
+forward 为 `[0.7898058953, -0.5474941007, -0.2765083316]`，正式跟随相机现在由
+position 与 look-at 两个机器人系 offset 生成，与遥控脚本保持一致。
 
 2026-07-27 耗时回归：三路并行 800-step 测试输出位于
 `outputs/house7_perf_parallel3_800_20260727_w{1,2,3}`。三次均完成 800 个 sim step、

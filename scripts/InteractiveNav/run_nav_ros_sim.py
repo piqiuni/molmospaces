@@ -103,6 +103,44 @@ def maybe_save_debug_snapshot(policy, observation) -> None:
     log.info("Saved debug camera snapshot: %s", path)
 
 
+def log_debug_camera_transform(task, policy) -> None:
+    camera_name = str(getattr(policy, "extra_image_camera_name", "") or "")
+    if not camera_name:
+        return
+    registry = getattr(getattr(task.env, "camera_manager", None), "registry", None)
+    camera = None if registry is None else registry.cameras.get(camera_name)
+    if camera is None:
+        return
+    try:
+        from molmo_spaces.env.data_views import create_mlspaces_body
+
+        base_pose = np.asarray(task.env.current_robot.robot_view.base.pose, dtype=float)
+        reference_name = str(getattr(camera, "_active_reference_body_name", "") or "")
+        if not reference_name:
+            reference_names = list(getattr(camera, "reference_body_names", []) or [])
+            reference_name = str(reference_names[0]) if reference_names else ""
+        reference_pose = np.asarray(
+            create_mlspaces_body(task.env.current_data, reference_name).pose,
+            dtype=float,
+        )
+        camera.update_pose(task.env)
+        camera_position = np.asarray(camera.pos, dtype=float)
+        camera_forward = np.asarray(camera.forward, dtype=float)
+        base_rotation = base_pose[:3, :3]
+        payload = {
+            "camera_name": camera_name,
+            "reference_body_name": reference_name,
+            "reference_in_robot": (np.linalg.inv(base_pose) @ reference_pose).tolist(),
+            "camera_position_robot_m": (
+                base_rotation.T @ (camera_position - base_pose[:3, 3])
+            ).tolist(),
+            "camera_forward_robot": (base_rotation.T @ camera_forward).tolist(),
+        }
+        log.info("DEBUG_CAMERA_TRANSFORM %s", json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        log.exception("Failed to log debug camera transform.")
+
+
 def configure_run_file_logging(output_dir: Path) -> Path:
     """Attach a file logger under the current run output directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -370,6 +408,7 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
         policy.task = task
         policy.reset()
+        log_debug_camera_transform(task, policy)
         door_occ_controller = getattr(policy, "door_occ_test_controller", None)
         if door_occ_controller is not None:
             door_occ_controller.prepare(task)
@@ -745,7 +784,6 @@ def build_nav_config(args) -> NavToObjBaseConfig:
                         reference_body_names=["robot_0/base", "base"],
                         camera_offset=debug_camera_offset or [-1.08, 0.62, 1.60],
                         lookat_offset=debug_camera_lookat_offset or [0.4, 0.0, 0.95],
-                        camera_quaternion=[0.5, 0.5, -0.5, -0.5],
                         up_axis="z",
                         fov=float(args.debug_front_camera_fov_deg),
                         skip_erosion=True,

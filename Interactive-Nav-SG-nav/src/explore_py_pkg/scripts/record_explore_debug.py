@@ -3382,19 +3382,44 @@ class ExploreDebugRecorder:
             frame = cv2.resize(raw_frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
             stuck = self._stuck_test_locked(now)
             active_goal = self._active_goal_xy_locked()
-            active_flag = 1 if active_goal is not None else 0
-            label = (
-                f"EXT STEP={_step4(self.latest_external_image_step)} IMG_STAMP={image_stamp:.3f} "
-                f"dist={self.distance_m:.2f}m last_goal=#{self.goal_count:03d} active={active_flag}"
-            )
-            stuck_label = (
-                f"STUCK_TEST={stuck['state']} dur={stuck['duration_sec']:.1f}s "
-                f"move={stuck['moved_m']:.2f}m yaw_net={stuck['yaw_delta_rad']:.2f} "
-                f"yaw_sum={stuck['yaw_motion_rad']:.2f}rad"
-            )
-            cv2.rectangle(frame, (8, 8), (min(frame.shape[1] - 8, 900), 66), (255, 255, 255), -1)
-            cv2.putText(frame, label, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (15, 15, 15), 2, cv2.LINE_AA)
-            cv2.putText(frame, stuck_label, (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (15, 15, 15), 2, cv2.LINE_AA)
+            if self.args.external_video_overlay:
+                active_flag = 1 if active_goal is not None else 0
+                label = (
+                    f"EXT STEP={_step4(self.latest_external_image_step)} IMG_STAMP={image_stamp:.3f} "
+                    f"dist={self.distance_m:.2f}m last_goal=#{self.goal_count:03d} active={active_flag}"
+                )
+                stuck_label = (
+                    f"STUCK_TEST={stuck['state']} dur={stuck['duration_sec']:.1f}s "
+                    f"move={stuck['moved_m']:.2f}m yaw_net={stuck['yaw_delta_rad']:.2f} "
+                    f"yaw_sum={stuck['yaw_motion_rad']:.2f}rad"
+                )
+                cv2.rectangle(
+                    frame,
+                    (8, 8),
+                    (min(frame.shape[1] - 8, 900), 66),
+                    (255, 255, 255),
+                    -1,
+                )
+                cv2.putText(
+                    frame,
+                    label,
+                    (18, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (15, 15, 15),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    frame,
+                    stuck_label,
+                    (18, 58),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62,
+                    (15, 15, 15),
+                    2,
+                    cv2.LINE_AA,
+                )
             self.external_video_frame_count += 1
             frame_index = self.external_video_frame_count
             frame_path = self.video_external_frame_dir / f"frame_{frame_index:06d}_external.png"
@@ -6248,6 +6273,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--first-person-video-with-map", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--semantic-video", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--external-video", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--external-video-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw the diagnostic status box at the top of external-camera video frames.",
+    )
     parser.add_argument("--first-person-video-fps", type=float, default=15.0)
     parser.add_argument(
         "--first-person-video-capture-mode",
