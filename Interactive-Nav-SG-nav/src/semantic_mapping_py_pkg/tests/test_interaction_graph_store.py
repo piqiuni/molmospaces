@@ -1223,3 +1223,46 @@ def test_superseded_attribute_frame_is_marked_stale_without_state_change():
     assert portal["attributes"]["attribute_status"] == "stale"
     assert portal["attributes"]["attribute_error"] == "observation_version_superseded"
     assert portal["interaction"]["state"] == "open"
+
+
+def test_configured_interaction_geometry_is_recorded_for_minimal_gt_node() -> None:
+    source_name = "fridge_house7"
+    store = InteractionGraphStore(
+        scene_id="test_scene",
+        interaction_geometry_overrides={
+            source_name: {
+                "interaction_approach_axis_xy": [1.0, 0.0],
+                "interaction_approach_pose_xyyaw": [8.25, 1.05, 3.141593],
+                "interaction_reference_aabb_center": [7.09, 1.05, 0.76],
+                "interaction_reference_aabb_size": [0.82, 0.88, 1.53],
+                "source": "test_calibration",
+            }
+        },
+    )
+    store.update_observations(
+        [
+            observation(
+                instance_id=source_name,
+                source_object_name=source_name,
+                semantic_name="fridge",
+                category="fridge",
+                is_receptacle=True,
+                is_articulable=True,
+                minimal_gt_observation=True,
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    node = next(
+        item
+        for item in store.as_graph_dict()["nodes"]
+        if item["type"] == "container"
+    )
+    assert node["attributes"]["interaction_approach_axis_xy"] == [1.0, 0.0]
+    assert node["attributes"]["interaction_approach_pose_xyyaw"] == [
+        8.25,
+        1.05,
+        3.141593,
+    ]
+    assert node["attributes"]["interaction_geometry_source"] == "test_calibration"

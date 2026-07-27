@@ -179,6 +179,9 @@ class SemanticMappingNode:
             room_attribute_min_confidence=room_inference_config.get(
                 "min_confidence", 0.2
             ),
+            interaction_geometry_overrides=graph_config.get(
+                "geometry_overrides", {}
+            ),
         )
         self.semantic_occ_overlay = SemanticOccupancyOverlay(
             enabled=overlay_config.get("enabled", True),

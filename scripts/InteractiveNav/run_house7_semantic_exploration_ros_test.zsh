@@ -27,6 +27,9 @@ ARTIFACT_WRITE_QUEUE_SIZE=${ARTIFACT_WRITE_QUEUE_SIZE:-4}
 VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-16}
 IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-4}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
+EXTERNAL_VIDEO_WIDTH_PX=${EXTERNAL_VIDEO_WIDTH_PX:-1024}
+TIMING_LOG_EVERY_N_STEPS=${TIMING_LOG_EVERY_N_STEPS:-50}
+RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES=${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES:-50}
 GT_STEP_INTERVAL=${GT_STEP_INTERVAL:-3}
 GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-4.0}
 GT_MIN_VISIBLE_PIXELS=${GT_MIN_VISIBLE_PIXELS:-16}
@@ -49,8 +52,8 @@ CLEAN_INTERMEDIATE=${CLEAN_INTERMEDIATE:-false}
 ENABLE_RECORDING=${ENABLE_RECORDING:-true}
 ENABLE_EXTERNAL_VIDEO=${ENABLE_EXTERNAL_VIDEO:-false}
 EXTERNAL_IMAGE_TOPIC=${EXTERNAL_IMAGE_TOPIC:-/molmo_spaces/debug_front_camera/image}
-DEBUG_FOLLOW_CAMERA_OFFSET=${DEBUG_FOLLOW_CAMERA_OFFSET:--1.4,0.0,1.35}
-DEBUG_FOLLOW_CAMERA_LOOKAT_OFFSET=${DEBUG_FOLLOW_CAMERA_LOOKAT_OFFSET:-0.0,0.0,0.35}
+DEBUG_FOLLOW_CAMERA_OFFSET=${DEBUG_FOLLOW_CAMERA_OFFSET:--1.08,0.62,1.60}
+DEBUG_FOLLOW_CAMERA_LOOKAT_OFFSET=${DEBUG_FOLLOW_CAMERA_LOOKAT_OFFSET:-0.4,0.0,0.95}
 if [[ -z "${INTERACTION_EXECUTION_MODE:-}" ]]; then
   if [[ -n "${DRAWER_EXECUTION_MODE:-}" ]]; then
     INTERACTION_EXECUTION_MODE=${DRAWER_EXECUTION_MODE}
@@ -117,6 +120,7 @@ case "${METHOD}" in
     FORCE_CLOSE_CONTAINERS=true
     COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_fridge.yaml}
+    SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/house7_interaction_geometry.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
   object_goal_model_mock)
@@ -264,15 +268,17 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       --first-person-video-with-map \
       --first-person-video-fps "${VIDEO_FPS}" \
       --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
+      --external-video-width-px "${EXTERNAL_VIDEO_WIDTH_PX}" \
       --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
       --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
+      --performance-log-every-n-frames "${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES}" \
       --video-history-size "${VIDEO_HISTORY_SIZE}" \
       --image-queue-size "${IMAGE_QUEUE_SIZE}" \
       --video-global-panel-scale 1.8 \
       --runtime-video-encode \
       --first-person-video-h264-preset "${VIDEO_ENCODER_PRESET}" \
       "${EXTERNAL_VIDEO_ARGS[@]}" \
-      --no-video-save-panel-frames \
+      --video-save-panel-frames \
       --no-first-person-video-h264 \
       >"${OUTPUT_DIR}/recorder.log" 2>&1 &
   else
@@ -304,7 +310,7 @@ if [[ "${ENABLE_EXTERNAL_VIDEO}" == true ]]; then
   PUBLISH_DEBUG_FRONT_CAMERA=true
   DEBUG_CAMERA_ARGS="--debug_front_camera_offset=${DEBUG_FOLLOW_CAMERA_OFFSET} --debug_front_camera_lookat_offset=${DEBUG_FOLLOW_CAMERA_LOOKAT_OFFSET}"
 fi
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 ${SIM_CAPTURE_ARGS} ${DEBUG_CAMERA_ARGS} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps 50 --sim_timing_log_every_n_steps 50"
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames 3 ${SIM_CAPTURE_ARGS} ${DEBUG_CAMERA_ARGS} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS} --timing_log_every_n_frames ${TIMING_LOG_EVERY_N_STEPS} --sim_timing_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS}"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \

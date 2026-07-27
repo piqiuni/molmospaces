@@ -643,6 +643,42 @@ def test_container_front_axis_overrides_nearest_radial_side() -> None:
         assert candidate.metadata["interaction_approach_axis_xy"] == (0.0, -1.0)
 
 
+def test_container_explicit_interaction_pose_overrides_live_aabb() -> None:
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [9.0, 9.0, 1.0],
+        "aabb_size": [2.0, 2.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "attributes": {
+            "source_object_name": "fridge_house7",
+            "interaction_approach_axis_xy": [1.0, 0.0],
+            "interaction_approach_pose_xyyaw": [8.25, 1.05, math.pi],
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 1.0,
+        },
+    }
+
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("container",))
+    ).generate({}, {"nodes": [node]}, robot_xy=(4.0, 4.0))[0]
+
+    assert candidate.goal_xyyaw == [8.25, 1.05, math.pi]
+    assert candidate.metadata["approach_strategy"] == "container_explicit_pose"
+    assert candidate.metadata["goal_xyyaw_candidates"][1] == [8.5, 1.05, math.pi]
+    assert candidate.interaction_command["interaction_approach_pose_xyyaw"] == [
+        8.25,
+        1.05,
+        math.pi,
+    ]
+
+
 def test_target_current_visibility_can_be_required() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(target_require_current_visibility=True)

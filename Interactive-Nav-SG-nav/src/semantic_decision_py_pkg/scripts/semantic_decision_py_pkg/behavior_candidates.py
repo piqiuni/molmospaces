@@ -567,6 +567,12 @@ class CandidateGenerator:
                     interaction.get("interaction_mode") or "open_close"
                 ),
                 "expected_state": "open",
+                "interaction_approach_pose_xyyaw": list(approach),
+                "interaction_approach_axis_xy": list(
+                    self._container_approach_axis(node) or []
+                ),
+                "interaction_ready_distance_m": self.config.interaction_ready_distance_m,
+                "interaction_ready_yaw_tolerance_rad": 0.55,
             }
             candidates.append(
                 BehaviorCandidate(
@@ -621,9 +627,13 @@ class CandidateGenerator:
                             "portal_aabb_normal"
                             if node_type == "portal"
                             else (
-                                "container_front_axis"
-                                if self._container_approach_axis(node) is not None
-                                else "radial_standoff"
+                                "container_explicit_pose"
+                                if self._container_approach_pose(node) is not None
+                                else (
+                                    "container_front_axis"
+                                    if self._container_approach_axis(node) is not None
+                                    else "radial_standoff"
+                                )
                             )
                         ),
                         "interaction_approach_axis_xy": self._container_approach_axis(
@@ -652,13 +662,27 @@ class CandidateGenerator:
                     robot_xy, target_xy, node, candidate_standoff
                 )
             else:
-                pose = cls._approach_pose(
-                    robot_xy,
-                    target_xy,
-                    candidate_standoff,
-                    node=node,
-                    fixed_axis=cls._container_approach_axis(node),
-                )
+                explicit_pose = cls._container_approach_pose(node)
+                if explicit_pose is not None:
+                    axis = cls._container_approach_axis(node)
+                    if axis is None:
+                        axis = (
+                            math.cos(float(explicit_pose[2]) + math.pi),
+                            math.sin(float(explicit_pose[2]) + math.pi),
+                        )
+                    pose = [
+                        float(explicit_pose[0]) + axis[0] * extra_standoff,
+                        float(explicit_pose[1]) + axis[1] * extra_standoff,
+                        float(explicit_pose[2]),
+                    ]
+                else:
+                    pose = cls._approach_pose(
+                        robot_xy,
+                        target_xy,
+                        candidate_standoff,
+                        node=node,
+                        fixed_axis=cls._container_approach_axis(node),
+                    )
             if not any(
                 math.hypot(pose[0] - previous[0], pose[1] - previous[1]) <= 1e-6
                 and abs(
@@ -722,6 +746,18 @@ class CandidateGenerator:
         if norm <= 1e-6:
             return None
         return float(values[0]) / norm, float(values[1]) / norm
+
+    @staticmethod
+    def _container_approach_pose(node: dict[str, Any]) -> list[float] | None:
+        attributes = node.get("attributes") or {}
+        values = list(
+            attributes.get("interaction_approach_pose_xyyaw")
+            or node.get("interaction_approach_pose_xyyaw")
+            or []
+        )
+        if len(values) < 3:
+            return None
+        return [float(values[0]), float(values[1]), float(values[2])]
 
     @staticmethod
     def _room_id_for_xy(

@@ -88,8 +88,10 @@ class BaseMujocoTask(ABC):
         # Optional profiler for granular timing (set via set_datagen_profiler)
         self._datagen_profiler = None
         self.last_step_timing_ms: dict[str, float] = {
+            "control_update": 0.0,
             "physics_step": 0.0,
             "sensor_polling": 0.0,
+            "bookkeeping": 0.0,
             "total": 0.0,
         }
 
@@ -338,8 +340,10 @@ class BaseMujocoTask(ABC):
         # Update episode step count
         self.episode_step_count += 1
 
+        control_t0 = time.perf_counter()
         for robot, action in zip(self._env.robots, actions, strict=True):
             robot.update_control(action)
+        control_ms = (time.perf_counter() - control_t0) * 1000.0
 
         # Physics step (MuJoCo simulation)
         if self._datagen_profiler is not None:
@@ -365,18 +369,21 @@ class BaseMujocoTask(ABC):
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("sensor_polling")
 
-        self.last_step_timing_ms = {
-            "physics_step": physics_ms,
-            "sensor_polling": sensor_ms,
-            "total": (time.perf_counter() - step_t0) * 1000.0,
-        }
-
+        bookkeeping_t0 = time.perf_counter()
         done = np.logical_or(terminated, truncated)
         self._cumulative_reward += np.where(done, 0, reward)
         self._num_steps_taken += np.where(done, 0, 1)
 
         # Cache the action for history tracking
         self._cache_latest_or_append(self.action_cache, self.last_action)
+        bookkeeping_ms = (time.perf_counter() - bookkeeping_t0) * 1000.0
+        self.last_step_timing_ms = {
+            "control_update": control_ms,
+            "physics_step": physics_ms,
+            "sensor_polling": sensor_ms,
+            "bookkeeping": bookkeeping_ms,
+            "total": (time.perf_counter() - step_t0) * 1000.0,
+        }
 
         return observation, reward, terminated, truncated, info
 
