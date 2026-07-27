@@ -828,6 +828,14 @@ class AtomicForceInteractionController:
         event_id = str(command.get("event_id") or f"interaction_{self._event_index:06d}")
         self._event_index += 1
         stamp_sec = time.time()
+        object_id = str(command.get("object_id") or "")
+        node_id = str(command.get("node_id") or "")
+        missing_articulation = str(exc).startswith("Articulated object not found:")
+        static_portal = missing_articulation and (
+            node_id.startswith("portal_")
+            or "doorframe" in object_id.casefold()
+            or "doorway" in object_id.casefold()
+        )
         try:
             view_restore_result = self._head_view_controller.restore(task.env)
         except (AttributeError, KeyError, ValueError):
@@ -840,8 +848,8 @@ class AtomicForceInteractionController:
             "command_id": str(command["command_id"]),
             "candidate_id": str(command.get("candidate_id") or ""),
             "decision_id": str(command.get("decision_id") or ""),
-            "node_id": str(command.get("node_id") or ""),
-            "object_id": str(command["object_id"]),
+            "node_id": node_id,
+            "object_id": object_id,
             "action": str(command.get("action") or "open"),
             "interaction_mode": str(command.get("interaction_mode") or "open_close"),
             "operation_method": str(command.get("operation_method") or "unknown"),
@@ -850,22 +858,32 @@ class AtomicForceInteractionController:
             "view_profile": str(command.get("view_profile") or "default"),
             "view_profile_result": view_result,
             "view_restore_result": view_restore_result,
-            "state": "unknown",
+            "state": "static_open" if static_portal else "unknown",
             "pre_state": "unknown",
-            "post_state": "unknown",
-            "success": False,
-            "status": "FAILED",
+            "post_state": "static_open" if static_portal else "unknown",
+            "success": static_portal,
+            "status": "SUCCEEDED" if static_portal else "FAILED",
             "confidence": 1.0,
-            "execution_cost": 1.0,
+            "execution_cost": 0.0 if static_portal else 1.0,
             "sim_steps_consumed": 0,
             "physics_substeps": 0,
             "task_steps_consumed": 0,
             "result_published_step": int(step),
             "interaction_execution_mode": self.interaction_execution_mode,
             "interaction_transition_steps": 0,
-            "source": "force_interaction_rejected",
-            "verification_source": "executor_resolution_failure",
-            "failure_reason": "articulation_resolution_failed",
+            "source": (
+                "executor_static_portal"
+                if static_portal
+                else "force_interaction_rejected"
+            ),
+            "verification_source": (
+                "simulator_no_articulation"
+                if static_portal
+                else "executor_resolution_failure"
+            ),
+            "failure_reason": (
+                "" if static_portal else "articulation_resolution_failed"
+            ),
             "error_type": type(exc).__name__,
             "error": str(exc),
             "step": int(step),
@@ -877,8 +895,8 @@ class AtomicForceInteractionController:
             "decision_id": result["decision_id"],
             "event_id": event_id,
             "behavior_type": "INTERACT",
-            "status": "FAILED",
-            "success": False,
+            "status": result["status"],
+            "success": result["success"],
             "interaction_result": result,
             "step": int(step),
             "stamp_sec": stamp_sec,
