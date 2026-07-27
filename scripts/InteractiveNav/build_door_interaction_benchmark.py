@@ -99,11 +99,16 @@ def group_episodes(
     max_episodes: int | None,
     *,
     episode_index_offset: int = 0,
+    preserve_source_episode_indices: bool = False,
 ) -> dict[int, list[tuple[int, dict[str, Any]]]]:
     end_idx = len(episodes) if max_episodes is None else min(len(episodes), start_idx + max_episodes)
     grouped: dict[int, list[tuple[int, dict[str, Any]]]] = {}
     for local_index, episode in enumerate(episodes[start_idx:end_idx], start=start_idx):
-        episode_index = episode_index_offset + local_index
+        source_index = episode.get("seed_generation", {}).get("source_episode_index")
+        if preserve_source_episode_indices and source_index is not None:
+            episode_index = int(source_index)
+        else:
+            episode_index = episode_index_offset + local_index
         grouped.setdefault(int(episode["house_index"]), []).append((episode_index, episode))
     return grouped
 
@@ -577,6 +582,7 @@ def build_v3_generation_validation(
     interactions: list[dict[str, Any]],
     oracle_plan: dict[str, Any],
     succ_pos_threshold: float,
+    target_identity_validation: dict[str, Any] | None,
     plot_path: Path | None,
 ) -> dict[str, Any]:
     required_ids = oracle_plan["required_interaction_ids"]
@@ -644,6 +650,7 @@ def build_v3_generation_validation(
             "visibility_passed": None,
             "expected_task_success": None,
         },
+        "target_identity_validation": copy.deepcopy(target_identity_validation),
         "minimal_plan_verified": None,
         "legacy_case_type": case_type,
         "legacy_sampling": sampling,
@@ -689,6 +696,7 @@ def make_interactive_nav_v3_payload(
     all_closed_change_stats: dict[str, Any],
     critical_door_names: list[str],
     noncritical_door_names: list[str],
+    target_identity_validation: dict[str, Any] | None,
     plot_path: Path | None,
 ) -> dict[str, Any]:
     interactions, interaction_ids_by_root = build_v3_channel_interactions(
@@ -750,6 +758,7 @@ def make_interactive_nav_v3_payload(
             interactions=interactions,
             oracle_plan=oracle_plan,
             succ_pos_threshold=succ_pos_threshold,
+            target_identity_validation=target_identity_validation,
             plot_path=plot_path,
         ),
         "legacy_case_type": case_type,
@@ -1004,6 +1013,7 @@ def build_case_sample(
     all_closed_path,
     all_closed_changed_strict: bool,
     all_closed_change_stats: dict[str, Any],
+    target_identity_validation: dict[str, Any] | None,
 ) -> dict[str, Any]:
     house_index = int(original_episode["house_index"])
     closed_doors = unique_preserve_order(closed_doors)
@@ -1061,6 +1071,7 @@ def build_case_sample(
         all_closed_change_stats=all_closed_change_stats,
         critical_door_names=critical_door_names,
         noncritical_door_names=noncritical_door_names,
+        target_identity_validation=target_identity_validation,
         plot_path=plot_path,
     )
     sample = normalize_episode_for_v3_channel(
@@ -1098,7 +1109,12 @@ def deterministic_nav_goal_for_episode(
     rng_state = np.random.get_state()
     np.random.seed((int(args.seed) * 1_000_003 + int(episode_index)) % (2**32 - 1))
     try:
-        return nav_paths.sample_nav_goal_for_episode(ctx.env, scene_map, episode)
+        return nav_paths.sample_nav_goal_for_episode(
+            ctx.env,
+            scene_map,
+            episode,
+            target_object_override=getattr(args, "target_object_override", None),
+        )
     finally:
         np.random.set_state(rng_state)
 
@@ -1122,6 +1138,26 @@ def run_episode_build(
     nav_goal, nav_goal_source, nav_goal_sampling_error, target_object, resolved_candidates = (
         deterministic_nav_goal_for_episode(args, ctx, open_scene_map, episode_index, episode)
     )
+    nav_objects, scene_resolved_candidates, _ = nav_paths.episode_nav_objects(ctx.env, episode)
+    target_by_name = {str(obj.name): obj for obj in nav_objects}
+    if target_object not in target_by_name:
+        raise ValueError(
+            "target_identity_mismatch: sampled target is not a resolved scene candidate: "
+            f"target={target_object!r} candidates={scene_resolved_candidates!r}"
+        )
+    target_identity_validation = nav_paths.target_goal_validation(
+        target_by_name[target_object],
+        nav_goal,
+        success_distance_threshold_m=float(episode["task"]["succ_pos_threshold"]),
+        terminal_position_tolerance_m=float(args.target_goal_tolerance_m),
+    )
+    target_identity_validation["resolved_candidates"] = list(scene_resolved_candidates)
+    target_identity_validation["source_task_target"] = episode["task"].get("pickup_obj_name")
+    if not target_identity_validation["passed"]:
+        raise ValueError(
+            "target_goal_mismatch: sampled terminal is not compatible with selected target: "
+            f"{target_identity_validation}"
+        )
     open_path = emi.compute_path_from_map(
         open_scene_map,
         start_xy,
@@ -1204,6 +1240,7 @@ def run_episode_build(
                 all_closed_path=all_closed_path,
                 all_closed_changed_strict=all_closed_changed_strict,
                 all_closed_change_stats=all_closed_change_stats,
+                target_identity_validation=target_identity_validation,
             )
         )
         built_all_closed = True
@@ -1242,6 +1279,7 @@ def run_episode_build(
                     all_closed_path=all_closed_path,
                     all_closed_changed_strict=all_closed_changed_strict,
                     all_closed_change_stats=all_closed_change_stats,
+                    target_identity_validation=target_identity_validation,
                 )
             )
             built_partial_count += 1
@@ -1294,6 +1332,7 @@ def run_episode_build(
                     all_closed_path=all_closed_path,
                     all_closed_changed_strict=all_closed_changed_strict,
                     all_closed_change_stats=all_closed_change_stats,
+                    target_identity_validation=target_identity_validation,
                 )
             )
             built_partial_count += 1
@@ -1353,6 +1392,7 @@ def run_episode_build(
                         all_closed_path=all_closed_path,
                         all_closed_changed_strict=all_closed_changed_strict,
                         all_closed_change_stats=all_closed_change_stats,
+                        target_identity_validation=target_identity_validation,
                     )
                 )
                 built_partial_count += 1
@@ -1366,6 +1406,7 @@ def run_episode_build(
         "data_split": episode["data_split"],
         "house_index": house_index,
         "target_object": target_object,
+        "target_identity_validation": target_identity_validation,
         "target_category": nav_paths.target_category(target_object),
         "target_candidates": resolved_candidates,
         "robot_xy": np.asarray(start_xy).tolist(),
@@ -1753,6 +1794,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Stable case-id offset for manifest-dispatched single-episode tasks.",
     )
+    parser.add_argument(
+        "--preserve_source_episode_indices",
+        action="store_true",
+        help="Use seed_generation.source_episode_index for stable IDs across worker shards.",
+    )
     parser.add_argument("--max_episodes", type=int, default=30)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--variant", default="ceiling")
@@ -1766,6 +1812,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--path_mean_distance_threshold_m", type=float, default=0.35)
     parser.add_argument("--path_max_distance_threshold_m", type=float, default=0.75)
     parser.add_argument("--path_length_delta_threshold_m", type=float, default=0.5)
+    parser.add_argument(
+        "--target_goal_tolerance_m",
+        type=float,
+        default=0.25,
+        help="Additional terminal tolerance for selected-target/goal consistency.",
+    )
+    parser.add_argument(
+        "--target_object_override",
+        help="Optional resolved candidate instance to use instead of nearest-target sampling.",
+    )
     parser.add_argument("--num_distractor_samples_per_episode", type=int, default=1)
     parser.add_argument("--num_mixed_samples_per_critical_door", type=int, default=1)
     parser.add_argument("--distractor_k_min", type=int, default=1)
@@ -1795,6 +1851,7 @@ def main() -> None:
         args.start_idx,
         args.max_episodes,
         episode_index_offset=args.episode_index_offset,
+        preserve_source_episode_indices=args.preserve_source_episode_indices,
     )
     total_episode_count = sum(len(indexed_episodes) for indexed_episodes in grouped.values())
 

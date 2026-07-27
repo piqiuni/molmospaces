@@ -339,7 +339,16 @@ def prepare_writable_scene_path(scene_path: Path) -> str:
         assets_root,
         local_assets_root,
     ] + tmp_asset_roots
-    mirror_root = WRITABLE_ASSET_MIRROR
+    # Every MuJoCo worker must have an isolated writable mirror.  The old fixed
+    # path let concurrent workers replace each other's scene symlinks, causing
+    # intermittent ``val_*.xml not found`` failures.  Callers may provide a
+    # stable per-worker path; otherwise derive one from the process ID.
+    mirror_root = Path(
+        os.environ.get(
+            "INTERACTIVE_NAV_SCENE_MIRROR",
+            str(WRITABLE_ASSET_MIRROR.with_name(f"{WRITABLE_ASSET_MIRROR.name}_{os.getpid()}")),
+        )
+    )
     mirror_root.mkdir(parents=True, exist_ok=True)
 
     def usable_source(src: Path) -> Path:

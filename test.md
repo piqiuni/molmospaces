@@ -701,6 +701,26 @@ scripts/InteractiveNav/configs/semantic_decision/object_goal_runtime.yaml
 scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge.yaml
 ```
 
+### 5.3.3 冻结 V3 单 episode 可视化评测
+
+冻结 benchmark 的 ROS object-goal 评测使用专用单 episode 入口。它会自行启动独立 ROS master、ROS 算法栈和 recorder；每次都强制输出六联图视频与俯视结果图。不要把多个 episode 放进同一次调用，以免把不同 episode 的 ROS 轨迹混入同一份 recorder 产物。
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:11311 \
+MAX_STEPS=1000 \
+VIDEO_FPS=5 \
+zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+  outputs/v3_container_episode_1000 1000
+```
+
+默认使用 `object_goal_v3_full_mllm.yaml` 与 `ros_object_goal_rule`，可通过 `SEMANTIC_DECISION_OVERRIDE`、`SEMANTIC_MAPPING_OVERRIDE` 或 `POLICY` 覆盖。完成后必须检查：
+
+- `debug/videos/overview_6panel.mp4`：ROS 相机、OCC、房间/交互、全局/局部代价图、语义图与拓扑图六联视频。
+- `eval/episodes/<episode>/episode_topdown.png`：场景底图、真实探索轨迹、起点、GT target、GT/实际交互及 oracle 路径。
+- `eval/episodes/<episode>/episode_result.json`：冻结 V3 的正式评测结果。
+
+该入口默认不重复缓存 head-camera 视频，以避免同一 episode 同时保存两份大视频。若需要保留它作为 force interaction 的补充第一视角，额外传 `RECORD_HEAD_CAMERA=true`。
+
 多场景交互实验使用专用批处理脚本。每个 worker 是独立子进程，拥有独立 `ROS_MASTER_URI`；场景按 round-robin 分片，worker 内部串行运行分到的场景：
 
 ```bash

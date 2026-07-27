@@ -65,3 +65,15 @@ def candidate_with_visual_operation_plan(candidate: dict, plan: dict) -> dict:
         )
     planned["interaction_command"] = interaction
     return planned
+
+
+def action_for_opaque_open_contract(action: object, *, enabled: bool) -> str:
+    """Project an action onto an evaluator's opaque-object ``open`` API.
+
+    V3 keeps part and joint resolution private, so it accepts only
+    ``open(opaque_object_id)``.  Normal ROS simulation retains its richer action
+    vocabulary unless this explicit adapter is enabled.
+    """
+
+    normalized = str(action or "open").casefold()
+    return "open" if enabled else normalized

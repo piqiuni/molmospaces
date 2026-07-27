@@ -325,6 +325,7 @@ def _execute_task(
     env["PYTHONPATH"] = f"{REPO_ROOT}:{env.get('PYTHONPATH', '')}"
     env["MUJOCO_GL"] = config.runtime.mujoco_gl
     env["MPLCONFIGDIR"] = str(run_dir / "matplotlib-cache")
+    env["INTERACTIVE_NAV_SCENE_MIRROR"] = str(run_dir / "scene_assets")
     if domain == "channel":
         input_dir = run_dir / "input"
         _write_json(input_dir / "benchmark.json", [task["episode"]])
@@ -338,6 +339,7 @@ def _execute_task(
                 "--mode", "build", "--input_mode", "original", "--variant", config.source.variant,
                 "--max_episodes", "1",
                 "--episode_index_offset", str(task["episode_index_offset"]),
+                "--preserve_source_episode_indices",
                 "--case_type_filter", str(task["recipe"]),
                 "--max_output_samples_per_house", "1",
                 "--num_distractor_samples_per_episode", "1",
@@ -777,6 +779,7 @@ def _execute_house_task(
     env["PYTHONPATH"] = f"{REPO_ROOT}:{env.get('PYTHONPATH', '')}"
     env["MUJOCO_GL"] = config.runtime.mujoco_gl
     env["MPLCONFIGDIR"] = str(run_dir / "matplotlib-cache")
+    env["INTERACTIVE_NAV_SCENE_MIRROR"] = str(run_dir / "scene_assets")
 
     if domain == "channel":
         input_dir = run_dir / "input"
@@ -791,6 +794,7 @@ def _execute_house_task(
                 "--mode", "build", "--input_mode", "original", "--variant", config.source.variant,
                 "--max_episodes", str(len(task["episodes"])),
                 "--episode_index_offset", str(task["episode_index_offset"]),
+                "--preserve_source_episode_indices",
                 # Filter before applying the per-house cap.  Otherwise the
                 # lexically first all_closed record consumes a slot and is
                 # discarded only later by _formal_house_episode.

@@ -1350,6 +1350,88 @@ def _episode_result_base(episode_index: int, episode: dict[str, Any], policy_nam
     }
 
 
+def _private_episode_visualization_context(
+    *,
+    task: Any,
+    catalog: InteractionCatalog,
+    episode: dict[str, Any],
+) -> dict[str, Any]:
+    """Capture post-evaluation-only GT geometry without exposing it to a policy.
+
+    This is deliberately a sidecar, not an ``EpisodeResult`` field: restricted
+    ROS policies must never receive target or internal articulated-object names
+    through their public V3 trace while an episode is being evaluated.
+    """
+
+    nav = episode["interactive_nav"]
+    target_name = str(nav["target"]["selected_instance"])
+    objects = task.env.object_managers[task.env.current_batch_index]
+    target = objects.get_object_by_name(target_name)
+    interactions: list[dict[str, Any]] = []
+    for row in nav.get("interactions", []):
+        runtime_joint = catalog.by_name(str(row["object_name"]), int(row["joint_index"]))
+        entry: dict[str, Any] = {
+            "interaction_id": str(row["interaction_id"]),
+            "type": str(row.get("type", "interaction")),
+        }
+        if runtime_joint is not None:
+            entry.update(
+                {
+                    "xy": runtime_joint.aabb_center[:2].astype(float).tolist(),
+                    "aabb_center": runtime_joint.aabb_center.astype(float).tolist(),
+                    "aabb_size": runtime_joint.aabb_size.astype(float).tolist(),
+                }
+            )
+        interactions.append(entry)
+    return {
+        "schema_version": "interactive_nav_v3_evaluator_private_visualization_v1",
+        "evaluator_private": True,
+        "case_id": str(nav["case_id"]),
+        "target": {
+            "xy": np.asarray(target.position[:2], dtype=float).tolist(),
+        },
+        "gt_interactions": interactions,
+        "actual_interactions": [],
+    }
+
+
+def _private_actual_interaction_markers(
+    attempts: list[dict[str, Any]],
+    catalog: InteractionCatalog,
+) -> list[dict[str, Any]]:
+    """Project resolved evaluator attempts to object locations for the sidecar."""
+
+    markers: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str | None]] = set()
+    for attempt in attempts:
+        object_name = attempt.get("resolved_object_name")
+        if object_name is None:
+            continue
+        joint_index = attempt.get("resolved_joint_index")
+        joints = [joint for joint in catalog.joints if joint.object_name == str(object_name)]
+        if joint_index is not None:
+            joints = [joint for joint in joints if joint.joint_index == int(joint_index)]
+        for joint in joints:
+            request = attempt.get("requested")
+            request = request if isinstance(request, dict) else {}
+            request_id = request.get("request_id")
+            key = (joint.object_name, joint.joint_index, None if request_id is None else str(request_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            markers.append(
+                {
+                    "request_id": request_id,
+                    "xy": joint.aabb_center[:2].astype(float).tolist(),
+                    "aabb_center": joint.aabb_center.astype(float).tolist(),
+                    "aabb_size": joint.aabb_size.astype(float).tolist(),
+                    "success": bool(attempt.get("success")),
+                    "classification": attempt.get("classification"),
+                }
+            )
+    return markers
+
+
 def _protocol_implementation_sha256() -> str:
     digest = hashlib.sha256()
     for path in (
@@ -1435,6 +1517,8 @@ def evaluate_episode(
     scoring_exclusion_reasons: list[str] = []
     scoring_eligible = True
     runtime_goal_blocked = False
+    catalog: InteractionCatalog | None = None
+    private_visualization: dict[str, Any] | None = None
     started = time.monotonic()
     base_data = _episode_result_base(episode_index, episode, config.policy, config.policy == "scripted_oracle")
     try:
@@ -1482,6 +1566,11 @@ def evaluate_episode(
             raise RuntimeError("JsonEvalTaskSampler returned no task")
         observation, _info = task.reset()
         catalog = InteractionCatalog(task.env)
+        private_visualization = _private_episode_visualization_context(
+            task=task,
+            catalog=catalog,
+            episode=episode,
+        )
         runtime_consistency = _runtime_consistency_checks(task, catalog, episode, sampler, config)
         runtime_goal_consistency = runtime_consistency["checks"]["oracle_terminal_goal"]
         scoring_exclusion_reasons = list(runtime_consistency["exclusion_reasons"])
@@ -1908,6 +1997,9 @@ def evaluate_episode(
                 pass
         if scene_install_module is not None and scene_install_original is not None:
             scene_install_module.install_scene_with_objects_and_grasps_from_path = scene_install_original
+    if private_visualization is not None and catalog is not None:
+        private_visualization["actual_interactions"] = _private_actual_interaction_markers(attempts, catalog)
+        _atomic_json(episode_dir / "episode_visualization.json", private_visualization)
     _atomic_json(trace_path, {"status": status, "run_signature": run_signature, "result": result, "trace": trace})
     return result
 

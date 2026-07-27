@@ -1,0 +1,235 @@
+#!/usr/bin/env zsh
+# Run one frozen V3 ROS object-goal episode with the required visual artifacts.
+#
+# Usage:
+#   zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+#     <run-output-dir> <episode-index>
+#
+# The script intentionally owns one ROS master and one recorder per episode.
+# A recorder directory cannot be attributed safely to multiple sequential V3
+# episodes, so this is a single-episode test entry point rather than a batch
+# evaluator wrapper.
+
+set -euo pipefail
+setopt null_glob
+
+SCRIPT_DIR=${0:A:h}
+REPO_ROOT=${SCRIPT_DIR:h:h}
+RUN_DIR=${1:?"usage: $0 <run-output-dir> <episode-index>"}
+EPISODE_INDEX=${2:?"usage: $0 <run-output-dir> <episode-index>"}
+if [[ "${RUN_DIR}" != /* ]]; then
+  RUN_DIR="${PWD}/${RUN_DIR}"
+fi
+if [[ ! "${EPISODE_INDEX}" =~ '^[0-9]+$' ]]; then
+  print -u2 -- "episode-index must be a non-negative integer: ${EPISODE_INDEX}"
+  exit 2
+fi
+
+BENCHMARK=${BENCHMARK:-${REPO_ROOT}/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json}
+POLICY=${POLICY:-ros_object_goal_rule}
+MAX_STEPS=${MAX_STEPS:-1000}
+VIDEO_FPS=${VIDEO_FPS:-5}
+VIDEO_PANEL_WIDTH_PX=${VIDEO_PANEL_WIDTH_PX:-480}
+RECORDER_DRAIN_WAIT_S=${RECORDER_DRAIN_WAIT_S:-8}
+RECORD_HEAD_CAMERA=${RECORD_HEAD_CAMERA:-false}
+ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11311}
+ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.zsh}
+SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${REPO_ROOT}/.env}
+SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_v3_full_mllm.yaml}
+SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
+EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
+NAV_CONFIG_OVERRIDE=${NAV_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
+RECORDER=${RECORDER:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py}
+
+for required_path in "${BENCHMARK}" "${ROS_SETUP}" "${SEMANTIC_MODEL_ENV_FILE}" \
+  "${SEMANTIC_DECISION_OVERRIDE}" "${SEMANTIC_MAPPING_OVERRIDE}" \
+  "${EXPLORE_PY_CONFIG_OVERRIDE}" "${NAV_CONFIG_OVERRIDE}" "${RECORDER}"; do
+  if [[ ! -f "${required_path}" ]]; then
+    print -u2 -- "Missing required file: ${required_path}"
+    exit 2
+  fi
+done
+
+mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/ros_home/log"
+if [[ -e "${RUN_DIR}/eval" ]]; then
+  print -u2 -- "Refusing to overwrite existing evaluator output: ${RUN_DIR}/eval"
+  exit 2
+fi
+
+export ROS_MASTER_URI
+export ROS_IP=${ROS_IP:-127.0.0.1}
+export ROS_HOSTNAME=${ROS_HOSTNAME:-127.0.0.1}
+export ROS_HOME="${RUN_DIR}/ros_home"
+export ROS_LOG_DIR="${RUN_DIR}/ros_home/log"
+export SEMANTIC_DECISION_ENV_FILE="${SEMANTIC_MODEL_ENV_FILE}"
+export SEMANTIC_MODEL_METRICS_PATH="${RUN_DIR}/mllm_metrics.jsonl"
+export PYTHONUNBUFFERED=1
+
+set +u
+source /home/user/miniconda3/etc/profile.d/conda.sh
+conda activate mlspaces
+set -u
+source "${ROS_SETUP}"
+export ROS_PACKAGE_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src:/opt/ros/noetic/share"
+export PYTHONPATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:${PYTHONPATH:-}"
+
+cleanup_process() {
+  local pid="${1:-}"
+  local grace_s="${2:-20}"
+  if [[ -z "${pid}" ]] || ! kill -0 "${pid}" 2>/dev/null; then
+    return
+  fi
+  kill -INT "${pid}" 2>/dev/null || true
+  local attempts=$(( grace_s * 2 ))
+  local attempt=1
+  while (( attempt <= attempts )); do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      wait "${pid}" 2>/dev/null || true
+      return
+    fi
+    sleep 0.5
+    attempt=$(( attempt + 1 ))
+  done
+  kill -TERM "${pid}" 2>/dev/null || true
+  sleep 1
+  kill -KILL "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+}
+
+ROSCORE_PID=""
+ROSLAUNCH_PID=""
+RECORDER_PID=""
+cleanup() {
+  cleanup_process "${RECORDER_PID:-}" 30
+  cleanup_process "${ROSLAUNCH_PID:-}" 20
+  cleanup_process "${ROSCORE_PID:-}" 10
+}
+trap cleanup EXIT INT TERM
+
+MASTER_PORT=${ROS_MASTER_URI##*:}
+MASTER_PORT=${MASTER_PORT%%/*}
+if [[ ! "${MASTER_PORT}" =~ '^[0-9]+$' ]]; then
+  print -u2 -- "ROS_MASTER_URI must include a numeric port: ${ROS_MASTER_URI}"
+  exit 2
+fi
+
+roscore -p "${MASTER_PORT}" >"${RUN_DIR}/roscore.log" 2>&1 &
+ROSCORE_PID=$!
+MASTER_READY=false
+for _attempt in {1..120}; do
+  if timeout 1s rosparam list >/dev/null 2>&1; then
+    MASTER_READY=true
+    break
+  fi
+  sleep 0.25
+done
+if [[ "${MASTER_READY}" != true ]]; then
+  print -u2 -- "ROS master did not become ready: ${ROS_MASTER_URI}"
+  exit 3
+fi
+
+roslaunch nav_pkg molmospaces_nav_system.launch \
+  start_sim:=false \
+  start_mapping:=true \
+  mapping_mode:=odom_locked \
+  start_nav:=true \
+  start_explore:=false \
+  start_explore_py:=true \
+  start_semantic_mapping:=true \
+  semantic_source:=realtime_gt \
+  publish_realtime_gt:=false \
+  start_semantic_decision:=true \
+  semantic_attribute_inference:=true \
+  semantic_attribute_model_name:= \
+  semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
+  semantic_config_override_file:="${SEMANTIC_MAPPING_OVERRIDE}" \
+  explore_py_config_override_file:="${EXPLORE_PY_CONFIG_OVERRIDE}" \
+  nav_config_override_file:="${NAV_CONFIG_OVERRIDE}" \
+  >"${RUN_DIR}/roslaunch.log" 2>&1 &
+ROSLAUNCH_PID=$!
+
+# Start before the evaluator so every public observation/step-sync is captured.
+PYTHONUNBUFFERED=1 python -u "${RECORDER}" \
+  --output-dir "${RUN_DIR}/debug" \
+  --occupancy-grid-topic /semantic_mapping/planning_occ_map \
+  --raw-occupancy-grid-topic /struct_mapping/occ_map \
+  --image-topic /molmo_spaces/head_camera/image \
+  --video-step-sync-topic /molmo_spaces/step_sync \
+  --first-person-video-capture-mode step \
+  --semantic-video \
+  --first-person-video-with-map \
+  --first-person-video-fps "${VIDEO_FPS}" \
+  --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
+  --video-frame-job-queue-size 4 \
+  --video-frame-queue-overflow block \
+  --video-history-size 16 \
+  --artifact-write-queue-size 4 \
+  --runtime-video-encode \
+  --video-save-panel-frames \
+  --interaction-result-topic /semantic_mapping/interaction_result \
+  --no-external-video \
+  >"${RUN_DIR}/recorder.log" 2>&1 &
+RECORDER_PID=$!
+sleep 1
+
+EVAL_ARGS=(
+  "${REPO_ROOT}/scripts/InteractiveNav/evaluate_interactive_nav_v3.py"
+  --benchmark "${BENCHMARK}"
+  --output-dir "${RUN_DIR}/eval"
+  --policy "${POLICY}"
+  --workers 1
+  --episode-indices "${EPISODE_INDEX}"
+  --max-steps "${MAX_STEPS}"
+  --ros-action-timeout-s 1.0
+  --ros-map-warmup-skip-frames 0
+  --video-fps "${VIDEO_FPS}"
+  --progress-every 1
+)
+if [[ "${RECORD_HEAD_CAMERA}" == true ]]; then
+  EVAL_ARGS+=(--record-video)
+fi
+set +e
+MUJOCO_GL=egl python "${EVAL_ARGS[@]}" >"${RUN_DIR}/eval.log" 2>&1
+EVAL_EXIT=$?
+set -e
+
+if (( RECORDER_DRAIN_WAIT_S > 0 )); then
+  sleep "${RECORDER_DRAIN_WAIT_S}"
+fi
+cleanup_process "${RECORDER_PID}" 30
+RECORDER_PID=""
+cleanup_process "${ROSLAUNCH_PID}" 20
+ROSLAUNCH_PID=""
+cleanup_process "${ROSCORE_PID}" 10
+ROSCORE_PID=""
+
+EPISODE_RESULTS=("${RUN_DIR}"/eval/episodes/${EPISODE_INDEX}_*/episode_result.json)
+if (( ${#EPISODE_RESULTS} != 1 )); then
+  print -u2 -- "Expected one completed episode result for index ${EPISODE_INDEX}; found ${#EPISODE_RESULTS}"
+  exit 4
+fi
+EPISODE_RESULT=${EPISODE_RESULTS[1]}
+EPISODE_DIR=${EPISODE_RESULT:h}
+TOPDOWN_PATH="${EPISODE_DIR}/episode_topdown.png"
+
+MUJOCO_GL=egl python "${REPO_ROOT}/scripts/InteractiveNav/render_interactive_nav_v3_topdown.py" \
+  --episode-result "${EPISODE_RESULT}" \
+  --benchmark "${BENCHMARK}" \
+  --debug-dir "${RUN_DIR}/debug" \
+  --private-context "${EPISODE_DIR}/episode_visualization.json" \
+  --output "${TOPDOWN_PATH}" \
+  >"${RUN_DIR}/topdown.log" 2>&1
+
+SIX_PANEL_PATH="${RUN_DIR}/debug/videos/overview_6panel.mp4"
+for required_artifact in "${RUN_DIR}/debug/final_occ_map.yaml" "${RUN_DIR}/debug/trajectory.csv" \
+  "${SIX_PANEL_PATH}" "${TOPDOWN_PATH}"; do
+  if [[ ! -s "${required_artifact}" ]]; then
+    print -u2 -- "Required visual artifact is missing or empty: ${required_artifact}"
+    exit 4
+  fi
+done
+
+print -r -- "[v3-ros-eval] six-panel=${SIX_PANEL_PATH}"
+print -r -- "[v3-ros-eval] topdown=${TOPDOWN_PATH}"
+print -r -- "[v3-ros-eval] result=${EPISODE_RESULT}"
+exit "${EVAL_EXIT}"

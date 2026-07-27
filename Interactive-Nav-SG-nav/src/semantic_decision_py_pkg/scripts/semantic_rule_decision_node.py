@@ -42,7 +42,10 @@ from std_msgs.msg import String
 
 class SemanticRuleDecisionNode:
     def __init__(self) -> None:
-        load_env_file(os.environ.get("SEMANTIC_DECISION_ENV_FILE"))
+        env_path = os.environ.get("SEMANTIC_DECISION_ENV_FILE")
+        # An explicitly selected model env file must take precedence over a
+        # shell-inherited credential from an unrelated service.
+        load_env_file(env_path, override=bool(env_path))
         rospy.init_node("semantic_rule_decision_node")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~policy", {}) or {}

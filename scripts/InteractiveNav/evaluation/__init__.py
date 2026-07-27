@@ -7,10 +7,24 @@ public API and the ``evaluate_interactive_nav_v3.py`` CLI use
 tests and experimental callers.
 """
 
-from .benchmark_runner import BenchmarkEvaluationConfig, run_evaluation
-
-# Keep the concise historical name for callers importing the package-level
-# API, while pointing it at the canonical benchmark protocol.
-EvaluationConfig = BenchmarkEvaluationConfig
-
 __all__ = ["BenchmarkEvaluationConfig", "EvaluationConfig", "run_evaluation"]
+
+
+def __getattr__(name: str):
+    """Keep offline reporting importable without a MuJoCo runtime.
+
+    The evaluator itself still imports ``benchmark_runner`` on demand.  This
+    matters for result-only tools such as ``episode_topdown``: they only need
+    NumPy/OpenCV/Matplotlib and should not require the simulator installation.
+    """
+
+    if name not in set(__all__):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from .benchmark_runner import BenchmarkEvaluationConfig, run_evaluation
+
+    values = {
+        "BenchmarkEvaluationConfig": BenchmarkEvaluationConfig,
+        "EvaluationConfig": BenchmarkEvaluationConfig,
+        "run_evaluation": run_evaluation,
+    }
+    return values[name]

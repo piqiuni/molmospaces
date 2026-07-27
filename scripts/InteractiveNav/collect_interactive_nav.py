@@ -1839,22 +1839,29 @@ def run_door_parallel(
                 "--benchmark_dir", str(benchmark_dir), "--output_dir", str(output_dir),
                 "--mode", "build", "--input_mode", "original", "--variant", config.source.variant,
                 "--max_episodes", str(len(shard_episodes)),
+                "--preserve_source_episode_indices",
                 "--num_distractor_samples_per_episode", "1", "--num_mixed_samples_per_critical_door", "1",
                 "--distractor_k_min", str(config.collection.domains.channel.distractor_k_min),
                 "--distractor_k_max", str(config.collection.domains.channel.distractor_k_max),
             ]
-            shard_jobs.append((shard_index, command, output_dir, shard_houses))
+            shard_env = {
+                **env,
+                "INTERACTIVE_NAV_SCENE_MIRROR": str(
+                    batch_dir / f"shard_{shard_index:03d}" / "scene_assets"
+                ),
+            }
+            shard_jobs.append((shard_index, command, output_dir, shard_houses, shard_env))
         with ThreadPoolExecutor(max_workers=len(shard_jobs) or 1) as executor:
             futures = {
                 executor.submit(
                     run_command, command,
                     log_path=batch_dir / f"shard_{index:03d}" / "run.log",
-                    env=env,
-                ): (index, output_dir, shard_houses)
-                for index, command, output_dir, shard_houses in shard_jobs
+                    env=shard_env,
+                ): (index, output_dir, shard_houses, shard_env)
+                for index, command, output_dir, shard_houses, shard_env in shard_jobs
             }
             for future in as_completed(futures):
-                index, output_dir, shard_houses = futures[future]
+                index, output_dir, shard_houses, _shard_env = futures[future]
                 returncode = future.result()
                 results.append({"batch": batch_index - 1, "shard": index, "house_indices": shard_houses, "returncode": returncode, "output_dir": str(output_dir)})
                 if (output_dir / "benchmark.json").exists():

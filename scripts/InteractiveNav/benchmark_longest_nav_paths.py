@@ -150,17 +150,66 @@ def nearest_nav_object(env, nav_objects: list[MlSpacesObject]) -> MlSpacesObject
     return min(nav_objects, key=lambda obj: float(np.linalg.norm(obj.position[:2] - robot_xy)))
 
 
+def target_goal_validation(
+    target_obj: MlSpacesObject,
+    goal: np.ndarray,
+    *,
+    success_distance_threshold_m: float,
+    terminal_position_tolerance_m: float = 0.25,
+) -> dict[str, Any]:
+    """Verify that a sampled navigation goal belongs to the selected object.
+
+    A goal sampler may choose any free point around an object, but it must not
+    silently return a point for a different candidate instance.  Keeping this
+    check next to target selection makes the target identity and terminal
+    geometry a single invariant for every Channel generation path.
+    """
+    target_position = np.asarray(target_obj.position, dtype=float)
+    goal_position = np.asarray(goal, dtype=float)
+    distance_m = float(np.linalg.norm(target_position[:2] - goal_position[:2]))
+    allowed_distance_m = float(success_distance_threshold_m) + float(
+        terminal_position_tolerance_m
+    )
+    return {
+        "target_object_name": str(target_obj.name),
+        "target_position_xy": target_position[:2].tolist(),
+        "goal_position_xy": goal_position[:2].tolist(),
+        "planar_distance_m": distance_m,
+        "success_distance_threshold_m": float(success_distance_threshold_m),
+        "terminal_position_tolerance_m": float(terminal_position_tolerance_m),
+        "allowed_distance_m": allowed_distance_m,
+        "passed": distance_m <= allowed_distance_m,
+        "validated_by": "selected_target_to_sampled_nav_goal_geometry",
+    }
+
+
 def sample_nav_goal_for_episode(
     env,
     scene_map,
     episode: dict[str, Any],
+    target_object_override: str | None = None,
 ) -> tuple[np.ndarray, str, str | None, str, list[str]]:
     nav_objects, resolved_candidates, _source_target_name = episode_nav_objects(env, episode)
-    target_obj = nearest_nav_object(env, nav_objects)
-    # The sampled goal belongs to the nearest eligible candidate, not
-    # necessarily the source task's first/canonical candidate.  Callers use
-    # this returned name as the V3 specific instance, so it must stay coupled
-    # to ``target_obj`` for every sampler/fallback branch below.
+    if target_object_override is not None:
+        target_object_override = normalize_object_name(
+            target_object_override,
+            set(resolved_candidates),
+        )
+        target_obj = next(
+            (obj for obj in nav_objects if obj.name == target_object_override),
+            None,
+        )
+        if target_obj is None:
+            raise ValueError(
+                "target_object_override is not a resolved episode candidate: "
+                f"target={target_object_override!r} candidates={resolved_candidates!r}"
+            )
+    else:
+        target_obj = nearest_nav_object(env, nav_objects)
+    # The sampled goal belongs to the selected eligible candidate, which may
+    # be the nearest candidate or an explicit override.  Callers use this
+    # returned name as the V3 specific instance, so it must stay coupled to
+    # ``target_obj`` for every sampler/fallback branch below.
     selected_target_name = target_obj.name
     sampler = NavGoalSampler(scene_map, check_target_in_view=False, camera_name="head_camera")
     sampler.set_target(target_obj)

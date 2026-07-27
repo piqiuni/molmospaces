@@ -10,6 +10,7 @@ if str(DECISION_SCRIPTS) not in sys.path:
 
 
 from semantic_decision_py_pkg.visual_interaction_planning import (
+    action_for_opaque_open_contract,
     candidate_with_visual_operation_plan,
     infer_visual_interaction_target_type,
 )
@@ -66,3 +67,8 @@ def test_portal_visual_plan_preserves_atomic_open_and_method() -> None:
     assert command["action"] == "open"
     assert command["operation_method"] == "double_hinged"
     assert command.get("sequence_type", "") == ""
+
+
+def test_opaque_open_contract_clamps_only_when_explicitly_enabled() -> None:
+    assert action_for_opaque_open_contract("scan", enabled=False) == "scan"
+    assert action_for_opaque_open_contract("scan", enabled=True) == "open"
