@@ -46,7 +46,10 @@ import rospy
 import tf
 from explore_py_pkg.debug_semantic_viz import (
     candidate_color,
-    portal_positions_between_rooms,
+    topology_edge_style,
+    topology_edge_visible,
+    topology_hierarchy_layout,
+    topology_node_style,
 )
 from actionlib_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
@@ -2408,6 +2411,387 @@ class ExploreDebugRecorder:
         return panel
 
     def _render_semantic_topology_panel_locked(
+        self,
+        panel_width: int,
+        panel_height: int,
+        graph: dict | None = None,
+        semantic_events: list[dict] | None = None,
+        observed_instance_ids: set[str] | None = None,
+        semantic_selection: dict | None = None,
+        semantic_execution_state: dict | None = None,
+        semantic_behavior_feedback: dict | None = None,
+        semantic_decision_trace: dict | None = None,
+        image_step: int | None = None,
+    ) -> object:
+        panel = np.full(
+            (panel_height, panel_width, 3),
+            (220, 248, 255),
+            dtype=np.uint8,
+        )
+        graph = self.latest_unified_graph if graph is None else graph
+        semantic_events = self.semantic_events if semantic_events is None else semantic_events
+        semantic_selection = (
+            self.latest_semantic_selection
+            if semantic_selection is None
+            else semantic_selection
+        )
+        semantic_execution_state = (
+            self.latest_semantic_execution_state
+            if semantic_execution_state is None
+            else semantic_execution_state
+        )
+        semantic_behavior_feedback = (
+            self.latest_semantic_behavior_feedback
+            if semantic_behavior_feedback is None
+            else semantic_behavior_feedback
+        )
+        semantic_decision_trace = (
+            self.latest_semantic_decision_trace
+            if semantic_decision_trace is None
+            else semantic_decision_trace
+        )
+        selected_target_id = _selection_target_id(semantic_selection)
+        all_nodes = [
+            node
+            for node in graph.get("nodes") or []
+            if self._node_observed_in_recording(node, observed_instance_ids)
+        ]
+        node_lookup = {
+            str(node.get("id") or ""): node
+            for node in all_nodes
+            if str(node.get("id") or "")
+        }
+        graph_edges = list(graph.get("edges") or [])
+        contains_edges = [
+            edge
+            for edge in graph_edges
+            if str(edge.get("relation") or "") == "contains"
+        ]
+        contained_ids = {str(edge.get("dst_id") or "") for edge in contains_edges}
+        selected_nodes = [
+            node
+            for node in all_nodes
+            if str(node.get("type") or "") in {"room", "portal", "container"}
+            or str(node.get("id") or "") in contained_ids
+        ]
+        selected_lookup = {
+            str(node.get("id") or ""): node for node in selected_nodes
+        }
+        display_edges = [
+            dict(edge)
+            for edge in graph_edges
+            if topology_edge_visible(edge, selected_lookup)
+        ]
+        edge_keys = {
+            (
+                str(edge.get("src_id") or ""),
+                str(edge.get("dst_id") or ""),
+                str(edge.get("relation") or ""),
+            )
+            for edge in display_edges
+        }
+        for node in selected_nodes:
+            node_id = str(node.get("id") or "")
+            node_type = str(node.get("type") or "")
+            if node_type == "portal":
+                connected_rooms = (node.get("attributes") or {}).get(
+                    "connected_room_ids"
+                ) or []
+                for room_id in connected_rooms:
+                    room_node_id = (
+                        str(room_id)
+                        if str(room_id).startswith("room_")
+                        else f"room_{room_id}"
+                    )
+                    key = (node_id, room_node_id, "connects")
+                    if room_node_id in selected_lookup and key not in edge_keys:
+                        display_edges.append(
+                            {
+                                "src_id": node_id,
+                                "dst_id": room_node_id,
+                                "relation": "connects",
+                            }
+                        )
+                        edge_keys.add(key)
+            elif node_type == "container":
+                room_id = node.get("room_id")
+                room_node_id = (
+                    f"room_{int(room_id)}"
+                    if room_id is not None
+                    else str(node.get("parent_id") or "")
+                )
+                key = (room_node_id, node_id, "has_child")
+                if room_node_id in selected_lookup and key not in edge_keys:
+                    display_edges.append(
+                        {
+                            "src_id": room_node_id,
+                            "dst_id": node_id,
+                            "relation": "has_child",
+                        }
+                    )
+                    edge_keys.add(key)
+
+        layout = topology_hierarchy_layout(
+            selected_nodes,
+            display_edges,
+            panel_width,
+            panel_height,
+        )
+        positions = layout["positions"]
+        boxes = layout["boxes"]
+        row_y = layout["row_y"]
+
+        def dashed_line(start, end, color, thickness=2, dash=6, gap=4):
+            dx = float(end[0] - start[0])
+            dy = float(end[1] - start[1])
+            length = max(1.0, math.hypot(dx, dy))
+            cursor = 0.0
+            while cursor < length:
+                segment_end = min(length, cursor + dash)
+                p1 = (
+                    int(start[0] + dx * cursor / length),
+                    int(start[1] + dy * cursor / length),
+                )
+                p2 = (
+                    int(start[0] + dx * segment_end / length),
+                    int(start[1] + dy * segment_end / length),
+                )
+                cv2.line(panel, p1, p2, color, thickness, cv2.LINE_AA)
+                cursor += dash + gap
+
+        def dashed_rectangle(box, color, thickness=2):
+            x1, y1, x2, y2 = box
+            dashed_line((x1, y1), (x2, y1), color, thickness)
+            dashed_line((x2, y1), (x2, y2), color, thickness)
+            dashed_line((x2, y2), (x1, y2), color, thickness)
+            dashed_line((x1, y2), (x1, y1), color, thickness)
+
+        def fit_text(text: str, max_width: int, scale: float = 0.28) -> str:
+            value = str(text or "")
+            if max_width <= 6:
+                return ""
+            while value:
+                width = cv2.getTextSize(
+                    value, cv2.FONT_HERSHEY_SIMPLEX, scale, 1
+                )[0][0]
+                if width <= max_width:
+                    return value
+                value = value[:-1]
+            return ""
+
+        label_names = {
+            "room": "room level",
+            "portal": "door level",
+            "container": "container level",
+            "object": "object level",
+        }
+        for node_type, y in row_y.items():
+            cv2.line(
+                panel,
+                (layout["left_gutter"], y),
+                (panel_width - 5, y),
+                (218, 221, 224),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                panel,
+                label_names[node_type],
+                (4, min(panel_height - 4, y + 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.25,
+                (120, 105, 90),
+                1,
+                cv2.LINE_AA,
+            )
+
+        for edge in display_edges:
+            src_id = str(edge.get("src_id") or "")
+            dst_id = str(edge.get("dst_id") or "")
+            src = positions.get(src_id)
+            dst = positions.get(dst_id)
+            if src is None or dst is None:
+                continue
+            src_type = str((selected_lookup.get(src_id) or {}).get("type") or "")
+            dst_type = str((selected_lookup.get(dst_id) or {}).get("type") or "")
+            style = topology_edge_style(
+                str(edge.get("relation") or ""), src_type, dst_type
+            )
+            if style is None:
+                continue
+            cv2.line(
+                panel,
+                src,
+                dst,
+                style["color"],
+                int(style["thickness"]),
+                cv2.LINE_AA,
+            )
+
+        ranked_group_ids = list(
+            semantic_decision_trace.get("model_ranked_group_ids") or []
+        )
+        candidate_groups = {
+            str(item.get("id") or ""): item
+            for item in semantic_decision_trace.get("candidate_groups") or []
+        }
+        ranked_node_ids = [
+            str((candidate_groups.get(str(group_id)) or {}).get("subject_id") or "")
+            for group_id in ranked_group_ids[:3]
+        ]
+        for node in selected_nodes:
+            node_id = str(node.get("id") or "")
+            box = boxes.get(node_id)
+            if box is None:
+                continue
+            style = topology_node_style(node)
+            x1, y1, x2, y2 = box
+            cv2.rectangle(panel, (x1, y1), (x2, y2), style["fill"], -1)
+            if style["dashed"]:
+                dashed_rectangle(box, style["border"], 2)
+            else:
+                cv2.rectangle(
+                    panel,
+                    (x1, y1),
+                    (x2, y2),
+                    style["border"],
+                    2,
+                    cv2.LINE_AA,
+                )
+            if self._node_matches_target(node, selected_target_id):
+                cv2.rectangle(
+                    panel,
+                    (max(1, x1 - 2), max(1, y1 - 2)),
+                    (min(panel_width - 2, x2 + 2), min(panel_height - 2, y2 + 2)),
+                    (235, 35, 210),
+                    2,
+                    cv2.LINE_AA,
+                )
+            if node_id in ranked_node_ids:
+                rank = ranked_node_ids.index(node_id) + 1
+                cv2.circle(panel, (x1 + 7, y1 + 7), 6, (0, 180, 245), -1)
+                cv2.putText(
+                    panel,
+                    str(rank),
+                    (x1 + 4, y1 + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.23,
+                    (20, 20, 20),
+                    1,
+                    cv2.LINE_AA,
+                )
+            node_type = str(node.get("type") or "object")
+            state = str((node.get("interaction") or {}).get("state") or "unknown")
+            display_label = self._semantic_node_display_label(node)
+            if node_type == "room":
+                room_id = node.get("room_id")
+                if room_id is None:
+                    room_id = node_id.removeprefix("room_")
+                line1 = fit_text(f"Room {room_id}", x2 - x1 - 8, 0.29)
+                line2 = fit_text(display_label, x2 - x1 - 8, 0.25)
+                cv2.putText(
+                    panel,
+                    line1,
+                    (x1 + 4, y1 + 13),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.29,
+                    (25, 25, 25),
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    panel,
+                    line2,
+                    (x1 + 4, y2 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.25,
+                    (25, 25, 25),
+                    1,
+                    cv2.LINE_AA,
+                )
+            else:
+                prefix = self._short_node_id(node)
+                text = (
+                    display_label
+                    if node_type == "object"
+                    else f"{prefix} {display_label}"
+                    if prefix
+                    else display_label
+                )
+                if node_type in {"portal", "container"}:
+                    text = f"{text} [{state}]"
+                text = fit_text(text, x2 - x1 - 6, 0.25)
+                text_width, text_height = cv2.getTextSize(
+                    text, cv2.FONT_HERSHEY_SIMPLEX, 0.25, 1
+                )[0]
+                cv2.putText(
+                    panel,
+                    text,
+                    (x1 + max(3, (x2 - x1 - text_width) // 2), (y1 + y2 + text_height) // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.25,
+                    (25, 25, 25),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        dashed_rectangle((4, 29, 13, 37), (35, 35, 210), 1)
+        cv2.putText(
+            panel, "closed", (16, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23,
+            (65, 65, 65), 1, cv2.LINE_AA,
+        )
+        cv2.rectangle(panel, (57, 29), (66, 37), (45, 175, 70), 2)
+        cv2.putText(
+            panel, "open", (69, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23,
+            (65, 65, 65), 1, cv2.LINE_AA,
+        )
+        execution_state = str(semantic_execution_state.get("state") or "IDLE")
+        behavior_type = str(semantic_selection.get("behavior_type") or "-")
+        feedback_status = str(semantic_behavior_feedback.get("status") or "-")
+        executed_group_id = str(
+            semantic_decision_trace.get("executed_group_id") or "-"
+        )
+        footer = fit_text(
+            f"{execution_state}/{behavior_type}  exec={executed_group_id}  feedback={feedback_status}",
+            panel_width - 10,
+            0.24,
+        )
+        cv2.putText(
+            panel,
+            footer,
+            (5, panel_height - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.24,
+            (55, 55, 55),
+            1,
+            cv2.LINE_AA,
+        )
+        if semantic_events:
+            event = semantic_events[-1]
+            event_text = fit_text(
+                f"r{event.get('graph_revision', 0)} {event.get('event', '')} {event.get('node_id') or event.get('relation', '')}",
+                max(80, panel_width - 155),
+                0.23,
+            )
+            cv2.putText(
+                panel,
+                event_text,
+                (145, 37),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.23,
+                (45, 105, 55),
+                1,
+                cv2.LINE_AA,
+            )
+        revision = int(graph.get("graph_revision", 0) or 0)
+        self._draw_panel_title(
+            panel,
+            f"SEMANTIC INTERACTION GRAPH r{revision}",
+            image_step,
+        )
+        return panel
+
+    def _render_semantic_topology_panel_legacy_locked(
         self,
         panel_width: int,
         panel_height: int,

@@ -170,6 +170,7 @@ def test_model_candidate_exposes_unknown_area_and_nearby_semantics() -> None:
         features={"distance_m": 4.0},
         metadata={
             "unknown_component_area_m2": 22.75,
+            "expected_visible_unknown_area_m2": 14.5,
             "nearby_semantic_nodes": [
                 {
                     "label": "refrigerator",
@@ -183,9 +184,11 @@ def test_model_candidate_exposes_unknown_area_and_nearby_semantics() -> None:
     request = client.build_request([candidate], {"enabled": True, "target_name": "apple"}, {})
 
     assert request["candidates"][0]["unknown_component_area_m2"] == 22.75
+    assert request["candidates"][0]["expected_visible_unknown_area_m2"] == 14.5
     assert request["candidates"][0]["nearby_semantic_nodes"] == [
         {"type": "refrigerator", "distance_m": 0.8, "visible": True}
     ]
+    assert "expected_visible_unknown_area_m2" in request["instruction"]
     assert "distance only as a tie-break" in request["instruction"]
 
 
@@ -200,7 +203,11 @@ def test_model_request_contains_only_semantic_candidate_fields_and_distance() ->
         goal_xyyaw=[3.0, 4.0, 1.2],
         interaction_command={"action": "open", "joint_names": ["joint_1"]},
         features={"distance_m": 2.345, "visibility_gain": 0.9, "interaction_cost": 1.0},
-        metadata={"node_type": "container", "debug": {"large": "payload"}},
+        metadata={
+            "node_type": "container",
+            "semantic_name": "refrigerator",
+            "debug": {"large": "payload"},
+        },
     )
 
     request = client.build_request(
@@ -224,6 +231,7 @@ def test_model_request_contains_only_semantic_candidate_fields_and_distance() ->
             "effect": "reveal_contents",
             "distance_m": 2.35,
             "subject_name": "refrigerator",
+            "subject_semantic_type": "refrigerator",
         }
     ]
     serialized = str(request)

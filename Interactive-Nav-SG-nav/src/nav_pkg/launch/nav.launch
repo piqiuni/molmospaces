@@ -4,10 +4,17 @@
     <arg name="base_local_planner" default="dwa_local_planner/DWAPlannerROS"/>
     <arg name="base_global_planner" default="nav_pkg/OrientedGlobalPlanner"/>
     <arg name="global_map_topic" default="/struct_mapping/occ_map"/>
+    <arg name="move_base_respawn" default="true"/>
+    <arg name="move_base_respawn_delay" default="2.0"/>
 
     <node pkg="nav_pkg" type="relay_node" name="relay_node" output="screen"/>
 
-    <node pkg="move_base" type="move_base" name="move_base" output="screen" >
+    <node pkg="move_base"
+          type="move_base"
+          name="move_base"
+          output="screen"
+          respawn="$(arg move_base_respawn)"
+          respawn_delay="$(arg move_base_respawn_delay)">
         <rosparam file="$(find nav_pkg)/configs/costmap_common_params.yaml" command="load" ns="global_costmap" />
         <rosparam file="$(find nav_pkg)/configs/costmap_common_params.yaml" command="load" ns="local_costmap" />
 

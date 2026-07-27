@@ -167,6 +167,41 @@ class TargetMissionTracker:
         self.pending_interaction: dict[str, str] | None = None
 
     @staticmethod
+    def priority_target_candidate(
+        candidates: list[dict[str, Any]] | None,
+        *,
+        currently_visible_only: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return a reliable concrete target-navigation candidate, preferring current visibility."""
+        matches = []
+        for candidate in candidates or []:
+            metadata = candidate.get("metadata") or {}
+            if str(candidate.get("behavior_type") or "").upper() != "NAVIGATE":
+                continue
+            if not bool(metadata.get("target_goal")) or not bool(
+                metadata.get("target_reliably_observed")
+            ):
+                continue
+            if currently_visible_only and not bool(metadata.get("target_visible_now")):
+                continue
+            matches.append(candidate)
+        if not matches:
+            return None
+        return min(
+            matches,
+            key=lambda candidate: (
+                0
+                if bool((candidate.get("metadata") or {}).get("target_visible_now"))
+                else 1,
+                float(
+                    (candidate.get("features") or {}).get("distance_m", float("inf"))
+                    or 0.0
+                ),
+                str(candidate.get("candidate_id") or ""),
+            ),
+        )
+
+    @staticmethod
     def _normalized(value: Any) -> str:
         return " ".join(str(value or "").casefold().replace("_", " ").split())
 

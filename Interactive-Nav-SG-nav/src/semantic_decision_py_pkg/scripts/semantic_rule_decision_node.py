@@ -109,6 +109,10 @@ class SemanticRuleDecisionNode:
         self.repeat_guard_min_frontier_shrink_m = max(
             0.0, float(config.get("repeat_guard_min_frontier_shrink_m", 0.15))
         )
+        self.repeat_guard_min_visible_area_shrink_m2 = max(
+            0.0,
+            float(config.get("repeat_guard_min_visible_area_shrink_m2", 0.5)),
+        )
         self.mission_mode = self._normalize_mission_mode(
             mission_config.get("mode", "semantic_interaction_exploration")
         )
@@ -160,6 +164,9 @@ class SemanticRuleDecisionNode:
                     model_config.get("history_region_size_m", 1.0)
                 ),
                 repeat_guard_low_gain_limit=self.repeat_guard_low_gain_limit,
+                explore_min_visible_gain_ratio=float(
+                    model_config.get("explore_min_visible_gain_ratio", 0.25)
+                ),
                 goal_position_tolerance_m=float(
                     model_config.get("stale_goal_position_tolerance_m", 0.35)
                 ),
@@ -205,6 +212,8 @@ class SemanticRuleDecisionNode:
         self.target_goal_complete = False
         self.target_context: dict = {}
         self.active_target_goal = False
+        self.priority_target_candidate_id = ""
+        self.preempt_requested_for_decision_id = ""
         self.cooldown_until: dict[str, float] = {}
         self.failure_counts: dict[str, int] = {}
         self.decision_index = 0
@@ -213,6 +222,11 @@ class SemanticRuleDecisionNode:
             String,
             queue_size=1,
             latch=True,
+        )
+        self.preempt_pub = rospy.Publisher(
+            topics.get("preempt_request", "/semantic_decision/preempt_request"),
+            String,
+            queue_size=2,
         )
         self.trace_pub = rospy.Publisher(
             "/semantic_decision/decision_trace", String, queue_size=1, latch=True
@@ -254,6 +268,8 @@ class SemanticRuleDecisionNode:
                 self.goal_complete = False
                 self.target_goal_complete = False
                 self.active_target_goal = False
+                self.priority_target_candidate_id = ""
+                self.preempt_requested_for_decision_id = ""
                 self.target_mission.reset()
                 self.cooldown_until.clear()
                 self.failure_counts.clear()
@@ -276,11 +292,49 @@ class SemanticRuleDecisionNode:
                 self.target_context = dict(target_context)
                 self.goal_complete = False
                 self.target_goal_complete = False
+                self.priority_target_candidate_id = ""
+                self.preempt_requested_for_decision_id = ""
                 self.target_mission.reset()
                 self._publish_goal_status(
                     "ACTIVE" if target_context.get("enabled") else "DISABLED"
                 )
             self.latest_candidates_payload = payload
+            priority_target = self.target_mission.priority_target_candidate(
+                payload.get("candidates") or []
+            )
+            if priority_target is not None:
+                self.priority_target_candidate_id = str(
+                    priority_target.get("candidate_id") or ""
+                )
+            if (
+                priority_target is not None
+                and self.active_candidate_id
+                and self.active_behavior_type == "EXPLORE"
+                and not self.active_target_goal
+                and self.preempt_requested_for_decision_id
+                != self.active_decision_id
+            ):
+                self.preempt_requested_for_decision_id = self.active_decision_id
+                self.preempt_pub.publish(
+                    String(
+                        data=json.dumps(
+                            {
+                                "decision_id": self.active_decision_id,
+                                "candidate_id": self.active_candidate_id,
+                                "replacement_candidate_id": str(
+                                    priority_target.get("candidate_id") or ""
+                                ),
+                                "reason": "preempted_by_target",
+                                "candidate_sequence": int(
+                                    payload.get("sequence", 0) or 0
+                                ),
+                                "timestamp": time.time(),
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                )
 
     def _feedback_callback(self, message: String) -> None:
         try:
@@ -299,8 +353,14 @@ class SemanticRuleDecisionNode:
         if status not in {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}:
             return
         self._record_decision_result(payload)
-        self.completion_tracker.note_feedback(payload)
-        if candidate_id:
+        detail = payload.get("detail") or {}
+        preempted_by_target = bool(
+            status == "CANCELED"
+            and str(detail.get("reason") or "") == "preempted_by_target"
+        )
+        if not preempted_by_target:
+            self.completion_tracker.note_feedback(payload)
+        if candidate_id and not preempted_by_target:
             if status == "SUCCEEDED":
                 self.failure_counts.pop(candidate_id, None)
                 cooldown_s = self.success_cooldown_s
@@ -312,13 +372,17 @@ class SemanticRuleDecisionNode:
                     failure_count,
                 )
             self.cooldown_until[candidate_id] = time.monotonic() + cooldown_s
-        if status != "SUCCEEDED" and self.active_behavior_type == "INTERACT":
+        if (
+            status != "SUCCEEDED"
+            and not preempted_by_target
+            and self.active_behavior_type == "INTERACT"
+        ):
             target_id = self._interaction_target_id(candidate_id)
             if target_id:
                 self.cooldown_until[target_id] = time.monotonic() + max(
                     0.0, self.interaction_target_failure_cooldown_s
                 )
-        if status != "SUCCEEDED":
+        if status != "SUCCEEDED" and not preempted_by_target:
             self.next_decision_time = time.monotonic() + self.failure_retry_delay_s
         if status == "SUCCEEDED":
             self.minimum_candidate_sequence = max(
@@ -375,6 +439,7 @@ class SemanticRuleDecisionNode:
         self.active_decision_id = ""
         self.active_behavior_type = ""
         self.active_target_goal = False
+        self.preempt_requested_for_decision_id = ""
 
     def _tick(self, _event) -> None:
         with self.state_lock:
@@ -435,7 +500,32 @@ class SemanticRuleDecisionNode:
             now=now,
             region_history=region_history,
         )
-        selected = self.policy.select(eligible)
+        priority_target = next(
+            (
+                candidate
+                for candidate in eligible
+                if candidate.candidate_id == self.priority_target_candidate_id
+                and bool((candidate.metadata or {}).get("target_goal"))
+            ),
+            None,
+        )
+        if priority_target is None:
+            priority_payload = self.target_mission.priority_target_candidate(
+                [candidate.to_dict() for candidate in eligible]
+            )
+            if priority_payload is not None:
+                priority_candidate_id = str(
+                    priority_payload.get("candidate_id") or ""
+                )
+                priority_target = next(
+                    (
+                        candidate
+                        for candidate in eligible
+                        if candidate.candidate_id == priority_candidate_id
+                    ),
+                    None,
+                )
+        selected = priority_target or self.policy.select(eligible)
         scored = list(eligible)
         curation = self.candidate_curator.curate(
             eligible,
@@ -471,11 +561,14 @@ class SemanticRuleDecisionNode:
         model_selected_group_id = ""
         model_selected_candidate_id = ""
         model_selection_succeeded = False
-        selection_override_reason = ""
+        selection_override_reason = (
+            "reliable_target_goal_priority" if priority_target is not None else ""
+        )
         if (
             self.policy_backend == "model"
             and not model_circuit_open
             and model_candidates
+            and priority_target is None
         ):
             model_selected = self.model_policy.select(
                 model_candidates,
@@ -518,6 +611,14 @@ class SemanticRuleDecisionNode:
                 self.model_circuit_breaker.record_success()
             elif self.model_policy.last_error:
                 self.model_circuit_breaker.record_failure(self.model_policy.last_error, now)
+        elif priority_target is not None:
+            self.model_policy.last_error = ""
+            self.model_policy.last_result_source = "rule_priority_target"
+            self.model_policy.last_reason = (
+                "Reliable mission target detected; execute its concrete NAVIGATE subgoal."
+            )
+            self.model_policy.last_confidence = "high"
+            self.model_policy.last_metrics = {}
         elif self.policy_backend == "model" and not model_candidates:
             self.model_policy.last_error = "no_curated_model_candidates"
             self.model_policy.last_result_source = "rule_fallback_empty_top_k"
@@ -526,7 +627,7 @@ class SemanticRuleDecisionNode:
             self.model_policy.last_error = "model_circuit_open_after_consecutive_timeouts"
             self.model_policy.last_result_source = "rule_fallback_circuit_open"
             self.model_policy.last_metrics = {}
-        if not model_selection_succeeded:
+        if not model_selection_succeeded and priority_target is None:
             selected, selection_override_reason = self._apply_repeat_guard(
                 selected,
                 eligible,
@@ -573,12 +674,33 @@ class SemanticRuleDecisionNode:
                     selected = validation.candidate
                 else:
                     stale_selected = True
-                    selected = self.policy.select(latest_eligible)
-                    stale_fallback_used = selected is not None
-                    selection_override_reason = (
-                        f"stale_response_rule_fallback:{validation.reason}"
+                    latest_priority_payload = (
+                        self.target_mission.priority_target_candidate(
+                            [candidate.to_dict() for candidate in latest_eligible]
+                        )
                     )
-                    if selected is not None:
+                    latest_priority_id = str(
+                        (latest_priority_payload or {}).get("candidate_id") or ""
+                    )
+                    selected = next(
+                        (
+                            candidate
+                            for candidate in latest_eligible
+                            if candidate.candidate_id == latest_priority_id
+                        ),
+                        None,
+                    ) or self.policy.select(latest_eligible)
+                    stale_fallback_used = selected is not None
+                    if latest_priority_id and selected is not None:
+                        selection_override_reason = (
+                            "stale_response_target_priority_fallback:"
+                            f"{validation.reason}"
+                        )
+                    else:
+                        selection_override_reason = (
+                            f"stale_response_rule_fallback:{validation.reason}"
+                        )
+                    if selected is not None and not latest_priority_id:
                         selected, repeat_reason = self._apply_repeat_guard(
                             selected,
                             latest_eligible,
@@ -692,6 +814,8 @@ class SemanticRuleDecisionNode:
                 self.target_mission.pending_interaction is not None
                 and selected.behavior_type == "INTERACT"
             )
+            if self.active_target_goal:
+                self.priority_target_candidate_id = selected.candidate_id
             self._record_decision_selection(
                 decision_id,
                 selected,
@@ -857,6 +981,33 @@ class SemanticRuleDecisionNode:
             )
         return total
 
+    def _region_expected_visible_area(
+        self,
+        history_key: str,
+        candidates: list[BehaviorCandidate],
+        graph: dict,
+    ) -> float:
+        total = 0.0
+        for candidate in candidates:
+            if str(candidate.behavior_type or "").upper() != "EXPLORE":
+                continue
+            if candidate_history_key(
+                candidate,
+                graph,
+                self.candidate_curator.config.region_size_m,
+            ) != history_key:
+                continue
+            total += max(
+                0.0,
+                float(
+                    (candidate.metadata or {}).get(
+                        "expected_visible_unknown_area_m2", 0.0
+                    )
+                    or 0.0
+                ),
+            )
+        return total
+
     def _record_decision_selection(
         self,
         decision_id: str,
@@ -921,6 +1072,13 @@ class SemanticRuleDecisionNode:
                     candidates,
                     graph,
                 ),
+                "region_expected_visible_area_before_m2": (
+                    self._region_expected_visible_area(
+                        history_key,
+                        candidates,
+                        graph,
+                    )
+                ),
                 "model_selected_group_id": model_selected_group_id,
                 "override_reason": override_reason,
                 "result": "PENDING",
@@ -941,7 +1099,13 @@ class SemanticRuleDecisionNode:
         if entry is None:
             return
         status = str(payload.get("status") or "UNKNOWN")
+        neutral_preempt = bool(
+            status == "CANCELED"
+            and str(((payload.get("detail") or {}).get("reason") or ""))
+            == "preempted_by_target"
+        )
         entry["result"] = status
+        entry["neutral_preempt"] = neutral_preempt
         group_id = str(entry.get("group_id") or "")
         history_key = str(entry.get("history_key") or "")
         entry["evaluate_after_sequence"] = (
@@ -956,7 +1120,7 @@ class SemanticRuleDecisionNode:
                 region_stats["success_count"] = int(
                     region_stats.get("success_count", 0) or 0
                 ) + 1
-            else:
+            elif not neutral_preempt:
                 region_stats["failure_count"] = int(
                     region_stats.get("failure_count", 0) or 0
                 ) + 1
@@ -996,12 +1160,30 @@ class SemanticRuleDecisionNode:
                 )
                 region_delta = region_current_length - region_before_length
                 region_shrink = region_before_length - region_current_length
+                region_current_visible_area = self._region_expected_visible_area(
+                    history_key,
+                    candidates,
+                    graph,
+                )
+                region_before_visible_area = float(
+                    entry.get("region_expected_visible_area_before_m2", 0.0)
+                    or 0.0
+                )
+                region_visible_area_shrink = (
+                    region_before_visible_area - region_current_visible_area
+                )
                 entry["frontier_length_after_m"] = current_length
                 entry["frontier_length_delta_m"] = delta
                 entry["frontier_shrink_m"] = shrink
                 entry["region_frontier_length_after_m"] = region_current_length
                 entry["region_frontier_length_delta_m"] = region_delta
                 entry["region_frontier_shrink_m"] = region_shrink
+                entry["region_expected_visible_area_after_m2"] = (
+                    region_current_visible_area
+                )
+                entry["region_expected_visible_area_shrink_m2"] = (
+                    region_visible_area_shrink
+                )
                 entry["frontier_metrics_evaluated"] = True
                 stats = self.group_history.setdefault(group_id, {})
                 stats["last_frontier_length_delta_m"] = delta
@@ -1020,12 +1202,17 @@ class SemanticRuleDecisionNode:
                     region_stats = self.region_history.setdefault(history_key, {})
                     region_stats["last_frontier_length_delta_m"] = region_delta
                     region_stats["last_frontier_shrink_m"] = region_shrink
+                    region_stats["last_expected_visible_area_shrink_m2"] = (
+                        region_visible_area_shrink
+                    )
                     if (
                         str(entry.get("behavior_type") or "").upper()
                         == "EXPLORE"
                         and str(entry.get("result") or "") == "SUCCEEDED"
                         and region_shrink
                         < self.repeat_guard_min_frontier_shrink_m
+                        and region_visible_area_shrink
+                        < self.repeat_guard_min_visible_area_shrink_m2
                     ):
                         region_stats["low_gain_repeat_count"] = int(
                             region_stats.get("low_gain_repeat_count", 0) or 0

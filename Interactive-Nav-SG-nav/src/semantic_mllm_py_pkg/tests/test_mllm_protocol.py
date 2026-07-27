@@ -68,6 +68,28 @@ def test_role_schemas_normalize_outputs() -> None:
     assert verification["success"] is True
 
 
+def test_attribute_patch_uses_part_confidence_when_global_confidence_is_omitted() -> None:
+    attribute = validate_attribute_patch(
+        {
+            "object_id": "fridge_1",
+            "interactable": True,
+            "interaction_class": "container",
+            "coarse_state": "closed",
+            "interaction_parts": [
+                {
+                    "part_id": "handle_1",
+                    "type": "handle",
+                    "state": "closed",
+                    "handle_visible": True,
+                    "confidence": 0.9,
+                }
+            ],
+        }
+    )
+
+    assert attribute["confidence"] == 0.9
+
+
 def test_mock_client_returns_role_payload() -> None:
     client = MLLMClient(MLLMClientConfig(mode="mock", model="mock"))
     response = client.request_json(

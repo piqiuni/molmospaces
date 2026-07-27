@@ -373,6 +373,9 @@ def compact_candidate(
     }
     if behavior_type != "EXPLORE" and candidate.target_name:
         result["subject_name"] = candidate.target_name
+    semantic_name = str(metadata.get("semantic_name") or "").strip()
+    if behavior_type == "INTERACT" and semantic_name:
+        result["subject_semantic_type"] = semantic_name
     room_id = _room_node_id(metadata.get("target_room_id") or metadata.get("room_id"))
     if room_id:
         result["room_id"] = room_id
@@ -392,6 +395,16 @@ def compact_candidate(
         )
         if unknown_area_m2 > 0.0:
             result["unknown_component_area_m2"] = round(unknown_area_m2, 2)
+        expected_visible_area_m2 = max(
+            0.0,
+            float(
+                metadata.get("expected_visible_unknown_area_m2", 0.0) or 0.0
+            ),
+        )
+        if expected_visible_area_m2 > 0.0:
+            result["expected_visible_unknown_area_m2"] = round(
+                expected_visible_area_m2, 2
+            )
     elif behavior_type == "INTERACT":
         state = str(metadata.get("state") or "")
         if state:
@@ -520,6 +533,21 @@ def compact_candidate_groups(
                         float(
                             (member.metadata or {}).get(
                                 "unknown_component_area_m2", 0.0
+                            )
+                            or 0.0
+                        ),
+                    )
+                    for member in members
+                ),
+                2,
+            )
+            item["expected_visible_unknown_area_m2"] = round(
+                sum(
+                    max(
+                        0.0,
+                        float(
+                            (member.metadata or {}).get(
+                                "expected_visible_unknown_area_m2", 0.0
                             )
                             or 0.0
                         ),
@@ -745,8 +773,16 @@ class ModelPolicyClient:
                 "Candidates passed generation checks and will be revalidated before execution. First infer "
                 "likely room function from observed room attributes and anchor objects, then relate that "
                 "function and nearby semantic objects to the target. For object goals, prefer a visible "
-                "target or an interaction likely to reveal it. Among exploration candidates with comparable "
-                "target relevance, prefer larger unknown_component_area_m2; use distance only as a tie-break, "
+                "target or an interaction likely to reveal it. Do not open a container merely because it is "
+                "available: prefer it only when its type and room are plausible for the target; otherwise "
+                "explore toward a more likely room. Treat container semantics as strong evidence: food and "
+                "drink are plausible in refrigerators or kitchen storage, while personal and bedside items "
+                "such as alarm clocks, keys, and books are plausible in dressers, drawers, desks, or "
+                "nightstands. Rank a semantically conflicting container below a portal or exploration action "
+                "even when that container is closer. Among exploration candidates with comparable "
+                "target relevance, first prefer larger expected_visible_unknown_area_m2 (the unknown area "
+                "likely exposed from this concrete viewpoint); use unknown_component_area_m2 only as "
+                "secondary long-term potential and distance only as a tie-break, "
                 "not as the primary objective. Use interaction effects, current graph state, remaining room "
                 "frontier, and compact history. Do not invent geometry, actions, or candidate IDs. Prefer a different spatial "
                 "region after repeated low-gain attempts unless revisiting is required by the target. "

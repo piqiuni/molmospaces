@@ -22,6 +22,7 @@ class CandidateCuratorConfig:
     max_candidates_per_region: int = 1
     region_size_m: float = 1.0
     repeat_guard_low_gain_limit: int = 2
+    explore_min_visible_gain_ratio: float = 0.25
     goal_position_tolerance_m: float = 0.35
     goal_yaw_tolerance_rad: float = 0.50
 
@@ -337,6 +338,42 @@ class CandidateCurator:
             for behavior_type in SUPPORTED_BEHAVIOR_TYPES
         }
         explore_pool = pools["EXPLORE"]
+        expected_visible_area_by_id = {
+            candidate.candidate_id: max(
+                0.0,
+                float(
+                    (candidate.metadata or {}).get(
+                        "expected_visible_unknown_area_m2", 0.0
+                    )
+                    or 0.0
+                ),
+            )
+            for candidate in explore_pool
+        }
+        max_expected_visible_area = max(
+            expected_visible_area_by_id.values(), default=0.0
+        )
+        omitted: dict[str, str] = {}
+        if max_expected_visible_area > 0.0:
+            minimum_visible_area = max_expected_visible_area * max(
+                0.0,
+                min(1.0, float(self.config.explore_min_visible_gain_ratio)),
+            )
+            visible_gain_pool = [
+                candidate
+                for candidate in explore_pool
+                if expected_visible_area_by_id[candidate.candidate_id]
+                + 1e-9
+                >= minimum_visible_area
+            ]
+            if visible_gain_pool:
+                for candidate in explore_pool:
+                    if candidate not in visible_gain_pool:
+                        omitted[candidate.candidate_id] = (
+                            "low_expected_visible_gain_suppressed"
+                        )
+                explore_pool = visible_gain_pool
+                pools["EXPLORE"] = visible_gain_pool
         non_repeated_explore = [
             candidate
             for candidate in explore_pool
@@ -348,7 +385,6 @@ class CandidateCurator:
             )
             < max(1, int(self.config.repeat_guard_low_gain_limit))
         ]
-        omitted: dict[str, str] = {}
         if non_repeated_explore:
             for candidate in explore_pool:
                 if candidate not in non_repeated_explore:

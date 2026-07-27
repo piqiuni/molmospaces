@@ -54,6 +54,8 @@ class FrontierCluster:
     information_gain: float
     distance_to_robot: float
     unknown_component_area_m2: float = 0.0
+    frontier_length_m: float = 0.0
+    expected_visible_unknown_area_m2: float = 0.0
     score: float = 0.0
     score_terms: dict[str, float] = field(default_factory=dict)
 
@@ -280,6 +282,16 @@ class FrontierExplorerCore:
         if dist + 1e-6 < self.config.hard_min_subgoal_distance_m:
             return None
         cluster_id = self._cluster_id(grid, centroid_world)
+        unknown_component_area_m2 = self._unknown_component_area_m2(
+            grid, cells, centroid_cell=(cx, cy)
+        )
+        frontier_length_m = float(len(cells)) * max(
+            float(grid.spec.resolution), 0.0
+        )
+        expected_visible_unknown_area_m2 = min(
+            unknown_component_area_m2,
+            frontier_length_m * max(float(self.config.sensor_range_m), 0.0),
+        )
         return FrontierCluster(
             cluster_id=cluster_id,
             cells=list(cells),
@@ -290,9 +302,9 @@ class FrontierExplorerCore:
             subgoal_yaw=subgoal_yaw,
             information_gain=float(len(cells)),
             distance_to_robot=dist,
-            unknown_component_area_m2=self._unknown_component_area_m2(
-                grid, cells, centroid_cell=(cx, cy)
-            ),
+            unknown_component_area_m2=unknown_component_area_m2,
+            frontier_length_m=frontier_length_m,
+            expected_visible_unknown_area_m2=expected_visible_unknown_area_m2,
         )
 
     def _unknown_component_area_m2(
@@ -515,7 +527,11 @@ class FrontierExplorerCore:
         return True
 
     def _score_cluster(self, cluster: FrontierCluster, grid, robot_xy, value_provider, state) -> None:
-        info = self._normalize_information(cluster.information_gain)
+        info = (
+            self._normalize_visible_area(cluster.expected_visible_unknown_area_m2)
+            if cluster.expected_visible_unknown_area_m2 > 0.0
+            else self._normalize_information(cluster.information_gain)
+        )
         distance_score = 1.0 / (1.0 + cluster.distance_to_robot)
         far_overrun_m = max(0.0, cluster.distance_to_robot - self.config.local_horizon_m)
         far_denominator = max(self.config.far_cluster_penalty_saturation_m, 1e-6)
@@ -549,6 +565,9 @@ class FrontierExplorerCore:
         cluster.score = score
         cluster.score_terms = {
             "information": info,
+            "expected_visible_unknown_area_m2": float(
+                cluster.expected_visible_unknown_area_m2
+            ),
             "distance": distance_score,
             "previous_subgoal": previous_subgoal_score,
             "continuity_cost": continuity_cost,
@@ -581,6 +600,13 @@ class FrontierExplorerCore:
 
     def _normalize_information(self, value: float) -> float:
         return min(1.0, max(0.0, value / max(float(self.config.min_cluster_cells * 10), 1.0)))
+
+    def _normalize_visible_area(self, value: float) -> float:
+        reference_area_m2 = max(
+            1.0,
+            2.0 * float(self.config.sensor_range_m) ** 2,
+        )
+        return min(1.0, max(0.0, float(value) / reference_area_m2))
 
     def _cluster_id(self, grid: OccupancyGridData, world_xy: tuple[float, float]) -> str:
         bucket = max(grid.spec.resolution * 4.0, 0.25)

@@ -449,6 +449,9 @@ class AtomicForceInteractionController:
                 "interaction_mode": str(command.get("interaction_mode") or "open_close"),
                 "operation_method": str(command.get("operation_method") or "unknown"),
                 "open_regions": list(command.get("open_regions") or []),
+                "approach_goal_xyyaw": list(
+                    command.get("approach_goal_xyyaw") or []
+                ),
                 "visual_operation_plan": dict(command.get("visual_operation_plan") or {}),
                 "view_profile": str(command.get("view_profile") or "default"),
                 "view_torso_pitch_rad": command.get("view_torso_pitch_rad"),
@@ -718,6 +721,14 @@ class AtomicForceInteractionController:
         if phase == "open":
             if mode == "fast":
                 self._force_observation_requested = True
+                if int(pending["observation_steps"]) > 1:
+                    pending["phase"] = "observe"
+                    pending["phase_step"] = 0
+                    pending["phase_plan"] = None
+                    pending["remaining_observation_steps"] = int(
+                        pending["observation_steps"]
+                    )
+                    return None
                 self._record_drawer_observation(task, step)
                 if int(pending["group_index"]) + 1 < len(pending["groups"]):
                     pending["group_index"] += 1
@@ -810,6 +821,7 @@ class AtomicForceInteractionController:
             "sequence_type": "drawer_scan",
             "operation_method": str(command.get("operation_method") or "pull"),
             "open_regions": list(command.get("open_regions") or []),
+            "approach_goal_xyyaw": list(command.get("approach_goal_xyyaw") or []),
             "visual_operation_plan": dict(command.get("visual_operation_plan") or {}),
             "grounded_regions": [
                 {

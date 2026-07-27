@@ -89,6 +89,37 @@ def test_unknown_component_area_counts_connected_unknown_cells_in_metric_area():
     assert math.isclose(area_m2, 0.75)
 
 
+def test_expected_visible_area_caps_large_component_by_frontier_aperture():
+    width = height = 30
+    data = [-1] * (width * height)
+    for y in range(10, 20):
+        for x in range(2, 10):
+            data[y * width + x] = 0
+    grid = OccupancyGridData(
+        GridSpec(width, height, 0.1, 0.0, 0.0, "map"), data
+    )
+    core = FrontierExplorerCore(
+        FrontierConfig(
+            min_cluster_cells=1,
+            sensor_range_m=5.0,
+            unknown_component_radius_m=5.0,
+            require_footprint_free=False,
+            require_turning_clearance=False,
+        )
+    )
+
+    cluster = core._build_cluster(
+        grid,
+        [(9, 14), (9, 15), (9, 16), (9, 17)],
+        robot_xy=(0.45, 1.55),
+    )
+
+    assert cluster is not None
+    assert math.isclose(cluster.frontier_length_m, 0.4)
+    assert cluster.unknown_component_area_m2 > 2.0
+    assert math.isclose(cluster.expected_visible_unknown_area_m2, 2.0)
+
+
 def test_subgoal_is_not_robot_current_cell_when_min_distance_is_set():
     grid = make_grid(12, 12, (2, 2, 10, 10))
     core = FrontierExplorerCore(FrontierConfig(min_cluster_cells=2, min_subgoal_distance_m=1.5))

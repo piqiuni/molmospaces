@@ -144,6 +144,30 @@ def test_spatial_history_survives_frontier_reclustering_and_suppresses_low_gain(
     assert result.omitted["frontier:new"] == "history_low_gain_suppressed"
 
 
+def test_curator_suppresses_low_visible_area_while_large_opening_exists() -> None:
+    curator = CandidateCurator(
+        CandidateCuratorConfig(
+            candidate_top_k=4,
+            explore_quota=4,
+            explore_min_visible_gain_ratio=0.25,
+        )
+    )
+    narrow = make_candidate("frontier:narrow", "EXPLORE", x=1.0, gain=0.9)
+    wide = make_candidate("frontier:wide", "EXPLORE", x=4.0, gain=1.0)
+    narrow.metadata["expected_visible_unknown_area_m2"] = 2.0
+    wide.metadata["expected_visible_unknown_area_m2"] = 20.0
+
+    result = curator.curate([narrow, wide])
+
+    assert [candidate.candidate_id for candidate in result.candidates] == [
+        "frontier:wide"
+    ]
+    assert (
+        result.omitted["frontier:narrow"]
+        == "low_expected_visible_gain_suppressed"
+    )
+
+
 def test_candidate_update_accepts_benign_sequence_refresh() -> None:
     selected = make_candidate("frontier:a", "EXPLORE", x=1.0, y=2.0)
     latest = make_candidate("frontier:a", "EXPLORE", x=1.1, y=2.0)

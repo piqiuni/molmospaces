@@ -14,6 +14,8 @@ def make_cluster() -> FrontierCluster:
         information_gain=18.0,
         distance_to_robot=2.5,
         unknown_component_area_m2=12.5,
+        frontier_length_m=0.3,
+        expected_visible_unknown_area_m2=1.5,
         score=1.2,
         score_terms={
             "information": 0.8,
@@ -29,6 +31,8 @@ def test_proposal_contains_geometry_but_not_semantic_scores() -> None:
     assert proposal["goal_xyyaw"] == [1.0, 3.0, 0.5]
     assert proposal["raw_features"]["frontier_cell_count"] == 3
     assert proposal["raw_features"]["unknown_component_area_m2"] == 12.5
+    assert proposal["raw_features"]["frontier_length_m"] == 0.3
+    assert proposal["raw_features"]["expected_visible_unknown_area_m2"] == 1.5
     assert proposal["geometry"]["proposal_score_terms"] == {
         "information": 0.8,
         "distance": 0.3,

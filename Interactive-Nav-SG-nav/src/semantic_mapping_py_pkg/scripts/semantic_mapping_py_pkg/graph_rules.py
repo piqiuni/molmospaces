@@ -119,7 +119,11 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         aabb_size = point3(box_3d.get("size"))
         bbox_2d = list(observation.get("bbox_2d") or [])
         segmentation = observation.get("segmentation")
-        visible_pixels = segmentation_pixel_count(segmentation)
+        visible_pixels = (
+            segmentation_pixel_count(segmentation)
+            if segmentation is not None
+            else int(observation.get("visible_pixels", 0) or 0)
+        )
         area = bbox_area(bbox_2d)
         visible_fraction = (
             min(1.0, float(visible_pixels) / area) if area > 0.0 else 0.0

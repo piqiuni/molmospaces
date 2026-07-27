@@ -246,6 +246,42 @@ def test_frontier_top_k_prefers_larger_unknown_component_over_nearer_cluster() -
     ]
 
 
+def test_frontier_top_k_prefers_visible_aperture_over_large_hidden_component() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig(max_frontier_candidates=1))
+    candidates = generator.generate(
+        {
+            "proposals": [
+                {
+                    "proposal_id": "narrow_large_component",
+                    "goal_xyyaw": [1.0, 0.0, 0.0],
+                    "raw_features": {
+                        "information_gain": 4.0,
+                        "distance_m": 1.0,
+                        "unknown_component_area_m2": 60.0,
+                        "expected_visible_unknown_area_m2": 2.0,
+                    },
+                },
+                {
+                    "proposal_id": "wide_opening",
+                    "goal_xyyaw": [4.0, 0.0, 0.0],
+                    "raw_features": {
+                        "information_gain": 30.0,
+                        "distance_m": 4.0,
+                        "unknown_component_area_m2": 25.0,
+                        "expected_visible_unknown_area_m2": 18.0,
+                    },
+                },
+            ]
+        },
+        {},
+        robot_xy=(0.0, 0.0),
+    )
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "frontier:wide_opening"
+    ]
+
+
 def test_legacy_frontier_top_k_also_prefers_larger_unknown_component() -> None:
     generator = CandidateGenerator(CandidateGeneratorConfig(max_frontier_candidates=1))
     candidates = generator.generate(
@@ -654,6 +690,124 @@ def test_observed_target_generates_navigation_candidate() -> None:
     assert candidate.metadata["target_visible_now"] is True
     assert candidate.metadata["verify_target_visibility"] is True
     assert candidate.metadata["target_min_visible_pixels"] == 16
+    assert candidate.metadata["target_navigation_required"] is True
+    assert candidate.metadata["target_goal_distance_m"] > 0.35
+
+
+def test_contained_target_navigation_anchors_outside_parent_container() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_fridge",
+                "type": "container",
+                "label": "fridge",
+                "aabb_center": [4.0, 2.0, 1.0],
+                "aabb_size": [1.0, 1.0, 2.0],
+            },
+            {
+                "id": "object_apple",
+                "type": "object",
+                "label": "apple",
+                "parent_id": "container_fridge",
+                "centroid": [4.0, 2.0, 1.0],
+                "confidence": 1.0,
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "attributes": {"visible_pixels": 64},
+            },
+        ]
+    }
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(1.0, 2.0),
+        target_context={"enabled": True, "object_labels": ["apple"]},
+    )[0]
+
+    assert math.isclose(candidate.goal_xyyaw[0], 2.5, abs_tol=1e-6)
+    assert math.isclose(candidate.goal_xyyaw[1], 2.0, abs_tol=1e-6)
+    assert candidate.metadata["navigation_anchor_id"] == "container_fridge"
+    assert candidate.metadata["approach_strategy"] == "target_parent_container_standoff"
+
+
+def test_target_near_container_uses_geometric_anchor_without_contains_edge() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_dresser",
+                "type": "container",
+                "label": "dresser",
+                "room_id": 1,
+                "aabb_center": [4.0, 2.0, 0.5],
+                "aabb_size": [1.0, 1.0, 1.0],
+            },
+            {
+                "id": "object_remote",
+                "type": "object",
+                "label": "remotecontrol",
+                "room_id": 1,
+                "centroid": [4.1, 2.0, 1.05],
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "attributes": {"visible_pixels": 64},
+            },
+        ]
+    }
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(1.0, 2.0),
+        target_context={"enabled": True, "object_labels": ["remotecontrol"]},
+    )[0]
+
+    assert candidate.metadata["navigation_anchor_id"] == "container_dresser"
+    assert candidate.metadata["approach_strategy"] == "target_parent_container_standoff"
+
+
+def test_target_reuses_successful_parent_container_approach_pose() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "container_fridge",
+                "type": "container",
+                "label": "fridge",
+                "aabb_center": [4.0, 2.0, 1.0],
+                "aabb_size": [2.0, 2.0, 2.0],
+                "interaction": {
+                    "operation_history": [
+                        {
+                            "success": True,
+                            "approach_goal_xyyaw": [3.25, 2.5, 0.75],
+                        }
+                    ]
+                },
+            },
+            {
+                "id": "object_apple",
+                "type": "object",
+                "label": "apple",
+                "parent_id": "container_fridge",
+                "centroid": [4.0, 2.0, 1.0],
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "attributes": {"visible_pixels": 64},
+            },
+        ]
+    }
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(1.0, 2.0),
+        target_context={"enabled": True, "object_labels": ["apple"]},
+    )[0]
+
+    assert candidate.goal_xyyaw == [3.25, 2.5, 0.75]
+    assert candidate.metadata["approach_strategy"] == (
+        "target_last_successful_interaction_pose"
+    )
 
 
 def test_weak_target_observation_is_not_verified_as_visible() -> None:

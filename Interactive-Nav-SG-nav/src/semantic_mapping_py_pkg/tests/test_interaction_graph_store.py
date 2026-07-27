@@ -724,7 +724,12 @@ def test_interaction_result_updates_planner_fields():
         source_mode="realtime_gt_observation",
     )
     assert store.update_interaction_result(
-        {"instance_id": "gt_000001", "state": "open", "source": "oracle_interaction"},
+        {
+            "instance_id": "gt_000001",
+            "state": "open",
+            "source": "oracle_interaction",
+            "approach_goal_xyyaw": [1.0, 2.0, 0.5],
+        },
         stamp=20.0,
     )
     portal = next(node for node in store.as_graph_dict(stamp=20.0)["nodes"] if node["type"] == "portal")
@@ -741,6 +746,7 @@ def test_interaction_result_updates_planner_fields():
             "success": True,
             "execution_cost": 1.0,
             "verification_source": "oracle_interaction",
+            "approach_goal_xyyaw": [1.0, 2.0, 0.5],
         }
     ]
     assert "joints" not in portal["attributes"]
@@ -798,8 +804,21 @@ def test_non_articulated_portal_feedback_persists_static_capability() -> None:
     store.update_observations(
         [doorframe], source_mode="realtime_gt_observation", stamp=3.0
     )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "doorframe_static_1",
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.95,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=4.0,
+    )
 
-    graph = store.as_graph_dict(stamp=3.0)
+    graph = store.as_graph_dict(stamp=4.0)
     portal = next(
         node for node in graph["nodes"]
         if node["id"] == "portal_doorframe_static_1"
@@ -927,6 +946,48 @@ def test_late_attribute_patch_does_not_override_interaction_state():
     )
     portal = next(node for node in store.as_graph_dict(stamp=11.0)["nodes"] if node["type"] == "portal")
     assert portal["interaction"]["state"] == "open"
+    assert portal["attributes"]["attribute_status"] == "ready"
+
+
+def test_newer_attribute_patch_does_not_override_verified_interaction_state():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [observation(instance_id="gt_000001", semantic_name="door", is_door=True)],
+        source_mode="realtime_gt_observation",
+        stamp=1.0,
+    )
+    assert store.update_interaction_result(
+        {
+            "instance_id": "gt_000001",
+            "state": "open",
+            "source": "executor_state_verification",
+            "event_id": "interaction_001",
+        },
+        stamp=10.0,
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "gt_000001",
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "container",
+            "coarse_state": "closed",
+            "confidence": 0.95,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=12.0,
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=12.0)["nodes"]
+        if node["id"] == "portal_gt_000001"
+    )
+    assert portal["type"] == "portal"
+    assert portal["interaction"]["state"] == "open"
+    assert portal["interaction"]["traversable"] is True
+    assert portal["interaction"]["requires_interaction"] is False
     assert portal["attributes"]["attribute_status"] == "ready"
 
 

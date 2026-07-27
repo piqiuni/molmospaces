@@ -5,6 +5,7 @@ import json
 import math
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -817,6 +818,45 @@ class ExplorePyNode:
                 detail,
             )
             return
+        requested_goal = list(command.get("goal_xyyaw") or [])
+        current_goal = [
+            float(cluster.subgoal_world[0]),
+            float(cluster.subgoal_world[1]),
+            float(cluster.subgoal_yaw),
+        ]
+        reservation_goal_drift_m = 0.0
+        try:
+            requested_goal_valid = len(requested_goal) >= 2 and all(
+                math.isfinite(float(value)) for value in requested_goal[:3]
+            )
+        except (TypeError, ValueError):
+            requested_goal_valid = False
+        if requested_goal_valid:
+            requested_yaw = (
+                float(requested_goal[2])
+                if len(requested_goal) > 2
+                else float(cluster.subgoal_yaw)
+            )
+            reservation_goal_drift_m = math.hypot(
+                float(requested_goal[0]) - current_goal[0],
+                float(requested_goal[1]) - current_goal[1],
+            )
+            cluster = replace(
+                cluster,
+                subgoal_world=(
+                    float(requested_goal[0]),
+                    float(requested_goal[1]),
+                ),
+                subgoal_yaw=requested_yaw,
+                distance_to_robot=(
+                    math.hypot(
+                        float(requested_goal[0]) - self.robot_xy[0],
+                        float(requested_goal[1]) - self.robot_xy[1],
+                    )
+                    if self.robot_xy is not None
+                    else cluster.distance_to_robot
+                ),
+            )
         self.external_reserved_cluster = cluster
         self.external_reserved_command = dict(command)
         self.last_selected_cluster = cluster
@@ -841,6 +881,11 @@ class ExplorePyNode:
                 float(cluster.subgoal_yaw),
             ],
             "frame_id": self.map_frame,
+            "candidate_sequence": int(command.get("candidate_sequence", 0) or 0),
+            "graph_revision": int(command.get("graph_revision", 0) or 0),
+            "current_cluster_goal_xyyaw": current_goal,
+            "reservation_goal_drift_m": reservation_goal_drift_m,
+            "selected_goal_preserved": requested_goal_valid,
         }
         self.external_reservation_ack_cache[command_id] = {
             "status": "READY",
@@ -855,6 +900,8 @@ class ExplorePyNode:
     def _finalize_external_frontier(self, command):
         cluster = self.external_reserved_cluster
         success = bool(command.get("success"))
+        detail = dict(command.get("detail") or {})
+        canceled = str(detail.get("reason") or "") == "preempted_by_target"
         if cluster is not None and self.robot_xy is not None:
             if self.state.active_goal is None:
                 self.state.start_goal(
@@ -863,7 +910,12 @@ class ExplorePyNode:
                     robot_yaw=self.robot_yaw,
                     goal_id=str(cluster.cluster_id),
                 )
-            if success:
+            if canceled:
+                self.state.clear_active_goal(
+                    "subgoal_canceled",
+                    event="preempted_by_target",
+                )
+            elif success:
                 has_frontier = self.core.has_frontier_near(
                     self.latest_grid,
                     cluster.centroid_world,
@@ -875,7 +927,6 @@ class ExplorePyNode:
                 else:
                     self.state.mark_active_reached()
             else:
-                detail = dict(command.get("detail") or {})
                 self.state.mark_active_failed(
                     str(detail.get("reason") or "semantic_executor_navigation_failed"),
                     source="semantic_executor",
@@ -884,9 +935,12 @@ class ExplorePyNode:
         self.external_reserved_command = None
         self._publish_behavior_feedback(
             command,
-            "SUCCEEDED" if success else "FAILED",
+            "CANCELED" if canceled else "SUCCEEDED" if success else "FAILED",
             success,
-            {"cluster_id": command.get("cluster_id", "")},
+            {
+                "cluster_id": command.get("cluster_id", ""),
+                **detail,
+            },
         )
 
     def _publish_behavior_feedback(self, command, status, success, detail):
@@ -1393,6 +1447,12 @@ class ExplorePyNode:
             "distance_to_robot": cluster.distance_to_robot,
             "unknown_component_area_m2": float(
                 getattr(cluster, "unknown_component_area_m2", 0.0) or 0.0
+            ),
+            "frontier_length_m": float(
+                getattr(cluster, "frontier_length_m", 0.0) or 0.0
+            ),
+            "expected_visible_unknown_area_m2": float(
+                getattr(cluster, "expected_visible_unknown_area_m2", 0.0) or 0.0
             ),
             "score": cluster.score,
             "score_terms": cluster.score_terms,

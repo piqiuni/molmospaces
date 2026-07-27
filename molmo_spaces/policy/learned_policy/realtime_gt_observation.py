@@ -359,7 +359,7 @@ class RealtimeGTObservationPublisher:
         camera_position = np.asarray(camera.pos, dtype=np.float64).copy()
         image_size = [int(segmentation.shape[1]), int(segmentation.shape[0])]
         observations = []
-        for spec_index, _visible_pixels, bbox_2d, segmentation_mask in visible:
+        for spec_index, visible_pixels, bbox_2d in visible:
             spec = self._specs[spec_index]
             position = np.asarray(data.xpos[spec.body_id], dtype=np.float64).copy()
             distance_m = float(np.linalg.norm(position - camera_position))
@@ -370,7 +370,7 @@ class RealtimeGTObservationPublisher:
                 self._build_observation(
                     spec,
                     bbox_2d,
-                    segmentation_mask,
+                    visible_pixels,
                     center,
                     size,
                 )
@@ -536,7 +536,7 @@ class RealtimeGTObservationPublisher:
 
     def _visible_instances(
         self, segmentation: np.ndarray
-    ) -> list[tuple[int, int, list[int], dict[str, list[int]]]]:
+    ) -> list[tuple[int, int, list[int]]]:
         if not self._specs or self._geom_to_spec.size == 0:
             return []
         geom_mask = segmentation[..., 1] == int(mujoco.mjtObj.mjOBJ_GEOM)
@@ -565,16 +565,11 @@ class RealtimeGTObservationPublisher:
         np.maximum.at(max_y, spec_indices, ys)
         result = []
         for spec_index in np.flatnonzero(counts >= self.min_visible_pixels):
-            instance_pixels = spec_indices == spec_index
             result.append(
                 (
                     int(spec_index),
                     int(counts[spec_index]),
                     [int(min_x[spec_index]), int(min_y[spec_index]), int(max_x[spec_index]), int(max_y[spec_index])],
-                    {
-                        "rows": ys[instance_pixels].astype(np.int32).tolist(),
-                        "cols": xs[instance_pixels].astype(np.int32).tolist(),
-                    },
                 )
             )
         return result
@@ -583,7 +578,7 @@ class RealtimeGTObservationPublisher:
         self,
         spec: _ObjectSpec,
         bbox_2d: list[int],
-        segmentation_mask: dict[str, list[int]],
+        visible_pixels: int,
         center: np.ndarray,
         size: np.ndarray,
     ) -> dict[str, Any]:
@@ -593,7 +588,7 @@ class RealtimeGTObservationPublisher:
             "id": spec.source_name,
             "name": str(category),
             "bbox_2d": list(bbox_2d),
-            "segmentation": dict(segmentation_mask),
+            "visible_pixels": max(0, int(visible_pixels)),
             "box_3d": {
                 "center": [float(value) for value in center],
                 "size": [float(value) for value in size],

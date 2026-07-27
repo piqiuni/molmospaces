@@ -230,6 +230,11 @@ class InteractionGraphStore:
                 history_entry["interaction_group_id"] = str(
                     result["interaction_group_id"]
                 )
+            approach_goal = list(result.get("approach_goal_xyyaw") or [])
+            if len(approach_goal) >= 2:
+                history_entry["approach_goal_xyyaw"] = [
+                    float(value) for value in approach_goal[:3]
+                ]
             history.append(history_entry)
         node.interaction["operation_history"] = history
         self._update_interaction_group_memory(node, result)
@@ -397,9 +402,19 @@ class InteractionGraphStore:
         if attribute_status in {"pending", "failed", "stale"}:
             self._bump_revision()
             return True
+        verified_state_override = dict(
+            node.attributes.get("interaction_state_override") or {}
+        )
+        has_verified_interaction_state = bool(
+            verified_state_override.get("event_id")
+        )
         confidence = float(patch.get("confidence", 0.0) or 0.0)
         interaction_class = normalize_label(patch.get("interaction_class"))
-        if confidence >= 0.5 and interaction_class in {"portal", "container", "support", "object"}:
+        if (
+            not has_verified_interaction_state
+            and confidence >= 0.5
+            and interaction_class in {"portal", "container", "support", "object"}
+        ):
             node.type = interaction_class
         parts = list(patch.get("interaction_parts") or [])
         for deprecated_key in (
@@ -429,7 +444,10 @@ class InteractionGraphStore:
             ],
             default=0.0,
         )
-        state_was_updated = latest_operation_stamp <= patch_stamp
+        state_was_updated = (
+            not has_verified_interaction_state
+            and latest_operation_stamp <= patch_stamp
+        )
         if state_was_updated:
             node.interaction.update(
                 {

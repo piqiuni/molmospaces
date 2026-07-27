@@ -32,7 +32,7 @@ from molmo_spaces.policy.learned_policy.left_arm_keyboard_debug_policy import (
 from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.profiler_utils import Profiler
-from runtime_target_selection import select_far_container_target
+from runtime_target_selection import load_fixed_container_target, select_far_container_target
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -207,11 +207,22 @@ def lookat_forward_up(camera_pos: list[float], target_pos: list[float]) -> tuple
 
 
 class RuntimeTargetPublisher:
-    def __init__(self, rospy_module, string_message_type, output_path: str, top_k: int) -> None:
+    def __init__(
+        self,
+        rospy_module,
+        string_message_type,
+        output_path: str,
+        top_k: int,
+        *,
+        selection_mode: str = "random_far_container_object",
+        selection_input_path: str = "",
+    ) -> None:
         self._rospy = rospy_module
         self._String = string_message_type
         self._output_path = Path(output_path).expanduser().resolve() if output_path else None
         self._top_k = max(1, int(top_k))
+        self._selection_mode = str(selection_mode or "random_far_container_object")
+        self._selection_input_path = str(selection_input_path or "")
         self._publisher = rospy_module.Publisher(
             "/semantic_decision/target",
             string_message_type,
@@ -222,11 +233,18 @@ class RuntimeTargetPublisher:
     def publish(self, task, selection_seed: int) -> dict[str, Any]:
         import json
 
-        context, selection = select_far_container_target(
-            task,
-            selection_seed=int(selection_seed),
-            top_k=self._top_k,
-        )
+        if self._selection_mode == "fixed_container_object":
+            if not self._selection_input_path:
+                raise ValueError(
+                    "fixed_container_object requires --runtime_target_selection_input_path"
+                )
+            context, selection = load_fixed_container_target(self._selection_input_path)
+        else:
+            context, selection = select_far_container_target(
+                task,
+                selection_seed=int(selection_seed),
+                top_k=self._top_k,
+            )
         gt_publisher = getattr(getattr(task, "policy", None), "_realtime_gt_publisher", None)
         if not getattr(gt_publisher, "episode_id", ""):
             context.setdefault("episode_id_hint", f"episode_seed_{int(selection_seed)}")
@@ -766,10 +784,11 @@ def parse_args():
         "--runtime_target_selection_mode",
         type=str,
         default="none",
-        choices=["none", "random_far_container_object"],
+        choices=["none", "random_far_container_object", "fixed_container_object"],
     )
     parser.add_argument("--runtime_target_selection_top_k", type=int, default=3)
     parser.add_argument("--runtime_target_selection_path", type=str, default="")
+    parser.add_argument("--runtime_target_selection_input_path", type=str, default="")
     parser.add_argument("--door_occ_test_root_name", type=str, default="")
     parser.add_argument(
         "--door_occ_test_open_step",
@@ -1108,6 +1127,8 @@ def main():
             String,
             args.runtime_target_selection_path,
             args.runtime_target_selection_top_k,
+            selection_mode=args.runtime_target_selection_mode,
+            selection_input_path=args.runtime_target_selection_input_path,
         )
         policy.runtime_target_seed = int(args.seed)
         policy.runtime_target_selection = {}

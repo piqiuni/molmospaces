@@ -7,6 +7,8 @@ from explore_py_pkg.debug_semantic_viz import (
     room_style_by_id,
     topology_edge_style,
     topology_edge_visible,
+    topology_hierarchy_layout,
+    topology_node_style,
 )
 
 
@@ -176,3 +178,57 @@ def test_room_style_labels_include_unknown_and_confidence():
 
     assert labels[1]["label"] == "Room 1 | livingroom | 0.53"
     assert labels[2]["label"] == "Room 2 | unknown | 0.00"
+
+
+def test_compact_topology_layout_keeps_all_hierarchy_boxes_inside_480x270_panel():
+    nodes = [
+        {"id": "room_0", "type": "room", "room_id": 0},
+        {"id": "room_1", "type": "room", "room_id": 1},
+        {
+            "id": "door_0",
+            "type": "portal",
+            "attributes": {"connected_room_ids": [0, 1]},
+        },
+        {"id": "fridge_0", "type": "container", "room_id": 1},
+        {"id": "drawer_0", "type": "container", "room_id": 0},
+        {"id": "apple_0", "type": "object"},
+        {"id": "book_0", "type": "object"},
+    ]
+    edges = [
+        {"src_id": "door_0", "dst_id": "room_0", "relation": "connects"},
+        {"src_id": "door_0", "dst_id": "room_1", "relation": "connects"},
+        {"src_id": "room_1", "dst_id": "fridge_0", "relation": "has_child"},
+        {"src_id": "room_0", "dst_id": "drawer_0", "relation": "has_child"},
+        {"src_id": "fridge_0", "dst_id": "apple_0", "relation": "contains"},
+        {"src_id": "drawer_0", "dst_id": "book_0", "relation": "contains"},
+    ]
+
+    layout = topology_hierarchy_layout(nodes, edges, 480, 270)
+
+    assert set(layout["boxes"]) == {node["id"] for node in nodes}
+    for x1, y1, x2, y2 in layout["boxes"].values():
+        assert 0 <= x1 < x2 < 480
+        assert 0 <= y1 < y2 < 270
+    assert (
+        layout["row_y"]["room"]
+        < layout["row_y"]["portal"]
+        < layout["row_y"]["container"]
+        < layout["row_y"]["object"]
+    )
+
+
+def test_topology_node_style_matches_reference_open_closed_encoding():
+    closed_door = topology_node_style(
+        {"type": "portal", "interaction": {"state": "closed"}}
+    )
+    open_door = topology_node_style(
+        {"type": "portal", "interaction": {"state": "open"}}
+    )
+    closed_fridge = topology_node_style(
+        {"type": "container", "interaction": {"state": "closed"}}
+    )
+
+    assert closed_door["dashed"] is True
+    assert open_door["dashed"] is False
+    assert open_door["border"] != closed_door["border"]
+    assert closed_fridge["dashed"] is True

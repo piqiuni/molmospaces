@@ -581,6 +581,26 @@ python scripts/InteractiveNav/run_semantic_interaction_exploration_batch.py \
   --scene-timeout-s 1500
 ```
 
+容器内物体交互导航队列使用专用脚本。脚本先顺序扫描场景，发现严格位于可交互容器内部的物体后立即入队；扫描满 5 个场景后才启动 5 个独立 ROS worker。公开目标上下文只包含目标物体，不包含其容器身份或 `require_interaction=true`：
+
+```bash
+python scripts/InteractiveNav/run_container_goal_queue.py \
+  --output-dir outputs/container_object_goal_queue \
+  --house-start 0 \
+  --house-count 10 \
+  --workers 5 \
+  --warmup-scenes 5 \
+  --task-horizon 1000 \
+  --scene-timeout-s 1500 \
+  --gt-step-interval 5 \
+  --gt-max-distance-m 6.0 \
+  --gt-min-visible-pixels 16 \
+  --env-file .env \
+  --allow-failures
+```
+
+每个任务默认启用 `semantic_interaction_object_goal`、模块 1/2/3 的 MLLM 配置、关闭初始门和容器、快速原子交互及六联图录像。批次根目录保存 `scan_results.json`、`queue_state.json`、`aggregate_metrics.json` 和 `summary.csv`；每个任务目录保存目标选择、语义结果、MLLM 指标和 `videos/overview_6panel.mp4`。
+
 例如 10 个场景和 2 个 worker 的分配为：
 
 ```text

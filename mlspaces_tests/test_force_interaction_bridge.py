@@ -213,6 +213,7 @@ def test_controller_discovers_drawer_joints_for_visual_plan(monkeypatch) -> None
         "object_id": "dresser_root",
         "action": "scan",
         "sequence_type": "drawer_scan",
+        "approach_goal_xyyaw": [1.0, 2.0, 0.5],
         "open_regions": [
             {"center": [0.5, 0.18], "confidence": 0.9},
             {"center": [0.5, 0.52], "confidence": 0.8},
@@ -356,6 +357,7 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     controller = AtomicForceInteractionController(
         close_all_doors_on_prepare=False,
         drawer_execution_mode="fast",
+        drawer_observation_steps=3,
     )
     controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
     controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
@@ -367,6 +369,7 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
         "object_id": "dresser_root",
         "action": "scan",
         "sequence_type": "drawer_scan",
+        "approach_goal_xyyaw": [1.0, 2.0, 0.5],
         "interaction_groups": [
             {"group_id": "bad", "joint_names": ["planner_must_not_select_this"]},
         ],
@@ -376,15 +379,17 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     data = SimpleNamespace(xpos=[[0.0, 0.0, 1.0], [0.0, 0.0, 0.2]])
     task = SimpleNamespace(env=SimpleNamespace(current_model=model, current_data=data))
 
-    for step in range(3):
+    for step in range(10):
         controller.before_step(task, step=step)
         result = controller.after_step(task, step=step)
 
     assert result is not None
     assert result["success"] is True
-    assert result["task_steps_consumed"] == 3
+    assert result["task_steps_consumed"] == 10
     assert result["drawer_execution_mode"] == "fast"
-    assert [item["observation_step"] for item in result["region_results"]] == [0, 1]
+    assert result["drawer_observation_steps"] == 3
+    assert result["approach_goal_xyyaw"] == [1.0, 2.0, 0.5]
+    assert [item["observation_step"] for item in result["region_results"]] == [3, 8]
     assert "interaction_group_results" not in result
     assert "joint_names" not in result
     assert "joint_infos" not in result
