@@ -157,8 +157,9 @@ def portal_positions_between_rooms(
     edges: list[dict[str, Any]] | None,
     room_positions: dict[str, tuple[int, int]],
     spacing: float = 24.0,
+    vertical_offset_y: float = 0.0,
 ) -> dict[str, tuple[int, int]]:
-    """Place connected portals on the line between their two room nodes."""
+    """Place connected portals between rooms, optionally half a level lower."""
     portals_by_room_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for portal in portals:
         connected_rooms = [
@@ -176,7 +177,7 @@ def portal_positions_between_rooms(
         first = room_positions[room_pair[0]]
         second = room_positions[room_pair[1]]
         midpoint_x = (first[0] + second[0]) * 0.5
-        midpoint_y = (first[1] + second[1]) * 0.5
+        midpoint_y = (first[1] + second[1]) * 0.5 + float(vertical_offset_y)
         delta_x = float(second[0] - first[0])
         delta_y = float(second[1] - first[1])
         length = max(1.0, (delta_x * delta_x + delta_y * delta_y) ** 0.5)

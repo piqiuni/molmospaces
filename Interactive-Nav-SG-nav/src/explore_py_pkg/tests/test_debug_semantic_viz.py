@@ -148,6 +148,13 @@ def test_connected_portal_is_positioned_between_its_rooms():
         {"room_1": (100, 120), "room_2": (300, 120)},
     ) == {"door": (200, 120)}
 
+    assert portal_positions_between_rooms(
+        portals,
+        [],
+        {"room_1": (100, 120), "room_2": (300, 120)},
+        vertical_offset_y=35,
+    ) == {"door": (200, 155)}
+
 
 def test_room_style_labels_include_unknown_and_confidence():
     labels = room_style_by_id(

@@ -102,6 +102,48 @@ def test_controller_requires_canonical_object_id() -> None:
         )
 
 
+def test_missing_articulation_publishes_failure_without_stopping_episode(monkeypatch) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    published = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, object_id: (_ for _ in ()).throw(
+            ValueError(f"Articulated object not found: {object_id}")
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_publish",
+        lambda _publisher, payload: published.append(payload),
+    )
+    controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    assert controller.enqueue_command(
+        {
+            "command_id": "missing_door",
+            "candidate_id": "interaction:missing_door:open",
+            "decision_id": "decision_missing",
+            "object_id": "doorframe_without_joint",
+            "action": "open",
+        }
+    )
+    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+
+    result = controller.before_step(task, step=210)
+
+    assert result is not None
+    assert result["status"] == "FAILED"
+    assert result["success"] is False
+    assert result["failure_reason"] == "articulation_resolution_failed"
+    assert result["verification_source"] == "executor_resolution_failure"
+    assert result["object_id"] == "doorframe_without_joint"
+    assert controller.should_pause_navigation() is False
+    assert controller.after_step(task, step=210) is None
+    assert len(published) == 2
+    assert published[1]["behavior_type"] == "INTERACT"
+    assert published[1]["status"] == "FAILED"
+
+
 def test_visual_drawer_regions_are_grounded_to_slide_joints_by_height() -> None:
     groups = ground_drawer_open_regions(
         [

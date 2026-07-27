@@ -2452,15 +2452,26 @@ class ExploreDebugRecorder:
         node_lookup = {node.get("id"): node for node in all_nodes}
         contains_edges = [edge for edge in graph.get("edges") or [] if edge.get("relation") == "contains"]
         contained_ids = {edge.get("dst_id") for edge in contains_edges}
+        direct_room_object_ids = {
+            edge.get("dst_id")
+            for edge in graph.get("edges") or []
+            if edge.get("relation") == "has_child"
+            and (node_lookup.get(edge.get("src_id")) or {}).get("type") == "room"
+            and (node_lookup.get(edge.get("dst_id")) or {}).get("type") == "object"
+        } - contained_ids
         selected = [
             node
             for node in all_nodes
-            if node.get("type") in {"room", "portal", "container"} or node.get("id") in contained_ids
+            if node.get("type") in {"room", "portal", "container"}
+            or node.get("id") in contained_ids
+            or node.get("id") in direct_room_object_ids
         ]
         room_row = max(126, int(panel_height * 0.28))
-        portal_row = max(room_row + 66, int(panel_height * 0.48))
-        container_row = max(portal_row + 62, int(panel_height * 0.68))
-        object_row = min(panel_height - 48, max(container_row + 58, int(panel_height * 0.86)))
+        available_hierarchy_height = max(72, panel_height - room_row - 48)
+        hierarchy_level_gap = max(36, min(62, available_hierarchy_height // 2))
+        portal_row = room_row + hierarchy_level_gap // 2
+        container_row = room_row + hierarchy_level_gap
+        object_row = min(panel_height - 48, room_row + hierarchy_level_gap * 2)
         slot_rows = {
             "room": (room_row, 5),
             "portal": (portal_row, 7),
@@ -2505,6 +2516,7 @@ class ExploreDebugRecorder:
                 for node_id, position in positions.items()
                 if str((node_lookup.get(node_id) or {}).get("type")) == "room"
             },
+            vertical_offset_y=portal_row - room_row,
         )
         for node_id, (x, y) in connected_portal_positions.items():
             positions[node_id] = (
@@ -2532,6 +2544,52 @@ class ExploreDebugRecorder:
                     max(24, min(panel_width - 24, x)),
                     slot_rows["container"][0],
                 )
+
+        direct_objects_by_room: dict[str, list[dict]] = {}
+        direct_object_rows: dict[str, dict[int, list[str]]] = {}
+        for node in selected:
+            if node.get("id") not in direct_room_object_ids:
+                continue
+            room_id = node.get("room_id")
+            parent_room_id = (
+                f"room_{int(room_id)}"
+                if room_id is not None
+                else str(node.get("parent_id") or "")
+            )
+            direct_objects_by_room.setdefault(parent_room_id, []).append(node)
+        ordered_room_ids = [str(node.get("id")) for node in rooms]
+        for room_index, room_node_id in enumerate(ordered_room_ids):
+            objects = sorted(
+                direct_objects_by_room.get(room_node_id, []),
+                key=lambda item: str(item.get("id")),
+            )
+            if not objects:
+                continue
+            room_x = positions[room_node_id][0]
+            left_x = (
+                8
+                if room_index == 0
+                else (positions[ordered_room_ids[room_index - 1]][0] + room_x) // 2
+            )
+            right_x = (
+                panel_width - 8
+                if room_index + 1 == len(ordered_room_ids)
+                else (room_x + positions[ordered_room_ids[room_index + 1]][0]) // 2
+            )
+            usable_width = max(40, right_x - left_x - 12)
+            columns = max(1, min(4, usable_width // 44))
+            for index, node in enumerate(objects):
+                row = index // columns
+                column = index % columns
+                row_count = min(columns, len(objects) - row * columns)
+                x = int(left_x + (column + 1) * (right_x - left_x) / (row_count + 1))
+                y = min(panel_height - 28, object_row + row * 28)
+                node_id = str(node.get("id"))
+                positions[node_id] = (
+                    max(20, min(panel_width - 20, x)),
+                    y,
+                )
+                direct_object_rows.setdefault(room_node_id, {}).setdefault(y, []).append(node_id)
 
         container_for_object = {
             str(edge.get("dst_id")): str(edge.get("src_id"))
@@ -2572,6 +2630,40 @@ class ExploreDebugRecorder:
                 )
             )
         }
+        for room_node_id, rows in direct_object_rows.items():
+            room_position = positions.get(room_node_id)
+            if room_position is None or not rows:
+                continue
+            bus_rows = sorted(rows)
+            cv2.line(
+                panel,
+                room_position,
+                (room_position[0], bus_rows[-1] - 10),
+                (175, 175, 175),
+                1,
+                cv2.LINE_AA,
+            )
+            for row_y in bus_rows:
+                object_positions = [
+                    positions[node_id]
+                    for node_id in rows[row_y]
+                    if node_id in positions
+                ]
+                if not object_positions:
+                    continue
+                bus_y = row_y - 10
+                min_x = min(room_position[0], *(position[0] for position in object_positions))
+                max_x = max(room_position[0], *(position[0] for position in object_positions))
+                cv2.line(panel, (min_x, bus_y), (max_x, bus_y), (175, 175, 175), 1, cv2.LINE_AA)
+                for object_position in object_positions:
+                    cv2.line(
+                        panel,
+                        (object_position[0], bus_y),
+                        object_position,
+                        (175, 175, 175),
+                        1,
+                        cv2.LINE_AA,
+                    )
         for edge in graph.get("edges") or []:
             src = positions.get(edge.get("src_id"))
             dst = positions.get(edge.get("dst_id"))
@@ -2595,7 +2687,9 @@ class ExploreDebugRecorder:
             if center is None:
                 continue
             color = self._semantic_node_color(node)
-            cv2.circle(panel, center, 13 if node.get("type") == "room" else 9, color, -1, cv2.LINE_AA)
+            node_type = str(node.get("type") or "object")
+            radius = 13 if node_type == "room" else 6 if node_type == "object" else 9
+            cv2.circle(panel, center, radius, color, -1, cv2.LINE_AA)
             ranked_group_ids = list(
                 semantic_decision_trace.get("model_ranked_group_ids") or []
             )
@@ -2639,13 +2733,28 @@ class ExploreDebugRecorder:
             if node.get("type") in {"portal", "container"}:
                 label += f"[{state}]"
             label_y = center[1] + 20
-            if node.get("type") == "portal":
-                label_y += (
-                    18
-                    if node_id in connected_portal_ids
-                    else 13 * portal_label_rows.get(node_id, 0)
-                )
-            cv2.putText(panel, label[:24], (center[0] - 30, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.26, (30, 30, 30), 1, cv2.LINE_AA)
+            if node.get("type") == "portal" and node_id in connected_portal_ids:
+                label_y = center[1] + 17
+            elif node.get("type") == "portal":
+                label_y += 13 * portal_label_rows.get(node_id, 0)
+            if node_type == "object":
+                label = display_ids.get(node_id, self._short_node_id(node))
+                label_x = center[0] - 9
+                label_y = center[1] + 13
+                font_scale = 0.20
+            else:
+                label_x = center[0] - 30
+                font_scale = 0.26
+            cv2.putText(
+                panel,
+                label[:24],
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (30, 30, 30),
+                1,
+                cv2.LINE_AA,
+            )
         revision = int(graph.get("graph_revision", 0) or 0)
         legend = "ROOM -- PORTAL -- ROOM    CONTAINER --contains--> OBJECT"
         cv2.putText(panel, legend, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (75, 75, 75), 1, cv2.LINE_AA)

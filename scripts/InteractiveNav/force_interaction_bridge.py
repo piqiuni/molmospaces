@@ -294,6 +294,15 @@ class AtomicForceInteractionController:
             if view_profile == "drawer_low_view":
                 self._force_observation_requested = True
             return None
+        except (KeyError, ValueError) as exc:
+            self._commands.task_done()
+            return self._publish_command_failure(
+                task,
+                command,
+                step,
+                exc,
+                view_result=locals().get("view_result"),
+            )
         except Exception:
             self._commands.task_done()
             raise
@@ -807,6 +816,82 @@ class AtomicForceInteractionController:
     def after_task_step(self) -> None:
         if self._pending is None and not self._restore_view_pending:
             self._pause_navigation = False
+
+    def _publish_command_failure(
+        self,
+        task,
+        command: dict[str, Any],
+        step: int,
+        exc: Exception,
+        view_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        event_id = str(command.get("event_id") or f"interaction_{self._event_index:06d}")
+        self._event_index += 1
+        stamp_sec = time.time()
+        try:
+            view_restore_result = self._head_view_controller.restore(task.env)
+        except (AttributeError, KeyError, ValueError):
+            view_restore_result = {
+                "applied": False,
+                "reason": "environment_view_restore_unavailable",
+            }
+        result = {
+            "event_id": event_id,
+            "command_id": str(command["command_id"]),
+            "candidate_id": str(command.get("candidate_id") or ""),
+            "decision_id": str(command.get("decision_id") or ""),
+            "node_id": str(command.get("node_id") or ""),
+            "object_id": str(command["object_id"]),
+            "action": str(command.get("action") or "open"),
+            "interaction_mode": str(command.get("interaction_mode") or "open_close"),
+            "operation_method": str(command.get("operation_method") or "unknown"),
+            "open_regions": list(command.get("open_regions") or []),
+            "visual_operation_plan": dict(command.get("visual_operation_plan") or {}),
+            "view_profile": str(command.get("view_profile") or "default"),
+            "view_profile_result": view_result,
+            "view_restore_result": view_restore_result,
+            "state": "unknown",
+            "pre_state": "unknown",
+            "post_state": "unknown",
+            "success": False,
+            "status": "FAILED",
+            "confidence": 1.0,
+            "execution_cost": 1.0,
+            "sim_steps_consumed": 0,
+            "physics_substeps": 0,
+            "task_steps_consumed": 0,
+            "result_published_step": int(step),
+            "interaction_execution_mode": self.interaction_execution_mode,
+            "interaction_transition_steps": 0,
+            "source": "force_interaction_rejected",
+            "verification_source": "executor_resolution_failure",
+            "failure_reason": "articulation_resolution_failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        feedback = {
+            "command_id": result["command_id"],
+            "candidate_id": result["candidate_id"],
+            "decision_id": result["decision_id"],
+            "event_id": event_id,
+            "behavior_type": "INTERACT",
+            "status": "FAILED",
+            "success": False,
+            "interaction_result": result,
+            "step": int(step),
+            "stamp_sec": stamp_sec,
+        }
+        self._events.append({"result": result, "feedback": feedback})
+        self._pending = None
+        self._restore_view_pending = False
+        self._pause_navigation = False
+        self._force_observation_requested = True
+        self._publish(self._result_publisher, result)
+        self._publish(self._feedback_publisher, feedback)
+        self._write_snapshot()
+        return result
 
     def finalize(self, completed_steps: int) -> None:
         self._completed_steps = int(completed_steps)
