@@ -229,7 +229,10 @@ class SemanticMappingNode:
         self.occ_sub = rospy.Subscriber(self.occupancy_grid_topic, OccupancyGrid, self.occupancy_callback, queue_size=1)
         self.room_context_sub = rospy.Subscriber(self.room_context_topic, String, self.room_context_callback, queue_size=1)
         self.gt_observation_sub = rospy.Subscriber(
-            self.gt_observations_topic, String, self.gt_observation_callback, queue_size=2
+            self.gt_observations_topic,
+            String,
+            self.gt_observation_callback,
+            queue_size=1,
         )
         self.interaction_command_sub = rospy.Subscriber(
             self.interaction_command_topic, String, self.interaction_command_callback, queue_size=2

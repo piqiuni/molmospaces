@@ -34,6 +34,7 @@ class RosBridgePolicy(BasePolicy):
         blocking_republish_pointcloud: bool = False,
         queue_size: int = 1,
         observation_queue_size: int = 1,
+        extra_image_queue_size: int = 16,
         publish_pointcloud: bool = True,
         publish_camera_info: bool = True,
         depth_camera_name: str = "head_camera",
@@ -104,6 +105,7 @@ class RosBridgePolicy(BasePolicy):
         self.tf_keepalive_period_s = max(0.0, float(tf_keepalive_period_s))
         self.queue_size = queue_size
         self.observation_queue_size = int(observation_queue_size)
+        self.extra_image_queue_size = int(extra_image_queue_size)
         self.publish_pointcloud = publish_pointcloud
         self.publish_camera_info = publish_camera_info
         self.depth_camera_name = depth_camera_name
@@ -254,10 +256,13 @@ class RosBridgePolicy(BasePolicy):
         )
         self._extra_image_pub = None
         if self.extra_image_topic and self.extra_image_camera_name:
+            extra_image_queue_size = (
+                None if self.extra_image_queue_size <= 0 else self.extra_image_queue_size
+            )
             self._extra_image_pub = rospy.Publisher(
                 self.extra_image_topic,
                 Image,
-                queue_size=observation_queue_size,
+                queue_size=extra_image_queue_size,
             )
         self._depth_pub = rospy.Publisher(self.depth_topic, Image, queue_size=self.queue_size)
         self._pointcloud_pub = rospy.Publisher(self.pointcloud_topic, PointCloud2, queue_size=self.queue_size)
@@ -288,7 +293,9 @@ class RosBridgePolicy(BasePolicy):
                 required_consecutive_observations=realtime_gt_required_consecutive_observations,
                 step_interval=realtime_gt_step_interval,
                 max_distance_m=realtime_gt_max_distance_m,
-                queue_size=self.queue_size,
+                # GT is a latest-state stream.  A deep ROS queue makes newly
+                # revealed container contents wait behind stale observations.
+                queue_size=1,
             )
         if self.step_frame_dir is not None:
             self.step_frame_dir.mkdir(parents=True, exist_ok=True)
@@ -1414,11 +1421,10 @@ class RosBridgePolicy(BasePolicy):
         stamp = self._next_common_stamp()
         self._publish_odom_and_tf(observation, stamp)
 
-        topic_messages = [
-            (self._obs_pub, messages.get("rgb")),
-            (self._extra_image_pub, messages.get("extra_rgb")),
-            (self._depth_pub, messages.get("depth")),
-        ]
+        # RGB topics are recording-only in the realtime-GT ROS pipeline. Do not
+        # duplicate them while waiting for a fresh navigation command; repeated
+        # large images create recorder backlog without adding mapping evidence.
+        topic_messages = [(self._depth_pub, messages.get("depth"))]
         if self.blocking_republish_pointcloud:
             topic_messages.append((self._pointcloud_pub, messages.get("pointcloud")))
         for publisher, message in topic_messages:

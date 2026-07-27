@@ -74,6 +74,9 @@ class SemanticCandidateNode:
                 target_min_consecutive_observations=int(
                     config.get("target_min_consecutive_observations", 2)
                 ),
+                target_arrival_tolerance_m=float(
+                    config.get("target_arrival_tolerance_m", 0.35)
+                ),
             )
         )
         self.explorer_status: dict = {}

@@ -16,7 +16,7 @@ from semantic_decision_py_pkg.behavior_candidates import CandidateGenerator
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 
 
-def test_minimal_gt_portal_generates_id_only_interaction_command() -> None:
+def test_minimal_gt_portal_generates_semantic_id_and_geometry_command() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
         [
@@ -53,7 +53,12 @@ def test_minimal_gt_portal_generates_id_only_interaction_command() -> None:
         "action",
         "interaction_mode",
         "expected_state",
+        "interaction_approach_pose_xyyaw",
+        "interaction_approach_axis_xy",
+        "interaction_ready_distance_m",
+        "interaction_ready_yaw_tolerance_rad",
     }
+
     assert "joint_names" not in command
     assert "close_other_joint_names" not in command
     assert "close_other_joints" not in command

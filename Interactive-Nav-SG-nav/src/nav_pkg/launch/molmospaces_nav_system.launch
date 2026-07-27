@@ -13,6 +13,8 @@
   <arg name="start_explore_py" default="false"/>
   <arg name="start_explore" default="$(eval 'false' if arg('manual_control') == 'true' else 'true')"/>
   <arg name="start_nav" default="$(eval 'false' if arg('manual_control') else 'true')"/>
+  <arg name="move_base_respawn" default="true"/>
+  <arg name="move_base_respawn_delay" default="2.0"/>
   <arg name="semantic_use_gt" default="false"/>
   <arg name="semantic_source" default="detector"/>
   <arg name="semantic_attribute_inference" default="false"/>
@@ -204,6 +206,8 @@
       <arg name="override_config_file" value="$(arg nav_config_override_file)"/>
       <arg name="base_local_planner" value="$(arg base_local_planner)"/>
       <arg name="global_map_topic" value="$(arg global_map_topic)"/>
+      <arg name="move_base_respawn" value="$(arg move_base_respawn)"/>
+      <arg name="move_base_respawn_delay" value="$(arg move_base_respawn_delay)"/>
     </include>
     <param name="/move_base/local_costmap/inflation_layer/inflation_radius"
            value="$(arg local_costmap_inflation_radius)"/>

@@ -7,6 +7,7 @@ from .geometry_utils import normalize_label
 
 PORTAL_LABELS = {
     "door",
+    "doorframe",
     "doorway",
     "gate",
     "entrance",
@@ -173,11 +174,20 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
             segmentation = observation.get("segmentation_rle")
         if segmentation is None:
             segmentation = observation.get("segmentation")
-        visible_pixels = segmentation_pixel_count(segmentation)
-        area = bbox_area(bbox_2d)
-        visible_fraction = (
-            min(1.0, float(visible_pixels) / area) if area > 0.0 else 0.0
-        )
+        if segmentation is not None:
+            visible_pixels = segmentation_pixel_count(segmentation)
+            area = bbox_area(bbox_2d)
+            visible_fraction = (
+                min(1.0, float(visible_pixels) / area) if area > 0.0 else 0.0
+            )
+        else:
+            visible_pixels = int(observation.get("visible_pixels", 0) or 0)
+            visible_fraction = observation.get("visible_fraction")
+            if visible_fraction is None:
+                area = bbox_area(bbox_2d)
+                visible_fraction = (
+                    min(1.0, float(visible_pixels) / area) if area > 0.0 else 0.0
+                )
     else:
         semantic_name = normalize_label(
             observation.get("semantic_name")
@@ -222,6 +232,7 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
             )
     connected_room_ids = [] if minimal_gt else observation.get("connected_room_ids") or []
     room_id = None if minimal_gt else observation.get("room_id")
+
     if room_id is not None:
         try:
             room_id = int(room_id)
@@ -252,6 +263,7 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "label_votes": {} if minimal_gt else dict(observation.get("label_votes") or {}),
         "confidence": 1.0 if minimal_gt else float(
             observation.get("confidence", observation.get("conf", 0.0)) or 0.0
+
         ),
         "position": position,
         "aabb_center": aabb_center,
@@ -335,6 +347,7 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
             interaction_mode = "slide"
         elif label in OPENABLE_CONTAINER_LABELS:
             interaction_mode = "open_close"
+
     elif node_type == "support":
         interaction_mode = "place_on"
     state = "unknown"
@@ -361,6 +374,7 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
         "completed_interaction_groups": [],
         "failed_interaction_groups": [],
     }
+
 def observation_from_detection(detection: dict[str, Any], observation_id: str, source: str = "detector") -> dict[str, Any]:
     world_position = detection.get("world_position") or detection.get("position") or {}
     world_box_center = detection.get("world_box3d_center") or detection.get("aabb_center") or detection.get("box3d_center") or world_position

@@ -224,6 +224,10 @@ object_room_priors:
     fridge: 2.0
     sink: 0.4
     cabinet: 0.3
+    dishwasher: 0.8
+    counter: 0.5
+    countertop: 0.5
+    table: 0.3
   bedroom:
     bed: 1.0
     pillow: 0.8
@@ -244,6 +248,10 @@ object_room_priors:
     coffee_table: 0.6
     chair: 0.3
     table: 0.2
+  diningroom:
+    dining_table: 1.0
+    table: 0.7
+    chair: 0.4
   storage:
     box: 0.5
     shelf: 0.4

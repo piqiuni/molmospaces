@@ -33,7 +33,7 @@ from molmo_spaces.policy.learned_policy.left_arm_keyboard_debug_policy import (
 from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.profiler_utils import Profiler
-from runtime_target_selection import select_far_container_target
+from runtime_target_selection import load_fixed_container_target, select_far_container_target
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -101,6 +101,44 @@ def maybe_save_debug_snapshot(policy, observation) -> None:
     path.with_suffix(".txt").write_text(f"camera={camera_name}\nshape={np.asarray(frame).shape}\n")
     policy.debug_snapshot_saved = True
     log.info("Saved debug camera snapshot: %s", path)
+
+
+def log_debug_camera_transform(task, policy) -> None:
+    camera_name = str(getattr(policy, "extra_image_camera_name", "") or "")
+    if not camera_name:
+        return
+    registry = getattr(getattr(task.env, "camera_manager", None), "registry", None)
+    camera = None if registry is None else registry.cameras.get(camera_name)
+    if camera is None:
+        return
+    try:
+        from molmo_spaces.env.data_views import create_mlspaces_body
+
+        base_pose = np.asarray(task.env.current_robot.robot_view.base.pose, dtype=float)
+        reference_name = str(getattr(camera, "_active_reference_body_name", "") or "")
+        if not reference_name:
+            reference_names = list(getattr(camera, "reference_body_names", []) or [])
+            reference_name = str(reference_names[0]) if reference_names else ""
+        reference_pose = np.asarray(
+            create_mlspaces_body(task.env.current_data, reference_name).pose,
+            dtype=float,
+        )
+        camera.update_pose(task.env)
+        camera_position = np.asarray(camera.pos, dtype=float)
+        camera_forward = np.asarray(camera.forward, dtype=float)
+        base_rotation = base_pose[:3, :3]
+        payload = {
+            "camera_name": camera_name,
+            "reference_body_name": reference_name,
+            "reference_in_robot": (np.linalg.inv(base_pose) @ reference_pose).tolist(),
+            "camera_position_robot_m": (
+                base_rotation.T @ (camera_position - base_pose[:3, 3])
+            ).tolist(),
+            "camera_forward_robot": (base_rotation.T @ camera_forward).tolist(),
+        }
+        log.info("DEBUG_CAMERA_TRANSFORM %s", json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        log.exception("Failed to log debug camera transform.")
 
 
 def configure_run_file_logging(output_dir: Path) -> Path:
@@ -302,11 +340,22 @@ def lookat_forward_up(camera_pos: list[float], target_pos: list[float]) -> tuple
 
 
 class RuntimeTargetPublisher:
-    def __init__(self, rospy_module, string_message_type, output_path: str, top_k: int) -> None:
+    def __init__(
+        self,
+        rospy_module,
+        string_message_type,
+        output_path: str,
+        top_k: int,
+        *,
+        selection_mode: str = "random_far_container_object",
+        selection_input_path: str = "",
+    ) -> None:
         self._rospy = rospy_module
         self._String = string_message_type
         self._output_path = Path(output_path).expanduser().resolve() if output_path else None
         self._top_k = max(1, int(top_k))
+        self._selection_mode = str(selection_mode or "random_far_container_object")
+        self._selection_input_path = str(selection_input_path or "")
         self._publisher = rospy_module.Publisher(
             "/semantic_decision/target",
             string_message_type,
@@ -317,11 +366,18 @@ class RuntimeTargetPublisher:
     def publish(self, task, selection_seed: int) -> dict[str, Any]:
         import json
 
-        context, selection = select_far_container_target(
-            task,
-            selection_seed=int(selection_seed),
-            top_k=self._top_k,
-        )
+        if self._selection_mode == "fixed_container_object":
+            if not self._selection_input_path:
+                raise ValueError(
+                    "fixed_container_object requires --runtime_target_selection_input_path"
+                )
+            context, selection = load_fixed_container_target(self._selection_input_path)
+        else:
+            context, selection = select_far_container_target(
+                task,
+                selection_seed=int(selection_seed),
+                top_k=self._top_k,
+            )
         gt_publisher = getattr(getattr(task, "policy", None), "_realtime_gt_publisher", None)
         if not getattr(gt_publisher, "episode_id", ""):
             context.setdefault("episode_id_hint", f"episode_seed_{int(selection_seed)}")
@@ -370,6 +426,7 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
         policy.task = task
         policy.reset()
+        log_debug_camera_transform(task, policy)
         door_occ_controller = getattr(policy, "door_occ_test_controller", None)
         if door_occ_controller is not None:
             door_occ_controller.prepare(task)
@@ -732,7 +789,7 @@ def build_nav_config(args) -> NavToObjBaseConfig:
                         pos=fixed_camera_pos,
                         forward=forward,
                         up=up,
-                        fov=75.0,
+                        fov=float(args.debug_front_camera_fov_deg),
                         skip_erosion=True,
                     )
                 )
@@ -745,9 +802,8 @@ def build_nav_config(args) -> NavToObjBaseConfig:
                         reference_body_names=["robot_0/base", "base"],
                         camera_offset=debug_camera_offset or [-1.08, 0.62, 1.60],
                         lookat_offset=debug_camera_lookat_offset or [0.4, 0.0, 0.95],
-                        camera_quaternion=[0.5, 0.5, -0.5, -0.5],
                         up_axis="z",
-                        fov=75.0,
+                        fov=float(args.debug_front_camera_fov_deg),
                         skip_erosion=True,
                     )
                 )
@@ -863,6 +919,12 @@ def parse_args():
         default=1,
         help="ROS RGB publisher queue; use 0 for synchronous per-step debug recording.",
     )
+    parser.add_argument(
+        "--extra_image_queue_size",
+        type=int,
+        default=16,
+        help="External/debug camera ROS publisher queue; positive values keep large images off the simulation thread.",
+    )
     parser.add_argument("--depth_topic", type=str, default="/molmo_spaces/head_camera/depth")
     parser.add_argument("--action_topic", type=str, default="/molmo_spaces/action")
     parser.add_argument("--pointcloud_topic", type=str, default="/registered_scan")
@@ -943,10 +1005,11 @@ def parse_args():
         "--runtime_target_selection_mode",
         type=str,
         default="none",
-        choices=["none", "random_far_container_object"],
+        choices=["none", "random_far_container_object", "fixed_container_object"],
     )
     parser.add_argument("--runtime_target_selection_top_k", type=int, default=3)
     parser.add_argument("--runtime_target_selection_path", type=str, default="")
+    parser.add_argument("--runtime_target_selection_input_path", type=str, default="")
     parser.add_argument("--door_occ_test_root_name", type=str, default="")
     parser.add_argument(
         "--door_occ_test_open_step",
@@ -963,8 +1026,17 @@ def parse_args():
     )
     parser.add_argument("--fixed_debug_camera_pos", type=str, default="")
     parser.add_argument("--fixed_debug_camera_target", type=str, default="")
-    parser.add_argument("--debug_front_camera_offset", type=str, default="-1.08,0.62,1.60")
-    parser.add_argument("--debug_front_camera_lookat_offset", type=str, default="0.4,0.0,0.95")
+    parser.add_argument(
+        "--debug_front_camera_offset",
+        type=str,
+        default="-0.779295308248162,0.9640243904369644,1.600000023841858",
+    )
+    parser.add_argument(
+        "--debug_front_camera_lookat_offset",
+        type=str,
+        default="0.010510587056107079,0.4165302897166183,1.3234916922873792",
+    )
+    parser.add_argument("--debug_front_camera_fov_deg", type=float, default=65.0)
     parser.add_argument("--depth_camera_name", type=str, default="head_camera")
     parser.add_argument("--pointcloud_frame_id", type=str, default="tf_frame_lidar")
     parser.add_argument("--pointcloud_stride", type=int, default=2)
@@ -1193,6 +1265,7 @@ def main():
             task=None,
             observation_topic=args.observation_topic,
             observation_queue_size=args.observation_queue_size,
+            extra_image_queue_size=args.extra_image_queue_size,
             action_topic=args.action_topic,
             pointcloud_topic=args.pointcloud_topic,
             camera_info_topic=args.camera_info_topic,
@@ -1281,6 +1354,8 @@ def main():
             String,
             args.runtime_target_selection_path,
             args.runtime_target_selection_top_k,
+            selection_mode=args.runtime_target_selection_mode,
+            selection_input_path=args.runtime_target_selection_input_path,
         )
         policy.runtime_target_seed = int(args.seed)
         policy.runtime_target_selection = {}

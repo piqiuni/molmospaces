@@ -243,3 +243,62 @@ def test_target_mission_rejects_unrelated_autonomous_interaction() -> None:
         feedback={"target_id": "container_cabinet", "target_name": "cabinet_1"},
         candidates=[],
     ) is False
+
+
+def test_visible_object_goal_becomes_priority_navigation_candidate() -> None:
+    candidate = TargetMissionTracker.priority_target_candidate(
+        [
+            {
+                "candidate_id": "target:object_apple",
+                "behavior_type": "NAVIGATE",
+                "target_id": "object_apple",
+                "target_name": "apple",
+                "metadata": {
+                    "target_goal": True,
+                    "target_visible_now": True,
+                    "target_reliably_observed": True,
+                },
+            }
+        ]
+    )
+
+    assert candidate["candidate_id"] == "target:object_apple"
+    assert candidate["behavior_type"] == "NAVIGATE"
+
+
+def test_visible_only_priority_rejects_historical_target_observation() -> None:
+    candidate = TargetMissionTracker.priority_target_candidate(
+        [
+            {
+                "candidate_id": "target:object_apple",
+                "behavior_type": "NAVIGATE",
+                "metadata": {
+                    "target_goal": True,
+                    "target_visible_now": False,
+                    "target_reliably_observed": True,
+                },
+            }
+        ],
+        currently_visible_only=True,
+    )
+
+    assert candidate is None
+
+
+def test_reliable_historical_target_remains_priority_navigation_candidate() -> None:
+    candidate = TargetMissionTracker.priority_target_candidate(
+        [
+            {
+                "candidate_id": "target:object_lettuce",
+                "behavior_type": "NAVIGATE",
+                "metadata": {
+                    "target_goal": True,
+                    "target_visible_now": False,
+                    "target_reliably_observed": True,
+                },
+            }
+        ]
+    )
+
+    assert candidate is not None
+    assert candidate["candidate_id"] == "target:object_lettuce"

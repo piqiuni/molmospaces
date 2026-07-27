@@ -747,6 +747,26 @@ python scripts/InteractiveNav/run_semantic_interaction_exploration_batch.py \
   --scene-timeout-s 1500
 ```
 
+容器内物体交互导航队列使用专用脚本。脚本先顺序扫描场景，发现严格位于可交互容器内部的物体后立即入队；扫描满 5 个场景后才启动 5 个独立 ROS worker。公开目标上下文只包含目标物体，不包含其容器身份或 `require_interaction=true`：
+
+```bash
+python scripts/InteractiveNav/run_container_goal_queue.py \
+  --output-dir outputs/container_object_goal_queue \
+  --house-start 0 \
+  --house-count 10 \
+  --workers 5 \
+  --warmup-scenes 5 \
+  --task-horizon 1000 \
+  --scene-timeout-s 1500 \
+  --gt-step-interval 5 \
+  --gt-max-distance-m 6.0 \
+  --gt-min-visible-pixels 16 \
+  --env-file .env \
+  --allow-failures
+```
+
+每个任务默认启用 `semantic_interaction_object_goal`、模块 1/2/3 的 MLLM 配置、关闭初始门和容器、快速原子交互及六联图录像。批次根目录保存 `scan_results.json`、`queue_state.json`、`aggregate_metrics.json` 和 `summary.csv`；每个任务目录保存目标选择、语义结果、MLLM 指标和 `videos/overview_6panel.mp4`。
+
 例如 10 个场景和 2 个 worker 的分配为：
 
 ```text
@@ -1150,37 +1170,156 @@ METHOD=object_goal_rule \
 HOUSE_IND=7 \
 USE_FIXED_ROUTE=true \
 ROUTE_ID=house7_force_route_01 \
-TASK_HORIZON=800 \
+TASK_HORIZON=1000 \
 INITIAL_DOOR_STATE=closed \
 SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/object_goal_apple.yaml \
-SEMANTIC_MAPPING_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/house7_interaction_geometry.yaml \
 GT_STEP_INTERVAL=1 \
 GT_MAX_DISTANCE_M=6.0 \
 VIDEO_FPS=15 \
 VIDEO_PANEL_WIDTH_PX=640 \
 EXTERNAL_VIDEO_WIDTH_PX=1024 \
 ENABLE_EXTERNAL_VIDEO=true \
-VIDEO_FRAME_JOB_QUEUE_SIZE=128 \
-ARTIFACT_WRITE_QUEUE_SIZE=1024 \
-VIDEO_HISTORY_SIZE=128 \
+VIDEO_FRAME_JOB_QUEUE_SIZE=1024 \
+ARTIFACT_WRITE_QUEUE_SIZE=4096 \
+VIDEO_HISTORY_SIZE=1024 \
 IMAGE_QUEUE_SIZE=16 \
+OBSERVATION_QUEUE_SIZE=16 \
+EXTRA_IMAGE_QUEUE_SIZE=16 \
+RECORDER_SHUTDOWN_GRACE_S=600 \
 CLEAN_INTERMEDIATE=false \
 SIM_TIMEOUT_S=1800 \
   scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
-  outputs/house7_object_goal_apple_route01_close_left_low_near_frontgate_paper_800_20260727_v2
+  outputs/house7_object_goal_apple_route01
 ```
 
 主要输出：`videos/overview_6panel.mp4`、`debug/semantic_keyframes/`、`debug/graph/` 和 `semantic_exploration_result.json`。
+
+模块 2 使用 LLM 直接选择具体 `NAVIGATE / INTERACT / EXPLORE` subgoal 时，使用独立配置保留规则基线。模型连接参数继续从仓库 `.env` 或 `SEMANTIC_MODEL_*` 环境变量读取：
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:12835 \
+METHOD=semantic_interaction_object_goal \
+RUNTIME_TARGET_MODE=none \
+HOUSE_IND=7 \
+USE_FIXED_ROUTE=true \
+ROUTE_ID=house7_force_route_01 \
+TASK_HORIZON=1000 \
+INITIAL_DOOR_STATE=closed \
+SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/object_goal_apple_module2_mllm.yaml \
+GT_STEP_INTERVAL=1 \
+GT_MAX_DISTANCE_M=6.0 \
+VIDEO_FPS=15 \
+VIDEO_PANEL_WIDTH_PX=640 \
+CLEAN_INTERMEDIATE=false \
+SIM_TIMEOUT_S=1800 \
+  scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/house7_object_goal_apple_module2_mllm_route01
+```
+
+该配置固定 `mission.mode=semantic_interaction_object_goal`，并用 `RUNTIME_TARGET_MODE=none` 禁止运行时随机容器目标覆盖，避免向模型泄露目标容器或强制交互信息。仅消融模块 2：模块 1 保持 `dynamic_rule`，模块 3 保持 `rule_verified`。决策 trace 中应满足正常模型路径的 `model_selected_candidate_id == executed_candidate_id`；若模型响应期间候选失效，则会记录 `candidate_validation_reason` 和 `stale_fallback_used`。
 
 2026-07-27 回归：冰箱物理正面轴校准为 `+X`，节点图记录固定交互位姿
 `[8.254459, 1.053060, 3.141593]`。本次机器人实际交互位姿为
 `[8.535121, 1.075141, -2.944551]`，位置误差 `0.282 m`、朝向误差
 `0.197 rad`，通过执行端位姿门控并成功从 `closed` 切换到 `open`。后续外部相机默认
-offset 调整为 `[-1.08, 0.62, 1.60]`，保持约 `1.24 m` 水平距离并位于机器人
-左后方约 `30 deg`；look-at offset 为 `[0.4, 0.0, 0.95]`，提高相机同时增加
-向下俯视角。原始外部相机 PNG 与视频均为 `1024x576`。节点图右侧决策文字框已移除，
+采用手动调好的 `CAMERA_REL`：position `[-0.779295308248162, 0.9640243904369644,
+1.600000023841858]`、yaw `-34.729731964609215 deg`、pitch
+`-16.0519210588521 deg`、FOV `65 deg`。运行脚本中的等价 look-at offset 为
+`[0.010510587056107079, 0.4165302897166183, 1.3234916922873792]`。相机水平距离
+约 `1.24 m`。原始外部相机 PNG 与视频均为 `1024x576`。节点图右侧决策文字框已移除，
 room 横向排列优先依据 portal-room 拓扑连接度，将 House 7 的 livingroom 放在
 bedroom 与 kitchen 之间。
+
+2026-07-28 House 7 论文首图相机回归：左后上方位姿会让机器人位于画面右侧，
+同时保持冰箱正面和内部物体可见。当前稳定跟随相机配置为
+`position_robot=[-1.45, 1.30, 1.90]`、
+`lookat_offset=[0.05, 0.40, 1.38]`、FOV `65 deg`，由
+`scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh` 默认使用。
+House 7 apple 800-step 回归输出为
+`outputs/house7_apple_rear_left_compromise_800_20260728_v4`，最终 apple 目标成功，
+外部最终 PNG 为 `1024x576`。
+
+#### 手动移动机器人并调外部相机
+
+历史手动可视化工具位于独立实验 worktree：
+
+- `/home/user/ldl/molmospaces-exp-setting/scripts/InteractiveNav/run_manual_interactive_nav_test.py`
+- `/home/user/ldl/molmospaces-exp-setting/scripts/InteractiveNav/manual_interactive_nav_camera.py`
+- `/home/user/ldl/molmospaces-exp-setting/scripts/InteractiveNav/manual_interactive_nav_policy.py`
+
+启动 House 7 冰箱内 apple 场景：
+
+```bash
+cd /home/user/ldl/molmospaces-exp-setting
+source /home/user/miniconda3/etc/profile.d/conda.sh
+conda activate mlspaces
+export MPLCONFIGDIR=/tmp/molmospaces-matplotlib
+python scripts/InteractiveNav/run_manual_interactive_nav_test.py \
+  --catalog scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_train_100/raw/mixed_rough/mixed_rough_catalog.json \
+  --case_id 'mixed_h7__refrigerator_4d8cd69ca487b76cae801cfb0248a055_1_0_6__apple_87e4661e0aaedff69f751b5ac78bd93c_1_0_6' \
+  --state_preset visualization \
+  --camera_mode robot_over_shoulder \
+  --camera_position_offset_robot -0.779295308248162 0.9640243904369644 1.600000023841858 \
+  --camera_lookat_offset_robot 0.010510587056107079 0.4165302897166183 1.3234916922873792 \
+  --camera_fov 65 \
+  --camera_translation_step 0.05 \
+  --camera_rotation_step_deg 1.0 \
+  --capture_dir /tmp/house7_manual_camera_tune
+```
+
+控制键：`W/S/A/D` 移动机器人，`I/K/J/L` 平移相机，`;/'` 调 yaw，`./` 调
+pitch，`O/P` 打开/关闭交互对象，`V` 截图，`C` 重置相机，`R` 重置机器人，
+`Esc` 退出。调好后终端打印的 `CAMERA_REL` 可直接记录；yaw/pitch 转成跟随相机
+look-at 时，只需用 `lookat = position + [cos(pitch)cos(yaw), cos(pitch)sin(yaw),
+sin(pitch)]`。
+
+注意：跟随相机配置不能同时设置固定 `camera_quaternion`。`RobotMountedCamera` 在
+`camera_quaternion` 非空时会忽略 `lookat_offset`；此前正式仿真仍传入
+`[0.5, 0.5, -0.5, -0.5]`，实际视线因此被固定为机器人坐标系正前方 `[1, 0, 0]`，
+没有使用遥控记录的 yaw/pitch。该覆盖已移除。上述 CAMERA_REL 对应的正确机器人系
+forward 为 `[0.7898058953, -0.5474941007, -0.2765083316]`，正式跟随相机现在由
+position 与 look-at 两个机器人系 offset 生成，与遥控脚本保持一致。
+
+2026-07-27 耗时回归：三路并行 800-step 测试输出位于
+`outputs/house7_perf_parallel3_800_20260727_w{1,2,3}`。三次均完成 800 个 sim step、
+800 行 `sim/step_timing.jsonl`、800 张 sim-step PNG 和 800 帧 6-panel 视频；主循环
+均值分别为 `1.031`、`1.042`、`1.023 s/step`。合并稳定阶段日志显示，外部相机
+同步 ROS 发布平均占 `510 ms/step`，而 sim-step PNG 队列入队仅占 `0.03 ms/step`。
+
+性能修复后，第一视角和外部相机分别使用独立的异步 ROS publisher queue，外部相机
+回调不再与 6-panel 渲染共用锁，等待导航命令期间也不再重复发布录像 RGB。最终
+100-step 回归位于 `outputs/house7_perf_short_all_async_lossless_100_20260727`：稳定阶段
+平均 `0.708 s/step`，外部图像 ROS 发布由 `441 ms` 降至 `1.48 ms`；100 个 sim step
+对应 100 张 sim-step PNG、100 张外部原始 PNG 和 100 张 topology panel PNG，且
+`artifact_write_dropped_jobs=0`、`video_frame_jobs_dropped=0`。
+
+2026-07-27 apple object-goal 修复：原先实时 GT 消息会携带每个实例的完整像素坐标，
+1024x576 下单条 ROS JSON 可达到约 `0.6-1.3 MB`；同时 GT publisher 复用了深度
+为 16 的通用 ROS 队列，导致冰箱打开后的新目标观测排在旧消息后。现在 GT 只发布
+`bbox_2d + visible_pixels + visible_fraction + box_3d`，发布端和语义映射订阅端均改为
+latest-only 队列 1。三路最终测试中，apple 从原始 GT 捕获到节点图 `NEW_NODE` 的
+墙钟延迟降为 `7.8-9.1 s`，此前并行长测为 `29-53 s`。
+
+该次回归曾通过精确 apple 与 refrigerator 绑定验证目标状态机。合并后的通用配置仅暴露
+apple 类别，不再向决策模块提供目标容器 ID 或强制交互信息；目标一旦稳定进入图中，便由
+事件驱动优先级抢占探索。容器内目标复用图关系推导出的父容器及其已验证交互位姿，不再
+根据 apple 几何中心生成可能位于冰箱内部或侧面的导航点；机器人已在该位姿时直接进入
+可见性验证，不再被无位移看门狗误判。完成后发布 `target_goal_succeeded` 并触发仿真提前退出。
+
+三路最终并行输出：
+
+- `outputs/house7_apple_latest_parallel3_800_20260727_w1`：step 451 成功，保留 10 step 后在 461 结束。
+- `outputs/house7_apple_latest_parallel3_800_20260727_w2`：step 339 成功，保留 10 step 后在 349 结束。
+- `outputs/house7_apple_latest_parallel3_800_20260727_w3`：step 385 成功，保留 10 step 后在 395 结束。
+
+三路均满足：冰箱交互成功、交互位姿验证通过、apple 当前稳定可见、目标导航成功、
+`target_goal_success=true`、`target_container_interaction_success=true`、
+`overall_success=true`。`sim_step_frames/manifest.jsonl` 与最终 6-panel 视频帧数一一对应，
+且 `video_frame_jobs_dropped=0`、`artifact_write_dropped_jobs=0`、渲染队列覆盖次数为 0。
+外部相机原始帧在 `debug/videos/external_camera_raw_frames/`，图 3 在
+`debug/videos/room_interaction_frames/`，节点图在
+`debug/videos/semantic_topology_frames/`，按 sim step 对齐后的完整 6-panel PNG 在
+`videos/offline_composite_frames/`。
 
 ## 8.6 Room分割测试
 

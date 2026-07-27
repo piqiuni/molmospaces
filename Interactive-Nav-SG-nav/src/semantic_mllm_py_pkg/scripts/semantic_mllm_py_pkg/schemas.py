@@ -55,7 +55,14 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
             }
         )
     result["interaction_parts"] = normalized_parts
-    result["confidence"] = _confidence(result.get("confidence"), 0.0)
+    part_confidence = max(
+        (float(part.get("confidence", 0.0) or 0.0) for part in normalized_parts),
+        default=0.0,
+    )
+    result["confidence"] = _confidence(
+        result.get("confidence"),
+        part_confidence,
+    )
     result["evidence_frame_ids"] = [str(item) for item in result.get("evidence_frame_ids") or []]
     return result
 

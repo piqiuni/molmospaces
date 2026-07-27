@@ -49,6 +49,7 @@ DEFAULT_CLASS_MAPPING = {
     "couch": "sofa",
     "toilet": "toilet",
     "sink": "sink",
+    "doorframe": "doorframe",
     "door": "door",
     "window_sill": "window",
 }
@@ -70,6 +71,7 @@ DEFAULT_CLASS_KEYWORDS = [
     ("couch", "sofa"),
     ("toilet", "toilet"),
     ("sink", "sink"),
+    ("doorframe", "doorframe"),
     ("door", "door"),
     ("window", "window"),
     ("cup", "cup"),

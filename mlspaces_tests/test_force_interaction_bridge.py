@@ -12,6 +12,7 @@ for path in (REPO_ROOT, SCRIPT_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+from scripts.InteractiveNav import force_interaction_runtime
 from scripts.InteractiveNav.force_interaction_bridge import (
     AtomicForceInteractionController,
     ground_drawer_open_regions,
@@ -94,6 +95,101 @@ def test_controller_deduplicates_command_ids() -> None:
     assert not controller.enqueue_command(command)
 
 
+def test_non_articulated_object_returns_static_failure_without_crashing(
+    monkeypatch,
+) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    published = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, root_name, **_kwargs: {
+            "supported": False,
+            "reason": "non_articulated",
+            "interaction_capability": "static",
+            "object_name": root_name,
+        },
+    )
+    monkeypatch.setattr(
+        controller, "_publish", lambda _publisher, payload: published.append(payload)
+    )
+    assert controller.enqueue_command(
+        {
+            "command_id": "static_doorframe",
+            "candidate_id": "portal_doorframe",
+            "node_id": "portal_doorframe",
+            "object_id": "doorframe_static_1",
+            "action": "open",
+        }
+    )
+
+    result = controller.before_step(
+        SimpleNamespace(env=SimpleNamespace()), step=9
+    )
+
+    assert result is not None
+    assert result["status"] == "FAILED"
+    assert result["reason"] == "non_articulated"
+    assert result["interaction_capability"] == "static"
+    assert result["interactable"] is False
+    assert len(published) == 2
+    assert published[1]["interaction_result"] == result
+
+
+def test_non_articulated_portal_is_marked_static_open_from_graph_type(
+    monkeypatch,
+) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    published = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, root_name, **_kwargs: {
+            "supported": False,
+            "reason": "non_articulated",
+            "interaction_capability": "static",
+            "object_name": root_name,
+        },
+    )
+    monkeypatch.setattr(
+        controller, "_publish", lambda _publisher, payload: published.append(payload)
+    )
+    assert controller.enqueue_command(
+        {
+            "command_id": "static_portal",
+            "candidate_id": "portal_candidate",
+            "node_id": "graph_node_17",
+            "node_type": "portal",
+            "object_id": "visual_instance_17",
+            "action": "open",
+        }
+    )
+
+    result = controller.before_step(SimpleNamespace(env=SimpleNamespace()), step=10)
+
+    assert result is not None
+    assert result["status"] == "SUCCEEDED"
+    assert result["success"] is True
+    assert result["post_state"] == "static_open"
+    assert result["source"] == "executor_static_portal"
+    assert published[1]["status"] == "SUCCEEDED"
+
+
+def test_prepare_articulation_force_reports_missing_group_as_static(monkeypatch) -> None:
+    monkeypatch.setattr(
+        force_interaction_runtime, "collect_articulation_groups", lambda _env: {}
+    )
+
+    plan = force_interaction_runtime.prepare_articulation_force(
+        SimpleNamespace(), "doorframe_static_1"
+    )
+
+    assert plan == {
+        "supported": False,
+        "reason": "non_articulated",
+        "interaction_capability": "static",
+        "object_name": "doorframe_static_1",
+        "available_object_names": [],
+    }
+
 def test_controller_requires_canonical_object_id() -> None:
     controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
     with pytest.raises(ValueError, match="requires object_id"):
@@ -125,6 +221,7 @@ def test_missing_portal_articulation_is_marked_static_open(monkeypatch) -> None:
             "decision_id": "decision_missing",
             "node_id": "portal_doorframe_without_joint",
             "object_id": "doorframe_without_joint",
+            "node_type": "portal",
             "action": "open",
         }
     )
@@ -169,6 +266,7 @@ def test_missing_container_articulation_remains_a_recoverable_failure(monkeypatc
             "decision_id": "decision_missing_container",
             "node_id": "container_missing",
             "object_id": "cabinet_without_joint",
+            "node_type": "container",
             "action": "open",
         }
     )
@@ -239,6 +337,7 @@ def test_controller_discovers_drawer_joints_for_visual_plan(monkeypatch) -> None
         "object_id": "dresser_root",
         "action": "scan",
         "sequence_type": "drawer_scan",
+        "approach_goal_xyyaw": [1.0, 2.0, 0.5],
         "open_regions": [
             {"center": [0.5, 0.18], "confidence": 0.9},
             {"center": [0.5, 0.52], "confidence": 0.8},
@@ -254,7 +353,6 @@ def test_controller_discovers_drawer_joints_for_visual_plan(monkeypatch) -> None
         ["bottom"],
     ]
     assert controller._pending["all_joint_names"] == ["top", "middle", "bottom"]
-
 
 def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
     monkeypatch,
@@ -383,6 +481,7 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     controller = AtomicForceInteractionController(
         close_all_doors_on_prepare=False,
         drawer_execution_mode="fast",
+        drawer_observation_steps=3,
     )
     controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
     controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
@@ -394,6 +493,7 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
         "object_id": "dresser_root",
         "action": "scan",
         "sequence_type": "drawer_scan",
+        "approach_goal_xyyaw": [1.0, 2.0, 0.5],
         "interaction_groups": [
             {"group_id": "bad", "joint_names": ["planner_must_not_select_this"]},
         ],
@@ -403,15 +503,17 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     data = SimpleNamespace(xpos=[[0.0, 0.0, 1.0], [0.0, 0.0, 0.2]])
     task = SimpleNamespace(env=SimpleNamespace(current_model=model, current_data=data))
 
-    for step in range(3):
+    for step in range(10):
         controller.before_step(task, step=step)
         result = controller.after_step(task, step=step)
 
     assert result is not None
     assert result["success"] is True
-    assert result["task_steps_consumed"] == 3
+    assert result["task_steps_consumed"] == 10
     assert result["drawer_execution_mode"] == "fast"
-    assert [item["observation_step"] for item in result["region_results"]] == [0, 1]
+    assert result["drawer_observation_steps"] == 3
+    assert result["approach_goal_xyyaw"] == [1.0, 2.0, 0.5]
+    assert [item["observation_step"] for item in result["region_results"]] == [3, 8]
     assert "interaction_group_results" not in result
     assert "joint_names" not in result
     assert "joint_infos" not in result

@@ -84,6 +84,31 @@ def navigation_goal_options(candidate: dict[str, Any]) -> list[tuple[float, floa
     return options
 
 
+def requires_graph_verification(module3: str, selection: dict[str, Any] | None) -> bool:
+    if str(module3 or "").casefold() == "rule_verified":
+        return True
+    selection = selection or {}
+    metadata = selection.get("metadata") or {}
+    return bool(
+        str(selection.get("behavior_type") or "").upper() == BEHAVIOR_NAVIGATE
+        and metadata.get("target_goal")
+        and metadata.get("verify_target_visibility", True)
+    )
+
+
+def target_ready_for_graph_verification(selection: dict[str, Any] | None) -> bool:
+    selection = selection or {}
+    metadata = selection.get("metadata") or {}
+    return bool(
+        str(selection.get("behavior_type") or "").upper() == BEHAVIOR_NAVIGATE
+        and metadata.get("target_goal")
+        and metadata.get("verify_target_visibility", True)
+        and metadata.get("target_visible_now")
+        and metadata.get("target_reliably_observed")
+        and not bool(metadata.get("target_navigation_required", True))
+    )
+
+
 def is_stuck_recovery_failure(detail: dict[str, Any]) -> bool:
     reason = str(detail.get("reason") or "").lower()
     status = str(detail.get("status") or "").lower()
@@ -223,6 +248,8 @@ class BehaviorExecutionStateMachine:
                 {"kind": "reserve_frontier", "candidate": self.candidate},
             )
         if behavior_type == BEHAVIOR_NAVIGATE:
+            if target_ready_for_graph_verification(candidate):
+                return self._transition(STATE_VERIFYING, now)
             return self._transition(
                 STATE_NAVIGATING,
                 now,

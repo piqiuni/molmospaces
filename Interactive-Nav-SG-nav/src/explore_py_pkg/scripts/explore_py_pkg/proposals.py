@@ -36,6 +36,15 @@ def cluster_to_proposal(cluster: Any, frame_id: str) -> dict[str, Any]:
             "frontier_cell_count": int(len(cluster.cells)),
             "information_gain": float(cluster.information_gain),
             "distance_m": float(cluster.distance_to_robot),
+            "unknown_component_area_m2": float(
+                getattr(cluster, "unknown_component_area_m2", 0.0) or 0.0
+            ),
+            "frontier_length_m": float(
+                getattr(cluster, "frontier_length_m", 0.0) or 0.0
+            ),
+            "expected_visible_unknown_area_m2": float(
+                getattr(cluster, "expected_visible_unknown_area_m2", 0.0) or 0.0
+            ),
         },
         "geometry": {
             "proposal_score": float(cluster.score),

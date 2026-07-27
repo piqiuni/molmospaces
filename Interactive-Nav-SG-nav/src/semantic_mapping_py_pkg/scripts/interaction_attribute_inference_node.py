@@ -380,6 +380,7 @@ class InteractionAttributeInferenceNode:
         except json.JSONDecodeError:
             return
         identifiers = {
+            str(payload.get("object_id") or ""),
             str(payload.get("instance_id") or ""),
             str(payload.get("node_id") or ""),
             str(payload.get("source_object_name") or ""),
