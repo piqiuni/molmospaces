@@ -1614,10 +1614,28 @@ def _run_claim(
 def initialize_run(args: argparse.Namespace) -> dict[str, Any]:
     run_root = args.run_root.expanduser().resolve()
     all_episodes, benchmark_fingerprint, sources = load_benchmark_manifest(args.benchmark_dir)
-    selected_indices = _parse_episode_indices(
-        args.episode_indices,
-        total_count=len(all_episodes),
-    )
+    if args.episode_indices is not None and args.scene_count is not None:
+        raise ValueError("--episode-indices and --scene-count cannot be used together")
+    selected_indices = _parse_episode_indices(args.episode_indices, total_count=len(all_episodes))
+    if args.scene_count is not None:
+        if args.scene_count < 1:
+            raise ValueError("--scene-count must be >= 1")
+        shuffled_episodes = list(all_episodes)
+        random.Random(args.seed).shuffle(shuffled_episodes)
+        selected_indices = []
+        selected_houses: set[int] = set()
+        for episode in shuffled_episodes:
+            if episode.house_index in selected_houses:
+                continue
+            selected_indices.append(episode.episode_idx)
+            selected_houses.add(episode.house_index)
+            if len(selected_indices) == args.scene_count:
+                break
+        if len(selected_indices) != args.scene_count:
+            raise ValueError(
+                f"Requested {args.scene_count} distinct scenes, but the benchmark only has "
+                f"{len(selected_indices)} distinct house_index values"
+            )
     if selected_indices is None:
         episodes = all_episodes
         selected_indices = [episode.episode_idx for episode in episodes]
@@ -1941,6 +1959,10 @@ def run_workers(args: argparse.Namespace) -> int:
         raise ValueError("worker_slot_start must be >= 0")
     if args.max_episodes_per_worker is not None and args.max_episodes_per_worker < 1:
         raise ValueError("max_episodes_per_worker must be >= 1 when provided")
+    if args.worker_start_wave_size < 1:
+        raise ValueError("worker_start_wave_size must be >= 1")
+    if args.worker_start_interval_seconds < 0:
+        raise ValueError("worker_start_interval_seconds must be >= 0")
     cuda_bindings = _parse_cuda_visible_devices_list(
         getattr(args, "cuda_visible_devices_list", None), workers=args.workers
     )
@@ -1982,6 +2004,13 @@ def run_workers(args: argparse.Namespace) -> int:
             if args.retry_failed:
                 command.append("--retry-failed")
             processes.append(subprocess.Popen(command, start_new_session=True))
+            workers_started = worker_offset + 1
+            if (
+                workers_started < args.workers
+                and workers_started % args.worker_start_wave_size == 0
+                and args.worker_start_interval_seconds > 0
+            ):
+                time.sleep(args.worker_start_interval_seconds)
         return_code = 0
         for process in processes:
             return_code = max(return_code, process.wait())
@@ -2011,6 +2040,15 @@ def _add_init_arguments(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         default=None,
         help="Optional global benchmark indices for a bounded smoke subset; accepts spaces and commas.",
+    )
+    parser.add_argument(
+        "--scene-count",
+        type=int,
+        default=None,
+        help=(
+            "Randomly select one episode from each distinct house_index until this many scenes are "
+            "selected. Mutually exclusive with --episode-indices."
+        ),
     )
     parser.add_argument("--task-horizon-steps", type=int, default=None)
     parser.add_argument("--filter-missing-scene-objects", action="store_true")
@@ -2092,6 +2130,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--worker-slot-start", type=int, default=0)
     run_parser.add_argument("--worker-id-prefix", default=None)
     run_parser.add_argument("--max-episodes-per-worker", type=int, default=None)
+    run_parser.add_argument(
+        "--worker-start-wave-size",
+        type=int,
+        default=1,
+        help="Start this many workers together before applying --worker-start-interval-seconds.",
+    )
+    run_parser.add_argument(
+        "--worker-start-interval-seconds",
+        type=float,
+        default=0.0,
+        help="Delay between worker start waves; zero preserves immediate startup behavior.",
+    )
     run_parser.add_argument(
         "--cuda-visible-devices-list",
         default=None,

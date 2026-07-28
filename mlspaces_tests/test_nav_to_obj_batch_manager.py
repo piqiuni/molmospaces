@@ -88,6 +88,51 @@ def test_init_uses_global_subset_and_records_episode_target_metadata(tmp_path: P
     assert loaded_config["episode_count"] == 2
 
 
+def test_init_scene_count_selects_distinct_houses_deterministically(tmp_path: Path) -> None:
+    benchmark_dir = _write_benchmark(tmp_path, count=4)
+    run_root = tmp_path / "scene_count_run"
+
+    assert manager.main(
+        [
+            "init",
+            "--benchmark-dir",
+            str(benchmark_dir),
+            "--run-root",
+            str(run_root),
+            "--command-template",
+            "echo {episode_idx}",
+            "--seed",
+            "17",
+            "--scene-count",
+            "3",
+        ]
+    ) == 0
+
+    manifest = json.loads((run_root / manager.MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert len(manifest["episodes"]) == 3
+    assert len({row["house_index"] for row in manifest["episodes"]}) == 3
+
+
+def test_init_rejects_scene_count_with_explicit_episode_indices(tmp_path: Path) -> None:
+    benchmark_dir = _write_benchmark(tmp_path)
+    with pytest.raises(ValueError, match="cannot be used together"):
+        manager.main(
+            [
+                "init",
+                "--benchmark-dir",
+                str(benchmark_dir),
+                "--run-root",
+                str(tmp_path / "invalid"),
+                "--command-template",
+                "echo {episode_idx}",
+                "--scene-count",
+                "2",
+                "--episode-indices",
+                "0",
+            ]
+        )
+
+
 def test_concurrent_claims_are_unique_and_terminal_results_are_deduplicated(tmp_path: Path) -> None:
     run_root = _initialize(tmp_path, selected=["0", "1"])
     _root, _config, ledger = manager._load_run_config(run_root)
@@ -405,6 +450,43 @@ def test_run_maps_each_cuda_binding_to_one_spawned_worker(tmp_path: Path) -> Non
         path.read_text(encoding="utf-8").strip()
         for path in (run_root / "episodes").rglob("stdout.log")
     } == {"2", "7"}
+
+
+def test_run_staggers_worker_start_waves(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_root = _initialize(tmp_path, selected=["0", "1", "2"])
+    commands: list[list[str]] = []
+    sleeps: list[float] = []
+
+    class FakeProcess:
+        def wait(self) -> int:
+            return 0
+
+    def fake_popen(command: list[str], *, start_new_session: bool) -> FakeProcess:
+        assert start_new_session is True
+        commands.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(manager.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(manager.time, "sleep", sleeps.append)
+
+    assert manager.main(
+        [
+            "run",
+            "--run-root",
+            str(run_root),
+            "--workers",
+            "3",
+            "--worker-start-wave-size",
+            "2",
+            "--worker-start-interval-seconds",
+            "0.25",
+            "--cuda-visible-devices-list",
+            "0,1,2",
+        ]
+    ) == 0
+
+    assert [command[command.index("--worker-slot") + 1] for command in commands] == ["0", "1", "2"]
+    assert sleeps == [0.25]
 
 
 def test_cuda_binding_list_requires_exact_worker_count() -> None:
