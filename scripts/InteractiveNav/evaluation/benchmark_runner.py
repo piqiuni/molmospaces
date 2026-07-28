@@ -31,8 +31,6 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 import mujoco
 import numpy as np
 
-from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
-from molmo_spaces.configs.robot_configs import ActionNoiseConfig, RBY1Config
 from molmo_spaces.evaluation.benchmark_schema import EpisodeSpec
 from molmo_spaces.tasks.json_eval_task_sampler import JsonEvalTaskSampler
 
@@ -48,6 +46,8 @@ from .benchmark_metrics import (
     score_interactions,
     spl,
     summarise_results,
+    target_candidate_names,
+    target_metric_rows,
     target_metrics,
     oracle_terminal_goal_consistency,
 )
@@ -60,7 +60,10 @@ from .benchmark_policies import (
 )
 from .benchmark_types import EpisodeResult, InteractionAttempt, PolicyAction, PolicyObservation, PublicEpisode
 from .public_goal import build_public_target_context as build_language_target_context
-from .restricted_gt_perception import RestrictedGTPerceptionPublisher
+from .restricted_gt_perception import (
+    RestrictedGTPerceptionPublisher,
+    build_private_object_specs_from_env,
+)
 from .ros_object_goal_adapter import (
     RosObjectGoalEvaluatorAdapter,
     build_public_target_context as build_ros_target_context,
@@ -75,7 +78,9 @@ from .trusted_interaction_skill import (
 )
 
 
-PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v7"
+PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v8"
+STEP_BUDGET_FORMULA_VERSION = "interactive_nav_v3_step_budget_v1"
+DYNAMIC_MAX_STEPS_CAP = 2000
 
 # Established ROS exploration posture.  The asymmetric shoulder roll tucks the
 # arms beside the torso so they neither move after the first navigation action
@@ -95,6 +100,14 @@ class BenchmarkEvaluationConfig:
     policy_kwargs: dict[str, Any] = field(default_factory=dict)
     workers: int = 1
     max_steps: int = 500
+    step_budget_mode: Literal["fixed", "dynamic"] = "fixed"
+    min_steps: int = 300
+    dynamic_path_free_m: float = 3.0
+    dynamic_steps_per_path_m: float = 25.0
+    dynamic_channel_interaction_steps: int = 150
+    dynamic_container_interaction_steps: int = 200
+    dynamic_container_joint_steps: int = 40
+    dynamic_step_quantum: int = 50
     episode_indices: list[int] | None = None
     max_episodes: int | None = None
     resume: bool = False
@@ -125,6 +138,8 @@ class BenchmarkEvaluationConfig:
     ros_interaction_command_topic: str = "/semantic_decision/interaction_command"
     ros_interaction_result_topic: str = "/semantic_mapping/interaction_result"
     restricted_gt_min_visible_pixels: int = 16
+    restricted_gt_min_bbox_area_pixels: int = 512
+    restricted_gt_max_distance_m: float = 4.0
     quality_gate_only: bool = False
     runtime_joint_position_tolerance: float = 0.02
     runtime_joint_fraction_tolerance: float = 0.05
@@ -137,6 +152,37 @@ class BenchmarkEvaluationConfig:
             raise ValueError("workers must be >= 1")
         if self.max_steps < 1:
             raise ValueError("max_steps must be >= 1")
+        if self.step_budget_mode not in {"fixed", "dynamic"}:
+            raise ValueError("step_budget_mode must be fixed or dynamic")
+        if self.min_steps < 1:
+            raise ValueError("min_steps must be >= 1")
+        if self.step_budget_mode == "dynamic":
+            if self.min_steps > self.max_steps:
+                raise ValueError("min_steps must be <= max_steps in dynamic mode")
+            if self.max_steps > DYNAMIC_MAX_STEPS_CAP:
+                raise ValueError(
+                    f"dynamic max_steps must be <= {DYNAMIC_MAX_STEPS_CAP}"
+                )
+        if not math.isfinite(float(self.dynamic_path_free_m)) or self.dynamic_path_free_m < 0:
+            raise ValueError("dynamic_path_free_m must be finite and non-negative")
+        for name, value in (
+            ("dynamic_steps_per_path_m", self.dynamic_steps_per_path_m),
+            ("dynamic_channel_interaction_steps", self.dynamic_channel_interaction_steps),
+            ("dynamic_container_interaction_steps", self.dynamic_container_interaction_steps),
+            ("dynamic_container_joint_steps", self.dynamic_container_joint_steps),
+        ):
+            if not math.isfinite(float(value)) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.dynamic_step_quantum < 1:
+            raise ValueError("dynamic_step_quantum must be >= 1")
+        if self.max_episodes is not None and self.max_episodes < 1:
+            raise ValueError("max_episodes must be >= 1")
+        if self.episode_indices is not None:
+            if not self.episode_indices:
+                raise ValueError("episode_indices must not be empty")
+            normalized_indices = [int(index) for index in self.episode_indices]
+            if len(normalized_indices) != len(set(normalized_indices)):
+                raise ValueError("episode_indices must not contain duplicates")
         if self.policy == "factory" and not self.policy_factory:
             raise ValueError("--policy-factory is required with --policy factory")
         if self.policy != "factory" and self.policy_factory:
@@ -166,6 +212,13 @@ class BenchmarkEvaluationConfig:
             raise ValueError("force_max_internal_steps must be >= 1")
         if self.restricted_gt_min_visible_pixels < 1:
             raise ValueError("restricted_gt_min_visible_pixels must be >= 1")
+        if self.restricted_gt_min_bbox_area_pixels < 1:
+            raise ValueError("restricted_gt_min_bbox_area_pixels must be >= 1")
+        if (
+            not math.isfinite(float(self.restricted_gt_max_distance_m))
+            or self.restricted_gt_max_distance_m < 0.0
+        ):
+            raise ValueError("restricted_gt_max_distance_m must be finite and non-negative")
         if self.progress_every < 1:
             raise ValueError("progress_every must be >= 1")
         for name, value in (
@@ -180,23 +233,6 @@ class BenchmarkEvaluationConfig:
             raise ValueError("policy_dt_ms must be an integer multiple of ctrl_dt_ms")
         if not math.isclose(self.ctrl_dt_ms / self.sim_dt_ms, round(self.ctrl_dt_ms / self.sim_dt_ms)):
             raise ValueError("ctrl_dt_ms must be an integer multiple of sim_dt_ms")
-
-
-class BenchmarkReplayConfig(NavToObjBaseConfig):
-    """Evaluator-local RBY1 config; never registered in the upstream evaluator."""
-
-    robot_config: RBY1Config = RBY1Config()
-    policy_dt_ms: float = 200.0
-    ctrl_dt_ms: float = 10.0
-    sim_dt_ms: float = 10.0
-    task_horizon: int = 500
-    output_dir: Path = Path("interactive_nav_benchmark_eval")
-    use_passive_viewer: bool = False
-    record_videos: bool = False
-
-    @property
-    def tag(self) -> str:
-        return "interactive_nav_v3_benchmark_eval"
 
 
 class V3BenchmarkTaskSampler(JsonEvalTaskSampler):
@@ -231,8 +267,7 @@ class V3BenchmarkTaskSampler(JsonEvalTaskSampler):
         bodies.discard(None)
         joints.discard(None)
         nav = self._interactive_nav
-        critical_bodies = {str(nav.get("target", {}).get("selected_instance", ""))}
-        critical_bodies.discard("")
+        critical_bodies = set(target_candidate_names(self.episode_spec.model_dump()))
         critical_bodies.update(str(row["object_name"]) for row in nav.get("interactions", []))
         missing_bodies = sorted(critical_bodies - bodies)
         if missing_bodies:
@@ -384,6 +419,128 @@ class RestrictedRosObjectGoalRuntime:
     opaque_to_joints: dict[str, tuple[RuntimeJoint, ...]]
 
 
+def _body_root_id(model: Any, body_id: int) -> int | None:
+    """Return the MuJoCo body-tree root for one evaluator-private body."""
+
+    try:
+        current = int(body_id)
+        parent_ids = getattr(model, "body_parentid")
+        body_count = len(parent_ids)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if not 0 <= current < body_count:
+        return None
+    root_ids = getattr(model, "body_rootid", None)
+    if root_ids is not None:
+        try:
+            root_id = int(root_ids[current])
+        except (TypeError, ValueError, IndexError):
+            root_id = -1
+        if 0 <= root_id < body_count:
+            return root_id
+    seen: set[int] = set()
+    while current not in seen:
+        seen.add(current)
+        try:
+            parent = int(parent_ids[current])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if parent == current or parent < 0 or parent >= body_count:
+            return current
+        if parent == 0:
+            return current
+        current = parent
+    return None
+
+
+def _perception_source_skill_aliases(
+    *,
+    model: Any,
+    private_specs: list[Any],
+    joints_by_object: dict[str, list[RuntimeJoint]],
+) -> dict[str, str]:
+    """Map rendered body sources to their sealed object-skill source.
+
+    A scene metadata record commonly names the static root of a doorway,
+    whereas :class:`InteractionCatalog` names the articulated leaf body that
+    owns its hinge.  Restricted GT can render either body.  Both therefore
+    need episode-local opaque IDs that resolve to the same private skill,
+    without ever publishing the raw body names to ROS.
+    """
+
+    skill_source_by_root: dict[int, str] = {}
+    ambiguous_roots: set[int] = set()
+    for source_name in sorted(joints_by_object):
+        joints = joints_by_object[source_name]
+        if not joints:
+            continue
+        root_id = _body_root_id(model, int(joints[0].body_id))
+        if root_id is None:
+            continue
+        existing = skill_source_by_root.get(root_id)
+        if existing is None:
+            skill_source_by_root[root_id] = source_name
+        elif existing != source_name:
+            ambiguous_roots.add(root_id)
+
+    aliases: dict[str, str] = {}
+    for spec in private_specs:
+        source_name = str(getattr(spec, "source_name", "") or "")
+        body_id = getattr(spec, "body_id", None)
+        if not source_name or body_id is None:
+            continue
+        root_id = _body_root_id(model, int(body_id))
+        if root_id is None or root_id in ambiguous_roots:
+            continue
+        skill_source = skill_source_by_root.get(root_id)
+        if skill_source is not None:
+            aliases[source_name] = skill_source
+    return aliases
+
+
+def _ordered_object_skill_joints(
+    *,
+    source_name: str,
+    all_joints: tuple[RuntimeJoint, ...],
+    interactions: list[dict[str, Any]],
+    plans: list[dict[str, Any]],
+) -> tuple[RuntimeJoint, ...]:
+    """Order recorded joints by frozen plan dependencies, then JSON order."""
+
+    rows_by_id = {
+        str(row["interaction_id"]): row
+        for row in interactions
+        if str(row.get("object_name")) == source_name
+    }
+    if not rows_by_id:
+        return tuple(sorted(all_joints, key=lambda item: item.joint_index))
+
+    ordered_indices: list[int] = []
+    seen_indices: set[int] = set()
+
+    def add_row(row: dict[str, Any] | None) -> None:
+        if row is None:
+            return
+        joint_index = int(row["joint_index"])
+        if joint_index not in seen_indices:
+            ordered_indices.append(joint_index)
+            seen_indices.add(joint_index)
+
+    for plan in plans:
+        for interaction_id in plan.get("required_interaction_ids", []):
+            add_row(rows_by_id.get(str(interaction_id)))
+    for row in interactions:
+        if str(row.get("object_name")) == source_name:
+            add_row(row)
+
+    joints_by_index = {int(joint.joint_index): joint for joint in all_joints}
+    return tuple(
+        joints_by_index[index]
+        for index in ordered_indices
+        if index in joints_by_index
+    )
+
+
 def _build_restricted_ros_object_goal_runtime(
     *,
     task: Any,
@@ -391,6 +548,7 @@ def _build_restricted_ros_object_goal_runtime(
     episode: dict[str, Any],
     public: PublicEpisode,
     config: BenchmarkEvaluationConfig,
+    episode_index: int,
     frame_callback: callable | None = None,
 ) -> RestrictedRosObjectGoalRuntime:
     """Create evaluator-owned restricted perception and sealed force skills.
@@ -403,28 +561,80 @@ def _build_restricted_ros_object_goal_runtime(
     perception = RestrictedGTPerceptionPublisher(
         camera_name="head_camera",
         min_visible_pixels=int(config.restricted_gt_min_visible_pixels),
+        min_bbox_area_pixels=int(config.restricted_gt_min_bbox_area_pixels),
+        max_distance_m=float(config.restricted_gt_max_distance_m),
         step_interval=1,
         frame_id="world",
+        initial_episode_index=int(episode_index) + 1,
     )
     private_registry = OpaqueObjectRegistry()
     opaque_to_source_name: dict[str, str] = {}
     opaque_to_joints: dict[str, tuple[RuntimeJoint, ...]] = {}
     joints_by_object: dict[str, list[RuntimeJoint]] = {}
+    nav = episode["interactive_nav"]
+    interactions = list(nav.get("interactions", []))
+    plans = list(nav.get("oracle_plans") or [])
+    if not plans and nav.get("oracle_plan"):
+        plans = [dict(nav["oracle_plan"])]
+    recorded_joint_indices: dict[str, set[int]] = {}
+    for row in interactions:
+        recorded_joint_indices.setdefault(str(row["object_name"]), set()).add(
+            int(row["joint_index"])
+        )
     for joint in catalog.joints:
         joints_by_object.setdefault(joint.object_name, []).append(joint)
-    for source_name in sorted(joints_by_object):
+    # The restricted renderer can report a door frame/root body while the
+    # catalog resolves the articulated child body.  Pre-register every render
+    # source and bind root/child aliases to one sealed evaluator skill so the
+    # opaque ID observed by ROS is always routable when it denotes an actual
+    # portal or container.  Non-articulated scene objects remain visible but
+    # deliberately receive no interaction capability.
+    private_specs = build_private_object_specs_from_env(task.env)
+    source_skill_aliases = _perception_source_skill_aliases(
+        model=task.env.current_model,
+        private_specs=private_specs,
+        joints_by_object=joints_by_object,
+    )
+    perception_sources = {
+        str(getattr(spec, "source_name", "") or "")
+        for spec in private_specs
+    }
+    source_names = sorted(
+        source_name
+        for source_name in (set(joints_by_object) | perception_sources)
+        if source_name
+    )
+    for source_name in source_names:
         opaque_id = perception.registry.public_id_for(source_name)
-        joints = tuple(sorted(joints_by_object[source_name], key=lambda item: item.joint_index))
+        skill_source_name = source_skill_aliases.get(source_name)
+        if skill_source_name is None and source_name in joints_by_object:
+            skill_source_name = source_name
+        if skill_source_name is None:
+            continue
+        all_joints = tuple(
+            sorted(joints_by_object[skill_source_name], key=lambda item: item.joint_index)
+        )
+        relevant_indices = recorded_joint_indices.get(skill_source_name)
+        joints = (
+            _ordered_object_skill_joints(
+                source_name=skill_source_name,
+                all_joints=all_joints,
+                interactions=interactions,
+                plans=plans,
+            )
+            if relevant_indices
+            else all_joints
+        )
         private_registry.register(
             opaque_id,
             joints=joints,
-            object_ref=source_name,
+            object_ref=skill_source_name,
             open_postcondition=OpenPostconditionSpec(
                 success_fraction=float(SUCCESS_OPEN_FRACTION),
                 minimum_open_joints=1,
             ),
         )
-        opaque_to_source_name[opaque_id] = source_name
+        opaque_to_source_name[opaque_id] = skill_source_name
         opaque_to_joints[opaque_id] = joints
 
     def execute_open_joint(joint: RuntimeJoint) -> JointOpenResult:
@@ -527,30 +737,368 @@ def _selected_indices(config: BenchmarkEvaluationConfig, episodes: list[dict[str
     indices = list(range(len(episodes))) if config.episode_indices is None else list(config.episode_indices)
     if config.max_episodes is not None:
         indices = indices[: int(config.max_episodes)]
-    for index in indices:
-        if not 0 <= int(index) < len(episodes):
+    normalized = [int(index) for index in indices]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("episode_indices must not contain duplicates")
+    for index in normalized:
+        if not 0 <= index < len(episodes):
             raise IndexError(f"episode index {index} outside [0,{len(episodes)})")
-    return [int(index) for index in indices]
+    return normalized
 
 
-def _build_replay_config(config: BenchmarkEvaluationConfig, output_dir: Path) -> BenchmarkReplayConfig:
-    replay = BenchmarkReplayConfig()
-    replay.output_dir = output_dir
-    replay.task_horizon = int(config.max_steps)
-    replay.policy_dt_ms = float(config.policy_dt_ms)
-    replay.ctrl_dt_ms = float(config.ctrl_dt_ms)
-    replay.sim_dt_ms = float(config.sim_dt_ms)
-    replay.num_workers = 1
-    replay.num_threads = 1
-    replay.profile = False
-    replay.datagen_profiler = False
-    replay.filter_for_successful_trajectories = False
-    replay.robot_config.action_noise_config = ActionNoiseConfig(enabled=False)
+def _skip_replay_freeze_task_config(
+    _observation: Any,
+    *,
+    task: Any | None = None,
+) -> None:
+    """V3 JSON is already frozen; satisfy ``BaseMujocoTask.reset`` only."""
+
+    del task
+    return None
+
+
+def _build_replay_config(
+    config: BenchmarkEvaluationConfig,
+    output_dir: Path,
+    *,
+    task_horizon: int | None = None,
+) -> Any:
+    """Build the minimal RBY1 config consumed by JSON replay."""
+
+    from molmo_spaces.configs.task_configs import NavToObjTaskConfig
+    from molmo_spaces.configs.task_sampler_configs import NavToObjTaskSamplerConfig
+    from molmo_spaces.robots.rby1 import RBY1
+
+    init_qpos = {
+        "base": np.array([0.0, 0.0, 0.0]),
+        "head": np.array([0.0, 0.6]),
+        "left_arm": np.array([0.5, 0.0, 0.0, -2.3, 0.0, -0.5, 0.0]),
+        "left_gripper": np.array([-0.05]),
+        "right_arm": np.array([0.5, 0.0, 0.0, -2.3, 0.0, -0.5, 0.0]),
+        "right_gripper": np.array([-0.05]),
+        "torso": np.zeros(6, dtype=float),
+    }
+    init_qpos_noise_range = {
+        group_name: np.zeros_like(values, dtype=float)
+        for group_name, values in init_qpos.items()
+    }
+    robot_config = SimpleNamespace(
+        robot_cls=RBY1,
+        robot_factory=RBY1,
+        robot_view_factory=None,
+        robot_namespace="robot_0/",
+        init_qpos=init_qpos,
+        init_qpos_noise_range=init_qpos_noise_range,
+        default_world_pose=[0.0, 0.0, 0.0],
+        use_holo_base=True,
+        command_mode={
+            "arm": "joint_position",
+            "gripper": "joint_position",
+            "base": "holo_joint_planar_position",
+            "head": None,
+        },
+        name="rby1",
+        robot_xml_path=Path("rby1_site_control.xml"),
+        gravcomp=True,
+        K_stiffness=None,
+        K_damping=None,
+        action_noise_config=SimpleNamespace(enabled=False),
+    )
+    replay = SimpleNamespace(
+        num_envs=1,
+        num_workers=1,
+        num_threads=1,
+        task_type="nav_to_obj",
+        use_passive_viewer=False,
+        viewer_camera=None,
+        viewer_cam_dict={},
+        policy_dt_ms=float(config.policy_dt_ms),
+        ctrl_dt_ms=float(config.ctrl_dt_ms),
+        sim_dt_ms=float(config.sim_dt_ms),
+        task_horizon=int(config.max_steps if task_horizon is None else task_horizon),
+        end_on_success=False,
+        collision_free_pose_limit=3,
+        scene_dataset="procthor-10k",
+        data_split="val",
+        camera_config=None,
+        robot_config=robot_config,
+        task_sampler_config=NavToObjTaskSamplerConfig(task_sampler_class=None),
+        task_config=NavToObjTaskConfig(task_cls=None),
+        task_config_preset_exp=None,
+        task_config_preset_scn=None,
+        policy_config=None,
+        benchmark_path=None,
+        eval_runtime_params=None,
+        output_dir=output_dir,
+        profile=False,
+        profiler=None,
+        datagen_profiler=False,
+        log_level="info",
+        use_wandb=False,
+        wandb_project=None,
+        wandb_name=None,
+        filter_for_successful_trajectories=False,
+        use_filament=False,
+        environment_light_intensity=15000.0,
+        record_videos=False,
+        seed=None,
+        seed_torch=False,
+        freeze_task_config=_skip_replay_freeze_task_config,
+    )
     if _is_current_ros_policy(config):
         for group_name, qpos in ROS_NAVIGATION_ARM_QPOS.items():
             replay.robot_config.init_qpos[group_name] = np.asarray(qpos, dtype=float)
             replay.robot_config.init_qpos_noise_range[group_name] = np.zeros(len(qpos), dtype=float)
     return replay
+
+
+def _budget_oracle_plans(nav: dict[str, Any]) -> list[dict[str, Any]]:
+    plans = list(nav.get("oracle_plans") or [])
+    if not plans and nav.get("oracle_plan"):
+        plans = [dict(nav["oracle_plan"])]
+    return plans
+
+
+def _budget_plan_components(
+    nav: dict[str, Any],
+    config: BenchmarkEvaluationConfig,
+) -> dict[str, Any]:
+    """Return the least-complex valid oracle-plan shape for budgeting only."""
+
+    interactions = {
+        str(row.get("interaction_id")): row
+        for row in nav.get("interactions", [])
+        if row.get("interaction_id") is not None
+    }
+    plans = _budget_oracle_plans(nav)
+    if not plans:
+        plans = [{"plan_id": None, "required_interaction_ids": list(interactions)}]
+
+    candidates: list[dict[str, Any]] = []
+    for plan in plans:
+        required_ids = [str(value) for value in plan.get("required_interaction_ids", [])]
+        type_counts = {"channel": 0, "container": 0, "unknown": 0}
+        for interaction_id in required_ids:
+            interaction_type = str(interactions.get(interaction_id, {}).get("type", ""))
+            if interaction_type.startswith("channel_"):
+                type_counts["channel"] += 1
+            elif interaction_type.startswith("container_"):
+                type_counts["container"] += 1
+            else:
+                type_counts["unknown"] += 1
+        candidates.append(
+            {
+                "plan_id": plan.get("plan_id"),
+                "required_interaction_count": len(required_ids),
+                "required_interaction_type_counts": type_counts,
+            }
+        )
+
+    def complexity(row: dict[str, Any]) -> tuple[int, int, str]:
+        counts = row["required_interaction_type_counts"]
+        weighted = (
+            int(counts["channel"]) * int(config.dynamic_channel_interaction_steps)
+            + int(counts["container"]) * int(config.dynamic_container_interaction_steps)
+            + int(counts["unknown"]) * int(config.dynamic_container_interaction_steps)
+        )
+        return weighted, int(row["required_interaction_count"]), str(row.get("plan_id") or "")
+
+    return min(candidates, key=complexity)
+
+
+def _budget_reference_path_length_m(episode: dict[str, Any], plan_id: Any) -> tuple[float, str]:
+    try:
+        reference = reference_path_length_m(episode)
+    except (KeyError, TypeError, ValueError):
+        reference = None
+    if reference is not None:
+        try:
+            reference = float(reference)
+        except (TypeError, ValueError):
+            reference = None
+        if reference is not None and math.isfinite(reference):
+            return max(0.0, reference), "frozen_navigation_validation"
+
+    nav = episode.get("interactive_nav", {})
+    plans = _budget_oracle_plans(nav)
+    selected = next((plan for plan in plans if plan.get("plan_id") == plan_id), plans[0] if plans else None)
+    pose = episode.get("task", {}).get("robot_base_pose", [])
+    if selected is not None and len(pose) >= 2:
+        current = np.asarray(pose[:2], dtype=float)
+        distance = 0.0
+        used = False
+        for step in selected.get("steps", []):
+            if step.get("type") != "navigate":
+                continue
+            goal = np.asarray(step.get("goal_point", [])[:2], dtype=float)
+            if goal.shape != (2,):
+                continue
+            distance += float(np.linalg.norm(goal - current))
+            current = goal
+            used = True
+        if used:
+            return distance, "oracle_waypoint_polyline_fallback"
+    return 0.0, "missing_path_fallback"
+
+
+def _safe_reference_path_length_m(episode: dict[str, Any]) -> float | None:
+    try:
+        value = reference_path_length_m(episode)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _budget_initial_target_visible(episode: dict[str, Any], minimum_visible_pixels: int) -> bool:
+    nav = episode.get("interactive_nav", {})
+    if nav.get("initial_state", {}).get("target_visible") is True:
+        return True
+    validation = nav.get("generation_validation", {}).get("navigation_validation", {})
+    pixels = validation.get("start_visible_pixels")
+    fraction = validation.get("start_visibility_fraction")
+    return bool(
+        pixels is not None
+        and fraction is not None
+        and int(pixels) >= int(minimum_visible_pixels)
+        and float(fraction) > 0.0
+    )
+
+
+def _budget_container_joint_count(episode: dict[str, Any]) -> int:
+    container_name = episode.get("interactive_nav", {}).get("target", {}).get("container_name")
+    if not container_name:
+        return 0
+    joints = {
+        (row.get("joint_name"), row.get("joint_index"))
+        for row in episode.get("scene_modifications", {}).get("articulation_states", [])
+        if row.get("object_name") == container_name
+    }
+    return len(joints)
+
+
+def episode_step_budget(
+    config: BenchmarkEvaluationConfig,
+    episode: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Compute a deterministic evaluator-private rollout budget for one episode."""
+
+    if config.step_budget_mode == "fixed":
+        return int(config.max_steps), {
+            "evaluator_private": True,
+            "formula_version": STEP_BUDGET_FORMULA_VERSION,
+            "mode": "fixed",
+            "effective_max_steps": int(config.max_steps),
+        }
+
+    nav = episode.get("interactive_nav", {})
+    plan = _budget_plan_components(nav, config)
+    path_length_m, path_source = _budget_reference_path_length_m(episode, plan.get("plan_id"))
+    initial_target_visible = _budget_initial_target_visible(
+        episode,
+        config.restricted_gt_min_visible_pixels,
+    )
+    counts = dict(plan["required_interaction_type_counts"])
+    container_joint_count = _budget_container_joint_count(episode)
+
+    # A missing/invalid frozen path is not evidence of a short task.  Use the
+    # hard cap so a malformed record cannot silently create a premature timeout.
+    if path_source != "frozen_navigation_validation":
+        return int(config.max_steps), {
+            "evaluator_private": True,
+            "formula_version": STEP_BUDGET_FORMULA_VERSION,
+            "mode": "dynamic",
+            "effective_max_steps": int(config.max_steps),
+            "minimum_steps": int(config.min_steps),
+            "maximum_steps": int(config.max_steps),
+            "conservative_fallback": True,
+            "fallback_reason": path_source,
+            "reference_path_length_m": None,
+            "required_plan_id": plan.get("plan_id"),
+            "required_interaction_count": int(plan["required_interaction_count"]),
+            "required_interaction_type_counts": counts,
+            "container_joint_count": container_joint_count,
+        }
+
+    path_steps = float(config.dynamic_steps_per_path_m) * max(
+        0.0,
+        path_length_m - float(config.dynamic_path_free_m),
+    )
+    channel_steps = (
+        0.0
+        if initial_target_visible
+        else float(config.dynamic_channel_interaction_steps) * int(counts["channel"])
+    )
+    container_steps = (
+        0.0
+        if initial_target_visible
+        else float(config.dynamic_container_interaction_steps) * int(counts["container"])
+    )
+    unknown_steps = (
+        0.0
+        if initial_target_visible
+        else float(config.dynamic_container_interaction_steps) * int(counts["unknown"])
+    )
+    container_joint_steps = 0.0
+    if not initial_target_visible and int(counts["container"]) > 0:
+        container_joint_steps = float(config.dynamic_container_joint_steps) * max(0, container_joint_count - 1)
+
+    raw_steps = (
+        float(config.min_steps)
+        + path_steps
+        + channel_steps
+        + container_steps
+        + unknown_steps
+        + container_joint_steps
+    )
+    quantum = int(config.dynamic_step_quantum)
+    rounded_steps = int(math.ceil(raw_steps / quantum) * quantum)
+    effective = min(int(config.max_steps), max(int(config.min_steps), rounded_steps))
+    basis = {
+        "evaluator_private": True,
+        "formula_version": STEP_BUDGET_FORMULA_VERSION,
+        "mode": "dynamic",
+        "effective_max_steps": effective,
+        "minimum_steps": int(config.min_steps),
+        "maximum_steps": int(config.max_steps),
+        "step_quantum": quantum,
+        "reference_path_length_m": path_length_m,
+        "reference_path_source": path_source,
+        "free_path_m": float(config.dynamic_path_free_m),
+        "initial_target_visible": initial_target_visible,
+        "required_plan_id": plan.get("plan_id"),
+        "required_interaction_count": int(plan["required_interaction_count"]),
+        "required_interaction_type_counts": counts,
+        "container_joint_count": container_joint_count,
+        "components": {
+            "base_steps": int(config.min_steps),
+            "path_steps": path_steps,
+            "channel_interaction_steps": channel_steps,
+            "container_interaction_steps": container_steps,
+            "unknown_interaction_steps": unknown_steps,
+            "container_joint_steps": container_joint_steps,
+        },
+        "raw_steps": raw_steps,
+        "rounded_steps": rounded_steps,
+    }
+    return effective, basis
+
+
+def _public_step_budget_basis(basis: dict[str, Any]) -> dict[str, Any]:
+    """Expose only the rollout limit, never the GT inputs used to derive it."""
+
+    return {
+        "evaluator_private": True,
+        "formula_version": basis.get("formula_version", STEP_BUDGET_FORMULA_VERSION),
+        "mode": basis.get("mode"),
+        "effective_max_steps": basis.get("effective_max_steps"),
+        "conservative_fallback": bool(basis.get("conservative_fallback", False)),
+    }
 
 
 def _apply_ros_navigation_arm_posture(spec: EpisodeSpec) -> None:
@@ -729,7 +1277,10 @@ def _runtime_consistency_checks(
                 and fraction_error <= float(config.runtime_joint_fraction_tolerance)
             ),
         })
-    articulation_passed = bool(articulation_rows) and all(row["passed"] for row in articulation_rows)
+    # ``unnecessary`` V3 episodes legitimately have no articulated joints.
+    # Treat the empty set as a passing readback instead of excluding those
+    # episodes before the policy gets a chance to navigate.
+    articulation_passed = all(row["passed"] for row in articulation_rows)
     checks["articulation_state_readback"] = {
         "passed": articulation_passed,
         "joint_count": len(articulation_rows),
@@ -768,18 +1319,26 @@ def _runtime_consistency_checks(
     if isinstance(expected_visible, bool):
         criteria = nav.get("success_criteria", {})
         camera_name = str(criteria.get("visibility", {}).get("camera_name", "head_camera"))
-        target_name = str(nav["target"]["selected_instance"])
-        actual_visibility = float(task.env.check_visibility(camera_name, target_name))
+        target_rows = target_metric_rows(task, episode)
+        chosen_target = min(target_rows, key=lambda row: float(row["distance_m"]))
+        target_names = [str(row["target_name"]) for row in target_rows]
+        candidate_visibility = {
+            str(row["target_name"]): float(row["visibility_fraction"])
+            for row in target_rows
+        }
+        actual_visibility = float(chosen_target["visibility_fraction"])
         actual_visible = actual_visibility > 0.0
         visibility_passed = actual_visible is expected_visible
         checks["initial_target_visibility"] = {
             "applicable": True,
             "passed": visibility_passed,
             "camera_name": camera_name,
-            "target_name": target_name,
+            "target_names": target_names,
+            "chosen_target_name": str(chosen_target["target_name"]),
             "expected_visible": expected_visible,
             "actual_visible": actual_visible,
             "actual_visibility_fraction": actual_visibility,
+            "candidate_visibility_fractions": candidate_visibility,
         }
         if not visibility_passed:
             reasons.append("initial_target_visibility_mismatch")
@@ -842,6 +1401,14 @@ def _capture_head_frame(task: Any, frames: list[np.ndarray], enabled: bool) -> N
     except Exception:
         return
     frames.append(frame.copy())
+
+
+def _save_video(frames: list[np.ndarray], destination: Path, fps: float) -> None:
+    """Load Torch-backed video utilities only when video output is requested."""
+
+    from molmo_spaces.utils.save_utils import save_frames_to_mp4
+
+    save_frames_to_mp4(frames, str(destination), fps=float(fps))
 
 
 def _robot_lock_snapshot(
@@ -1038,8 +1605,14 @@ def _drawer_scan_runtime_groups(
     open_regions: tuple[tuple[float, float], ...],
     *,
     allowed_joint_indices: set[int] | None = None,
+    fallback_to_all: bool = False,
 ) -> list[tuple[RuntimeJoint, dict[str, Any]]]:
-    """Ground a public drawer plan to private slide joints in visual order."""
+    """Ground a public drawer plan to private slide joints in visual order.
+
+    ``fallback_to_all`` is reserved for the explicit evaluator-routed public
+    bbox direct-scan protocol.  A normal MLLM plan with no drawer-front regions
+    must continue to fail rather than silently enumerate hidden drawers.
+    """
 
     model = task.env.current_model
     data = task.env.current_data
@@ -1059,7 +1632,7 @@ def _drawer_scan_runtime_groups(
         joint_rows,
         regions,
         body_heights,
-        fallback_to_all=False,
+        fallback_to_all=bool(fallback_to_all),
     )
     result: list[tuple[RuntimeJoint, dict[str, Any]]] = []
     for group in grounded:
@@ -1114,6 +1687,7 @@ def _execute_private_drawer_scan(
     joints: tuple[RuntimeJoint, ...],
     open_regions: tuple[tuple[float, float], ...],
     allowed_joint_indices: set[int],
+    fallback_to_all: bool = False,
     config: BenchmarkEvaluationConfig,
     decision_index: int,
     frames: list[np.ndarray],
@@ -1130,6 +1704,7 @@ def _execute_private_drawer_scan(
         joints,
         open_regions,
         allowed_joint_indices=allowed_joint_indices,
+        fallback_to_all=fallback_to_all,
     )
     if not groups:
         return {
@@ -1451,6 +2026,75 @@ def _resolved_interaction_ids(attempt: dict[str, Any]) -> list[str]:
     return [] if value is None else [str(value)]
 
 
+def _episode_oracle_plans(episode: dict[str, Any]) -> list[dict[str, Any]]:
+    nav = episode["interactive_nav"]
+    plans = list(nav.get("oracle_plans") or [])
+    if not plans and nav.get("oracle_plan"):
+        plans = [dict(nav["oracle_plan"])]
+    return plans
+
+
+def _order_interaction_ids_by_oracle_plan(
+    episode: dict[str, Any], interaction_ids: list[str]
+) -> list[str]:
+    """Put one macro action's credited IDs in a valid plan/prerequisite order."""
+
+    unique_ids = list(dict.fromkeys(str(value) for value in interaction_ids))
+    available = set(unique_ids)
+    best_order: list[str] = []
+    for plan in _episode_oracle_plans(episode):
+        ordered = list(
+            dict.fromkeys(
+                str(value)
+                for value in plan.get("required_interaction_ids", [])
+                if str(value) in available
+            )
+        )
+        if len(ordered) > len(best_order):
+            best_order = ordered
+    used = set(best_order)
+    return [*best_order, *(value for value in unique_ids if value not in used)]
+
+
+def _object_skill_satisfies_an_oracle_plan(
+    *,
+    episode: dict[str, Any],
+    source_name: str,
+    successful_ids: list[str],
+) -> bool:
+    """Require a complete object-local requirement set, not merely N open joints."""
+
+    successful = set(successful_ids)
+    interactions = {
+        str(row["interaction_id"]): row
+        for row in episode["interactive_nav"].get("interactions", [])
+    }
+    object_interaction_ids = {
+        interaction_id
+        for interaction_id, row in interactions.items()
+        if str(row.get("object_name")) == source_name
+    }
+    # An unnecessary-interaction episode may still receive an extra public
+    # object command.  There is no frozen V3 object postcondition to bind it to;
+    # preserve the trusted physical skill result and let formal scoring reject
+    # the extra attempt separately.
+    if not object_interaction_ids:
+        return True
+    object_requirements: list[set[str]] = []
+    for plan in _episode_oracle_plans(episode):
+        required = {
+            str(interaction_id)
+            for interaction_id in plan.get("required_interaction_ids", [])
+            if str(interaction_id) in interactions
+            and str(interactions[str(interaction_id)].get("object_name")) == source_name
+        }
+        if required:
+            object_requirements.append(required)
+    if object_requirements:
+        return any(required.issubset(successful) for required in object_requirements)
+    return bool(successful)
+
+
 def _successful_object_skill_interaction_ids(
     *,
     episode: dict[str, Any],
@@ -1477,7 +2121,7 @@ def _successful_object_skill_interaction_ids(
                 and int(row.get("joint_index", -1)) == int(joint.joint_index)
             ):
                 resolved.append(str(row["interaction_id"]))
-    return list(dict.fromkeys(resolved))
+    return _order_interaction_ids_by_oracle_plan(episode, resolved)
 
 
 def _successful_drawer_scan_interaction_ids(
@@ -1589,6 +2233,7 @@ def _consume_pending_ros_object_goal_interaction(
                 joints=joints,
                 open_regions=request.open_regions,
                 allowed_joint_indices=allowed_drawer_joint_indices,
+                fallback_to_all=bool(request.direct_bbox_drawer_scan),
                 config=config,
                 decision_index=decision_index,
                 frames=frames,
@@ -1630,13 +2275,21 @@ def _consume_pending_ros_object_goal_interaction(
                 joints=joints,
                 joint_results=joint_results,
             )
+            skill_completed = bool(
+                event.public_result.completed
+                and _object_skill_satisfies_an_oracle_plan(
+                    episode=episode,
+                    source_name=str(source_name),
+                    successful_ids=successful_ids,
+                )
+            )
             completion = runtime.adapter.complete_interaction(
                 request.command_id,
-                success=event.public_result.completed,
+                success=skill_completed,
             )
             public_result = event.public_result.to_public_dict()
+            public_result["status"] = "completed" if skill_completed else "failed"
             simulated_seconds = float(sum(result.simulated_seconds for result in joint_results))
-            skill_completed = bool(event.public_result.completed)
             postcondition = None if event.postcondition is None else event.postcondition.value
     else:
         completion = runtime.adapter.complete_interaction(request.command_id, success=False)
@@ -1662,15 +2315,24 @@ def _consume_pending_ros_object_goal_interaction(
         if attempt.get("classification") == "required_valid" and bool(attempt.get("success"))
         for interaction_id in _resolved_interaction_ids(attempt)
     }
-    prerequisite_ids = {
-        str(prerequisite["interaction_id"])
-        for row in episode["interactive_nav"].get("interactions", [])
-        if str(row.get("interaction_id")) in successful_ids
-        for prerequisite in row.get("prerequisites", [])
-    }
     prerequisite_satisfied: bool | None = None
     if matching_ids:
-        prerequisite_satisfied = prerequisite_ids.issubset(prior_success)
+        completed_for_attempt = set(prior_success)
+        prerequisite_satisfied = True
+        rows_by_id = {
+            str(row["interaction_id"]): row
+            for row in episode["interactive_nav"].get("interactions", [])
+        }
+        for interaction_id in successful_ids:
+            prerequisites = {
+                str(prerequisite["interaction_id"])
+                for prerequisite in rows_by_id.get(interaction_id, {}).get(
+                    "prerequisites", []
+                )
+            }
+            if not prerequisites.issubset(completed_for_attempt):
+                prerequisite_satisfied = False
+            completed_for_attempt.add(interaction_id)
     private_attempt = InteractionAttempt(
         requested=public_request.to_public_dict(),
         classification=classification,  # type: ignore[arg-type]
@@ -1794,6 +2456,30 @@ def _episode_result_base(episode_index: int, episode: dict[str, Any], policy_nam
     }
 
 
+@dataclass
+class _PhaseTimings:
+    samples_ms: dict[str, list[float]] = field(default_factory=dict)
+
+    def record(self, name: str, started: float) -> float:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self.samples_ms.setdefault(name, []).append(elapsed_ms)
+        return elapsed_ms
+
+    def summary(self) -> dict[str, Any]:
+        phases: dict[str, Any] = {}
+        for name, values in self.samples_ms.items():
+            samples = np.asarray(values, dtype=float)
+            phases[name] = {
+                "count": int(samples.size),
+                "mean": float(np.mean(samples)),
+                "p50": float(np.percentile(samples, 50)),
+                "p95": float(np.percentile(samples, 95)),
+                "max": float(np.max(samples)),
+                "total": float(np.sum(samples)),
+            }
+        return {"unit": "ms", "phases": phases}
+
+
 def _private_episode_visualization_context(
     *,
     task: Any,
@@ -1808,9 +2494,14 @@ def _private_episode_visualization_context(
     """
 
     nav = episode["interactive_nav"]
-    target_name = str(nav["target"]["selected_instance"])
+    target_names = target_candidate_names(episode)
     objects = task.env.object_managers[task.env.current_batch_index]
-    target = objects.get_object_by_name(target_name)
+    target_positions = {
+        target_name: np.asarray(
+            objects.get_object_by_name(target_name).position[:2], dtype=float
+        ).tolist()
+        for target_name in target_names
+    }
     interactions: list[dict[str, Any]] = []
     for row in nav.get("interactions", []):
         runtime_joint = catalog.by_name(str(row["object_name"]), int(row["joint_index"]))
@@ -1832,7 +2523,8 @@ def _private_episode_visualization_context(
         "evaluator_private": True,
         "case_id": str(nav["case_id"]),
         "target": {
-            "xy": np.asarray(target.position[:2], dtype=float).tolist(),
+            "xy": target_positions[target_names[0]],
+            "candidate_xy": target_positions,
         },
         "gt_interactions": interactions,
         "actual_interactions": [],
@@ -1963,11 +2655,32 @@ def evaluate_episode(
     runtime_goal_blocked = False
     catalog: InteractionCatalog | None = None
     private_visualization: dict[str, Any] | None = None
+    effective_max_steps = int(config.max_steps)
+    step_budget_basis: dict[str, Any] = {
+        "evaluator_private": True,
+        "formula_version": STEP_BUDGET_FORMULA_VERSION,
+        "mode": config.step_budget_mode,
+        "effective_max_steps": effective_max_steps,
+        "conservative_fallback": True,
+        "fallback_reason": "budget_computation_not_completed",
+    }
+    reference: float | None = None
+    phase_timings = _PhaseTimings()
     started = time.monotonic()
     base_data = _episode_result_base(episode_index, episode, config.policy, config.policy == "scripted_oracle")
     try:
+        phase_started = time.perf_counter()
         interactive_nav_v3.validate_interactive_nav_v3_episode(episode, expected_domains=list(nav["interaction_domains"]))
+        phase_timings.record("episode_validation", phase_started)
         spec = EpisodeSpec.model_validate(episode)
+        effective_max_steps, step_budget_basis = episode_step_budget(config, episode)
+        print(
+            "[episode-step-budget] "
+            f"episode={episode_index} mode={config.step_budget_mode} "
+            f"effective={effective_max_steps} cap={config.max_steps} "
+            f"fallback={bool(step_budget_basis.get('conservative_fallback', False))}",
+            flush=True,
+        )
         original_cameras = [camera.name for camera in spec.cameras]
         spec.cameras = [camera for camera in spec.cameras if camera.name in set(config.camera_names)]
         missing_cameras = sorted(set(config.camera_names) - {camera.name for camera in spec.cameras})
@@ -1987,7 +2700,7 @@ def evaluate_episode(
             # is the established ROS navigation configuration; the frozen JSON
             # on disk remains unchanged.
             _apply_ros_navigation_arm_posture(spec)
-        replay = _build_replay_config(config, episode_dir)
+        replay = _build_replay_config(config, episode_dir, task_horizon=effective_max_steps)
         sampler = V3BenchmarkTaskSampler(replay, spec, nav)
         # Collection and this evaluator use a writable scene mirror.  Do not let
         # the upstream sampler attempt to mutate the shared resource cache.
@@ -2003,19 +2716,26 @@ def evaluate_episode(
         source_scene_path = variants["base"]
         variants["base"] = probe.prepare_writable_scene_path(Path(source_scene_path))
         try:
+            phase_started = time.perf_counter()
             task = sampler.sample_task(house_index=spec.house_index, variant="base")
+            phase_timings.record("task_sample", phase_started)
         finally:
             variants["base"] = source_scene_path
         if task is None:
             raise RuntimeError("JsonEvalTaskSampler returned no task")
+        phase_started = time.perf_counter()
         observation, _info = task.reset()
+        phase_timings.record("task_reset", phase_started)
         catalog = InteractionCatalog(task.env)
         private_visualization = _private_episode_visualization_context(
             task=task,
             catalog=catalog,
             episode=episode,
         )
+        private_visualization["step_budget"] = step_budget_basis
+        phase_started = time.perf_counter()
         runtime_consistency = _runtime_consistency_checks(task, catalog, episode, sampler, config)
+        phase_timings.record("runtime_consistency", phase_started)
         runtime_goal_consistency = runtime_consistency["checks"]["oracle_terminal_goal"]
         scoring_exclusion_reasons = list(runtime_consistency["exclusion_reasons"])
         scoring_eligible = bool(runtime_consistency["eligible"])
@@ -2025,6 +2745,7 @@ def evaluate_episode(
         )
         public = _public_episode(episode, [camera.name for camera in spec.cameras], tuple(spec.img_resolution))
         if not runtime_goal_blocked and not config.quality_gate_only:
+            phase_started = time.perf_counter()
             policy = _build_policy(config, public)
             policy.reset(public)
             if isinstance(policy, ScriptedOraclePolicy):
@@ -2036,8 +2757,10 @@ def evaluate_episode(
                     episode=episode,
                     public=public,
                     config=config,
+                    episode_index=episode_index,
                     frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
                 )
+            phase_timings.record("policy_setup", phase_started)
             base_data["policy_name"] = str(getattr(policy, "name", config.policy))
             base_data["uses_oracle_gt"] = bool(getattr(policy, "uses_oracle_gt", False))
         public_runtime_goal_consistency = runtime_goal_consistency
@@ -2062,6 +2785,7 @@ def evaluate_episode(
             "runtime_image_resolution": list(spec.img_resolution),
             "benchmark_image_resolution": list(episode.get("img_resolution", [])),
             "interaction_catalog_joint_count": len(catalog.joints),
+            "step_budget": _public_step_budget_basis(step_budget_basis),
         }
         if _is_current_ros_policy(config):
             runtime_trace["effective_navigation_arm_qpos"] = {
@@ -2074,6 +2798,8 @@ def evaluate_episode(
                 "enabled": True,
                 "camera_name": "head_camera",
                 "minimum_visible_pixels": int(config.restricted_gt_min_visible_pixels),
+                "minimum_bbox_area_pixels": int(config.restricted_gt_min_bbox_area_pixels),
+                "maximum_distance_m": float(config.restricted_gt_max_distance_m),
                 "interaction_endpoint": "opaque_object_open",
             }
         trace.append(
@@ -2090,19 +2816,25 @@ def evaluate_episode(
         elif config.quality_gate_only:
             terminal_reason = "quality_gate_complete"
         for decision_index in range(
-            0 if runtime_goal_blocked or config.quality_gate_only else int(config.max_steps)
+            0 if runtime_goal_blocked or config.quality_gate_only else effective_max_steps
         ):
+            decision_timing: dict[str, float] = {}
+            decision_started = time.perf_counter()
+            phase_started = decision_started
             current_nav_ok, target_distance, target_visibility = target_metrics(task, episode)
             nav_ok = bool(current_nav_ok or transient_target_discovery is not None)
             terminal_score = score_interactions(task.env, episode, attempts)
+            decision_timing["precheck"] = phase_timings.record("step_precheck", phase_started)
             # The task endpoint is deliberately independent from the hidden V3
             # interaction recipe.  Formal interaction-conditioned success is
             # evaluated below from private postconditions, but a method that has
             # reached and sees the actual target finishes its rollout now.
             if nav_ok:
                 terminal_reason = "target_found"
+                phase_timings.record("step_total", decision_started)
                 break
             if restricted_ros_runtime is not None:
+                phase_started = time.perf_counter()
                 consumed = _consume_pending_ros_object_goal_interaction(
                     task=task,
                     runtime=restricted_ros_runtime,
@@ -2111,6 +2843,9 @@ def evaluate_episode(
                     config=config,
                     decision_index=decision_index,
                     frames=frames,
+                )
+                decision_timing["restricted_interaction_poll"] = phase_timings.record(
+                    "restricted_interaction_poll", phase_started
                 )
                 if consumed is not None:
                     attempts.append(consumed["private_attempt"])
@@ -2121,10 +2856,14 @@ def evaluate_episode(
                         "kind": "interact",
                         **consumed["public_attempt"],
                     }
+                    decision_timing["total"] = phase_timings.record(
+                        "step_total", decision_started
+                    )
                     trace.append(
                         {
                             "decision_step": decision_index,
                             "interaction": consumed["public_attempt"],
+                            "timing_ms": decision_timing,
                         }
                     )
                     if consumed.get("target_discovery") is not None:
@@ -2139,9 +2878,16 @@ def evaluate_episode(
                 elapsed_seconds=time.monotonic() - started,
                 previous_action=previous_action,
             )
+            phase_started = time.perf_counter()
             action = policy.act(policy_observation)
-            event: dict[str, Any] = {"decision_step": decision_index, "action": action.to_dict()}
+            decision_timing["policy_act"] = phase_timings.record("policy_act", phase_started)
+            event: dict[str, Any] = {
+                "decision_step": decision_index,
+                "action": action.to_dict(),
+                "timing_ms": decision_timing,
+            }
             if restricted_ros_runtime is not None:
+                phase_started = time.perf_counter()
                 consumed = _consume_pending_ros_object_goal_interaction(
                     task=task,
                     runtime=restricted_ros_runtime,
@@ -2150,6 +2896,9 @@ def evaluate_episode(
                     config=config,
                     decision_index=decision_index,
                     frames=frames,
+                )
+                decision_timing["restricted_interaction_poll_after_act"] = phase_timings.record(
+                    "restricted_interaction_poll_after_act", phase_started
                 )
                 if consumed is not None:
                     attempts.append(consumed["private_attempt"])
@@ -2160,10 +2909,14 @@ def evaluate_episode(
                         "kind": "interact",
                         **consumed["public_attempt"],
                     }
+                    decision_timing["total"] = phase_timings.record(
+                        "step_total", decision_started
+                    )
                     trace.append(
                         {
                             "decision_step": decision_index,
                             "interaction": consumed["public_attempt"],
+                            "timing_ms": decision_timing,
                         }
                     )
                     if consumed.get("target_discovery") is not None:
@@ -2173,9 +2926,13 @@ def evaluate_episode(
                     continue
             if action.kind == "stop":
                 terminal_reason = str(action.metadata.get("reason", "policy_stop"))
+                decision_timing["total"] = phase_timings.record(
+                    "step_total", decision_started
+                )
                 trace.append(event)
                 break
             if action.kind == "base":
+                phase_started = time.perf_counter()
                 if action.metadata.get("oracle_waypoint"):
                     observation, increment, reached, details = _execute_oracle_waypoint(task, action, config)
                     notify = getattr(policy, "notify_action_result", None)
@@ -2190,34 +2947,74 @@ def evaluate_episode(
                 nav_path_length += increment
                 nav_sim_seconds += float(config.policy_dt_ms) / 1000.0
                 navigation_steps += 1
+                decision_timing["base_action"] = phase_timings.record("base_action", phase_started)
+                phase_started = time.perf_counter()
                 _capture_head_frame(task, frames, config.record_video)
+                decision_timing["frame_capture"] = phase_timings.record(
+                    "frame_capture", phase_started
+                )
                 if restricted_ros_runtime is not None:
+                    phase_started = time.perf_counter()
                     _publish_restricted_ros_frame(restricted_ros_runtime, task, decision_index=decision_index)
+                    decision_timing["restricted_gt_publish"] = phase_timings.record(
+                        "restricted_gt_publish", phase_started
+                    )
                 _discard_task_rollout_cache(task)
                 previous_action = action.to_dict()
+                decision_timing["total"] = phase_timings.record(
+                    "step_total", decision_started
+                )
                 trace.append(event)
                 if terminal_reason == "native_task_terminated":
                     break
                 continue
             if action.kind == "view":
+                phase_started = time.perf_counter()
                 view_actions += 1
                 event["view"] = _apply_view(task, action)
                 observation = task.get_observations()
+                decision_timing["view_action"] = phase_timings.record("view_action", phase_started)
+                phase_started = time.perf_counter()
                 _capture_head_frame(task, frames, config.record_video)
+                decision_timing["frame_capture"] = phase_timings.record(
+                    "frame_capture", phase_started
+                )
                 if restricted_ros_runtime is not None:
+                    phase_started = time.perf_counter()
                     _publish_restricted_ros_frame(restricted_ros_runtime, task, decision_index=decision_index)
+                    decision_timing["restricted_gt_publish"] = phase_timings.record(
+                        "restricted_gt_publish", phase_started
+                    )
                 _discard_task_rollout_cache(task)
                 previous_action = action.to_dict()
+                decision_timing["total"] = phase_timings.record(
+                    "step_total", decision_started
+                )
                 trace.append(event)
                 continue
             if action.kind == "observe":
+                phase_started = time.perf_counter()
                 event["observe"] = {"refreshed": True}
                 observation = task.get_observations()
+                decision_timing["observe_action"] = phase_timings.record(
+                    "observe_action", phase_started
+                )
+                phase_started = time.perf_counter()
                 _capture_head_frame(task, frames, config.record_video)
+                decision_timing["frame_capture"] = phase_timings.record(
+                    "frame_capture", phase_started
+                )
                 if restricted_ros_runtime is not None:
+                    phase_started = time.perf_counter()
                     _publish_restricted_ros_frame(restricted_ros_runtime, task, decision_index=decision_index)
+                    decision_timing["restricted_gt_publish"] = phase_timings.record(
+                        "restricted_gt_publish", phase_started
+                    )
                 _discard_task_rollout_cache(task)
                 previous_action = action.to_dict()
+                decision_timing["total"] = phase_timings.record(
+                    "step_total", decision_started
+                )
                 trace.append(event)
                 continue
             if action.kind != "interact":
@@ -2228,6 +3025,7 @@ def evaluate_episode(
                     f"{config.ros_interaction_command_topic}, not a direct PolicyAction"
                 )
 
+            phase_started = time.perf_counter()
             runtime_joint, interaction_id, classification, resolver_meta = _resolve_interaction(
                 env=task.env,
                 episode=episode,
@@ -2298,9 +3096,19 @@ def evaluate_episode(
             public_attempts.append(attempt)
             interaction_sim_seconds += float(simulated_seconds)
             event["interaction"] = attempt
+            decision_timing["interaction_action"] = phase_timings.record(
+                "interaction_action", phase_started
+            )
+            phase_started = time.perf_counter()
             _capture_head_frame(task, frames, config.record_video)
+            decision_timing["frame_capture"] = phase_timings.record(
+                "frame_capture", phase_started
+            )
             _discard_task_rollout_cache(task)
             previous_action = action.to_dict()
+            decision_timing["total"] = phase_timings.record(
+                "step_total", decision_started
+            )
             trace.append(event)
         else:
             if not runtime_goal_blocked and not config.quality_gate_only:
@@ -2317,14 +3125,14 @@ def evaluate_episode(
             and terminal_score.sequence_success
             and (terminal_score.non_interaction_success if requirement == "unnecessary" else True)
         )
-        reference = reference_path_length_m(episode)
+        reference = _safe_reference_path_length_m(episode)
         correct_count = terminal_score.correct_action_count
         extra_count = sum(row.get("classification") == "extra_valid" for row in attempts)
         invalid_count = sum(row.get("classification") == "invalid" for row in attempts)
         video_path = None
         if config.record_video and frames:
             destination = episode_dir / "head_camera.mp4"
-            probe.save_frames_to_mp4(frames, str(destination), fps=float(config.video_fps))
+            _save_video(frames, destination, config.video_fps)
             video_path = str(destination)
         result = EpisodeResult(
             **base_data,
@@ -2356,12 +3164,16 @@ def evaluate_episode(
             target_distance_m=target_distance,
             target_visibility_fraction=target_visibility,
             interaction_attempts=public_attempts if restricted_public_mode else attempts,
+            episode_step_budget=effective_max_steps,
+            step_budget_mode=config.step_budget_mode,
+            step_budget_basis=_public_step_budget_basis(step_budget_basis),
             trace_path=str(trace_path),
             video_path=video_path,
             scoring_eligible=scoring_eligible,
             scoring_exclusion_reasons=scoring_exclusion_reasons,
             runtime_goal_consistency=public_runtime_goal_consistency,
             runtime_consistency=public_runtime_consistency,
+            timing_summary=phase_timings.summary(),
         ).to_dict()
         if transient_target_discovery is not None and private_visualization is not None:
             # Keep the scan-time target evidence beside other evaluator-only
@@ -2393,6 +3205,8 @@ def evaluate_episode(
         status = "complete"
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+        if reference is None:
+            reference = _safe_reference_path_length_m(episode)
         public_runtime_goal_consistency = runtime_goal_consistency
         public_runtime_consistency = runtime_consistency
         if restricted_public_mode:
@@ -2419,8 +3233,8 @@ def evaluate_episode(
             extra_interaction_action_count=sum(row.get("classification") == "extra_valid" for row in attempts),
             invalid_interaction_action_count=sum(row.get("classification") == "invalid" for row in attempts),
             navigation_path_length_m=nav_path_length,
-            reference_path_length_m=reference_path_length_m(episode),
-            spl=0.0 if reference_path_length_m(episode) is not None else None,
+            reference_path_length_m=reference,
+            spl=0.0 if reference is not None else None,
             navigation_simulated_seconds=nav_sim_seconds,
             interaction_simulated_seconds=interaction_sim_seconds,
             total_simulated_seconds=nav_sim_seconds + interaction_sim_seconds,
@@ -2428,6 +3242,9 @@ def evaluate_episode(
             target_distance_m=None,
             target_visibility_fraction=None,
             interaction_attempts=public_attempts if restricted_public_mode else attempts,
+            episode_step_budget=effective_max_steps,
+            step_budget_mode=config.step_budget_mode,
+            step_budget_basis=_public_step_budget_basis(step_budget_basis),
             trace_path=str(trace_path),
             error=error,
             scoring_eligible=False,
@@ -2438,6 +3255,7 @@ def evaluate_episode(
             ),
             runtime_goal_consistency=public_runtime_goal_consistency,
             runtime_consistency=public_runtime_consistency,
+            timing_summary=phase_timings.summary(),
         ).to_dict()
         if restricted_public_mode:
             trace.append({"exception": error})
@@ -2557,7 +3375,11 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
     raw_config = asdict(config)
     raw_config["benchmark"] = str(config.benchmark)
     raw_config["output_dir"] = str(config.output_dir)
-    payloads = [(raw_config, index, episodes[index], signature) for index in indices]
+    total_payloads = len(indices)
+
+    def make_payload(index: int) -> tuple[dict[str, Any], int, dict[str, Any], str]:
+        return raw_config, index, episodes[index], signature
+
     rows: list[dict[str, Any]] = []
     progress_started = time.monotonic()
 
@@ -2567,13 +3389,13 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
             return
         elapsed = max(time.monotonic() - progress_started, 1e-9)
         rate = completed / elapsed
-        remaining = len(payloads) - completed
+        remaining = total_payloads - completed
         eta_seconds = None if rate <= 0 else remaining / rate
         payload = {
             "time": time.strftime("%Y-%m-%d %H:%M:%S%z"),
             "processed": completed,
-            "total": len(payloads),
-            "progress": 0.0 if not payloads else completed / len(payloads),
+            "total": total_payloads,
+            "progress": 0.0 if not total_payloads else completed / total_payloads,
             "eligible": sum(bool(row.get("scoring_eligible")) for row in rows),
             "ineligible": sum(not bool(row.get("scoring_eligible")) for row in rows),
             "exceptions": sum(row.get("status") == "exception" for row in rows),
@@ -2584,7 +3406,7 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
         _atomic_json(config.output_dir / "progress.json", payload)
         print(
             "[quality-gate-progress] "
-            f"time={payload['time']} processed={completed}/{len(payloads)} "
+            f"time={payload['time']} processed={completed}/{total_payloads} "
             f"eligible={payload['eligible']} ineligible={payload['ineligible']} "
             f"exceptions={payload['exceptions']} rate={rate:.3f}/s "
             f"eta_s={'unknown' if eta_seconds is None else int(eta_seconds)}",
@@ -2592,18 +3414,35 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
         )
 
     if config.workers == 1:
-        for payload in payloads:
-            rows.append(_worker(payload))
+        for index in indices:
+            rows.append(_worker(make_payload(index)))
             record_progress()
     else:
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=config.workers,
             mp_context=multiprocessing.get_context("spawn"),
         ) as pool:
-            futures = [pool.submit(_worker, payload) for payload in payloads]
-            for future in concurrent.futures.as_completed(futures):
-                rows.append(future.result())
-                record_progress()
+            # Keep only a small bounded queue of serialized episodes.  Submitting
+            # the entire benchmark at once needlessly duplicates large JSON
+            # payloads in the parent and multiprocessing feeder threads.
+            index_iter = iter(indices)
+            pending: set[concurrent.futures.Future] = set()
+            for _ in range(max(1, int(config.workers) * 2)):
+                try:
+                    pending.add(pool.submit(_worker, make_payload(next(index_iter))))
+                except StopIteration:
+                    break
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    rows.append(future.result())
+                    record_progress()
+                    try:
+                        pending.add(pool.submit(_worker, make_payload(next(index_iter))))
+                    except StopIteration:
+                        pass
     record_progress(force=True)
     rows.sort(key=lambda row: int(row["episode_index"]))
     summary = summarise_results(rows)
@@ -2616,6 +3455,15 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
             "policy": config.policy,
             "workers": config.workers,
             "max_steps": config.max_steps,
+            "step_budget_mode": config.step_budget_mode,
+            "min_steps": config.min_steps,
+            "episode_step_budget_min": min((int(row["episode_step_budget"]) for row in rows), default=None),
+            "episode_step_budget_max": max((int(row["episode_step_budget"]) for row in rows), default=None),
+            "episode_step_budget_mean": (
+                sum(int(row["episode_step_budget"]) for row in rows) / len(rows)
+                if rows
+                else None
+            ),
             "episode_indices": indices,
             "result_count": len(rows),
             "complete_count": sum(row.get("status") == "complete" for row in rows),
@@ -2647,7 +3495,20 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--policy-factory")
     parser.add_argument("--policy-kwargs-json")
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=500,
+        help="Fixed rollout length, or the hard cap when --step-budget-mode=dynamic.",
+    )
+    parser.add_argument("--step-budget-mode", choices=["fixed", "dynamic"], default="fixed")
+    parser.add_argument("--min-steps", type=int, default=300)
+    parser.add_argument("--dynamic-path-free-m", type=float, default=3.0)
+    parser.add_argument("--dynamic-steps-per-path-m", type=float, default=25.0)
+    parser.add_argument("--dynamic-channel-interaction-steps", type=int, default=150)
+    parser.add_argument("--dynamic-container-interaction-steps", type=int, default=200)
+    parser.add_argument("--dynamic-container-joint-steps", type=int, default=40)
+    parser.add_argument("--dynamic-step-quantum", type=int, default=50)
     parser.add_argument("--episode-indices", type=int, nargs="+")
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument("--resume", action="store_true")
@@ -2697,6 +3558,13 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--ros-interaction-command-topic", default="/semantic_decision/interaction_command")
     parser.add_argument("--ros-interaction-result-topic", default="/semantic_mapping/interaction_result")
     parser.add_argument("--restricted-gt-min-visible-pixels", type=int, default=16)
+    parser.add_argument("--restricted-gt-min-bbox-area-pixels", type=int, default=512)
+    parser.add_argument(
+        "--restricted-gt-max-distance-m",
+        type=float,
+        default=4.0,
+        help="Maximum head-camera distance for evaluator-published restricted-GT observations; 0 disables the limit.",
+    )
     parser.add_argument(
         "--quality-gate-only",
         action="store_true",
@@ -2716,6 +3584,14 @@ def parse_args() -> BenchmarkEvaluationConfig:
         policy_kwargs=_parse_policy_kwargs(args.policy_kwargs_json),
         workers=args.workers,
         max_steps=args.max_steps,
+        step_budget_mode=args.step_budget_mode,
+        min_steps=args.min_steps,
+        dynamic_path_free_m=args.dynamic_path_free_m,
+        dynamic_steps_per_path_m=args.dynamic_steps_per_path_m,
+        dynamic_channel_interaction_steps=args.dynamic_channel_interaction_steps,
+        dynamic_container_interaction_steps=args.dynamic_container_interaction_steps,
+        dynamic_container_joint_steps=args.dynamic_container_joint_steps,
+        dynamic_step_quantum=args.dynamic_step_quantum,
         episode_indices=args.episode_indices,
         max_episodes=args.max_episodes,
         resume=args.resume,
@@ -2746,6 +3622,8 @@ def parse_args() -> BenchmarkEvaluationConfig:
         ros_interaction_command_topic=args.ros_interaction_command_topic,
         ros_interaction_result_topic=args.ros_interaction_result_topic,
         restricted_gt_min_visible_pixels=args.restricted_gt_min_visible_pixels,
+        restricted_gt_min_bbox_area_pixels=args.restricted_gt_min_bbox_area_pixels,
+        restricted_gt_max_distance_m=args.restricted_gt_max_distance_m,
         quality_gate_only=args.quality_gate_only,
         runtime_joint_position_tolerance=args.runtime_joint_position_tolerance,
         runtime_joint_fraction_tolerance=args.runtime_joint_fraction_tolerance,

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import inspect
 
-from scripts.InteractiveNav.evaluation.benchmark_policies import RosBridgePolicyAdapter
+from scripts.InteractiveNav.evaluation.benchmark_policies import (
+    RosBridgePolicyAdapter,
+    build_ros_bridge_policy,
+)
 from scripts.InteractiveNav.evaluation.benchmark_types import PolicyObservation, PublicEpisode
 from scripts.InteractiveNav.evaluation.ros_navigation_factory import (
     CURRENT_ROS_NAVIGATION_FACTORY,
@@ -50,6 +53,11 @@ def _public_episode() -> PublicEpisode:
 def test_current_ros_factory_is_importable_without_ros_runtime() -> None:
     assert CURRENT_ROS_NAVIGATION_FACTORY.endswith(":create_current_ros_navigation_policy")
     assert "public_episode" in inspect.signature(create_current_ros_navigation_policy).parameters
+
+
+def test_v3_bridge_keeps_cmd_vel_fresh_for_control_step_budgets() -> None:
+    source = inspect.getsource(build_ros_bridge_policy)
+    assert "require_fresh_cmd_vel=True" in source
 
 
 def test_ros_bridge_adapter_normalizes_navigation_and_timeout_without_task() -> None:

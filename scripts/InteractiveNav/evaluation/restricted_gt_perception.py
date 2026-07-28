@@ -269,12 +269,19 @@ class OpaqueEpisodeRegistry:
     source name, asset ID, or MuJoCo body index.
     """
 
-    def __init__(self, *, instance_prefix: str = "obj") -> None:
+    def __init__(
+        self,
+        *,
+        instance_prefix: str = "obj",
+        initial_episode_index: int = 1,
+    ) -> None:
         prefix = re.sub(r"[^a-z0-9]", "", str(instance_prefix).casefold())
         if re.fullmatch(r"[a-z][a-z0-9]*", prefix) is None:
             raise ValueError("instance_prefix must start with an ASCII letter")
+        if not 1 <= int(initial_episode_index) <= 999999:
+            raise ValueError("initial_episode_index must be in [1, 999999]")
         self._instance_prefix = prefix
-        self._episode_index = 0
+        self._episode_index = int(initial_episode_index) - 1
         self._episode_id = ""
         self._next_instance_index = 1
         self._source_to_id: dict[str, str] = {}
@@ -707,6 +714,9 @@ def build_restricted_gt_frame(
     frame_index: int = 0,
     episode_reset: bool = False,
     min_visible_pixels: int = 1,
+    min_bbox_area_pixels: int = 1,
+    max_distance_m: float = 0.0,
+    camera_position: Sequence[float] | None = None,
     frame_id: str = "world",
     geom_object_type: int | None = None,
     geom_to_spec: np.ndarray | None = None,
@@ -726,6 +736,17 @@ def build_restricted_gt_frame(
         raise ValueError("Segmentation must have shape [height, width, >=2]")
     if int(min_visible_pixels) < 1:
         raise ValueError("min_visible_pixels must be >= 1")
+    if int(min_bbox_area_pixels) < 1:
+        raise ValueError("min_bbox_area_pixels must be >= 1")
+    if not math.isfinite(float(max_distance_m)) or float(max_distance_m) < 0.0:
+        raise ValueError("max_distance_m must be finite and non-negative")
+    if float(max_distance_m) > 0.0 and camera_position is None:
+        raise ValueError("camera_position is required when max_distance_m is enabled")
+    camera_xyz = (
+        _triplet(camera_position, path="private_runtime.camera_position")
+        if camera_position is not None
+        else None
+    )
     object_type = _mujoco_geom_object_type() if geom_object_type is None else int(geom_object_type)
     mapping = _geom_to_spec_mapping(model, private_specs) if geom_to_spec is None else np.asarray(geom_to_spec, dtype=np.int32)
     height, width = int(array.shape[0]), int(array.shape[1])
@@ -756,6 +777,17 @@ def build_restricted_gt_frame(
             mask[ys[selection], xs[selection]] = True
             object_ys, object_xs = np.nonzero(mask)
             center, size = _runtime_aabb(spec, model, data)
+            bbox_area = int(object_xs.max() - object_xs.min() + 1) * int(
+                object_ys.max() - object_ys.min() + 1
+            )
+            if bbox_area < int(min_bbox_area_pixels):
+                continue
+            if (
+                camera_xyz is not None
+                and float(max_distance_m) > 0.0
+                and math.dist(center, camera_xyz) > float(max_distance_m)
+            ):
+                continue
             observations.append(
                 RestrictedObservation(
                     instance_id=registry.public_id_for(spec.source_name),
@@ -792,14 +824,21 @@ class RestrictedGTPerceptionPublisher:
         camera_name: str = "head_camera",
         topic: str = "/semantic_mapping/gt_observations",
         min_visible_pixels: int = 16,
+        min_bbox_area_pixels: int = 512,
+        max_distance_m: float = 4.0,
         step_interval: int = 1,
         frame_id: str = "world",
         rospy_module: Any | None = None,
         string_message_type: Any | None = None,
         queue_size: int = 1,
+        initial_episode_index: int = 1,
     ) -> None:
         if int(min_visible_pixels) < 1:
             raise ValueError("min_visible_pixels must be >= 1")
+        if int(min_bbox_area_pixels) < 1:
+            raise ValueError("min_bbox_area_pixels must be >= 1")
+        if not math.isfinite(float(max_distance_m)) or float(max_distance_m) < 0.0:
+            raise ValueError("max_distance_m must be finite and non-negative")
         if int(step_interval) < 1:
             raise ValueError("step_interval must be >= 1")
         if (rospy_module is None) != (string_message_type is None):
@@ -807,9 +846,11 @@ class RestrictedGTPerceptionPublisher:
         self.camera_name = str(camera_name)
         self.topic = str(topic)
         self.min_visible_pixels = int(min_visible_pixels)
+        self.min_bbox_area_pixels = int(min_bbox_area_pixels)
+        self.max_distance_m = float(max_distance_m)
         self.step_interval = int(step_interval)
         self.frame_id = str(frame_id)
-        self.registry = OpaqueEpisodeRegistry()
+        self.registry = OpaqueEpisodeRegistry(initial_episode_index=initial_episode_index)
         self.frame_index = 0
         self._episode_reset_pending = True
         self._cached_model_identity: int | None = None
@@ -877,6 +918,18 @@ class RestrictedGTPerceptionPublisher:
                 segmentation = np.asarray(env.render_segmentation_frame(self.camera_name))
             except Exception as exc:
                 raise RuntimeError(f"Restricted GT segmentation render failed: {type(exc).__name__}: {exc}") from exc
+        camera_position = None
+        if self.max_distance_m > 0.0:
+            try:
+                camera = env.camera_manager.registry[self.camera_name]
+                camera_position = _triplet(
+                    camera.pos,
+                    path="private_runtime.camera_position",
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Restricted GT camera position is required for distance filtering"
+                ) from exc
         model = getattr(env, "current_model", None)
         data = getattr(env, "current_data", None)
         if candidates is None:
@@ -895,6 +948,9 @@ class RestrictedGTPerceptionPublisher:
             frame_index=self.frame_index,
             episode_reset=self._episode_reset_pending,
             min_visible_pixels=self.min_visible_pixels,
+            min_bbox_area_pixels=self.min_bbox_area_pixels,
+            max_distance_m=self.max_distance_m,
+            camera_position=camera_position,
             frame_id=self.frame_id,
             geom_to_spec=mapping,
         )

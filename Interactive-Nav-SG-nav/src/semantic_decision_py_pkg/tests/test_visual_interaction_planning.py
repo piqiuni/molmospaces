@@ -11,7 +11,9 @@ if str(DECISION_SCRIPTS) not in sys.path:
 
 from semantic_decision_py_pkg.visual_interaction_planning import (
     action_for_opaque_open_contract,
+    candidate_with_direct_drawer_scan,
     candidate_with_visual_operation_plan,
+    current_visible_bbox_2d,
     infer_visual_interaction_target_type,
 )
 
@@ -72,3 +74,63 @@ def test_portal_visual_plan_preserves_atomic_open_and_method() -> None:
 def test_opaque_open_contract_clamps_only_when_explicitly_enabled() -> None:
     assert action_for_opaque_open_contract("scan", enabled=False) == "scan"
     assert action_for_opaque_open_contract("scan", enabled=True) == "open"
+
+
+def test_current_visible_drawer_uses_public_container_box_for_direct_scan() -> None:
+    candidate = {
+        "target_name": "dresser_asset",
+        "interaction_command": {"action": "open", "joint_names": ["private_joint"]},
+    }
+    node = {
+        "type": "container",
+        "name": "Dresser",
+        "is_currently_visible": True,
+        "attributes": {"projected_bbox_2d": [50, 30, 10, 90]},
+    }
+
+    assert current_visible_bbox_2d(node) == [10.0, 30.0, 50.0, 90.0]
+    planned = candidate_with_direct_drawer_scan(candidate, node, capture_step=17)
+
+    assert planned is not None
+    command = planned["interaction_command"]
+    assert command["action"] == "scan"
+    assert command["sequence_type"] == "drawer_scan"
+    assert command["open_regions"] == []
+    assert command["drawer_container_bbox_2d"] == [10.0, 30.0, 50.0, 90.0]
+    assert command["drawer_container_capture_step"] == 17
+    assert "joint_names" not in command
+
+
+def test_direct_drawer_scan_requires_a_current_valid_box() -> None:
+    candidate = {"interaction_command": {"action": "open"}}
+    assert candidate_with_direct_drawer_scan(
+        candidate,
+        {"is_currently_visible": False, "bbox_2d": [0, 0, 20, 20]},
+        capture_step=4,
+    ) is None
+    assert candidate_with_direct_drawer_scan(
+        candidate,
+        {"is_currently_visible": True, "bbox_2d": [0, 0, 0, 20]},
+        capture_step=4,
+    ) is None
+    assert candidate_with_direct_drawer_scan(
+        candidate,
+        {"is_currently_visible": True, "bbox_2d": [0, 0, 20, 20]},
+        capture_step=None,
+    ) is None
+
+
+def test_model_drawer_plan_cannot_inherit_a_direct_scan_box() -> None:
+    candidate = {
+        "interaction_command": {"drawer_container_bbox_2d": [1, 2, 3, 4]},
+    }
+    planned = candidate_with_visual_operation_plan(
+        candidate,
+        {
+            "target_type": "drawer_container",
+            "action": "scan",
+            "operation_method": "pull",
+            "open_regions": [],
+        },
+    )
+    assert "drawer_container_bbox_2d" not in planned["interaction_command"]

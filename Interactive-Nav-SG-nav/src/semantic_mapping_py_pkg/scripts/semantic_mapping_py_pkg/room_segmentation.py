@@ -4,6 +4,8 @@ from collections import deque
 
 import numpy as np
 
+from .geometry_utils import grid_origin_yaw, world_to_grid
+
 
 class RoomSegmentationState:
     def __init__(self):
@@ -51,6 +53,7 @@ class RoomSegmenter:
         room_id_overlap_ratio=0.25,
         room_merge_confirmations=3,
         room_grid_stability_frames=1,
+        room_portal_small_component_confidence=70,
         state=None,
     ):
         self.room_free_threshold = int(room_free_threshold)
@@ -92,6 +95,10 @@ class RoomSegmenter:
         self.room_id_overlap_ratio = min(1.0, max(0.0, float(room_id_overlap_ratio)))
         self.room_merge_confirmations = max(1, int(room_merge_confirmations))
         self.room_grid_stability_frames = max(1, int(room_grid_stability_frames))
+        self.room_portal_small_component_confidence = min(
+            99,
+            max(1, int(room_portal_small_component_confidence)),
+        )
         self.state = state if state is not None else RoomSegmentationState()
 
     def update_portal_hints(self, observations, source_mode="detector_online"):
@@ -250,9 +257,17 @@ class RoomSegmenter:
                     continue
                 segmentation_free[labels == component_id] = 1
 
+        portal_cut_mask = np.zeros_like(segmentation_free, dtype=np.uint8)
+        pre_portal_cut_free = None
         if cv2 is not None and self.room_portal_cut_enabled:
-            self._apply_portal_cuts(segmentation_free, occ_grid.info, cv2)
+            pre_portal_cut_free = segmentation_free.copy()
+            portal_cut_mask = self._apply_portal_cuts(
+                segmentation_free,
+                occ_grid.info,
+                cv2,
+            )
 
+        component_confidence = {}
         if cv2 is not None:
             distance = cv2.distanceTransform((segmentation_free * 255).astype(np.uint8), cv2.DIST_L2, 5)
             core_mask = (
@@ -268,21 +283,41 @@ class RoomSegmenter:
                     continue
                 ys, xs = np.where(labels == component_id)
                 component_cells[next_temp_id] = [int(y) * width + int(x) for y, x in zip(ys.tolist(), xs.tolist())]
+                component_confidence[next_temp_id] = 100
                 next_temp_id += 1
+
+            if pre_portal_cut_free is not None and np.any(portal_cut_mask):
+                for component in self._portal_separated_small_components(
+                    segmentation_free,
+                    pre_portal_cut_free,
+                    portal_cut_mask,
+                    component_cells,
+                    width,
+                    height,
+                ):
+                    component_cells[next_temp_id] = component
+                    component_confidence[next_temp_id] = (
+                        self.room_portal_small_component_confidence
+                    )
+                    next_temp_id += 1
         else:
             component_cells = self._fallback_component_cells(segmentation_free, width, height)
+            component_confidence = {
+                temp_room_id: 100 for temp_room_id in component_cells
+            }
 
         if not component_cells:
             fallback_component = np.flatnonzero(segmentation_free > 0).tolist()
             if len(fallback_component) >= self.room_min_component_cells:
                 component_cells[1] = [int(index) for index in fallback_component]
+                component_confidence[1] = 100
 
         remapped_ids = self._remap_room_component_ids(component_cells, occ_grid.info)
         for temp_room_id, component in component_cells.items():
             stable_room_id = remapped_ids.get(temp_room_id, temp_room_id)
             for comp_idx in component:
                 room_ids[comp_idx] = stable_room_id
-                room_conf[comp_idx] = 100
+                room_conf[comp_idx] = component_confidence.get(temp_room_id, 100)
 
         queue = deque(idx for idx, room_id in enumerate(room_ids) if room_id >= 0)
         while queue:
@@ -363,10 +398,9 @@ class RoomSegmenter:
 
     def _apply_portal_cuts(self, segmentation_free, grid_info, cv2):
         resolution = float(grid_info.resolution)
+        cut_mask = np.zeros_like(segmentation_free, dtype=np.uint8)
         if resolution <= 0.0:
-            return
-        origin_x = float(grid_info.origin.position.x)
-        origin_y = float(grid_info.origin.position.y)
+            return cut_mask
         height, width = segmentation_free.shape
         for hint in self.state.portal_hints.values():
             if not hint.get("active"):
@@ -382,24 +416,98 @@ class RoomSegmenter:
             end = list(center)
             start[span_axis] -= 0.5 * span
             end[span_axis] += 0.5 * span
-            start_cell = (
-                int(round((float(start[0]) - origin_x) / resolution)),
-                int(round((float(start[1]) - origin_y) / resolution)),
+            start_cell = world_to_grid(
+                start[0],
+                start[1],
+                grid_info,
+                check_bounds=False,
             )
-            end_cell = (
-                int(round((float(end[0]) - origin_x) / resolution)),
-                int(round((float(end[1]) - origin_y) / resolution)),
+            end_cell = world_to_grid(
+                end[0],
+                end[1],
+                grid_info,
+                check_bounds=False,
             )
+            if start_cell is None or end_cell is None:
+                continue
             if not self._line_may_intersect_grid(start_cell, end_cell, width, height):
                 continue
             cv2.line(
-                segmentation_free,
+                cut_mask,
                 start_cell,
                 end_cell,
-                0,
+                1,
                 thickness=self.room_portal_cut_thickness_cells,
                 lineType=cv2.LINE_8,
             )
+        cut_mask = ((cut_mask > 0) & (segmentation_free > 0)).astype(np.uint8)
+        segmentation_free[cut_mask > 0] = 0
+        return cut_mask
+
+    def _portal_separated_small_components(
+        self,
+        segmentation_free,
+        pre_portal_cut_free,
+        portal_cut_mask,
+        core_component_cells,
+        width,
+        height,
+    ):
+        """Keep room-sized pockets that an active virtual portal cut isolated.
+
+        Core-based room seeds intentionally discard narrow spaces.  Once a
+        portal cut separates such a pocket from a core room, however, leaving
+        it unknown loses the topology change caused by the portal.  Only
+        retain components that were connected before the cut, are now split
+        by it, and meet the ordinary minimum room area.
+        """
+
+        post_components, _ = self._free_components_with_labels(
+            segmentation_free,
+            width,
+            height,
+        )
+        if len(post_components) < 2:
+            return []
+        _pre_components, pre_labels = self._free_components_with_labels(
+            pre_portal_cut_free,
+            width,
+            height,
+        )
+        seeded_cells = {
+            int(cell)
+            for component in core_component_cells.values()
+            for cell in component
+        }
+        components_by_pre_cut = {}
+        for component in post_components:
+            if not component:
+                continue
+            pre_cut_component_id = int(pre_labels[component[0]])
+            if pre_cut_component_id < 0:
+                continue
+            components_by_pre_cut.setdefault(pre_cut_component_id, []).append(
+                component
+            )
+
+        preserved = []
+        for components in components_by_pre_cut.values():
+            if len(components) < 2:
+                continue
+            for component in components:
+                if len(component) < self.room_min_component_cells:
+                    continue
+                if any(cell in seeded_cells for cell in component):
+                    continue
+                if not self._component_touches_mask(
+                    component,
+                    portal_cut_mask,
+                    width,
+                    height,
+                ):
+                    continue
+                preserved.append(component)
+        return preserved
 
     def _portal_hint_key(self, observation, center):
         explicit = (
@@ -455,6 +563,27 @@ class RoomSegmenter:
             or min(start[1], end[1]) >= height
         )
 
+    @staticmethod
+    def _component_touches_mask(component, mask, width, height):
+        for index in component:
+            x = int(index) % width
+            y = int(index) // width
+            for dx, dy in (
+                (-1, -1),
+                (0, -1),
+                (1, -1),
+                (-1, 0),
+                (1, 0),
+                (-1, 1),
+                (0, 1),
+                (1, 1),
+            ):
+                nx = x + dx
+                ny = y + dy
+                if 0 <= nx < width and 0 <= ny < height and mask[ny, nx] > 0:
+                    return True
+        return False
+
     def _fill_enclosed_obstacles(self, values, room_ids, room_conf, width, height, cv2):
         room_grid = np.asarray(room_ids, dtype=np.int32).reshape(height, width)
         conf_grid = np.asarray(room_conf, dtype=np.int32).reshape(height, width)
@@ -506,17 +635,20 @@ class RoomSegmenter:
             conf_grid[mask] = 55
         return room_grid.reshape(height * width).tolist(), conf_grid.reshape(height * width).tolist()
 
-    def _fallback_component_cells(self, segmentation_free, width, height):
+    @staticmethod
+    def _free_components_with_labels(segmentation_free, width, height):
         flat = segmentation_free.reshape(height * width)
         visited = np.zeros(height * width, dtype=bool)
-        components = {}
-        next_temp_id = 1
+        labels = np.full(height * width, -1, dtype=np.int32)
+        components = []
         for index in range(height * width):
             if visited[index] or flat[index] <= 0:
                 continue
             visited[index] = True
             queue = deque([index])
             component = [index]
+            component_id = len(components)
+            labels[index] = component_id
             while queue:
                 current = queue.popleft()
                 x = current % width
@@ -530,13 +662,26 @@ class RoomSegmenter:
                     if visited[nidx] or flat[nidx] <= 0:
                         continue
                     visited[nidx] = True
+                    labels[nidx] = component_id
                     component.append(nidx)
                     queue.append(nidx)
+            components.append(component)
+        return components, labels
+
+    def _fallback_component_cells(self, segmentation_free, width, height):
+        components, _ = self._free_components_with_labels(
+            segmentation_free,
+            width,
+            height,
+        )
+        accepted = {}
+        next_temp_id = 1
+        for component in components:
             if len(component) < self.room_core_min_component_cells:
                 continue
-            components[next_temp_id] = component
+            accepted[next_temp_id] = component
             next_temp_id += 1
-        return components
+        return accepted
 
     def _remap_room_component_ids(self, component_cells, grid_info):
         remapped = {}
@@ -605,4 +750,5 @@ class RoomSegmenter:
             float(grid_info.resolution),
             float(grid_info.origin.position.x),
             float(grid_info.origin.position.y),
+            round(grid_origin_yaw(grid_info), 6),
         )

@@ -143,6 +143,9 @@ class EpisodeResult:
     target_distance_m: float | None
     target_visibility_fraction: float | None
     interaction_attempts: list[dict[str, Any]]
+    episode_step_budget: int | None = None
+    step_budget_mode: str = "fixed"
+    step_budget_basis: dict[str, Any] = field(default_factory=dict)
     trace_path: str | None = None
     video_path: str | None = None
     error: str | None = None
@@ -152,6 +155,7 @@ class EpisodeResult:
     scoring_exclusion_reasons: list[str] = field(default_factory=list)
     runtime_goal_consistency: dict[str, Any] | None = None
     runtime_consistency: dict[str, Any] | None = None
+    timing_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

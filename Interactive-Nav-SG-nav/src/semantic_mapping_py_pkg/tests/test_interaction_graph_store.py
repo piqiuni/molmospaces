@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from semantic_mapping_py_pkg.gt_observation_provider import build_gt_observation_batches
+from semantic_mapping_py_pkg.geometry_utils import grid_to_world
 from semantic_mapping_py_pkg.graph_rules import observation_from_detection
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore
@@ -601,6 +603,55 @@ def test_portal_room_connections_are_inferred_from_room_ring():
     assert all(edge["attributes"]["requires_interaction"] is True for edge in connects)
 
 
+def test_portal_room_connections_respect_rotated_grid_origin():
+    class RotatedGridInfo(FakeGridInfo):
+        class Origin:
+            class Position:
+                x = 0.0
+                y = 0.0
+
+            class Orientation:
+                x = 0.0
+                y = 0.0
+                z = math.sqrt(0.5)
+                w = math.sqrt(0.5)
+
+            position = Position()
+            orientation = Orientation()
+
+        origin = Origin()
+
+    scene_data = []
+    for _y in range(RotatedGridInfo.height):
+        scene_data.extend([1, 1, 1, 1, 2, 2, 2, 2])
+    info = RotatedGridInfo()
+    portal_x, portal_y = grid_to_world(4, 4, info, center=False)
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_room_grid(info, scene_data, [100] * len(scene_data))
+    store.update_observations(
+        [
+            observation(
+                instance_id="rotated_door",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=0.0,
+                position=[portal_x, portal_y, 1.0],
+                aabb_center=[portal_x, portal_y, 1.0],
+                aabb_size=[0.2, 1.0, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert set(portal["attributes"]["connected_room_ids"]) == {1, 2}
+
+
 def test_portal_room_ring_does_not_reach_distant_room():
     class WideGridInfo(FakeGridInfo):
         width = 12
@@ -775,6 +826,166 @@ def test_interaction_result_updates_planner_fields():
     )
     portal = next(node for node in store.as_graph_dict(stamp=21.0)["nodes"] if node["type"] == "portal")
     assert len(portal["interaction"]["operation_history"]) == 1
+
+
+def test_successful_opaque_open_result_establishes_semantic_postcondition():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="opaque_door_1",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=None,
+                aabb_center=[0.0, 0.0, 1.0],
+                aabb_size=[0.1, 0.9, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+        stamp=10.0,
+    )
+
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_opaque_door_1",
+            "object_id": "opaque_door_1",
+            "event_id": "opaque_open_001",
+            "action": "open",
+            "success": True,
+            "source": "evaluator_object_skill",
+            "approach_goal_xyyaw": [-1.0, 0.0, 0.0],
+        },
+        stamp=11.0,
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict(stamp=11.0)["nodes"]
+        if node["type"] == "portal"
+    )
+    assert portal["interaction"]["state"] == "open"
+    assert portal["interaction"]["state_source"] == "successful_action_postcondition"
+    assert portal["interaction"]["traversable"] is True
+    assert portal["interaction"]["requires_interaction"] is False
+    assert portal["interaction"]["operation_history"][-1] == {
+        "event_id": "opaque_open_001",
+        "action": "open",
+        "timestamp": 11.0,
+        "pre_state": "unknown",
+        "post_state": "open",
+        "success": True,
+        "execution_cost": 1.0,
+        "verification_source": "successful_action_postcondition",
+        "approach_goal_xyyaw": [-1.0, 0.0, 0.0],
+    }
+
+    # Later minimal observations do not overwrite the sealed action outcome.
+    store.update_observations(
+        [
+            observation(
+                instance_id="opaque_door_1",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=None,
+                aabb_center=[0.0, 0.0, 1.0],
+                aabb_size=[0.1, 0.9, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+        stamp=12.0,
+    )
+    portal = next(
+        node for node in store.as_graph_dict(stamp=12.0)["nodes"]
+        if node["type"] == "portal"
+    )
+    assert portal["interaction"]["state"] == "open"
+    assert portal["interaction"]["traversable"] is True
+
+
+def test_evaluator_object_skill_prefers_its_resolved_opaque_id_over_stale_node_id():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="obj_target",
+                semantic_name="dresser",
+                is_receptacle=True,
+                is_articulable=True,
+                joint_type="slide",
+                joint_range=[0.0, 0.4],
+                joint_value=None,
+            ),
+            observation(
+                instance_id="obj_stale",
+                semantic_name="cabinet",
+                is_receptacle=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=None,
+            ),
+        ],
+        source_mode="realtime_gt_observation",
+        stamp=10.0,
+    )
+    nodes_by_instance = {
+        str(node["attributes"].get("instance_id") or ""): node
+        for node in store.as_graph_dict(stamp=10.0)["nodes"]
+    }
+
+    assert store.update_interaction_result(
+        {
+            "node_id": nodes_by_instance["obj_stale"]["id"],
+            "object_id": "obj_target",
+            "event_id": "bbox_routed_drawer_scan",
+            "action": "open",
+            "success": True,
+            "source": "evaluator_object_skill",
+        },
+        stamp=11.0,
+    )
+
+    updated = {
+        str(node["attributes"].get("instance_id") or ""): node
+        for node in store.as_graph_dict(stamp=11.0)["nodes"]
+    }
+    assert updated["obj_target"]["interaction"]["state"] == "open"
+    assert updated["obj_stale"]["interaction"].get("state") != "open"
+
+
+def test_failed_opaque_open_result_does_not_establish_open_state():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="opaque_door_1",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_opaque_door_1",
+            "action": "open",
+            "success": False,
+            "source": "evaluator_object_skill",
+        }
+    )
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["interaction"]["traversable"] is False
+    assert portal["interaction"]["requires_interaction"] is True
 
 
 def test_non_articulated_portal_feedback_persists_static_capability() -> None:

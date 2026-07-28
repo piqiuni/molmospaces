@@ -29,19 +29,77 @@ def joint_open_fraction(env: Any, interaction: dict[str, Any]) -> float:
     return float(np.clip(probe.semantic_open_fraction(value, closed, opened), 0.0, 1.0))
 
 
-def target_metrics(task: Any, episode: dict[str, Any]) -> tuple[bool, float, float]:
-    """Evaluate the frozen V3 selected instance, never a category substitute."""
+def target_candidate_names(episode: dict[str, Any]) -> list[str]:
+    """Return the runtime-authoritative V3 NavToObj candidate instances."""
 
-    target_name = str(episode["interactive_nav"]["target"]["selected_instance"])
+    nav = episode["interactive_nav"]
+    target = nav["target"]
+    task = episode.get("task", {})
+    selection_mode = str(
+        task.get("selection_mode")
+        or target.get("selection_mode")
+        or nav.get("success_criteria", {}).get("target_selection")
+        or "specific_instance"
+    )
+    if selection_mode == "specific_instance":
+        selected = target.get("selected_instance") or task.get("pickup_obj_name")
+        if not selected:
+            raise ValueError("specific_instance target is missing selected_instance")
+        return [str(selected)]
+    if selection_mode != "any_candidate":
+        raise ValueError(f"Unsupported target selection mode: {selection_mode!r}")
+
+    raw_candidates = task.get("pickup_obj_candidates") or target.get(
+        "instruction_consistent_candidates"
+    )
+    candidates = list(dict.fromkeys(str(value) for value in (raw_candidates or []) if value))
+    if not candidates:
+        raise ValueError("any_candidate target has no runtime candidates")
+    return candidates
+
+
+def target_metric_rows(task: Any, episode: dict[str, Any]) -> list[dict[str, Any]]:
     objects = task.env.object_managers[task.env.current_batch_index]
-    target = objects.get_object_by_name(target_name)
     robot_xy = np.asarray(task.env.current_robot.robot_view.base.pose[:2, 3], dtype=float)
-    distance = float(np.linalg.norm(np.asarray(target.position[:2], dtype=float) - robot_xy))
     criteria = episode["interactive_nav"]["success_criteria"]
     camera_name = str(criteria["visibility"].get("camera_name", "head_camera"))
-    visibility = float(task.env.check_visibility(camera_name, target_name))
-    threshold = float(criteria["distance"]["threshold_m"])
-    return bool(distance < threshold and visibility > 0.0), distance, visibility
+    rows: list[dict[str, Any]] = []
+    for target_name in target_candidate_names(episode):
+        target = objects.get_object_by_name(target_name)
+        distance = float(
+            np.linalg.norm(np.asarray(target.position[:2], dtype=float) - robot_xy)
+        )
+        visibility = float(task.env.check_visibility(camera_name, target_name))
+        rows.append(
+            {
+                "target_name": target_name,
+                "distance_m": distance,
+                "visibility_fraction": visibility,
+            }
+        )
+    return rows
+
+
+def target_metrics(task: Any, episode: dict[str, Any]) -> tuple[bool, float, float]:
+    """Evaluate one frozen target or any instruction-consistent V3 candidate."""
+
+    rows = target_metric_rows(task, episode)
+    threshold = float(
+        episode["interactive_nav"]["success_criteria"]["distance"]["threshold_m"]
+    )
+    # ``NavToObjTask`` is authoritative for the native benchmark: it selects
+    # the nearest candidate first and checks visibility on that same object.
+    # Keep this exact ordering for V3 as well; accepting ``any_candidate`` in
+    # the schema must not silently introduce a different success definition.
+    chosen = min(rows, key=lambda row: float(row["distance_m"]))
+    return (
+        bool(
+            float(chosen["distance_m"]) < threshold
+            and float(chosen["visibility_fraction"]) > 0.0
+        ),
+        float(chosen["distance_m"]),
+        float(chosen["visibility_fraction"]),
+    )
 
 
 def oracle_terminal_goal_consistency(task: Any, episode: dict[str, Any]) -> dict[str, Any]:
@@ -61,10 +119,14 @@ def oracle_terminal_goal_consistency(task: Any, episode: dict[str, Any]) -> dict
     """
 
     nav = episode["interactive_nav"]
-    target_name = str(nav["target"]["selected_instance"])
+    target_names = target_candidate_names(episode)
     objects = task.env.object_managers[task.env.current_batch_index]
-    target = objects.get_object_by_name(target_name)
-    target_xy = np.asarray(target.position[:2], dtype=float)
+    target_positions = {
+        target_name: np.asarray(
+            objects.get_object_by_name(target_name).position[:2], dtype=float
+        )
+        for target_name in target_names
+    }
     threshold = float(nav["success_criteria"]["distance"]["threshold_m"])
     candidates: list[dict[str, Any]] = []
     for plan in _oracle_plans(nav):
@@ -76,7 +138,12 @@ def oracle_terminal_goal_consistency(task: Any, episode: dict[str, Any]) -> dict
             if goal.shape != (2,):
                 continue
             tolerance = float(step.get("position_tolerance_m", 0.0))
-            distance = float(np.linalg.norm(goal - target_xy))
+            distances = {
+                target_name: float(np.linalg.norm(goal - target_xy))
+                for target_name, target_xy in target_positions.items()
+            }
+            matched_target_name = min(distances, key=distances.get)
+            distance = distances[matched_target_name]
             allowed = threshold + max(0.0, tolerance)
             candidates.append(
                 {
@@ -86,13 +153,23 @@ def oracle_terminal_goal_consistency(task: Any, episode: dict[str, Any]) -> dict
                     "distance_to_live_target_m": distance,
                     "allowed_distance_m": allowed,
                     "consistent": bool(distance < allowed),
+                    "matched_target_name": matched_target_name,
+                    "candidate_distances_m": distances,
                 }
             )
+    singular_target = target_names[0] if len(target_names) == 1 else None
+    singular_position = (
+        target_positions[singular_target].tolist() if singular_target is not None else None
+    )
     return {
         "checked": bool(candidates),
         "consistent": True if not candidates else any(bool(item["consistent"]) for item in candidates),
-        "target_name": target_name,
-        "target_position_xy": target_xy.tolist(),
+        "target_name": singular_target,
+        "target_position_xy": singular_position,
+        "target_names": target_names,
+        "target_positions_xy": {
+            name: position.tolist() for name, position in target_positions.items()
+        },
         "success_distance_threshold_m": threshold,
         "terminal_goal_candidates": candidates,
     }
@@ -219,9 +296,20 @@ def reference_path_length_m(episode: dict[str, Any]) -> float | None:
     nav = episode["interactive_nav"]
     validation = dict(nav.get("generation_validation", {}).get("navigation_validation", {}))
     if str(nav.get("interaction_requirement")) == "unnecessary":
-        keys = ("initial_state_path_length_m", "path_length_m", "all_open_path_length_m")
+        keys = (
+            "initial_state_path_length_m",
+            "oracle_path_length_m",
+            "path_length_m",
+            "all_open_path_length_m",
+        )
     else:
-        keys = ("oracle_restored_path_length_m", "path_length_m", "all_open_path_length_m")
+        keys = (
+            "oracle_restored_path_length_m",
+            "oracle_path_length_m",
+            "path_length_m",
+            "interaction_pose_path_length_m",
+            "all_open_path_length_m",
+        )
     for key in keys:
         value = validation.get(key)
         if value is not None:

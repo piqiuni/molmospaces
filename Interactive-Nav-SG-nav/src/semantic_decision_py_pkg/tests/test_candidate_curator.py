@@ -168,6 +168,160 @@ def test_curator_suppresses_low_visible_area_while_large_opening_exists() -> Non
     )
 
 
+def test_curator_prioritizes_reachable_unvisited_room_frontier() -> None:
+    curator = CandidateCurator(
+        CandidateCuratorConfig(candidate_top_k=4, explore_quota=4)
+    )
+    historical = make_candidate("frontier:history", "EXPLORE", x=8.0, room_id=2)
+    visited = make_candidate("frontier:a_visited", "EXPLORE", x=3.0, room_id=2)
+    unreachable = make_candidate(
+        "frontier:b_unreachable", "EXPLORE", x=3.0, y=1.0, room_id=4
+    )
+    new_room = make_candidate(
+        "frontier:z_new_room", "EXPLORE", x=3.0, y=-1.0, room_id=3
+    )
+    for candidate in (visited, unreachable, new_room):
+        candidate.metadata.update(
+            {
+                "robot_room_id": 1,
+                "room_reachable": True,
+                "expected_visible_unknown_area_m2": 10.0,
+            }
+        )
+    unreachable.metadata["room_reachable"] = False
+
+    result = curator.curate(
+        [visited, unreachable, new_room],
+        history_by_key={
+            candidate_history_key(historical): {"selection_count": 1},
+        },
+    )
+
+    assert result.ranked_ids_by_type["EXPLORE"][0] == "frontier:z_new_room"
+    assert (
+        result.quality_terms_by_id["frontier:z_new_room"]
+        ["unvisited_room_frontier_bonus"]
+        == 0.15
+    )
+    assert (
+        result.quality_terms_by_id["frontier:b_unreachable"]
+        ["unvisited_room_frontier_bonus"]
+        == 0.0
+    )
+    assert result.decision_hint_by_id["frontier:z_new_room"] == "NEW_ROOM_FRONTIER"
+    assert "frontier:b_unreachable" not in result.decision_hint_by_id
+
+
+def test_curator_rejects_invisible_unreachable_container_interaction() -> None:
+    candidate = make_candidate(
+        "interaction:container_stale:open",
+        "INTERACT",
+        x=4.0,
+        node_type="container",
+    )
+    candidate.metadata.update(
+        {
+            "is_currently_visible": False,
+            "room_reachable": False,
+        }
+    )
+
+    result = CandidateCurator().curate([candidate])
+
+    assert result.candidates == []
+    assert result.rejected == {
+        "interaction:container_stale:open": "container_not_visible_and_room_unreachable"
+    }
+
+
+def test_curator_keeps_substantially_larger_visible_area_ahead_of_new_room() -> None:
+    curator = CandidateCurator(
+        CandidateCuratorConfig(candidate_top_k=3, explore_quota=3)
+    )
+    historical = make_candidate("frontier:history", "EXPLORE", x=8.0, room_id=2)
+    large_visited = make_candidate(
+        "frontier:z_large_visited", "EXPLORE", x=4.0, room_id=2
+    )
+    smaller_new = make_candidate(
+        "frontier:a_smaller_new", "EXPLORE", x=4.0, y=1.0, room_id=3
+    )
+    for candidate, area in ((large_visited, 20.0), (smaller_new, 8.0)):
+        candidate.metadata.update(
+            {
+                "robot_room_id": 1,
+                "room_reachable": True,
+                "expected_visible_unknown_area_m2": area,
+            }
+        )
+
+    result = curator.curate(
+        [large_visited, smaller_new],
+        history_by_key={
+            candidate_history_key(historical): {"selection_count": 1},
+        },
+    )
+
+    assert result.ranked_ids_by_type["EXPLORE"] == [
+        "frontier:z_large_visited",
+        "frontier:a_smaller_new",
+    ]
+    assert (
+        result.quality_terms_by_id["frontier:z_large_visited"]
+        ["visible_unknown_area_priority"]
+        == 0.5
+    )
+    assert (
+        result.quality_terms_by_id["frontier:a_smaller_new"]
+        ["unvisited_room_frontier_bonus"]
+        == 0.15
+    )
+
+
+def test_curator_keeps_repeat_low_gain_suppression_with_new_room_bonus() -> None:
+    curator = CandidateCurator(
+        CandidateCuratorConfig(
+            candidate_top_k=3,
+            explore_quota=3,
+            repeat_guard_low_gain_limit=2,
+        )
+    )
+    repeated = make_candidate(
+        "frontier:repeat_same_room", "EXPLORE", x=2.0, room_id=2
+    )
+    new_room = make_candidate(
+        "frontier:new_room", "EXPLORE", x=4.0, room_id=3
+    )
+    for candidate, area in ((repeated, 20.0), (new_room, 10.0)):
+        candidate.metadata.update(
+            {
+                "robot_room_id": 1,
+                "room_reachable": True,
+                "expected_visible_unknown_area_m2": area,
+            }
+        )
+    repeated_key = candidate_history_key(repeated)
+
+    result = curator.curate(
+        [repeated, new_room],
+        history_by_key={
+            repeated_key: {
+                "selection_count": 3,
+                "low_gain_repeat_count": 2,
+            },
+        },
+    )
+
+    assert result.omitted["frontier:repeat_same_room"] == "history_low_gain_suppressed"
+    assert [candidate.candidate_id for candidate in result.candidates] == [
+        "frontier:new_room"
+    ]
+    assert (
+        result.quality_terms_by_id["frontier:new_room"]
+        ["unvisited_room_frontier_bonus"]
+        == 0.15
+    )
+
+
 def test_candidate_update_accepts_benign_sequence_refresh() -> None:
     selected = make_candidate("frontier:a", "EXPLORE", x=1.0, y=2.0)
     latest = make_candidate("frontier:a", "EXPLORE", x=1.1, y=2.0)
@@ -203,4 +357,187 @@ def test_candidate_update_rejects_moved_or_changed_interaction() -> None:
     assert (
         validate_candidate_update(selected, [changed]).reason
         == "candidate_semantics_changed"
+    )
+
+
+def test_object_goal_curator_hides_semantically_conflicting_container() -> None:
+    curator = CandidateCurator()
+    dresser = make_candidate(
+        "interaction:dresser:open",
+        "INTERACT",
+        x=1.0,
+        node_type="container",
+    )
+    dresser.target_name = "obj_000003"
+    dresser.metadata.update(
+        {
+            "semantic_name": "dresser",
+            "target_match": False,
+            "robot_room_id": 1,
+        }
+    )
+    portal = make_candidate(
+        "interaction:portal_12:open",
+        "INTERACT",
+        x=2.0,
+        node_type="portal",
+    )
+    portal.target_id = "portal_12"
+    portal.metadata.update({"robot_room_id": 1, "connected_room_ids": [1, 2]})
+
+    result = curator.curate(
+        [dresser, portal],
+        target_context={"enabled": True, "target_name": "Irishpotato_123"},
+    )
+
+    assert [candidate.candidate_id for candidate in result.candidates] == [
+        "interaction:portal_12:open"
+    ]
+    assert (
+        result.omitted["interaction:dresser:open"]
+        == "target_container_semantic_mismatch"
+    )
+
+
+def test_object_goal_curator_keeps_plausible_drawer_for_pencil() -> None:
+    curator = CandidateCurator()
+    dresser = make_candidate(
+        "interaction:dresser:open",
+        "INTERACT",
+        x=1.0,
+        node_type="container",
+    )
+    dresser.target_name = "ChestOfDrawers_asset"
+    dresser.metadata.update(
+        {
+            "semantic_name": "dresser",
+            "target_match": False,
+            "robot_room_id": 1,
+        }
+    )
+    frontier = make_candidate("frontier:other", "EXPLORE", x=3.0)
+
+    result = curator.curate(
+        [dresser, frontier],
+        target_context={"enabled": True, "target_name": "pencil"},
+    )
+
+    assert "interaction:dresser:open" in {
+        candidate.candidate_id for candidate in result.candidates
+    }
+    assert (
+        result.decision_hint_by_id["interaction:dresser:open"]
+        == "PLAUSIBLE_TARGET_CONTAINER"
+    )
+
+
+def test_topology_pre_score_prioritizes_first_portal_on_observed_target_route() -> None:
+    curator = CandidateCurator()
+    target = make_candidate(
+        "target:apple",
+        "NAVIGATE",
+        x=8.0,
+        room_id=3,
+        target_goal=True,
+    )
+    target.metadata["robot_room_id"] = 1
+    first_portal = make_candidate(
+        "interaction:portal_12:open",
+        "INTERACT",
+        x=2.0,
+        node_type="portal",
+    )
+    first_portal.target_id = "portal_12"
+    first_portal.metadata.update(
+        {"robot_room_id": 1, "target_room_id": 1, "connected_room_ids": [1, 2]}
+    )
+    second_portal = make_candidate(
+        "interaction:portal_23:open",
+        "INTERACT",
+        x=5.0,
+        node_type="portal",
+    )
+    second_portal.target_id = "portal_23"
+    second_portal.metadata.update(
+        {"robot_room_id": 1, "target_room_id": 2, "connected_room_ids": [2, 3]}
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_12",
+                "type": "portal",
+                "attributes": {"connected_room_ids": [1, 2]},
+            },
+            {
+                "id": "portal_23",
+                "type": "portal",
+                "attributes": {"connected_room_ids": [2, 3]},
+            },
+        ]
+    }
+
+    result = curator.curate(
+        [target, first_portal, second_portal],
+        graph=graph,
+        target_context={"enabled": True, "target_name": "apple"},
+    )
+
+    assert result.decision_hint_by_id[first_portal.candidate_id] == "NEXT_ROUTE_PORTAL"
+    assert result.decision_hint_by_id[second_portal.candidate_id] == "REMOTE_PORTAL"
+    assert (
+        result.quality_by_id[first_portal.candidate_id]
+        > result.quality_by_id[second_portal.candidate_id]
+    )
+    assert (
+        result.quality_terms_by_id[first_portal.candidate_id]["topology_priority"]
+        == 1.35
+    )
+
+
+def test_post_interaction_traversal_outranks_plausible_container() -> None:
+    curator = CandidateCurator()
+    traversal = make_candidate(
+        "post_interaction_traversal:portal_12",
+        "NAVIGATE",
+        x=1.5,
+        room_id=2,
+    )
+    traversal.metadata.update(
+        {
+            "post_interaction_traversal": True,
+            "robot_room_id": 1,
+            "portal_node_id": "portal_12",
+        }
+    )
+    dresser = make_candidate(
+        "interaction:dresser:open",
+        "INTERACT",
+        x=0.5,
+        node_type="container",
+    )
+    dresser.target_name = "dresser"
+    dresser.metadata.update(
+        {
+            "semantic_name": "dresser",
+            "target_match": False,
+            "robot_room_id": 1,
+        }
+    )
+
+    result = curator.curate(
+        [traversal, dresser],
+        target_context={"enabled": True, "target_name": "pencil"},
+    )
+
+    assert (
+        result.decision_hint_by_id[traversal.candidate_id]
+        == "POST_INTERACTION_TRAVERSE"
+    )
+    assert (
+        result.quality_by_id[traversal.candidate_id]
+        > result.quality_by_id[dresser.candidate_id]
+    )
+    assert (
+        result.quality_terms_by_id[traversal.candidate_id]["topology_priority"]
+        == 1.5
     )

@@ -40,6 +40,73 @@ ROOM_ANCHOR_LABELS = {
 }
 
 
+# This context is deliberately compact: it is sent alongside the regular
+# candidate payload in the existing request, rather than triggering a second
+# model call for room classification.
+ROOM_OBJECT_REASONING_MAX_ROOMS = 12
+ROOM_OBJECT_REASONING_MAX_PORTALS = 12
+ROOM_OBJECT_REASONING_MAX_CONTAINERS = 12
+ROOM_OBJECT_REASONING_MAX_ANCHORS_PER_ROOM = 4
+ROOM_OBJECT_REASONING_MAX_LABELS = 6
+
+# Semantic priors guide the model toward observed rooms and containers, but
+# must never be treated as proof that an unobserved object is present there.
+TARGET_ROOM_OBJECT_PRIORS = (
+    {
+        "semantic_class": "food",
+        "terms": frozenset(
+            {
+                "apple",
+                "banana",
+                "bread",
+                "cake",
+                "carrot",
+                "cheese",
+                "drink",
+                "egg",
+                "food",
+                "fruit",
+                "irishpotato",
+                "juice",
+                "milk",
+                "orange",
+                "potato",
+                "snack",
+                "tomato",
+                "vegetable",
+                "water",
+            }
+        ),
+        "room_types": ("kitchen", "dining_room"),
+        "container_types": (
+            "refrigerator",
+            "fridge",
+            "cabinet",
+            "pantry",
+            "cupboard",
+        ),
+    },
+    {
+        "semantic_class": "bedside_personal_item",
+        "terms": frozenset(
+            {
+                "alarm_clock",
+                "book",
+                "charger",
+                "glasses",
+                "key",
+                "keys",
+                "phone",
+                "remote",
+                "wallet",
+            }
+        ),
+        "room_types": ("bedroom", "office", "living_room"),
+        "container_types": ("dresser", "drawer", "desk", "nightstand"),
+    },
+)
+
+
 @dataclass
 class ModelPolicyConfig:
     mode: str = "disabled"
@@ -58,6 +125,10 @@ class ModelPolicyConfig:
     metrics_path: str = ""
     selection_granularity: str = "candidate"
     history_region_size_m: float = 1.0
+    # A model may still overlook an observed route-critical portal.  The guard
+    # only applies to deterministic high-priority hints and leaves ordinary
+    # semantic/exploration ranking to the MLLM.
+    pre_score_guard_margin: float = 0.75
 
 
 @dataclass
@@ -322,6 +393,203 @@ def compact_robot_context(
     return result
 
 
+def _normalized_semantic_terms(values: Iterable[Any]) -> set[str]:
+    terms: set[str] = set()
+    for value in values:
+        text = str(value or "").casefold().replace("_", " ").replace("-", " ")
+        normalized = " ".join(text.split())
+        if not normalized:
+            continue
+        terms.add(normalized)
+        terms.add(normalized.replace(" ", ""))
+        terms.update(normalized.split())
+    return terms
+
+
+def _normalized_semantic_labels(values: Iterable[Any]) -> set[str]:
+    labels: set[str] = set()
+    for value in values:
+        text = str(value or "").casefold().replace("_", " ").replace("-", " ")
+        normalized = " ".join(text.split())
+        if normalized:
+            labels.add(normalized)
+            labels.add(normalized.replace(" ", ""))
+    return labels
+
+
+def _compact_semantic_label(value: Any, limit: int = 64) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _target_room_object_prior(mission: dict[str, Any]) -> dict[str, Any]:
+    target = dict(mission.get("target") or {})
+    labels = [
+        _compact_semantic_label(value)
+        for value in list(target.get("labels") or [])[:ROOM_OBJECT_REASONING_MAX_LABELS]
+        if _compact_semantic_label(value)
+    ]
+    name = _compact_semantic_label(target.get("name") or "unknown")
+    terms = _normalized_semantic_terms([name, *labels])
+    profile = next(
+        (
+            item
+            for item in TARGET_ROOM_OBJECT_PRIORS
+            if terms.intersection(_normalized_semantic_terms(item["terms"]))
+        ),
+        None,
+    )
+    result: dict[str, Any] = {
+        "name": name or "unknown",
+        "visible": bool(target.get("visible", False)),
+        "semantic_class": str((profile or {}).get("semantic_class") or "unknown"),
+        "plausible_room_types": list((profile or {}).get("room_types") or []),
+        "plausible_container_types": list(
+            (profile or {}).get("container_types") or []
+        ),
+    }
+    if labels:
+        result["labels"] = labels
+    declared_container = _compact_semantic_label(target.get("likely_container"))
+    if declared_container:
+        result["declared_likely_container"] = declared_container
+        if declared_container not in result["plausible_container_types"]:
+            result["plausible_container_types"].append(declared_container)
+    return result
+
+
+def _compact_room_object_anchor(anchor: dict[str, Any]) -> dict[str, Any] | None:
+    anchor_type = _compact_semantic_label(anchor.get("type"))
+    if not anchor_type:
+        return None
+    return {"type": anchor_type, "visible": bool(anchor.get("visible", False))}
+
+
+def build_room_object_reasoning_context(
+    mission: dict[str, Any], semantic_graph: dict[str, Any]
+) -> dict[str, Any]:
+    """Build bounded stage-one evidence for a single two-stage MLLM request.
+
+    The fields labelled ``observed_*`` originate from the compact semantic
+    graph. ``target`` carries only general semantic priors, so a matching room
+    remains a candidate for exploration rather than asserted containment.
+    """
+
+    target = _target_room_object_prior(mission)
+    plausible_rooms = _normalized_semantic_labels(target["plausible_room_types"])
+    plausible_containers = _normalized_semantic_labels(
+        target["plausible_container_types"]
+    )
+    raw_containers = sorted(
+        list(semantic_graph.get("containers") or []),
+        key=lambda item: str(item.get("id") or ""),
+    )[:ROOM_OBJECT_REASONING_MAX_CONTAINERS]
+    observed_containers = []
+    containers_by_room: dict[str, list[str]] = {}
+    for container in raw_containers:
+        container_type = _compact_semantic_label(container.get("type"))
+        container_id = _compact_semantic_label(container.get("id"))
+        if not container_type or not container_id:
+            continue
+        entry = {
+            "id": container_id,
+            "type": container_type,
+            "state": _compact_semantic_label(container.get("state") or "unknown"),
+            "interaction_available": bool(container.get("interaction_available")),
+        }
+        room_id = _compact_semantic_label(container.get("room_id"))
+        if room_id:
+            entry["room_id"] = room_id
+            containers_by_room.setdefault(room_id, []).append(container_type)
+        observed_containers.append(entry)
+
+    observed_rooms = []
+    for room in sorted(
+        list(semantic_graph.get("rooms") or []),
+        key=lambda item: str(item.get("id") or ""),
+    )[:ROOM_OBJECT_REASONING_MAX_ROOMS]:
+        room_id = _compact_semantic_label(room.get("id"))
+        room_type = _compact_semantic_label(room.get("type") or "unknown")
+        if not room_id:
+            continue
+        entry: dict[str, Any] = {"id": room_id, "type": room_type or "unknown"}
+        if "room_attribute_confidence" in room:
+            entry["room_attribute_confidence"] = round(
+                float(room.get("room_attribute_confidence") or 0.0), 2
+            )
+        anchors = []
+        for anchor in list(room.get("anchor_objects") or [])[
+            :ROOM_OBJECT_REASONING_MAX_ANCHORS_PER_ROOM
+        ]:
+            compact_anchor = _compact_room_object_anchor(dict(anchor or {}))
+            if compact_anchor is not None:
+                anchors.append(compact_anchor)
+        if anchors:
+            entry["anchor_objects"] = anchors
+
+        evidence = []
+        if _normalized_semantic_labels([room_type]).intersection(plausible_rooms):
+            evidence.append(f"room_type:{room_type}")
+        for anchor in anchors:
+            anchor_type = str(anchor["type"])
+            if _normalized_semantic_labels([anchor_type]).intersection(
+                plausible_containers
+            ):
+                evidence.append(f"anchor_object:{anchor_type}")
+        for container_type in containers_by_room.get(room_id, []):
+            if _normalized_semantic_labels([container_type]).intersection(
+                plausible_containers
+            ):
+                evidence.append(f"container:{container_type}")
+        entry["target_plausibility"] = {
+            "matches_semantic_prior": bool(evidence),
+            "evidence": evidence[:ROOM_OBJECT_REASONING_MAX_ANCHORS_PER_ROOM],
+        }
+        observed_rooms.append(entry)
+
+    observed_portals = []
+    for portal in sorted(
+        list(semantic_graph.get("portals") or []),
+        key=lambda item: str(item.get("id") or ""),
+    )[:ROOM_OBJECT_REASONING_MAX_PORTALS]:
+        portal_id = _compact_semantic_label(portal.get("id"))
+        if not portal_id:
+            continue
+        observed_portals.append(
+            {
+                "id": portal_id,
+                "type": _compact_semantic_label(portal.get("type") or "portal"),
+                "state": _compact_semantic_label(portal.get("state") or "unknown"),
+                "interaction_available": bool(portal.get("interaction_available")),
+                "connects": [
+                    _compact_semantic_label(room_id)
+                    for room_id in list(portal.get("connects") or [])[:4]
+                    if _compact_semantic_label(room_id)
+                ],
+            }
+        )
+
+    result: dict[str, Any] = {
+        "stage": "observed_room_target_plausibility",
+        "target": target,
+        "observed_rooms": observed_rooms,
+        "observed_portals": observed_portals,
+        "observed_containers": observed_containers,
+    }
+    current_room = _compact_semantic_label(semantic_graph.get("current_room"))
+    if current_room:
+        result["current_room"] = current_room
+    unassigned_anchors = []
+    for anchor in list(semantic_graph.get("unassigned_anchor_objects") or [])[
+        :ROOM_OBJECT_REASONING_MAX_ANCHORS_PER_ROOM
+    ]:
+        compact_anchor = _compact_room_object_anchor(dict(anchor or {}))
+        if compact_anchor is not None:
+            unassigned_anchors.append(compact_anchor)
+    if unassigned_anchors:
+        result["unassigned_anchor_objects"] = unassigned_anchors
+    return result
+
+
 def _compact_history(history: dict[str, Any] | None) -> dict[str, Any]:
     history = history or {}
     if not history:
@@ -346,6 +614,9 @@ def compact_candidate(
     *,
     history: dict[str, Any] | None = None,
     room_frontier_length_m: float = 0.0,
+    pre_score: float | None = None,
+    pre_score_terms: dict[str, Any] | None = None,
+    decision_hint: str = "",
 ) -> dict[str, Any]:
     behavior_type = str(candidate.behavior_type or "").upper()
     metadata = candidate.metadata or {}
@@ -442,6 +713,15 @@ def compact_candidate(
     compact_history = _compact_history(history)
     if compact_history:
         result["history"] = compact_history
+    if pre_score is not None:
+        result["pre_score"] = round(float(pre_score), 3)
+    if pre_score_terms:
+        result["pre_score_terms"] = {
+            str(key): round(float(value), 3)
+            for key, value in pre_score_terms.items()
+        }
+    if decision_hint:
+        result["decision_hint"] = str(decision_hint)
     return result
 
 
@@ -592,6 +872,9 @@ def compact_candidate_options(
     candidate_history: dict[str, dict[str, Any]] | None = None,
     history_region_size_m: float = 1.0,
     room_frontier_lengths: dict[str, float] | None = None,
+    pre_scores: dict[str, float] | None = None,
+    pre_score_terms: dict[str, dict[str, float]] | None = None,
+    decision_hints: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, list[BehaviorCandidate]]]:
     if str(selection_granularity or "candidate").casefold() == "room":
         return compact_candidate_groups(
@@ -605,6 +888,9 @@ def compact_candidate_options(
         if room_frontier_lengths is not None
         else aggregate_room_frontier_lengths(candidates, graph)
     )
+    pre_scores = dict(pre_scores or {})
+    pre_score_terms = dict(pre_score_terms or {})
+    decision_hints = dict(decision_hints or {})
     lookup: dict[str, list[BehaviorCandidate]] = {}
     projected = []
     for candidate in sorted(candidates, key=lambda item: item.candidate_id):
@@ -621,6 +907,11 @@ def compact_candidate_options(
             candidate,
             history=history,
             room_frontier_length_m=room_frontier_lengths.get(room_id, 0.0),
+            pre_score=(
+                pre_scores[candidate_id] if candidate_id in pre_scores else None
+            ),
+            pre_score_terms=pre_score_terms.get(candidate_id),
+            decision_hint=decision_hints.get(candidate_id, ""),
         )
         if (
             str(candidate.behavior_type or "").upper() == "EXPLORE"
@@ -658,6 +949,8 @@ class ModelPolicyClient:
         self.last_selected_candidate_id = ""
         self.last_reason = ""
         self.last_confidence = ""
+        self.last_pre_score_guard = ""
+        self.last_rejected_model_ids: list[str] = []
         self.last_candidate_groups: list[dict[str, Any]] = []
         self._mllm_client = MLLMClient(
             MLLMClientConfig(
@@ -690,6 +983,8 @@ class ModelPolicyClient:
         self.last_selected_candidate_id = ""
         self.last_reason = ""
         self.last_confidence = ""
+        self.last_pre_score_guard = ""
+        self.last_rejected_model_ids = []
         if not candidates:
             return None
         payload = self.build_request(
@@ -715,25 +1010,181 @@ class ModelPolicyClient:
             )
             or None,
         )
+        response, rejected_model_ids = self._sanitize_model_selection(
+            response,
+            set(candidate_groups),
+        )
+        self.last_rejected_model_ids = rejected_model_ids
+        if response is None:
+            self.last_error = (
+                "invalid_model_selection:no_valid_curated_candidate"
+                + (
+                    f":rejected={','.join(rejected_model_ids)}"
+                    if rejected_model_ids
+                    else ""
+                )
+            )
+            self.last_result_source = "curated_fallback_invalid_response"
+            fallback_id = self._curated_fallback_id(
+                candidate_groups,
+                robot_context or {},
+            )
+            if not fallback_id:
+                return None
+            self.last_ranking_ids = [fallback_id]
+            self.last_selected_group_id = fallback_id
+            self.last_selected_candidate_id = candidate_groups[fallback_id][0].candidate_id
+            self.last_reason = "CURATED_FALLBACK_INVALID_MODEL_ID"
+            self.last_confidence = "low"
+            return candidate_groups[fallback_id][0]
         try:
             response = validate_subgoal_selection(response, set(candidate_groups))
         except (TypeError, ValueError) as exc:
             self.last_error = f"invalid_model_selection: {exc}"
-            self.last_result_source = "rule_fallback_invalid_response"
+            self.last_result_source = "curated_fallback_invalid_response"
             return None
         selected_id = response["candidate_id"]
         self.last_ranking_ids = list(response.get("ranked_ids") or [selected_id])
-        self.last_selected_group_id = selected_id
-        self.last_selected_candidate_id = candidate_groups[selected_id][0].candidate_id
         self.last_reason = str(response.get("reason") or "")
         self.last_confidence = str(response.get("confidence") or "")
+        selected_id = self._apply_pre_score_guard(
+            selected_id,
+            candidate_groups,
+            robot_context or {},
+        )
+        if selected_id not in self.last_ranking_ids:
+            self.last_ranking_ids.insert(0, selected_id)
+        elif self.last_ranking_ids[0] != selected_id:
+            self.last_ranking_ids.remove(selected_id)
+            self.last_ranking_ids.insert(0, selected_id)
+        self.last_selected_group_id = selected_id
+        self.last_selected_candidate_id = candidate_groups[selected_id][0].candidate_id
         scores = response["scores"]
         for candidate in candidates:
             if candidate.candidate_id in scores:
                 candidate.score = float(scores[candidate.candidate_id])
                 candidate.score_terms = {"model_score": candidate.score}
-        self.last_result_source = "model"
+        self.last_result_source = (
+            "model_pre_score_guard"
+            if self.last_pre_score_guard
+            else "model_filtered_unknown_ids"
+            if self.last_rejected_model_ids
+            else "model"
+        )
         return candidate_groups[selected_id][0]
+
+    @staticmethod
+    def _sanitize_model_selection(
+        response: Any,
+        candidate_ids: set[str],
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """Drop hallucinated option IDs before schema validation/execution.
+
+        The model may return one valid option after an invalid one.  Keeping
+        the valid suffix is preferable to throwing away the whole decision,
+        while an all-invalid response remains a hard failure for the caller's
+        curated-pool fallback.
+        """
+        if not isinstance(response, dict):
+            return None, []
+        raw_ranked = response.get("ranked_ids") or []
+        if not isinstance(raw_ranked, list):
+            return None, []
+        if not raw_ranked and response.get("candidate_id"):
+            raw_ranked = [response.get("candidate_id")]
+        valid: list[str] = []
+        rejected: list[str] = []
+        for value in raw_ranked:
+            candidate_id = str(value or "")
+            if candidate_id not in candidate_ids:
+                if candidate_id and candidate_id not in rejected:
+                    rejected.append(candidate_id)
+                continue
+            if candidate_id not in valid:
+                valid.append(candidate_id)
+        if not valid:
+            return None, rejected
+        sanitized = dict(response)
+        sanitized["candidate_id"] = valid[0]
+        sanitized["ranked_ids"] = valid[:3]
+        raw_scores = response.get("scores") or {}
+        if isinstance(raw_scores, dict):
+            sanitized["scores"] = {
+                str(key): value
+                for key, value in raw_scores.items()
+                if str(key) in candidate_ids
+            }
+        return sanitized, rejected
+
+    @staticmethod
+    def _curated_fallback_id(
+        candidate_groups: dict[str, list[BehaviorCandidate]],
+        robot_context: dict[str, Any],
+    ) -> str:
+        if not candidate_groups:
+            return ""
+        pre_scores = dict(robot_context.get("candidate_pre_scores") or {})
+
+        def fallback_key(group_id: str) -> tuple[float, float, float, str]:
+            candidate = candidate_groups[group_id][0]
+            return (
+                -float(
+                    pre_scores.get(
+                        group_id,
+                        pre_scores.get(candidate.candidate_id, 0.0),
+                    )
+                    or 0.0
+                ),
+                -float(candidate.score),
+                max(0.0, float(candidate.features.get("distance_m", 0.0) or 0.0)),
+                group_id,
+            )
+
+        return min(candidate_groups, key=fallback_key)
+
+    def _apply_pre_score_guard(
+        self,
+        selected_id: str,
+        candidate_groups: dict[str, list[BehaviorCandidate]],
+        robot_context: dict[str, Any],
+    ) -> str:
+        if self.config.selection_granularity.casefold() == "room":
+            return selected_id
+        margin = max(0.0, float(self.config.pre_score_guard_margin))
+        pre_scores = dict(robot_context.get("candidate_pre_scores") or {})
+        hints = dict(robot_context.get("candidate_decision_hints") or {})
+        protected_hints = {
+            "TARGET_GOAL",
+            "POST_INTERACTION_TRAVERSE",
+            "TARGET_CONTAINER",
+            "NEXT_ROUTE_PORTAL",
+        }
+        protected = [
+            candidate_id
+            for candidate_id in candidate_groups
+            if str(hints.get(candidate_id) or "").upper() in protected_hints
+            and candidate_id in pre_scores
+        ]
+        if not protected:
+            return selected_id
+        best_id = max(
+            protected,
+            key=lambda candidate_id: (
+                float(pre_scores.get(candidate_id, 0.0) or 0.0),
+                candidate_id,
+            ),
+        )
+        selected_score = float(pre_scores.get(selected_id, 0.0) or 0.0)
+        best_score = float(pre_scores.get(best_id, 0.0) or 0.0)
+        if best_id == selected_id or best_score < selected_score + margin:
+            return selected_id
+        hint = str(hints.get(best_id) or "").upper()
+        self.last_pre_score_guard = (
+            f"{hint}:{selected_id}->{best_id}:margin={best_score - selected_score:.3f}"
+        )
+        self.last_reason = f"PRE_SCORE_GUARD_{hint}"
+        self.last_confidence = "high"
+        return best_id
 
     def build_request(
         self,
@@ -756,8 +1207,27 @@ class ModelPolicyClient:
                 (robot_context or {}).get("room_frontier_lengths") or {}
             )
             or None,
+            pre_scores=dict(
+                (robot_context or {}).get("candidate_pre_scores") or {}
+            ),
+            pre_score_terms=dict(
+                (robot_context or {}).get("candidate_pre_score_terms") or {}
+            ),
+            decision_hints=dict(
+                (robot_context or {}).get("candidate_decision_hints") or {}
+            ),
         )
         self.last_candidate_groups = list(compact_candidates)
+        mission = compact_target_context(target_context)
+        semantic_graph = compact_semantic_graph(
+            graph,
+            robot_context=robot_context,
+            max_nodes=self.config.max_graph_nodes,
+        )
+        room_object_reasoning = build_room_object_reasoning_context(
+            mission,
+            semantic_graph,
+        )
         if self.config.selection_granularity.casefold() == "room":
             instruction = (
                 "Rank the room-level exploration groups and concrete interaction or navigation actions "
@@ -768,24 +1238,37 @@ class ModelPolicyClient:
             )
         else:
             instruction = (
-                "Rank the concrete subgoals by semantic relevance to the mission. Each ID "
-                "is a specific navigation, interaction, or frontier action and must be returned unchanged. "
-                "Candidates passed generation checks and will be revalidated before execution. First infer "
-                "likely room function from observed room attributes and anchor objects, then relate that "
-                "function and nearby semantic objects to the target. For object goals, prefer a visible "
-                "target or an interaction likely to reveal it. Do not open a container merely because it is "
-                "available: prefer it only when its type and room are plausible for the target; otherwise "
-                "explore toward a more likely room. Treat container semantics as strong evidence: food and "
-                "drink are plausible in refrigerators or kitchen storage, while personal and bedside items "
-                "such as alarm clocks, keys, and books are plausible in dressers, drawers, desks, or "
-                "nightstands. Rank a semantically conflicting container below a portal or exploration action "
-                "even when that container is closer. Among exploration candidates with comparable "
-                "target relevance, first prefer larger expected_visible_unknown_area_m2 (the unknown area "
-                "likely exposed from this concrete viewpoint); use unknown_component_area_m2 only as "
-                "secondary long-term potential and distance only as a tie-break, "
-                "not as the primary objective. Use interaction effects, current graph state, remaining room "
-                "frontier, and compact history. Do not invent geometry, actions, or candidate IDs. Prefer a different spatial "
-                "region after repeated low-gain attempts unless revisiting is required by the target. "
+                "Rank the concrete subgoals for the object-goal mission. Each ID is an executable navigation, "
+                "interaction, or frontier action and must be returned unchanged. Only IDs present in the "
+                "current candidates array may appear in ranked_ids; IDs mentioned only in recent_decisions, "
+                "history, or graph are historical context and are forbidden. Use one internal two-stage "
+                "process and return only the final Stage 2 JSON. STAGE 1 "
+                "(OBSERVED_ROOM_OBJECT_PLAUSIBILITY): read room_object_reasoning before ranking. Treat "
+                "observed_rooms, anchor_objects, observed_containers, and observed_portals as graph evidence. "
+                "Treat target plausible_room_types and plausible_container_types only as semantic priors, not "
+                "proof of containment or unobserved state; identify observed rooms, portals, and containers "
+                "that could plausibly reveal the target. STAGE 2 (EXECUTABLE_CANDIDATE_RANKING): apply those "
+                "Stage 1 findings to the current candidates array and rank only executable candidate IDs. "
+                "Apply this order: "
+                "(1) TARGET_GOAL when the target is reliably observed; (2) POST_INTERACTION_TRAVERSE immediately "
+                "after opening a portal so the robot actually crosses the state-changing doorway; "
+                "(3) NEXT_ROUTE_PORTAL before a remote container or frontier because it opens the observed "
+                "topological route; (4) TARGET_CONTAINER or a semantically plausible container; "
+                "(5) the frontier most likely to expose a plausible "
+                "room. decision_hint is deterministic graph/goal evidence and pre_score is a transparent "
+                "ranking prior; normally rank a high-priority hint first unless recent_decisions show that the "
+                "same region/action just failed without progress. If POST_INTERACTION_TRAVERSE is present and "
+                "TARGET_GOAL is absent, it is the mandatory first choice unless that exact current candidate's "
+                "history reports failure; do not detour to another portal, container, or frontier. Never infer "
+                "that a generic nearby container "
+                "contains the target. Food belongs in refrigerators or kitchen storage, while personal or "
+                "bedside items belong in dressers, drawers, desks, or nightstands. A semantically conflicting "
+                "container must rank below a portal or useful frontier even when closer. Do not repeat a "
+                "successful interaction; after a failed or low-gain repetition choose a different route or "
+                "spatial region. Among comparable frontiers prioritize expected_visible_unknown_area_m2, then "
+                "unknown_component_area_m2, using distance only as a tie-break. Use only observed graph state, "
+                "room attributes, anchor objects, candidate history, pre_score_terms, and interaction effects. "
+                "Do not invent geometry, actions, containment, or candidate IDs. "
                 "Return exactly one compact JSON object with ranked_ids containing at most three IDs, "
                 "reason set to TARGET_VISIBLE, REVEAL_TARGET_CONTAINER, UNLOCK_ROUTE, EXPLORE_TARGET_ROOM, "
                 "INFORMATION_GAIN, RECOVERY_DIVERSIFICATION, DISTANCE_TIEBREAK, or "
@@ -793,16 +1276,13 @@ class ModelPolicyClient:
                 "scores, markdown, or additional keys."
             )
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "instruction": instruction,
-            "mission": compact_target_context(target_context),
+            "mission": mission,
             "robot": compact_robot_context(graph, robot_context),
             "recent_decisions": recent_decisions[-8:],
-            "graph": compact_semantic_graph(
-                graph,
-                robot_context=robot_context,
-                max_nodes=self.config.max_graph_nodes,
-            ),
+            "graph": semantic_graph,
+            "room_object_reasoning": room_object_reasoning,
             "candidates": compact_candidates,
         }
 
@@ -865,6 +1345,7 @@ class ModelPolicyClient:
                 "mission": payload.get("mission") or {},
                 "robot": payload.get("robot") or {},
                 "graph": payload.get("graph") or {},
+                "room_object_reasoning": payload.get("room_object_reasoning") or {},
                 "candidates": payload.get("candidates") or [],
                 "recent_decisions": payload.get("recent_decisions") or [],
             },

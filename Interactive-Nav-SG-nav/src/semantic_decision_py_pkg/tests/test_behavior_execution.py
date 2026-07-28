@@ -11,10 +11,16 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_PREPARING_EXPLORE,
     STATE_SUCCEEDED,
     STATE_VERIFYING,
+    bounded_empty_plan_retry_delay,
     committed_turn_sign,
+    is_post_interaction_traversal_navigation,
     navigation_goal_options,
+    navigation_requires_final_yaw,
+    navigation_should_prerotate,
     normalize_angle,
     path_lookahead_point,
+    prerotation_control_step_budget,
+    prerotation_rgb_step_gate,
     requires_graph_verification,
     target_ready_for_graph_verification,
     is_stuck_recovery_failure,
@@ -103,6 +109,64 @@ def test_committed_turn_sign_is_stable_at_pi_boundary() -> None:
     assert math.isclose(normalize_angle(3.0 * math.pi), math.pi, abs_tol=1e-6)
 
 
+def test_prerotation_step_budget_uses_only_required_v3_control_steps() -> None:
+    assert prerotation_control_step_budget(
+        math.pi,
+        math.pi / 6.0,
+        speed_rad_s=1.25,
+        control_dt_s=0.2,
+        max_control_steps=12,
+    ) == 11
+    assert prerotation_control_step_budget(
+        math.pi / 6.0 + 0.01,
+        math.pi / 6.0,
+        speed_rad_s=1.25,
+        control_dt_s=0.2,
+        max_control_steps=12,
+    ) == 1
+    assert prerotation_control_step_budget(
+        0.1,
+        math.pi / 6.0,
+        speed_rad_s=1.25,
+        control_dt_s=0.2,
+        max_control_steps=12,
+    ) == 0
+
+
+def test_prerotation_rgb_step_gate_allows_one_command_per_evaluator_step() -> None:
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=10,
+        current_rgb_step_seq=10,
+        nonzero_commands_sent=0,
+        max_control_steps=12,
+    ) == "wait"
+    # A jump is still one new eligible command, not one per skipped sequence.
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=10,
+        current_rgb_step_seq=14,
+        nonzero_commands_sent=1,
+        max_control_steps=12,
+    ) == "send"
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=14,
+        current_rgb_step_seq=13,
+        nonzero_commands_sent=2,
+        max_control_steps=12,
+    ) == "stop"
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=14,
+        current_rgb_step_seq=15,
+        nonzero_commands_sent=12,
+        max_control_steps=12,
+    ) == "stop"
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=14,
+        current_rgb_step_seq=None,
+        nonzero_commands_sent=2,
+        max_control_steps=12,
+    ) == "wait"
+
+
 def test_path_lookahead_uses_plan_direction_instead_of_final_goal_bearing() -> None:
     lookahead = path_lookahead_point(
         (0.0, 0.0),
@@ -130,6 +194,46 @@ def test_navigation_goal_options_preserve_nearest_first_and_remove_duplicates() 
         (1.25, 2.0, 0.0),
         (1.50, 2.0, math.pi),
     ]
+
+
+def test_explore_navigation_skips_prerotation_and_final_yaw_alignment() -> None:
+    assert not navigation_should_prerotate("EXPLORE")
+    assert navigation_should_prerotate("INTERACT")
+    assert navigation_should_prerotate("NAVIGATE")
+
+    assert not navigation_requires_final_yaw("EXPLORE", True, [1.0, 2.0, 0.5])
+    assert navigation_requires_final_yaw("INTERACT", True, [1.0, 2.0, 0.5])
+    assert navigation_requires_final_yaw("NAVIGATE", True, [1.0, 2.0, 0.5])
+    assert not navigation_requires_final_yaw("INTERACT", False, [1.0, 2.0, 0.5])
+    assert not navigation_requires_final_yaw("INTERACT", True, [1.0, 2.0])
+
+
+def test_post_interaction_traversal_retry_is_scoped_to_navigate_continuation() -> None:
+    traversal = {
+        "behavior_type": "NAVIGATE",
+        "metadata": {"post_interaction_traversal": True},
+    }
+    assert is_post_interaction_traversal_navigation(traversal)
+    assert not is_post_interaction_traversal_navigation(
+        {"behavior_type": "NAVIGATE", "metadata": {}}
+    )
+    assert not is_post_interaction_traversal_navigation(
+        {"behavior_type": "INTERACT", "metadata": traversal["metadata"]}
+    )
+    assert not is_post_interaction_traversal_navigation(
+        {"behavior_type": "EXPLORE", "metadata": traversal["metadata"]}
+    )
+
+
+def test_empty_plan_retry_delay_is_bounded_by_deadline() -> None:
+    assert bounded_empty_plan_retry_delay(10.0, 18.0, 0.5) == 0.5
+    assert math.isclose(
+        bounded_empty_plan_retry_delay(17.8, 18.0, 0.5),
+        0.2,
+        abs_tol=1e-9,
+    )
+    assert bounded_empty_plan_retry_delay(18.0, 18.0, 0.5) is None
+    assert bounded_empty_plan_retry_delay(18.1, 18.0, 0.5) is None
 
 
 def test_target_navigation_uses_graph_verification_for_mllm_module3() -> None:

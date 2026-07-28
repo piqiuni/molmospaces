@@ -127,14 +127,17 @@ class JsonEvalRunner(ParallelRolloutRunner):
                 f"Expected benchmark.json file with list of episode specs."
             )
 
+        eval_params = exp_config.eval_runtime_params
+        episode_idx = eval_params.episode_idx
+        if episode_idx is None and eval_params.max_episodes is not None:
+            all_episodes = all_episodes[: int(eval_params.max_episodes)]
+
         self._episodes_by_house: dict[int, list[EpisodeSpec]] = defaultdict(list)
         for ep in all_episodes:
             self._episodes_by_house[ep.house_index].append(ep)
         self._episodes_by_house = dict(self._episodes_by_house)
 
         # If episode_idx is specified, only process the house containing that episode
-        eval_params = exp_config.eval_runtime_params
-        episode_idx = eval_params.episode_idx
         if episode_idx is not None:
             if episode_idx < 0 or episode_idx >= len(all_episodes):
                 raise ValueError(
@@ -206,6 +209,8 @@ class JsonEvalRunner(ParallelRolloutRunner):
                 # This house doesn't contain the target episode, return empty list
                 return [], None
             all_episodes = [target_episode]
+        elif eval_params.max_episodes is not None:
+            all_episodes = all_episodes[: int(eval_params.max_episodes)]
 
         house_episodes = [ep for ep in all_episodes if ep.house_index == house_id]
 

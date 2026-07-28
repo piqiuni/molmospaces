@@ -35,6 +35,13 @@ from semantic_decision_py_pkg.model_policy import (
     compact_candidate_options,
     compact_candidate_groups,
 )
+from semantic_decision_py_pkg.post_interaction_traversal import (
+    build_post_interaction_traversal_candidate,
+    inject_pending_traversal,
+    is_terminal_post_interaction_traversal_failure,
+    pending_priority_candidate,
+    portal_center_xy,
+)
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.rule_policy import (
     RulePolicy,
@@ -58,6 +65,7 @@ class SemanticRuleDecisionNode:
         rospy.init_node("semantic_rule_decision_node")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~policy", {}) or {}
+        candidate_config = rospy.get_param("~candidate", {}) or {}
         mission_config = rospy.get_param("~mission", {}) or {}
         ablation_config = rospy.get_param("~ablation", {}) or {}
         self.ablation = AblationConfig(
@@ -109,6 +117,9 @@ class SemanticRuleDecisionNode:
         )
         self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
         self.failure_retry_delay_s = float(config.get("failure_retry_delay_s", 2.0))
+        self.portal_traversal_distance_m = max(
+            0.0, float(candidate_config.get("portal_traversal_distance_m", 0.9))
+        )
         self.direct_atomic_outcome_belief_enabled = bool(
             config.get("direct_atomic_outcome_belief_enabled", False)
         )
@@ -156,6 +167,9 @@ class SemanticRuleDecisionNode:
                 history_region_size_m=float(
                     model_config.get("history_region_size_m", 1.0)
                 ),
+                pre_score_guard_margin=float(
+                    model_config.get("pre_score_guard_margin", 0.75)
+                ),
             )
         )
         self.candidate_curator = CandidateCurator(
@@ -182,6 +196,9 @@ class SemanticRuleDecisionNode:
                 ),
                 goal_yaw_tolerance_rad=float(
                     model_config.get("stale_goal_yaw_tolerance_rad", 0.50)
+                ),
+                suppress_semantic_container_mismatch=bool(
+                    model_config.get("suppress_semantic_container_mismatch", True)
                 ),
             )
         )
@@ -217,6 +234,8 @@ class SemanticRuleDecisionNode:
         self.active_decision_id = ""
         self.active_behavior_type = ""
         self.active_interaction_candidate: dict = {}
+        self.pending_post_interaction_traversal: dict = {}
+        self.terminal_post_interaction_traversal_ids: set[str] = set()
         self.minimum_candidate_sequence = 0
         self.next_decision_time = 0.0
         self.goal_complete = False
@@ -276,6 +295,8 @@ class SemanticRuleDecisionNode:
                 self.active_decision_id = ""
                 self.active_behavior_type = ""
                 self.active_interaction_candidate = {}
+                self.pending_post_interaction_traversal = {}
+                self.terminal_post_interaction_traversal_ids.clear()
                 self.minimum_candidate_sequence = 0
                 self.next_decision_time = 0.0
                 self.goal_complete = False
@@ -407,12 +428,18 @@ class SemanticRuleDecisionNode:
                 )
         if status != "SUCCEEDED" and not preempted_by_target:
             self.next_decision_time = time.monotonic() + self.failure_retry_delay_s
-        if status == "SUCCEEDED":
-            self.minimum_candidate_sequence = max(
-                self.minimum_candidate_sequence,
-                int(self.latest_candidates_payload.get("sequence", 0) or 0) + 1,
-            )
         active_behavior_type = self.active_behavior_type
+        if is_terminal_post_interaction_traversal_failure(
+            candidate_id,
+            active_behavior_type,
+            status,
+            detail,
+        ):
+            self.terminal_post_interaction_traversal_ids.add(candidate_id)
+            if str(
+                self.pending_post_interaction_traversal.get("candidate_id") or ""
+            ) == candidate_id:
+                self.pending_post_interaction_traversal = {}
         target_interaction_succeeded = (
             status == "SUCCEEDED"
             and active_behavior_type == "INTERACT"
@@ -458,6 +485,31 @@ class SemanticRuleDecisionNode:
                 self._publish_goal_status("SUCCEEDED", detail=detail)
                 if self.mission_mode == "semantic_interaction_object_goal":
                     self.goal_complete = True
+        post_interaction_traversal = None
+        if (
+            status == "SUCCEEDED"
+            and active_behavior_type == "INTERACT"
+            and not self.goal_complete
+        ):
+            post_interaction_traversal = build_post_interaction_traversal_candidate(
+                self.active_interaction_candidate,
+                payload,
+                robot_xy=self.latest_candidates_payload.get("robot_xy") or [],
+                traversal_distance_m=self.portal_traversal_distance_m,
+            )
+            if post_interaction_traversal is not None:
+                pending_payload = post_interaction_traversal.to_dict()
+                pending_payload.setdefault("metadata", {})["source_episode_id"] = str(
+                    self.latest_candidates_payload.get("episode_id") or ""
+                )
+                self.pending_post_interaction_traversal = pending_payload
+                self.minimum_candidate_sequence = 0
+                self.next_decision_time = 0.0
+        if status == "SUCCEEDED" and post_interaction_traversal is None:
+            self.minimum_candidate_sequence = max(
+                self.minimum_candidate_sequence,
+                int(self.latest_candidates_payload.get("sequence", 0) or 0) + 1,
+            )
         self.active_candidate_id = ""
         self.active_decision_id = ""
         self.active_behavior_type = ""
@@ -482,6 +534,17 @@ class SemanticRuleDecisionNode:
                 self.decision_in_flight = False
 
     def _decide_from_snapshot(self, candidate_snapshot: dict) -> None:
+        with self.state_lock:
+            pending_post_interaction_traversal = copy.deepcopy(
+                self.pending_post_interaction_traversal
+            )
+        pending_post_interaction_traversal_id = str(
+            pending_post_interaction_traversal.get("candidate_id") or ""
+        )
+        pending_post_interaction_traversal_injected = inject_pending_traversal(
+            candidate_snapshot,
+            pending_post_interaction_traversal,
+        )
         use_direct_atomic_outcome_beliefs = uses_direct_atomic_outcome_beliefs(
             self.ablation.module3,
             self.direct_atomic_outcome_belief_enabled,
@@ -612,13 +675,20 @@ class SemanticRuleDecisionNode:
                     ),
                     None,
                 )
-        selected = priority_target or self.policy.select(eligible)
+        priority_post_interaction_traversal = pending_priority_candidate(
+            eligible,
+            pending_post_interaction_traversal_id,
+        )
+        selected = priority_target or priority_post_interaction_traversal
+        if selected is None and self.policy_backend != "model":
+            selected = self.policy.select(eligible)
         scored = list(eligible)
         curation = self.candidate_curator.curate(
             eligible,
             graph=candidate_snapshot.get("graph_context") or {},
             history_by_key=region_history,
             observation_step=self._observation_step(candidate_snapshot),
+            target_context=candidate_snapshot.get("target_context") or {},
         )
         model_candidates = (
             list(eligible)
@@ -638,6 +708,9 @@ class SemanticRuleDecisionNode:
             candidate_history=region_history,
             history_region_size_m=self.candidate_curator.config.region_size_m,
             room_frontier_lengths=room_frontier_lengths,
+            pre_scores=curation.quality_by_id,
+            pre_score_terms=curation.quality_terms_by_id,
+            decision_hints=curation.decision_hint_by_id,
         )
         self.model_policy.last_candidate_groups = projected_groups
         self.model_policy.last_ranking_ids = []
@@ -645,17 +718,23 @@ class SemanticRuleDecisionNode:
         self.model_policy.last_selected_candidate_id = ""
         self.model_policy.last_reason = ""
         self.model_policy.last_confidence = ""
+        self.model_policy.last_rejected_model_ids = []
         model_selected_group_id = ""
         model_selected_candidate_id = ""
         model_selection_succeeded = False
         selection_override_reason = (
-            "reliable_target_goal_priority" if priority_target is not None else ""
+            "reliable_target_goal_priority"
+            if priority_target is not None
+            else "post_interaction_traversal_priority"
+            if priority_post_interaction_traversal is not None
+            else ""
         )
         if (
             self.policy_backend == "model"
             and not model_circuit_open
             and model_candidates
             and priority_target is None
+            and priority_post_interaction_traversal is None
         ):
             model_selected = self.model_policy.select(
                 model_candidates,
@@ -671,6 +750,13 @@ class SemanticRuleDecisionNode:
                     "group_history": group_history,
                     "candidate_history": region_history,
                     "room_frontier_lengths": room_frontier_lengths,
+                    "candidate_pre_scores": dict(curation.quality_by_id),
+                    "candidate_pre_score_terms": dict(
+                        curation.quality_terms_by_id
+                    ),
+                    "candidate_decision_hints": dict(
+                        curation.decision_hint_by_id
+                    ),
                 },
                 metrics_context={
                     "episode_id": candidate_snapshot.get("episode_id", ""),
@@ -695,6 +781,12 @@ class SemanticRuleDecisionNode:
             if model_selected is not None:
                 selected = model_selected
                 model_selection_succeeded = True
+                if self.model_policy.last_result_source == (
+                    "curated_fallback_invalid_response"
+                ):
+                    selection_override_reason = (
+                        "curated_fallback_invalid_model_selection"
+                    )
                 self.model_circuit_breaker.record_success()
             elif self.model_policy.last_error:
                 self.model_circuit_breaker.record_failure(self.model_policy.last_error, now)
@@ -706,6 +798,16 @@ class SemanticRuleDecisionNode:
             )
             self.model_policy.last_confidence = "high"
             self.model_policy.last_metrics = {}
+        elif priority_post_interaction_traversal is not None:
+            self.model_policy.last_error = ""
+            self.model_policy.last_result_source = (
+                "rule_post_interaction_traversal_priority"
+            )
+            self.model_policy.last_reason = (
+                "Successful portal open; execute its one-shot traversal continuation."
+            )
+            self.model_policy.last_confidence = "high"
+            self.model_policy.last_metrics = {}
         elif self.policy_backend == "model" and not model_candidates:
             self.model_policy.last_error = "no_curated_model_candidates"
             self.model_policy.last_result_source = "rule_fallback_empty_top_k"
@@ -714,17 +816,40 @@ class SemanticRuleDecisionNode:
             self.model_policy.last_error = "model_circuit_open_after_consecutive_timeouts"
             self.model_policy.last_result_source = "rule_fallback_circuit_open"
             self.model_policy.last_metrics = {}
-        if not model_selection_succeeded and priority_target is None:
-            selected, selection_override_reason = self._apply_repeat_guard(
+        if (
+            not model_selection_succeeded
+            and priority_target is None
+            and priority_post_interaction_traversal is None
+        ):
+            fallback_pool = (
+                model_candidates if self.policy_backend == "model" else eligible
+            )
+            selected = self.policy.select(fallback_pool)
+            if self.policy_backend == "model" and selected is not None:
+                selection_override_reason = (
+                    "curated_rule_fallback:"
+                    f"{self.model_policy.last_result_source or 'model_unavailable'}"
+                )
+            selected, repeat_reason = self._apply_repeat_guard(
                 selected,
-                eligible,
+                fallback_pool,
                 candidate_snapshot.get("graph_context") or {},
             )
+            if repeat_reason:
+                selection_override_reason = (
+                    f"{selection_override_reason}:{repeat_reason}"
+                    if selection_override_reason
+                    else repeat_reason
+                )
         input_selected_fingerprint = (
             candidate_fingerprint(selected) if selected is not None else ""
         )
         with self.state_lock:
             latest_snapshot = copy.deepcopy(self.latest_candidates_payload)
+        inject_pending_traversal(
+            latest_snapshot,
+            pending_post_interaction_traversal,
+        )
         latest_sequence = int(latest_snapshot.get("sequence", 0) or 0)
         latest_revision = int(latest_snapshot.get("graph_revision", 0) or 0)
         stale_selected = False
@@ -745,9 +870,32 @@ class SemanticRuleDecisionNode:
                     now=time.monotonic(),
                     region_history=latest_region_history,
                 )
+                latest_selection_pool = latest_eligible
+                if (
+                    self.policy_backend == "model"
+                    and self.model_policy.config.selection_granularity.casefold()
+                    != "room"
+                ):
+                    latest_curation = self.candidate_curator.curate(
+                        latest_eligible,
+                        graph=latest_snapshot.get("graph_context") or {},
+                        history_by_key=latest_region_history,
+                        observation_step=self._observation_step(latest_snapshot),
+                        target_context=latest_snapshot.get("target_context") or {},
+                    )
+                    latest_selection_pool = list(latest_curation.candidates)
+                latest_pending_traversal = pending_priority_candidate(
+                    latest_eligible,
+                    pending_post_interaction_traversal_id,
+                )
+                if latest_pending_traversal is not None and all(
+                    candidate.candidate_id != latest_pending_traversal.candidate_id
+                    for candidate in latest_selection_pool
+                ):
+                    latest_selection_pool.append(latest_pending_traversal)
                 validation = validate_candidate_update(
                     selected,
-                    latest_eligible,
+                    latest_selection_pool,
                     position_tolerance_m=(
                         self.candidate_curator.config.goal_position_tolerance_m
                     ),
@@ -772,11 +920,11 @@ class SemanticRuleDecisionNode:
                     selected = next(
                         (
                             candidate
-                            for candidate in latest_eligible
+                            for candidate in latest_selection_pool
                             if candidate.candidate_id == latest_priority_id
                         ),
                         None,
-                    ) or self.policy.select(latest_eligible)
+                    ) or self.policy.select(latest_selection_pool)
                     stale_fallback_used = selected is not None
                     if latest_priority_id and selected is not None:
                         selection_override_reason = (
@@ -790,7 +938,7 @@ class SemanticRuleDecisionNode:
                     if selected is not None and not latest_priority_id:
                         selected, repeat_reason = self._apply_repeat_guard(
                             selected,
-                            latest_eligible,
+                            latest_selection_pool,
                             latest_snapshot.get("graph_context") or {},
                         )
                         if repeat_reason:
@@ -834,11 +982,21 @@ class SemanticRuleDecisionNode:
             "model_selected_candidate_id": model_selected_candidate_id,
             "model_reason": self.model_policy.last_reason,
             "model_confidence": self.model_policy.last_confidence,
+            "model_pre_score_guard": self.model_policy.last_pre_score_guard,
+            "model_rejected_candidate_ids": list(
+                self.model_policy.last_rejected_model_ids
+            ),
             "direct_atomic_outcome_belief_enabled": use_direct_atomic_outcome_beliefs,
             "interaction_outcome_beliefs": self.interaction_outcome_beliefs.as_list()
             if use_direct_atomic_outcome_beliefs
             else [],
             "outcome_belief_suppressed_candidate_ids": outcome_belief_suppressed_candidate_ids,
+            "pending_post_interaction_traversal_id": (
+                pending_post_interaction_traversal_id
+            ),
+            "pending_post_interaction_traversal_injected": (
+                pending_post_interaction_traversal_injected
+            ),
             "candidate_groups": list(self.model_policy.last_candidate_groups),
             "model_candidate_options": list(self.model_policy.last_candidate_groups),
             "candidate_curation": curation.trace(),
@@ -888,6 +1046,10 @@ class SemanticRuleDecisionNode:
                     ),
                     "model_reason": self.model_policy.last_reason,
                     "model_confidence": self.model_policy.last_confidence,
+                    "model_result_source": self.model_policy.last_result_source,
+                    "model_rejected_candidate_ids": list(
+                        self.model_policy.last_rejected_model_ids
+                    ),
                     "executed_group_id": executed_group_id,
                     "executed_history_key": executed_history_key,
                     "selection_override_reason": selection_override_reason,
@@ -902,23 +1064,25 @@ class SemanticRuleDecisionNode:
             self.active_candidate_id = selected.candidate_id
             self.active_decision_id = decision_id
             self.active_behavior_type = selected.behavior_type
-            self.active_interaction_candidate = (
-                {
-                    "candidate_id": selected.candidate_id,
-                    "behavior_type": selected.behavior_type,
-                    "target_id": selected.target_id,
-                    "decision_id": decision_id,
-                    "interaction_command": dict(selected.interaction_command or {}),
-                }
-                if selected.behavior_type == "INTERACT"
-                else {}
-            )
+            if selected.behavior_type == "INTERACT":
+                self.active_interaction_candidate = selected.to_dict()
+                self.active_interaction_candidate["decision_id"] = decision_id
+                center = portal_center_xy(
+                    execution_snapshot.get("graph_context") or {},
+                    selected.target_id,
+                )
+                if center is not None:
+                    self.active_interaction_candidate["portal_center_xy"] = center
+            else:
+                self.active_interaction_candidate = {}
             self.active_target_goal = bool((selected.metadata or {}).get("target_goal")) or (
                 self.target_mission.pending_interaction is not None
                 and selected.behavior_type == "INTERACT"
             )
             if self.active_target_goal:
                 self.priority_target_candidate_id = selected.candidate_id
+            if selected.candidate_id == pending_post_interaction_traversal_id:
+                self.pending_post_interaction_traversal = {}
             self._record_decision_selection(
                 decision_id,
                 selected,
@@ -965,6 +1129,9 @@ class SemanticRuleDecisionNode:
         with self.state_lock:
             cooldown_until = dict(self.cooldown_until)
             target_goal_complete = bool(self.target_goal_complete)
+            terminal_post_interaction_traversal_ids = set(
+                self.terminal_post_interaction_traversal_ids
+            )
         candidates = []
         rejected: dict[str, str] = {}
         for payload in candidate_snapshot.get("candidates") or []:
@@ -977,6 +1144,12 @@ class SemanticRuleDecisionNode:
                 rejected[candidate_id] = "candidate_cooldown"
                 continue
             metadata = payload.get("metadata") or {}
+            if (
+                candidate_id in terminal_post_interaction_traversal_ids
+                and bool(metadata.get("post_interaction_traversal"))
+            ):
+                rejected[candidate_id] = "post_interaction_traversal_failed"
+                continue
             if target_goal_complete and (
                 bool(metadata.get("target_goal"))
                 or bool(metadata.get("target_match"))

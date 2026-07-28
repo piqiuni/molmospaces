@@ -796,7 +796,7 @@ scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge_model_mock.y
 
 ### 5.3.3 冻结 V3 单 episode 可视化评测
 
-冻结 benchmark 的 ROS object-goal 评测使用专用单 episode 入口。它会自行启动独立 ROS master、ROS 算法栈和 recorder；每次都强制输出六联图视频与俯视结果图。不要把多个 episode 放进同一次调用，以免把不同 episode 的 ROS 轨迹混入同一份 recorder 产物。
+冻结 benchmark 的 ROS object-goal 评测使用专用单 episode 入口。它会自行启动独立 ROS master 和 ROS 算法栈；默认还会启动 recorder，并强制输出六联图视频与俯视结果图。不要把多个 episode 放进同一次调用，以免把不同 episode 的 ROS 轨迹混入同一份 recorder 产物。
 
 ```bash
 ROS_MASTER_URI=http://127.0.0.1:11311 \
@@ -826,6 +826,29 @@ zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
 - `eval/episodes/<episode>/episode_result.json`：冻结 V3 的正式评测结果。
 
 该入口默认不重复缓存 head-camera 视频，以避免同一 episode 同时保存两份大视频。若需要保留它作为 force interaction 的补充第一视角，额外传 `RECORD_HEAD_CAMERA=true`。
+
+马上进行并行回归、只关心正式结果和耗时定位时，可启用 `FAST_EVAL=true`。该模式只关闭 recorder、逐 step 图片、离线视频和俯视渲染，不改变 episode 顺序、timeout、最大 step 或成功判定。每个实例必须使用不同的输出目录和 ROS master 端口；脚本在端口已有 ROS master 时会直接拒绝运行，避免误接到其他实例。
+
+```bash
+# 原生 nav_to_obj；为每个实例替换 IDX、PORT 和输出目录。
+IDX=0
+PORT=12101
+ROS_MASTER_URI=http://127.0.0.1:${PORT} \
+FAST_EVAL=true EPISODE_IDX=${IDX} \
+zsh scripts/InteractiveNav/run_native_nav_to_obj_eval.zsh \
+  outputs/native_nav_fast_${IDX}
+
+# 冻结 InteractiveNav V3；BENCHMARK 必须指向实际存在的 benchmark.json。
+IDX=0
+PORT=12102
+BENCHMARK=/absolute/path/to/benchmark.json \
+ROS_MASTER_URI=http://127.0.0.1:${PORT} \
+FAST_EVAL=true \
+zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+  outputs/interactive_nav_v3_fast_${IDX} ${IDX}
+```
+
+原生入口把逐 step 分项耗时写到 `debug/step_timing.jsonl`，并生成 `debug/step_timing_summary.json`；V3 入口把汇总写入 `episode_result.json` 的 `result.timing_summary`，逐决策分项位于 `trace[].timing_ms`。优先比较 `policy_act`、`base_action`、`step_precheck`、ROS action wait、传感器和 task step 的 p50/p95，以定位未知 step 耗时。
 
 多场景交互实验使用专用批处理脚本。每个 worker 是独立子进程，拥有独立 `ROS_MASTER_URI`；场景按 round-robin 分片，worker 内部串行运行分到的场景：
 

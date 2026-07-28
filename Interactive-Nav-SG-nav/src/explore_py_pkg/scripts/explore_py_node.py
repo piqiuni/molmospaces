@@ -703,6 +703,7 @@ class ExplorePyNode:
         payload = {
             "ready": self.latest_grid is not None and self.robot_xy is not None,
             "external_behavior_control": self.external_behavior_control,
+            "initial_scan_complete": self.initial_spin_done,
             "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
             "map_resolution": (
                 float(self.latest_grid.spec.resolution)

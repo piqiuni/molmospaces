@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+import re
 from typing import Any, Iterable
 
 from .behavior_candidates import BehaviorCandidate
@@ -23,8 +24,18 @@ class CandidateCuratorConfig:
     region_size_m: float = 1.0
     repeat_guard_low_gain_limit: int = 2
     explore_min_visible_gain_ratio: float = 0.25
+    # Keep the visibility term stronger than the room-novelty term: a clearly
+    # larger observed unknown region should not lose merely because it is in
+    # a room that was seen earlier.
+    explore_visible_unknown_area_weight: float = 0.50
+    explore_new_room_bonus: float = 0.15
     goal_position_tolerance_m: float = 0.35
     goal_yaw_tolerance_rad: float = 0.50
+    # In object-goal mode an observed container whose semantics contradict the
+    # requested object is noise for the MLLM.  Keep this opt-in at the curator
+    # boundary (rather than the generator) so exploration can still retain the
+    # observation as a fallback when no better proposal exists.
+    suppress_semantic_container_mismatch: bool = True
 
 
 @dataclass
@@ -37,6 +48,7 @@ class CandidateCurationResult:
     history_key_by_id: dict[str, str] = field(default_factory=dict)
     ranked_ids_by_type: dict[str, list[str]] = field(default_factory=dict)
     mandatory_ids: list[str] = field(default_factory=list)
+    decision_hint_by_id: dict[str, str] = field(default_factory=dict)
 
     def trace(self) -> dict[str, Any]:
         return {
@@ -58,6 +70,7 @@ class CandidateCurationResult:
             "history_key_by_id": dict(self.history_key_by_id),
             "rejected": dict(self.rejected),
             "omitted": dict(self.omitted),
+            "decision_hint_by_id": dict(self.decision_hint_by_id),
         }
 
 
@@ -88,9 +101,15 @@ def _room_node_id(value: Any) -> str:
     return text if text.startswith("room_") else f"room_{text}"
 
 
-def candidate_room_id(candidate: BehaviorCandidate, graph: dict[str, Any]) -> str:
+def _explicit_candidate_room_id(candidate: BehaviorCandidate) -> str:
+    """Return an observation-provided room id, never a geometric fallback."""
     metadata = candidate.metadata or {}
     room_id = _room_node_id(metadata.get("target_room_id") or metadata.get("room_id"))
+    return "" if room_id in {"", "unknown", "room_unknown"} else room_id
+
+
+def candidate_room_id(candidate: BehaviorCandidate, graph: dict[str, Any]) -> str:
+    room_id = _explicit_candidate_room_id(candidate)
     if room_id:
         return room_id
     goal = list(candidate.goal_xyyaw or [])
@@ -193,6 +212,16 @@ def candidate_rejection_reason(candidate: BehaviorCandidate) -> str:
     if bool(metadata.get("interaction_group_previously_failed")):
         return "interaction_group_previously_failed"
     if behavior_type == "INTERACT":
+        # Keep the generation-time container guard effective when a candidate
+        # was queued from an earlier graph revision and is being revalidated.
+        # Require explicit public values so legacy candidates that do not
+        # report visibility/reachability remain backward-compatible.
+        if (
+            str(metadata.get("node_type") or "").casefold() == "container"
+            and metadata.get("is_currently_visible") is False
+            and metadata.get("room_reachable") is False
+        ):
+            return "container_not_visible_and_room_unreachable"
         action = _candidate_action(candidate)
         state = str(metadata.get("state") or "unknown").casefold()
         if action == "open" and state in {"open", "static_open", "completed"}:
@@ -251,6 +280,356 @@ def _clamp01(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _tokens(value: Any) -> set[str]:
+    """Return small semantic tokens without adding a model-side dependency."""
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", str(value or "").casefold())
+        if token
+    }
+
+
+# These are deliberately broad, conservative priors.  They are not ground
+# truth and are only used to remove an obvious contradiction (for example a
+# dresser candidate for a potato); unknown objects/containers remain eligible.
+_FOOD_TOKENS = {
+    "apple",
+    "banana",
+    "bread",
+    "carrot",
+    "cheese",
+    "chicken",
+    "cookie",
+    "drink",
+    "food",
+    "fruit",
+    "juice",
+    "milk",
+    "orange",
+    "potato",
+    "rice",
+    "snack",
+    "soda",
+    "tomato",
+    "vegetable",
+    "water",
+    "wine",
+}
+_PERSONAL_TOKENS = {
+    "alarmclock",
+    "book",
+    "clock",
+    "key",
+    "keys",
+    "laptop",
+    "notebook",
+    "pen",
+    "pencil",
+    "phone",
+    "remote",
+    "sock",
+    "toy",
+    "watch",
+}
+_KITCHEN_ITEM_TOKENS = {
+    "bottle",
+    "bowl",
+    "cup",
+    "fork",
+    "kettle",
+    "knife",
+    "mug",
+    "pan",
+    "plate",
+    "pot",
+    "spoon",
+}
+_KITCHEN_CONTAINER_TOKENS = {
+    "cabinet",
+    "cupboard",
+    "drawer",
+    "fridge",
+    "pantry",
+    "refrigerator",
+    "shelf",
+    "storage",
+}
+_PERSONAL_CONTAINER_TOKENS = {
+    "cabinet",
+    "desk",
+    "drawer",
+    "dresser",
+    "nightstand",
+    "shelf",
+    "wardrobe",
+}
+_STRONGLY_PERSONAL_CONTAINERS = {"dresser", "nightstand", "wardrobe", "desk"}
+_STRONGLY_KITCHEN_CONTAINERS = {"fridge", "refrigerator", "oven", "dishwasher"}
+
+
+def _target_tokens(target_context: dict[str, Any] | None) -> set[str]:
+    target_context = target_context or {}
+    values = list(target_context.get("object_labels") or [])
+    values.extend(
+        target_context.get(key)
+        for key in ("target_name", "target_object", "object_label")
+        if target_context.get(key)
+    )
+    result: set[str] = set()
+    for value in values:
+        result.update(_tokens(value))
+    return result
+
+
+def _container_tokens(candidate: BehaviorCandidate) -> set[str]:
+    metadata = candidate.metadata or {}
+    values = [
+        candidate.target_name,
+        metadata.get("semantic_name"),
+        metadata.get("category"),
+        metadata.get("source_object_name"),
+    ]
+    result: set[str] = set()
+    for value in values:
+        result.update(_tokens(value))
+    return result
+
+
+def _contains_semantic_term(tokens: set[str], vocabulary: set[str]) -> bool:
+    return any(
+        term == token or term in token or token in term
+        for token in tokens
+        for term in vocabulary
+    )
+
+
+def _semantic_container_compatibility(
+    candidate: BehaviorCandidate,
+    target_context: dict[str, Any] | None,
+) -> tuple[str, float]:
+    """Classify an interaction container against the *public* goal text.
+
+    Returns ``(reason, compatibility)`` where compatibility is 1 for a
+    plausible match, 0 for an explicit contradiction, and 0.5 when no safe
+    semantic conclusion can be made.  This intentionally never consults
+    hidden simulator state or target-room metadata.
+    """
+    if _normalized_behavior_type(candidate) != "INTERACT":
+        return "not_container", 0.5
+    metadata = candidate.metadata or {}
+    if str(metadata.get("node_type") or "").casefold() != "container":
+        return "not_container", 0.5
+    if bool(metadata.get("target_match")):
+        return "explicit_target_match", 1.0
+    target_context = target_context or {}
+    if not bool(target_context.get("enabled")):
+        return "target_disabled", 0.5
+    target = _target_tokens(target_context)
+    containers = _container_tokens(candidate)
+    if not target or not containers:
+        return "semantic_unknown", 0.5
+    is_food = _contains_semantic_term(target, _FOOD_TOKENS)
+    is_kitchen_item = _contains_semantic_term(target, _KITCHEN_ITEM_TOKENS)
+    is_kitchen_target = is_food or is_kitchen_item
+    is_personal = _contains_semantic_term(target, _PERSONAL_TOKENS)
+    is_kitchen_container = _contains_semantic_term(
+        containers, _KITCHEN_CONTAINER_TOKENS
+    )
+    is_personal_container = _contains_semantic_term(
+        containers, _PERSONAL_CONTAINER_TOKENS
+    )
+    if is_kitchen_target and is_personal_container and not is_kitchen_container:
+        return "target_container_semantic_mismatch", 0.0
+    if is_personal and is_kitchen_container and not is_personal_container:
+        return "target_container_semantic_mismatch", 0.0
+    if is_kitchen_target and is_kitchen_container:
+        return "plausible_kitchen_container", 1.0
+    if is_personal and is_personal_container:
+        return "plausible_personal_container", 1.0
+    # A strongly typed contradiction is safer than a weak lexical overlap.
+    if is_kitchen_target and _contains_semantic_term(
+        containers, _STRONGLY_PERSONAL_CONTAINERS
+    ):
+        return "target_container_semantic_mismatch", 0.0
+    if is_personal and _contains_semantic_term(
+        containers, _STRONGLY_KITCHEN_CONTAINERS
+    ):
+        return "target_container_semantic_mismatch", 0.0
+    return "semantic_unknown", 0.5
+
+
+def _normalized_room_id(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    text = str(value)
+    return text if text.startswith("room_") else f"room_{text}"
+
+
+def _candidate_room(value: Any) -> str:
+    return _normalized_room_id(value)
+
+
+def _portal_endpoints(candidate: BehaviorCandidate) -> set[str]:
+    metadata = candidate.metadata or {}
+    return {
+        _normalized_room_id(value)
+        for value in metadata.get("connected_room_ids") or []
+        if value not in (None, "")
+    }
+
+
+def _topology_hints(
+    candidates: list[BehaviorCandidate],
+    graph: dict[str, Any],
+    target_context: dict[str, Any] | None,
+) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, str]]:
+    """Compute deterministic route/mission priors before asking the MLLM.
+
+    The graph is observation-derived.  Closed portal edges are treated as
+    *potential* edges for ranking only; execution still goes through the
+    normal interaction policy.  This lets the first portal on an observed
+    route outrank a nearby but irrelevant container without leaking GT.
+    """
+    candidates = list(candidates)
+    target_rooms: set[str] = set()
+    current_rooms: set[str] = set()
+    for candidate in candidates:
+        metadata = candidate.metadata or {}
+        if metadata.get("target_goal") or metadata.get("target_match"):
+            room = _candidate_room(metadata.get("target_room_id") or metadata.get("room_id"))
+            if room:
+                target_rooms.add(room)
+        room = _candidate_room(metadata.get("robot_room_id"))
+        if room:
+            current_rooms.add(room)
+
+    # Include observed portal nodes not currently represented as candidates so
+    # route distance reflects the whole semantic graph.
+    portal_endpoints_by_id: dict[str, set[str]] = {}
+    for node in graph.get("nodes") or []:
+        if str(node.get("type") or "").casefold() != "portal":
+            continue
+        attributes = node.get("attributes") or {}
+        values = node.get("connected_room_ids")
+        if values is None:
+            values = attributes.get("connected_room_ids") or []
+        endpoints = {
+            _normalized_room_id(value) for value in values if value not in (None, "")
+        }
+        if endpoints:
+            portal_endpoints_by_id[str(node.get("id") or "")] = endpoints
+    for candidate in candidates:
+        if _normalized_behavior_type(candidate) == "INTERACT":
+            node_type = str((candidate.metadata or {}).get("node_type") or "").casefold()
+            if node_type == "portal":
+                endpoints = _portal_endpoints(candidate)
+                if endpoints:
+                    portal_endpoints_by_id.setdefault(candidate.target_id, endpoints)
+
+    adjacency: dict[str, set[str]] = {}
+    for endpoints in portal_endpoints_by_id.values():
+        values = sorted(endpoints)
+        for index, left in enumerate(values):
+            for right in values[index + 1 :]:
+                adjacency.setdefault(left, set()).add(right)
+                adjacency.setdefault(right, set()).add(left)
+
+    # Reverse BFS from all currently observed target rooms.  If no target room
+    # is observed yet, local portal hints still provide useful ordering.
+    distance_to_target: dict[str, int] = {}
+    queue = list(sorted(target_rooms))
+    for room in queue:
+        distance_to_target[room] = 0
+    while queue:
+        room = queue.pop(0)
+        for neighbor in sorted(adjacency.get(room, set())):
+            if neighbor in distance_to_target:
+                continue
+            distance_to_target[neighbor] = distance_to_target[room] + 1
+            queue.append(neighbor)
+
+    scores: dict[str, float] = {}
+    terms: dict[str, dict[str, float]] = {}
+    hints: dict[str, str] = {}
+    for candidate in candidates:
+        metadata = candidate.metadata or {}
+        behavior_type = _normalized_behavior_type(candidate)
+        hint = ""
+        topology_bonus = 0.0
+        if bool(metadata.get("target_goal")):
+            hint = "TARGET_GOAL"
+            topology_bonus = 1.25
+        elif bool(metadata.get("post_interaction_traversal")):
+            # Once a portal interaction succeeds, traversing through its
+            # opening is the state-transition continuation.  It must outrank
+            # a newly visible but merely plausible container nearby.
+            hint = "POST_INTERACTION_TRAVERSE"
+            topology_bonus = 1.50
+        elif behavior_type == "INTERACT" and bool(metadata.get("target_match")):
+            hint = "TARGET_CONTAINER"
+            topology_bonus = 0.95
+        elif (
+            behavior_type == "INTERACT"
+            and str(metadata.get("node_type") or "").casefold() == "portal"
+        ):
+            endpoints = portal_endpoints_by_id.get(
+                candidate.target_id
+            ) or _portal_endpoints(candidate)
+            local = bool(current_rooms & endpoints)
+            critical = False
+            if local and distance_to_target:
+                for room in current_rooms & endpoints:
+                    current_distance = distance_to_target.get(room)
+                    if current_distance is None:
+                        continue
+                    for neighbor in endpoints - {room}:
+                        if (
+                            distance_to_target.get(neighbor, current_distance + 1)
+                            < current_distance
+                        ):
+                            critical = True
+                            break
+                    if critical:
+                        break
+            if critical:
+                hint = "NEXT_ROUTE_PORTAL"
+                topology_bonus = 1.35
+            elif local:
+                hint = "LOCAL_ROUTE_PORTAL"
+                topology_bonus = 0.45
+            elif endpoints:
+                hint = "REMOTE_PORTAL"
+                topology_bonus = 0.15
+        elif behavior_type == "EXPLORE":
+            room = _candidate_room(
+                metadata.get("target_room_id") or metadata.get("room_id")
+            )
+            if room and room in target_rooms:
+                hint = "TARGET_ROOM_FRONTIER"
+                topology_bonus = 0.55
+        compatibility_reason, compatibility = _semantic_container_compatibility(
+            candidate, target_context
+        )
+        if (
+            behavior_type == "INTERACT"
+            and str(metadata.get("node_type") or "").casefold() == "container"
+        ):
+            if compatibility >= 1.0 and not hint:
+                hint = "PLAUSIBLE_TARGET_CONTAINER"
+                topology_bonus += 0.40
+            elif compatibility_reason == "semantic_unknown" and not hint:
+                hint = "UNKNOWN_CONTAINER"
+        if topology_bonus:
+            terms[candidate.candidate_id] = {"topology_priority": topology_bonus}
+            scores[candidate.candidate_id] = topology_bonus
+        else:
+            terms[candidate.candidate_id] = {}
+            scores[candidate.candidate_id] = 0.0
+        if hint:
+            hints[candidate.candidate_id] = hint
+    return scores, terms, hints
+
+
 def _relative_scores(
     candidates: list[BehaviorCandidate],
     getter,
@@ -266,6 +645,93 @@ def _relative_scores(
         candidate_id: rank[value] if higher_is_better else 1.0 - rank[value]
         for candidate_id, value in values.items()
     }
+
+
+def _expected_visible_unknown_area(candidate: BehaviorCandidate) -> float:
+    try:
+        return max(
+            0.0,
+            float(
+                (candidate.metadata or {}).get(
+                    "expected_visible_unknown_area_m2", 0.0
+                )
+                or 0.0
+            ),
+        )
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _known_room_id(value: Any) -> str:
+    room_id = _room_node_id(value)
+    return "" if room_id in {"", "unknown", "room_unknown"} else room_id
+
+
+def _history_explore_room_id(history_key: str) -> str:
+    parts = str(history_key or "").split(":", 3)
+    if len(parts) < 3 or parts[0] != "explore_region":
+        return ""
+    return _known_room_id(parts[1])
+
+
+def _history_records_room_visit(history: dict[str, Any]) -> bool:
+    for field in ("selection_count", "visit_count"):
+        try:
+            if float(history.get(field, 0) or 0) > 0.0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    # The node writes this field together with selection_count.  Keeping this
+    # fallback makes the curator compatible with persisted history from older
+    # runs that may not contain the counter yet (step zero is still a visit).
+    return "last_selected_step" in history
+
+
+def _visited_explore_room_ids(
+    history_by_key: dict[str, dict[str, Any]],
+) -> set[str]:
+    visited: set[str] = set()
+    for history_key, history in history_by_key.items():
+        if not isinstance(history, dict) or not _history_records_room_visit(history):
+            continue
+        room_id = _history_explore_room_id(history_key)
+        if room_id:
+            visited.add(room_id)
+    return visited
+
+
+def _new_room_frontier_ids(
+    candidates: Iterable[BehaviorCandidate],
+    graph: dict[str, Any],
+    visited_room_ids: set[str],
+) -> set[str]:
+    """Find eligible frontiers in observed rooms that have not been visited.
+
+    A candidate reaches this helper only after normal curator validation.  The
+    explicit false checks below additionally keep a room novelty bonus off a
+    candidate whose local reachability metadata became unavailable.  Room
+    identity comes from the candidate when present, otherwise the already-used
+    observation graph association in :func:`candidate_room_id`; no simulator
+    or benchmark ground truth is consulted.
+    """
+    result: set[str] = set()
+    for candidate in candidates:
+        if _normalized_behavior_type(candidate) != "EXPLORE":
+            continue
+        metadata = candidate.metadata or {}
+        if metadata.get("room_reachable") is False or any(
+            metadata.get(key) is False
+            for key in ("reachable", "path_reachable", "approach_reachable")
+        ):
+            continue
+        room_id = _known_room_id(candidate_room_id(candidate, graph))
+        if not room_id or room_id in visited_room_ids:
+            continue
+        robot_room_id = _known_room_id(metadata.get("robot_room_id"))
+        if robot_room_id and room_id == robot_room_id:
+            continue
+        result.add(candidate.candidate_id)
+    return result
 
 
 class CandidateCurator:
@@ -314,6 +780,7 @@ class CandidateCurator:
         graph: dict[str, Any] | None = None,
         history_by_key: dict[str, dict[str, Any]] | None = None,
         observation_step: int = 0,
+        target_context: dict[str, Any] | None = None,
     ) -> CandidateCurationResult:
         graph = graph or {}
         history_by_key = history_by_key or {}
@@ -323,6 +790,35 @@ class CandidateCurator:
             history_by_key=history_by_key,
             observation_step=observation_step,
         )
+        omitted: dict[str, str] = {}
+        if (
+            self.config.suppress_semantic_container_mismatch
+            and bool((target_context or {}).get("enabled"))
+            and accepted
+        ):
+            incompatible_ids = {
+                candidate.candidate_id
+                for candidate in accepted
+                if _semantic_container_compatibility(candidate, target_context)[1] <= 0.0
+            }
+            # Keep an incompatible container as a last-resort fallback only
+            # when it is literally the sole proposal.  In normal mixed tasks
+            # a portal/frontier is available and the noisy candidate is hidden
+            # from the model request while remaining in the raw graph.
+            if incompatible_ids and any(
+                candidate.candidate_id not in incompatible_ids for candidate in accepted
+            ):
+                accepted = [
+                    candidate
+                    for candidate in accepted
+                    if candidate.candidate_id not in incompatible_ids
+                ]
+                omitted.update(
+                    {
+                        candidate_id: "target_container_semantic_mismatch"
+                        for candidate_id in incompatible_ids
+                    }
+                )
         history_key_by_id = {
             candidate.candidate_id: candidate_history_key(
                 candidate, graph, self.config.region_size_m
@@ -339,21 +835,12 @@ class CandidateCurator:
         }
         explore_pool = pools["EXPLORE"]
         expected_visible_area_by_id = {
-            candidate.candidate_id: max(
-                0.0,
-                float(
-                    (candidate.metadata or {}).get(
-                        "expected_visible_unknown_area_m2", 0.0
-                    )
-                    or 0.0
-                ),
-            )
+            candidate.candidate_id: _expected_visible_unknown_area(candidate)
             for candidate in explore_pool
         }
         max_expected_visible_area = max(
             expected_visible_area_by_id.values(), default=0.0
         )
-        omitted: dict[str, str] = {}
         if max_expected_visible_area > 0.0:
             minimum_visible_area = max_expected_visible_area * max(
                 0.0,
@@ -391,6 +878,12 @@ class CandidateCurator:
                     omitted[candidate.candidate_id] = "history_low_gain_suppressed"
             pools["EXPLORE"] = non_repeated_explore
 
+        visited_explore_room_ids = _visited_explore_room_ids(history_by_key)
+        new_room_frontier_ids = _new_room_frontier_ids(
+            pools["EXPLORE"],
+            graph,
+            visited_explore_room_ids,
+        )
         quality_by_id: dict[str, float] = {}
         quality_terms_by_id: dict[str, dict[str, float]] = {}
         for behavior_type, pool in pools.items():
@@ -399,9 +892,27 @@ class CandidateCurator:
                 pool,
                 history_by_key,
                 history_key_by_id,
+                new_room_frontier_ids,
             )
             quality_by_id.update(scores)
             quality_terms_by_id.update(terms)
+        topology_scores, topology_terms, decision_hint_by_id = _topology_hints(
+            accepted,
+            graph,
+            target_context,
+        )
+        for candidate in accepted:
+            candidate_id = candidate.candidate_id
+            if candidate_id not in quality_terms_by_id:
+                quality_terms_by_id[candidate_id] = {}
+            quality_terms_by_id[candidate_id].update(
+                topology_terms.get(candidate_id) or {}
+            )
+            quality_by_id[candidate_id] = float(quality_by_id.get(candidate_id, 0.0)) + float(
+                topology_scores.get(candidate_id, 0.0)
+            )
+        for candidate_id in sorted(new_room_frontier_ids):
+            decision_hint_by_id.setdefault(candidate_id, "NEW_ROOM_FRONTIER")
         ranked = {
             behavior_type: sorted(
                 pool,
@@ -509,6 +1020,7 @@ class CandidateCurator:
             history_key_by_id=history_key_by_id,
             ranked_ids_by_type=ranked_ids_by_type,
             mandatory_ids=[candidate.candidate_id for candidate in mandatory],
+            decision_hint_by_id=decision_hint_by_id,
         )
 
     def _score_pool(
@@ -517,6 +1029,7 @@ class CandidateCurator:
         pool: list[BehaviorCandidate],
         history_by_key: dict[str, dict[str, Any]],
         history_key_by_id: dict[str, str],
+        new_room_frontier_ids: set[str],
     ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
         if not pool:
             return {}, {}
@@ -549,6 +1062,13 @@ class CandidateCurator:
             for candidate in pool
         }
         if behavior_type == "EXPLORE":
+            expected_visible_area_by_id = {
+                candidate.candidate_id: _expected_visible_unknown_area(candidate)
+                for candidate in pool
+            }
+            max_expected_visible_area = max(
+                expected_visible_area_by_id.values(), default=0.0
+            )
             information_rank = _relative_scores(
                 pool,
                 lambda candidate: max(
@@ -580,6 +1100,21 @@ class CandidateCurator:
                     * history_novelty[candidate.candidate_id],
                     "frontier_stability": 0.10
                     * stability_rank[candidate.candidate_id],
+                    "visible_unknown_area_priority": max(
+                        0.0,
+                        float(self.config.explore_visible_unknown_area_weight),
+                    )
+                    * (
+                        expected_visible_area_by_id[candidate.candidate_id]
+                        / max_expected_visible_area
+                        if max_expected_visible_area > 0.0
+                        else 0.0
+                    ),
+                    "unvisited_room_frontier_bonus": max(
+                        0.0, float(self.config.explore_new_room_bonus)
+                    )
+                    if candidate.candidate_id in new_room_frontier_ids
+                    else 0.0,
                 }
                 for candidate in pool
             }

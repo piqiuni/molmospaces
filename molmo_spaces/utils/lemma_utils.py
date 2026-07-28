@@ -1,10 +1,17 @@
-import functools
+from __future__ import annotations
 
-from nltk.corpus.reader.wordnet import Synset
+import functools
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nltk.corpus.reader.wordnet import Synset
 
 from molmo_spaces.utils.synset_utils import wn
 
-PHYSICAL_ENTITY_SYNSET = wn.synset("physical_entity.n.01")
+
+@functools.cache
+def _physical_entity_synset():
+    return wn.synset("physical_entity.n.01")
 
 
 def normalize_expression(text: str) -> str:
@@ -17,7 +24,8 @@ def normalize_expression(text: str) -> str:
 def is_physical_entity(synset: Synset | str) -> bool:
     if isinstance(synset, str):
         synset = wn.synset(synset)
-    return PHYSICAL_ENTITY_SYNSET in synset.lowest_common_hypernyms(PHYSICAL_ENTITY_SYNSET)
+    physical_entity = _physical_entity_synset()
+    return physical_entity in synset.lowest_common_hypernyms(physical_entity)
 
 
 @functools.lru_cache(maxsize=1000)

@@ -4,6 +4,7 @@ import json
 import logging
 from pathlib import Path
 import struct
+import sys
 import time
 from typing import Any
 import zlib
@@ -11,10 +12,19 @@ import zlib
 import mujoco
 import numpy as np
 
-from robot_conversion_patches import patch_droid_config_for_rum
-from semantic_door_occ_runtime import DoorOccPoseSequenceController, DoorOccRuntimeController
-from force_interaction_bridge import AtomicForceInteractionController
-from force_interaction_runtime import ForceDriveConfig
+# Support both ``python scripts/InteractiveNav/run_nav_ros_sim.py`` and
+# package-qualified imports from the native benchmark wrapper.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.InteractiveNav.robot_conversion_patches import patch_droid_config_for_rum
+from scripts.InteractiveNav.semantic_door_occ_runtime import (
+    DoorOccPoseSequenceController,
+    DoorOccRuntimeController,
+)
+from scripts.InteractiveNav.force_interaction_bridge import AtomicForceInteractionController
+from scripts.InteractiveNav.force_interaction_runtime import ForceDriveConfig
 
 from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
 from molmo_spaces.configs.camera_configs import (
@@ -33,7 +43,10 @@ from molmo_spaces.policy.learned_policy.left_arm_keyboard_debug_policy import (
 from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.profiler_utils import Profiler
-from runtime_target_selection import load_fixed_container_target, select_far_container_target
+from scripts.InteractiveNav.runtime_target_selection import (
+    load_fixed_container_target,
+    select_far_container_target,
+)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)

@@ -12,6 +12,7 @@ import json
 import pytest
 
 from scripts.InteractiveNav.evaluation.ros_object_goal_adapter import (
+    DIRECT_DRAWER_SCAN_BBOX_TTL_S,
     RestrictedGTContractError,
     RestrictedGTObservation,
     RosObjectGoalEvaluatorAdapter,
@@ -60,13 +61,13 @@ class _FakeRospy:
         return subscriber
 
 
-def _adapter(*, executor=None) -> tuple[RosObjectGoalEvaluatorAdapter, _FakeRospy]:
+def _adapter(*, executor=None, clock=None) -> tuple[RosObjectGoalEvaluatorAdapter, _FakeRospy]:
     rospy = _FakeRospy()
     adapter = RosObjectGoalEvaluatorAdapter(
         rospy_module=rospy,
         string_message_type=_FakeString,
         interaction_executor=executor,
-        clock=lambda: 123.5,
+        clock=clock or (lambda: 123.5),
     )
     return adapter, rospy
 
@@ -251,6 +252,243 @@ def test_drawer_scan_visual_hint_is_sanitized_but_never_emitted_in_result() -> N
     assert "guessed_private_drawer" not in serialized
     assert "force_target_fraction" not in serialized
     assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
+
+
+def test_direct_bbox_drawer_scan_routes_a_unique_current_public_box() -> None:
+    private_handle = object()
+    adapter, rospy = _adapter()
+    _reset(adapter, {"obj_000017": private_handle, "obj_000018": object()})
+    adapter.publish_observations(
+        [
+            RestrictedGTObservation(
+                instance_id="obj_000017",
+                name="dresser",
+                bbox_2d_xyxy=[0, 0, 1, 1],
+                segmentation_rle={"size": [4, 4], "counts": [0, 16]},
+                box3d_center=[1.0, 2.0, 0.5],
+                box3d_size=[0.8, 0.6, 1.7],
+            ),
+            RestrictedGTObservation(
+                instance_id="obj_000018",
+                name="cabinet",
+                bbox_2d_xyxy=[2, 0, 3, 1],
+                segmentation_rle={"size": [4, 4], "counts": [0, 16]},
+                box3d_center=[2.0, 2.0, 0.5],
+                box3d_size=[0.8, 0.6, 1.7],
+            ),
+        ],
+        capture_step=3,
+    )
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "scan-visible-dresser",
+            # Direct scan identity comes from the public box, not this stale
+            # method-side selector.
+            "object_id": "not-an-evaluator-id",
+            "action": "open",
+            "sequence_type": "drawer_scan",
+            "drawer_container_bbox_2d": [0, 0, 1, 1],
+            "drawer_container_capture_step": 3,
+        }
+    )
+
+    assert request is not None
+    assert request.private_handle is private_handle
+    assert request.instance_id == "obj_000017"
+    assert request.sequence_type == "drawer_scan"
+    assert request.open_regions == ()
+    assert request.direct_bbox_drawer_scan is True
+    result = adapter.complete_interaction(request.command_id, success=True)
+    serialized = json.dumps(result, sort_keys=True)
+    assert "drawer_container_bbox_2d" not in serialized
+    assert "direct_bbox_drawer_scan" not in serialized
+    assert "not-an-evaluator-id" not in serialized
+    assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
+
+
+def test_direct_bbox_drawer_scan_routes_exact_public_box_after_approach_lag() -> None:
+    """A graph-selected drawer box may arrive after its approach navigation."""
+
+    now = [100.0]
+    private_handle = object()
+    adapter, rospy = _adapter(clock=lambda: now[0])
+    _reset(adapter, {"obj_000017": private_handle})
+    drawer = RestrictedGTObservation(
+        instance_id="obj_000017",
+        name="dresser",
+        bbox_2d_xyxy=[0, 0, 1, 1],
+        segmentation_rle={"size": [4, 4], "counts": [0, 16]},
+        box3d_center=[1.0, 2.0, 0.5],
+        box3d_size=[0.8, 0.6, 1.7],
+    )
+    adapter.publish_observations([drawer], capture_step=455)
+    # The evaluator keeps publishing during navigation, but the semantic graph
+    # can still carry the last public drawer crop when the executor is ready.
+    # This mirrors the observed 455 -> 532 V3 delay.
+    for capture_step in range(456, 533):
+        adapter.publish_observations([], capture_step=capture_step)
+    now[0] += DIRECT_DRAWER_SCAN_BBOX_TTL_S * 0.75
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "scan-after-approach",
+            "object_id": "stale-method-selector",
+            "action": "open",
+            "sequence_type": "drawer_scan",
+            "drawer_container_bbox_2d": [0, 0, 1, 1],
+            "drawer_container_capture_step": 455,
+        }
+    )
+
+    assert request is not None
+    assert request.private_handle is private_handle
+    assert request.instance_id == "obj_000017"
+    assert request.sequence_type == "drawer_scan"
+    assert request.direct_bbox_drawer_scan is True
+    result = adapter.complete_interaction(request.command_id, success=True)
+    serialized = json.dumps(result, sort_keys=True)
+    assert "stale-method-selector" not in serialized
+    assert "drawer_container_bbox_2d" not in serialized
+
+
+def test_direct_bbox_drawer_scan_rejects_noncurrent_or_ambiguous_public_boxes() -> None:
+    adapter, rospy = _adapter()
+    _reset(adapter, {"obj_000017": object(), "obj_000018": object()})
+    observation = RestrictedGTObservation(
+        instance_id="obj_000017",
+        name="dresser",
+        bbox_2d_xyxy=[0, 0, 1, 1],
+        segmentation_rle={"size": [4, 4], "counts": [0, 16]},
+        box3d_center=[1.0, 2.0, 0.5],
+        box3d_size=[0.8, 0.6, 1.7],
+    )
+    adapter.publish_observations([observation], capture_step=3)
+    # The requested public step is empty, so the box cannot select the older
+    # frame even though the adapter retains a small asynchronous history.
+    adapter.publish_observations([], capture_step=4)
+    assert adapter.receive_interaction_command(
+        {
+            "command_id": "scan-stale-dresser",
+            "action": "open",
+            "sequence_type": "drawer_scan",
+            "drawer_container_bbox_2d": [0, 0, 1, 1],
+            "drawer_container_capture_step": 4,
+        }
+    ) is None
+    stale = _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1])
+    assert stale["status"] == "REJECTED"
+    assert stale["reason"] == "unresolved_drawer_scan_target"
+    assert stale["object_id"] == ""
+
+    # Matching must also be unique; a box cannot select among two public
+    # instances that overlap equally.
+    adapter.publish_observations(
+        [
+            observation,
+            RestrictedGTObservation(
+                instance_id="obj_000018",
+                name="cabinet",
+                bbox_2d_xyxy=[0, 0, 1, 1],
+                segmentation_rle={"size": [4, 4], "counts": [0, 16]},
+                box3d_center=[2.0, 2.0, 0.5],
+                box3d_size=[0.8, 0.6, 1.7],
+            ),
+        ],
+        capture_step=5,
+    )
+    assert adapter.receive_interaction_command(
+        {
+            "command_id": "scan-ambiguous-dresser",
+            "action": "open",
+            "sequence_type": "drawer_scan",
+            "drawer_container_bbox_2d": [0, 0, 1, 1],
+            "drawer_container_capture_step": 5,
+        }
+    ) is None
+    ambiguous = _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1])
+    assert ambiguous["status"] == "REJECTED"
+    assert ambiguous["reason"] == "unresolved_drawer_scan_target"
+    assert "obj_000017" not in json.dumps(ambiguous, sort_keys=True)
+    assert "obj_000018" not in json.dumps(ambiguous, sort_keys=True)
+
+
+def test_direct_bbox_drawer_scan_requires_matching_public_step_and_fresh_frame() -> None:
+    now = [100.0]
+    adapter, rospy = _adapter(clock=lambda: now[0])
+    _reset(adapter, {"obj_000017": object()})
+    observation = RestrictedGTObservation(
+        instance_id="obj_000017",
+        name="dresser",
+        bbox_2d_xyxy=[0, 0, 1, 1],
+        segmentation_rle={"size": [4, 4], "counts": [0, 16]},
+        box3d_center=[1.0, 2.0, 0.5],
+        box3d_size=[0.8, 0.6, 1.7],
+    )
+    adapter.publish_observations([observation], capture_step=7)
+
+    def rejected(command_id: str, **hint) -> None:
+        assert adapter.receive_interaction_command(
+            {
+                "command_id": command_id,
+                # A valid opaque selector must not turn an invalid direct-bbox
+                # request into an ordinary MLLM drawer scan.
+                "object_id": "obj_000017",
+                "action": "open",
+                "sequence_type": "drawer_scan",
+                "drawer_container_bbox_2d": [0, 0, 1, 1],
+                **hint,
+            }
+        ) is None
+        result = _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1])
+        assert result["status"] == "REJECTED"
+        assert result["reason"] == "unresolved_drawer_scan_target"
+
+    # A box from the public frame cannot be rebound to an arbitrary older or
+    # future frame token.
+    rejected("scan-old-step", drawer_container_capture_step=6)
+    rejected("scan-negative-step", drawer_container_capture_step=-1)
+    # Direct bbox routing requires the public step field; a normal MLLM scan
+    # remains compatible because it sends no drawer_container_bbox_2d field.
+    rejected("scan-missing-step")
+
+    now[0] += DIRECT_DRAWER_SCAN_BBOX_TTL_S + 0.01
+    rejected("scan-expired-frame", drawer_container_capture_step=7)
+
+
+def test_episode_reset_clears_direct_bbox_frame_history() -> None:
+    adapter, rospy = _adapter()
+    _reset(adapter, {"obj_000017": object()})
+    adapter.publish_observations(
+        [
+            RestrictedGTObservation(
+                instance_id="obj_000017",
+                name="dresser",
+                bbox_2d_xyxy=[0, 0, 1, 1],
+                segmentation_rle={"size": [4, 4], "counts": [0, 16]},
+                box3d_center=[1.0, 2.0, 0.5],
+                box3d_size=[0.8, 0.6, 1.7],
+            )
+        ],
+        capture_step=7,
+    )
+
+    # Keep the public episode ID intentionally unchanged: generation, not
+    # merely a string comparison, must prevent cache reuse across a reset.
+    _reset(adapter, {"obj_000018": object()})
+    assert adapter.receive_interaction_command(
+        {
+            "command_id": "scan-before-reset",
+            "object_id": "obj_000018",
+            "action": "open",
+            "sequence_type": "drawer_scan",
+            "drawer_container_bbox_2d": [0, 0, 1, 1],
+            "drawer_container_capture_step": 7,
+        }
+    ) is None
+    result = _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1])
+    assert result["status"] == "REJECTED"
+    assert result["reason"] == "unresolved_drawer_scan_target"
 
 
 def test_executor_receives_private_handle_and_unknown_raw_name_is_rejected() -> None:
