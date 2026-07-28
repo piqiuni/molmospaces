@@ -30,6 +30,7 @@ from semantic_decision_py_pkg.behavior_execution import (
 )
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.visual_interaction_planning import (
+    action_for_opaque_open_contract,
     candidate_with_visual_operation_plan,
     infer_visual_interaction_target_type,
 )
@@ -71,8 +72,10 @@ TERMINAL_STATES = {
 
 class SemanticBehaviorExecutor:
     def __init__(self) -> None:
-        env_file = os.environ.get("SEMANTIC_DECISION_ENV_FILE")
-        load_env_file(env_file, override=bool(env_file))
+        env_path = os.environ.get("SEMANTIC_DECISION_ENV_FILE")
+        # Keep an explicitly selected endpoint and its credential paired even
+        # when the ROS launcher inherited a different OPENAI_API_KEY.
+        load_env_file(env_path, override=bool(env_path))
         rospy.init_node("semantic_behavior_executor")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~executor", {}) or {}
@@ -167,6 +170,9 @@ class SemanticBehaviorExecutor:
         )
         self.final_align_timeout_s = float(
             config.get("final_align_timeout_s", config.get("interaction_final_align_timeout_s", 15.0))
+        )
+        self.evaluator_opaque_open_only = bool(
+            config.get("evaluator_opaque_open_only", False)
         )
         self.make_plan_preflight_enabled = bool(
             config.get("make_plan_preflight_enabled", True)
@@ -713,6 +719,10 @@ class SemanticBehaviorExecutor:
     def _publish_interaction_command(self, candidate: dict) -> None:
         interaction = candidate.get("interaction_command") or {}
         metadata = candidate.get("metadata") or {}
+        action = action_for_opaque_open_contract(
+            interaction.get("action", "open"),
+            enabled=self.evaluator_opaque_open_only,
+        )
         with self.lock:
             self.interaction_command_sequence += 1
             interaction_sequence = self.interaction_command_sequence
@@ -726,7 +736,7 @@ class SemanticBehaviorExecutor:
             "node_type": str(
                 interaction.get("node_type") or metadata.get("node_type") or ""
             ).casefold(),
-            "action": interaction.get("action", "open"),
+            "action": action,
             "interaction_mode": interaction.get("interaction_mode", "open_close"),
             "sequence_type": interaction.get("sequence_type", ""),
             "operation_method": interaction.get("operation_method", "unknown"),

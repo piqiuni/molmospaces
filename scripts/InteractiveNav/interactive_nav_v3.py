@@ -82,6 +82,52 @@ def build_nav_to_obj_success_criteria(succ_pos_threshold: float) -> dict[str, An
     }
 
 
+def build_point_target(
+    *,
+    goal_point: list[float],
+    goal_yaw: float | None,
+    sampling_source: str,
+    clearance_m: float,
+    grounding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if len(goal_point) != 3:
+        raise ValueError("PointGoal goal_point must contain exactly three values")
+    if clearance_m < 0.0:
+        raise ValueError("PointGoal clearance_m must be non-negative")
+    return {
+        "target_type": "point",
+        "goal_point": [float(value) for value in goal_point],
+        "goal_yaw": None if goal_yaw is None else float(goal_yaw),
+        "sampling_source": str(sampling_source),
+        "clearance_m": float(clearance_m),
+        "grounding": dict(grounding or {"attributes": {}}),
+    }
+
+
+def build_nav_to_point_success_criteria(
+    succ_pos_threshold: float,
+    *,
+    require_goal_yaw: bool = False,
+    yaw_threshold_rad: float | None = None,
+) -> dict[str, Any]:
+    if succ_pos_threshold <= 0.0:
+        raise ValueError("PointGoal success threshold must be positive")
+    if require_goal_yaw and (yaw_threshold_rad is None or yaw_threshold_rad <= 0.0):
+        raise ValueError("A positive yaw threshold is required when goal yaw is enforced")
+    return {
+        "type": "nav_to_point",
+        "distance": {
+            "metric": "planar_robot_base_to_point",
+            "threshold_m": float(succ_pos_threshold),
+            "comparison": "less_or_equal",
+        },
+        "require_goal_yaw": bool(require_goal_yaw),
+        "yaw_threshold_rad": (
+            float(yaw_threshold_rad) if require_goal_yaw else None
+        ),
+    }
+
+
 def _joint_type(joint: dict[str, Any]) -> str:
     value = str(joint.get("mujoco_joint_type", joint.get("joint_type", ""))).lower()
     normalized = value.strip().strip("[]")
@@ -260,15 +306,31 @@ def _validate_common_v3_episode(
 
     task = episode.get("task", {})
     target = payload.get("target", {})
-    selected_instance = target.get("selected_instance")
-    if task.get("selection_mode") != "specific_instance":
-        raise ValueError("Generated v3 episodes must use specific_instance")
-    if task.get("pickup_obj_name") != selected_instance:
-        raise ValueError("task.pickup_obj_name does not match target.selected_instance")
-    if task.get("pickup_obj_candidates") != [selected_instance]:
-        raise ValueError("specific_instance candidates must contain only the selected target")
+    task_type = task.get("task_type")
+    is_point_goal = task_type == "nav_to_point"
+    selected_instance = None if is_point_goal else target.get("selected_instance")
+    if is_point_goal:
+        if target.get("target_type") != "point":
+            raise ValueError("nav_to_point tasks require a point target")
+        task_goal = task.get("goal_point")
+        target_goal = target.get("goal_point")
+        if task_goal != target_goal:
+            raise ValueError("task.goal_point does not match target.goal_point")
+        if len(task_goal or []) != 3:
+            raise ValueError("PointGoal must contain a three-value goal_point")
+        if bool(task.get("require_goal_yaw")) and task.get("goal_yaw") is None:
+            raise ValueError("PointGoal requires goal_yaw when require_goal_yaw is true")
+    else:
+        if task_type != "nav_to_obj":
+            raise ValueError(f"Unsupported V3 task_type: {task_type!r}")
+        if task.get("selection_mode") != "specific_instance":
+            raise ValueError("Generated object-goal v3 episodes must use specific_instance")
+        if task.get("pickup_obj_name") != selected_instance:
+            raise ValueError("task.pickup_obj_name does not match target.selected_instance")
+        if task.get("pickup_obj_candidates") != [selected_instance]:
+            raise ValueError("specific_instance candidates must contain only the selected target")
 
-    if "container" in domains:
+    if "container" in domains and not is_point_goal:
         grounding = target.get("grounding", {})
         matching_count = grounding.get("matching_instance_count")
         if not isinstance(matching_count, int) or matching_count < 1:
@@ -283,8 +345,8 @@ def _validate_common_v3_episode(
             raise ValueError("container target grounding must name a measured container")
 
     relevant_objects = episode.get("task_relevant_objects", [])
-    required_objects = [selected_instance]
-    if "container" in domains:
+    required_objects = [] if is_point_goal else [selected_instance]
+    if "container" in domains and not is_point_goal:
         required_objects.append(target.get("container_name"))
     for required_object in required_objects:
         if required_object not in relevant_objects:
@@ -358,6 +420,13 @@ def _validate_common_v3_episode(
     task_threshold = float(task.get("succ_pos_threshold", -1.0))
     if float(success_criteria.get("distance", {}).get("threshold_m", -2.0)) != task_threshold:
         raise ValueError("success_criteria distance threshold does not mirror the task")
+    expected_success_type = "nav_to_point" if is_point_goal else "nav_to_obj"
+    if success_criteria.get("type") != expected_success_type:
+        raise ValueError("success_criteria type does not mirror the task")
+    if is_point_goal and bool(success_criteria.get("require_goal_yaw")) != bool(
+        task.get("require_goal_yaw")
+    ):
+        raise ValueError("PointGoal yaw requirement does not mirror the task")
 
     plans = payload.get("oracle_plans", [])
     if not plans or plans[0] != payload.get("oracle_plan"):
@@ -399,7 +468,20 @@ def _validate_common_v3_episode(
         observe_steps = [
             step for step in plan.get("steps", []) if step.get("type") == "observe_target"
         ]
-        if len(observe_steps) != 1 or observe_steps[0].get("object_name") != selected_instance:
+        if is_point_goal:
+            if observe_steps:
+                raise ValueError("PointGoal oracle plans must not contain observe_target")
+            terminal_steps = [
+                step
+                for step in plan.get("steps", [])
+                if step.get("type") == "navigate"
+                and step.get("reason") == "satisfy_nav_to_point_success"
+            ]
+            if len(terminal_steps) != 1:
+                raise ValueError("PointGoal oracle plan must contain one terminal navigate step")
+            if terminal_steps[0].get("goal_point") != task.get("goal_point"):
+                raise ValueError("PointGoal terminal oracle step does not match task.goal_point")
+        elif len(observe_steps) != 1 or observe_steps[0].get("object_name") != selected_instance:
             raise ValueError("Oracle plan must observe exactly the selected target")
 
     return {
@@ -407,6 +489,7 @@ def _validate_common_v3_episode(
         "task": task,
         "target": target,
         "selected_instance": selected_instance,
+        "is_point_goal": is_point_goal,
         "domains": domains,
         "interactions": interactions,
         "interaction_by_id": interaction_by_id,
@@ -726,6 +809,31 @@ def _serialize_and_validate_v3(episode: dict[str, Any]) -> dict[str, Any]:
     validated["interactive_nav"]["generation_validation"][
         "minimal_plan_verified"
     ] = minimal_value
+    source_parent_index = episode.get("interactive_nav", {}).get(
+        "parent_benchmark_episode_index"
+    )
+    if source_parent_index is None:
+        validated["interactive_nav"]["parent_benchmark_episode_index"] = None
+    source_prefixes = (
+        episode.get("interactive_nav", {})
+        .get("generation_validation", {})
+        .get("oracle_prefixes", [])
+    )
+    validated_prefixes = (
+        validated.get("interactive_nav", {})
+        .get("generation_validation", {})
+        .get("oracle_prefixes", [])
+    )
+    required_nullable_prefix_keys = {
+        "robot_reachable_to_next_goal",
+        "target_distance_passed",
+        "target_visibility_fraction",
+        "task_success",
+    }
+    for source, destination in zip(source_prefixes, validated_prefixes, strict=False):
+        for key in required_nullable_prefix_keys:
+            if key in source and source[key] is None:
+                destination[key] = None
     try:
         from jsonschema import Draft202012Validator
     except ImportError:
@@ -743,6 +851,10 @@ def validate_interactive_nav_v3_episode(
     """Unified V3 entry: common invariants followed by domain-specific checks."""
     context = _validate_common_v3_episode(episode, expected_domains=expected_domains)
     domains = context["domains"]
+    if context["is_point_goal"] and "container" in domains:
+        raise ValueError(
+            "Pure PointGoal V3 episodes currently support channel interactions only"
+        )
     if domains == ["container"]:
         _validate_container_scene(context)
     elif domains == ["channel"]:
@@ -758,6 +870,59 @@ def validate_channel_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
     return validate_interactive_nav_v3_episode(
         episode, expected_domains=["channel"]
     )
+
+
+def validate_point_goal_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
+    if episode.get("task", {}).get("task_type") != "nav_to_point":
+        raise ValueError("PointGoal validator requires task_type=nav_to_point")
+    return validate_interactive_nav_v3_episode(episode, expected_domains=["channel"])
+
+
+def validate_instruction_goal_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:
+    """Validate an instruction overlay without repeating collection-time evidence checks."""
+
+    language = episode.get("language", {})
+    if language.get("task_input_mode") != "instruction":
+        raise ValueError("InstructionGoal requires language.task_input_mode=instruction")
+    if not str(language.get("task_description") or "").strip():
+        raise ValueError("InstructionGoal requires a non-empty instruction")
+
+    payload = episode.get("interactive_nav", {})
+    plans = payload.get("oracle_plans") or []
+    if not plans or plans[0] != payload.get("oracle_plan"):
+        raise ValueError("InstructionGoal source must keep oracle_plan=oracle_plans[0]")
+    valid_step_indices = set(range(len(plans[0].get("steps") or [])))
+    grounded_steps = language.get("grounded_plan_step_indices") or []
+    if not set(grounded_steps).issubset(valid_step_indices):
+        raise ValueError("InstructionGoal references an unknown oracle plan step")
+
+    valid_entities: set[str] = set()
+    target = payload.get("target", {})
+    for key in ("selected_instance", "container_name"):
+        if target.get(key):
+            valid_entities.add(str(target[key]))
+    for interaction in payload.get("interactions") or []:
+        for key in ("interaction_id", "object_name", "joint_name"):
+            if interaction.get(key):
+                valid_entities.add(str(interaction[key]))
+    graph_context = (
+        payload.get("instruction_generation", {}).get("graph_context") or {}
+    )
+    for node in graph_context.get("nodes") or []:
+        for value in (
+            node.get("id"),
+            node.get("name"),
+            (node.get("attributes") or {}).get("source_object_name"),
+        ):
+            if value:
+                valid_entities.add(str(value))
+    grounded_entities = {str(value) for value in language.get("grounded_entity_ids") or []}
+    unknown_entities = grounded_entities - valid_entities
+    if unknown_entities:
+        raise ValueError(
+            f"InstructionGoal references unknown V3 entities: {sorted(unknown_entities)}"
+        )
+    return _serialize_and_validate_v3(episode)
 
 
 def validate_container_v3_episode(episode: dict[str, Any]) -> dict[str, Any]:

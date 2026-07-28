@@ -52,7 +52,10 @@
       "$ref": "#/$defs/sceneModifications"
     },
     "task": {
-      "$ref": "#/$defs/navToObjTask"
+      "oneOf": [
+        {"$ref": "#/$defs/navToObjTask"},
+        {"$ref": "#/$defs/navToPointTask"}
+      ]
     },
     "task_relevant_objects": {
       "type": "array",
@@ -162,6 +165,48 @@
       },
       "additionalProperties": true
     },
+    "navToPointTask": {
+      "type": "object",
+      "required": [
+        "task_cls",
+        "task_type",
+        "robot_base_pose",
+        "goal_point",
+        "succ_pos_threshold",
+        "require_goal_yaw"
+      ],
+      "properties": {
+        "task_cls": {
+          "const": "molmo_spaces.tasks.point_nav_task.PointNavTask"
+        },
+        "task_type": {
+          "const": "nav_to_point"
+        },
+        "robot_base_pose": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 7,
+          "maxItems": 7
+        },
+        "goal_point": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "goal_yaw": {"type": ["number", "null"]},
+        "succ_pos_threshold": {
+          "type": "number",
+          "exclusiveMinimum": 0.0
+        },
+        "require_goal_yaw": {"type": "boolean"},
+        "succ_yaw_threshold": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0.0
+        }
+      },
+      "additionalProperties": true
+    },
     "language": {
       "type": "object",
       "required": [
@@ -178,6 +223,7 @@
         "instruction_type": {
           "enum": [
             "object_goal",
+            "point_goal",
             "route_instruction",
             "interaction_instruction",
             "route_interaction_instruction"
@@ -196,6 +242,23 @@
         },
         "referral_expressions_priority": {
           "type": "object"
+        },
+        "task_input_mode": {
+          "enum": ["goal_spec", "instruction"]
+        },
+        "grounded_entity_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "grounded_plan_step_indices": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 0},
+          "uniqueItems": true
+        },
+        "generation_mode": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "additionalProperties": true
@@ -213,7 +276,7 @@
       },
       "additionalProperties": true
     },
-    "target": {
+    "objectTarget": {
       "type": "object",
       "required": [
         "selection_mode",
@@ -240,6 +303,36 @@
       },
       "additionalProperties": true
     },
+    "pointTarget": {
+      "type": "object",
+      "required": [
+        "target_type",
+        "goal_point",
+        "sampling_source",
+        "clearance_m",
+        "grounding"
+      ],
+      "properties": {
+        "target_type": {"const": "point"},
+        "goal_point": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "goal_yaw": {"type": ["number", "null"]},
+        "sampling_source": {"type": "string", "minLength": 1},
+        "clearance_m": {"type": "number", "minimum": 0.0},
+        "grounding": {"$ref": "#/$defs/targetGrounding"}
+      },
+      "additionalProperties": true
+    },
+    "target": {
+      "oneOf": [
+        {"$ref": "#/$defs/objectTarget"},
+        {"$ref": "#/$defs/pointTarget"}
+      ]
+    },
     "distanceCriterion": {
       "type": "object",
       "required": ["metric", "threshold_m", "comparison"],
@@ -261,7 +354,7 @@
       },
       "additionalProperties": false
     },
-    "successCriteria": {
+    "navToObjSuccessCriteria": {
       "type": "object",
       "required": [
         "type",
@@ -280,6 +373,36 @@
         "combination": {"const": "all"}
       },
       "additionalProperties": false
+    },
+    "pointDistanceCriterion": {
+      "type": "object",
+      "required": ["metric", "threshold_m", "comparison"],
+      "properties": {
+        "metric": {"const": "planar_robot_base_to_point"},
+        "threshold_m": {"type": "number", "exclusiveMinimum": 0.0},
+        "comparison": {"const": "less_or_equal"}
+      },
+      "additionalProperties": false
+    },
+    "navToPointSuccessCriteria": {
+      "type": "object",
+      "required": ["type", "distance", "require_goal_yaw"],
+      "properties": {
+        "type": {"const": "nav_to_point"},
+        "distance": {"$ref": "#/$defs/pointDistanceCriterion"},
+        "require_goal_yaw": {"type": "boolean"},
+        "yaw_threshold_rad": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "successCriteria": {
+      "oneOf": [
+        {"$ref": "#/$defs/navToObjSuccessCriteria"},
+        {"$ref": "#/$defs/navToPointSuccessCriteria"}
+      ]
     },
     "interactionState": {
       "type": "object",
@@ -372,6 +495,7 @@
         "prerequisite_for_interaction",
         "reveal_target_object",
         "satisfy_nav_to_obj_success",
+        "satisfy_nav_to_point_success",
         "verify_target_visible"
       ]
     },
@@ -442,7 +566,7 @@
           "exclusiveMinimum": 0.0,
           "maximum": 1.0
         },
-        "control_mode": {"enum": ["direct", "force"]},
+        "control_mode": {"const": "force"},
         "reason": {"$ref": "#/$defs/oracleReason"}
       },
       "additionalProperties": false

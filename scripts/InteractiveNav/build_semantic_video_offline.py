@@ -12,6 +12,16 @@ from pathlib import Path
 import cv2
 
 
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -22,7 +32,7 @@ def load_jsonl(path: Path) -> list[dict]:
     return sorted(records, key=lambda record: int(record.get("step_index", 0)))
 
 
-def load_recorder_frames(path: Path) -> list[dict]:
+def load_recorder_frames(path: Path, *, source_seq_is_step_index: bool = False) -> list[dict]:
     if not path.exists():
         return []
     with path.open(newline="", encoding="utf-8") as handle:
@@ -37,7 +47,10 @@ def load_recorder_frames(path: Path) -> list[dict]:
         source_seq = record.get("source_seq")
         record["source_step_value"] = (
             int(source_seq)
-            if source_sequences_are_zero_based and source_seq not in {None, ""}
+            if (
+                (source_sequences_are_zero_based or source_seq_is_step_index)
+                and source_seq not in {None, ""}
+            )
             else max(0, int(source_seq) - 1)
             if source_seq not in {None, ""}
             else max(0, int(record.get("step_id") or 1) - 1)
@@ -329,9 +342,19 @@ def main() -> None:
     if not sim_manifest.exists():
         sim_manifest = scene_dir / "step_frames" / "manifest.jsonl"
     sim_records = load_jsonl(sim_manifest)
-    recorder_records = load_recorder_frames(debug_dir / "video_frames.csv")
+    recorder_summary = load_json(debug_dir / "summary.json")
+    source_seq_is_step_index = (
+        recorder_summary.get("first_person_video_trigger") == "step_sync"
+    )
+    recorder_records = load_recorder_frames(
+        debug_dir / "video_frames.csv",
+        source_seq_is_step_index=source_seq_is_step_index,
+    )
     if not recorder_records:
-        recorder_records = load_recorder_frames(scene_dir / "video_frames.csv")
+        recorder_records = load_recorder_frames(
+            scene_dir / "video_frames.csv",
+            source_seq_is_step_index=source_seq_is_step_index,
+        )
     if not sim_records:
         raise RuntimeError(f"No simulator step frames found under {scene_dir}")
     if not recorder_records:

@@ -745,10 +745,12 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
                              scan.intensities[src_idx] > 0.0f);
       const float r = scan.ranges[src_idx];
 
-      // 对于前向深度相机生成的伪360scan：
-      // 未观测波束必须忽略（设为 > maxRange），避免被错误当成“远距离自由空间”。
+      // For a forward RGB-D pseudo scan, a missing beam is outside the
+      // camera FoV (or lacks reliable depth), not a max-range free-space ray.
+      // GMapping explicitly ignores NaN readings, whereas a range above
+      // maxRange is ray-traced as free space by its map registration path.
       if (!observed || !std::isfinite(r) || r < scan.range_min)
-        ranges_double[i] = maxRange_ + 1.0;
+        ranges_double[i] = std::numeric_limits<double>::quiet_NaN();
       else
         ranges_double[i] = static_cast<double>(r);
     }
@@ -761,7 +763,7 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
       const float r = scan.ranges[i];
 
       if (!observed || !std::isfinite(r) || r < scan.range_min)
-        ranges_double[i] = maxRange_ + 1.0;
+        ranges_double[i] = std::numeric_limits<double>::quiet_NaN();
       else
         ranges_double[i] = static_cast<double>(r);
     }
@@ -1185,7 +1187,9 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
   scan.intensities.resize(num_beams);
   std::vector<unsigned int> beam_point_counts(num_beams, 0);
   
-  // Initialize all ranges to max range (unknown)
+  // Keep provisional bins at max range while collecting the closest point.
+  // Unsupported bins are converted to NaN below so GMapping ignores them;
+  // they must not be interpreted as free space out to range_max.
   std::fill(scan.ranges.begin(), scan.ranges.end(), scan.range_max);
   std::fill(scan.intensities.begin(), scan.intensities.end(), 0.0);
   
@@ -1240,7 +1244,7 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     }
     else
     {
-      scan.ranges[i] = scan.range_max;
+      scan.ranges[i] = std::numeric_limits<float>::quiet_NaN();
     }
   }
 
@@ -1268,7 +1272,7 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
       if (support_count < pointcloud_scan_min_support_neighbors_)
       {
         observed[i] = 0;
-        scan.ranges[i] = scan.range_max;
+        scan.ranges[i] = std::numeric_limits<float>::quiet_NaN();
       }
     }
   }

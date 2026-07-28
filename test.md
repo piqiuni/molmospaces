@@ -230,6 +230,152 @@ python scripts/InteractiveNav/build_mixed_interaction_benchmark.py \
   --output_dir scripts/InteractiveNav/output/mixed_interaction_v3_smoke10
 ```
 
+### 4.5.2 Full 逐步采集与 smoke
+
+`mode: full` 不生成错误动作负轨迹，也不生成 `open_gt_control`。它按指定
+executor 执行连续导航和交互，并将每个 step 的第一视角图像、动作、qpos/qvel、
+phase、segment、reward、terminal 和 info 写入 `trajectory.h5`；同时为每个相机
+写出同一 step 序列的 MP4。force 模式的交互 step 使用
+`force effort -> mujoco.mj_step() -> joint readback`，不会直接写 qpos。
+
+统一 full smoke 配置：
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-interactive-full
+python scripts/InteractiveNav/collect_interactive_nav.py \
+  --config scripts/InteractiveNav/configs/collection/procthor10k_train_full_3domain_smoke.yaml \
+  --stage full
+```
+
+full 训练资格要求：
+
+- channel：`nav_to_door`、`force_open_door`、`nav_to_target`、`terminal_observation`
+- container：`nav_to_container`、`force_open_container`、`terminal_observation`
+- mixed：上述两组交互 segment 和 `terminal_observation`
+- H5 数组（图像、动作、状态）长度完全对齐，且至少有一个 `force_joint` step 和
+  一个 terminal step
+- 失败 rollout 仅保留在 `full/runs` 供诊断，不计入训练数据；汇总见
+  `full/summary.json`
+
+full 导航使用平滑后的 waypoint 作为 RBY1 holonomic base 的绝对 position target，
+由 MuJoCo actuator 逐步跟踪。导航和 force 阶段会保持初始 head、左右臂、夹爪和
+torso 的 qpos/qvel/position target；`lock_base_during_force: true` 还会在每个 force
+step 前后恢复 base 的 x/y/yaw pose，避免交互把机器人推离操作位或让机械臂下落，
+并在 force metadata 中记录锁定组和最大漂移。
+
+full 数据时间基准默认是 `collection_hz=5`，即 `dt=0.2s`；H5 训练 step 与 MP4
+视频帧使用同一频率。内部 MuJoCo/controller 可以使用更高频率，但只在每个 0.2s
+采样边界保存一次。按人类步行速度 1.4m/s 的 60%（0.84m/s）计算，每个导航
+采样间隔对应约 0.168m；当前场景实际导航距离约 4.666m，对应约 28 个导航 step。
+冰箱门 2s 连续打开对应 10 个交互 step，目标开度从 0% 递增到100%。任务
+`success_threshold`（当前 0.8）只记录成功事件，不提前结束2s交互轨迹。
+
+复用预计算 rough 时可配置：
+
+```yaml
+rough:
+  container_catalog: /path/to/container/rough_catalog.json
+  mixed_catalog: /path/to/mixed/mixed_rough_catalog.json
+  generate_if_missing: false
+```
+
+统一入口相关测试：
+
+```bash
+python -m pytest -q \
+  mlspaces_tests/data_generation/test_collect_interactive_nav.py \
+  mlspaces_tests/data_generation/test_container_interaction_benchmark.py \
+  mlspaces_tests/data_generation/test_mixed_interaction_benchmark.py
+```
+
+主要输出位于配置的 `output.root`：
+
+- `scene_manifest.json`：版本化 train house 清单
+- `seeds/benchmark.json`：真实 train scene 生成的 NavToObj seed episode
+- `raw/{channel,container,mixed}/benchmark.json`：三类 fine 原始 V3 数据
+- `balanced/benchmark.json`：最终严格均衡 benchmark
+- `balanced/audit.json`、`balanced/structure_report.md`：字段、类别、recipe、house 与占位值审计
+
+full step 级采集使用同一入口；`full.max_episodes` 表示每个
+`full.domains` 中各采集的 episode 数。先运行单个 mixed smoke：
+
+```bash
+export MUJOCO_GL=egl
+export MPLCONFIGDIR=/tmp/matplotlib-interactive-full
+python scripts/InteractiveNav/collect_interactive_nav.py \
+  --config scripts/InteractiveNav/configs/collection/procthor10k_train_full_smoke.yaml \
+  --stage full
+```
+
+三类各采一个 smoke 可改用
+`scripts/InteractiveNav/configs/collection/procthor10k_train_full_3domain_smoke.yaml`。
+
+full 输出位于 `output.root/full/`：每个 run 包含 `trajectory.h5`、`manifest.json`、
+交互结果和日志。只有 `returncode=0`、H5 对齐校验通过且 `success=true` 的 run 才会
+进入 `valid_trajectory_count`；导航或操作失败不会被当成 rollout 负轨迹。
+
+### 4.5.3 PointGoal / InstructionGoal 数据生成 demo
+
+从现有 InteractiveNav V3 channel benchmark 采一个 interaction-aware PointGoal：
+
+```bash
+conda activate mlspaces
+export MUJOCO_GL=egl
+python scripts/InteractiveNav/generate_point_goal_v3.py \
+  <V3_BENCHMARK_OR_DIR> \
+  --episode-index 0 \
+  --interaction-aware \
+  --px-per-m 50 \
+  --output-dir scripts/InteractiveNav/output/point_goal_v3_smoke
+```
+
+直接从原始 scene split 采一个普通可达 PointGoal：
+
+```bash
+python scripts/InteractiveNav/generate_point_goal_v3.py \
+  --source-mode scene_split \
+  --house-ind 7 \
+  --output-dir scripts/InteractiveNav/output/point_goal_raw_scene_smoke
+```
+
+基于 V3 oracle plan 规则生成 hidden/partial/explicit 三条 InstructionGoal：
+
+```bash
+python scripts/InteractiveNav/generate_instruction_goal_v3.py \
+  <V3_BENCHMARK_OR_DIR> \
+  --mode rule \
+  --output-dir scripts/InteractiveNav/output/instruction_goal_rule_smoke
+```
+
+如果已有 full rollout，可按 segment 抽取首/中/尾关键帧并调用 VLM；`--graph-json`
+可选传入 unified graph JSON，生成器只保留 GT path 周围指定半径及必需交互实体：
+
+```bash
+python scripts/InteractiveNav/generate_instruction_goal_v3.py \
+  <V3_BENCHMARK_OR_DIR> \
+  --mode vlm \
+  --trajectory-h5 <FULL_RUN>/trajectory.h5 \
+  --graph-json <GRAPH_JSON> \
+  --graph-radius-m 1.0 \
+  --model-mode http \
+  --endpoint <OPENAI_COMPATIBLE_ENDPOINT> \
+  --model <MODEL_NAME> \
+  --output-dir scripts/InteractiveNav/output/instruction_goal_vlm_smoke
+```
+
+只验证 full H5 关键帧和 V3 封装、不访问外部 API 时，将上面的
+`--model-mode http ...` 替换为 `--model-mode mock`。
+
+不访问外部模型的轻量单元测试与 V3 示例校验：
+
+```bash
+conda activate mlspaces
+python -m pytest -q mlspaces_tests/data_generation/test_interactive_nav_task_generation.py
+python scripts/InteractiveNav/dataset_definition/v3/validate_examples.py
+```
+
 相关单元测试：
 
 ```bash
@@ -647,6 +793,26 @@ scripts/InteractiveNav/configs/semantic_decision/object_goal_runtime.yaml
 scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge.yaml
 scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge_model_mock.yaml
 ```
+
+### 5.3.3 冻结 V3 单 episode 可视化评测
+
+冻结 benchmark 的 ROS object-goal 评测使用专用单 episode 入口。它会自行启动独立 ROS master、ROS 算法栈和 recorder；每次都强制输出六联图视频与俯视结果图。不要把多个 episode 放进同一次调用，以免把不同 episode 的 ROS 轨迹混入同一份 recorder 产物。
+
+```bash
+ROS_MASTER_URI=http://127.0.0.1:11311 \
+MAX_STEPS=1000 \
+VIDEO_FPS=5 \
+zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+  outputs/v3_container_episode_1000 1000
+```
+
+默认使用 `object_goal_v3_full_mllm.yaml` 与 `ros_object_goal_rule`，可通过 `SEMANTIC_DECISION_OVERRIDE`、`SEMANTIC_MAPPING_OVERRIDE` 或 `POLICY` 覆盖。完成后必须检查：
+
+- `debug/videos/overview_6panel.mp4`：ROS 相机、OCC、房间/交互、全局/局部代价图、语义图与拓扑图六联视频。
+- `eval/episodes/<episode>/episode_topdown.png`：场景底图、真实探索轨迹、起点、GT target、GT/实际交互及 oracle 路径。
+- `eval/episodes/<episode>/episode_result.json`：冻结 V3 的正式评测结果。
+
+该入口默认不重复缓存 head-camera 视频，以避免同一 episode 同时保存两份大视频。若需要保留它作为 force interaction 的补充第一视角，额外传 `RECORD_HEAD_CAMERA=true`。
 
 多场景交互实验使用专用批处理脚本。每个 worker 是独立子进程，拥有独立 `ROS_MASTER_URI`；场景按 round-robin 分片，worker 内部串行运行分到的场景：
 

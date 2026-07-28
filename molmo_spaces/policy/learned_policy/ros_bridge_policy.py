@@ -85,6 +85,7 @@ class RosBridgePolicy(BasePolicy):
         step_frame_dir: str = "",
         step_frame_queue_size: int = 4,
         step_sync_topic: str = "/molmo_spaces/step_sync",
+        tf_keepalive_period_s: float = 0.25,
     ) -> None:
         super().__init__(config, task)
         self.observation_topic = observation_topic
@@ -98,6 +99,10 @@ class RosBridgePolicy(BasePolicy):
             0.0, float(blocking_observation_republish_period_s)
         )
         self.blocking_republish_pointcloud = bool(blocking_republish_pointcloud)
+        # The evaluator can spend wall-clock seconds inside a sealed simulator
+        # interaction.  Keep the last public pose transform fresh during those
+        # pauses without replaying RGB/depth/point-cloud observations.
+        self.tf_keepalive_period_s = max(0.0, float(tf_keepalive_period_s))
         self.queue_size = queue_size
         self.observation_queue_size = int(observation_queue_size)
         self.extra_image_queue_size = int(extra_image_queue_size)
@@ -155,13 +160,6 @@ class RosBridgePolicy(BasePolicy):
                 self.cmd_vel_control_dt_s = 0.1
         else:
             self.cmd_vel_control_dt_s = max(1e-3, float(cmd_vel_control_dt_s))
-        # Default arm poses used when incoming action does not include arm groups.
-        self.default_left_arm_qpos = np.array(
-            [0.28, 0.0, 0.0, -0.64, 0.39, -0.26, -0.04], dtype=np.float32
-        )
-        self.default_right_arm_qpos = np.array(
-            [0.28, 0.0, 0.0, -0.64, 0.39, -0.26, -0.04], dtype=np.float32
-        )
         # Cache per-intrinsics projection lookup tables for depth->pointcloud.
         # This avoids rebuilding uv grids every frame.
         self._pointcloud_projection_cache: dict[
@@ -179,6 +177,11 @@ class RosBridgePolicy(BasePolicy):
         self._last_base_position_xyz: np.ndarray | None = None
         self._last_base_pose_xyyaw: np.ndarray | None = None
         self._last_common_stamp_s: float | None = None
+        self._stamp_lock = threading.Lock()
+        self._tf_cache_lock = threading.Lock()
+        self._latest_odom_tf_state: tuple[float, ...] | None = None
+        self._latest_base_to_lidar_tf: tuple[float, ...] | None = None
+        self._tf_keepalive_timer = None
         self._base_position_jump_warn_m: float = 1.0
         self._timing_frame_count: int = 0
         self._timing_acc_ms: dict[str, float] = {
@@ -312,6 +315,11 @@ class RosBridgePolicy(BasePolicy):
         self._mapping_reset_pub = rospy.Publisher("/nav_system/reset", Empty, queue_size=1)
         self._explorer_reset_pub = rospy.Publisher("/explore_py/reset", Empty, queue_size=1)
         self._clear_costmaps = rospy.ServiceProxy("/move_base/clear_costmaps", EmptyService)
+        if self.publish_odom and self.tf_keepalive_period_s > 0.0:
+            self._tf_keepalive_timer = rospy.Timer(
+                rospy.Duration.from_sec(self.tf_keepalive_period_s),
+                self._tf_keepalive_callback,
+            )
         self._episode_count = 0
 
     @staticmethod
@@ -523,18 +531,18 @@ class RosBridgePolicy(BasePolicy):
             )
             T_base_lidar = self._apply_lidar_calibration(T_base_lidar)
             qx, qy, qz, qw = self._rotation_matrix_to_quaternion(T_base_lidar[:3, :3])
-            tf_msg = self._TransformStamped()
-            tf_msg.header.stamp = stamp
-            tf_msg.header.frame_id = self.base_frame_id
-            tf_msg.child_frame_id = self.pointcloud_frame_id
-            tf_msg.transform.translation.x = float(T_base_lidar[0, 3])
-            tf_msg.transform.translation.y = float(T_base_lidar[1, 3])
-            tf_msg.transform.translation.z = float(T_base_lidar[2, 3])
-            tf_msg.transform.rotation.x = qx
-            tf_msg.transform.rotation.y = qy
-            tf_msg.transform.rotation.z = qz
-            tf_msg.transform.rotation.w = qw
-            self._tf_broadcaster.sendTransform(tf_msg)
+            state = (
+                float(T_base_lidar[0, 3]),
+                float(T_base_lidar[1, 3]),
+                float(T_base_lidar[2, 3]),
+                qx,
+                qy,
+                qz,
+                qw,
+            )
+            self._publish_base_to_lidar_tf_from_state(state, stamp)
+            with self._tf_cache_lock:
+                self._latest_base_to_lidar_tf = state
             return False
 
         T_base_lidar = self._apply_lidar_calibration(T_base_lidar)
@@ -554,18 +562,18 @@ class RosBridgePolicy(BasePolicy):
             qz,
             qw,
         )
-        tf_msg = self._TransformStamped()
-        tf_msg.header.stamp = stamp
-        tf_msg.header.frame_id = self.base_frame_id
-        tf_msg.child_frame_id = self.pointcloud_frame_id
-        tf_msg.transform.translation.x = float(T_base_lidar[0, 3])
-        tf_msg.transform.translation.y = float(T_base_lidar[1, 3])
-        tf_msg.transform.translation.z = float(T_base_lidar[2, 3])
-        tf_msg.transform.rotation.x = qx
-        tf_msg.transform.rotation.y = qy
-        tf_msg.transform.rotation.z = qz
-        tf_msg.transform.rotation.w = qw
-        self._tf_broadcaster.sendTransform(tf_msg)
+        state = (
+            float(T_base_lidar[0, 3]),
+            float(T_base_lidar[1, 3]),
+            float(T_base_lidar[2, 3]),
+            qx,
+            qy,
+            qz,
+            qw,
+        )
+        self._publish_base_to_lidar_tf_from_state(state, stamp)
+        with self._tf_cache_lock:
+            self._latest_base_to_lidar_tf = state
         return True
 
     @staticmethod
@@ -646,6 +654,11 @@ class RosBridgePolicy(BasePolicy):
             self._move_base_active = False
         self._last_base_position_xyz = None
         self._last_base_pose_xyyaw = None
+        with self._tf_cache_lock:
+            # Do not let the keepalive publish a previous house's transform
+            # while the navigation stack is resetting its map/costmaps.
+            self._latest_odom_tf_state = None
+            self._latest_base_to_lidar_tf = None
         if self._realtime_gt_publisher is not None:
             self._realtime_gt_publisher.reset()
 
@@ -862,6 +875,20 @@ class RosBridgePolicy(BasePolicy):
             robot_view = self.task.env.current_robot.robot_view
             return {**robot_view.get_noop_ctrl_dict(["base"]), "done": False}
         return {"done": False}
+
+    @staticmethod
+    def _fill_missing_navigation_holds(chosen_action: dict[str, Any], robot_view: Any) -> None:
+        """Complete a base-only action by holding each omitted robot group in place."""
+
+        if "base" not in chosen_action:
+            chosen_action["base"] = robot_view.get_noop_ctrl_dict(["base"])["base"]
+        move_group_ids = set(robot_view.move_group_ids())
+        for arm_name in ("left_arm", "right_arm"):
+            if arm_name not in move_group_ids or arm_name in chosen_action:
+                continue
+            chosen_action[arm_name] = np.asarray(
+                robot_view.get_noop_ctrl_dict([arm_name])[arm_name], dtype=np.float32
+            ).copy()
 
     def _extract_image_from_observation(self, observation: Any) -> np.ndarray | None:
         obs_dict = self._extract_observation_dict(observation)
@@ -1237,14 +1264,90 @@ class RosBridgePolicy(BasePolicy):
         )
 
     def _next_common_stamp(self):
-        stamp = self._rospy.Time.now()
-        stamp_s = float(stamp.to_sec())
-        if self._last_common_stamp_s is not None and stamp_s <= self._last_common_stamp_s:
-            # Keep publish timestamps strictly monotonic to avoid occasional time back-jumps.
-            stamp_s = self._last_common_stamp_s + 1e-6
-            stamp = self._rospy.Time.from_sec(stamp_s)
-        self._last_common_stamp_s = stamp_s
-        return stamp
+        with self._stamp_lock:
+            stamp = self._rospy.Time.now()
+            stamp_s = float(stamp.to_sec())
+            if self._last_common_stamp_s is not None and stamp_s <= self._last_common_stamp_s:
+                # Keep publish timestamps strictly monotonic to avoid occasional time back-jumps.
+                stamp_s = self._last_common_stamp_s + 1e-6
+                stamp = self._rospy.Time.from_sec(stamp_s)
+            self._last_common_stamp_s = stamp_s
+            return stamp
+
+    def _publish_odom_and_base_tf_from_state(self, state: tuple[float, ...], stamp) -> None:
+        """Publish a numeric odom/base snapshot with the supplied ROS timestamp."""
+
+        px, py, pz, qx, qy, qz, qw, twist_x, twist_y, twist_yaw = state
+        odom_msg = self._Odometry()
+        odom_msg.header.stamp = stamp
+        odom_msg.header.frame_id = self.odom_frame_id
+        odom_msg.child_frame_id = self.base_frame_id
+        odom_msg.pose.pose.position.x = px
+        odom_msg.pose.pose.position.y = py
+        odom_msg.pose.pose.position.z = pz
+        odom_msg.pose.pose.orientation.x = qx
+        odom_msg.pose.pose.orientation.y = qy
+        odom_msg.pose.pose.orientation.z = qz
+        odom_msg.pose.pose.orientation.w = qw
+        odom_msg.twist.twist.linear.x = twist_x
+        odom_msg.twist.twist.linear.y = twist_y
+        odom_msg.twist.twist.angular.z = twist_yaw
+        self._odom_pub.publish(odom_msg)
+
+        tf_msg = self._TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = self.odom_frame_id
+        tf_msg.child_frame_id = self.base_frame_id
+        tf_msg.transform.translation.x = px
+        tf_msg.transform.translation.y = py
+        tf_msg.transform.translation.z = pz
+        tf_msg.transform.rotation.x = qx
+        tf_msg.transform.rotation.y = qy
+        tf_msg.transform.rotation.z = qz
+        tf_msg.transform.rotation.w = qw
+        self._tf_broadcaster.sendTransform(tf_msg)
+
+    def _publish_base_to_lidar_tf_from_state(self, state: tuple[float, ...], stamp) -> None:
+        """Publish a cached base-to-lidar transform without touching MuJoCo."""
+
+        x, y, z, qx, qy, qz, qw = state
+        tf_msg = self._TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = self.base_frame_id
+        tf_msg.child_frame_id = self.pointcloud_frame_id
+        tf_msg.transform.translation.x = x
+        tf_msg.transform.translation.y = y
+        tf_msg.transform.translation.z = z
+        tf_msg.transform.rotation.x = qx
+        tf_msg.transform.rotation.y = qy
+        tf_msg.transform.rotation.z = qz
+        tf_msg.transform.rotation.w = qw
+        self._tf_broadcaster.sendTransform(tf_msg)
+
+    def _tf_keepalive_callback(self, _event: Any) -> None:
+        """Refresh only public pose TF while simulator control is synchronously blocked."""
+
+        if not self.publish_odom:
+            return
+        with self._tf_cache_lock:
+            odom_state = self._latest_odom_tf_state
+            lidar_state = self._latest_base_to_lidar_tf
+        if odom_state is None:
+            return
+        if self.base_frame_id != self.pointcloud_frame_id and lidar_state is None:
+            return
+        try:
+            stamp = self._next_common_stamp()
+            self._publish_odom_and_base_tf_from_state(odom_state, stamp)
+            if lidar_state is not None:
+                self._publish_base_to_lidar_tf_from_state(lidar_state, stamp)
+        except Exception as exc:
+            # The timer must never terminate a rollout because ROS is shutting down.
+            self._rospy.logwarn_throttle(
+                5.0,
+                "RosBridgePolicy: TF keepalive publication failed: %s",
+                str(exc),
+            )
 
     def _publish_odom_and_tf(self, observation: Any, stamp) -> bool:
         if not self.publish_odom:
@@ -1304,35 +1407,10 @@ class RosBridgePolicy(BasePolicy):
                 )
         self._last_base_position_xyz = curr_pos
         self._last_base_pose_xyyaw = curr_pose_xyyaw
-
-        odom_msg = self._Odometry()
-        odom_msg.header.stamp = stamp
-        odom_msg.header.frame_id = self.odom_frame_id
-        odom_msg.child_frame_id = self.base_frame_id
-        odom_msg.pose.pose.position.x = px
-        odom_msg.pose.pose.position.y = py
-        odom_msg.pose.pose.position.z = pz
-        odom_msg.pose.pose.orientation.x = qx
-        odom_msg.pose.pose.orientation.y = qy
-        odom_msg.pose.pose.orientation.z = qz
-        odom_msg.pose.pose.orientation.w = qw
-        odom_msg.twist.twist.linear.x = twist_x
-        odom_msg.twist.twist.linear.y = twist_y
-        odom_msg.twist.twist.angular.z = twist_yaw
-        self._odom_pub.publish(odom_msg)
-
-        tf_msg = self._TransformStamped()
-        tf_msg.header.stamp = stamp
-        tf_msg.header.frame_id = self.odom_frame_id
-        tf_msg.child_frame_id = self.base_frame_id
-        tf_msg.transform.translation.x = px
-        tf_msg.transform.translation.y = py
-        tf_msg.transform.translation.z = pz
-        tf_msg.transform.rotation.x = qx
-        tf_msg.transform.rotation.y = qy
-        tf_msg.transform.rotation.z = qz
-        tf_msg.transform.rotation.w = qw
-        self._tf_broadcaster.sendTransform(tf_msg)
+        odom_state = (px, py, pz, qx, qy, qz, qw, twist_x, twist_y, twist_yaw)
+        self._publish_odom_and_base_tf_from_state(odom_state, stamp)
+        with self._tf_cache_lock:
+            self._latest_odom_tf_state = odom_state
         return self._publish_base_to_lidar_tf(observation, stamp)
 
     def _republish_observation_messages(
@@ -1680,39 +1758,11 @@ class RosBridgePolicy(BasePolicy):
             chosen_action.setdefault("done", False)
             if self.task is not None:
                 robot_view = self.task.env.current_robot.robot_view
-                if "base" not in chosen_action:
-                    chosen_action["base"] = robot_view.get_noop_ctrl_dict(["base"])["base"]
-
-                move_group_ids = set(robot_view.move_group_ids())
-                if "left_arm" in move_group_ids and "left_arm" not in chosen_action:
-                    noop_left = np.asarray(
-                        robot_view.get_noop_ctrl_dict(["left_arm"])["left_arm"], dtype=np.float32
-                    )
-                    if noop_left.shape == self.default_left_arm_qpos.shape:
-                        chosen_action["left_arm"] = self.default_left_arm_qpos.copy()
-                    else:
-                        self._rospy.logwarn_throttle(
-                            5.0,
-                            "RosBridgePolicy: left_arm default shape mismatch (%s vs %s), falling back to noop.",
-                            str(self.default_left_arm_qpos.shape),
-                            str(noop_left.shape),
-                        )
-                        chosen_action["left_arm"] = noop_left
-
-                if "right_arm" in move_group_ids and "right_arm" not in chosen_action:
-                    noop_right = np.asarray(
-                        robot_view.get_noop_ctrl_dict(["right_arm"])["right_arm"], dtype=np.float32
-                    )
-                    if noop_right.shape == self.default_right_arm_qpos.shape:
-                        chosen_action["right_arm"] = self.default_right_arm_qpos.copy()
-                    else:
-                        self._rospy.logwarn_throttle(
-                            5.0,
-                            "RosBridgePolicy: right_arm default shape mismatch (%s vs %s), falling back to noop.",
-                            str(self.default_right_arm_qpos.shape),
-                            str(noop_right.shape),
-                        )
-                        chosen_action["right_arm"] = noop_right
+                # A base-only navigation command must hold the reset posture.
+                # Do not inject a separate hard-coded arm pose on the first
+                # action: it creates a visible arm swing and can contaminate
+                # the head-camera depth map.
+                self._fill_missing_navigation_holds(chosen_action, robot_view)
         stage_ms["postprocess_action"] = (time.perf_counter() - t0_post) * 1000.0
         if not self.last_action_source:
             self.last_action_source = "fallback_noop"
@@ -1726,6 +1776,9 @@ class RosBridgePolicy(BasePolicy):
         return chosen_action
 
     def close(self):
+        if self._tf_keepalive_timer is not None:
+            self._tf_keepalive_timer.shutdown()
+            self._tf_keepalive_timer = None
         if self._step_frame_thread is not None:
             self._step_frame_queue.put(None)
             self._step_frame_thread.join()

@@ -391,9 +391,40 @@ def analyze_object_pair(
     dependency_rows: list[dict[str, Any]],
     case_id: str,
     candidate_acceptor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    prevalidated_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    # Mixed collection can reuse a Container candidate already validated in the
+    # same frozen scene.  Its path-specific acceptor still runs below; only the
+    # repeated pose search and visibility rendering are skipped.
+    if prevalidated_candidates:
+        cached_failures = []
+        for candidate in prevalidated_candidates:
+            accepted = candidate
+            if candidate_acceptor is not None:
+                acceptance = candidate_acceptor(candidate)
+                if not acceptance.get("accepted", False):
+                    cached_failures.append(
+                        {
+                            "joint_index": int(candidate["joint"]["joint_index"]),
+                            "reason": acceptance.get(
+                                "reason", "cached_candidate_rejected_by_acceptor"
+                            ),
+                        }
+                    )
+                    continue
+                accepted = {**candidate, **acceptance.get("metadata", {})}
+            return {
+                "valid": True,
+                "selected": accepted,
+                "candidate_joint_indices": [int(accepted["joint"]["joint_index"])],
+                "candidate_joint_results": [accepted],
+                "binding": accepted.get("binding"),
+                "multi_oracle": False,
+                "reused_container_validation": True,
+            }
+
     valid_joint_candidates: list[dict[str, Any]] = []
-    joint_failures: list[dict[str, Any]] = []
+    joint_failures: list[dict[str, Any]] = cached_failures if prevalidated_candidates else []
     dependencies_by_index = {
         int(row["joint_index"]): row for row in dependency_rows
     }
@@ -841,10 +872,7 @@ def build_oracle_plan(
                 "joint_name": joint["joint_name"],
                 "joint_index": joint_index,
                 "target_fraction": 1.0,
-                "control_mode": "force"
-                if joint_index == controlling_joint_index
-                and selected.get("joint_type") == "slide"
-                else "direct",
+                "control_mode": "force",
                 "reason": "reveal_target_object"
                 if sequence_index == len(selected["joint_sequence"]) - 1
                 else "prerequisite_for_interaction",

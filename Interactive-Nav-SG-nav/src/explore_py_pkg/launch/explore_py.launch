@@ -13,7 +13,7 @@
     <rosparam if="$(eval arg('override_config_file') != '')"
               file="$(arg override_config_file)"
               command="load"/>
-    <param name="exploration/external_control_enabled"
+    <param name="exploration/external_behavior_control"
            value="$(arg external_control_enabled)"/>
   </node>
 </launch>

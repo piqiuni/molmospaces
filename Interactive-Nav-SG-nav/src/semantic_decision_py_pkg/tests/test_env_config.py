@@ -18,6 +18,15 @@ def test_load_env_file_does_not_override_existing_values(tmp_path, monkeypatch) 
     assert os.environ["NEW_VALUE"] == "hello world"
 
 
+def test_explicit_env_file_can_replace_inherited_credential(tmp_path, monkeypatch) -> None:
+    path = tmp_path / ".env"
+    path.write_text("OPENAI_API_KEY=expected-key\n", encoding="utf-8")
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-key")
+
+    assert load_env_file(path, override=True) == path
+    assert os.environ["OPENAI_API_KEY"] == "expected-key"
+
+
 def test_model_overrides_are_typed_and_explicit(monkeypatch) -> None:
     monkeypatch.setenv("SEMANTIC_MODEL_MODE", "http")
     monkeypatch.setenv("SEMANTIC_MODEL_NAME", "model-x")

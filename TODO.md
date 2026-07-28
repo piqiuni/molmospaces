@@ -292,6 +292,23 @@
 - [ ] 形成 detector 输入、交互状态、规划决策、执行结果的统一记录格式
 - [ ] 能导出用于后续 agent / end-to-end 方法训练的数据样本
 
+### Phase 6 任务形式扩展（2026-07-27）
+
+- [x] V3 schema 直接支持 `nav_to_point` target、成功条件和 terminal oracle navigate，
+  不引入 `derived_task`。
+- [x] 完成 PointGoal demo：从 V3 channel episode 的机器人膨胀 occupancy 采样普通可达或
+  interaction-aware 目标点，并保留 GT path；提供原始 `scene_split` 普通可达采样入口。
+- [x] 完成 InstructionGoal 规则 demo：由 V3 oracle 导航/交互动作生成 hidden、partial、
+  explicit 三种自然语言指令，并保存实体与 plan step grounding。
+- [x] 接入结构化 plan + 路径走廊 graph 的 LLM 输入，以及 full H5 按 segment 抽关键帧的
+  VLM 输入；支持 mock/command/http 后端。
+- [x] 在真实 V3 benchmark 上完成 interaction-aware PointGoal、原始 scene_split PointGoal、
+  rule InstructionGoal，以及真实 full H5 关键帧 + mock-VLM 封装 smoke。
+- [ ] 接入真实外部 VLM API 后，人工评估视频指令自然度、视觉证据选择与 grounding；
+  当前只验证了不访问外部服务的 mock 后端和完整数据通路。
+- [ ] 将 PointGoal runtime task/success evaluator 接入统一 benchmark evaluation；当前阶段
+  已完成数据生成与 schema demo，尚未把 `nav_to_point` 作为正式在线评测任务注册。
+
 ### Phase 6 当前 mixed 数据推进状态（2026-07-15）
 
 - [x] 从 `container_rough_catalog_v1` 二次生产 crossing rough：任一全开 GT path 穿过 interactive door 即保留；关闭门阻断目标且门前几何提示仍可达只作为 `mixed_required_verified` 子集标签，不再作为 rough 输入门槛。门前提示不视为 manipulation-validated 操作姿态。
@@ -475,6 +492,8 @@
 - [ ] 明确 obj-goal 与 point-goal 两个设置下是否共用一套指标与主表
 
 ### 4.5.1 当前固定评测标准
+
+详细定义见 [`docs/interactive_navigation_metrics.md`](docs/interactive_navigation_metrics.md)。
 
 主评测表保持简洁，只报告 5 个方法无关指标：
 

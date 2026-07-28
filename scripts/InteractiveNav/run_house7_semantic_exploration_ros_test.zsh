@@ -11,6 +11,9 @@ USE_FIXED_ROUTE=${USE_FIXED_ROUTE:-true}
 SCENE_SEED=${SCENE_SEED:-${HOUSE_IND}}
 METHOD=${METHOD:-interactive_rule}
 OUTPUT_DIR=${1:-${REPO_ROOT}/outputs/house7_${METHOD}_${ROUTE_ID}_$(date +%Y%m%d_%H%M%S)}
+if [[ "${OUTPUT_DIR}" != /* ]]; then
+  OUTPUT_DIR="${PWD}/${OUTPUT_DIR}"
+fi
 ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.zsh}
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11501}
 TASK_HORIZON=${TASK_HORIZON:-1000}
@@ -23,6 +26,7 @@ if [[ -z "${VIDEO_PANEL_WIDTH_PX:-}" ]]; then
   fi
 fi
 VIDEO_FRAME_JOB_QUEUE_SIZE=${VIDEO_FRAME_JOB_QUEUE_SIZE:-4}
+VIDEO_FRAME_QUEUE_OVERFLOW=${VIDEO_FRAME_QUEUE_OVERFLOW:-block}
 ARTIFACT_WRITE_QUEUE_SIZE=${ARTIFACT_WRITE_QUEUE_SIZE:-4}
 VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-16}
 IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-4}
@@ -35,6 +39,7 @@ STEP_SYNC_QUEUE_SIZE=${STEP_SYNC_QUEUE_SIZE:-2048}
 EXTRA_IMAGE_QUEUE_SIZE=${EXTRA_IMAGE_QUEUE_SIZE:-16}
 TIMING_LOG_EVERY_N_STEPS=${TIMING_LOG_EVERY_N_STEPS:-50}
 RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES=${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES:-50}
+RECORDER_DRAIN_WAIT_S=${RECORDER_DRAIN_WAIT_S:-30}
 RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-180}
 GT_STEP_INTERVAL=${GT_STEP_INTERVAL:-3}
 GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-4.0}
@@ -86,6 +91,7 @@ SEMANTIC_ATTRIBUTE_MODEL_NAME=${SEMANTIC_ATTRIBUTE_MODEL_NAME:-}
 SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-8.0}
 SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-}
 SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${REPO_ROOT}/.env}
+RAW_OCCUPANCY_GRID_TOPIC=${RAW_OCCUPANCY_GRID_TOPIC:-/struct_mapping/occ_map}
 SKIP_DEBUG_RECORDER=${SKIP_DEBUG_RECORDER:-false}
 SKIP_OFFLINE_VIDEO=${SKIP_OFFLINE_VIDEO:-false}
 SKIP_COVERAGE=${SKIP_COVERAGE:-false}
@@ -310,7 +316,9 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
     PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
       --output-dir "${OUTPUT_DIR}/debug" \
       --occupancy-grid-topic /semantic_mapping/planning_occ_map \
+      --raw-occupancy-grid-topic "${RAW_OCCUPANCY_GRID_TOPIC}" \
       --first-person-video-capture-mode step \
+      --video-step-sync-topic /molmo_spaces/step_sync \
       --semantic-video \
       --first-person-video-with-map \
       --first-person-video-fps "${VIDEO_FPS}" \
@@ -319,6 +327,7 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       "${EXTERNAL_VIDEO_OVERLAY_ARG}" \
       "${PAPER_FRAME_EXPORT_ARGS[@]}" \
       --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
+      --video-frame-queue-overflow "${VIDEO_FRAME_QUEUE_OVERFLOW}" \
       --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
       --performance-log-every-n-frames "${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES}" \
       --video-history-size "${VIDEO_HISTORY_SIZE}" \
@@ -334,6 +343,7 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
     PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
       --output-dir "${OUTPUT_DIR}/debug" \
       --occupancy-grid-topic /semantic_mapping/planning_occ_map \
+      --raw-occupancy-grid-topic "${RAW_OCCUPANCY_GRID_TOPIC}" \
       --no-first-person-video \
       --no-first-person-video-with-map \
       --no-semantic-video \
@@ -424,11 +434,26 @@ LAUNCH_EXIT=$?
 set -e
 LAUNCH_PID=""
 if [[ "${LAUNCH_EXIT}" -ne 0 ]] && [[ "${LAUNCH_EXIT}" -ne 130 ]]; then
-  print -u2 -- "Navigation launch exited with ${LAUNCH_EXIT}"
-  exit "${LAUNCH_EXIT}"
+  # The finite simulator is a required roslaunch child.  Once it finishes
+  # cleanly, roslaunch shuts down the remaining graph and returns 1 even
+  # though the episode loop completed.  Preserve real launch failures, but
+  # allow the recorder/video post-processing to run for that normal case.
+  if grep -Fq "Worker 0 completed processing assigned houses" "${OUTPUT_DIR}/roslaunch.log" \
+    && grep -Fq "Completed 1 houses, skipped 0 houses" "${OUTPUT_DIR}/roslaunch.log"; then
+    print -u2 -- "Navigation simulator completed; accepting roslaunch exit ${LAUNCH_EXIT} for post-processing"
+  else
+    print -u2 -- "Navigation launch exited with ${LAUNCH_EXIT}"
+    exit "${LAUNCH_EXIT}"
+  fi
 fi
 
 if [[ -n "${RECORDER_PID}" ]]; then
+  if [[ "${ENABLE_RECORDING}" == true ]] && (( RECORDER_DRAIN_WAIT_S > 0 )); then
+    # The simulator can finish before the recorder has consumed all queued
+    # step-sync messages. Keep ROS master alive briefly so an exact-step video
+    # is not silently completed with stale panel states.
+    sleep "${RECORDER_DRAIN_WAIT_S}"
+  fi
   cleanup_process "${RECORDER_PID}" "${RECORDER_SHUTDOWN_GRACE_S}"
   RECORDER_PID=""
 fi
@@ -524,6 +549,7 @@ video = {
 }
 coverage = read_json(output_dir / "debug" / "exploration_coverage.json")
 semantic_summary = read_json(output_dir / "debug" / "summary.json").get("semantic_summary", {})
+debug_summary = read_json(output_dir / "debug" / "summary.json")
 force = read_json(output_dir / "force_interaction_events.json")
 completion = read_json(output_dir / "completion_status.json")
 if sim_frames <= 0:
@@ -672,6 +698,16 @@ result = {
     ) if (output_dir / "analysis_elapsed_sec.txt").exists() else None,
     "step_timing": step_timing,
     "valid_step_video": sim_frames > 0 and video.get("output_frame_count") == sim_frames,
+    "exact_step_video": bool(
+        sim_frames > 0
+        and video.get("output_frame_count") == sim_frames
+        and debug_summary.get("first_person_video_trigger") == "step_sync"
+        and int(debug_summary.get("step_sync_count", 0) or 0) >= sim_frames
+        and int(debug_summary.get("video_frame_jobs_dropped", 0) or 0) == 0
+        and int(offline_video_summary.get("exact_step_match_count", 0) or 0) == sim_frames
+        and int(debug_summary.get("step_sync_image_reuse_count", 0) or 0) == 0
+        and int(debug_summary.get("step_sync_placeholder_count", 0) or 0) == 0
+    ),
     "step_sync_image_match_count": debug_summary.get("step_sync_image_match_count", 0),
     "step_sync_image_reuse_count": debug_summary.get("step_sync_image_reuse_count", 0),
     "step_sync_placeholder_count": debug_summary.get("step_sync_placeholder_count", 0),

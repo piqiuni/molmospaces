@@ -448,6 +448,7 @@ def run_evaluation(
     add_custom_object: bool = False,
     custom_object_path: str | Path | None = None,
     custom_object_name: str | None = None,
+    runner_cls: type[JsonEvalRunner] = JsonEvalRunner,
 ) -> EvaluationResults:
     """Run evaluation on a JSON benchmark programmatically.
 
@@ -475,6 +476,9 @@ def run_evaluation(
         custom_object_path: Path to the custom object XML file. Required if add_custom_object is True.
         custom_object_name: Natural language name for the custom object (e.g., 'lemon', 'cup').
             If not provided, will attempt to extract from the object path.
+        runner_cls: Optional JsonEvalRunner subclass. The subclass can override rollout
+            hooks while the benchmark loading, official task construction, and result
+            aggregation remain unchanged.
 
     Returns:
         EvaluationResults containing success counts, output paths, and per-episode details.
@@ -612,14 +616,14 @@ def run_evaluation(
     )
 
     # Patch config with evaluation-specific runtime parameters
-    exp_config = JsonEvalRunner.patch_config(
+    exp_config = runner_cls.patch_config(
         exp_config=exp_config,
         episode_idx=episode_idx,
         add_custom_object=add_custom_object,
         custom_object_path=custom_object_path,
         custom_object_name=custom_object_name,
     )
-    JsonEvalRunner.adjust_robot(exp_config)
+    runner_cls.adjust_robot(exp_config)
 
     # Resolve checkpoint path for logging
     resolved_checkpoint = checkpoint_path or getattr(
@@ -664,7 +668,7 @@ def run_evaluation(
     # Run evaluation
     # Only pass preloaded policy for single-worker mode. With multiple workers,
     # each worker must create its own connection (WebSocket/msgpack can't be pickled).
-    runner = JsonEvalRunner(exp_config, benchmark_dir)
+    runner = runner_cls(exp_config, benchmark_dir)
     success_count, total_count = runner.run(preloaded_policy=policy)
 
     # Collect per-episode results

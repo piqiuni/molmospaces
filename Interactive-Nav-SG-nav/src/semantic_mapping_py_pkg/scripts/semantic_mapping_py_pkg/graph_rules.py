@@ -67,6 +67,9 @@ def point3(values=None):
 
 def segmentation_pixel_count(segmentation: Any) -> int:
     if isinstance(segmentation, dict):
+        rle_count = rle_foreground_pixel_count(segmentation)
+        if rle_count is not None:
+            return rle_count
         rows = list(segmentation.get("rows") or [])
         cols = list(segmentation.get("cols") or [])
         return min(len(rows), len(cols))
@@ -79,6 +82,54 @@ def segmentation_pixel_count(segmentation: Any) -> int:
             if bool(value)
         )
     return 0
+
+
+def rle_foreground_pixel_count(mask_rle: Any) -> int | None:
+    """Return the foreground-pixel count of an uncompressed binary mask RLE.
+
+    Restricted-GT observations use the standard alternating background/foreground
+    run convention, beginning with a background run.  Counting the odd runs is
+    sufficient for visibility gating and avoids materialising a full-resolution
+    mask in the semantic-mapping process.
+
+    ``None`` denotes a non-RLE payload so callers can retain support for the
+    legacy sparse ``{"rows": ..., "cols": ...}`` representation.  Malformed
+    RLE is treated as zero visible pixels instead of trusting an invalid count.
+    """
+
+    if not isinstance(mask_rle, dict) or "counts" not in mask_rle:
+        return None
+    size = mask_rle.get("size")
+    counts = mask_rle.get("counts")
+    if (
+        not isinstance(size, (list, tuple))
+        or len(size) != 2
+        or isinstance(counts, (str, bytes))
+    ):
+        return 0
+    try:
+        height = int(size[0])
+        width = int(size[1])
+    except (TypeError, ValueError):
+        return 0
+    if height < 0 or width < 0:
+        return 0
+
+    total = 0
+    foreground = 0
+    try:
+        for index, value in enumerate(counts):
+            run = int(value)
+            if run < 0:
+                return 0
+            total += run
+            if index % 2 == 1:
+                foreground += run
+    except (TypeError, ValueError):
+        return 0
+    if total != height * width:
+        return 0
+    return foreground
 
 
 def bbox_area(bbox: Any) -> float:
@@ -118,7 +169,11 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         aabb_center = point3(box_3d.get("center"))
         aabb_size = point3(box_3d.get("size"))
         bbox_2d = list(observation.get("bbox_2d") or [])
-        segmentation = observation.get("segmentation")
+        segmentation = observation.get("mask_rle")
+        if segmentation is None:
+            segmentation = observation.get("segmentation_rle")
+        if segmentation is None:
+            segmentation = observation.get("segmentation")
         if segmentation is not None:
             visible_pixels = segmentation_pixel_count(segmentation)
             area = bbox_area(bbox_2d)
@@ -230,8 +285,9 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "orientation": [0.0, 0.0, 0.0, 1.0] if minimal_gt else list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
         "interaction_approach_axis_xy": [] if minimal_gt else list(observation.get("interaction_approach_axis_xy") or []),
         "source_object_name": str(
-            observation.get("source_object_name") or observation.get("id") or ""
-
+            observation.get("id")
+            if minimal_gt
+            else observation.get("source_object_name") or observation.get("id") or ""
         ),
         "visible_pixels": visible_pixels,
         "visible_fraction": float(visible_fraction or 0.0),

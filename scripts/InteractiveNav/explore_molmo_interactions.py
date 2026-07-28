@@ -227,6 +227,16 @@ def build_config(args: argparse.Namespace, task_mode: str):
 
 def load_context(args: argparse.Namespace, task_mode: str) -> LoadedContext:
     ensure_runtime_dependencies()
+    # InteractiveNav collectors operate on already-versioned local scene assets.
+    # Disabling resource-manager locks avoids attempts to create cache lock files
+    # in read-only/shared caches and mirrors container_scene_probe.load_scene_context.
+    import molmo_spaces.tasks.task_sampler as task_sampler_module
+    from molmo_spaces.molmo_spaces_constants import get_resource_manager
+
+    manager = get_resource_manager()
+    manager.symlink_lock = False
+    manager.cache_lock = False
+    task_sampler_module.install_scene_with_objects_and_grasps_from_path = lambda *a, **k: {}
     cfg = build_config(args, task_mode=task_mode)
     sampler = cfg.task_sampler_config.task_sampler_class(cfg)
     task = None
@@ -234,6 +244,12 @@ def load_context(args: argparse.Namespace, task_mode: str) -> LoadedContext:
         if task_mode == "scene_only":
             sampler._increment_task_and_reset_house(force_advance_scene=False, house_index=args.house_ind)
             scene_path = sampler._current_house_scene_path(variant=args.variant)
+            if not Path(scene_path).exists():
+                from scripts.InteractiveNav.container_scene_probe import (
+                    prepare_writable_scene_path,
+                )
+
+                scene_path = prepare_writable_scene_path(Path(scene_path))
             sampler.update_scene(scene_path=scene_path, variant=args.variant)
         else:
             task = sampler.sample_task(house_index=args.house_ind, variant=args.variant)

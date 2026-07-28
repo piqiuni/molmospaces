@@ -1164,7 +1164,7 @@ def parse_args():
         "--initial_arm_qpos",
         type=str,
         default="0.28,0.0,0.0,-0.64,0.39,-0.26,-0.04",
-        help="Comma-separated 7-DoF RBY1 left/right arm initial and hold qpos for ROS navigation runs.",
+        help="Comma-separated 7-DoF RBY1 left/right arm initial qpos for ROS navigation runs.",
     )
     parser.add_argument("--initial_left_arm_qpos", type=str, default="")
     parser.add_argument("--initial_right_arm_qpos", type=str, default="")
@@ -1310,17 +1310,6 @@ def main():
             step_frame_dir=args.step_frame_dir,
             step_frame_queue_size=args.step_frame_queue_size,
         )
-        arm_qpos = parse_qpos_csv(args.initial_arm_qpos)
-        left_arm_qpos = parse_qpos_csv(args.initial_left_arm_qpos)
-        right_arm_qpos = parse_qpos_csv(args.initial_right_arm_qpos)
-        if left_arm_qpos is None:
-            left_arm_qpos = arm_qpos
-        if right_arm_qpos is None:
-            right_arm_qpos = arm_qpos
-        if left_arm_qpos is not None:
-            policy.default_left_arm_qpos = left_arm_qpos.copy()
-        if right_arm_qpos is not None:
-            policy.default_right_arm_qpos = right_arm_qpos.copy()
         policy.scene_timeout_s = args.scene_timeout_s
         policy.max_consecutive_action_timeouts = args.max_consecutive_action_timeouts
     policy.retain_task_history = bool(args.retain_task_history)

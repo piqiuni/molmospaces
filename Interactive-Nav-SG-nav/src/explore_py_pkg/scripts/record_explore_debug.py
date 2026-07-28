@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import zlib
+from array import array
 from collections import deque
 from pathlib import Path
 
@@ -404,6 +405,112 @@ def _write_grid_pgm_yaml(prefix: Path, grid: OccupancyGrid) -> None:
                 f"resolution: {float(grid.info.resolution):.6f}",
                 "origin: "
                 f"[{float(origin.position.x):.6f}, {float(origin.position.y):.6f}, {_grid_origin_yaw(grid):.6f}]",
+                "negate: 0",
+                "occupied_thresh: 0.65",
+                "free_thresh: 0.196",
+                "",
+            ]
+        )
+    )
+
+
+def _occupancy_grid_pair_key(grid: OccupancyGrid) -> tuple:
+    """Return the raw-map identity retained by the semantic overlay output."""
+    header = grid.header
+    stamp = header.stamp
+    origin = grid.info.origin
+    orientation = origin.orientation
+    return (
+        int(header.seq),
+        int(stamp.secs),
+        int(stamp.nsecs),
+        str(header.frame_id),
+        int(grid.info.width),
+        int(grid.info.height),
+        float(grid.info.resolution),
+        float(origin.position.x),
+        float(origin.position.y),
+        float(origin.position.z),
+        float(orientation.x),
+        float(orientation.y),
+        float(orientation.z),
+        float(orientation.w),
+    )
+
+
+def _occupancy_grid_pair_metadata(grid: OccupancyGrid) -> dict:
+    header = grid.header
+    stamp = header.stamp
+    origin = grid.info.origin
+    orientation = origin.orientation
+    return {
+        "header": {
+            "seq": int(header.seq),
+            "stamp": {"secs": int(stamp.secs), "nsecs": int(stamp.nsecs)},
+            "frame_id": str(header.frame_id),
+        },
+        "info": {
+            "width": int(grid.info.width),
+            "height": int(grid.info.height),
+            "resolution": float(grid.info.resolution),
+            "origin": {
+                "position": [
+                    float(origin.position.x),
+                    float(origin.position.y),
+                    float(origin.position.z),
+                ],
+                "orientation": [
+                    float(orientation.x),
+                    float(orientation.y),
+                    float(orientation.z),
+                    float(orientation.w),
+                ],
+            },
+        },
+    }
+
+
+def _compact_occupancy_grid_for_pair(grid: OccupancyGrid) -> dict:
+    """Store a grid for delayed raw/overlay pairing without retaining int lists."""
+    origin = grid.info.origin
+    return {
+        "metadata": _occupancy_grid_pair_metadata(grid),
+        "width": int(grid.info.width),
+        "height": int(grid.info.height),
+        "resolution": float(grid.info.resolution),
+        "origin_x": float(origin.position.x),
+        "origin_y": float(origin.position.y),
+        "origin_yaw": _grid_origin_yaw(grid),
+        "data": array("b", (int(value) for value in grid.data)),
+    }
+
+
+def _write_compact_grid_pgm_yaml(prefix: Path, snapshot: dict) -> None:
+    width = int(snapshot["width"])
+    height = int(snapshot["height"])
+    values = snapshot["data"]
+    pgm_path = prefix.with_suffix(".pgm")
+    yaml_path = prefix.with_suffix(".yaml")
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    raw = bytearray(width * height)
+    for y in range(height):
+        for x in range(width):
+            value = int(values[y * width + x])
+            if value < 0:
+                pixel = 205
+            elif value >= 50:
+                pixel = 0
+            else:
+                pixel = 254
+            raw[(height - 1 - y) * width + x] = pixel
+    pgm_path.write_bytes(f"P5\n{width} {height}\n255\n".encode("ascii") + bytes(raw))
+    yaml_path.write_text(
+        "\n".join(
+            [
+                f"image: {pgm_path}",
+                f"resolution: {float(snapshot['resolution']):.6f}",
+                "origin: "
+                f"[{float(snapshot['origin_x']):.6f}, {float(snapshot['origin_y']):.6f}, {float(snapshot['origin_yaw']):.6f}]",
                 "negate: 0",
                 "occupied_thresh: 0.65",
                 "free_thresh: 0.196",
@@ -935,6 +1042,21 @@ class ExploreDebugRecorder:
         self.shutting_down = False
         self.start_wall_time = time.time()
         self.latest_grid: OccupancyGrid | None = None
+        self.latest_raw_grid: OccupancyGrid | None = None
+        self.latest_paired_grid: dict | None = None
+        self.latest_paired_raw_grid: dict | None = None
+        self.latest_occupancy_grid_pair_key: tuple | None = None
+        self.occupancy_grid_pair_count = 0
+        self._unpaired_planning_grids: dict[tuple, dict] = {}
+        self._unpaired_raw_grids: dict[tuple, dict] = {}
+        self._occupancy_pairing_enabled = bool(
+            args.raw_occupancy_grid_topic
+            and args.raw_occupancy_grid_topic != args.occupancy_grid_topic
+        )
+        # Semantic overlays can lag raw maps by multiple publications.  Keep a
+        # useful window, but store compact signed-byte cells rather than the
+        # memory-heavy ROS ``list[int]`` payload.
+        self._occupancy_grid_pair_cache_size = 32
         self.latest_global_costmap: OccupancyGrid | None = None
         self.latest_local_costmap: OccupancyGrid | None = None
         self.latest_grid_video_rgb = None
@@ -949,7 +1071,13 @@ class ExploreDebugRecorder:
         self.latest_grid_step = 0
         self.latest_global_costmap_step = 0
         self.latest_local_costmap_step = 0
-        history_size = max(16, int(args.video_history_size))
+        self._retain_video_state_history = bool(args.first_person_video)
+        history_size = (
+            max(16, int(args.video_history_size))
+            if self._retain_video_state_history
+            else 1
+        )
+        self._plan_history_limit = max(32, history_size)
         self.grid_video_history = deque(maxlen=history_size)
         self.global_costmap_video_history = deque(maxlen=history_size)
         self.local_costmap_video_history = deque(maxlen=history_size)
@@ -1218,6 +1346,18 @@ class ExploreDebugRecorder:
         self.video_frames_writer.writeheader()
 
         self.subscribers.append(rospy.Subscriber(args.occupancy_grid_topic, OccupancyGrid, self.occupancy_callback, queue_size=1))
+        if (
+            args.raw_occupancy_grid_topic
+            and args.raw_occupancy_grid_topic != args.occupancy_grid_topic
+        ):
+            self.subscribers.append(
+                rospy.Subscriber(
+                    args.raw_occupancy_grid_topic,
+                    OccupancyGrid,
+                    self.raw_occupancy_callback,
+                    queue_size=1,
+                )
+            )
         self.subscribers.append(rospy.Subscriber(args.global_costmap_topic, OccupancyGrid, self.global_costmap_callback, queue_size=1))
         self.subscribers.append(rospy.Subscriber(args.global_costmap_updates_topic, OccupancyGridUpdate, self.global_costmap_update_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.local_costmap_topic, OccupancyGrid, self.local_costmap_callback, queue_size=1))
@@ -1351,24 +1491,57 @@ class ExploreDebugRecorder:
         rospy.on_shutdown(self.shutdown)
 
     def occupancy_callback(self, msg: OccupancyGrid) -> None:
-        video_rgb = self._grid_to_video_rgb_locked(msg)
+        video_rgb = (
+            self._grid_to_video_rgb_locked(msg)
+            if self._retain_video_state_history
+            else None
+        )
         with self.lock:
             if self.shutting_down:
                 return
             self.latest_grid = msg
+            if self._occupancy_pairing_enabled:
+                self._register_occupancy_grid_pair_locked(msg, raw=False)
             self.latest_grid_video_rgb = video_rgb
             self.latest_grid_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_grid_wall_time = time.time()
             self.latest_grid_step = self.debug_step
-            self.grid_video_history.append(
-                (
-                    self.latest_grid_video_stamp,
-                    self.latest_grid,
-                    self.latest_grid_video_rgb,
-                    self.latest_grid_step,
-                    self.latest_grid_wall_time,
+            if self._retain_video_state_history:
+                self.grid_video_history.append(
+                    (
+                        self.latest_grid_video_stamp,
+                        self.latest_grid,
+                        self.latest_grid_video_rgb,
+                        self.latest_grid_step,
+                        self.latest_grid_wall_time,
+                    )
                 )
-            )
+
+    def raw_occupancy_callback(self, msg: OccupancyGrid) -> None:
+        """Retain the raw mapper output for post-run overlay diagnostics."""
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.latest_raw_grid = msg
+            if self._occupancy_pairing_enabled:
+                self._register_occupancy_grid_pair_locked(msg, raw=True)
+
+    def _register_occupancy_grid_pair_locked(self, grid: OccupancyGrid, *, raw: bool) -> None:
+        """Keep the newest raw/planning grids that have an identical ROS header."""
+        key = _occupancy_grid_pair_key(grid)
+        snapshot = _compact_occupancy_grid_for_pair(grid)
+        own = self._unpaired_raw_grids if raw else self._unpaired_planning_grids
+        other = self._unpaired_planning_grids if raw else self._unpaired_raw_grids
+        counterpart = other.pop(key, None)
+        if counterpart is not None:
+            self.latest_paired_raw_grid = snapshot if raw else counterpart
+            self.latest_paired_grid = counterpart if raw else snapshot
+            self.latest_occupancy_grid_pair_key = key
+            self.occupancy_grid_pair_count += 1
+            return
+        own[key] = snapshot
+        while len(own) > self._occupancy_grid_pair_cache_size:
+            own.pop(next(iter(own)))
 
     def gt_observations_callback(self, msg: String) -> None:
         try:
@@ -1401,9 +1574,10 @@ class ExploreDebugRecorder:
                 if instance_id:
                     self.observed_instance_ids.add(instance_id)
             self.latest_gt_observations = payload
-            self.gt_observation_history.append(
-                (float(payload.get("stamp_sec", 0.0) or 0.0), payload, set(self.observed_instance_ids))
-            )
+            if self._retain_video_state_history:
+                self.gt_observation_history.append(
+                    (float(payload.get("stamp_sec", 0.0) or 0.0), payload, set(self.observed_instance_ids))
+                )
 
     def unified_graph_callback(self, msg: String) -> None:
         try:
@@ -1435,25 +1609,26 @@ class ExploreDebugRecorder:
                 self.semantic_events_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
             if events:
                 self.pending_semantic_keyframe_revision = revision
-            self.unified_graph_history.append(
-                (
-                    float(payload.get("timestamp", 0.0) or 0.0),
-                    payload,
-                    list(self.semantic_events[-3:]),
-                    int(self.pending_semantic_keyframe_revision),
+            if self._retain_video_state_history:
+                self.unified_graph_history.append(
+                    (
+                        float(payload.get("timestamp", 0.0) or 0.0),
+                        payload,
+                        list(self.semantic_events[-3:]),
+                        int(self.pending_semantic_keyframe_revision),
+                    )
                 )
-            )
 
     def scene_id_grid_callback(self, msg: OccupancyGrid) -> None:
-        copied = _copy_grid(msg)
-        rgb = self._scene_id_grid_to_rgb(copied)
+        copied = _copy_grid(msg) if self._retain_video_state_history else None
+        rgb = self._scene_id_grid_to_rgb(copied) if copied is not None else None
         if np is not None:
-            values = np.asarray(copied.data, dtype=np.int32)
+            values = np.asarray(msg.data, dtype=np.int32)
             valid_values = values[values >= 0]
             valid_cell_count = int(valid_values.size)
             unique_ids = [int(value) for value in np.unique(valid_values).tolist()]
         else:
-            valid_values = [int(value) for value in copied.data if int(value) >= 0]
+            valid_values = [int(value) for value in msg.data if int(value) >= 0]
             valid_cell_count = len(valid_values)
             unique_ids = sorted(set(valid_values))
         with self.lock:
@@ -1468,14 +1643,15 @@ class ExploreDebugRecorder:
                 msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             )
             self.latest_scene_id_grid_step = self.debug_step
-            self.scene_id_grid_history.append(
-                (
-                    self.latest_scene_id_grid_stamp,
-                    copied,
-                    rgb,
-                    self.latest_scene_id_grid_step,
+            if self._retain_video_state_history:
+                self.scene_id_grid_history.append(
+                    (
+                        self.latest_scene_id_grid_stamp,
+                        copied,
+                        rgb,
+                        self.latest_scene_id_grid_step,
+                    )
                 )
-            )
 
     def semantic_decision_event_callback(
         self, msg: String, callback_args: tuple[str, str]
@@ -1574,7 +1750,11 @@ class ExploreDebugRecorder:
 
     def global_costmap_callback(self, msg: OccupancyGrid) -> None:
         copied = _copy_grid(msg)
-        video_rgb = self._costmap_to_video_rgb_locked(copied)
+        video_rgb = (
+            self._costmap_to_video_rgb_locked(copied)
+            if self._retain_video_state_history
+            else None
+        )
         with self.lock:
             if self.shutting_down:
                 return
@@ -1583,14 +1763,15 @@ class ExploreDebugRecorder:
             self.latest_global_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_global_costmap_wall_time = time.time()
             self.latest_global_costmap_step = self.debug_step
-            self.global_costmap_video_history.append(
-                (
-                    self.latest_global_costmap_video_stamp,
-                    self.latest_global_costmap,
-                    self.latest_global_costmap_video_rgb,
-                    self.latest_global_costmap_step,
+            if self._retain_video_state_history:
+                self.global_costmap_video_history.append(
+                    (
+                        self.latest_global_costmap_video_stamp,
+                        self.latest_global_costmap,
+                        self.latest_global_costmap_video_rgb,
+                        self.latest_global_costmap_step,
+                    )
                 )
-            )
 
     def global_costmap_update_callback(self, msg: OccupancyGridUpdate) -> None:
         with self.lock:
@@ -1598,7 +1779,13 @@ class ExploreDebugRecorder:
                 return
             if not _apply_grid_update(self.latest_global_costmap, msg):
                 return
-            grid_snapshot = _copy_grid(self.latest_global_costmap)
+            grid_snapshot = (
+                _copy_grid(self.latest_global_costmap)
+                if self._retain_video_state_history
+                else None
+            )
+        if not self._retain_video_state_history:
+            return
         video_rgb = self._costmap_to_video_rgb_locked(grid_snapshot)
         with self.lock:
             if self.shutting_down:
@@ -1618,7 +1805,11 @@ class ExploreDebugRecorder:
 
     def local_costmap_callback(self, msg: OccupancyGrid) -> None:
         copied = _copy_grid(msg)
-        video_rgb = self._costmap_to_video_rgb_locked(copied)
+        video_rgb = (
+            self._costmap_to_video_rgb_locked(copied)
+            if self._retain_video_state_history
+            else None
+        )
         with self.lock:
             if self.shutting_down:
                 return
@@ -1627,14 +1818,15 @@ class ExploreDebugRecorder:
             self.latest_local_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_local_costmap_wall_time = time.time()
             self.latest_local_costmap_step = self.debug_step
-            self.local_costmap_video_history.append(
-                (
-                    self.latest_local_costmap_video_stamp,
-                    self.latest_local_costmap,
-                    self.latest_local_costmap_video_rgb,
-                    self.latest_local_costmap_step,
+            if self._retain_video_state_history:
+                self.local_costmap_video_history.append(
+                    (
+                        self.latest_local_costmap_video_stamp,
+                        self.latest_local_costmap,
+                        self.latest_local_costmap_video_rgb,
+                        self.latest_local_costmap_step,
+                    )
                 )
-            )
 
     def local_costmap_update_callback(self, msg: OccupancyGridUpdate) -> None:
         with self.lock:
@@ -1643,6 +1835,23 @@ class ExploreDebugRecorder:
             # debug image drift away from the true costmap frame. Use the full
             # /costmap message for local visualization instead.
             return
+
+    def _enqueue_video_frame(self, job: tuple) -> bool:
+        """Queue a frozen frame without silently losing exact-step recordings."""
+        if self.args.video_frame_queue_overflow == "block":
+            while not self.shutting_down:
+                try:
+                    self.video_frame_jobs.put(job, timeout=0.25)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+        try:
+            self.video_frame_jobs.put_nowait(job)
+            return True
+        except queue.Full:
+            self.video_frame_jobs_dropped += 1
+            return False
 
     def image_callback(self, msg: Image) -> None:
         if self.shutting_down:
@@ -1677,14 +1886,10 @@ class ExploreDebugRecorder:
             snapshot = self._capture_video_snapshot_locked(stamp)
             snapshot["source_seq"] = source_seq
             snapshot["callback_index"] = self.image_callback_count
-        try:
-            self.video_frame_jobs.put_nowait((width, height, rgb, stamp, source_step, snapshot))
-            if step_capture:
-                with self.lock:
-                    self.last_recorded_image_stamp_ns = source_stamp_ns
-                    self.last_recorded_image_key = source_key
-        except queue.Full:
-            self.video_frame_jobs_dropped += 1
+        if self._enqueue_video_frame((width, height, rgb, stamp, source_step, snapshot)) and step_capture:
+            with self.lock:
+                self.last_recorded_image_stamp_ns = source_stamp_ns
+                self.last_recorded_image_key = source_key
 
     def step_sync_callback(self, msg: String) -> None:
         if self.shutting_down:
@@ -1707,22 +1912,19 @@ class ExploreDebugRecorder:
             snapshot["source_seq"] = source_seq
             snapshot["callback_index"] = self.step_sync_count
             snapshot["capture_trigger"] = "step_sync"
-        try:
-            self.video_frame_jobs.put_nowait(
-                (
-                    self.step_sync_placeholder_width,
-                    self.step_sync_placeholder_height,
-                    self.step_sync_placeholder_rgb,
-                    stamp,
-                    source_seq,
-                    snapshot,
-                )
+        if self._enqueue_video_frame(
+            (
+                self.step_sync_placeholder_width,
+                self.step_sync_placeholder_height,
+                self.step_sync_placeholder_rgb,
+                stamp,
+                source_seq,
+                snapshot,
             )
+        ):
             with self.lock:
                 self.last_recorded_image_stamp_ns = source_stamp_ns
                 self.last_recorded_image_key = source_key
-        except queue.Full:
-            self.video_frame_jobs_dropped += 1
 
     def _capture_video_snapshot_locked(self, image_stamp: float) -> dict:
         capture_wall_time = time.time()
@@ -5311,7 +5513,10 @@ class ExploreDebugRecorder:
                 self.latest_local_global_plan = snapshot
             else:
                 self.latest_local_plan = snapshot
-            self.plan_records.setdefault(plan_type, []).append(snapshot)
+            records = self.plan_records.setdefault(plan_type, [])
+            records.append(snapshot)
+            if len(records) > self._plan_history_limit:
+                del records[:-self._plan_history_limit]
             self._write_event(
                 "plan_update",
                 {
@@ -6413,6 +6618,9 @@ class ExploreDebugRecorder:
             final_overlay_crop = ""
             final_first_person = ""
             final_external = ""
+            paired_occ_map_pgm = ""
+            paired_raw_occ_map_pgm = ""
+            paired_map_metadata = ""
             if self.args.first_person_video and self.latest_image is not None:
                 image_stamp, image_width, image_height, image_rgb = self.latest_image
                 final_first_person = str(self.first_person_dir / "final_first_person.png")
@@ -6434,6 +6642,30 @@ class ExploreDebugRecorder:
                     global_plan=self.latest_global_plan,
                     local_plan=self.latest_local_plan,
                 )
+            if self.latest_raw_grid is not None:
+                _write_grid_pgm_yaml(self.output_dir / "final_raw_occ_map", self.latest_raw_grid)
+            if self.latest_paired_grid is not None and self.latest_paired_raw_grid is not None:
+                paired_occ_prefix = self.output_dir / "final_paired_occ_map"
+                paired_raw_prefix = self.output_dir / "final_paired_raw_occ_map"
+                _write_compact_grid_pgm_yaml(paired_occ_prefix, self.latest_paired_grid)
+                _write_compact_grid_pgm_yaml(paired_raw_prefix, self.latest_paired_raw_grid)
+                paired_occ_map_pgm = str(paired_occ_prefix.with_suffix(".pgm"))
+                paired_raw_occ_map_pgm = str(paired_raw_prefix.with_suffix(".pgm"))
+                paired_metadata_path = self.output_dir / "final_occ_map_pair.json"
+                paired_metadata_path.write_text(
+                    json.dumps(
+                        {
+                            "pair_count": self.occupancy_grid_pair_count,
+                            "pair_key": self.latest_occupancy_grid_pair_key,
+                            "planning": self.latest_paired_grid["metadata"],
+                            "raw": self.latest_paired_raw_grid["metadata"],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                paired_map_metadata = str(paired_metadata_path)
             refreshed_subgoal_overlays = self._refresh_all_subgoal_overlays_locked()
             uniform_subgoal_crop = self._render_uniform_subgoal_crops_locked()
             subgoal_contact_sheet = self._render_subgoal_contact_sheet()
@@ -6485,6 +6717,17 @@ class ExploreDebugRecorder:
                 "final_occ_map_yaml": str(self.output_dir / "final_occ_map.yaml")
                 if self.latest_grid is not None
                 else "",
+                "raw_occupancy_grid_topic": self.args.raw_occupancy_grid_topic,
+                "final_raw_occ_map_pgm": str(self.output_dir / "final_raw_occ_map.pgm")
+                if self.latest_raw_grid is not None
+                else "",
+                "final_raw_occ_map_yaml": str(self.output_dir / "final_raw_occ_map.yaml")
+                if self.latest_raw_grid is not None
+                else "",
+                "occupancy_grid_pair_count": self.occupancy_grid_pair_count,
+                "final_paired_occ_map_pgm": paired_occ_map_pgm,
+                "final_paired_raw_occ_map_pgm": paired_raw_occ_map_pgm,
+                "final_occ_map_pair_metadata": paired_map_metadata,
                 "final_first_person": final_first_person,
                 "final_external_camera": final_external,
                 "refreshed_subgoal_overlays": refreshed_subgoal_overlays,
@@ -6498,6 +6741,7 @@ class ExploreDebugRecorder:
                 "video_finalization_pending": True,
                 "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
                 "video_frame_jobs_dropped": self.video_frame_jobs_dropped,
+                "video_frame_queue_overflow": self.args.video_frame_queue_overflow,
             }
             (self.output_dir / "summary.json").write_text(
                 json.dumps(summary_checkpoint, ensure_ascii=False, indent=2, sort_keys=True)
@@ -6550,6 +6794,17 @@ class ExploreDebugRecorder:
                 "final_occ_map_yaml": str(self.output_dir / "final_occ_map.yaml")
                 if self.latest_grid is not None
                 else "",
+                "raw_occupancy_grid_topic": self.args.raw_occupancy_grid_topic,
+                "final_raw_occ_map_pgm": str(self.output_dir / "final_raw_occ_map.pgm")
+                if self.latest_raw_grid is not None
+                else "",
+                "final_raw_occ_map_yaml": str(self.output_dir / "final_raw_occ_map.yaml")
+                if self.latest_raw_grid is not None
+                else "",
+                "occupancy_grid_pair_count": self.occupancy_grid_pair_count,
+                "final_paired_occ_map_pgm": paired_occ_map_pgm,
+                "final_paired_raw_occ_map_pgm": paired_raw_occ_map_pgm,
+                "final_occ_map_pair_metadata": paired_map_metadata,
                 "final_first_person": final_first_person,
                 "final_external_camera": final_external,
                 "final_first_person_stamp": 0.0 if self.latest_image is None else float(self.latest_image[0]),
@@ -6570,6 +6825,7 @@ class ExploreDebugRecorder:
                 "first_person_video_error": self.first_person_video_error,
                 "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
                 "video_frame_jobs_dropped": self.video_frame_jobs_dropped,
+                "video_frame_queue_overflow": self.args.video_frame_queue_overflow,
                 "first_person_video_map_mode": "causal_state_snapshot_on_image_callback_offline_encode",
                 "semantic_video": bool(self.args.semantic_video),
                 "semantic_summary": self._semantic_summary(),
@@ -6637,6 +6893,11 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record explore_py runtime debug artifacts.")
     parser.add_argument("--output-dir", default="", help="Directory for JSONL, CSV, and PNG overlays.")
     parser.add_argument("--occupancy-grid-topic", default="/struct_mapping/occ_map")
+    parser.add_argument(
+        "--raw-occupancy-grid-topic",
+        default="",
+        help="Optional raw mapper OccupancyGrid saved alongside the display/planning grid at shutdown.",
+    )
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--map-frame", default="tf_frame_map")
     parser.add_argument("--odom-frame", default="tf_frame_odom")
@@ -6755,6 +7016,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=512,
         help="Frozen per-image state snapshots waiting for asynchronous rendering.",
+    )
+    parser.add_argument(
+        "--video-frame-queue-overflow",
+        choices=("drop", "block"),
+        default="drop",
+        help="Drop full queues for throughput, or block callbacks to preserve every requested frame.",
     )
     parser.add_argument(
         "--video-history-size",

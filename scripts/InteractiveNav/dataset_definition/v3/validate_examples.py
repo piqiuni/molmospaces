@@ -28,17 +28,23 @@ def _validate_cross_field_invariants(episode: dict[str, Any]) -> None:
     }
     oracle_plans = interactive_nav["oracle_plans"]
 
-    assert task["selection_mode"] == target["selection_mode"]
-    assert (
-        interactive_nav["success_criteria"]["target_selection"]
-        == task["selection_mode"]
-    )
+    is_point_goal = task["task_type"] == "nav_to_point"
+    if is_point_goal:
+        assert target["target_type"] == "point"
+        assert target["goal_point"] == task["goal_point"]
+        assert interactive_nav["success_criteria"]["type"] == "nav_to_point"
+    else:
+        assert task["selection_mode"] == target["selection_mode"]
+        assert (
+            interactive_nav["success_criteria"]["target_selection"]
+            == task["selection_mode"]
+        )
     assert (
         interactive_nav["success_criteria"]["distance"]["threshold_m"]
         == task["succ_pos_threshold"]
     )
 
-    if task["selection_mode"] == "specific_instance":
+    if not is_point_goal and task["selection_mode"] == "specific_instance":
         assert target["selected_instance"] == task["pickup_obj_name"]
         assert task["pickup_obj_candidates"] == [target["selected_instance"]]
 
