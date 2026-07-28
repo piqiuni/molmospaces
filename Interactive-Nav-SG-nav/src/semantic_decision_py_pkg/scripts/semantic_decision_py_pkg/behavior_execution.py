@@ -395,6 +395,42 @@ class BehaviorExecutionStateMachine:
             return []
         return self._finish(True, detail or {"target_visible": True}, now)
 
+    def retry_target_navigation(
+        self,
+        start_goal_index: int,
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Try an unvisited target approach pose without ending the decision."""
+
+        if (
+            self.state != STATE_VERIFYING
+            or self.candidate is None
+            or self._behavior_type() != BEHAVIOR_NAVIGATE
+            or not bool((self.candidate.get("metadata") or {}).get("target_goal"))
+        ):
+            return []
+        try:
+            retry_index = int(start_goal_index)
+        except (TypeError, ValueError):
+            return []
+        if retry_index < 0 or retry_index >= len(navigation_goal_options(self.candidate)):
+            return []
+        now = time.monotonic() if now is None else float(now)
+        retry_detail = dict(detail or {})
+        retry_detail.setdefault("reason", "target_visibility_unconfirmed")
+        return self._transition(
+            STATE_NAVIGATING,
+            now,
+            {
+                "kind": "navigate",
+                "candidate": self.candidate,
+                "start_goal_index": retry_index,
+                "retry_reason": "target_visibility_unconfirmed",
+                "detail": retry_detail,
+            },
+        )
+
     def timeout_reason(self, now: float | None = None) -> str:
         if self.state in {STATE_IDLE, STATE_SUCCEEDED, STATE_FAILED}:
             return ""

@@ -49,6 +49,19 @@ import rospy
 from std_msgs.msg import String
 
 
+def priority_target_is_available(
+    candidate: dict | None,
+    cooldown_until: dict[str, float],
+    now: float,
+) -> bool:
+    if candidate is None:
+        return False
+    candidate_id = str(candidate.get("candidate_id") or "")
+    if not candidate_id:
+        return False
+    return float(now) >= float(cooldown_until.get(candidate_id, 0.0) or 0.0)
+
+
 class SemanticRuleDecisionNode:
     def __init__(self) -> None:
         env_path = os.environ.get("SEMANTIC_DECISION_ENV_FILE")
@@ -222,6 +235,8 @@ class SemanticRuleDecisionNode:
         self.goal_complete = False
         self.target_goal_complete = False
         self.target_context: dict = {}
+        self.episode_active = True
+        self.lifecycle_generation = 0
         self.interaction_outcome_beliefs = InteractionOutcomeBeliefStore()
         self.active_target_goal = False
         self.priority_target_candidate_id = ""
@@ -303,19 +318,49 @@ class SemanticRuleDecisionNode:
                 self.target_context, ensure_ascii=False, sort_keys=True
             )
             if target_key != previous_target_key:
+                next_generation = int(
+                    target_context.get("episode_generation", 0) or 0
+                )
+                generation_changed = (
+                    next_generation != self.lifecycle_generation
+                    and (next_generation > 0 or self.lifecycle_generation > 0)
+                )
                 self.target_context = dict(target_context)
+                self.episode_active = bool(
+                    target_context.get("episode_active", True)
+                )
+                self.lifecycle_generation = next_generation
                 self.goal_complete = False
                 self.target_goal_complete = False
                 self.priority_target_candidate_id = ""
                 self.preempt_requested_for_decision_id = ""
                 self.target_mission.reset()
+                if generation_changed:
+                    self.active_candidate_id = ""
+                    self.active_decision_id = ""
+                    self.active_behavior_type = ""
+                    self.active_interaction_candidate = {}
+                    self.active_target_goal = False
                 self._publish_goal_status(
                     "ACTIVE" if target_context.get("enabled") else "DISABLED"
                 )
             self.latest_candidates_payload = payload
+            if not self.episode_active:
+                self.priority_target_candidate_id = ""
+                return
+            now = time.monotonic()
             priority_target = self.target_mission.priority_target_candidate(
-                payload.get("candidates") or []
+                [
+                    candidate
+                    for candidate in (payload.get("candidates") or [])
+                    if priority_target_is_available(
+                        candidate,
+                        self.cooldown_until,
+                        now,
+                    )
+                ]
             )
+            self.priority_target_candidate_id = ""
             if priority_target is not None:
                 self.priority_target_candidate_id = str(
                     priority_target.get("candidate_id") or ""
@@ -467,6 +512,8 @@ class SemanticRuleDecisionNode:
 
     def _tick(self, _event) -> None:
         with self.state_lock:
+            if not self.episode_active:
+                return
             if self.active_candidate_id or self.decision_in_flight:
                 return
             if time.monotonic() < self.next_decision_time:
@@ -482,6 +529,8 @@ class SemanticRuleDecisionNode:
                 self.decision_in_flight = False
 
     def _decide_from_snapshot(self, candidate_snapshot: dict) -> None:
+        if not self._lifecycle_snapshot_is_current(candidate_snapshot):
+            return
         use_direct_atomic_outcome_beliefs = uses_direct_atomic_outcome_beliefs(
             self.ablation.module3,
             self.direct_atomic_outcome_belief_enabled,
@@ -720,6 +769,8 @@ class SemanticRuleDecisionNode:
                 eligible,
                 candidate_snapshot.get("graph_context") or {},
             )
+        if not self._lifecycle_snapshot_is_current(candidate_snapshot):
+            return
         input_selected_fingerprint = (
             candidate_fingerprint(selected) if selected is not None else ""
         )
@@ -880,6 +931,12 @@ class SemanticRuleDecisionNode:
                         "graph_revision", 0
                     ),
                     "model_input_candidate_sequence": candidate_sequence,
+                    "episode_generation": int(
+                        (execution_snapshot.get("target_context") or {}).get(
+                            "episode_generation", 0
+                        )
+                        or 0
+                    ),
                     "model_selected_group_id": model_selected_group_id,
                     "model_ranked_group_ids": list(self.model_policy.last_ranking_ids),
                     "model_selected_candidate_id": model_selected_candidate_id,
@@ -930,6 +987,21 @@ class SemanticRuleDecisionNode:
         self.selected_pub.publish(
             String(data=json.dumps(selection, ensure_ascii=False, separators=(",", ":")))
         )
+
+    def _lifecycle_snapshot_is_current(self, candidate_snapshot: dict) -> bool:
+        snapshot_context = candidate_snapshot.get("target_context") or {}
+        if snapshot_context.get("episode_active") is False:
+            return False
+        snapshot_generation = int(
+            snapshot_context.get("episode_generation", 0) or 0
+        )
+        with self.state_lock:
+            if not self.episode_active:
+                return False
+            current_generation = int(self.lifecycle_generation)
+        if snapshot_generation > 0 or current_generation > 0:
+            return snapshot_generation == current_generation
+        return True
 
     @staticmethod
     def _observation_step(candidate_snapshot: dict) -> int:

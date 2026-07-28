@@ -20,9 +20,15 @@ candidate:
   target_require_same_room: false
   target_allow_connected_room: true
   target_min_visible_pixels: 16
-  target_min_visible_fraction: 0.05
+  # Thin targets such as houseplants can occupy enough reliable pixels while
+  # covering only a tiny fraction of their loose 2-D bounding box.  Keep the
+  # pixel/consecutive-observation gates authoritative for native nav_to_obj.
+  target_min_visible_fraction: 0.0
   target_min_consecutive_observations: 1
   target_arrival_tolerance_m: 0.35
+  # Fallback for non-native object-goal runs.  Native evaluation replaces this
+  # with the benchmark episode's succ_pos_threshold.
+  target_success_distance_m: 1.5
   container_require_same_room: true
   container_allow_connected_room: true
   portal_standoff_m: 0.85
@@ -74,6 +80,16 @@ completion:
 
 executor:
   interaction_navigation_timeout_s: 180.0
+  # Do not send an unvalidated target goal while move_base is completing a
+  # preempted exploration action.
+  navigation_cancel_wait_s: 3.0
+  # Target approach poses can be spatially distinct.  Fail over promptly when
+  # DWA makes no progress, while leaving exploratory navigation unchanged.
+  target_navigation_stagnation_timeout_s: 4.0
+  # After reaching a target standoff where it is still not visible, allow one
+  # fresh graph update before trying the next side-on target approach pose.
+  target_visibility_retry_delay_s: 1.0
+  make_plan_fail_open: false
   make_plan_empty_retry_count: 2
   make_plan_empty_retry_delay_s: 0.15
   explore_make_plan_fail_open_after_retries: true

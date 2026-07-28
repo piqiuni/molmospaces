@@ -205,6 +205,9 @@ class SemanticBehaviorExecutor:
         self.final_align_cancel_wait_s = float(
             config.get("final_align_cancel_wait_s", 1.0)
         )
+        self.navigation_cancel_wait_s = max(
+            0.0, float(config.get("navigation_cancel_wait_s", 2.0))
+        )
         self.stuck_recovery_enabled = bool(config.get("stuck_recovery_enabled", True))
         self.stuck_recovery_subgoal_failures = max(
             1, int(config.get("stuck_recovery_subgoal_failures", 3))
@@ -236,6 +239,18 @@ class SemanticBehaviorExecutor:
         self.navigation_stagnation_timeout_s = float(
             config.get("navigation_stagnation_timeout_s", 12.0)
         )
+        self.target_navigation_stagnation_timeout_s = max(
+            0.0,
+            float(
+                config.get(
+                    "target_navigation_stagnation_timeout_s",
+                    self.navigation_stagnation_timeout_s,
+                )
+            ),
+        )
+        self.target_visibility_retry_delay_s = max(
+            0.0, float(config.get("target_visibility_retry_delay_s", 1.0))
+        )
         self.navigation_stagnation_distance_m = float(
             config.get("navigation_stagnation_distance_m", 0.10)
         )
@@ -244,6 +259,8 @@ class SemanticBehaviorExecutor:
         )
         self.lock = threading.RLock()
         self.selection: dict | None = None
+        self.episode_active = True
+        self.episode_generation = 0
         self.latest_graph: dict = {}
         self._last_explore_reservation_publish_at = 0.0
         self._explore_reservation_publish_count = 0
@@ -251,6 +268,7 @@ class SemanticBehaviorExecutor:
         self._explore_feedback_matched_count = 0
         self._explore_feedback_ignored_count = 0
         self._last_explore_feedback = {}
+        self._target_visibility_retry: dict[str, object] | None = None
         self._stuck_failure_origin_xy: tuple[float, float] | None = None
         self._stuck_failure_candidate_ids: set[str] = set()
         self._latest_occupancy: OccupancyGrid | None = None
@@ -301,6 +319,14 @@ class SemanticBehaviorExecutor:
             queue_size=4,
         )
         rospy.Subscriber(
+            topics.get("target")
+            or topics.get("target_context")
+            or "/semantic_decision/target",
+            String,
+            self._target_context_callback,
+            queue_size=4,
+        )
+        rospy.Subscriber(
             topics.get("preempt_request", "/semantic_decision/preempt_request"),
             String,
             self._preempt_callback,
@@ -338,12 +364,48 @@ class SemanticBehaviorExecutor:
         )
         self.timer = rospy.Timer(rospy.Duration(0.2), self._tick)
 
+    def _target_context_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        target_context = payload.get("target_context")
+        if isinstance(target_context, dict):
+            payload = target_context
+        if "episode_active" not in payload and "episode_generation" not in payload:
+            return
+
+        invalidate_execution = False
+        with self.lock:
+            current_generation = int(self.episode_generation or 0)
+            next_generation = self._parse_episode_generation(
+                payload.get("episode_generation", current_generation),
+                default=current_generation,
+            )
+            next_active = bool(payload.get("episode_active", self.episode_active))
+            generation_changed = next_generation != current_generation
+            invalidate_execution = generation_changed or not next_active
+            self.episode_active = next_active
+            self.episode_generation = next_generation
+            if invalidate_execution:
+                self._clear_execution_locked()
+
+        if invalidate_execution:
+            self._cancel_navigation_safely()
+            self._publish_cmd_vel_safely(Twist())
+
     def _selection_callback(self, message: String) -> None:
         try:
             selection = json.loads(message.data)
         except json.JSONDecodeError:
             return
+        if not isinstance(selection, dict):
+            return
         with self.lock:
+            if not self._candidate_lifecycle_is_current_locked(selection):
+                return
             if self.machine.state != STATE_IDLE or self.selection is not None:
                 self._publish_feedback(selection, "REJECTED", False, {"reason": "executor_busy"})
                 return
@@ -353,6 +415,7 @@ class SemanticBehaviorExecutor:
             self.interaction_command_sequence = 0
             self.verification_retries = 0
             self.model_events = []
+            self._target_visibility_retry = None
             commands = self.machine.start(selection)
             if self.machine.state == STATE_VERIFYING and requires_graph_verification(
                 self.ablation.module3, selection
@@ -372,7 +435,9 @@ class SemanticBehaviorExecutor:
         cancel_navigation = False
         finalize_explore = False
         with self.lock:
-            if self.selection is None:
+            if self.selection is None or not self._candidate_lifecycle_is_current_locked(
+                self.selection
+            ):
                 return
             requested_decision_id = str(request.get("decision_id") or "")
             active_decision_id = str(self.selection.get("decision_id") or "")
@@ -391,7 +456,7 @@ class SemanticBehaviorExecutor:
             self.selection = None
             self.machine.reset()
         if cancel_navigation:
-            self.move_base.cancel_goal()
+            self._cancel_navigation_safely()
         detail = {
             "reason": "preempted_by_target",
             "replacement_candidate_id": str(
@@ -565,16 +630,97 @@ class SemanticBehaviorExecutor:
         with self.lock:
             self._latest_occupancy = message
 
-    def _verify_graph_locked(self) -> list[dict]:
-        if self.machine.state != STATE_VERIFYING or self.selection is None:
+    @staticmethod
+    def _node_xy(node: dict) -> tuple[float, float] | None:
+        for key in ("aabb_center", "centroid", "position"):
+            values = node.get(key)
+            if not isinstance(values, (list, tuple)) or len(values) < 2:
+                continue
+            try:
+                x, y = float(values[0]), float(values[1])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(x) and math.isfinite(y):
+                return x, y
+        return None
+
+    def _target_distance_evidence_locked(self, node: dict, metadata: dict) -> dict:
+        """Evaluate the selected target against its benchmark distance threshold."""
+
+        try:
+            threshold_m = float(metadata.get("target_success_distance_m", 1.5))
+        except (TypeError, ValueError):
+            threshold_m = float("nan")
+        target_xy = self._node_xy(node)
+        if target_xy is None:
+            fallback_xy = metadata.get("target_position_xy")
+            if isinstance(fallback_xy, (list, tuple)) and len(fallback_xy) >= 2:
+                try:
+                    candidate_xy = float(fallback_xy[0]), float(fallback_xy[1])
+                except (TypeError, ValueError):
+                    candidate_xy = None
+                if (
+                    candidate_xy is not None
+                    and math.isfinite(candidate_xy[0])
+                    and math.isfinite(candidate_xy[1])
+                ):
+                    target_xy = candidate_xy
+        robot_pose = self._current_pose(self.map_frame) if target_xy is not None else None
+        distance_m = None
+        if robot_pose is not None:
+            distance_m = math.hypot(
+                target_xy[0] - float(robot_pose[0]),
+                target_xy[1] - float(robot_pose[1]),
+            )
+        distance_passed = bool(
+            distance_m is not None
+            and math.isfinite(threshold_m)
+            and threshold_m > 0.0
+            # NavToObjTask rewards strictly inside this threshold.
+            and distance_m < threshold_m
+        )
+        return {
+            "target_distance_m": distance_m,
+            "target_success_distance_m": (
+                threshold_m if math.isfinite(threshold_m) and threshold_m > 0.0 else None
+            ),
+            "target_distance_passed": distance_passed,
+            "target_position_xy": list(target_xy) if target_xy is not None else None,
+        }
+
+    def _verify_graph_locked(
+        self, *, allow_pending_target_visibility_retry: bool = False
+    ) -> list[dict]:
+        if (
+            self.machine.state != STATE_VERIFYING
+            or self.selection is None
+            or not self._candidate_lifecycle_is_current_locked(self.selection)
+        ):
+            return []
+        # A just-completed approach goal can leave one stale graph update in
+        # flight.  Defer visibility completion until the post-arrival grace
+        # timer explicitly rechecks it; otherwise that stale update can end
+        # the decision before we try the next side-on pose.
+        if (
+            self._target_visibility_retry is not None
+            and not allow_pending_target_visibility_retry
+        ):
             return []
         target_id = str(self.selection.get("target_id") or "")
         target_name = str(self.selection.get("target_name") or "")
         for node in self.latest_graph.get("nodes") or []:
             attributes = node.get("attributes") or {}
-            if str(node.get("id") or "") != target_id and str(
+            node_id = str(node.get("id") or "")
+            source_name = str(
                 attributes.get("source_object_name") or node.get("name") or ""
-            ) != target_name:
+            )
+            # An explicit candidate instance is authoritative.  Falling back
+            # to its category/source name here can accept a same-class
+            # distractor and terminate the benchmark episode incorrectly.
+            if target_id:
+                if node_id != target_id:
+                    continue
+            elif source_name != target_name:
                 continue
             metadata = self.selection.get("metadata") or {}
             if (
@@ -594,23 +740,33 @@ class SemanticBehaviorExecutor:
                 consecutive_observations = int(
                     attributes.get("consecutive_observations", 2) or 0
                 )
+                min_visible_fraction = metadata.get(
+                    "target_min_visible_fraction", 0.2
+                )
+                if min_visible_fraction is None:
+                    min_visible_fraction = 0.2
                 target_visible = target_visible and (
-                    visible_fraction >= float(
-                        metadata.get("target_min_visible_fraction", 0.2) or 0.2
-                    )
+                    visible_fraction >= float(min_visible_fraction)
                     and consecutive_observations >= int(
                         metadata.get("target_min_consecutive_observations", 2) or 2
                     )
                 )
+                distance_evidence = self._target_distance_evidence_locked(node, metadata)
+                completion_passed = bool(
+                    target_visible and distance_evidence["target_distance_passed"]
+                )
                 return self.machine.on_target_visibility(
-                    target_visible,
+                    completion_passed,
                     detail={
                         "node_id": node.get("id"),
                         "target_visible": target_visible,
+                        "target_visibility_passed": target_visible,
                         "visible_pixels": visible_pixels,
                         "visible_fraction": visible_fraction,
                         "consecutive_observations": consecutive_observations,
                         "min_visible_pixels": min_visible_pixels,
+                        **distance_evidence,
+                        "target_completion_passed": completion_passed,
                         "graph_revision": self.latest_graph.get(
                             "graph_revision", 0
                         ),
@@ -630,14 +786,21 @@ class SemanticBehaviorExecutor:
     def _tick(self, _event) -> None:
         reservation_retry = None
         with self.lock:
-            reason = self.machine.timeout_reason()
-            if reason in {"navigation_timeout", "interaction_navigation_timeout"}:
+            if not self.episode_active:
+                return
+            commands = self._advance_target_visibility_retry_locked(time.monotonic())
+            if commands:
                 reason = ""
-            cancel_navigation = bool(reason) and self.machine.state in {
-                STATE_NAVIGATING,
-                STATE_APPROACH_INTERACTION,
-            }
-            commands = self.machine.fail_timeout(reason) if reason else []
+                cancel_navigation = False
+            else:
+                reason = self.machine.timeout_reason()
+                if reason in {"navigation_timeout", "interaction_navigation_timeout"}:
+                    reason = ""
+                cancel_navigation = bool(reason) and self.machine.state in {
+                    STATE_NAVIGATING,
+                    STATE_APPROACH_INTERACTION,
+                }
+                commands = self.machine.fail_timeout(reason) if reason else []
             if (
                 not reason
                 and self.machine.state == STATE_PREPARING_EXPLORE
@@ -657,13 +820,24 @@ class SemanticBehaviorExecutor:
                 "explore_feedback_matched_count": self._explore_feedback_matched_count,
                 "explore_feedback_ignored_count": self._explore_feedback_ignored_count,
                 "last_explore_feedback": dict(self._last_explore_feedback),
+                "target_visibility_retry_pending": bool(self._target_visibility_retry),
+                "target_visibility_next_goal_index": (
+                    None
+                    if self._target_visibility_retry is None
+                    else self._target_visibility_retry.get("next_goal_option_index")
+                ),
+                "target_visibility_retry_reason": (
+                    ""
+                    if self._target_visibility_retry is None
+                    else str(self._target_visibility_retry.get("reason") or "")
+                ),
                 "timestamp": time.time(),
             }
         self.state_pub.publish(
             String(data=json.dumps(state_payload, ensure_ascii=False, separators=(",", ":")))
         )
         if cancel_navigation:
-            self.move_base.cancel_goal()
+            self._cancel_navigation_safely()
         self._dispatch(commands)
         if reservation_retry is not None:
             self._publish_explore_command(reservation_retry, action="reserve_frontier")
@@ -685,9 +859,10 @@ class SemanticBehaviorExecutor:
             elif kind == "navigate":
                 candidate = dict(command["candidate"])
                 decision_id = str(candidate.get("decision_id") or "")
+                start_goal_index = int(command.get("start_goal_index", 0) or 0)
                 threading.Thread(
                     target=self._run_navigation,
-                    args=(decision_id, candidate),
+                    args=(decision_id, candidate, start_goal_index),
                     daemon=True,
                 ).start()
             elif kind == "interact":
@@ -711,6 +886,15 @@ class SemanticBehaviorExecutor:
         success: bool | None = None,
         detail: dict | None = None,
     ) -> None:
+        with self.lock:
+            if action == "reserve_frontier":
+                if not self._active_candidate_is_current_locked(
+                    candidate,
+                    states={STATE_PREPARING_EXPLORE},
+                ):
+                    return
+            elif not self._candidate_lifecycle_is_current_locked(candidate):
+                return
         if action == "reserve_frontier":
             self._last_explore_reservation_publish_at = time.monotonic()
             self._explore_reservation_publish_count += 1
@@ -718,6 +902,9 @@ class SemanticBehaviorExecutor:
             "command_id": self._command_id(candidate),
             "decision_id": candidate.get("decision_id", ""),
             "candidate_id": candidate.get("candidate_id", ""),
+            "episode_generation": self._parse_episode_generation(
+                candidate.get("episode_generation", 0)
+            ),
             "action": action,
             "cluster_id": (candidate.get("metadata") or {}).get(
                 "cluster_id", candidate.get("target_id", "")
@@ -730,11 +917,30 @@ class SemanticBehaviorExecutor:
             payload["success"] = bool(success)
         if detail:
             payload["detail"] = dict(detail)
-        self.explore_command_pub.publish(
-            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        )
+        with self.lock:
+            if action == "reserve_frontier":
+                if not self._active_candidate_is_current_locked(
+                    candidate,
+                    states={STATE_PREPARING_EXPLORE},
+                ):
+                    return
+            elif not self._candidate_lifecycle_is_current_locked(candidate):
+                return
+            self.explore_command_pub.publish(
+                String(
+                    data=json.dumps(
+                        payload, ensure_ascii=False, separators=(",", ":")
+                    )
+                )
+            )
 
     def _publish_interaction_command(self, candidate: dict) -> None:
+        with self.lock:
+            if not self._active_candidate_is_current_locked(
+                candidate,
+                states={STATE_INTERACTING},
+            ):
+                return
         interaction = candidate.get("interaction_command") or {}
         metadata = candidate.get("metadata") or {}
         action = action_for_opaque_open_contract(
@@ -748,6 +954,9 @@ class SemanticBehaviorExecutor:
             "command_id": self._command_id(candidate),
             "decision_id": candidate.get("decision_id", ""),
             "candidate_id": candidate.get("candidate_id", ""),
+            "episode_generation": self._parse_episode_generation(
+                candidate.get("episode_generation", 0)
+            ),
             "event_id": f"{candidate.get('decision_id', 'decision')}_interaction_{interaction_sequence:03d}",
             "node_id": interaction.get("node_id", candidate.get("target_id", "")),
             "object_id": interaction.get("object_id", candidate.get("target_name", "")),
@@ -777,10 +986,19 @@ class SemanticBehaviorExecutor:
             ),
         }
         with self.lock:
+            if not self._active_candidate_is_current_locked(
+                candidate,
+                states={STATE_INTERACTING},
+            ):
+                return
             self.pre_interaction_image_sequence = self.latest_image_sequence
-        self.interaction_command_pub.publish(
-            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        )
+            self.interaction_command_pub.publish(
+                String(
+                    data=json.dumps(
+                        payload, ensure_ascii=False, separators=(",", ":")
+                    )
+                )
+            )
 
     def _plan_and_publish_interaction(self, decision_id: str, candidate: dict) -> None:
         with self.lock:
@@ -812,27 +1030,30 @@ class SemanticBehaviorExecutor:
         )
         planned_candidate = dict(candidate)
         result_source = "rule_fallback_model_error"
+        validated_plan = None
         if response.payload is not None and not response.error:
             try:
-                plan = validate_visual_interaction_plan(
+                validated_plan = validate_visual_interaction_plan(
                     response.payload,
                     expected_target_type=expected_target_type,
                     requested_action=requested_action,
                 )
                 planned_candidate = candidate_with_visual_operation_plan(
-                    planned_candidate, plan
+                    planned_candidate, validated_plan
                 )
                 result_source = "model"
-                with self.lock:
-                    self.active_skill_plan = {
-                        "visual_operation_plan": plan,
-                        "subactions": [],
-                        "max_retries": 0,
-                    }
-                    self.pending_skill_actions = []
             except ValueError:
                 result_source = "rule_fallback_invalid_response"
         with self.lock:
+            if not self._interaction_is_current(decision_id):
+                return
+            if validated_plan is not None:
+                self.active_skill_plan = {
+                    "visual_operation_plan": validated_plan,
+                    "subactions": [],
+                    "max_retries": 0,
+                }
+                self.pending_skill_actions = []
             self._append_model_event_locked(
                 "skill_planning",
                 response,
@@ -840,9 +1061,6 @@ class SemanticBehaviorExecutor:
                 candidate,
                 result_source,
             )
-        with self.lock:
-            if not self._interaction_is_current(decision_id):
-                return
         self._publish_interaction_command(planned_candidate)
 
     def _candidate_for_skill_action(self, candidate: dict, action: dict) -> dict:
@@ -1063,12 +1281,122 @@ class SemanticBehaviorExecutor:
             return ""
         return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
 
-    def _interaction_is_current(self, decision_id: str) -> bool:
-        return bool(
-            self.selection is not None
-            and str(self.selection.get("decision_id") or "") == decision_id
-            and self.machine.state in {STATE_INTERACTING, STATE_VERIFYING}
+    @staticmethod
+    def _parse_episode_generation(value, *, default: int = 0) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _candidate_lifecycle_is_current_locked(self, candidate: dict) -> bool:
+        if not self.episode_active:
+            return False
+        candidate_generation = self._parse_episode_generation(
+            candidate.get("episode_generation", 0)
         )
+        current_generation = int(self.episode_generation or 0)
+        if candidate_generation > 0 or current_generation > 0:
+            return candidate_generation == current_generation
+        return True
+
+    def _active_candidate_is_current_locked(
+        self,
+        candidate: dict,
+        *,
+        states: set[str] | None = None,
+    ) -> bool:
+        if self.selection is None:
+            return False
+        if not self._candidate_lifecycle_is_current_locked(candidate):
+            return False
+        if not self._candidate_lifecycle_is_current_locked(self.selection):
+            return False
+        candidate_decision_id = str(candidate.get("decision_id") or "")
+        active_decision_id = str(self.selection.get("decision_id") or "")
+        if not candidate_decision_id or candidate_decision_id != active_decision_id:
+            return False
+        return states is None or self.machine.state in states
+
+    def _clear_execution_locked(self) -> None:
+        self.selection = None
+        self.machine.reset()
+        self._target_visibility_retry = None
+        self.active_skill_plan = {}
+        self.pending_skill_actions = []
+        self.interaction_command_sequence = 0
+        self.verification_retries = 0
+        self.model_events = []
+        self._last_explore_reservation_publish_at = 0.0
+        self._explore_reservation_publish_count = 0
+        self._explore_feedback_received_count = 0
+        self._explore_feedback_matched_count = 0
+        self._explore_feedback_ignored_count = 0
+        self._last_explore_feedback = {}
+        self.pre_interaction_image_sequence = self.latest_image_sequence
+        self._reset_stuck_failures()
+
+    def _interaction_is_current(self, decision_id: str) -> bool:
+        with self.lock:
+            return bool(
+                self.selection is not None
+                and str(self.selection.get("decision_id") or "") == decision_id
+                and self._candidate_lifecycle_is_current_locked(self.selection)
+                and self.machine.state in {STATE_INTERACTING, STATE_VERIFYING}
+            )
+
+    def _cancel_navigation_safely(self) -> bool:
+        try:
+            self.move_base.cancel_goal()
+        except (rospy.ROSException, AttributeError):
+            return False
+        return True
+
+    def _wait_for_move_base_inactive(self, decision_id: str) -> bool:
+        """Cancel a stale action goal before calling move_base's plan service."""
+        try:
+            state = int(self.move_base.get_state())
+        except (rospy.ROSException, AttributeError, TypeError, ValueError):
+            # Retain compatibility with lightweight action-client shims that do
+            # not expose get_state.
+            return True
+        if state in TERMINAL_STATES:
+            return True
+        self._cancel_navigation_safely()
+        deadline = time.monotonic() + self.navigation_cancel_wait_s
+        while (
+            not rospy.is_shutdown()
+            and self._navigation_is_current(decision_id)
+            and time.monotonic() < deadline
+        ):
+            try:
+                state = int(self.move_base.get_state())
+            except (rospy.ROSException, AttributeError, TypeError, ValueError):
+                return True
+            if state in TERMINAL_STATES:
+                return True
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        try:
+            state = int(self.move_base.get_state())
+        except (rospy.ROSException, AttributeError, TypeError, ValueError):
+            return True
+        if state in TERMINAL_STATES:
+            return True
+        rospy.logwarn(
+            "[semantic_behavior_executor] move_base stayed active after cancellation "
+            "for %.2fs (state=%s)",
+            self.navigation_cancel_wait_s,
+            state,
+        )
+        return False
+
+    def _publish_cmd_vel_safely(self, command: Twist) -> bool:
+        if rospy.is_shutdown():
+            return False
+        try:
+            self.cmd_vel_pub.publish(command)
+        except (rospy.ROSException, AttributeError):
+            return False
+        return True
 
     def _current_pose(self, frame_id: str) -> tuple[float, float, float] | None:
         try:
@@ -1085,7 +1413,7 @@ class SemanticBehaviorExecutor:
     def _publish_rotation(self, angular_z: float) -> None:
         command = Twist()
         command.angular.z = float(angular_z)
-        self.cmd_vel_pub.publish(command)
+        self._publish_cmd_vel_safely(command)
 
     def _rotate_to_yaw(
         self,
@@ -1177,7 +1505,7 @@ class SemanticBehaviorExecutor:
             return None
         if abs(normalize_angle(goal_yaw - pose[2])) <= self.final_align_yaw_tolerance_rad:
             return True
-        self.move_base.cancel_goal()
+        self._cancel_navigation_safely()
         self.move_base.wait_for_result(
             rospy.Duration(max(0.0, self.final_align_cancel_wait_s))
         )
@@ -1190,17 +1518,56 @@ class SemanticBehaviorExecutor:
             self.final_align_timeout_s,
         )
 
-    def _run_navigation(self, decision_id: str, candidate: dict) -> None:
-        ready = self.move_base.wait_for_server(rospy.Duration(30.0))
+    def _wait_for_move_base_server(
+        self,
+        decision_id: str,
+        timeout_s: float = 30.0,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while (
+            not rospy.is_shutdown()
+            and self._navigation_is_current(decision_id)
+            and time.monotonic() < deadline
+        ):
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                if self.move_base.wait_for_server(
+                    rospy.Duration(min(0.5, remaining))
+                ):
+                    return True
+            except rospy.ROSException:
+                return False
+        return False
+
+    def _run_navigation(
+        self, decision_id: str, candidate: dict, start_goal_index: int = 0
+    ) -> None:
+        ready = self._wait_for_move_base_server(decision_id, timeout_s=30.0)
+        if not self._navigation_is_current(decision_id):
+            return
         if not ready:
             self._handle_navigation_result(decision_id, False, {"reason": "move_base_unavailable"})
             return
-        if not self._navigation_is_current(decision_id):
+        if not self._wait_for_move_base_inactive(decision_id):
+            if self._navigation_is_current(decision_id):
+                self._handle_navigation_result(
+                    decision_id,
+                    False,
+                    {"reason": "move_base_cancel_timeout"},
+                )
             return
         primary_goal_values = list(candidate.get("goal_xyyaw") or [])
         goal_options = navigation_goal_options(candidate)
-        if not goal_options:
-            self._handle_navigation_result(decision_id, False, {"reason": "missing_goal"})
+        try:
+            start_goal_index = int(start_goal_index)
+        except (TypeError, ValueError):
+            start_goal_index = 0
+        if not goal_options or start_goal_index < 0 or start_goal_index >= len(goal_options):
+            self._handle_navigation_result(
+                decision_id,
+                False,
+                {"reason": "missing_goal", "start_goal_index": start_goal_index},
+            )
             return
         behavior_type = str(candidate.get("behavior_type") or "")
         metadata = candidate.get("metadata") or {}
@@ -1223,7 +1590,7 @@ class SemanticBehaviorExecutor:
             current_pose = self._current_pose(
                 str(metadata.get("frame_id") or self.map_frame)
             )
-            primary_x, primary_y, primary_yaw = goal_options[0]
+            primary_x, primary_y, primary_yaw = goal_options[start_goal_index]
             if current_pose is not None:
                 position_error = math.hypot(
                     primary_x - current_pose[0], primary_y - current_pose[1]
@@ -1247,28 +1614,52 @@ class SemanticBehaviorExecutor:
             (candidate.get("metadata") or {}).get("frame_id") or self.map_frame
         )
         goal_frame = goal.target_pose.header.frame_id
-        selected_goal = None
-        path_lookahead = None
         attempted_goals = []
-        is_explore = str(candidate.get("behavior_type") or "").upper() == "EXPLORE"
-        for option_index, (option_x, option_y, option_yaw) in enumerate(goal_options):
-            preflight_attempts = 1 + (
-                self.make_plan_empty_retry_count if is_explore else 0
-            )
+        behavior_type_upper = str(candidate.get("behavior_type") or "").upper()
+        is_explore = behavior_type_upper == "EXPLORE"
+        runtime_fallback_enabled = bool(metadata.get("target_goal")) and (
+            behavior_type_upper == "NAVIGATE"
+        )
+        stagnation_timeout_s = (
+            self.target_navigation_stagnation_timeout_s
+            if runtime_fallback_enabled
+            else self.navigation_stagnation_timeout_s
+        )
+        navigation_timeout_s = (
+            self.machine.config.interaction_navigation_timeout_s
+            if behavior_type_upper == "INTERACT"
+            else self.machine.config.navigation_timeout_s
+        )
+        deadline = time.monotonic() + navigation_timeout_s
+        runtime_fallback_count = 0
+        require_final_yaw = self.final_align_enabled and len(primary_goal_values) > 2
+
+        for option_index in range(start_goal_index, len(goal_options)):
+            x, y, yaw = goal_options[option_index]
+            if time.monotonic() >= deadline:
+                break
+            # Empty plans and temporary service rejection can occur while a
+            # canceled action is leaving move_base or while costmaps/TF catch
+            # up after a graph update. Retry before accepting a fail-open goal.
+            preflight_attempts = 1 + self.make_plan_empty_retry_count
             plan_reachable = False
-            option_lookahead = None
+            path_lookahead = None
             preflight_reason = ""
             actual_attempts = 0
             for preflight_index in range(preflight_attempts):
                 actual_attempts += 1
                 (
                     plan_reachable,
-                    option_lookahead,
+                    path_lookahead,
                     preflight_reason,
-                ) = self._preflight_navigation_plan(
-                    goal_frame, option_x, option_y, option_yaw
-                )
-                if plan_reachable or preflight_reason != "empty_plan":
+                ) = self._preflight_navigation_plan(goal_frame, x, y, yaw)
+                retryable_preflight = preflight_reason in {
+                    "empty_plan",
+                    "service_unavailable",
+                }
+                if plan_reachable and not retryable_preflight:
+                    break
+                if not retryable_preflight:
                     break
                 if preflight_index + 1 < preflight_attempts:
                     time.sleep(self.make_plan_empty_retry_delay_s)
@@ -1283,147 +1674,190 @@ class SemanticBehaviorExecutor:
                     "hard_constraints_passed", True
                 ))
             )
-            attempted_goals.append(
-                {
-                    "index": option_index,
-                    "goal_xyyaw": [option_x, option_y, option_yaw],
-                    "reachable": bool(plan_reachable or fail_open_empty_plan),
-                    "preflight_reason": preflight_reason,
-                    "preflight_attempts": actual_attempts,
-                    "fail_open_after_empty_plan": fail_open_empty_plan,
-                }
-            )
-            if plan_reachable or fail_open_empty_plan:
-                selected_goal = option_x, option_y, option_yaw
-                path_lookahead = option_lookahead
-                break
-        if selected_goal is None:
-            self._handle_navigation_result(
-                decision_id,
-                False,
-                {
-                    "reason": "make_plan_unreachable",
-                    "attempted_goal_count": len(attempted_goals),
-                    "attempted_goals": attempted_goals,
-                },
-            )
-            return
-        x, y, yaw = selected_goal
-        if attempted_goals[-1]["index"] > 0:
-            rospy.loginfo(
-                "[semantic_behavior_executor] selected interaction fallback goal %d/%d",
-                attempted_goals[-1]["index"] + 1,
-                len(goal_options),
-            )
-        prerotated = self._prerotate_for_rear_goal(
-            decision_id,
-            goal_frame,
-            x,
-            y,
-            heading_target_xy=path_lookahead,
-        )
-        if not prerotated:
-            rospy.logwarn(
-                "[semantic_behavior_executor] rear-goal prerotation timed out; sending move_base goal"
-            )
-        if not self._navigation_is_current(decision_id):
-            return
-        goal.target_pose.header.stamp = rospy.Time.now()
-        goal.target_pose.pose.position.x = x
-        goal.target_pose.pose.position.y = y
-        goal.target_pose.pose.orientation.z = math.sin(0.5 * yaw)
-        goal.target_pose.pose.orientation.w = math.cos(0.5 * yaw)
-        self.move_base.send_goal(goal)
-        start_pose = self._current_pose(goal_frame)
-        progress_watchdog = NavigationProgressWatchdog(
-            timeout_s=self.navigation_stagnation_timeout_s,
-            min_displacement_m=self.navigation_stagnation_distance_m,
-            min_yaw_change_rad=self.navigation_stagnation_yaw_rad,
-        )
-        progress_watchdog.reset(
-            start_pose,
-            time.monotonic(),
-        )
-        navigation_timeout_s = (
-            self.machine.config.interaction_navigation_timeout_s
-            if str(candidate.get("behavior_type") or "") == "INTERACT"
-            else self.machine.config.navigation_timeout_s
-        )
-        deadline = time.monotonic() + navigation_timeout_s
-        near_goal_since = None
-        require_final_yaw = self.final_align_enabled and len(primary_goal_values) > 2
-        state = int(self.move_base.get_state())
-        while (
-            not rospy.is_shutdown()
-            and self._navigation_is_current(decision_id)
-            and state not in TERMINAL_STATES
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.10)
-            state = int(self.move_base.get_state())
-            pose = self._current_pose(goal_frame)
-            near_final_yaw_alignment = bool(
-                pose is not None
-                and require_final_yaw
-                and math.hypot(x - pose[0], y - pose[1])
-                <= self.final_align_max_distance_m
-            )
-            if not near_final_yaw_alignment and progress_watchdog.observe(
-                pose,
-                time.monotonic(),
-            ):
-                self.move_base.cancel_goal()
-                self._handle_navigation_result(
-                    decision_id,
-                    False,
-                    {
-                        "reason": "navigation_stagnation",
-                        "stagnation_timeout_s": self.navigation_stagnation_timeout_s,
-                        "stagnation_distance_m": self.navigation_stagnation_distance_m,
-                        "stagnation_yaw_rad": self.navigation_stagnation_yaw_rad,
-                    },
+            attempt = {
+                "index": option_index,
+                "goal_xyyaw": [x, y, yaw],
+                "reachable": bool(plan_reachable or fail_open_empty_plan),
+                "preflight_reason": preflight_reason,
+                "preflight_attempts": actual_attempts,
+                "fail_open_after_empty_plan": fail_open_empty_plan,
+            }
+            attempted_goals.append(attempt)
+            if not (plan_reachable or fail_open_empty_plan):
+                continue
+            if option_index > 0:
+                rospy.loginfo(
+                    "[semantic_behavior_executor] selected navigation fallback goal %d/%d",
+                    option_index + 1,
+                    len(goal_options),
                 )
+            prerotated = self._prerotate_for_rear_goal(
+                decision_id,
+                goal_frame,
+                x,
+                y,
+                heading_target_xy=path_lookahead,
+            )
+            if not prerotated:
+                rospy.logwarn(
+                    "[semantic_behavior_executor] rear-goal prerotation timed out; sending move_base goal"
+                )
+            if not self._navigation_is_current(decision_id):
                 return
-            if require_final_yaw:
-                if pose is None:
-                    near_goal_since = None
-                    continue
-                distance = math.hypot(x - pose[0], y - pose[1])
-                yaw_error = abs(normalize_angle(yaw - pose[2]))
-                if (
-                    distance <= self.final_align_max_distance_m
-                    and yaw_error > self.final_align_yaw_tolerance_rad
+            if time.monotonic() >= deadline:
+                break
+            goal.target_pose.header.stamp = rospy.Time.now()
+            goal.target_pose.pose.position.x = x
+            goal.target_pose.pose.position.y = y
+            goal.target_pose.pose.orientation.z = math.sin(0.5 * yaw)
+            goal.target_pose.pose.orientation.w = math.cos(0.5 * yaw)
+            self.move_base.send_goal(goal)
+            attempt["execution_started"] = True
+            start_pose = self._current_pose(goal_frame)
+            progress_watchdog = NavigationProgressWatchdog(
+                timeout_s=stagnation_timeout_s,
+                min_displacement_m=self.navigation_stagnation_distance_m,
+                min_yaw_change_rad=self.navigation_stagnation_yaw_rad,
+            )
+            progress_watchdog.reset(start_pose, time.monotonic())
+            near_goal_since = None
+            state = int(self.move_base.get_state())
+            while (
+                not rospy.is_shutdown()
+                and self._navigation_is_current(decision_id)
+                and state not in TERMINAL_STATES
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.10)
+                state = int(self.move_base.get_state())
+                pose = self._current_pose(goal_frame)
+                near_final_yaw_alignment = bool(
+                    pose is not None
+                    and require_final_yaw
+                    and math.hypot(x - pose[0], y - pose[1])
+                    <= self.final_align_max_distance_m
+                )
+                if not near_final_yaw_alignment and progress_watchdog.observe(
+                    pose,
+                    time.monotonic(),
                 ):
-                    if near_goal_since is None:
-                        near_goal_since = time.monotonic()
-                    elif (
-                        time.monotonic() - near_goal_since
-                        >= self.final_align_trigger_delay_s
+                    self._cancel_navigation_safely()
+                    attempt["execution_status"] = "navigation_stagnation"
+                    attempt["stagnation_timeout_s"] = stagnation_timeout_s
+                    if (
+                        runtime_fallback_enabled
+                        and option_index + 1 < len(goal_options)
+                        and time.monotonic() < deadline
+                        and self._wait_for_move_base_inactive(decision_id)
                     ):
-                        aligned = self._final_align_goal(
-                            decision_id,
-                            goal_frame,
-                            x,
-                            y,
-                            yaw,
+                        runtime_fallback_count += 1
+                        rospy.loginfo(
+                            "[semantic_behavior_executor] target navigation stagnated; "
+                            "trying fallback goal %d/%d",
+                            option_index + 2,
+                            len(goal_options),
                         )
+                        break
+                    self._handle_navigation_result(
+                        decision_id,
+                        False,
+                        {
+                            "reason": "navigation_stagnation",
+                            "stagnation_timeout_s": stagnation_timeout_s,
+                            "stagnation_distance_m": self.navigation_stagnation_distance_m,
+                            "stagnation_yaw_rad": self.navigation_stagnation_yaw_rad,
+                            "executed_goal_index": option_index,
+                            "runtime_fallback_count": runtime_fallback_count,
+                            "attempted_goals": attempted_goals,
+                        },
+                    )
+                    return
+                if require_final_yaw:
+                    if pose is None:
+                        near_goal_since = None
+                        continue
+                    distance = math.hypot(x - pose[0], y - pose[1])
+                    yaw_error = abs(normalize_angle(yaw - pose[2]))
+                    if (
+                        distance <= self.final_align_max_distance_m
+                        and yaw_error > self.final_align_yaw_tolerance_rad
+                    ):
+                        if near_goal_since is None:
+                            near_goal_since = time.monotonic()
+                        elif (
+                            time.monotonic() - near_goal_since
+                            >= self.final_align_trigger_delay_s
+                        ):
+                            aligned = self._final_align_goal(
+                                decision_id,
+                                goal_frame,
+                                x,
+                                y,
+                                yaw,
+                            )
+                            self._handle_navigation_result(
+                                decision_id,
+                                bool(aligned),
+                                {
+                                    "reason": "direct_final_yaw_alignment",
+                                    "position_error_m": distance,
+                                    "yaw_error_rad": yaw_error,
+                                    "executed_goal_index": option_index,
+                                    "runtime_fallback_count": runtime_fallback_count,
+                                    "attempted_goals": attempted_goals,
+                                },
+                            )
+                            return
+                    else:
+                        near_goal_since = None
+            if not self._navigation_is_current(decision_id):
+                return
+            if attempt.get("execution_status") == "navigation_stagnation":
+                continue
+            if state not in TERMINAL_STATES:
+                self._cancel_navigation_safely()
+                if require_final_yaw:
+                    aligned = self._final_align_goal(
+                        decision_id,
+                        goal_frame,
+                        x,
+                        y,
+                        yaw,
+                    )
+                    if aligned is not None:
                         self._handle_navigation_result(
                             decision_id,
                             bool(aligned),
                             {
-                                "reason": "direct_final_yaw_alignment",
-                                "position_error_m": distance,
-                                "yaw_error_rad": yaw_error,
+                                "reason": "navigation_timeout_final_alignment",
+                                "executed_goal_index": option_index,
+                                "runtime_fallback_count": runtime_fallback_count,
+                                "attempted_goals": attempted_goals,
                             },
                         )
                         return
-                else:
-                    near_goal_since = None
-        if not self._navigation_is_current(decision_id):
-            return
-        if state not in TERMINAL_STATES:
-            self.move_base.cancel_goal()
-            if require_final_yaw:
+                self._handle_navigation_result(
+                    decision_id,
+                    False,
+                    {
+                        "reason": "navigation_timeout",
+                        "executed_goal_index": option_index,
+                        "runtime_fallback_count": runtime_fallback_count,
+                        "attempted_goals": attempted_goals,
+                    },
+                )
+                return
+            success = state == GoalStatus.SUCCEEDED
+            attempt["execution_status_code"] = state
+            attempt["execution_status"] = self.move_base.get_goal_status_text() or str(state)
+            detail = {
+                "status_code": state,
+                "status": attempt["execution_status"],
+                "executed_goal_index": option_index,
+                "runtime_fallback_count": runtime_fallback_count,
+                "attempted_goals": attempted_goals,
+            }
+            if success and require_final_yaw:
                 aligned = self._final_align_goal(
                     decision_id,
                     goal_frame,
@@ -1431,34 +1865,45 @@ class SemanticBehaviorExecutor:
                     y,
                     yaw,
                 )
-                if aligned is not None:
-                    self._handle_navigation_result(
-                        decision_id,
-                        bool(aligned),
-                        {"reason": "navigation_timeout_final_alignment"},
-                    )
-                    return
-            self._handle_navigation_result(decision_id, False, {"reason": "navigation_timeout"})
+                if aligned is False:
+                    success = False
+                    detail["reason"] = "final_yaw_alignment_failed"
+                elif aligned is True:
+                    detail["reason"] = "final_yaw_alignment"
+            if success:
+                self._handle_navigation_result(decision_id, True, detail)
+                return
+            if (
+                state in {GoalStatus.ABORTED, GoalStatus.REJECTED}
+                and runtime_fallback_enabled
+                and option_index + 1 < len(goal_options)
+                and time.monotonic() < deadline
+            ):
+                runtime_fallback_count += 1
+                rospy.loginfo(
+                    "[semantic_behavior_executor] move_base aborted; trying navigation fallback goal %d/%d",
+                    option_index + 2,
+                    len(goal_options),
+                )
+                continue
+            self._handle_navigation_result(decision_id, False, detail)
             return
-        success = state == GoalStatus.SUCCEEDED
-        detail = {
-            "status_code": state,
-            "status": self.move_base.get_goal_status_text() or str(state),
-        }
-        if success and require_final_yaw:
-            aligned = self._final_align_goal(
-                decision_id,
-                goal_frame,
-                x,
-                y,
-                yaw,
-            )
-            if aligned is False:
-                success = False
-                detail["reason"] = "final_yaw_alignment_failed"
-            elif aligned is True:
-                detail["reason"] = "final_yaw_alignment"
-        self._handle_navigation_result(decision_id, success, detail)
+
+        reason = (
+            "navigation_timeout_before_goal_dispatch"
+            if time.monotonic() >= deadline
+            else "make_plan_unreachable"
+        )
+        self._handle_navigation_result(
+            decision_id,
+            False,
+            {
+                "reason": reason,
+                "attempted_goal_count": len(attempted_goals),
+                "runtime_fallback_count": runtime_fallback_count,
+                "attempted_goals": attempted_goals,
+            },
+        )
 
     def _preflight_navigation_plan(
         self,
@@ -1526,21 +1971,122 @@ class SemanticBehaviorExecutor:
     def _handle_navigation_result(
         self, decision_id: str, success: bool, detail: dict
     ) -> None:
+        if not self._navigation_is_current(decision_id):
+            return
         recovery_detail = self._maybe_run_stuck_recovery(decision_id, success, detail)
         if recovery_detail:
             detail = {**detail, **recovery_detail}
         with self.lock:
-            if self.selection is None or str(self.selection.get("decision_id") or "") != decision_id:
+            if not self._navigation_is_current(decision_id):
                 return
             commands = self.machine.on_navigation_result(success, detail=detail)
+            retry_armed = False
             if (
                 self.machine.state == STATE_VERIFYING
+                and success
+                and self._is_target_visibility_retry_candidate_locked()
+            ):
+                self._arm_target_visibility_retry_locked(detail)
+                retry_armed = self._target_visibility_retry is not None
+            if (
+                self.machine.state == STATE_VERIFYING
+                and not retry_armed
                 and requires_graph_verification(
                     self.ablation.module3, self.selection
                 )
             ):
                 commands.extend(self._verify_graph_locked())
         self._dispatch(commands)
+
+    def _is_target_visibility_retry_candidate_locked(self) -> bool:
+        if self.selection is None or self.machine.candidate is None:
+            return False
+        metadata = self.selection.get("metadata") or {}
+        return bool(
+            str(self.selection.get("behavior_type") or "").upper() == "NAVIGATE"
+            and metadata.get("target_goal")
+            and metadata.get("verify_target_visibility", True)
+            and self._candidate_lifecycle_is_current_locked(self.selection)
+        )
+
+    def _arm_target_visibility_retry_locked(self, detail: dict) -> None:
+        self._target_visibility_retry = None
+        if not self._is_target_visibility_retry_candidate_locked():
+            return
+        goal_options = navigation_goal_options(self.selection or {})
+        try:
+            completed_goal_index = int(detail.get("executed_goal_index", 0) or 0)
+        except (TypeError, ValueError):
+            completed_goal_index = 0
+        next_goal_index = completed_goal_index + 1
+        if next_goal_index >= len(goal_options):
+            return
+        self._target_visibility_retry = {
+            "decision_id": str(self.selection.get("decision_id") or ""),
+            "next_goal_option_index": next_goal_index,
+            "ready_at_monotonic": time.monotonic()
+            + self.target_visibility_retry_delay_s,
+            "arrival_graph_revision": int(self.latest_graph.get("graph_revision", 0) or 0),
+            "reason": "target_visibility_unconfirmed",
+        }
+        rospy.loginfo(
+            "[semantic_behavior_executor] target approach goal %d/%d reached; "
+            "waiting %.1fs for a fresh visibility check before fallback goal %d/%d",
+            completed_goal_index + 1,
+            len(goal_options),
+            self.target_visibility_retry_delay_s,
+            next_goal_index + 1,
+            len(goal_options),
+        )
+
+    def _advance_target_visibility_retry_locked(self, now: float) -> list[dict]:
+        retry = self._target_visibility_retry
+        if retry is None:
+            return []
+        decision_id = str(retry.get("decision_id") or "")
+        if (
+            not self._is_target_visibility_retry_candidate_locked()
+            or self.selection is None
+            or str(self.selection.get("decision_id") or "") != decision_id
+        ):
+            self._target_visibility_retry = None
+            return []
+        if now < float(retry.get("ready_at_monotonic", now) or now):
+            return []
+        # Re-check once after the post-arrival observation grace period before
+        # moving to the next side-on approach pose.
+        commands = self._verify_graph_locked(
+            allow_pending_target_visibility_retry=True
+        )
+        if self.machine.state != STATE_VERIFYING:
+            self._target_visibility_retry = None
+            rospy.loginfo(
+                "[semantic_behavior_executor] target visibility confirmed after "
+                "post-arrival recheck"
+            )
+            return commands
+        try:
+            next_goal_index = int(retry.get("next_goal_option_index", -1))
+        except (TypeError, ValueError):
+            next_goal_index = -1
+        self._target_visibility_retry = None
+        rospy.loginfo(
+            "[semantic_behavior_executor] target visibility remains unconfirmed; "
+            "trying fallback goal %d/%d",
+            next_goal_index + 1,
+            len(navigation_goal_options(self.selection or {})),
+        )
+        commands.extend(
+            self.machine.retry_target_navigation(
+                next_goal_index,
+                detail={
+                    "reason": "target_visibility_unconfirmed",
+                    "arrival_graph_revision": retry.get("arrival_graph_revision"),
+                },
+                now=now,
+            )
+        )
+        return commands
 
     def _maybe_run_stuck_recovery(
         self, decision_id: str, success: bool, detail: dict
@@ -1622,10 +2168,10 @@ class SemanticBehaviorExecutor:
                     return False
                 command = Twist()
                 command.linear.x = float(linear_x)
-                self.cmd_vel_pub.publish(command)
+                self._publish_cmd_vel_safely(command)
                 time.sleep(0.05)
         finally:
-            self.cmd_vel_pub.publish(Twist())
+            self._publish_cmd_vel_safely(Twist())
         pose = self._current_pose(self.map_frame)
         return bool(
             pose is not None
@@ -1693,11 +2239,22 @@ class SemanticBehaviorExecutor:
             return bool(
                 self.selection is not None
                 and str(self.selection.get("decision_id") or "") == decision_id
+                and self._candidate_lifecycle_is_current_locked(self.selection)
                 and self.machine.state in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}
             )
 
     def _finish_terminal(self, command: dict) -> None:
         with self.lock:
+            command_candidate = dict(command.get("candidate") or {})
+            if command_candidate and not self._active_candidate_is_current_locked(
+                command_candidate
+            ):
+                return
+            if not command_candidate and (
+                self.selection is None
+                or not self._candidate_lifecycle_is_current_locked(self.selection)
+            ):
+                return
             selection = dict(self.selection or {})
             was_navigating = self.machine.state in {
                 STATE_NAVIGATING,
@@ -1710,8 +2267,9 @@ class SemanticBehaviorExecutor:
             self._publish_feedback(selection, status, bool(command.get("success")), detail)
             self.selection = None
             self.machine.reset()
+            self._target_visibility_retry = None
         if was_navigating:
-            self.move_base.cancel_goal()
+            self._cancel_navigation_safely()
 
     def _publish_feedback(
         self, selection: dict, status: str, success: bool | None, detail: dict
@@ -1722,6 +2280,9 @@ class SemanticBehaviorExecutor:
             "behavior_type": selection.get("behavior_type", ""),
             "target_id": selection.get("target_id", ""),
             "target_name": selection.get("target_name", ""),
+            "episode_generation": self._parse_episode_generation(
+                selection.get("episode_generation", 0)
+            ),
             "command_id": self._command_id(selection),
             "status": status,
             "success": success,
@@ -1733,13 +2294,23 @@ class SemanticBehaviorExecutor:
         )
 
     def _matches_active(self, payload: dict) -> bool:
-        if self.selection is None:
-            return False
-        command_id = str(payload.get("command_id") or "")
-        candidate_id = str(payload.get("candidate_id") or "")
-        return command_id == self._command_id(self.selection) or (
-            candidate_id and candidate_id == str(self.selection.get("candidate_id") or "")
-        )
+        with self.lock:
+            if self.selection is None or not self._candidate_lifecycle_is_current_locked(
+                self.selection
+            ):
+                return False
+            if "episode_generation" in payload:
+                payload_generation = self._parse_episode_generation(
+                    payload.get("episode_generation", 0)
+                )
+                if payload_generation != int(self.episode_generation or 0):
+                    return False
+            command_id = str(payload.get("command_id") or "")
+            candidate_id = str(payload.get("candidate_id") or "")
+            return command_id == self._command_id(self.selection) or (
+                candidate_id
+                and candidate_id == str(self.selection.get("candidate_id") or "")
+            )
 
     @staticmethod
     def _command_id(candidate: dict) -> str:

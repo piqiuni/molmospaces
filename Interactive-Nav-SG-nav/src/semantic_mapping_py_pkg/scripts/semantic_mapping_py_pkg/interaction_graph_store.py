@@ -339,8 +339,8 @@ class InteractionGraphStore:
             [max(0.1, max_x - min_x), max(0.1, max_y - min_y), float(size[2])],
         )
 
-    def apply_attribute_patch(self, patch, stamp=None):
-        object_id = str(patch.get("object_id") or "")
+    def _attribute_patch_target(self, object_id):
+        object_id = str(object_id or "")
         node = self.nodes.get(object_id)
         if node is None:
             node = next(
@@ -351,6 +351,14 @@ class InteractionGraphStore:
                 ),
                 None,
             )
+        return node
+
+    def has_attribute_patch_target(self, object_id):
+        return self._attribute_patch_target(object_id) is not None
+
+    def apply_attribute_patch(self, patch, stamp=None):
+        object_id = str(patch.get("object_id") or "")
+        node = self._attribute_patch_target(object_id)
         if node is None:
             return False
         attribute_status = str(patch.get("attribute_status") or "ready")

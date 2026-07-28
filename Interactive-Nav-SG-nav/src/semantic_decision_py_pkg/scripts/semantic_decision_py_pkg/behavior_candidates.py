@@ -79,6 +79,7 @@ class CandidateGeneratorConfig:
     target_min_visible_fraction: float = 0.2
     target_min_consecutive_observations: int = 2
     target_arrival_tolerance_m: float = 0.35
+    target_success_distance_m: float = 1.5
 
 
 class CandidateGenerator:
@@ -92,6 +93,8 @@ class CandidateGenerator:
         robot_xy: tuple[float, float] | None,
         target_context: dict[str, Any] | None = None,
     ) -> list[BehaviorCandidate]:
+        if (target_context or {}).get("episode_active") is False:
+            return []
         if (explorer_status or {}).get("initial_scan_complete") is False:
             return []
         candidates = self._frontier_candidates(explorer_status or {})
@@ -160,6 +163,7 @@ class CandidateGenerator:
             position = self._node_xy(navigation_anchor, prefer_aabb=True)
             if position is None:
                 continue
+            target_position = self._node_xy(node, prefer_aabb=True)
             previous_interaction_goal = self._successful_interaction_approach(
                 navigation_anchor
             )
@@ -168,13 +172,45 @@ class CandidateGenerator:
                 if navigation_anchor is not node
                 else None
             )
-            goal = previous_interaction_goal or configured_interaction_goal or self._approach_pose(
-                robot_xy,
-                position,
-                float(target_context.get("standoff_m", self.config.target_standoff_m)),
-                node=navigation_anchor,
-                fixed_axis=self._container_approach_axis(navigation_anchor),
+            target_standoff_m = float(
+                target_context.get("standoff_m", self.config.target_standoff_m)
             )
+            has_container_front_axis = (
+                self._container_approach_axis(navigation_anchor) is not None
+            )
+            is_container_target = (
+                str(navigation_anchor.get("type") or "") == "container"
+                or has_container_front_axis
+            )
+            if (
+                navigation_anchor is node
+                and previous_interaction_goal is None
+                and configured_interaction_goal is None
+                and not is_container_target
+            ):
+                # A free-standing target can be visible from a blocked side.
+                # Preserve the radial approach first, then let make_plan choose
+                # a side-on fallback before treating the target as unreachable.
+                goal_candidates = self._target_object_approach_candidates(
+                    robot_xy,
+                    position,
+                    navigation_anchor,
+                    target_standoff_m,
+                )
+                goal = goal_candidates[0]
+            else:
+                goal = (
+                    previous_interaction_goal
+                    or configured_interaction_goal
+                    or self._approach_pose(
+                        robot_xy,
+                        position,
+                        target_standoff_m,
+                        node=navigation_anchor,
+                        fixed_axis=self._container_approach_axis(navigation_anchor),
+                    )
+                )
+                goal_candidates = [goal]
             distance_m = math.hypot(goal[0] - robot_xy[0], goal[1] - robot_xy[1])
             target_arrival_tolerance_m = max(
                 0.0,
@@ -185,6 +221,20 @@ class CandidateGenerator:
                     )
                 ),
             )
+            try:
+                target_success_distance_m = float(
+                    target_context.get(
+                        "success_distance_threshold_m",
+                        self.config.target_success_distance_m,
+                    )
+                )
+            except (TypeError, ValueError):
+                target_success_distance_m = float(self.config.target_success_distance_m)
+            if (
+                not math.isfinite(target_success_distance_m)
+                or target_success_distance_m <= 0.0
+            ):
+                target_success_distance_m = float(self.config.target_success_distance_m)
             node_id = str(node.get("id") or "")
             containing_container = (
                 navigation_anchor
@@ -305,10 +355,23 @@ class CandidateGenerator:
                         "target_max_consecutive_observations": max_consecutive_observations,
                         "target_reliably_observed": reliably_observed,
                         "target_goal_distance_m": distance_m,
+                        "goal_xyyaw_candidates": goal_candidates,
+                        "target_fallback_goal_count": max(
+                            0, len(goal_candidates) - 1
+                        ),
                         "target_arrival_tolerance_m": target_arrival_tolerance_m,
                         "target_navigation_required": (
                             distance_m > target_arrival_tolerance_m
                         ),
+                        # This is the actual object center, not the standoff
+                        # waypoint used for navigation.  It is used to gate
+                        # semantic completion on the benchmark distance rule.
+                        "target_position_xy": (
+                            list(target_position)
+                            if target_position is not None
+                            else None
+                        ),
+                        "target_success_distance_m": target_success_distance_m,
                         "target_min_visible_fraction": target_min_visible_fraction,
                         "target_min_consecutive_observations": target_min_consecutive_observations,
                         "verify_target_visibility": verify_visibility,
@@ -386,6 +449,21 @@ class CandidateGenerator:
         ).strip().casefold()
         if requested_source_name:
             return requested_source_name == observed_source_name
+        raw_candidate_instances = target_context.get("candidate_instances") or []
+        if isinstance(raw_candidate_instances, str):
+            raw_candidate_instances = [raw_candidate_instances]
+        elif not isinstance(raw_candidate_instances, (list, tuple, set)):
+            raw_candidate_instances = []
+        requested_candidate_instances = {
+            str(value).strip().casefold()
+            for value in raw_candidate_instances
+            if str(value).strip()
+        }
+        if requested_candidate_instances:
+            return bool(
+                requested_candidate_instances
+                & {observed_instance_id, observed_source_name}
+            )
         requested = list(target_context.get("object_labels") or [])
         for key in ("object_label", "target_object", "target_name"):
             value = target_context.get(key)
@@ -741,11 +819,15 @@ class CandidateGenerator:
                 continue
             if node_type == "container" and not self._is_openable_container(node):
                 continue
-            node_state = str(interaction.get("state") or "unknown")
-            if node_type == "portal" and (
-                not bool(interaction.get("requires_interaction"))
-                or node_state not in {"closed", "ajar", "unknown"}
-            ):
+            # An interaction action must be grounded in a known actionable
+            # joint state.  ``unknown`` is the mapper's initial/default state
+            # while attribute inference or joint readback is still pending;
+            # emitting an ``open`` candidate for it races that update and can
+            # execute a redundant action after the object is already open.
+            node_state = str(interaction.get("state") or "unknown").strip().casefold()
+            if node_state not in {"closed", "ajar"}:
+                continue
+            if node_type == "portal" and not bool(interaction.get("requires_interaction")):
                 continue
             confidence = float(
                 interaction.get("state_confidence", interaction.get("confidence", node.get("confidence", 0.0)))
@@ -797,8 +879,6 @@ class CandidateGenerator:
                 target_context.get("enabled")
                 and self._matches_interaction_target(node, target_context)
             )
-            if node_type == "container" and node_state in {"open", "static_open"}:
-                continue
             object_id = str(
                 attributes.get("instance_id") or source_object_name or node_id
             )
@@ -898,6 +978,11 @@ class CandidateGenerator:
                                 )
                             )
                         ),
+                        "portal_tangential_fallback_count": (
+                            max(0, len(goal_candidates) - 3)
+                            if node_type == "portal"
+                            else 0
+                        ),
                         "interaction_approach_axis_xy": self._container_approach_axis(
                             node
                         ),
@@ -918,6 +1003,21 @@ class CandidateGenerator:
         node_type: str,
     ) -> list[list[float]]:
         candidates: list[list[float]] = []
+
+        def append_unique(pose: list[float]) -> None:
+            if not any(
+                math.hypot(pose[0] - previous[0], pose[1] - previous[1]) <= 1e-6
+                and abs(
+                    math.atan2(
+                        math.sin(pose[2] - previous[2]),
+                        math.cos(pose[2] - previous[2]),
+                    )
+                )
+                <= 1e-6
+                for previous in candidates
+            ):
+                candidates.append(pose)
+
         for extra_standoff in (0.0, 0.25, 0.50):
             candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
             if node_type == "portal":
@@ -946,15 +1046,48 @@ class CandidateGenerator:
                         node=node,
                         fixed_axis=cls._container_approach_axis(node),
                     )
+            append_unique(pose)
+
+        if node_type == "portal":
+            for pose in cls._portal_tangential_approach_poses(
+                robot_xy,
+                target_xy,
+                node,
+                max(0.0, float(standoff_m)),
+            ):
+                append_unique(pose)
+        return candidates
+
+    @classmethod
+    def _target_object_approach_candidates(
+        cls,
+        robot_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+        node: dict[str, Any],
+        standoff_m: float,
+    ) -> list[list[float]]:
+        """Return radial and side-on standoffs for a free-standing target."""
+        dx = float(robot_xy[0]) - float(target_xy[0])
+        dy = float(robot_xy[1]) - float(target_xy[1])
+        norm = math.hypot(dx, dy)
+        radial = (-1.0, 0.0) if norm <= 1e-6 else (dx / norm, dy / norm)
+        axes = (
+            radial,
+            (-radial[1], radial[0]),
+            (radial[1], -radial[0]),
+            (-radial[0], -radial[1]),
+        )
+        candidates: list[list[float]] = []
+        for axis in axes:
+            pose = cls._approach_pose(
+                robot_xy,
+                target_xy,
+                standoff_m,
+                node=node,
+                fixed_axis=axis,
+            )
             if not any(
                 math.hypot(pose[0] - previous[0], pose[1] - previous[1]) <= 1e-6
-                and abs(
-                    math.atan2(
-                        math.sin(pose[2] - previous[2]),
-                        math.cos(pose[2] - previous[2]),
-                    )
-                )
-                <= 1e-6
                 for previous in candidates
             ):
                 candidates.append(pose)
@@ -1268,3 +1401,76 @@ class CandidateGenerator:
         y = target_xy[1] + side * normal_y * offset
         yaw = math.atan2(target_xy[1] - y, target_xy[0] - x)
         return [x, y, yaw]
+
+    @classmethod
+    def _portal_tangential_approach_poses(
+        cls,
+        robot_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+        node: dict[str, Any],
+        standoff_m: float,
+    ) -> list[list[float]]:
+        """Sample along a portal's width when its centerline is inflated/blocked."""
+        attributes = node.get("attributes") or {}
+        reference_center = list(
+            attributes.get("interaction_reference_aabb_center")
+            or node.get("aabb_center")
+            or target_xy
+        )
+        if len(reference_center) >= 2:
+            target_xy = float(reference_center[0]), float(reference_center[1])
+        size = list(
+            attributes.get("interaction_reference_aabb_size")
+            or node.get("aabb_size")
+            or []
+        )
+        if len(size) < 2:
+            return []
+        size_x = max(0.0, float(size[0]))
+        size_y = max(0.0, float(size[1]))
+        major = max(size_x, size_y)
+        minor = min(size_x, size_y)
+        if major <= 1e-6 or major / max(minor, 1e-6) < 1.35:
+            return []
+        tangent_x, tangent_y = (0.0, 1.0) if size_x <= size_y else (1.0, 0.0)
+        half_major = 0.5 * major
+        edge_margin = min(0.25, 0.25 * major)
+        tangent_limit = max(0.0, half_major - edge_margin)
+        if tangent_limit <= 1e-6:
+            return []
+
+        robot_projection = (
+            (robot_xy[0] - target_xy[0]) * tangent_x
+            + (robot_xy[1] - target_xy[1]) * tangent_y
+        )
+        projected_offset = max(-tangent_limit, min(tangent_limit, robot_projection))
+        preferred_sign = 1.0 if projected_offset >= 0.0 else -1.0
+        raw_offsets = (
+            projected_offset,
+            preferred_sign * min(0.25, tangent_limit),
+            -preferred_sign * min(0.25, tangent_limit),
+            preferred_sign * min(0.50, tangent_limit),
+            -preferred_sign * min(0.50, tangent_limit),
+        )
+        base = cls._portal_approach_pose(
+            robot_xy,
+            target_xy,
+            node,
+            standoff_m,
+        )
+        poses = []
+        used_offsets = []
+        for offset in raw_offsets:
+            if abs(offset) <= 1e-6 or any(
+                abs(offset - previous) <= 1e-6 for previous in used_offsets
+            ):
+                continue
+            used_offsets.append(offset)
+            poses.append(
+                [
+                    base[0] + tangent_x * offset,
+                    base[1] + tangent_y * offset,
+                    base[2],
+                ]
+            )
+        return poses

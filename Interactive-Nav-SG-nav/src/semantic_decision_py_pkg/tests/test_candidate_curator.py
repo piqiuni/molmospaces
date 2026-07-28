@@ -204,3 +204,28 @@ def test_candidate_update_rejects_moved_or_changed_interaction() -> None:
         validate_candidate_update(selected, [changed]).reason
         == "candidate_semantics_changed"
     )
+
+
+def test_candidate_update_rejects_interaction_invalidated_by_graph_refresh() -> None:
+    selected = make_candidate(
+        "interaction:door:open",
+        "INTERACT",
+        x=1.0,
+        node_type="portal",
+        state="closed",
+    )
+    already_open = make_candidate(
+        "interaction:door:open",
+        "INTERACT",
+        x=1.0,
+        node_type="portal",
+        state="open",
+    )
+
+    removed = validate_candidate_update(selected, [])
+    satisfied = validate_candidate_update(selected, [already_open])
+
+    assert removed.valid is False
+    assert removed.reason == "candidate_missing"
+    assert satisfied.valid is False
+    assert satisfied.reason == "interaction_action_already_satisfied"

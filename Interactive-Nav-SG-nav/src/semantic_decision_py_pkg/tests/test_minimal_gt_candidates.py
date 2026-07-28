@@ -38,7 +38,32 @@ def test_minimal_gt_portal_generates_semantic_id_and_geometry_command() -> None:
         source_mode="realtime_gt_observation",
     )
 
-    candidates = CandidateGenerator().generate(
+    generator = CandidateGenerator()
+    candidates = generator.generate(
+        {"initial_scan_complete": True},
+        store.as_graph_dict(),
+        robot_xy=(0.0, 0.0),
+    )
+
+    # Minimal GT observations intentionally do not include joint readback or a
+    # semantic state.  The default ``unknown`` state must not create an action
+    # before attribute inference supplies a grounded state.
+    assert [candidate for candidate in candidates if candidate.behavior_type == "INTERACT"] == []
+
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "double_door_root",
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.9,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    candidates = generator.generate(
         {"initial_scan_complete": True},
         store.as_graph_dict(),
         robot_xy=(0.0, 0.0),

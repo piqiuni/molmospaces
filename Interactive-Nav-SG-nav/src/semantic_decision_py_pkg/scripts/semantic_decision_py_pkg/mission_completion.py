@@ -48,7 +48,12 @@ class MissionCompletionTracker:
         target_enabled: bool,
     ) -> bool:
         if self.complete:
-            return True
+            if not target_enabled:
+                return True
+            self.complete = False
+            self.reason = ""
+            self.confirmations = 0
+            self.empty_since_step = None
         sequence = int(candidates_payload.get("sequence", 0) or 0)
         if sequence == self.last_sequence:
             return False
@@ -115,6 +120,7 @@ class MissionCompletionTracker:
         )
         ready_to_complete = (
             not has_active_behavior
+            and not target_enabled
             and initial_scan_complete
             and exhausted
             and navigation_frontier_exhausted

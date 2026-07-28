@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -74,13 +75,7 @@ class ExplorePyNode:
         self.initial_spin_timeout_sec = float(exploration_cfg.get("initial_spin_timeout_sec", 25.0))
         self.initial_spin_settle_sec = float(exploration_cfg.get("initial_spin_settle_sec", 1.0))
         self.initial_spin_cmd_rate_hz = float(exploration_cfg.get("initial_spin_cmd_rate_hz", 10.0))
-        self.initial_spin_done = not self.initial_spin_enabled
-        self.initial_spin_active = False
-        self.initial_spin_start_time = 0.0
-        self.initial_spin_done_time = 0.0
-        self.initial_spin_last_yaw = None
-        self.initial_spin_accumulated_yaw = 0.0
-        self.initial_spin_reason = "disabled" if self.initial_spin_done else "pending"
+        self._reset_initial_spin_state()
         self.local_plan_watchdog_enabled = bool(exploration_cfg.get("local_plan_watchdog_enabled", True))
         self.local_plan_watchdog_sec = float(exploration_cfg.get("local_plan_watchdog_sec", 12.0))
         self.local_plan_min_poses = int(exploration_cfg.get("local_plan_min_poses", 3))
@@ -245,6 +240,8 @@ class ExplorePyNode:
         self.value_fusion = ValueMapFusion()
         self.skill_api = ExplorationSkillApi(self)
         self.make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
+        self._lifecycle_lock = threading.RLock()
+        self._reset_generation = 0
 
         self.latest_grid_msg = None
         self.latest_grid = None
@@ -318,62 +315,67 @@ class ExplorePyNode:
                       self.topics.get("move_base_status", "/move_base/status"))
 
     def reset_callback(self, _msg):
-        self._cancel_move_base_goal("external_reset")
-        self.state = ExplorerState(self.state.config)
-        self.value_fusion = ValueMapFusion()
-        self.latest_grid_msg = None
-        self.latest_grid = None
-        self.robot_xy = None
-        self.robot_yaw = None
-        self.latest_clusters = []
-        self.last_selected_cluster = None
-        self.external_reserved_cluster = None
-        self.external_reserved_command = None
-        self.external_reservation_ack_cache.clear()
-        self.external_reservation_received_count = 0
-        self.external_reservation_replay_count = 0
-        self.external_reservation_last_command_id = ""
-        self.external_reservation_last_cluster_id = ""
-        self.external_reservation_last_status = ""
-        self.external_reservation_last_detail = {}
-        self.latest_global_plan_pose_count = 0
-        self.latest_global_plan_length_m = 0.0
-        self.latest_global_plan_time = 0.0
-        self.latest_global_plan_endpoint = None
-        self.latest_global_plan_goal_distance_m = float("inf")
-        self.latest_global_plan_matches_active_goal = False
-        self.latest_local_plan_pose_count = 0
-        self.latest_local_plan_length_m = 0.0
-        self.latest_local_plan_time = 0.0
-        self.local_plan_bad_since = 0.0
-        self.last_goal_publish_time = 0.0
-        self.last_status_key = ""
-        self.seen_terminal_status_keys.clear()
-        self.last_move_base_feedback = None
-        self.active_move_base_goal_id = ""
-        self.active_goal_publish_ros_time = 0.0
-        self.active_goal_publish_wall_time = 0.0
-        self.sent_goal_count = 0
-        self._reset_rotation_replan_tracking()
-        self.initial_spin_done = not self.initial_spin_enabled
-        self.initial_spin_active = False
-        self.initial_spin_start_time = 0.0
-        self.initial_spin_done_time = 0.0
-        self.initial_spin_last_yaw = None
-        self.initial_spin_accumulated_yaw = 0.0
-        self.initial_spin_reason = "disabled" if self.initial_spin_done else "pending"
+        with self._lifecycle_lock:
+            self._reset_generation += 1
+            self._cancel_move_base_goal("external_reset")
+            self.state = ExplorerState(self.state.config)
+            self.value_fusion = ValueMapFusion()
+            self.latest_grid_msg = None
+            self.latest_grid = None
+            self.robot_xy = None
+            self.robot_yaw = None
+            self.latest_clusters = []
+            self.last_selected_cluster = None
+            self.external_reserved_cluster = None
+            self.external_reserved_command = None
+            self.external_reservation_ack_cache.clear()
+            self.external_reservation_received_count = 0
+            self.external_reservation_replay_count = 0
+            self.external_reservation_last_command_id = ""
+            self.external_reservation_last_cluster_id = ""
+            self.external_reservation_last_status = ""
+            self.external_reservation_last_detail = {}
+            self.latest_global_plan_pose_count = 0
+            self.latest_global_plan_length_m = 0.0
+            self.latest_global_plan_time = 0.0
+            self.latest_global_plan_endpoint = None
+            self.latest_global_plan_goal_distance_m = float("inf")
+            self.latest_global_plan_matches_active_goal = False
+            self.latest_local_plan_pose_count = 0
+            self.latest_local_plan_length_m = 0.0
+            self.latest_local_plan_time = 0.0
+            self.local_plan_bad_since = 0.0
+            self.last_goal_publish_time = 0.0
+            self.last_status_key = ""
+            self.seen_terminal_status_keys.clear()
+            self.last_move_base_feedback = None
+            self.active_move_base_goal_id = ""
+            self.active_goal_publish_ros_time = 0.0
+            self.active_goal_publish_wall_time = 0.0
+            self.sent_goal_count = 0
+            self._reset_rotation_replan_tracking()
+            self._reset_initial_spin_state()
         marker = Marker()
         marker.action = Marker.DELETEALL
-        self.frontier_pub.publish(MarkerArray(markers=[marker]))
+        self._publish_safely(self.frontier_pub, MarkerArray(markers=[marker]))
         rospy.logwarn("[explore_py] exploration state reset for a new scene")
 
     def occupancy_callback(self, msg):
-        self.latest_grid_msg = msg
-        self.latest_grid = self._convert_grid(msg)
+        grid = self._convert_grid(msg)
+        with self._lifecycle_lock:
+            self.latest_grid_msg = msg
+            self.latest_grid = grid
 
     def odom_callback(self, msg):
-        self.robot_xy = (float(msg.pose.pose.position.x), float(msg.pose.pose.position.y))
-        self.robot_yaw = self._yaw_from_quaternion(msg.pose.pose.orientation)
+        robot_xy = (float(msg.pose.pose.position.x), float(msg.pose.pose.position.y))
+        robot_yaw = self._yaw_from_quaternion(msg.pose.pose.orientation)
+        with self._lifecycle_lock:
+            self.robot_xy = robot_xy
+            self.robot_yaw = robot_yaw
+            # Odom arrives much faster than the explorer tick.  Account for
+            # the scan here so the stop command is tied to the actual yaw
+            # crossing rather than the next (normally 1 Hz) frontier update.
+            self._record_initial_spin_yaw(robot_yaw, time.time())
 
     def strategy_bias_callback(self, msg):
         self.value_fusion.set_strategy_bias_json(msg.data)
@@ -676,32 +678,52 @@ class ExplorePyNode:
         self.state.mark_active_failed(reason, source="explorer")
 
     def compute_next_subgoal(self, force=False, publish_selection=True):
-        if self.latest_grid is None or self.robot_xy is None:
+        with self._lifecycle_lock:
+            reset_generation = self._reset_generation
+            latest_grid = self.latest_grid
+            robot_xy = self.robot_xy
+            robot_yaw = self.robot_yaw
+            value_fusion = self.value_fusion
+            state = self.state
+            sent_goal_count = self.sent_goal_count
+        if latest_grid is None or robot_xy is None:
             return None
         clusters = self.core.extract_frontier_clusters(
-            self.latest_grid,
-            self.robot_xy,
-            value_provider=self.value_fusion,
-            state=self.state,
+            latest_grid,
+            robot_xy,
+            value_provider=value_fusion,
+            state=state,
         )
-        self.state.update_seen_clusters(clusters)
-        self.latest_clusters = clusters
+        state.update_seen_clusters(clusters)
         if not clusters:
-            if publish_selection:
-                self.last_selected_cluster = None
+            with self._lifecycle_lock:
+                if reset_generation != self._reset_generation:
+                    return None
+                self.latest_clusters = clusters
+                if publish_selection:
+                    self.last_selected_cluster = None
             return None
-        if self.sent_goal_count < self.initial_local_goal_count:
-            cluster = self.core.select_initial_local_cluster(clusters, self.robot_xy, robot_yaw=self.robot_yaw)
+        if sent_goal_count < self.initial_local_goal_count:
+            cluster = self.core.select_initial_local_cluster(
+                clusters,
+                robot_xy,
+                robot_yaw=robot_yaw,
+            )
         else:
-            ranked = self.core.rank_clusters(clusters, self.robot_xy, state=self.state)
+            ranked = self.core.rank_clusters(clusters, robot_xy, state=state)
             cluster = ranked[0] if ranked else None
-        if publish_selection:
-            self.last_selected_cluster = cluster
+        with self._lifecycle_lock:
+            if reset_generation != self._reset_generation:
+                return None
+            self.latest_clusters = clusters
+            if publish_selection:
+                self.last_selected_cluster = cluster
         return cluster
 
     def build_status_payload(self):
         payload = {
             "ready": self.latest_grid is not None and self.robot_xy is not None,
+            "initial_scan_complete": bool(self.initial_spin_done),
             "external_behavior_control": self.external_behavior_control,
             "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
             "map_resolution": (
@@ -872,7 +894,7 @@ class ExplorePyNode:
         point_msg.header.stamp = rospy.Time.now()
         point_msg.header.frame_id = self.map_frame
         point_msg.point = Point(cluster.subgoal_world[0], cluster.subgoal_world[1], 0.0)
-        self.subgoal_pub.publish(point_msg)
+        self._publish_safely(self.subgoal_pub, point_msg)
         detail = {
             "cluster_id": cluster.cluster_id,
             "goal_xyyaw": [
@@ -954,7 +976,8 @@ class ExplorePyNode:
             "detail": dict(detail or {}),
             "timestamp": time.time(),
         }
-        self.behavior_feedback_pub.publish(
+        self._publish_safely(
+            self.behavior_feedback_pub,
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
 
@@ -1184,17 +1207,20 @@ class ExplorePyNode:
         msg.pose.orientation.w = qw
         self.active_goal_publish_ros_time = msg.header.stamp.to_sec()
         self.active_goal_publish_wall_time = time.time()
-        self.goal_pub.publish(msg)
+        self._publish_safely(self.goal_pub, msg)
 
         point_msg = PointStamped()
         point_msg.header = msg.header
         point_msg.point = Point(goal.point[0], goal.point[1], 0.0)
-        self.subgoal_pub.publish(point_msg)
+        self._publish_safely(self.subgoal_pub, point_msg)
         goal.status = SUBGOAL_WAITING
         self.last_goal_publish_time = time.time()
 
     def _publish_status(self):
-        self.status_pub.publish(String(data=json.dumps(self.build_status_payload(), ensure_ascii=False, sort_keys=True)))
+        self._publish_safely(
+            self.status_pub,
+            String(data=json.dumps(self.build_status_payload(), ensure_ascii=False, sort_keys=True)),
+        )
 
     def _publish_frontiers(self):
         markers = MarkerArray()
@@ -1325,69 +1351,126 @@ class ExplorePyNode:
             label.color.a = 1.0
             label.text = f"ACTIVE yaw={goal.yaw:.2f}"
             markers.markers.append(label)
-        self.frontier_pub.publish(markers)
+        self._publish_safely(self.frontier_pub, markers)
+
+    def _reset_initial_spin_state(self) -> None:
+        self.initial_spin_done = not self.initial_spin_enabled
+        self.initial_spin_active = False
+        self.initial_spin_start_time = 0.0
+        self.initial_spin_done_time = 0.0
+        self.initial_spin_last_yaw = None
+        self.initial_spin_accumulated_yaw = 0.0
+        self.initial_spin_reason = "disabled" if self.initial_spin_done else "pending"
 
     def _should_run_initial_spin(self) -> bool:
-        if self.initial_spin_done:
-            return False
-        if self.state.active_goal is not None:
-            self.initial_spin_done = True
-            self.initial_spin_reason = "skipped_active_goal"
-            return False
-        if self.robot_yaw is None:
-            return True
-        if self.initial_spin_done_time > 0.0:
+        """Keep normal exploration navigation gated for the scan and its settle time."""
+        with self._lifecycle_lock:
+            if self.state.active_goal is not None:
+                return False
+            if not self.initial_spin_done:
+                return True
+            # A completed/timeout scan needs a brief stationary window so the
+            # map and local planner can consume the final view.  Disabled and
+            # skipped scans must never delay an already-running navigation goal.
+            if (
+                not self.initial_spin_enabled
+                or self.initial_spin_done_time <= 0.0
+                or self.initial_spin_reason not in {"completed", "timeout"}
+                or self.initial_spin_settle_sec <= 0.0
+            ):
+                return False
             return time.time() - self.initial_spin_done_time < self.initial_spin_settle_sec
-        return True
 
     def _tick_initial_spin(self) -> None:
-        now = time.time()
-        if self.robot_yaw is None:
-            self.initial_spin_reason = "waiting_for_yaw"
+        with self._lifecycle_lock:
+            self._advance_initial_spin(time.time(), allow_start=True)
+
+    def _initial_spin_cmd_timer_callback(self, _event) -> None:
+        with self._lifecycle_lock:
+            # Preserve the explorer tick as the only place allowed to arm the
+            # scan.  The high-rate timer merely maintains an already-running
+            # command/timeout loop; otherwise it can start rotating before the
+            # first frontier update is available.
+            if not rospy.is_shutdown() and self.initial_spin_active:
+                self._advance_initial_spin(time.time(), allow_start=False)
+
+    def _advance_initial_spin(self, now: float, *, allow_start: bool = True) -> None:
+        """Run the scan controller; only the explorer tick may arm a new scan."""
+        if self.initial_spin_done:
+            return
+        if not self.initial_spin_active and not allow_start:
+            return
+        if self.state.active_goal is not None:
+            self._finish_initial_spin("skipped_active_goal", now)
             return
         if not self.initial_spin_active:
+            if self.latest_grid is None or self.robot_xy is None:
+                return
+            if self.robot_yaw is None:
+                self.initial_spin_reason = "waiting_for_yaw"
+                return
             self.initial_spin_active = True
             self.initial_spin_start_time = now
             self.initial_spin_last_yaw = self.robot_yaw
             self.initial_spin_accumulated_yaw = 0.0
             self.initial_spin_reason = "spinning"
             rospy.loginfo("[explore_py] initial 360deg scan started")
-        else:
-            delta = self._signed_angle_diff(self.robot_yaw, self.initial_spin_last_yaw)
-            self.initial_spin_accumulated_yaw += abs(delta)
-            self.initial_spin_last_yaw = self.robot_yaw
 
-        timed_out = now - self.initial_spin_start_time >= self.initial_spin_timeout_sec
-        completed = self.initial_spin_accumulated_yaw >= self.initial_spin_angle_rad
-        if completed or timed_out:
-            self._publish_zero_cmd_vel()
-            self.initial_spin_done = True
-            self.initial_spin_active = False
-            self.initial_spin_done_time = now
-            self.initial_spin_reason = "completed" if completed else "timeout"
-            rospy.loginfo(
-                "[explore_py] initial scan finished reason=%s accumulated_yaw=%.2f",
-                self.initial_spin_reason,
-                self.initial_spin_accumulated_yaw,
-            )
+        if self.initial_spin_accumulated_yaw >= self.initial_spin_angle_rad:
+            self._finish_initial_spin("completed", now)
             return
-
+        if now - self.initial_spin_start_time >= self.initial_spin_timeout_sec:
+            self._finish_initial_spin("timeout", now)
+            return
         self._publish_initial_spin_cmd()
 
-    def _initial_spin_cmd_timer_callback(self, _event) -> None:
-        if self.initial_spin_active and not self.initial_spin_done and not rospy.is_shutdown():
-            self._publish_initial_spin_cmd()
+    def _record_initial_spin_yaw(self, yaw: float, now: float) -> None:
+        """Accumulate unwrapped odometry yaw while the high-rate scan is active."""
+        if not self.initial_spin_active or self.initial_spin_done:
+            return
+        if self.initial_spin_last_yaw is None:
+            self.initial_spin_last_yaw = yaw
+            return
+        delta = self._signed_angle_diff(yaw, self.initial_spin_last_yaw)
+        self.initial_spin_accumulated_yaw += abs(delta)
+        self.initial_spin_last_yaw = yaw
+        if self.initial_spin_accumulated_yaw >= self.initial_spin_angle_rad:
+            self._finish_initial_spin("completed", now)
+
+    def _finish_initial_spin(self, reason: str, now: float) -> None:
+        if self.initial_spin_done:
+            return
+        self._publish_zero_cmd_vel()
+        self.initial_spin_done = True
+        self.initial_spin_active = False
+        self.initial_spin_done_time = now
+        self.initial_spin_reason = reason
+        rospy.loginfo(
+            "[explore_py] initial scan finished reason=%s accumulated_yaw=%.2f",
+            self.initial_spin_reason,
+            self.initial_spin_accumulated_yaw,
+        )
 
     def _publish_initial_spin_cmd(self) -> None:
         cmd = Twist()
         cmd.angular.z = self.initial_spin_angular_speed
-        self.cmd_vel_pub.publish(cmd)
+        self._publish_safely(self.cmd_vel_pub, cmd)
 
     def _publish_zero_cmd_vel(self) -> None:
-        self.cmd_vel_pub.publish(Twist())
+        self._publish_safely(self.cmd_vel_pub, Twist())
+
+    @staticmethod
+    def _publish_safely(publisher, msg) -> bool:
+        if rospy.is_shutdown():
+            return False
+        try:
+            publisher.publish(msg)
+        except (rospy.ROSException, AttributeError):
+            return False
+        return True
 
     def _cancel_move_base_goal(self, reason: str) -> None:
-        self.cancel_pub.publish(GoalID())
+        self._publish_safely(self.cancel_pub, GoalID())
         self._publish_zero_cmd_vel()
         self.active_move_base_goal_id = ""
         rospy.loginfo("[explore_py] canceled move_base goal after explorer transition: %s", reason)

@@ -24,6 +24,7 @@ from semantic_mapping_py_pkg.graph_ablation import apply_module1_ablation
 from semantic_mapping_py_pkg.interaction_graph_viz import build_graph_marker_array
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text
+from semantic_mapping_py_pkg.pending_attribute_patches import PendingAttributePatchCache
 from semantic_mapping_py_pkg.room_segmentation import RoomSegmenter, RoomSegmentationState
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
 from semantic_mapping_py_pkg.ros_params import get_frames, get_nested_param, get_topics
@@ -62,6 +63,9 @@ class SemanticMappingNode:
         self.interaction_result_topic = topics.get("interaction_result", "/semantic_mapping/interaction_result")
         self.attribute_updates_topic = topics.get(
             "attribute_updates", "/semantic_mapping/attribute_updates"
+        )
+        self.target_context_topic = topics.get(
+            "target", topics.get("target_context", "/semantic_decision/target")
         )
         self.planning_occupancy_grid_topic = topics.get(
             "planning_occupancy_grid", "/semantic_mapping/planning_occ_map"
@@ -183,6 +187,9 @@ class SemanticMappingNode:
                 "geometry_overrides", {}
             ),
         )
+        self.pending_attribute_patches = PendingAttributePatchCache(
+            max_entries=config.get("attribute_pending_patch_max_entries", 128)
+        )
         self.semantic_occ_overlay = SemanticOccupancyOverlay(
             enabled=overlay_config.get("enabled", True),
             clear_padding_m=overlay_config.get("clear_padding_m", 0.10),
@@ -242,6 +249,12 @@ class SemanticMappingNode:
         )
         self.attribute_updates_sub = rospy.Subscriber(
             self.attribute_updates_topic, String, self.attribute_updates_callback, queue_size=2
+        )
+        self.target_context_sub = rospy.Subscriber(
+            self.target_context_topic,
+            String,
+            self.target_context_callback,
+            queue_size=4,
         )
 
         self.object_pub = rospy.Publisher(self.object_map_topic, String, queue_size=1)
@@ -304,6 +317,7 @@ class SemanticMappingNode:
                 source_mode="detector_online",
             )
             self.graph_store.update_observations(observations, stamp=stamp, source_mode="detector_online")
+            self.pending_attribute_patches.replay(self.graph_store)
             if portal_structure_changed:
                 self._refresh_room_grid_locked()
             self.graph_store.prune_stale_nodes(self.object_stale_after_sec, now=stamp)
@@ -335,6 +349,9 @@ class SemanticMappingNode:
         with self.lock:
             episode_changed = episode_id and episode_id != self.graph_store.episode_id
             if bool(parsed.get("episode_reset")) or episode_changed:
+                # Keep patches already produced for this episode: the GT and
+                # attribute subscribers can run in either order.
+                self.pending_attribute_patches.observe_episode(episode_id)
                 self._save_episode_graph_locked(final=True)
                 self.graph_store.reset(episode_id=episode_id, source_mode="realtime_gt_observation")
                 self.semantic_occ_overlay.reset()
@@ -354,6 +371,7 @@ class SemanticMappingNode:
                 source_mode="realtime_gt_observation",
                 capture_step=parsed.get("capture_step"),
             )
+            self.pending_attribute_patches.replay(self.graph_store)
             publish_bundle = self._collect_publish_bundle_locked()
         self._safe_publish_bundle(publish_bundle)
 
@@ -390,14 +408,45 @@ class SemanticMappingNode:
             return
         parsed = parse_json_object_or_text(msg.data)
         episode_id = str(parsed.get("episode_id") or "")
-        if episode_id and self.graph_store.episode_id and episode_id != self.graph_store.episode_id:
-            return
+        episode_generation = parsed.get("episode_generation", 0)
         stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
         changed = False
         with self.lock:
             for patch in parsed.get("updates") or []:
                 if isinstance(patch, dict):
-                    changed = self.graph_store.apply_attribute_patch(patch, stamp=stamp) or changed
+                    changed = self.pending_attribute_patches.apply_or_store(
+                        self.graph_store,
+                        patch,
+                        episode_id=episode_id,
+                        episode_generation=episode_generation,
+                        stamp=stamp,
+                    ) or changed
+            publish_bundle = self._collect_publish_bundle_locked() if changed else None
+        if publish_bundle is not None:
+            self._safe_publish_bundle(publish_bundle)
+
+    def target_context_callback(self, msg):
+        parsed = parse_json_object_or_text(msg.data)
+        target_context = parsed.get("target_context")
+        if isinstance(target_context, dict):
+            parsed = target_context
+        if "episode_active" not in parsed and "episode_generation" not in parsed:
+            return
+        with self.lock:
+            accepted = self.pending_attribute_patches.update_lifecycle(
+                episode_id=(
+                    str(parsed.get("episode_id") or "")
+                    if "episode_id" in parsed
+                    else None
+                ),
+                episode_generation=parsed.get("episode_generation"),
+                episode_active=parsed.get("episode_active"),
+            )
+            changed = (
+                self.pending_attribute_patches.replay(self.graph_store)
+                if accepted and self.pending_attribute_patches.episode_active
+                else False
+            )
             publish_bundle = self._collect_publish_bundle_locked() if changed else None
         if publish_bundle is not None:
             self._safe_publish_bundle(publish_bundle)

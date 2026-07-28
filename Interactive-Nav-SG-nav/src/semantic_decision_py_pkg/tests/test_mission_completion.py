@@ -36,7 +36,7 @@ def test_completion_requires_distinct_stable_empty_sequences() -> None:
     ) is True
 
 
-def test_completion_uses_navigation_and_interaction_frontiers_with_target_enabled() -> None:
+def test_completion_does_not_finish_while_target_goal_is_unresolved() -> None:
     tracker = MissionCompletionTracker(
         MissionCompletionConfig(empty_candidate_confirmations=1)
     )
@@ -45,7 +45,45 @@ def test_completion_uses_navigation_and_interaction_frontiers_with_target_enable
         payload(1, exhausted=True, candidate_count=0),
         has_active_behavior=False,
         target_enabled=True,
+    ) is False
+    assert tracker.complete is False
+    assert tracker.confirmations == 0
+
+
+def test_completion_can_finish_after_target_goal_is_disabled() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(empty_candidate_confirmations=1)
+    )
+
+    assert tracker.update(
+        payload(1, exhausted=True, candidate_count=0),
+        has_active_behavior=False,
+        target_enabled=True,
+    ) is False
+    assert tracker.update(
+        payload(2, exhausted=True, candidate_count=0),
+        has_active_behavior=False,
+        target_enabled=False,
     ) is True
+
+
+def test_enabling_target_goal_reopens_prior_exploration_completion() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(empty_candidate_confirmations=1)
+    )
+
+    assert tracker.update(
+        payload(1, exhausted=True, candidate_count=0),
+        has_active_behavior=False,
+        target_enabled=False,
+    ) is True
+    assert tracker.update(
+        payload(2, exhausted=True, candidate_count=0),
+        has_active_behavior=False,
+        target_enabled=True,
+    ) is False
+    assert tracker.complete is False
+    assert tracker.reason == ""
 
 
 def test_completion_is_blocked_by_actions_or_interaction_frontiers() -> None:

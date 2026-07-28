@@ -49,6 +49,7 @@ candidate:
   target_min_visible_fraction: 0.2
   target_min_consecutive_observations: 2
   target_arrival_tolerance_m: 0.35
+  target_success_distance_m: 1.5
 
 policy:
   backend: "rule"

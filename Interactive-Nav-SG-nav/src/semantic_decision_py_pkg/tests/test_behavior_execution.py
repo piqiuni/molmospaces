@@ -269,12 +269,23 @@ def test_interaction_approach_uses_short_navigation_timeout() -> None:
 
 def test_target_navigation_waits_for_visibility_verification() -> None:
     machine = BehaviorExecutionStateMachine()
-    commands = machine.start(target_candidate(), now=0.0)
+    candidate = target_candidate()
+    candidate["metadata"]["goal_xyyaw_candidates"] = [
+        [4.0, 2.0, 0.0],
+        [4.0, 3.0, 0.5],
+        [5.0, 3.0, 1.0],
+    ]
+    commands = machine.start(candidate, now=0.0)
     assert commands[0]["kind"] == "navigate"
 
-    assert machine.on_navigation_result(True, now=1.0) == []
+    assert machine.on_navigation_result(True, {"executed_goal_index": 1}, now=1.0) == []
     assert machine.state == STATE_VERIFYING
-    assert machine.on_target_visibility(False, now=2.0) == []
+    retry = machine.retry_target_navigation(2, now=2.0)
+    assert machine.state == STATE_NAVIGATING
+    assert retry[0]["kind"] == "navigate"
+    assert retry[0]["start_goal_index"] == 2
+    assert machine.on_navigation_result(True, {"executed_goal_index": 2}, now=2.5) == []
+    assert machine.state == STATE_VERIFYING
     terminal = machine.on_target_visibility(
         True,
         detail={"visible_pixels": 24, "min_visible_pixels": 16},
@@ -284,6 +295,15 @@ def test_target_navigation_waits_for_visibility_verification() -> None:
     assert machine.state == STATE_SUCCEEDED
     assert terminal[0]["kind"] == "terminal"
     assert terminal[0]["success"] is True
+
+
+def test_target_visibility_retry_rejects_missing_or_exhausted_fallback_goal() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(target_candidate(), now=0.0)
+    machine.on_navigation_result(True, {"executed_goal_index": 0}, now=1.0)
+
+    assert machine.retry_target_navigation(1, now=2.0) == []
+    assert machine.state == STATE_VERIFYING
 
 
 def test_visible_reliable_target_skips_navigation_and_verifies_graph() -> None:

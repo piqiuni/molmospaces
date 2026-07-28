@@ -91,7 +91,7 @@ def test_generator_does_not_use_object_name_to_reject_portal_fixture() -> None:
                 "interaction": {
                     "is_interactable": True,
                     "requires_interaction": True,
-                    "state": "unknown",
+                    "state": "closed",
                     "state_confidence": 1.0,
                 },
             }
@@ -101,6 +101,87 @@ def test_generator_does_not_use_object_name_to_reject_portal_fixture() -> None:
     candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
     assert len(candidates) == 1
     assert candidates[0].target_id == "portal_doorframe_1"
+
+
+def test_unknown_joint_state_does_not_generate_interaction_candidate() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("portal", "container"))
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_unknown",
+                "type": "portal",
+                "centroid": [1.0, 0.0, 1.0],
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "unknown",
+                    "state_confidence": 1.0,
+                },
+            },
+            {
+                "id": "container_unknown",
+                "type": "container",
+                "centroid": [2.0, 0.0, 1.0],
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "unknown",
+                    "state_confidence": 1.0,
+                },
+            },
+        ]
+    }
+
+    assert generator.generate({}, graph, robot_xy=(0.0, 0.0)) == []
+
+
+def test_inactive_episode_does_not_generate_candidates() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "object_target",
+                "type": "object",
+                "centroid": [1.0, 0.0, 1.0],
+                "attributes": {"source_object_name": "television"},
+            }
+        ]
+    }
+    assert generator.generate(
+        {"initial_scan_complete": True},
+        graph,
+        robot_xy=(0.0, 0.0),
+        target_context={"enabled": True, "episode_active": False},
+    ) == []
+
+
+def test_known_ajar_state_still_generates_interaction_candidate() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("portal",))
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_ajar",
+                "type": "portal",
+                "centroid": [1.0, 0.0, 1.0],
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "ajar",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "interaction:portal_ajar:open"
+    ]
 
 
 def test_portal_approach_uses_stable_closed_reference_geometry() -> None:
@@ -652,10 +733,44 @@ def test_portal_approach_uses_door_aabb_normal() -> None:
     assert math.isclose(candidate.goal_xyyaw[1], 5.0, abs_tol=1e-6)
     assert math.isclose(candidate.goal_xyyaw[2], 0.0, abs_tol=1e-6)
     assert candidate.metadata["approach_strategy"] == "portal_aabb_normal"
-    assert len(candidate.metadata["goal_xyyaw_candidates"]) == 3
+    assert len(candidate.metadata["goal_xyyaw_candidates"]) > 3
     assert math.isclose(
         candidate.metadata["goal_xyyaw_candidates"][1][0], 3.50, abs_tol=1e-6
     )
+    assert candidate.metadata["portal_tangential_fallback_count"] > 0
+
+
+def test_portal_approach_adds_robot_side_tangential_fallback() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig(portal_standoff_m=1.0))
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_wide",
+                "type": "portal",
+                "centroid": [10.0, 5.0, 1.0],
+                "aabb_size": [2.0, 1.0, 2.1],
+                "state_age_sec": 0.0,
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    candidate = generator.generate({}, graph, robot_xy=(10.95, 7.0))[0]
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+
+    assert goals[:3] == [
+        [10.0, 6.5, -math.pi / 2.0],
+        [10.0, 6.75, -math.pi / 2.0],
+        [10.0, 7.0, -math.pi / 2.0],
+    ]
+    assert math.isclose(goals[3][0], 10.75, abs_tol=1e-6)
+    assert math.isclose(goals[3][1], 6.5, abs_tol=1e-6)
+    assert math.isclose(goals[3][2], -math.pi / 2.0, abs_tol=1e-6)
 
 
 def test_observed_target_generates_navigation_candidate() -> None:
@@ -679,7 +794,11 @@ def test_observed_target_generates_navigation_candidate() -> None:
         {},
         graph,
         robot_xy=(1.0, 2.0),
-        target_context={"enabled": True, "object_labels": ["fridge"]},
+        target_context={
+            "enabled": True,
+            "object_labels": ["fridge"],
+            "success_distance_threshold_m": 1.25,
+        },
     )
     assert len(candidates) == 1
     candidate = candidates[0]
@@ -692,6 +811,53 @@ def test_observed_target_generates_navigation_candidate() -> None:
     assert candidate.metadata["target_min_visible_pixels"] == 16
     assert candidate.metadata["target_navigation_required"] is True
     assert candidate.metadata["target_goal_distance_m"] > 0.35
+    assert candidate.metadata["target_position_xy"] == [4.0, 2.0]
+    assert candidate.metadata["target_success_distance_m"] == 1.25
+
+
+def test_target_candidate_instances_exclude_same_category_distractors() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "object_eval_vase",
+                "type": "object",
+                "name": "vase",
+                "centroid": [2.0, 0.0, 1.0],
+                "is_currently_visible": True,
+                "attributes": {
+                    "instance_id": "vase_eval_1",
+                    "source_object_name": "vase_eval_1",
+                    "visible_pixels": 32,
+                },
+            },
+            {
+                "id": "object_distractor_vase",
+                "type": "object",
+                "name": "vase",
+                "centroid": [1.0, 0.0, 1.0],
+                "is_currently_visible": True,
+                "attributes": {
+                    "instance_id": "vase_distractor",
+                    "source_object_name": "vase_distractor",
+                    "visible_pixels": 32,
+                },
+            },
+        ]
+    }
+
+    candidates = generator.generate(
+        {},
+        graph,
+        robot_xy=(0.0, 0.0),
+        target_context={
+            "enabled": True,
+            "object_labels": ["vase"],
+            "candidate_instances": ["vase_eval_1"],
+        },
+    )
+
+    assert [candidate.candidate_id for candidate in candidates] == ["target:object_eval_vase"]
 
 
 def test_contained_target_navigation_anchors_outside_parent_container() -> None:
@@ -729,6 +895,42 @@ def test_contained_target_navigation_anchors_outside_parent_container() -> None:
     assert math.isclose(candidate.goal_xyyaw[1], 2.0, abs_tol=1e-6)
     assert candidate.metadata["navigation_anchor_id"] == "container_fridge"
     assert candidate.metadata["approach_strategy"] == "target_parent_container_standoff"
+
+
+def test_free_standing_target_includes_side_on_navigation_fallbacks() -> None:
+    generator = CandidateGenerator()
+    graph = {
+        "nodes": [
+            {
+                "id": "object_plant",
+                "type": "object",
+                "label": "houseplant",
+                "aabb_center": [4.0, 2.0, 0.5],
+                "aabb_size": [0.4, 0.4, 1.0],
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "attributes": {"visible_pixels": 64},
+            }
+        ]
+    }
+
+    candidate = generator.generate(
+        {},
+        graph,
+        robot_xy=(1.0, 2.0),
+        target_context={"enabled": True, "object_labels": ["houseplant"]},
+    )[0]
+
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+    assert candidate.goal_xyyaw == goals[0]
+    assert len(goals) == 4
+    assert candidate.metadata["target_fallback_goal_count"] == 3
+    assert {(round(goal[0], 3), round(goal[1], 3)) for goal in goals} == {
+        (2.8, 2.0),
+        (4.0, 0.8),
+        (4.0, 3.2),
+        (5.2, 2.0),
+    }
 
 
 def test_target_near_container_uses_geometric_anchor_without_contains_edge() -> None:
@@ -1010,12 +1212,16 @@ def test_container_front_axis_overrides_nearest_radial_side() -> None:
             "state_confidence": 1.0,
         },
     }
-    target = CandidateGenerator().generate(
-        {},
-        {"nodes": [node]},
-        robot_xy=(4.0, 4.0),
-        target_context={"enabled": True, "object_labels": ["fridge"]},
-    )[0]
+    target = next(
+        candidate
+        for candidate in CandidateGenerator().generate(
+            {},
+            {"nodes": [node]},
+            robot_xy=(4.0, 4.0),
+            target_context={"enabled": True, "object_labels": ["fridge"]},
+        )
+        if candidate.candidate_id == "target:container_fridge"
+    )
     interaction = CandidateGenerator(
         CandidateGeneratorConfig(interaction_types=("container",))
     ).generate({}, {"nodes": [node]}, robot_xy=(4.0, 4.0))[0]

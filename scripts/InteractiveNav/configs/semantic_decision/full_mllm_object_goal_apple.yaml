@@ -78,6 +78,9 @@ completion:
 
 executor:
   interaction_navigation_timeout_s: 180.0
+  navigation_cancel_wait_s: 3.0
+  target_navigation_stagnation_timeout_s: 4.0
+  make_plan_fail_open: false
   make_plan_empty_retry_count: 2
   make_plan_empty_retry_delay_s: 0.15
   explore_make_plan_fail_open_after_retries: true

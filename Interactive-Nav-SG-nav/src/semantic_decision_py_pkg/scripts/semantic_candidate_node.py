@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 from semantic_decision_py_pkg.behavior_candidates import (
@@ -16,6 +17,15 @@ patch_roslogging_findcaller_for_py311()
 import rospy
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
+
+
+def resolve_initial_scan_complete(explorer_input: dict) -> bool:
+    if "initial_scan_complete" in explorer_input:
+        return bool(explorer_input.get("initial_scan_complete"))
+    initial_spin = explorer_input.get("initial_spin")
+    if isinstance(initial_spin, dict) and "done" in initial_spin:
+        return bool(initial_spin.get("done"))
+    return False
 
 
 class SemanticCandidateNode:
@@ -77,6 +87,9 @@ class SemanticCandidateNode:
                 target_arrival_tolerance_m=float(
                     config.get("target_arrival_tolerance_m", 0.35)
                 ),
+                target_success_distance_m=float(
+                    config.get("target_success_distance_m", 1.5)
+                ),
             )
         )
         self.explorer_status: dict = {}
@@ -86,6 +99,7 @@ class SemanticCandidateNode:
         self.target_context: dict = dict(rospy.get_param("~target", {}) or {})
         self.robot_xy: tuple[float, float] | None = None
         self.sequence = 0
+        self.publish_lock = threading.Lock()
         self.publisher = rospy.Publisher(
             topics.get("candidates", "/semantic_decision/candidates"),
             String,
@@ -141,9 +155,23 @@ class SemanticCandidateNode:
 
     def _graph_callback(self, message: String) -> None:
         try:
-            self.graph = json.loads(message.data)
+            graph = json.loads(message.data)
         except json.JSONDecodeError:
             return
+        previous_graph = self.graph
+        revision_changed = (
+            not previous_graph
+            or graph.get("graph_revision") != previous_graph.get("graph_revision")
+            or str(graph.get("episode_id") or "")
+            != str(previous_graph.get("episode_id") or "")
+        )
+        self.graph = graph
+        # A graph revision can invalidate an interaction candidate while the
+        # decision MLLM is still answering.  Publish the regenerated candidate
+        # set immediately so the decision node's stale-response validation sees
+        # the new sequence instead of waiting for the periodic timer.
+        if revision_changed:
+            self._publish(None)
 
     def _target_callback(self, message: String) -> None:
         try:
@@ -151,7 +179,12 @@ class SemanticCandidateNode:
         except json.JSONDecodeError:
             return
         if isinstance(payload, dict):
+            changed = payload != self.target_context
             self.target_context = payload
+            if changed:
+                # Episode lifecycle changes must invalidate an in-flight model
+                # response immediately, rather than waiting for the 1 Hz timer.
+                self._publish(None)
 
     def _odom_callback(self, message: Odometry) -> None:
         self.robot_xy = (
@@ -160,13 +193,26 @@ class SemanticCandidateNode:
         )
 
     def _publish(self, _event) -> None:
+        with self.publish_lock:
+            self._publish_locked()
+
+    def _publish_locked(self) -> None:
         explorer_input = (
             self.explorer_proposal_stream
             if self.has_proposal_stream
             else self.explorer_status
         )
+        initial_scan_complete = resolve_initial_scan_complete(explorer_input)
+        episode_active = bool(self.target_context.get("episode_active", True))
+        if not episode_active:
+            initial_scan_complete = False
+        normalized_explorer_input = dict(explorer_input)
+        normalized_explorer_input["initial_scan_complete"] = initial_scan_complete
         candidates = self.generator.generate(
-            explorer_input, self.graph, self.robot_xy, self.target_context
+            normalized_explorer_input,
+            self.graph,
+            self.robot_xy,
+            self.target_context,
         )
         navigation_frontiers = [
             candidate for candidate in candidates if candidate.behavior_type == "EXPLORE"
@@ -179,10 +225,7 @@ class SemanticCandidateNode:
                 (candidate.metadata or {}).get("interaction_group_already_explored")
             )
         ]
-        ready = bool(explorer_input.get("ready", False))
-        initial_scan_complete = bool(
-            explorer_input.get("initial_scan_complete", True)
-        )
+        ready = bool(explorer_input.get("ready", False)) and episode_active
         explorer_state = explorer_input.get("state") or {}
         active_navigation_frontier = bool(
             explorer_input.get("active_proposal_id")
@@ -208,6 +251,7 @@ class SemanticCandidateNode:
             "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
             "target_context": dict(self.target_context),
             "exploration_context": {
+                "episode_active": episode_active,
                 "ready": ready,
                 "initial_scan_complete": initial_scan_complete,
                 "frontier_exhausted": combined_frontier_exhausted,

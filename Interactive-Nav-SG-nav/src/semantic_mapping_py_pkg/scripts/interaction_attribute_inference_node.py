@@ -54,6 +54,9 @@ class InteractionAttributeInferenceNode:
         self.interaction_result_topic = topics.get(
             "interaction_result", "/semantic_mapping/interaction_result"
         )
+        self.target_context_topic = topics.get(
+            "target", topics.get("target_context", "/semantic_decision/target")
+        )
         self.status_topic = topics.get(
             "attribute_inference_status",
             "/semantic_mapping/attribute_inference_status",
@@ -128,6 +131,12 @@ class InteractionAttributeInferenceNode:
             "missing_image": 0,
         }
         self.current_episode_id = ""
+        # The target context is the lifecycle authority shared by the native
+        # evaluator and the semantic-decision nodes.  Keep a generation token
+        # on every request so a slow response from an earlier episode can
+        # never be published into the next one.
+        self.episode_active = True
+        self.episode_generation = 0
         self.request_sequence = 0
         self.last_request: dict[str, float] = {}
         self.pending: dict[str, dict] = {}
@@ -154,6 +163,12 @@ class InteractionAttributeInferenceNode:
             self._interaction_result_callback,
             queue_size=10,
         )
+        rospy.Subscriber(
+            self.target_context_topic,
+            String,
+            self._target_context_callback,
+            queue_size=4,
+        )
         rospy.loginfo(
             "[interaction_attribute_inference] image=%s detections=%s output=%s model=%s workers=%d queue=%d",
             self.image_topic,
@@ -175,6 +190,57 @@ class InteractionAttributeInferenceNode:
             self.latest_image = image.copy()
             self.latest_stamp = message.header.stamp.to_sec() or time.time()
         self._process_pending_detections()
+
+    def _target_context_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        target_context = payload.get("target_context")
+        if isinstance(target_context, dict):
+            payload = target_context
+        if "episode_active" not in payload and "episode_generation" not in payload:
+            return
+
+        stale_requests: list[tuple[str, int]] = []
+        with self.lock:
+            current_generation = int(getattr(self, "episode_generation", 0) or 0)
+            try:
+                next_generation = int(
+                    payload.get("episode_generation", current_generation) or 0
+                )
+            except (TypeError, ValueError):
+                next_generation = current_generation
+            next_active = bool(
+                payload.get("episode_active", getattr(self, "episode_active", True))
+            )
+            generation_changed = next_generation != current_generation
+            invalidate_requests = generation_changed or not next_active
+
+            self.episode_active = next_active
+            self.episode_generation = next_generation
+            target_episode_id = str(payload.get("episode_id") or "")
+            if target_episode_id:
+                self.current_episode_id = target_episode_id
+
+            if invalidate_requests:
+                stale_requests = [
+                    (object_id, int(request.get("request_sequence", 0) or 0))
+                    for object_id, request in self.pending.items()
+                ]
+                self.pending_detection_payload = None
+                self.pending.clear()
+            if generation_changed:
+                self.last_request.clear()
+                self.completed.clear()
+                self.generations.clear()
+                self.aliases.clear()
+
+        for object_id, request_sequence in stale_requests:
+            self.request_queue.discard(object_id, request_sequence)
+        self._publish_status()
 
     @staticmethod
     def _decode_ros_image(message: Image):
@@ -227,6 +293,8 @@ class InteractionAttributeInferenceNode:
     def _detection_callback(self, message: String) -> None:
         with self.lock:
             self.filter_counts["messages_received"] += 1
+            if not self.episode_active:
+                return
         try:
             payload = json.loads(message.data)
         except json.JSONDecodeError:
@@ -239,6 +307,8 @@ class InteractionAttributeInferenceNode:
         if not isinstance(detections, list):
             return
         with self.lock:
+            if not self.episode_active:
+                return
             self.pending_detection_payload = dict(payload) if isinstance(payload, dict) else {
                 "detections": detections
             }
@@ -248,9 +318,13 @@ class InteractionAttributeInferenceNode:
 
     def _process_pending_detections(self) -> None:
         with self.lock:
+            if not self.episode_active:
+                self.pending_detection_payload = None
+                return
             payload = self.pending_detection_payload
             image = None if self.latest_image is None else self.latest_image.copy()
             image_stamp = self.latest_stamp
+            episode_generation = self.episode_generation
             if isinstance(payload, dict) and image is not None:
                 self.pending_detection_payload = None
         if not isinstance(payload, dict) or image is None:
@@ -265,6 +339,9 @@ class InteractionAttributeInferenceNode:
         episode_id = str(payload.get("episode_id") or "") if isinstance(payload, dict) else ""
         frame_id = str(payload.get("frame_index") or "") if isinstance(payload, dict) else ""
         observation_stamp = self._observation_stamp(payload, image_stamp)
+        with self.lock:
+            if not self.episode_active or episode_generation != self.episode_generation:
+                return
         if episode_id:
             self._set_episode(episode_id)
         requests = []
@@ -290,7 +367,9 @@ class InteractionAttributeInferenceNode:
             self._register_aliases(object_id, detection)
             signature = self._state_signature(detection)
             self._invalidate_if_state_changed(object_id, signature, episode_id)
-            reservation = self._try_reserve(object_id, signature)
+            reservation = self._try_reserve(
+                object_id, signature, episode_generation=episode_generation
+            )
             if not object_id or reservation is None:
                 continue
             crop = self._crop(image, detection, self.crop_margin_ratio)
@@ -308,6 +387,7 @@ class InteractionAttributeInferenceNode:
                     "stamp": observation_stamp,
                     "signature": signature,
                     "generation": reservation["generation"],
+                    "episode_generation": episode_generation,
                     "request_sequence": reservation["request_sequence"],
                     "enqueued_at": time.monotonic(),
                 }
@@ -315,27 +395,61 @@ class InteractionAttributeInferenceNode:
         for request_payload in sorted(
             requests, key=lambda item: (-float(item["priority"]), item["object_id"])
         ):
-            accepted, displaced = self.request_queue.put(request_payload)
+            # Serialize the lifecycle check with queue insertion.  If an
+            # episode ends concurrently, the callback can then discard every
+            # request that was actually inserted and no new stale work leaks
+            # into the worker queue.
+            with self.lock:
+                current = self._is_current_request_locked(
+                    str(request_payload["object_id"]),
+                    str(request_payload["episode_id"]),
+                    int(request_payload["generation"]),
+                    int(request_payload["request_sequence"]),
+                    int(request_payload["episode_generation"]),
+                )
+                if not current:
+                    accepted, displaced = False, request_payload
+                else:
+                    accepted, displaced = self.request_queue.put(request_payload)
             if accepted:
                 with self.lock:
-                    self.filter_counts["enqueued"] += 1
+                    current = self._is_current_request_locked(
+                        str(request_payload["object_id"]),
+                        str(request_payload["episode_id"]),
+                        int(request_payload["generation"]),
+                        int(request_payload["request_sequence"]),
+                        int(request_payload["episode_generation"]),
+                    )
+                    if current:
+                        self.filter_counts["enqueued"] += 1
+                        self._publish_updates(
+                            str(request_payload["episode_id"]),
+                            float(request_payload["stamp"]),
+                            [
+                                {
+                                    "object_id": request_payload["object_id"],
+                                    "attribute_status": "pending",
+                                    "request_sequence": request_payload[
+                                        "request_sequence"
+                                    ],
+                                    "source": "mllm_attribute_inference",
+                                }
+                            ],
+                        )
                 if displaced is not None:
                     self._release(
                         str(displaced.get("object_id") or ""),
                         int(displaced.get("request_sequence", 0) or 0),
                     )
-                self._publish_updates(
-                    str(request_payload["episode_id"]),
-                    float(request_payload["stamp"]),
-                    [
-                        {
-                            "object_id": request_payload["object_id"],
-                            "attribute_status": "pending",
-                            "request_sequence": request_payload["request_sequence"],
-                            "source": "mllm_attribute_inference",
-                        }
-                    ],
-                )
+                if not current:
+                    self.request_queue.discard(
+                        str(request_payload["object_id"]),
+                        int(request_payload["request_sequence"]),
+                    )
+                    self._release(
+                        str(request_payload["object_id"]),
+                        int(request_payload["request_sequence"]),
+                    )
             else:
                 self._release(
                     str(request_payload["object_id"]),
@@ -362,6 +476,8 @@ class InteractionAttributeInferenceNode:
                 "pending_requests": len(self.pending),
                 "has_latest_image": self.latest_image is not None,
                 "has_pending_detection": self.pending_detection_payload is not None,
+                "episode_active": self.episode_active,
+                "episode_generation": self.episode_generation,
             }
         self.status_publisher.publish(
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -533,11 +649,18 @@ class InteractionAttributeInferenceNode:
         score += max(0.0, self.max_distance_m - distance_m)
         return score
 
-    def _try_reserve(self, object_id: str, signature: str) -> dict | None:
+    def _try_reserve(
+        self, object_id: str, signature: str, *, episode_generation: int
+    ) -> dict | None:
         if not object_id:
             return None
         now = time.monotonic()
         with self.lock:
+            if (
+                not self.episode_active
+                or int(episode_generation) != int(self.episode_generation)
+            ):
+                return None
             if object_id in self.pending:
                 return None
             completed = self.completed.get(object_id)
@@ -556,6 +679,7 @@ class InteractionAttributeInferenceNode:
                 "signature": signature,
                 "generation": self.generations.get(object_id, 0),
                 "episode_id": self.current_episode_id,
+                "episode_generation": int(episode_generation),
             }
             return {
                 "generation": self.generations.get(object_id, 0),
@@ -591,6 +715,9 @@ class InteractionAttributeInferenceNode:
                 data=json.dumps(
                     {
                         "episode_id": episode_id,
+                        "episode_generation": int(
+                            getattr(self, "episode_generation", 0) or 0
+                        ),
                         "stamp_sec": stamp,
                         "updates": updates,
                     },
@@ -610,6 +737,7 @@ class InteractionAttributeInferenceNode:
         stamp: float,
         signature: str,
         generation: int,
+        episode_generation: int,
         request_sequence: int,
         enqueued_at: float,
     ) -> None:
@@ -622,7 +750,11 @@ class InteractionAttributeInferenceNode:
             with self.lock:
                 self.filter_counts["started"] += 1
             if not self._is_current_request(
-                object_id, episode_id, generation, request_sequence
+                object_id,
+                episode_id,
+                generation,
+                request_sequence,
+                episode_generation,
             ):
                 outcome_status = "stale"
                 return
@@ -666,15 +798,28 @@ class InteractionAttributeInferenceNode:
                     "queue_lag_sec": queue_lag_sec,
                 },
             )
+            with self.lock:
+                if not self._is_current_request_locked(
+                    object_id,
+                    episode_id,
+                    generation,
+                    request_sequence,
+                    episode_generation,
+                ):
+                    outcome_status = "stale"
+                    return
             if response.error or response.payload is None:
                 outcome_error = str(response.error or "empty_model_response")
                 return
             patch = validate_attribute_patch(response.payload)
             with self.lock:
-                if episode_id and episode_id != self.current_episode_id:
-                    outcome_status = "stale"
-                    return
-                if generation != self.generations.get(object_id, 0):
+                if not self._is_current_request_locked(
+                    object_id,
+                    episode_id,
+                    generation,
+                    request_sequence,
+                    episode_generation,
+                ):
                     outcome_status = "stale"
                     return
             patch.update(
@@ -695,16 +840,43 @@ class InteractionAttributeInferenceNode:
                     "total_lag_sec": max(0.0, time.monotonic() - float(enqueued_at)),
                 }
             )
-            self._publish_updates(episode_id, stamp, [patch])
-            succeeded = True
+            # Publish under the lifecycle lock so an inactive/generation
+            # transition cannot land between the final freshness check and
+            # the ready update itself.
+            with self.lock:
+                if not self._is_current_request_locked(
+                    object_id,
+                    episode_id,
+                    generation,
+                    request_sequence,
+                    episode_generation,
+                ):
+                    outcome_status = "stale"
+                    return
+                self._publish_updates(episode_id, stamp, [patch])
+                succeeded = True
         except Exception as exc:
             outcome_error = str(exc)
-            rospy.logwarn_throttle(5.0, "attribute inference failed: %s", exc)
+            with self.lock:
+                if not self._is_current_request_locked(
+                    object_id,
+                    episode_id,
+                    generation,
+                    request_sequence,
+                    episode_generation,
+                ):
+                    outcome_status = "stale"
+            if outcome_status != "stale":
+                rospy.logwarn_throttle(5.0, "attribute inference failed: %s", exc)
         finally:
             publish_status = False
             with self.lock:
                 current_request = self._is_current_request_locked(
-                    object_id, episode_id, generation, request_sequence
+                    object_id,
+                    episode_id,
+                    generation,
+                    request_sequence,
+                    episode_generation,
                 )
                 if current_request:
                     self.pending.pop(object_id, None)
@@ -755,20 +927,48 @@ class InteractionAttributeInferenceNode:
             return None
 
     def _is_current_request(
-        self, object_id: str, episode_id: str, generation: int, request_sequence: int
+        self,
+        object_id: str,
+        episode_id: str,
+        generation: int,
+        request_sequence: int,
+        episode_generation: int | None = None,
     ) -> bool:
         with self.lock:
             return self._is_current_request_locked(
-                object_id, episode_id, generation, request_sequence
+                object_id,
+                episode_id,
+                generation,
+                request_sequence,
+                episode_generation,
             )
 
     def _is_current_request_locked(
-        self, object_id: str, episode_id: str, generation: int, request_sequence: int
+        self,
+        object_id: str,
+        episode_id: str,
+        generation: int,
+        request_sequence: int,
+        episode_generation: int | None = None,
     ) -> bool:
         pending = self.pending.get(object_id) or {}
         pending_generation = pending.get("generation", -1)
+        current_episode_generation = int(
+            getattr(self, "episode_generation", 0) or 0
+        )
+        request_episode_generation = (
+            current_episode_generation
+            if episode_generation is None
+            else int(episode_generation)
+        )
+        pending_episode_generation = int(
+            pending.get("episode_generation", current_episode_generation) or 0
+        )
         return (
-            (not episode_id or episode_id == self.current_episode_id)
+            bool(getattr(self, "episode_active", True))
+            and request_episode_generation == current_episode_generation
+            and pending_episode_generation == request_episode_generation
+            and (not episode_id or episode_id == self.current_episode_id)
             and int(pending.get("request_sequence", 0) or 0) == int(request_sequence)
             and int(
                 -1 if pending_generation is None else pending_generation
