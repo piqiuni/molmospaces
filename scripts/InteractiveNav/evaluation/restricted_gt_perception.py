@@ -269,12 +269,19 @@ class OpaqueEpisodeRegistry:
     source name, asset ID, or MuJoCo body index.
     """
 
-    def __init__(self, *, instance_prefix: str = "obj") -> None:
+    def __init__(
+        self,
+        *,
+        instance_prefix: str = "obj",
+        initial_episode_index: int = 1,
+    ) -> None:
         prefix = re.sub(r"[^a-z0-9]", "", str(instance_prefix).casefold())
         if re.fullmatch(r"[a-z][a-z0-9]*", prefix) is None:
             raise ValueError("instance_prefix must start with an ASCII letter")
+        if not 1 <= int(initial_episode_index) <= 999999:
+            raise ValueError("initial_episode_index must be in [1, 999999]")
         self._instance_prefix = prefix
-        self._episode_index = 0
+        self._episode_index = int(initial_episode_index) - 1
         self._episode_id = ""
         self._next_instance_index = 1
         self._source_to_id: dict[str, str] = {}
@@ -797,6 +804,7 @@ class RestrictedGTPerceptionPublisher:
         rospy_module: Any | None = None,
         string_message_type: Any | None = None,
         queue_size: int = 1,
+        initial_episode_index: int = 1,
     ) -> None:
         if int(min_visible_pixels) < 1:
             raise ValueError("min_visible_pixels must be >= 1")
@@ -809,7 +817,7 @@ class RestrictedGTPerceptionPublisher:
         self.min_visible_pixels = int(min_visible_pixels)
         self.step_interval = int(step_interval)
         self.frame_id = str(frame_id)
-        self.registry = OpaqueEpisodeRegistry()
+        self.registry = OpaqueEpisodeRegistry(initial_episode_index=initial_episode_index)
         self.frame_index = 0
         self._episode_reset_pending = True
         self._cached_model_identity: int | None = None

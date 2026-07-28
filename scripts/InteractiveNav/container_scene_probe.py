@@ -8,7 +8,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -20,17 +20,6 @@ from scipy.ndimage import distance_transform_edt
 from scipy.spatial.transform import Slerp
 from scipy.spatial.transform import Rotation as R
 
-from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
-from molmo_spaces.configs.camera_configs import (
-    FrankaDroidCameraSystem,
-    RBY1GoProD455CameraSystem,
-)
-from molmo_spaces.configs.policy_configs import AStarNavToObjPolicyConfig
-from molmo_spaces.configs.robot_configs import (
-    FloatingRUMRobotConfig,
-    FrankaRobotConfig,
-    RBY1MOpenCloseConfig,
-)
 from molmo_spaces.env.data_views import Door, MlSpacesArticulationObject, MlSpacesFreeJointBody
 from molmo_spaces.evaluation.benchmark_schema import EpisodeSpec
 from molmo_spaces.molmo_spaces_constants import get_resource_manager
@@ -42,8 +31,10 @@ from molmo_spaces.utils.lazy_loading_utils import install_uid
 from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
 from molmo_spaces.utils.pose import pose_mat_to_7d, pos_quat_to_pose_mat
 from molmo_spaces.utils.rendering_utils import get_geom_seg_mask
-from molmo_spaces.utils.save_utils import save_frames_to_mp4
 from molmo_spaces.utils.scene_metadata_utils import get_scene_metadata
+
+if TYPE_CHECKING:
+    from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -227,6 +218,18 @@ class RBY1InteractionJsonTaskSampler(JsonEvalTaskSampler):
 
 
 def build_scene_config(args: argparse.Namespace) -> NavToObjBaseConfig:
+    from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
+    from molmo_spaces.configs.camera_configs import (
+        FrankaDroidCameraSystem,
+        RBY1GoProD455CameraSystem,
+    )
+    from molmo_spaces.configs.policy_configs import AStarNavToObjPolicyConfig
+    from molmo_spaces.configs.robot_configs import (
+        FloatingRUMRobotConfig,
+        FrankaRobotConfig,
+        RBY1MOpenCloseConfig,
+    )
+
     cfg = NavToObjBaseConfig()
     cfg.seed = args.seed
     cfg.task_type = "nav_to_obj"
@@ -5314,6 +5317,8 @@ def execute_rby1_whole_body_interaction(
 
         fps = capture_video_fps
         video_paths: dict[str, str] = {}
+        from molmo_spaces.utils.save_utils import save_frames_to_mp4
+
         for camera_name, camera_frames in frames.items():
             path = output_dir / f"{camera_name}.mp4"
             save_frames_to_mp4(camera_frames, str(path), fps=fps)

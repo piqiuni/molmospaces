@@ -15,17 +15,19 @@ Key design principle: The EpisodeSpec is authoritative. All fields needed to
 recreate the episode are in the JSON, and if the field is present it strictly overrides the existing config.
 """
 
+from __future__ import annotations
+
 import importlib
 import logging
 import types
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import mujoco
 import numpy as np
 from mujoco import MjSpec
 from scipy.spatial.transform import Rotation as R
 
-from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.configs.camera_configs import (
     CameraSystemConfig,
     FixedExocentricCameraConfig,
@@ -68,6 +70,9 @@ from molmo_spaces.utils.lazy_loading_utils import install_uid
 from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms
 from molmo_spaces.utils.object_metadata import ObjectMeta
 from molmo_spaces.utils.pose import pos_quat_to_pose_mat
+
+if TYPE_CHECKING:
+    from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 
 log = logging.getLogger(__name__)
 

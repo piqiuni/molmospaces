@@ -22,13 +22,24 @@ SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1500}
 VIDEO_FPS=${VIDEO_FPS:-15}
 VIDEO_PANEL_WIDTH_PX=${VIDEO_PANEL_WIDTH_PX:-640}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
-ENABLE_RECORDING=${ENABLE_RECORDING:-true}
-SKIP_OFFLINE_VIDEO=${SKIP_OFFLINE_VIDEO:-false}
+FAST_EVAL=${FAST_EVAL:-false}
+if [[ "${FAST_EVAL}" == true ]]; then
+  ENABLE_RECORDING=${ENABLE_RECORDING:-false}
+  SKIP_OFFLINE_VIDEO=${SKIP_OFFLINE_VIDEO:-true}
+  NATIVE_NAV_RECORD_STEP_FRAMES=${NATIVE_NAV_RECORD_STEP_FRAMES:-false}
+  NATIVE_NAV_RECORD_VIDEOS=${NATIVE_NAV_RECORD_VIDEOS:-false}
+else
+  ENABLE_RECORDING=${ENABLE_RECORDING:-true}
+  SKIP_OFFLINE_VIDEO=${SKIP_OFFLINE_VIDEO:-false}
+  NATIVE_NAV_RECORD_STEP_FRAMES=${NATIVE_NAV_RECORD_STEP_FRAMES:-true}
+  NATIVE_NAV_RECORD_VIDEOS=${NATIVE_NAV_RECORD_VIDEOS:-true}
+fi
 FILTER_MISSING_SCENE_OBJECTS=${FILTER_MISSING_SCENE_OBJECTS:-false}
 TASK_HORIZON_STEPS=${TASK_HORIZON_STEPS:-}
 ENABLE_ATTRIBUTE_INFERENCE=${ENABLE_ATTRIBUTE_INFERENCE:-false}
+SHARED_MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/molmospaces-matplotlib-${UID}}
 
-mkdir -p "${OUTPUT_ROOT}" "${DEBUG_DIR}" "${OUTPUT_ROOT}/ros_home/log"
+mkdir -p "${OUTPUT_ROOT}" "${DEBUG_DIR}" "${OUTPUT_ROOT}/ros_home/log" "${SHARED_MPLCONFIGDIR}"
 export ROS_MASTER_URI
 export ROS_IP=${ROS_IP:-127.0.0.1}
 export ROS_HOSTNAME=${ROS_HOSTNAME:-127.0.0.1}
@@ -36,7 +47,10 @@ export MLSPACES_CACHE_DIR
 export MLSPACES_ASSETS_DIR
 export ROS_HOME="${OUTPUT_ROOT}/ros_home"
 export ROS_LOG_DIR="${OUTPUT_ROOT}/ros_home/log"
+export MPLCONFIGDIR="${SHARED_MPLCONFIGDIR}"
 export NATIVE_NAV_DEBUG_DIR="${DEBUG_DIR}"
+export NATIVE_NAV_RECORD_STEP_FRAMES
+export NATIVE_NAV_RECORD_VIDEOS
 if [[ "${FILTER_MISSING_SCENE_OBJECTS}" == true ]]; then
   export NATIVE_NAV_FILTER_MISSING_SCENE_OBJECTS=1
 fi
@@ -93,14 +107,30 @@ trap on_signal INT TERM
 
 MASTER_PORT=${ROS_MASTER_URI##*:}
 MASTER_PORT=${MASTER_PORT%%/*}
+if [[ ! "${MASTER_PORT}" =~ '^[0-9]+$' ]]; then
+  print -u2 -- "ROS_MASTER_URI must include a numeric port: ${ROS_MASTER_URI}"
+  exit 2
+fi
+if timeout 1s rosparam list >/dev/null 2>&1; then
+  print -u2 -- "Refusing to reuse an existing ROS master: ${ROS_MASTER_URI}"
+  exit 2
+fi
 roscore -p "${MASTER_PORT}" >"${OUTPUT_ROOT}/roscore.log" 2>&1 &
 ROSCORE_PID=$!
 
 MASTER_READY=false
 for _attempt in {1..120}; do
+  if ! kill -0 "${ROSCORE_PID}" 2>/dev/null; then
+    wait "${ROSCORE_PID}" 2>/dev/null || true
+    print -u2 -- "roscore exited before becoming ready; port ${MASTER_PORT} may be occupied"
+    exit 3
+  fi
   if timeout 1s rosparam list >/dev/null 2>&1; then
-    MASTER_READY=true
-    break
+    sleep 0.1
+    if kill -0 "${ROSCORE_PID}" 2>/dev/null; then
+      MASTER_READY=true
+      break
+    fi
   fi
   sleep 0.25
 done
@@ -168,6 +198,11 @@ roslaunch \
   output_dir:="${OUTPUT_ROOT}/ros_system" \
   >"${OUTPUT_ROOT}/roslaunch.log" 2>&1 &
 LAUNCH_PID=$!
+if ! kill -0 "${LAUNCH_PID}" 2>/dev/null; then
+  wait "${LAUNCH_PID}" 2>/dev/null || true
+  print -u2 -- "roslaunch exited before the evaluator started; see ${OUTPUT_ROOT}/roslaunch.log"
+  exit 3
+fi
 
 set +e
 FILTER_MISSING_SCENE_OBJECTS_ARG=()

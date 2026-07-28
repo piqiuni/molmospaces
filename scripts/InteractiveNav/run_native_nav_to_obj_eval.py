@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -39,9 +40,9 @@ from molmo_spaces.evaluation.json_eval_runner import JsonEvalRunner
 from molmo_spaces.policy.learned_policy.ros_bridge_policy import RosBridgePolicy
 from molmo_spaces.tasks.json_eval_task_sampler import JsonEvalTaskSampler
 
-from force_interaction_bridge import AtomicForceInteractionController
-from force_interaction_runtime import ForceDriveConfig
-from run_nav_ros_sim import NavRosRolloutRunner
+from scripts.InteractiveNav.force_interaction_bridge import AtomicForceInteractionController
+from scripts.InteractiveNav.force_interaction_runtime import ForceDriveConfig
+from scripts.InteractiveNav.run_nav_ros_sim import NavRosRolloutRunner
 from scripts.InteractiveNav.evaluation.benchmark_runner import ROS_NAVIGATION_ARM_QPOS
 
 
@@ -63,6 +64,52 @@ def _write_json(path: Path, payload: Any) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
         encoding="utf-8",
     )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _summarize_step_timings(path: Path) -> dict[str, Any]:
+    """Build a compact diagnostic summary without retaining all step rows."""
+
+    values: dict[str, list[float]] = {}
+    step_count = 0
+    timeout_count = 0
+    if path.is_file():
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                row = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            step_count += 1
+            timeout_count += int(bool(row.get("action_timed_out", False)))
+            for key, value in row.items():
+                if key.endswith("_ms") and isinstance(value, (int, float)):
+                    values.setdefault(key, []).append(float(value))
+
+    metrics: dict[str, dict[str, float]] = {}
+    for key, samples in values.items():
+        ordered = sorted(samples)
+        p50_index = max(0, math.ceil(0.50 * len(ordered)) - 1)
+        p95_index = max(0, math.ceil(0.95 * len(ordered)) - 1)
+        metrics[key] = {
+            "mean": float(sum(ordered) / len(ordered)),
+            "p50": float(ordered[p50_index]),
+            "p95": float(ordered[p95_index]),
+            "max": float(ordered[-1]),
+        }
+    return {
+        "path": str(path),
+        "step_count": step_count,
+        "action_timeout_count": timeout_count,
+        "metrics_ms": metrics,
+    }
 
 
 def _target_metadata(task) -> dict[str, Any]:
@@ -112,9 +159,11 @@ def _target_metadata(task) -> dict[str, Any]:
         "require_interaction": False,
         "completion_requires_visibility": True,
         "require_current_visibility": False,
-        "target_require_same_room": False,
-        "target_allow_connected_room": True,
-        "target_min_visible_pixels": 16,
+        "require_same_room": False,
+        "allow_connected_room": True,
+        "min_visible_pixels": 16,
+        "min_visible_fraction": 0.0,
+        "min_consecutive_observations": 1,
     }
     return {
         "mode": "native_molmospaces_nav_to_obj",
@@ -187,8 +236,9 @@ class NativeRosBridgePolicy(RosBridgePolicy):
             allow_static_lidar_tf_fallback=False,
             cmd_vel_topic="/cmd_vel_stamped",
             cmd_vel_timeout_s=0.5,
+            cmd_vel_linear_gain=3.0,
             require_fresh_cmd_vel=True,
-            require_move_base_active_for_cmd_vel=False,
+            require_move_base_active_for_cmd_vel=True,
             map_warmup_skip_frames=config.native_map_warmup_skip_frames,
             immediate_noop_after_publish=False,
             timing_log_every_n_frames=30,
@@ -198,13 +248,17 @@ class NativeRosBridgePolicy(RosBridgePolicy):
             realtime_gt_topic="/semantic_mapping/gt_observations",
             realtime_gt_camera_name="head_camera",
             realtime_gt_min_visible_pixels=16,
-            realtime_gt_min_visible_fraction=0.2,
-            realtime_gt_required_consecutive_observations=2,
+            realtime_gt_min_visible_fraction=0.0,
+            realtime_gt_required_consecutive_observations=1,
             realtime_gt_step_interval=3,
             realtime_gt_max_distance_m=4.0,
             # Keep the simulator frame manifest at the run root so the
             # existing offline six-panel video builder can consume it.
-            step_frame_dir=str(debug_root.parent / "sim_step_frames"),
+            step_frame_dir=(
+                str(debug_root.parent / "sim_step_frames")
+                if config.native_record_step_frames
+                else ""
+            ),
             step_frame_queue_size=4,
             step_sync_topic="/molmo_spaces/step_sync",
         )
@@ -215,6 +269,7 @@ class NativeRosBridgePolicy(RosBridgePolicy):
         )
         self.retain_task_history = False
         self.sim_timing_log_every_n_steps = int(config.native_sim_timing_log_every_n_steps)
+        self.sim_timing_path = str(debug_root / "step_timing.jsonl")
         self.step_log_every_n_steps = int(config.native_step_log_every_n_steps)
         self.debug_snapshot_path = str(debug_root / "native_first_frame.png")
         self.debug_snapshot_camera_name = "head_camera"
@@ -303,6 +358,7 @@ class NativeNavToObjEvalConfig(JsonBenchmarkEvalConfig):
     ctrl_dt_ms: float = 10.0
     sim_dt_ms: float = 10.0
     record_videos: bool = True
+    end_on_success: bool = True
 
     native_debug_dir: Path = Path("native_nav_debug")
     native_observation_topic: str = "/molmo_spaces/head_camera/image"
@@ -319,6 +375,7 @@ class NativeNavToObjEvalConfig(JsonBenchmarkEvalConfig):
     native_interaction_execution_mode: str = "smooth"
     native_interaction_transition_steps: int = 5
     native_filter_missing_scene_objects: bool = False
+    native_record_step_frames: bool = True
 
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
@@ -331,6 +388,10 @@ class NativeNavToObjEvalConfig(JsonBenchmarkEvalConfig):
             "yes",
         }:
             self.native_filter_missing_scene_objects = True
+        self.native_record_step_frames = _env_bool(
+            "NATIVE_NAV_RECORD_STEP_FRAMES", self.native_record_step_frames
+        )
+        self.record_videos = _env_bool("NATIVE_NAV_RECORD_VIDEOS", self.record_videos)
 
     @property
     def tag(self) -> str:
@@ -557,6 +618,9 @@ def main() -> None:
             getattr(results.exp_config, "native_filter_missing_scene_objects", False)
         ),
     }
+    timing_summary = _summarize_step_timings(debug_dir / "step_timing.jsonl")
+    summary["step_timing"] = timing_summary
+    _write_json(debug_dir / "step_timing_summary.json", timing_summary)
     _write_json(results.output_dir / "native_eval_summary.json", summary)
     _write_json(debug_dir / "native_eval_summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)

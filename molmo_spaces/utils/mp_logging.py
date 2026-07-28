@@ -1,14 +1,13 @@
 import hashlib
 import io
 import logging
+import multiprocessing as mp
 import os
 import socket
 import sys
 import threading
 from contextlib import closing, contextmanager
 from typing import cast
-
-from torch import multiprocessing as mp
 
 from molmo_spaces.molmo_spaces_constants import ABS_PATH_OF_TOP_LEVEL_MOLMO_SPACES_DIR
 

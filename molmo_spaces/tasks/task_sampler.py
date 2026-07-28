@@ -7,6 +7,8 @@ If task parameters are explicitly provided, they are fixed. Otherwise they are s
 Subclasses of AbstractMujocoTaskSampler should implement the _sample_task method.
 """
 
+from __future__ import annotations
+
 import logging
 import math
 import os
@@ -14,14 +16,12 @@ import random
 from abc import abstractmethod
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import mujoco
 import numpy as np
-import torch
 from mujoco import MjData, MjSpec
 
-from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.env.arena.arena_utils import get_all_bodies_with_joints_as_mlspaces_objects
 from molmo_spaces.env.arena.randomization.dynamics import DynamicsRandomizer
 from molmo_spaces.env.arena.randomization.lighting import LightingRandomizer
@@ -205,6 +205,9 @@ from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.tasks.task_sampler_errors import HouseInvalidForTask
 from molmo_spaces.utils.lazy_loading_utils import install_scene_with_objects_and_grasps_from_path
 from molmo_spaces.utils.mujoco_scene_utils import randomize_door_joints
+
+if TYPE_CHECKING:
+    from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 
 log = logging.getLogger(__name__)
 
@@ -420,7 +423,10 @@ class BaseMujocoTaskSampler:
         self.current_seed = seed
         random.seed(seed)
         np.random.seed(seed)
-        torch.manual_seed(seed)
+        if getattr(self.config, "seed_torch", True):
+            import torch
+
+            torch.manual_seed(seed)
 
     def _create_robot(self, mj_data: MjData) -> Robot:
         return self.config.robot_config.robot_factory(mj_data, self.config)

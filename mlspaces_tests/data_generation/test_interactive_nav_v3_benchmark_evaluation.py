@@ -7,10 +7,12 @@ resume behavior.  They never create a MuJoCo task or load a scene.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
+import numpy as np
 import pytest
 
 from scripts.InteractiveNav.evaluation import benchmark_runner
@@ -20,6 +22,8 @@ from scripts.InteractiveNav.evaluation.benchmark_metrics import (
     reference_path_length_m,
     spl,
     summarise_results,
+    target_candidate_names,
+    target_metrics,
 )
 from scripts.InteractiveNav.evaluation.benchmark_policies import (
     ScriptedOraclePolicy,
@@ -310,6 +314,88 @@ def test_oracle_terminal_goal_consistency_detects_selected_instance_mismatch() -
     assert consistency["terminal_goal_candidates"][0]["allowed_distance_m"] == 1.75
 
 
+def test_any_candidate_keeps_native_nearest_candidate_semantics() -> None:
+    class _Objects:
+        def __init__(self) -> None:
+            self.positions = {
+                "apple_near": [0.5, 0.0, 0.5],
+                "apple_far": [1.0, 0.0, 0.5],
+            }
+
+        def get_object_by_name(self, name: str) -> SimpleNamespace:
+            return SimpleNamespace(position=self.positions[name])
+
+    class _Env:
+        current_batch_index = 0
+        object_managers = [_Objects()]
+
+        class _Robot:
+            class _View:
+                class _Base:
+                    pose = np.eye(4)
+
+                base = _Base()
+
+            robot_view = _View()
+
+        current_robot = _Robot()
+
+        def __init__(self) -> None:
+            self.visibility = {"apple_near": 0.0, "apple_far": 1.0}
+
+        def check_visibility(self, _camera: str, name: str) -> float:
+            return self.visibility[name]
+
+    env = _Env()
+    task = SimpleNamespace(env=env)
+    episode = {
+        "task": {
+            "selection_mode": "any_candidate",
+            "pickup_obj_name": "apple_near",
+            "pickup_obj_candidates": ["apple_near", "apple_far"],
+        },
+        "interactive_nav": {
+            "target": {
+                "selection_mode": "any_candidate",
+                "selected_instance": "apple_near",
+                "instruction_consistent_candidates": ["apple_near", "apple_far"],
+            },
+            "success_criteria": {
+                "target_selection": "any_candidate",
+                "distance": {"threshold_m": 1.5},
+                "visibility": {"camera_name": "head_camera"},
+            },
+        },
+    }
+
+    assert target_candidate_names(episode) == ["apple_near", "apple_far"]
+    success, distance, visibility = target_metrics(task, episode)
+    assert success is False
+    assert distance == pytest.approx(0.5)
+    assert visibility == 0.0
+
+    env.visibility["apple_near"] = 1.0
+    success, distance, visibility = target_metrics(task, episode)
+    assert success is True
+    assert distance == pytest.approx(0.5)
+    assert visibility == 1.0
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("channel_episode.json", 5.7),
+        ("container_episode.json", 4.2),
+        ("mixed_episode.json", 7.4),
+        ("no_interaction_episode.json", 2.4),
+    ],
+)
+def test_example_path_references_are_not_silently_dropped(filename: str, expected: float) -> None:
+    path = Path(__file__).parents[2] / "scripts" / "InteractiveNav" / "dataset_definition" / "v3" / "examples" / filename
+    episode = json.loads(path.read_text(encoding="utf-8"))
+    assert reference_path_length_m(episode) == pytest.approx(expected)
+
+
 def test_config_validation_and_index_selection_are_local() -> None:
     config = benchmark_runner.BenchmarkEvaluationConfig(
         benchmark=Path("benchmark.json"),
@@ -329,6 +415,42 @@ def test_config_validation_and_index_selection_are_local() -> None:
         benchmark_runner.BenchmarkEvaluationConfig(
             benchmark=Path("benchmark.json"), output_dir=Path("out"), policy_dt_ms=205.0
         ).validate()
+    with pytest.raises(ValueError, match="duplicates"):
+        benchmark_runner.BenchmarkEvaluationConfig(
+            benchmark=Path("benchmark.json"),
+            output_dir=Path("out"),
+            episode_indices=[1, 1],
+        ).validate()
+    with pytest.raises(ValueError, match="must not be empty"):
+        benchmark_runner.BenchmarkEvaluationConfig(
+            benchmark=Path("benchmark.json"),
+            output_dir=Path("out"),
+            episode_indices=[],
+        ).validate()
+    with pytest.raises(ValueError, match="max_episodes"):
+        benchmark_runner.BenchmarkEvaluationConfig(
+            benchmark=Path("benchmark.json"),
+            output_dir=Path("out"),
+            max_episodes=0,
+        ).validate()
+
+
+def test_video_output_resolves_lazy_saver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[list[np.ndarray], str, float]] = []
+    fake_save_utils = ModuleType("molmo_spaces.utils.save_utils")
+    fake_save_utils.save_frames_to_mp4 = (  # type: ignore[attr-defined]
+        lambda frames, path, fps: calls.append((frames, path, fps))
+    )
+    monkeypatch.setitem(sys.modules, "molmo_spaces.utils.save_utils", fake_save_utils)
+    frames = [np.zeros((2, 2, 3), dtype=np.uint8)]
+    destination = tmp_path / "episode.mp4"
+
+    benchmark_runner._save_video(frames, destination, 7.5)
+
+    assert calls == [(frames, str(destination), 7.5)]
 
 
 def test_empty_benchmark_resume_and_signature_guard(tmp_path: Path) -> None:

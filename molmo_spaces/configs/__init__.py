@@ -10,27 +10,44 @@ This module provides configuration classes organized by category:
 - policy_configs: Policy-related configurations
 """
 
-from molmo_spaces.configs.abstract_config import Config
-from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
-from molmo_spaces.configs.camera_configs import (
-    CameraConfig,
-    CameraSystemConfig,
-    FixedExocentricCameraConfig,
-    FrankaDroidCameraSystem,
-    FrankaRandomizedD405D455CameraSystem,
-    MjcfCameraConfig,
-    RandomizedExocentricCameraConfig,
-    RBY1GoProD455CameraSystem,
-    RBY1MjcfCameraSystem,
-    RobotMountedCameraConfig,
-)
-from molmo_spaces.configs.policy_configs import BasePolicyConfig
-from molmo_spaces.configs.robot_configs import BaseRobotConfig, FrankaRobotConfig
-from molmo_spaces.configs.task_configs import BaseMujocoTaskConfig, PickTaskConfig
-from molmo_spaces.configs.task_sampler_configs import (
-    BaseMujocoTaskSamplerConfig,
-    PickTaskSamplerConfig,
-)
+from importlib import import_module
+from typing import Any
+
+_EXPORT_MODULES = {
+    "Config": "molmo_spaces.configs.abstract_config",
+    "MlSpacesExpConfig": "molmo_spaces.configs.abstract_exp_config",
+    "CameraSystemConfig": "molmo_spaces.configs.camera_configs",
+    "CameraConfig": "molmo_spaces.configs.camera_configs",
+    "MjcfCameraConfig": "molmo_spaces.configs.camera_configs",
+    "RobotMountedCameraConfig": "molmo_spaces.configs.camera_configs",
+    "FixedExocentricCameraConfig": "molmo_spaces.configs.camera_configs",
+    "RandomizedExocentricCameraConfig": "molmo_spaces.configs.camera_configs",
+    "RBY1MjcfCameraSystem": "molmo_spaces.configs.camera_configs",
+    "RBY1GoProD455CameraSystem": "molmo_spaces.configs.camera_configs",
+    "FrankaRandomizedD405D455CameraSystem": "molmo_spaces.configs.camera_configs",
+    "FrankaDroidCameraSystem": "molmo_spaces.configs.camera_configs",
+    "BaseRobotConfig": "molmo_spaces.configs.robot_configs",
+    "FrankaRobotConfig": "molmo_spaces.configs.robot_configs",
+    "BaseMujocoTaskConfig": "molmo_spaces.configs.task_configs",
+    "PickTaskConfig": "molmo_spaces.configs.task_configs",
+    "BaseMujocoTaskSamplerConfig": "molmo_spaces.configs.task_sampler_configs",
+    "PickTaskSamplerConfig": "molmo_spaces.configs.task_sampler_configs",
+    "BasePolicyConfig": "molmo_spaces.configs.policy_configs",
+    "ObjectManipulationPlannerPolicyConfig": "molmo_spaces.configs.policy_configs",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 __all__ = [
     "Config",

@@ -36,7 +36,9 @@ VIDEO_FPS=${VIDEO_FPS:-5}
 VIDEO_PANEL_WIDTH_PX=${VIDEO_PANEL_WIDTH_PX:-480}
 RECORDER_DRAIN_WAIT_S=${RECORDER_DRAIN_WAIT_S:-8}
 RECORD_HEAD_CAMERA=${RECORD_HEAD_CAMERA:-false}
+FAST_EVAL=${FAST_EVAL:-false}
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11311}
+RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
 ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.zsh}
 SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${REPO_ROOT}/.env}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_v3_full_mllm.yaml}
@@ -44,15 +46,20 @@ SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/sem
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
 NAV_CONFIG_OVERRIDE=${NAV_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 RECORDER=${RECORDER:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py}
+SHARED_MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/molmospaces-matplotlib-${UID}}
 
 for required_path in "${BENCHMARK}" "${ROS_SETUP}" "${SEMANTIC_MODEL_ENV_FILE}" \
   "${SEMANTIC_DECISION_OVERRIDE}" "${SEMANTIC_MAPPING_OVERRIDE}" \
-  "${EXPLORE_PY_CONFIG_OVERRIDE}" "${NAV_CONFIG_OVERRIDE}" "${RECORDER}"; do
+  "${EXPLORE_PY_CONFIG_OVERRIDE}" "${NAV_CONFIG_OVERRIDE}"; do
   if [[ ! -f "${required_path}" ]]; then
     print -u2 -- "Missing required file: ${required_path}"
     exit 2
   fi
 done
+if [[ "${FAST_EVAL}" != true ]] && [[ ! -f "${RECORDER}" ]]; then
+  print -u2 -- "Missing required recorder: ${RECORDER}"
+  exit 2
+fi
 
 if [[ "${METHOD}" != "full_mllm_object_goal" ]]; then
   print -u2 -- "V3 benchmark wrapper requires METHOD=full_mllm_object_goal, got: ${METHOD}"
@@ -73,7 +80,7 @@ for required_mllm_setting in \
 done
 print -r -- "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
 
-mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/ros_home/log"
+mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}"
 if [[ -e "${RUN_DIR}/eval" ]]; then
   print -u2 -- "Refusing to overwrite existing evaluator output: ${RUN_DIR}/eval"
   exit 2
@@ -84,6 +91,7 @@ export ROS_IP=${ROS_IP:-127.0.0.1}
 export ROS_HOSTNAME=${ROS_HOSTNAME:-127.0.0.1}
 export ROS_HOME="${RUN_DIR}/ros_home"
 export ROS_LOG_DIR="${RUN_DIR}/ros_home/log"
+export MPLCONFIGDIR="${SHARED_MPLCONFIGDIR}"
 export SEMANTIC_DECISION_ENV_FILE="${SEMANTIC_MODEL_ENV_FILE}"
 export SEMANTIC_MODEL_METRICS_PATH="${RUN_DIR}/mllm_metrics.jsonl"
 export PYTHONUNBUFFERED=1
@@ -93,6 +101,9 @@ source /home/user/miniconda3/etc/profile.d/conda.sh
 conda activate mlspaces
 set -u
 source "${ROS_SETUP}"
+# ROS setup files may restore a default master URI; keep this episode's
+# explicitly isolated master after sourcing.
+export ROS_MASTER_URI="${RUN_ROS_MASTER_URI}"
 export ROS_PACKAGE_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src:/opt/ros/noetic/share"
 export PYTHONPATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:${PYTHONPATH:-}"
 
@@ -135,14 +146,26 @@ if [[ ! "${MASTER_PORT}" =~ '^[0-9]+$' ]]; then
   print -u2 -- "ROS_MASTER_URI must include a numeric port: ${ROS_MASTER_URI}"
   exit 2
 fi
+if timeout 1s rosparam list >/dev/null 2>&1; then
+  print -u2 -- "Refusing to reuse an existing ROS master: ${ROS_MASTER_URI}"
+  exit 2
+fi
 
 roscore -p "${MASTER_PORT}" >"${RUN_DIR}/roscore.log" 2>&1 &
 ROSCORE_PID=$!
 MASTER_READY=false
 for _attempt in {1..120}; do
+  if ! kill -0 "${ROSCORE_PID}" 2>/dev/null; then
+    wait "${ROSCORE_PID}" 2>/dev/null || true
+    print -u2 -- "roscore exited before becoming ready; port ${MASTER_PORT} may be occupied"
+    exit 3
+  fi
   if timeout 1s rosparam list >/dev/null 2>&1; then
-    MASTER_READY=true
-    break
+    sleep 0.1
+    if kill -0 "${ROSCORE_PID}" 2>/dev/null; then
+      MASTER_READY=true
+      break
+    fi
   fi
   sleep 0.25
 done
@@ -171,29 +194,36 @@ roslaunch nav_pkg molmospaces_nav_system.launch \
   >"${RUN_DIR}/roslaunch.log" 2>&1 &
 ROSLAUNCH_PID=$!
 
-# Start before the evaluator so every public observation/step-sync is captured.
-PYTHONUNBUFFERED=1 python -u "${RECORDER}" \
-  --output-dir "${RUN_DIR}/debug" \
-  --occupancy-grid-topic /semantic_mapping/planning_occ_map \
-  --raw-occupancy-grid-topic /struct_mapping/occ_map \
-  --image-topic /molmo_spaces/head_camera/image \
-  --video-step-sync-topic /molmo_spaces/step_sync \
-  --first-person-video-capture-mode step \
-  --semantic-video \
-  --first-person-video-with-map \
-  --first-person-video-fps "${VIDEO_FPS}" \
-  --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
-  --video-frame-job-queue-size 4 \
-  --video-frame-queue-overflow block \
-  --video-history-size 16 \
-  --artifact-write-queue-size 4 \
-  --runtime-video-encode \
-  --video-save-panel-frames \
-  --interaction-result-topic /semantic_mapping/interaction_result \
-  --no-external-video \
-  >"${RUN_DIR}/recorder.log" 2>&1 &
-RECORDER_PID=$!
-sleep 1
+if [[ "${FAST_EVAL}" != true ]]; then
+  # Start before the evaluator so every public observation/step-sync is captured.
+  PYTHONUNBUFFERED=1 python -u "${RECORDER}" \
+    --output-dir "${RUN_DIR}/debug" \
+    --occupancy-grid-topic /semantic_mapping/planning_occ_map \
+    --raw-occupancy-grid-topic /struct_mapping/occ_map \
+    --image-topic /molmo_spaces/head_camera/image \
+    --video-step-sync-topic /molmo_spaces/step_sync \
+    --first-person-video-capture-mode step \
+    --semantic-video \
+    --first-person-video-with-map \
+    --first-person-video-fps "${VIDEO_FPS}" \
+    --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
+    --video-frame-job-queue-size 4 \
+    --video-frame-queue-overflow block \
+    --video-history-size 16 \
+    --artifact-write-queue-size 4 \
+    --runtime-video-encode \
+    --video-save-panel-frames \
+    --interaction-result-topic /semantic_mapping/interaction_result \
+    --no-external-video \
+    >"${RUN_DIR}/recorder.log" 2>&1 &
+  RECORDER_PID=$!
+  sleep 1
+fi
+if ! kill -0 "${ROSLAUNCH_PID}" 2>/dev/null; then
+  wait "${ROSLAUNCH_PID}" 2>/dev/null || true
+  print -u2 -- "roslaunch exited before the evaluator started; see ${RUN_DIR}/roslaunch.log"
+  exit 3
+fi
 
 EVAL_ARGS=(
   "${REPO_ROOT}/scripts/InteractiveNav/evaluate_interactive_nav_v3.py"
@@ -216,7 +246,7 @@ MUJOCO_GL=egl python "${EVAL_ARGS[@]}" >"${RUN_DIR}/eval.log" 2>&1
 EVAL_EXIT=$?
 set -e
 
-if (( RECORDER_DRAIN_WAIT_S > 0 )); then
+if [[ "${FAST_EVAL}" != true ]] && (( RECORDER_DRAIN_WAIT_S > 0 )); then
   sleep "${RECORDER_DRAIN_WAIT_S}"
 fi
 cleanup_process "${RECORDER_PID}" 30
@@ -233,6 +263,10 @@ if (( ${#EPISODE_RESULTS} != 1 )); then
 fi
 EPISODE_RESULT=${EPISODE_RESULTS[1]}
 EPISODE_DIR=${EPISODE_RESULT:h}
+if [[ "${FAST_EVAL}" == true ]]; then
+  print -r -- "[v3-ros-eval-fast] result=${EPISODE_RESULT}"
+  exit "${EVAL_EXIT}"
+fi
 TOPDOWN_PATH="${EPISODE_DIR}/episode_topdown.png"
 
 MUJOCO_GL=egl python "${REPO_ROOT}/scripts/InteractiveNav/render_interactive_nav_v3_topdown.py" \

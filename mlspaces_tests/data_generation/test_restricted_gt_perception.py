@@ -102,3 +102,11 @@ def test_registry_reset_invalidates_previous_episode_ids() -> None:
     assert new_episode != old_episode
     assert registry.resolve_private_source_name(old_id) is None
     assert registry.public_id_for("private_a") == "obj_000001"
+
+
+def test_registry_can_start_from_the_evaluator_episode_index() -> None:
+    registry = OpaqueEpisodeRegistry(initial_episode_index=42)
+
+    assert registry.episode_id == "episode_000042"
+    assert registry.public_id_for("private_a") == "obj_000001"
+    assert registry.reset() == "episode_000043"

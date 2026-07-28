@@ -7,11 +7,6 @@ import numpy as np
 from filelock import FileLock
 from tqdm import tqdm
 
-try:
-    import open_clip
-except ImportError:
-    print("Try `pip install open-clip-torch` for open_clip")
-
 from molmospaces_resources import PickleLMDBMap
 
 from molmo_spaces.molmo_spaces_constants import (
@@ -55,6 +50,12 @@ def get_clip_model():
     global _CLIP
 
     if _CLIP is None:
+        try:
+            import open_clip
+        except ImportError as exc:
+            raise ImportError(
+                "CLIP features require the optional `open-clip-torch` dependency"
+            ) from exc
         clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
             DEFAULT_CLIP_MODEL, pretrained=DEFAULT_CLIP_PRETRAIN, device=DEFAULT_DEVICE
         )
