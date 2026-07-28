@@ -15,6 +15,7 @@ ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11601}
 RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
 SEMANTIC_DECISION_CONFIG=${SEMANTIC_DECISION_CONFIG:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/config/default.yaml}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_runtime.yaml}
+SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1500}
@@ -25,6 +26,7 @@ ENABLE_RECORDING=${ENABLE_RECORDING:-true}
 SKIP_OFFLINE_VIDEO=${SKIP_OFFLINE_VIDEO:-false}
 FILTER_MISSING_SCENE_OBJECTS=${FILTER_MISSING_SCENE_OBJECTS:-false}
 TASK_HORIZON_STEPS=${TASK_HORIZON_STEPS:-}
+ENABLE_ATTRIBUTE_INFERENCE=${ENABLE_ATTRIBUTE_INFERENCE:-false}
 
 mkdir -p "${OUTPUT_ROOT}" "${DEBUG_DIR}" "${OUTPUT_ROOT}/ros_home/log"
 export ROS_MASTER_URI
@@ -142,6 +144,7 @@ roslaunch \
   mapping_mode:=odom_locked \
   start_semantic_mapping:=true \
   semantic_source:=realtime_gt \
+  semantic_attribute_inference:="${ENABLE_ATTRIBUTE_INFERENCE}" \
   publish_realtime_gt:=false \
   start_nav:=true \
   start_explore:=false \
@@ -150,6 +153,7 @@ roslaunch \
   start_semantic_decision:=true \
   semantic_decision_config_file:="${SEMANTIC_DECISION_CONFIG}" \
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
+  semantic_config_override_file:="${SEMANTIC_MAPPING_OVERRIDE}" \
   nav_config_override_file:="${ROUTE_NAV_CONFIG}" \
   exploration_only:=false \
   randomize_camera:=false \

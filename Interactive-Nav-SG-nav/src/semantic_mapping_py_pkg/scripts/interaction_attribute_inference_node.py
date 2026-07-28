@@ -5,12 +5,18 @@ import json
 import os
 import threading
 import time
+from io import BytesIO
 
-import cv2
 import numpy as np
 import rospy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+
+try:
+    import cv2
+except ImportError:  # ROS may run under a Python interpreter without OpenCV.
+    cv2 = None
+    from PIL import Image as PILImage
 
 from semantic_mllm_py_pkg import load_env_file
 from semantic_mllm_py_pkg.client import MLLMClient
@@ -190,12 +196,33 @@ class InteractionAttributeInferenceNode:
             int(message.height), int(message.width), channels
         )
         if encoding == "rgb8":
-            return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            if cv2 is not None:
+                return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            return image[..., ::-1].copy()
         if encoding == "rgba8":
-            return cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+            if cv2 is not None:
+                return cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+            return image[..., :3][..., ::-1].copy()
         if encoding == "bgra8":
-            return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+            if cv2 is not None:
+                return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+            return image[..., :3].copy()
         return image
+
+    @staticmethod
+    def _encode_jpeg(image: np.ndarray) -> bytes:
+        if cv2 is not None:
+            ok, encoded = cv2.imencode(
+                ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+            )
+            return encoded.tobytes() if ok else b""
+        if image.ndim == 2:
+            pil_image = PILImage.fromarray(image, mode="L")
+        else:
+            pil_image = PILImage.fromarray(image[..., ::-1], mode="RGB")
+        buffer = BytesIO()
+        pil_image.save(buffer, format="JPEG", quality=80)
+        return buffer.getvalue()
 
     def _detection_callback(self, message: String) -> None:
         with self.lock:
@@ -599,8 +626,8 @@ class InteractionAttributeInferenceNode:
             ):
                 outcome_status = "stale"
                 return
-            ok, encoded = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            if not ok:
+            encoded = self._encode_jpeg(crop)
+            if not encoded:
                 return
             image_data = "data:image/jpeg;base64," + __import__("base64").b64encode(encoded).decode("ascii")
             response = self.client.request_json(
