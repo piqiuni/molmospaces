@@ -34,6 +34,61 @@ def committed_turn_sign(
     return 1 if error >= 0.0 else -1
 
 
+def prerotation_control_step_budget(
+    initial_error_rad: float,
+    exit_tolerance_rad: float,
+    speed_rad_s: float,
+    control_dt_s: float,
+    max_control_steps: int,
+) -> int:
+    """Bound a V3 pre-rotation by simulator control steps, not ROS publishes.
+
+    A V3 RGB header sequence identifies the evaluator action which will
+    consume the next fresh command.  Budget only the angular distance still
+    outside the forward sector, so a worst-case pi-to-30-degree pre-turn needs
+    eleven 200 ms control steps at the 1.25 rad/s navigation cap.
+    """
+
+    remaining_rad = max(
+        0.0, abs(float(initial_error_rad)) - max(0.0, float(exit_tolerance_rad))
+    )
+    angular_step_rad = abs(float(speed_rad_s)) * max(0.0, float(control_dt_s))
+    if remaining_rad <= 0.0 or angular_step_rad <= 0.0:
+        return 0
+    required_motion_steps = int(math.ceil(remaining_rad / angular_step_rad))
+    return min(
+        max(1, int(max_control_steps)),
+        required_motion_steps,
+    )
+
+
+def prerotation_rgb_step_gate(
+    *,
+    last_sent_rgb_step_seq: int | None,
+    current_rgb_step_seq: int | None,
+    nonzero_commands_sent: int,
+    max_control_steps: int,
+) -> str:
+    """Decide whether the V3 pre-rotation may send one new nonzero command.
+
+    Repeated image republishes retain their header sequence and must never
+    authorize another action.  A sequence reset is fail-closed because it may
+    belong to a new evaluator episode.  The caller records a ``send`` by
+    assigning ``current_rgb_step_seq`` to ``last_sent_rgb_step_seq``.
+    """
+
+    if current_rgb_step_seq is None:
+        return "wait"
+    if last_sent_rgb_step_seq is not None:
+        if int(current_rgb_step_seq) < int(last_sent_rgb_step_seq):
+            return "stop"
+        if int(current_rgb_step_seq) == int(last_sent_rgb_step_seq):
+            return "wait"
+    if int(nonzero_commands_sent) >= max(0, int(max_control_steps)):
+        return "stop"
+    return "send"
+
+
 def path_lookahead_point(
     start_xy: tuple[float, float],
     path_xy: list[tuple[float, float]],

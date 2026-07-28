@@ -307,6 +307,51 @@ def test_direct_bbox_drawer_scan_routes_a_unique_current_public_box() -> None:
     assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
 
 
+def test_direct_bbox_drawer_scan_routes_exact_public_box_after_approach_lag() -> None:
+    """A graph-selected drawer box may arrive after its approach navigation."""
+
+    now = [100.0]
+    private_handle = object()
+    adapter, rospy = _adapter(clock=lambda: now[0])
+    _reset(adapter, {"obj_000017": private_handle})
+    drawer = RestrictedGTObservation(
+        instance_id="obj_000017",
+        name="dresser",
+        bbox_2d_xyxy=[0, 0, 1, 1],
+        segmentation_rle={"size": [4, 4], "counts": [0, 16]},
+        box3d_center=[1.0, 2.0, 0.5],
+        box3d_size=[0.8, 0.6, 1.7],
+    )
+    adapter.publish_observations([drawer], capture_step=455)
+    # The evaluator keeps publishing during navigation, but the semantic graph
+    # can still carry the last public drawer crop when the executor is ready.
+    # This mirrors the observed 455 -> 532 V3 delay.
+    for capture_step in range(456, 533):
+        adapter.publish_observations([], capture_step=capture_step)
+    now[0] += DIRECT_DRAWER_SCAN_BBOX_TTL_S * 0.75
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "scan-after-approach",
+            "object_id": "stale-method-selector",
+            "action": "open",
+            "sequence_type": "drawer_scan",
+            "drawer_container_bbox_2d": [0, 0, 1, 1],
+            "drawer_container_capture_step": 455,
+        }
+    )
+
+    assert request is not None
+    assert request.private_handle is private_handle
+    assert request.instance_id == "obj_000017"
+    assert request.sequence_type == "drawer_scan"
+    assert request.direct_bbox_drawer_scan is True
+    result = adapter.complete_interaction(request.command_id, success=True)
+    serialized = json.dumps(result, sort_keys=True)
+    assert "stale-method-selector" not in serialized
+    assert "drawer_container_bbox_2d" not in serialized
+
+
 def test_direct_bbox_drawer_scan_rejects_noncurrent_or_ambiguous_public_boxes() -> None:
     adapter, rospy = _adapter()
     _reset(adapter, {"obj_000017": object(), "obj_000018": object()})

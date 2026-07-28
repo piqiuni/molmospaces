@@ -19,6 +19,8 @@ from semantic_decision_py_pkg.behavior_execution import (
     navigation_should_prerotate,
     normalize_angle,
     path_lookahead_point,
+    prerotation_control_step_budget,
+    prerotation_rgb_step_gate,
     requires_graph_verification,
     target_ready_for_graph_verification,
     is_stuck_recovery_failure,
@@ -105,6 +107,64 @@ def test_committed_turn_sign_is_stable_at_pi_boundary() -> None:
     assert committed_turn_sign(1.0) == 1
     assert committed_turn_sign(-1.0) == -1
     assert math.isclose(normalize_angle(3.0 * math.pi), math.pi, abs_tol=1e-6)
+
+
+def test_prerotation_step_budget_uses_only_required_v3_control_steps() -> None:
+    assert prerotation_control_step_budget(
+        math.pi,
+        math.pi / 6.0,
+        speed_rad_s=1.25,
+        control_dt_s=0.2,
+        max_control_steps=12,
+    ) == 11
+    assert prerotation_control_step_budget(
+        math.pi / 6.0 + 0.01,
+        math.pi / 6.0,
+        speed_rad_s=1.25,
+        control_dt_s=0.2,
+        max_control_steps=12,
+    ) == 1
+    assert prerotation_control_step_budget(
+        0.1,
+        math.pi / 6.0,
+        speed_rad_s=1.25,
+        control_dt_s=0.2,
+        max_control_steps=12,
+    ) == 0
+
+
+def test_prerotation_rgb_step_gate_allows_one_command_per_evaluator_step() -> None:
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=10,
+        current_rgb_step_seq=10,
+        nonzero_commands_sent=0,
+        max_control_steps=12,
+    ) == "wait"
+    # A jump is still one new eligible command, not one per skipped sequence.
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=10,
+        current_rgb_step_seq=14,
+        nonzero_commands_sent=1,
+        max_control_steps=12,
+    ) == "send"
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=14,
+        current_rgb_step_seq=13,
+        nonzero_commands_sent=2,
+        max_control_steps=12,
+    ) == "stop"
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=14,
+        current_rgb_step_seq=15,
+        nonzero_commands_sent=12,
+        max_control_steps=12,
+    ) == "stop"
+    assert prerotation_rgb_step_gate(
+        last_sent_rgb_step_seq=14,
+        current_rgb_step_seq=None,
+        nonzero_commands_sent=2,
+        max_control_steps=12,
+    ) == "wait"
 
 
 def test_path_lookahead_uses_plan_direction_instead_of_final_goal_bearing() -> None:

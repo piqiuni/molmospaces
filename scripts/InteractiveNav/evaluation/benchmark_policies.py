@@ -383,6 +383,10 @@ def build_ros_bridge_policy(
         action_topic=action_topic,
         action_timeout_s=float(action_timeout_s),
         cmd_vel_linear_gain=float(cmd_vel_linear_gain),
+        # V3's pre-rotation sends at most one nonzero command for each RGB
+        # evaluator step.  Keep a command fresh-only so it cannot spill into a
+        # later get_action call and exceed that control-step budget.
+        require_fresh_cmd_vel=True,
         require_move_base_active_for_cmd_vel=bool(require_move_base_active),
         map_warmup_skip_frames=int(map_warmup_skip_frames),
         publish_realtime_gt=False,

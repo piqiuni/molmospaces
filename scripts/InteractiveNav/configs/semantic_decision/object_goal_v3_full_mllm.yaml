@@ -75,10 +75,27 @@ completion:
   empty_candidate_confirmations: 3
   stagnation_failure_limit: 8
 
+topics:
+  # RosBridge's evaluator-step heartbeat, used only to cap V3 pre-rotation.
+  step_sync: "/molmo_spaces/step_sync"
+
 executor:
   # V3 exposes only open(opaque_object_id); a drawer_scan visual hint remains
   # opaque and is expanded privately into low-view open-observe-close steps.
   evaluator_opaque_open_only: true
   # Pre-rotate only when the path heading differs by more than 30 degrees.
+  # Stop as soon as it re-enters that same forward sector: do not spend extra
+  # simulator control steps aligning the base exactly with the path.
   rear_goal_enter_angle_rad: 0.5235987755982988
+  rear_goal_exit_angle_rad: 0.5235987755982988
+  # Match the existing DWA max_vel_theta cap (rad/s); the executor never
+  # requests a faster pre-rotation than normal navigation permits.
+  rear_goal_rotate_speed_rad_s: 1.25
+  # With 200 ms control steps this is at most 0.25 rad / step.  From pi to
+  # the 30-degree forward sector needs 11 motion steps; 12 remains a strict
+  # absolute ceiling even if future thresholds are changed.
+  rear_goal_prerotate_step_sync_enabled: true
+  rear_goal_prerotate_control_dt_s: 0.2
+  rear_goal_prerotate_max_control_steps: 12
+  rear_goal_prerotate_step_sync_stall_timeout_s: 2.0
   interaction_navigation_timeout_s: 180.0

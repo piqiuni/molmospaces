@@ -41,17 +41,121 @@ class _FakeAdapter:
         return {"status": "COMPLETED" if success else "FAILED"}
 
 
-def _runtime_joint(*, object_name: str, joint_name: str, joint_index: int) -> benchmark_runner.RuntimeJoint:
+def _runtime_joint(
+    *,
+    object_name: str,
+    joint_name: str,
+    joint_index: int,
+    body_id: int = 1,
+) -> benchmark_runner.RuntimeJoint:
     return benchmark_runner.RuntimeJoint(
         object_name=object_name,
         object_category="Fridge",
         domain="container",
         joint_name=joint_name,
         joint_index=joint_index,
-        body_id=1,
+        body_id=body_id,
         aabb_center=np.asarray([0.0, 0.0, 0.0]),
         aabb_size=np.asarray([1.0, 1.0, 1.0]),
     )
+
+
+def test_restricted_gt_root_body_alias_resolves_to_articulated_object_skill() -> None:
+    """A rendered door frame must route to its child hinge's opaque skill."""
+
+    model = SimpleNamespace(
+        body_parentid=np.asarray([0, 0, 1, 2, 0]),
+        body_rootid=np.asarray([0, 1, 1, 1, 4]),
+    )
+    leaf = _runtime_joint(
+        object_name="private_door_leaf",
+        joint_name="private_hinge",
+        joint_index=0,
+        body_id=2,
+    )
+    aliases = benchmark_runner._perception_source_skill_aliases(
+        model=model,
+        private_specs=[
+            SimpleNamespace(source_name="private_door_root", body_id=1),
+            SimpleNamespace(source_name="private_door_leaf", body_id=2),
+            SimpleNamespace(source_name="private_door_handle", body_id=3),
+            SimpleNamespace(source_name="unrelated_object", body_id=4),
+        ],
+        joints_by_object={"private_door_leaf": [leaf]},
+    )
+
+    assert aliases == {
+        "private_door_root": "private_door_leaf",
+        "private_door_leaf": "private_door_leaf",
+        "private_door_handle": "private_door_leaf",
+    }
+
+
+def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A public frame's root-body ID must be accepted by the sealed adapter."""
+
+    class _FakeAdapter:
+        def __init__(self, **_kwargs) -> None:
+            self.private_instances: dict[str, str] = {}
+
+        def reset(self, *, private_instances, **_kwargs) -> None:
+            self.private_instances = dict(private_instances)
+
+        def publish_restricted_gt_frame(self, *_args, **_kwargs) -> None:
+            return None
+
+    model = SimpleNamespace(
+        body_parentid=np.asarray([0, 0, 1]),
+        body_rootid=np.asarray([0, 1, 1]),
+    )
+    leaf = _runtime_joint(
+        object_name="private_door_leaf",
+        joint_name="private_hinge",
+        joint_index=0,
+        body_id=2,
+    )
+    specs = [
+        SimpleNamespace(source_name="private_door_root", body_id=1),
+        SimpleNamespace(source_name="private_door_leaf", body_id=2),
+    ]
+    monkeypatch.setattr(benchmark_runner, "RosObjectGoalEvaluatorAdapter", _FakeAdapter)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "build_private_object_specs_from_env",
+        lambda _env: specs,
+    )
+    monkeypatch.setattr(
+        benchmark_runner.RestrictedGTPerceptionPublisher,
+        "build",
+        lambda self, *_args, **_kwargs: None,
+    )
+
+    runtime = benchmark_runner._build_restricted_ros_object_goal_runtime(
+        task=SimpleNamespace(env=SimpleNamespace(current_model=model)),
+        catalog=SimpleNamespace(joints=[leaf]),
+        episode={"interactive_nav": {"interactions": [], "oracle_plans": []}},
+        public=SimpleNamespace(instruction="find the apple"),
+        config=SimpleNamespace(
+            restricted_gt_min_visible_pixels=16,
+            restricted_gt_min_bbox_area_pixels=512,
+            restricted_gt_max_distance_m=4.0,
+            ros_target_topic="/target",
+            ros_restricted_gt_topic="/gt",
+            ros_interaction_command_topic="/command",
+            ros_interaction_result_topic="/result",
+        ),
+        episode_index=0,
+    )
+
+    root_opaque_id = runtime.perception.registry.public_id_for("private_door_root")
+    leaf_opaque_id = runtime.perception.registry.public_id_for("private_door_leaf")
+    assert runtime.opaque_to_source_name[root_opaque_id] == "private_door_leaf"
+    assert runtime.opaque_to_joints[root_opaque_id] == (leaf,)
+    assert runtime.opaque_to_source_name[leaf_opaque_id] == "private_door_leaf"
+    assert root_opaque_id in runtime.adapter.private_instances
+    assert leaf_opaque_id in runtime.adapter.private_instances
 
 
 def test_opaque_ros_object_command_keeps_private_resolution_out_of_public_attempt(

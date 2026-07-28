@@ -2,5 +2,8 @@ exploration:
   external_behavior_control: true
   # Complete the initial 360° scan before semantic candidate dispatch.
   initial_spin_enabled: true
+  # Under evaluator action waits, a 95 s wall-clock limit can end around
+  # 5.4 rad before the commanded 2π scan is complete.
+  initial_spin_timeout_sec: 140.0
   local_plan_watchdog_enabled: true
   local_plan_watchdog_sec: 12.0

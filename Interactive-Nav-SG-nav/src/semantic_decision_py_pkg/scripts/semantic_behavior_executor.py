@@ -28,6 +28,8 @@ from semantic_decision_py_pkg.behavior_execution import (
     navigation_should_prerotate,
     normalize_angle,
     path_lookahead_point,
+    prerotation_control_step_budget,
+    prerotation_rgb_step_gate,
     requires_graph_verification,
     is_stuck_recovery_failure,
     safe_grid_motion_distance,
@@ -150,6 +152,21 @@ class SemanticBehaviorExecutor:
         )
         self.rear_goal_prerotate_timeout_s = float(
             config.get("rear_goal_prerotate_timeout_s", 12.0)
+        )
+        self.rear_goal_prerotate_step_sync_enabled = bool(
+            config.get("rear_goal_prerotate_step_sync_enabled", False)
+        )
+        self.rear_goal_prerotate_control_dt_s = max(
+            1e-3,
+            float(config.get("rear_goal_prerotate_control_dt_s", 0.2)),
+        )
+        self.rear_goal_prerotate_max_control_steps = max(
+            1,
+            int(config.get("rear_goal_prerotate_max_control_steps", 12)),
+        )
+        self.rear_goal_prerotate_step_sync_stall_timeout_s = max(
+            0.1,
+            float(config.get("rear_goal_prerotate_step_sync_stall_timeout_s", 2.0)),
         )
         self.rear_goal_lookahead_m = float(
             config.get("rear_goal_lookahead_m", 0.75)
@@ -275,6 +292,10 @@ class SemanticBehaviorExecutor:
         self._stuck_failure_origin_xy: tuple[float, float] | None = None
         self._stuck_failure_candidate_ids: set[str] = set()
         self._latest_occupancy: OccupancyGrid | None = None
+        self._latest_step_sync_index: int | None = None
+        self._latest_step_sync_received_at = 0.0
+        self._latest_rgb_step_seq: int | None = None
+        self._latest_rgb_step_received_at = 0.0
         self.latest_image = None
         self.latest_image_sequence = 0
         self.pre_interaction_image_sequence = 0
@@ -357,6 +378,13 @@ class SemanticBehaviorExecutor:
             self._image_callback,
             queue_size=1,
         )
+        if self.rear_goal_prerotate_step_sync_enabled:
+            rospy.Subscriber(
+                topics.get("step_sync", "/molmo_spaces/step_sync"),
+                String,
+                self._step_sync_callback,
+                queue_size=1,
+            )
         self.timer = rospy.Timer(rospy.Duration(0.2), self._tick)
 
     def _selection_callback(self, message: String) -> None:
@@ -545,14 +573,34 @@ class SemanticBehaviorExecutor:
         else:
             self._dispatch(commands)
 
+    def _step_sync_callback(self, message: String) -> None:
+        """Record evaluator progress without using TF's keepalive stream."""
+
+        try:
+            payload = json.loads(message.data)
+            step_index = int(payload["step_index"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        with self.lock:
+            self._latest_step_sync_index = step_index
+            self._latest_step_sync_received_at = time.monotonic()
+
     def _image_callback(self, message: Image) -> None:
         try:
             image = self._decode_ros_image(message)
         except Exception:
             return
+        try:
+            rgb_step_seq = int(message.header.seq)
+        except (AttributeError, TypeError, ValueError):
+            rgb_step_seq = None
+        received_at = time.monotonic()
         with self.lock:
             self.latest_image = image.copy()
             self.latest_image_sequence += 1
+            if rgb_step_seq is not None:
+                self._latest_rgb_step_seq = rgb_step_seq
+                self._latest_rgb_step_received_at = received_at
 
     @staticmethod
     def _decode_ros_image(message: Image):
@@ -1179,31 +1227,119 @@ class SemanticBehaviorExecutor:
         speed_rad_s: float,
         timeout_s: float,
         turn_sign: int | None = None,
+        max_prerotate_control_steps: int | None = None,
+        step_sync_stall_timeout_s: float | None = None,
     ) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         committed_sign = turn_sign
+        with self.lock:
+            last_step_sync_index = self._latest_step_sync_index
+            last_step_sync_at = self._latest_step_sync_received_at
+            start_rgb_step_seq = self._latest_rgb_step_seq
+            last_sent_rgb_step_seq = start_rgb_step_seq
+            start_rgb_received_at = self._latest_rgb_step_received_at
+        nonzero_commands_sent = 0
+        saw_new_rgb_step = False
+        last_rgb_step_advance_at = time.monotonic()
+        last_step_sync_progress_at = time.monotonic()
+        gate_stall_timeout_s = max(
+            0.1, float(step_sync_stall_timeout_s or 2.0)
+        )
+
+        def finish_prerotation(reason: str, success: bool) -> bool:
+            if max_prerotate_control_steps is not None:
+                rospy.loginfo(
+                    "[semantic_behavior_executor] pre-rotation finished "
+                    "reason=%s nonzero_commands=%d start_rgb_seq=%s last_rgb_seq=%s",
+                    reason,
+                    nonzero_commands_sent,
+                    start_rgb_step_seq,
+                    last_sent_rgb_step_seq,
+                )
+            return success
+
         try:
             while (
                 not rospy.is_shutdown()
                 and self._navigation_is_current(decision_id)
                 and time.monotonic() < deadline
             ):
+                current_rgb_step_seq = None
+                if max_prerotate_control_steps is not None:
+                    with self.lock:
+                        current_step_sync_index = self._latest_step_sync_index
+                        current_step_sync_at = self._latest_step_sync_received_at
+                        current_rgb_step_seq = self._latest_rgb_step_seq
+                    if current_step_sync_at > last_step_sync_at:
+                        if (
+                            last_step_sync_index is not None
+                            and (
+                                current_step_sync_index is None
+                                or current_step_sync_index < last_step_sync_index
+                            )
+                        ):
+                            return finish_prerotation("sync_reset", False)
+                        last_step_sync_index = current_step_sync_index
+                        last_step_sync_at = current_step_sync_at
+                        last_step_sync_progress_at = time.monotonic()
+                    now = time.monotonic()
+                    if not saw_new_rgb_step and (
+                        start_rgb_received_at <= 0.0
+                        or now - start_rgb_received_at
+                        >= gate_stall_timeout_s
+                    ):
+                        return finish_prerotation("rgb_stale_at_start", False)
+                    if current_rgb_step_seq is not None:
+                        if (
+                            last_sent_rgb_step_seq is not None
+                            and current_rgb_step_seq < last_sent_rgb_step_seq
+                        ):
+                            return finish_prerotation("rgb_reset", False)
+                        if (
+                            last_sent_rgb_step_seq is None
+                            or current_rgb_step_seq > last_sent_rgb_step_seq
+                        ):
+                            saw_new_rgb_step = True
+                            last_rgb_step_advance_at = now
+                    if (
+                        nonzero_commands_sent > 0
+                        and now - last_step_sync_progress_at
+                        >= gate_stall_timeout_s
+                    ):
+                        return finish_prerotation("step_sync_stall", False)
+                    if (
+                        now - last_rgb_step_advance_at
+                        >= gate_stall_timeout_s
+                    ):
+                        return finish_prerotation("rgb_step_stall", False)
                 pose = self._current_pose(frame_id)
                 if pose is None:
                     time.sleep(0.05)
                     continue
                 error = normalize_angle(float(target_yaw) - pose[2])
                 if abs(error) <= max(0.0, float(tolerance_rad)):
-                    return True
+                    return finish_prerotation("tolerance", True)
                 if committed_sign is None:
                     committed_sign = committed_turn_sign(
                         error,
                         self.rear_goal_pi_tie_tolerance_rad,
                         self.rear_goal_pi_turn_sign,
                     )
-                self._publish_rotation(
-                    float(committed_sign) * abs(float(speed_rad_s))
-                )
+                if max_prerotate_control_steps is not None:
+                    gate = prerotation_rgb_step_gate(
+                        last_sent_rgb_step_seq=last_sent_rgb_step_seq,
+                        current_rgb_step_seq=current_rgb_step_seq,
+                        nonzero_commands_sent=nonzero_commands_sent,
+                        max_control_steps=max_prerotate_control_steps,
+                    )
+                    if gate == "stop":
+                        return finish_prerotation("rgb_step_budget", False)
+                    if gate == "wait":
+                        time.sleep(0.01)
+                        continue
+                    last_sent_rgb_step_seq = current_rgb_step_seq
+                    nonzero_commands_sent += 1
+                self._publish_rotation(float(committed_sign) * abs(float(speed_rad_s)))
                 time.sleep(0.05)
         finally:
             self._publish_rotation(0.0)
@@ -1232,6 +1368,19 @@ class SemanticBehaviorExecutor:
             self.rear_goal_pi_tie_tolerance_rad,
             self.rear_goal_pi_turn_sign,
         )
+        max_prerotate_control_steps = None
+        step_sync_stall_timeout_s = None
+        if self.rear_goal_prerotate_step_sync_enabled:
+            max_prerotate_control_steps = prerotation_control_step_budget(
+                error,
+                self.rear_goal_exit_angle_rad,
+                self.rear_goal_rotate_speed_rad_s,
+                self.rear_goal_prerotate_control_dt_s,
+                self.rear_goal_prerotate_max_control_steps,
+            )
+            step_sync_stall_timeout_s = self.rear_goal_prerotate_step_sync_stall_timeout_s
+            if max_prerotate_control_steps <= 0:
+                return True
         return self._rotate_to_yaw(
             decision_id,
             frame_id,
@@ -1240,6 +1389,8 @@ class SemanticBehaviorExecutor:
             self.rear_goal_rotate_speed_rad_s,
             self.rear_goal_prerotate_timeout_s,
             turn_sign=turn_sign,
+            max_prerotate_control_steps=max_prerotate_control_steps,
+            step_sync_stall_timeout_s=step_sync_stall_timeout_s,
         )
 
     def _final_align_goal(

@@ -212,6 +212,28 @@ def test_curator_prioritizes_reachable_unvisited_room_frontier() -> None:
     assert "frontier:b_unreachable" not in result.decision_hint_by_id
 
 
+def test_curator_rejects_invisible_unreachable_container_interaction() -> None:
+    candidate = make_candidate(
+        "interaction:container_stale:open",
+        "INTERACT",
+        x=4.0,
+        node_type="container",
+    )
+    candidate.metadata.update(
+        {
+            "is_currently_visible": False,
+            "room_reachable": False,
+        }
+    )
+
+    result = CandidateCurator().curate([candidate])
+
+    assert result.candidates == []
+    assert result.rejected == {
+        "interaction:container_stale:open": "container_not_visible_and_room_unreachable"
+    }
+
+
 def test_curator_keeps_substantially_larger_visible_area_ahead_of_new_room() -> None:
     curator = CandidateCurator(
         CandidateCuratorConfig(candidate_top_k=3, explore_quota=3)

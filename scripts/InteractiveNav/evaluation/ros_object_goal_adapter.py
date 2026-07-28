@@ -56,12 +56,14 @@ DEFAULT_INTERACTION_RESULT_TOPIC = "/semantic_mapping/interaction_result"
 # high: this is identity routing for a sealed evaluator skill, not a detector
 # association heuristic.
 DIRECT_DRAWER_SCAN_BBOX_MIN_IOU = 0.85
-# Keep a very small public-frame history so a command can cross the normal ROS
-# callback boundary, but never let an old observation become a durable object
-# selector.  These are wall-clock limits, intentionally independent of a
-# simulator's logical ``stamp_sec``.
-DIRECT_DRAWER_SCAN_BBOX_HISTORY_SIZE = 4
-DIRECT_DRAWER_SCAN_BBOX_TTL_S = 2.0
+# The semantic graph can lag the evaluator while the robot completes the
+# approach to a drawer.  Retain a bounded public-frame window large enough for
+# that normal navigation delay.  A command still has to name the exact public
+# capture step and pass the high IoU/unique-match checks below, so this does
+# not turn an old box into a free-form object selector.  These are wall-clock
+# limits, intentionally independent of a simulator's logical ``stamp_sec``.
+DIRECT_DRAWER_SCAN_BBOX_HISTORY_SIZE = 128
+DIRECT_DRAWER_SCAN_BBOX_TTL_S = 30.0
 
 
 class RestrictedGTContractError(ValueError):
@@ -1233,7 +1235,7 @@ class RosObjectGoalEvaluatorAdapter:
         requested_bbox: tuple[float, float, float, float],
         capture_step: int,
     ) -> str | None:
-        """Route a box from one recent evaluator-published public frame."""
+        """Route a box from one bounded evaluator-published public frame."""
 
         now = float(self._clock())
         fresh_frames = deque(

@@ -298,6 +298,10 @@ if (( ${#EPISODE_RESULTS} != 1 )); then
 fi
 EPISODE_RESULT=${EPISODE_RESULTS[1]}
 EPISODE_DIR=${EPISODE_RESULT:h}
+if [[ "${FAST_EVAL}" == true ]]; then
+  print -r -- "[v3-ros-eval-fast] result=${EPISODE_RESULT}"
+  exit "${EVAL_EXIT}"
+fi
 
 # The evaluator may finish while step-sync callbacks or six-panel renders are
 # still queued.  Drain against the evaluator's exact completed-step count,
@@ -319,11 +323,6 @@ cleanup_process "${ROSLAUNCH_PID}" 20
 ROSLAUNCH_PID=""
 cleanup_process "${ROSCORE_PID}" 10
 ROSCORE_PID=""
-
-if [[ "${FAST_EVAL}" == true ]]; then
-  print -r -- "[v3-ros-eval-fast] result=${EPISODE_RESULT}"
-  exit "${EVAL_EXIT}"
-fi
 TOPDOWN_PATH="${EPISODE_DIR}/episode_topdown.png"
 
 MUJOCO_GL=egl python "${REPO_ROOT}/scripts/InteractiveNav/render_interactive_nav_v3_topdown.py" \

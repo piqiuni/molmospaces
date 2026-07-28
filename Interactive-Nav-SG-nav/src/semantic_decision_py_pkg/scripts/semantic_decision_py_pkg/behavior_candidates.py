@@ -767,6 +767,18 @@ class CandidateGenerator:
             node_room_id = node.get("room_id")
             allow_connected_room = bool(self.config.container_allow_connected_room)
             room_hops = self._room_hops(graph, robot_room_id, node_room_id)
+            # A remembered container can remain in the graph after it leaves
+            # the current camera view.  Do not turn that stale observation
+            # into a physical INTERACT request when the observed room graph
+            # also has no reachable route to it.  This is deliberately a
+            # conjunction: a visible container or a reachable remembered one
+            # may still be useful for planning.
+            if (
+                node_type == "container"
+                and node.get("is_currently_visible") is False
+                and room_hops is None
+            ):
+                continue
             if (
                 node_type == "container"
                 and self.config.container_require_same_room

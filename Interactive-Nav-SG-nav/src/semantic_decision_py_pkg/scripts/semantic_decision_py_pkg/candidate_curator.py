@@ -212,6 +212,16 @@ def candidate_rejection_reason(candidate: BehaviorCandidate) -> str:
     if bool(metadata.get("interaction_group_previously_failed")):
         return "interaction_group_previously_failed"
     if behavior_type == "INTERACT":
+        # Keep the generation-time container guard effective when a candidate
+        # was queued from an earlier graph revision and is being revalidated.
+        # Require explicit public values so legacy candidates that do not
+        # report visibility/reachability remain backward-compatible.
+        if (
+            str(metadata.get("node_type") or "").casefold() == "container"
+            and metadata.get("is_currently_visible") is False
+            and metadata.get("room_reachable") is False
+        ):
+            return "container_not_visible_and_room_unreachable"
         action = _candidate_action(candidate)
         state = str(metadata.get("state") or "unknown").casefold()
         if action == "open" and state in {"open", "static_open", "completed"}:

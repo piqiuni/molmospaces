@@ -60,7 +60,10 @@ from .benchmark_policies import (
 )
 from .benchmark_types import EpisodeResult, InteractionAttempt, PolicyAction, PolicyObservation, PublicEpisode
 from .public_goal import build_public_target_context as build_language_target_context
-from .restricted_gt_perception import RestrictedGTPerceptionPublisher
+from .restricted_gt_perception import (
+    RestrictedGTPerceptionPublisher,
+    build_private_object_specs_from_env,
+)
 from .ros_object_goal_adapter import (
     RosObjectGoalEvaluatorAdapter,
     build_public_target_context as build_ros_target_context,
@@ -416,6 +419,85 @@ class RestrictedRosObjectGoalRuntime:
     opaque_to_joints: dict[str, tuple[RuntimeJoint, ...]]
 
 
+def _body_root_id(model: Any, body_id: int) -> int | None:
+    """Return the MuJoCo body-tree root for one evaluator-private body."""
+
+    try:
+        current = int(body_id)
+        parent_ids = getattr(model, "body_parentid")
+        body_count = len(parent_ids)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if not 0 <= current < body_count:
+        return None
+    root_ids = getattr(model, "body_rootid", None)
+    if root_ids is not None:
+        try:
+            root_id = int(root_ids[current])
+        except (TypeError, ValueError, IndexError):
+            root_id = -1
+        if 0 <= root_id < body_count:
+            return root_id
+    seen: set[int] = set()
+    while current not in seen:
+        seen.add(current)
+        try:
+            parent = int(parent_ids[current])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if parent == current or parent < 0 or parent >= body_count:
+            return current
+        if parent == 0:
+            return current
+        current = parent
+    return None
+
+
+def _perception_source_skill_aliases(
+    *,
+    model: Any,
+    private_specs: list[Any],
+    joints_by_object: dict[str, list[RuntimeJoint]],
+) -> dict[str, str]:
+    """Map rendered body sources to their sealed object-skill source.
+
+    A scene metadata record commonly names the static root of a doorway,
+    whereas :class:`InteractionCatalog` names the articulated leaf body that
+    owns its hinge.  Restricted GT can render either body.  Both therefore
+    need episode-local opaque IDs that resolve to the same private skill,
+    without ever publishing the raw body names to ROS.
+    """
+
+    skill_source_by_root: dict[int, str] = {}
+    ambiguous_roots: set[int] = set()
+    for source_name in sorted(joints_by_object):
+        joints = joints_by_object[source_name]
+        if not joints:
+            continue
+        root_id = _body_root_id(model, int(joints[0].body_id))
+        if root_id is None:
+            continue
+        existing = skill_source_by_root.get(root_id)
+        if existing is None:
+            skill_source_by_root[root_id] = source_name
+        elif existing != source_name:
+            ambiguous_roots.add(root_id)
+
+    aliases: dict[str, str] = {}
+    for spec in private_specs:
+        source_name = str(getattr(spec, "source_name", "") or "")
+        body_id = getattr(spec, "body_id", None)
+        if not source_name or body_id is None:
+            continue
+        root_id = _body_root_id(model, int(body_id))
+        if root_id is None or root_id in ambiguous_roots:
+            continue
+        skill_source = skill_source_by_root.get(root_id)
+        if skill_source is not None:
+            aliases[source_name] = skill_source
+    return aliases
+
+
 def _ordered_object_skill_joints(
     *,
     source_name: str,
@@ -501,15 +583,41 @@ def _build_restricted_ros_object_goal_runtime(
         )
     for joint in catalog.joints:
         joints_by_object.setdefault(joint.object_name, []).append(joint)
-    for source_name in sorted(joints_by_object):
+    # The restricted renderer can report a door frame/root body while the
+    # catalog resolves the articulated child body.  Pre-register every render
+    # source and bind root/child aliases to one sealed evaluator skill so the
+    # opaque ID observed by ROS is always routable when it denotes an actual
+    # portal or container.  Non-articulated scene objects remain visible but
+    # deliberately receive no interaction capability.
+    private_specs = build_private_object_specs_from_env(task.env)
+    source_skill_aliases = _perception_source_skill_aliases(
+        model=task.env.current_model,
+        private_specs=private_specs,
+        joints_by_object=joints_by_object,
+    )
+    perception_sources = {
+        str(getattr(spec, "source_name", "") or "")
+        for spec in private_specs
+    }
+    source_names = sorted(
+        source_name
+        for source_name in (set(joints_by_object) | perception_sources)
+        if source_name
+    )
+    for source_name in source_names:
         opaque_id = perception.registry.public_id_for(source_name)
+        skill_source_name = source_skill_aliases.get(source_name)
+        if skill_source_name is None and source_name in joints_by_object:
+            skill_source_name = source_name
+        if skill_source_name is None:
+            continue
         all_joints = tuple(
-            sorted(joints_by_object[source_name], key=lambda item: item.joint_index)
+            sorted(joints_by_object[skill_source_name], key=lambda item: item.joint_index)
         )
-        relevant_indices = recorded_joint_indices.get(source_name)
+        relevant_indices = recorded_joint_indices.get(skill_source_name)
         joints = (
             _ordered_object_skill_joints(
-                source_name=source_name,
+                source_name=skill_source_name,
                 all_joints=all_joints,
                 interactions=interactions,
                 plans=plans,
@@ -520,13 +628,13 @@ def _build_restricted_ros_object_goal_runtime(
         private_registry.register(
             opaque_id,
             joints=joints,
-            object_ref=source_name,
+            object_ref=skill_source_name,
             open_postcondition=OpenPostconditionSpec(
                 success_fraction=float(SUCCESS_OPEN_FRACTION),
                 minimum_open_joints=1,
             ),
         )
-        opaque_to_source_name[opaque_id] = source_name
+        opaque_to_source_name[opaque_id] = skill_source_name
         opaque_to_joints[opaque_id] = joints
 
     def execute_open_joint(joint: RuntimeJoint) -> JointOpenResult:
@@ -638,19 +746,24 @@ def _selected_indices(config: BenchmarkEvaluationConfig, episodes: list[dict[str
     return normalized
 
 
+def _skip_replay_freeze_task_config(
+    _observation: Any,
+    *,
+    task: Any | None = None,
+) -> None:
+    """V3 JSON is already frozen; satisfy ``BaseMujocoTask.reset`` only."""
+
+    del task
+    return None
+
+
 def _build_replay_config(
     config: BenchmarkEvaluationConfig,
     output_dir: Path,
     *,
     task_horizon: int | None = None,
 ) -> Any:
-    """Build the minimal RBY1 config consumed by JSON replay.
-
-    Importing ``NavToObjBaseConfig`` pulls every planner and robot backend into
-    each evaluator process (CuRobo, Torch, Franka MJX, and their transitive
-    dependencies).  JSON replay only needs an attribute container plus the
-    concrete NavToObj task/sampler and RBY1 runtime classes.
-    """
+    """Build the minimal RBY1 config consumed by JSON replay."""
 
     from molmo_spaces.configs.task_configs import NavToObjTaskConfig
     from molmo_spaces.configs.task_sampler_configs import NavToObjTaskSamplerConfig
@@ -730,6 +843,7 @@ def _build_replay_config(
         record_videos=False,
         seed=None,
         seed_torch=False,
+        freeze_task_config=_skip_replay_freeze_task_config,
     )
     if _is_current_ros_policy(config):
         for group_name, qpos in ROS_NAVIGATION_ARM_QPOS.items():

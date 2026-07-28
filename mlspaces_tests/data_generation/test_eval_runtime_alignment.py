@@ -88,6 +88,7 @@ def test_v3_minimal_replay_config_preserves_runtime_contract(tmp_path: Path) -> 
     assert replay.ctrl_dt_ms == 10.0
     assert replay.sim_dt_ms == 10.0
     assert replay.seed_torch is False
+    assert replay.freeze_task_config([{}], task=None) is None
     assert replay.robot_config.name == "rby1"
     assert replay.robot_config.robot_factory.__name__ == "RBY1"
     assert replay.robot_config.action_noise_config.enabled is False
@@ -104,6 +105,39 @@ def test_v3_minimal_replay_config_preserves_runtime_contract(tmp_path: Path) -> 
         not values.any()
         for values in replay.robot_config.init_qpos_noise_range.values()
     )
+
+
+def test_v3_minimal_replay_config_satisfies_base_task_reset_freeze_hook(
+    tmp_path: Path,
+) -> None:
+    from molmo_spaces.tasks.task import BaseMujocoTask
+    from scripts.InteractiveNav.evaluation.benchmark_runner import (
+        BenchmarkEvaluationConfig,
+        _build_replay_config,
+    )
+
+    replay = _build_replay_config(
+        BenchmarkEvaluationConfig(benchmark=Path("benchmark.json"), output_dir=tmp_path),
+        tmp_path,
+    )
+
+    class ResetProbe:
+        def __init__(self) -> None:
+            self._env = SimpleNamespace(n_batch=1)
+            self.config = replay
+            self.sensor_suite = None
+            self._registered_policy = None
+
+        @staticmethod
+        def get_and_cache_all_step_information():
+            return [{"qpos": {}}], None, None, None, [{}]
+
+    task = ResetProbe()
+    observation, info = BaseMujocoTask.reset(task)
+
+    assert observation == [{"qpos": {}}]
+    assert info == [{}]
+    assert task.frozen_config is None
 
 
 def test_multiworker_eval_does_not_construct_or_share_parent_policy() -> None:

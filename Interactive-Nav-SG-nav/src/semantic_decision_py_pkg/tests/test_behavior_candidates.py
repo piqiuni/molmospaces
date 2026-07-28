@@ -1432,6 +1432,60 @@ def test_container_same_room_filter_rejects_closed_room_transition() -> None:
     assert generator.generate({}, graph, robot_xy=(1.0, 0.0)) == []
 
 
+def test_invisible_unreachable_container_is_not_an_interaction_candidate() -> None:
+    """A stale container in a disconnected room cannot create INTERACT."""
+
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("container",))
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "room_1",
+                "type": "room",
+                "room_id": 1,
+                "aabb_center": [1.0, 0.0, 0.1],
+                "aabb_size": [2.0, 2.0, 0.2],
+            },
+            {
+                "id": "room_2",
+                "type": "room",
+                "room_id": 2,
+                "aabb_center": [5.0, 0.0, 0.1],
+                "aabb_size": [2.0, 2.0, 0.2],
+            },
+            {
+                "id": "container_dresser",
+                "type": "container",
+                "room_id": 2,
+                "label": "dresser",
+                "centroid": [5.0, 0.0, 0.5],
+                "state_age_sec": 0.0,
+                "is_currently_visible": False,
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            },
+        ],
+        "edges": [
+            {
+                "relation": "connects",
+                "src_id": "portal_1",
+                "dst_id": "room_1",
+                "attributes": {
+                    "candidate_connected_room_ids": [1, 2],
+                    "traversable": False,
+                },
+            }
+        ],
+    }
+
+    assert generator.generate({}, graph, robot_xy=(1.0, 0.0)) == []
+
+
 def test_target_same_room_filter_allows_traversable_room_transition() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(

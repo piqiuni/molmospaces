@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -40,6 +41,37 @@ def test_dwa_requires_terminal_goal_yaw() -> None:
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["DWAPlannerROS"]
     assert float(config["yaw_goal_tolerance"]) <= 0.25
     assert config["latch_xy_goal_tolerance"] is True
+
+
+def test_v3_prerotation_uses_navigation_speed_cap_and_forward_sector() -> None:
+    semantic_config_path = (
+        REPO_ROOT
+        / "scripts"
+        / "InteractiveNav"
+        / "configs"
+        / "semantic_decision"
+        / "object_goal_v3_full_mllm.yaml"
+    )
+    dwa_config_path = (
+        REPO_ROOT
+        / "Interactive-Nav-SG-nav"
+        / "src"
+        / "nav_pkg"
+        / "configs"
+        / "controller"
+        / "dwa_controller_params.yaml"
+    )
+    executor = yaml.safe_load(semantic_config_path.read_text(encoding="utf-8"))["executor"]
+    dwa = yaml.safe_load(dwa_config_path.read_text(encoding="utf-8"))["DWAPlannerROS"]
+
+    assert math.isclose(float(executor["rear_goal_enter_angle_rad"]), math.pi / 6.0)
+    assert float(executor["rear_goal_exit_angle_rad"]) == float(
+        executor["rear_goal_enter_angle_rad"]
+    )
+    assert float(executor["rear_goal_rotate_speed_rad_s"]) <= float(dwa["max_vel_theta"])
+    assert executor["rear_goal_prerotate_step_sync_enabled"] is True
+    assert math.isclose(float(executor["rear_goal_prerotate_control_dt_s"]), 0.2)
+    assert int(executor["rear_goal_prerotate_max_control_steps"]) == 12
 
 
 def test_oriented_global_planner_plugin_is_exported() -> None:
