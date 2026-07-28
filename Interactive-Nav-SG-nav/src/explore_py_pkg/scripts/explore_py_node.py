@@ -554,12 +554,8 @@ class ExplorePyNode:
                     self._fail_if_global_plan_not_current_goal()
                 if self.state.active_goal is not None:
                     self._fail_if_local_plan_missing()
-                if self.state.active_goal is not None:
-                    self.state.mark_active_covered_if_frontier_gone(
-                        has_frontier,
-                        confirm_ticks=self.frontier_gone_confirm_ticks,
-                        min_goal_age_sec=self.frontier_gone_min_goal_age_sec,
-                    )
+                # A dispatched goal stays owned by move_base even when map
+                # observations consume or move its source frontier.
         if active_goal_before_update and self.state.active_goal is None:
             self._cancel_move_base_goal(self.state.last_event or "explorer_closed_goal")
             self.active_move_base_goal_id = ""

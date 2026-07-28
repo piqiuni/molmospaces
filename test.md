@@ -1,6 +1,6 @@
 # 交互导航开发测试手册
 
-最后更新：2026-07-26
+最后更新：2026-07-29
 
 ## 1. 文档定位
 
@@ -1702,3 +1702,209 @@ conda run -n mlspaces python scripts/InteractiveNav/evaluate_module3_visual_plan
 ```
 
 无可用视觉模型时可用 `--mode mock --model mock-module3` 检查裁图、协议、schema 和评分链路；mock 结果不能作为视觉能力结论。
+
+---
+
+## 12. Native `NavToObj` 远程 A100 大规模测试
+
+本节使用 `scripts/InteractiveNav/nav_to_obj_batch_manager.py` 调度
+`run_native_nav_to_obj_eval.zsh`。每个 episode 都由一个独立 ROS master 和一次
+原生 JSON evaluator 调用执行；不要把多个 episode 塞进同一个 ROS 进程。
+
+### 12.1 结果口径：严格任务分数与 ROS-adapted 执行器分开标注
+
+当前入口的最终成功与总数来自 MolmoSpaces 的 `NavToObjTask` 和
+`native_eval_summary.json`，而不是 ROS topic、`move_base` 状态或日志关键字。执行器本身
+是 ROS-adapted：它为映射打开 head-camera depth，并在 runtime replay spec 上应用 RBY1
+导航手臂姿态；因此结果应写作“**native NavToObj 官方任务判定 × ROS-adapted 执行器**”，
+不能称为未适配 ROS 的原版 policy 复现。
+
+| 结果桶 | 必须满足 | 可否进入严格任务分数表 |
+| --- | --- | --- |
+| 严格任务 replay | 固定同一 benchmark SHA、同一 evaluator/launcher 哈希、统一的 horizon（下例为 500）、`--filter-missing-scene-objects` 未开启、`NATIVE_NAV_DYNAMIC_HORIZON=false` | 可以；表头仍注明 ROS-adapted 执行器 |
+| ROS-adapted 兼容/筛选 | 资源版本不匹配时启用 `--filter-missing-scene-objects`，或采用动态缩短 horizon / 其他非统一测试预算 | 不可以；单独报告 compatibility/screening 结果和覆盖率 |
+
+`--filter-missing-scene-objects` 会删去本地场景中不存在的 benchmark pose/joint 条目，属于
+compatibility mode，绝不是 exact replay。`--task-horizon-steps 500` 是本批次所有方法必须
+一致记录的公开预算；不可针对 episode 动态缩短后与严格桶混报。
+
+### 12.2 远程机前置检查
+
+先通过远程传输/SSH 工具登录 A100，再在**远程 shell** 中执行下面命令。
+本机供连接工具使用的 SSH `.env` 文件仅供连接工具读取：不要 `source`、复制、写入
+`--worker-env`，也不要把它传给 `--semantic-model-env-file`。后者只接受独立、非 SSH 凭据的
+模型运行时 env 文件；本基线默认不传它。
+
+```bash
+cd /path/to/remote/worktree
+export REPO="$(pwd -P)"
+export MLSPACES_CACHE_DIR=/path/to/remote/molmo-cache
+export MLSPACES_ASSETS_DIR=/path/to/remote/molmo-assets
+export BENCHMARK_DIR="$MLSPACES_ASSETS_DIR/benchmarks/molmospaces-bench-v2/procthor-10k/NavToObjDataGenConfig/NavToObjProcthor10kBench_20260112_json_benchmark"
+export CONDA_SH=/path/to/remote/miniconda3/etc/profile.d/conda.sh
+export CONDA_ENV=mlspaces
+export MLSPACES_PYTHON=/path/to/remote/miniconda3/envs/mlspaces/bin/python
+export ROS_SETUP="$REPO/Interactive-Nav-SG-nav/devel/setup.bash"
+export BASE_PORT=15601
+
+nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version --format=csv,noheader
+test -x "$MLSPACES_PYTHON"
+test -f "$CONDA_SH"
+test -f "$ROS_SETUP"
+test -x "$REPO/scripts/InteractiveNav/run_native_nav_to_obj_eval.zsh"
+test -f "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py"
+test -d "$BENCHMARK_DIR"
+bash -n "$REPO/scripts/InteractiveNav/run_native_nav_to_obj_eval.zsh"
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" --help
+for slot in 0 1 2 3 4; do
+  ss -ltnH "sport = :$((BASE_PORT + slot))"
+done
+```
+
+为未来追加的 worker 保持同一环境，初始化时把**非敏感的路径和性能开关**固化为
+`--worker-env`。这些键值会写入 `run_config.json`，所以其中不能放 token、密码、API key
+或 SSH 配置。建议大规模吞吐阶段关闭录像；待抽检失败/成功样本时再单独重放并开录像。
+
+### 12.3 idx 33/40 smoke：先验证 benchmark、评测代码和远程环境一致
+
+下例只选择全局 benchmark episode 33 与 40，但调度顺序仍由 seed 随机化。先检查
+`plan`，再以一个 worker 串行运行；应先人工检查两个 attempt 的 evaluator summary，确认后
+再进入全量批次。
+
+```bash
+export SMOKE_ROOT="$REPO/outputs/native_nav_to_obj_smoke_33_40_$(date +%Y%m%d_%H%M%S)"
+
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" init \
+  --benchmark-dir "$BENCHMARK_DIR" \
+  --run-root "$SMOKE_ROOT" \
+  --episode-indices 33,40 \
+  --seed 20260729 \
+  --task-horizon-steps 500 \
+  --base-ros-master-port "$BASE_PORT" \
+  --ros-hostname 127.0.0.1 \
+  --max-attempts-per-episode 1 \
+  --episode-timeout-seconds 1800 \
+  --worker-env "MLSPACES_CACHE_DIR=$MLSPACES_CACHE_DIR" \
+  --worker-env "MLSPACES_ASSETS_DIR=$MLSPACES_ASSETS_DIR" \
+  --worker-env "CONDA_SH=$CONDA_SH" \
+  --worker-env "CONDA_ENV=$CONDA_ENV" \
+  --worker-env "MLSPACES_PYTHON=$MLSPACES_PYTHON" \
+  --worker-env "ROS_SETUP=$ROS_SETUP" \
+  --worker-env "MUJOCO_GL=egl" \
+  --worker-env "PYOPENGL_PLATFORM=egl" \
+  --worker-env "ENABLE_RECORDING=false" \
+  --worker-env "NATIVE_NAV_RECORD_VIDEOS=false" \
+  --worker-env "SKIP_OFFLINE_VIDEO=true" \
+  --worker-env "NATIVE_NAV_DYNAMIC_HORIZON=false"
+
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" plan \
+  --run-root "$SMOKE_ROOT" --count 2
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" run \
+  --run-root "$SMOKE_ROOT" --workers 1 --worker-slot-start 0 --worker-id-prefix a100-smoke \
+  --cuda-visible-devices-list 0
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" status \
+  --run-root "$SMOKE_ROOT"
+```
+
+`init` 会写入 `run_config.json`、`episode_manifest.json` 和 SQLite ledger，并固定
+benchmark SHA、全局 episode 索引、launcher/evaluator 哈希及运行配置。每次 worker 启动前
+还会复核 benchmark 与入口代码；任一项漂移时应新建 `RUN_ROOT`，不能续用旧根目录。
+
+smoke 通过的最低条件是：两条记录均有 `batch_result.json`，其中 `return_code=0`，且所引用
+的 `native_eval_summary.json` 中 `total_count=1`；`official_success` 可为 0，它表示一次
+有效但失败的 benchmark rollout，不等于基础设施失败。另应确认 summary 的
+`native_filter_missing_scene_objects=false`，并保留 `run_config.json` 作为结果 provenance。
+
+### 12.4 全量或可中断批次：随机未测 episode、可动态加 worker
+
+不传 `--episode-indices` 即选择完整 benchmark。SQLite 会在 `init` 时以 `--seed` 将全局
+episode 索引打乱并保存 `selection_rank`；每个 worker 以 `BEGIN IMMEDIATE` 原子领取下一个
+pending episode。因此中断时，后续 worker 会先领取尚未开始的随机序列项，而不是从 0
+顺序扫描，也不会重复领取正在运行或已终态的 episode。
+
+```bash
+export RUN_ROOT="$REPO/outputs/native_nav_to_obj_a100_strict_$(date +%Y%m%d_%H%M%S)"
+
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" init \
+  --benchmark-dir "$BENCHMARK_DIR" \
+  --run-root "$RUN_ROOT" \
+  --seed 20260729 \
+  --task-horizon-steps 500 \
+  --base-ros-master-port "$BASE_PORT" \
+  --ros-hostname 127.0.0.1 \
+  --max-attempts-per-episode 2 \
+  --episode-timeout-seconds 1800 \
+  --worker-env "MLSPACES_CACHE_DIR=$MLSPACES_CACHE_DIR" \
+  --worker-env "MLSPACES_ASSETS_DIR=$MLSPACES_ASSETS_DIR" \
+  --worker-env "CONDA_SH=$CONDA_SH" \
+  --worker-env "CONDA_ENV=$CONDA_ENV" \
+  --worker-env "MLSPACES_PYTHON=$MLSPACES_PYTHON" \
+  --worker-env "ROS_SETUP=$ROS_SETUP" \
+  --worker-env "MUJOCO_GL=egl" \
+  --worker-env "PYOPENGL_PLATFORM=egl" \
+  --worker-env "ENABLE_RECORDING=false" \
+  --worker-env "NATIVE_NAV_RECORD_VIDEOS=false" \
+  --worker-env "SKIP_OFFLINE_VIDEO=true" \
+  --worker-env "NATIVE_NAV_DYNAMIC_HORIZON=false"
+
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" plan \
+  --run-root "$RUN_ROOT" --count 20
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" run \
+  --run-root "$RUN_ROOT" --workers 2 --worker-slot-start 0 --worker-id-prefix a100-initial \
+  --cuda-visible-devices-list 0,1
+```
+
+若当前机器的对象/场景资源与 benchmark 记录的资产版本不完全一致，不要在上述严格桶上临时
+打开兼容开关。另建一个清晰命名的 screening 根目录，例如
+`native_nav_to_obj_a100_compat_*`，并在 `init` 时额外传入
+`--filter-missing-scene-objects`，同时把
+`--worker-env "NATIVE_NAV_DYNAMIC_HORIZON=true"` 及其动态 horizon 参数固化。
+该根目录的结果仅用于运行稳定性、覆盖率和问题筛查，不能与严格桶累计或比较成功率。
+
+`run` 在当前 shell 中启动一组 worker。需要扩容时，不要停止已有 worker；另开一个远程
+shell，使用尚未占用的 slot。单个 worker 和一次追加多个 worker 分别为：
+
+```bash
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" worker \
+  --run-root "$RUN_ROOT" --worker-id a100-extra-02 --worker-slot 2 \
+  --cuda-visible-devices 2
+
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" run \
+  --run-root "$RUN_ROOT" --workers 2 --worker-slot-start 3 --worker-id-prefix a100-scale \
+  --cuda-visible-devices-list 3,4
+```
+
+slot `N` 默认使用 `http://127.0.0.1:$((BASE_PORT + N))`。ledger 对 ROS master slot 也有
+独立 lease，重复使用正在活动的 slot 会被拒绝；每次实际尝试又有单独的
+`episodes/episode_<idx>/attempt_<n>_<token>/` 目录、`ROS_HOME` 和临时目录。不要手动设为
+所有 worker 共用同一 `ROS_MASTER_URI`，也不要从别的进程占用该端口范围。
+`--cuda-visible-devices` 是单 worker 运行时覆盖，优先于继承环境和 `--worker-env`，实际
+绑定会写入该 attempt 的 `claim.json` 与 `batch_result.json`；`--cuda-visible-devices-list`
+必须恰好为本次 `--workers` 数量提供一个逗号分隔的绑定。
+
+### 12.5 监控、恢复与结果分母
+
+```bash
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" status \
+  --run-root "$RUN_ROOT"
+"$MLSPACES_PYTHON" "$REPO/scripts/InteractiveNav/nav_to_obj_batch_manager.py" reclaim \
+  --run-root "$RUN_ROOT"
+```
+
+`status` 的 `counts`、`pending_never_started`、`running`、`active_worker_slot_count` 和
+`official_successes` 是唯一批次总览来源；SQLite 开启 WAL，不能手工编辑其 status。失联
+worker 的 episode lease 到期后可由下一 worker 重新领取；`reclaim` 只回收已过期 lease。
+`--retry-failed` 是显式动作，只会重排未超过 attempt 上限的 launcher 失败项，绝不会重跑
+已完成 episode。
+
+- 尚未全部完成时，报告 `official_successes / completed` 为“已完成样本条件成功率”，同时报告覆盖率 `completed / selected_episode_count`、`failed`、`exhausted` 与 `pending`；不得把它写成完整 benchmark 成功率。
+- 只有 `completed == selected_episode_count` 且 `failed=exhausted=running=pending=0` 时，才可报告最终 `official_successes / selected_episode_count`。其中 completed 中的 `official_success=0` 是正式失败样本，必须保留在分母。
+- launcher 非零、超时、无有效 summary 的 `failed` 不是已评测的 0 分样本；先修复或明确单列，不得静默从分母剔除，也不得与 compatibility/screening 桶相加。
+- 特别地，若 `return_code=0` 但 summary 的 `total_count=0`（常见于缺失 grasp/joint
+  资源而 task sampler 跳过 episode），该记录是“不可评估的资产/采样兼容性排除”，不是导航
+  失败，也不是基础设施成功。单列其数量和原因；在补齐资源前不要用 `--retry-failed` 重跑。
+
+禁止项：严格桶不要启用 `--filter-missing-scene-objects`、`NATIVE_NAV_DYNAMIC_HORIZON=true`、逐
+episode 的不同 horizon 或未记录的 `--command-template`；不要向 `--worker-env` 写入 SSH/模型
+凭据；不要混用不同 benchmark、代码哈希、策略配置或 `RUN_ROOT`；不要依据 ROS 日志自行判
+定成功，必须读取 evaluator 产生的 `native_eval_summary.json`。

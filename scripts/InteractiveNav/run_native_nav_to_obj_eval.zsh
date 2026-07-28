@@ -1,16 +1,19 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=${0:A:h}
-REPO_ROOT=${SCRIPT_DIR:h:h}
-USER_CACHE_ROOT=${USER_CACHE_ROOT:-/home/user}
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
+USER_CACHE_ROOT=${USER_CACHE_ROOT:-${HOME}}
 MLSPACES_CACHE_DIR=${MLSPACES_CACHE_DIR:-${USER_CACHE_ROOT}/.cache/molmo-spaces-resources}
-MLSPACES_ASSETS_DIR=${MLSPACES_ASSETS_DIR:-/home/user/ldl/molmospaces/assets}
+MLSPACES_ASSETS_DIR=${MLSPACES_ASSETS_DIR:-${REPO_ROOT}/assets}
 BENCHMARK_DIR=${BENCHMARK_DIR:-${MLSPACES_ASSETS_DIR}/benchmarks/molmospaces-bench-v2/procthor-10k/NavToObjDataGenConfig/NavToObjProcthor10kBench_20260112_json_benchmark}
 EPISODE_IDX=${EPISODE_IDX:-0}
 OUTPUT_ROOT=${1:-${REPO_ROOT}/outputs/native_nav_to_obj_eval_$(date +%Y%m%d_%H%M%S)}
 DEBUG_DIR=${DEBUG_DIR:-${OUTPUT_ROOT}/debug}
-ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.zsh}
+ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.bash}
+CONDA_SH=${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}
+CONDA_ENV=${CONDA_ENV:-mlspaces}
+MLSPACES_PYTHON=${MLSPACES_PYTHON:-}
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11601}
 RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
 SEMANTIC_DECISION_CONFIG=${SEMANTIC_DECISION_CONFIG:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/config/default.yaml}
@@ -34,6 +37,7 @@ NATIVE_NAV_DYNAMIC_HORIZON_MIN_STEPS=${NATIVE_NAV_DYNAMIC_HORIZON_MIN_STEPS:-360
 NATIVE_NAV_DYNAMIC_HORIZON_BASE_STEPS=${NATIVE_NAV_DYNAMIC_HORIZON_BASE_STEPS:-240}
 NATIVE_NAV_DYNAMIC_HORIZON_STEPS_PER_METER=${NATIVE_NAV_DYNAMIC_HORIZON_STEPS_PER_METER:-45}
 FILTER_MISSING_SCENE_OBJECTS=${FILTER_MISSING_SCENE_OBJECTS:-false}
+GMAPPING_OVERLAY_PRELOAD=${GMAPPING_OVERLAY_PRELOAD:-true}
 TASK_HORIZON_STEPS=${TASK_HORIZON_STEPS:-}
 ROS_HOUSE_IND=${ROS_HOUSE_IND:-0}
 ROS_TARGET_TYPES=${ROS_TARGET_TYPES:-television}
@@ -43,14 +47,18 @@ SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${SEMANTIC_DECISION_ENV_FILE:
 SEMANTIC_MODEL_METRICS_PATH=${SEMANTIC_MODEL_METRICS_PATH:-${OUTPUT_ROOT}/mllm_metrics.jsonl}
 
 if [[ -n "${SEMANTIC_MODEL_ENV_FILE}" ]] && [[ ! -f "${SEMANTIC_MODEL_ENV_FILE}" ]]; then
-  print -u2 -- "Semantic model env file does not exist: ${SEMANTIC_MODEL_ENV_FILE}"
+  printf 'Semantic model env file does not exist: %s\n' "${SEMANTIC_MODEL_ENV_FILE}" >&2
   exit 2
 fi
 
-mkdir -p "${OUTPUT_ROOT}" "${DEBUG_DIR}" "${OUTPUT_ROOT}/ros_home/log"
+RUNTIME_TMPDIR=${TMPDIR:-${OUTPUT_ROOT}/tmp}
+mkdir -p "${OUTPUT_ROOT}" "${DEBUG_DIR}" "${OUTPUT_ROOT}/ros_home/log" "${RUNTIME_TMPDIR}"
 export ROS_MASTER_URI
 export ROS_IP=${ROS_IP:-127.0.0.1}
 export ROS_HOSTNAME=${ROS_HOSTNAME:-127.0.0.1}
+export TMPDIR="${RUNTIME_TMPDIR}"
+export TMP="${RUNTIME_TMPDIR}"
+export TEMP="${RUNTIME_TMPDIR}"
 export MLSPACES_CACHE_DIR
 export MLSPACES_ASSETS_DIR
 export ROS_HOME="${OUTPUT_ROOT}/ros_home"
@@ -71,17 +79,46 @@ if [[ "${FILTER_MISSING_SCENE_OBJECTS}" == true ]]; then
   export NATIVE_NAV_FILTER_MISSING_SCENE_OBJECTS=1
 fi
 
+if [[ ! -f "${CONDA_SH}" ]]; then
+  printf 'Conda setup file does not exist: %s\n' "${CONDA_SH}" >&2
+  exit 2
+fi
+if [[ ! -f "${ROS_SETUP}" ]]; then
+  printf 'ROS setup file does not exist: %s\n' "${ROS_SETUP}" >&2
+  exit 2
+fi
+
 set +u
-source /home/user/miniconda3/etc/profile.d/conda.sh
-conda activate mlspaces
-set -u
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+if [[ -z "${MLSPACES_PYTHON}" ]]; then
+  MLSPACES_PYTHON="$(command -v python)"
+fi
+if [[ ! -x "${MLSPACES_PYTHON}" ]]; then
+  printf 'MlSpaces Python executable does not exist: %s\n' "${MLSPACES_PYTHON}" >&2
+  exit 2
+fi
 source "${ROS_SETUP}"
+set -u
 # Some ROS setup files restore the default master URI.  Re-apply the run-local
 # value after sourcing so the simulator, nodes, recorder, and evaluator share
 # the same isolated master.
 export ROS_MASTER_URI="${RUN_ROS_MASTER_URI}"
-export ROS_PACKAGE_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src:/opt/ros/noetic/share"
+export ROS_PACKAGE_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src:${ROS_PACKAGE_PATH:-}"
+export LD_LIBRARY_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/devel/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:${SCRIPT_DIR}:${PYTHONPATH:-}"
+
+# RoboStack's generated binaries can retain a DT_RPATH to its underlay.  Load
+# the workspace's paired GMapping libraries in the ROS process so the custom
+# odometry-locked overlay is used instead of an ABI-incompatible underlay.
+ROS_LAUNCH_LD_PRELOAD=${LD_PRELOAD:-}
+if [[ "${GMAPPING_OVERLAY_PRELOAD}" == true ]]; then
+  GMAPPING_UTILS_LIBRARY="${REPO_ROOT}/Interactive-Nav-SG-nav/devel/lib/libutils.so"
+  GMAPPING_GRIDFASTSLAM_LIBRARY="${REPO_ROOT}/Interactive-Nav-SG-nav/devel/lib/libgridfastslam.so"
+  if [[ -f "${GMAPPING_UTILS_LIBRARY}" && -f "${GMAPPING_GRIDFASTSLAM_LIBRARY}" ]]; then
+    ROS_LAUNCH_LD_PRELOAD="${GMAPPING_UTILS_LIBRARY}:${GMAPPING_GRIDFASTSLAM_LIBRARY}${ROS_LAUNCH_LD_PRELOAD:+:${ROS_LAUNCH_LD_PRELOAD}}"
+  fi
+fi
 
 cleanup_process() {
   local pid="${1:-}"
@@ -126,8 +163,8 @@ trap on_signal INT TERM
 
 MASTER_PORT=${ROS_MASTER_URI##*:}
 MASTER_PORT=${MASTER_PORT%%/*}
-if ss -ltnH "sport = :${MASTER_PORT}" | rg -q .; then
-  print -u2 -- "ROS master port is already occupied: ${ROS_MASTER_URI}"
+if ss -ltnH "sport = :${MASTER_PORT}" | grep -q .; then
+  printf 'ROS master port is already occupied: %s\n' "${ROS_MASTER_URI}" >&2
   exit 3
 fi
 roscore -p "${MASTER_PORT}" >"${OUTPUT_ROOT}/roscore.log" 2>&1 &
@@ -135,24 +172,24 @@ ROSCORE_PID=$!
 
 sleep 0.5
 if ! kill -0 "${ROSCORE_PID}" 2>/dev/null; then
-  print -u2 -- "ROS master failed to start on ${ROS_MASTER_URI}; the port may be occupied"
+  printf 'ROS master failed to start on %s; the port may be occupied\n' "${ROS_MASTER_URI}" >&2
   exit 3
 fi
-if rg -Fq "roscore cannot run as another roscore/master is already running" \
+if grep -Fq "roscore cannot run as another roscore/master is already running" \
   "${OUTPUT_ROOT}/roscore.log"; then
-  print -u2 -- "ROS master port is already occupied: ${ROS_MASTER_URI}"
+  printf 'ROS master port is already occupied: %s\n' "${ROS_MASTER_URI}" >&2
   exit 3
 fi
 
 MASTER_READY=false
 for _attempt in {1..120}; do
   if ! kill -0 "${ROSCORE_PID}" 2>/dev/null; then
-    print -u2 -- "ROS master exited while starting on ${ROS_MASTER_URI}"
+    printf 'ROS master exited while starting on %s\n' "${ROS_MASTER_URI}" >&2
     exit 3
   fi
-  if rg -Fq "roscore cannot run as another roscore/master is already running" \
+  if grep -Fq "roscore cannot run as another roscore/master is already running" \
     "${OUTPUT_ROOT}/roscore.log"; then
-    print -u2 -- "ROS master port is already occupied: ${ROS_MASTER_URI}"
+    printf 'ROS master port is already occupied: %s\n' "${ROS_MASTER_URI}" >&2
     exit 3
   fi
   if timeout 1s rosparam list >/dev/null 2>&1; then
@@ -162,7 +199,7 @@ for _attempt in {1..120}; do
   sleep 0.25
 done
 if [[ "${MASTER_READY}" != true ]]; then
-  print -u2 -- "ROS master did not become ready"
+  printf 'ROS master did not become ready\n' >&2
   exit 3
 fi
 
@@ -195,7 +232,7 @@ if [[ "${ENABLE_RECORDING}" == true ]]; then
   sleep 1
 fi
 
-roslaunch \
+env LD_PRELOAD="${ROS_LAUNCH_LD_PRELOAD}" roslaunch \
   "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=false \
   start_mapping:=true \
@@ -235,28 +272,28 @@ NAV_STACK_READY=false
 NAV_STACK_READY_DEADLINE=$((SECONDS + NAV_STACK_READY_TIMEOUT_S))
 while (( SECONDS < NAV_STACK_READY_DEADLINE )); do
   if ! kill -0 "${LAUNCH_PID}" 2>/dev/null; then
-    print -u2 -- "ROS launch exited before the native navigation stack became ready"
+    printf 'ROS launch exited before the native navigation stack became ready\n' >&2
     tail -n 80 "${OUTPUT_ROOT}/roslaunch.log" >&2 || true
     exit 4
   fi
   NODE_LIST=$(timeout 1s rosnode list 2>/dev/null || true)
   REQUIRED_NODES_READY=true
   for _node in /move_base /semantic_mapping_py /explore_py /semantic_candidate_node /semantic_rule_decision_node /semantic_behavior_executor /relay_node; do
-    if ! print -r -- "${NODE_LIST}" | rg -Fxq "${_node}"; then
+    if ! grep -Fxq "${_node}" <<<"${NODE_LIST}"; then
       REQUIRED_NODES_READY=false
       break
     fi
   done
   if [[ "${REQUIRED_NODES_READY}" == true ]] \
     && timeout 1s rosnode ping -c 1 /move_base >/dev/null 2>&1 \
-    && timeout 1s rostopic info /cmd_vel 2>/dev/null | rg -Fq "/relay_node"; then
+    && timeout 1s rostopic info /cmd_vel 2>/dev/null | grep -Fq "/relay_node"; then
     NAV_STACK_READY=true
     break
   fi
   sleep 0.25
 done
 if [[ "${NAV_STACK_READY}" != true ]]; then
-  print -u2 -- "Native navigation ROS stack did not become ready within ${NAV_STACK_READY_TIMEOUT_S}s"
+  printf 'Native navigation ROS stack did not become ready within %ss\n' "${NAV_STACK_READY_TIMEOUT_S}" >&2
   tail -n 80 "${OUTPUT_ROOT}/roslaunch.log" >&2 || true
   exit 4
 fi
@@ -271,7 +308,7 @@ TASK_HORIZON_STEPS_ARG=()
 if [[ -n "${TASK_HORIZON_STEPS}" ]]; then
   TASK_HORIZON_STEPS_ARG=(--task-horizon-steps "${TASK_HORIZON_STEPS}")
 fi
-python -u "${SCRIPT_DIR}/run_native_nav_to_obj_eval.py" \
+"${MLSPACES_PYTHON}" -u "${SCRIPT_DIR}/run_native_nav_to_obj_eval.py" \
   --benchmark-dir "${BENCHMARK_DIR}" \
   --output-root "${OUTPUT_ROOT}" \
   --debug-dir "${DEBUG_DIR}" \
@@ -289,7 +326,7 @@ if [[ -n "${RECORDER_PID}" ]]; then
 fi
 
 if [[ "${EVAL_RC}" -eq 0 ]] && [[ "${ENABLE_RECORDING}" == true ]] && [[ "${SKIP_OFFLINE_VIDEO}" != true ]]; then
-  python "${SCRIPT_DIR}/build_semantic_video_offline.py" \
+  "${MLSPACES_PYTHON}" "${SCRIPT_DIR}/build_semantic_video_offline.py" \
     --scene-dir "${OUTPUT_ROOT}" \
     --debug-dir "${DEBUG_DIR}" \
     --fps "${VIDEO_FPS}" \

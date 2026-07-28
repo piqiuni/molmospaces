@@ -23,7 +23,7 @@ import numpy as np
 import yaml
 
 
-TOPDOWN_SCHEMA_VERSION = "interactive_nav_v3_episode_topdown_v2"
+TOPDOWN_SCHEMA_VERSION = "interactive_nav_v3_episode_topdown_v3"
 _UNKNOWN_MIN = 50
 _UNKNOWN_MAX = 250
 
@@ -334,6 +334,30 @@ def _private_context_markers(context: dict[str, Any] | None, key: str) -> list[d
     return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
 
 
+def _context_nav_target_candidates(context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return valid optional NavToObj candidate markers from a private sidecar.
+
+    The regular V3 task has one GT target.  Native NavToObj instead accepts any
+    instance from a frozen candidate set, so its adapter supplies this optional
+    list without changing the semantics of regular V3 reports.
+    """
+
+    markers: list[dict[str, Any]] = []
+    seen: set[tuple[float, float]] = set()
+    for row in _private_context_markers(context, "nav_to_obj_candidates"):
+        xy = _as_xy(row.get("xy") or row.get("aabb_center"))
+        if xy is None:
+            continue
+        key = (round(float(xy[0]), 6), round(float(xy[1]), 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        marker = dict(row)
+        marker["xy"] = xy
+        markers.append(marker)
+    return markers
+
+
 def _frozen_target_name(episode: dict[str, Any]) -> str | None:
     """Return the frozen task instance name without querying evaluator-only state."""
 
@@ -353,10 +377,11 @@ def _extract_gt_markers(episode: dict[str, Any], context: dict[str, Any] | None)
     if isinstance(context, dict) and isinstance(context.get("target"), dict):
         point = _as_xy(context["target"].get("xy") or context["target"].get("aabb_center"))
         if point is not None:
+            configured_label = context["target"].get("label")
             target = {
                 "xy": point,
-                "label": "GT target",
-                "source": "evaluator_private_geometry",
+                "label": str(configured_label) if configured_label else "GT target",
+                "source": str(context["target"].get("source", "evaluator_private_geometry")),
             }
     if target is None:
         point = _oracle_navigation_point(episode, reason="satisfy_nav_to_obj_success")
@@ -669,6 +694,17 @@ def _load_static_scene_map(
     # Keep that resolution for the static background too, so the replayed GT
     # route uses the identical map scale rather than a visualization-only proxy.
     px_per_m = int(round(float(coverage_metadata.get("oracle_route_px_per_m", 200))))
+    if isinstance(context, dict):
+        requested_px_per_m = context.get("topdown_px_per_m")
+        try:
+            requested_px_per_m = int(round(float(requested_px_per_m)))
+        except (TypeError, ValueError):
+            requested_px_per_m = None
+        # This report-only override is useful for very large native houses.  It
+        # changes only the static visualization raster, never the evaluator or
+        # an official task outcome.
+        if requested_px_per_m is not None and 40 <= requested_px_per_m <= 200:
+            px_per_m = requested_px_per_m
     map_cls = iTHORMap if is_ithor else ProcTHORMap
     # Load through the same scene-only sampler used by the reference drawing
     # script.  It performs the project asset/mirror setup before ProcTHORMap
@@ -919,8 +955,15 @@ def render_episode_topdown(
     trajectory_source = "ros_recorder"
     if not len(trajectory_xy):
         trajectory_xy, trajectory_yaw = load_trace_trajectory(trace)
-        trajectory_source = "evaluator_trace" if len(trajectory_xy) else "unavailable"
+        trajectory_source = str(result.get("trajectory_source") or "evaluator_trace") if len(trajectory_xy) else "unavailable"
     target, gt_markers = _extract_gt_markers(episode, context)
+    nav_target_candidates = _context_nav_target_candidates(context)
+    candidate_total = len(nav_target_candidates)
+    if isinstance(context, dict):
+        try:
+            candidate_total = max(candidate_total, int(context.get("nav_to_obj_candidate_total", candidate_total)))
+        except (TypeError, ValueError):
+            pass
     actual_markers = _extract_actual_markers(result, context, debug_dir)
     benchmark_start = _benchmark_start_pose(episode)
     if benchmark_start is None and len(trajectory_xy):
@@ -1017,6 +1060,34 @@ def render_episode_topdown(
             bbox={"facecolor": "#111827", "edgecolor": "none", "alpha": 0.84, "pad": 1.8},
         )
 
+    if nav_target_candidates:
+        candidate_xy = np.asarray([marker["xy"] for marker in nav_target_candidates], dtype=float)
+        ax.scatter(
+            candidate_xy[:, 0],
+            candidate_xy[:, 1],
+            s=122,
+            marker="o",
+            facecolors="none",
+            edgecolors="#0891b2",
+            linewidths=1.65,
+            zorder=11,
+        )
+        inferred_success_xy = np.asarray(
+            [marker["xy"] for marker in nav_target_candidates if marker.get("is_official_success_candidate_inferred")],
+            dtype=float,
+        )
+        if len(inferred_success_xy):
+            ax.scatter(
+                inferred_success_xy[:, 0],
+                inferred_success_xy[:, 1],
+                s=86,
+                marker="*",
+                color="#16a34a",
+                edgecolors="white",
+                linewidths=0.7,
+                zorder=12,
+            )
+
     def draw_marker(
         marker: dict[str, Any], *, color: str, marker_style: str, size: float, text: str, font_size: float = 7.4
     ) -> None:
@@ -1034,7 +1105,7 @@ def render_episode_topdown(
         )
 
     if target is not None:
-        target_suffix = "" if target["source"] == "evaluator_private_geometry" else " (plan point)"
+        target_suffix = " (plan point)" if target["source"] == "frozen_oracle_plan_fallback" else ""
         target_text = f"{target['label']}{target_suffix}"
         if target.get("object_name"):
             wrapped_name = "\n".join(textwrap.wrap(str(target["object_name"]), width=32, break_long_words=True))
@@ -1058,12 +1129,28 @@ def render_episode_topdown(
     status_label = str(result.get("terminal_reason", result.get("status", "unknown")))
     path_length = result.get("navigation_path_length_m")
     path_text = "unknown" if not isinstance(path_length, (int, float)) else f"{float(path_length):.2f} m"
+    trajectory_labels = {
+        "ros_recorder": "ROS recorder trajectory",
+        "evaluator_trace": "evaluator trace",
+        "sparse_stdout_action_trace": "sparse base-command trace (not continuous trajectory)",
+        "sparse_stdout_action_trace_plus_terminal_h5_pose": "sparse base-command trace + official terminal pose",
+        "official_h5_terminal_pose": "official terminal pose only",
+        "unavailable": "unavailable",
+    }
+    trajectory_label = trajectory_labels.get(trajectory_source, trajectory_source)
     gt_path_text = "unavailable"
     if gt_oracle_path is not None and isinstance(gt_oracle_path.get("length_m"), (int, float)):
         qualifier = "reconstructed" if gt_oracle_path.get("complete") else "partial"
         gt_path_text = f"{float(gt_oracle_path['length_m']):.2f} m ({qualifier})"
-    title = f"InteractiveNav V3 eval top-down — {case_label}"
-    subtitle = f"{coverage_label}  |  GT oracle route: {gt_path_text}  |  driven path: {path_text}  |  terminal: {status_label}"
+    title_prefix = str(result.get("topdown_title") or "InteractiveNav V3 eval top-down")
+    title = f"{title_prefix} — {case_label}"
+    candidate_text = ""
+    if nav_target_candidates:
+        candidate_text = f"  |  NavToObj targets observed: {len(nav_target_candidates)}/{candidate_total}"
+    subtitle = (
+        f"{coverage_label}  |  GT oracle route: {gt_path_text}  |  driven path: {path_text}"
+        f"  |  trace: {trajectory_label}{candidate_text}  |  terminal: {status_label}"
+    )
     ax.set_title(f"{title}\n{subtitle}", loc="left", fontsize=11.5, pad=12)
     ax.set_axis_off()
     legend_handles = [
@@ -1073,13 +1160,27 @@ def render_episode_topdown(
         Patch(facecolor="#76b85a", label="mapped free"),
         Patch(facecolor="#d32f2f", label="false occupied"),
         Line2D([], [], color="#7c3aed", lw=2.2, linestyle=(0, (5, 2.4)), label="GT oracle route (reconstructed)"),
-        Line2D([], [], color="#06b6d4", lw=2, label="robot trajectory"),
+        Line2D([], [], color="#06b6d4", lw=2, label=trajectory_label),
         Line2D([], [], marker="^", color="w", markerfacecolor="#2563eb", markeredgecolor="white", markersize=8, label="benchmark start + heading"),
         Line2D([], [], marker="o", color="w", markerfacecolor="#ef4444", markeredgecolor="white", markersize=7, label="final pose"),
         Line2D([], [], marker="*", color="w", markerfacecolor="#fbbf24", markeredgecolor="white", markersize=11, label="GT target"),
         Line2D([], [], marker="D", color="w", markerfacecolor="#d946ef", markeredgecolor="white", markersize=7, label="GT required interaction"),
         Line2D([], [], marker="X", color="w", markerfacecolor="#ef4444", markeredgecolor="white", markersize=7, label="actual interaction (red=failed)"),
     ]
+    if nav_target_candidates:
+        legend_handles.append(
+            Line2D(
+                [], [], marker="o", color="#0891b2", markerfacecolor="none", markersize=8,
+                label="eligible NavToObj target",
+            )
+        )
+    if any(marker.get("is_official_success_candidate_inferred") for marker in nav_target_candidates):
+        legend_handles.append(
+            Line2D(
+                [], [], marker="*", color="w", markerfacecolor="#16a34a", markeredgecolor="white", markersize=9,
+                label="inferred official-success target",
+            )
+        )
     ax.legend(
         handles=legend_handles,
         loc="lower left",
@@ -1136,6 +1237,10 @@ def render_episode_topdown(
         },
         "gt_oracle_path_error": gt_oracle_path_error,
         "gt_target": None if target is None else {**target, "xy": np.asarray(target["xy"], dtype=float).tolist()},
+        "nav_to_obj_candidates": [
+            {**row, "xy": np.asarray(row["xy"], dtype=float).tolist()} for row in nav_target_candidates
+        ],
+        "nav_to_obj_candidate_total": candidate_total,
         "gt_interactions": [{**row, "xy": np.asarray(row["xy"], dtype=float).tolist()} for row in gt_markers],
         "actual_interactions": [{**row, "xy": np.asarray(row["xy"], dtype=float).tolist()} for row in actual_markers],
         "fallbacks_used": {

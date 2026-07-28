@@ -337,3 +337,50 @@ def test_reset_initial_spin_state_clears_yaw_for_the_next_scene():
     assert node.initial_spin_last_yaw is None
     assert node.initial_spin_accumulated_yaw == 0.0
     assert node.initial_spin_reason == "pending"
+
+
+def test_tick_keeps_dispatched_goal_when_frontier_refresh_removes_source():
+    class ActiveGoal:
+        point = (1.0, 2.0)
+
+    class State:
+        def __init__(self):
+            self.active_goal = ActiveGoal()
+            self.frontier_gone_checks = 0
+
+        def update_goal_progress(self, _robot_xy, robot_yaw=None):
+            del robot_yaw
+            return None
+
+        def mark_active_covered_if_frontier_gone(self, *_args, **_kwargs):
+            self.frontier_gone_checks += 1
+            self.active_goal = None
+
+    class Core:
+        @staticmethod
+        def is_free_world(_grid, _point):
+            return True
+
+    node = ExplorePyNode.__new__(ExplorePyNode)
+    node.latest_grid = object()
+    node.robot_xy = (0.0, 0.0)
+    node.robot_yaw = 0.0
+    node.external_behavior_control = False
+    node.state = State()
+    node.core = Core()
+    node.goal_republish_interval_sec = 0.0
+    node._should_run_initial_spin = lambda: False
+    node._active_goal_has_frontier = lambda: False
+    node._maybe_replan_rotation_oscillation = lambda: False
+    node._fail_if_global_plan_not_current_goal = lambda: None
+    node._fail_if_local_plan_missing = lambda: None
+    node._publish_frontiers = lambda: None
+    node._publish_status = lambda: None
+    cancellations = []
+    node._cancel_move_base_goal = cancellations.append
+
+    node.tick(None)
+
+    assert node.state.active_goal is not None
+    assert node.state.frontier_gone_checks == 0
+    assert cancellations == []

@@ -20,15 +20,16 @@ from typing import Any
 
 import mujoco
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-os.environ.setdefault("MLSPACES_CACHE_DIR", "/home/user/.cache/molmo-spaces-resources")
-os.environ.setdefault("MLSPACES_ASSETS_DIR", "/home/user/ldl/molmospaces/assets")
+os.environ.setdefault("MLSPACES_CACHE_DIR", str(Path.home() / ".cache/molmo-spaces-resources"))
+os.environ.setdefault("MLSPACES_ASSETS_DIR", str(_REPO_ROOT / "assets"))
 
 # ROS setup files may prepend another editable MolmoSpaces checkout.  The
 # native benchmark run must use the code in this worktree, including the
 # runner injection in eval_main.py.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -492,6 +493,10 @@ class NativeNavToObjEvalConfig(JsonBenchmarkEvalConfig):
     policy_dt_ms: float = 200.0
     ctrl_dt_ms: float = 10.0
     sim_dt_ms: float = 10.0
+    # Preserve the first physical state that satisfies NavToObjTask's official
+    # distance-and-visibility criterion before a subsequent ROS action can
+    # occlude the target again.
+    end_on_success: bool = True
     record_videos: bool = True
 
     native_debug_dir: Path = Path("native_nav_debug")

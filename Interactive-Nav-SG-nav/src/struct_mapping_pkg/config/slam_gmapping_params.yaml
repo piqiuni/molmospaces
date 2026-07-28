@@ -1,5 +1,5 @@
 # 地图更新间隔
-map_update_interval: 0.5
+map_update_interval: 0.1
 reset_topic: "/nav_system/reset"
 odom_topic: "/odom"
 scan_filter_queue_size: 1
@@ -30,7 +30,7 @@ stt: 0.002  # 旋转→旋转噪声，原0.4降至0.02
 # 地图更新阈值
 linearUpdate: 0.5
 angularUpdate: 0.2
-temporalUpdate: 1.0
+temporalUpdate: 0.1
 resampleThreshold: 0.5
 
 # 粒子滤波参数（里程计准确时可以用更少粒子）
