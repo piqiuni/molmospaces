@@ -4,13 +4,20 @@ import json
 import math
 import queue
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
 import mujoco
 import numpy as np
 
-from force_interaction_runtime import (
+# This module is imported both from package-qualified benchmark code and from
+# standalone InteractiveNav scripts/tests whose sys.path starts in this folder.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.InteractiveNav.force_interaction_runtime import (
     ForceDriveConfig,
     HeadViewController,
     advance_articulation_force,

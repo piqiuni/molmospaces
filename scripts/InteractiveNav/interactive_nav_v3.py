@@ -309,6 +309,7 @@ def _validate_common_v3_episode(
     task_type = task.get("task_type")
     is_point_goal = task_type == "nav_to_point"
     selected_instance = None if is_point_goal else target.get("selected_instance")
+    candidate_instances: list[str] = []
     if is_point_goal:
         if target.get("target_type") != "point":
             raise ValueError("nav_to_point tasks require a point target")
@@ -323,12 +324,42 @@ def _validate_common_v3_episode(
     else:
         if task_type != "nav_to_obj":
             raise ValueError(f"Unsupported V3 task_type: {task_type!r}")
-        if task.get("selection_mode") != "specific_instance":
-            raise ValueError("Generated object-goal v3 episodes must use specific_instance")
-        if task.get("pickup_obj_name") != selected_instance:
-            raise ValueError("task.pickup_obj_name does not match target.selected_instance")
-        if task.get("pickup_obj_candidates") != [selected_instance]:
-            raise ValueError("specific_instance candidates must contain only the selected target")
+        selection_mode = task.get("selection_mode")
+        if selection_mode not in {"specific_instance", "any_candidate"}:
+            raise ValueError(f"Unsupported object-goal selection_mode: {selection_mode!r}")
+        if target.get("selection_mode") != selection_mode:
+            raise ValueError("target.selection_mode does not mirror task.selection_mode")
+        if payload.get("success_criteria", {}).get("target_selection") != selection_mode:
+            raise ValueError("success_criteria.target_selection does not mirror task.selection_mode")
+        raw_candidates = task.get("pickup_obj_candidates")
+        if not isinstance(raw_candidates, list) or not raw_candidates:
+            raise ValueError("object-goal task requires non-empty pickup_obj_candidates")
+        candidate_instances = [str(value) for value in raw_candidates]
+        if any(not value for value in candidate_instances) or len(set(candidate_instances)) != len(
+            candidate_instances
+        ):
+            raise ValueError("pickup_obj_candidates must contain unique non-empty names")
+        target_candidates = [
+            str(value) for value in target.get("instruction_consistent_candidates", [])
+        ]
+        if target_candidates != candidate_instances:
+            raise ValueError(
+                "target.instruction_consistent_candidates must mirror task.pickup_obj_candidates"
+            )
+        pickup_obj_name = task.get("pickup_obj_name")
+        if pickup_obj_name not in candidate_instances:
+            raise ValueError("task.pickup_obj_name must be one of pickup_obj_candidates")
+        if selection_mode == "specific_instance":
+            if pickup_obj_name != selected_instance:
+                raise ValueError("task.pickup_obj_name does not match target.selected_instance")
+            if candidate_instances != [selected_instance]:
+                raise ValueError(
+                    "specific_instance candidates must contain only the selected target"
+                )
+        elif selected_instance is not None and selected_instance not in candidate_instances:
+            raise ValueError(
+                "any_candidate target.selected_instance must be null or a runtime candidate"
+            )
 
     if "container" in domains and not is_point_goal:
         grounding = target.get("grounding", {})
@@ -345,7 +376,7 @@ def _validate_common_v3_episode(
             raise ValueError("container target grounding must name a measured container")
 
     relevant_objects = episode.get("task_relevant_objects", [])
-    required_objects = [] if is_point_goal else [selected_instance]
+    required_objects = [] if is_point_goal else list(candidate_instances)
     if "container" in domains and not is_point_goal:
         required_objects.append(target.get("container_name"))
     for required_object in required_objects:
@@ -481,14 +512,18 @@ def _validate_common_v3_episode(
                 raise ValueError("PointGoal oracle plan must contain one terminal navigate step")
             if terminal_steps[0].get("goal_point") != task.get("goal_point"):
                 raise ValueError("PointGoal terminal oracle step does not match task.goal_point")
-        elif len(observe_steps) != 1 or observe_steps[0].get("object_name") != selected_instance:
-            raise ValueError("Oracle plan must observe exactly the selected target")
+        elif (
+            len(observe_steps) != 1
+            or observe_steps[0].get("object_name") not in candidate_instances
+        ):
+            raise ValueError("Oracle plan must observe exactly one runtime target candidate")
 
     return {
         "payload": payload,
         "task": task,
         "target": target,
         "selected_instance": selected_instance,
+        "candidate_instances": candidate_instances,
         "is_point_goal": is_point_goal,
         "domains": domains,
         "interactions": interactions,
@@ -540,8 +575,8 @@ def _validate_passing_success(context: dict[str, Any]) -> None:
     task_threshold = float(context["task"].get("succ_pos_threshold", -1.0))
     if float(success_evidence.get("distance_threshold_m", -2.0)) != task_threshold:
         raise ValueError("success_evidence distance threshold does not mirror the task")
-    if success_evidence.get("target_object_name") != context["selected_instance"]:
-        raise ValueError("success_evidence target does not match the selected instance")
+    if success_evidence.get("target_object_name") not in context["candidate_instances"]:
+        raise ValueError("success_evidence target does not match a runtime candidate")
 
 
 def _prefixes_by_plan(context: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -901,6 +936,11 @@ def validate_instruction_goal_v3_episode(episode: dict[str, Any]) -> dict[str, A
     for key in ("selected_instance", "container_name"):
         if target.get(key):
             valid_entities.add(str(target[key]))
+    valid_entities.update(
+        str(value)
+        for value in target.get("instruction_consistent_candidates", [])
+        if value
+    )
     for interaction in payload.get("interactions") or []:
         for key in ("interaction_id", "object_name", "joint_name"):
             if interaction.get(key):

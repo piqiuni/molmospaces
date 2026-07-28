@@ -238,7 +238,7 @@ any_candidate
 }
 ```
 
-任意 Instruction-consistent candidate 满足 NavToObj 条件即可成功。`pickup_obj_name` 在该模式下是兼容当前 task config 的代表实例，不将其解释为唯一成功目标。
+该模式保留全部 Instruction-consistent candidates。当前 `NavToObjTask` 的运行时语义是先按机器人平面距离选择最近候选，再对同一个最近候选检查距离与可见性；`pickup_obj_name` 只是兼容 task config 的代表实例，不将其解释为唯一成功目标。
 
 ## NavToObj 成功条件
 
@@ -252,7 +252,7 @@ head_camera visibility_fraction(selected_target) > 0
 
 `task.succ_pos_threshold` 是运行时权威阈值。`interactive_nav.success_criteria` 是结构化镜像，用于生成验证和跨 evaluator 解释，不替代 `NavToObjTask.judge_success()`。
 
-对于 `specific_instance`，selected target 是 `pickup_obj_candidates` 中唯一实例。对于 `any_candidate`，只要任一候选满足条件即可。
+对于 `specific_instance`，selected target 是 `pickup_obj_candidates` 中唯一实例。对于 `any_candidate`，selected target 是当前机器人位姿下距离最近的候选，距离与可见性必须由同一实例同时满足。该定义与当前 `NavToObjTask.calculate_distance()` / `check_object_visible()` 保持一致。
 
 抽屉中的 `joint_object_consistent_motion` 只用于证明目标属于 moving compartment，不能替代最终 head-camera 可见性成功条件。
 

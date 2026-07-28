@@ -166,3 +166,11 @@ def test_restricted_gt_filters_by_camera_distance_and_projected_bbox_area() -> N
     assert [item["name"] for item in unbounded_payload["observations"]] == [
         "refrigerator"
     ]
+
+
+def test_registry_can_start_from_the_evaluator_episode_index() -> None:
+    registry = OpaqueEpisodeRegistry(initial_episode_index=42)
+
+    assert registry.episode_id == "episode_000042"
+    assert registry.public_id_for("private_a") == "obj_000001"
+    assert registry.reset() == "episode_000043"

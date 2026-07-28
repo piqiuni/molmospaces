@@ -158,6 +158,25 @@ class EvaluationResults:
         return self.success_count / self.total_count
 
 
+def _resolve_parent_policy(
+    exp_config: MlSpacesExpConfig,
+    preloaded_policy: BasePolicy | None,
+    num_workers: int,
+) -> BasePolicy | None:
+    """Only construct/share a policy in the single-process evaluation path."""
+
+    if num_workers > 1:
+        if preloaded_policy is not None:
+            raise ValueError(
+                "preloaded_policy is only supported with num_workers=1; "
+                "multiprocessing workers must construct process-local policies"
+            )
+        return None
+    if preloaded_policy is not None:
+        return preloaded_policy
+    return exp_config.policy_config.policy_cls(exp_config, exp_config.task_type)
+
+
 def get_args():
     parser = argparse.ArgumentParser(
         description="Evaluation pipeline for learned policies on JSON benchmarks",
@@ -357,6 +376,7 @@ class EvalRuntimeParams:
     add_custom_object: bool = False
     custom_object_path: str | Path | None = None
     custom_object_name: str | None = None
+    max_episodes: int | None = None
 
 
 def create_eval_config(
@@ -548,7 +568,9 @@ def run_evaluation(
         else:
             log.info(f"Using provided custom object name: {custom_object_name}")
 
-    if max_episodes is not None and len(episodes) > max_episodes:
+    if max_episodes is not None and max_episodes < 1:
+        raise ValueError("max_episodes must be >= 1")
+    if episode_idx is None and max_episodes is not None and len(episodes) > max_episodes:
         log.info(f"Evaluating the first {max_episodes} episodes of {len(episodes)} total episodes")
         episodes = episodes[:max_episodes]
     if not episodes:
@@ -623,6 +645,13 @@ def run_evaluation(
         custom_object_path=custom_object_path,
         custom_object_name=custom_object_name,
     )
+    # ``max_episodes`` is a runner concern, so carry it through the same
+    # process-safe runtime parameter object as episode_idx.  Slicing only the
+    # parent-side logging list is insufficient: JsonEvalRunner reloads the
+    # benchmark inside each worker.
+    if exp_config.eval_runtime_params is None:
+        exp_config.eval_runtime_params = EvalRuntimeParams()
+    exp_config.eval_runtime_params.max_episodes = max_episodes
     runner_cls.adjust_robot(exp_config)
 
     # Resolve checkpoint path for logging
@@ -655,11 +684,10 @@ def run_evaluation(
             }
         )
 
-    # Create or use provided policy
-    if preloaded_policy is not None:
-        policy = preloaded_policy
-    else:
-        policy = exp_config.policy_config.policy_cls(exp_config, exp_config.task_type)
+    # A parent-owned policy can be reused in the single-process path.  Passing
+    # it through spawn/forkserver workers attempts to pickle live model/ROS/
+    # socket state and also makes workers share an invalid connection.
+    policy = _resolve_parent_policy(exp_config, preloaded_policy, num_workers)
 
     # # Run evaluation
     # runner = JsonEvalRunner(exp_config, benchmark_dir)
@@ -739,6 +767,7 @@ def main() -> None:
         environment_light_intensity=args.environment_light_intensity,
         camera_config_override=eval_camera_config,
         episode_idx=args.idx,
+        max_episodes=args.max_episodes,
         add_custom_object=args.add_custom_object,
         custom_object_path=args.custom_object_path,
         custom_object_name=args.custom_object_name,

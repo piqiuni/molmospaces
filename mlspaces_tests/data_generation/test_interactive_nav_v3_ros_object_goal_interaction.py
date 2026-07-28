@@ -17,7 +17,9 @@ from scripts.InteractiveNav.evaluation import benchmark_metrics, benchmark_runne
 from scripts.InteractiveNav.evaluation.ros_object_goal_adapter import EvaluatorInteractionRequest
 from scripts.InteractiveNav.evaluation.trusted_interaction_skill import (
     JointOpenResult,
+    ObjectInteractionResult,
     OpaqueObjectRegistry,
+    OpenPostcondition,
     OpenPostconditionSpec,
     TrustedInteractionSkill,
 )
@@ -229,6 +231,176 @@ def test_drawer_scan_gate_and_scoring_ids_use_private_drawer_type_and_physical_o
     episode["interactive_nav"]["interactions"][0]["type"] = "container_hinged_door"
     episode["interactive_nav"]["interactions"][1]["type"] = "container_hinged_door"
     assert not benchmark_runner._is_trusted_drawer_scan_target(episode, source_name, (top, bottom))
+
+
+def test_object_skill_completion_requires_a_complete_object_local_oracle_plan() -> None:
+    source_name = "private_fridge_body"
+    episode = {
+        "interactive_nav": {
+            "interactions": [
+                {
+                    "interaction_id": "outer",
+                    "object_name": source_name,
+                    "joint_index": 3,
+                },
+                {
+                    "interaction_id": "inner",
+                    "object_name": source_name,
+                    "joint_index": 1,
+                    "prerequisites": [{"interaction_id": "outer"}],
+                },
+                {
+                    "interaction_id": "alternative",
+                    "object_name": source_name,
+                    "joint_index": 0,
+                },
+            ],
+            "oracle_plans": [
+                {"plan_id": "two_joint", "required_interaction_ids": ["outer", "inner"]},
+                {"plan_id": "alternative", "required_interaction_ids": ["alternative"]},
+            ],
+        }
+    }
+
+    assert not benchmark_runner._object_skill_satisfies_an_oracle_plan(
+        episode=episode,
+        source_name=source_name,
+        successful_ids=["outer"],
+    )
+    assert benchmark_runner._object_skill_satisfies_an_oracle_plan(
+        episode=episode,
+        source_name=source_name,
+        successful_ids=["inner", "outer"],
+    )
+    assert benchmark_runner._object_skill_satisfies_an_oracle_plan(
+        episode=episode,
+        source_name=source_name,
+        successful_ids=["alternative"],
+    )
+    assert benchmark_runner._object_skill_satisfies_an_oracle_plan(
+        episode={"interactive_nav": {"interactions": [], "oracle_plans": []}},
+        source_name=source_name,
+        successful_ids=[],
+    )
+    assert benchmark_runner._order_interaction_ids_by_oracle_plan(
+        episode,
+        ["inner", "outer"],
+    ) == ["outer", "inner"]
+    inner_joint = _runtime_joint(
+        object_name=source_name,
+        joint_name="inner",
+        joint_index=1,
+    )
+    outer_joint = _runtime_joint(
+        object_name=source_name,
+        joint_name="outer",
+        joint_index=3,
+    )
+    ordered_joints = benchmark_runner._ordered_object_skill_joints(
+        source_name=source_name,
+        all_joints=(inner_joint, outer_joint),
+        interactions=episode["interactive_nav"]["interactions"],
+        plans=episode["interactive_nav"]["oracle_plans"],
+    )
+    assert [joint.joint_index for joint in ordered_joints] == [3, 1]
+
+
+def test_partial_object_skill_result_is_reported_failed_to_ros(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_name = "private_fridge_body"
+    opaque_id = "obj_000008"
+    command_id = "partial_open"
+    joints = (
+        _runtime_joint(object_name=source_name, joint_name="outer", joint_index=3),
+        _runtime_joint(object_name=source_name, joint_name="inner", joint_index=1),
+    )
+    adapter = _FakeAdapter(
+        EvaluatorInteractionRequest(
+            command_id=command_id,
+            episode_id="episode_000008",
+            instance_id=opaque_id,
+            action="open",
+            private_handle=object(),
+        )
+    )
+    public_result = ObjectInteractionResult(
+        request_id=command_id,
+        instance_id=opaque_id,
+        operation="open",
+        status="completed",
+    )
+    runtime = SimpleNamespace(
+        adapter=adapter,
+        skill=SimpleNamespace(
+            execute_private=lambda _request: SimpleNamespace(
+                joint_results=(
+                    JointOpenResult(True, 0.0, 0.9),
+                    JointOpenResult(False, 0.0, 0.2),
+                ),
+                public_result=public_result,
+                postcondition=OpenPostcondition.SATISFIED,
+            )
+        ),
+        opaque_to_source_name={opaque_id: source_name},
+        opaque_to_joints={opaque_id: joints},
+    )
+    episode = {
+        "interactive_nav": {
+            "interaction_requirement": "required",
+            "interactions": [
+                {
+                    "interaction_id": "outer",
+                    "object_name": source_name,
+                    "joint_index": 3,
+                    "prerequisites": [],
+                },
+                {
+                    "interaction_id": "inner",
+                    "object_name": source_name,
+                    "joint_index": 1,
+                    "prerequisites": [{"interaction_id": "outer"}],
+                },
+            ],
+            "oracle_plans": [
+                {"plan_id": "both", "required_interaction_ids": ["outer", "inner"]}
+            ],
+        }
+    }
+    task = SimpleNamespace(env=object(), get_observations=lambda: {})
+    config = SimpleNamespace(
+        interaction_max_distance_m=1.75,
+        require_interaction_visible=True,
+        record_video=False,
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_check_interaction_access",
+        lambda *_args, **_kwargs: (True, {}),
+    )
+    monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_publish_restricted_ros_frame",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(benchmark_runner, "_discard_task_rollout_cache", lambda _task: None)
+
+    consumed = benchmark_runner._consume_pending_ros_object_goal_interaction(
+        task=task,
+        runtime=runtime,
+        episode=episode,
+        private_attempts=[],
+        config=config,
+        decision_index=1,
+        frames=[],
+    )
+
+    assert consumed is not None
+    assert adapter.completions == [(command_id, False)]
+    assert consumed["public_attempt"]["status"] == "failed"
+    assert consumed["private_attempt"]["success"] is False
+    assert consumed["private_attempt"]["resolved_interaction_ids"] == ["outer"]
 
 
 def test_failed_drawer_scan_cannot_return_transient_target_discovery(

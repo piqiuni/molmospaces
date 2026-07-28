@@ -1,13 +1,17 @@
+from __future__ import annotations
+
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.env.abstract_sensors import SensorSuite
 from molmo_spaces.env.data_views import MlSpacesObject
 from molmo_spaces.env.env import BaseMujocoEnv
 from molmo_spaces.tasks.task import BaseMujocoTask
+
+if TYPE_CHECKING:
+    from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 
 log = logging.getLogger(__name__)
 

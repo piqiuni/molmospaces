@@ -53,7 +53,9 @@ RECORDER_DRAIN_POLL_S=${RECORDER_DRAIN_POLL_S:-0.5}
 RECORDER_DRAIN_PROGRESS_S=${RECORDER_DRAIN_PROGRESS_S:-10}
 RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-120}
 RECORD_HEAD_CAMERA=${RECORD_HEAD_CAMERA:-false}
+FAST_EVAL=${FAST_EVAL:-false}
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11311}
+RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
 ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.zsh}
 SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${REPO_ROOT}/.env}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_v3_full_mllm.yaml}
@@ -62,16 +64,24 @@ EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/s
 NAV_CONFIG_OVERRIDE=${NAV_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 RECORDER=${RECORDER:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py}
 RECORDER_DRAIN_HELPER=${RECORDER_DRAIN_HELPER:-${SCRIPT_DIR}/wait_for_recorder_drain.py}
+SHARED_MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/molmospaces-matplotlib-${UID}}
 
 for required_path in "${BENCHMARK}" "${ROS_SETUP}" "${SEMANTIC_MODEL_ENV_FILE}" \
   "${SEMANTIC_DECISION_OVERRIDE}" "${SEMANTIC_MAPPING_OVERRIDE}" \
-  "${EXPLORE_PY_CONFIG_OVERRIDE}" "${NAV_CONFIG_OVERRIDE}" "${RECORDER}" \
-  "${RECORDER_DRAIN_HELPER}"; do
+  "${EXPLORE_PY_CONFIG_OVERRIDE}" "${NAV_CONFIG_OVERRIDE}"; do
   if [[ ! -f "${required_path}" ]]; then
     print -u2 -- "Missing required file: ${required_path}"
     exit 2
   fi
 done
+if [[ "${FAST_EVAL}" != true ]]; then
+  for required_path in "${RECORDER}" "${RECORDER_DRAIN_HELPER}"; do
+    if [[ ! -f "${required_path}" ]]; then
+      print -u2 -- "Missing required recorder support file: ${required_path}"
+      exit 2
+    fi
+  done
+fi
 
 if [[ "${METHOD}" != "full_mllm_object_goal" ]]; then
   print -u2 -- "V3 benchmark wrapper requires METHOD=full_mllm_object_goal, got: ${METHOD}"
@@ -98,7 +108,7 @@ print -r -- "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
 print -r -- "[v3-eval] step_budget_mode=${STEP_BUDGET_MODE} min_steps=${MIN_STEPS} max_steps=${MAX_STEPS}"
 print -r -- "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY}"
 
-mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/ros_home/log"
+mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}"
 if [[ -e "${RUN_DIR}/eval" ]]; then
   print -u2 -- "Refusing to overwrite existing evaluator output: ${RUN_DIR}/eval"
   exit 2
@@ -109,6 +119,7 @@ export ROS_IP=${ROS_IP:-127.0.0.1}
 export ROS_HOSTNAME=${ROS_HOSTNAME:-127.0.0.1}
 export ROS_HOME="${RUN_DIR}/ros_home"
 export ROS_LOG_DIR="${RUN_DIR}/ros_home/log"
+export MPLCONFIGDIR="${SHARED_MPLCONFIGDIR}"
 export SEMANTIC_DECISION_ENV_FILE="${SEMANTIC_MODEL_ENV_FILE}"
 export SEMANTIC_MODEL_METRICS_PATH="${RUN_DIR}/mllm_metrics.jsonl"
 export PYTHONUNBUFFERED=1
@@ -118,6 +129,9 @@ source /home/user/miniconda3/etc/profile.d/conda.sh
 conda activate mlspaces
 set -u
 source "${ROS_SETUP}"
+# ROS setup files may restore a default master URI; keep this episode's
+# explicitly isolated master after sourcing.
+export ROS_MASTER_URI="${RUN_ROS_MASTER_URI}"
 export ROS_PACKAGE_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src:/opt/ros/noetic/share"
 export PYTHONPATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:${PYTHONPATH:-}"
 
@@ -160,14 +174,26 @@ if [[ ! "${MASTER_PORT}" =~ '^[0-9]+$' ]]; then
   print -u2 -- "ROS_MASTER_URI must include a numeric port: ${ROS_MASTER_URI}"
   exit 2
 fi
+if timeout 1s rosparam list >/dev/null 2>&1; then
+  print -u2 -- "Refusing to reuse an existing ROS master: ${ROS_MASTER_URI}"
+  exit 2
+fi
 
 roscore -p "${MASTER_PORT}" >"${RUN_DIR}/roscore.log" 2>&1 &
 ROSCORE_PID=$!
 MASTER_READY=false
 for _attempt in {1..120}; do
+  if ! kill -0 "${ROSCORE_PID}" 2>/dev/null; then
+    wait "${ROSCORE_PID}" 2>/dev/null || true
+    print -u2 -- "roscore exited before becoming ready; port ${MASTER_PORT} may be occupied"
+    exit 3
+  fi
   if timeout 1s rosparam list >/dev/null 2>&1; then
-    MASTER_READY=true
-    break
+    sleep 0.1
+    if kill -0 "${ROSCORE_PID}" 2>/dev/null; then
+      MASTER_READY=true
+      break
+    fi
   fi
   sleep 0.25
 done
@@ -196,31 +222,38 @@ roslaunch nav_pkg molmospaces_nav_system.launch \
   >"${RUN_DIR}/roslaunch.log" 2>&1 &
 ROSLAUNCH_PID=$!
 
-# Start before the evaluator so every public observation/step-sync is captured.
-PYTHONUNBUFFERED=1 python -u "${RECORDER}" \
-  --output-dir "${RUN_DIR}/debug" \
-  --occupancy-grid-topic /semantic_mapping/planning_occ_map \
-  --raw-occupancy-grid-topic /struct_mapping/occ_map \
-  --image-topic /molmo_spaces/head_camera/image \
-  --video-step-sync-topic /molmo_spaces/step_sync \
-  --step-sync-capture-every "${VIDEO_STEP_SAMPLE_EVERY}" \
-  --first-person-video-capture-mode step \
-  --semantic-video \
-  --first-person-video-with-map \
-  --first-person-video-fps "${VIDEO_FPS}" \
-  --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
-  --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
-  --video-frame-queue-overflow block \
-  --video-history-size 16 \
-  --artifact-write-queue-size 4 \
-  --runtime-video-encode \
-  --no-video-save-panel-frames \
-  --no-video-save-composite-frames \
-  --interaction-result-topic /semantic_mapping/interaction_result \
-  --no-external-video \
-  >"${RUN_DIR}/recorder.log" 2>&1 &
-RECORDER_PID=$!
-sleep 1
+if [[ "${FAST_EVAL}" != true ]]; then
+  # Start before the evaluator so every public observation/step-sync is captured.
+  PYTHONUNBUFFERED=1 python -u "${RECORDER}" \
+    --output-dir "${RUN_DIR}/debug" \
+    --occupancy-grid-topic /semantic_mapping/planning_occ_map \
+    --raw-occupancy-grid-topic /struct_mapping/occ_map \
+    --image-topic /molmo_spaces/head_camera/image \
+    --video-step-sync-topic /molmo_spaces/step_sync \
+    --step-sync-capture-every "${VIDEO_STEP_SAMPLE_EVERY}" \
+    --first-person-video-capture-mode step \
+    --semantic-video \
+    --first-person-video-with-map \
+    --first-person-video-fps "${VIDEO_FPS}" \
+    --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
+    --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
+    --video-frame-queue-overflow block \
+    --video-history-size 16 \
+    --artifact-write-queue-size 4 \
+    --runtime-video-encode \
+    --no-video-save-panel-frames \
+    --no-video-save-composite-frames \
+    --interaction-result-topic /semantic_mapping/interaction_result \
+    --no-external-video \
+    >"${RUN_DIR}/recorder.log" 2>&1 &
+  RECORDER_PID=$!
+  sleep 1
+fi
+if ! kill -0 "${ROSLAUNCH_PID}" 2>/dev/null; then
+  wait "${ROSLAUNCH_PID}" 2>/dev/null || true
+  print -u2 -- "roslaunch exited before the evaluator started; see ${RUN_DIR}/roslaunch.log"
+  exit 3
+fi
 
 EVAL_ARGS=(
   "${REPO_ROOT}/scripts/InteractiveNav/evaluate_interactive_nav_v3.py"
@@ -252,6 +285,12 @@ MUJOCO_GL=egl python "${EVAL_ARGS[@]}" >"${RUN_DIR}/eval.log" 2>&1
 EVAL_EXIT=$?
 set -e
 
+if [[ "${FAST_EVAL}" == true ]]; then
+  cleanup_process "${ROSLAUNCH_PID}" 20
+  ROSLAUNCH_PID=""
+  cleanup_process "${ROSCORE_PID}" 10
+  ROSCORE_PID=""
+fi
 EPISODE_RESULTS=("${RUN_DIR}"/eval/episodes/${EPISODE_INDEX}_*/episode_result.json)
 if (( ${#EPISODE_RESULTS} != 1 )); then
   print -u2 -- "Expected one completed episode result for index ${EPISODE_INDEX}; found ${#EPISODE_RESULTS}"
@@ -281,6 +320,10 @@ ROSLAUNCH_PID=""
 cleanup_process "${ROSCORE_PID}" 10
 ROSCORE_PID=""
 
+if [[ "${FAST_EVAL}" == true ]]; then
+  print -r -- "[v3-ros-eval-fast] result=${EPISODE_RESULT}"
+  exit "${EVAL_EXIT}"
+fi
 TOPDOWN_PATH="${EPISODE_DIR}/episode_topdown.png"
 
 MUJOCO_GL=egl python "${REPO_ROOT}/scripts/InteractiveNav/render_interactive_nav_v3_topdown.py" \
