@@ -30,6 +30,8 @@ OBSERVATION_QUEUE_SIZE=${OBSERVATION_QUEUE_SIZE:-16}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
 EXTERNAL_VIDEO_WIDTH_PX=${EXTERNAL_VIDEO_WIDTH_PX:-1024}
 EXTERNAL_VIDEO_OVERLAY=${EXTERNAL_VIDEO_OVERLAY:-true}
+PAPER_FRAME_EXPORTS=${PAPER_FRAME_EXPORTS:-false}
+STEP_SYNC_QUEUE_SIZE=${STEP_SYNC_QUEUE_SIZE:-2048}
 EXTRA_IMAGE_QUEUE_SIZE=${EXTRA_IMAGE_QUEUE_SIZE:-16}
 TIMING_LOG_EVERY_N_STEPS=${TIMING_LOG_EVERY_N_STEPS:-50}
 RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES=${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES:-50}
@@ -297,6 +299,14 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
     if [[ "${ENABLE_EXTERNAL_VIDEO}" == true ]]; then
       EXTERNAL_VIDEO_ARGS=(--external-image-topic "${EXTERNAL_IMAGE_TOPIC}" --external-video)
     fi
+    PAPER_FRAME_EXPORT_ARGS=(--no-paper-frame-exports)
+    if [[ "${PAPER_FRAME_EXPORTS}" == true ]]; then
+      PAPER_FRAME_EXPORT_ARGS=(
+        --paper-frame-exports
+        --video-step-sync-topic /molmo_spaces/step_sync
+        --step-sync-queue-size "${STEP_SYNC_QUEUE_SIZE}"
+      )
+    fi
     PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
       --output-dir "${OUTPUT_DIR}/debug" \
       --occupancy-grid-topic /semantic_mapping/planning_occ_map \
@@ -307,6 +317,7 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
       --external-video-width-px "${EXTERNAL_VIDEO_WIDTH_PX}" \
       "${EXTERNAL_VIDEO_OVERLAY_ARG}" \
+      "${PAPER_FRAME_EXPORT_ARGS[@]}" \
       --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
       --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
       --performance-log-every-n-frames "${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES}" \

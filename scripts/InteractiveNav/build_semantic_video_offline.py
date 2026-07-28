@@ -27,10 +27,18 @@ def load_recorder_frames(path: Path) -> list[dict]:
         return []
     with path.open(newline="", encoding="utf-8") as handle:
         records = list(csv.DictReader(handle))
+    source_sequences = [
+        int(record["source_seq"])
+        for record in records
+        if record.get("source_seq") not in {None, ""}
+    ]
+    source_sequences_are_zero_based = bool(source_sequences) and min(source_sequences) == 0
     for record in records:
         source_seq = record.get("source_seq")
         record["source_step_value"] = (
-            max(0, int(source_seq) - 1)
+            int(source_seq)
+            if source_sequences_are_zero_based and source_seq not in {None, ""}
+            else max(0, int(source_seq) - 1)
             if source_seq not in {None, ""}
             else max(0, int(record.get("step_id") or 1) - 1)
         )

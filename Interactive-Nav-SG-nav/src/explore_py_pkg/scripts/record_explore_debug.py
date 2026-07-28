@@ -918,6 +918,7 @@ class ExploreDebugRecorder:
         self.video_semantic_topology_frame_dir = self.video_dir / "semantic_topology_frames"
         self.video_composite_frame_dir = self.video_dir / "composite_frames"
         self.video_external_frame_dir = self.video_dir / "external_camera_frames"
+        self.video_external_overlay_frame_dir = self.video_dir / "external_camera_overlay_frames"
         self.video_external_raw_frame_dir = self.video_dir / "external_camera_raw_frames"
         self.semantic_keyframe_dir = output_dir / "semantic_keyframes"
         self.graph_dir = output_dir / "graph"
@@ -2308,13 +2309,15 @@ class ExploreDebugRecorder:
         semantic_selection: dict | None = None,
         image_step: int | None = None,
         world_bounds: tuple[float, float, float, float] | None = None,
+        draw_title: bool = True,
     ):
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
         target_id = _selection_target_id(semantic_selection)
         reference_grid = occupancy_grid or scene_grid
         if reference_grid is None:
-            self._draw_panel_title(panel, "ROOM SEGMENTS", image_step)
+            if draw_title:
+                self._draw_panel_title(panel, "ROOM SEGMENTS", image_step)
             return panel
 
         grid_width = int(reference_grid.info.width)
@@ -2463,11 +2466,12 @@ class ExploreDebugRecorder:
                 float(pose[2]),
                 14,
             )
-        self._draw_panel_title(
-            panel,
-            "ROOM SEGMENTS + INTERACTION",
-            image_step,
-        )
+        if draw_title:
+            self._draw_panel_title(
+                panel,
+                "ROOM SEGMENTS + INTERACTION",
+                image_step,
+            )
         return panel
 
     def _render_semantic_topology_panel_locked(
@@ -2482,6 +2486,7 @@ class ExploreDebugRecorder:
         semantic_behavior_feedback: dict | None = None,
         semantic_decision_trace: dict | None = None,
         image_step: int | None = None,
+        draw_title: bool = True,
     ) -> object:
         panel = np.full(
             (panel_height, panel_width, 3),
@@ -2844,11 +2849,12 @@ class ExploreDebugRecorder:
                 cv2.LINE_AA,
             )
         revision = int(graph.get("graph_revision", 0) or 0)
-        self._draw_panel_title(
-            panel,
-            f"SEMANTIC INTERACTION GRAPH r{revision}",
-            image_step,
-        )
+        if draw_title:
+            self._draw_panel_title(
+                panel,
+                f"SEMANTIC INTERACTION GRAPH r{revision}",
+                image_step,
+            )
         return panel
 
     def _render_semantic_topology_panel_legacy_locked(
@@ -3406,8 +3412,10 @@ class ExploreDebugRecorder:
             local_costmap_panel = None
             costmap_panel = None
             room_segment_panel = None
+            room_segment_clean_panel = None
             semantic_spatial_panel = None
             semantic_topology_panel = None
+            semantic_topology_clean_panel = None
             occupancy_world_bounds = self._update_video_occupancy_world_bounds_locked(
                 map_grid
             )
@@ -3503,7 +3511,15 @@ class ExploreDebugRecorder:
                     semantic_selection=semantic_selection,
                     image_step=image_step,
                     world_bounds=occupancy_world_bounds,
+                    draw_title=not self.args.paper_frame_exports,
                 )
+                if self.args.paper_frame_exports:
+                    room_segment_clean_panel = room_segment_panel.copy()
+                    self._draw_panel_title(
+                        room_segment_panel,
+                        "ROOM SEGMENTS + INTERACTION",
+                        image_step,
+                    )
                 semantic_spatial_panel = self._render_semantic_spatial_panel_locked(
                     frame_width,
                     frame_height,
@@ -3527,7 +3543,15 @@ class ExploreDebugRecorder:
                     semantic_behavior_feedback=semantic_behavior_feedback,
                     semantic_decision_trace=semantic_decision_trace,
                     image_step=image_step,
+                    draw_title=not self.args.paper_frame_exports,
                 )
+                if self.args.paper_frame_exports:
+                    semantic_topology_clean_panel = semantic_topology_panel.copy()
+                    self._draw_panel_title(
+                        semantic_topology_panel,
+                        f"SEMANTIC INTERACTION GRAPH r{graph_revision}",
+                        image_step,
+                    )
             dist_to_goal = (
                 math.hypot(
                     float(pose[0]) - float(active_goal[0]),
@@ -3612,11 +3636,21 @@ class ExploreDebugRecorder:
                     if local_costmap_panel is not None:
                         self.artifact_writer.submit_png(local_costmap_path, local_costmap_panel)
                     if room_segment_panel is not None:
-                        self.artifact_writer.submit_png(room_interaction_path, room_segment_panel)
+                        self.artifact_writer.submit_png(
+                            room_interaction_path,
+                            room_segment_clean_panel
+                            if room_segment_clean_panel is not None
+                            else room_segment_panel,
+                        )
                     if semantic_spatial_panel is not None:
                         self.artifact_writer.submit_png(semantic_spatial_path, semantic_spatial_panel)
                     if semantic_topology_panel is not None:
-                        self.artifact_writer.submit_png(semantic_topology_path, semantic_topology_panel)
+                        self.artifact_writer.submit_png(
+                            semantic_topology_path,
+                            semantic_topology_clean_panel
+                            if semantic_topology_clean_panel is not None
+                            else semantic_topology_panel,
+                        )
                 self.artifact_writer.submit_png(composite_path, frame)
                 if semantic_keyframe_path is not None:
                     self.artifact_writer.submit_png(semantic_keyframe_path, frame)
@@ -3641,11 +3675,16 @@ class ExploreDebugRecorder:
                         bytearray(local_costmap_panel.tobytes()),
                     )
                 if room_segment_panel is not None:
+                    room_segment_output = (
+                        room_segment_clean_panel
+                        if room_segment_clean_panel is not None
+                        else room_segment_panel
+                    )
                     _write_png(
                         room_interaction_path,
-                        int(room_segment_panel.shape[1]),
-                        int(room_segment_panel.shape[0]),
-                        bytearray(room_segment_panel.tobytes()),
+                        int(room_segment_output.shape[1]),
+                        int(room_segment_output.shape[0]),
+                        bytearray(room_segment_output.tobytes()),
                     )
                 if semantic_spatial_panel is not None:
                     _write_png(
@@ -3655,11 +3694,16 @@ class ExploreDebugRecorder:
                         bytearray(semantic_spatial_panel.tobytes()),
                     )
                 if semantic_topology_panel is not None:
+                    semantic_topology_output = (
+                        semantic_topology_clean_panel
+                        if semantic_topology_clean_panel is not None
+                        else semantic_topology_panel
+                    )
                     _write_png(
                         semantic_topology_path,
-                        int(semantic_topology_panel.shape[1]),
-                        int(semantic_topology_panel.shape[0]),
-                        bytearray(semantic_topology_panel.tobytes()),
+                        int(semantic_topology_output.shape[1]),
+                        int(semantic_topology_output.shape[0]),
+                        bytearray(semantic_topology_output.tobytes()),
                     )
                 _write_png(composite_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
                 if semantic_keyframe_path is not None:
@@ -3764,7 +3808,8 @@ class ExploreDebugRecorder:
             frame_width = max(1, frame_width)
             frame_height = max(1, frame_height)
             raw_frame = np.frombuffer(bytes(rgb), dtype=np.uint8).reshape((height, width, 3))
-            frame = cv2.resize(raw_frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
+            clean_frame = cv2.resize(raw_frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
+            frame = clean_frame.copy()
             stuck = self._stuck_test_locked(now)
             active_goal = self._active_goal_xy_locked()
             if self.args.external_video_overlay:
@@ -3808,15 +3853,34 @@ class ExploreDebugRecorder:
             self.external_video_frame_count += 1
             frame_index = self.external_video_frame_count
             frame_path = self.video_external_frame_dir / f"frame_{frame_index:06d}_external.png"
+            overlay_frame_path = self.video_external_overlay_frame_dir / f"frame_{frame_index:06d}_external_overlay.png"
             raw_frame_path = self.video_external_raw_frame_dir / f"frame_{frame_index:06d}_external_raw.png"
             if self.artifact_writer is not None:
                 self.artifact_writer.submit_png(raw_frame_path, raw_frame)
-                self.artifact_writer.submit_png(frame_path, frame)
+                self.artifact_writer.submit_png(
+                    frame_path,
+                    clean_frame if self.args.paper_frame_exports else frame,
+                )
+                if self.args.paper_frame_exports:
+                    self.artifact_writer.submit_png(overlay_frame_path, frame)
                 if self.args.runtime_video_encode:
                     self.artifact_writer.submit_video("external", Path(self.external_video_path), frame)
             else:
                 _write_png(raw_frame_path, width, height, bytearray(raw_frame.tobytes()))
-                _write_png(frame_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
+                external_output = clean_frame if self.args.paper_frame_exports else frame
+                _write_png(
+                    frame_path,
+                    int(external_output.shape[1]),
+                    int(external_output.shape[0]),
+                    bytearray(external_output.tobytes()),
+                )
+                if self.args.paper_frame_exports:
+                    _write_png(
+                        overlay_frame_path,
+                        int(frame.shape[1]),
+                        int(frame.shape[0]),
+                        bytearray(frame.tobytes()),
+                    )
             self.external_video_frames.append(
                 {
                     "frame_index": frame_index,
@@ -3827,7 +3891,8 @@ class ExploreDebugRecorder:
                     "goal_count": self.goal_count,
                     "active_goal": list(active_goal) if active_goal is not None else None,
                     "stuck": stuck,
-                    "frame": str(frame_path),
+                    "frame": str(overlay_frame_path if self.args.paper_frame_exports else frame_path),
+                    "clean_frame": str(frame_path),
                     "raw_frame": str(raw_frame_path),
                 }
             )
@@ -6702,6 +6767,15 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Save the six individual panel PNGs in addition to each composite frame.",
+    )
+    parser.add_argument(
+        "--paper-frame-exports",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Save clean external-camera, room-interaction, and topology PNGs while "
+            "retaining diagnostic titles and step overlays in videos."
+        ),
     )
     parser.add_argument("--semantic-occ-alpha", type=float, default=0.35)
     parser.add_argument("--first-person-video-codec", default="mp4v")
