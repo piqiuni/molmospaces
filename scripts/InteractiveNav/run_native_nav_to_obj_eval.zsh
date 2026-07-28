@@ -16,17 +16,36 @@ RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
 SEMANTIC_DECISION_CONFIG=${SEMANTIC_DECISION_CONFIG:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/config/default.yaml}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_runtime.yaml}
 SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-}
-EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
-ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
+EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/native_nav_to_obj_spin_bootstrap.yaml}
+ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/native_nav_to_obj_dwa_recovery.yaml}
+NATIVE_NAV_LOCAL_COSTMAP_INFLATION_RADIUS=${NATIVE_NAV_LOCAL_COSTMAP_INFLATION_RADIUS:-0.15}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1500}
+NAV_STACK_READY_TIMEOUT_S=${NAV_STACK_READY_TIMEOUT_S:-60}
 VIDEO_FPS=${VIDEO_FPS:-15}
 VIDEO_PANEL_WIDTH_PX=${VIDEO_PANEL_WIDTH_PX:-640}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
 ENABLE_RECORDING=${ENABLE_RECORDING:-true}
 SKIP_OFFLINE_VIDEO=${SKIP_OFFLINE_VIDEO:-false}
+NATIVE_NAV_RECORD_VIDEOS=${NATIVE_NAV_RECORD_VIDEOS:-true}
+NATIVE_NAV_ACTION_TIMEOUT_S=${NATIVE_NAV_ACTION_TIMEOUT_S:-0.5}
+NATIVE_NAV_MAX_CONSECUTIVE_ACTION_TIMEOUTS=${NATIVE_NAV_MAX_CONSECUTIVE_ACTION_TIMEOUTS:-0}
+NATIVE_NAV_DYNAMIC_HORIZON=${NATIVE_NAV_DYNAMIC_HORIZON:-false}
+NATIVE_NAV_DYNAMIC_HORIZON_MIN_STEPS=${NATIVE_NAV_DYNAMIC_HORIZON_MIN_STEPS:-360}
+NATIVE_NAV_DYNAMIC_HORIZON_BASE_STEPS=${NATIVE_NAV_DYNAMIC_HORIZON_BASE_STEPS:-240}
+NATIVE_NAV_DYNAMIC_HORIZON_STEPS_PER_METER=${NATIVE_NAV_DYNAMIC_HORIZON_STEPS_PER_METER:-45}
 FILTER_MISSING_SCENE_OBJECTS=${FILTER_MISSING_SCENE_OBJECTS:-false}
 TASK_HORIZON_STEPS=${TASK_HORIZON_STEPS:-}
+ROS_HOUSE_IND=${ROS_HOUSE_IND:-0}
+ROS_TARGET_TYPES=${ROS_TARGET_TYPES:-television}
+ROS_TASK_HORIZON=${ROS_TASK_HORIZON:-${TASK_HORIZON_STEPS:-500}}
 ENABLE_ATTRIBUTE_INFERENCE=${ENABLE_ATTRIBUTE_INFERENCE:-false}
+SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${SEMANTIC_DECISION_ENV_FILE:-}}
+SEMANTIC_MODEL_METRICS_PATH=${SEMANTIC_MODEL_METRICS_PATH:-${OUTPUT_ROOT}/mllm_metrics.jsonl}
+
+if [[ -n "${SEMANTIC_MODEL_ENV_FILE}" ]] && [[ ! -f "${SEMANTIC_MODEL_ENV_FILE}" ]]; then
+  print -u2 -- "Semantic model env file does not exist: ${SEMANTIC_MODEL_ENV_FILE}"
+  exit 2
+fi
 
 mkdir -p "${OUTPUT_ROOT}" "${DEBUG_DIR}" "${OUTPUT_ROOT}/ros_home/log"
 export ROS_MASTER_URI
@@ -37,6 +56,17 @@ export MLSPACES_ASSETS_DIR
 export ROS_HOME="${OUTPUT_ROOT}/ros_home"
 export ROS_LOG_DIR="${OUTPUT_ROOT}/ros_home/log"
 export NATIVE_NAV_DEBUG_DIR="${DEBUG_DIR}"
+export NATIVE_NAV_RECORD_VIDEOS
+export NATIVE_NAV_ACTION_TIMEOUT_S
+export NATIVE_NAV_MAX_CONSECUTIVE_ACTION_TIMEOUTS
+export NATIVE_NAV_DYNAMIC_HORIZON
+export NATIVE_NAV_DYNAMIC_HORIZON_MIN_STEPS
+export NATIVE_NAV_DYNAMIC_HORIZON_BASE_STEPS
+export NATIVE_NAV_DYNAMIC_HORIZON_STEPS_PER_METER
+export SEMANTIC_MODEL_METRICS_PATH
+if [[ -n "${SEMANTIC_MODEL_ENV_FILE}" ]]; then
+  export SEMANTIC_DECISION_ENV_FILE="${SEMANTIC_MODEL_ENV_FILE}"
+fi
 if [[ "${FILTER_MISSING_SCENE_OBJECTS}" == true ]]; then
   export NATIVE_NAV_FILTER_MISSING_SCENE_OBJECTS=1
 fi
@@ -56,7 +86,10 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic
 cleanup_process() {
   local pid="${1:-}"
   local grace_s="${2:-15}"
-  if [[ -z "${pid}" ]] || ! kill -0 "${pid}" 2>/dev/null; then
+  if [[ -z "${pid}" ]]; then
+    return
+  fi
+  if ! kill -0 "${pid}" 2>/dev/null; then
     return
   fi
   kill -INT "${pid}" 2>/dev/null || true
@@ -93,11 +126,35 @@ trap on_signal INT TERM
 
 MASTER_PORT=${ROS_MASTER_URI##*:}
 MASTER_PORT=${MASTER_PORT%%/*}
+if ss -ltnH "sport = :${MASTER_PORT}" | rg -q .; then
+  print -u2 -- "ROS master port is already occupied: ${ROS_MASTER_URI}"
+  exit 3
+fi
 roscore -p "${MASTER_PORT}" >"${OUTPUT_ROOT}/roscore.log" 2>&1 &
 ROSCORE_PID=$!
 
+sleep 0.5
+if ! kill -0 "${ROSCORE_PID}" 2>/dev/null; then
+  print -u2 -- "ROS master failed to start on ${ROS_MASTER_URI}; the port may be occupied"
+  exit 3
+fi
+if rg -Fq "roscore cannot run as another roscore/master is already running" \
+  "${OUTPUT_ROOT}/roscore.log"; then
+  print -u2 -- "ROS master port is already occupied: ${ROS_MASTER_URI}"
+  exit 3
+fi
+
 MASTER_READY=false
 for _attempt in {1..120}; do
+  if ! kill -0 "${ROSCORE_PID}" 2>/dev/null; then
+    print -u2 -- "ROS master exited while starting on ${ROS_MASTER_URI}"
+    exit 3
+  fi
+  if rg -Fq "roscore cannot run as another roscore/master is already running" \
+    "${OUTPUT_ROOT}/roscore.log"; then
+    print -u2 -- "ROS master port is already occupied: ${ROS_MASTER_URI}"
+    exit 3
+  fi
   if timeout 1s rosparam list >/dev/null 2>&1; then
     MASTER_READY=true
     break
@@ -115,6 +172,7 @@ if [[ "${ENABLE_RECORDING}" == true ]]; then
     "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
     --output-dir "${DEBUG_DIR}" \
     --occupancy-grid-topic /semantic_mapping/planning_occ_map \
+    --raw-occupancy-grid-topic /struct_mapping/occ_map \
     --image-topic /molmo_spaces/head_camera/image \
     --video-step-sync-topic /molmo_spaces/step_sync \
     --first-person-video-capture-mode step \
@@ -155,19 +213,54 @@ roslaunch \
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
   semantic_config_override_file:="${SEMANTIC_MAPPING_OVERRIDE}" \
   nav_config_override_file:="${ROUTE_NAV_CONFIG}" \
+  local_costmap_inflation_radius:="${NATIVE_NAV_LOCAL_COSTMAP_INFLATION_RADIUS}" \
   exploration_only:=false \
   randomize_camera:=false \
   robot:=rby1 \
   scene_dataset:=procthor-10k \
   data_split:=val \
-  house_ind:=0 \
-  house_inds:=0 \
-  target_types:=television \
-  task_horizon:=500 \
+  house_ind:="${ROS_HOUSE_IND}" \
+  house_inds:="${ROS_HOUSE_IND}" \
+  target_types:="${ROS_TARGET_TYPES}" \
+  task_horizon:="${ROS_TASK_HORIZON}" \
   scene_timeout_s:="${SIM_TIMEOUT_S}" \
   output_dir:="${OUTPUT_ROOT}/ros_system" \
   >"${OUTPUT_ROOT}/roslaunch.log" 2>&1 &
 LAUNCH_PID=$!
+
+# Do not wait for scans, maps, candidates, or a velocity command here: those
+# require the evaluator's first observation.  Only wait for the static ROS
+# control stack so the first observation cannot race node/action-server setup.
+NAV_STACK_READY=false
+NAV_STACK_READY_DEADLINE=$((SECONDS + NAV_STACK_READY_TIMEOUT_S))
+while (( SECONDS < NAV_STACK_READY_DEADLINE )); do
+  if ! kill -0 "${LAUNCH_PID}" 2>/dev/null; then
+    print -u2 -- "ROS launch exited before the native navigation stack became ready"
+    tail -n 80 "${OUTPUT_ROOT}/roslaunch.log" >&2 || true
+    exit 4
+  fi
+  NODE_LIST=$(timeout 1s rosnode list 2>/dev/null || true)
+  REQUIRED_NODES_READY=true
+  for _node in /move_base /semantic_mapping_py /explore_py /semantic_candidate_node /semantic_rule_decision_node /semantic_behavior_executor /relay_node; do
+    if ! print -r -- "${NODE_LIST}" | rg -Fxq "${_node}"; then
+      REQUIRED_NODES_READY=false
+      break
+    fi
+  done
+  if [[ "${REQUIRED_NODES_READY}" == true ]] \
+    && timeout 1s rosnode ping -c 1 /move_base >/dev/null 2>&1 \
+    && timeout 1s rostopic info /cmd_vel 2>/dev/null | rg -Fq "/relay_node"; then
+    NAV_STACK_READY=true
+    break
+  fi
+  sleep 0.25
+done
+if [[ "${NAV_STACK_READY}" != true ]]; then
+  print -u2 -- "Native navigation ROS stack did not become ready within ${NAV_STACK_READY_TIMEOUT_S}s"
+  tail -n 80 "${OUTPUT_ROOT}/roslaunch.log" >&2 || true
+  exit 4
+fi
+sleep 0.5
 
 set +e
 FILTER_MISSING_SCENE_OBJECTS_ARG=()

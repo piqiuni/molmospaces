@@ -13,11 +13,18 @@ class CompletionMonitorConfig:
     mode: str = "disabled"
     frontier_confirmations: int = 3
     post_completion_hold_steps: int = 0
+    semantic_target_requires_distance_and_visibility: bool = False
 
 
 class CompletionState:
     def __init__(self, config: CompletionMonitorConfig | None = None) -> None:
         self.config = config or CompletionMonitorConfig()
+        # Native benchmark episodes publish a latched semantic status.  Keep
+        # the expected lifecycle fields outside ``reset`` so a monitor can be
+        # reset between rollouts without briefly accepting a terminal status
+        # retained from the preceding episode.
+        self.semantic_episode_id = ""
+        self.semantic_episode_generation: int | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -30,6 +37,44 @@ class CompletionState:
         self.target_detail: dict[str, Any] = {}
         self.requested_at_wall_time = 0.0
         self.requested_at_step: int | None = None
+
+    def configure_semantic_episode(
+        self,
+        *,
+        episode_id: str = "",
+        episode_generation: int | None = None,
+    ) -> None:
+        """Restrict semantic completion to one target lifecycle, when set."""
+
+        self.semantic_episode_id = str(episode_id or "")
+        if episode_generation is None:
+            self.semantic_episode_generation = None
+            return
+        try:
+            self.semantic_episode_generation = int(episode_generation)
+        except (TypeError, ValueError):
+            self.semantic_episode_generation = None
+
+    def _matches_semantic_episode(self, payload: dict[str, Any]) -> bool:
+        if not self.semantic_episode_id and self.semantic_episode_generation is None:
+            return True
+        target_context = payload.get("target_context")
+        if not isinstance(target_context, dict):
+            return False
+        if (
+            self.semantic_episode_id
+            and str(target_context.get("episode_id") or "")
+            != self.semantic_episode_id
+        ):
+            return False
+        if self.semantic_episode_generation is not None:
+            try:
+                generation = int(target_context.get("episode_generation"))
+            except (TypeError, ValueError):
+                return False
+            if generation != self.semantic_episode_generation:
+                return False
+        return True
 
     def update_frontier(self, payload: dict[str, Any]) -> bool:
         if self.requested or str(self.config.mode) != "frontier":
@@ -57,12 +102,19 @@ class CompletionState:
     def update_semantic(self, payload: dict[str, Any]) -> bool:
         if self.requested or str(self.config.mode) != "semantic":
             return self.requested
+        if not self._matches_semantic_episode(payload):
+            return self.requested
         status = str(payload.get("status") or "").upper()
         detail = dict(payload.get("detail") or {})
         reason = str(detail.get("reason") or "")
         self.last_semantic_status = status
         mission_mode = str(payload.get("mission_mode") or "").casefold()
         if status == "SUCCEEDED" and reason == "target_goal_succeeded":
+            if self.config.semantic_target_requires_distance_and_visibility and not (
+                bool(detail.get("target_visibility_passed", detail.get("target_visible", False)))
+                and bool(detail.get("target_distance_passed", False))
+            ):
+                return self.requested
             self.target_goal_succeeded = True
             self.target_detail = detail
             if mission_mode in {"object_goal", "semantic_interaction_object_goal"}:
@@ -114,6 +166,10 @@ class CompletionState:
             "last_semantic_status": self.last_semantic_status,
             "target_goal_succeeded": self.target_goal_succeeded,
             "target_detail": dict(self.target_detail),
+            "semantic_episode_filter": {
+                "episode_id": self.semantic_episode_id,
+                "episode_generation": self.semantic_episode_generation,
+            },
             "frontier_confirmations": self.frontier_confirmations,
             "requested_at_wall_time": self.requested_at_wall_time,
             "requested_at_step": self.requested_at_step,
@@ -154,6 +210,19 @@ class RosCompletionMonitor:
     def prepare(self) -> None:
         with self.lock:
             self.state.reset()
+            self._write_snapshot(None)
+
+    def configure_semantic_episode(
+        self,
+        *,
+        episode_id: str = "",
+        episode_generation: int | None = None,
+    ) -> None:
+        with self.lock:
+            self.state.configure_semantic_episode(
+                episode_id=episode_id,
+                episode_generation=episode_generation,
+            )
             self._write_snapshot(None)
 
     def should_stop(self, completed_steps: int) -> bool:

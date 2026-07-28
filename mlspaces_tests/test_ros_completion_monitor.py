@@ -60,3 +60,61 @@ def test_object_goal_completion_stops_on_verified_target_success() -> None:
         }
     ) is True
     assert state.reason == "target_goal_succeeded"
+
+
+def test_strict_object_goal_completion_requires_distance_and_visibility_evidence() -> None:
+    state = CompletionState(
+        CompletionMonitorConfig(
+            mode="semantic",
+            semantic_target_requires_distance_and_visibility=True,
+        )
+    )
+    payload = {
+        "status": "SUCCEEDED",
+        "mission_mode": "semantic_interaction_object_goal",
+        "detail": {
+            "reason": "target_goal_succeeded",
+            "target_visibility_passed": True,
+            "target_distance_passed": False,
+        },
+    }
+
+    assert state.update_semantic(payload) is False
+    assert state.target_goal_succeeded is False
+
+    payload["detail"]["target_distance_passed"] = True
+    assert state.update_semantic(payload) is True
+    assert state.reason == "target_goal_succeeded"
+
+
+def test_semantic_completion_ignores_latched_terminal_from_other_episode() -> None:
+    state = CompletionState(CompletionMonitorConfig(mode="semantic"))
+    state.configure_semantic_episode(
+        episode_id="native_nav_to_obj_0002",
+        episode_generation=2,
+    )
+
+    assert state.update_semantic(
+        {
+            "status": "EXPLORATION_EXHAUSTED",
+            "target_context": {
+                "episode_id": "native_nav_to_obj_0001",
+                "episode_generation": 1,
+            },
+            "detail": {"reason": "navigation_and_interaction_frontiers_exhausted"},
+        }
+    ) is False
+    assert state.requested is False
+
+    assert state.update_semantic(
+        {
+            "status": "SUCCEEDED",
+            "mission_mode": "semantic_interaction_object_goal",
+            "target_context": {
+                "episode_id": "native_nav_to_obj_0002",
+                "episode_generation": 2,
+            },
+            "detail": {"reason": "target_goal_succeeded"},
+        }
+    ) is True
+    assert state.reason == "target_goal_succeeded"

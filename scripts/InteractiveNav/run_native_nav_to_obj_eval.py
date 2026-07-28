@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -41,6 +42,7 @@ from molmo_spaces.tasks.json_eval_task_sampler import JsonEvalTaskSampler
 
 from force_interaction_bridge import AtomicForceInteractionController
 from force_interaction_runtime import ForceDriveConfig
+from ros_completion_monitor import CompletionMonitorConfig, RosCompletionMonitor
 from run_nav_ros_sim import NavRosRolloutRunner
 from scripts.InteractiveNav.evaluation.benchmark_runner import ROS_NAVIGATION_ARM_QPOS
 
@@ -92,6 +94,18 @@ def _target_metadata(task) -> dict[str, Any]:
     if not category:
         category = natural_name
 
+    # Keep the ROS-side early-exit criterion aligned with the benchmark task.
+    # The executor receives this value through the target context and still
+    # leaves the task itself as the final success authority.
+    try:
+        success_distance_threshold_m = float(
+            getattr(task_config, "succ_pos_threshold", 1.5)
+        )
+    except (TypeError, ValueError):
+        success_distance_threshold_m = 1.5
+    if not math.isfinite(success_distance_threshold_m) or success_distance_threshold_m <= 0.0:
+        success_distance_threshold_m = 1.5
+
     labels = sorted(
         {
             value.casefold()
@@ -105,6 +119,10 @@ def _target_metadata(task) -> dict[str, Any]:
         "selection_mode": selection_mode,
         "target_name": natural_name,
         "object_labels": labels,
+        # NavTask defines success over this benchmark-provided candidate set.
+        # Keep semantic target selection on the same instances instead of
+        # accepting another object of the same category elsewhere in the house.
+        "candidate_instances": candidates,
         "standoff_m": 1.0,
         # False means the ordinary nav-to-object goal does not require an
         # interaction, but it intentionally leaves all interaction candidates
@@ -115,6 +133,9 @@ def _target_metadata(task) -> dict[str, Any]:
         "target_require_same_room": False,
         "target_allow_connected_room": True,
         "target_min_visible_pixels": 16,
+        # Mirror NavToObjTask's planar distance threshold.  The executor must
+        # also observe the selected target before it can signal completion.
+        "success_distance_threshold_m": success_distance_threshold_m,
     }
     return {
         "mode": "native_molmospaces_nav_to_obj",
@@ -127,6 +148,31 @@ def _target_metadata(task) -> dict[str, Any]:
         "target_context": target_context,
         "interaction_available": True,
     }
+
+
+def _resolve_distance_adaptive_horizon_steps(
+    base_horizon_steps: int,
+    initial_goal_distance_m: float,
+    *,
+    minimum_steps: int,
+    fixed_overhead_steps: int,
+    steps_per_meter: float,
+) -> int:
+    """Return a conservative per-episode screening horizon.
+
+    ``initial_goal_distance_m`` is a straight-line lower bound, not a
+    traversable-path estimate.  The result is therefore clamped to the
+    original benchmark horizon and used only when the opt-in screening mode is
+    enabled.
+    """
+
+    if base_horizon_steps <= 0 or not math.isfinite(initial_goal_distance_m):
+        return base_horizon_steps
+    lower_bound = min(base_horizon_steps, max(1, int(minimum_steps)))
+    proposed_steps = math.ceil(
+        float(fixed_overhead_steps) + float(steps_per_meter) * initial_goal_distance_m
+    )
+    return min(base_horizon_steps, max(lower_bound, proposed_steps))
 
 
 def _apply_native_navigation_arm_posture(episode_spec) -> dict[str, list[float]]:
@@ -157,6 +203,21 @@ class NativeRosBridgePolicy(RosBridgePolicy):
         self.native_episode_index = 0
         self.current_native_episode_dir: Path | None = None
         self.native_target_metadata: dict[str, Any] = {}
+        self.native_episode_active = False
+        self.native_episode_generation = 0
+        self.native_dynamic_horizon_enabled = bool(
+            config.native_dynamic_horizon_enabled
+        )
+        self.native_dynamic_horizon_min_steps = int(
+            config.native_dynamic_horizon_min_steps
+        )
+        self.native_dynamic_horizon_base_steps = int(
+            config.native_dynamic_horizon_base_steps
+        )
+        self.native_dynamic_horizon_steps_per_meter = float(
+            config.native_dynamic_horizon_steps_per_meter
+        )
+        self.native_horizon_metadata: dict[str, Any] = {}
 
         super().__init__(
             config,
@@ -198,7 +259,10 @@ class NativeRosBridgePolicy(RosBridgePolicy):
             realtime_gt_topic="/semantic_mapping/gt_observations",
             realtime_gt_camera_name="head_camera",
             realtime_gt_min_visible_pixels=16,
-            realtime_gt_min_visible_fraction=0.2,
+            # Keep the bridge gate aligned with the target-candidate gate.
+            # Thin objects can have a reliable pixel count but occupy only a
+            # tiny portion of a loose projected box.
+            realtime_gt_min_visible_fraction=0.0,
             realtime_gt_required_consecutive_observations=2,
             realtime_gt_step_interval=3,
             realtime_gt_max_distance_m=4.0,
@@ -219,6 +283,18 @@ class NativeRosBridgePolicy(RosBridgePolicy):
         self.debug_snapshot_path = str(debug_root / "native_first_frame.png")
         self.debug_snapshot_camera_name = "head_camera"
         self.debug_snapshot_saved = False
+        # Semantic goal-status is the only ROS-side lifecycle signal that can
+        # end a native rollout.  It is deliberately separate from execution
+        # state/individual behavior feedback; NavToObjTask still judges the
+        # official benchmark success after the loop exits.
+        self.completion_monitor = RosCompletionMonitor(
+            CompletionMonitorConfig(
+                mode="semantic",
+                semantic_target_requires_distance_and_visibility=True,
+            ),
+            semantic_topic="/semantic_decision/goal_status",
+            output_path=debug_root / "completion_status.json",
+        )
 
         self._native_target_publisher = self._rospy.Publisher(
             "/semantic_decision/target",
@@ -247,9 +323,77 @@ class NativeRosBridgePolicy(RosBridgePolicy):
             drawer_observation_steps=1,
         )
 
+    def _configure_episode_horizon(self) -> None:
+        """Record the initial GT distance and optionally shorten this episode."""
+
+        raw_horizon = getattr(self.task, "_native_base_task_horizon_steps", None)
+        if raw_horizon is None:
+            raw_horizon = getattr(self.task, "_task_horizon", None)
+        try:
+            base_horizon_steps = int(raw_horizon)
+        except (TypeError, ValueError, OverflowError):
+            self.native_horizon_metadata = {
+                "dynamic_horizon_enabled": self.native_dynamic_horizon_enabled,
+                "base_task_horizon_steps": raw_horizon,
+                "effective_task_horizon_steps": raw_horizon,
+                "initial_goal_distance_error": "task_horizon_not_finite",
+            }
+            return
+
+        # A rollout framework may reset its policy more than once for the same
+        # task.  Preserve the original benchmark cap so a second reset does
+        # not treat an already shortened horizon as its new baseline.
+        setattr(self.task, "_native_base_task_horizon_steps", base_horizon_steps)
+
+        horizon_metadata: dict[str, Any] = {
+            "dynamic_horizon_enabled": self.native_dynamic_horizon_enabled,
+            "base_task_horizon_steps": base_horizon_steps,
+            "effective_task_horizon_steps": base_horizon_steps,
+        }
+        try:
+            initial_goal_distance_m = float(self.task.calculate_distance(0))
+        except Exception as exc:
+            horizon_metadata["initial_goal_distance_error"] = str(exc)
+            self.native_horizon_metadata = horizon_metadata
+            return
+        if not math.isfinite(initial_goal_distance_m):
+            horizon_metadata["initial_goal_distance_error"] = "distance_not_finite"
+            self.native_horizon_metadata = horizon_metadata
+            return
+
+        horizon_metadata["initial_goal_distance_m"] = initial_goal_distance_m
+        if self.native_dynamic_horizon_enabled:
+            effective_horizon_steps = _resolve_distance_adaptive_horizon_steps(
+                base_horizon_steps,
+                initial_goal_distance_m,
+                minimum_steps=self.native_dynamic_horizon_min_steps,
+                fixed_overhead_steps=self.native_dynamic_horizon_base_steps,
+                steps_per_meter=self.native_dynamic_horizon_steps_per_meter,
+            )
+            # ``BaseMujocoTask`` reads this value in ``is_done`` every step.
+            # Do not modify the shared experiment config: only this episode is
+            # distance-adaptive, and the original benchmark limit remains an
+            # upper bound.
+            self.task._task_horizon = effective_horizon_steps
+            horizon_metadata["effective_task_horizon_steps"] = effective_horizon_steps
+            horizon_metadata["formula"] = {
+                "minimum_steps": self.native_dynamic_horizon_min_steps,
+                "fixed_overhead_steps": self.native_dynamic_horizon_base_steps,
+                "steps_per_meter": self.native_dynamic_horizon_steps_per_meter,
+            }
+            log.info(
+                "Distance-adaptive screening horizon: %.3fm -> %d/%d steps",
+                initial_goal_distance_m,
+                effective_horizon_steps,
+                base_horizon_steps,
+            )
+        self.native_horizon_metadata = horizon_metadata
+
     def reset(self):
         super().reset()
         self.native_episode_index += 1
+        self.native_episode_generation += 1
+        self.native_episode_active = True
         self.debug_snapshot_saved = False
         self.current_native_episode_dir = self.native_debug_root / (
             f"episode_{self.native_episode_index:04d}"
@@ -259,10 +403,21 @@ class NativeRosBridgePolicy(RosBridgePolicy):
             self.current_native_episode_dir / "force_interaction_events.json"
         )
 
+        self._configure_episode_horizon()
         self.native_target_metadata = _target_metadata(self.task)
+        self.native_target_metadata["horizon"] = dict(self.native_horizon_metadata)
         target_context = dict(self.native_target_metadata["target_context"])
         target_context["episode_id"] = f"native_nav_to_obj_{self.native_episode_index:04d}"
+        target_context["episode_active"] = True
+        target_context["episode_generation"] = self.native_episode_generation
         self.native_target_metadata["target_context"] = target_context
+        self.completion_monitor.output_path = (
+            self.current_native_episode_dir / "completion_status.json"
+        )
+        self.completion_monitor.configure_semantic_episode(
+            episode_id=str(target_context["episode_id"]),
+            episode_generation=int(target_context["episode_generation"]),
+        )
         _write_json(
             self.current_native_episode_dir / "target_selection.json",
             self.native_target_metadata,
@@ -277,14 +432,49 @@ class NativeRosBridgePolicy(RosBridgePolicy):
             )
         )
 
+    def finish_episode(
+        self,
+        step_index: int | None = None,
+        *,
+        reason: str = "native_rollout_finished",
+    ) -> None:
+        """Stop downstream semantic actions before evaluator finalization."""
+        if not self.native_episode_active:
+            return
+        self.native_episode_active = False
+        target_context = dict(self.native_target_metadata.get("target_context") or {})
+        target_context.update(
+            {
+                "enabled": False,
+                "episode_active": False,
+                "episode_generation": self.native_episode_generation,
+                "finish_reason": str(reason),
+            }
+        )
+        if step_index is not None:
+            target_context["finish_step"] = int(step_index)
+        self._native_target_publisher.publish(
+            self._String(
+                data=json.dumps(target_context, ensure_ascii=False, separators=(",", ":"))
+            )
+        )
+        self._move_base_cancel_pub.publish(self._GoalID())
+        # Do not reset the explorer after the terminal episode transition.  A
+        # reset starts a fresh initial-spin timer, which can race ROS shutdown
+        # and keep producing frontier work after the benchmark is finished.
+        # The target lifecycle transition above and the move_base cancel are
+        # sufficient to stop downstream semantic/execution nodes.
+
     def close(self):
         try:
+            self.finish_episode(reason="policy_close")
             self.force_interaction_controller.close()
         finally:
             try:
                 self._native_target_publisher.unregister()
             except Exception:
                 pass
+            self.completion_monitor.close()
             super().close()
 
 
@@ -319,12 +509,108 @@ class NativeNavToObjEvalConfig(JsonBenchmarkEvalConfig):
     native_interaction_execution_mode: str = "smooth"
     native_interaction_transition_steps: int = 5
     native_filter_missing_scene_objects: bool = False
+    native_dynamic_horizon_enabled: bool = False
+    native_dynamic_horizon_min_steps: int = 360
+    native_dynamic_horizon_base_steps: int = 240
+    native_dynamic_horizon_steps_per_meter: float = 45.0
 
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
         env_debug_dir = os.environ.get("NATIVE_NAV_DEBUG_DIR")
         if env_debug_dir:
             self.native_debug_dir = Path(env_debug_dir).expanduser().resolve()
+        record_videos = os.environ.get("NATIVE_NAV_RECORD_VIDEOS")
+        if record_videos:
+            self.record_videos = record_videos.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+        action_timeout_s = os.environ.get("NATIVE_NAV_ACTION_TIMEOUT_S")
+        if action_timeout_s:
+            try:
+                parsed_action_timeout_s = float(action_timeout_s)
+            except ValueError as exc:
+                raise ValueError(
+                    "NATIVE_NAV_ACTION_TIMEOUT_S must be a positive number"
+                ) from exc
+            if (
+                not math.isfinite(parsed_action_timeout_s)
+                or parsed_action_timeout_s <= 0.0
+            ):
+                raise ValueError("NATIVE_NAV_ACTION_TIMEOUT_S must be a positive number")
+            self.native_action_timeout_s = parsed_action_timeout_s
+        max_consecutive_action_timeouts = os.environ.get(
+            "NATIVE_NAV_MAX_CONSECUTIVE_ACTION_TIMEOUTS"
+        )
+        if max_consecutive_action_timeouts:
+            try:
+                self.native_max_consecutive_action_timeouts = int(
+                    max_consecutive_action_timeouts
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "NATIVE_NAV_MAX_CONSECUTIVE_ACTION_TIMEOUTS must be a non-negative integer"
+                ) from exc
+            if self.native_max_consecutive_action_timeouts < 0:
+                raise ValueError(
+                    "NATIVE_NAV_MAX_CONSECUTIVE_ACTION_TIMEOUTS must be a non-negative integer"
+                )
+        dynamic_horizon = os.environ.get("NATIVE_NAV_DYNAMIC_HORIZON")
+        if dynamic_horizon:
+            normalized_dynamic_horizon = dynamic_horizon.strip().lower()
+            if normalized_dynamic_horizon in {"1", "true", "yes", "on"}:
+                self.native_dynamic_horizon_enabled = True
+            elif normalized_dynamic_horizon in {"0", "false", "no", "off"}:
+                self.native_dynamic_horizon_enabled = False
+            else:
+                raise ValueError(
+                    "NATIVE_NAV_DYNAMIC_HORIZON must be a boolean value"
+                )
+        dynamic_min_steps = os.environ.get("NATIVE_NAV_DYNAMIC_HORIZON_MIN_STEPS")
+        if dynamic_min_steps:
+            try:
+                self.native_dynamic_horizon_min_steps = int(dynamic_min_steps)
+            except ValueError as exc:
+                raise ValueError(
+                    "NATIVE_NAV_DYNAMIC_HORIZON_MIN_STEPS must be a positive integer"
+                ) from exc
+            if self.native_dynamic_horizon_min_steps <= 0:
+                raise ValueError(
+                    "NATIVE_NAV_DYNAMIC_HORIZON_MIN_STEPS must be a positive integer"
+                )
+        dynamic_base_steps = os.environ.get("NATIVE_NAV_DYNAMIC_HORIZON_BASE_STEPS")
+        if dynamic_base_steps:
+            try:
+                self.native_dynamic_horizon_base_steps = int(dynamic_base_steps)
+            except ValueError as exc:
+                raise ValueError(
+                    "NATIVE_NAV_DYNAMIC_HORIZON_BASE_STEPS must be a non-negative integer"
+                ) from exc
+            if self.native_dynamic_horizon_base_steps < 0:
+                raise ValueError(
+                    "NATIVE_NAV_DYNAMIC_HORIZON_BASE_STEPS must be a non-negative integer"
+                )
+        dynamic_steps_per_meter = os.environ.get(
+            "NATIVE_NAV_DYNAMIC_HORIZON_STEPS_PER_METER"
+        )
+        if dynamic_steps_per_meter:
+            try:
+                self.native_dynamic_horizon_steps_per_meter = float(
+                    dynamic_steps_per_meter
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "NATIVE_NAV_DYNAMIC_HORIZON_STEPS_PER_METER must be non-negative"
+                ) from exc
+            if (
+                not math.isfinite(self.native_dynamic_horizon_steps_per_meter)
+                or self.native_dynamic_horizon_steps_per_meter < 0.0
+            ):
+                raise ValueError(
+                    "NATIVE_NAV_DYNAMIC_HORIZON_STEPS_PER_METER must be non-negative"
+                )
         if os.environ.get("NATIVE_NAV_FILTER_MISSING_SCENE_OBJECTS", "").lower() in {
             "1",
             "true",
@@ -379,11 +665,20 @@ class NativeNavToObjJsonEvalRunner(JsonEvalRunner):
             success = NavRosRolloutRunner.run_single_rollout(*args, **kwargs)
         except Exception as exc:
             if policy is not None and getattr(policy, "current_native_episode_dir", None):
+                failure_result = {
+                    "exception": type(exc).__name__,
+                    "error": str(exc),
+                }
+                if getattr(policy, "native_horizon_metadata", None):
+                    failure_result["horizon"] = dict(policy.native_horizon_metadata)
                 _write_json(
                     policy.current_native_episode_dir / "official_nav_to_obj_result.json",
-                    {"exception": type(exc).__name__, "error": str(exc)},
+                    failure_result,
                 )
             raise
+        finally:
+            if policy is not None and hasattr(policy, "finish_episode"):
+                policy.finish_episode(reason="rollout_runner_returned")
 
         result = {
             "official_task": "molmo_spaces.tasks.nav_task.NavToObjTask",
@@ -404,6 +699,8 @@ class NativeNavToObjJsonEvalRunner(JsonEvalRunner):
                 result["visibility_error"] = str(exc)
         if policy is not None and getattr(policy, "current_native_episode_dir", None):
             result["debug_dir"] = str(policy.current_native_episode_dir)
+            if getattr(policy, "native_horizon_metadata", None):
+                result["horizon"] = dict(policy.native_horizon_metadata)
             _write_json(
                 policy.current_native_episode_dir / "official_nav_to_obj_result.json",
                 result,
@@ -556,6 +853,24 @@ def main() -> None:
         "native_filter_missing_scene_objects": bool(
             getattr(results.exp_config, "native_filter_missing_scene_objects", False)
         ),
+        "native_dynamic_horizon": {
+            "enabled": bool(
+                getattr(results.exp_config, "native_dynamic_horizon_enabled", False)
+            ),
+            "minimum_steps": int(
+                getattr(results.exp_config, "native_dynamic_horizon_min_steps", 0)
+            ),
+            "fixed_overhead_steps": int(
+                getattr(results.exp_config, "native_dynamic_horizon_base_steps", 0)
+            ),
+            "steps_per_meter": float(
+                getattr(
+                    results.exp_config,
+                    "native_dynamic_horizon_steps_per_meter",
+                    0.0,
+                )
+            ),
+        },
     }
     _write_json(results.output_dir / "native_eval_summary.json", summary)
     _write_json(debug_dir / "native_eval_summary.json", summary)

@@ -457,6 +457,7 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
 
         success = False
         step_idx = 0
+        episode_end_reason = "task_done"
         episode_started_mono = time.monotonic()
         consecutive_action_timeouts = 0
         scene_timeout_s = max(0.0, float(getattr(policy, "scene_timeout_s", 0.0)))
@@ -481,10 +482,10 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         )
         while not task.is_done():
             if shutdown_event is not None and shutdown_event.is_set():
-                if timing_diagnostics is not None:
-                    timing_diagnostics.close()
-                return False
+                episode_end_reason = "shutdown_event"
+                break
             if completion_monitor is not None and completion_monitor.should_stop(step_idx):
+                episode_end_reason = "completion_monitor"
                 break
             elapsed_s = time.monotonic() - episode_started_mono
             if scene_timeout_s > 0.0 and elapsed_s >= scene_timeout_s:
@@ -533,6 +534,13 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             policy_t0 = time.perf_counter()
             action_cmd = policy.get_action(observation)
             policy_ms = (time.perf_counter() - policy_t0) * 1000.0
+            # A latched semantic terminal state can arrive while
+            # ``get_action`` is waiting for a ROS command.  Check it before
+            # treating that expected quiet period as a bridge/action timeout.
+            # The task remains the authority for the returned success value.
+            if completion_monitor is not None and completion_monitor.should_stop(step_idx):
+                episode_end_reason = "completion_monitor"
+                break
             if getattr(policy, "last_action_timed_out", False):
                 consecutive_action_timeouts += 1
             else:
@@ -553,6 +561,7 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                     f"after {step_idx} completed steps"
                 )
             if action_cmd is None:
+                episode_end_reason = "policy_stopped"
                 break
             if (
                 force_interaction_controller is not None
@@ -672,7 +681,12 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
             step_idx += 1
             if end_on_success and "success" in infos[0] and infos[0]["success"]:
                 success = True
+                episode_end_reason = "end_on_success"
                 break
+
+        finish_episode = getattr(policy, "finish_episode", None)
+        if callable(finish_episode):
+            finish_episode(step_index=step_idx, reason=episode_end_reason)
 
         try:
             task.env.current_model.opt.enableflags &= ~int(mujoco.mjtEnableBit.mjENBL_SLEEP)
