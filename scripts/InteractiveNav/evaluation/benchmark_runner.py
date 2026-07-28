@@ -37,6 +37,7 @@ from molmo_spaces.evaluation.benchmark_schema import EpisodeSpec
 from molmo_spaces.tasks.json_eval_task_sampler import JsonEvalTaskSampler
 
 from scripts.InteractiveNav import container_scene_probe as probe
+from scripts.InteractiveNav.force_interaction_runtime import ground_drawer_open_regions
 from scripts.InteractiveNav import interactive_nav_v3
 
 from .benchmark_metrics import (
@@ -67,13 +68,14 @@ from .ros_object_goal_adapter import (
 from .trusted_interaction_skill import (
     JointOpenResult,
     ObjectInteractionRequest,
+    ObjectInteractionResult,
     OpaqueObjectRegistry,
     OpenPostconditionSpec,
     TrustedInteractionSkill,
 )
 
 
-PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v6"
+PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v7"
 
 # Established ROS exploration posture.  The asymmetric shoulder roll tucks the
 # arms beside the torso so they neither move after the first navigation action
@@ -918,8 +920,15 @@ def _execute_locked_force(
     config: BenchmarkEvaluationConfig,
     *,
     frame_callback: callable | None = None,
+    target_open_fraction: float | None = None,
 ) -> tuple[bool, dict[str, Any], float, float, float]:
-    """Execute the collection-equivalent 2s force ramp while locking the robot."""
+    """Execute a force ramp while locking the robot at its current pose.
+
+    ``target_open_fraction`` defaults to the configured opening target.  The
+    drawer scan skill also uses this trusted routine with ``0.0`` to close one
+    drawer before moving to the next one, preserving the same force schedule,
+    collection frequency, and base/arm lock as ordinary V3 force opening.
+    """
 
     before = joint_open_fraction(
         env,
@@ -930,7 +939,12 @@ def _execute_locked_force(
         raise ValueError(f"Joint not found: {runtime_joint.joint_name}")
     lower, upper = [float(value) for value in env.current_model.jnt_range[joint_id]]
     closed, opened = probe.joint_closed_open_values([lower, upper])
-    target = closed + float(config.force_target_fraction) * (opened - closed)
+    start_fraction = float(before)
+    target_fraction = float(
+        config.force_target_fraction if target_open_fraction is None else target_open_fraction
+    )
+    target_fraction = float(np.clip(target_fraction, 0.0, 1.0))
+    target = closed + target_fraction * (opened - closed)
     controller = probe.ForceJointController(env, runtime_joint.joint_name, target)
     sim_dt = float(env.current_model.opt.timestep)
     sample_count = max(1, int(round(float(config.force_duration_seconds) * float(config.force_collection_hz))))
@@ -949,7 +963,8 @@ def _execute_locked_force(
     try:
         for sample_index in range(sample_count):
             progress = (sample_index + 1) / sample_count
-            controller.target_value = closed + float(config.force_target_fraction) * progress * (opened - closed)
+            scheduled_fraction = start_fraction + progress * (target_fraction - start_fraction)
+            controller.target_value = closed + scheduled_fraction * (opened - closed)
             for _ in range(internal_per_sample):
                 _apply_robot_lock(env, snapshot)
                 row = controller.step()
@@ -970,6 +985,7 @@ def _execute_locked_force(
         {
             "force_duration_seconds": float(config.force_duration_seconds),
             "force_collection_hz": float(config.force_collection_hz),
+            "target_open_fraction": target_fraction,
             "dataset_steps": sample_count,
             "internal_steps": internal_total,
             "simulated_seconds": internal_total * sim_dt,
@@ -983,7 +999,351 @@ def _execute_locked_force(
             "observed_direction_signs": sorted(set(direction_signs)),
         }
     )
-    return bool(after >= SUCCESS_OPEN_FRACTION), metadata, before, after, internal_total * sim_dt
+    reached = (
+        after >= SUCCESS_OPEN_FRACTION
+        if target_fraction >= 0.5
+        else after <= 1.0 - SUCCESS_OPEN_FRACTION
+    )
+    return bool(reached), metadata, before, after, internal_total * sim_dt
+
+
+def _drawer_scan_target_evidence(
+    task: Any,
+    episode: dict[str, Any],
+    config: BenchmarkEvaluationConfig,
+) -> dict[str, Any] | None:
+    """Record a private target observation made while one drawer is open."""
+
+    _visible, distance, visibility = target_metrics(task, episode)
+    resolution = config.image_resolution or tuple(episode.get("img_resolution") or (640, 480))
+    width, height = int(resolution[0]), int(resolution[1])
+    visible_pixels = int(round(float(visibility) * max(1, width) * max(1, height)))
+    threshold = float(episode["interactive_nav"]["success_criteria"]["distance"]["threshold_m"])
+    if not (
+        float(distance) < threshold
+        and visible_pixels >= int(config.restricted_gt_min_visible_pixels)
+    ):
+        return None
+    return {
+        "distance_m": float(distance),
+        "visibility_fraction": float(visibility),
+        "visible_pixels": visible_pixels,
+        "minimum_visible_pixels": int(config.restricted_gt_min_visible_pixels),
+    }
+
+
+def _drawer_scan_runtime_groups(
+    task: Any,
+    joints: tuple[RuntimeJoint, ...],
+    open_regions: tuple[tuple[float, float], ...],
+    *,
+    allowed_joint_indices: set[int] | None = None,
+) -> list[tuple[RuntimeJoint, dict[str, Any]]]:
+    """Ground a public drawer plan to private slide joints in visual order."""
+
+    model = task.env.current_model
+    data = task.env.current_data
+    by_name: dict[str, RuntimeJoint] = {}
+    joint_rows: list[dict[str, Any]] = []
+    body_heights: dict[str, float] = {}
+    for joint in joints:
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint.joint_name)
+        if joint_id < 0 or int(model.jnt_type[joint_id]) != int(mujoco.mjtJoint.mjJNT_SLIDE):
+            continue
+        body_id = int(model.jnt_bodyid[joint_id])
+        by_name[joint.joint_name] = joint
+        joint_rows.append({"joint_name": joint.joint_name, "joint_type": "slide"})
+        body_heights[joint.joint_name] = float(data.xpos[body_id][2])
+    regions = [{"center": [float(x), float(y)]} for x, y in open_regions]
+    grounded = ground_drawer_open_regions(
+        joint_rows,
+        regions,
+        body_heights,
+        fallback_to_all=False,
+    )
+    result: list[tuple[RuntimeJoint, dict[str, Any]]] = []
+    for group in grounded:
+        names = list(group.get("joint_names") or [])
+        if len(names) != 1:
+            continue
+        joint = by_name.get(str(names[0]))
+        if joint is not None and (
+            allowed_joint_indices is None or int(joint.joint_index) in allowed_joint_indices
+        ):
+            result.append((joint, group))
+    return result
+
+
+def _trusted_drawer_scan_joint_indices(
+    episode: dict[str, Any],
+    source_name: str,
+) -> set[int]:
+    """Return only frozen V3 drawer joints for one evaluator-private object."""
+
+    return {
+        int(row["joint_index"])
+        for row in episode["interactive_nav"].get("interactions", [])
+        if str(row.get("object_name")) == source_name
+        and str(row.get("type")) == "container_sliding_drawer"
+    }
+
+
+def _is_trusted_drawer_scan_target(
+    episode: dict[str, Any],
+    source_name: str,
+    joints: tuple[RuntimeJoint, ...],
+) -> bool:
+    """Require a private V3 drawer row before expanding a public scan hint.
+
+    ``sequence_type`` and visual regions originate from the evaluated method and
+    therefore cannot by themselves grant a different simulator skill.  The
+    evaluator only enables the drawer macro for an opaque object that maps to at
+    least one frozen ``container_sliding_drawer`` interaction in this episode.
+    """
+
+    drawer_indices = _trusted_drawer_scan_joint_indices(episode, source_name)
+    runtime_indices = {int(joint.joint_index) for joint in joints}
+    return bool(drawer_indices.intersection(runtime_indices))
+
+
+def _execute_private_drawer_scan(
+    *,
+    task: Any,
+    runtime: RestrictedRosObjectGoalRuntime,
+    episode: dict[str, Any],
+    joints: tuple[RuntimeJoint, ...],
+    open_regions: tuple[tuple[float, float], ...],
+    allowed_joint_indices: set[int],
+    config: BenchmarkEvaluationConfig,
+    decision_index: int,
+    frames: list[np.ndarray],
+) -> dict[str, Any]:
+    """Run the trusted low-view, open-observe-close drawer macro skill.
+
+    Only normalized visual regions enter from the method.  The mapping to slide
+    joints, force execution, target-observation evidence and all joint results
+    remain evaluator-private.
+    """
+
+    groups = _drawer_scan_runtime_groups(
+        task,
+        joints,
+        open_regions,
+        allowed_joint_indices=allowed_joint_indices,
+    )
+    if not groups:
+        return {
+            "success": False,
+            "joint_results": (),
+            "opened_joints": (),
+            "simulated_seconds": 0.0,
+            "target_discovery": None,
+            "metadata": {
+                "execution_mode": "drawer_scan",
+                "reason": "no_grounded_visible_drawers",
+                "group_count": 0,
+            },
+            "observation": task.get_observations(),
+        }
+
+    initial_head = probe.get_head_joint_position(task.env)
+    initial_torso = probe.get_torso_joint_position(task.env)
+    view_applied = False
+    group_records: list[dict[str, Any]] = []
+    opened_pairs: list[tuple[RuntimeJoint, JointOpenResult]] = []
+    touched_joints: list[RuntimeJoint] = []
+    cleanup_records: list[dict[str, Any]] = []
+    total_seconds = 0.0
+    observed_target_discovery: dict[str, Any] | None = None
+    completed = True
+    cleanup_succeeded = True
+    observation = task.get_observations()
+    try:
+        probe.lower_head_for_drawer_view(task.env, tilt_delta=0.30)
+        if initial_torso is not None:
+            probe.lean_torso_for_drawer_view(
+                task.env,
+                default_qpos=initial_torso,
+                pitch_delta=0.35,
+            )
+        mujoco.mj_forward(task.env.current_model, task.env.current_data)
+        task.env.camera_manager.registry.update_all_cameras(task.env)
+        view_applied = True
+        _capture_head_frame(task, frames, config.record_video)
+        for group_index, (joint, group) in enumerate(groups):
+            opened = False
+            closed = False
+            group_record: dict[str, Any] = {
+                "group_index": group_index,
+                "grounding_source": str(group.get("grounding_source") or ""),
+            }
+            touched_joints.append(joint)
+            try:
+                opened, open_meta, before, after_open, open_seconds = _execute_locked_force(
+                    task.env,
+                    joint,
+                    config,
+                    frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
+                )
+                total_seconds += float(open_seconds)
+                open_result = JointOpenResult(
+                    executor_succeeded=bool(opened),
+                    open_fraction_before=float(before),
+                    open_fraction_after=float(after_open),
+                    simulated_seconds=float(open_seconds),
+                    metadata=open_meta,
+                )
+                group_record.update(
+                    {
+                        "opened": bool(opened),
+                        "open_fraction_after_open": float(after_open),
+                        "open_seconds": float(open_seconds),
+                        "open_metadata": open_meta,
+                    }
+                )
+                if opened:
+                    opened_pairs.append((joint, open_result))
+                    observation = task.get_observations()
+                    _capture_head_frame(task, frames, config.record_video)
+                    published_open_frame = _publish_restricted_ros_frame(
+                        runtime,
+                        task,
+                        decision_index=decision_index,
+                    )
+                    group_record["published_open_frame"] = bool(published_open_frame)
+                    if published_open_frame:
+                        evidence = _drawer_scan_target_evidence(task, episode, config)
+                        if evidence is not None and observed_target_discovery is None:
+                            observed_target_discovery = {**evidence, "group_index": group_index}
+                else:
+                    completed = False
+            except Exception as exc:
+                completed = False
+                group_record["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                # The close is in the per-drawer cleanup block rather than
+                # after image/semantic updates.  A rendering or publication
+                # failure must never leave this drawer open or allow the next
+                # drawer to be opened concurrently.
+                try:
+                    closed, close_meta, _close_before, after_close, close_seconds = _execute_locked_force(
+                        task.env,
+                        joint,
+                        config,
+                        frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
+                        target_open_fraction=0.0,
+                    )
+                    total_seconds += float(close_seconds)
+                    group_record.update(
+                        {
+                            "closed": bool(closed),
+                            "open_fraction_after_close": float(after_close),
+                            "close_seconds": float(close_seconds),
+                            "close_metadata": close_meta,
+                        }
+                    )
+                    if not closed:
+                        completed = False
+                except Exception as exc:
+                    closed = False
+                    completed = False
+                    group_record["closed"] = False
+                    group_record["close_error"] = f"{type(exc).__name__}: {exc}"
+                try:
+                    observation = task.get_observations()
+                    _capture_head_frame(task, frames, config.record_video)
+                    group_record["published_closed_frame"] = bool(
+                        _publish_restricted_ros_frame(
+                            runtime,
+                            task,
+                            decision_index=decision_index,
+                        )
+                    )
+                except Exception as exc:
+                    # The physical close result remains authoritative for this
+                    # macro.  Do not expose the exception to the method.
+                    group_record["post_close_observation_error"] = f"{type(exc).__name__}: {exc}"
+                group_records.append(group_record)
+            if not (opened and closed):
+                # A failed group is first cleaned up above, then terminates the
+                # macro.  Continuing could open a second drawer while recovery
+                # is already known to be unreliable.
+                completed = False
+                break
+    finally:
+        # A force/controller/render exception can occur between the main close
+        # and result recording.  Verify every touched drawer is closed before
+        # restoring the view; recovery remains evaluator-private and a failed
+        # recovery makes the macro unsuccessful.
+        seen_joint_names: set[str] = set()
+        for joint in reversed(touched_joints):
+            if joint.joint_name in seen_joint_names:
+                continue
+            seen_joint_names.add(joint.joint_name)
+            try:
+                remaining_fraction = joint_open_fraction(
+                    task.env,
+                    {"joint_name": joint.joint_name},
+                )
+                recovery_record: dict[str, Any] = {
+                    "remaining_open_fraction_before": float(remaining_fraction),
+                }
+                if remaining_fraction > 1.0 - SUCCESS_OPEN_FRACTION:
+                    recovered, recovery_meta, _before, after, recovery_seconds = _execute_locked_force(
+                        task.env,
+                        joint,
+                        config,
+                        frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
+                        target_open_fraction=0.0,
+                    )
+                    total_seconds += float(recovery_seconds)
+                    recovery_record.update(
+                        {
+                            "recovery_attempted": True,
+                            "recovered": bool(recovered),
+                            "open_fraction_after_recovery": float(after),
+                            "recovery_seconds": float(recovery_seconds),
+                            "recovery_metadata": recovery_meta,
+                        }
+                    )
+                    if not recovered:
+                        cleanup_succeeded = False
+                else:
+                    recovery_record["recovery_attempted"] = False
+                cleanup_records.append(recovery_record)
+            except Exception as exc:
+                cleanup_succeeded = False
+                cleanup_records.append({"recovery_error": f"{type(exc).__name__}: {exc}"})
+        if initial_head is not None:
+            probe.set_head_joint_position(task.env, initial_head)
+        if initial_torso is not None:
+            probe.set_torso_joint_position(task.env, initial_torso)
+        mujoco.mj_forward(task.env.current_model, task.env.current_data)
+        task.env.camera_manager.registry.update_all_cameras(task.env)
+        observation = task.get_observations()
+        _capture_head_frame(task, frames, config.record_video)
+        _publish_restricted_ros_frame(runtime, task, decision_index=decision_index)
+
+    success = bool(completed and cleanup_succeeded and len(opened_pairs) == len(groups))
+    return {
+        "success": success,
+        "joint_results": tuple(result for _, result in opened_pairs),
+        "opened_joints": tuple(joint for joint, _ in opened_pairs),
+        "simulated_seconds": float(total_seconds),
+        # A transient target observation becomes a task endpoint only when the
+        # whole open-observe-close macro completed and all drawers were cleaned
+        # up.  This prevents a failed/partially open scan from earning success.
+        "target_discovery": observed_target_discovery if success else None,
+        "metadata": {
+            "execution_mode": "drawer_scan",
+            "view_profile": "drawer_low_view",
+            "view_applied": view_applied,
+            "group_count": len(groups),
+            "groups": group_records,
+            "cleanup": cleanup_records,
+        },
+        "observation": observation,
+    }
 
 
 def _runtime_joint_from_v3(interaction: dict[str, Any]) -> RuntimeJoint:
@@ -1120,6 +1480,33 @@ def _successful_object_skill_interaction_ids(
     return list(dict.fromkeys(resolved))
 
 
+def _successful_drawer_scan_interaction_ids(
+    *,
+    episode: dict[str, Any],
+    source_name: str,
+    opened_joints: tuple[RuntimeJoint, ...],
+) -> list[str]:
+    """Credit only private drawer joints that reached the open observation."""
+
+    ids_by_joint_index: dict[int, list[str]] = {}
+    for row in episode["interactive_nav"].get("interactions", []):
+        if str(row.get("object_name")) != source_name:
+            continue
+        ids_by_joint_index.setdefault(int(row.get("joint_index", -1)), []).append(
+            str(row["interaction_id"])
+        )
+    resolved: list[str] = []
+    seen: set[str] = set()
+    # ``opened_joints`` retains the physical top-to-bottom drawer-scan order.
+    # Preserve it for prerequisite scoring instead of reordering by JSON rows.
+    for joint in opened_joints:
+        for interaction_id in ids_by_joint_index.get(int(joint.joint_index), []):
+            if interaction_id not in seen:
+                resolved.append(interaction_id)
+                seen.add(interaction_id)
+    return resolved
+
+
 def _publish_restricted_ros_frame(
     runtime: RestrictedRosObjectGoalRuntime,
     task: Any,
@@ -1179,23 +1566,78 @@ def _consume_pending_ros_object_goal_interaction(
     joint_results: tuple[JointOpenResult, ...] = ()
     public_result: dict[str, Any]
     successful_ids: list[str] = []
+    transient_satisfied_ids: list[str] = []
+    target_discovery: dict[str, Any] | None = None
+    executor_metadata: dict[str, Any] = {}
+    executor_name = "trusted_object_force" if source_name is not None else None
+    observation = task.get_observations()
     if access_ok:
-        event = runtime.skill.execute_private(public_request)
-        joint_results = event.joint_results
-        successful_ids = _successful_object_skill_interaction_ids(
-            episode=episode,
-            source_name=str(source_name),
-            joints=joints,
-            joint_results=joint_results,
+        is_trusted_drawer_scan = bool(
+            request.sequence_type == "drawer_scan"
+            and source_name is not None
+            and _is_trusted_drawer_scan_target(episode, str(source_name), joints)
         )
-        completion = runtime.adapter.complete_interaction(
-            request.command_id,
-            success=event.public_result.completed,
-        )
-        public_result = event.public_result.to_public_dict()
-        simulated_seconds = float(sum(result.simulated_seconds for result in joint_results))
-        skill_completed = bool(event.public_result.completed)
-        postcondition = None if event.postcondition is None else event.postcondition.value
+        if is_trusted_drawer_scan:
+            allowed_drawer_joint_indices = _trusted_drawer_scan_joint_indices(
+                episode,
+                str(source_name),
+            )
+            scan = _execute_private_drawer_scan(
+                task=task,
+                runtime=runtime,
+                episode=episode,
+                joints=joints,
+                open_regions=request.open_regions,
+                allowed_joint_indices=allowed_drawer_joint_indices,
+                config=config,
+                decision_index=decision_index,
+                frames=frames,
+            )
+            joint_results = tuple(scan["joint_results"])
+            opened_joints = tuple(scan["opened_joints"])
+            successful_ids = _successful_drawer_scan_interaction_ids(
+                episode=episode,
+                source_name=str(source_name),
+                opened_joints=opened_joints,
+            )
+            transient_satisfied_ids = list(successful_ids)
+            skill_completed = bool(scan["success"])
+            # The macro itself only returns discovery after cleanup, but retain
+            # this boundary check so a future executor cannot accidentally turn
+            # a failed physical interaction into a target task success.
+            target_discovery = scan.get("target_discovery") if skill_completed else None
+            simulated_seconds = float(scan["simulated_seconds"])
+            postcondition = "drawer_scan_satisfied" if skill_completed else "drawer_scan_failed"
+            executor_metadata = dict(scan.get("metadata") or {})
+            executor_name = "trusted_drawer_scan"
+            completion = runtime.adapter.complete_interaction(
+                request.command_id,
+                success=skill_completed,
+            )
+            public_result = ObjectInteractionResult(
+                request_id=request.command_id,
+                instance_id=request.instance_id,
+                operation="open",
+                status="completed" if skill_completed else "failed",
+            ).to_public_dict()
+            observation = scan["observation"]
+        else:
+            event = runtime.skill.execute_private(public_request)
+            joint_results = event.joint_results
+            successful_ids = _successful_object_skill_interaction_ids(
+                episode=episode,
+                source_name=str(source_name),
+                joints=joints,
+                joint_results=joint_results,
+            )
+            completion = runtime.adapter.complete_interaction(
+                request.command_id,
+                success=event.public_result.completed,
+            )
+            public_result = event.public_result.to_public_dict()
+            simulated_seconds = float(sum(result.simulated_seconds for result in joint_results))
+            skill_completed = bool(event.public_result.completed)
+            postcondition = None if event.postcondition is None else event.postcondition.value
     else:
         completion = runtime.adapter.complete_interaction(request.command_id, success=False)
         public_result = {
@@ -1241,14 +1683,16 @@ def _consume_pending_ros_object_goal_interaction(
         joint_fraction_before=None,
         joint_fraction_after=None,
         prerequisite_satisfied=prerequisite_satisfied,
-        executor="trusted_object_force" if source_name is not None else None,
+        executor=executor_name,
         simulated_seconds=simulated_seconds,
         metadata={
             # This private trace is retained only for formal V3 scoring and is
-            # never handed to the ROS method.  It records no controller steps.
+            # never handed to the ROS method.
             "access": access_meta,
             "postcondition": postcondition,
             "joint_result_count": len(joint_results),
+            "transient_satisfied_interaction_ids": transient_satisfied_ids,
+            "drawer_scan": executor_metadata,
         },
     ).to_dict()
     public_attempt = {
@@ -1257,7 +1701,6 @@ def _consume_pending_ros_object_goal_interaction(
         "simulated_seconds": simulated_seconds,
         "result_status": str(completion.get("status") or "FAILED"),
     }
-    observation = task.get_observations()
     _capture_head_frame(task, frames, config.record_video)
     _publish_restricted_ros_frame(runtime, task, decision_index=decision_index)
     _discard_task_rollout_cache(task)
@@ -1266,6 +1709,7 @@ def _consume_pending_ros_object_goal_interaction(
         "public_attempt": public_attempt,
         "observation": observation,
         "simulated_seconds": simulated_seconds,
+        "target_discovery": target_discovery,
     }
 
 
@@ -1639,6 +2083,7 @@ def evaluate_episode(
         )
         _capture_head_frame(task, frames, config.record_video)
         previous_action: dict[str, Any] | None = None
+        transient_target_discovery: dict[str, Any] | None = None
 
         if runtime_goal_blocked:
             terminal_reason = "runtime_consistency_ineligible"
@@ -1647,7 +2092,8 @@ def evaluate_episode(
         for decision_index in range(
             0 if runtime_goal_blocked or config.quality_gate_only else int(config.max_steps)
         ):
-            nav_ok, target_distance, target_visibility = target_metrics(task, episode)
+            current_nav_ok, target_distance, target_visibility = target_metrics(task, episode)
+            nav_ok = bool(current_nav_ok or transient_target_discovery is not None)
             terminal_score = score_interactions(task.env, episode, attempts)
             # The task endpoint is deliberately independent from the hidden V3
             # interaction recipe.  Formal interaction-conditioned success is
@@ -1681,6 +2127,10 @@ def evaluate_episode(
                             "interaction": consumed["public_attempt"],
                         }
                     )
+                    if consumed.get("target_discovery") is not None:
+                        transient_target_discovery = dict(consumed["target_discovery"])
+                        terminal_reason = "target_found_during_drawer_scan"
+                        break
                     continue
             policy_observation = PolicyObservation(
                 observation=observation,
@@ -1716,6 +2166,10 @@ def evaluate_episode(
                             "interaction": consumed["public_attempt"],
                         }
                     )
+                    if consumed.get("target_discovery") is not None:
+                        transient_target_discovery = dict(consumed["target_discovery"])
+                        terminal_reason = "target_found_during_drawer_scan"
+                        break
                     continue
             if action.kind == "stop":
                 terminal_reason = str(action.metadata.get("reason", "policy_stop"))
@@ -1852,7 +2306,8 @@ def evaluate_episode(
             if not runtime_goal_blocked and not config.quality_gate_only:
                 terminal_reason = "max_steps"
 
-        nav_ok, target_distance, target_visibility = target_metrics(task, episode)
+        current_nav_ok, target_distance, target_visibility = target_metrics(task, episode)
+        nav_ok = bool(current_nav_ok or transient_target_discovery is not None)
         terminal_score = score_interactions(task.env, episode, attempts)
         requirement = str(nav["interaction_requirement"])
         task_success = bool(nav_ok)
@@ -1908,6 +2363,16 @@ def evaluate_episode(
             runtime_goal_consistency=public_runtime_goal_consistency,
             runtime_consistency=public_runtime_consistency,
         ).to_dict()
+        if transient_target_discovery is not None and private_visualization is not None:
+            # Keep the scan-time target evidence beside other evaluator-only
+            # visualization GT.  The public trace retains only the real final
+            # camera metrics after the drawer is closed.
+            private_visualization["transient_target_discovery"] = {
+                "distance_m": float(transient_target_discovery["distance_m"]),
+                "visibility_fraction": float(transient_target_discovery["visibility_fraction"]),
+                "visible_pixels": int(transient_target_discovery["visible_pixels"]),
+                "group_index": int(transient_target_discovery["group_index"]),
+            }
         terminal_trace: dict[str, Any] = {
             "task_success": task_success,
             "interaction_conditioned_success": interaction_conditioned_success,

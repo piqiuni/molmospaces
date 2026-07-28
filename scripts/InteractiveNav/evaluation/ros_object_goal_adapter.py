@@ -35,6 +35,7 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 import json
+import math
 import threading
 import time
 from typing import Any
@@ -570,6 +571,11 @@ class EvaluatorInteractionRequest:
     node_id: str = ""
     candidate_id: str = ""
     decision_id: str = ""
+    # These are method-produced visual hints, never simulator selectors.  They
+    # remain evaluator-private so the public completion event stays the compact
+    # opaque-object contract.
+    sequence_type: str = ""
+    open_regions: tuple[tuple[float, float], ...] = field(default_factory=tuple)
 
 
 InteractionExecutor = Callable[[EvaluatorInteractionRequest], bool | Mapping[str, Any]]
@@ -993,6 +999,7 @@ class RosObjectGoalEvaluatorAdapter:
             node_id = str(payload.get("node_id") or "")
             candidate_id = str(payload.get("candidate_id") or "")
             decision_id = str(payload.get("decision_id") or "")
+            sequence_type, open_regions = self._drawer_scan_hint(payload)
             private_handle = self._private_instances.get(instance_id)
             episode_id = self._episode_id
         if action != "open":
@@ -1026,6 +1033,8 @@ class RosObjectGoalEvaluatorAdapter:
             node_id=node_id,
             candidate_id=candidate_id,
             decision_id=decision_id,
+            sequence_type=sequence_type,
+            open_regions=open_regions,
         )
         with self._lock:
             self._pending_by_command_id[command_id] = request
@@ -1064,6 +1073,43 @@ class RosObjectGoalEvaluatorAdapter:
             if value:
                 return value
         return ""
+
+    @staticmethod
+    def _drawer_scan_hint(
+        payload: Mapping[str, Any],
+    ) -> tuple[str, tuple[tuple[float, float], ...]]:
+        """Keep only public visual drawer-scan hints from a ROS command.
+
+        A V3 method still requests ``open(opaque_object_id)``.  When its MLLM
+        has selected a drawer scan, the evaluator may use normalized image
+        centers to choose private slide joints.  Guessed joint names, force
+        settings, part IDs and other simulator metadata are intentionally not
+        accepted here.
+        """
+
+        if str(payload.get("sequence_type") or "").strip().casefold() != "drawer_scan":
+            return "", ()
+        raw_regions = payload.get("open_regions")
+        if not isinstance(raw_regions, list):
+            return "drawer_scan", ()
+        regions: list[tuple[float, float]] = []
+        for raw_region in raw_regions[:12]:
+            if not isinstance(raw_region, Mapping):
+                continue
+            center = raw_region.get("center")
+            if not isinstance(center, (list, tuple)) or len(center) < 2:
+                continue
+            try:
+                x, y = float(center[0]), float(center[1])
+            except (TypeError, ValueError):
+                continue
+            if not (math.isfinite(x) and math.isfinite(y) and 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                continue
+            point = (x, y)
+            if point not in regions:
+                regions.append(point)
+        regions.sort(key=lambda point: (point[1], point[0]))
+        return "drawer_scan", tuple(regions)
 
     def _reject_unresolved_command(
         self,

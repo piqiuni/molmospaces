@@ -806,7 +806,20 @@ zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
   outputs/v3_container_episode_1000 1000
 ```
 
-默认使用 `object_goal_v3_full_mllm.yaml` 与 `ros_object_goal_rule`，可通过 `SEMANTIC_DECISION_OVERRIDE`、`SEMANTIC_MAPPING_OVERRIDE` 或 `POLICY` 覆盖。完成后必须检查：
+该入口固定为 `METHOD=full_mllm_object_goal`：`object_goal_v3_full_mllm.yaml` 必须包含
+`dynamic_mllm / mllm_score / mllm_skill_verified`。其中 `POLICY=ros_object_goal_rule`
+只是受限 GT、ROS 和 opaque interaction 的评测适配器名，不是规则语义方法，不能替换为
+其他 policy。需要替换 MLLM 配置时，可传 `SEMANTIC_DECISION_OVERRIDE` 与
+`SEMANTIC_MAPPING_OVERRIDE`，但脚本会校验三模块仍为完整 MLLM。
+
+对抽屉目标，MLLM 输出的是高层 `drawer_scan` 宏动作和可见抽屉的归一化区域；V3 对外
+仍只发送 opaque `open(object_id)`，由可信评测侧私有执行“低头 → 从上到下逐格打开 →
+观察/更新受限感知 → 关闭 → 下一格 → 恢复视角”。扫描期间已验证的开度和目标可见性会
+被私有地计入评测，因此关闭抽屉不会被误判为交互或目标失败。空/非法视觉区域会直接
+失败，不会退化成扫描全部 simulator drawer；每个 force substep 都锁定机身与上肢，异常时
+会先尝试关闭已触及抽屉并恢复视角。
+
+完成后必须检查：
 
 - `debug/videos/overview_6panel.mp4`：ROS 相机、OCC、房间/交互、全局/局部代价图、语义图与拓扑图六联视频。
 - `eval/episodes/<episode>/episode_topdown.png`：场景底图、真实探索轨迹、起点、GT target、GT/实际交互及 oracle 路径。

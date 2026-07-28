@@ -1,5 +1,6 @@
 from force_interaction_runtime import (
     build_articulation_targets,
+    ground_drawer_open_regions,
     joint_open_fraction,
     merge_door_leaf_joint_records,
 )
@@ -54,6 +55,38 @@ def test_drawer_style_command_opens_one_slide_and_closes_other_slides():
 def test_open_fraction_uses_closed_endpoint_for_slide():
     assert joint_open_fraction(0.0, [0.0, 0.45]) == 0.0
     assert joint_open_fraction(0.45, [0.0, 0.45]) == 1.0
+
+
+def test_drawer_scan_grounding_uses_visual_top_to_bottom_order():
+    groups = ground_drawer_open_regions(
+        [
+            {"joint_name": "drawer_top", "joint_type": "slide"},
+            {"joint_name": "drawer_bottom", "joint_type": "slide"},
+        ],
+        [
+            {"center": [0.5, 0.82]},
+            {"center": [0.5, 0.18]},
+        ],
+        {"drawer_top": 1.2, "drawer_bottom": 0.5},
+        fallback_to_all=False,
+    )
+
+    assert [group["joint_names"] for group in groups] == [
+        ["drawer_top"],
+        ["drawer_bottom"],
+    ]
+    assert all(group["grounding_source"] == "visual_region_vertical_order" for group in groups)
+
+
+def test_mllm_drawer_scan_does_not_invent_hidden_drawers_without_regions():
+    groups = ground_drawer_open_regions(
+        [{"joint_name": "drawer_top", "joint_type": "slide"}],
+        [],
+        {"drawer_top": 1.2},
+        fallback_to_all=False,
+    )
+
+    assert groups == []
 
 
 def test_double_door_merges_missing_leaf_and_excludes_handle():

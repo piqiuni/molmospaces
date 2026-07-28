@@ -445,6 +445,8 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if not self._matches_active(payload):
                 return
+            visual_plan = dict(self.active_skill_plan.get("visual_operation_plan") or {})
+            is_drawer_scan = str(visual_plan.get("target_type") or "") == "drawer_container"
             if (
                 self.ablation.module3 == "mllm_skill_verified"
                 and bool(payload.get("success"))
@@ -479,13 +481,29 @@ class SemanticBehaviorExecutor:
                 self.machine.state == STATE_VERIFYING
                 and self.ablation.module3 == "mllm_skill_verified"
             ):
-                decision_id = str((self.selection or {}).get("decision_id") or "")
-                result_image_sequence = self.latest_image_sequence
-                threading.Thread(
-                    target=self._run_visual_verification,
-                    args=(decision_id, payload, result_image_sequence),
-                    daemon=True,
-                ).start()
+                if is_drawer_scan:
+                    # A drawer scan intentionally closes each drawer after its
+                    # low-view observation.  Re-checking the final exterior
+                    # crop as though it should remain open would reject a
+                    # successful scan.  The semantic map receives the frames
+                    # captured while each drawer is open instead.
+                    commands.extend(
+                        self.machine.on_verification_result(
+                            True,
+                            detail={
+                                **payload,
+                                "verification_mode": "drawer_scan_backend",
+                            },
+                        )
+                    )
+                else:
+                    decision_id = str((self.selection or {}).get("decision_id") or "")
+                    result_image_sequence = self.latest_image_sequence
+                    threading.Thread(
+                        target=self._run_visual_verification,
+                        args=(decision_id, payload, result_image_sequence),
+                        daemon=True,
+                    ).start()
         if next_candidate is not None:
             self._publish_interaction_command(next_candidate)
         else:

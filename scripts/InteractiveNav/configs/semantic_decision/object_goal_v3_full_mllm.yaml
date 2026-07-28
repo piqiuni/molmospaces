@@ -72,7 +72,7 @@ completion:
   stagnation_failure_limit: 8
 
 executor:
-  # V3 exposes only open(opaque_object_id); the evaluator privately resolves
-  # any object parts/joints and runs the trusted force skill.
+  # V3 exposes only open(opaque_object_id); a drawer_scan visual hint remains
+  # opaque and is expanded privately into low-view open-observe-close steps.
   evaluator_opaque_open_only: true
   interaction_navigation_timeout_s: 180.0

@@ -26,6 +26,10 @@ if [[ ! "${EPISODE_INDEX}" =~ '^[0-9]+$' ]]; then
 fi
 
 BENCHMARK=${BENCHMARK:-${REPO_ROOT}/scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json}
+# POLICY is the evaluator's ROS/restricted-GT adapter.  METHOD names the
+# semantic method loaded into that adapter and is deliberately fixed to MLLM
+# for all V3 benchmark runs through this entry point.
+METHOD=${METHOD:-full_mllm_object_goal}
 POLICY=${POLICY:-ros_object_goal_rule}
 MAX_STEPS=${MAX_STEPS:-1000}
 VIDEO_FPS=${VIDEO_FPS:-5}
@@ -49,6 +53,25 @@ for required_path in "${BENCHMARK}" "${ROS_SETUP}" "${SEMANTIC_MODEL_ENV_FILE}" 
     exit 2
   fi
 done
+
+if [[ "${METHOD}" != "full_mllm_object_goal" ]]; then
+  print -u2 -- "V3 benchmark wrapper requires METHOD=full_mllm_object_goal, got: ${METHOD}"
+  exit 2
+fi
+if [[ "${POLICY}" != "ros_object_goal_rule" ]]; then
+  print -u2 -- "V3 full-MLLM uses the ros_object_goal_rule evaluator adapter, got POLICY=${POLICY}"
+  exit 2
+fi
+for required_mllm_setting in \
+  'module1: "dynamic_mllm"' \
+  'module2: "mllm_score"' \
+  'module3: "mllm_skill_verified"'; do
+  if ! grep -Fq -- "${required_mllm_setting}" "${SEMANTIC_DECISION_OVERRIDE}"; then
+    print -u2 -- "V3 semantic override is not the required full-MLLM method: missing ${required_mllm_setting}"
+    exit 2
+  fi
+done
+print -r -- "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
 
 mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/ros_home/log"
 if [[ -e "${RUN_DIR}/eval" ]]; then

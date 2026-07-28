@@ -136,6 +136,7 @@ def score_interactions(
     by_id = {str(row["interaction_id"]): row for row in interactions}
     fractions = {key: joint_open_fraction(env, row) for key, row in by_id.items()}
     successful_required: list[str] = []
+    transient_satisfied: set[str] = set()
     for row in attempts:
         if row.get("classification") != "required_valid" or not bool(row.get("success")):
             continue
@@ -148,6 +149,10 @@ def score_interactions(
             successful_required.extend(str(value) for value in resolved_ids if value is not None)
         elif row.get("resolved_interaction_id") is not None:
             successful_required.append(str(row["resolved_interaction_id"]))
+        metadata = row.get("metadata") or {}
+        transient_ids = metadata.get("transient_satisfied_interaction_ids", [])
+        if isinstance(transient_ids, (list, tuple, set)):
+            transient_satisfied.update(str(value) for value in transient_ids if value is not None)
     completed: set[str] = set()
     sequence_success = True
     correct_action_count = 0
@@ -180,7 +185,11 @@ def score_interactions(
                 plan_id
                 for plan_id, required_ids in plan_rows
                 if required_ids.issubset(completed)
-                and all(fractions.get(item, 0.0) >= SUCCESS_OPEN_FRACTION for item in required_ids)
+                and all(
+                    fractions.get(item, 0.0) >= SUCCESS_OPEN_FRACTION
+                    or item in transient_satisfied
+                    for item in required_ids
+                )
             ),
             None,
         )

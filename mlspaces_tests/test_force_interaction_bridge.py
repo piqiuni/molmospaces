@@ -431,12 +431,17 @@ def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
 def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch) -> None:
     state = {"drawer_top": 0.0, "drawer_bottom": 0.0}
     published = []
+    prepared_targets = []
+    lock_calls = []
     joints = [
         {"joint_name": "drawer_top", "joint_type": "slide", "joint_id": 0},
         {"joint_name": "drawer_bottom", "joint_type": "slide", "joint_id": 1},
     ]
 
     def prepare(_env, _root, open_joint_names=None, close_joint_names=None):
+        prepared_targets.append(
+            (tuple(open_joint_names or []), tuple(close_joint_names or []))
+        )
         targets = {
             name: 1.0 for name in open_joint_names or []
         }
@@ -453,6 +458,9 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
         }
 
     def advance(_env, plan, **_kwargs):
+        callback = _kwargs.get("robot_lock_callback")
+        if callback is not None:
+            callback()
         state.update(plan["targets"])
         return {"physics_substeps": 1, "fallback": False}
 
@@ -478,6 +486,14 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
         "scripts.InteractiveNav.force_interaction_bridge.collect_articulation_groups",
         lambda _env: {"dresser_root": {"joints": joints}},
     )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge._capture_robot_lock",
+        lambda _env: {"locked": True},
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge._apply_robot_lock",
+        lambda _env, snapshot: lock_calls.append(snapshot),
+    )
     controller = AtomicForceInteractionController(
         close_all_doors_on_prepare=False,
         drawer_execution_mode="fast",
@@ -494,6 +510,10 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
         "action": "scan",
         "sequence_type": "drawer_scan",
         "approach_goal_xyyaw": [1.0, 2.0, 0.5],
+        "open_regions": [
+            {"center": [0.5, 0.2]},
+            {"center": [0.5, 0.8]},
+        ],
         "interaction_groups": [
             {"group_id": "bad", "joint_names": ["planner_must_not_select_this"]},
         ],
@@ -519,6 +539,18 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     assert "joint_infos" not in result
     assert result["source"] == "force_container_sequence"
     assert len(published) == 2
+    # A completed close phase now separates the two drawers.  In particular,
+    # the bottom drawer is never opened in the same transition that closes the
+    # top one, even in the low-latency ``fast`` mode.
+    assert prepared_targets == [
+        (("drawer_top",), ()),
+        ((), ("drawer_top",)),
+        (("drawer_bottom",), ()),
+        ((), ("drawer_bottom",)),
+    ]
+    # The lock is applied before/after each phase and passed down to the force
+    # routine so real MuJoCo substeps also reassert the robot pose.
+    assert len(lock_calls) >= 12
 
 
 def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -> None:
@@ -580,10 +612,14 @@ def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -
     assert controller.enqueue_command(
         {
             "command_id": "drawer_scan_smooth",
-            "object_id": "dresser_root",
-            "action": "scan",
-            "sequence_type": "drawer_scan",
-        }
+                "object_id": "dresser_root",
+                "action": "scan",
+                "sequence_type": "drawer_scan",
+                "open_regions": [
+                    {"center": [0.5, 0.2]},
+                    {"center": [0.5, 0.8]},
+                ],
+            }
     )
     model = SimpleNamespace(jnt_bodyid=[0, 1])
     data = SimpleNamespace(xpos=[[0.0, 0.0, 1.0], [0.0, 0.0, 0.2]])
@@ -599,3 +635,54 @@ def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -
     assert result["success"] is True
     assert result["drawer_transition_steps"] == 3
     assert result["task_steps_consumed"] == 14
+
+
+def test_drawer_scan_failure_best_effort_closes_and_restores_view(monkeypatch) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    command = {
+        "command_id": "drawer_failure",
+        "object_id": "dresser_root",
+        "action": "scan",
+        "sequence_type": "drawer_scan",
+    }
+    # Mirror a command already taken from the queue by ``before_step``.
+    controller._commands.put(command)
+    controller._commands.get_nowait()
+    controller._pending = {
+        "kind": "drawer_sequence",
+        "command": command,
+        "all_joint_names": ["drawer_top", "drawer_bottom"],
+        "robot_lock_snapshot": None,
+        "view_result": {"applied": True},
+    }
+    prepared_close_names = []
+    published = []
+
+    def prepare(_env, _root, close_joint_names=None, **_kwargs):
+        prepared_close_names.append(tuple(close_joint_names or []))
+        return {"targets": {name: 0.0 for name in close_joint_names or []}}
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_state_force",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.complete_articulation_force",
+        lambda *_args, **_kwargs: {"success": True},
+    )
+    controller._head_view_controller.restore = lambda _env: {"restored": True}
+    monkeypatch.setattr(controller, "_publish", lambda _publisher, payload: published.append(payload))
+
+    result = controller._abort_drawer_sequence(
+        SimpleNamespace(env=SimpleNamespace()),
+        step=9,
+        exc=RuntimeError("render failed"),
+    )
+
+    assert prepared_close_names == [("drawer_top", "drawer_bottom")]
+    assert result["status"] == "FAILED"
+    assert result["failure_reason"] == "drawer_scan_execution_failed"
+    assert result["view_restore_result"] == {"restored": True}
+    assert controller._pending is None
+    assert controller.should_pause_navigation() is False
+    assert len(published) == 2

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import math
-import math
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import mujoco
 import numpy as np
@@ -47,6 +46,76 @@ def joint_open_fraction(value: float, joint_range) -> float:
     if span <= 1e-8:
         return 0.0
     return float(np.clip(abs(float(value) - closed) / span, 0.0, 1.0))
+
+
+def ground_drawer_open_regions(
+    joints: list[dict[str, Any]],
+    open_regions: list[dict[str, Any]],
+    body_heights: dict[str, float],
+    *,
+    fallback_to_all: bool = True,
+) -> list[dict[str, Any]]:
+    """Privately map public crop-space drawer regions to slide joints.
+
+    The visual plan contains only normalized image centers.  Simulator joint
+    names and body heights remain on the trusted execution side.  Regions and
+    joints are both ordered top-to-bottom before matching, so a plan never
+    needs to expose a private joint selector.
+    """
+
+    drawers = [
+        dict(joint)
+        for joint in joints
+        if str(joint.get("joint_type") or "").casefold() == "slide"
+        and str(joint.get("joint_name") or "")
+    ]
+    drawers.sort(
+        key=lambda joint: (
+            -float(body_heights.get(str(joint.get("joint_name") or ""), 0.0)),
+            str(joint.get("joint_name") or ""),
+        )
+    )
+    if not drawers:
+        return []
+    regions = [
+        dict(region)
+        for region in open_regions
+        if isinstance(region, dict)
+        and isinstance(region.get("center"), (list, tuple))
+        and len(region["center"]) >= 2
+    ]
+    regions.sort(key=lambda region: (float(region["center"][1]), float(region["center"][0])))
+    if not regions:
+        if not fallback_to_all:
+            return []
+        return [
+            {
+                "group_id": f"sim_drawer_{index:02d}",
+                "joint_names": [str(joint["joint_name"])],
+                "open_region": None,
+                "grounding_source": "simulator_all_slide_joints",
+            }
+            for index, joint in enumerate(drawers)
+        ]
+
+    available = list(range(len(drawers)))
+    grounded = []
+    for region_index, region in enumerate(regions[: len(drawers)]):
+        y = max(0.0, min(1.0, float(region["center"][1])))
+        target_rank = y * max(0, len(drawers) - 1)
+        drawer_index = min(available, key=lambda index: (abs(index - target_rank), index))
+        available.remove(drawer_index)
+        grounded.append(
+            {
+                "group_id": f"visual_drawer_{region_index:02d}",
+                "joint_names": [str(drawers[drawer_index]["joint_name"])],
+                "open_region": region,
+                "grounding_source": "visual_region_vertical_order",
+                "simulator_rank": drawer_index,
+            }
+        )
+    grounded.sort(key=lambda group: float((group["open_region"] or {})["center"][1]))
+    return grounded
 
 
 def merge_door_leaf_joint_records(
@@ -624,6 +693,8 @@ def complete_articulation_force(
     env,
     plan: dict[str, Any],
     config: ForceDriveConfig | None = None,
+    *,
+    robot_lock_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     config = config or ForceDriveConfig()
     model = env.current_model
@@ -633,6 +704,7 @@ def complete_articulation_force(
         data,
         plan["targets"],
         config=config,
+        robot_lock_callback=robot_lock_callback,
     )
     plan["drive"] = drive_result
     plan["force_specs"] = _build_force_specs(model, plan["targets"])
@@ -801,6 +873,8 @@ def advance_articulation_force(
     start_values: Mapping[str, float],
     transition_steps: int,
     config: ForceDriveConfig | None = None,
+    *,
+    robot_lock_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Advance an articulation toward a target over one task step."""
     config = config or ForceDriveConfig()
@@ -824,6 +898,7 @@ def advance_articulation_force(
         env.current_data,
         targets,
         config=step_config,
+        robot_lock_callback=robot_lock_callback,
     )
     fallback = False
     if not drive.get("success"):
@@ -1081,6 +1156,8 @@ def drive_joint_group_to_targets(
     data: mujoco.MjData,
     joint_targets: Mapping[str, float],
     config: ForceDriveConfig | None = None,
+    *,
+    robot_lock_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     config = config or ForceDriveConfig()
     specs = []
@@ -1118,6 +1195,8 @@ def drive_joint_group_to_targets(
     minimum_contact_distance = initial_contacts["minimum_distance"]
     try:
         for substep in range(max(1, int(config.max_physics_substeps))):
+            if robot_lock_callback is not None:
+                robot_lock_callback()
             data.xfrc_applied[:, :] = 0.0
             all_stable = True
             for spec in specs:
@@ -1139,6 +1218,8 @@ def drive_joint_group_to_targets(
                     and abs(velocity) <= config.velocity_tolerance
                 )
             mujoco.mj_step(model, data)
+            if robot_lock_callback is not None:
+                robot_lock_callback()
             completed_substeps = substep + 1
             contact_stats = _robot_articulation_contact_stats(model, data, root_body_id)
             max_contact_count = max(max_contact_count, int(contact_stats["count"]))

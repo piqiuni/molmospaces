@@ -220,6 +220,39 @@ def test_object_level_command_uses_private_handle_but_redacts_force_result() -> 
     assert published == result
 
 
+def test_drawer_scan_visual_hint_is_sanitized_but_never_emitted_in_result() -> None:
+    adapter, rospy = _adapter()
+    _reset(adapter, {"obj_000017": object()})
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "scan-dresser",
+            "object_id": "obj_000017",
+            "action": "open",
+            "sequence_type": "drawer_scan",
+            "open_regions": [
+                {"center": [0.6, 0.8], "confidence": 0.9},
+                {"center": [0.4, 0.2], "confidence": 0.8},
+                {"center": [4.0, 0.5]},
+                {"center": [0.4, 0.2]},
+            ],
+            "joint_names": ["guessed_private_drawer"],
+            "force_target_fraction": 1.0,
+        }
+    )
+
+    assert request is not None
+    assert request.action == "open"
+    assert request.sequence_type == "drawer_scan"
+    assert request.open_regions == ((0.4, 0.2), (0.6, 0.8))
+    result = adapter.complete_interaction(request.command_id, success=True)
+    serialized = json.dumps(result, sort_keys=True)
+    assert "drawer_scan" not in serialized
+    assert "guessed_private_drawer" not in serialized
+    assert "force_target_fraction" not in serialized
+    assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
+
+
 def test_executor_receives_private_handle_and_unknown_raw_name_is_rejected() -> None:
     private_handle = {"body": "private_mujoco_name", "joint": "private_joint"}
     received = []

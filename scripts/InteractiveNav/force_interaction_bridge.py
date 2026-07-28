@@ -7,6 +7,9 @@ from pathlib import Path
 import time
 from typing import Any
 
+import mujoco
+import numpy as np
+
 from force_interaction_runtime import (
     ForceDriveConfig,
     HeadViewController,
@@ -15,6 +18,7 @@ from force_interaction_runtime import (
     complete_articulation_force,
     collect_articulation_groups,
     finalize_articulation_force_transition,
+    ground_drawer_open_regions,
     prepare_articulation_force,
     prepare_articulation_state_force,
     open_door_root_with_force,
@@ -23,63 +27,77 @@ from force_interaction_runtime import (
 )
 
 
-def ground_drawer_open_regions(
-    joints: list[dict[str, Any]],
-    open_regions: list[dict[str, Any]],
-    body_heights: dict[str, float],
-) -> list[dict[str, Any]]:
-    """Match crop-space drawer centers to simulator-only slide joints by vertical order."""
-    drawers = [
-        dict(joint)
-        for joint in joints
-        if str(joint.get("joint_type") or "").casefold() == "slide"
-        and str(joint.get("joint_name") or "")
-    ]
-    drawers.sort(
-        key=lambda joint: (
-            -float(body_heights.get(str(joint.get("joint_name") or ""), 0.0)),
-            str(joint.get("joint_name") or ""),
-        )
-    )
-    if not drawers:
-        return []
-    regions = [
-        dict(region)
-        for region in open_regions
-        if isinstance(region, dict)
-        and isinstance(region.get("center"), (list, tuple))
-        and len(region["center"]) >= 2
-    ]
-    regions.sort(key=lambda region: (float(region["center"][1]), float(region["center"][0])))
-    if not regions:
-        return [
-            {
-                "group_id": f"sim_drawer_{index:02d}",
-                "joint_names": [str(joint["joint_name"])],
-                "open_region": None,
-                "grounding_source": "simulator_all_slide_joints",
-            }
-            for index, joint in enumerate(drawers)
-        ]
+def _capture_robot_lock(task_env) -> dict[str, Any] | None:
+    """Snapshot base and upper body after the drawer low-view posture is set."""
 
-    available = list(range(len(drawers)))
-    grounded = []
-    for region_index, region in enumerate(regions[: len(drawers)]):
-        y = max(0.0, min(1.0, float(region["center"][1])))
-        target_rank = y * max(0, len(drawers) - 1)
-        drawer_index = min(available, key=lambda index: (abs(index - target_rank), index))
-        available.remove(drawer_index)
-        grounded.append(
-            {
-                "group_id": f"visual_drawer_{region_index:02d}",
-                "joint_names": [str(drawers[drawer_index]["joint_name"])],
-                "open_region": region,
-                "grounding_source": "visual_region_vertical_order",
-                "simulator_rank": drawer_index,
-            }
-        )
-    grounded.sort(key=lambda group: float((group["open_region"] or {})["center"][1]))
-    return grounded
+    try:
+        robot_view = task_env.current_robot.robot_view
+        base = robot_view.base
+        groups: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for name in ("left_arm", "right_arm", "left_gripper", "right_gripper", "torso", "head"):
+            try:
+                group = robot_view.get_move_group(name)
+            except (AttributeError, KeyError, ValueError):
+                continue
+            groups[name] = (
+                np.asarray(group.joint_pos, dtype=float).copy(),
+                np.zeros_like(np.asarray(group.joint_vel, dtype=float)),
+                np.asarray(group.noop_ctrl, dtype=float).copy(),
+            )
+        return {
+            "base_pose": np.asarray(base.pose, dtype=float).copy(),
+            "base_ctrl": np.asarray(base.ctrl, dtype=float).copy(),
+            "base_hold_target": np.asarray(
+                [
+                    float(base.pose[0, 3]),
+                    float(base.pose[1, 3]),
+                    math.atan2(float(base.pose[1, 0]), float(base.pose[0, 0])),
+                ],
+                dtype=float,
+            ),
+            "groups": groups,
+        }
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _apply_robot_lock(task_env, snapshot: dict[str, Any] | None) -> None:
+    """Reassert the interaction pose before/after every force substep."""
+
+    if snapshot is None:
+        return
+    try:
+        robot_view = task_env.current_robot.robot_view
+        base = robot_view.base
+        base.pose = np.asarray(snapshot["base_pose"], dtype=float).copy()
+        base.joint_vel = np.zeros_like(base.joint_vel)
+        base_hold_target = np.asarray(snapshot["base_hold_target"], dtype=float)
+        base_ctrl = np.asarray(snapshot["base_ctrl"], dtype=float)
+        try:
+            base.ctrl = (
+                base_hold_target.copy()
+                if np.asarray(base.ctrl).shape == base_hold_target.shape
+                else base_ctrl.copy()
+            )
+        except (AttributeError, ValueError):
+            pass
+        for name, (qpos, qvel, ctrl) in dict(snapshot["groups"]).items():
+            group = robot_view.get_move_group(name)
+            group.joint_pos = qpos.copy()
+            group.joint_vel = qvel.copy()
+            try:
+                group.ctrl = ctrl.copy()
+            except (AttributeError, ValueError):
+                pass
+        mujoco.mj_forward(task_env.current_model, task_env.current_data)
+        try:
+            task_env.camera_manager.registry.update_all_cameras(task_env)
+        except AttributeError:
+            pass
+    except (AttributeError, KeyError, TypeError, ValueError):
+        # The bridge can also be unit-tested with a reduced mock environment;
+        # in a real simulator a complete snapshot is always available.
+        return
 
 
 class AtomicForceInteractionController:
@@ -199,7 +217,10 @@ class AtomicForceInteractionController:
     def before_step(self, task, step: int) -> dict[str, Any] | None:
         if self._pending is not None:
             if self._pending.get("kind") == "drawer_sequence":
-                self._advance_drawer_sequence_before_step(task)
+                try:
+                    self._advance_drawer_sequence_before_step(task)
+                except Exception as exc:
+                    return self._abort_drawer_sequence(task, step, exc)
             elif self._pending.get("kind") == "articulation_sequence":
                 self._advance_articulation_sequence_before_step(task, step)
             return None
@@ -224,7 +245,10 @@ class AtomicForceInteractionController:
             )
             if str(command.get("sequence_type") or "") == "drawer_scan":
                 self._start_drawer_sequence(task, command, step)
-                self._advance_drawer_sequence_before_step(task)
+                try:
+                    self._advance_drawer_sequence_before_step(task)
+                except Exception as exc:
+                    return self._abort_drawer_sequence(task, step, exc)
                 return None
             view_profile = str(command.get("view_profile") or "default")
             try:
@@ -405,7 +429,10 @@ class AtomicForceInteractionController:
         if pending is None:
             return None
         if pending.get("kind") == "drawer_sequence":
-            return self._advance_drawer_sequence_after_step(task, step)
+            try:
+                return self._advance_drawer_sequence_after_step(task, step)
+            except Exception as exc:
+                return self._abort_drawer_sequence(task, step, exc)
         if pending.get("phase") == "pre_interaction_hold" and int(
             pending.get("remaining_view_hold_steps", 0)
         ) > 0:
@@ -615,9 +642,13 @@ class AtomicForceInteractionController:
             list(articulation.get("joints") or []),
             list(command.get("open_regions") or []),
             body_heights,
+            # An MLLM drawer_scan may operate only on front/handle regions it
+            # actually identified.  Do not silently convert an empty visual
+            # plan into a simulator-wide sweep of hidden drawers.
+            fallback_to_all=False,
         )
         if not groups:
-            raise ValueError("drawer_scan requires at least one slide joint")
+            raise ValueError("drawer_scan requires at least one valid visible drawer region")
         self._pending = {
             "kind": "drawer_sequence",
             "command": command,
@@ -645,6 +676,9 @@ class AtomicForceInteractionController:
             "physics_substeps": 0,
             "view_result": None,
             "view_restore_result": None,
+            # Filled after the low view is applied, then reasserted around
+            # every internal force substep for the whole drawer macro.
+            "robot_lock_snapshot": None,
         }
         self._pause_navigation = True
 
@@ -662,22 +696,26 @@ class AtomicForceInteractionController:
         transition_steps = int(pending["transition_steps"]) if mode == "smooth" else 1
         if pending.get("phase_plan") is None:
             if phase == "open":
-                close_names = [
-                    name
-                    for name in pending["all_joint_names"]
-                    if name not in current_group["joint_names"]
-                ]
                 pending["phase_plan"] = prepare_articulation_state_force(
                     task.env,
                     pending["command"]["object_id"],
                     open_joint_names=current_group["joint_names"],
-                    close_joint_names=close_names,
+                    # The prior close phase has already returned every
+                    # processed drawer to its closed state.  Keep this force
+                    # transition single-purpose so opening the next drawer
+                    # never overlaps any close transition.
+                    close_joint_names=[],
                 )
             else:
                 pending["phase_plan"] = prepare_articulation_state_force(
                     task.env,
                     pending["command"]["object_id"],
-                    close_joint_names=pending["all_joint_names"],
+                    # Close the drawer that was just observed before advancing
+                    # to the next one.  Do not overlap its close transition
+                    # with opening the following drawer: V3 and normal ROS
+                    # execution share the explicit open → observe → close
+                    # macro semantics.
+                    close_joint_names=current_group["joint_names"],
                 )
             pending["phase_start_values"] = {
                 str(info["joint_name"]): float(info["joint_value"])
@@ -702,18 +740,16 @@ class AtomicForceInteractionController:
             )
             if pending["view_result"] is None:
                 pending["view_result"] = view_result
-        if phase == "close" and group_index == len(groups) - 1:
-            view_progress = progress if mode == "smooth" else 1.0
-            self._head_view_controller.command(
-                task.env,
-                "drawer_low_view",
-                tilt_rad=float(command.get("view_tilt_rad", 0.30) or 0.30)
-                * (1.0 - view_progress),
-                torso_pitch_rad=float(
-                    command.get("view_torso_pitch_rad", 0.35) or 0.35
-                )
-                * (1.0 - view_progress),
-            )
+            # In smooth mode the low-view pose itself ramps over the first
+            # drawer-open transition.  Refresh the lock after each view update
+            # so it holds the current ramp pose instead of resetting to the
+            # first partial tilt on every force substep.
+            pending["robot_lock_snapshot"] = _capture_robot_lock(task.env)
+        if pending.get("robot_lock_snapshot") is None:
+            pending["robot_lock_snapshot"] = _capture_robot_lock(task.env)
+        robot_lock = pending.get("robot_lock_snapshot")
+        if robot_lock is not None:
+            _apply_robot_lock(task.env, robot_lock)
         transition = advance_articulation_force(
             task.env,
             pending["phase_plan"],
@@ -721,7 +757,12 @@ class AtomicForceInteractionController:
             start_values=pending["phase_start_values"],
             transition_steps=transition_steps,
             config=self.force_config,
+            robot_lock_callback=(
+                None if robot_lock is None else lambda: _apply_robot_lock(task.env, robot_lock)
+            ),
         )
+        if robot_lock is not None:
+            _apply_robot_lock(task.env, robot_lock)
         pending["phase_step"] = next_step
         pending["physics_substeps"] += int(transition.get("physics_substeps", 0))
         pending["transition_log"].append(
@@ -747,25 +788,10 @@ class AtomicForceInteractionController:
         if phase in {"open", "close"} and int(pending["phase_step"]) < transition_steps:
             return None
         if phase == "open":
-            if mode == "fast":
-                self._force_observation_requested = True
-                if int(pending["observation_steps"]) > 1:
-                    pending["phase"] = "observe"
-                    pending["phase_step"] = 0
-                    pending["phase_plan"] = None
-                    pending["remaining_observation_steps"] = int(
-                        pending["observation_steps"]
-                    )
-                    return None
-                self._record_drawer_observation(task, step)
-                if int(pending["group_index"]) + 1 < len(pending["groups"]):
-                    pending["group_index"] += 1
-                    pending["phase"] = "open"
-                else:
-                    pending["phase"] = "close"
-                pending["phase_step"] = 0
-                pending["phase_plan"] = None
-                return None
+            # Fast mode shortens only each force transition; it must not skip
+            # the observation or merge closing this drawer with opening the
+            # next one.  This keeps the physical sequence identical to the
+            # evaluator-owned V3 drawer scan.
             pending["phase"] = "observe"
             pending["phase_step"] = 0
             pending["phase_plan"] = None
@@ -788,9 +814,59 @@ class AtomicForceInteractionController:
                 pending["phase_step"] = 0
                 pending["phase_plan"] = None
                 return None
+            # Release the lock only after the final drawer has fully closed;
+            # restoring the head/torso is a separate final action.
+            pending["robot_lock_snapshot"] = None
             pending["view_restore_result"] = self._head_view_controller.restore(task.env)
             return self._finish_drawer_sequence(task, step)
         return None
+
+    def _abort_drawer_sequence(
+        self,
+        task,
+        step: int,
+        exc: Exception,
+    ) -> dict[str, Any]:
+        """Best-effort close and restore if any drawer macro phase fails."""
+
+        pending = self._pending
+        if pending is None or pending.get("kind") != "drawer_sequence":
+            raise exc
+        command = dict(pending["command"])
+        recovery_detail = "not_attempted"
+        try:
+            recovery_plan = prepare_articulation_state_force(
+                task.env,
+                command["object_id"],
+                close_joint_names=list(pending.get("all_joint_names") or []),
+            )
+            robot_lock = pending.get("robot_lock_snapshot") or _capture_robot_lock(task.env)
+            if robot_lock is not None:
+                _apply_robot_lock(task.env, robot_lock)
+            recovery = complete_articulation_force(
+                task.env,
+                recovery_plan,
+                config=self.force_config,
+                robot_lock_callback=(
+                    None if robot_lock is None else lambda: _apply_robot_lock(task.env, robot_lock)
+                ),
+            )
+            recovery_detail = "succeeded" if bool(recovery.get("success")) else "not_confirmed"
+        except Exception as recovery_exc:
+            recovery_detail = f"failed:{type(recovery_exc).__name__}"
+        finally:
+            pending["robot_lock_snapshot"] = None
+            self._commands.task_done()
+        failure = RuntimeError(
+            f"drawer_scan_execution_failed:{type(exc).__name__}; recovery={recovery_detail}"
+        )
+        return self._publish_command_failure(
+            task,
+            command,
+            step,
+            failure,
+            view_result=pending.get("view_result"),
+        )
 
     def _record_drawer_observation(self, task, step: int) -> None:
         pending = self._pending
@@ -996,6 +1072,7 @@ class AtomicForceInteractionController:
         node_type = str(command.get("node_type") or "").casefold()
         missing_articulation = str(exc).startswith("Articulated object not found:")
         invalid_interaction_pose = str(exc).startswith("Interaction pose invalid:")
+        drawer_scan_execution_failed = str(exc).startswith("drawer_scan_execution_failed:")
         static_portal = missing_articulation and node_type == "portal"
         try:
             view_restore_result = self._head_view_controller.restore(task.env)
@@ -1004,6 +1081,18 @@ class AtomicForceInteractionController:
                 "applied": False,
                 "reason": "environment_view_restore_unavailable",
             }
+        if static_portal:
+            verification_source = "simulator_no_articulation"
+            failure_reason = ""
+        elif drawer_scan_execution_failed:
+            verification_source = "executor_drawer_sequence_failure"
+            failure_reason = "drawer_scan_execution_failed"
+        elif invalid_interaction_pose:
+            verification_source = "executor_pose_precondition"
+            failure_reason = "interaction_pose_invalid"
+        else:
+            verification_source = "executor_resolution_failure"
+            failure_reason = "articulation_resolution_failed"
         result = {
             "event_id": event_id,
             "command_id": str(command["command_id"]),
@@ -1038,24 +1127,8 @@ class AtomicForceInteractionController:
                 if static_portal
                 else "force_interaction_rejected"
             ),
-            "verification_source": (
-                "simulator_no_articulation"
-                if static_portal
-                else (
-                    "executor_pose_precondition"
-                    if invalid_interaction_pose
-                    else "executor_resolution_failure"
-                )
-            ),
-            "failure_reason": (
-                ""
-                if static_portal
-                else (
-                    "interaction_pose_invalid"
-                    if invalid_interaction_pose
-                    else "articulation_resolution_failed"
-                )
-            ),
+            "verification_source": verification_source,
+            "failure_reason": failure_reason,
             "interaction_pose_validation": dict(
                 command.get("interaction_pose_validation") or {}
             ),
