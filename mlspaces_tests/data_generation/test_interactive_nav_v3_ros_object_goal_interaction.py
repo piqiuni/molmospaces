@@ -319,3 +319,97 @@ def test_failed_drawer_scan_cannot_return_transient_target_discovery(
     assert adapter.completions == [(command_id, False)]
     assert consumed["private_attempt"]["success"] is False
     assert consumed["target_discovery"] is None
+
+
+@pytest.mark.parametrize(
+    ("direct_bbox_drawer_scan", "expected_fallback"),
+    [(False, False), (True, True)],
+)
+def test_empty_drawer_regions_fall_back_only_for_direct_public_bbox_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    direct_bbox_drawer_scan: bool,
+    expected_fallback: bool,
+) -> None:
+    opaque_id = "obj_000071"
+    source_name = "private_dresser_body"
+    joint = _runtime_joint(object_name=source_name, joint_name="private_slide", joint_index=4)
+    command_id = f"drawer_scan_empty_{int(direct_bbox_drawer_scan)}"
+    adapter = _FakeAdapter(
+        EvaluatorInteractionRequest(
+            command_id=command_id,
+            episode_id="episode_public_3",
+            instance_id=opaque_id,
+            action="open",
+            private_handle=object(),
+            sequence_type="drawer_scan",
+            open_regions=(),
+            direct_bbox_drawer_scan=direct_bbox_drawer_scan,
+        )
+    )
+    runtime = SimpleNamespace(
+        adapter=adapter,
+        skill=object(),
+        opaque_to_source_name={opaque_id: source_name},
+        opaque_to_joints={opaque_id: (joint,)},
+    )
+    episode = {
+        "interactive_nav": {
+            "interaction_requirement": "required",
+            "interactions": [
+                {
+                    "interaction_id": "drawer_target",
+                    "object_name": source_name,
+                    "joint_index": 4,
+                    "type": "container_sliding_drawer",
+                    "prerequisites": [],
+                }
+            ],
+            "oracle_plans": [],
+        }
+    }
+    task = SimpleNamespace(env=object(), get_observations=lambda: {"camera": "public-observation"})
+    config = SimpleNamespace(
+        interaction_max_distance_m=1.75,
+        require_interaction_visible=True,
+        record_video=False,
+    )
+    scan_kwargs: dict = {}
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_check_interaction_access",
+        lambda *_args, **_kwargs: (True, {"distance_m": 0.5, "visibility": 1.0}),
+    )
+
+    def execute_scan(**kwargs):
+        scan_kwargs.update(kwargs)
+        success = bool(kwargs["fallback_to_all"])
+        return {
+            "success": success,
+            "joint_results": (),
+            "opened_joints": (joint,) if success else (),
+            "simulated_seconds": 1.0 if success else 0.0,
+            "target_discovery": None,
+            "metadata": {"execution_mode": "drawer_scan"},
+            "observation": {"camera": "public-observation"},
+        }
+
+    monkeypatch.setattr(benchmark_runner, "_execute_private_drawer_scan", execute_scan)
+    monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(benchmark_runner, "_publish_restricted_ros_frame", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(benchmark_runner, "_discard_task_rollout_cache", lambda _task: None)
+
+    consumed = benchmark_runner._consume_pending_ros_object_goal_interaction(
+        task=task,
+        runtime=runtime,
+        episode=episode,
+        private_attempts=[],
+        config=config,
+        decision_index=5,
+        frames=[],
+    )
+
+    assert consumed is not None
+    assert scan_kwargs["open_regions"] == ()
+    assert scan_kwargs["fallback_to_all"] is expected_fallback
+    assert consumed["private_attempt"]["success"] is expected_fallback
+    assert adapter.completions == [(command_id, expected_fallback)]

@@ -102,3 +102,67 @@ def test_registry_reset_invalidates_previous_episode_ids() -> None:
     assert new_episode != old_episode
     assert registry.resolve_private_source_name(old_id) is None
     assert registry.public_id_for("private_a") == "obj_000001"
+
+
+def test_restricted_gt_filters_by_camera_distance_and_projected_bbox_area() -> None:
+    segmentation = np.zeros((8, 8, 2), dtype=np.int32)
+    segmentation[..., 1] = -1
+    segmentation[0:3, 0:3, 0] = 1
+    segmentation[0:3, 0:3, 1] = 42
+    segmentation[0:3, 4:7, 0] = 2
+    segmentation[0:3, 4:7, 1] = 42
+    segmentation[6:7, 0:1, 0] = 3
+    segmentation[6:7, 0:1, 1] = 42
+
+    payload = build_restricted_gt_frame(
+        segmentation=segmentation,
+        registry=OpaqueEpisodeRegistry(),
+        candidates=[
+            PrivateObjectSpec(
+                source_name="near_large",
+                semantic_category="cabinet",
+                geom_ids=(1,),
+                aabb_center=(2.0, 0.0, 0.0),
+            ),
+            PrivateObjectSpec(
+                source_name="far_large",
+                semantic_category="refrigerator",
+                geom_ids=(2,),
+                aabb_center=(6.75, 0.0, 0.0),
+            ),
+            PrivateObjectSpec(
+                source_name="near_tiny",
+                semantic_category="cup",
+                geom_ids=(3,),
+                aabb_center=(1.0, 0.0, 0.0),
+            ),
+        ],
+        geom_object_type=42,
+        min_visible_pixels=1,
+        min_bbox_area_pixels=4,
+        max_distance_m=4.0,
+        camera_position=(0.0, 0.0, 0.0),
+    )
+
+    assert [item["name"] for item in payload["observations"]] == ["cabinet"]
+
+    unbounded_payload = build_restricted_gt_frame(
+        segmentation=segmentation,
+        registry=OpaqueEpisodeRegistry(),
+        candidates=[
+            PrivateObjectSpec(
+                source_name="far_large",
+                semantic_category="refrigerator",
+                geom_ids=(2,),
+                aabb_center=(6.75, 0.0, 0.0),
+            )
+        ],
+        geom_object_type=42,
+        min_visible_pixels=1,
+        min_bbox_area_pixels=4,
+        max_distance_m=0.0,
+    )
+
+    assert [item["name"] for item in unbounded_payload["observations"]] == [
+        "refrigerator"
+    ]

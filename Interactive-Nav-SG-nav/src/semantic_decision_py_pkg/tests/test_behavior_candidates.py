@@ -71,6 +71,72 @@ def test_generator_combines_frontiers_and_closed_portals() -> None:
     assert interaction.metadata["requires_approach"] is True
 
 
+def test_successfully_opened_portal_generates_one_way_traversal_goal() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_traversal_distance_m=0.9,
+            portal_traversal_max_start_distance_m=2.0,
+            portal_traversal_completion_margin_m=0.35,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_door_1",
+                "type": "portal",
+                "name": "door_1",
+                "aabb_center": [0.0, 0.0, 1.0],
+                "aabb_size": [0.1, 0.9, 2.0],
+                "attributes": {
+                    "source_object_name": "door_1",
+                    "interaction_reference_aabb_center": [0.0, 0.0, 1.0],
+                    "interaction_reference_aabb_size": [0.1, 0.9, 2.0],
+                    "connected_room_ids": [1, 2],
+                },
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": False,
+                    "state": "open",
+                    "state_confidence": 1.0,
+                    "traversable": True,
+                    "operation_history": [
+                        {
+                            "event_id": "open_event_1",
+                            "action": "open",
+                            "success": True,
+                            "post_state": "open",
+                            "approach_goal_xyyaw": [-1.0, 0.0, 0.0],
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+    candidates = generator.generate({}, graph, robot_xy=(-1.0, 0.0))
+
+    assert len(candidates) == 1
+    traversal = candidates[0]
+    assert traversal.candidate_id == "traverse:portal_door_1:open_event_1"
+    assert traversal.behavior_type == "NAVIGATE"
+    assert traversal.source == "post_interaction_portal"
+    assert traversal.goal_xyyaw == [0.9, 0.0, 0.0]
+    assert traversal.metadata["post_interaction_traversal"] is True
+
+    # Once the base is clearly beyond the original door plane, the traversal
+    # candidate cannot reverse and send it back through the same portal.
+    assert generator.generate({}, graph, robot_xy=(0.4, 0.0)) == []
+
+    graph["nodes"][0]["interaction"]["operation_history"][0][
+        "approach_goal_xyyaw"
+    ] = [0.0, 1.0, -math.pi / 2.0]
+    opposite_axis = generator.generate({}, graph, robot_xy=(0.0, 1.0))[0]
+    assert math.isclose(opposite_axis.goal_xyyaw[0], 0.0, abs_tol=1e-6)
+    assert math.isclose(opposite_axis.goal_xyyaw[1], -0.9, abs_tol=1e-6)
+    assert math.isclose(opposite_axis.goal_xyyaw[2], -math.pi / 2.0, abs_tol=1e-6)
+
+
 def test_generator_does_not_use_object_name_to_reject_portal_fixture() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(interaction_types=("portal",))
@@ -652,10 +718,26 @@ def test_portal_approach_uses_door_aabb_normal() -> None:
     assert math.isclose(candidate.goal_xyyaw[1], 5.0, abs_tol=1e-6)
     assert math.isclose(candidate.goal_xyyaw[2], 0.0, abs_tol=1e-6)
     assert candidate.metadata["approach_strategy"] == "portal_aabb_normal"
-    assert len(candidate.metadata["goal_xyyaw_candidates"]) == 3
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+    assert len(goals) == 18
     assert math.isclose(
-        candidate.metadata["goal_xyyaw_candidates"][1][0], 3.50, abs_tol=1e-6
+        goals[1][0], 3.50, abs_tol=1e-6
     )
+    # Tangential fallbacks and the opposite doorway side are both present.
+    assert any(
+        math.isclose(goal[0], 3.75, abs_tol=1e-6)
+        and math.isclose(abs(goal[1] - 5.0), 0.20, abs_tol=1e-6)
+        for goal in goals
+    )
+    assert any(math.isclose(goal[0], 6.25, abs_tol=1e-6) for goal in goals)
+    # All approach poses, including mirrored/tangential ones, face the portal.
+    for goal_x, goal_y, goal_yaw in goals:
+        expected_yaw = math.atan2(5.0 - goal_y, 5.0 - goal_x)
+        assert math.isclose(
+            math.atan2(math.sin(goal_yaw - expected_yaw), math.cos(goal_yaw - expected_yaw)),
+            0.0,
+            abs_tol=1e-6,
+        )
 
 
 def test_observed_target_generates_navigation_candidate() -> None:

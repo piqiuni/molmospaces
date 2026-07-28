@@ -1,4 +1,6 @@
 exploration:
   external_behavior_control: true
+  # Complete the initial 360° scan before semantic candidate dispatch.
+  initial_spin_enabled: true
   local_plan_watchdog_enabled: true
   local_plan_watchdog_sec: 12.0

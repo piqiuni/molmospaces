@@ -54,6 +54,7 @@ from explore_py_pkg.debug_semantic_viz import (
     portal_room_node_ids,
     topology_order_rooms,
 )
+from step_sync_image_cache import CachedStepImage, ExactStepImageCache
 from actionlib_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
 from map_msgs.msg import OccupancyGridUpdate
@@ -239,11 +240,12 @@ class _AsyncArtifactWriter:
 
     def submit_video(self, stream: str, path: Path, frame) -> None:
         self.submitted_video_jobs += 1
-        try:
-            self.video_jobs.put_nowait((str(stream), Path(path), frame.copy()))
-            self.video_queue_peak = max(self.video_queue_peak, self.video_jobs.qsize())
-        except queue.Full:
-            self.dropped_jobs += 1
+        # Runtime MP4 is the primary artifact.  A full encoder queue should
+        # back-pressure the renderer instead of silently deleting a dataset
+        # step.  PNG exports remain best-effort because they are optional debug
+        # artifacts and may legitimately be disabled for throughput.
+        self.video_jobs.put((str(stream), Path(path), frame.copy()))
+        self.video_queue_peak = max(self.video_queue_peak, self.video_jobs.qsize())
 
     def _submit(self, job) -> None:
         try:
@@ -376,6 +378,27 @@ class _AsyncArtifactWriter:
                 log_handle = getattr(process, "_explore_log_handle", None)
                 if log_handle is not None:
                     log_handle.close()
+
+
+def _video_frame_export_policy(
+    *,
+    runtime_video_encode: bool,
+    artifact_writer_available: bool,
+    save_panel_frames: bool,
+    save_composite_frames: bool,
+) -> tuple[bool, bool]:
+    """Return whether per-step panel and composite PNGs must be written.
+
+    Runtime ffmpeg consumes the in-memory composite directly, so writing that
+    same frame to PNG is redundant unless explicitly requested.  When runtime
+    encoding is unavailable, composite PNGs remain mandatory for the offline
+    video fallback.
+    """
+
+    save_panels = bool(save_panel_frames)
+    runtime_encoder_available = bool(runtime_video_encode and artifact_writer_available)
+    save_composite = bool(save_composite_frames or not runtime_encoder_available)
+    return save_panels, save_composite
 
 
 def _write_grid_pgm_yaml(prefix: Path, grid: OccupancyGrid) -> None:
@@ -608,6 +631,18 @@ def _image_msg_to_rgb(msg: Image) -> tuple[int, int, bytearray] | None:
         min_step = width * channels
         if step < min_step or len(data) < step * height:
             return None
+        # The RosBridgePolicy publishes contiguous rgb8 frames.  Avoid the
+        # Python per-pixel loop here: under three concurrent ROS workers it can
+        # delay image callbacks beyond the step_sync pairing window and make a
+        # valid camera frame look absent.
+        if encoding == "rgb8" and step == min_step:
+            return width, height, bytearray(data[: min_step * height])
+        if np is not None:
+            rows = np.frombuffer(data, dtype=np.uint8).reshape(height, step)[:, :min_step]
+            if encoding == "rgb8":
+                return width, height, bytearray(rows.tobytes())
+            bgr = rows.reshape(height, width, 3)
+            return width, height, bytearray(bgr[:, :, ::-1].copy().tobytes())
         for y in range(height):
             src_row = y * step
             dst_row = y * width * 3
@@ -1077,6 +1112,29 @@ class ExploreDebugRecorder:
             if self._retain_video_state_history
             else 1
         )
+        # RGB and /molmo_spaces/step_sync are published on separate ROS
+        # connections.  Retain a short exact-key cache so a sync callback can
+        # wait for its real camera image instead of rendering a black
+        # placeholder merely because callback ordering crossed threads.
+        # RGB callbacks can run far ahead of the step_sync subscriber while
+        # six-panel rendering is back-pressured.  This queue is deliberately
+        # independent from the much smaller OCC/costmap history.
+        self.step_sync_image_cache_size = max(8, int(args.step_sync_image_cache_size))
+        self.step_sync_image_cache = ExactStepImageCache(
+            max_size=self.step_sync_image_cache_size
+        )
+        self.step_sync_image_wait_sec = max(0.0, float(args.step_sync_image_wait_sec))
+        self.step_sync_image_max_stamp_delta_ns = max(
+            0,
+            int(round(float(args.step_sync_image_max_stamp_delta_sec) * 1_000_000_000.0)),
+        )
+        self.step_sync_image_fallback_max_age_ns = max(
+            self.step_sync_image_max_stamp_delta_ns,
+            int(round(float(args.step_sync_image_fallback_max_age_sec) * 1_000_000_000.0)),
+        )
+        self.step_sync_image_match_count = 0
+        self.step_sync_image_reuse_count = 0
+        self.step_sync_placeholder_count = 0
         self._plan_history_limit = max(32, history_size)
         self.grid_video_history = deque(maxlen=history_size)
         self.global_costmap_video_history = deque(maxlen=history_size)
@@ -1088,8 +1146,15 @@ class ExploreDebugRecorder:
         self.last_source_image_seq: int | None = None
         self.last_recorded_image_stamp_ns: int | None = None
         self.last_recorded_image_key: tuple[int, int] | None = None
+        self.last_step_sync_key: tuple[int, int] | None = None
         self.image_callback_count = 0
         self.step_sync_count = 0
+        # A six-panel frame is substantially more expensive than a simulator
+        # step.  Keep the raw step count for diagnostics while allowing the V3
+        # runner to sample the visual stream at its requested video rate.
+        self.step_sync_capture_every = max(1, int(args.step_sync_capture_every))
+        self.step_sync_capture_count = 0
+        self.step_sync_skipped_count = 0
         self.step_sync_placeholder_width = max(1, int(args.step_sync_image_width))
         self.step_sync_placeholder_height = max(1, int(args.step_sync_image_height))
         self.step_sync_placeholder_rgb = bytes(
@@ -1305,6 +1370,8 @@ class ExploreDebugRecorder:
                 "step_id",
                 "source_seq",
                 "callback_index",
+                "camera_source",
+                "camera_stamp_delta_sec",
                 "elapsed_sec",
                 "image_stamp",
                 "map_stamp",
@@ -1869,6 +1936,7 @@ class ExploreDebugRecorder:
             return
         width, height, rgb = converted
         stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
+        cache_for_step_sync = False
         with self.lock:
             if self.shutting_down:
                 return
@@ -1882,10 +1950,23 @@ class ExploreDebugRecorder:
             self.latest_image_step = source_step
             self.last_image_wall_time = time.time()
             if self.args.video_step_sync_topic:
-                return
-            snapshot = self._capture_video_snapshot_locked(stamp)
-            snapshot["source_seq"] = source_seq
-            snapshot["callback_index"] = self.image_callback_count
+                cache_for_step_sync = True
+            else:
+                snapshot = self._capture_video_snapshot_locked(stamp)
+                snapshot["source_seq"] = source_seq
+                snapshot["callback_index"] = self.image_callback_count
+        if cache_for_step_sync:
+            self.step_sync_image_cache.put(
+                CachedStepImage(
+                    source_seq=source_seq,
+                    stamp_ns=source_stamp_ns,
+                    stamp=stamp,
+                    width=width,
+                    height=height,
+                    rgb=bytes(rgb),
+                )
+            )
+            return
         if self._enqueue_video_frame((width, height, rgb, stamp, source_step, snapshot)) and step_capture:
             with self.lock:
                 self.last_recorded_image_stamp_ns = source_stamp_ns
@@ -1903,20 +1984,62 @@ class ExploreDebugRecorder:
         source_stamp_ns = int(round(stamp * 1_000_000_000.0))
         source_key = (source_seq, source_stamp_ns)
         with self.lock:
-            if self.shutting_down or self.last_recorded_image_key == source_key:
+            if self.shutting_down or self.last_step_sync_key == source_key:
                 return
+            self.last_step_sync_key = source_key
             self.step_sync_count += 1
+            callback_index = self.step_sync_count
             self.debug_step = source_seq
             self.latest_image_step = source_seq
+            if (callback_index - 1) % self.step_sync_capture_every:
+                self.step_sync_skipped_count += 1
+                return
+            self.step_sync_capture_count += 1
+            capture_index = self.step_sync_capture_count
+        matched_selection = self.step_sync_image_cache.wait_select(
+            source_seq,
+            source_stamp_ns,
+            timeout_sec=self.step_sync_image_wait_sec,
+            max_stamp_delta_ns=self.step_sync_image_max_stamp_delta_ns,
+            fallback_max_age_ns=self.step_sync_image_fallback_max_age_ns,
+        )
+        if matched_selection is None:
+            frame_width = self.step_sync_placeholder_width
+            frame_height = self.step_sync_placeholder_height
+            frame_rgb = self.step_sync_placeholder_rgb
+            camera_source = "placeholder"
+            camera_stamp_delta_sec = float("inf")
+        else:
+            matched_image = matched_selection.frame
+            frame_width = matched_image.width
+            frame_height = matched_image.height
+            frame_rgb = matched_image.rgb
+            camera_source = matched_selection.source
+            if matched_selection.reused:
+                camera_source += "_reuse"
+            camera_stamp_delta_sec = matched_selection.stamp_delta_ns / 1_000_000_000.0
+        with self.lock:
+            if self.shutting_down or self.last_recorded_image_key == source_key:
+                return
+            if matched_selection is None:
+                self.step_sync_placeholder_count += 1
+            else:
+                self.step_sync_image_match_count += 1
+                if matched_selection.reused:
+                    self.step_sync_image_reuse_count += 1
             snapshot = self._capture_video_snapshot_locked(stamp)
             snapshot["source_seq"] = source_seq
-            snapshot["callback_index"] = self.step_sync_count
+            snapshot["callback_index"] = callback_index
+            snapshot["capture_index"] = capture_index
+            snapshot["step_sync_capture_every"] = self.step_sync_capture_every
             snapshot["capture_trigger"] = "step_sync"
+            snapshot["camera_source"] = camera_source
+            snapshot["camera_stamp_delta_sec"] = camera_stamp_delta_sec
         if self._enqueue_video_frame(
             (
-                self.step_sync_placeholder_width,
-                self.step_sync_placeholder_height,
-                self.step_sync_placeholder_rgb,
+                frame_width,
+                frame_height,
+                frame_rgb,
                 stamp,
                 source_seq,
                 snapshot,
@@ -3518,6 +3641,12 @@ class ExploreDebugRecorder:
     ) -> None:
         if not self.args.first_person_video or cv2 is None or np is None:
             return
+        save_panel_frames, save_composite_frames = _video_frame_export_policy(
+            runtime_video_encode=bool(self.args.runtime_video_encode),
+            artifact_writer_available=self.artifact_writer is not None,
+            save_panel_frames=bool(self.args.video_save_panel_frames),
+            save_composite_frames=bool(self.args.video_save_composite_frames),
+        )
         now = time.time()
         if self.args.first_person_video_capture_mode != "step":
             capture_fps = max(0.1, float(self.args.first_person_video_capture_fps))
@@ -3559,6 +3688,10 @@ class ExploreDebugRecorder:
                 stuck = snapshot["stuck"]
                 source_seq = int(snapshot.get("source_seq", image_step))
                 callback_index = int(snapshot.get("callback_index", image_step))
+                camera_source = str(snapshot.get("camera_source") or "image_callback")
+                camera_stamp_delta_sec = float(
+                    snapshot.get("camera_stamp_delta_sec", 0.0) or 0.0
+                )
                 graph = snapshot["unified_graph"]
                 gt_observations = snapshot["gt_observations"]
                 semantic_events = snapshot["semantic_events"]
@@ -3829,7 +3962,7 @@ class ExploreDebugRecorder:
                 semantic_keyframe_path = self.semantic_keyframe_dir / f"revision_{graph_revision:06d}.png"
                 self.last_semantic_keyframe_revision = graph_revision
             if self.artifact_writer is not None:
-                if self.args.video_save_panel_frames:
+                if save_panel_frames:
                     self.artifact_writer.submit_png(camera_path, camera_frame)
                     if occ_panel is not None:
                         self.artifact_writer.submit_png(map_path, occ_panel)
@@ -3853,61 +3986,64 @@ class ExploreDebugRecorder:
                             if semantic_topology_clean_panel is not None
                             else semantic_topology_panel,
                         )
-                self.artifact_writer.submit_png(composite_path, frame)
+                if save_composite_frames:
+                    self.artifact_writer.submit_png(composite_path, frame)
                 if semantic_keyframe_path is not None:
                     self.artifact_writer.submit_png(semantic_keyframe_path, frame)
                 if self.args.runtime_video_encode:
                     self.artifact_writer.submit_video("first_person", Path(self.first_person_video_path), frame)
             else:
-                _write_png(camera_path, frame_width, frame_height, bytearray(camera_frame.tobytes()))
-                if occ_panel is not None:
-                    _write_png(map_path, int(occ_panel.shape[1]), int(occ_panel.shape[0]), bytearray(occ_panel.tobytes()))
-                if global_costmap_panel is not None:
-                    _write_png(
-                        global_costmap_path,
-                        int(global_costmap_panel.shape[1]),
-                        int(global_costmap_panel.shape[0]),
-                        bytearray(global_costmap_panel.tobytes()),
-                    )
-                if local_costmap_panel is not None:
-                    _write_png(
-                        local_costmap_path,
-                        int(local_costmap_panel.shape[1]),
-                        int(local_costmap_panel.shape[0]),
-                        bytearray(local_costmap_panel.tobytes()),
-                    )
-                if room_segment_panel is not None:
-                    room_segment_output = (
-                        room_segment_clean_panel
-                        if room_segment_clean_panel is not None
-                        else room_segment_panel
-                    )
-                    _write_png(
-                        room_interaction_path,
-                        int(room_segment_output.shape[1]),
-                        int(room_segment_output.shape[0]),
-                        bytearray(room_segment_output.tobytes()),
-                    )
-                if semantic_spatial_panel is not None:
-                    _write_png(
-                        semantic_spatial_path,
-                        int(semantic_spatial_panel.shape[1]),
-                        int(semantic_spatial_panel.shape[0]),
-                        bytearray(semantic_spatial_panel.tobytes()),
-                    )
-                if semantic_topology_panel is not None:
-                    semantic_topology_output = (
-                        semantic_topology_clean_panel
-                        if semantic_topology_clean_panel is not None
-                        else semantic_topology_panel
-                    )
-                    _write_png(
-                        semantic_topology_path,
-                        int(semantic_topology_output.shape[1]),
-                        int(semantic_topology_output.shape[0]),
-                        bytearray(semantic_topology_output.tobytes()),
-                    )
-                _write_png(composite_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
+                if save_panel_frames:
+                    _write_png(camera_path, frame_width, frame_height, bytearray(camera_frame.tobytes()))
+                    if occ_panel is not None:
+                        _write_png(map_path, int(occ_panel.shape[1]), int(occ_panel.shape[0]), bytearray(occ_panel.tobytes()))
+                    if global_costmap_panel is not None:
+                        _write_png(
+                            global_costmap_path,
+                            int(global_costmap_panel.shape[1]),
+                            int(global_costmap_panel.shape[0]),
+                            bytearray(global_costmap_panel.tobytes()),
+                        )
+                    if local_costmap_panel is not None:
+                        _write_png(
+                            local_costmap_path,
+                            int(local_costmap_panel.shape[1]),
+                            int(local_costmap_panel.shape[0]),
+                            bytearray(local_costmap_panel.tobytes()),
+                        )
+                    if room_segment_panel is not None:
+                        room_segment_output = (
+                            room_segment_clean_panel
+                            if room_segment_clean_panel is not None
+                            else room_segment_panel
+                        )
+                        _write_png(
+                            room_interaction_path,
+                            int(room_segment_output.shape[1]),
+                            int(room_segment_output.shape[0]),
+                            bytearray(room_segment_output.tobytes()),
+                        )
+                    if semantic_spatial_panel is not None:
+                        _write_png(
+                            semantic_spatial_path,
+                            int(semantic_spatial_panel.shape[1]),
+                            int(semantic_spatial_panel.shape[0]),
+                            bytearray(semantic_spatial_panel.tobytes()),
+                        )
+                    if semantic_topology_panel is not None:
+                        semantic_topology_output = (
+                            semantic_topology_clean_panel
+                            if semantic_topology_clean_panel is not None
+                            else semantic_topology_panel
+                        )
+                        _write_png(
+                            semantic_topology_path,
+                            int(semantic_topology_output.shape[1]),
+                            int(semantic_topology_output.shape[0]),
+                            bytearray(semantic_topology_output.tobytes()),
+                        )
+                if save_composite_frames:
+                    _write_png(composite_path, int(frame.shape[1]), int(frame.shape[0]), bytearray(frame.tobytes()))
                 if semantic_keyframe_path is not None:
                     _write_png(
                         semantic_keyframe_path,
@@ -3920,6 +4056,8 @@ class ExploreDebugRecorder:
                 "step_id": image_step,
                 "source_seq": source_seq,
                 "callback_index": callback_index,
+                "camera_source": camera_source,
+                "camera_stamp_delta_sec": camera_stamp_delta_sec,
                 "elapsed_sec": capture_wall_time - self.start_wall_time,
                 "image_stamp": image_stamp,
                 "map_stamp": map_stamp,
@@ -3934,17 +4072,19 @@ class ExploreDebugRecorder:
                 "stuck": stuck,
                 "panel_width": frame_width,
                 "panel_height": frame_height,
-                "camera_frame": str(camera_path) if self.args.video_save_panel_frames else "",
-                "map_frame": str(map_path) if occ_panel is not None else "",
-                "global_costmap_frame": str(global_costmap_path) if global_costmap_panel is not None else "",
-                "local_costmap_frame": str(local_costmap_path) if local_costmap_panel is not None else "",
-                "room_interaction_frame": str(room_interaction_path)
-                if self.args.video_save_panel_frames and room_segment_panel is not None
+                "camera_frame": str(camera_path) if save_panel_frames else "",
+                "map_frame": str(map_path) if save_panel_frames and occ_panel is not None else "",
+                "global_costmap_frame": str(global_costmap_path) if save_panel_frames and global_costmap_panel is not None else "",
+                "local_costmap_frame": str(local_costmap_path)
+                if save_panel_frames and local_costmap_panel is not None
                 else "",
-                "semantic_spatial_frame": str(semantic_spatial_path) if semantic_spatial_panel is not None else "",
-                "semantic_topology_frame": str(semantic_topology_path) if semantic_topology_panel is not None else "",
+                "room_interaction_frame": str(room_interaction_path)
+                if save_panel_frames and room_segment_panel is not None
+                else "",
+                "semantic_spatial_frame": str(semantic_spatial_path) if save_panel_frames and semantic_spatial_panel is not None else "",
+                "semantic_topology_frame": str(semantic_topology_path) if save_panel_frames and semantic_topology_panel is not None else "",
                 "graph_revision": graph_revision,
-                "composite_frame": str(composite_path),
+                "composite_frame": str(composite_path) if save_composite_frames else "",
             }
             self.first_person_video_frames.append(record)
             self.video_frames_writer.writerow(
@@ -3953,6 +4093,12 @@ class ExploreDebugRecorder:
                     "step_id": image_step,
                     "source_seq": source_seq,
                     "callback_index": callback_index,
+                    "camera_source": camera_source,
+                    "camera_stamp_delta_sec": (
+                        ""
+                        if not math.isfinite(camera_stamp_delta_sec)
+                        else f"{camera_stamp_delta_sec:.6f}"
+                    ),
                     "elapsed_sec": f"{record['elapsed_sec']:.3f}",
                     "image_stamp": f"{image_stamp:.6f}" if image_stamp > 0.0 else "",
                     "map_stamp": f"{map_stamp:.6f}" if map_stamp > 0.0 else "",
@@ -3973,18 +4119,18 @@ class ExploreDebugRecorder:
                     "stuck_yaw_motion_rad": f"{stuck['yaw_motion_rad']:.6f}",
                     "panel_width": frame_width,
                     "panel_height": frame_height,
-                    "camera_frame": str(camera_path) if self.args.video_save_panel_frames else "",
-                    "map_frame": str(map_path) if occ_panel is not None else "",
+                    "camera_frame": str(camera_path) if save_panel_frames else "",
+                    "map_frame": str(map_path) if save_panel_frames and occ_panel is not None else "",
                     "global_costmap_step": global_costmap_step,
                     "local_costmap_step": local_costmap_step,
-                    "global_costmap_frame": str(global_costmap_path) if global_costmap_panel is not None else "",
-                    "local_costmap_frame": str(local_costmap_path) if local_costmap_panel is not None else "",
+                    "global_costmap_frame": str(global_costmap_path) if save_panel_frames and global_costmap_panel is not None else "",
+                    "local_costmap_frame": str(local_costmap_path) if save_panel_frames and local_costmap_panel is not None else "",
                     "room_interaction_frame": str(room_interaction_path)
-                    if self.args.video_save_panel_frames and room_segment_panel is not None
+                    if save_panel_frames and room_segment_panel is not None
                     else "",
-                    "semantic_spatial_frame": str(semantic_spatial_path) if semantic_spatial_panel is not None else "",
-                    "semantic_topology_frame": str(semantic_topology_path) if semantic_topology_panel is not None else "",
-                    "composite_frame": str(composite_path),
+                    "semantic_spatial_frame": str(semantic_spatial_path) if save_panel_frames and semantic_spatial_panel is not None else "",
+                    "semantic_topology_frame": str(semantic_topology_path) if save_panel_frames and semantic_topology_panel is not None else "",
+                    "composite_frame": str(composite_path) if save_composite_frames else "",
                 }
             )
             self.last_first_person_video_frame_time = now
@@ -6589,6 +6735,7 @@ class ExploreDebugRecorder:
                 return
             self.shutting_down = True
             subscribers = list(self.subscribers)
+        self.step_sync_image_cache.close()
         try:
             self.stall_timer.shutdown()
         except Exception:
@@ -6670,8 +6817,10 @@ class ExploreDebugRecorder:
             uniform_subgoal_crop = self._render_uniform_subgoal_crops_locked()
             subgoal_contact_sheet = self._render_subgoal_contact_sheet()
             subgoal_overlay_contact_sheet = self._render_subgoal_overlay_contact_sheet()
+            artifact_writer_stats = {}
             if self.artifact_writer is not None:
                 self.artifact_writer.close()
+                artifact_writer_stats = self.artifact_writer.stats_snapshot()
                 if self.artifact_writer.errors:
                     error_text = "; ".join(self.artifact_writer.errors[-5:])
                     self.first_person_video_error = error_text
@@ -6692,6 +6841,17 @@ class ExploreDebugRecorder:
                 "final_image_step": self.latest_image_step,
                 "image_callback_count": self.image_callback_count,
                 "step_sync_count": self.step_sync_count,
+                "step_sync_capture_every": self.step_sync_capture_every,
+                "step_sync_capture_count": self.step_sync_capture_count,
+                "step_sync_skipped_count": self.step_sync_skipped_count,
+                "step_sync_image_match_count": self.step_sync_image_match_count,
+                "step_sync_image_reuse_count": self.step_sync_image_reuse_count,
+                "step_sync_placeholder_count": self.step_sync_placeholder_count,
+                "step_sync_image_cache_size": self.step_sync_image_cache_size,
+                "step_sync_image_cache_active": self.step_sync_image_cache.active_size,
+                "step_sync_image_wait_sec": self.step_sync_image_wait_sec,
+                "step_sync_image_max_stamp_delta_sec": self.step_sync_image_max_stamp_delta_ns / 1_000_000_000.0,
+                "step_sync_image_fallback_max_age_sec": self.step_sync_image_fallback_max_age_ns / 1_000_000_000.0,
                 "room_segment_callback_count": self.room_segment_callback_count,
                 "room_segment_valid_cell_count": self.latest_room_segment_valid_cell_count,
                 "room_segment_unique_ids": self.latest_room_segment_unique_ids,
@@ -6740,8 +6900,12 @@ class ExploreDebugRecorder:
                 "finalization_complete": False,
                 "video_finalization_pending": True,
                 "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
+                "artifact_writer_stats": artifact_writer_stats,
                 "video_frame_jobs_dropped": self.video_frame_jobs_dropped,
                 "video_frame_queue_overflow": self.args.video_frame_queue_overflow,
+                "runtime_video_encode": bool(self.args.runtime_video_encode),
+                "video_save_panel_frames": bool(self.args.video_save_panel_frames),
+                "video_save_composite_frames": bool(self.args.video_save_composite_frames),
             }
             (self.output_dir / "summary.json").write_text(
                 json.dumps(summary_checkpoint, ensure_ascii=False, indent=2, sort_keys=True)
@@ -6769,6 +6933,17 @@ class ExploreDebugRecorder:
                 "final_image_step": self.latest_image_step,
                 "image_callback_count": self.image_callback_count,
                 "step_sync_count": self.step_sync_count,
+                "step_sync_capture_every": self.step_sync_capture_every,
+                "step_sync_capture_count": self.step_sync_capture_count,
+                "step_sync_skipped_count": self.step_sync_skipped_count,
+                "step_sync_image_match_count": self.step_sync_image_match_count,
+                "step_sync_image_reuse_count": self.step_sync_image_reuse_count,
+                "step_sync_placeholder_count": self.step_sync_placeholder_count,
+                "step_sync_image_cache_size": self.step_sync_image_cache_size,
+                "step_sync_image_cache_active": self.step_sync_image_cache.active_size,
+                "step_sync_image_wait_sec": self.step_sync_image_wait_sec,
+                "step_sync_image_max_stamp_delta_sec": self.step_sync_image_max_stamp_delta_ns / 1_000_000_000.0,
+                "step_sync_image_fallback_max_age_sec": self.step_sync_image_fallback_max_age_ns / 1_000_000_000.0,
                 "room_segment_callback_count": self.room_segment_callback_count,
                 "room_segment_valid_cell_count": self.latest_room_segment_valid_cell_count,
                 "room_segment_unique_ids": self.latest_room_segment_unique_ids,
@@ -6824,9 +6999,17 @@ class ExploreDebugRecorder:
                 "first_person_video_codec": self.first_person_video_codec_name,
                 "first_person_video_error": self.first_person_video_error,
                 "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
+                "artifact_writer_stats": artifact_writer_stats,
                 "video_frame_jobs_dropped": self.video_frame_jobs_dropped,
                 "video_frame_queue_overflow": self.args.video_frame_queue_overflow,
-                "first_person_video_map_mode": "causal_state_snapshot_on_image_callback_offline_encode",
+                "runtime_video_encode": bool(self.args.runtime_video_encode),
+                "video_save_panel_frames": bool(self.args.video_save_panel_frames),
+                "video_save_composite_frames": bool(self.args.video_save_composite_frames),
+                "first_person_video_map_mode": (
+                    "causal_state_snapshot_runtime_encode"
+                    if self.args.runtime_video_encode
+                    else "causal_state_snapshot_offline_encode"
+                ),
                 "semantic_video": bool(self.args.semantic_video),
                 "semantic_summary": self._semantic_summary(),
                 "semantic_decision_event_count": self.semantic_decision_event_count,
@@ -6951,8 +7134,41 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--image-topic", default="/molmo_spaces/head_camera/image")
     parser.add_argument("--video-step-sync-topic", default="")
     parser.add_argument("--step-sync-queue-size", type=int, default=1024)
+    parser.add_argument(
+        "--step-sync-capture-every",
+        type=int,
+        default=1,
+        help=(
+            "Render one six-panel frame for every N unique step-sync markers; "
+            "all markers remain counted in the recorder summary."
+        ),
+    )
     parser.add_argument("--step-sync-image-width", type=int, default=1024)
     parser.add_argument("--step-sync-image-height", type=int, default=576)
+    parser.add_argument(
+        "--step-sync-image-cache-size",
+        type=int,
+        default=128,
+        help="Decoded RGB backlog retained independently of OCC/costmap history.",
+    )
+    parser.add_argument(
+        "--step-sync-image-wait-sec",
+        type=float,
+        default=0.25,
+        help="Maximum wait for the exact RGB image published alongside a step_sync marker.",
+    )
+    parser.add_argument(
+        "--step-sync-image-max-stamp-delta-sec",
+        type=float,
+        default=0.005,
+        help="Timestamp tolerance used after requiring the exact image sequence number.",
+    )
+    parser.add_argument(
+        "--step-sync-image-fallback-max-age-sec",
+        type=float,
+        default=3.0,
+        help="Maximum age for a nearest real RGB fallback when an exact callback was dropped.",
+    )
     parser.add_argument("--external-image-topic", default="")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--cmd-vel-stamped-topic", default="/cmd_vel_stamped")
@@ -7010,7 +7226,7 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="External video width; zero reuses --first-person-video-width-px. Raw external PNGs keep source resolution.",
     )
-    parser.add_argument("--image-queue-size", type=int, default=1)
+    parser.add_argument("--image-queue-size", type=int, default=8)
     parser.add_argument(
         "--video-frame-job-queue-size",
         type=int,
@@ -7034,6 +7250,16 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Save the six individual panel PNGs in addition to each composite frame.",
+    )
+    parser.add_argument(
+        "--video-save-composite-frames",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Save every composite video frame as PNG. Runtime MP4 encoding uses "
+            "in-memory frames and does not require these PNGs; offline encoding "
+            "enables them automatically."
+        ),
     )
     parser.add_argument(
         "--paper-frame-exports",
@@ -7072,7 +7298,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-match-min-after-goal-sec", type=float, default=0.0)
     parser.add_argument("--plan-match-post-goal-sec", type=float, default=60.0)
     parser.add_argument("--plan-goal-match-tolerance-m", type=float, default=1.0)
-    return parser.parse_args(rospy.myargv()[1:])
+    args = parser.parse_args(rospy.myargv()[1:])
+    if args.step_sync_capture_every < 1:
+        parser.error("--step-sync-capture-every must be at least one")
+    return args
 
 
 def main() -> None:

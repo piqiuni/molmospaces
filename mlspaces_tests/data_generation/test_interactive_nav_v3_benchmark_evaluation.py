@@ -209,6 +209,171 @@ def test_reference_path_length_and_spl_follow_v3_semantics() -> None:
     assert spl(True, 3.0, 6.0) == 0.5
 
 
+def _budget_episode(
+    *,
+    path_length_m: float | None,
+    interaction_types: list[str],
+    container_joint_count: int = 0,
+    initial_target_visible: bool = False,
+) -> dict[str, object]:
+    interactions = [
+        {"interaction_id": f"interaction_{index}", "type": interaction_type}
+        for index, interaction_type in enumerate(interaction_types)
+    ]
+    navigation_validation = {}
+    if path_length_m is not None:
+        key = "oracle_restored_path_length_m" if interactions else "initial_state_path_length_m"
+        navigation_validation[key] = path_length_m
+    articulation_states = [
+        {
+            "object_name": "container_1",
+            "joint_name": f"joint_{index}",
+            "joint_index": index,
+        }
+        for index in range(container_joint_count)
+    ]
+    return {
+        "task": {"robot_base_pose": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]},
+        "scene_modifications": {"articulation_states": articulation_states},
+        "interactive_nav": {
+            "interaction_requirement": "required" if interactions else "unnecessary",
+            "initial_state": {"target_visible": initial_target_visible},
+            "target": {"container_name": "container_1" if container_joint_count else None},
+            "interactions": interactions,
+            "oracle_plan": {
+                "plan_id": "oracle_0",
+                "required_interaction_ids": [row["interaction_id"] for row in interactions],
+                "steps": [],
+            },
+            "generation_validation": {"navigation_validation": navigation_validation},
+        },
+    }
+
+
+def test_dynamic_step_budget_matches_short_visible_example() -> None:
+    config = benchmark_runner.BenchmarkEvaluationConfig(
+        benchmark=Path("benchmark.json"),
+        output_dir=Path("out"),
+        max_steps=2000,
+        step_budget_mode="dynamic",
+    )
+
+    hidden_budget, _hidden_basis = benchmark_runner.episode_step_budget(
+        config,
+        _budget_episode(
+            path_length_m=3.0,
+            interaction_types=["channel_hinged_door", "container_hinged_door"],
+            container_joint_count=4,
+            initial_target_visible=False,
+        ),
+    )
+    budget, basis = benchmark_runner.episode_step_budget(
+        config,
+        _budget_episode(
+            path_length_m=3.0,
+            interaction_types=["channel_hinged_door", "container_hinged_door"],
+            container_joint_count=4,
+            initial_target_visible=True,
+        ),
+    )
+
+    assert budget == 300
+    assert hidden_budget == 800
+    assert basis["initial_target_visible"] is True
+
+
+def test_dynamic_step_budget_accounts_for_mixed_drawer_search() -> None:
+    config = benchmark_runner.BenchmarkEvaluationConfig(
+        benchmark=Path("benchmark.json"),
+        output_dir=Path("out"),
+        max_steps=2000,
+        step_budget_mode="dynamic",
+    )
+
+    budget, basis = benchmark_runner.episode_step_budget(
+        config,
+        _budget_episode(
+            path_length_m=11.5,
+            interaction_types=["channel_hinged_door", "container_sliding_drawer"],
+            container_joint_count=4,
+        ),
+    )
+
+    assert budget == 1000
+    assert basis["required_interaction_type_counts"] == {"channel": 1, "container": 1, "unknown": 0}
+    assert basis["container_joint_count"] == 4
+
+
+def test_dynamic_step_budget_clamps_and_fixed_mode_stays_compatible() -> None:
+    dynamic = benchmark_runner.BenchmarkEvaluationConfig(
+        benchmark=Path("benchmark.json"),
+        output_dir=Path("out"),
+        max_steps=2000,
+        step_budget_mode="dynamic",
+    )
+    episode = _budget_episode(
+        path_length_m=100.0,
+        interaction_types=["channel_hinged_door", "container_hinged_door"],
+        container_joint_count=12,
+    )
+    fixed = replace(dynamic, step_budget_mode="fixed", max_steps=777)
+
+    assert benchmark_runner.episode_step_budget(dynamic, episode)[0] == 2000
+    assert benchmark_runner.episode_step_budget(fixed, episode)[0] == 777
+
+
+def test_dynamic_step_budget_uses_cap_when_path_is_missing() -> None:
+    config = benchmark_runner.BenchmarkEvaluationConfig(
+        benchmark=Path("benchmark.json"),
+        output_dir=Path("out"),
+        max_steps=2000,
+        step_budget_mode="dynamic",
+    )
+
+    budget, basis = benchmark_runner.episode_step_budget(
+        config,
+        _budget_episode(
+            path_length_m=None,
+            interaction_types=["channel_hinged_door", "container_hinged_door"],
+        ),
+    )
+
+    assert budget == 2000
+    assert basis["conservative_fallback"] is True
+
+
+def test_public_step_budget_basis_redacts_private_gt_inputs() -> None:
+    public = benchmark_runner._public_step_budget_basis(
+        {
+            "formula_version": "v1",
+            "mode": "dynamic",
+            "effective_max_steps": 900,
+            "reference_path_length_m": 12.5,
+            "required_plan_id": "oracle_0",
+            "required_interaction_count": 2,
+            "container_joint_count": 7,
+        }
+    )
+
+    assert public == {
+        "evaluator_private": True,
+        "formula_version": "v1",
+        "mode": "dynamic",
+        "effective_max_steps": 900,
+        "conservative_fallback": False,
+    }
+
+
+def test_dynamic_config_enforces_the_2000_step_hard_cap() -> None:
+    with pytest.raises(ValueError, match="<= 2000"):
+        benchmark_runner.BenchmarkEvaluationConfig(
+            benchmark=Path("benchmark.json"),
+            output_dir=Path("out"),
+            max_steps=2001,
+            step_budget_mode="dynamic",
+        ).validate()
+
+
 def test_summary_groups_and_interaction_precision() -> None:
     rows = [
         _result_row(),

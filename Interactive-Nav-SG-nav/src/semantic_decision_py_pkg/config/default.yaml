@@ -99,6 +99,8 @@ model:
   max_frontiers_per_room: 2
   max_candidates_per_region: 1
   explore_min_visible_gain_ratio: 0.25
+  suppress_semantic_container_mismatch: true
+  pre_score_guard_margin: 0.75
   history_region_size_m: 1.0
   stale_goal_position_tolerance_m: 0.35
   stale_goal_yaw_tolerance_rad: 0.50
@@ -142,6 +144,8 @@ executor:
   make_plan_fail_open: true
   make_plan_empty_retry_count: 2
   make_plan_empty_retry_delay_s: 0.15
+  post_interaction_traversal_make_plan_retry_window_s: 8.0
+  post_interaction_traversal_make_plan_retry_interval_s: 0.5
   explore_make_plan_fail_open_after_retries: true
   navigation_stagnation_timeout_s: 12.0
   navigation_stagnation_distance_m: 0.10

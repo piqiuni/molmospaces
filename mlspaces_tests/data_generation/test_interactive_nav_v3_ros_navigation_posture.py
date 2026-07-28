@@ -47,7 +47,9 @@ def test_ros_replay_config_uses_the_same_noise_free_navigation_posture() -> None
     )
 
     replay = _build_replay_config(config, Path("output"))
+    budgeted_replay = _build_replay_config(config, Path("output"), task_horizon=1375)
 
+    assert budgeted_replay.task_horizon == 1375
     for name, qpos in ROS_NAVIGATION_ARM_QPOS.items():
         np.testing.assert_array_equal(replay.robot_config.init_qpos[name], np.asarray(qpos, dtype=float))
         np.testing.assert_array_equal(replay.robot_config.init_qpos_noise_range[name], np.zeros(len(qpos)))

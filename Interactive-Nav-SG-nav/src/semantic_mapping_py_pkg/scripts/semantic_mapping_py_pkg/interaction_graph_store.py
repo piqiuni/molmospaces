@@ -4,7 +4,7 @@ import time
 import math
 from collections import defaultdict
 
-from .geometry_utils import grid_index, normalize_label, world_to_grid
+from .geometry_utils import grid_index, grid_to_world, normalize_label, world_to_grid
 from .graph_rules import (
     default_interaction_payload,
     distance_xy,
@@ -15,6 +15,35 @@ from .graph_rules import (
 )
 from .graph_schema import NavigationHint, SceneGraphBundle, SceneGraphEdge, SceneGraphNode
 from .room_inference_backends import WeightedRoomAttributeInferencer
+
+
+_SEMANTIC_POSTCONDITION_BY_ACTION = {
+    "open": "open",
+    "close": "closed",
+}
+
+
+def _resolved_interaction_state(result):
+    """Resolve a public semantic postcondition without reading joint state.
+
+    Evaluator-owned interaction skills intentionally expose only the requested
+    action and whether the sealed skill succeeded.  In that contract a
+    successful ``open``/``close`` result establishes the corresponding
+    semantic postcondition even when no simulator articulation is returned.
+    """
+
+    explicit_state = result.get("state") or result.get("post_state")
+    if explicit_state is not None:
+        return str(explicit_state), False
+    if result.get("success") is not True:
+        return None, False
+    action = str(result.get("action") or "").strip().casefold()
+    inferred_state = _SEMANTIC_POSTCONDITION_BY_ACTION.get(action)
+    if inferred_state is None and not action:
+        expected_state = str(result.get("expected_state") or "").strip().casefold()
+        if expected_state in {"open", "closed"}:
+            inferred_state = expected_state
+    return inferred_state, inferred_state is not None
 
 
 class InteractionGraphStore:
@@ -155,13 +184,37 @@ class InteractionGraphStore:
 
     def update_interaction_result(self, result, stamp=None):
         node_id = str(result.get("node_id") or "")
-        node = self.nodes.get(node_id)
-        if node is None:
-            instance_id = str(
-                result.get("object_id") or result.get("instance_id") or ""
-            )
+        instance_id = str(
+            result.get("object_id") or result.get("instance_id") or ""
+        )
+        # An evaluator object-skill result has already resolved its opaque
+        # object ID against the evaluator's current public frame.  Prefer that
+        # public identity over a navigation-side node ID, which can be stale
+        # when a direct bbox drawer scan was routed to a different graph node.
+        prefer_instance_id = bool(instance_id) and str(
+            result.get("source") or ""
+        ).casefold() == "evaluator_object_skill"
+        node = None
+        if prefer_instance_id:
             node = next(
-                (candidate for candidate in self.nodes.values() if candidate.attributes.get("instance_id") == instance_id),
+                (
+                    candidate
+                    for candidate in self.nodes.values()
+                    if str(candidate.attributes.get("instance_id") or "")
+                    == instance_id
+                ),
+                None,
+            )
+        if node is None:
+            node = self.nodes.get(node_id)
+        if node is None and instance_id:
+            node = next(
+                (
+                    candidate
+                    for candidate in self.nodes.values()
+                    if str(candidate.attributes.get("instance_id") or "")
+                    == instance_id
+                ),
                 None,
             )
         if node is None:
@@ -180,13 +233,17 @@ class InteractionGraphStore:
             return False
         now = float(stamp if stamp is not None else time.time())
         pre_state = str(node.interaction.get("state", "unknown"))
-        explicit_state = result.get("state") or result.get("post_state")
-        if explicit_state is not None:
-            node.interaction["state"] = str(explicit_state)
-            node.interaction["state_source"] = str(
-                result.get("source")
-                or result.get("verification_source")
-                or "interaction_result"
+        resolved_state, inferred_from_action = _resolved_interaction_state(result)
+        if resolved_state is not None:
+            node.interaction["state"] = str(resolved_state)
+            node.interaction["state_source"] = (
+                "successful_action_postcondition"
+                if inferred_from_action
+                else str(
+                    result.get("source")
+                    or result.get("verification_source")
+                    or "interaction_result"
+                )
             )
             node.interaction["state_confidence"] = float(
                 result.get("confidence", 1.0)
@@ -201,7 +258,7 @@ class InteractionGraphStore:
                 {
                     "is_interactable": False,
                     "interaction_mode": "none",
-                    "state": str(explicit_state or "static"),
+                    "state": str(resolved_state or "static"),
                     "state_source": str(
                         result.get("source")
                         or result.get("verification_source")
@@ -229,7 +286,13 @@ class InteractionGraphStore:
                     "post_state": str(state),
                     "success": bool(result.get("success", True)),
                     "execution_cost": float(result.get("execution_cost", result.get("cost", 1.0))),
-                    "verification_source": str(result.get("verification_source") or result.get("source") or "interaction_result"),
+                    "verification_source": str(
+                        "successful_action_postcondition"
+                        if inferred_from_action
+                        else result.get("verification_source")
+                        or result.get("source")
+                        or "interaction_result"
+                    ),
                 }
             if result.get("interaction_group_id"):
                 history_entry["interaction_group_id"] = str(
@@ -243,7 +306,7 @@ class InteractionGraphStore:
             history.append(history_entry)
         node.interaction["operation_history"] = history
         self._update_interaction_group_memory(node, result)
-        if explicit_state is not None or static_capability:
+        if resolved_state is not None or static_capability:
             node.attributes["interaction_state_override"] = {
                 key: node.interaction.get(key)
                 for key in (
@@ -820,8 +883,7 @@ class InteractionGraphStore:
                 continue
             mx = idx % width
             my = idx // width
-            wx = float(grid_info.origin.position.x) + (mx + 0.5) * float(grid_info.resolution)
-            wy = float(grid_info.origin.position.y) + (my + 0.5) * float(grid_info.resolution)
+            wx, wy = grid_to_world(mx, my, grid_info)
             room_points[scene_id].append((wx, wy))
             if idx < len(confidence_data):
                 room_conf[scene_id].append(float(confidence_data[idx]))
@@ -992,8 +1054,9 @@ class InteractionGraphStore:
                 continue
             mx = idx % width
             my = idx // width
-            xs.append(float(grid_info.origin.position.x) + (mx + 0.5) * float(grid_info.resolution))
-            ys.append(float(grid_info.origin.position.y) + (my + 0.5) * float(grid_info.resolution))
+            wx, wy = grid_to_world(mx, my, grid_info)
+            xs.append(wx)
+            ys.append(wy)
         if xs and ys:
             return [sum(xs) / len(xs), sum(ys) / len(ys), 0.5 * self.room_box_height]
         return [float(room_id), 0.0, 0.0]
@@ -1013,8 +1076,9 @@ class InteractionGraphStore:
                 continue
             mx = idx % width
             my = idx // width
-            xs.append(float(grid_info.origin.position.x) + (mx + 0.5) * float(grid_info.resolution))
-            ys.append(float(grid_info.origin.position.y) + (my + 0.5) * float(grid_info.resolution))
+            wx, wy = grid_to_world(mx, my, grid_info)
+            xs.append(wx)
+            ys.append(wy)
         if len(xs) > 1 and len(ys) > 1:
             return [max(max(xs) - min(xs), float(grid_info.resolution)), max(max(ys) - min(ys), float(grid_info.resolution)), self.room_box_height]
         resolution = float(grid_info.resolution) if grid_info is not None else 0.5

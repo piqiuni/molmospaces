@@ -84,6 +84,52 @@ def navigation_goal_options(candidate: dict[str, Any]) -> list[tuple[float, floa
     return options
 
 
+def navigation_should_prerotate(behavior_type: str) -> bool:
+    """Keep exploration goals responsive while preserving precise skill approaches."""
+
+    return str(behavior_type or "").upper() != BEHAVIOR_EXPLORE
+
+
+def navigation_requires_final_yaw(
+    behavior_type: str,
+    final_align_enabled: bool,
+    primary_goal_values: list[Any],
+) -> bool:
+    """Frontier viewpoints need position reachability, not a strict terminal yaw."""
+
+    return bool(
+        final_align_enabled
+        and str(behavior_type or "").upper() != BEHAVIOR_EXPLORE
+        and len(primary_goal_values) > 2
+    )
+
+
+def is_post_interaction_traversal_navigation(
+    candidate: dict[str, Any] | None,
+) -> bool:
+    """Scope stale-costmap retries to the sealed portal continuation only."""
+
+    candidate = candidate or {}
+    metadata = candidate.get("metadata") or {}
+    return bool(
+        str(candidate.get("behavior_type") or "").upper() == BEHAVIOR_NAVIGATE
+        and metadata.get("post_interaction_traversal")
+    )
+
+
+def bounded_empty_plan_retry_delay(
+    now_s: float,
+    deadline_s: float,
+    interval_s: float,
+) -> float | None:
+    """Return the next retry delay without sleeping beyond the retry window."""
+
+    remaining_s = float(deadline_s) - float(now_s)
+    if remaining_s <= 0.0:
+        return None
+    return min(max(0.0, float(interval_s)), remaining_s)
+
+
 def requires_graph_verification(module3: str, selection: dict[str, Any] | None) -> bool:
     if str(module3 or "").casefold() == "rule_verified":
         return True

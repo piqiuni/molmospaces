@@ -23,6 +23,10 @@ from semantic_mapping_py_pkg.graph_rules import observation_from_detection
 from semantic_mapping_py_pkg.graph_ablation import apply_module1_ablation
 from semantic_mapping_py_pkg.interaction_graph_viz import build_graph_marker_array
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
+from semantic_mapping_py_pkg.interaction_result_contract import (
+    merge_interaction_result_with_command,
+    take_pending_interaction_command,
+)
 from semantic_mapping_py_pkg.messages import dumps_compact, parse_json_list, parse_json_object_or_text
 from semantic_mapping_py_pkg.room_segmentation import RoomSegmenter, RoomSegmentationState
 from semantic_mapping_py_pkg.ros_py311_compat import patch_roslogging_findcaller_for_py311
@@ -195,6 +199,8 @@ class SemanticMappingNode:
         self.latest_scene = None
         self.latest_occupancy_grid = None
         self.latest_room_segment_grid = None
+        self.pending_interaction_commands = {}
+        self.max_pending_interaction_commands = 128
         self.room_segmenter = RoomSegmenter(
             room_free_threshold=self.room_free_threshold,
             room_unknown_id=self.room_unknown_id,
@@ -339,6 +345,7 @@ class SemanticMappingNode:
                 self.graph_store.reset(episode_id=episode_id, source_mode="realtime_gt_observation")
                 self.semantic_occ_overlay.reset()
                 self.semantic_occ_update_tracker.reset()
+                self.pending_interaction_commands.clear()
                 self.object_store.objects = []
                 self.object_store.next_id = 1
                 self.room_segmenter.state = RoomSegmentationState()
@@ -359,20 +366,23 @@ class SemanticMappingNode:
 
     def interaction_command_callback(self, msg):
         parsed = parse_json_object_or_text(msg.data)
-        if str(parsed.get("action") or "").casefold() != "open":
-            return
         with self.lock:
-            changed = self.semantic_occ_overlay.set_interaction_pending(
-                parsed.get("node_id"), True
-            )
+            self._remember_interaction_command_locked(parsed)
+            changed = False
+            if str(parsed.get("action") or "").casefold() == "open":
+                changed = self.semantic_occ_overlay.set_interaction_pending(
+                    parsed.get("node_id"), True
+                )
             publish_bundle = self._collect_publish_bundle_locked() if changed else None
         if publish_bundle is not None:
             self._safe_publish_bundle(publish_bundle)
 
     def interaction_result_callback(self, msg):
         parsed = parse_json_object_or_text(msg.data)
-        stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
         with self.lock:
+            command = self._take_interaction_command_locked(parsed)
+            parsed = merge_interaction_result_with_command(parsed, command)
+            stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
             pending_changed = self.semantic_occ_overlay.set_interaction_pending(
                 parsed.get("node_id"), False
             )
@@ -384,6 +394,21 @@ class SemanticMappingNode:
             )
         if publish_bundle is not None:
             self._safe_publish_bundle(publish_bundle)
+
+    def _remember_interaction_command_locked(self, command):
+        key = str(command.get("command_id") or command.get("event_id") or "")
+        if not key:
+            return
+        self.pending_interaction_commands.pop(key, None)
+        self.pending_interaction_commands[key] = dict(command)
+        while len(self.pending_interaction_commands) > self.max_pending_interaction_commands:
+            oldest_key = next(iter(self.pending_interaction_commands))
+            self.pending_interaction_commands.pop(oldest_key, None)
+
+    def _take_interaction_command_locked(self, result):
+        return take_pending_interaction_command(
+            self.pending_interaction_commands, result
+        )
 
     def attribute_updates_callback(self, msg):
         if self.ablation.module1 != "dynamic_mllm":

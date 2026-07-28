@@ -64,6 +64,9 @@ class CandidateGeneratorConfig:
     max_state_age_sec: float = 300.0
     min_state_confidence: float = 0.5
     portal_standoff_m: float = 1.0
+    portal_traversal_distance_m: float = 0.9
+    portal_traversal_max_start_distance_m: float = 2.0
+    portal_traversal_completion_margin_m: float = 0.35
     container_standoff_m: float = 1.0
     drawer_standoff_m: float = 1.0
     interaction_safety_margin_m: float = 0.0
@@ -100,6 +103,9 @@ class CandidateGenerator:
                 self._interaction_candidates(
                     graph or {}, robot_xy, target_context or {}
                 )
+            )
+            candidates.extend(
+                self._portal_traversal_candidates(graph or {}, robot_xy)
             )
             candidates.extend(
                 self._target_candidates(graph or {}, robot_xy, target_context or {})
@@ -908,6 +914,135 @@ class CandidateGenerator:
             )
         return candidates
 
+    def _portal_traversal_candidates(
+        self,
+        graph: dict[str, Any],
+        robot_xy: tuple[float, float],
+    ) -> list[BehaviorCandidate]:
+        """Create a one-shot goal beyond a portal opened from the current side."""
+
+        if "portal" not in set(self.config.interaction_types):
+            return []
+        candidates: list[BehaviorCandidate] = []
+        for node in graph.get("nodes") or []:
+            if str(node.get("type") or "").casefold() != "portal":
+                continue
+            interaction = node.get("interaction") or {}
+            state = str(interaction.get("state") or "unknown").casefold()
+            if state not in {"open", "static_open"}:
+                continue
+            if interaction.get("traversable") is False:
+                continue
+            history = list(interaction.get("operation_history") or [])
+            open_event = next(
+                (
+                    event
+                    for event in reversed(history)
+                    if bool(event.get("success"))
+                    and str(event.get("action") or "").casefold() == "open"
+                    and str(event.get("post_state") or state).casefold()
+                    in {"open", "static_open"}
+                    and len(list(event.get("approach_goal_xyyaw") or [])) >= 2
+                ),
+                None,
+            )
+            if open_event is None:
+                continue
+            approach = list(open_event.get("approach_goal_xyyaw") or [])
+            attributes = node.get("attributes") or {}
+            center = list(
+                attributes.get("interaction_reference_aabb_center")
+                or node.get("aabb_center")
+                or node.get("centroid")
+                or []
+            )
+            if len(center) < 2:
+                continue
+            center_x, center_y = float(center[0]), float(center[1])
+            through_x = center_x - float(approach[0])
+            through_y = center_y - float(approach[1])
+            through_norm = math.hypot(through_x, through_y)
+            if through_norm <= 1e-6:
+                continue
+            unit_x = through_x / through_norm
+            unit_y = through_y / through_norm
+            robot_to_center = math.hypot(
+                float(robot_xy[0]) - center_x,
+                float(robot_xy[1]) - center_y,
+            )
+            if robot_to_center > max(
+                0.0, float(self.config.portal_traversal_max_start_distance_m)
+            ):
+                continue
+            signed_progress = (
+                (float(robot_xy[0]) - center_x) * unit_x
+                + (float(robot_xy[1]) - center_y) * unit_y
+            )
+            if signed_progress >= max(
+                0.0, float(self.config.portal_traversal_completion_margin_m)
+            ):
+                continue
+            traversal_distance = max(
+                0.0, float(self.config.portal_traversal_distance_m)
+            )
+            goal = [
+                center_x + unit_x * traversal_distance,
+                center_y + unit_y * traversal_distance,
+                math.atan2(unit_y, unit_x),
+            ]
+            distance_m = math.hypot(
+                goal[0] - float(robot_xy[0]), goal[1] - float(robot_xy[1])
+            )
+            node_id = str(node.get("id") or "")
+            event_id = str(open_event.get("event_id") or "latest_open")
+            source_object_name = str(
+                attributes.get("source_object_name") or node.get("name") or node_id
+            )
+            candidates.append(
+                BehaviorCandidate(
+                    candidate_id=f"traverse:{node_id}:{event_id}",
+                    behavior_type=BEHAVIOR_NAVIGATE,
+                    source="post_interaction_portal",
+                    target_id=node_id,
+                    target_name=source_object_name,
+                    goal_xyyaw=goal,
+                    features={
+                        "exploration_gain": 1.25,
+                        "visibility_gain": 1.15,
+                        "semantic_gain": 1.0,
+                        "target_relevance": 0.0,
+                        "distance_m": distance_m,
+                        "interaction_cost": 0.0,
+                        "state_age_ratio": 0.0,
+                        "confidence": float(
+                            interaction.get("state_confidence", 1.0) or 1.0
+                        ),
+                        "priority": 1.0,
+                    },
+                    metadata={
+                        "node_type": "portal",
+                        "semantic_name": str(
+                            attributes.get("semantic_name")
+                            or attributes.get("category")
+                            or node.get("label")
+                            or "door"
+                        ),
+                        "state": state,
+                        "post_interaction_traversal": True,
+                        "opened_portal_id": node_id,
+                        "source_interaction_event_id": event_id,
+                        "connected_room_ids": list(
+                            attributes.get("connected_room_ids") or []
+                        ),
+                        "room_transition_required": True,
+                        "requires_approach": False,
+                        "verify_target_visibility": False,
+                        "goal_xyyaw_candidates": [goal],
+                    },
+                )
+            )
+        return candidates
+
     @classmethod
     def _approach_candidates(
         cls,
@@ -918,9 +1053,43 @@ class CandidateGenerator:
         node_type: str,
     ) -> list[list[float]]:
         candidates: list[list[float]] = []
+        if node_type == "portal":
+            # A single radial approach can put all fallbacks on the blocked
+            # side of a doorway.  Keep the original (robot-side, zero-offset)
+            # candidates first, then try small tangential offsets and the
+            # opposite doorway side.  The executor preflights these in order
+            # and stops at the first reachable pose.
+            for side_multiplier in (1.0, -1.0):
+                for tangent_offset_m in (0.0, 0.20, -0.20):
+                    for extra_standoff in (0.0, 0.25, 0.50):
+                        candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
+                        pose = cls._portal_approach_pose(
+                            robot_xy,
+                            target_xy,
+                            node,
+                            candidate_standoff,
+                            side_multiplier=side_multiplier,
+                            tangent_offset_m=tangent_offset_m,
+                        )
+                        if not any(
+                            math.hypot(pose[0] - previous[0], pose[1] - previous[1]) <= 1e-6
+                            and abs(
+                                math.atan2(
+                                    math.sin(pose[2] - previous[2]),
+                                    math.cos(pose[2] - previous[2]),
+                                )
+                            )
+                            <= 1e-6
+                            for previous in candidates
+                        ):
+                            candidates.append(pose)
+            return candidates
+
         for extra_standoff in (0.0, 0.25, 0.50):
             candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
             if node_type == "portal":
+                # Kept unreachable by the branch above; this guard makes the
+                # non-portal path below explicit if node types are extended.
                 pose = cls._portal_approach_pose(
                     robot_xy, target_xy, node, candidate_standoff
                 )
@@ -1233,6 +1402,8 @@ class CandidateGenerator:
         target_xy: tuple[float, float],
         node: dict[str, Any],
         standoff_m: float,
+        side_multiplier: float = 1.0,
+        tangent_offset_m: float = 0.0,
     ) -> list[float]:
         attributes = node.get("attributes") or {}
         reference_center = list(
@@ -1247,24 +1418,49 @@ class CandidateGenerator:
             or node.get("aabb_size")
             or []
         )
-        if len(size) < 2:
-            return cls._approach_pose(robot_xy, target_xy, standoff_m)
-        size_x = max(0.0, float(size[0]))
-        size_y = max(0.0, float(size[1]))
+        boundary_distance = 0.0
+        size_x = max(0.0, float(size[0])) if len(size) >= 1 else 0.0
+        size_y = max(0.0, float(size[1])) if len(size) >= 2 else 0.0
         major = max(size_x, size_y)
         minor = min(size_x, size_y)
-        if major <= 1e-6 or major / max(minor, 1e-6) < 1.35:
-            return cls._approach_pose(robot_xy, target_xy, standoff_m)
-        if size_x <= size_y:
-            normal_x, normal_y = 1.0, 0.0
+        elongated = major > 1e-6 and major / max(minor, 1e-6) >= 1.35
+        if elongated:
+            # The short AABB axis is the doorway normal.  Use the robot side
+            # for the primary pose and allow the caller to request the other
+            # side with side_multiplier=-1.
+            if size_x <= size_y:
+                normal_x, normal_y = 1.0, 0.0
+            else:
+                normal_x, normal_y = 0.0, 1.0
+            side = 1.0 if (
+                (robot_xy[0] - target_xy[0]) * normal_x
+                + (robot_xy[1] - target_xy[1]) * normal_y
+            ) >= 0.0 else -1.0
+            normal_x *= side * float(side_multiplier)
+            normal_y *= side * float(side_multiplier)
+            boundary_distance = 0.5 * minor
         else:
-            normal_x, normal_y = 0.0, 1.0
-        side = 1.0 if (
-            (robot_xy[0] - target_xy[0]) * normal_x
-            + (robot_xy[1] - target_xy[1]) * normal_y
-        ) >= 0.0 else -1.0
-        offset = max(0.0, standoff_m) + 0.5 * minor
-        x = target_xy[0] + side * normal_x * offset
-        y = target_xy[1] + side * normal_y * offset
+            # Rotated/nearly-square AABBs do not expose a reliable normal.
+            # Retain the old radial direction as the primary side, and mirror
+            # that direction for the opposite-side fallback.
+            dx = float(robot_xy[0]) - float(target_xy[0])
+            dy = float(robot_xy[1]) - float(target_xy[1])
+            distance = math.hypot(dx, dy)
+            if distance <= 1e-6:
+                normal_x, normal_y = -1.0, 0.0
+            else:
+                normal_x, normal_y = dx / distance, dy / distance
+            if size_x > 1e-6 and size_y > 1e-6:
+                ray_denominator = abs(normal_x) / (0.5 * size_x) + abs(normal_y) / (0.5 * size_y)
+                if ray_denominator > 1e-6:
+                    boundary_distance = 1.0 / ray_denominator
+            normal_x *= float(side_multiplier)
+            normal_y *= float(side_multiplier)
+        offset = max(0.0, standoff_m) + boundary_distance
+        tangent_x, tangent_y = -normal_y, normal_x
+        x = target_xy[0] + normal_x * offset + tangent_x * float(tangent_offset_m)
+        y = target_xy[1] + normal_y * offset + tangent_y * float(tangent_offset_m)
+        # Every candidate faces the interaction reference, including the
+        # opposite-side and tangential fallbacks.
         yaw = math.atan2(target_xy[1] - y, target_xy[0] - x)
         return [x, y, yaw]

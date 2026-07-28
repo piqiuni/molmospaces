@@ -11,8 +11,12 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_PREPARING_EXPLORE,
     STATE_SUCCEEDED,
     STATE_VERIFYING,
+    bounded_empty_plan_retry_delay,
     committed_turn_sign,
+    is_post_interaction_traversal_navigation,
     navigation_goal_options,
+    navigation_requires_final_yaw,
+    navigation_should_prerotate,
     normalize_angle,
     path_lookahead_point,
     requires_graph_verification,
@@ -130,6 +134,46 @@ def test_navigation_goal_options_preserve_nearest_first_and_remove_duplicates() 
         (1.25, 2.0, 0.0),
         (1.50, 2.0, math.pi),
     ]
+
+
+def test_explore_navigation_skips_prerotation_and_final_yaw_alignment() -> None:
+    assert not navigation_should_prerotate("EXPLORE")
+    assert navigation_should_prerotate("INTERACT")
+    assert navigation_should_prerotate("NAVIGATE")
+
+    assert not navigation_requires_final_yaw("EXPLORE", True, [1.0, 2.0, 0.5])
+    assert navigation_requires_final_yaw("INTERACT", True, [1.0, 2.0, 0.5])
+    assert navigation_requires_final_yaw("NAVIGATE", True, [1.0, 2.0, 0.5])
+    assert not navigation_requires_final_yaw("INTERACT", False, [1.0, 2.0, 0.5])
+    assert not navigation_requires_final_yaw("INTERACT", True, [1.0, 2.0])
+
+
+def test_post_interaction_traversal_retry_is_scoped_to_navigate_continuation() -> None:
+    traversal = {
+        "behavior_type": "NAVIGATE",
+        "metadata": {"post_interaction_traversal": True},
+    }
+    assert is_post_interaction_traversal_navigation(traversal)
+    assert not is_post_interaction_traversal_navigation(
+        {"behavior_type": "NAVIGATE", "metadata": {}}
+    )
+    assert not is_post_interaction_traversal_navigation(
+        {"behavior_type": "INTERACT", "metadata": traversal["metadata"]}
+    )
+    assert not is_post_interaction_traversal_navigation(
+        {"behavior_type": "EXPLORE", "metadata": traversal["metadata"]}
+    )
+
+
+def test_empty_plan_retry_delay_is_bounded_by_deadline() -> None:
+    assert bounded_empty_plan_retry_delay(10.0, 18.0, 0.5) == 0.5
+    assert math.isclose(
+        bounded_empty_plan_retry_delay(17.8, 18.0, 0.5),
+        0.2,
+        abs_tol=1e-9,
+    )
+    assert bounded_empty_plan_retry_delay(18.0, 18.0, 0.5) is None
+    assert bounded_empty_plan_retry_delay(18.1, 18.0, 0.5) is None
 
 
 def test_target_navigation_uses_graph_verification_for_mllm_module3() -> None:

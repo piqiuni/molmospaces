@@ -51,9 +51,74 @@ DEFAULT_GT_OBSERVATIONS_TOPIC = "/semantic_mapping/gt_observations"
 DEFAULT_INTERACTION_COMMAND_TOPIC = "/semantic_decision/interaction_command"
 DEFAULT_INTERACTION_RESULT_TOPIC = "/semantic_mapping/interaction_result"
 
+# A direct drawer scan is intentionally bound to a box that was already
+# published on the public perception topic.  The threshold is deliberately
+# high: this is identity routing for a sealed evaluator skill, not a detector
+# association heuristic.
+DIRECT_DRAWER_SCAN_BBOX_MIN_IOU = 0.85
+# Keep a very small public-frame history so a command can cross the normal ROS
+# callback boundary, but never let an old observation become a durable object
+# selector.  These are wall-clock limits, intentionally independent of a
+# simulator's logical ``stamp_sec``.
+DIRECT_DRAWER_SCAN_BBOX_HISTORY_SIZE = 4
+DIRECT_DRAWER_SCAN_BBOX_TTL_S = 2.0
+
 
 class RestrictedGTContractError(ValueError):
     """Raised when an evaluator-side payload violates the public contract."""
+
+
+def _public_bbox_xyxy(value: Any) -> tuple[float, float, float, float] | None:
+    """Normalize one finite, positive-area public pixel box.
+
+    This helper deliberately accepts only the same geometry that the evaluator
+    has already put on the ROS perception topic.  It never consults simulator
+    geometry, segmentation IDs, or private object handles.
+    """
+
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(item) and item >= 0.0 for item in (x0, y0, x1, y1)):
+        return None
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def _public_capture_step(value: Any) -> int | None:
+    """Normalize one non-negative public perception capture step."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        return None
+    capture_step = int(numeric)
+    return capture_step if capture_step >= 0 else None
+
+
+def _bbox_iou_xyxy(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    """Return IoU for two validated public pixel boxes."""
+
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    first_area = (first[2] - first[0]) * (first[3] - first[1])
+    second_area = (second[2] - second[0]) * (second[3] - second[1])
+    union = first_area + second_area - intersection
+    return 0.0 if union <= 0.0 else intersection / union
 
 
 _PERCEPTION_TOP_LEVEL_KEYS = frozenset(
@@ -576,6 +641,19 @@ class EvaluatorInteractionRequest:
     # opaque-object contract.
     sequence_type: str = ""
     open_regions: tuple[tuple[float, float], ...] = field(default_factory=tuple)
+    # True only when the evaluator uniquely routed a drawer scan from a box it
+    # had already exposed in the latest public perception frame.  This is not
+    # emitted in the ROS completion event.
+    direct_bbox_drawer_scan: bool = False
+
+
+@dataclass(frozen=True)
+class _PublicVisibleBoxFrame:
+    """One evaluator-published frame eligible for direct bbox routing."""
+
+    capture_step: int
+    published_at_sec: float
+    boxes: tuple[tuple[str, tuple[float, float, float, float]], ...]
 
 
 InteractionExecutor = Callable[[EvaluatorInteractionRequest], bool | Mapping[str, Any]]
@@ -697,6 +775,7 @@ class RosObjectGoalEvaluatorAdapter:
         self._result_publisher = None
         self._command_subscriber = None
         self._episode_id = ""
+        self._episode_generation = 0
         self._private_instances: dict[str, Any] = {}
         self._pending_by_command_id: dict[str, EvaluatorInteractionRequest] = {}
         self._pending_order: deque[str] = deque()
@@ -705,6 +784,12 @@ class RosObjectGoalEvaluatorAdapter:
         self._event_sequence = 0
         self._published_result_events: list[dict[str, Any]] = []
         self._legacy_consecutive_observations: dict[str, int] = {}
+        # These hold only ids and boxes that have already been published on
+        # the public perception topic.  Do not add source names, simulator
+        # handles, joints, visibility internals, or state.
+        self._public_visible_box_frames: deque[_PublicVisibleBoxFrame] = deque(
+            maxlen=DIRECT_DRAWER_SCAN_BBOX_HISTORY_SIZE
+        )
 
     @property
     def episode_id(self) -> str:
@@ -798,6 +883,8 @@ class RosObjectGoalEvaluatorAdapter:
                 raise RestrictedGTContractError("private_instances cannot contain an empty opaque id")
             normalized_instances[opaque_id] = private_handle
         with self._lock:
+            self._episode_generation += 1
+            episode_generation = self._episode_generation
             self._episode_id = normalized_episode_id
             self._private_instances = normalized_instances
             self._pending_by_command_id.clear()
@@ -807,19 +894,22 @@ class RosObjectGoalEvaluatorAdapter:
             self._event_sequence = 0
             self._published_result_events = []
             self._legacy_consecutive_observations.clear()
-        # The mapping node resets on this empty episode marker.  Publishing it
-        # before target context ensures old graph state cannot be reused.
-        self._publish_semantic_minimal_observations_payload(
-            {
-                "schema_version": "interactive_nav_v3_semantic_minimal_gt_v1",
-                "episode_id": normalized_episode_id,
-                "episode_reset": True,
-                "capture_step": -1,
-                "stamp_sec": float(self._clock()),
-                "observations": [],
-            }
-        )
-        self._publish(self._target_publisher, normalized_target)
+            self._public_visible_box_frames.clear()
+            # The mapping node resets on this empty episode marker.  Keeping
+            # this publication under the episode lock prevents an in-flight
+            # prior frame from repopulating the new episode's bbox cache.
+            self._publish_semantic_minimal_observations_payload(
+                {
+                    "schema_version": "interactive_nav_v3_semantic_minimal_gt_v1",
+                    "episode_id": normalized_episode_id,
+                    "episode_reset": True,
+                    "capture_step": -1,
+                    "stamp_sec": float(self._clock()),
+                    "observations": [],
+                },
+                expected_generation=episode_generation,
+            )
+            self._publish(self._target_publisher, normalized_target)
 
     def publish_observations(
         self,
@@ -834,6 +924,7 @@ class RosObjectGoalEvaluatorAdapter:
             if not self._episode_id:
                 raise RuntimeError("reset() must be called before publishing observations")
             episode_id = self._episode_id
+            episode_generation = self._episode_generation
         semantic_payload = {
             "schema_version": "interactive_nav_v3_semantic_minimal_gt_v1",
             "episode_id": episode_id,
@@ -844,7 +935,11 @@ class RosObjectGoalEvaluatorAdapter:
                 observation.to_semantic_minimal_payload() for observation in observations
             ],
         }
-        return self.publish_semantic_minimal_perception_payload(semantic_payload)
+        self._publish_semantic_minimal_observations_payload(
+            semantic_payload,
+            expected_generation=episode_generation,
+        )
+        return deepcopy(semantic_payload)
 
     def publish_semantic_minimal_perception_payload(
         self, payload: Mapping[str, Any]
@@ -859,7 +954,11 @@ class RosObjectGoalEvaluatorAdapter:
                 raise RestrictedGTContractError(
                     "semantic minimal perception payload episode_id must match the active episode"
                 )
-        self._publish_semantic_minimal_observations_payload(payload)
+            episode_generation = self._episode_generation
+        self._publish_semantic_minimal_observations_payload(
+            payload,
+            expected_generation=episode_generation,
+        )
         return deepcopy(dict(payload))
 
     def publish_strict_perception_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -880,8 +979,12 @@ class RosObjectGoalEvaluatorAdapter:
                 raise RestrictedGTContractError(
                     "strict perception payload episode_id must match the active episode"
                 )
+            episode_generation = self._episode_generation
         adapted = adapt_strict_perception_payload_for_semantic_mapping(payload)
-        self._publish_semantic_minimal_observations_payload(adapted)
+        self._publish_semantic_minimal_observations_payload(
+            adapted,
+            expected_generation=episode_generation,
+        )
         return deepcopy(adapted)
 
     def publish_restricted_gt_frame(
@@ -915,7 +1018,11 @@ class RosObjectGoalEvaluatorAdapter:
                 raise RestrictedGTContractError(
                     "restricted-GT frame episode_id must match the active episode"
                 )
-        self._publish_semantic_minimal_observations_payload(adapted)
+            episode_generation = self._episode_generation
+        self._publish_semantic_minimal_observations_payload(
+            adapted,
+            expected_generation=episode_generation,
+        )
         return deepcopy(adapted)
 
     def pop_next_interaction_request(self) -> EvaluatorInteractionRequest | None:
@@ -999,9 +1106,36 @@ class RosObjectGoalEvaluatorAdapter:
             node_id = str(payload.get("node_id") or "")
             candidate_id = str(payload.get("candidate_id") or "")
             decision_id = str(payload.get("decision_id") or "")
-            sequence_type, open_regions = self._drawer_scan_hint(payload)
+            (
+                sequence_type,
+                open_regions,
+                drawer_container_bbox,
+                drawer_container_capture_step,
+                has_drawer_container_bbox,
+            ) = self._drawer_scan_hint(payload)
+            direct_bbox_drawer_scan = False
+            unresolved_public_drawer_box = False
+            if sequence_type == "drawer_scan" and has_drawer_container_bbox:
+                if (
+                    drawer_container_bbox is None
+                    or drawer_container_capture_step is None
+                ):
+                    unresolved_public_drawer_box = True
+                else:
+                    matched_instance_id = self._match_public_bbox_at_capture_step_locked(
+                        drawer_container_bbox,
+                        drawer_container_capture_step,
+                    )
+                    if matched_instance_id is None:
+                        unresolved_public_drawer_box = True
+                    else:
+                        # The public box, not a method-provided object selector,
+                        # determines the opaque object for this direct scan.
+                        instance_id = matched_instance_id
+                        direct_bbox_drawer_scan = True
             private_handle = self._private_instances.get(instance_id)
             episode_id = self._episode_id
+            episode_generation = self._episode_generation
         if action != "open":
             return self._reject_unresolved_command(
                 command_id=command_id,
@@ -1012,6 +1146,17 @@ class RosObjectGoalEvaluatorAdapter:
                 candidate_id=candidate_id,
                 decision_id=decision_id,
                 reason="unsupported_action",
+            )
+        if unresolved_public_drawer_box:
+            return self._reject_unresolved_command(
+                command_id=command_id,
+                episode_id=episode_id,
+                instance_id="",
+                action=action,
+                node_id=node_id,
+                candidate_id=candidate_id,
+                decision_id=decision_id,
+                reason="unresolved_drawer_scan_target",
             )
         if private_handle is None:
             return self._reject_unresolved_command(
@@ -1035,8 +1180,17 @@ class RosObjectGoalEvaluatorAdapter:
             decision_id=decision_id,
             sequence_type=sequence_type,
             open_regions=open_regions,
+            direct_bbox_drawer_scan=direct_bbox_drawer_scan,
         )
         with self._lock:
+            if (
+                episode_generation != self._episode_generation
+                or episode_id != self._episode_id
+            ):
+                # A reset replaced the private registry after this command was
+                # matched.  Do not allow an old request to enter the new
+                # episode's evaluator queue.
+                return None
             self._pending_by_command_id[command_id] = request
             self._pending_order.append(command_id)
         if self._interaction_executor is not None:
@@ -1074,24 +1228,77 @@ class RosObjectGoalEvaluatorAdapter:
                 return value
         return ""
 
+    def _match_public_bbox_at_capture_step_locked(
+        self,
+        requested_bbox: tuple[float, float, float, float],
+        capture_step: int,
+    ) -> str | None:
+        """Route a box from one recent evaluator-published public frame."""
+
+        now = float(self._clock())
+        fresh_frames = deque(
+            (
+                frame
+                for frame in self._public_visible_box_frames
+                if 0.0 <= now - frame.published_at_sec <= DIRECT_DRAWER_SCAN_BBOX_TTL_S
+            ),
+            maxlen=DIRECT_DRAWER_SCAN_BBOX_HISTORY_SIZE,
+        )
+        self._public_visible_box_frames = fresh_frames
+        matching_frames = [
+            frame
+            for frame in fresh_frames
+            if int(frame.capture_step) == int(capture_step)
+        ]
+        if len(matching_frames) != 1:
+            return None
+        matches = {
+            instance_id
+            for instance_id, published_bbox in matching_frames[0].boxes
+            if _bbox_iou_xyxy(requested_bbox, published_bbox)
+            >= DIRECT_DRAWER_SCAN_BBOX_MIN_IOU
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
     @staticmethod
     def _drawer_scan_hint(
         payload: Mapping[str, Any],
-    ) -> tuple[str, tuple[tuple[float, float], ...]]:
+    ) -> tuple[
+        str,
+        tuple[tuple[float, float], ...],
+        tuple[float, float, float, float] | None,
+        int | None,
+        bool,
+    ]:
         """Keep only public visual drawer-scan hints from a ROS command.
 
         A V3 method still requests ``open(opaque_object_id)``.  When its MLLM
         has selected a drawer scan, the evaluator may use normalized image
         centers to choose private slide joints.  Guessed joint names, force
         settings, part IDs and other simulator metadata are intentionally not
-        accepted here.
+        accepted here.  A ``drawer_container_bbox_2d`` plus its public
+        ``drawer_container_capture_step`` binds a direct scan to an object
+        that was visible in one recent evaluator-published frame.
         """
 
         if str(payload.get("sequence_type") or "").strip().casefold() != "drawer_scan":
-            return "", ()
+            return "", (), None, None, False
+        has_drawer_container_bbox = "drawer_container_bbox_2d" in payload
+        drawer_container_bbox = _public_bbox_xyxy(
+            payload.get("drawer_container_bbox_2d")
+        )
+        drawer_container_capture_step = _public_capture_step(
+            payload.get("drawer_container_capture_step")
+        )
         raw_regions = payload.get("open_regions")
         if not isinstance(raw_regions, list):
-            return "drawer_scan", ()
+            return (
+                "drawer_scan",
+                (),
+                drawer_container_bbox,
+                drawer_container_capture_step,
+                has_drawer_container_bbox,
+            )
         regions: list[tuple[float, float]] = []
         for raw_region in raw_regions[:12]:
             if not isinstance(raw_region, Mapping):
@@ -1109,7 +1316,13 @@ class RosObjectGoalEvaluatorAdapter:
             if point not in regions:
                 regions.append(point)
         regions.sort(key=lambda point: (point[1], point[0]))
-        return "drawer_scan", tuple(regions)
+        return (
+            "drawer_scan",
+            tuple(regions),
+            drawer_container_bbox,
+            drawer_container_capture_step,
+            has_drawer_container_bbox,
+        )
 
     def _reject_unresolved_command(
         self,
@@ -1186,9 +1399,74 @@ class RosObjectGoalEvaluatorAdapter:
         validate_restricted_perception_payload(payload)
         self._publish(self._observations_publisher, dict(payload))
 
-    def _publish_semantic_minimal_observations_payload(self, payload: Mapping[str, Any]) -> None:
+    def _publish_semantic_minimal_observations_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        expected_generation: int | None = None,
+    ) -> None:
+        """Publish and atomically cache one public perception frame.
+
+        The cache becomes eligible only after the ROS publication succeeds.
+        Holding the episode lock across both operations means an interaction
+        callback cannot route against a frame from a reset or half-published
+        episode.
+        """
+
         validate_semantic_minimal_perception_payload(payload)
-        self._publish(self._observations_publisher, dict(payload))
+        payload_episode_id = str(payload.get("episode_id") or "")
+        is_reset = bool(payload.get("episode_reset", False))
+        capture_step = _public_capture_step(payload.get("capture_step"))
+        visible_boxes: list[tuple[str, tuple[float, float, float, float]]] = []
+        if not is_reset and capture_step is not None:
+            for observation in payload.get("observations") or []:
+                if not isinstance(observation, Mapping):
+                    continue
+                instance_id = str(observation.get("id") or "").strip()
+                bbox = _public_bbox_xyxy(observation.get("bbox_2d"))
+                if instance_id and bbox is not None:
+                    visible_boxes.append((instance_id, bbox))
+        with self._lock:
+            if not self._episode_id:
+                raise RuntimeError("reset() must be called before publishing observations")
+            if payload_episode_id != self._episode_id:
+                raise RestrictedGTContractError(
+                    "semantic minimal perception payload episode_id must match the active episode"
+                )
+            if (
+                expected_generation is not None
+                and int(expected_generation) != self._episode_generation
+            ):
+                raise RestrictedGTContractError(
+                    "active episode changed before publishing perception payload"
+                )
+            self._publish(self._observations_publisher, dict(payload))
+            if is_reset:
+                self._public_visible_box_frames.clear()
+                return
+            if capture_step is None:
+                # The mapper may still consume a detector frame with a malformed
+                # step, but that frame cannot serve as a direct-scan selector.
+                return
+            # A drawer macro can publish several physical views at the same
+            # decision step.  Keep only the latest one for that public step so
+            # duplicate boxes cannot make the route spuriously ambiguous.
+            retained = [
+                frame
+                for frame in self._public_visible_box_frames
+                if int(frame.capture_step) != capture_step
+            ]
+            retained.append(
+                _PublicVisibleBoxFrame(
+                    capture_step=capture_step,
+                    published_at_sec=float(self._clock()),
+                    boxes=tuple(visible_boxes),
+                )
+            )
+            self._public_visible_box_frames = deque(
+                retained[-DIRECT_DRAWER_SCAN_BBOX_HISTORY_SIZE:],
+                maxlen=DIRECT_DRAWER_SCAN_BBOX_HISTORY_SIZE,
+            )
 
     def _publish(self, publisher: Any, payload: Mapping[str, Any]) -> None:
         if publisher is None or self._String is None:
