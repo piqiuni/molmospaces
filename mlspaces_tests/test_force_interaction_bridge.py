@@ -637,6 +637,121 @@ def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -
     assert result["task_steps_consumed"] == 14
 
 
+def test_drawer_scan_reconciles_rebound_after_final_task_step(monkeypatch) -> None:
+    state = {"drawer_top": 0.0, "drawer_bottom": 0.8}
+    prepared_close_names = []
+    published = []
+    command = {
+        "command_id": "drawer_rebound",
+        "candidate_id": "drawer_scan",
+        "decision_id": "decision_1",
+        "object_id": "dresser_root",
+        "action": "scan",
+        "sequence_type": "drawer_scan",
+    }
+
+    def infos(_env, _root):
+        return [
+            {"joint_name": name, "open_fraction": value, "joint_value": value}
+            for name, value in state.items()
+        ]
+
+    def prepare(_env, _root, close_joint_names=None, **_kwargs):
+        names = list(close_joint_names or [])
+        prepared_close_names.append(tuple(names))
+        return {
+            "group": {"joints": []},
+            "targets": {name: 0.0 for name in names},
+            "selected_joint_names": [],
+            "closed_joint_names": names,
+            "pre_joint_infos": infos(None, None),
+        }
+
+    def complete(_env, plan, **_kwargs):
+        for name in plan["closed_joint_names"]:
+            state[name] = 0.0
+        return {
+            # Close-only force plans historically report false here because
+            # they have no open-selection.  The bridge must verify simulator
+            # state instead of trusting that summary flag.
+            "success": False,
+            "atomic_fallback": True,
+            "physics_substeps": 7,
+        }
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.articulation_joint_infos",
+        infos,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_state_force",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.complete_articulation_force",
+        complete,
+    )
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    controller._head_view_controller.restore = lambda _env: {"applied": True}
+    monkeypatch.setattr(
+        controller,
+        "_publish",
+        lambda _publisher, payload: published.append(payload),
+    )
+    controller._commands.put(command)
+    controller._commands.get_nowait()
+    controller._pending = {
+        "kind": "drawer_sequence",
+        "command": command,
+        "step": 10,
+        "phase": "close",
+        "phase_step": 1,
+        "group_index": 1,
+        "groups": [
+            {"group_id": "top", "joint_names": ["drawer_top"]},
+            {"group_id": "bottom", "joint_names": ["drawer_bottom"]},
+        ],
+        "all_joint_names": ["drawer_top", "drawer_bottom"],
+        "transition_steps": 1,
+        "observation_steps": 1,
+        "group_results": [
+            {"region_id": "top", "success": True},
+            {"region_id": "bottom", "success": True},
+        ],
+        "transition_log": [],
+        "physics_substeps": 20,
+        "view_result": {"applied": True},
+        "view_restore_result": None,
+        "robot_lock_snapshot": None,
+    }
+    task = SimpleNamespace(env=SimpleNamespace())
+
+    result = controller._advance_drawer_sequence_after_step(task, step=11)
+
+    assert result is not None
+    assert result["status"] == "SUCCEEDED"
+    assert result["final_close_success"] is True
+    assert result["final_close_recovery"] == {
+        "attempted": True,
+        "success": True,
+        "physics_substeps": 7,
+        "atomic_fallback": True,
+    }
+    assert prepared_close_names == [("drawer_top", "drawer_bottom")]
+    assert result["physics_substeps"] == 27
+    assert result["transition_log"][-1]["phase"] == "final_close_recovery"
+    assert len(published) == 2
+
+
+def test_drawer_close_verification_requires_every_selected_joint() -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+
+    assert not controller._drawer_close_is_confirmed(
+        [{"joint_name": "drawer_top", "open_fraction": 0.0}],
+        ["drawer_top", "drawer_bottom"],
+    )
+
+
 def test_drawer_scan_failure_best_effort_closes_and_restores_view(monkeypatch) -> None:
     controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
     command = {

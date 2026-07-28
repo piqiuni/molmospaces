@@ -165,6 +165,9 @@ class RosBridgePolicy(BasePolicy):
         self._pointcloud_projection_cache: dict[
             tuple[int, int, float, float, float, float], tuple[np.ndarray, np.ndarray]
         ] = {}
+        self._last_depth_geometry_signature: (
+            tuple[str, int, int, float, float, float, float] | None
+        ) = None
 
         self._step_idx = 0
         self._latest_action: dict[str, Any] | None = None
@@ -963,14 +966,24 @@ class RosBridgePolicy(BasePolicy):
         return fx, fy, cx, cy
 
     def _get_camera_fov_deg(self, camera_name: str) -> float | None:
-        cam_cfg = getattr(getattr(self.config, "camera_config", None), "cameras", None)
-        if cam_cfg is None:
-            return None
-        for cam in cam_cfg:
-            if getattr(cam, "name", None) == camera_name:
-                fov = getattr(cam, "fov", None)
-                if fov is not None:
-                    return float(fov)
+        # JSON evaluation creates a policy before its per-episode configuration.
+        # Prefer the active task's configuration, which owns the replayed camera
+        # specification, so the fallback cannot retain an unset worker config.
+        task_config = getattr(getattr(self, "task", None), "config", None)
+        policy_config = getattr(self, "config", None)
+        seen_configs: set[int] = set()
+        for config in (task_config, policy_config):
+            if config is None or id(config) in seen_configs:
+                continue
+            seen_configs.add(id(config))
+            cameras = getattr(getattr(config, "camera_config", None), "cameras", None)
+            if cameras is None:
+                continue
+            for cam in cameras:
+                if getattr(cam, "name", None) == camera_name:
+                    fov = getattr(cam, "fov", None)
+                    if fov is not None:
+                        return float(fov)
         return None
 
     def _intrinsics_from_fov(
@@ -1609,6 +1622,31 @@ class RosBridgePolicy(BasePolicy):
                     )
                     if fov_intrinsics is not None:
                         intrinsics = fov_intrinsics
+                if intrinsics is not None:
+                    fx, fy, cx, cy = intrinsics
+                    geometry_signature = (
+                        camera_name,
+                        int(depth.shape[1]),
+                        int(depth.shape[0]),
+                        round(float(fx), 6),
+                        round(float(fy), 6),
+                        round(float(cx), 6),
+                        round(float(cy), 6),
+                    )
+                    if geometry_signature != self._last_depth_geometry_signature:
+                        self._rospy.loginfo(
+                            "RosBridgePolicy: RGB-D projection camera=%s depth=%dx%d "
+                            "K=(fx=%.6f, fy=%.6f, cx=%.6f, cy=%.6f; fx/fy=%.6f)",
+                            camera_name,
+                            int(depth.shape[1]),
+                            int(depth.shape[0]),
+                            fx,
+                            fy,
+                            cx,
+                            cy,
+                            fx / max(fy, 1e-6),
+                        )
+                        self._last_depth_geometry_signature = geometry_signature
                 stage_ms["depth_extract_intrinsics"] = (
                     time.perf_counter() - t0_depth_extract
                 ) * 1000.0

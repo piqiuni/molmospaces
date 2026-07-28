@@ -1,0 +1,7 @@
+exploration:
+  external_behavior_control: true
+  local_plan_watchdog_enabled: true
+  local_plan_watchdog_sec: 12.0
+
+frontier:
+  use_voronoi_viewpoints: false

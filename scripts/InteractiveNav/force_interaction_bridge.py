@@ -814,6 +814,15 @@ class AtomicForceInteractionController:
                 pending["phase_step"] = 0
                 pending["phase_plan"] = None
                 return None
+            # The force transition completes in ``before_step`` and the task
+            # physics step runs before this callback.  A lightly damped drawer
+            # can therefore rebound after the transition itself reported that
+            # it reached the closed target.  Reconcile every scanned drawer
+            # together after that final task step, then verify the actual joint
+            # state again in ``_finish_drawer_sequence``.
+            pending["final_close_recovery"] = self._reconcile_final_drawer_close(
+                task
+            )
             # Release the lock only after the final drawer has fully closed;
             # restoring the head/torso is a separate final action.
             pending["robot_lock_snapshot"] = None
@@ -894,6 +903,85 @@ class AtomicForceInteractionController:
             }
         )
 
+    def _drawer_close_is_confirmed(
+        self,
+        joint_infos: list[dict[str, Any]],
+        joint_names: list[str],
+    ) -> bool:
+        expected_names = {str(name) for name in joint_names if str(name)}
+        observed = {
+            str(info.get("joint_name") or ""): info
+            for info in joint_infos
+            if str(info.get("joint_name") or "") in expected_names
+        }
+        return bool(expected_names) and set(observed) == expected_names and all(
+            float(info.get("open_fraction", 1.0))
+            <= 1.0 - float(self.force_config.open_fraction_threshold)
+            for info in observed.values()
+        )
+
+    def _reconcile_final_drawer_close(self, task) -> dict[str, Any]:
+        pending = self._pending
+        joint_names = list(pending.get("all_joint_names") or [])
+        object_id = str(pending["command"]["object_id"])
+        pre_infos = articulation_joint_infos(task.env, object_id)
+        if self._drawer_close_is_confirmed(pre_infos, joint_names):
+            return {
+                "attempted": False,
+                "success": True,
+                "physics_substeps": 0,
+                "atomic_fallback": False,
+            }
+
+        physics_substeps = 0
+        atomic_fallback = False
+        try:
+            recovery_plan = prepare_articulation_state_force(
+                task.env,
+                object_id,
+                close_joint_names=joint_names,
+            )
+            robot_lock = pending.get("robot_lock_snapshot")
+            recovery = complete_articulation_force(
+                task.env,
+                recovery_plan,
+                config=self.force_config,
+                robot_lock_callback=(
+                    None
+                    if robot_lock is None
+                    else lambda: _apply_robot_lock(task.env, robot_lock)
+                ),
+            )
+            physics_substeps = int(recovery.get("physics_substeps", 0))
+            atomic_fallback = bool(recovery.get("atomic_fallback", False))
+            pending["physics_substeps"] += physics_substeps
+            pending["transition_log"].append(
+                {
+                    "phase": "final_close_recovery",
+                    "task_step_index": 1,
+                    "progress": 1.0,
+                    "fallback": atomic_fallback,
+                    "physics_substeps": physics_substeps,
+                }
+            )
+            post_infos = articulation_joint_infos(task.env, object_id)
+            return {
+                "attempted": True,
+                "success": self._drawer_close_is_confirmed(
+                    post_infos, joint_names
+                ),
+                "physics_substeps": physics_substeps,
+                "atomic_fallback": atomic_fallback,
+            }
+        except Exception as exc:
+            return {
+                "attempted": True,
+                "success": False,
+                "physics_substeps": physics_substeps,
+                "atomic_fallback": atomic_fallback,
+                "error_type": type(exc).__name__,
+            }
+
     def _finish_drawer_sequence(self, task, step: int) -> dict[str, Any]:
         pending = self._pending
         command = pending["command"]
@@ -903,11 +991,9 @@ class AtomicForceInteractionController:
         success = bool(pending["group_results"]) and all(
             bool(group.get("success")) for group in pending["group_results"]
         )
-        final_close_success = bool(final_joint_infos) and all(
-            float(info.get("open_fraction", 1.0))
-            <= 1.0 - float(self.force_config.open_fraction_threshold)
-            for info in final_joint_infos
-            if info.get("joint_name") in pending["all_joint_names"]
+        final_close_success = self._drawer_close_is_confirmed(
+            final_joint_infos,
+            list(pending["all_joint_names"]),
         )
         success = success and final_close_success
         event_id = str(command.get("event_id") or f"interaction_{self._event_index:06d}")
@@ -940,6 +1026,15 @@ class AtomicForceInteractionController:
             ],
             "region_results": list(pending["group_results"]),
             "final_close_success": final_close_success,
+            "final_close_recovery": dict(
+                pending.get("final_close_recovery")
+                or {
+                    "attempted": False,
+                    "success": final_close_success,
+                    "physics_substeps": 0,
+                    "atomic_fallback": False,
+                }
+            ),
             "view_profile": "drawer_low_view",
             "view_profile_result": pending["view_result"],
             "view_restore_result": pending["view_restore_result"],

@@ -1,0 +1,8 @@
+exploration:
+  external_behavior_control: true
+  local_plan_watchdog_enabled: true
+  local_plan_watchdog_sec: 12.0
+
+frontier:
+  min_viewpoint_frontier_distance_m: 0.35
+  near_frontier_relax_distance_m: 3.0

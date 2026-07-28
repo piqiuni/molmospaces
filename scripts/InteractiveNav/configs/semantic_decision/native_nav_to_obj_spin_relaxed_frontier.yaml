@@ -1,0 +1,15 @@
+exploration:
+  external_behavior_control: true
+  initial_spin_enabled: true
+  initial_spin_angle_rad: 6.283185307179586
+  initial_spin_angular_speed: 0.60
+  initial_spin_timeout_sec: 20.0
+  initial_spin_settle_sec: 0.5
+  initial_spin_cmd_rate_hz: 10.0
+  local_plan_watchdog_enabled: true
+  local_plan_watchdog_sec: 12.0
+
+frontier:
+  hard_min_cluster_cells: 1
+  min_cluster_cells: 3
+  use_voronoi_viewpoints: false

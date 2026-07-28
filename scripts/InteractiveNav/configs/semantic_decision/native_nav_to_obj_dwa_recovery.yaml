@@ -1,0 +1,38 @@
+# Native NavToObj recovery profile.
+#
+# The stock ROS Noetic DWA plugin ignores the repository-specific
+# `conditional_reverse_*` controls.  Keep the supported recovery settings in
+# the native evaluator instead of changing the shared exploration defaults.
+
+GlobalPlanner:
+  allow_unknown: false
+  orientation_mode: 3
+  orientation_window_size: 8
+
+DWAPlannerROS:
+  # Permit slow, collision-checked reverse trajectories when a forward arc
+  # or in-place turn is blocked.
+  min_vel_x: -0.10
+  xy_goal_tolerance: 0.30
+  yaw_goal_tolerance: 0.20
+  latch_xy_goal_tolerance: true
+  heading_scoring: true
+  heading_scoring_timestep: 0.8
+
+# Restore the fast-decaying local obstacle map used by the stable native
+# baseline.  The top-level launch argument below applies the same inflation
+# radius after move_base starts.
+controller_frequency: 10.0
+
+global_costmap:
+  transform_tolerance: 3.0
+
+local_costmap:
+  transform_tolerance: 3.0
+  update_frequency: 10.0
+  publish_frequency: 10.0
+  obstacle_layer:
+    local_obstacles:
+      observation_persistence: 0.5
+  inflation_layer:
+    inflation_radius: 0.15
