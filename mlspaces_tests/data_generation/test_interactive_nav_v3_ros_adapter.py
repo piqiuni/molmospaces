@@ -77,4 +77,3 @@ def test_ros_bridge_adapter_normalizes_navigation_and_timeout_without_task() -> 
     timeout_action = adapter.act(policy_observation)
     assert timeout_action.kind == "observe"
     assert timeout_action.metadata["reason"] == "ros_bridge_no_fresh_action"
-

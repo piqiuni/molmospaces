@@ -73,4 +73,3 @@ def create_current_ros_navigation_policy(
 
 # A concise alias is convenient for factory specifications in experiment YAML.
 build_policy = create_current_ros_navigation_policy
-

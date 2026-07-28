@@ -1337,12 +1337,43 @@ ROUTE_ID=house7_force_route_01 \
 TASK_HORIZON=1000 \
 INITIAL_DOOR_STATE=closed \
 ENABLE_RECORDING=true \
+ENABLE_EXTERNAL_VIDEO=true \
+EXTERNAL_VIDEO_OVERLAY=true \
+PAPER_FRAME_EXPORTS=true \
+EXTRA_IMAGE_QUEUE_SIZE=0 \
+GT_STEP_INTERVAL=1 \
+GT_MAX_DISTANCE_M=6.0 \
+GT_MIN_VISIBLE_PIXELS=16 \
+VIDEO_FPS=15 \
+VIDEO_PANEL_WIDTH_PX=640 \
+EXTERNAL_VIDEO_WIDTH_PX=1024 \
+CLEAN_INTERMEDIATE=false \
 SIM_TIMEOUT_S=1800 \
   zsh scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
   outputs/house7_full_mllm_apple_hidden_container
 ```
 
 `METHOD=full_mllm_object_goal_apple` 内部选择的 `full_mllm_object_goal_apple.yaml` 不包含 apple 实例 ID、冰箱 ID、容器类别或强制交互提示。内部选择的 `full_mllm_house7_mapping.yaml` 只在执行侧合并全 MLLM ablation 与 House 7 已校准的冰箱正面交互位姿，不把容器关系写入任务目标或 LLM prompt。运行时目标采样同样默认只向 `/semantic_decision/target` 发布目标物体类别；完整容器关系保存在 `target_selection.json` 的 `private_target_context` 和候选记录中，仅用于任务构造与离线评测。只有队列脚本显式传入 `--reveal-container-context` 时才公开容器上下文。
+
+论文逐帧导出使用 `PAPER_FRAME_EXPORTS=true`。该模式通过
+`/molmo_spaces/step_sync` 为每个 sim step 保存一组严格对齐的图片，并区分“论文静帧”和
+“带调试信息的视频帧”：
+
+- 无文字外部相机 PNG（`1024x576`）：`debug/videos/external_camera_frames/`
+- 带上方诊断文字、用于外部相机视频的 PNG：`debug/videos/external_camera_overlay_frames/`
+- 模拟器原始分辨率、无文字外部相机 PNG：`debug/videos/external_camera_raw_frames/`
+- 无上方白条、无标题/step、无右下角 step 的图 3：`debug/videos/room_interaction_frames/`
+- 无上方白条、无标题/step、无右下角 step 的图 6：`debug/videos/semantic_topology_frames/`
+- 保留标题、任务目标、当前 subgoal 和 step 信息的六面板视频：`videos/overview_6panel.mp4`
+- 保留上方诊断文字的外部相机视频：`debug/videos/external_camera.mp4`
+
+2026-07-28 成功长测输出：
+`outputs/house7_full_mllm_apple_paper_1000_20260728_v2`。任务只公开 `apple` 类别，
+冰箱在 step 835 成功打开，apple 在 step 934 满足可见性完成条件，保留 10 个成功后帧并在
+step 944 提前结束；`target_goal_success=true`、
+`target_object_visible_navigation_success=true`、`overall_success=true`。六面板、外部相机、
+图 3、图 6、sim-step 与离线 composite 均保存 944 张/帧，两个写入队列丢帧数均为 0，
+离线六面板对齐为 944/944 exact step match。
 
 2026-07-27 回归：冰箱物理正面轴校准为 `+X`，节点图记录固定交互位姿
 `[8.254459, 1.053060, 3.141593]`。本次机器人实际交互位姿为
