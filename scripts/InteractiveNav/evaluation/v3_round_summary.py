@@ -28,7 +28,8 @@ import re
 from typing import Any, Iterable, Sequence
 
 
-SCHEMA_VERSION = "interactive_nav_v3_round_summary_v2"
+SCHEMA_VERSION = "interactive_nav_v3_round_summary_v3"
+PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v1"
 _WORKER_INDEX_RE = re.compile(r"^worker[_-]?(?P<index>\d+)")
 _PRE_SCORE_MARKERS = {
     "pre_score_guard",
@@ -90,6 +91,47 @@ def _finite_number(value: Any) -> float | int | None:
 def _optional_int(value: Any) -> int | None:
     number = _finite_number(value)
     return int(number) if number is not None else None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    """Return a persisted Boolean without treating a missing value as false."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, (str, int, float))]
+
+
+def _json_object(value: Any) -> dict[str, Any] | None:
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _paper_spl_from_saved_paths(
+    nav_success: bool | None,
+    reference_length_m: float | int | None,
+    executed_length_m: float | int | None,
+) -> float | None:
+    """Recompute paper SPL from its saved NavToObj inputs.
+
+    Older V3 rows stored an interaction-conditioned SPL value.  A post-hoc
+    report must not resurrect that definition merely because a `spl` scalar is
+    present in the JSON.
+    """
+
+    if nav_success is None or reference_length_m is None or executed_length_m is None:
+        return None
+    reference = max(0.0, float(reference_length_m))
+    executed = max(0.0, float(executed_length_m))
+    if not nav_success:
+        return 0.0
+    return reference / max(reference, executed, 1e-9)
 
 
 def _worker_dir(round_root: Path, result_path: Path) -> Path:
@@ -274,6 +316,29 @@ def summarise_episode(round_root: Path, result_path: Path) -> tuple[dict[str, An
     invalid_count = _optional_int(result.get("invalid_interaction_action_count")) or 0
     raw_early_stop = result.get("early_stop")
     raw_early_stop = raw_early_stop if isinstance(raw_early_stop, dict) else {}
+    scoring_eligible = _optional_bool(result.get("scoring_eligible"))
+    if scoring_eligible is None:
+        # The evaluator's historical contract treats an omitted field as
+        # eligible.  Preserve that contract for old artifacts, while all new
+        # records write the Boolean explicitly.
+        scoring_eligible = True
+    raw_requirement = result.get("interaction_requirement")
+    interaction_requirement = (
+        str(raw_requirement) if raw_requirement not in (None, "") else None
+    )
+    raw_paper_schema_version = result.get("paper_metric_schema_version")
+    paper_metric_schema_version = (
+        str(raw_paper_schema_version)
+        if raw_paper_schema_version not in (None, "")
+        else None
+    )
+    paper_metric_config = _json_object(result.get("paper_metric_config"))
+    paper_nav_success = _optional_bool(result.get("nav_success"))
+    paper_spl = _paper_spl_from_saved_paths(
+        paper_nav_success,
+        reference_path,
+        actual_path,
+    )
 
     expected_step_sync_count = _optional_int(result.get("step_count"))
     step_sync_count = _optional_int(debug_summary.get("step_sync_count"))
@@ -312,7 +377,9 @@ def summarise_episode(round_root: Path, result_path: Path) -> tuple[dict[str, An
         "house_index": _optional_int(result.get("house_index")),
         "case_id": result.get("case_id"),
         "status": result.get("status", document.get("status")),
-        "scoring_eligible": result.get("scoring_eligible"),
+        "scoring_eligible": scoring_eligible,
+        "domains": _string_list(result.get("domains")),
+        "interaction_requirement": interaction_requirement,
         "success": bool(result.get("success", result.get("task_success", False))),
         "terminal_reason": result.get("terminal_reason"),
         "early_stop": {
@@ -349,6 +416,46 @@ def summarise_episode(round_root: Path, result_path: Path) -> tuple[dict[str, An
             "error_count": extra_count + invalid_count,
             "extra_count": extra_count,
             "invalid_count": invalid_count,
+        },
+        # The formal paper metrics use evaluator-owned scalars.  SPL is the
+        # sole exception: it is recomputed from saved NavToObj success and
+        # planar paths so a stale interaction-conditioned `spl` field cannot
+        # contaminate a post-hoc report.  A round summary must never infer
+        # interaction correctness from redacted public attempts.
+        "paper_metrics": {
+            "schema_version": paper_metric_schema_version,
+            "metric_config": paper_metric_config,
+            "nav_success": paper_nav_success,
+            "spl": paper_spl,
+            "saved_spl_diagnostic": _finite_number(result.get("spl")),
+            "required_interaction_success": _optional_bool(
+                result.get("required_interaction_success")
+            ),
+            "interaction_precision": _finite_number(
+                result.get("interaction_precision_episode")
+            ),
+            "total_cost": _finite_number(result.get("episode_total_cost")),
+            "total_cost_breakdown": _json_object(
+                result.get("episode_total_cost_breakdown")
+            ),
+            "interaction_attempt_count": _optional_int(
+                result.get("interaction_action_count")
+            ),
+            "valid_interaction_attempt_count": _optional_int(
+                result.get("valid_interaction_attempt_count")
+            ),
+            "error_interaction_attempt_count": _optional_int(
+                result.get("error_interaction_attempt_count")
+            ),
+            "task_irrelevant_interaction_attempt_count": _optional_int(
+                result.get("task_irrelevant_interaction_attempt_count")
+            ),
+            "failed_interaction_attempt_count": _optional_int(
+                result.get("failed_interaction_attempt_count")
+            ),
+            "repeated_interaction_attempt_count": _optional_int(
+                result.get("repeated_interaction_attempt_count")
+            ),
         },
         "coverage": {
             "exploration_ratio": coverage_ratio,
@@ -404,6 +511,214 @@ def summarise_episode(round_root: Path, result_path: Path) -> tuple[dict[str, An
     return row, warnings
 
 
+def _paper_metric_value(row: dict[str, Any], key: str) -> Any:
+    paper = row.get("paper_metrics")
+    return paper.get(key) if isinstance(paper, dict) else None
+
+
+def _strict_paper_rate(
+    rows: Sequence[dict[str, Any]], key: str
+) -> tuple[float | None, int, int]:
+    """Aggregate a Boolean metric only when every scored row persisted it."""
+
+    denominator = len(rows)
+    values = [_optional_bool(_paper_metric_value(row, key)) for row in rows]
+    missing_count = sum(value is None for value in values)
+    if denominator == 0 or missing_count:
+        return None, denominator, missing_count
+    return sum(bool(value) for value in values) / denominator, denominator, 0
+
+
+def _strict_paper_mean(
+    rows: Sequence[dict[str, Any]], key: str
+) -> tuple[float | None, int, int]:
+    """Aggregate a scalar metric without silently dropping incomplete rows."""
+
+    denominator = len(rows)
+    values = [_finite_number(_paper_metric_value(row, key)) for row in rows]
+    missing_count = sum(value is None for value in values)
+    if denominator == 0 or missing_count:
+        return None, denominator, missing_count
+    mean = sum(float(value) for value in values if value is not None) / denominator
+    return mean, denominator, 0
+
+
+def _paper_provenance(
+    rows: Sequence[dict[str, Any]], key: str
+) -> dict[str, Any]:
+    """Check that a group has one explicit evaluator metric contract."""
+
+    serialized: dict[str, Any] = {}
+    missing_count = 0
+    for row in rows:
+        value = _paper_metric_value(row, key)
+        if value is None:
+            missing_count += 1
+            continue
+        if key == "metric_config":
+            if not isinstance(value, dict):
+                missing_count += 1
+                continue
+            fingerprint = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            serialized[fingerprint] = value
+        elif isinstance(value, str) and value:
+            serialized[value] = value
+        else:
+            missing_count += 1
+
+    consistent = bool(rows) and missing_count == 0 and len(serialized) == 1
+    return {
+        "value": next(iter(serialized.values())) if consistent else None,
+        "consistent": consistent,
+        "missing_count": missing_count,
+        "distinct_count": len(serialized),
+    }
+
+
+def _paper_group_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Compute the paper's five metrics from persisted evaluator scalars.
+
+    This module deliberately does not reconstruct these values from action
+    traces.  In particular, public interaction attempts do not contain the
+    evaluator-private required/irrelevant/repeat classification needed for IP
+    and Total Cost.
+    """
+
+    metric_schema = _paper_provenance(rows, "schema_version")
+    metric_config = _paper_provenance(rows, "metric_config")
+    sr, sr_denominator, sr_missing = _strict_paper_rate(rows, "nav_success")
+    spl, spl_denominator, spl_missing = _strict_paper_mean(rows, "spl")
+    required_rows = [
+        row for row in rows if row.get("interaction_requirement") == "required"
+    ]
+    isr, isr_denominator, isr_missing = _strict_paper_rate(
+        required_rows, "required_interaction_success"
+    )
+    ip, ip_denominator, ip_missing = _strict_paper_mean(
+        rows, "interaction_precision"
+    )
+    total_cost, total_cost_denominator, total_cost_missing = _strict_paper_mean(
+        rows, "total_cost"
+    )
+
+    # A legacy result can contain similarly named fields whose definitions
+    # predate the paper protocol.  Do not present those as formal paper scores
+    # unless every episode records one explicit, shared metric schema.
+    if not metric_schema["consistent"]:
+        sr = spl = isr = ip = total_cost = None
+
+    # A Cost value without one frozen parameter vector is not comparable across
+    # workers, so make it unavailable rather than averaging incompatible runs.
+    if not metric_config["consistent"]:
+        total_cost = None
+
+    return {
+        "episode_count": len(rows),
+        "paper_metric_schema_version": metric_schema["value"],
+        "paper_metric_schema_consistent": metric_schema["consistent"],
+        "paper_metric_schema_missing_count": metric_schema["missing_count"],
+        "paper_metric_schema_distinct_count": metric_schema["distinct_count"],
+        "paper_metric_config": metric_config["value"],
+        "paper_metric_config_consistent": metric_config["consistent"],
+        "paper_metric_config_missing_count": metric_config["missing_count"],
+        "paper_metric_config_distinct_count": metric_config["distinct_count"],
+        # Canonical paper names.
+        "sr": sr,
+        "spl": spl,
+        "isr": isr,
+        "ip": ip,
+        "total_cost": total_cost,
+        # Compatibility aliases used by the evaluator's regular summary.
+        "success_rate": sr,
+        "mean_spl": spl,
+        "required_interaction_success_rate": isr,
+        "interaction_precision": ip,
+        "mean_total_cost": total_cost,
+        # Explicit denominators make N/A (for example ISR on unnecessary-only
+        # episodes) distinguishable from a zero-valued metric.
+        "sr_denominator": sr_denominator,
+        "sr_missing_count": sr_missing,
+        "spl_denominator": spl_denominator,
+        "spl_missing_count": spl_missing,
+        "isr_denominator": isr_denominator,
+        "isr_missing_count": isr_missing,
+        "ip_denominator": ip_denominator,
+        "ip_missing_count": ip_missing,
+        "total_cost_denominator": total_cost_denominator,
+        "total_cost_missing_count": total_cost_missing,
+    }
+
+
+def _paper_round_summary(episodes: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    eligible_rows = [
+        row for row in episodes if bool(row.get("scoring_eligible", True))
+    ]
+    groups: dict[str, list[dict[str, Any]]] = {"overall": eligible_rows}
+    for domain in ("channel", "container", "mixed"):
+        expected = {"channel", "container"} if domain == "mixed" else {domain}
+        groups[f"domain/{domain}"] = [
+            row for row in eligible_rows if set(row.get("domains", [])) == expected
+        ]
+    for requirement in ("required", "unnecessary", "beneficial"):
+        groups[f"requirement/{requirement}"] = [
+            row
+            for row in eligible_rows
+            if row.get("interaction_requirement") == requirement
+        ]
+
+    overall = _paper_group_summary(eligible_rows)
+    return {
+        "schema_version": PAPER_METRIC_SCHEMA_VERSION,
+        "scope": "scoring-eligible episodes discovered below round_root",
+        "total_episode_count": len(episodes),
+        "scoring_eligible_episode_count": len(eligible_rows),
+        "runtime_ineligible_episode_count": len(episodes) - len(eligible_rows),
+        "paper_metric_schema_version": overall["paper_metric_schema_version"],
+        "paper_metric_schema_consistent": overall["paper_metric_schema_consistent"],
+        "paper_metric_config": overall["paper_metric_config"],
+        "paper_metric_config_consistent": overall["paper_metric_config_consistent"],
+        "groups": {
+            name: _paper_group_summary(rows)
+            for name, rows in groups.items()
+            if rows
+        },
+    }
+
+
+def _paper_metric_warnings(paper_summary: dict[str, Any]) -> list[str]:
+    groups = paper_summary.get("groups")
+    overall = groups.get("overall") if isinstance(groups, dict) else None
+    if not isinstance(overall, dict) or not overall.get("episode_count"):
+        return []
+    warnings: list[str] = []
+    if not overall.get("paper_metric_schema_consistent"):
+        warnings.append(
+            "Paper metrics are not formally comparable: episode results do not "
+            "share one persisted paper_metric_schema_version."
+        )
+    if not overall.get("paper_metric_config_consistent"):
+        warnings.append(
+            "Total Cost is unavailable: episode results do not share one persisted "
+            "paper_metric_config."
+        )
+    for name, missing_key in (
+        ("SR", "sr_missing_count"),
+        ("SPL", "spl_missing_count"),
+        ("ISR", "isr_missing_count"),
+        ("IP", "ip_missing_count"),
+        ("Total Cost", "total_cost_missing_count"),
+    ):
+        missing_count = int(overall.get(missing_key, 0) or 0)
+        if missing_count:
+            warnings.append(
+                f"Paper {name} is unavailable for {missing_count} scoring-eligible episode(s) "
+                "because the evaluator scalar was not persisted."
+            )
+    return warnings
+
+
 def summarise_round(round_root: Path) -> dict[str, Any]:
     """Build the machine-readable summary for all discovered episodes."""
 
@@ -415,6 +730,9 @@ def summarise_round(round_root: Path) -> dict[str, Any]:
         episode, episode_warnings = summarise_episode(root, result_path)
         episodes.append(episode)
         warnings.extend(episode_warnings)
+
+    paper_metrics = _paper_round_summary(episodes)
+    warnings.extend(_paper_metric_warnings(paper_metrics))
 
     success_count = sum(bool(row["success"]) for row in episodes)
     evaluator_times = [
@@ -448,6 +766,7 @@ def summarise_round(round_root: Path) -> dict[str, Any]:
         ),
         "parallel_wall_time_estimate_s": max(evaluator_times, default=None),
         "episode_wall_time_sum_s": sum(evaluator_times) if evaluator_times else None,
+        "paper_metrics": paper_metrics,
         "episodes": episodes,
         "warnings": warnings,
     }
@@ -565,6 +884,22 @@ def render_terminal_summary(summary: dict[str, Any]) -> str:
     warning_count = len(summary.get("warnings", []))
     if warning_count:
         totals += f" warnings={warning_count}"
+    paper_metrics = summary.get("paper_metrics")
+    paper_groups = (
+        paper_metrics.get("groups") if isinstance(paper_metrics, dict) else None
+    )
+    paper_overall = (
+        paper_groups.get("overall") if isinstance(paper_groups, dict) else None
+    )
+    if isinstance(paper_overall, dict):
+        totals += (
+            " paper="
+            f"SR={_format_ratio(paper_overall.get('sr'))} "
+            f"SPL={_format_ratio(paper_overall.get('spl'))} "
+            f"ISR={_format_ratio(paper_overall.get('isr'))} "
+            f"IP={_format_ratio(paper_overall.get('ip'))} "
+            f"TotalCost={_format_number(paper_overall.get('total_cost'))}"
+        )
     return f"{table}\n{totals}" if table else totals
 
 

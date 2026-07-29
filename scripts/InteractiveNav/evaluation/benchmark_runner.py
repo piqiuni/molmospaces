@@ -39,8 +39,15 @@ from scripts.InteractiveNav.force_interaction_runtime import ground_drawer_open_
 from scripts.InteractiveNav import interactive_nav_v3
 
 from .benchmark_metrics import (
+    DEFAULT_PAPER_COST_ERROR_SURCHARGE,
+    DEFAULT_PAPER_COST_FAILURE_PENALTY,
+    DEFAULT_PAPER_COST_INTERACTION_ATTEMPT,
+    PAPER_METRIC_SCHEMA_VERSION,
+    PaperMetricConfig,
     SUCCESS_OPEN_FRACTION,
     joint_open_fraction,
+    paper_episode_total_cost,
+    paper_interaction_attempt_score,
     path_length_bin,
     reference_path_length_m,
     score_interactions,
@@ -84,7 +91,7 @@ from .trusted_interaction_skill import (
 )
 
 
-PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v9"
+PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v10"
 STEP_BUDGET_FORMULA_VERSION = "interactive_nav_v3_step_budget_v1"
 DYNAMIC_MAX_STEPS_CAP = 2000
 
@@ -156,6 +163,9 @@ class BenchmarkEvaluationConfig:
     runtime_joint_fraction_tolerance: float = 0.05
     runtime_base_position_tolerance_m: float = 0.05
     runtime_base_yaw_tolerance_rad: float = 0.05
+    paper_cost_interaction_attempt: float = DEFAULT_PAPER_COST_INTERACTION_ATTEMPT
+    paper_cost_error_surcharge: float = DEFAULT_PAPER_COST_ERROR_SURCHARGE
+    paper_cost_failure_penalty: float = DEFAULT_PAPER_COST_FAILURE_PENALTY
     progress_every: int = 10
 
     def validate(self) -> None:
@@ -163,6 +173,7 @@ class BenchmarkEvaluationConfig:
             raise ValueError("workers must be >= 1")
         if self.max_steps < 1:
             raise ValueError("max_steps must be >= 1")
+        _paper_metric_config(self).validate()
         if self.step_budget_mode not in {"fixed", "dynamic"}:
             raise ValueError("step_budget_mode must be fixed or dynamic")
         if self.min_steps < 1:
@@ -253,6 +264,16 @@ class BenchmarkEvaluationConfig:
             raise ValueError("policy_dt_ms must be an integer multiple of ctrl_dt_ms")
         if not math.isclose(self.ctrl_dt_ms / self.sim_dt_ms, round(self.ctrl_dt_ms / self.sim_dt_ms)):
             raise ValueError("ctrl_dt_ms must be an integer multiple of sim_dt_ms")
+
+
+def _paper_metric_config(config: BenchmarkEvaluationConfig) -> PaperMetricConfig:
+    """Project evaluator CLI values into the frozen paper metric protocol."""
+
+    return PaperMetricConfig(
+        interaction_attempt_cost=float(config.paper_cost_interaction_attempt),
+        error_interaction_surcharge=float(config.paper_cost_error_surcharge),
+        failure_penalty=float(config.paper_cost_failure_penalty),
+    )
 
 
 class V3BenchmarkTaskSampler(JsonEvalTaskSampler):
@@ -2435,6 +2456,14 @@ def _consume_pending_ros_object_goal_interaction(
             "access": access_meta,
             "postcondition": postcondition,
             "joint_result_count": len(joint_results),
+            # The task-level acknowledgement may remain false while another
+            # required effect is pending.  Preserve physical effects so the
+            # paper's V/E accounting remains per attempted interaction.
+            "effect_achieved_interaction_ids": successful_ids,
+            # Retain the matched task-relevant IDs even when approach gating
+            # prevents force execution.  This private detail lets the paper
+            # breakdown label such an attempt as failed rather than unrelated.
+            "requested_interaction_ids": matching_ids,
             "transient_satisfied_interaction_ids": transient_satisfied_ids,
             "drawer_scan": executor_metadata,
         },
@@ -2675,6 +2704,7 @@ def _run_signature(config: BenchmarkEvaluationConfig, benchmark_sha256: str, ind
         config_payload.pop(key, None)
     payload = {
         "protocol_version": PROTOCOL_VERSION,
+        "paper_metric_config": _paper_metric_config(config).to_dict(),
         "protocol_implementation_sha256": _protocol_implementation_sha256(),
         "benchmark_sha256": benchmark_sha256,
         "episode_indices": indices,
@@ -2762,6 +2792,8 @@ def evaluate_episode(
     phase_timings = _PhaseTimings()
     started = time.monotonic()
     base_data = _episode_result_base(episode_index, episode, config.policy, config.policy == "scripted_oracle")
+    paper_metric_config = _paper_metric_config(config)
+    paper_metric_config_payload = paper_metric_config.to_dict()
     try:
         phase_started = time.perf_counter()
         interactive_nav_v3.validate_interactive_nav_v3_episode(episode, expected_domains=list(nav["interaction_domains"]))
@@ -3261,6 +3293,13 @@ def evaluate_episode(
         correct_count = terminal_score.correct_action_count
         extra_count = sum(row.get("classification") == "extra_valid" for row in attempts)
         invalid_count = sum(row.get("classification") == "invalid" for row in attempts)
+        paper_interaction_score = paper_interaction_attempt_score(episode, attempts)
+        episode_total_cost, episode_total_cost_breakdown = paper_episode_total_cost(
+            nav_success=nav_ok,
+            navigation_path_length_m=nav_path_length,
+            interaction_score=paper_interaction_score,
+            config=paper_metric_config,
+        )
         video_path = None
         if config.record_video and frames:
             destination = episode_dir / "head_camera.mp4"
@@ -3288,7 +3327,7 @@ def evaluate_episode(
             invalid_interaction_action_count=int(invalid_count),
             navigation_path_length_m=nav_path_length,
             reference_path_length_m=reference,
-            spl=spl(interaction_conditioned_success, reference, nav_path_length),
+            spl=spl(nav_ok, reference, nav_path_length),
             navigation_simulated_seconds=nav_sim_seconds,
             interaction_simulated_seconds=interaction_sim_seconds,
             total_simulated_seconds=nav_sim_seconds + interaction_sim_seconds + view_actions * float(config.policy_dt_ms) / 1000.0,
@@ -3307,6 +3346,28 @@ def evaluate_episode(
             runtime_consistency=public_runtime_consistency,
             timing_summary=phase_timings.summary(),
             early_stop=stall_tracker.snapshot(),
+            paper_metric_schema_version=PAPER_METRIC_SCHEMA_VERSION,
+            paper_metric_config=paper_metric_config_payload,
+            valid_interaction_attempt_count=(
+                paper_interaction_score.valid_interaction_attempt_count
+            ),
+            error_interaction_attempt_count=(
+                paper_interaction_score.error_interaction_attempt_count
+            ),
+            task_irrelevant_interaction_attempt_count=(
+                paper_interaction_score.task_irrelevant_interaction_attempt_count
+            ),
+            failed_interaction_attempt_count=(
+                paper_interaction_score.failed_interaction_attempt_count
+            ),
+            repeated_interaction_attempt_count=(
+                paper_interaction_score.repeated_interaction_attempt_count
+            ),
+            interaction_precision_episode=(
+                paper_interaction_score.interaction_precision_episode
+            ),
+            episode_total_cost=episode_total_cost,
+            episode_total_cost_breakdown=episode_total_cost_breakdown,
         ).to_dict()
         if transient_target_discovery is not None and private_visualization is not None:
             # Keep the scan-time target evidence beside other evaluator-only
@@ -3349,6 +3410,13 @@ def evaluate_episode(
                 runtime_consistency
             )
             error = "restricted evaluator exception"
+        paper_interaction_score = paper_interaction_attempt_score(episode, attempts)
+        episode_total_cost, episode_total_cost_breakdown = paper_episode_total_cost(
+            nav_success=False,
+            navigation_path_length_m=nav_path_length,
+            interaction_score=paper_interaction_score,
+            config=paper_metric_config,
+        )
         result = EpisodeResult(
             **base_data,
             status="exception",
@@ -3392,6 +3460,28 @@ def evaluate_episode(
             runtime_consistency=public_runtime_consistency,
             timing_summary=phase_timings.summary(),
             early_stop=stall_tracker.snapshot(),
+            paper_metric_schema_version=PAPER_METRIC_SCHEMA_VERSION,
+            paper_metric_config=paper_metric_config_payload,
+            valid_interaction_attempt_count=(
+                paper_interaction_score.valid_interaction_attempt_count
+            ),
+            error_interaction_attempt_count=(
+                paper_interaction_score.error_interaction_attempt_count
+            ),
+            task_irrelevant_interaction_attempt_count=(
+                paper_interaction_score.task_irrelevant_interaction_attempt_count
+            ),
+            failed_interaction_attempt_count=(
+                paper_interaction_score.failed_interaction_attempt_count
+            ),
+            repeated_interaction_attempt_count=(
+                paper_interaction_score.repeated_interaction_attempt_count
+            ),
+            interaction_precision_episode=(
+                paper_interaction_score.interaction_precision_episode
+            ),
+            episode_total_cost=episode_total_cost,
+            episode_total_cost_breakdown=episode_total_cost_breakdown,
         ).to_dict()
         if restricted_public_mode:
             trace.append({"exception": error})
@@ -3450,6 +3540,12 @@ def _write_reports(output_dir: Path, rows: list[dict[str, Any]], summary: dict[s
                 "status": row.get("status"),
                 "scoring_eligible": bool(row.get("scoring_eligible", False)),
                 "exclusion_reasons": row.get("scoring_exclusion_reasons", []),
+                "nav_success": row.get("nav_success"),
+                "spl": row.get("spl"),
+                "required_interaction_success": row.get("required_interaction_success"),
+                "interaction_precision_episode": row.get("interaction_precision_episode"),
+                "episode_total_cost": row.get("episode_total_cost"),
+                "paper_metric_config": row.get("paper_metric_config"),
                 "runtime_consistency": row.get("runtime_consistency"),
             }), ensure_ascii=False) + "\n")
     scoring_tmp.replace(scoring_path)
@@ -3471,6 +3567,7 @@ def _write_reports(output_dir: Path, rows: list[dict[str, Any]], summary: dict[s
         f"- Runtime-ineligible: {summary.get('runtime_ineligible_episode_count', 0)}",
         f"- Early-stopped scored failures: {summary.get('early_stop_episode_count', 0)}",
         f"- Early-stop reasons: {summary.get('early_stop_reason_counts', {})}",
+        f"- Paper metric configuration: {summary.get('paper_metric_config', {})}",
         "",
         "## Formal score groups",
         "",
@@ -3483,6 +3580,7 @@ def _write_reports(output_dir: Path, rows: list[dict[str, Any]], summary: dict[s
             f"TaskSR={values['task_success_rate']}, ICS={values['interaction_conditioned_success_rate']}, "
             f"NavSR={values['nav_success_rate']}, ISR={values['required_interaction_success_rate']}, "
             f"IP={values['interaction_precision']}, SPL={values['mean_spl']}, "
+            f"TotalCost={values.get('mean_total_cost')}, "
             f"EarlyStop={values.get('early_stop_episode_count', 0)}"
         )
     report = output_dir / "report.md"
@@ -3590,6 +3688,7 @@ def run_evaluation(config: BenchmarkEvaluationConfig) -> dict[str, Any]:
     summary.update(
         {
             "protocol_version": PROTOCOL_VERSION,
+            "paper_metric_config": _paper_metric_config(config).to_dict(),
             "run_signature": signature,
             "benchmark": str(benchmark_file),
             "benchmark_sha256": benchmark_hash,
@@ -3728,6 +3827,24 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--runtime-joint-fraction-tolerance", type=float, default=0.05)
     parser.add_argument("--runtime-base-position-tolerance-m", type=float, default=0.05)
     parser.add_argument("--runtime-base-yaw-tolerance-rad", type=float, default=0.05)
+    parser.add_argument(
+        "--paper-cost-interaction-attempt",
+        type=float,
+        default=DEFAULT_PAPER_COST_INTERACTION_ATTEMPT,
+        help="Paper Total Cost lambda: base cost for every interaction attempt.",
+    )
+    parser.add_argument(
+        "--paper-cost-error-surcharge",
+        type=float,
+        default=DEFAULT_PAPER_COST_ERROR_SURCHARGE,
+        help="Paper Total Cost mu: additional cost for an erroneous attempt (must exceed lambda).",
+    )
+    parser.add_argument(
+        "--paper-cost-failure-penalty",
+        type=float,
+        default=DEFAULT_PAPER_COST_FAILURE_PENALTY,
+        help="Paper Total Cost kappa: fixed penalty for NavToObj terminal failure.",
+    )
     parser.add_argument("--progress-every", type=int, default=10)
     args = parser.parse_args()
     return BenchmarkEvaluationConfig(
@@ -3788,6 +3905,9 @@ def parse_args() -> BenchmarkEvaluationConfig:
         runtime_joint_fraction_tolerance=args.runtime_joint_fraction_tolerance,
         runtime_base_position_tolerance_m=args.runtime_base_position_tolerance_m,
         runtime_base_yaw_tolerance_rad=args.runtime_base_yaw_tolerance_rad,
+        paper_cost_interaction_attempt=args.paper_cost_interaction_attempt,
+        paper_cost_error_surcharge=args.paper_cost_error_surcharge,
+        paper_cost_failure_penalty=args.paper_cost_failure_penalty,
         progress_every=args.progress_every,
     )
 

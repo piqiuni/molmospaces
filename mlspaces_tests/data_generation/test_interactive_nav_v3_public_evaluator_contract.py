@@ -8,6 +8,7 @@ separately from interaction-conditioned completion.
 
 from __future__ import annotations
 
+from dataclasses import fields
 import json
 
 import numpy as np
@@ -16,6 +17,7 @@ from scripts.InteractiveNav.evaluation.benchmark_metrics import summarise_result
 from scripts.InteractiveNav.evaluation.benchmark_runner import (
     _redact_runtime_consistency_for_restricted_policy,
 )
+from scripts.InteractiveNav.evaluation.benchmark_types import EpisodeResult
 from scripts.InteractiveNav.evaluation.public_goal import build_public_target_context
 from scripts.InteractiveNav.evaluation.restricted_gt_perception import (
     RESTRICTED_GT_PROTOCOL_VERSION,
@@ -130,9 +132,99 @@ def test_summary_separates_task_success_from_interaction_conditioned_success() -
 
     group = summarise_results(rows)["groups"]["overall"]
 
-    assert group["success_rate"] == 0.5
+    # ``success_rate`` is the paper SR: terminal NavToObj success only.  The
+    # historical interaction-conditioned flag is retained as a diagnostic,
+    # never as the SR numerator.
+    assert group["success_rate"] == 1.0
     assert group["task_success_rate"] == 0.5
     assert group["interaction_conditioned_success_rate"] == 0.5
+    assert group["nav_success_rate"] == 1.0
+
+
+def test_restricted_paper_metric_result_contract_is_scalar_and_redacted() -> None:
+    """Saved paper fields must score a ROS row without re-exporting private IDs."""
+
+    result_fields = {item.name for item in fields(EpisodeResult)}
+    assert {
+        "paper_metric_schema_version",
+        "paper_metric_config",
+        "valid_interaction_attempt_count",
+        "error_interaction_attempt_count",
+        "task_irrelevant_interaction_attempt_count",
+        "failed_interaction_attempt_count",
+        "repeated_interaction_attempt_count",
+        "interaction_precision_episode",
+        "episode_total_cost",
+        "episode_total_cost_breakdown",
+    }.issubset(result_fields)
+    assert not {
+        "resolved_object_name",
+        "resolved_joint_name",
+        "resolved_interaction_id",
+        "resolved_interaction_ids",
+    } & result_fields
+
+    # This is the shape retained in a restricted evaluator's final artifact:
+    # attempts expose only opaque routing/outcome, while paper calculation is
+    # recoverable from evaluator-owned scalar fields and its frozen config.
+    public_row = {
+        "domains": ["channel"],
+        "interaction_requirement": "required",
+        "nav_success": True,
+        "task_success": True,
+        "required_interaction_success": True,
+        "sequence_success": True,
+        "interaction_action_count": 2,
+        "valid_interaction_attempt_count": 1,
+        "error_interaction_attempt_count": 1,
+        "task_irrelevant_interaction_attempt_count": 0,
+        "failed_interaction_attempt_count": 1,
+        "repeated_interaction_attempt_count": 0,
+        "interaction_precision_episode": 0.5,
+        "spl": 0.8,
+        "episode_total_cost": 5.2,
+        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v1",
+        "paper_metric_config": {
+            "schema_version": "interactive_nav_v3_paper_metrics_v1",
+            "interaction_attempt_cost": 0.4,
+            "error_interaction_surcharge": 1.2,
+            "failure_penalty": 7.0,
+        },
+        "episode_total_cost_breakdown": {
+            "navigation_path_length_m": 3.2,
+            "interaction_attempt_cost": 0.8,
+            "error_interaction_surcharge": 1.2,
+            "failure_penalty": 0.0,
+        },
+        "interaction_attempts": [
+            {
+                "request_id": "request_1",
+                "instance_id": "obj_000001",
+                "operation": "open",
+                "status": "completed",
+            },
+            {
+                "request_id": "request_2",
+                "instance_id": "obj_000001",
+                "operation": "open",
+                "status": "failed",
+            },
+        ],
+    }
+
+    group = summarise_results([public_row])["groups"]["overall"]
+    assert group["success_rate"] == 1.0
+    assert group["required_interaction_success_rate"] == 1.0
+    assert group["interaction_precision"] == 0.5
+    assert group["mean_total_cost"] == 5.2
+
+    serialized = json.dumps(public_row, sort_keys=True)
+    for private_value in (
+        "private_door_body",
+        "private_door_hinge",
+        "required_interaction_0",
+    ):
+        assert private_value not in serialized
 
 
 def test_restricted_result_redacts_private_runtime_consistency_details() -> None:

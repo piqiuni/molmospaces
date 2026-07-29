@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass
+import math
 from typing import Any
 
 import mujoco
@@ -14,6 +15,70 @@ from scripts.InteractiveNav import container_scene_probe as probe
 
 SUCCESS_OPEN_FRACTION = 0.8
 DEFAULT_PATH_BINS_M = (0.0, 3.0, 5.0, 8.0, 12.0, 20.0)
+
+# These values are deliberately part of the evaluator protocol rather than a
+# post-hoc plotting choice.  ``lambda`` matches the deployed semantic policy's
+# interaction cost weight; the larger error surcharge and fixed failure penalty
+# make Eq. (1) in the paper reproducible from saved episode results.  All three
+# can be overridden by the evaluator CLI and are frozen into every manifest and
+# episode result.
+PAPER_METRIC_SCHEMA_VERSION = "interactive_nav_v3_paper_metrics_v1"
+DEFAULT_PAPER_COST_INTERACTION_ATTEMPT = 0.30
+DEFAULT_PAPER_COST_ERROR_SURCHARGE = 1.00
+DEFAULT_PAPER_COST_FAILURE_PENALTY = 5.00
+
+
+@dataclass(frozen=True)
+class PaperMetricConfig:
+    """Frozen coefficients for the paper's all-episode Total Cost metric."""
+
+    interaction_attempt_cost: float = DEFAULT_PAPER_COST_INTERACTION_ATTEMPT
+    error_interaction_surcharge: float = DEFAULT_PAPER_COST_ERROR_SURCHARGE
+    failure_penalty: float = DEFAULT_PAPER_COST_FAILURE_PENALTY
+
+    def validate(self) -> None:
+        values = {
+            "interaction_attempt_cost": self.interaction_attempt_cost,
+            "error_interaction_surcharge": self.error_interaction_surcharge,
+            "failure_penalty": self.failure_penalty,
+        }
+        for name, value in values.items():
+            if not math.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if float(self.error_interaction_surcharge) <= float(self.interaction_attempt_cost):
+            raise ValueError(
+                "error_interaction_surcharge must be strictly greater than "
+                "interaction_attempt_cost (mu > lambda)"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "schema_version": PAPER_METRIC_SCHEMA_VERSION,
+            "formula": "L_exec_m + lambda*A + mu*E + kappa*(1-S)",
+            "interaction_attempt_cost": float(self.interaction_attempt_cost),
+            "error_interaction_surcharge": float(self.error_interaction_surcharge),
+            "failure_penalty": float(self.failure_penalty),
+            "lambda_interaction_attempt_cost": float(self.interaction_attempt_cost),
+            "mu_error_interaction_surcharge": float(self.error_interaction_surcharge),
+            "kappa_failure_penalty": float(self.failure_penalty),
+        }
+
+
+@dataclass(frozen=True)
+class PaperInteractionAttemptScore:
+    """Per-episode interaction quantities needed by IP and Total Cost."""
+
+    interaction_attempt_count: int
+    valid_interaction_attempt_count: int
+    error_interaction_attempt_count: int
+    task_irrelevant_interaction_attempt_count: int
+    failed_interaction_attempt_count: int
+    repeated_interaction_attempt_count: int
+    interaction_precision_episode: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def joint_open_fraction(env: Any, interaction: dict[str, Any]) -> float:
@@ -284,6 +349,178 @@ def score_interactions(
     )
 
 
+def _attempt_resolved_interaction_ids(attempt: dict[str, Any]) -> list[str]:
+    """Return every V3 interaction ID an evaluator associated with one attempt."""
+
+    values = attempt.get("resolved_interaction_ids")
+    ids = [str(value) for value in values if value is not None] if isinstance(values, (list, tuple, set)) else []
+    value = attempt.get("resolved_interaction_id")
+    if value is not None:
+        ids.append(str(value))
+    return list(dict.fromkeys(ids))
+
+
+def _attempt_targeted_interaction_ids(attempt: dict[str, Any]) -> list[str]:
+    """Return V3 IDs targeted by an attempt, including failed resolutions."""
+
+    ids = _attempt_resolved_interaction_ids(attempt)
+    metadata = attempt.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    values = metadata.get("requested_interaction_ids")
+    if isinstance(values, (list, tuple, set)):
+        ids.extend(str(value) for value in values if value is not None)
+    return list(dict.fromkeys(ids))
+
+
+def _attempt_effect_interaction_ids(
+    attempt: dict[str, Any],
+    required_ids: set[str],
+) -> list[str]:
+    """Return required effects actually produced by one private evaluator attempt.
+
+    The ROS object skill can perform a physically successful sub-effect while
+    returning a task-level acknowledgement of ``False`` because another
+    required effect is still pending.  Its explicit effect list is therefore
+    authoritative for process metrics.  The ordinary single-joint executor
+    falls back to its successful resolved ID.
+    """
+
+    metadata = attempt.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    candidates: list[str] = []
+    for key in (
+        "effect_achieved_interaction_ids",
+        "transient_satisfied_interaction_ids",
+    ):
+        values = metadata.get(key)
+        if isinstance(values, (list, tuple, set)):
+            candidates.extend(str(value) for value in values if value is not None)
+    # ``resolved_interaction_ids`` is evaluator-private output from the
+    # object-level skill and contains only joints whose expected open effect
+    # was observed.  Keep this compatibility path for already generated V3
+    # ROS traces while the explicit metadata is being introduced.
+    plural = attempt.get("resolved_interaction_ids")
+    if isinstance(plural, (list, tuple, set)):
+        candidates.extend(str(value) for value in plural if value is not None)
+    if not candidates and bool(attempt.get("success")):
+        candidates.extend(_attempt_resolved_interaction_ids(attempt))
+    return list(dict.fromkeys(value for value in candidates if value in required_ids))
+
+
+def paper_interaction_attempt_score(
+    episode: dict[str, Any],
+    attempts: list[dict[str, Any]],
+) -> PaperInteractionAttemptScore:
+    """Compute paper-IP numerator/denominator and the union-counted error set.
+
+    ``E`` counts erroneous *attempts*, rather than adding category counts: an
+    invalid request which also fails is one attempt in Eq. (1).  A repeated
+    request only becomes an error once every required effect it produces was
+    already complete; a multi-joint macro that completes a new effect is not
+    penalised merely because it also touches an earlier joint.
+    """
+
+    nav = episode["interactive_nav"]
+    requirement = str(nav.get("interaction_requirement", "required"))
+    required_ids = {
+        str(interaction["interaction_id"])
+        for interaction in nav.get("interactions", [])
+        if interaction.get("interaction_id") is not None
+    }
+    completed_ids: set[str] = set()
+    valid_count = 0
+    error_count = 0
+    irrelevant_count = 0
+    failed_count = 0
+    repeated_count = 0
+
+    for attempt in attempts:
+        targeted_ids = _attempt_targeted_interaction_ids(attempt)
+        classification = str(attempt.get("classification") or "")
+        # A failed evaluator-side resolution may have no credited ID yet still
+        # be a request for the annotated entity.  `required_valid` is assigned
+        # only after matching that entity; do not turn such a failed relevant
+        # request into an unrelated-object error in the saved breakdown.
+        targets_required = bool(required_ids.intersection(targeted_ids)) or bool(
+            required_ids and classification == "required_valid"
+        )
+        effect_ids = _attempt_effect_interaction_ids(attempt, required_ids)
+        has_new_effect = bool(set(effect_ids) - completed_ids)
+        repeated = bool(effect_ids) and not has_new_effect
+        # A relevant request that cannot produce its expected effect is a
+        # failed interaction even if an executor reported a benign low-level
+        # completion.  Conversely, an effect-producing ROS macro is not
+        # treated as failed just because its task-level acknowledgement waits
+        # for a later prerequisite.
+        failed = bool(
+            not effect_ids
+            and (
+                targets_required
+                or classification == "required_valid"
+                or not bool(attempt.get("success"))
+            )
+        )
+        irrelevant = not targets_required
+
+        if has_new_effect:
+            valid_count += 1
+        if irrelevant:
+            irrelevant_count += 1
+        if failed:
+            failed_count += 1
+        if repeated:
+            repeated_count += 1
+        if irrelevant or failed or repeated:
+            error_count += 1
+        completed_ids.update(effect_ids)
+
+    attempt_count = len(attempts)
+    if attempt_count:
+        precision = float(valid_count / attempt_count)
+    else:
+        precision = 1.0 if requirement == "unnecessary" else 0.0
+    return PaperInteractionAttemptScore(
+        interaction_attempt_count=int(attempt_count),
+        valid_interaction_attempt_count=int(valid_count),
+        error_interaction_attempt_count=int(error_count),
+        task_irrelevant_interaction_attempt_count=int(irrelevant_count),
+        failed_interaction_attempt_count=int(failed_count),
+        repeated_interaction_attempt_count=int(repeated_count),
+        interaction_precision_episode=float(precision),
+    )
+
+
+def paper_episode_total_cost(
+    *,
+    nav_success: bool,
+    navigation_path_length_m: float,
+    interaction_score: PaperInteractionAttemptScore,
+    config: PaperMetricConfig,
+) -> tuple[float, dict[str, float | int]]:
+    """Evaluate and expose every term of the paper's Total Cost equation."""
+
+    config.validate()
+    path_length = max(0.0, float(navigation_path_length_m))
+    attempt_cost = float(config.interaction_attempt_cost) * int(
+        interaction_score.interaction_attempt_count
+    )
+    error_cost = float(config.error_interaction_surcharge) * int(
+        interaction_score.error_interaction_attempt_count
+    )
+    failure_cost = float(config.failure_penalty) * int(not bool(nav_success))
+    total = float(path_length + attempt_cost + error_cost + failure_cost)
+    return total, {
+        "navigation_path_length_m": path_length,
+        "interaction_attempt_cost": attempt_cost,
+        "error_interaction_surcharge": error_cost,
+        "failure_penalty": failure_cost,
+        "interaction_attempt_count": int(interaction_score.interaction_attempt_count),
+        "error_interaction_attempt_count": int(interaction_score.error_interaction_attempt_count),
+        "nav_success_indicator": int(bool(nav_success)),
+        "total_cost": total,
+    }
+
+
 def reference_path_length_m(episode: dict[str, Any]) -> float | None:
     """Return the best frozen V3 path reference usable for SPL.
 
@@ -357,6 +594,69 @@ def _mean(rows: list[dict[str, Any]], key: str) -> float | None:
     return None if not values else float(np.mean(values))
 
 
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return None
+    return float(value)
+
+
+def _strict_mean(values: list[float | None]) -> float | None:
+    """Mean only when every episode in a formal denominator has the value."""
+
+    if not values or any(value is None for value in values):
+        return None
+    return float(np.mean([float(value) for value in values if value is not None]))
+
+
+def _strict_rate(values: list[bool | None]) -> float | None:
+    if not values or any(value is None for value in values):
+        return None
+    return float(sum(bool(value) for value in values if value is not None) / len(values))
+
+
+def _paper_nav_success(row: dict[str, Any]) -> bool | None:
+    """Return the terminal NavToObj predicate, never legacy V3 success."""
+
+    value = row.get("nav_success")
+    if value is None:
+        value = row.get("task_success")
+    return None if value is None else bool(value)
+
+
+def _paper_spl(row: dict[str, Any]) -> float | None:
+    nav_success = _paper_nav_success(row)
+    reference = _finite_float(row.get("reference_path_length_m"))
+    executed = _finite_float(row.get("navigation_path_length_m"))
+    if nav_success is None or reference is None or executed is None:
+        return None
+    # Recompute rather than trusting a stored `spl`: V3 versions before this
+    # protocol incorrectly gated SPL by interaction-conditioned success.
+    return spl(nav_success, reference, executed)
+
+
+def _paper_interaction_precision(row: dict[str, Any]) -> float | None:
+    value = _finite_float(row.get("interaction_precision_episode"))
+    if value is not None:
+        return value
+    valid_count = _finite_float(row.get("valid_interaction_attempt_count"))
+    attempt_count = _finite_float(row.get("interaction_action_count"))
+    requirement = row.get("interaction_requirement")
+    if valid_count is None or attempt_count is None or requirement is None:
+        return None
+    if attempt_count > 0.0:
+        return float(valid_count / attempt_count)
+    return 1.0 if str(requirement) == "unnecessary" else 0.0
+
+
+def _paper_total_cost(row: dict[str, Any]) -> float | None:
+    # Episode results store the evaluated equation and its full breakdown.  Do
+    # not derive a cost from legacy correct-action counters: those cannot
+    # distinguish effect-level credit from the paper's attempt-level V/E.
+    return _finite_float(row.get("episode_total_cost"))
+
+
 def _triggered_early_stops(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         payload
@@ -369,6 +669,24 @@ def _triggered_early_stops(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     interaction_attempts = sum(int(row.get("interaction_action_count", 0)) for row in rows)
     correct_actions = sum(int(row.get("correct_interaction_action_count", 0)) for row in rows)
+    paper_nav_values = [_paper_nav_success(row) for row in rows]
+    paper_spl_values = [_paper_spl(row) for row in rows]
+    required_rows = [
+        row for row in rows if str(row.get("interaction_requirement") or "") == "required"
+    ]
+    paper_isr_values = [
+        None
+        if row.get("required_interaction_success") is None
+        else bool(row.get("required_interaction_success"))
+        for row in required_rows
+    ]
+    paper_ip_values = [_paper_interaction_precision(row) for row in rows]
+    paper_cost_values = [_paper_total_cost(row) for row in rows]
+    paper_sr = _strict_rate(paper_nav_values)
+    paper_spl = _strict_mean(paper_spl_values)
+    paper_isr = _strict_rate(paper_isr_values)
+    paper_ip = _strict_mean(paper_ip_values)
+    paper_total_cost = _strict_mean(paper_cost_values)
     early_stops = _triggered_early_stops(rows)
     early_stop_reasons = Counter(
         str(payload.get("reason") or "unknown") for payload in early_stops
@@ -380,21 +698,49 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     return {
         "episode_count": len(rows),
-        "success_rate": _rate(rows, "success"),
+        # The five primary fields below intentionally follow the paper rather
+        # than the historical interaction-conditioned V3 `success` field.
+        "success_rate": paper_sr,
         "task_success_rate": _rate_with_fallback(rows, "task_success", "nav_success"),
         "interaction_conditioned_success_rate": _rate_with_fallback(
             rows, "interaction_conditioned_success", "success"
         ),
-        "nav_success_rate": _rate(rows, "nav_success"),
-        "required_interaction_success_rate": _rate(rows, "required_interaction_success"),
+        "nav_success_rate": paper_sr,
+        "required_interaction_success_rate": paper_isr,
         "sequence_success_rate": _rate(rows, "sequence_success"),
         "non_interaction_success_rate": _rate(rows, "non_interaction_success"),
-        "interaction_precision": None if interaction_attempts == 0 else correct_actions / interaction_attempts,
+        "interaction_precision": paper_ip,
+        "mean_total_cost": paper_total_cost,
+        "paper_sr": paper_sr,
+        "paper_spl": paper_spl,
+        "paper_isr": paper_isr,
+        "paper_ip": paper_ip,
+        "paper_total_cost": paper_total_cost,
+        "paper_metric_denominators": {
+            "sr_episode_count": len(rows),
+            "sr_missing_episode_count": sum(value is None for value in paper_nav_values),
+            "spl_episode_count": len(rows),
+            "spl_missing_episode_count": sum(value is None for value in paper_spl_values),
+            "isr_required_episode_count": len(required_rows),
+            "isr_missing_required_episode_count": sum(value is None for value in paper_isr_values),
+            "ip_episode_count": len(rows),
+            "ip_missing_episode_count": sum(value is None for value in paper_ip_values),
+            "total_cost_episode_count": len(rows),
+            "total_cost_missing_episode_count": sum(
+                value is None for value in paper_cost_values
+            ),
+        },
+        # Retain the former micro calculation only as a diagnostic.  It is not
+        # paper IP because long traces would otherwise dominate the score.
+        "interaction_precision_micro_legacy": (
+            None if interaction_attempts == 0 else correct_actions / interaction_attempts
+        ),
         "mean_step_count": _mean(rows, "step_count"),
         "mean_navigation_path_length_m": _mean(rows, "navigation_path_length_m"),
         "mean_reference_path_length_m": _mean(rows, "reference_path_length_m"),
-        "mean_spl": _mean(rows, "spl"),
-        "spl_eligible_episode_count": sum(row.get("spl") is not None for row in rows),
+        "mean_spl": paper_spl,
+        "mean_saved_spl_diagnostic": _mean(rows, "spl"),
+        "spl_eligible_episode_count": sum(value is not None for value in paper_spl_values),
         "mean_total_simulated_seconds": _mean(rows, "total_simulated_seconds"),
         "mean_interaction_action_count": _mean(rows, "interaction_action_count"),
         "mean_extra_interaction_action_count": _mean(rows, "extra_interaction_action_count"),
@@ -439,7 +785,8 @@ def summarise_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for label in sorted({str(row["path_length_bin"]) for row in eligible_rows if row.get("path_length_bin")}):
         groups[f"path_length/{label}"] = [row for row in eligible_rows if row.get("path_length_bin") == label]
     return {
-        "schema_version": "interactive_nav_v3_benchmark_eval_summary_v3",
+        "schema_version": "interactive_nav_v3_benchmark_eval_summary_v4",
+        "paper_metric_schema_version": PAPER_METRIC_SCHEMA_VERSION,
         "total_episode_count": len(rows),
         "scoring_eligible_episode_count": len(eligible_rows),
         "runtime_ineligible_episode_count": len(rows) - len(eligible_rows),

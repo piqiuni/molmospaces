@@ -61,12 +61,37 @@ def _result_row(**overrides: object) -> dict[str, object]:
         "interaction_types": ["channel_hinged_door"],
         "path_length_bin": "[3,5)",
         "success": True,
+        "task_success": True,
+        "interaction_conditioned_success": True,
         "nav_success": True,
         "required_interaction_success": True,
         "sequence_success": True,
         "non_interaction_success": None,
         "interaction_action_count": 3,
         "correct_interaction_action_count": 2,
+        # These are the evaluator-owned, per-episode fields used by the paper
+        # metrics.  They deliberately are not inferred from the legacy
+        # ``correct_interaction_action_count`` aggregate.
+        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v1",
+        "paper_metric_config": {
+            "schema_version": "interactive_nav_v3_paper_metrics_v1",
+            "interaction_attempt_cost": 0.3,
+            "error_interaction_surcharge": 1.0,
+            "failure_penalty": 5.0,
+        },
+        "valid_interaction_attempt_count": 2,
+        "error_interaction_attempt_count": 1,
+        "task_irrelevant_interaction_attempt_count": 0,
+        "failed_interaction_attempt_count": 0,
+        "repeated_interaction_attempt_count": 1,
+        "interaction_precision_episode": 2 / 3,
+        "episode_total_cost": 5.9,
+        "episode_total_cost_breakdown": {
+            "navigation_path_length_m": 4.0,
+            "interaction_attempt_cost": 0.9,
+            "error_interaction_surcharge": 1.0,
+            "failure_penalty": 0.0,
+        },
         "step_count": 5,
         "navigation_path_length_m": 4.0,
         "reference_path_length_m": 3.0,
@@ -388,9 +413,17 @@ def test_summary_groups_and_interaction_precision() -> None:
             interaction_types=["container_hinged_door"],
             path_length_bin="[0,3)",
             success=False,
+            task_success=True,
+            nav_success=True,
             non_interaction_success=False,
             interaction_action_count=0,
             correct_interaction_action_count=0,
+            valid_interaction_attempt_count=0,
+            error_interaction_attempt_count=0,
+            # Paper IP assigns a perfect score to a no-action unnecessary
+            # episode; it is then macro-averaged with the required episode.
+            interaction_precision_episode=1.0,
+            reference_path_length_m=1.0,
             spl=0.25,
             terminal_reason="policy_stop",
         ),
@@ -398,16 +431,166 @@ def test_summary_groups_and_interaction_precision() -> None:
 
     summary = summarise_results(rows)["groups"]
     assert summary["overall"]["episode_count"] == 2
-    assert summary["overall"]["interaction_precision"] == pytest.approx(2 / 3)
+    assert summary["overall"]["interaction_precision"] == pytest.approx(5 / 6)
     assert summary["overall"]["mean_spl"] == pytest.approx(0.5)
     assert summary["domain/channel"]["success_rate"] == 1.0
     assert summary["requirement/unnecessary"]["non_interaction_success_rate"] == 0.0
     assert summary["interaction_type/container_hinged_door"]["episode_count"] == 1
 
     no_interaction_summary = summarise_results(
-        [_result_row(interaction_action_count=0, correct_interaction_action_count=0)]
+        [
+            _result_row(
+                interaction_action_count=0,
+                correct_interaction_action_count=0,
+                valid_interaction_attempt_count=0,
+                error_interaction_attempt_count=0,
+                # The complementary zero-attempt required case is an IP
+                # failure, rather than the old undefined/micro-ratio value.
+                interaction_precision_episode=0.0,
+            )
+        ]
     )
-    assert no_interaction_summary["groups"]["overall"]["interaction_precision"] is None
+    assert no_interaction_summary["groups"]["overall"]["interaction_precision"] == 0.0
+
+
+def test_paper_sr_and_spl_use_nav_terminal_success_not_interaction_success() -> None:
+    """SR/SPL must remain navigation metrics even if interaction scoring differs."""
+
+    rows = [
+        _result_row(
+            # Navigation reached the target, but the interaction sequence was
+            # not valid.  It still counts for paper SR/SPL.
+            success=False,
+            task_success=True,
+            interaction_conditioned_success=False,
+            nav_success=True,
+            required_interaction_success=False,
+            sequence_success=False,
+            # Simulate the old persisted SPL, which was gated on the failed
+            # interaction score.  The aggregate must recompute 3 / 4 from
+            # saved nav/path data instead of trusting this stale field.
+            spl=0.0,
+        ),
+        _result_row(
+            # A second nav success keeps the expected paper endpoint distinct
+            # from the historical interaction-conditioned score.
+            success=False,
+            task_success=True,
+            interaction_conditioned_success=False,
+            nav_success=True,
+            required_interaction_success=False,
+            sequence_success=False,
+            reference_path_length_m=2.0,
+            # The correct nav-only SPL is 2 / 4, not this stale value.
+            spl=0.0,
+        ),
+        _result_row(
+            # Conversely, a stale legacy interaction-conditioned flag must
+            # not convert a navigation failure into SR/SPL credit.
+            success=True,
+            task_success=False,
+            interaction_conditioned_success=True,
+            nav_success=False,
+            required_interaction_success=True,
+            sequence_success=True,
+            # A stale success SPL likewise cannot grant a failed navigation
+            # episode credit.
+            spl=1.0,
+        ),
+    ]
+
+    group = summarise_results(rows)["groups"]["overall"]
+
+    assert group["success_rate"] == pytest.approx(2 / 3)
+    assert group["nav_success_rate"] == pytest.approx(2 / 3)
+    assert group["mean_spl"] == pytest.approx(5 / 12)
+    assert group["spl_eligible_episode_count"] == 3
+
+
+def test_paper_isr_excludes_unnecessary_episodes_from_its_denominator() -> None:
+    rows = [
+        _result_row(
+            interaction_requirement="required",
+            required_interaction_success=True,
+        ),
+        _result_row(
+            interaction_requirement="unnecessary",
+            # This deliberately disagrees with the required row: if the
+            # aggregate includes it, ISR becomes 1/2 instead of 1.
+            required_interaction_success=False,
+            non_interaction_success=True,
+            interaction_precision_episode=1.0,
+            interaction_action_count=0,
+            correct_interaction_action_count=0,
+            valid_interaction_attempt_count=0,
+            error_interaction_attempt_count=0,
+        ),
+    ]
+
+    groups = summarise_results(rows)["groups"]
+    assert groups["overall"]["required_interaction_success_rate"] == 1.0
+    assert groups["requirement/required"]["required_interaction_success_rate"] == 1.0
+    assert groups["requirement/unnecessary"]["required_interaction_success_rate"] is None
+
+
+def test_paper_ip_is_episode_macro_and_defines_both_zero_attempt_cases() -> None:
+    rows = [
+        _result_row(
+            interaction_requirement="required",
+            interaction_action_count=5,
+            correct_interaction_action_count=1,
+            valid_interaction_attempt_count=1,
+            error_interaction_attempt_count=4,
+            interaction_precision_episode=0.2,
+        ),
+        _result_row(
+            interaction_requirement="required",
+            interaction_action_count=1,
+            correct_interaction_action_count=1,
+            valid_interaction_attempt_count=1,
+            error_interaction_attempt_count=0,
+            interaction_precision_episode=1.0,
+        ),
+        _result_row(
+            interaction_requirement="unnecessary",
+            interaction_action_count=0,
+            correct_interaction_action_count=0,
+            valid_interaction_attempt_count=0,
+            error_interaction_attempt_count=0,
+            interaction_precision_episode=1.0,
+        ),
+        _result_row(
+            interaction_requirement="required",
+            interaction_action_count=0,
+            correct_interaction_action_count=0,
+            valid_interaction_attempt_count=0,
+            error_interaction_attempt_count=0,
+            interaction_precision_episode=0.0,
+        ),
+    ]
+
+    group = summarise_results(rows)["groups"]["overall"]
+
+    # Macro mean: (0.2 + 1 + 1 + 0) / 4.  The old action-level micro ratio
+    # would incorrectly report 2 / 6 instead.
+    assert group["interaction_precision"] == pytest.approx(0.55)
+
+
+def test_paper_total_cost_is_macro_averaged_from_saved_episode_costs() -> None:
+    rows = [
+        _result_row(episode_total_cost=1.25),
+        _result_row(
+            domains=["container"],
+            recipe="container_hidden",
+            interaction_types=["container_hinged_door"],
+            episode_total_cost=8.75,
+        ),
+    ]
+
+    groups = summarise_results(rows)["groups"]
+    assert groups["overall"]["mean_total_cost"] == pytest.approx(5.0)
+    assert groups["domain/channel"]["mean_total_cost"] == pytest.approx(1.25)
+    assert groups["domain/container"]["mean_total_cost"] == pytest.approx(8.75)
 
 
 def test_summary_excludes_runtime_ineligible_rows_from_formal_metrics() -> None:
