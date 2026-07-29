@@ -14,6 +14,7 @@ from semantic_decision_py_pkg.candidate_curator import (
     CandidateCuratorConfig,
     candidate_fingerprint,
     candidate_history_key,
+    preserve_missing_explore_candidate_update,
     validate_candidate_update,
 )
 from semantic_decision_py_pkg.env_config import apply_model_env_overrides, load_env_file
@@ -36,11 +37,15 @@ from semantic_decision_py_pkg.model_policy import (
     compact_candidate_groups,
 )
 from semantic_decision_py_pkg.post_interaction_traversal import (
+    PostInteractionRefreshConfig,
+    PostInteractionRefreshGate,
+    PostInteractionRefreshStatus,
     build_post_interaction_traversal_candidate,
     inject_pending_traversal,
     is_terminal_post_interaction_traversal_failure,
     pending_priority_candidate,
     portal_center_xy,
+    reproject_post_interaction_traversal_candidate,
 )
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.rule_policy import (
@@ -120,6 +125,37 @@ class SemanticRuleDecisionNode:
         self.portal_traversal_distance_m = max(
             0.0, float(candidate_config.get("portal_traversal_distance_m", 0.9))
         )
+        self.post_interaction_refresh_gate = PostInteractionRefreshGate(
+            PostInteractionRefreshConfig(
+                enabled=bool(
+                    config.get("post_interaction_refresh_enabled", True)
+                ),
+                min_candidate_updates=max(
+                    1,
+                    int(
+                        config.get(
+                            "post_interaction_refresh_min_candidate_updates", 2
+                        )
+                    ),
+                ),
+                timeout_s=max(
+                    0.0,
+                    float(config.get("post_interaction_refresh_timeout_s", 30.0)),
+                ),
+                require_graph_revision=bool(
+                    config.get("post_interaction_refresh_require_graph_revision", True)
+                ),
+                require_observation_step=bool(
+                    config.get("post_interaction_refresh_require_observation_step", True)
+                ),
+                require_portal_open_confirmation=bool(
+                    config.get(
+                        "post_interaction_refresh_require_portal_open_confirmation",
+                        True,
+                    )
+                ),
+            )
+        )
         self.direct_atomic_outcome_belief_enabled = bool(
             config.get("direct_atomic_outcome_belief_enabled", False)
         )
@@ -191,6 +227,27 @@ class SemanticRuleDecisionNode:
                 explore_min_visible_gain_ratio=float(
                     model_config.get("explore_min_visible_gain_ratio", 0.25)
                 ),
+                explore_visible_unknown_area_weight=float(
+                    model_config.get("explore_visible_unknown_area_weight", 0.50)
+                ),
+                explore_new_room_bonus=float(
+                    model_config.get("explore_new_room_bonus", 0.70)
+                ),
+                explore_potential_child_room_bonus=float(
+                    model_config.get("explore_potential_child_room_bonus", 0.25)
+                ),
+                explore_room_target_affinity_bonus=float(
+                    model_config.get("explore_room_target_affinity_bonus", 0.20)
+                ),
+                explore_room_target_mismatch_penalty=float(
+                    model_config.get("explore_room_target_mismatch_penalty", 0.60)
+                ),
+                room_target_mismatch_confidence_threshold=float(
+                    model_config.get("room_target_mismatch_confidence_threshold", 0.75)
+                ),
+                reserve_unentered_room_frontier_slots=int(
+                    model_config.get("reserve_unentered_room_frontier_slots", 1)
+                ),
                 goal_position_tolerance_m=float(
                     model_config.get("stale_goal_position_tolerance_m", 0.35)
                 ),
@@ -228,6 +285,10 @@ class SemanticRuleDecisionNode:
         self.decision_history = deque(maxlen=32)
         self.group_history: dict[str, dict] = {}
         self.region_history: dict[str, dict] = {}
+        # This is intentionally pose-derived rather than selection-derived:
+        # an EXPLORE decision that fails at a doorway must not make the child
+        # room look visited on the next ranking cycle.
+        self.entered_room_ids: set[str] = set()
         self.last_selected_group_id = ""
         self.last_selected_history_key = ""
         self.active_candidate_id = ""
@@ -296,6 +357,7 @@ class SemanticRuleDecisionNode:
                 self.active_behavior_type = ""
                 self.active_interaction_candidate = {}
                 self.pending_post_interaction_traversal = {}
+                self.post_interaction_refresh_gate.clear()
                 self.terminal_post_interaction_traversal_ids.clear()
                 self.minimum_candidate_sequence = 0
                 self.next_decision_time = 0.0
@@ -311,6 +373,7 @@ class SemanticRuleDecisionNode:
                 self.decision_history.clear()
                 self.group_history.clear()
                 self.region_history.clear()
+                self.entered_room_ids.clear()
                 self.last_selected_group_id = ""
                 self.last_selected_history_key = ""
                 self.model_circuit_breaker = ModelCircuitBreaker(
@@ -333,6 +396,7 @@ class SemanticRuleDecisionNode:
                 self._publish_goal_status(
                     "ACTIVE" if target_context.get("enabled") else "DISABLED"
                 )
+            self._update_entered_rooms(payload)
             self.latest_candidates_payload = payload
             priority_target = self.target_mission.priority_target_candidate(
                 payload.get("candidates") or []
@@ -429,6 +493,9 @@ class SemanticRuleDecisionNode:
         if status != "SUCCEEDED" and not preempted_by_target:
             self.next_decision_time = time.monotonic() + self.failure_retry_delay_s
         active_behavior_type = self.active_behavior_type
+        pending_traversal_id = str(
+            self.pending_post_interaction_traversal.get("candidate_id") or ""
+        )
         if is_terminal_post_interaction_traversal_failure(
             candidate_id,
             active_behavior_type,
@@ -440,6 +507,16 @@ class SemanticRuleDecisionNode:
                 self.pending_post_interaction_traversal.get("candidate_id") or ""
             ) == candidate_id:
                 self.pending_post_interaction_traversal = {}
+        elif (
+            status == "SUCCEEDED"
+            and active_behavior_type == "NAVIGATE"
+            and candidate_id
+            and candidate_id == pending_traversal_id
+        ):
+            # Keep this candidate cached while the executor waits for a
+            # post-open path; remove it only once the crossing actually
+            # completes, rather than as soon as it is selected.
+            self.pending_post_interaction_traversal = {}
         target_interaction_succeeded = (
             status == "SUCCEEDED"
             and active_behavior_type == "INTERACT"
@@ -503,6 +580,30 @@ class SemanticRuleDecisionNode:
                     self.latest_candidates_payload.get("episode_id") or ""
                 )
                 self.pending_post_interaction_traversal = pending_payload
+                refresh_status = self.post_interaction_refresh_gate.begin(
+                    self.latest_candidates_payload,
+                    portal_id=str(post_interaction_traversal.target_id or ""),
+                    now=time.monotonic(),
+                )
+                pending_payload.setdefault("metadata", {}).update(
+                    {
+                        "post_interaction_refresh_enabled": bool(
+                            refresh_status.active
+                        ),
+                        "post_interaction_refresh_baseline_sequence": (
+                            refresh_status.baseline_sequence
+                        ),
+                        "post_interaction_refresh_baseline_graph_revision": (
+                            refresh_status.baseline_graph_revision
+                        ),
+                        "post_interaction_refresh_baseline_observation_step": (
+                            refresh_status.baseline_observation_step
+                        ),
+                    }
+                )
+                self._publish_post_interaction_refresh_trace(
+                    "started", refresh_status
+                )
                 self.minimum_candidate_sequence = 0
                 self.next_decision_time = 0.0
         if status == "SUCCEEDED" and post_interaction_traversal is None:
@@ -517,8 +618,55 @@ class SemanticRuleDecisionNode:
         self.active_target_goal = False
         self.preempt_requested_for_decision_id = ""
 
+    def _publish_post_interaction_refresh_trace(
+        self, phase: str, refresh_status: PostInteractionRefreshStatus
+    ) -> None:
+        """Expose a bounded post-open wait without pretending it is a decision."""
+
+        self.trace_pub.publish(
+            String(
+                data=json.dumps(
+                    {
+                        "timestamp": time.time(),
+                        "event": "post_interaction_refresh",
+                        "phase": str(phase),
+                        "episode_id": str(
+                            self.latest_candidates_payload.get("episode_id") or ""
+                        ),
+                        "pending_post_interaction_traversal_id": str(
+                            self.pending_post_interaction_traversal.get(
+                                "candidate_id"
+                            )
+                            or ""
+                        ),
+                        "refresh": refresh_status.to_dict(),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        )
+
     def _tick(self, _event) -> None:
+        released_refresh_status: PostInteractionRefreshStatus | None = None
         with self.state_lock:
+            if self.post_interaction_refresh_gate.active:
+                refresh_status = self.post_interaction_refresh_gate.status(
+                    self.latest_candidates_payload,
+                    now=time.monotonic(),
+                )
+                if not refresh_status.ready:
+                    return
+                self.post_interaction_refresh_gate.clear()
+                if not refresh_status.timed_out:
+                    refreshed_traversal = reproject_post_interaction_traversal_candidate(
+                        self.pending_post_interaction_traversal,
+                        self.latest_candidates_payload,
+                        traversal_distance_m=self.portal_traversal_distance_m,
+                    )
+                    if refreshed_traversal is not None:
+                        self.pending_post_interaction_traversal = refreshed_traversal
+                released_refresh_status = refresh_status
             if self.active_candidate_id or self.decision_in_flight:
                 return
             if time.monotonic() < self.next_decision_time:
@@ -527,6 +675,15 @@ class SemanticRuleDecisionNode:
                 return
             candidate_snapshot = copy.deepcopy(self.latest_candidates_payload)
             self.decision_in_flight = True
+        if released_refresh_status is not None:
+            self._publish_post_interaction_refresh_trace(
+                (
+                    "timeout_fallback_to_make_plan"
+                    if released_refresh_status.timed_out
+                    else "released"
+                ),
+                released_refresh_status,
+            )
         try:
             self._decide_from_snapshot(candidate_snapshot)
         finally:
@@ -689,6 +846,7 @@ class SemanticRuleDecisionNode:
             history_by_key=region_history,
             observation_step=self._observation_step(candidate_snapshot),
             target_context=candidate_snapshot.get("target_context") or {},
+            entered_room_ids=self._entered_rooms_snapshot(),
         )
         model_candidates = (
             list(eligible)
@@ -757,6 +915,7 @@ class SemanticRuleDecisionNode:
                     "candidate_decision_hints": dict(
                         curation.decision_hint_by_id
                     ),
+                    "entered_room_ids": list(curation.entered_room_ids),
                 },
                 metrics_context={
                     "episode_id": candidate_snapshot.get("episode_id", ""),
@@ -882,6 +1041,7 @@ class SemanticRuleDecisionNode:
                         history_by_key=latest_region_history,
                         observation_step=self._observation_step(latest_snapshot),
                         target_context=latest_snapshot.get("target_context") or {},
+                        entered_room_ids=self._entered_rooms_snapshot(),
                     )
                     latest_selection_pool = list(latest_curation.candidates)
                 latest_pending_traversal = pending_priority_candidate(
@@ -893,6 +1053,14 @@ class SemanticRuleDecisionNode:
                     for candidate in latest_selection_pool
                 ):
                     latest_selection_pool.append(latest_pending_traversal)
+                latest_priority_payload = (
+                    self.target_mission.priority_target_candidate(
+                        [candidate.to_dict() for candidate in latest_eligible]
+                    )
+                )
+                latest_priority_id = str(
+                    (latest_priority_payload or {}).get("candidate_id") or ""
+                )
                 validation = validate_candidate_update(
                     selected,
                     latest_selection_pool,
@@ -903,20 +1071,17 @@ class SemanticRuleDecisionNode:
                         self.candidate_curator.config.goal_yaw_tolerance_rad
                     ),
                 )
+                validation = preserve_missing_explore_candidate_update(
+                    selected,
+                    validation,
+                    priority_target_candidate_id=latest_priority_id,
+                )
                 candidate_validation_reason = validation.reason
                 execution_snapshot = latest_snapshot
                 if validation.valid:
                     selected = validation.candidate
                 else:
                     stale_selected = True
-                    latest_priority_payload = (
-                        self.target_mission.priority_target_candidate(
-                            [candidate.to_dict() for candidate in latest_eligible]
-                        )
-                    )
-                    latest_priority_id = str(
-                        (latest_priority_payload or {}).get("candidate_id") or ""
-                    )
                     selected = next(
                         (
                             candidate
@@ -1000,6 +1165,7 @@ class SemanticRuleDecisionNode:
             "candidate_groups": list(self.model_policy.last_candidate_groups),
             "model_candidate_options": list(self.model_policy.last_candidate_groups),
             "candidate_curation": curation.trace(),
+            "entered_room_ids": list(curation.entered_room_ids),
             "eligibility_rejections": eligibility_rejections,
             "executed_candidate_id": selected.candidate_id if selected is not None else "",
             "executed_group_id": executed_group_id,
@@ -1081,8 +1247,6 @@ class SemanticRuleDecisionNode:
             )
             if self.active_target_goal:
                 self.priority_target_candidate_id = selected.candidate_id
-            if selected.candidate_id == pending_post_interaction_traversal_id:
-                self.pending_post_interaction_traversal = {}
             self._record_decision_selection(
                 decision_id,
                 selected,
@@ -1103,6 +1267,66 @@ class SemanticRuleDecisionNode:
             )
             or 0
         )
+
+    @staticmethod
+    def _physical_room_ids(candidate_snapshot: dict) -> set[str]:
+        """Return room labels containing the *current robot pose* only.
+
+        AABB membership is deliberately evaluated from the incoming robot_xy,
+        never from a selected goal or history record.  Potential-child AABBs
+        require a small interior margin so standing on a door plane does not
+        falsely count as crossing into the child room.
+        """
+
+        robot_xy = list(candidate_snapshot.get("robot_xy") or [])
+        graph = candidate_snapshot.get("graph_context") or {}
+        if len(robot_xy) >= 2:
+            result: set[str] = set()
+            for node in graph.get("nodes") or []:
+                if str(node.get("type") or "").casefold() != "room":
+                    continue
+                attributes = node.get("attributes") or {}
+                if not bool(attributes.get("active", True)):
+                    continue
+                center = list(node.get("aabb_center") or node.get("centroid") or [])
+                size = list(node.get("aabb_size") or [])
+                room_id = node.get("room_id")
+                if room_id is None:
+                    room_id = node.get("id")
+                if len(center) < 2 or len(size) < 2 or room_id in (None, ""):
+                    continue
+                half_x = 0.5 * abs(float(size[0]))
+                half_y = 0.5 * abs(float(size[1]))
+                margin = min(0.10, half_x * 0.25, half_y * 0.25) if bool(
+                    attributes.get("is_potential_room")
+                ) else 0.0
+                if (
+                    abs(float(robot_xy[0]) - float(center[0])) <= half_x - margin + 1e-6
+                    and abs(float(robot_xy[1]) - float(center[1]))
+                    <= half_y - margin + 1e-6
+                ):
+                    text = str(room_id)
+                    result.add(text if text.startswith("room_") else f"room_{text}")
+            if result:
+                return result
+        # Candidate generation stamps robot_room_id from the same physical
+        # odometry position.  It is a safe compatibility fallback for graphs
+        # without room AABBs, unlike target_room_id which is never consulted.
+        result = set()
+        for candidate in candidate_snapshot.get("candidates") or []:
+            room_id = (candidate.get("metadata") or {}).get("robot_room_id")
+            if room_id in (None, ""):
+                continue
+            text = str(room_id)
+            result.add(text if text.startswith("room_") else f"room_{text}")
+        return result
+
+    def _update_entered_rooms(self, candidate_snapshot: dict) -> None:
+        self.entered_room_ids.update(self._physical_room_ids(candidate_snapshot))
+
+    def _entered_rooms_snapshot(self) -> set[str]:
+        with self.state_lock:
+            return set(self.entered_room_ids)
 
     def _region_history_context(self, candidate_snapshot: dict) -> dict[str, dict]:
         observation_step = self._observation_step(candidate_snapshot)
@@ -1318,7 +1542,6 @@ class SemanticRuleDecisionNode:
         region_stats["selection_count"] = int(
             region_stats.get("selection_count", 0) or 0
         ) + 1
-        region_stats["visit_count"] = int(region_stats.get("visit_count", 0) or 0) + 1
         region_stats["consecutive_selection_count"] = (
             int(region_stats.get("consecutive_selection_count", 0) or 0) + 1
             if self.last_selected_history_key == history_key

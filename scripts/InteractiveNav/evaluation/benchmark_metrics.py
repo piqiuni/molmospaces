@@ -357,9 +357,27 @@ def _mean(rows: list[dict[str, Any]], key: str) -> float | None:
     return None if not values else float(np.mean(values))
 
 
+def _triggered_early_stops(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        payload
+        for row in rows
+        if isinstance((payload := row.get("early_stop")), dict)
+        and bool(payload.get("triggered"))
+    ]
+
+
 def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     interaction_attempts = sum(int(row.get("interaction_action_count", 0)) for row in rows)
     correct_actions = sum(int(row.get("correct_interaction_action_count", 0)) for row in rows)
+    early_stops = _triggered_early_stops(rows)
+    early_stop_reasons = Counter(
+        str(payload.get("reason") or "unknown") for payload in early_stops
+    )
+    early_stop_failure_counts = [
+        int(payload["failed_subgoal_count"])
+        for payload in early_stops
+        if payload.get("failed_subgoal_count") is not None
+    ]
     return {
         "episode_count": len(rows),
         "success_rate": _rate(rows, "success"),
@@ -382,6 +400,11 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_extra_interaction_action_count": _mean(rows, "extra_interaction_action_count"),
         "mean_invalid_interaction_action_count": _mean(rows, "invalid_interaction_action_count"),
         "terminal_reason_counts": dict(Counter(str(row.get("terminal_reason")) for row in rows)),
+        "early_stop_episode_count": len(early_stops),
+        "early_stop_reason_counts": dict(sorted(early_stop_reasons.items())),
+        "mean_early_stop_failed_subgoal_count": (
+            float(np.mean(early_stop_failure_counts)) if early_stop_failure_counts else None
+        ),
     }
 
 
@@ -394,6 +417,10 @@ def summarise_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for row in rows
         if not bool(row.get("scoring_eligible", True))
         for reason in row.get("scoring_exclusion_reasons", [])
+    )
+    early_stops = _triggered_early_stops(rows)
+    early_stop_reasons = Counter(
+        str(payload.get("reason") or "unknown") for payload in early_stops
     )
     groups: dict[str, list[dict[str, Any]]] = {"overall": list(eligible_rows)}
     for domain in ("channel", "container", "mixed"):
@@ -412,10 +439,12 @@ def summarise_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for label in sorted({str(row["path_length_bin"]) for row in eligible_rows if row.get("path_length_bin")}):
         groups[f"path_length/{label}"] = [row for row in eligible_rows if row.get("path_length_bin") == label]
     return {
-        "schema_version": "interactive_nav_v3_benchmark_eval_summary_v2",
+        "schema_version": "interactive_nav_v3_benchmark_eval_summary_v3",
         "total_episode_count": len(rows),
         "scoring_eligible_episode_count": len(eligible_rows),
         "runtime_ineligible_episode_count": len(rows) - len(eligible_rows),
         "runtime_ineligible_reason_counts": dict(exclusion_reasons),
+        "early_stop_episode_count": len(early_stops),
+        "early_stop_reason_counts": dict(sorted(early_stop_reasons.items())),
         "groups": {name: _group_summary(values) for name, values in groups.items() if values},
     }

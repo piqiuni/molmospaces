@@ -3,6 +3,7 @@ from semantic_decision_py_pkg.candidate_curator import (
     CandidateCurator,
     CandidateCuratorConfig,
     candidate_history_key,
+    preserve_missing_explore_candidate_update,
     validate_candidate_update,
 )
 
@@ -195,13 +196,14 @@ def test_curator_prioritizes_reachable_unvisited_room_frontier() -> None:
         history_by_key={
             candidate_history_key(historical): {"selection_count": 1},
         },
+        entered_room_ids=[1, 2],
     )
 
     assert result.ranked_ids_by_type["EXPLORE"][0] == "frontier:z_new_room"
     assert (
         result.quality_terms_by_id["frontier:z_new_room"]
         ["unvisited_room_frontier_bonus"]
-        == 0.15
+        == 0.70
     )
     assert (
         result.quality_terms_by_id["frontier:b_unreachable"]
@@ -234,7 +236,7 @@ def test_curator_rejects_invisible_unreachable_container_interaction() -> None:
     }
 
 
-def test_curator_keeps_substantially_larger_visible_area_ahead_of_new_room() -> None:
+def test_curator_prioritizes_unentered_room_over_larger_visited_area() -> None:
     curator = CandidateCurator(
         CandidateCuratorConfig(candidate_top_k=3, explore_quota=3)
     )
@@ -259,11 +261,12 @@ def test_curator_keeps_substantially_larger_visible_area_ahead_of_new_room() -> 
         history_by_key={
             candidate_history_key(historical): {"selection_count": 1},
         },
+        entered_room_ids=[1, 2],
     )
 
     assert result.ranked_ids_by_type["EXPLORE"] == [
-        "frontier:z_large_visited",
         "frontier:a_smaller_new",
+        "frontier:z_large_visited",
     ]
     assert (
         result.quality_terms_by_id["frontier:z_large_visited"]
@@ -273,7 +276,7 @@ def test_curator_keeps_substantially_larger_visible_area_ahead_of_new_room() -> 
     assert (
         result.quality_terms_by_id["frontier:a_smaller_new"]
         ["unvisited_room_frontier_bonus"]
-        == 0.15
+        == 0.70
     )
 
 
@@ -309,6 +312,7 @@ def test_curator_keeps_repeat_low_gain_suppression_with_new_room_bonus() -> None
                 "low_gain_repeat_count": 2,
             },
         },
+        entered_room_ids=[1, 2],
     )
 
     assert result.omitted["frontier:repeat_same_room"] == "history_low_gain_suppressed"
@@ -318,7 +322,127 @@ def test_curator_keeps_repeat_low_gain_suppression_with_new_room_bonus() -> None
     assert (
         result.quality_terms_by_id["frontier:new_room"]
         ["unvisited_room_frontier_bonus"]
-        == 0.15
+        == 0.70
+    )
+
+
+def test_room_selection_history_does_not_mark_room_as_entered() -> None:
+    curator = CandidateCurator(CandidateCuratorConfig(candidate_top_k=2, explore_quota=2))
+    frontier = make_candidate("frontier:child", "EXPLORE", x=3.0, room_id=2)
+    frontier.metadata.update({"robot_room_id": 1, "room_reachable": True})
+    history_key = candidate_history_key(frontier)
+
+    still_unentered = curator.curate(
+        [frontier],
+        history_by_key={history_key: {"selection_count": 5, "visit_count": 5}},
+        entered_room_ids=[1],
+    )
+
+    assert still_unentered.decision_hint_by_id[frontier.candidate_id] == "NEW_ROOM_FRONTIER"
+    assert frontier.metadata["room_status"] == "unentered_new_room"
+    assert still_unentered.quality_terms_by_id[frontier.candidate_id][
+        "unvisited_room_frontier_bonus"
+    ] == 0.70
+
+    physically_entered = curator.curate([frontier], entered_room_ids=[1, 2])
+    assert frontier.metadata["room_status"] == "entered_room"
+    assert frontier.candidate_id not in physically_entered.decision_hint_by_id
+    assert physically_entered.quality_terms_by_id[frontier.candidate_id][
+        "unvisited_room_frontier_bonus"
+    ] == 0.0
+
+
+def test_curator_reserves_small_unentered_room_before_visible_area_filter() -> None:
+    curator = CandidateCurator(
+        CandidateCuratorConfig(
+            candidate_top_k=1,
+            explore_quota=1,
+            explore_new_room_bonus=0.0,
+            reserve_unentered_room_frontier_slots=1,
+            explore_min_visible_gain_ratio=0.50,
+        )
+    )
+    current_large = make_candidate("frontier:current", "EXPLORE", x=1.0, room_id=1)
+    child_small = make_candidate("frontier:child", "EXPLORE", x=4.0, room_id=2)
+    current_large.metadata.update(
+        {
+            "robot_room_id": 1,
+            "room_reachable": True,
+            "expected_visible_unknown_area_m2": 50.0,
+        }
+    )
+    child_small.metadata.update(
+        {
+            "robot_room_id": 1,
+            "room_reachable": True,
+            "expected_visible_unknown_area_m2": 1.0,
+        }
+    )
+
+    result = curator.curate(
+        [current_large, child_small], entered_room_ids=[1]
+    )
+
+    assert [candidate.candidate_id for candidate in result.candidates] == ["frontier:child"]
+    assert result.reserved_new_room_ids == ["frontier:child"]
+    assert "frontier:child" not in result.omitted
+
+
+def test_curator_penalizes_high_confidence_room_target_mismatch() -> None:
+    curator = CandidateCurator(CandidateCuratorConfig(candidate_top_k=3, explore_quota=3))
+    kitchen = make_candidate("frontier:kitchen", "EXPLORE", x=3.0, room_id=2)
+    bedroom = make_candidate("frontier:bedroom", "EXPLORE", x=4.0, room_id=3)
+    for candidate in (kitchen, bedroom):
+        candidate.metadata.update(
+            {
+                "robot_room_id": 1,
+                "room_reachable": True,
+                "expected_visible_unknown_area_m2": 10.0,
+            }
+        )
+    graph = {
+        "nodes": [
+            {
+                "id": "room_2",
+                "type": "room",
+                "room_id": 2,
+                "attributes": {
+                    "room_attribute": "kitchen",
+                    "room_attribute_confidence": 0.95,
+                },
+            },
+            {
+                "id": "room_3",
+                "type": "room",
+                "room_id": 3,
+                "attributes": {
+                    "room_attribute": "bedroom",
+                    "room_attribute_confidence": 0.95,
+                },
+            },
+        ]
+    }
+
+    result = curator.curate(
+        [kitchen, bedroom],
+        graph=graph,
+        entered_room_ids=[1],
+        target_context={"enabled": True, "target_name": "apple", "object_labels": ["apple"]},
+    )
+
+    assert result.ranked_ids_by_type["EXPLORE"] == [
+        "frontier:kitchen",
+        "frontier:bedroom",
+    ]
+    assert kitchen.metadata["room_target_affinity"] == 1.0
+    assert bedroom.metadata["room_target_affinity_reason"] == (
+        "room_target_high_confidence_mismatch"
+    )
+    assert result.quality_terms_by_id["frontier:bedroom"][
+        "high_confidence_room_target_mismatch_penalty"
+    ] == -0.60
+    assert result.decision_hint_by_id["frontier:bedroom"] == (
+        "NEW_ROOM_FRONTIER_HIGH_CONFIDENCE_MISMATCH"
     )
 
 
@@ -330,6 +454,25 @@ def test_candidate_update_accepts_benign_sequence_refresh() -> None:
 
     assert validation.valid
     assert validation.candidate is latest
+
+
+def test_candidate_update_keeps_dispatched_explore_goal_when_reclustering_removes_it() -> None:
+    selected = make_candidate("frontier:gone", "EXPLORE", x=1.0, y=2.0)
+    missing = validate_candidate_update(selected, [])
+
+    preserved = preserve_missing_explore_candidate_update(selected, missing)
+
+    assert preserved.valid
+    assert preserved.reason == "explore_candidate_missing_preserved"
+    assert preserved.candidate is selected
+
+    target_priority = preserve_missing_explore_candidate_update(
+        selected,
+        missing,
+        priority_target_candidate_id="target:pencil",
+    )
+    assert not target_priority.valid
+    assert target_priority.reason == "candidate_missing"
 
 
 def test_candidate_update_rejects_moved_or_changed_interaction() -> None:

@@ -140,6 +140,48 @@ def test_round_summary_tolerates_missing_optional_artifacts(tmp_path: Path) -> N
     assert "—" in rendered
 
 
+def test_round_summary_surfaces_scored_early_stop_diagnostics(tmp_path: Path) -> None:
+    result_path = tmp_path / "worker_3" / "episode_result.json"
+    _write_json(
+        result_path,
+        {
+            "episode_index": 88,
+            "success": False,
+            "scoring_eligible": True,
+            "terminal_reason": "cross_subgoal_navigation_stall",
+            "step_count": 157,
+            "episode_step_budget": 500,
+            "early_stop": {
+                "triggered": True,
+                "reason": "cross_subgoal_navigation_stall",
+                "trigger_step": 157,
+                "failed_subgoal_count": 8,
+                "observed_navigation_failure_count": 9,
+                "displacement_m": 0.04,
+            },
+        },
+    )
+
+    summary = v3_round_summary.summarise_round(tmp_path)
+    rendered = v3_round_summary.render_terminal_summary(summary)
+
+    assert summary["success_count"] == 0
+    assert summary["early_stop_count"] == 1
+    assert summary["early_stop_reason_counts"] == {
+        "cross_subgoal_navigation_stall": 1
+    }
+    assert summary["episodes"][0]["early_stop"] == {
+        "triggered": True,
+        "reason": "cross_subgoal_navigation_stall",
+        "trigger_step": 157,
+        "failed_subgoal_count": 8,
+        "observed_navigation_failure_count": 9,
+        "displacement_m": 0.04,
+    }
+    assert "early-stop" in rendered
+    assert "cross_subgoal_navigation_stall; n=8@157" in rendered
+
+
 def test_round_summary_uses_sampled_video_frame_expectation(tmp_path: Path) -> None:
     worker = tmp_path / "worker_1_ep_73"
     _write_json(

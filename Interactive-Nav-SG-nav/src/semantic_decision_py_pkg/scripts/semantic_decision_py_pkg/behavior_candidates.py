@@ -63,12 +63,20 @@ class CandidateGeneratorConfig:
     container_allow_connected_room: bool = False
     max_state_age_sec: float = 300.0
     min_state_confidence: float = 0.5
+    # A portal's default graph state is deliberately not sufficient to open it
+    # in the full-MLLM policy.  Wait for Module 1 to classify the observed
+    # object so an already-open static door is not treated as a closed door.
+    portal_require_attribute_ready: bool = False
+    portal_allow_unknown_state: bool = True
     portal_standoff_m: float = 1.0
     portal_traversal_distance_m: float = 0.9
     portal_traversal_max_start_distance_m: float = 2.0
     portal_traversal_completion_margin_m: float = 0.35
     container_standoff_m: float = 1.0
-    drawer_standoff_m: float = 1.0
+    # ``None`` means drawers inherit ``container_standoff_m``.  The shipped
+    # YAML makes the equivalence explicit (both are 0.50 m), while preserving
+    # an opt-in per-drawer adjustment for a future task.
+    drawer_standoff_m: float | None = None
     interaction_safety_margin_m: float = 0.0
     interaction_ready_distance_m: float = 0.45
     require_current_visibility: bool = False
@@ -110,7 +118,10 @@ class CandidateGenerator:
             candidates.extend(
                 self._target_candidates(graph or {}, robot_xy, target_context or {})
             )
+        self._attach_portal_child_room_context(candidates, graph or {})
+        self._attach_frontier_room_context(candidates, graph or {}, robot_xy)
         self._attach_spatial_context(candidates, graph or {})
+        candidates = self._limit_frontier_candidates(candidates)
         return sorted(candidates, key=lambda candidate: candidate.candidate_id)
 
     def _target_candidates(
@@ -524,7 +535,6 @@ class CandidateGenerator:
                     str(proposal.get("cluster_id") or ""),
                 )
             )
-        proposals = proposals[: max(0, int(self.config.max_frontier_candidates))]
         raw_information = []
         raw_unknown_areas = []
         raw_expected_visible_areas = []
@@ -729,6 +739,296 @@ class CandidateGenerator:
             if nearby:
                 candidate.metadata["nearby_semantic_nodes"] = nearby[:3]
 
+    @staticmethod
+    def _attach_portal_child_room_context(
+        candidates: list[BehaviorCandidate], graph: dict[str, Any]
+    ) -> None:
+        """Associate near-door frontiers with graph-only portal child rooms.
+
+        The mapping side never assigns the child ID to unknown occupancy cells.
+        This bounded geometric association is only a candidate label, so a
+        fresh frontier just beyond an opened door can retain a stable room
+        identity until ordinary free-space segmentation observes that room.
+        """
+
+        potential_rooms = []
+        for node in graph.get("nodes") or []:
+            if str(node.get("type") or "").casefold() != "room":
+                continue
+            attributes = node.get("attributes") or {}
+            if not bool(attributes.get("is_potential_room")) or not bool(
+                attributes.get("active", True)
+            ):
+                continue
+            room_id = node.get("room_id")
+            center = list(node.get("aabb_center") or node.get("centroid") or [])
+            size = list(node.get("aabb_size") or [])
+            if room_id is None or len(center) < 2 or len(size) < 2:
+                continue
+            potential_rooms.append(
+                (
+                    max(abs(float(size[0])) * abs(float(size[1])), 1e-6),
+                    int(room_id),
+                    float(center[0]),
+                    float(center[1]),
+                    0.5 * abs(float(size[0])),
+                    0.5 * abs(float(size[1])),
+                    str(attributes.get("source_portal_id") or ""),
+                )
+            )
+        if not potential_rooms:
+            return
+        for candidate in candidates:
+            if candidate.behavior_type != BEHAVIOR_EXPLORE:
+                continue
+            goal = list(candidate.goal_xyyaw or [])
+            if len(goal) < 2:
+                continue
+            matches = [
+                item
+                for item in potential_rooms
+                if abs(float(goal[0]) - item[2]) <= item[4] + 0.15
+                and abs(float(goal[1]) - item[3]) <= item[5] + 0.15
+            ]
+            if not matches:
+                continue
+            _, room_id, _x, _y, _half_x, _half_y, portal_id = min(matches)
+            candidate.metadata.update(
+                {
+                    "target_room_id": room_id,
+                    "room_id": room_id,
+                    "room_assignment_source": "portal_open_potential_child",
+                    "potential_room": True,
+                    "source_portal_id": portal_id,
+                }
+            )
+
+    @staticmethod
+    def _room_context_for_xy(
+        graph: dict[str, Any], xy: tuple[float, float] | list[float] | None
+    ) -> dict[str, Any]:
+        """Return an occupancy/graph room label for a physical XY position.
+
+        Potential rooms are useful door-side labels, but they must not steal a
+        normal segmented room simply because their synthetic AABB overlaps the
+        doorway.  Prefer an observed room when both contain the point; use a
+        potential room only when it is the only available physical label.
+        """
+
+        values = list(xy or [])
+        if len(values) < 2:
+            return {}
+        matches: list[tuple[int, float, str, Any, dict[str, Any]]] = []
+        for node in graph.get("nodes") or []:
+            if str(node.get("type") or "").casefold() != "room":
+                continue
+            attributes = node.get("attributes") or {}
+            if not bool(attributes.get("active", True)):
+                continue
+            center = list(node.get("aabb_center") or node.get("centroid") or [])
+            size = list(node.get("aabb_size") or [])
+            room_id = node.get("room_id")
+            if room_id is None:
+                room_id = node.get("id")
+            if len(center) < 2 or len(size) < 2 or room_id in (None, ""):
+                continue
+            half_x = 0.5 * abs(float(size[0]))
+            half_y = 0.5 * abs(float(size[1]))
+            if (
+                abs(float(values[0]) - float(center[0])) > half_x + 1e-6
+                or abs(float(values[1]) - float(center[1])) > half_y + 1e-6
+            ):
+                continue
+            is_potential = bool(attributes.get("is_potential_room"))
+            matches.append(
+                (
+                    1 if is_potential else 0,
+                    max(half_x * half_y, 1e-6),
+                    str(room_id),
+                    room_id,
+                    node,
+                )
+            )
+        if not matches:
+            return {}
+        _potential_rank, _area, _sortable_room_id, room_id, node = min(matches)
+        attributes = node.get("attributes") or {}
+        result: dict[str, Any] = {
+            "room_id": room_id,
+            "potential_room": bool(attributes.get("is_potential_room")),
+        }
+        source_portal_id = str(attributes.get("source_portal_id") or "")
+        if source_portal_id:
+            result["source_portal_id"] = source_portal_id
+        room_attribute = str(attributes.get("room_attribute") or "").strip()
+        if room_attribute and room_attribute.casefold() != "unknown":
+            result["room_attribute"] = room_attribute
+            result["room_attribute_confidence"] = max(
+                0.0,
+                min(1.0, float(attributes.get("room_attribute_confidence", 0.0) or 0.0)),
+            )
+            scores = dict(attributes.get("room_attribute_scores") or {})
+            if scores:
+                result["room_attribute_scores"] = scores
+        return result
+
+    @staticmethod
+    def _room_context_by_id(graph: dict[str, Any], room_id: Any) -> dict[str, Any]:
+        if room_id in (None, ""):
+            return {}
+        normalized = str(room_id).removeprefix("room_")
+        for node in graph.get("nodes") or []:
+            if str(node.get("type") or "").casefold() != "room":
+                continue
+            node_room_id = node.get("room_id")
+            if node_room_id is None:
+                node_room_id = node.get("id")
+            if node_room_id in (None, ""):
+                continue
+            if str(node_room_id).removeprefix("room_") != normalized:
+                continue
+            attributes = node.get("attributes") or {}
+            result: dict[str, Any] = {
+                "room_id": node_room_id,
+                "potential_room": bool(attributes.get("is_potential_room")),
+            }
+            source_portal_id = str(attributes.get("source_portal_id") or "")
+            if source_portal_id:
+                result["source_portal_id"] = source_portal_id
+            room_attribute = str(attributes.get("room_attribute") or "").strip()
+            if room_attribute and room_attribute.casefold() != "unknown":
+                result["room_attribute"] = room_attribute
+                result["room_attribute_confidence"] = max(
+                    0.0,
+                    min(
+                        1.0,
+                        float(attributes.get("room_attribute_confidence", 0.0) or 0.0),
+                    ),
+                )
+                scores = dict(attributes.get("room_attribute_scores") or {})
+                if scores:
+                    result["room_attribute_scores"] = scores
+            return result
+        return {}
+
+    @classmethod
+    def _attach_frontier_room_context(
+        cls,
+        candidates: list[BehaviorCandidate],
+        graph: dict[str, Any],
+        robot_xy: tuple[float, float] | None,
+    ) -> None:
+        """Attach explicit current/target room metadata to every frontier.
+
+        ExplorePy proposals are geometric and normally have no room identity.
+        Assigning it here (after the portal-child association) prevents all
+        frontiers from being treated as a generic ``NEW_ROOM_FRONTIER`` and
+        keeps a door-created child room distinct from the room containing the
+        robot.
+        """
+
+        robot_context = cls._room_context_for_xy(graph, robot_xy)
+        robot_room_id = robot_context.get("room_id")
+        for candidate in candidates:
+            if candidate.behavior_type != BEHAVIOR_EXPLORE:
+                continue
+            metadata = candidate.metadata
+            target_room_id = metadata.get("target_room_id") or metadata.get("room_id")
+            target_context = cls._room_context_by_id(graph, target_room_id)
+            assignment_source = str(metadata.get("room_assignment_source") or "")
+            if not target_context:
+                point = list(metadata.get("frontier_point") or candidate.goal_xyyaw or [])
+                target_context = cls._room_context_for_xy(graph, point)
+                if target_context:
+                    assignment_source = "occupancy_room_aabb"
+            if robot_room_id not in (None, ""):
+                metadata["robot_room_id"] = robot_room_id
+                metadata["current_room_id"] = robot_room_id
+            if target_context:
+                target_room_id = target_context["room_id"]
+                metadata["target_room_id"] = target_room_id
+                metadata["room_id"] = target_room_id
+                metadata["potential_room"] = bool(target_context.get("potential_room"))
+                for key in (
+                    "source_portal_id",
+                    "room_attribute",
+                    "room_attribute_confidence",
+                    "room_attribute_scores",
+                ):
+                    if key in target_context:
+                        metadata[key] = target_context[key]
+                if assignment_source:
+                    metadata["room_assignment_source"] = assignment_source
+                if robot_room_id not in (None, ""):
+                    metadata["room_relation"] = (
+                        "current_room"
+                        if str(target_room_id).removeprefix("room_")
+                        == str(robot_room_id).removeprefix("room_")
+                        else "other_room"
+                    )
+            # A frontier emitted by ExplorePy already passed a local geometry
+            # feasibility test.  Do not turn an absent topology edge into a
+            # false hard constraint; explicit false remains respected.
+            metadata.setdefault("room_reachable", True)
+
+    @staticmethod
+    def _frontier_priority_key(candidate: BehaviorCandidate) -> tuple[float, float, float, float, str]:
+        metadata = candidate.metadata or {}
+        return (
+            -float(metadata.get("expected_visible_unknown_area_m2", 0.0) or 0.0),
+            -float(metadata.get("unknown_component_area_m2", 0.0) or 0.0),
+            -float(candidate.features.get("exploration_gain", 0.0) or 0.0),
+            max(0.0, float(candidate.features.get("distance_m", 0.0) or 0.0)),
+            candidate.candidate_id,
+        )
+
+    def _limit_frontier_candidates(
+        self, candidates: list[BehaviorCandidate]
+    ) -> list[BehaviorCandidate]:
+        """Apply the frontier cap without dropping every door-side room.
+
+        The raw proposal stream is globally ranked by visible area.  Reserve
+        one feasible proposal per distinct other-room label before filling the
+        remaining slots, so a small frontier just beyond a door can reach the
+        curator and the MLLM instead of being erased by same-room area alone.
+        """
+
+        limit = max(0, int(self.config.max_frontier_candidates))
+        frontiers = [
+            candidate
+            for candidate in candidates
+            if candidate.behavior_type == BEHAVIOR_EXPLORE
+        ]
+        if limit <= 0:
+            return [candidate for candidate in candidates if candidate not in frontiers]
+        if len(frontiers) <= limit:
+            return candidates
+        ordered = sorted(frontiers, key=self._frontier_priority_key)
+        reserved_by_room: dict[str, BehaviorCandidate] = {}
+        for candidate in ordered:
+            metadata = candidate.metadata or {}
+            room_id = str(
+                metadata.get("target_room_id") or metadata.get("room_id") or ""
+            )
+            robot_room_id = str(metadata.get("robot_room_id") or "")
+            if not room_id or metadata.get("room_reachable") is False:
+                continue
+            if robot_room_id and room_id.removeprefix("room_") == robot_room_id.removeprefix("room_"):
+                continue
+            reserved_by_room.setdefault(room_id, candidate)
+        reserved = sorted(reserved_by_room.values(), key=self._frontier_priority_key)[:limit]
+        selected_ids = {candidate.candidate_id for candidate in reserved}
+        for candidate in ordered:
+            if len(selected_ids) >= limit:
+                break
+            selected_ids.add(candidate.candidate_id)
+        return [
+            candidate
+            for candidate in candidates
+            if candidate.behavior_type != BEHAVIOR_EXPLORE
+            or candidate.candidate_id in selected_ids
+        ]
+
     def _interaction_candidates(
         self,
         graph: dict[str, Any],
@@ -748,11 +1048,7 @@ class CandidateGenerator:
             if node_type == "container" and not self._is_openable_container(node):
                 continue
             node_state = str(interaction.get("state") or "unknown")
-            if node_type == "portal" and (
-                not bool(interaction.get("requires_interaction"))
-                or node_state not in {"closed", "ajar", "unknown"}
-            ):
-                continue
+            attributes = node.get("attributes") or {}
             confidence = float(
                 interaction.get("state_confidence", interaction.get("confidence", node.get("confidence", 0.0)))
                 or 0.0
@@ -762,6 +1058,31 @@ class CandidateGenerator:
             state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
             if state_age_sec > self.config.max_state_age_sec:
                 continue
+            if node_type == "portal":
+                if (
+                    not bool(interaction.get("requires_interaction"))
+                    or node_state not in {"closed", "ajar", "unknown"}
+                ):
+                    continue
+                if self.config.portal_require_attribute_ready:
+                    attribute_status = str(
+                        attributes.get("attribute_status")
+                        or interaction.get("attribute_status")
+                        or ""
+                    ).strip().lower()
+                    if attribute_status != "ready" and not self._has_verified_pending_portal_state(
+                        interaction,
+                        attributes,
+                        node_state,
+                        confidence,
+                        state_age_sec,
+                    ):
+                        continue
+                if (
+                    node_state == "unknown"
+                    and not self.config.portal_allow_unknown_state
+                ):
+                    continue
             if self.config.require_current_visibility and not bool(node.get("is_currently_visible")):
                 continue
             node_room_id = node.get("room_id")
@@ -792,13 +1113,20 @@ class CandidateGenerator:
             if position is None:
                 continue
             object_distance = math.hypot(position[0] - robot_xy[0], position[1] - robot_xy[1])
-            standoff = (
-                self.config.portal_standoff_m
-                if node_type == "portal"
-                else self.config.container_standoff_m
-            )
+            if node_type == "portal":
+                standoff = self.config.portal_standoff_m
+                standoff_source = "portal"
+            elif self._is_drawer_container(node):
+                standoff = (
+                    self.config.drawer_standoff_m
+                    if self.config.drawer_standoff_m is not None
+                    else self.config.container_standoff_m
+                )
+                standoff_source = "drawer"
+            else:
+                standoff = self.config.container_standoff_m
+                standoff_source = "container"
             node_id = str(node.get("id") or "")
-            attributes = node.get("attributes") or {}
             source_object_name = str(
                 attributes.get("source_object_name") or node.get("name") or node_id
             )
@@ -829,6 +1157,58 @@ class CandidateGenerator:
                 node_type,
             )
             approach = goal_candidates[0]
+            portal_aabb_center_xy: list[float] = []
+            portal_aabb_size_xy: list[float] = []
+            portal_clearance_aabb_center_xy: list[float] = []
+            portal_clearance_aabb_size_xy: list[float] = []
+            if node_type == "portal":
+                reference_center = list(
+                    attributes.get("interaction_reference_aabb_center")
+                    or node.get("aabb_center")
+                    or node.get("centroid")
+                    or []
+                )
+                reference_size = list(
+                    attributes.get("interaction_reference_aabb_size")
+                    or node.get("aabb_size")
+                    or []
+                )
+                clearance_center = list(
+                    node.get("aabb_center") or reference_center or []
+                )
+                clearance_size = list(node.get("aabb_size") or reference_size or [])
+                if len(reference_center) >= 2:
+                    try:
+                        portal_aabb_center_xy = [
+                            float(reference_center[0]),
+                            float(reference_center[1]),
+                        ]
+                    except (TypeError, ValueError):
+                        portal_aabb_center_xy = []
+                if len(reference_size) >= 2:
+                    try:
+                        portal_aabb_size_xy = [
+                            abs(float(reference_size[0])),
+                            abs(float(reference_size[1])),
+                        ]
+                    except (TypeError, ValueError):
+                        portal_aabb_size_xy = []
+                if len(clearance_center) >= 2:
+                    try:
+                        portal_clearance_aabb_center_xy = [
+                            float(clearance_center[0]),
+                            float(clearance_center[1]),
+                        ]
+                    except (TypeError, ValueError):
+                        portal_clearance_aabb_center_xy = []
+                if len(clearance_size) >= 2:
+                    try:
+                        portal_clearance_aabb_size_xy = [
+                            abs(float(clearance_size[0])),
+                            abs(float(clearance_size[1])),
+                        ]
+                    except (TypeError, ValueError):
+                        portal_clearance_aabb_size_xy = []
             approach_distance = math.hypot(
                 approach[0] - robot_xy[0], approach[1] - robot_xy[1]
             )
@@ -899,6 +1279,7 @@ class CandidateGenerator:
                         "room_hops": room_hops,
                         "room_reachable": room_hops is not None,
                         "interaction_standoff_m": interaction_standoff,
+                        "interaction_standoff_source": standoff_source,
                         "interaction_safety_margin_m": self.config.interaction_safety_margin_m,
                         "target_enabled": bool(target_context.get("enabled")),
                         "target_match": explicit_target_reinteraction,
@@ -920,11 +1301,76 @@ class CandidateGenerator:
                             node
                         ),
                         "goal_xyyaw_candidates": goal_candidates,
+                        # Preserve the geometry used to construct the two-sided
+                        # approach options.  The post-open continuation uses it
+                        # to select an AABB-clear goal on the far side instead
+                        # of recreating one radial point at the door center.
+                        "portal_aabb_center_xy": portal_aabb_center_xy,
+                        "portal_aabb_size_xy": portal_aabb_size_xy,
+                        "portal_clearance_aabb_center_xy": (
+                            portal_clearance_aabb_center_xy
+                        ),
+                        "portal_clearance_aabb_size_xy": (
+                            portal_clearance_aabb_size_xy
+                        ),
                     },
 
                 )
             )
         return candidates
+
+    def _has_verified_pending_portal_state(
+        self,
+        interaction: dict[str, Any],
+        attributes: dict[str, Any],
+        node_state: str,
+        confidence: float,
+        state_age_sec: float,
+    ) -> bool:
+        """Keep a verified closed portal actionable while its refresh is pending.
+
+        Module 1 publishes ``pending`` before issuing a refresh request.  A
+        portal that was already classified successfully would otherwise blink
+        out of the candidate stream for the duration of that request.  The
+        exception is deliberately narrow: default graph state and never-ready
+        portals remain blocked by ``portal_require_attribute_ready``.
+        """
+
+        if str(attributes.get("attribute_status") or "").strip().lower() != "pending":
+            return False
+        if node_state not in {"closed", "ajar"}:
+            return False
+        if not bool(interaction.get("is_interactable")):
+            return False
+        if not bool(interaction.get("requires_interaction")):
+            return False
+        if confidence < self.config.min_state_confidence:
+            return False
+        if state_age_sec > self.config.max_state_age_sec:
+            return False
+
+        verified = attributes.get("interaction_state_override") or {}
+        if not isinstance(verified, dict):
+            return False
+        verified_state = str(verified.get("state") or "").strip().lower()
+        verified_source = str(
+            verified.get("state_source") or attributes.get("attribute_source") or ""
+        ).strip().lower()
+        try:
+            verified_confidence = float(
+                verified.get(
+                    "state_confidence",
+                    attributes.get("attribute_confidence", 0.0),
+                )
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            return False
+        return (
+            verified_state in {"closed", "ajar"}
+            and verified_source == "mllm_attribute_inference"
+            and verified_confidence >= self.config.min_state_confidence
+        )
 
     def _portal_traversal_candidates(
         self,
@@ -1010,6 +1456,11 @@ class CandidateGenerator:
             source_object_name = str(
                 attributes.get("source_object_name") or node.get("name") or node_id
             )
+            potential_room_ids = list(attributes.get("potential_room_ids") or [])
+            target_room_id = attributes.get("portal_child_room_id")
+            if target_room_id is None and potential_room_ids:
+                target_room_id = potential_room_ids[0]
+            source_room_id = attributes.get("portal_child_source_room_id")
             candidates.append(
                 BehaviorCandidate(
                     candidate_id=f"traverse:{node_id}:{event_id}",
@@ -1046,6 +1497,10 @@ class CandidateGenerator:
                         "connected_room_ids": list(
                             attributes.get("connected_room_ids") or []
                         ),
+                        "target_room_id": target_room_id,
+                        "room_id": target_room_id,
+                        "source_room_id": source_room_id,
+                        "potential_room": target_room_id is not None,
                         "room_transition_required": True,
                         "requires_approach": False,
                         "verify_target_visibility": False,
@@ -1140,6 +1595,50 @@ class CandidateGenerator:
             ):
                 candidates.append(pose)
         return candidates
+
+    @staticmethod
+    def _is_drawer_container(node: dict[str, Any]) -> bool:
+        """Identify drawer semantics without treating every container as one.
+
+        The graph keeps drawers as ``container`` nodes.  Prefer the structured
+        interaction recipe, then fall back to stable object labels for legacy
+        graphs that did not publish drawer groups.
+        """
+
+        attributes = node.get("attributes") or {}
+        interaction = node.get("interaction") or {}
+        groups = list(attributes.get("interaction_groups") or [])
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            values = (
+                group.get("mode"),
+                group.get("view_profile"),
+                group.get("group_id"),
+                group.get("target_joint_names"),
+            )
+            if any("drawer" in str(value or "").casefold() for value in values):
+                return True
+        joint_infos = list(attributes.get("joint_infos") or [])
+        if any(
+            "drawer" in str(info.get("joint_name") or "").casefold()
+            for info in joint_infos
+            if isinstance(info, dict)
+        ):
+            return True
+        labels = (
+            node.get("label"),
+            node.get("name"),
+            attributes.get("semantic_name"),
+            attributes.get("category"),
+            attributes.get("source_object_name"),
+            interaction.get("interaction_mode"),
+        )
+        return any(
+            marker in str(label or "").casefold()
+            for label in labels
+            for marker in ("drawer", "dresser", "chest_of_drawers", "chestofdrawers")
+        )
 
     @staticmethod
     def _is_openable_container(node: dict[str, Any]) -> bool:
@@ -1281,6 +1780,8 @@ class CandidateGenerator:
         matches: list[tuple[float, int]] = []
         for node in graph.get("nodes") or []:
             if str(node.get("type") or "") != "room":
+                continue
+            if not bool((node.get("attributes") or {}).get("active", True)):
                 continue
             center = list(node.get("aabb_center") or node.get("centroid") or [])
             size = list(node.get("aabb_size") or [])

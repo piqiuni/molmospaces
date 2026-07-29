@@ -11,6 +11,7 @@ if str(PACKAGE_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(PACKAGE_SCRIPTS))
 
 from semantic_mapping_py_pkg.room_segmentation import RoomSegmenter
+from semantic_mapping_py_pkg.semantic_occ_overlay import SemanticOccupancyOverlay
 
 
 def _grid(width=24, height=16, resolution=0.25, yaw=0.0):
@@ -163,6 +164,83 @@ def test_portal_separated_small_free_space_becomes_low_confidence_room():
     assert len(pocket_room_ids) == 1
     assert next(iter(pocket_room_ids)) >= 0
     assert {room_conf_after[index] for index in pocket_indices} == {70}
+
+
+def test_confirmed_portal_overlay_segments_narrow_far_side_with_stable_reference():
+    """A successful open must make the observed far side a real room.
+
+    The raw map deliberately keeps the door cell occupied.  The topology path
+    receives only the confirmed semantic overlay and uses the original,
+    closed-door AABB as its virtual room boundary.
+    """
+
+    grid = _small_portal_pocket_grid()
+    values = np.asarray(grid.data, dtype=np.int8).reshape(
+        grid.info.height, grid.info.width
+    )
+    values[5, 12] = 100
+    grid.data = values.reshape(-1).tolist()
+    segmenter = RoomSegmenter(
+        room_min_component_cells=12,
+        room_core_min_component_cells=20,
+        room_core_clearance_cells=1,
+        room_remove_enclosed_occupied=False,
+        room_portal_cut_margin_m=0.0,
+        room_portal_cut_thickness_cells=1,
+        room_portal_small_component_confidence=70,
+        room_grid_stability_frames=3,
+    )
+    door = _door_observation(center_x=12.0, center_y=5.0)
+    assert segmenter.update_portal_hints(
+        [door], source_mode="realtime_gt_observation"
+    )
+    raw_room_ids, _ = segmenter.segment(grid)
+    assert _room_count(raw_room_ids) == 1
+
+    overlay = SemanticOccupancyOverlay(clear_padding_m=0.0)
+    portal = {
+        "id": "door_1",
+        "type": "portal",
+        "aabb_center": [12.0, 5.0, 1.0],
+        "aabb_size": [0.15, 1.0, 2.0],
+        "interaction": {"state": "closed"},
+    }
+    overlay.update_graph({"nodes": [portal]})
+    portal["interaction"] = {"state": "open"}
+    overlay.update_graph({"nodes": [portal]})
+    planning_data, _mask, stats = overlay.apply(
+        grid.info,
+        grid.data,
+        include_pending=False,
+    )
+    assert stats["active_portal_ids"] == ["door_1"]
+
+    planning_grid = SimpleNamespace(info=grid.info, data=planning_data)
+    room_ids, room_conf = segmenter.segment(planning_grid, force_stable=True)
+    pocket_indices = [
+        y * grid.info.width + x
+        for y in range(4, 8)
+        for x in range(13, 17)
+    ]
+    assert _room_count(room_ids) == 2
+    assert {room_ids[index] for index in pocket_indices} == {2}
+    assert {room_conf[index] for index in pocket_indices} == {70}
+
+
+def test_post_open_reference_refresh_replaces_an_active_portal_anchor():
+    segmenter = _segmenter()
+    assert segmenter.update_portal_hints(
+        [_door_observation(center_x=3.0)],
+        source_mode="realtime_gt_observation",
+    )
+    assert segmenter.update_portal_hints(
+        [_door_observation(center_x=4.0, size_xy=(1.0, 0.15))],
+        source_mode="realtime_gt_observation",
+        refresh_active=True,
+    )
+    hint = segmenter.state.portal_hints["door_1"]
+    assert hint["center"] == [4.0, 1.875, 1.0]
+    assert hint["size"] == [1.0, 0.15, 2.0]
 
 
 def test_detector_portal_hint_requires_stable_confirmations_and_freezes_anchor():

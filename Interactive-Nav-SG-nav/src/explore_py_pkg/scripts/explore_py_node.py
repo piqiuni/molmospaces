@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -40,10 +41,13 @@ from actionlib_msgs.msg import GoalID, GoalStatusArray
 from geometry_msgs.msg import Point, PointStamped, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
 from nav_msgs.srv import GetPlan
+from sensor_msgs.msg import Image
 from std_msgs.msg import Empty, String
 from visualization_msgs.msg import Marker, MarkerArray
 
+from explore_py_pkg.external_reservation import resolve_external_frontier_reservation
 from explore_py_pkg.frontier_core import FrontierConfig, FrontierExplorerCore, GridSpec, OccupancyGridData
+from explore_py_pkg.initial_scan import initial_scan_rgb_step_gate
 from explore_py_pkg.nav_client import TERMINAL_FAILURE, TERMINAL_SUCCESS, status_name
 from explore_py_pkg.skill_api import ExplorationSkillApi
 from explore_py_pkg.state import ExplorerState, ExplorerStateConfig, SUBGOAL_REACHED, SUBGOAL_WAITING
@@ -70,17 +74,41 @@ class ExplorePyNode:
         self.frontier_gone_min_goal_age_sec = float(exploration_cfg.get("frontier_gone_min_goal_age_sec", 8.0))
         self.initial_spin_enabled = bool(exploration_cfg.get("initial_spin_enabled", False))
         self.initial_spin_angle_rad = float(exploration_cfg.get("initial_spin_angle_rad", 2.0 * math.pi))
-        self.initial_spin_angular_speed = float(exploration_cfg.get("initial_spin_angular_speed", 0.35))
+        self.initial_spin_angular_speed = float(exploration_cfg.get("initial_spin_angular_speed", 1.25))
         self.initial_spin_timeout_sec = float(exploration_cfg.get("initial_spin_timeout_sec", 25.0))
         self.initial_spin_settle_sec = float(exploration_cfg.get("initial_spin_settle_sec", 1.0))
         self.initial_spin_cmd_rate_hz = float(exploration_cfg.get("initial_spin_cmd_rate_hz", 10.0))
+        self.initial_spin_fresh_step_gate_enabled = bool(
+            exploration_cfg.get("initial_spin_fresh_step_gate_enabled", True)
+        )
+        self.initial_spin_fresh_command_gate_enabled = bool(
+            exploration_cfg.get("initial_spin_fresh_command_gate_enabled", True)
+        )
+        # Legacy fallback only.  V3 receives a bridge-side fresh-command gate
+        # after its current RGB action wait has opened, so no timer delay is
+        # needed to guess the correct side of that boundary.
+        self.initial_spin_fresh_step_min_delay_sec = max(
+            0.0,
+            float(exploration_cfg.get("initial_spin_fresh_step_min_delay_sec", 0.05)),
+        )
+        self.initial_spin_max_control_steps = max(
+            1, int(exploration_cfg.get("initial_spin_max_control_steps", 28))
+        )
+        self.initial_spin_lock = threading.RLock()
         self.initial_spin_done = not self.initial_spin_enabled
         self.initial_spin_active = False
         self.initial_spin_start_time = 0.0
+        self.initial_spin_start_monotonic = 0.0
         self.initial_spin_done_time = 0.0
         self.initial_spin_last_yaw = None
         self.initial_spin_accumulated_yaw = 0.0
         self.initial_spin_reason = "disabled" if self.initial_spin_done else "pending"
+        self.initial_spin_latest_rgb_step_seq = None
+        self.initial_spin_latest_rgb_received_at = 0.0
+        self.initial_spin_latest_step_sync_index = None
+        self.initial_spin_latest_fresh_command_gate_step_seq = None
+        self.initial_spin_last_sent_rgb_step_seq = None
+        self.initial_spin_nonzero_commands_sent = 0
         self.local_plan_watchdog_enabled = bool(exploration_cfg.get("local_plan_watchdog_enabled", True))
         self.local_plan_watchdog_sec = float(exploration_cfg.get("local_plan_watchdog_sec", 12.0))
         self.local_plan_min_poses = int(exploration_cfg.get("local_plan_min_poses", 3))
@@ -306,6 +334,26 @@ class ExplorePyNode:
             self.behavior_command_callback,
             queue_size=4,
         )
+        if self.initial_spin_fresh_step_gate_enabled:
+            rospy.Subscriber(
+                self.topics.get("rgb_image", "/molmo_spaces/head_camera/image"),
+                Image,
+                self.initial_spin_rgb_callback,
+                queue_size=1,
+            )
+            rospy.Subscriber(
+                self.topics.get("step_sync", "/molmo_spaces/step_sync"),
+                String,
+                self.initial_spin_step_sync_callback,
+                queue_size=4,
+            )
+            if self.initial_spin_fresh_command_gate_enabled:
+                rospy.Subscriber(
+                    self.topics.get("fresh_command_gate", "/molmo_spaces/fresh_cmd_gate"),
+                    String,
+                    self.initial_spin_fresh_command_gate_callback,
+                    queue_size=4,
+                )
 
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.tick_rate_hz, 1e-3)), self.tick)
         self.initial_spin_cmd_timer = rospy.Timer(
@@ -358,10 +406,18 @@ class ExplorePyNode:
         self.initial_spin_done = not self.initial_spin_enabled
         self.initial_spin_active = False
         self.initial_spin_start_time = 0.0
+        self.initial_spin_start_monotonic = 0.0
         self.initial_spin_done_time = 0.0
         self.initial_spin_last_yaw = None
         self.initial_spin_accumulated_yaw = 0.0
         self.initial_spin_reason = "disabled" if self.initial_spin_done else "pending"
+        with self.initial_spin_lock:
+            self.initial_spin_latest_rgb_step_seq = None
+            self.initial_spin_latest_rgb_received_at = 0.0
+            self.initial_spin_latest_step_sync_index = None
+            self.initial_spin_latest_fresh_command_gate_step_seq = None
+            self.initial_spin_last_sent_rgb_step_seq = None
+            self.initial_spin_nonzero_commands_sent = 0
         marker = Marker()
         marker.action = Marker.DELETEALL
         self.frontier_pub.publish(MarkerArray(markers=[marker]))
@@ -374,6 +430,56 @@ class ExplorePyNode:
     def odom_callback(self, msg):
         self.robot_xy = (float(msg.pose.pose.position.x), float(msg.pose.pose.position.y))
         self.robot_yaw = self._yaw_from_quaternion(msg.pose.pose.orientation)
+
+    def initial_spin_rgb_callback(self, msg: Image) -> None:
+        try:
+            step_seq = int(msg.header.seq)
+        except (AttributeError, TypeError, ValueError):
+            return
+        with self.initial_spin_lock:
+            received_at = time.monotonic()
+            self.initial_spin_latest_rgb_step_seq = step_seq
+            self.initial_spin_latest_rgb_received_at = received_at
+            # Starting from this callback anchors the first gated command to
+            # the current RosBridge observation rather than an old frame that
+            # may already have left its fresh-command wait.
+            if (
+                self.initial_spin_enabled
+                and not self.initial_spin_done
+                and not self.initial_spin_active
+                and self.robot_yaw is not None
+                and self.state.active_goal is None
+            ):
+                self._start_initial_spin_locked(time.time(), received_at)
+            # The bridge may already have opened this action's fresh command
+            # window before the RGB callback was scheduled.  Consume that
+            # exact window once rather than waiting for a 10 Hz timer.
+            if (
+                self.initial_spin_active
+                and self.initial_spin_latest_fresh_command_gate_step_seq == step_seq
+            ):
+                self._tick_initial_spin(allow_fresh_command=True)
+
+    def initial_spin_step_sync_callback(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+            step_index = int(payload["step_index"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        with self.initial_spin_lock:
+            self.initial_spin_latest_step_sync_index = step_index
+
+    def initial_spin_fresh_command_gate_callback(self, msg: String) -> None:
+        """Consume the bridge event that opens the current fresh-cmd wait."""
+
+        try:
+            payload = json.loads(msg.data)
+            step_index = int(payload["step_index"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        with self.initial_spin_lock:
+            self.initial_spin_latest_fresh_command_gate_step_seq = step_index
+            self._tick_initial_spin(allow_fresh_command=True)
 
     def strategy_bias_callback(self, msg):
         self.value_fusion.set_strategy_bias_json(msg.data)
@@ -730,7 +836,17 @@ class ExplorePyNode:
                 "active": self.initial_spin_active,
                 "accumulated_yaw_rad": self.initial_spin_accumulated_yaw,
                 "target_yaw_rad": self.initial_spin_angle_rad,
+                "angular_speed_rad_s": self.initial_spin_angular_speed,
                 "cmd_rate_hz": self.initial_spin_cmd_rate_hz,
+                "fresh_step_gate_enabled": self.initial_spin_fresh_step_gate_enabled,
+                "fresh_command_gate_enabled": self.initial_spin_fresh_command_gate_enabled,
+                "fresh_step_min_delay_sec": self.initial_spin_fresh_step_min_delay_sec,
+                "max_control_steps": self.initial_spin_max_control_steps,
+                "nonzero_commands_sent": self.initial_spin_nonzero_commands_sent,
+                "last_sent_rgb_step_seq": self.initial_spin_last_sent_rgb_step_seq,
+                "latest_rgb_step_seq": self.initial_spin_latest_rgb_step_seq,
+                "latest_step_sync_index": self.initial_spin_latest_step_sync_index,
+                "latest_fresh_command_gate_step_seq": self.initial_spin_latest_fresh_command_gate_step_seq,
                 "reason": self.initial_spin_reason,
             },
             "plan_watchdog": {
@@ -794,13 +910,13 @@ class ExplorePyNode:
                 cached_ack["detail"],
             )
             return
-        cluster = next(
-            (
-                candidate
-                for candidate in self.latest_clusters
-                if str(candidate.cluster_id) == cluster_id
-            ),
-            None,
+        cluster, frontier_missing_goal_preserved = (
+            resolve_external_frontier_reservation(
+                command,
+                self.latest_clusters,
+                grid_spec=(self.latest_grid.spec if self.latest_grid is not None else None),
+                robot_xy=self.robot_xy,
+            )
         )
         if cluster is None:
             detail = {"reason": "frontier_not_available", "cluster_id": cluster_id}
@@ -887,6 +1003,7 @@ class ExplorePyNode:
             "current_cluster_goal_xyyaw": current_goal,
             "reservation_goal_drift_m": reservation_goal_drift_m,
             "selected_goal_preserved": requested_goal_valid,
+            "frontier_missing_goal_preserved": frontier_missing_goal_preserved,
         }
         self.external_reservation_ack_cache[command_id] = {
             "status": "READY",
@@ -895,7 +1012,12 @@ class ExplorePyNode:
         }
         self.external_reservation_last_status = "READY"
         self.external_reservation_last_detail = detail
-        rospy.loginfo("[explore_py] reservation ready: command=%s cluster=%s", command_id, cluster_id)
+        rospy.loginfo(
+            "[explore_py] reservation ready: command=%s cluster=%s retained_missing_frontier=%s",
+            command_id,
+            cluster_id,
+            frontier_missing_goal_preserved,
+        )
         self._publish_behavior_feedback(command, "READY", None, detail)
 
     def _finalize_external_frontier(self, command):
@@ -1341,43 +1463,119 @@ class ExplorePyNode:
             return time.time() - self.initial_spin_done_time < self.initial_spin_settle_sec
         return True
 
-    def _tick_initial_spin(self) -> None:
-        now = time.time()
-        if self.robot_yaw is None:
-            self.initial_spin_reason = "waiting_for_yaw"
-            return
-        if not self.initial_spin_active:
-            self.initial_spin_active = True
-            self.initial_spin_start_time = now
-            self.initial_spin_last_yaw = self.robot_yaw
-            self.initial_spin_accumulated_yaw = 0.0
-            self.initial_spin_reason = "spinning"
-            rospy.loginfo("[explore_py] initial 360deg scan started")
-        else:
-            delta = self._signed_angle_diff(self.robot_yaw, self.initial_spin_last_yaw)
+    def _finish_initial_spin(self, now: float, reason: str) -> None:
+        self._publish_zero_cmd_vel()
+        self.initial_spin_done = True
+        self.initial_spin_active = False
+        self.initial_spin_done_time = now
+        self.initial_spin_reason = reason
+        rospy.loginfo(
+            "[explore_py] initial scan finished reason=%s accumulated_yaw=%.2f "
+            "commands=%d",
+            reason,
+            self.initial_spin_accumulated_yaw,
+            self.initial_spin_nonzero_commands_sent,
+        )
+
+    def _start_initial_spin_locked(
+        self, wall_now: float, monotonic_now: float
+    ) -> None:
+        self.initial_spin_active = True
+        self.initial_spin_start_time = wall_now
+        self.initial_spin_start_monotonic = monotonic_now
+        self.initial_spin_last_yaw = self.robot_yaw
+        self.initial_spin_accumulated_yaw = 0.0
+        self.initial_spin_reason = "spinning"
+        rospy.loginfo(
+            "[explore_py] initial 360deg scan started speed=%.2frad/s "
+            "max_steps=%d fresh_gate=%s",
+            self.initial_spin_angular_speed,
+            self.initial_spin_max_control_steps,
+            self.initial_spin_fresh_step_gate_enabled,
+        )
+
+    def _tick_initial_spin(self, *, allow_fresh_command: bool = False) -> None:
+        """Advance startup scanning, with at most one command per RGB step.
+
+        Timer calls only integrate odometry and enforce terminal conditions.
+        A nonzero V3 scan command is emitted exclusively by the bridge's
+        fresh-command-window event, after RosBridge has started waiting for
+        the command belonging to that same RGB observation.
+        """
+
+        with self.initial_spin_lock:
+            if self.initial_spin_done:
+                return
+            now = time.time()
+            if self.robot_yaw is None:
+                self.initial_spin_reason = "waiting_for_yaw"
+                return
+            # Starting is deliberately RGB-driven.  A periodic tick may run
+            # before the next evaluator observation and must never revive a
+            # completed scan from a stale callback.
+            if not self.initial_spin_active:
+                return
+
+            delta = self._signed_angle_diff(
+                self.robot_yaw, self.initial_spin_last_yaw
+            )
             self.initial_spin_accumulated_yaw += abs(delta)
             self.initial_spin_last_yaw = self.robot_yaw
 
-        timed_out = now - self.initial_spin_start_time >= self.initial_spin_timeout_sec
-        completed = self.initial_spin_accumulated_yaw >= self.initial_spin_angle_rad
-        if completed or timed_out:
-            self._publish_zero_cmd_vel()
-            self.initial_spin_done = True
-            self.initial_spin_active = False
-            self.initial_spin_done_time = now
-            self.initial_spin_reason = "completed" if completed else "timeout"
-            rospy.loginfo(
-                "[explore_py] initial scan finished reason=%s accumulated_yaw=%.2f",
-                self.initial_spin_reason,
-                self.initial_spin_accumulated_yaw,
+            timed_out = (
+                self.initial_spin_timeout_sec > 0.0
+                and now - self.initial_spin_start_time >= self.initial_spin_timeout_sec
             )
-            return
+            completed = self.initial_spin_accumulated_yaw >= self.initial_spin_angle_rad
+            if completed or timed_out:
+                self._finish_initial_spin(now, "completed" if completed else "timeout")
+                return
 
-        self._publish_initial_spin_cmd()
+            if self.initial_spin_fresh_step_gate_enabled:
+                if not allow_fresh_command:
+                    return
+                gate = initial_scan_rgb_step_gate(
+                    last_sent_rgb_step_seq=self.initial_spin_last_sent_rgb_step_seq,
+                    current_rgb_step_seq=self.initial_spin_latest_rgb_step_seq,
+                    latest_step_sync_index=self.initial_spin_latest_step_sync_index,
+                    nonzero_commands_sent=self.initial_spin_nonzero_commands_sent,
+                    max_control_steps=self.initial_spin_max_control_steps,
+                )
+                if gate == "stop":
+                    reason = (
+                        "step_cap"
+                        if self.initial_spin_nonzero_commands_sent
+                        >= self.initial_spin_max_control_steps
+                        else "rgb_sequence_reset"
+                    )
+                    self._finish_initial_spin(now, reason)
+                    return
+                if gate == "wait":
+                    return
+                if self.initial_spin_fresh_command_gate_enabled:
+                    if (
+                        self.initial_spin_latest_fresh_command_gate_step_seq
+                        != self.initial_spin_latest_rgb_step_seq
+                    ):
+                        return
+                elif (
+                    self.initial_spin_latest_rgb_received_at
+                    < self.initial_spin_start_monotonic
+                    or time.monotonic() - self.initial_spin_latest_rgb_received_at
+                    < self.initial_spin_fresh_step_min_delay_sec
+                ):
+                    return
+                self.initial_spin_last_sent_rgb_step_seq = (
+                    self.initial_spin_latest_rgb_step_seq
+                )
+                self.initial_spin_nonzero_commands_sent += 1
+            self._publish_initial_spin_cmd()
 
     def _initial_spin_cmd_timer_callback(self, _event) -> None:
-        if self.initial_spin_active and not self.initial_spin_done and not rospy.is_shutdown():
-            self._publish_initial_spin_cmd()
+        if not rospy.is_shutdown():
+            self._tick_initial_spin(
+                allow_fresh_command=not self.initial_spin_fresh_step_gate_enabled
+            )
 
     def _publish_initial_spin_cmd(self) -> None:
         cmd = Twist()

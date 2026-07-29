@@ -144,8 +144,18 @@ class SemanticOccupancyOverlay:
             if node.get("type") != "portal":
                 continue
             node_id = str(node.get("id") or "")
-            center = self._point3(node.get("aabb_center"))
-            size = self._point3(node.get("aabb_size"))
+            attributes = node.get("attributes") or {}
+            # The visual AABB can follow a rotating door leaf.  A semantic
+            # portal is anchored to the immutable pre-open doorway geometry
+            # whenever that reference is available.
+            center = self._point3(
+                attributes.get("interaction_reference_aabb_center")
+                or node.get("aabb_center")
+            )
+            size = self._point3(
+                attributes.get("interaction_reference_aabb_size")
+                or node.get("aabb_size")
+            )
             if not node_id or center is None or size is None or size[0] <= 0.0 or size[1] <= 0.0:
                 continue
             state = str((node.get("interaction") or {}).get("state") or "unknown")
@@ -155,7 +165,22 @@ class SemanticOccupancyOverlay:
                 active.add(node_id)
         self.active_portal_ids = active | self.pending_portal_ids
 
-    def apply(self, grid_info: Any, raw_data: list[int]) -> tuple[list[int], list[int], dict[str, Any]]:
+    def apply(
+        self,
+        grid_info: Any,
+        raw_data: list[int],
+        *,
+        include_pending: bool = True,
+    ) -> tuple[list[int], list[int], dict[str, Any]]:
+        """Apply portal clear regions to an occupancy grid.
+
+        Planning may optimistically clear a portal while an object-skill is in
+        flight so that the controller can keep its local map current.  Room
+        topology must be stricter: it may only use a clear region after the
+        successful interaction has updated the graph state.  ``include_pending``
+        keeps those two consumers on the same implementation without letting a
+        failed open create an observed room.
+        """
         width = int(grid_info.width)
         height = int(grid_info.height)
         cell_count = width * height
@@ -168,7 +193,10 @@ class SemanticOccupancyOverlay:
                 "update_bounds": None,
                 "valid": False,
             }
-        if not self.enabled or not self.active_portal_ids:
+        active_portal_ids = set(self.active_portal_ids)
+        if not include_pending:
+            active_portal_ids.difference_update(self.pending_portal_ids)
+        if not self.enabled or not active_portal_ids:
             return result, mask, {
                 "active_portal_ids": [],
                 "cleared_cells": 0,
@@ -194,7 +222,7 @@ class SemanticOccupancyOverlay:
         cleared_cells = 0
         applied_ids = []
         bounds = None
-        for node_id in sorted(self.active_portal_ids):
+        for node_id in sorted(active_portal_ids):
             reference = self.reference_aabbs.get(node_id)
             if reference is None:
                 continue

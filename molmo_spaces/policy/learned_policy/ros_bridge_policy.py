@@ -85,6 +85,7 @@ class RosBridgePolicy(BasePolicy):
         step_frame_dir: str = "",
         step_frame_queue_size: int = 4,
         step_sync_topic: str = "/molmo_spaces/step_sync",
+        fresh_command_gate_topic: str = "/molmo_spaces/fresh_cmd_gate",
         tf_keepalive_period_s: float = 0.25,
     ) -> None:
         super().__init__(config, task)
@@ -146,6 +147,7 @@ class RosBridgePolicy(BasePolicy):
         self.extra_image_camera_name = extra_image_camera_name
         self.step_frame_dir = Path(step_frame_dir).expanduser().resolve() if step_frame_dir else None
         self.step_sync_topic = str(step_sync_topic)
+        self.fresh_command_gate_topic = str(fresh_command_gate_topic)
         self._step_frame_queue: queue.Queue = queue.Queue(
             maxsize=max(1, int(step_frame_queue_size))
         )
@@ -252,6 +254,15 @@ class RosBridgePolicy(BasePolicy):
         self._step_sync_pub = (
             rospy.Publisher(self.step_sync_topic, String, queue_size=32)
             if self.step_sync_topic
+            else None
+        )
+        # This is distinct from step_sync: it marks that the current RGB
+        # observation's fresh-cmd wait has begun.  A startup scan can use it
+        # to publish one command in the same evaluator action without relying
+        # on timer phase or guessing whether an RGB callback ran too early.
+        self._fresh_command_gate_pub = (
+            rospy.Publisher(self.fresh_command_gate_topic, String, queue_size=32)
+            if self.fresh_command_gate_topic
             else None
         )
         self._extra_image_pub = None
@@ -1465,6 +1476,19 @@ class RosBridgePolicy(BasePolicy):
             self._String(data=json.dumps(payload, separators=(",", ":")))
         )
 
+    def _publish_fresh_command_gate(self, stamp) -> None:
+        """Announce that this observation's fresh-cmd wait is open."""
+
+        if self._fresh_command_gate_pub is None:
+            return
+        payload = {
+            "step_index": int(self._step_idx),
+            "stamp_sec": float(stamp.to_sec()),
+        }
+        self._fresh_command_gate_pub.publish(
+            self._String(data=json.dumps(payload, separators=(",", ":")))
+        )
+
     def _run_step_frame_writer(self) -> None:
         import cv2
 
@@ -1672,6 +1696,7 @@ class RosBridgePolicy(BasePolicy):
 
         t0_wait = time.perf_counter()
         wait_start_mono = time.monotonic()
+        self._publish_fresh_command_gate(common_stamp)
         deadline = (
             wait_start_mono + self.action_timeout_s if self.action_timeout_s > 0.0 else None
         )

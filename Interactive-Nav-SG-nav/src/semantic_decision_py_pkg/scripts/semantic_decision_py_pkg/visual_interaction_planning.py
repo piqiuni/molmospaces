@@ -101,6 +101,40 @@ def current_visible_bbox_2d(node: dict) -> list[float] | None:
     return [left, top, right, bottom]
 
 
+def _public_capture_step(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        capture_step = int(value)
+    except (TypeError, ValueError):
+        return None
+    return capture_step if capture_step >= 0 else None
+
+
+def current_visible_bbox_capture_step(node: dict) -> int | None:
+    """Return the public frame that supplied a currently visible node box.
+
+    A graph-level ``capture_step`` is insufficient by itself: an object can
+    remain in the graph while its 2-D box is from an older observation.  The
+    direct drawer-scan contract must bind the box to the exact public frame
+    that observed the container.
+    """
+
+    if not bool(node.get("is_currently_visible")):
+        return None
+    attributes = node.get("attributes") or {}
+    for key in (
+        "last_observation_frame_index",
+        "observation_capture_step",
+        "frame_index",
+        "capture_step",
+    ):
+        capture_step = _public_capture_step(attributes.get(key))
+        if capture_step is not None:
+            return capture_step
+    return _public_capture_step(node.get("capture_step"))
+
+
 def candidate_with_direct_drawer_scan(
     candidate: dict,
     node: dict,
@@ -138,6 +172,82 @@ def candidate_with_direct_drawer_scan(
     interaction["drawer_container_capture_step"] = public_capture_step
     planned["interaction_command"] = interaction
     return planned
+
+
+def fresh_direct_drawer_scan_candidate(
+    candidate: dict,
+    node: dict,
+    *,
+    graph_capture_step: object,
+    graph_revision: object,
+    minimum_graph_capture_step: object,
+    minimum_graph_revision: object,
+    rgb_image_sequence: object,
+    minimum_rgb_image_sequence: object,
+    rgb_capture_step: object,
+    minimum_rgb_capture_step: object,
+) -> tuple[dict | None, str]:
+    """Build a scan request only from a post-arrival public RGB/GT frame.
+
+    The executor snapshots the graph and RGB stream when the approach pose is
+    reached.  This helper rejects every pre-arrival graph box, a box belonging
+    to another capture step, and a graph update that did not have a fresh RGB
+    observation.  Its returned candidate is therefore safe to send directly
+    to the evaluator's ``bbox + capture_step`` drawer-scan route.
+    """
+
+    current_graph_capture_step = _public_capture_step(graph_capture_step)
+    baseline_graph_capture_step = _public_capture_step(minimum_graph_capture_step)
+    current_graph_revision = _public_capture_step(graph_revision)
+    baseline_graph_revision = _public_capture_step(minimum_graph_revision)
+    if current_graph_capture_step is None:
+        return None, "missing_graph_capture_step"
+    if baseline_graph_capture_step is not None:
+        if current_graph_capture_step <= baseline_graph_capture_step:
+            return None, "graph_capture_not_fresh"
+    elif (
+        current_graph_revision is None
+        or baseline_graph_revision is None
+        or current_graph_revision <= baseline_graph_revision
+    ):
+        # When the arrival snapshot lacked a capture step, a later graph
+        # revision is the minimum evidence that this is not the old box.
+        return None, "graph_revision_not_fresh"
+
+    node_capture_step = current_visible_bbox_capture_step(node)
+    if node_capture_step != current_graph_capture_step:
+        return None, "target_not_observed_in_current_capture"
+
+    try:
+        current_rgb_image_sequence = int(rgb_image_sequence)
+        baseline_rgb_image_sequence = int(minimum_rgb_image_sequence)
+    except (TypeError, ValueError):
+        return None, "missing_rgb_image_sequence"
+    if current_rgb_image_sequence <= baseline_rgb_image_sequence:
+        return None, "rgb_image_not_fresh"
+
+    current_rgb_capture_step = _public_capture_step(rgb_capture_step)
+    baseline_rgb_capture_step = _public_capture_step(minimum_rgb_capture_step)
+    if baseline_rgb_capture_step is not None:
+        if (
+            current_rgb_capture_step is None
+            or current_rgb_capture_step <= baseline_rgb_capture_step
+        ):
+            return None, "rgb_capture_not_fresh"
+    if (
+        current_rgb_capture_step is not None
+        and current_rgb_capture_step < current_graph_capture_step
+    ):
+        return None, "rgb_precedes_gt_capture"
+
+    planned = candidate_with_direct_drawer_scan(
+        candidate,
+        node,
+        capture_step=current_graph_capture_step,
+    )
+    if planned is None:
+        return None, "target_bbox_unavailable"
+    return planned, "ready"
 
 
 def action_for_opaque_open_contract(action: object, *, enabled: bool) -> str:

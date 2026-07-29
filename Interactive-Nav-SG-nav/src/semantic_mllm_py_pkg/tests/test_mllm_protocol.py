@@ -7,6 +7,7 @@ from semantic_mllm_py_pkg.ablation import AblationConfig
 from semantic_mllm_py_pkg.client import MLLMClient, MLLMClientConfig
 from semantic_mllm_py_pkg.schemas import (
     validate_attribute_patch,
+    validate_room_attribute_patch,
     validate_skill_action,
     validate_skill_plan,
     validate_subgoal_selection,
@@ -88,6 +89,47 @@ def test_attribute_patch_uses_part_confidence_when_global_confidence_is_omitted(
     )
 
     assert attribute["confidence"] == 0.9
+
+
+def test_attribute_patch_normalizes_model_interaction_labels() -> None:
+    attribute = validate_attribute_patch(
+        {
+            "object_id": "door_1",
+            "interactable": True,
+            "interaction_class": "Door",
+            "coarse_state": " Static Open ",
+        }
+    )
+    assert attribute["interaction_class"] == "portal"
+    assert attribute["coarse_state"] == "static_open"
+
+    closed = validate_attribute_patch(
+        {
+            "object_id": "door_2",
+            "interactable": True,
+            "interaction_class": "PORTAL",
+            "coarse_state": "Closed",
+        }
+    )
+    assert closed["coarse_state"] == "closed"
+
+
+def test_room_attribute_patch_is_separate_from_object_patch() -> None:
+    room = validate_room_attribute_patch(
+        {
+            "room_id": "7",
+            "room_attribute": "Kitchen",
+            "confidence": 1.2,
+            "evidence_object_ids": ["object_stove_1", 3],
+        }
+    )
+
+    assert room == {
+        "room_id": 7,
+        "room_attribute": "kitchen",
+        "confidence": 1.0,
+        "evidence_object_ids": ["object_stove_1", "3"],
+    }
 
 
 def test_mock_client_returns_role_payload() -> None:

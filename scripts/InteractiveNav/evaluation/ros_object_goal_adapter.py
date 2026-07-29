@@ -647,6 +647,11 @@ class EvaluatorInteractionRequest:
     # had already exposed in the latest public perception frame.  This is not
     # emitted in the ROS completion event.
     direct_bbox_drawer_scan: bool = False
+    # A semantic portal can be present in the navigation graph while not
+    # corresponding to an evaluator-registered articulated object.  Keep that
+    # rejection queued so the evaluator can record it as an invalid *attempt*
+    # rather than silently losing it or reporting a physical skill failure.
+    rejection_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -1044,6 +1049,7 @@ class RosObjectGoalEvaluatorAdapter:
         *,
         success: bool,
         status: str | None = None,
+        reason: str | None = None,
     ) -> dict[str, Any]:
         """Publish a minimal high-level completion result for one request.
 
@@ -1060,6 +1066,7 @@ class RosObjectGoalEvaluatorAdapter:
             request,
             success=bool(success),
             status=status or ("SUCCEEDED" if success else "FAILED"),
+            reason=reason,
         )
 
     def reject_interaction(
@@ -1108,6 +1115,7 @@ class RosObjectGoalEvaluatorAdapter:
             node_id = str(payload.get("node_id") or "")
             candidate_id = str(payload.get("candidate_id") or "")
             decision_id = str(payload.get("decision_id") or "")
+            node_type = str(payload.get("node_type") or "").strip().casefold()
             (
                 sequence_type,
                 open_regions,
@@ -1161,6 +1169,44 @@ class RosObjectGoalEvaluatorAdapter:
                 reason="unresolved_drawer_scan_target",
             )
         if private_handle is None:
+            if instance_id and self._is_semantic_portal_command(
+                node_type=node_type,
+                node_id=node_id,
+                candidate_id=candidate_id,
+            ):
+                # The semantic graph may infer a doorway from geometry even
+                # though no public opaque object was registered for a force
+                # interaction.  Do not send a false physical-failure signal:
+                # queue an evaluator-only invalid attempt for the rollout to
+                # score and trace on its next interaction poll.
+                request = EvaluatorInteractionRequest(
+                    command_id=command_id,
+                    episode_id=episode_id,
+                    instance_id=instance_id,
+                    action=action,
+                    private_handle=None,
+                    node_id=node_id,
+                    candidate_id=candidate_id,
+                    decision_id=decision_id,
+                    rejection_reason="unknown_instance_id",
+                )
+                with self._lock:
+                    if (
+                        episode_generation != self._episode_generation
+                        or episode_id != self._episode_id
+                    ):
+                        return None
+                    self._pending_by_command_id[command_id] = request
+                    self._pending_order.append(command_id)
+                if self._interaction_executor is not None:
+                    self.complete_interaction(
+                        command_id,
+                        success=False,
+                        status="INVALID",
+                        reason=request.rejection_reason,
+                    )
+                    return None
+                return request
             return self._reject_unresolved_command(
                 command_id=command_id,
                 episode_id=episode_id,
@@ -1229,6 +1275,21 @@ class RosObjectGoalEvaluatorAdapter:
             if value:
                 return value
         return ""
+
+    @staticmethod
+    def _is_semantic_portal_command(
+        *,
+        node_type: str,
+        node_id: str,
+        candidate_id: str,
+    ) -> bool:
+        """Recognise a doorway request without treating arbitrary IDs as one."""
+
+        if str(node_type).strip().casefold() == "portal":
+            return True
+        if str(node_id).strip().casefold().startswith("portal"):
+            return True
+        return str(candidate_id).strip().casefold().startswith("interaction:portal")
 
     def _match_public_bbox_at_capture_step_locked(
         self,
@@ -1392,6 +1453,26 @@ class RosObjectGoalEvaluatorAdapter:
         }
         if reason:
             payload["reason"] = str(reason)
+        if (
+            str(status).strip().upper() == "INVALID"
+            and str(reason or "").strip().casefold() == "unknown_instance_id"
+            and self._is_semantic_portal_command(
+                node_type="",
+                node_id=request.node_id,
+                candidate_id=request.candidate_id,
+            )
+        ):
+            # This is a public capability conclusion, not an articulation
+            # readback: a geometry-derived doorway has no evaluator-registered
+            # object skill.  Persist it in the semantic graph so later Module
+            # 1 updates cannot turn the same doorway into another open request.
+            payload.update(
+                {
+                    "state": "static",
+                    "interactable": False,
+                    "interaction_capability": "static",
+                }
+            )
         self._publish(self._result_publisher, payload)
         with self._lock:
             self._published_result_events.append(deepcopy(payload))

@@ -52,6 +52,7 @@ class SemanticMappingNode:
         scene_types = get_nested_param(rospy, "scene_types", {}) or {}
         object_room_priors = get_nested_param(rospy, "object_room_priors", {}) or {}
         room_inference_config = get_nested_param(rospy, "room_inference", {}) or {}
+        room_mllm_config = get_nested_param(rospy, "room_mllm", {}) or {}
 
         self.world_frame = frames.get("world_frame", "tf_frame_map")
         self.object_detection_topic = topics.get("object_detections", "/semantic_mapping/object_detections")
@@ -66,6 +67,12 @@ class SemanticMappingNode:
         self.interaction_result_topic = topics.get("interaction_result", "/semantic_mapping/interaction_result")
         self.attribute_updates_topic = topics.get(
             "attribute_updates", "/semantic_mapping/attribute_updates"
+        )
+        self.room_attribute_requests_topic = topics.get(
+            "room_attribute_requests", "/semantic_mapping/room_attribute_requests"
+        )
+        self.room_attribute_updates_topic = topics.get(
+            "room_attribute_updates", "/semantic_mapping/room_attribute_updates"
         )
         self.planning_occupancy_grid_topic = topics.get(
             "planning_occupancy_grid", "/semantic_mapping/planning_occ_map"
@@ -136,8 +143,22 @@ class SemanticMappingNode:
         self.room_grid_stability_frames = int(
             config.get("room_grid_stability_frames", 3)
         )
+        self.room_segment_use_semantic_overlay = bool(
+            config.get("room_segment_use_semantic_overlay", True)
+        )
+        self.room_post_open_force_refresh = bool(
+            config.get("room_post_open_force_refresh", True)
+        )
         self.room_geometry_stability_frames = int(
             config.get("room_geometry_stability_frames", 5)
+        )
+        self.room_mllm_enabled = bool(room_mllm_config.get("enabled", True))
+        self.room_mllm_min_evidence_objects = max(
+            1, int(room_mllm_config.get("min_evidence_objects", 1))
+        )
+        self.room_mllm_min_confidence = max(
+            0.0,
+            min(1.0, float(room_mllm_config.get("min_confidence", 0.55))),
         )
         self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
         self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
@@ -183,6 +204,7 @@ class SemanticMappingNode:
             room_attribute_min_confidence=room_inference_config.get(
                 "min_confidence", 0.2
             ),
+            room_mllm_min_confidence=self.room_mllm_min_confidence,
             interaction_geometry_overrides=graph_config.get(
                 "geometry_overrides", {}
             ),
@@ -199,6 +221,13 @@ class SemanticMappingNode:
         self.latest_scene = None
         self.latest_occupancy_grid = None
         self.latest_room_segment_grid = None
+        # A successful portal opening is followed by one immediate planning
+        # map publication from the first newer raw OCC.  The normal timer is
+        # intentionally not accelerated for every SLAM frame: this narrow
+        # hand-off gives the post-open causal gate a source-matched map
+        # without turning full-map publishing into the hot path.
+        self._post_open_planning_refresh_after_stamp_sec = None
+        self._post_open_room_refresh_result = None
         self.pending_interaction_commands = {}
         self.max_pending_interaction_commands = 128
         self.room_segmenter = RoomSegmenter(
@@ -249,6 +278,12 @@ class SemanticMappingNode:
         self.attribute_updates_sub = rospy.Subscriber(
             self.attribute_updates_topic, String, self.attribute_updates_callback, queue_size=2
         )
+        self.room_attribute_updates_sub = rospy.Subscriber(
+            self.room_attribute_updates_topic,
+            String,
+            self.room_attribute_updates_callback,
+            queue_size=2,
+        )
 
         self.object_pub = rospy.Publisher(self.object_map_topic, String, queue_size=1)
         self.marker_pub = rospy.Publisher(self.object_markers_topic, MarkerArray, queue_size=1)
@@ -259,6 +294,9 @@ class SemanticMappingNode:
         )
         self.unified_graph_pub = rospy.Publisher(self.unified_graph_topic, String, queue_size=1, latch=True)
         self.navigation_hints_pub = rospy.Publisher(self.navigation_hints_topic, String, queue_size=1, latch=True)
+        self.room_attribute_requests_pub = rospy.Publisher(
+            self.room_attribute_requests_topic, String, queue_size=1
+        )
         self.planning_occupancy_grid_pub = rospy.Publisher(
             self.planning_occupancy_grid_topic, OccupancyGrid, queue_size=1, latch=True
         )
@@ -336,8 +374,26 @@ class SemanticMappingNode:
         observations = parsed.get("observations")
         if not isinstance(observations, list):
             return
+        capture_step = self._capture_step_from_payload(parsed)
+        # ``capture_step`` is envelope metadata in the restricted-GT contract.
+        # Copy it into the mapper's private observation records so delayed
+        # Module-1 patches can be rejected against the correct version rather
+        # than every minimal-GT observation silently looking like frame zero.
+        observations = [
+            {
+                **observation,
+                **({"_capture_step": capture_step} if capture_step is not None else {}),
+            }
+            for observation in observations
+            if isinstance(observation, dict)
+        ]
         episode_id = str(parsed.get("episode_id") or "")
-        stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
+        stamp_value = parsed.get("stamp_sec")
+        stamp = (
+            float(stamp_value)
+            if stamp_value is not None
+            else rospy.Time.now().to_sec()
+        )
         with self.lock:
             episode_changed = episode_id and episode_id != self.graph_store.episode_id
             if bool(parsed.get("episode_reset")) or episode_changed:
@@ -345,6 +401,8 @@ class SemanticMappingNode:
                 self.graph_store.reset(episode_id=episode_id, source_mode="realtime_gt_observation")
                 self.semantic_occ_overlay.reset()
                 self.semantic_occ_update_tracker.reset()
+                self._post_open_planning_refresh_after_stamp_sec = None
+                self._post_open_room_refresh_result = None
                 self.pending_interaction_commands.clear()
                 self.object_store.objects = []
                 self.object_store.next_id = 1
@@ -359,7 +417,7 @@ class SemanticMappingNode:
                 observations,
                 stamp=stamp,
                 source_mode="realtime_gt_observation",
-                capture_step=parsed.get("capture_step"),
+                capture_step=capture_step,
             )
             publish_bundle = self._collect_publish_bundle_locked()
         self._safe_publish_bundle(publish_bundle)
@@ -382,14 +440,52 @@ class SemanticMappingNode:
         with self.lock:
             command = self._take_interaction_command_locked(parsed)
             parsed = merge_interaction_result_with_command(parsed, command)
-            stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
+            stamp_value = parsed.get("stamp_sec")
+            stamp = (
+                float(stamp_value)
+                if stamp_value is not None
+                else rospy.Time.now().to_sec()
+            )
             pending_changed = self.semantic_occ_overlay.set_interaction_pending(
                 parsed.get("node_id"), False
             )
             changed = self.graph_store.update_interaction_result(parsed, stamp=stamp)
+            successful_open = self._is_successful_open_result(parsed)
+            node_type = str(parsed.get("node_type") or "").casefold()
+            portal_reference = (
+                self._confirmed_open_portal_reference_locked(parsed)
+                if successful_open and node_type != "portal"
+                else None
+            )
+            is_portal_open = successful_open and (
+                node_type == "portal"
+                or portal_reference is not None
+            )
+            if is_portal_open:
+                # This must not depend on ``changed``.  A result can arrive
+                # after the graph has already been updated, while the next
+                # raw OCC is still the first map that can prove post-open
+                # traversability to the planner.
+                self._post_open_planning_refresh_after_stamp_sec = stamp
+                self._post_open_room_refresh_result = dict(parsed)
+                rospy.loginfo(
+                    "[semantic_mapping_node.py] armed post-open raw OCC bridge: "
+                    "result_stamp=%.6f node_id=%s node_type=%s "
+                    "graph_changed=%s portal_reference=%s",
+                    stamp,
+                    str(parsed.get("node_id") or ""),
+                    str(parsed.get("node_type") or ""),
+                    changed,
+                    portal_reference is not None,
+                )
+            room_grid_changed = False
+            if changed and self.room_post_open_force_refresh and not is_portal_open:
+                room_grid_changed = self._refresh_confirmed_open_portal_room_grid_locked(
+                    parsed
+                )
             publish_bundle = (
                 self._collect_publish_bundle_locked()
-                if changed or pending_changed
+                if (changed or pending_changed or room_grid_changed) and not is_portal_open
                 else None
             )
         if publish_bundle is not None:
@@ -417,12 +513,44 @@ class SemanticMappingNode:
         episode_id = str(parsed.get("episode_id") or "")
         if episode_id and self.graph_store.episode_id and episode_id != self.graph_store.episode_id:
             return
-        stamp = float(parsed.get("stamp_sec", rospy.Time.now().to_sec()))
+        stamp_value = parsed.get("stamp_sec")
+        stamp = (
+            float(stamp_value)
+            if stamp_value is not None
+            else rospy.Time.now().to_sec()
+        )
         changed = False
         with self.lock:
             for patch in parsed.get("updates") or []:
                 if isinstance(patch, dict):
                     changed = self.graph_store.apply_attribute_patch(patch, stamp=stamp) or changed
+            publish_bundle = self._collect_publish_bundle_locked() if changed else None
+        if publish_bundle is not None:
+            self._safe_publish_bundle(publish_bundle)
+
+    def room_attribute_updates_callback(self, msg):
+        """Apply room-only Module-1 updates on their dedicated topic."""
+
+        if self.ablation.module1 != "dynamic_mllm":
+            return
+        parsed = parse_json_object_or_text(msg.data)
+        episode_id = str(parsed.get("episode_id") or "")
+        if episode_id and self.graph_store.episode_id and episode_id != self.graph_store.episode_id:
+            return
+        stamp_value = parsed.get("stamp_sec")
+        stamp = (
+            float(stamp_value)
+            if stamp_value is not None
+            else rospy.Time.now().to_sec()
+        )
+        changed = False
+        with self.lock:
+            for patch in parsed.get("updates") or []:
+                if isinstance(patch, dict):
+                    changed = (
+                        self.graph_store.apply_room_attribute_patch(patch, stamp=stamp)
+                        or changed
+                    )
             publish_bundle = self._collect_publish_bundle_locked() if changed else None
         if publish_bundle is not None:
             self._safe_publish_bundle(publish_bundle)
@@ -450,13 +578,197 @@ class SemanticMappingNode:
     def occupancy_callback(self, msg):
         with self.lock:
             self.latest_occupancy_grid = msg
+            deferred_room_refresh_result = None
+            if self._raw_occupancy_is_after_post_open_refresh_locked(msg):
+                result_stamp = self._post_open_planning_refresh_after_stamp_sec
+                # Publish the first source-new raw map before room
+                # segmentation.  This bypasses full graph/overlay collection
+                # on the causal post-open path; the normal timer still emits
+                # the slower semantic bundle afterwards.
+                self._publish_post_open_raw_planning_grid_locked(
+                    msg,
+                    result_stamp=result_stamp,
+                )
+                self._post_open_planning_refresh_after_stamp_sec = None
+                deferred_room_refresh_result = getattr(
+                    self, "_post_open_room_refresh_result", None
+                )
+                self._post_open_room_refresh_result = None
             self.scene_store.initialize_from_occupancy_grid(msg)
-            self._refresh_room_grid_locked()
+            if (
+                deferred_room_refresh_result is not None
+                and self.room_post_open_force_refresh
+            ):
+                # The planner has already received the unmodified raw map.
+                # Rebuild room topology only afterwards, while preserving the
+                # normal semantic bundle for its timer-driven publication.
+                self._refresh_confirmed_open_portal_room_grid_locked(
+                    deferred_room_refresh_result
+                )
+            else:
+                self._refresh_room_grid_locked()
 
-    def _refresh_room_grid_locked(self):
+    @staticmethod
+    def _is_successful_open_result(result):
+        return (
+            result.get("success") is True
+            and str(result.get("action") or "").casefold() == "open"
+        )
+
+    def _publish_post_open_raw_planning_grid_locked(self, planning_grid, *, result_stamp):
+        """Directly hand the first post-open raw OCC to the planning map."""
+
+        self.planning_occupancy_grid_pub.publish(planning_grid)
+        raw_stamp = self._occupancy_header_stamp_sec(planning_grid)
+        rospy.loginfo(
+            "[semantic_mapping_node.py] published post-open raw planning OCC: "
+            "raw_stamp=%s result_stamp=%s raw_seq=%s",
+            "%.6f" % raw_stamp if raw_stamp is not None else "missing",
+            "%.6f" % result_stamp if result_stamp is not None else "missing",
+            int(getattr(planning_grid.header, "seq", 0) or 0),
+        )
+
+    def _raw_occupancy_is_after_post_open_refresh_locked(self, msg):
+        """Return whether ``msg`` consumes the one-shot portal-open refresh.
+
+        Prefer the source header relationship whenever both publishers provide
+        stamps.  If a raw map has no usable stamp, arrival after the mapper's
+        interaction-result callback is the only available ordering signal;
+        the executor records that fallback explicitly in its causal trace.
+        """
+
+        result_stamp = self._post_open_planning_refresh_after_stamp_sec
+        if result_stamp is None:
+            return False
+        raw_stamp = self._occupancy_header_stamp_sec(msg)
+        if raw_stamp is None:
+            return True
+        return raw_stamp > result_stamp
+
+    @staticmethod
+    def _occupancy_header_stamp_sec(msg):
+        stamp = getattr(getattr(msg, "header", None), "stamp", None)
+        try:
+            value = float(stamp.to_sec())
+        except (AttributeError, TypeError, ValueError):
+            try:
+                value = float(stamp.secs) + float(stamp.nsecs) * 1e-9
+            except (AttributeError, TypeError, ValueError):
+                return None
+        return value if math.isfinite(value) and value > 0.0 else None
+
+    def _refresh_confirmed_open_portal_room_grid_locked(self, result):
+        """Commit a real room split immediately after a successful portal open.
+
+        The planner is allowed to use a pending door clear region, while room
+        topology is not.  At this point the interaction graph has already
+        confirmed the postcondition, so use the immutable pre-open doorway
+        reference to refresh its virtual cut and force one stable segmentation
+        update.  The graph store will then replace its synthetic portal child
+        only when observed free space actually yields a second room ID.
+        """
+
+        if result.get("success") is False:
+            return False
+        action = str(result.get("action") or "").casefold()
+        if action and action != "open":
+            return False
+        reference = self._confirmed_open_portal_reference_locked(result)
+        if reference is None:
+            return False
+        self.room_segmenter.update_portal_hints(
+            [reference],
+            source_mode="realtime_gt_observation",
+            refresh_active=True,
+        )
+        self._refresh_room_grid_locked(force_stable=True)
+        return True
+
+    def _confirmed_open_portal_reference_locked(self, result):
+        """Build a stable, closed-door geometry observation for a result."""
+
+        requested_node_id = str(result.get("node_id") or "")
+        requested_object_id = str(
+            result.get("object_id") or result.get("instance_id") or ""
+        )
+        for node in self.graph_store.as_graph_dict().get("nodes") or []:
+            if node.get("type") != "portal":
+                continue
+            attributes = node.get("attributes") or {}
+            instance_id = str(attributes.get("instance_id") or "")
+            source_object_name = str(attributes.get("source_object_name") or "")
+            if (
+                requested_node_id
+                and str(node.get("id") or "") != requested_node_id
+                and (
+                    not requested_object_id
+                    or (
+                        instance_id != requested_object_id
+                        and source_object_name != requested_object_id
+                    )
+                )
+            ):
+                continue
+            if (
+                requested_object_id
+                and not requested_node_id
+                and instance_id != requested_object_id
+                and source_object_name != requested_object_id
+            ):
+                continue
+            state = str((node.get("interaction") or {}).get("state") or "").casefold()
+            if state not in {"open", "ajar", "static_open"}:
+                continue
+            center = list(
+                attributes.get("interaction_reference_aabb_center")
+                or node.get("aabb_center")
+                or []
+            )
+            size = list(
+                attributes.get("interaction_reference_aabb_size")
+                or node.get("aabb_size")
+                or []
+            )
+            if len(center) < 2 or len(size) < 2:
+                continue
+            reference_id = str(
+                attributes.get("source_object_name")
+                or instance_id
+                or node.get("id")
+            )
+            return {
+                "id": reference_id,
+                "name": "door",
+                "is_door": True,
+                "box_3d": {"center": center, "size": size},
+            }
+        return None
+
+    def _room_segmentation_occupancy_locked(self):
+        """Return raw occupancy plus confirmed portal clears for room labels."""
+
+        raw = self.latest_occupancy_grid
+        if raw is None or not self.room_segment_use_semantic_overlay:
+            return raw
+        graph_payload = apply_module1_ablation(
+            self.graph_store.as_graph_dict(), self.ablation.module1
+        )
+        self.semantic_occ_overlay.update_graph(graph_payload)
+        effective_data, _mask_data, _stats = self.semantic_occ_overlay.apply(
+            raw.info,
+            raw.data,
+            include_pending=False,
+        )
+        return self._build_occupancy_copy(effective_data)
+
+    def _refresh_room_grid_locked(self, *, force_stable=False):
         if self.latest_occupancy_grid is None:
             return
-        room_ids, room_conf = self._segment_rooms_from_occupancy(self.latest_occupancy_grid)
+        room_occupancy = self._room_segmentation_occupancy_locked()
+        room_ids, room_conf = self._segment_rooms_from_occupancy(
+            room_occupancy,
+            force_stable=force_stable,
+        )
         room_merges = self.room_segmenter.consume_confirmed_merges()
         self.latest_room_segment_grid = self._build_cropped_room_segment_grid(room_ids)
         self.graph_store.update_room_grid(
@@ -516,6 +828,81 @@ class SemanticMappingNode:
         grid.data = [int(v) for v in data]
         return grid
 
+    def _build_room_attribute_request_locked(self, graph_payload):
+        """Build no-image room evidence for the independent Module-1 lane."""
+
+        if not (
+            self.room_mllm_enabled and self.ablation.module1 == "dynamic_mllm"
+        ):
+            return None
+        nodes = list(graph_payload.get("nodes") or [])
+        evidence_by_room = {}
+        for node in nodes:
+            if str(node.get("type") or "") in {"scene", "room", "portal"}:
+                continue
+            room_id = node.get("room_id")
+            if room_id is None:
+                continue
+            try:
+                room_id = int(room_id)
+            except (TypeError, ValueError):
+                continue
+            attributes = node.get("attributes") or {}
+            evidence_by_room.setdefault(room_id, []).append(
+                {
+                    "object_id": str(attributes.get("instance_id") or node.get("id") or ""),
+                    "node_id": str(node.get("id") or ""),
+                    "name": str(node.get("name") or node.get("label") or "object"),
+                    "category": str(attributes.get("category") or ""),
+                    "type": str(node.get("type") or "object"),
+                    "confidence": float(node.get("confidence", 0.0) or 0.0),
+                    "currently_visible": bool(node.get("is_currently_visible", False)),
+                }
+            )
+
+        rooms = []
+        for node in nodes:
+            if str(node.get("type") or "") != "room":
+                continue
+            room_id = node.get("room_id")
+            attributes = node.get("attributes") or {}
+            try:
+                room_id = int(room_id)
+            except (TypeError, ValueError):
+                continue
+            if not attributes.get("active", True) or attributes.get("is_potential_room", False):
+                continue
+            evidence = sorted(
+                evidence_by_room.get(room_id, []),
+                key=lambda item: (item["object_id"], item["node_id"]),
+            )
+            if len(evidence) < self.room_mllm_min_evidence_objects:
+                continue
+            rooms.append(
+                {
+                    "room_id": room_id,
+                    "room_node_id": str(node.get("id") or f"room_{room_id}"),
+                    # This lane intentionally receives no RGB, crop, pose, or
+                    # geometric evidence: room ID plus room-member objects is
+                    # the complete model context.
+                    "objects": evidence,
+                }
+            )
+        if not rooms:
+            return None
+        capture_step = graph_payload.get("capture_step")
+        try:
+            capture_step = int(capture_step)
+        except (TypeError, ValueError):
+            capture_step = None
+        return {
+            "episode_id": str(graph_payload.get("episode_id") or ""),
+            "stamp_sec": float(graph_payload.get("timestamp") or rospy.Time.now().to_sec()),
+            "graph_revision": int(graph_payload.get("graph_revision", 0) or 0),
+            "capture_step": capture_step,
+            "rooms": sorted(rooms, key=lambda item: (item["room_id"], item["room_node_id"])),
+        }
+
     def _collect_publish_bundle_locked(self):
         obj_map = self.object_store.as_obj_map() if self.enable_object_mapping else None
         scene_info_ready = self.enable_scene_mapping and self.scene_store.info is not None
@@ -525,6 +912,7 @@ class SemanticMappingNode:
         graph_payload = apply_module1_ablation(
             self.graph_store.as_graph_dict(), self.ablation.module1
         )
+        room_attribute_request = self._build_room_attribute_request_locked(graph_payload)
         self.semantic_occ_overlay.update_graph(graph_payload)
         planning_grid = None
         planning_update = None
@@ -539,6 +927,7 @@ class SemanticMappingNode:
             planning_data, mask_data, overlay_stats = self.semantic_occ_overlay.apply(
                 self.latest_occupancy_grid.info,
                 self.latest_occupancy_grid.data,
+                include_pending=True,
             )
             planning_grid = self._build_occupancy_copy(planning_data)
             door_clear_mask = self._build_occupancy_copy(mask_data)
@@ -557,6 +946,7 @@ class SemanticMappingNode:
             "scene_conf_grid": scene_conf_grid,
             "room_segment_grid": room_segment_grid,
             "graph_payload": graph_payload,
+            "room_attribute_request": room_attribute_request,
             "planning_grid": planning_grid,
             "planning_update": planning_update,
             "door_clear_mask": door_clear_mask,
@@ -569,6 +959,7 @@ class SemanticMappingNode:
         scene_conf_grid = bundle["scene_conf_grid"]
         room_segment_grid = bundle["room_segment_grid"]
         graph_payload = bundle["graph_payload"]
+        room_attribute_request = bundle["room_attribute_request"]
         planning_grid = bundle["planning_grid"]
         planning_update = bundle["planning_update"]
         door_clear_mask = bundle["door_clear_mask"]
@@ -586,6 +977,10 @@ class SemanticMappingNode:
             if planning_update is not None:
                 self.planning_occupancy_grid_updates_pub.publish(planning_update)
         self.unified_graph_pub.publish(String(data=dumps_compact(graph_payload)))
+        if room_attribute_request is not None:
+            self.room_attribute_requests_pub.publish(
+                String(data=dumps_compact(room_attribute_request))
+            )
         self.navigation_hints_pub.publish(String(data=dumps_compact(graph_payload["views"]["navigation_view"]["hints"])))
         self.unified_graph_markers_pub.publish(build_graph_marker_array(graph_payload, self.world_frame))
         self.unified_graph_markers_lifted_pub.publish(
@@ -690,6 +1085,19 @@ class SemanticMappingNode:
         except (TypeError, ValueError):
             return rospy.Time.now().to_sec()
 
+    @staticmethod
+    def _capture_step_from_payload(parsed):
+        if not isinstance(parsed, dict):
+            return None
+        value = parsed.get("capture_step")
+        if value is None:
+            value = parsed.get("frame_index")
+        try:
+            capture_step = int(value)
+        except (TypeError, ValueError):
+            return None
+        return capture_step if capture_step >= 0 else None
+
     def _publish_lifted_graph_tf(self):
         tf_msg = TransformStamped()
         tf_msg.header.stamp = rospy.Time.now()
@@ -699,8 +1107,8 @@ class SemanticMappingNode:
         tf_msg.transform.rotation.w = 1.0
         self.static_tf_broadcaster.sendTransform(tf_msg)
 
-    def _segment_rooms_from_occupancy(self, occ_grid):
-        return self.room_segmenter.segment(occ_grid)
+    def _segment_rooms_from_occupancy(self, occ_grid, *, force_stable=False):
+        return self.room_segmenter.segment(occ_grid, force_stable=force_stable)
 
     def _save_graph_payload(self, graph_payload):
         if not self.graph_save_path:

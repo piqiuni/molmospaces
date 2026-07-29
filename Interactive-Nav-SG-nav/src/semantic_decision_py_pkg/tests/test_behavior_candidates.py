@@ -92,7 +92,10 @@ def test_successfully_opened_portal_generates_one_way_traversal_goal() -> None:
                     "source_object_name": "door_1",
                     "interaction_reference_aabb_center": [0.0, 0.0, 1.0],
                     "interaction_reference_aabb_size": [0.1, 0.9, 2.0],
-                    "connected_room_ids": [1, 2],
+                    "connected_room_ids": [1, 1000000],
+                    "portal_child_room_id": 1000000,
+                    "portal_child_source_room_id": 1,
+                    "potential_room_ids": [1000000],
                 },
                 "interaction": {
                     "is_interactable": True,
@@ -123,6 +126,9 @@ def test_successfully_opened_portal_generates_one_way_traversal_goal() -> None:
     assert traversal.source == "post_interaction_portal"
     assert traversal.goal_xyyaw == [0.9, 0.0, 0.0]
     assert traversal.metadata["post_interaction_traversal"] is True
+    assert traversal.metadata["target_room_id"] == 1000000
+    assert traversal.metadata["source_room_id"] == 1
+    assert traversal.metadata["potential_room"] is True
 
     # Once the base is clearly beyond the original door plane, the traversal
     # candidate cannot reverse and send it back through the same portal.
@@ -135,6 +141,167 @@ def test_successfully_opened_portal_generates_one_way_traversal_goal() -> None:
     assert math.isclose(opposite_axis.goal_xyyaw[0], 0.0, abs_tol=1e-6)
     assert math.isclose(opposite_axis.goal_xyyaw[1], -0.9, abs_tol=1e-6)
     assert math.isclose(opposite_axis.goal_xyyaw[2], -math.pi / 2.0, abs_tol=1e-6)
+
+
+def test_frontier_just_beyond_opened_portal_keeps_potential_room_identity() -> None:
+    generator = CandidateGenerator()
+    explorer_status = {
+        "proposals": [
+            {
+                "proposal_id": "child_frontier",
+                "goal_xyyaw": [0.9, 0.0, 0.0],
+                "frontier_point": [1.0, 0.0],
+                "raw_features": {
+                    "information_gain": 4.0,
+                    "unknown_component_area_m2": 2.0,
+                    "expected_visible_unknown_area_m2": 1.0,
+                    "distance_m": 0.9,
+                },
+                "geometry": {"hard_constraints_passed": True},
+            }
+        ]
+    }
+    graph = {
+        "nodes": [
+            {
+                "id": "room_1000000",
+                "type": "room",
+                "room_id": 1000000,
+                "centroid": [0.9, 0.0, 0.1],
+                "aabb_center": [0.9, 0.0, 0.1],
+                "aabb_size": [1.2, 1.2, 0.2],
+                "attributes": {
+                    "active": True,
+                    "is_potential_room": True,
+                    "source_portal_id": "portal_door_1",
+                    "observed_free_space": False,
+                },
+            }
+        ]
+    }
+
+    candidates = generator.generate(explorer_status, graph, robot_xy=(0.0, 0.0))
+    frontier = next(candidate for candidate in candidates if candidate.behavior_type == "EXPLORE")
+
+    assert frontier.metadata["target_room_id"] == 1000000
+    assert frontier.metadata["room_assignment_source"] == "portal_open_potential_child"
+    assert frontier.metadata["potential_room"] is True
+
+
+def test_frontiers_include_physical_current_and_target_room_metadata() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig(max_frontier_candidates=2))
+    candidates = generator.generate(
+        {
+            "proposals": [
+                {
+                    "proposal_id": "same_room",
+                    "goal_xyyaw": [0.5, 0.0, 0.0],
+                    "frontier_point": [0.6, 0.0],
+                    "raw_features": {"distance_m": 0.5},
+                },
+                {
+                    "proposal_id": "door_child",
+                    "goal_xyyaw": [3.0, 0.0, 0.0],
+                    "frontier_point": [3.1, 0.0],
+                    "raw_features": {"distance_m": 3.0},
+                },
+            ]
+        },
+        {
+            "nodes": [
+                {
+                    "id": "room_1",
+                    "type": "room",
+                    "room_id": 1,
+                    "aabb_center": [0.0, 0.0, 0.0],
+                    "aabb_size": [2.0, 2.0, 1.0],
+                    "attributes": {"active": True},
+                },
+                {
+                    "id": "room_2",
+                    "type": "room",
+                    "room_id": 2,
+                    "aabb_center": [3.0, 0.0, 0.0],
+                    "aabb_size": [1.5, 1.5, 1.0],
+                    "attributes": {
+                        "active": True,
+                        "is_potential_room": True,
+                        "source_portal_id": "portal_1",
+                        "room_attribute": "kitchen",
+                        "room_attribute_confidence": 0.9,
+                    },
+                },
+            ]
+        },
+        robot_xy=(0.0, 0.0),
+    )
+    by_id = {candidate.candidate_id: candidate for candidate in candidates}
+
+    same_room = by_id["frontier:same_room"].metadata
+    assert same_room["robot_room_id"] == 1
+    assert same_room["current_room_id"] == 1
+    assert same_room["target_room_id"] == 1
+    assert same_room["room_relation"] == "current_room"
+
+    child = by_id["frontier:door_child"].metadata
+    assert child["robot_room_id"] == 1
+    assert child["target_room_id"] == 2
+    assert child["potential_room"] is True
+    assert child["source_portal_id"] == "portal_1"
+    assert child["room_attribute"] == "kitchen"
+
+
+def test_frontier_cap_reserves_other_room_proposal_before_global_area_fill() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig(max_frontier_candidates=1))
+    candidates = generator.generate(
+        {
+            "proposals": [
+                {
+                    "proposal_id": "large_current",
+                    "goal_xyyaw": [0.5, 0.0, 0.0],
+                    "frontier_point": [0.5, 0.0],
+                    "raw_features": {
+                        "distance_m": 0.5,
+                        "unknown_component_area_m2": 50.0,
+                        "expected_visible_unknown_area_m2": 40.0,
+                    },
+                },
+                {
+                    "proposal_id": "small_child",
+                    "goal_xyyaw": [3.0, 0.0, 0.0],
+                    "frontier_point": [3.0, 0.0],
+                    "raw_features": {
+                        "distance_m": 3.0,
+                        "unknown_component_area_m2": 2.0,
+                        "expected_visible_unknown_area_m2": 1.0,
+                    },
+                },
+            ]
+        },
+        {
+            "nodes": [
+                {
+                    "id": "room_1",
+                    "type": "room",
+                    "room_id": 1,
+                    "aabb_center": [0.0, 0.0, 0.0],
+                    "aabb_size": [2.0, 2.0, 1.0],
+                    "attributes": {"active": True},
+                },
+                {
+                    "id": "room_2",
+                    "type": "room",
+                    "room_id": 2,
+                    "aabb_center": [3.0, 0.0, 0.0],
+                    "aabb_size": [1.5, 1.5, 1.0],
+                    "attributes": {"active": True, "is_potential_room": True},
+                },
+            ]
+        },
+        robot_xy=(0.0, 0.0),
+    )
+
+    assert [candidate.candidate_id for candidate in candidates] == ["frontier:small_child"]
 
 
 def test_generator_does_not_use_object_name_to_reject_portal_fixture() -> None:
@@ -167,6 +334,107 @@ def test_generator_does_not_use_object_name_to_reject_portal_fixture() -> None:
     candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
     assert len(candidates) == 1
     assert candidates[0].target_id == "portal_doorframe_1"
+
+
+def test_portal_open_waits_for_ready_module1_state_in_full_mllm_mode() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_require_attribute_ready=True,
+            portal_allow_unknown_state=False,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_1",
+                "type": "portal",
+                "centroid": [2.0, 0.0, 1.0],
+                "state_age_sec": 0.0,
+                "attributes": {"attribute_status": "pending"},
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    assert generator.generate({}, graph, robot_xy=(0.0, 0.0)) == []
+
+    graph["nodes"][0]["attributes"]["attribute_status"] = "ready"
+    candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
+    assert [candidate.target_id for candidate in candidates] == ["portal_1"]
+
+    # A refresh publishes pending before Module 1 returns.  Keep the last
+    # successful closed-door evidence eligible rather than making the portal
+    # flicker out of the candidate stream.
+    graph["nodes"][0]["attributes"].update(
+        {
+            "attribute_status": "pending",
+            "attribute_source": "mllm_attribute_inference",
+            "attribute_confidence": 0.9,
+            "interaction_state_override": {
+                "state": "closed",
+                "state_source": "mllm_attribute_inference",
+                "state_confidence": 0.9,
+            },
+        }
+    )
+    candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
+    assert [candidate.target_id for candidate in candidates] == ["portal_1"]
+
+    graph["nodes"][0]["interaction"]["state"] = "unknown"
+    assert generator.generate({}, graph, robot_xy=(0.0, 0.0)) == []
+
+
+def test_pending_portal_refresh_requires_valid_previous_module1_evidence() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_require_attribute_ready=True,
+            portal_allow_unknown_state=False,
+            max_state_age_sec=5.0,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_1",
+                "type": "portal",
+                "centroid": [2.0, 0.0, 1.0],
+                "state_age_sec": 1.0,
+                "attributes": {
+                    "attribute_status": "pending",
+                    "attribute_source": "mllm_attribute_inference",
+                    "attribute_confidence": 0.4,
+                    "interaction_state_override": {
+                        "state": "closed",
+                        "state_source": "mllm_attribute_inference",
+                        "state_confidence": 0.4,
+                    },
+                },
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 0.9,
+                },
+            }
+        ]
+    }
+
+    # A pending request alone, or a weak previous result, is not sufficient.
+    assert generator.generate({}, graph, robot_xy=(0.0, 0.0)) == []
+
+    graph["nodes"][0]["attributes"]["attribute_confidence"] = 0.9
+    graph["nodes"][0]["attributes"]["interaction_state_override"][
+        "state_confidence"
+    ] = 0.9
+    graph["nodes"][0]["state_age_sec"] = 6.0
+    assert generator.generate({}, graph, robot_xy=(0.0, 0.0)) == []
 
 
 def test_portal_approach_uses_stable_closed_reference_geometry() -> None:
@@ -492,6 +760,75 @@ def test_container_candidates_can_be_enabled_without_changing_portal_logic() -> 
     assert candidates[0].metadata["node_type"] == "container"
 
 
+def test_native_interaction_standoffs_keep_drawers_with_containers() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal", "container"),
+            portal_standoff_m=0.85,
+            container_standoff_m=0.50,
+            drawer_standoff_m=0.50,
+            interaction_safety_margin_m=0.25,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_1",
+                "type": "portal",
+                "centroid": [3.0, 0.0, 1.0],
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            },
+            {
+                "id": "fridge_1",
+                "type": "container",
+                "name": "refrigerator",
+                "centroid": [0.0, 3.0, 1.0],
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            },
+            {
+                "id": "drawer_1",
+                "type": "container",
+                "name": "chest_of_drawers",
+                "centroid": [0.0, -3.0, 0.5],
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            },
+        ]
+    }
+
+    candidates = {
+        candidate.target_id: candidate
+        for candidate in generator.generate({}, graph, robot_xy=(0.0, 0.0))
+    }
+
+    assert math.isclose(
+        candidates["portal_1"].metadata["interaction_standoff_m"], 1.10
+    )
+    assert candidates["portal_1"].metadata["interaction_standoff_source"] == "portal"
+    assert math.isclose(
+        candidates["fridge_1"].metadata["interaction_standoff_m"], 0.75
+    )
+    assert candidates["fridge_1"].metadata["interaction_standoff_source"] == "container"
+    assert math.isclose(
+        candidates["drawer_1"].metadata["interaction_standoff_m"], 0.75
+    )
+    assert candidates["drawer_1"].metadata["interaction_standoff_source"] == "drawer"
+
+
 def test_multi_drawer_metadata_emits_id_only_open_candidate() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(
@@ -701,7 +1038,12 @@ def test_portal_approach_uses_door_aabb_normal() -> None:
                 "id": "portal_double",
                 "type": "portal",
                 "centroid": [5.0, 5.0, 1.0],
-                "aabb_size": [0.2, 2.0, 2.1],
+                "aabb_center": [5.4, 5.0, 1.0],
+                "aabb_size": [1.0, 2.0, 2.1],
+                "attributes": {
+                    "interaction_reference_aabb_center": [5.0, 5.0, 1.0],
+                    "interaction_reference_aabb_size": [0.2, 2.0, 2.1],
+                },
                 "state_age_sec": 0.0,
                 "is_currently_visible": True,
                 "interaction": {
@@ -718,6 +1060,9 @@ def test_portal_approach_uses_door_aabb_normal() -> None:
     assert math.isclose(candidate.goal_xyyaw[1], 5.0, abs_tol=1e-6)
     assert math.isclose(candidate.goal_xyyaw[2], 0.0, abs_tol=1e-6)
     assert candidate.metadata["approach_strategy"] == "portal_aabb_normal"
+    assert candidate.metadata["portal_aabb_center_xy"] == [5.0, 5.0]
+    assert candidate.metadata["portal_clearance_aabb_center_xy"] == [5.4, 5.0]
+    assert candidate.metadata["portal_clearance_aabb_size_xy"] == [1.0, 2.0]
     goals = candidate.metadata["goal_xyyaw_candidates"]
     assert len(goals) == 18
     assert math.isclose(

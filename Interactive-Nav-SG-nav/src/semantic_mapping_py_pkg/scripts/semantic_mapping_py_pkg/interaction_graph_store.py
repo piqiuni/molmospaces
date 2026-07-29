@@ -23,6 +23,13 @@ _SEMANTIC_POSTCONDITION_BY_ACTION = {
 }
 
 
+# Room-segmentation IDs are allocated from small positive integers.  Keep
+# portal-child rooms in a separate, stable range: they represent a topological
+# hypothesis only and must never be written into the occupancy-derived room
+# grid.
+_PORTAL_CHILD_ROOM_ID_BASE = 1_000_000
+
+
 def _resolved_interaction_state(result):
     """Resolve a public semantic postcondition without reading joint state.
 
@@ -57,7 +64,12 @@ class InteractionGraphStore:
         object_room_search_margin_m=0.75,
         object_room_priors=None,
         room_attribute_min_confidence=0.2,
+        room_mllm_min_confidence=0.55,
         interaction_geometry_overrides=None,
+        portal_child_room_enabled=True,
+        portal_child_room_offset_m=0.9,
+        portal_child_room_depth_m=1.2,
+        portal_child_room_min_width_m=1.2,
     ):
         self.scene_id = str(scene_id or "scene")
         self.match_distance = float(match_distance)
@@ -71,10 +83,27 @@ class InteractionGraphStore:
             object_room_priors or {},
             min_confidence=room_attribute_min_confidence,
         )
+        # The rule inferencer remains an immediate fallback.  An asynchronous
+        # MLLM room result is allowed to replace it only when it is both fresh
+        # and confident enough; otherwise every relation rebuild would erase a
+        # useful result or let an uncertain answer steer exploration.
+        self.room_mllm_min_confidence = max(
+            0.0, min(1.0, float(room_mllm_min_confidence))
+        )
         self.interaction_geometry_overrides = {
             str(key): dict(value or {})
             for key, value in (interaction_geometry_overrides or {}).items()
         }
+        self.portal_child_room_enabled = bool(portal_child_room_enabled)
+        self.portal_child_room_offset_m = max(
+            0.2, float(portal_child_room_offset_m)
+        )
+        self.portal_child_room_depth_m = max(
+            0.4, float(portal_child_room_depth_m)
+        )
+        self.portal_child_room_min_width_m = max(
+            0.4, float(portal_child_room_min_width_m)
+        )
         self.room_geometries = {}
         self.room_geometry_candidates = {}
         self.room_geometry_stability_frames = 5
@@ -89,6 +118,7 @@ class InteractionGraphStore:
         self.graph_revision = 0
         self.capture_step = None
         self.interaction_event_counter = 1
+        self.next_portal_child_room_id = _PORTAL_CHILD_ROOM_ID_BASE
         self._ensure_scene_node()
 
     def reset(self, episode_id="", source_mode=None):
@@ -107,6 +137,7 @@ class InteractionGraphStore:
         self.graph_revision = 0
         self.capture_step = None
         self.interaction_event_counter = 1
+        self.next_portal_child_room_id = _PORTAL_CHILD_ROOM_ID_BASE
         self._ensure_scene_node()
 
     def update_room_grid(
@@ -325,6 +356,13 @@ class InteractionGraphStore:
             node.attributes["interaction_state_override"]["event_id"] = event_id
             node.attributes["interaction_state_override"]["timestamp"] = now
         node.last_seen = now
+        if (
+            self.portal_child_room_enabled
+            and node.type == "portal"
+            and result.get("success") is not False
+            and str(state).casefold() in {"open", "static_open"}
+        ):
+            self._ensure_open_portal_child_room(node, history)
         self._rebuild_relations(now=now)
         self._bump_revision()
         return True
@@ -424,7 +462,26 @@ class InteractionGraphStore:
         )
         if request_sequence and latest_request_sequence and request_sequence < latest_request_sequence:
             return False
-        patch_frame_index = patch.get("observation_frame_index")
+        # A Module-1 call is asynchronous: later ordinary scans do not make
+        # the requested visual evidence invalid.  Request sequence plus the
+        # evidence signature are the freshness contract; capture step remains
+        # telemetry for diagnosing inference lag only.
+        patch_signature = str(patch.get("observation_signature") or "")
+        latest_request_signature = str(
+            node.attributes.get("attribute_request_signature") or ""
+        )
+        if (
+            request_sequence
+            and latest_request_sequence
+            and request_sequence == latest_request_sequence
+            and latest_request_signature
+            and patch_signature
+            and patch_signature != latest_request_signature
+        ):
+            return False
+        patch_frame_index = patch.get(
+            "observation_frame_index", patch.get("observation_capture_step")
+        )
         current_frame_index = node.attributes.get("last_observation_frame_index")
         try:
             patch_frame_index = int(patch_frame_index)
@@ -432,22 +489,16 @@ class InteractionGraphStore:
         except (TypeError, ValueError):
             patch_frame_index = None
             current_frame_index = None
-        if (
-            patch_frame_index is not None
-            and current_frame_index is not None
-            and patch_frame_index < current_frame_index
+        observation_lag_steps = (
+            max(0, current_frame_index - patch_frame_index)
+            if patch_frame_index is not None and current_frame_index is not None
+            else None
+        )
+        request_signature = latest_request_signature
+        if patch_signature and (
+            attribute_status == "pending" or not request_signature
         ):
-            node.attributes.update(
-                {
-                    "attribute_status": "stale",
-                    "attribute_request_sequence": max(
-                        latest_request_sequence, request_sequence
-                    ),
-                    "attribute_error": "observation_version_superseded",
-                }
-            )
-            self._bump_revision()
-            return True
+            request_signature = patch_signature
         node.attributes.update(
             {
                 "attribute_status": attribute_status,
@@ -465,6 +516,8 @@ class InteractionGraphStore:
                 "attribute_observation_signature": str(
                     patch.get("observation_signature") or ""
                 ),
+                "attribute_request_signature": request_signature,
+                "attribute_observation_lag_steps": observation_lag_steps,
             }
         )
         if attribute_status in {"pending", "failed", "stale"}:
@@ -555,6 +608,150 @@ class InteractionGraphStore:
 
         node.attributes["attribute_updated_at"] = patch_stamp
         self._rebuild_relations(now=patch_stamp)
+        self._bump_revision()
+        return True
+
+    def apply_room_attribute_patch(self, patch, stamp=None):
+        """Apply an asynchronous room-only Module-1 result.
+
+        Object state patches and room evidence patches deliberately have
+        independent IDs, queues, and capture-step versions.  This prevents a
+        delayed room classification from changing an interaction object and
+        lets the rule-based room prior continue to serve as a fallback.
+        """
+
+        try:
+            room_id = int(patch.get("room_id"))
+        except (TypeError, ValueError):
+            return False
+        requested_node_id = str(patch.get("room_node_id") or "")
+        room_node = self.nodes.get(requested_node_id)
+        if room_node is None or room_node.type != "room":
+            room_node = next(
+                (
+                    candidate
+                    for candidate in self.nodes.values()
+                    if candidate.type == "room"
+                    and candidate.room_id is not None
+                    and int(candidate.room_id) == room_id
+                ),
+                None,
+            )
+        if (
+            room_node is None
+            or not room_node.attributes.get("active", True)
+            or room_node.attributes.get("is_potential_room", False)
+        ):
+            return False
+
+        attribute_status = str(
+            patch.get("room_attribute_status")
+            or patch.get("attribute_status")
+            or "ready"
+        ).casefold()
+        patch_stamp = float(stamp if stamp is not None else time.time())
+        request_sequence = int(patch.get("request_sequence", 0) or 0)
+        latest_request_sequence = int(
+            room_node.attributes.get("room_attribute_request_sequence", 0) or 0
+        )
+        if (
+            request_sequence
+            and latest_request_sequence
+            and request_sequence < latest_request_sequence
+        ):
+            return False
+
+        # As for object attributes, a later map scan only changes the age of
+        # the text evidence.  A room result is current when it targets the
+        # current active room and matches the latest requested evidence
+        # signature; capture step is explicitly retained as telemetry.
+        patch_signature = str(patch.get("observation_signature") or "")
+        latest_request_signature = str(
+            room_node.attributes.get("room_attribute_request_signature") or ""
+        )
+        if (
+            request_sequence
+            and latest_request_sequence
+            and request_sequence == latest_request_sequence
+            and latest_request_signature
+            and patch_signature
+            and patch_signature != latest_request_signature
+        ):
+            return False
+
+        patch_capture_step = patch.get(
+            "observation_capture_step", patch.get("capture_step")
+        )
+        current_capture_step = self.capture_step
+        try:
+            patch_capture_step = int(patch_capture_step)
+        except (TypeError, ValueError):
+            patch_capture_step = None
+        try:
+            current_capture_step = int(current_capture_step)
+        except (TypeError, ValueError):
+            current_capture_step = None
+        observation_lag_steps = (
+            max(0, current_capture_step - patch_capture_step)
+            if patch_capture_step is not None and current_capture_step is not None
+            else None
+        )
+        request_signature = latest_request_signature
+        if patch_signature and (
+            attribute_status == "pending" or not request_signature
+        ):
+            request_signature = patch_signature
+
+        room_node.attributes.update(
+            {
+                "room_attribute_status": attribute_status,
+                "room_attribute_request_sequence": max(
+                    latest_request_sequence, request_sequence
+                ),
+                "room_attribute_observation_stamp_sec": float(
+                    patch.get("observation_stamp_sec", patch_stamp) or patch_stamp
+                ),
+                "room_attribute_observation_capture_step": patch_capture_step,
+                "room_attribute_observation_signature": str(
+                    patch.get("observation_signature") or ""
+                ),
+                "room_attribute_request_signature": request_signature,
+                "room_attribute_observation_lag_steps": observation_lag_steps,
+                "room_attribute_queue_lag_sec": float(
+                    patch.get("queue_lag_sec", 0.0) or 0.0
+                ),
+                "room_attribute_response_lag_sec": float(
+                    patch.get("response_lag_sec", 0.0) or 0.0
+                ),
+                "room_attribute_total_lag_sec": float(
+                    patch.get("total_lag_sec", 0.0) or 0.0
+                ),
+                "room_attribute_error": str(patch.get("error") or ""),
+            }
+        )
+        if attribute_status == "ready":
+            room_node.attributes.update(
+                {
+                    "room_mllm_attribute": normalize_label(
+                        patch.get("room_attribute") or "unknown"
+                    )
+                    or "unknown",
+                    "room_mllm_attribute_confidence": max(
+                        0.0, min(1.0, float(patch.get("confidence", 0.0) or 0.0))
+                    ),
+                    "room_mllm_attribute_evidence_object_ids": [
+                        str(item)
+                        for item in patch.get("evidence_object_ids") or []
+                        if str(item)
+                    ],
+                    "room_mllm_attribute_source": str(
+                        patch.get("source") or "mllm_room_attribute_inference"
+                    ),
+                    "room_mllm_attribute_model": str(patch.get("model_name") or ""),
+                    "room_mllm_attribute_updated_at": patch_stamp,
+                }
+            )
+        self._refresh_room_attributes()
         self._bump_revision()
         return True
 
@@ -756,6 +953,13 @@ class InteractionGraphStore:
                 "candidate_labels": list(observation.get("candidate_labels") or []),
                 "label_votes": dict(observation.get("label_votes") or {}),
                 "connected_room_ids": list(observation.get("connected_room_ids") or []),
+                # Keep direct room endpoints separate from the derived public
+                # connectivity.  The latter may additionally contain a
+                # post-open portal-child room while its free space is still
+                # unobserved.
+                "observed_connected_room_ids": list(
+                    observation.get("connected_room_ids") or []
+                ),
                 "source": observation.get("source"),
                 "source_object_name": observation.get("source_object_name"),
                 "visible_pixels": int(observation.get("visible_pixels", 0)),
@@ -1105,6 +1309,227 @@ class InteractionGraphStore:
         room_size = [max(float(size[0]), 0.1), max(float(size[1]), 0.1), self.room_box_height]
         return room_size
 
+    @staticmethod
+    def _distinct_room_ids(values):
+        result = []
+        for value in values or []:
+            try:
+                room_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if room_id < 0 or room_id in result:
+                continue
+            result.append(room_id)
+        return result
+
+    def _portal_observed_room_ids(self, node):
+        """Return only room IDs supported by observations/segmentation.
+
+        ``connected_room_ids`` is intentionally not read here because it is
+        also the public topology field and can contain a synthetic child room
+        after a successful open.  Keeping this source separate prevents a
+        potential child from being mistaken for observed free space on later
+        graph refreshes.
+        """
+
+        direct = self._distinct_room_ids(
+            node.attributes.get("observed_connected_room_ids") or []
+        )
+        if self.source_mode == "gt_replay" and direct:
+            return direct[:2]
+        inferred = self._distinct_room_ids(self._infer_portal_room_ids(node))
+        if inferred:
+            return inferred[:2]
+        if node.room_id is not None:
+            return [self._resolve_room_id(node.room_id)]
+        return []
+
+    def _allocate_portal_child_room_id(self):
+        while True:
+            room_id = int(self.next_portal_child_room_id)
+            self.next_portal_child_room_id += 1
+            if f"room_{room_id}" not in self.nodes:
+                return room_id
+
+    def _portal_child_direction(self, node, source_room_id, history):
+        """Estimate the side reached by crossing a just-opened portal.
+
+        A successful interaction approach is the most reliable local signal:
+        from approach pose to door center points through the doorway.  If an
+        older result lacks that pose, use the known source-room centroid; the
+        final AABB-normal fallback only gives the potential room a stable
+        visualization/association anchor and is explicitly marked as such.
+        """
+
+        center = list(
+            node.attributes.get("interaction_reference_aabb_center")
+            or node.aabb_center
+            or node.centroid
+            or []
+        )
+        if len(center) < 2:
+            return (1.0, 0.0, "fallback_axis")
+        center_x, center_y = float(center[0]), float(center[1])
+        for event in reversed(list(history or [])):
+            if not bool(event.get("success")):
+                continue
+            approach = list(event.get("approach_goal_xyyaw") or [])
+            if len(approach) < 2:
+                continue
+            dx = center_x - float(approach[0])
+            dy = center_y - float(approach[1])
+            norm = math.hypot(dx, dy)
+            if norm > 1e-6:
+                return (dx / norm, dy / norm, "interaction_approach")
+        source_room = self.nodes.get(f"room_{int(source_room_id)}")
+        if source_room is not None:
+            source_center = list(
+                source_room.aabb_center or source_room.centroid or []
+            )
+            if len(source_center) >= 2:
+                dx = center_x - float(source_center[0])
+                dy = center_y - float(source_center[1])
+                norm = math.hypot(dx, dy)
+                if norm > 1e-6:
+                    return (dx / norm, dy / norm, "source_room_centroid")
+        size = list(node.aabb_size or [])
+        size_x = abs(float(size[0])) if len(size) >= 1 else 0.0
+        size_y = abs(float(size[1])) if len(size) >= 2 else 0.0
+        # The long AABB axis approximates the door span, so cross it to get
+        # a deterministic normal when neither side was otherwise observed.
+        if size_x >= size_y:
+            return (0.0, 1.0, "door_aabb_normal")
+        return (1.0, 0.0, "door_aabb_normal")
+
+    def _ensure_open_portal_child_room(self, node, history):
+        """Create one unobserved child room after a portal changes state.
+
+        This is deliberately a graph-only room.  It provides a stable target
+        for the post-door transition and nearby frontier association, while
+        leaving every unknown occupancy-grid cell at ``room_unknown_id``.
+        """
+
+        observed_room_ids = self._portal_observed_room_ids(node)
+        if len(observed_room_ids) >= 2:
+            return None
+        source_room_id = (
+            observed_room_ids[0]
+            if observed_room_ids
+            else self._resolve_room_id(node.room_id)
+            if node.room_id is not None
+            else None
+        )
+        if source_room_id is None:
+            return None
+        attributes = node.attributes
+        existing = attributes.get("portal_child_room_id")
+        try:
+            child_room_id = int(existing)
+        except (TypeError, ValueError):
+            child_room_id = None
+        if child_room_id is not None:
+            child = self.nodes.get(f"room_{child_room_id}")
+            if child is not None and child.attributes.get("active", True):
+                attributes["portal_child_source_room_id"] = int(source_room_id)
+                attributes["potential_room_ids"] = [child_room_id]
+                return child_room_id
+        child_room_id = self._allocate_portal_child_room_id()
+        unit_x, unit_y, direction_source = self._portal_child_direction(
+            node, source_room_id, history
+        )
+        center = list(
+            attributes.get("interaction_reference_aabb_center")
+            or node.aabb_center
+            or node.centroid
+            or [0.0, 0.0, 0.0]
+        )
+        center.extend([0.0] * max(0, 3 - len(center)))
+        portal_size = list(
+            attributes.get("interaction_reference_aabb_size") or node.aabb_size or []
+        )
+        portal_size.extend([0.0] * max(0, 3 - len(portal_size)))
+        portal_span_m = max(abs(float(portal_size[0])), abs(float(portal_size[1])))
+        width_m = max(self.portal_child_room_min_width_m, portal_span_m + 0.4)
+        depth_m = self.portal_child_room_depth_m
+        # Axis-aligned projection of a small oriented doorway-side rectangle.
+        size_x = max(0.4, abs(unit_x) * depth_m + abs(unit_y) * width_m)
+        size_y = max(0.4, abs(unit_y) * depth_m + abs(unit_x) * width_m)
+        child_center = [
+            float(center[0]) + unit_x * self.portal_child_room_offset_m,
+            float(center[1]) + unit_y * self.portal_child_room_offset_m,
+            0.5 * self.room_box_height,
+        ]
+        self.room_id_to_name.setdefault(child_room_id, "unobserved_portal_room")
+        child = self._ensure_room_node(child_room_id)
+        child.name = f"unobserved_room_beyond_{node.id}"
+        child.centroid = list(child_center)
+        child.aabb_center = list(child_center)
+        child.aabb_size = [size_x, size_y, self.room_box_height]
+        child.confidence = max(float(child.confidence), 0.25)
+        child.attributes.update(
+            {
+                "active": True,
+                "is_potential_room": True,
+                "observed_free_space": False,
+                "cell_count": 0,
+                "source_portal_id": node.id,
+                "source_room_id": int(source_room_id),
+                "portal_child_direction_xy": [round(unit_x, 4), round(unit_y, 4)],
+                "portal_child_direction_source": direction_source,
+                "room_geometry_source": "portal_open_potential_child",
+            }
+        )
+        attributes.update(
+            {
+                "portal_child_room_id": child_room_id,
+                "portal_child_source_room_id": int(source_room_id),
+                "potential_room_ids": [child_room_id],
+            }
+        )
+        return child_room_id
+
+    def _resolve_portal_child_room(self, node, observed_room_ids):
+        """Retire a synthetic child once segmentation observes its far side."""
+
+        attributes = node.attributes
+        try:
+            child_room_id = int(attributes.get("portal_child_room_id"))
+        except (TypeError, ValueError):
+            return None
+        try:
+            source_room_id = int(attributes.get("portal_child_source_room_id"))
+        except (TypeError, ValueError):
+            source_room_id = None
+        observed_room_ids = self._distinct_room_ids(observed_room_ids)
+        actual_room_id = next(
+            (
+                room_id
+                for room_id in observed_room_ids
+                if room_id != source_room_id and room_id != child_room_id
+            ),
+            None,
+        )
+        if actual_room_id is None:
+            return None
+        child = self.nodes.get(f"room_{child_room_id}")
+        if child is not None:
+            child.attributes.update(
+                {
+                    "active": False,
+                    "resolved_to_room_id": int(actual_room_id),
+                    "resolved_from_observed_free_space": True,
+                }
+            )
+        self.room_redirects[child_room_id] = int(actual_room_id)
+        attributes.update(
+            {
+                "resolved_portal_child_room_id": child_room_id,
+                "portal_child_room_id": None,
+                "potential_room_ids": [],
+            }
+        )
+        return int(actual_room_id)
+
     def _rebuild_relations(self, now=None):
         now = float(now if now is not None else time.time())
         self.edges = {}
@@ -1143,23 +1568,62 @@ class InteractionGraphStore:
 
         for node in non_rooms:
             if node.type == "portal":
-                connected_room_ids = list(node.attributes.get("connected_room_ids") or [])
-                if self.source_mode != "gt_replay" or not connected_room_ids:
-                    connected_room_ids = self._infer_portal_room_ids(node)
-                connected_room_ids = [
+                observed_room_ids = [
                     self._resolve_room_id(room_id)
-                    for room_id in connected_room_ids
-                    if room_id is not None
+                    for room_id in self._portal_observed_room_ids(node)
                 ]
+                observed_room_ids = self._distinct_room_ids(observed_room_ids)
+                try:
+                    child_source_room_id = int(
+                        node.attributes.get("portal_child_source_room_id")
+                    )
+                except (TypeError, ValueError):
+                    child_source_room_id = None
+                if child_source_room_id in observed_room_ids:
+                    observed_room_ids = [child_source_room_id] + [
+                        room_id
+                        for room_id in observed_room_ids
+                        if room_id != child_source_room_id
+                    ]
+                # If a new free-space component has appeared on the far side,
+                # replace the graph-only child with the occupancy-derived
+                # room.  Until then, retain the child as topology only.
+                self._resolve_portal_child_room(node, observed_room_ids)
+                potential_room_ids = self._distinct_room_ids(
+                    node.attributes.get("potential_room_ids") or []
+                )
+                connected_room_ids = list(observed_room_ids)
+                for room_id in potential_room_ids:
+                    potential_node = self.nodes.get(f"room_{room_id}")
+                    if potential_node is None or not potential_node.attributes.get(
+                        "active", True
+                    ):
+                        continue
+                    if room_id not in connected_room_ids:
+                        connected_room_ids.append(room_id)
                 node.attributes["connected_room_ids"] = connected_room_ids
-                node.attributes["connectivity_source"] = (
-                    "observation"
-                    if self.source_mode == "gt_replay" and connected_room_ids
-                    else "room_segment_ring"
+                node.attributes["observed_connected_room_ids"] = list(
+                    observed_room_ids
                 )
-                node.attributes["connectivity_status"] = (
-                    "connected" if len(connected_room_ids) >= 2 else "partial" if len(connected_room_ids) == 1 else "unknown"
-                )
+                node.attributes["potential_room_ids"] = list(potential_room_ids)
+                if potential_room_ids:
+                    node.attributes["connectivity_source"] = (
+                        "portal_open_potential_child"
+                    )
+                    node.attributes["connectivity_status"] = "potential"
+                else:
+                    node.attributes["connectivity_source"] = (
+                        "observation"
+                        if self.source_mode == "gt_replay" and observed_room_ids
+                        else "room_segment_ring"
+                    )
+                    node.attributes["connectivity_status"] = (
+                        "connected"
+                        if len(connected_room_ids) >= 2
+                        else "partial"
+                        if len(connected_room_ids) == 1
+                        else "unknown"
+                    )
                 traversable = node.interaction.get("traversable")
                 edge_attributes = {
                     "portal_node_id": node.id,
@@ -1170,6 +1634,9 @@ class InteractionGraphStore:
                     "interaction_cost": float(node.interaction.get("interaction_cost", 1.0)),
                     "expected_effect": "unlock_connectivity",
                     "connectivity_status": node.attributes["connectivity_status"],
+                    "observed_connected_room_ids": list(observed_room_ids),
+                    "potential_room_ids": list(potential_room_ids),
+                    "potential_connectivity": bool(potential_room_ids),
                 }
                 for room_id in sorted(set(int(room) for room in connected_room_ids if room is not None)):
                     room_node = self._ensure_room_node(room_id)
@@ -1386,15 +1853,57 @@ class InteractionGraphStore:
             result = self.room_attribute_inferencer.infer(
                 evidence_by_room.get(room_id, [])
             )
+            # Persist the deterministic prior separately.  It is useful for
+            # diagnosis and remains the effective value while the MLLM lane is
+            # pending, unavailable, stale, or low confidence.
             room_node.attributes.update(
                 {
-                    "room_attribute": result["room_attribute"],
-                    "room_attribute_confidence": float(result["confidence"]),
-                    "room_attribute_scores": dict(result["scores"]),
-                    "room_attribute_evidence": list(result["evidence"]),
-                    "room_attribute_source": "weighted_object_types",
+                    "room_attribute_rule": result["room_attribute"],
+                    "room_attribute_rule_confidence": float(result["confidence"]),
+                    "room_attribute_rule_scores": dict(result["scores"]),
+                    "room_attribute_rule_evidence": list(result["evidence"]),
                 }
             )
+            mllm_attribute = normalize_label(
+                room_node.attributes.get("room_mllm_attribute") or "unknown"
+            )
+            mllm_confidence = float(
+                room_node.attributes.get("room_mllm_attribute_confidence", 0.0)
+                or 0.0
+            )
+            mllm_is_usable = (
+                room_node.attributes.get("room_attribute_status") == "ready"
+                and mllm_attribute not in {"", "unknown"}
+                and mllm_confidence >= self.room_mllm_min_confidence
+            )
+            if mllm_is_usable:
+                room_node.attributes.update(
+                    {
+                        "room_attribute": mllm_attribute,
+                        "room_attribute_confidence": mllm_confidence,
+                        "room_attribute_scores": dict(result["scores"]),
+                        "room_attribute_evidence": list(
+                            room_node.attributes.get(
+                                "room_mllm_attribute_evidence_object_ids"
+                            )
+                            or []
+                        ),
+                        "room_attribute_source": str(
+                            room_node.attributes.get("room_mllm_attribute_source")
+                            or "mllm_room_attribute_inference"
+                        ),
+                    }
+                )
+            else:
+                room_node.attributes.update(
+                    {
+                        "room_attribute": result["room_attribute"],
+                        "room_attribute_confidence": float(result["confidence"]),
+                        "room_attribute_scores": dict(result["scores"]),
+                        "room_attribute_evidence": list(result["evidence"]),
+                        "room_attribute_source": "weighted_object_types",
+                    }
+                )
 
     def _bump_revision(self):
         self.graph_revision += 1

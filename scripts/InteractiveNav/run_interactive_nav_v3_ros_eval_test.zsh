@@ -41,17 +41,34 @@ DYNAMIC_CONTAINER_INTERACTION_STEPS=${DYNAMIC_CONTAINER_INTERACTION_STEPS:-200}
 DYNAMIC_CONTAINER_JOINT_STEPS=${DYNAMIC_CONTAINER_JOINT_STEPS:-40}
 DYNAMIC_STEP_QUANTUM=${DYNAMIC_STEP_QUANTUM:-50}
 VIDEO_FPS=${VIDEO_FPS:-5}
-# The simulator publishes one step marker at 10 Hz.  Sampling every two
-# markers keeps the required six-panel video at its configured 5 fps without
-# allowing expensive composite rendering to stall the RGB/step-sync pairing.
-VIDEO_STEP_SAMPLE_EVERY=${VIDEO_STEP_SAMPLE_EVERY:-2}
+# This is a diagnostic runner, not the large-scale benchmark launcher: keep
+# one path/costmap/semantic composite for every evaluator step.
+VIDEO_STEP_SAMPLE_EVERY=${VIDEO_STEP_SAMPLE_EVERY:-1}
 VIDEO_PANEL_WIDTH_PX=${VIDEO_PANEL_WIDTH_PX:-480}
-# Absorb short render bursts without making an unbounded back-pressure buffer.
-VIDEO_FRAME_JOB_QUEUE_SIZE=${VIDEO_FRAME_JOB_QUEUE_SIZE:-48}
-RECORDER_DRAIN_TIMEOUT_S=${RECORDER_DRAIN_TIMEOUT_S:-${RECORDER_DRAIN_WAIT_S:-300}}
+# A 1500-step V3 episode needs a large frozen-snapshot queue when six-panel
+# rendering is slower than simulation.  If this exceptional capacity is still
+# exhausted, discard the oldest pending render job so fresh RGB/plan snapshots
+# remain paired instead of blocking callbacks into placeholder frames.
+VIDEO_FRAME_JOB_QUEUE_SIZE=${VIDEO_FRAME_JOB_QUEUE_SIZE:-2048}
+VIDEO_FRAME_QUEUE_OVERFLOW=${VIDEO_FRAME_QUEUE_OVERFLOW:-drop_oldest}
+STEP_SYNC_QUEUE_SIZE=${STEP_SYNC_QUEUE_SIZE:-4096}
+STEP_SYNC_IMAGE_CACHE_SIZE=${STEP_SYNC_IMAGE_CACHE_SIZE:-256}
+STEP_SYNC_IMAGE_FALLBACK_MAX_AGE_SEC=${STEP_SYNC_IMAGE_FALLBACK_MAX_AGE_SEC:-12}
+VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-16}
+# Frozen OCC/local proxies use this cap.  The recorder intentionally retains
+# the global costmap at native grid resolution as lossless PNG so its
+# inflation bands remain inspectable in the six-panel diagnostic video.
+VIDEO_SNAPSHOT_GRID_MAX_DIM=${VIDEO_SNAPSHOT_GRID_MAX_DIM:-512}
+VIDEO_SNAPSHOT_JPEG_QUALITY=${VIDEO_SNAPSHOT_JPEG_QUALITY:-90}
+VIDEO_SNAPSHOT_CATEGORICAL_FORMAT=${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT:-png}
+VIDEO_OCC_CROP_MARGIN_M=${VIDEO_OCC_CROP_MARGIN_M:-2.5}
+ARTIFACT_WRITE_QUEUE_SIZE=${ARTIFACT_WRITE_QUEUE_SIZE:-256}
+# Full per-step composites may take substantially longer than the simulator;
+# let the recorder finish them before teardown.
+RECORDER_DRAIN_TIMEOUT_S=${RECORDER_DRAIN_TIMEOUT_S:-${RECORDER_DRAIN_WAIT_S:-5400}}
 RECORDER_DRAIN_POLL_S=${RECORDER_DRAIN_POLL_S:-0.5}
 RECORDER_DRAIN_PROGRESS_S=${RECORDER_DRAIN_PROGRESS_S:-10}
-RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-120}
+RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-600}
 RECORD_HEAD_CAMERA=${RECORD_HEAD_CAMERA:-false}
 FAST_EVAL=${FAST_EVAL:-false}
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11311}
@@ -106,7 +123,7 @@ for required_mllm_setting in \
 done
 print -r -- "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
 print -r -- "[v3-eval] step_budget_mode=${STEP_BUDGET_MODE} min_steps=${MIN_STEPS} max_steps=${MAX_STEPS}"
-print -r -- "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY}"
+print -r -- "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY} render_queue=${VIDEO_FRAME_JOB_QUEUE_SIZE} overflow=${VIDEO_FRAME_QUEUE_OVERFLOW} occ_local_proxy=${VIDEO_SNAPSHOT_GRID_MAX_DIM}px/${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT} global_costmap=native/png crop_margin=${VIDEO_OCC_CROP_MARGIN_M}m"
 
 mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}"
 if [[ -e "${RUN_DIR}/eval" ]]; then
@@ -230,16 +247,23 @@ if [[ "${FAST_EVAL}" != true ]]; then
     --raw-occupancy-grid-topic /struct_mapping/occ_map \
     --image-topic /molmo_spaces/head_camera/image \
     --video-step-sync-topic /molmo_spaces/step_sync \
+    --step-sync-queue-size "${STEP_SYNC_QUEUE_SIZE}" \
     --step-sync-capture-every "${VIDEO_STEP_SAMPLE_EVERY}" \
+    --step-sync-image-cache-size "${STEP_SYNC_IMAGE_CACHE_SIZE}" \
+    --step-sync-image-fallback-max-age-sec "${STEP_SYNC_IMAGE_FALLBACK_MAX_AGE_SEC}" \
+    --video-snapshot-grid-max-dim "${VIDEO_SNAPSHOT_GRID_MAX_DIM}" \
+    --video-snapshot-jpeg-quality "${VIDEO_SNAPSHOT_JPEG_QUALITY}" \
+    --video-snapshot-categorical-format "${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT}" \
+    --video-occ-crop-margin-m "${VIDEO_OCC_CROP_MARGIN_M}" \
     --first-person-video-capture-mode step \
     --semantic-video \
     --first-person-video-with-map \
     --first-person-video-fps "${VIDEO_FPS}" \
     --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
     --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
-    --video-frame-queue-overflow block \
-    --video-history-size 16 \
-    --artifact-write-queue-size 4 \
+    --video-frame-queue-overflow "${VIDEO_FRAME_QUEUE_OVERFLOW}" \
+    --video-history-size "${VIDEO_HISTORY_SIZE}" \
+    --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
     --runtime-video-encode \
     --no-video-save-panel-frames \
     --no-video-save-composite-frames \

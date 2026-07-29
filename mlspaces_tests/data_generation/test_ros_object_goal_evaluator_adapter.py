@@ -529,6 +529,42 @@ def test_executor_receives_private_handle_and_unknown_raw_name_is_rejected() -> 
     assert len(received) == 1
 
 
+def test_unknown_semantic_portal_is_queued_for_invalid_evaluator_scoring() -> None:
+    adapter, rospy = _adapter()
+    _reset(adapter, {"obj_000017": object()})
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "open-static-doorway",
+            "node_id": "portal_obj_000021",
+            "candidate_id": "interaction:portal_obj_000021:open",
+            "node_type": "portal",
+            "object_id": "obj_000021",
+            "action": "open",
+        }
+    )
+
+    assert request is not None
+    assert request.private_handle is None
+    assert request.rejection_reason == "unknown_instance_id"
+    assert adapter.pending_interaction_count == 1
+    # Production evaluator code consumes this queued marker and emits the
+    # result with INVALID status in the same decision turn.
+    result = adapter.complete_interaction(
+        request.command_id,
+        success=False,
+        status="INVALID",
+        reason=request.rejection_reason,
+    )
+    assert result["status"] == "INVALID"
+    assert result["success"] is False
+    assert result["reason"] == "unknown_instance_id"
+    assert result["state"] == "static"
+    assert result["interactable"] is False
+    assert result["interaction_capability"] == "static"
+    assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
+
+
 def test_reset_clears_pending_command_and_publishes_empty_episode_marker() -> None:
     adapter, rospy = _adapter()
     _reset(adapter, {"obj_000017": object()})

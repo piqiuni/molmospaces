@@ -108,7 +108,22 @@ def test_pending_open_interaction_clears_before_result_and_rolls_back():
     assert pending_stats["active_portal_ids"] == ["portal_door"]
     assert pending_data[10 * GridInfo.width + 10] == 0
 
+    # Room topology must not treat an in-flight skill as an observed opening.
+    room_data, room_mask, room_stats = overlay.apply(
+        GridInfo(), raw, include_pending=False
+    )
+    assert room_data == raw
+    assert max(room_mask) == 0
+    assert room_stats["active_portal_ids"] == []
+
     assert overlay.set_interaction_pending("portal_door", False) is True
+    overlay.update_graph(graph(portal("open")))
+    confirmed_data, _mask, confirmed_stats = overlay.apply(
+        GridInfo(), raw, include_pending=False
+    )
+    assert confirmed_stats["active_portal_ids"] == ["portal_door"]
+    assert confirmed_data[10 * GridInfo.width + 10] == 0
+
     overlay.update_graph(graph(portal("closed")))
     restored, _mask, restored_stats = overlay.apply(GridInfo(), raw)
     assert restored == raw
@@ -127,6 +142,22 @@ def test_ajar_portal_keeps_semantic_clearance():
     planning, _mask, stats = overlay.apply(GridInfo(), raw)
     assert stats["active_portal_ids"] == ["portal_door"]
     assert planning[10 * GridInfo.width + 10] == 0
+
+
+def test_overlay_prefers_immutable_doorway_reference_over_open_leaf_aabb():
+    overlay = SemanticOccupancyOverlay(clear_padding_m=0.0)
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    opened = portal("open", center=(1.5, 1.5, 1.0))
+    opened["attributes"] = {
+        "interaction_reference_aabb_center": [1.0, 1.0, 1.0],
+        "interaction_reference_aabb_size": [0.8, 0.1, 2.0],
+    }
+    overlay.update_graph(graph(opened))
+
+    planning, _mask, stats = overlay.apply(GridInfo(), raw)
+    assert stats["active_portal_ids"] == ["portal_door"]
+    assert planning[10 * GridInfo.width + 10] == 0
+    assert planning[15 * GridInfo.width + 15] == 100
 
 
 def test_overlay_reports_the_small_door_update_region():

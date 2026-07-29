@@ -434,6 +434,33 @@ def test_summary_excludes_runtime_ineligible_rows_from_formal_metrics() -> None:
     assert "domain/container" not in summary["groups"]
 
 
+def test_summary_keeps_cross_subgoal_early_stop_as_scored_failure() -> None:
+    summary = summarise_results(
+        [
+            _result_row(
+                success=False,
+                nav_success=False,
+                terminal_reason="cross_subgoal_navigation_stall",
+                early_stop={
+                    "triggered": True,
+                    "reason": "cross_subgoal_navigation_stall",
+                    "failed_subgoal_count": 8,
+                },
+            )
+        ]
+    )
+
+    assert summary["scoring_eligible_episode_count"] == 1
+    assert summary["early_stop_episode_count"] == 1
+    assert summary["early_stop_reason_counts"] == {
+        "cross_subgoal_navigation_stall": 1
+    }
+    overall = summary["groups"]["overall"]
+    assert overall["success_rate"] == 0.0
+    assert overall["early_stop_episode_count"] == 1
+    assert overall["mean_early_stop_failed_subgoal_count"] == 8.0
+
+
 def test_task_robot_base_pose_is_runtime_authoritative() -> None:
     episode = {
         "task": {
@@ -597,6 +624,12 @@ def test_config_validation_and_index_selection_are_local() -> None:
             benchmark=Path("benchmark.json"),
             output_dir=Path("out"),
             max_episodes=0,
+        ).validate()
+    with pytest.raises(ValueError, match="min_failed_subgoals"):
+        benchmark_runner.BenchmarkEvaluationConfig(
+            benchmark=Path("benchmark.json"),
+            output_dir=Path("out"),
+            ros_stall_min_failed_subgoals=1,
         ).validate()
 
 

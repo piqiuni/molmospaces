@@ -78,7 +78,23 @@ def final_recorder_summary_errors(
     if placeholder_count:
         errors.append(f"step_sync_placeholder_count={placeholder_count}")
     dropped_frames = int(payload.get("video_frame_jobs_dropped", 0) or 0)
-    if dropped_frames:
+    has_drop_breakdown = (
+        "video_frame_jobs_dropped_oldest" in payload
+        or "video_frame_jobs_dropped_newest" in payload
+    )
+    dropped_newest = int(payload.get("video_frame_jobs_dropped_newest", 0) or 0)
+    if has_drop_breakdown:
+        # ``drop_oldest`` is an intentional freshness policy.  The strict
+        # frame-count check above still catches an incomplete video, but do
+        # not mislabel an explicitly recorded oldest-job eviction as an RGB
+        # placeholder or an unexplained newest-frame loss.
+        if dropped_newest:
+            errors.append(
+                "video_frame_jobs_dropped_newest="
+                f"{dropped_newest} (total={dropped_frames})"
+            )
+    elif dropped_frames:
+        # Summaries written before the split counters remain strict.
         errors.append(f"video_frame_jobs_dropped={dropped_frames}")
     writer_stats = payload.get("artifact_writer_stats") or {}
     written_video_jobs = int(writer_stats.get("written_video_jobs", -1))

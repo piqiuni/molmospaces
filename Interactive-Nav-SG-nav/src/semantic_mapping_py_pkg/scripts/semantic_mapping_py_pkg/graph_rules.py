@@ -299,7 +299,15 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
             0 if minimal_gt else observation.get("consecutive_observations", 0) or 0
         ),
         "camera_name": "" if minimal_gt else str(observation.get("camera_name") or ""),
-        "frame_index": 0 if minimal_gt else int(observation.get("frame_index", 0) or 0),
+        # A strict minimal-GT wire record must not smuggle in a caller-owned
+        # frame index.  The mapping callback may attach `_capture_step` from
+        # its validated envelope as private version metadata before calling
+        # this normalizer.
+        "frame_index": (
+            int(observation.get("_capture_step", 0) or 0)
+            if minimal_gt
+            else int(observation.get("frame_index", 0) or 0)
+        ),
         "episode_id": "" if minimal_gt else str(observation.get("episode_id") or ""),
         "source": "realtime_gt_observation" if minimal_gt else str(observation.get("source") or "detector"),
         "name": str(

@@ -7,6 +7,7 @@ from .interaction_prompt import (
 )
 from .schemas import (
     validate_attribute_patch,
+    validate_room_attribute_patch,
     validate_skill_action,
     validate_skill_plan,
     validate_subgoal_selection,
@@ -24,6 +25,7 @@ __all__ = [
     "VISUAL_INTERACTION_PLANNING_INSTRUCTION",
     "visual_interaction_planning_context",
     "validate_attribute_patch",
+    "validate_room_attribute_patch",
     "validate_skill_action",
     "validate_skill_plan",
     "validate_subgoal_selection",
