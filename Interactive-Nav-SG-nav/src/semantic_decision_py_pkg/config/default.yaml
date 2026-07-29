@@ -17,6 +17,13 @@ topics:
   move_base: "/move_base"
   cmd_vel: "/cmd_vel"
   occupancy: "/move_base/local_costmap/costmap"
+  # Raw SLAM source and the semantic StaticLayer input used by the global
+  # planner.  A post-open traversal gates across both before reading costmap.
+  raw_occupancy_grid: "/struct_mapping/occ_map"
+  planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
+  global_costmap: "/move_base/global_costmap/costmap"
+  global_costmap_updates: "/move_base/global_costmap/costmap_updates"
+  local_plan: "/move_base/DWAPlannerROS/local_plan"
 
 mission:
   mode: "semantic_interaction_exploration"
@@ -33,9 +40,14 @@ candidate:
   container_allow_connected_room: false
   max_state_age_sec: 300.0
   min_state_confidence: 0.5
+  portal_require_attribute_ready: false
+  portal_allow_unknown_state: true
   portal_standoff_m: 0.85
   container_standoff_m: 0.5
-  drawer_standoff_m: 0.25
+  # Drawer containers use the same nominal approach distance as other
+  # containers.  Keep this explicit so a future task can tune drawers without
+  # accidentally restoring the old, shorter 0.25 m distance.
+  drawer_standoff_m: 0.5
   interaction_safety_margin_m: 0.25
   interaction_ready_distance_m: 0.45
   require_current_visibility: false
@@ -73,6 +85,16 @@ policy:
   failure_cooldown_schedule_s: [30.0, 60.0, 180.0]
   success_cooldown_s: 5.0
   failure_retry_delay_s: 2.0
+  # After a portal open, retain the crossing candidate until the *same* portal
+  # is publicly open/traversable and a fresh capture has reached the graph.
+  # The evaluator continues advancing RGB-D/scan steps while decision making
+  # waits; any timeout only falls back to executor-side make_plan waiting.
+  post_interaction_refresh_enabled: true
+  post_interaction_refresh_min_candidate_updates: 2
+  post_interaction_refresh_timeout_s: 30.0
+  post_interaction_refresh_require_graph_revision: true
+  post_interaction_refresh_require_observation_step: true
+  post_interaction_refresh_require_portal_open_confirmation: true
   repeat_guard_enabled: true
   repeat_guard_low_gain_limit: 2
   repeat_guard_min_frontier_shrink_m: 0.15
@@ -99,6 +121,13 @@ model:
   max_frontiers_per_room: 2
   max_candidates_per_region: 1
   explore_min_visible_gain_ratio: 0.25
+  explore_visible_unknown_area_weight: 0.50
+  explore_new_room_bonus: 0.70
+  explore_potential_child_room_bonus: 0.25
+  explore_room_target_affinity_bonus: 0.20
+  explore_room_target_mismatch_penalty: 0.60
+  room_target_mismatch_confidence_threshold: 0.75
+  reserve_unentered_room_frontier_slots: 1
   suppress_semantic_container_mismatch: true
   pre_score_guard_margin: 0.75
   history_region_size_m: 1.0
@@ -144,12 +173,27 @@ executor:
   make_plan_fail_open: true
   make_plan_empty_retry_count: 2
   make_plan_empty_retry_delay_s: 0.15
-  post_interaction_traversal_make_plan_retry_window_s: 8.0
-  post_interaction_traversal_make_plan_retry_interval_s: 0.5
+  # A successful portal open must causally propagate from raw SLAM occupancy
+  # through planning_occ_map to the global costmap before make_plan runs.
+  # This is one total bounded wait, rather than a per-stage retry loop.
+  post_interaction_costmap_fresh_timeout_s: 2.0
+  post_interaction_costmap_fresh_poll_interval_s: 0.05
+  # Once that fresh map is observed, keep any same-waypoint retry short.
+  post_interaction_traversal_make_plan_retry_window_s: 0.35
+  post_interaction_traversal_make_plan_retry_interval_s: 0.10
   explore_make_plan_fail_open_after_retries: true
   navigation_stagnation_timeout_s: 12.0
   navigation_stagnation_distance_m: 0.10
   navigation_stagnation_yaw_rad: 0.15
+  # Do not cancel a deliberately slow DWA trajectory when it has published a
+  # fresh plan and has made a material net reduction toward its goal.
+  navigation_stagnation_goal_distance_reduction_m: 0.02
+  navigation_stagnation_local_plan_max_age_s: 1.0
+  navigation_stagnation_local_plan_min_poses: 2
+  # An INTERACT command remains committed across a small set of approach
+  # poses; switch only after the current approach hits the stagnation guard.
+  interaction_approach_fallback_max_attempts: 3
+  interaction_approach_fallback_cancel_wait_s: 0.5
   stuck_recovery_enabled: true
   stuck_recovery_subgoal_failures: 3
   stuck_recovery_min_displacement_m: 0.10

@@ -7,11 +7,22 @@ DWAPlannerROS:
   xy_goal_tolerance: 0.30
   yaw_goal_tolerance: 0.20
   latch_xy_goal_tolerance: true
-  heading_scoring: true
-  heading_scoring_timestep: 0.8
+  # Stock DWA parameters only.  Loosen the path/goal tether enough for a
+  # collision-free local detour, while retaining the native doorway behavior.
+  path_distance_bias: 18.0
+  goal_distance_bias: 20.0
+  occdist_scale: 0.10
+  max_scaling_factor: 0.20
 
 global_costmap:
   transform_tolerance: 3.0
+  # The semantic OCC overlay publishes immediately after an interaction
+  # result; bound propagation to make_plan to one 100 ms costmap cycle.
+  update_frequency: 10.0
+  publish_frequency: 10.0
 
 local_costmap:
   transform_tolerance: 3.0
+  # Keep the full nearby continuation visible after a door traversal.
+  width: 6.0
+  height: 6.0

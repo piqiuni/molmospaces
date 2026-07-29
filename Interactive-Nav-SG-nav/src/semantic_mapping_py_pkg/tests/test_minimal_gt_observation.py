@@ -129,6 +129,19 @@ def test_compact_minimal_gt_discards_private_routing_aliases() -> None:
     assert normalized["joint_infos"] == []
 
 
+def test_minimal_gt_uses_only_mapper_attached_capture_step_for_versioning() -> None:
+    raw = compact_rle_observation()
+    # A public caller-provided frame_index remains ignored by the minimal-GT
+    # normalizer, while the validated envelope can be attached privately by
+    # semantic_mapping_node before graph ingestion.
+    raw["frame_index"] = 999
+    raw["_capture_step"] = 23
+
+    normalized = normalize_observation(raw)
+
+    assert normalized["frame_index"] == 23
+
+
 def test_compact_minimal_gt_uses_explicit_visible_pixel_count() -> None:
     observation = minimal_observation(
         "apple_1", "Apple", [1.0, 2.0, 0.5], [0.1, 0.1, 0.1], pixels=1

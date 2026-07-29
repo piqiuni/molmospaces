@@ -2,3 +2,9 @@ ablation:
   module1: "dynamic_mllm"
   module2: "mllm_score"
   module3: "mllm_skill_verified"
+
+# The V3 launcher starts interaction_attribute_inference_node when
+# semantic_attribute_inference=true.  Its second, independent lane consumes
+# room + in-room object metadata only (no RGB/crop).
+room_mllm:
+  enabled: true

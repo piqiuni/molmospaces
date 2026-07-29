@@ -225,6 +225,11 @@ def _current_room_id(
     closest_id = ""
     closest_distance_sq = float("inf")
     for room in rooms:
+        # A portal child is a topological destination, not evidence that the
+        # robot has already crossed the doorway.  It must not steal the
+        # current-room label merely because its synthetic centroid is close.
+        if bool(room.get("potential_room")):
+            continue
         centroid = list(room.get("_centroid") or [])
         if len(centroid) < 2:
             continue
@@ -250,6 +255,10 @@ def compact_semantic_graph(
     graph_nodes = list(graph.get("nodes") or [])[: max(0, int(max_nodes))]
     for node in graph_nodes:
         node_type = str(node.get("type") or "").casefold()
+        if node_type == "room" and not bool(
+            (node.get("attributes") or {}).get("active", True)
+        ):
+            continue
         if node_type in {"scene", "room", "portal"}:
             continue
         label = str(node.get("label") or node.get("name") or node_type).strip()
@@ -275,6 +284,10 @@ def compact_semantic_graph(
             unassigned_anchors.append(anchor)
     for node in graph_nodes:
         node_type = str(node.get("type") or "").casefold()
+        if node_type == "room" and not bool(
+            (node.get("attributes") or {}).get("active", True)
+        ):
+            continue
         if node_type not in {"room", "portal", "container"}:
             continue
         attributes = node.get("attributes") or {}
@@ -291,6 +304,17 @@ def compact_semantic_graph(
                 "type": inferred_attribute if inferred_known else semantic_name or "unknown",
                 "_centroid": list(node.get("centroid") or [])[:2],
             }
+            if bool(attributes.get("is_potential_room")):
+                # This is a graph-only room created after a successful portal
+                # open.  It carries topology for exploration but deliberately
+                # has no occupancy-derived free-space evidence yet.
+                room["potential_room"] = True
+                room["observed_free_space"] = bool(
+                    attributes.get("observed_free_space", False)
+                )
+                source_portal_id = str(attributes.get("source_portal_id") or "")
+                if source_portal_id:
+                    room["source_portal_id"] = source_portal_id
             if inferred_known:
                 if semantic_name and semantic_name.casefold() != inferred_attribute.casefold():
                     room["observed_type"] = semantic_name
@@ -390,6 +414,13 @@ def compact_robot_context(
     result = {}
     if semantic_graph.get("current_room"):
         result["current_room"] = semantic_graph["current_room"]
+    entered_room_ids = [
+        _room_node_id(value)
+        for value in list((robot_context or {}).get("entered_room_ids") or [])
+        if _room_node_id(value)
+    ]
+    if entered_room_ids:
+        result["entered_rooms"] = sorted(set(entered_room_ids))[:12]
     return result
 
 
@@ -512,6 +543,14 @@ def build_room_object_reasoning_context(
         if not room_id:
             continue
         entry: dict[str, Any] = {"id": room_id, "type": room_type or "unknown"}
+        if bool(room.get("potential_room")):
+            entry["potential_room"] = True
+            entry["observed_free_space"] = bool(
+                room.get("observed_free_space", False)
+            )
+            source_portal_id = _compact_semantic_label(room.get("source_portal_id"))
+            if source_portal_id:
+                entry["source_portal_id"] = source_portal_id
         if "room_attribute_confidence" in room:
             entry["room_attribute_confidence"] = round(
                 float(room.get("room_attribute_confidence") or 0.0), 2
@@ -676,6 +715,34 @@ def compact_candidate(
             result["expected_visible_unknown_area_m2"] = round(
                 expected_visible_area_m2, 2
             )
+        room_status = str(metadata.get("room_status") or "")
+        if room_status:
+            result["room_status"] = room_status
+        robot_room_id = _room_node_id(
+            metadata.get("robot_room_id") or metadata.get("current_room_id")
+        )
+        if robot_room_id:
+            result["robot_room_id"] = robot_room_id
+        if bool(metadata.get("potential_room")):
+            result["potential_room"] = True
+        source_portal_id = str(metadata.get("source_portal_id") or "")
+        if source_portal_id:
+            result["source_portal_id"] = source_portal_id
+        room_attribute = str(metadata.get("room_attribute") or "").strip()
+        if room_attribute:
+            result["room_attribute"] = room_attribute
+        if "room_attribute_confidence" in metadata:
+            result["room_attribute_confidence"] = round(
+                max(0.0, min(1.0, float(metadata.get("room_attribute_confidence") or 0.0))),
+                2,
+            )
+        if "room_target_affinity" in metadata:
+            result["room_target_affinity"] = round(
+                float(metadata.get("room_target_affinity") or 0.0), 2
+            )
+        affinity_reason = str(metadata.get("room_target_affinity_reason") or "")
+        if affinity_reason:
+            result["room_target_affinity_reason"] = affinity_reason
     elif behavior_type == "INTERACT":
         state = str(metadata.get("state") or "")
         if state:
@@ -1166,25 +1233,67 @@ class ModelPolicyClient:
             and candidate_id in pre_scores
         ]
         if not protected:
-            return selected_id
-        best_id = max(
-            protected,
+            protected_selected = selected_id
+        else:
+            best_id = max(
+                protected,
+                key=lambda candidate_id: (
+                    float(pre_scores.get(candidate_id, 0.0) or 0.0),
+                    candidate_id,
+                ),
+            )
+            selected_score = float(pre_scores.get(selected_id, 0.0) or 0.0)
+            best_score = float(pre_scores.get(best_id, 0.0) or 0.0)
+            if best_id == selected_id or best_score < selected_score + margin:
+                protected_selected = selected_id
+            else:
+                hint = str(hints.get(best_id) or "").upper()
+                self.last_pre_score_guard = (
+                    f"{hint}:{selected_id}->{best_id}:margin={best_score - selected_score:.3f}"
+                )
+                self.last_reason = f"PRE_SCORE_GUARD_{hint}"
+                self.last_confidence = "high"
+                protected_selected = best_id
+
+        # Target, post-door, target-container, and route-portal guards always
+        # win over room novelty.  Only when none is selected do we protect an
+        # actually unentered room from an arbitrary MLLM detour back into a
+        # previously entered room.  High-confidence semantic mismatches are
+        # deliberately excluded from this guard and remain an exploration
+        # fallback rather than a forced choice.
+        selected_hint = str(hints.get(protected_selected) or "").upper()
+        if selected_hint in protected_hints:
+            return protected_selected
+        new_room_ids = [
+            candidate_id
+            for candidate_id, members in candidate_groups.items()
+            if str(hints.get(candidate_id) or "").upper() == "NEW_ROOM_FRONTIER"
+            and bool((members[0].metadata or {}).get("room_status") == "unentered_new_room")
+        ]
+        if not new_room_ids:
+            return protected_selected
+        best_new_room_id = max(
+            new_room_ids,
             key=lambda candidate_id: (
                 float(pre_scores.get(candidate_id, 0.0) or 0.0),
                 candidate_id,
             ),
         )
-        selected_score = float(pre_scores.get(selected_id, 0.0) or 0.0)
-        best_score = float(pre_scores.get(best_id, 0.0) or 0.0)
-        if best_id == selected_id or best_score < selected_score + margin:
-            return selected_id
-        hint = str(hints.get(best_id) or "").upper()
+        selected_score = float(pre_scores.get(protected_selected, 0.0) or 0.0)
+        best_new_room_score = float(pre_scores.get(best_new_room_id, 0.0) or 0.0)
+        if (
+            best_new_room_id == protected_selected
+            or best_new_room_score < selected_score + margin
+        ):
+            return protected_selected
         self.last_pre_score_guard = (
-            f"{hint}:{selected_id}->{best_id}:margin={best_score - selected_score:.3f}"
+            "NEW_ROOM_FRONTIER:"
+            f"{protected_selected}->{best_new_room_id}:"
+            f"margin={best_new_room_score - selected_score:.3f}"
         )
-        self.last_reason = f"PRE_SCORE_GUARD_{hint}"
+        self.last_reason = "PRE_SCORE_GUARD_NEW_ROOM_FRONTIER"
         self.last_confidence = "high"
-        return best_id
+        return best_new_room_id
 
     def build_request(
         self,
@@ -1249,13 +1358,19 @@ class ModelPolicyClient:
                 "proof of containment or unobserved state; identify observed rooms, portals, and containers "
                 "that could plausibly reveal the target. STAGE 2 (EXECUTABLE_CANDIDATE_RANKING): apply those "
                 "Stage 1 findings to the current candidates array and rank only executable candidate IDs. "
+                "A room marked potential_room is an unobserved topological child behind a successfully opened "
+                "portal; use it to favor crossing or nearby exploration, but do not treat it as observed free "
+                "space or infer its contents. "
                 "Apply this order: "
                 "(1) TARGET_GOAL when the target is reliably observed; (2) POST_INTERACTION_TRAVERSE immediately "
                 "after opening a portal so the robot actually crosses the state-changing doorway; "
                 "(3) NEXT_ROUTE_PORTAL before a remote container or frontier because it opens the observed "
                 "topological route; (4) TARGET_CONTAINER or a semantically plausible container; "
-                "(5) the frontier most likely to expose a plausible "
-                "room. decision_hint is deterministic graph/goal evidence and pre_score is a transparent "
+                "(5) an eligible frontier with room_status=unentered_new_room when its room_target_affinity "
+                "is neutral or positive, before a frontier in current_room or entered_room; "
+                "(6) other frontiers. If room_target_affinity_reason says high_confidence_mismatch, keep "
+                "that room as a fallback but rank it below a compatible or unknown new room. decision_hint is "
+                "deterministic graph/goal evidence and pre_score is a transparent "
                 "ranking prior; normally rank a high-priority hint first unless recent_decisions show that the "
                 "same region/action just failed without progress. If POST_INTERACTION_TRAVERSE is present and "
                 "TARGET_GOAL is absent, it is the mandatory first choice unless that exact current candidate's "

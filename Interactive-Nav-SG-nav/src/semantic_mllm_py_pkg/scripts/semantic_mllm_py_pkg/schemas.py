@@ -31,13 +31,54 @@ def _confidence(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _normalized_token(value: Any) -> str:
+    """Normalize short categorical MLLM fields before graph routing."""
+
+    return re.sub(r"[\s-]+", "_", str(value or "").strip().casefold())
+
+
+def _interaction_class(value: Any) -> str:
+    token = _normalized_token(value)
+    return {
+        "door": "portal",
+        "doorway": "portal",
+        "gate": "portal",
+        "barrier": "portal",
+        "portal": "portal",
+        "fridge": "container",
+        "refrigerator": "container",
+        "cabinet": "container",
+        "drawer": "container",
+        "container": "container",
+        "none": "none",
+        "non_interactable": "none",
+        "not_interactable": "none",
+        "unknown": "unknown",
+    }.get(token, "unknown")
+
+
+def _coarse_interaction_state(value: Any) -> str:
+    """Accept ordinary model casing/phrasing without widening planner states."""
+
+    token = _normalized_token(value)
+    if token in {"open", "opened", "fully_open", "wide_open", "open_state"}:
+        return "open"
+    if token in {"closed", "close", "shut", "fully_closed", "closed_state"}:
+        return "closed"
+    if token in {"ajar", "partially_open", "half_open", "part_open"}:
+        return "ajar"
+    if token in {"static_open", "fixed_open", "always_open"}:
+        return "static_open"
+    return "unknown"
+
+
 def validate_attribute_patch(value: Any) -> dict[str, Any]:
     result = parse_json_object(value)
     if not str(result.get("object_id") or ""):
         raise ValueError("attribute patch requires object_id")
     result["interactable"] = bool(result.get("interactable", False))
-    result["interaction_class"] = str(result.get("interaction_class") or "unknown")
-    result["coarse_state"] = str(result.get("coarse_state") or "unknown")
+    result["interaction_class"] = _interaction_class(result.get("interaction_class"))
+    result["coarse_state"] = _coarse_interaction_state(result.get("coarse_state"))
     parts = result.get("interaction_parts") or []
     if not isinstance(parts, list):
         raise ValueError("interaction_parts must be a list")
@@ -64,6 +105,34 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
         part_confidence,
     )
     result["evidence_frame_ids"] = [str(item) for item in result.get("evidence_frame_ids") or []]
+    return result
+
+
+def validate_room_attribute_patch(value: Any) -> dict[str, Any]:
+    """Normalize a room-level Module-1 response.
+
+    Room inference deliberately receives only a room identifier and its visible
+    object evidence.  Keep the result separate from an object attribute patch
+    so a delayed room result can never be routed onto an interaction node.
+    """
+
+    result = parse_json_object(value)
+    room_id = result.get("room_id")
+    if room_id is None or str(room_id).strip() == "":
+        raise ValueError("room attribute patch requires room_id")
+    try:
+        result["room_id"] = int(room_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("room attribute patch room_id must be an integer") from exc
+    room_attribute = str(
+        result.get("room_attribute") or result.get("scene_attribute") or "unknown"
+    ).strip()
+    result["room_attribute"] = room_attribute.casefold() if room_attribute else "unknown"
+    result["confidence"] = _confidence(result.get("confidence"), 0.0)
+    evidence_object_ids = result.get("evidence_object_ids") or []
+    if not isinstance(evidence_object_ids, list):
+        raise ValueError("evidence_object_ids must be a list")
+    result["evidence_object_ids"] = [str(item) for item in evidence_object_ids if str(item)]
     return result
 
 

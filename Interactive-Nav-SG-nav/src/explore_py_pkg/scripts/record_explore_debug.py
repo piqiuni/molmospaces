@@ -15,6 +15,7 @@ import time
 import zlib
 from array import array
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -85,6 +86,60 @@ STATUS_NAMES = {
 }
 
 
+@dataclass(frozen=True)
+class _VideoPoint:
+    x: float
+    y: float
+    z: float = 0.0
+
+
+@dataclass(frozen=True)
+class _VideoQuaternion:
+    x: float
+    y: float
+    z: float
+    w: float
+
+
+@dataclass(frozen=True)
+class _VideoPose:
+    position: _VideoPoint
+    orientation: _VideoQuaternion
+
+
+@dataclass(frozen=True)
+class _VideoMapInfo:
+    width: int
+    height: int
+    resolution: float
+    origin: _VideoPose
+
+
+@dataclass(frozen=True)
+class _VideoHeader:
+    frame_id: str
+
+
+@dataclass(frozen=True)
+class _FrozenVideoGrid:
+    """Render-only map proxy with no ROS message or full cell payload.
+
+    A queued six-panel frame can outlive hundreds of mapper publications.  It
+    must therefore not retain the source ``OccupancyGrid`` and its multi-million
+    element Python list.  The proxy preserves the coordinate transform and a
+    encoded panel-scale visual base; overlays reconstruct paths from world
+    coordinates in the renderer thread.  Occupancy and room-label rasters use
+    PNG so their discrete colors are not blurred into one another.
+    """
+
+    header: _VideoHeader
+    info: _VideoMapInfo
+    rgb_jpeg: bytes
+    known_world_bounds: tuple[float, float, float, float] | None = None
+    data: None = None
+    image_encoding: str = "jpeg"
+
+
 def _step4(value: int | float | None) -> str:
     return f"{int(value or 0):04d}"
 
@@ -135,6 +190,246 @@ def _pose_xy_yaw(msg: Odometry) -> tuple[float, float, float]:
 
 def _grid_origin_yaw(grid: OccupancyGrid) -> float:
     return _yaw_from_quaternion(grid.info.origin.orientation)
+
+
+def _known_cell_bounds_from_grid(
+    grid: OccupancyGrid,
+) -> tuple[int, int, int, int] | None:
+    """Return ``[min_x, min_y, max_x, max_y)`` for known grid cells."""
+
+    if np is None or getattr(grid, "data", None) is None:
+        return None
+    width = int(grid.info.width)
+    height = int(grid.info.height)
+    resolution = float(grid.info.resolution)
+    if width <= 0 or height <= 0 or resolution <= 0.0:
+        return None
+    values = np.asarray(grid.data, dtype=np.int16).reshape((height, width))
+    known = values >= 0
+    # Avoid materializing one index per known cell (millions for a full map)
+    # on every mapper callback; bounds only need occupied rows and columns.
+    known_rows = np.flatnonzero(np.any(known, axis=1))
+    known_cols = np.flatnonzero(np.any(known, axis=0))
+    if known_rows.size == 0 or known_cols.size == 0:
+        return None
+    return (
+        int(np.min(known_cols)),
+        int(np.min(known_rows)),
+        int(np.max(known_cols) + 1),
+        int(np.max(known_rows) + 1),
+    )
+
+
+def _world_bounds_from_cell_bounds(
+    grid: OccupancyGrid,
+    cell_bounds: tuple[int, int, int, int] | None,
+) -> tuple[float, float, float, float] | None:
+    """Convert an axis-aligned grid-cell rectangle into world bounds."""
+
+    if cell_bounds is None:
+        return None
+    resolution = float(grid.info.resolution)
+    if resolution <= 0.0:
+        return None
+    origin = grid.info.origin
+    origin_yaw = _grid_origin_yaw(grid)
+    cos_yaw = math.cos(origin_yaw)
+    sin_yaw = math.sin(origin_yaw)
+
+    def world_from_cell(cell_x: float, cell_y: float) -> tuple[float, float]:
+        local_x = cell_x * resolution
+        local_y = cell_y * resolution
+        return (
+            float(origin.position.x) + cos_yaw * local_x - sin_yaw * local_y,
+            float(origin.position.y) + sin_yaw * local_x + cos_yaw * local_y,
+        )
+
+    min_cell_x, min_cell_y, max_cell_x, max_cell_y = cell_bounds
+    corners = [
+        world_from_cell(float(min_cell_x), float(min_cell_y)),
+        world_from_cell(float(max_cell_x), float(min_cell_y)),
+        world_from_cell(float(min_cell_x), float(max_cell_y)),
+        world_from_cell(float(max_cell_x), float(max_cell_y)),
+    ]
+    return (
+        min(point[0] for point in corners),
+        min(point[1] for point in corners),
+        max(point[0] for point in corners),
+        max(point[1] for point in corners),
+    )
+
+
+def _known_world_bounds_from_grid(
+    grid: OccupancyGrid,
+) -> tuple[float, float, float, float] | None:
+    """Measure known occupancy bounds before discarding a source grid."""
+
+    return _world_bounds_from_cell_bounds(grid, _known_cell_bounds_from_grid(grid))
+
+
+def _video_proxy_dimensions(width: int, height: int, max_dimension: int) -> tuple[int, int]:
+    width = max(1, int(width))
+    height = max(1, int(height))
+    limit = max(1, int(max_dimension))
+    scale = min(1.0, float(limit) / float(max(width, height)))
+    return (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+
+
+def _encode_video_proxy_rgb(
+    rgb,
+    jpeg_quality: int,
+    *,
+    image_encoding: str = "jpeg",
+) -> bytes:
+    if cv2 is None or np is None or rgb is None:
+        return b""
+    image_encoding = str(image_encoding).strip().lower()
+    if image_encoding not in {"jpeg", "png"}:
+        image_encoding = "jpeg"
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    suffix = ".png" if image_encoding == "png" else ".jpg"
+    encoding_params = (
+        []
+        if image_encoding == "png"
+        else [cv2.IMWRITE_JPEG_QUALITY, max(1, min(100, int(jpeg_quality)))]
+    )
+    ok, encoded = cv2.imencode(
+        suffix,
+        bgr,
+        encoding_params,
+    )
+    return bytes(encoded) if ok else b""
+
+
+def _decode_video_proxy_rgb(payload: bytes):
+    if cv2 is None or np is None or not payload:
+        return None
+    encoded = np.frombuffer(payload, dtype=np.uint8)
+    bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return None
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def _video_grid_render_rgb(grid, base):
+    """Decode a queued proxy only in the render worker, never in callbacks."""
+
+    if isinstance(grid, _FrozenVideoGrid):
+        return _decode_video_proxy_rgb(grid.rgb_jpeg)
+    if isinstance(base, (bytes, bytearray)):
+        return _decode_video_proxy_rgb(bytes(base))
+    return base
+
+
+def _freeze_video_grid(
+    grid: OccupancyGrid,
+    rgb,
+    *,
+    max_dimension: int,
+    jpeg_quality: int,
+    known_world_bounds: tuple[float, float, float, float] | None = None,
+    content_cell_bounds: tuple[int, int, int, int] | None = None,
+    visual_crop_margin_m: float = 0.0,
+    categorical: bool = False,
+    image_encoding: str = "jpeg",
+) -> _FrozenVideoGrid:
+    """Copy a bounded, render-only map proxy without retaining source cells.
+
+    For occupancy maps, crop in source-grid coordinates *before* downsampling.
+    The crop margin is metric, so the displayed extent is independent of the
+    frozen proxy resolution.  The adjusted origin keeps all world-coordinate
+    overlays exact in the renderer thread.
+    """
+
+    source_width = max(1, int(grid.info.width))
+    source_height = max(1, int(grid.info.height))
+    crop_min_x = 0
+    crop_min_y = 0
+    crop_max_x = source_width
+    crop_max_y = source_height
+    source_resolution = float(grid.info.resolution)
+    if content_cell_bounds is not None and source_resolution > 0.0:
+        min_x, min_y, max_x, max_y = content_cell_bounds
+        margin_cells = max(
+            0,
+            int(math.ceil(max(0.0, float(visual_crop_margin_m)) / source_resolution)),
+        )
+        crop_min_x = max(0, int(min_x) - margin_cells)
+        crop_min_y = max(0, int(min_y) - margin_cells)
+        crop_max_x = min(source_width, int(max_x) + margin_cells)
+        crop_max_y = min(source_height, int(max_y) + margin_cells)
+        if crop_max_x <= crop_min_x or crop_max_y <= crop_min_y:
+            crop_min_x, crop_min_y = 0, 0
+            crop_max_x, crop_max_y = source_width, source_height
+
+    source_width = max(1, crop_max_x - crop_min_x)
+    source_height = max(1, crop_max_y - crop_min_y)
+    if rgb is not None:
+        source_rgb_height, source_rgb_width = rgb.shape[:2]
+        if source_rgb_width == int(grid.info.width) and source_rgb_height == int(grid.info.height):
+            # Visual rows are flipped relative to OccupancyGrid cell rows.
+            rgb = rgb[
+                int(grid.info.height) - crop_max_y : int(grid.info.height) - crop_min_y,
+                crop_min_x:crop_max_x,
+            ]
+    proxy_width, proxy_height = _video_proxy_dimensions(
+        source_width, source_height, max_dimension
+    )
+    proxy_rgb = rgb
+    if (
+        proxy_rgb is not None
+        and cv2 is not None
+        and (int(proxy_rgb.shape[1]) != proxy_width or int(proxy_rgb.shape[0]) != proxy_height)
+    ):
+        proxy_rgb = cv2.resize(
+            proxy_rgb,
+            (proxy_width, proxy_height),
+            # Discrete OCC / room colors must not be averaged into visually
+            # plausible but semantically wrong colors.
+            interpolation=cv2.INTER_NEAREST if categorical else cv2.INTER_AREA,
+        )
+    origin = grid.info.origin
+    origin_yaw = _grid_origin_yaw(grid)
+    origin_cos = math.cos(origin_yaw)
+    origin_sin = math.sin(origin_yaw)
+    origin_offset_x = crop_min_x * source_resolution
+    origin_offset_y = crop_min_y * source_resolution
+    origin_copy = _VideoPose(
+        position=_VideoPoint(
+            float(origin.position.x) + origin_cos * origin_offset_x - origin_sin * origin_offset_y,
+            float(origin.position.y) + origin_sin * origin_offset_x + origin_cos * origin_offset_y,
+            float(origin.position.z),
+        ),
+        orientation=_VideoQuaternion(
+            float(origin.orientation.x),
+            float(origin.orientation.y),
+            float(origin.orientation.z),
+            float(origin.orientation.w),
+        ),
+    )
+    return _FrozenVideoGrid(
+        header=_VideoHeader(str(grid.header.frame_id or "")),
+        info=_VideoMapInfo(
+            width=proxy_width,
+            height=proxy_height,
+            # Preserve world extents after image downsampling.  Width is used
+            # as the authoritative scale because proxy dimensions retain the
+            # source aspect ratio.
+            resolution=source_resolution
+            * (float(source_width) / float(proxy_width)),
+            origin=origin_copy,
+        ),
+        rgb_jpeg=_encode_video_proxy_rgb(
+            proxy_rgb,
+            jpeg_quality,
+            image_encoding=image_encoding,
+        ),
+        known_world_bounds=known_world_bounds,
+        image_encoding=str(image_encoding).strip().lower(),
+    )
 
 
 def _world_to_cell(grid: OccupancyGrid, x: float, y: float) -> tuple[int, int] | None:
@@ -1094,6 +1389,12 @@ class ExploreDebugRecorder:
         self._occupancy_grid_pair_cache_size = 32
         self.latest_global_costmap: OccupancyGrid | None = None
         self.latest_local_costmap: OccupancyGrid | None = None
+        # These are render-only proxies, never source OccupancyGrid messages.
+        # Queued video snapshots reference them safely even when rendering
+        # falls far behind mapper publication.
+        self.latest_grid_video_grid: _FrozenVideoGrid | None = None
+        self.latest_global_costmap_video_grid: _FrozenVideoGrid | None = None
+        self.latest_local_costmap_video_grid: _FrozenVideoGrid | None = None
         self.latest_grid_video_rgb = None
         self.latest_global_costmap_video_rgb = None
         self.latest_local_costmap_video_rgb = None
@@ -1256,7 +1557,15 @@ class ExploreDebugRecorder:
         self.video_frame_jobs: queue.Queue = queue.Queue(
             maxsize=max(1, int(args.video_frame_job_queue_size))
         )
+        # ROS can invoke image and step-sync callbacks concurrently.  Keep the
+        # full-queue replacement atomic so ``drop_oldest`` always preserves the
+        # newly captured state snapshot rather than blocking a callback until
+        # its matching RGB image has fallen out of the cache.
+        self.video_frame_enqueue_lock = threading.Lock()
         self.video_frame_jobs_dropped = 0
+        self.video_frame_jobs_dropped_oldest = 0
+        self.video_frame_jobs_dropped_newest = 0
+        self.video_frame_jobs_dropped_oldest_steps: list[int] = []
         self.recording_timing_windows: dict[str, list[float]] = {
             "six_panel_render": [],
             "external_frame_callback": [],
@@ -1557,9 +1866,75 @@ class ExploreDebugRecorder:
         self.tf_record_timer = rospy.Timer(rospy.Duration(max(0.1, args.tf_record_period_sec)), self.tf_record_timer_callback)
         rospy.on_shutdown(self.shutdown)
 
+    def _freeze_grid_for_video(
+        self,
+        grid: OccupancyGrid,
+        *,
+        render_kind: str,
+    ) -> _FrozenVideoGrid:
+        """Create a bounded render proxy before a map enters video history."""
+
+        categorical_encoding = str(
+            getattr(self.args, "video_snapshot_categorical_format", "png")
+        ).strip().lower()
+        if categorical_encoding not in {"jpeg", "png"}:
+            categorical_encoding = "png"
+        max_dimension = int(self.args.video_snapshot_grid_max_dim)
+        if render_kind == "occupancy":
+            rgb = self._grid_to_video_rgb_locked(grid)
+            known_cell_bounds = _known_cell_bounds_from_grid(grid)
+            known_world_bounds = _world_bounds_from_cell_bounds(
+                grid, known_cell_bounds
+            )
+            visual_crop_margin_m = max(
+                0.0,
+                float(getattr(self.args, "video_occ_crop_margin_m", 2.5)),
+            )
+            categorical = True
+            image_encoding = categorical_encoding
+        elif render_kind == "scene":
+            rgb = self._scene_id_grid_to_rgb(grid)
+            known_world_bounds = None
+            known_cell_bounds = None
+            visual_crop_margin_m = 0.0
+            categorical = True
+            image_encoding = categorical_encoding
+        elif render_kind == "global_costmap":
+            # The six-panel global costmap is the diagnostic source of truth
+            # for clearance and global-plan validity.  Keep its native grid
+            # dimensions and encode it losslessly: a 512 px JPEG proxy can
+            # erase the one-cell inflation bands that explain a planning
+            # decision.  Local costmap and other queued maps remain bounded.
+            rgb = self._costmap_to_video_rgb_locked(grid)
+            known_world_bounds = None
+            known_cell_bounds = None
+            visual_crop_margin_m = 0.0
+            categorical = False
+            image_encoding = "png"
+            max_dimension = max(int(grid.info.width), int(grid.info.height), 1)
+        else:
+            rgb = self._costmap_to_video_rgb_locked(grid)
+            known_world_bounds = None
+            known_cell_bounds = None
+            visual_crop_margin_m = 0.0
+            categorical = False
+            image_encoding = "jpeg"
+            max_dimension = int(self.args.video_snapshot_grid_max_dim)
+        return _freeze_video_grid(
+            grid,
+            rgb,
+            max_dimension=max_dimension,
+            jpeg_quality=int(self.args.video_snapshot_jpeg_quality),
+            known_world_bounds=known_world_bounds,
+            content_cell_bounds=known_cell_bounds,
+            visual_crop_margin_m=visual_crop_margin_m,
+            categorical=categorical,
+            image_encoding=image_encoding,
+        )
+
     def occupancy_callback(self, msg: OccupancyGrid) -> None:
-        video_rgb = (
-            self._grid_to_video_rgb_locked(msg)
+        video_grid = (
+            self._freeze_grid_for_video(msg, render_kind="occupancy")
             if self._retain_video_state_history
             else None
         )
@@ -1569,7 +1944,8 @@ class ExploreDebugRecorder:
             self.latest_grid = msg
             if self._occupancy_pairing_enabled:
                 self._register_occupancy_grid_pair_locked(msg, raw=False)
-            self.latest_grid_video_rgb = video_rgb
+            self.latest_grid_video_grid = video_grid
+            self.latest_grid_video_rgb = None if video_grid is None else video_grid.rgb_jpeg
             self.latest_grid_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_grid_wall_time = time.time()
             self.latest_grid_step = self.debug_step
@@ -1577,7 +1953,7 @@ class ExploreDebugRecorder:
                 self.grid_video_history.append(
                     (
                         self.latest_grid_video_stamp,
-                        self.latest_grid,
+                        self.latest_grid_video_grid,
                         self.latest_grid_video_rgb,
                         self.latest_grid_step,
                         self.latest_grid_wall_time,
@@ -1687,8 +2063,11 @@ class ExploreDebugRecorder:
                 )
 
     def scene_id_grid_callback(self, msg: OccupancyGrid) -> None:
-        copied = _copy_grid(msg) if self._retain_video_state_history else None
-        rgb = self._scene_id_grid_to_rgb(copied) if copied is not None else None
+        video_grid = (
+            self._freeze_grid_for_video(msg, render_kind="scene")
+            if self._retain_video_state_history
+            else None
+        )
         if np is not None:
             values = np.asarray(msg.data, dtype=np.int32)
             valid_values = values[values >= 0]
@@ -1704,8 +2083,10 @@ class ExploreDebugRecorder:
             self.room_segment_callback_count += 1
             self.latest_room_segment_valid_cell_count = valid_cell_count
             self.latest_room_segment_unique_ids = unique_ids
-            self.latest_scene_id_grid = copied
-            self.latest_scene_id_grid_rgb = rgb
+            self.latest_scene_id_grid = video_grid
+            self.latest_scene_id_grid_rgb = (
+                None if video_grid is None else video_grid.rgb_jpeg
+            )
             self.latest_scene_id_grid_stamp = (
                 msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             )
@@ -1714,8 +2095,8 @@ class ExploreDebugRecorder:
                 self.scene_id_grid_history.append(
                     (
                         self.latest_scene_id_grid_stamp,
-                        copied,
-                        rgb,
+                        self.latest_scene_id_grid,
+                        self.latest_scene_id_grid_rgb,
                         self.latest_scene_id_grid_step,
                     )
                 )
@@ -1817,8 +2198,8 @@ class ExploreDebugRecorder:
 
     def global_costmap_callback(self, msg: OccupancyGrid) -> None:
         copied = _copy_grid(msg)
-        video_rgb = (
-            self._costmap_to_video_rgb_locked(copied)
+        video_grid = (
+            self._freeze_grid_for_video(copied, render_kind="global_costmap")
             if self._retain_video_state_history
             else None
         )
@@ -1826,7 +2207,10 @@ class ExploreDebugRecorder:
             if self.shutting_down:
                 return
             self.latest_global_costmap = copied
-            self.latest_global_costmap_video_rgb = video_rgb
+            self.latest_global_costmap_video_grid = video_grid
+            self.latest_global_costmap_video_rgb = (
+                None if video_grid is None else video_grid.rgb_jpeg
+            )
             self.latest_global_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_global_costmap_wall_time = time.time()
             self.latest_global_costmap_step = self.debug_step
@@ -1834,7 +2218,7 @@ class ExploreDebugRecorder:
                 self.global_costmap_video_history.append(
                     (
                         self.latest_global_costmap_video_stamp,
-                        self.latest_global_costmap,
+                        self.latest_global_costmap_video_grid,
                         self.latest_global_costmap_video_rgb,
                         self.latest_global_costmap_step,
                     )
@@ -1853,18 +2237,21 @@ class ExploreDebugRecorder:
             )
         if not self._retain_video_state_history:
             return
-        video_rgb = self._costmap_to_video_rgb_locked(grid_snapshot)
+        video_grid = self._freeze_grid_for_video(
+            grid_snapshot, render_kind="global_costmap"
+        )
         with self.lock:
             if self.shutting_down:
                 return
-            self.latest_global_costmap_video_rgb = video_rgb
+            self.latest_global_costmap_video_grid = video_grid
+            self.latest_global_costmap_video_rgb = video_grid.rgb_jpeg
             self.latest_global_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_global_costmap_wall_time = time.time()
             self.latest_global_costmap_step = self.debug_step
             self.global_costmap_video_history.append(
                 (
                     self.latest_global_costmap_video_stamp,
-                    grid_snapshot,
+                    self.latest_global_costmap_video_grid,
                     self.latest_global_costmap_video_rgb,
                     self.latest_global_costmap_step,
                 )
@@ -1872,8 +2259,8 @@ class ExploreDebugRecorder:
 
     def local_costmap_callback(self, msg: OccupancyGrid) -> None:
         copied = _copy_grid(msg)
-        video_rgb = (
-            self._costmap_to_video_rgb_locked(copied)
+        video_grid = (
+            self._freeze_grid_for_video(copied, render_kind="costmap")
             if self._retain_video_state_history
             else None
         )
@@ -1881,7 +2268,10 @@ class ExploreDebugRecorder:
             if self.shutting_down:
                 return
             self.latest_local_costmap = copied
-            self.latest_local_costmap_video_rgb = video_rgb
+            self.latest_local_costmap_video_grid = video_grid
+            self.latest_local_costmap_video_rgb = (
+                None if video_grid is None else video_grid.rgb_jpeg
+            )
             self.latest_local_costmap_video_stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
             self.latest_local_costmap_wall_time = time.time()
             self.latest_local_costmap_step = self.debug_step
@@ -1889,7 +2279,7 @@ class ExploreDebugRecorder:
                 self.local_costmap_video_history.append(
                     (
                         self.latest_local_costmap_video_stamp,
-                        self.latest_local_costmap,
+                        self.latest_local_costmap_video_grid,
                         self.latest_local_costmap_video_rgb,
                         self.latest_local_costmap_step,
                     )
@@ -1904,7 +2294,15 @@ class ExploreDebugRecorder:
             return
 
     def _enqueue_video_frame(self, job: tuple) -> bool:
-        """Queue a frozen frame without silently losing exact-step recordings."""
+        """Queue a frozen frame using the selected bounded-backlog policy.
+
+        ``block`` preserves every requested frame but can stall the step-sync
+        callback long enough for its matching RGB image to be evicted.  The
+        V3 visual-debug runner instead uses ``drop_oldest``: when the renderer
+        falls behind, retain the newest frozen image/map/path snapshot and
+        discard the oldest pending render job.  This keeps callback pairing
+        current and makes any intentional temporal gap explicit in summary.
+        """
         if self.args.video_frame_queue_overflow == "block":
             while not self.shutting_down:
                 try:
@@ -1913,12 +2311,47 @@ class ExploreDebugRecorder:
                 except queue.Full:
                     continue
             return False
-        try:
-            self.video_frame_jobs.put_nowait(job)
-            return True
-        except queue.Full:
+        with self.video_frame_enqueue_lock:
+            try:
+                self.video_frame_jobs.put_nowait(job)
+                return True
+            except queue.Full:
+                if self.args.video_frame_queue_overflow != "drop_oldest":
+                    self.video_frame_jobs_dropped += 1
+                    self.video_frame_jobs_dropped_newest += 1
+                    return False
+
+            # Balance Queue's unfinished-task count for the evicted render
+            # job before inserting the newest snapshot.  The single enqueue
+            # lock prevents another callback from consuming the freed slot.
+            try:
+                dropped_job = self.video_frame_jobs.get_nowait()
+            except queue.Empty:
+                # A renderer may have consumed the item between ``put_nowait``
+                # and this call.  One immediate retry is enough in that case.
+                try:
+                    self.video_frame_jobs.put_nowait(job)
+                    return True
+                except queue.Full:
+                    self.video_frame_jobs_dropped += 1
+                    self.video_frame_jobs_dropped_newest += 1
+                    return False
+            self.video_frame_jobs.task_done()
             self.video_frame_jobs_dropped += 1
-            return False
+            self.video_frame_jobs_dropped_oldest += 1
+            try:
+                self.video_frame_jobs_dropped_oldest_steps.append(
+                    int(dropped_job[4])
+                )
+            except (IndexError, TypeError, ValueError):
+                pass
+            try:
+                self.video_frame_jobs.put_nowait(job)
+                return True
+            except queue.Full:  # pragma: no cover - guarded by enqueue lock
+                self.video_frame_jobs_dropped += 1
+                self.video_frame_jobs_dropped_newest += 1
+                return False
 
     def image_callback(self, msg: Image) -> None:
         if self.shutting_down:
@@ -2076,7 +2509,7 @@ class ExploreDebugRecorder:
             self.grid_video_history,
             (
                 self.latest_grid_video_stamp,
-                self.latest_grid,
+                self.latest_grid_video_grid,
                 self.latest_grid_video_rgb,
                 self.latest_grid_step,
                 self.latest_grid_wall_time,
@@ -2086,7 +2519,7 @@ class ExploreDebugRecorder:
             self.global_costmap_video_history,
             (
                 self.latest_global_costmap_video_stamp,
-                self.latest_global_costmap,
+                self.latest_global_costmap_video_grid,
                 self.latest_global_costmap_video_rgb,
                 self.latest_global_costmap_step,
             ),
@@ -2095,7 +2528,7 @@ class ExploreDebugRecorder:
             self.local_costmap_video_history,
             (
                 self.latest_local_costmap_video_stamp,
-                self.latest_local_costmap,
+                self.latest_local_costmap_video_grid,
                 self.latest_local_costmap_video_rgb,
                 self.latest_local_costmap_step,
             ),
@@ -2394,57 +2827,11 @@ class ExploreDebugRecorder:
     def _known_occupancy_world_bounds(
         grid: OccupancyGrid | None,
     ) -> tuple[float, float, float, float] | None:
-        if grid is None or np is None:
+        if isinstance(grid, _FrozenVideoGrid):
+            return grid.known_world_bounds
+        if grid is None:
             return None
-        width = int(grid.info.width)
-        height = int(grid.info.height)
-        resolution = float(grid.info.resolution)
-        if width <= 0 or height <= 0 or resolution <= 0.0:
-            return None
-        values = np.asarray(grid.data, dtype=np.int16).reshape((height, width))
-        known_rows, known_cols = np.where(values >= 0)
-        if known_rows.size == 0 or known_cols.size == 0:
-            return None
-        origin = grid.info.origin
-        origin_yaw = math.atan2(
-            2.0 * (
-                origin.orientation.w * origin.orientation.z
-                + origin.orientation.x * origin.orientation.y
-            ),
-            1.0
-            - 2.0
-            * (
-                origin.orientation.y * origin.orientation.y
-                + origin.orientation.z * origin.orientation.z
-            ),
-        )
-        cos_yaw = math.cos(origin_yaw)
-        sin_yaw = math.sin(origin_yaw)
-
-        def world_from_cell(cell_x: float, cell_y: float) -> tuple[float, float]:
-            local_x = cell_x * resolution
-            local_y = cell_y * resolution
-            return (
-                float(origin.position.x) + cos_yaw * local_x - sin_yaw * local_y,
-                float(origin.position.y) + sin_yaw * local_x + cos_yaw * local_y,
-            )
-
-        min_cell_x = float(np.min(known_cols))
-        min_cell_y = float(np.min(known_rows))
-        max_cell_x = float(np.max(known_cols) + 1)
-        max_cell_y = float(np.max(known_rows) + 1)
-        corners = [
-            world_from_cell(min_cell_x, min_cell_y),
-            world_from_cell(max_cell_x, min_cell_y),
-            world_from_cell(min_cell_x, max_cell_y),
-            world_from_cell(max_cell_x, max_cell_y),
-        ]
-        return (
-            min(point[0] for point in corners),
-            min(point[1] for point in corners),
-            max(point[0] for point in corners),
-            max(point[1] for point in corners),
-        )
+        return _known_world_bounds_from_grid(grid)
 
     def _update_video_occupancy_world_bounds_locked(
         self,
@@ -2666,8 +3053,9 @@ class ExploreDebugRecorder:
         cell_min_y = 0.0
         cell_max_x = float(grid_width)
         cell_max_y = float(grid_height)
-        if np is not None:
-            reference_values = np.asarray(reference_grid.data, dtype=np.int16).reshape(
+        reference_data = getattr(reference_grid, "data", None)
+        if np is not None and reference_data is not None:
+            reference_values = np.asarray(reference_data, dtype=np.int16).reshape(
                 (grid_height, grid_width)
             )
             known_rows, known_cols = np.where(reference_values >= 0)
@@ -3601,7 +3989,7 @@ class ExploreDebugRecorder:
         rospy.loginfo(
             (
                 "RecorderTiming kind=%s n=%d avg/p50/p95/max=%.1f/%.1f/%.1f/%.1fms; "
-                "render_queue=%d/%d dropped_render=%d; png_queue=%d/%d peak=%d "
+                "render_queue=%d/%d dropped_render=%d(oldest=%d,newest=%d); png_queue=%d/%d peak=%d "
                 "write_avg/max=%.1f/%.1fms submitted/written=%d/%d; "
                 "video_queue=%d/%d peak=%d write_avg/max=%.1f/%.1fms; dropped_artifacts=%d"
             ),
@@ -3614,6 +4002,8 @@ class ExploreDebugRecorder:
             self.video_frame_jobs.qsize(),
             self.video_frame_jobs.maxsize,
             self.video_frame_jobs_dropped,
+            self.video_frame_jobs_dropped_oldest,
+            self.video_frame_jobs_dropped_newest,
             int(writer_stats.get("png_queue_size", 0)),
             int(writer_stats.get("png_queue_capacity", 0)),
             int(writer_stats.get("png_queue_peak", 0)),
@@ -3706,6 +4096,18 @@ class ExploreDebugRecorder:
                 route_plan = snapshot["route_plan"]
                 graph_revision = int(graph.get("graph_revision", 0) or 0)
                 pending_semantic_keyframe_revision = int(snapshot["pending_semantic_keyframe_revision"])
+            # Histories and queued jobs carry JPEG bytes rather than full map
+            # arrays.  Decode only for this one composite render.
+            map_base = _video_grid_render_rgb(map_grid, map_base)
+            global_costmap_base = _video_grid_render_rgb(
+                global_costmap, global_costmap_base
+            )
+            local_costmap_base = _video_grid_render_rgb(
+                local_costmap, local_costmap_base
+            )
+            scene_id_grid_rgb = _video_grid_render_rgb(
+                scene_id_grid, scene_id_grid_rgb
+            )
             selected_goal_values = list(semantic_selection.get("goal_xyyaw") or [])
             selected_goal = (
                 (
@@ -3754,6 +4156,13 @@ class ExploreDebugRecorder:
             occupancy_world_bounds = self._update_video_occupancy_world_bounds_locked(
                 map_grid
             )
+            # A frozen OCC proxy is already cropped around this exact snapshot's
+            # known cells.  Use its own bounds for the map panel so a growing
+            # historical union cannot turn a 2.5 m margin into a map-wide view.
+            occ_panel_world_bounds = (
+                self._known_occupancy_world_bounds(map_grid)
+                or occupancy_world_bounds
+            )
             if self.args.first_person_video_with_map:
                 occ_panel = self._render_video_map_panel_locked(
                     frame_width,
@@ -3769,12 +4178,13 @@ class ExploreDebugRecorder:
                     local_plan=local_plan,
                     image_step=image_step,
                     crop_margin_px=int(self.args.video_occ_crop_margin_px),
+                    crop_margin_m=float(self.args.video_occ_crop_margin_m),
                     semantic_candidates=semantic_candidates,
                     semantic_selection=semantic_selection,
                     draw_semantic_candidates=True,
                     route_plan=route_plan,
                     draw_route_plan=True,
-                    world_bounds=occupancy_world_bounds,
+                    world_bounds=occ_panel_world_bounds,
                 )
                 self._draw_task_subgoal_header(
                     occ_panel,
@@ -3783,6 +4193,11 @@ class ExploreDebugRecorder:
                 )
                 costmap_left_width = max(1, frame_width // 2)
                 costmap_right_width = max(1, frame_width - costmap_left_width)
+                # Keep the global costmap in the same current world-space
+                # viewport as the OCC panel.  Without this explicit bound the
+                # generic renderer accumulates trajectory/plan extents in
+                # ``video_global_costmap_bbox``, eventually making the
+                # costmap map-wide and shrinking inflation/path detail.
                 global_costmap_panel = self._render_video_map_panel_locked(
                     costmap_left_width,
                     frame_height,
@@ -3802,6 +4217,8 @@ class ExploreDebugRecorder:
                     global_plan=global_plan,
                     image_step=image_step,
                     semantic_selection=semantic_selection,
+                    crop_margin_m=float(self.args.video_occ_crop_margin_m),
+                    world_bounds=occ_panel_world_bounds,
                 )
                 global_costmap_panel = self._zoom_panel_image(
                     global_costmap_panel,
@@ -4771,6 +5188,7 @@ class ExploreDebugRecorder:
         local_plan: dict | None = None,
         image_step: int | None = None,
         crop_margin_px: int | None = None,
+        crop_margin_m: float | None = None,
         semantic_candidates: dict | None = None,
         semantic_selection: dict | None = None,
         draw_semantic_candidates: bool = False,
@@ -4781,9 +5199,9 @@ class ExploreDebugRecorder:
         if cv2 is None or np is None:
             return None
         if grid is None:
-            grid = self.latest_grid
-        if base is None and grid is self.latest_grid:
-            base = self.latest_grid_video_rgb
+            grid = self.latest_grid_video_grid or self.latest_grid
+        if base is None:
+            base = _video_grid_render_rgb(grid, self.latest_grid_video_rgb)
         if title is None:
             title = f"OCC MAP step={_step4(self.latest_grid_step)}"
         if grid is None or base is None:
@@ -4866,6 +5284,21 @@ class ExploreDebugRecorder:
         def world_to_px(x: float, y: float) -> tuple[int, int] | None:
             return cell_to_px(_world_to_cell(grid, x, y))
 
+        def crop_margin_pixels() -> int:
+            """Return a visual crop margin without proxy-resolution drift."""
+
+            if crop_margin_m is not None:
+                resolution = max(float(grid.info.resolution), 1e-6)
+                return max(0, int(math.ceil(max(0.0, crop_margin_m) / resolution)))
+            return max(
+                8,
+                int(
+                    self.args.video_map_crop_margin_px
+                    if crop_margin_px is None
+                    else crop_margin_px
+                ),
+            )
+
         points: list[tuple[int, int]] = []
         for _, x, y, _ in trajectory:
             transformed = self._transform_xy_yaw_to_frame(x, y, 0.0, self.args.odom_frame, grid_frame)
@@ -4920,14 +5353,7 @@ class ExploreDebugRecorder:
             if bound_points:
                 xs = [point[0] for point in bound_points]
                 ys = [point[1] for point in bound_points]
-                margin = max(
-                    8,
-                    int(
-                        self.args.video_map_crop_margin_px
-                        if crop_margin_px is None
-                        else crop_margin_px
-                    ),
-                )
+                margin = crop_margin_pixels()
                 min_x = max(0, min(xs) - margin)
                 min_y = max(0, min(ys) - margin)
                 max_x = min(width - 1, max(xs) + margin)
@@ -4938,10 +5364,7 @@ class ExploreDebugRecorder:
         elif points:
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
-            margin = max(
-                8,
-                int(self.args.video_map_crop_margin_px if crop_margin_px is None else crop_margin_px),
-            )
+            margin = crop_margin_pixels()
             current_bbox = (
                 max(0, min(xs) - margin),
                 max(0, min(ys) - margin),
@@ -4988,7 +5411,11 @@ class ExploreDebugRecorder:
             return int(round(offset_x + (x - min_x) * scale)), int(round(offset_y + (y - min_y) * scale))
 
         frontier_points: list[tuple[int, int]] = []
-        if draw_frontiers and goal_in_grid is not None:
+        grid_data = getattr(grid, "data", None)
+        # Frozen video proxies intentionally omit the full cell payload.  Path,
+        # goal, robot, and semantic overlays remain exact through metadata;
+        # only optional per-cell frontier dots are skipped.
+        if draw_frontiers and goal_in_grid is not None and grid_data is not None:
             goal_cell = _world_to_cell(grid, goal_in_grid[0], goal_in_grid[1])
             if goal_cell is not None:
                 radius_cells = max(1, int(math.ceil(self.args.frontier_check_radius_m / max(float(grid.info.resolution), 1e-6))))
@@ -4999,13 +5426,13 @@ class ExploreDebugRecorder:
                     for cx in range(gx - radius_cells, gx + radius_cells + 1):
                         if cx < 0 or cx >= int(grid.info.width):
                             continue
-                        if not _is_free(int(grid.data[cy * int(grid.info.width) + cx])):
+                        if not _is_free(int(grid_data[cy * int(grid.info.width) + cx])):
                             continue
                         has_unknown_neighbor = False
                         for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
                             if nx < 0 or ny < 0 or nx >= int(grid.info.width) or ny >= int(grid.info.height):
                                 continue
-                            if _is_unknown(int(grid.data[ny * int(grid.info.width) + nx])):
+                            if _is_unknown(int(grid_data[ny * int(grid.info.width) + nx])):
                                 has_unknown_neighbor = True
                                 break
                         if has_unknown_neighbor:
@@ -6902,7 +7329,14 @@ class ExploreDebugRecorder:
                 "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
                 "artifact_writer_stats": artifact_writer_stats,
                 "video_frame_jobs_dropped": self.video_frame_jobs_dropped,
+                "video_frame_jobs_dropped_oldest": self.video_frame_jobs_dropped_oldest,
+                "video_frame_jobs_dropped_newest": self.video_frame_jobs_dropped_newest,
+                "video_frame_jobs_dropped_oldest_steps": self.video_frame_jobs_dropped_oldest_steps,
                 "video_frame_queue_overflow": self.args.video_frame_queue_overflow,
+                "video_snapshot_grid_max_dim": self.args.video_snapshot_grid_max_dim,
+                "video_snapshot_jpeg_quality": self.args.video_snapshot_jpeg_quality,
+                "video_snapshot_categorical_format": self.args.video_snapshot_categorical_format,
+                "video_occ_crop_margin_m": self.args.video_occ_crop_margin_m,
                 "runtime_video_encode": bool(self.args.runtime_video_encode),
                 "video_save_panel_frames": bool(self.args.video_save_panel_frames),
                 "video_save_composite_frames": bool(self.args.video_save_composite_frames),
@@ -7001,7 +7435,14 @@ class ExploreDebugRecorder:
                 "artifact_write_dropped_jobs": 0 if self.artifact_writer is None else self.artifact_writer.dropped_jobs,
                 "artifact_writer_stats": artifact_writer_stats,
                 "video_frame_jobs_dropped": self.video_frame_jobs_dropped,
+                "video_frame_jobs_dropped_oldest": self.video_frame_jobs_dropped_oldest,
+                "video_frame_jobs_dropped_newest": self.video_frame_jobs_dropped_newest,
+                "video_frame_jobs_dropped_oldest_steps": self.video_frame_jobs_dropped_oldest_steps,
                 "video_frame_queue_overflow": self.args.video_frame_queue_overflow,
+                "video_snapshot_grid_max_dim": self.args.video_snapshot_grid_max_dim,
+                "video_snapshot_jpeg_quality": self.args.video_snapshot_jpeg_quality,
+                "video_snapshot_categorical_format": self.args.video_snapshot_categorical_format,
+                "video_occ_crop_margin_m": self.args.video_occ_crop_margin_m,
                 "runtime_video_encode": bool(self.args.runtime_video_encode),
                 "video_save_panel_frames": bool(self.args.video_save_panel_frames),
                 "video_save_composite_frames": bool(self.args.video_save_composite_frames),
@@ -7169,6 +7610,30 @@ def _parse_args() -> argparse.Namespace:
         default=3.0,
         help="Maximum age for a nearest real RGB fallback when an exact callback was dropped.",
     )
+    parser.add_argument(
+        "--video-snapshot-grid-max-dim",
+        type=int,
+        default=512,
+        help=(
+            "Largest side retained by a queued map/costmap/room-grid proxy; "
+            "path overlays remain in world coordinates."
+        ),
+    )
+    parser.add_argument(
+        "--video-snapshot-jpeg-quality",
+        type=int,
+        default=90,
+        help="JPEG quality for immutable queued map proxy bases.",
+    )
+    parser.add_argument(
+        "--video-snapshot-categorical-format",
+        choices=("png", "jpeg"),
+        default="png",
+        help=(
+            "Encoding for frozen occupancy/room-label proxies. PNG preserves "
+            "discrete map classes without JPEG color mixing."
+        ),
+    )
     parser.add_argument("--external-image-topic", default="")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--cmd-vel-stamped-topic", default="/cmd_vel_stamped")
@@ -7235,9 +7700,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--video-frame-queue-overflow",
-        choices=("drop", "block"),
+        choices=("drop", "drop_oldest", "block"),
         default="drop",
-        help="Drop full queues for throughput, or block callbacks to preserve every requested frame.",
+        help=(
+            "Drop the newest frame for throughput, replace the oldest pending "
+            "frame to keep current callback pairing, or block to preserve every "
+            "requested frame."
+        ),
     )
     parser.add_argument(
         "--video-history-size",
@@ -7286,7 +7755,21 @@ def _parse_args() -> argparse.Namespace:
         help="Log six-panel render, external callback, encoder, and PNG queue timing every N frames.",
     )
     parser.add_argument("--video-map-crop-margin-px", type=int, default=90)
-    parser.add_argument("--video-occ-crop-margin-px", type=int, default=25)
+    parser.add_argument(
+        "--video-occ-crop-margin-px",
+        type=int,
+        default=25,
+        help="Legacy pixel margin used only when --video-occ-crop-margin-m is omitted.",
+    )
+    parser.add_argument(
+        "--video-occ-crop-margin-m",
+        type=float,
+        default=2.5,
+        help=(
+            "Physical OCC-panel padding around known cells. This is applied "
+            "before proxy downsampling and is invariant to proxy resolution."
+        ),
+    )
     parser.add_argument("--video-global-panel-scale", type=float, default=1.0)
     parser.add_argument("--video-map-desync-step-warn", type=int, default=3)
     parser.add_argument("--video-map-max-age-sec", type=float, default=2.0)
@@ -7301,6 +7784,12 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args(rospy.myargv()[1:])
     if args.step_sync_capture_every < 1:
         parser.error("--step-sync-capture-every must be at least one")
+    if args.video_snapshot_grid_max_dim < 16:
+        parser.error("--video-snapshot-grid-max-dim must be at least 16")
+    if not 1 <= args.video_snapshot_jpeg_quality <= 100:
+        parser.error("--video-snapshot-jpeg-quality must be in [1, 100]")
+    if args.video_occ_crop_margin_m < 0.0:
+        parser.error("--video-occ-crop-margin-m must be non-negative")
     return args
 
 

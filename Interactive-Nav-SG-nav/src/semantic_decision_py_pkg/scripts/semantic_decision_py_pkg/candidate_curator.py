@@ -24,11 +24,16 @@ class CandidateCuratorConfig:
     region_size_m: float = 1.0
     repeat_guard_low_gain_limit: int = 2
     explore_min_visible_gain_ratio: float = 0.25
-    # Keep the visibility term stronger than the room-novelty term: a clearly
-    # larger observed unknown region should not lose merely because it is in
-    # a room that was seen earlier.
+    # An actually unentered room is a navigation milestone, not just a small
+    # information-gain tie breaker.  Its candidate is still demoted when a
+    # high-confidence observed room attribute conflicts with the object goal.
     explore_visible_unknown_area_weight: float = 0.50
-    explore_new_room_bonus: float = 0.15
+    explore_new_room_bonus: float = 0.70
+    explore_potential_child_room_bonus: float = 0.25
+    explore_room_target_affinity_bonus: float = 0.20
+    explore_room_target_mismatch_penalty: float = 0.60
+    room_target_mismatch_confidence_threshold: float = 0.75
+    reserve_unentered_room_frontier_slots: int = 1
     goal_position_tolerance_m: float = 0.35
     goal_yaw_tolerance_rad: float = 0.50
     # In object-goal mode an observed container whose semantics contradict the
@@ -49,6 +54,8 @@ class CandidateCurationResult:
     ranked_ids_by_type: dict[str, list[str]] = field(default_factory=dict)
     mandatory_ids: list[str] = field(default_factory=list)
     decision_hint_by_id: dict[str, str] = field(default_factory=dict)
+    entered_room_ids: list[str] = field(default_factory=list)
+    reserved_new_room_ids: list[str] = field(default_factory=list)
 
     def trace(self) -> dict[str, Any]:
         return {
@@ -71,6 +78,8 @@ class CandidateCurationResult:
             "rejected": dict(self.rejected),
             "omitted": dict(self.omitted),
             "decision_hint_by_id": dict(self.decision_hint_by_id),
+            "entered_room_ids": list(self.entered_room_ids),
+            "reserved_new_room_ids": list(self.reserved_new_room_ids),
         }
 
 
@@ -119,6 +128,8 @@ def candidate_room_id(candidate: BehaviorCandidate, graph: dict[str, Any]) -> st
     closest_distance_sq = float("inf")
     for node in graph.get("nodes") or []:
         if str(node.get("type") or "").casefold() != "room":
+            continue
+        if not bool((node.get("attributes") or {}).get("active", True)):
             continue
         centroid = list(node.get("centroid") or [])
         if len(centroid) < 2:
@@ -271,6 +282,35 @@ def validate_candidate_update(
         if yaw_delta > max(0.0, float(yaw_tolerance_rad)):
             return CandidateValidationResult(False, "candidate_goal_yaw_changed")
     return CandidateValidationResult(True, "candidate_content_compatible", latest)
+
+
+def preserve_missing_explore_candidate_update(
+    selected: BehaviorCandidate,
+    validation: CandidateValidationResult,
+    *,
+    priority_target_candidate_id: str = "",
+) -> CandidateValidationResult:
+    """Retain a committed frontier goal across a reclustering-only refresh.
+
+    Frontier cluster ids are map-derived and can disappear as soon as the
+    sensor observes their boundary.  Once the decision node has selected an
+    EXPLORE candidate, that disappearance alone must not replace its original
+    navigation goal.  A newly available reliable target still takes priority,
+    and all other validation failures remain safety-relevant.
+    """
+
+    if (
+        validation.valid
+        or validation.reason != "candidate_missing"
+        or _normalized_behavior_type(selected) != "EXPLORE"
+        or str(priority_target_candidate_id or "")
+    ):
+        return validation
+    return CandidateValidationResult(
+        True,
+        "explore_candidate_missing_preserved",
+        selected,
+    )
 
 
 def _clamp01(value: Any, default: float = 0.0) -> float:
@@ -674,45 +714,18 @@ def _history_explore_room_id(history_key: str) -> str:
     return _known_room_id(parts[1])
 
 
-def _history_records_room_visit(history: dict[str, Any]) -> bool:
-    for field in ("selection_count", "visit_count"):
-        try:
-            if float(history.get(field, 0) or 0) > 0.0:
-                return True
-        except (TypeError, ValueError):
-            continue
-    # The node writes this field together with selection_count.  Keeping this
-    # fallback makes the curator compatible with persisted history from older
-    # runs that may not contain the counter yet (step zero is still a visit).
-    return "last_selected_step" in history
-
-
-def _visited_explore_room_ids(
-    history_by_key: dict[str, dict[str, Any]],
-) -> set[str]:
-    visited: set[str] = set()
-    for history_key, history in history_by_key.items():
-        if not isinstance(history, dict) or not _history_records_room_visit(history):
-            continue
-        room_id = _history_explore_room_id(history_key)
-        if room_id:
-            visited.add(room_id)
-    return visited
-
-
 def _new_room_frontier_ids(
     candidates: Iterable[BehaviorCandidate],
     graph: dict[str, Any],
-    visited_room_ids: set[str],
+    entered_room_ids: set[str],
 ) -> set[str]:
-    """Find eligible frontiers in observed rooms that have not been visited.
+    """Find eligible frontiers in rooms the base has not physically entered.
 
-    A candidate reaches this helper only after normal curator validation.  The
-    explicit false checks below additionally keep a room novelty bonus off a
-    candidate whose local reachability metadata became unavailable.  Room
-    identity comes from the candidate when present, otherwise the already-used
-    observation graph association in :func:`candidate_room_id`; no simulator
-    or benchmark ground truth is consulted.
+    Decision selection is deliberately not evidence of a room visit: the
+    selected frontier can fail before crossing a door.  ``entered_room_ids``
+    is maintained from robot pose/room geometry by the decision node.  The
+    explicit false checks below retain existing safety semantics for a stale
+    local-reachability assertion.
     """
     result: set[str] = set()
     for candidate in candidates:
@@ -724,14 +737,154 @@ def _new_room_frontier_ids(
             for key in ("reachable", "path_reachable", "approach_reachable")
         ):
             continue
-        room_id = _known_room_id(candidate_room_id(candidate, graph))
-        if not room_id or room_id in visited_room_ids:
+        # New-room status needs an observed/portal-child assignment.  A
+        # nearest-centroid fallback is only useful for grouping legacy
+        # candidates and must not manufacture a room transition.
+        room_id = _known_room_id(_explicit_candidate_room_id(candidate))
+        if not room_id or room_id in entered_room_ids:
             continue
         robot_room_id = _known_room_id(metadata.get("robot_room_id"))
-        if robot_room_id and room_id == robot_room_id:
+        # Without a current physical-room label this is an ordinary legacy
+        # frontier, not evidence of a cross-room opportunity.
+        if not robot_room_id or room_id == robot_room_id:
             continue
         result.add(candidate.candidate_id)
     return result
+
+
+def _room_node_for_candidate(
+    candidate: BehaviorCandidate, graph: dict[str, Any]
+) -> dict[str, Any]:
+    room_id = _known_room_id(_explicit_candidate_room_id(candidate))
+    if not room_id:
+        return {}
+    normalized = room_id.removeprefix("room_")
+    for node in graph.get("nodes") or []:
+        if str(node.get("type") or "").casefold() != "room":
+            continue
+        node_room = _known_room_id(node.get("room_id") or node.get("id"))
+        if node_room and node_room.removeprefix("room_") == normalized:
+            return node
+    return {}
+
+
+def _normalized_room_attribute(value: Any) -> str:
+    return " ".join(
+        str(value or "").casefold().replace("_", " ").replace("-", " ").split()
+    )
+
+
+def _room_target_affinity(
+    candidate: BehaviorCandidate,
+    graph: dict[str, Any],
+    target_context: dict[str, Any] | None,
+    *,
+    mismatch_confidence_threshold: float,
+) -> tuple[float, str, float, str]:
+    """Return affinity, reason, confidence and observed room attribute.
+
+    This only uses the public target label and observation-derived room
+    attribute.  Unknown/potential rooms remain neutral; a mismatch is applied
+    only when the room classifier itself is sufficiently confident.
+    """
+
+    target_context = target_context or {}
+    if not bool(target_context.get("enabled")):
+        return 0.0, "target_disabled", 0.0, ""
+    target = _target_tokens(target_context)
+    if not target:
+        return 0.0, "target_semantics_unknown", 0.0, ""
+    room_node = _room_node_for_candidate(candidate, graph)
+    metadata = candidate.metadata or {}
+    attributes = room_node.get("attributes") or {}
+    room_attribute = str(
+        metadata.get("room_attribute")
+        or attributes.get("room_attribute")
+        or ""
+    ).strip()
+    normalized_room = _normalized_room_attribute(room_attribute)
+    if not normalized_room or normalized_room == "unknown":
+        return 0.0, "room_attribute_unknown", 0.0, ""
+    try:
+        confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    metadata.get(
+                        "room_attribute_confidence",
+                        attributes.get("room_attribute_confidence", 0.0),
+                    )
+                    or 0.0
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        confidence = 0.0
+    is_food_or_kitchen_item = _contains_semantic_term(
+        target, _FOOD_TOKENS | _KITCHEN_ITEM_TOKENS
+    )
+    is_personal = _contains_semantic_term(target, _PERSONAL_TOKENS)
+    kitchen_rooms = {"kitchen", "dining room"}
+    personal_rooms = {"bedroom", "office", "living room"}
+    if is_food_or_kitchen_item:
+        if normalized_room in kitchen_rooms:
+            return 1.0, "room_target_semantic_match", confidence, room_attribute
+        if confidence >= max(0.0, float(mismatch_confidence_threshold)):
+            return -1.0, "room_target_high_confidence_mismatch", confidence, room_attribute
+    elif is_personal:
+        if normalized_room in personal_rooms:
+            return 1.0, "room_target_semantic_match", confidence, room_attribute
+        if confidence >= max(0.0, float(mismatch_confidence_threshold)):
+            return -1.0, "room_target_high_confidence_mismatch", confidence, room_attribute
+    return 0.0, "room_target_semantic_unknown", confidence, room_attribute
+
+
+def _annotate_frontier_room_state(
+    candidates: Iterable[BehaviorCandidate],
+    graph: dict[str, Any],
+    entered_room_ids: set[str],
+    new_room_frontier_ids: set[str],
+    target_context: dict[str, Any] | None,
+    config: CandidateCuratorConfig,
+) -> dict[str, tuple[float, str, float, str]]:
+    """Expose physical room state and target affinity in candidate metadata."""
+
+    affinity_by_id: dict[str, tuple[float, str, float, str]] = {}
+    for candidate in candidates:
+        if _normalized_behavior_type(candidate) != "EXPLORE":
+            continue
+        metadata = candidate.metadata
+        room_id = _known_room_id(_explicit_candidate_room_id(candidate))
+        robot_room_id = _known_room_id(metadata.get("robot_room_id"))
+        if not room_id:
+            room_status = "unknown_room"
+        elif room_id in entered_room_ids:
+            room_status = "entered_room"
+        elif robot_room_id and room_id == robot_room_id:
+            room_status = "current_room"
+        elif candidate.candidate_id in new_room_frontier_ids:
+            room_status = "unentered_new_room"
+        else:
+            room_status = "other_room"
+        metadata["room_status"] = room_status
+        metadata["target_room_id"] = metadata.get("target_room_id") or room_id
+        metadata["room_id"] = metadata.get("room_id") or room_id
+        affinity = _room_target_affinity(
+            candidate,
+            graph,
+            target_context,
+            mismatch_confidence_threshold=config.room_target_mismatch_confidence_threshold,
+        )
+        affinity_by_id[candidate.candidate_id] = affinity
+        value, reason, confidence, room_attribute = affinity
+        metadata["room_target_affinity"] = value
+        metadata["room_target_affinity_reason"] = reason
+        if confidence > 0.0:
+            metadata["room_attribute_confidence"] = confidence
+        if room_attribute:
+            metadata["room_attribute"] = room_attribute
+    return affinity_by_id
 
 
 class CandidateCurator:
@@ -781,9 +934,15 @@ class CandidateCurator:
         history_by_key: dict[str, dict[str, Any]] | None = None,
         observation_step: int = 0,
         target_context: dict[str, Any] | None = None,
+        entered_room_ids: Iterable[Any] | None = None,
     ) -> CandidateCurationResult:
         graph = graph or {}
         history_by_key = history_by_key or {}
+        entered_room_ids = {
+            room_id
+            for room_id in (_known_room_id(value) for value in (entered_room_ids or []))
+            if room_id
+        }
         accepted, rejected = self.filter_candidates(
             candidates,
             graph=graph,
@@ -834,6 +993,11 @@ class CandidateCurator:
             for behavior_type in SUPPORTED_BEHAVIOR_TYPES
         }
         explore_pool = pools["EXPLORE"]
+        eligible_new_room_frontier_ids = _new_room_frontier_ids(
+            explore_pool,
+            graph,
+            entered_room_ids,
+        )
         expected_visible_area_by_id = {
             candidate.candidate_id: _expected_visible_unknown_area(candidate)
             for candidate in explore_pool
@@ -852,6 +1016,7 @@ class CandidateCurator:
                 if expected_visible_area_by_id[candidate.candidate_id]
                 + 1e-9
                 >= minimum_visible_area
+                or candidate.candidate_id in eligible_new_room_frontier_ids
             ]
             if visible_gain_pool:
                 for candidate in explore_pool:
@@ -864,7 +1029,8 @@ class CandidateCurator:
         non_repeated_explore = [
             candidate
             for candidate in explore_pool
-            if int(
+            if candidate.candidate_id in eligible_new_room_frontier_ids
+            or int(
                 (
                     history_by_key.get(history_key_by_id[candidate.candidate_id]) or {}
                 ).get("low_gain_repeat_count", 0)
@@ -878,11 +1044,18 @@ class CandidateCurator:
                     omitted[candidate.candidate_id] = "history_low_gain_suppressed"
             pools["EXPLORE"] = non_repeated_explore
 
-        visited_explore_room_ids = _visited_explore_room_ids(history_by_key)
         new_room_frontier_ids = _new_room_frontier_ids(
             pools["EXPLORE"],
             graph,
-            visited_explore_room_ids,
+            entered_room_ids,
+        )
+        room_affinity_by_id = _annotate_frontier_room_state(
+            accepted,
+            graph,
+            entered_room_ids,
+            new_room_frontier_ids,
+            target_context,
+            self.config,
         )
         quality_by_id: dict[str, float] = {}
         quality_terms_by_id: dict[str, dict[str, float]] = {}
@@ -893,6 +1066,7 @@ class CandidateCurator:
                 history_by_key,
                 history_key_by_id,
                 new_room_frontier_ids,
+                room_affinity_by_id,
             )
             quality_by_id.update(scores)
             quality_terms_by_id.update(terms)
@@ -912,7 +1086,13 @@ class CandidateCurator:
                 topology_scores.get(candidate_id, 0.0)
             )
         for candidate_id in sorted(new_room_frontier_ids):
-            decision_hint_by_id.setdefault(candidate_id, "NEW_ROOM_FRONTIER")
+            affinity = room_affinity_by_id.get(candidate_id, (0.0, "", 0.0, ""))
+            hint = (
+                "NEW_ROOM_FRONTIER_HIGH_CONFIDENCE_MISMATCH"
+                if affinity[1] == "room_target_high_confidence_mismatch"
+                else "NEW_ROOM_FRONTIER"
+            )
+            decision_hint_by_id.setdefault(candidate_id, hint)
         ranked = {
             behavior_type: sorted(
                 pool,
@@ -934,11 +1114,14 @@ class CandidateCurator:
                 for candidate in accepted
                 if bool((candidate.metadata or {}).get("target_goal"))
                 or bool((candidate.metadata or {}).get("target_match"))
+                or bool((candidate.metadata or {}).get("post_interaction_traversal"))
             ],
             key=lambda candidate: (
                 0
                 if bool((candidate.metadata or {}).get("target_goal"))
-                else 1,
+                else 1
+                if bool((candidate.metadata or {}).get("post_interaction_traversal"))
+                else 2,
                 candidate.candidate_id,
             ),
         )
@@ -974,6 +1157,17 @@ class CandidateCurator:
 
         for candidate in mandatory:
             add(candidate, mandatory_candidate=True)
+
+        reserved_new_room_ids: list[str] = []
+        for candidate in ranked["EXPLORE"]:
+            if len(reserved_new_room_ids) >= max(
+                0, int(self.config.reserve_unentered_room_frontier_slots)
+            ):
+                break
+            if candidate.candidate_id not in new_room_frontier_ids:
+                continue
+            if add(candidate):
+                reserved_new_room_ids.append(candidate.candidate_id)
 
         quotas = {
             "NAVIGATE": max(0, int(self.config.navigate_quota)),
@@ -1021,6 +1215,8 @@ class CandidateCurator:
             ranked_ids_by_type=ranked_ids_by_type,
             mandatory_ids=[candidate.candidate_id for candidate in mandatory],
             decision_hint_by_id=decision_hint_by_id,
+            entered_room_ids=sorted(entered_room_ids),
+            reserved_new_room_ids=reserved_new_room_ids,
         )
 
     def _score_pool(
@@ -1030,6 +1226,7 @@ class CandidateCurator:
         history_by_key: dict[str, dict[str, Any]],
         history_key_by_id: dict[str, str],
         new_room_frontier_ids: set[str],
+        room_affinity_by_id: dict[str, tuple[float, str, float, str]],
     ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
         if not pool:
             return {}, {}
@@ -1114,6 +1311,27 @@ class CandidateCurator:
                         0.0, float(self.config.explore_new_room_bonus)
                     )
                     if candidate.candidate_id in new_room_frontier_ids
+                    else 0.0,
+                    "potential_child_room_bonus": max(
+                        0.0, float(self.config.explore_potential_child_room_bonus)
+                    )
+                    if candidate.candidate_id in new_room_frontier_ids
+                    and bool((candidate.metadata or {}).get("potential_room"))
+                    else 0.0,
+                    "room_target_affinity": max(
+                        0.0,
+                        float(self.config.explore_room_target_affinity_bonus),
+                    )
+                    if room_affinity_by_id.get(candidate.candidate_id, (0.0,))[0]
+                    > 0.0
+                    else 0.0,
+                    "high_confidence_room_target_mismatch_penalty": -max(
+                        0.0,
+                        float(self.config.explore_room_target_mismatch_penalty),
+                    )
+                    if candidate.candidate_id in new_room_frontier_ids
+                    and room_affinity_by_id.get(candidate.candidate_id, (0.0,))[0]
+                    < 0.0
                     else 0.0,
                 }
                 for candidate in pool

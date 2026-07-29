@@ -4,21 +4,34 @@ from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
     NavigationProgressWatchdog,
+    PostInteractionCostmapBaseline,
+    PostInteractionRawMapBarrier,
     STATE_APPROACH_INTERACTION,
     STATE_FINALIZING_EXPLORE,
     STATE_INTERACTING,
     STATE_NAVIGATING,
     STATE_PREPARING_EXPLORE,
     STATE_SUCCEEDED,
+    STATE_WAITING_FOR_DRAWER_SCAN,
     STATE_VERIFYING,
     bounded_empty_plan_retry_delay,
     committed_turn_sign,
     is_post_interaction_traversal_navigation,
     navigation_goal_options,
+    navigation_prerotation_heading_target,
     navigation_requires_final_yaw,
     navigation_should_prerotate,
+    next_interaction_approach_option_index,
     normalize_angle,
     path_lookahead_point,
+    post_open_path_is_confirmed,
+    post_open_path_retryable_preflight_reason,
+    post_interaction_costmap_baseline_keys,
+    post_interaction_costmap_receipts_fresh_source,
+    post_interaction_costmap_fresh_source,
+    post_interaction_costmap_is_fresh,
+    post_interaction_planning_occupancy_fresh_source,
+    post_interaction_raw_occupancy_fresh_source,
     prerotation_control_step_budget,
     prerotation_rgb_step_gate,
     requires_graph_verification,
@@ -41,12 +54,74 @@ def test_navigation_progress_watchdog_resets_on_translation_or_rotation() -> Non
     assert not watchdog.observe((0.0, 0.0, 0.17), now=22.0)
 
 
-def test_stuck_recovery_requires_explicit_stagnation_or_oscillation() -> None:
+def test_navigation_progress_watchdog_keeps_a_fresh_local_plan_making_goal_progress() -> None:
+    watchdog = NavigationProgressWatchdog(
+        timeout_s=12.0,
+        min_displacement_m=0.10,
+        min_goal_distance_reduction_m=0.02,
+    )
+    watchdog.reset((0.0, 0.0, 0.0), now=0.0, goal_distance_m=2.0)
+
+    # The base has moved less than 10 cm, but an active local plan has made a
+    # real 3 cm reduction toward the selected goal.  This must not become a
+    # false semantic "stagnation" cancellation.
+    assert not watchdog.observe(
+        (0.03, 0.0, 0.0),
+        now=12.0,
+        goal_distance_m=1.97,
+        local_plan_fresh=True,
+    )
+    assert not watchdog.observe(
+        (0.03, 0.0, 0.0),
+        now=23.9,
+        goal_distance_m=1.97,
+        local_plan_fresh=False,
+    )
+    assert watchdog.observe(
+        (0.03, 0.0, 0.0),
+        now=24.0,
+        goal_distance_m=1.97,
+        local_plan_fresh=False,
+    )
+
+
+def test_stuck_recovery_accepts_repeated_no_progress_plan_failures() -> None:
     assert is_stuck_recovery_failure({"reason": "navigation_stagnation"})
     assert is_stuck_recovery_failure({"status": "Robot appears to be oscillating"})
-    assert not is_stuck_recovery_failure({"reason": "make_plan_unreachable"})
+    assert is_stuck_recovery_failure({"reason": "make_plan_unreachable"})
+    assert is_stuck_recovery_failure({"status": "Failed to get a plan"})
     assert not is_stuck_recovery_failure({"reason": "final_yaw_alignment_failed"})
     assert not is_stuck_recovery_failure({"status_code": 4, "status": "ABORTED"})
+
+
+def test_interaction_approach_fallback_is_stagnation_only_and_bounded() -> None:
+    kwargs = {
+        "behavior_type": "INTERACT",
+        "failure_detail": {"reason": "navigation_stagnation"},
+        "selected_option_index": 0,
+        "attempted_navigation_count": 1,
+        "max_navigation_attempts": 3,
+        "goal_option_count": 4,
+    }
+    assert next_interaction_approach_option_index(**kwargs) == 1
+    assert (
+        next_interaction_approach_option_index(
+            **{**kwargs, "attempted_navigation_count": 3}
+        )
+        is None
+    )
+    assert (
+        next_interaction_approach_option_index(
+            **{**kwargs, "failure_detail": {"reason": "make_plan_unreachable"}}
+        )
+        is None
+    )
+    assert (
+        next_interaction_approach_option_index(
+            **{**kwargs, "behavior_type": "NAVIGATE"}
+        )
+        is None
+    )
 
 
 def test_safe_grid_motion_distance_stops_before_rear_obstacle() -> None:
@@ -177,6 +252,11 @@ def test_path_lookahead_uses_plan_direction_instead_of_final_goal_bearing() -> N
     assert lookahead == (-0.8, 0.1)
 
 
+def test_navigation_prerotation_never_falls_back_to_final_goal() -> None:
+    assert navigation_prerotation_heading_target(None) is None
+    assert navigation_prerotation_heading_target((-0.8, 0.1)) == (-0.8, 0.1)
+
+
 def test_navigation_goal_options_preserve_nearest_first_and_remove_duplicates() -> None:
     candidate = {
         "goal_xyyaw": [1.0, 2.0, 0.0],
@@ -225,6 +305,96 @@ def test_post_interaction_traversal_retry_is_scoped_to_navigate_continuation() -
     )
 
 
+def test_post_open_costmap_gate_requires_a_new_receipt_after_open() -> None:
+    baseline = PostInteractionCostmapBaseline(
+        portal_id="portal_47",
+        source_event_id="object_skill_000047",
+        receipt_count=18,
+        header_seq=941,
+        update_receipt_count=41,
+        update_header_seq=502,
+    )
+
+    # Header values are diagnostic only: local receipt counters must advance.
+    # Incremental costmap_updates are primary; sparse full-grid publications
+    # remain a valid fallback.
+    assert not post_interaction_costmap_is_fresh(baseline, 18, 41)
+    assert post_interaction_costmap_fresh_source(baseline, 19, 41) == "full"
+    assert post_interaction_costmap_is_fresh(baseline, 19, 41)
+    assert (
+        post_interaction_costmap_fresh_source(baseline, 18, 42)
+        == "costmap_update"
+    )
+    assert (
+        post_interaction_costmap_fresh_source(baseline, 19, 42)
+        == "costmap_update"
+    )
+
+
+def test_post_open_causal_map_gate_requires_raw_then_planning_then_costmap() -> None:
+    baseline = PostInteractionCostmapBaseline(
+        portal_id="portal_47",
+        source_event_id="object_skill_000047",
+        receipt_count=18,
+        update_receipt_count=41,
+        raw_occupancy_receipt_count=7,
+        planning_occupancy_receipt_count=12,
+        interaction_result_stamp_sec=100.0,
+    )
+
+    # A raw map received after the result but stamped before it is precisely
+    # the residual-map failure this gate must reject.
+    assert post_interaction_raw_occupancy_fresh_source(baseline, 8, 99.9) == ""
+    assert (
+        post_interaction_raw_occupancy_fresh_source(baseline, 8, 100.1)
+        == "header_stamp"
+    )
+    raw_barrier = PostInteractionRawMapBarrier(
+        receipt_count=8,
+        header_seq=71,
+        header_stamp_sec=100.1,
+        planning_occupancy_receipt_count=12,
+    )
+
+    # The planning grid must arrive after that raw callback and retain its
+    # source timestamp (semantic_mapping copies the raw map header).
+    assert (
+        post_interaction_planning_occupancy_fresh_source(
+            raw_barrier, 12, 100.1
+        )
+        == ""
+    )
+    assert (
+        post_interaction_planning_occupancy_fresh_source(
+            raw_barrier, 13, 100.0
+        )
+        == ""
+    )
+    assert (
+        post_interaction_planning_occupancy_fresh_source(
+            raw_barrier, 13, 100.1
+        )
+        == "source_header_stamp"
+    )
+
+    # Only a global publication after the admitted planning map can release
+    # make_plan.  An earlier residual delta does not count.
+    assert post_interaction_costmap_receipts_fresh_source(18, 41, 18, 41) == ""
+    assert (
+        post_interaction_costmap_receipts_fresh_source(18, 41, 18, 42)
+        == "costmap_update"
+    )
+
+
+def test_post_open_costmap_gate_prefers_exact_event_then_portal_fallback() -> None:
+    assert post_interaction_costmap_baseline_keys(
+        "object_skill_000047", "portal_47"
+    ) == ("event:object_skill_000047", "portal:portal_47")
+    assert post_interaction_costmap_baseline_keys("", "portal_47") == (
+        "portal:portal_47",
+    )
+
+
 def test_empty_plan_retry_delay_is_bounded_by_deadline() -> None:
     assert bounded_empty_plan_retry_delay(10.0, 18.0, 0.5) == 0.5
     assert math.isclose(
@@ -234,6 +404,21 @@ def test_empty_plan_retry_delay_is_bounded_by_deadline() -> None:
     )
     assert bounded_empty_plan_retry_delay(18.0, 18.0, 0.5) is None
     assert bounded_empty_plan_retry_delay(18.1, 18.0, 0.5) is None
+
+
+def test_post_open_path_waits_for_transient_planner_availability() -> None:
+    assert post_open_path_retryable_preflight_reason("empty_plan")
+    assert post_open_path_retryable_preflight_reason("endpoint_mismatch")
+    assert post_open_path_retryable_preflight_reason("service_unavailable")
+    assert post_open_path_retryable_preflight_reason("pose_unavailable")
+    assert not post_open_path_retryable_preflight_reason("disabled")
+
+
+def test_post_open_path_rejects_normal_navigation_fail_open_result() -> None:
+    assert post_open_path_is_confirmed(True, "reachable")
+    assert not post_open_path_is_confirmed(True, "service_unavailable")
+    assert not post_open_path_is_confirmed(True, "pose_unavailable")
+    assert not post_open_path_is_confirmed(False, "empty_plan")
 
 
 def test_target_navigation_uses_graph_verification_for_mllm_module3() -> None:
@@ -273,6 +458,55 @@ def test_interaction_execution_orders_approach_action_and_verification() -> None
     assert machine.state == STATE_SUCCEEDED
     assert terminal[0]["kind"] == "terminal"
     assert terminal[0]["success"] is True
+
+
+def test_drawer_interaction_waits_for_post_arrival_public_scan_frame() -> None:
+    machine = BehaviorExecutionStateMachine(
+        ExecutionConfig(drawer_scan_wait_timeout_s=2.0)
+    )
+    candidate = interaction_candidate()
+    commands = machine.start(candidate, now=0.0)
+    assert commands[0]["kind"] == "navigate"
+
+    commands = machine.on_navigation_result(
+        True,
+        now=1.0,
+        wait_for_drawer_scan=True,
+    )
+    assert machine.state == STATE_WAITING_FOR_DRAWER_SCAN
+    assert commands[0]["kind"] == "wait_for_drawer_scan"
+    assert machine.timeout_reason(now=2.9) == ""
+    assert machine.timeout_reason(now=3.1) == "drawer_scan_fresh_frame_timeout"
+
+    fresh_candidate = {
+        **candidate,
+        "interaction_command": {
+            "sequence_type": "drawer_scan",
+            "drawer_container_bbox_2d": [10.0, 20.0, 30.0, 40.0],
+            "drawer_container_capture_step": 42,
+        },
+    }
+    commands = machine.on_drawer_scan_ready(fresh_candidate, now=1.2)
+    assert machine.state == STATE_INTERACTING
+    assert commands[0]["kind"] == "publish_drawer_scan"
+    assert commands[0]["candidate"]["interaction_command"][
+        "drawer_container_capture_step"
+    ] == 42
+
+
+def test_drawer_interaction_fresh_frame_timeout_is_explicit() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(interaction_candidate(), now=0.0)
+    machine.on_navigation_result(True, now=1.0, wait_for_drawer_scan=True)
+
+    terminal = machine.on_drawer_scan_wait_failed(
+        {"reason": "drawer_scan_fresh_frame_timeout", "last_reason": "rgb_image_not_fresh"},
+        now=2.0,
+    )
+
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is False
+    assert machine.error == "drawer_scan_fresh_frame_timeout"
 
 
 def test_explore_behavior_reserves_navigates_and_finalizes() -> None:

@@ -156,6 +156,9 @@ class EpisodeResult:
     runtime_goal_consistency: dict[str, Any] | None = None
     runtime_consistency: dict[str, Any] | None = None
     timing_summary: dict[str, Any] = field(default_factory=dict)
+    # Evaluator-side termination diagnostics.  A triggered guard is a normal
+    # scored failure, not a runtime exception or scoring exclusion.
+    early_stop: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

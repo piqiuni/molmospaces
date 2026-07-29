@@ -68,6 +68,12 @@ from .ros_object_goal_adapter import (
     RosObjectGoalEvaluatorAdapter,
     build_public_target_context as build_ros_target_context,
 )
+from .ros_navigation_stall import (
+    CROSS_SUBGOAL_STALL_REASON,
+    CrossSubgoalStallConfig,
+    CrossSubgoalStallTracker,
+    RosBehaviorFeedbackObserver,
+)
 from .trusted_interaction_skill import (
     JointOpenResult,
     ObjectInteractionRequest,
@@ -78,7 +84,7 @@ from .trusted_interaction_skill import (
 )
 
 
-PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v8"
+PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v9"
 STEP_BUDGET_FORMULA_VERSION = "interactive_nav_v3_step_budget_v1"
 DYNAMIC_MAX_STEPS_CAP = 2000
 
@@ -137,6 +143,11 @@ class BenchmarkEvaluationConfig:
     ros_restricted_gt_topic: str = "/semantic_mapping/gt_observations"
     ros_interaction_command_topic: str = "/semantic_decision/interaction_command"
     ros_interaction_result_topic: str = "/semantic_mapping/interaction_result"
+    ros_behavior_feedback_topic: str = "/semantic_decision/behavior_feedback"
+    ros_stall_early_stop_enabled: bool = True
+    ros_stall_min_failed_subgoals: int = 8
+    ros_stall_max_displacement_m: float = 0.15
+    ros_stall_min_no_progress_steps: int = 20
     restricted_gt_min_visible_pixels: int = 16
     restricted_gt_min_bbox_area_pixels: int = 512
     restricted_gt_max_distance_m: float = 4.0
@@ -221,6 +232,15 @@ class BenchmarkEvaluationConfig:
             raise ValueError("restricted_gt_max_distance_m must be finite and non-negative")
         if self.progress_every < 1:
             raise ValueError("progress_every must be >= 1")
+        if self.ros_stall_min_failed_subgoals < 2:
+            raise ValueError("ros_stall_min_failed_subgoals must be >= 2")
+        if (
+            not math.isfinite(float(self.ros_stall_max_displacement_m))
+            or self.ros_stall_max_displacement_m <= 0.0
+        ):
+            raise ValueError("ros_stall_max_displacement_m must be finite and positive")
+        if self.ros_stall_min_no_progress_steps < 0:
+            raise ValueError("ros_stall_min_no_progress_steps must be >= 0")
         for name, value in (
             ("runtime_joint_position_tolerance", self.runtime_joint_position_tolerance),
             ("runtime_joint_fraction_tolerance", self.runtime_joint_fraction_tolerance),
@@ -2187,6 +2207,68 @@ def _consume_pending_ros_object_goal_interaction(
     request = runtime.adapter.pop_next_interaction_request()
     if request is None:
         return None
+    rejection_reason = str(getattr(request, "rejection_reason", "") or "")
+    if rejection_reason:
+        # A geometric semantic doorway can be selectable by the navigation
+        # method even when it has no evaluator-registered articulated object.
+        # This is an invalid interaction request, not a failed force skill:
+        # record it in the formal attempt counts while preserving genuine
+        # execution failures for registered objects below.
+        completion = runtime.adapter.complete_interaction(
+            request.command_id,
+            success=False,
+            status="INVALID",
+            reason=rejection_reason,
+        )
+        public_request = ObjectInteractionRequest(
+            request_id=request.command_id,
+            instance_id=request.instance_id,
+            operation="open",
+        )
+        public_result = {
+            **public_request.to_public_dict(),
+            "status": "invalid",
+            "reason": rejection_reason,
+        }
+        private_attempt = InteractionAttempt(
+            requested=public_request.to_public_dict(),
+            classification="invalid",
+            resolved_object_name=None,
+            resolved_joint_name=None,
+            resolved_joint_index=None,
+            resolved_interaction_id=None,
+            success=False,
+            joint_fraction_before=None,
+            joint_fraction_after=None,
+            prerequisite_satisfied=None,
+            executor=None,
+            simulated_seconds=0.0,
+            metadata={
+                "rejection": {
+                    "reason": rejection_reason,
+                    "node_id": request.node_id,
+                    "candidate_id": request.candidate_id,
+                    "rejected_before_execution": True,
+                }
+            },
+        ).to_dict()
+        public_attempt = {
+            **public_result,
+            "decision_step": int(decision_index),
+            "simulated_seconds": 0.0,
+            "result_status": str(completion.get("status") or "INVALID"),
+        }
+        observation = task.get_observations()
+        _capture_head_frame(task, frames, config.record_video)
+        _publish_restricted_ros_frame(runtime, task, decision_index=decision_index)
+        _discard_task_rollout_cache(task)
+        return {
+            "private_attempt": private_attempt,
+            "public_attempt": public_attempt,
+            "simulated_seconds": 0.0,
+            "observation": observation,
+            "target_discovery": None,
+        }
     source_name = runtime.opaque_to_source_name.get(request.instance_id)
     joints = runtime.opaque_to_joints.get(request.instance_id, ())
     public_request = ObjectInteractionRequest(
@@ -2578,6 +2660,7 @@ def _protocol_implementation_sha256() -> str:
         Path(__file__).with_name("public_goal.py"),
         Path(__file__).with_name("restricted_gt_perception.py"),
         Path(__file__).with_name("ros_object_goal_adapter.py"),
+        Path(__file__).with_name("ros_navigation_stall.py"),
         Path(__file__).with_name("trusted_interaction_skill.py"),
         Path(interactive_nav_v3.__file__),
     ):
@@ -2642,6 +2725,17 @@ def evaluate_episode(
     attempts: list[dict[str, Any]] = []
     public_attempts: list[dict[str, Any]] = []
     restricted_ros_runtime: RestrictedRosObjectGoalRuntime | None = None
+    ros_behavior_feedback: RosBehaviorFeedbackObserver | None = None
+    stall_tracker = CrossSubgoalStallTracker(
+        CrossSubgoalStallConfig(
+            enabled=bool(
+                _is_current_ros_policy(config) and config.ros_stall_early_stop_enabled
+            ),
+            min_failed_subgoals=int(config.ros_stall_min_failed_subgoals),
+            max_displacement_m=float(config.ros_stall_max_displacement_m),
+            min_no_progress_steps=int(config.ros_stall_min_no_progress_steps),
+        )
+    )
     navigation_steps = 0
     view_actions = 0
     nav_path_length = 0.0
@@ -2760,6 +2854,18 @@ def evaluate_episode(
                     episode_index=episode_index,
                     frame_callback=lambda: _capture_head_frame(task, frames, config.record_video),
                 )
+            if stall_tracker.config.enabled:
+                try:
+                    ros_behavior_feedback = RosBehaviorFeedbackObserver(
+                        config.ros_behavior_feedback_topic
+                    )
+                    ros_behavior_feedback.begin_episode()
+                    stall_tracker.observe_pose(_base_pose_xyyaw(task)[:2], 0)
+                except Exception as exc:
+                    # A missing optional observer must not turn an otherwise
+                    # valid benchmark episode into an exception.  Its absence
+                    # remains visible in the evaluator diagnostics.
+                    stall_tracker.disable(f"{type(exc).__name__}: {exc}")
             phase_timings.record("policy_setup", phase_started)
             base_data["policy_name"] = str(getattr(policy, "name", config.policy))
             base_data["uses_oracle_gt"] = bool(getattr(policy, "uses_oracle_gt", False))
@@ -2833,6 +2939,32 @@ def evaluate_episode(
                 terminal_reason = "target_found"
                 phase_timings.record("step_total", decision_started)
                 break
+            if ros_behavior_feedback is not None:
+                phase_started = time.perf_counter()
+                base_pose = _base_pose_xyyaw(task)
+                stall_tracker.observe_pose(base_pose[:2], decision_index)
+                stalled = False
+                for feedback in ros_behavior_feedback.drain():
+                    stalled = stall_tracker.note_feedback(
+                        feedback,
+                        base_pose[:2],
+                        decision_index,
+                    ) or stalled
+                decision_timing["ros_stall_guard"] = phase_timings.record(
+                    "ros_stall_guard", phase_started
+                )
+                if stalled:
+                    terminal_reason = CROSS_SUBGOAL_STALL_REASON
+                    decision_timing["total"] = phase_timings.record(
+                        "step_total", decision_started
+                    )
+                    # This guard fires before ``policy.act``.  It therefore
+                    # has no corresponding public observation, action, or
+                    # RosBridge step-sync marker, and must not inflate the
+                    # counted evaluator steps beyond the recordable video.
+                    # The trigger remains in ``EpisodeResult.early_stop``
+                    # and the terminal trace below.
+                    break
             if restricted_ros_runtime is not None:
                 phase_started = time.perf_counter()
                 consumed = _consume_pending_ros_object_goal_interaction(
@@ -3174,6 +3306,7 @@ def evaluate_episode(
             runtime_goal_consistency=public_runtime_goal_consistency,
             runtime_consistency=public_runtime_consistency,
             timing_summary=phase_timings.summary(),
+            early_stop=stall_tracker.snapshot(),
         ).to_dict()
         if transient_target_discovery is not None and private_visualization is not None:
             # Keep the scan-time target evidence beside other evaluator-only
@@ -3201,6 +3334,8 @@ def evaluate_episode(
                 "sequence_success": terminal_score.sequence_success,
                 "non_interaction_success": terminal_score.non_interaction_success,
             }
+        if stall_tracker.snapshot().get("triggered"):
+            terminal_trace["early_stop"] = stall_tracker.snapshot()
         trace.append({"terminal": terminal_trace})
         status = "complete"
     except Exception as exc:
@@ -3256,6 +3391,7 @@ def evaluate_episode(
             runtime_goal_consistency=public_runtime_goal_consistency,
             runtime_consistency=public_runtime_consistency,
             timing_summary=phase_timings.summary(),
+            early_stop=stall_tracker.snapshot(),
         ).to_dict()
         if restricted_public_mode:
             trace.append({"exception": error})
@@ -3263,6 +3399,8 @@ def evaluate_episode(
             trace.append({"exception": error, "traceback": traceback.format_exc()})
         status = "exception"
     finally:
+        if ros_behavior_feedback is not None:
+            ros_behavior_feedback.close()
         if restricted_ros_runtime is not None:
             try:
                 restricted_ros_runtime.adapter.close()
@@ -3331,6 +3469,8 @@ def _write_reports(output_dir: Path, rows: list[dict[str, Any]], summary: dict[s
         f"- Episodes replayed: {len(rows)}",
         f"- Scoring-eligible: {summary.get('scoring_eligible_episode_count', len(rows))}",
         f"- Runtime-ineligible: {summary.get('runtime_ineligible_episode_count', 0)}",
+        f"- Early-stopped scored failures: {summary.get('early_stop_episode_count', 0)}",
+        f"- Early-stop reasons: {summary.get('early_stop_reason_counts', {})}",
         "",
         "## Formal score groups",
         "",
@@ -3342,7 +3482,8 @@ def _write_reports(output_dir: Path, rows: list[dict[str, Any]], summary: dict[s
             f"- `{name}`: n={values['episode_count']}, SR={values['success_rate']}, "
             f"TaskSR={values['task_success_rate']}, ICS={values['interaction_conditioned_success_rate']}, "
             f"NavSR={values['nav_success_rate']}, ISR={values['required_interaction_success_rate']}, "
-            f"IP={values['interaction_precision']}, SPL={values['mean_spl']}"
+            f"IP={values['interaction_precision']}, SPL={values['mean_spl']}, "
+            f"EarlyStop={values.get('early_stop_episode_count', 0)}"
         )
     report = output_dir / "report.md"
     temporary = report.with_name(f".{report.name}.{os.getpid()}.tmp")
@@ -3557,6 +3698,19 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--ros-restricted-gt-topic", default="/semantic_mapping/gt_observations")
     parser.add_argument("--ros-interaction-command-topic", default="/semantic_decision/interaction_command")
     parser.add_argument("--ros-interaction-result-topic", default="/semantic_mapping/interaction_result")
+    parser.add_argument("--ros-behavior-feedback-topic", default="/semantic_decision/behavior_feedback")
+    parser.add_argument(
+        "--ros-stall-early-stop-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "End a ROS rollout after repeated distinct NAVIGATE/EXPLORE failures "
+            "with no material simulated-base displacement."
+        ),
+    )
+    parser.add_argument("--ros-stall-min-failed-subgoals", type=int, default=8)
+    parser.add_argument("--ros-stall-max-displacement-m", type=float, default=0.15)
+    parser.add_argument("--ros-stall-min-no-progress-steps", type=int, default=20)
     parser.add_argument("--restricted-gt-min-visible-pixels", type=int, default=16)
     parser.add_argument("--restricted-gt-min-bbox-area-pixels", type=int, default=512)
     parser.add_argument(
@@ -3621,6 +3775,11 @@ def parse_args() -> BenchmarkEvaluationConfig:
         ros_restricted_gt_topic=args.ros_restricted_gt_topic,
         ros_interaction_command_topic=args.ros_interaction_command_topic,
         ros_interaction_result_topic=args.ros_interaction_result_topic,
+        ros_behavior_feedback_topic=args.ros_behavior_feedback_topic,
+        ros_stall_early_stop_enabled=args.ros_stall_early_stop_enabled,
+        ros_stall_min_failed_subgoals=args.ros_stall_min_failed_subgoals,
+        ros_stall_max_displacement_m=args.ros_stall_max_displacement_m,
+        ros_stall_min_no_progress_steps=args.ros_stall_min_no_progress_steps,
         restricted_gt_min_visible_pixels=args.restricted_gt_min_visible_pixels,
         restricted_gt_min_bbox_area_pixels=args.restricted_gt_min_bbox_area_pixels,
         restricted_gt_max_distance_m=args.restricted_gt_max_distance_m,

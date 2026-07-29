@@ -28,7 +28,7 @@ import re
 from typing import Any, Iterable, Sequence
 
 
-SCHEMA_VERSION = "interactive_nav_v3_round_summary_v1"
+SCHEMA_VERSION = "interactive_nav_v3_round_summary_v2"
 _WORKER_INDEX_RE = re.compile(r"^worker[_-]?(?P<index>\d+)")
 _PRE_SCORE_MARKERS = {
     "pre_score_guard",
@@ -272,6 +272,8 @@ def summarise_episode(round_root: Path, result_path: Path) -> tuple[dict[str, An
     attempt_count = len(attempts) if isinstance(attempts, list) else 0
     extra_count = _optional_int(result.get("extra_interaction_action_count")) or 0
     invalid_count = _optional_int(result.get("invalid_interaction_action_count")) or 0
+    raw_early_stop = result.get("early_stop")
+    raw_early_stop = raw_early_stop if isinstance(raw_early_stop, dict) else {}
 
     expected_step_sync_count = _optional_int(result.get("step_count"))
     step_sync_count = _optional_int(debug_summary.get("step_sync_count"))
@@ -313,6 +315,18 @@ def summarise_episode(round_root: Path, result_path: Path) -> tuple[dict[str, An
         "scoring_eligible": result.get("scoring_eligible"),
         "success": bool(result.get("success", result.get("task_success", False))),
         "terminal_reason": result.get("terminal_reason"),
+        "early_stop": {
+            "triggered": bool(raw_early_stop.get("triggered")),
+            "reason": raw_early_stop.get("reason"),
+            "trigger_step": _optional_int(raw_early_stop.get("trigger_step")),
+            "failed_subgoal_count": _optional_int(
+                raw_early_stop.get("failed_subgoal_count")
+            ),
+            "observed_navigation_failure_count": _optional_int(
+                raw_early_stop.get("observed_navigation_failure_count")
+            ),
+            "displacement_m": _finite_number(raw_early_stop.get("displacement_m")),
+        },
         "step_count": expected_step_sync_count,
         "episode_step_budget": _optional_int(result.get("episode_step_budget")),
         "path": {
@@ -409,6 +423,12 @@ def summarise_round(round_root: Path) -> dict[str, Any]:
         if (value := row["wall_time"]["evaluator_elapsed_s"]) is not None
     ]
     terminal_counts = Counter(str(row.get("terminal_reason") or "unknown") for row in episodes)
+    early_stop_rows = [
+        row["early_stop"] for row in episodes if row["early_stop"]["triggered"]
+    ]
+    early_stop_counts = Counter(
+        str(row.get("reason") or "unknown") for row in early_stop_rows
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "round_root": str(root),
@@ -417,6 +437,8 @@ def summarise_round(round_root: Path) -> dict[str, Any]:
         "success_count": success_count,
         "success_rate": success_count / len(episodes) if episodes else None,
         "terminal_reason_counts": dict(sorted(terminal_counts.items())),
+        "early_stop_count": len(early_stop_rows),
+        "early_stop_reason_counts": dict(sorted(early_stop_counts.items())),
         "total_mllm_call_count": sum(int(row["mllm"]["call_count"]) for row in episodes),
         "total_pre_score_guard_count": sum(
             int(row["mllm"]["pre_score_guard_count"]) for row in episodes
@@ -447,6 +469,7 @@ def _table(rows: Iterable[dict[str, Any]]) -> str:
         "ep",
         "ok",
         "terminal",
+        "early-stop",
         "steps/budget",
         "path/ref m",
         "target/vis",
@@ -477,12 +500,23 @@ def _table(rows: Iterable[dict[str, Any]]) -> str:
             if video_count is not None and video_expected is not None
             else "—"
         )
+        early_stop = row["early_stop"]
+        early_stop_text = "—"
+        if early_stop["triggered"]:
+            reason = str(early_stop["reason"] or "unknown")
+            failed_count = early_stop["failed_subgoal_count"]
+            trigger_step = early_stop["trigger_step"]
+            early_stop_text = (
+                f"{reason}; n={failed_count if failed_count is not None else '—'}"
+                f"@{trigger_step if trigger_step is not None else '—'}"
+            )
         body.append(
             [
                 str(row["worker"]),
                 str(row["episode_index"] if row["episode_index"] is not None else "—"),
                 "Y" if row["success"] else "N",
                 str(row["terminal_reason"] or "—"),
+                early_stop_text,
                 f"{row['step_count'] if row['step_count'] is not None else '—'}/"
                 f"{row['episode_step_budget'] if row['episode_step_budget'] is not None else '—'}",
                 f"{_format_number(row['path']['navigation_length_m'])}/"
@@ -524,6 +558,8 @@ def render_terminal_summary(summary: dict[str, Any]) -> str:
         f"mllm={summary.get('total_mllm_call_count', 0)} "
         f"pre_score_guard={summary.get('total_pre_score_guard_count', 0)} "
         f"candidate_repeats={summary.get('total_repeated_candidate_count', 0)} "
+        f"early_stops={summary.get('early_stop_count', 0)} "
+        f"early_stop_reasons={summary.get('early_stop_reason_counts', {})} "
         f"parallel_wall_estimate={parallel_wall}s"
     )
     warning_count = len(summary.get("warnings", []))

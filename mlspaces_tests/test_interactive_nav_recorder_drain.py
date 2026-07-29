@@ -140,6 +140,35 @@ def test_final_summary_requires_nondropping_runtime_video(tmp_path: Path) -> Non
     assert "written_video_jobs=3 < expected=4" in errors
 
 
+def test_final_summary_distinguishes_intentional_oldest_eviction(
+    tmp_path: Path,
+) -> None:
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "finalization_complete": True,
+                "step_sync_count": 4,
+                "first_person_video_frame_count": 4,
+                "step_sync_placeholder_count": 0,
+                "video_frame_jobs_dropped": 2,
+                "video_frame_jobs_dropped_oldest": 2,
+                "video_frame_jobs_dropped_newest": 0,
+                "video_frame_queue_overflow": "drop_oldest",
+                "runtime_video_encode": True,
+                "artifact_writer_stats": {"written_video_jobs": 4},
+                "first_person_video_error": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Completeness remains enforced by the frame-count checks; this assertion
+    # only verifies that a deliberately documented freshness eviction is not
+    # reported as an unexplained newest-frame loss or RGB placeholder.
+    assert final_recorder_summary_errors(summary_path, 4) == []
+
+
 def test_final_summary_validates_raw_steps_and_sampled_video_separately(
     tmp_path: Path,
 ) -> None:

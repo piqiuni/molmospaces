@@ -16,6 +16,8 @@ topics:
   interaction_command: "/semantic_decision/interaction_command"
   interaction_result: "/semantic_mapping/interaction_result"
   attribute_updates: "/semantic_mapping/attribute_updates"
+  room_attribute_requests: "/semantic_mapping/room_attribute_requests"
+  room_attribute_updates: "/semantic_mapping/room_attribute_updates"
   planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
   planning_occupancy_grid_updates: "/semantic_mapping/planning_occ_map_updates"
   door_clear_mask: "/semantic_mapping/door_clear_mask"
@@ -119,6 +121,20 @@ room_inference:
   min_confidence: 0.2
   evidence_window_sec: 5.0
 
+# Module-1's room lane is intentionally text-only: it receives a room ID and
+# the graph's in-room object labels, never RGB or a visual crop.  The existing
+# weighted object rules remain active while this asynchronous lane is pending
+# or low confidence.
+room_mllm:
+  enabled: true
+  min_evidence_objects: 1
+  min_confidence: 0.55
+  worker_count: 1
+  max_queue_size: 4
+  min_interval_s: 2.0
+  success_refresh_interval_s: 120.0
+  max_output_tokens: 96
+
 semantic_map:
   enable_object_mapping: true
   enable_scene_mapping: true
@@ -153,6 +169,10 @@ semantic_map:
   room_id_overlap_ratio: 0.25
   room_merge_confirmations: 3
   room_grid_stability_frames: 3
+  # Room topology uses confirmed semantic door clears, never an in-flight
+  # interaction command.  A successful open forces one immediate stable split.
+  room_segment_use_semantic_overlay: true
+  room_post_open_force_refresh: true
   room_geometry_stability_frames: 5
   lifted_graph_frame: "tf_frame_map_graph"
   lifted_graph_z_offset: 10.0

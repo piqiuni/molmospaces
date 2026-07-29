@@ -6,6 +6,7 @@ import math
 import os
 import threading
 import time
+from collections import deque
 
 import base64
 import cv2
@@ -14,20 +15,32 @@ from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
     NavigationProgressWatchdog,
+    PostInteractionCostmapBaseline,
+    PostInteractionPlanningMapBarrier,
+    PostInteractionRawMapBarrier,
     STATE_APPROACH_INTERACTION,
     STATE_IDLE,
     STATE_INTERACTING,
     STATE_NAVIGATING,
     STATE_PREPARING_EXPLORE,
+    STATE_WAITING_FOR_DRAWER_SCAN,
     STATE_VERIFYING,
     bounded_empty_plan_retry_delay,
     committed_turn_sign,
     is_post_interaction_traversal_navigation,
     navigation_goal_options,
+    navigation_prerotation_heading_target,
     navigation_requires_final_yaw,
     navigation_should_prerotate,
+    next_interaction_approach_option_index,
     normalize_angle,
     path_lookahead_point,
+    post_open_path_is_confirmed,
+    post_open_path_retryable_preflight_reason,
+    post_interaction_costmap_baseline_keys,
+    post_interaction_costmap_receipts_fresh_source,
+    post_interaction_planning_occupancy_fresh_source,
+    post_interaction_raw_occupancy_fresh_source,
     prerotation_control_step_budget,
     prerotation_rgb_step_gate,
     requires_graph_verification,
@@ -39,6 +52,7 @@ from semantic_decision_py_pkg.visual_interaction_planning import (
     action_for_opaque_open_contract,
     candidate_with_direct_drawer_scan,
     candidate_with_visual_operation_plan,
+    fresh_direct_drawer_scan_candidate,
     infer_visual_interaction_target_type,
 )
 from semantic_mllm_py_pkg.ablation import AblationConfig
@@ -60,8 +74,9 @@ import rospy
 import tf
 from actionlib_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, Twist
+from map_msgs.msg import OccupancyGridUpdate
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 from nav_msgs.srv import GetPlan
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
@@ -120,6 +135,12 @@ class SemanticBehaviorExecutor:
         self.mllm_crop_max_side_px = max(
             128, int(model_config.get("crop_max_side_px", 512))
         )
+        self.drawer_scan_wait_timeout_s = max(
+            0.1, float(config.get("drawer_scan_wait_timeout_s", 8.0))
+        )
+        self.drawer_scan_wait_poll_interval_s = max(
+            0.01, float(config.get("drawer_scan_wait_poll_interval_s", 0.10))
+        )
         self.machine = BehaviorExecutionStateMachine(
             ExecutionConfig(
                 navigation_timeout_s=float(config.get("navigation_timeout_s", 180.0)),
@@ -127,6 +148,7 @@ class SemanticBehaviorExecutor:
                     config.get("interaction_navigation_timeout_s", 180.0)
                 ),
                 interaction_timeout_s=float(config.get("interaction_timeout_s", 30.0)),
+                drawer_scan_wait_timeout_s=self.drawer_scan_wait_timeout_s,
                 verification_timeout_s=float(config.get("verification_timeout_s", 30.0)),
                 explore_prepare_timeout_s=float(
                     config.get("explore_prepare_timeout_s", 10.0)
@@ -222,7 +244,7 @@ class SemanticBehaviorExecutor:
             0.0,
             float(
                 config.get(
-                    "post_interaction_traversal_make_plan_retry_window_s", 8.0
+                    "post_interaction_traversal_make_plan_retry_window_s", 0.35
                 )
             ),
         )
@@ -230,7 +252,25 @@ class SemanticBehaviorExecutor:
             0.01,
             float(
                 config.get(
-                    "post_interaction_traversal_make_plan_retry_interval_s", 0.5
+                    "post_interaction_traversal_make_plan_retry_interval_s", 0.10
+                )
+            ),
+        )
+        self.post_interaction_costmap_fresh_timeout_s = max(
+            0.0,
+            float(
+                config.get(
+                    "post_interaction_costmap_fresh_timeout_s",
+                    2.0,
+                )
+            ),
+        )
+        self.post_interaction_costmap_fresh_poll_interval_s = max(
+            0.01,
+            float(
+                config.get(
+                    "post_interaction_costmap_fresh_poll_interval_s",
+                    self.post_interaction_traversal_make_plan_retry_interval_s,
                 )
             ),
         )
@@ -280,6 +320,26 @@ class SemanticBehaviorExecutor:
         self.navigation_stagnation_yaw_rad = float(
             config.get("navigation_stagnation_yaw_rad", 0.15)
         )
+        self.navigation_stagnation_goal_distance_reduction_m = max(
+            0.0,
+            float(config.get("navigation_stagnation_goal_distance_reduction_m", 0.02)),
+        )
+        self.navigation_stagnation_local_plan_max_age_s = max(
+            0.0,
+            float(config.get("navigation_stagnation_local_plan_max_age_s", 1.0)),
+        )
+        self.navigation_stagnation_local_plan_min_poses = max(
+            1,
+            int(config.get("navigation_stagnation_local_plan_min_poses", 2)),
+        )
+        self.interaction_approach_fallback_max_attempts = max(
+            1,
+            int(config.get("interaction_approach_fallback_max_attempts", 3)),
+        )
+        self.interaction_approach_fallback_cancel_wait_s = max(
+            0.0,
+            float(config.get("interaction_approach_fallback_cancel_wait_s", 0.5)),
+        )
         self.lock = threading.RLock()
         self.selection: dict | None = None
         self.latest_graph: dict = {}
@@ -292,6 +352,42 @@ class SemanticBehaviorExecutor:
         self._stuck_failure_origin_xy: tuple[float, float] | None = None
         self._stuck_failure_candidate_ids: set[str] = set()
         self._latest_occupancy: OccupancyGrid | None = None
+        # The post-open continuation is a causal map pipeline, not simply a
+        # new global-costmap notification: raw SLAM OCC -> semantic planning
+        # OCC (the StaticLayer input) -> global costmap.  Counters are local
+        # because ROS header sequences can reset with move_base.
+        self._raw_occupancy_received_count = 0
+        self._latest_raw_occupancy_header_seq: int | None = None
+        self._latest_raw_occupancy_header_stamp_sec: float | None = None
+        self._latest_raw_occupancy_received_at = 0.0
+        self._planning_occupancy_received_count = 0
+        self._latest_planning_occupancy_header_seq: int | None = None
+        self._latest_planning_occupancy_header_stamp_sec: float | None = None
+        self._latest_planning_occupancy_received_at = 0.0
+        self._raw_occupancy_events: deque[PostInteractionRawMapBarrier] = deque(
+            maxlen=64
+        )
+        # ``costmap_updates`` is the low-latency final signal.  Keep the full
+        # map too as a fallback, but only after a newer planning OCC has been
+        # observed.
+        self._global_costmap_received_count = 0
+        self._latest_global_costmap_header_seq: int | None = None
+        self._latest_global_costmap_received_at = 0.0
+        self._global_costmap_update_received_count = 0
+        self._latest_global_costmap_update_header_seq: int | None = None
+        self._latest_global_costmap_update_received_at = 0.0
+        self._post_interaction_costmap_baselines: dict[
+            str, PostInteractionCostmapBaseline
+        ] = {}
+        self._post_interaction_raw_map_barriers: dict[
+            str, tuple[PostInteractionRawMapBarrier, str]
+        ] = {}
+        self._post_interaction_planning_map_barriers: dict[
+            str, PostInteractionPlanningMapBarrier
+        ] = {}
+        self._global_costmap_condition = threading.Condition(self.lock)
+        self._latest_local_plan_received_at = 0.0
+        self._latest_local_plan_pose_count = 0
         self._latest_step_sync_index: int | None = None
         self._latest_step_sync_received_at = 0.0
         self._latest_rgb_step_seq: int | None = None
@@ -299,6 +395,8 @@ class SemanticBehaviorExecutor:
         self.latest_image = None
         self.latest_image_sequence = 0
         self.pre_interaction_image_sequence = 0
+        self._drawer_scan_wait_contexts: dict[str, dict] = {}
+        self._drawer_scan_wait_records: dict[str, dict] = {}
         self.active_skill_plan: dict = {}
         self.pending_skill_actions: list[dict] = []
         self.interaction_command_sequence = 0
@@ -373,6 +471,42 @@ class SemanticBehaviorExecutor:
             queue_size=1,
         )
         rospy.Subscriber(
+            topics.get("raw_occupancy_grid", "/struct_mapping/occ_map"),
+            OccupancyGrid,
+            self._raw_occupancy_callback,
+            queue_size=1,
+        )
+        rospy.Subscriber(
+            topics.get(
+                "planning_occupancy_grid",
+                "/semantic_mapping/planning_occ_map",
+            ),
+            OccupancyGrid,
+            self._planning_occupancy_callback,
+            queue_size=1,
+        )
+        rospy.Subscriber(
+            topics.get("global_costmap", "/move_base/global_costmap/costmap"),
+            OccupancyGrid,
+            self._global_costmap_callback,
+            queue_size=1,
+        )
+        rospy.Subscriber(
+            topics.get(
+                "global_costmap_updates",
+                "/move_base/global_costmap/costmap_updates",
+            ),
+            OccupancyGridUpdate,
+            self._global_costmap_update_callback,
+            queue_size=8,
+        )
+        rospy.Subscriber(
+            topics.get("local_plan", "/move_base/DWAPlannerROS/local_plan"),
+            Path,
+            self._local_plan_callback,
+            queue_size=1,
+        )
+        rospy.Subscriber(
             topics.get("rgb_image", "/molmo_spaces/head_camera/image"),
             Image,
             self._image_callback,
@@ -402,6 +536,10 @@ class SemanticBehaviorExecutor:
             self.interaction_command_sequence = 0
             self.verification_retries = 0
             self.model_events = []
+            decision_id = str(selection.get("decision_id") or "")
+            if decision_id:
+                self._drawer_scan_wait_contexts.pop(decision_id, None)
+                self._drawer_scan_wait_records.pop(decision_id, None)
             commands = self.machine.start(selection)
             if self.machine.state == STATE_VERIFYING and requires_graph_verification(
                 self.ablation.module3, selection
@@ -494,6 +632,7 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if not self._matches_active(payload):
                 return
+            self._record_post_interaction_costmap_baseline_locked(payload)
             visual_plan = dict(self.active_skill_plan.get("visual_operation_plan") or {})
             is_drawer_scan = str(visual_plan.get("target_type") or "") == "drawer_container"
             if (
@@ -649,6 +788,610 @@ class SemanticBehaviorExecutor:
         with self.lock:
             self._latest_occupancy = message
 
+    @staticmethod
+    def _map_header_fields(
+        message: OccupancyGrid | OccupancyGridUpdate,
+    ) -> tuple[int | None, float | None]:
+        """Extract diagnostic map-header values without trusting either one.
+
+        Local receipt counters carry the synchronization guarantee.  Header
+        stamps additionally prove that a raw OCC was generated after the
+        evaluator's action result when both publisher clocks are available.
+        """
+
+        header = getattr(message, "header", None)
+        try:
+            header_seq = int(getattr(header, "seq", None))
+        except (TypeError, ValueError):
+            header_seq = None
+        stamp = getattr(header, "stamp", None)
+        try:
+            stamp_sec = float(stamp.to_sec())
+        except (AttributeError, TypeError, ValueError):
+            try:
+                stamp_sec = float(stamp.secs) + float(stamp.nsecs) * 1e-9
+            except (AttributeError, TypeError, ValueError):
+                stamp_sec = None
+        if stamp_sec is not None and not math.isfinite(stamp_sec):
+            stamp_sec = None
+        return header_seq, stamp_sec
+
+    def _raw_occupancy_callback(self, message: OccupancyGrid) -> None:
+        """Record raw SLAM OCC and the planning counter visible at receipt."""
+
+        header_seq, header_stamp_sec = self._map_header_fields(message)
+        with self._global_costmap_condition:
+            self._raw_occupancy_received_count += 1
+            self._latest_raw_occupancy_header_seq = header_seq
+            self._latest_raw_occupancy_header_stamp_sec = header_stamp_sec
+            self._latest_raw_occupancy_received_at = time.monotonic()
+            self._raw_occupancy_events.append(
+                PostInteractionRawMapBarrier(
+                    receipt_count=self._raw_occupancy_received_count,
+                    header_seq=header_seq,
+                    header_stamp_sec=header_stamp_sec,
+                    planning_occupancy_receipt_count=(
+                        self._planning_occupancy_received_count
+                    ),
+                    planning_occupancy_header_seq=(
+                        self._latest_planning_occupancy_header_seq
+                    ),
+                    planning_occupancy_header_stamp_sec=(
+                        self._latest_planning_occupancy_header_stamp_sec
+                    ),
+                )
+            )
+            self._global_costmap_condition.notify_all()
+
+    def _planning_occupancy_callback(self, message: OccupancyGrid) -> None:
+        """Record the semantic OCC actually consumed by StaticLayer."""
+
+        header_seq, header_stamp_sec = self._map_header_fields(message)
+        with self._global_costmap_condition:
+            self._planning_occupancy_received_count += 1
+            self._latest_planning_occupancy_header_seq = header_seq
+            self._latest_planning_occupancy_header_stamp_sec = header_stamp_sec
+            self._latest_planning_occupancy_received_at = time.monotonic()
+            self._global_costmap_condition.notify_all()
+
+    def _global_costmap_callback(self, message: OccupancyGrid) -> None:
+        """Record a full global-costmap fallback publication."""
+
+        header_seq, _ = self._map_header_fields(message)
+        with self._global_costmap_condition:
+            self._global_costmap_received_count += 1
+            self._latest_global_costmap_header_seq = header_seq
+            self._latest_global_costmap_received_at = time.monotonic()
+            self._global_costmap_condition.notify_all()
+
+    def _global_costmap_update_callback(self, message: OccupancyGridUpdate) -> None:
+        """Record the primary incremental global-costmap planner update."""
+
+        header_seq, _ = self._map_header_fields(message)
+        with self._global_costmap_condition:
+            self._global_costmap_update_received_count += 1
+            self._latest_global_costmap_update_header_seq = header_seq
+            self._latest_global_costmap_update_received_at = time.monotonic()
+            self._global_costmap_condition.notify_all()
+
+    def _record_post_interaction_costmap_baseline_locked(
+        self, payload: dict
+    ) -> None:
+        """Bind a successful portal-open result to every map-stage baseline.
+
+        A semantic graph revision and a global-costmap delta can both precede
+        the physical map change.  The matching traversal must observe the
+        causal chain raw OCC -> planning OCC -> global costmap after this
+        exact result before it asks ``make_plan``.
+        """
+
+        if not (
+            payload.get("success") is True
+            or str(payload.get("status") or "").upper() == "SUCCEEDED"
+        ):
+            return
+        selection = self.selection or {}
+        interaction = selection.get("interaction_command") or {}
+        metadata = selection.get("metadata") or {}
+        detail = payload.get("detail") or {}
+        node_type = str(
+            payload.get("node_type")
+            or detail.get("node_type")
+            or interaction.get("node_type")
+            or metadata.get("node_type")
+            or ""
+        ).casefold()
+        action = str(
+            payload.get("action")
+            or detail.get("action")
+            or interaction.get("action")
+            or ""
+        ).casefold()
+        if node_type != "portal" or action != "open":
+            return
+        portal_id = str(
+            payload.get("node_id")
+            or detail.get("node_id")
+            or interaction.get("node_id")
+            or selection.get("target_id")
+            or ""
+        )
+        source_event_id = str(
+            payload.get("event_id")
+            or detail.get("event_id")
+            or selection.get("decision_id")
+            or ""
+        )
+        keys = post_interaction_costmap_baseline_keys(source_event_id, portal_id)
+        if not keys:
+            return
+        try:
+            result_stamp_sec = float(payload.get("stamp_sec"))
+        except (TypeError, ValueError):
+            result_stamp_sec = None
+        if result_stamp_sec is not None and not math.isfinite(result_stamp_sec):
+            result_stamp_sec = None
+        baseline = PostInteractionCostmapBaseline(
+            portal_id=portal_id,
+            source_event_id=source_event_id,
+            receipt_count=self._global_costmap_received_count,
+            header_seq=self._latest_global_costmap_header_seq,
+            update_receipt_count=self._global_costmap_update_received_count,
+            update_header_seq=self._latest_global_costmap_update_header_seq,
+            raw_occupancy_receipt_count=self._raw_occupancy_received_count,
+            raw_occupancy_header_seq=self._latest_raw_occupancy_header_seq,
+            raw_occupancy_header_stamp_sec=(
+                self._latest_raw_occupancy_header_stamp_sec
+            ),
+            planning_occupancy_receipt_count=(
+                self._planning_occupancy_received_count
+            ),
+            planning_occupancy_header_seq=(
+                self._latest_planning_occupancy_header_seq
+            ),
+            planning_occupancy_header_stamp_sec=(
+                self._latest_planning_occupancy_header_stamp_sec
+            ),
+            interaction_result_stamp_sec=result_stamp_sec,
+        )
+        for key in keys:
+            self._post_interaction_costmap_baselines[key] = baseline
+            self._post_interaction_raw_map_barriers.pop(key, None)
+            self._post_interaction_planning_map_barriers.pop(key, None)
+        rospy.loginfo(
+            "[semantic_behavior_executor] recorded post-open map baseline: "
+            "portal=%s event=%s result_stamp=%s raw=%d planning=%d "
+            "update=%d full=%d",
+            portal_id,
+            source_event_id,
+            str(baseline.interaction_result_stamp_sec),
+            baseline.raw_occupancy_receipt_count,
+            baseline.planning_occupancy_receipt_count,
+            baseline.update_receipt_count,
+            baseline.receipt_count,
+        )
+
+    def _post_interaction_costmap_baseline_locked(
+        self, candidate: dict
+    ) -> tuple[PostInteractionCostmapBaseline | None, str]:
+        metadata = candidate.get("metadata") or {}
+        portal_id = str(
+            metadata.get("opened_portal_id") or candidate.get("target_id") or ""
+        )
+        source_event_id = str(metadata.get("source_interaction_event_id") or "")
+        for key in post_interaction_costmap_baseline_keys(
+            source_event_id, portal_id
+        ):
+            baseline = self._post_interaction_costmap_baselines.get(key)
+            if baseline is not None:
+                return baseline, key
+        return None, ""
+
+    def _post_interaction_raw_map_barrier_locked(
+        self,
+        baseline: PostInteractionCostmapBaseline,
+        baseline_key: str,
+    ) -> tuple[PostInteractionRawMapBarrier | None, str]:
+        """Choose the first raw OCC receipt proven newer than the open."""
+
+        recorded = self._post_interaction_raw_map_barriers.get(baseline_key)
+        if recorded is not None:
+            return recorded
+        for raw_event in self._raw_occupancy_events:
+            raw_fresh_source = post_interaction_raw_occupancy_fresh_source(
+                baseline,
+                raw_event.receipt_count,
+                raw_event.header_stamp_sec,
+            )
+            if not raw_fresh_source:
+                continue
+            recorded = raw_event, raw_fresh_source
+            self._post_interaction_raw_map_barriers[baseline_key] = recorded
+            rospy.loginfo(
+                "[semantic_behavior_executor] admitted post-open raw OCC: "
+                "portal=%s source=%s result_stamp=%s raw_receipt=%d "
+                "raw_stamp=%s planning_baseline=%d",
+                baseline.portal_id,
+                raw_fresh_source,
+                str(baseline.interaction_result_stamp_sec),
+                raw_event.receipt_count,
+                str(raw_event.header_stamp_sec),
+                raw_event.planning_occupancy_receipt_count,
+            )
+            return recorded
+        return None, ""
+
+    def _post_interaction_planning_map_barrier_locked(
+        self,
+        baseline_key: str,
+        raw_barrier: PostInteractionRawMapBarrier,
+        raw_fresh_source: str,
+    ) -> PostInteractionPlanningMapBarrier | None:
+        """Record planning OCC, then snapshot the costmap counters after it."""
+
+        existing = self._post_interaction_planning_map_barriers.get(baseline_key)
+        if existing is not None:
+            return existing
+        planning_fresh_source = post_interaction_planning_occupancy_fresh_source(
+            raw_barrier,
+            self._planning_occupancy_received_count,
+            self._latest_planning_occupancy_header_stamp_sec,
+        )
+        if not planning_fresh_source:
+            return None
+        barrier = PostInteractionPlanningMapBarrier(
+            raw_map=raw_barrier,
+            raw_fresh_source=raw_fresh_source,
+            receipt_count=self._planning_occupancy_received_count,
+            header_seq=self._latest_planning_occupancy_header_seq,
+            header_stamp_sec=self._latest_planning_occupancy_header_stamp_sec,
+            planning_fresh_source=planning_fresh_source,
+            costmap_receipt_count=self._global_costmap_received_count,
+            costmap_header_seq=self._latest_global_costmap_header_seq,
+            costmap_update_receipt_count=(
+                self._global_costmap_update_received_count
+            ),
+            costmap_update_header_seq=(
+                self._latest_global_costmap_update_header_seq
+            ),
+        )
+        self._post_interaction_planning_map_barriers[baseline_key] = barrier
+        rospy.loginfo(
+            "[semantic_behavior_executor] admitted post-open planning OCC: "
+            "source=%s receipt=%d stamp=%s; awaiting later global costmap "
+            "update=%d full=%d",
+            planning_fresh_source,
+            barrier.receipt_count,
+            str(barrier.header_stamp_sec),
+            barrier.costmap_update_receipt_count,
+            barrier.costmap_receipt_count,
+        )
+        return barrier
+
+    def _wait_for_post_interaction_costmap_freshness(
+        self, decision_id: str, candidate: dict
+    ) -> tuple[bool, dict]:
+        """Hold traversal through raw OCC -> planning OCC -> costmap.
+
+        A costmap delta immediately after an interaction can describe a
+        pre-open planning map.  Do not call ``make_plan`` until a raw SLAM map
+        newer than the action result has reached the semantic planner and a
+        later global-costmap delta (or full map) has followed it.  The entire
+        causal chain shares one bounded wait budget.
+        """
+
+        started_at = time.monotonic()
+        deadline = started_at + self.post_interaction_costmap_fresh_timeout_s
+        with self._global_costmap_condition:
+            baseline, baseline_key = self._post_interaction_costmap_baseline_locked(
+                candidate
+            )
+            while True:
+                current_full_count = self._global_costmap_received_count
+                current_full_header_seq = self._latest_global_costmap_header_seq
+                current_update_count = self._global_costmap_update_received_count
+                current_update_header_seq = (
+                    self._latest_global_costmap_update_header_seq
+                )
+                current_raw_count = self._raw_occupancy_received_count
+                current_raw_header_seq = self._latest_raw_occupancy_header_seq
+                current_raw_header_stamp_sec = (
+                    self._latest_raw_occupancy_header_stamp_sec
+                )
+                current_planning_count = self._planning_occupancy_received_count
+                current_planning_header_seq = (
+                    self._latest_planning_occupancy_header_seq
+                )
+                current_planning_header_stamp_sec = (
+                    self._latest_planning_occupancy_header_stamp_sec
+                )
+                raw_barrier: PostInteractionRawMapBarrier | None = None
+                raw_fresh_source = ""
+                planning_barrier: PostInteractionPlanningMapBarrier | None = None
+                if baseline is not None:
+                    raw_barrier, raw_fresh_source = (
+                        self._post_interaction_raw_map_barrier_locked(
+                            baseline, baseline_key
+                        )
+                    )
+                    if raw_barrier is not None:
+                        planning_barrier = (
+                            self._post_interaction_planning_map_barrier_locked(
+                                baseline_key,
+                                raw_barrier,
+                                raw_fresh_source,
+                            )
+                        )
+                if raw_barrier is None:
+                    causal_stage = "waiting_raw_occupancy"
+                elif planning_barrier is None:
+                    causal_stage = "waiting_planning_occupancy"
+                else:
+                    causal_stage = "waiting_global_costmap"
+                costmap_baseline_full_count = (
+                    None
+                    if baseline is None
+                    else (
+                        planning_barrier.costmap_receipt_count
+                        if planning_barrier is not None
+                        else baseline.receipt_count
+                    )
+                )
+                costmap_baseline_full_header_seq = (
+                    None
+                    if baseline is None
+                    else (
+                        planning_barrier.costmap_header_seq
+                        if planning_barrier is not None
+                        else baseline.header_seq
+                    )
+                )
+                costmap_baseline_update_count = (
+                    None
+                    if baseline is None
+                    else (
+                        planning_barrier.costmap_update_receipt_count
+                        if planning_barrier is not None
+                        else baseline.update_receipt_count
+                    )
+                )
+                costmap_baseline_update_header_seq = (
+                    None
+                    if baseline is None
+                    else (
+                        planning_barrier.costmap_update_header_seq
+                        if planning_barrier is not None
+                        else baseline.update_header_seq
+                    )
+                )
+                elapsed_s = max(0.0, time.monotonic() - started_at)
+                detail = {
+                    "opened_portal_id": str(
+                        (candidate.get("metadata") or {}).get("opened_portal_id")
+                        or candidate.get("target_id")
+                        or ""
+                    ),
+                    "post_open_costmap_baseline_key": baseline_key,
+                    "post_open_costmap_baseline_receipt_count": (
+                        costmap_baseline_full_count
+                    ),
+                    "post_open_costmap_baseline_header_seq": (
+                        costmap_baseline_full_header_seq
+                    ),
+                    "post_open_costmap_latest_receipt_count": current_full_count,
+                    "post_open_costmap_latest_header_seq": current_full_header_seq,
+                    "post_open_costmap_baseline_update_receipt_count": (
+                        costmap_baseline_update_count
+                    ),
+                    "post_open_costmap_baseline_update_header_seq": (
+                        costmap_baseline_update_header_seq
+                    ),
+                    "post_open_costmap_latest_update_receipt_count": (
+                        current_update_count
+                    ),
+                    "post_open_costmap_latest_update_header_seq": (
+                        current_update_header_seq
+                    ),
+                    "post_open_costmap_wait_elapsed_s": elapsed_s,
+                    "post_open_costmap_wait_timeout_s": (
+                        self.post_interaction_costmap_fresh_timeout_s
+                    ),
+                    "post_open_causal_map_stage": causal_stage,
+                    "post_open_result_stamp_sec": (
+                        None
+                        if baseline is None
+                        else baseline.interaction_result_stamp_sec
+                    ),
+                    "post_open_raw_occ_baseline_receipt_count": (
+                        None
+                        if baseline is None
+                        else baseline.raw_occupancy_receipt_count
+                    ),
+                    "post_open_raw_occ_baseline_header_seq": (
+                        None
+                        if baseline is None
+                        else baseline.raw_occupancy_header_seq
+                    ),
+                    "post_open_raw_occ_baseline_header_stamp_sec": (
+                        None
+                        if baseline is None
+                        else baseline.raw_occupancy_header_stamp_sec
+                    ),
+                    "post_open_raw_occ_latest_receipt_count": current_raw_count,
+                    "post_open_raw_occ_latest_header_seq": current_raw_header_seq,
+                    "post_open_raw_occ_latest_header_stamp_sec": (
+                        current_raw_header_stamp_sec
+                    ),
+                    "post_open_raw_occ_admitted_receipt_count": (
+                        None if raw_barrier is None else raw_barrier.receipt_count
+                    ),
+                    "post_open_raw_occ_admitted_header_seq": (
+                        None if raw_barrier is None else raw_barrier.header_seq
+                    ),
+                    "post_open_raw_occ_admitted_header_stamp_sec": (
+                        None
+                        if raw_barrier is None
+                        else raw_barrier.header_stamp_sec
+                    ),
+                    "post_open_raw_occ_fresh_source": raw_fresh_source,
+                    "post_open_planning_occ_baseline_receipt_count": (
+                        None
+                        if baseline is None
+                        else baseline.planning_occupancy_receipt_count
+                    ),
+                    "post_open_planning_occ_baseline_header_seq": (
+                        None
+                        if baseline is None
+                        else baseline.planning_occupancy_header_seq
+                    ),
+                    "post_open_planning_occ_baseline_header_stamp_sec": (
+                        None
+                        if baseline is None
+                        else baseline.planning_occupancy_header_stamp_sec
+                    ),
+                    "post_open_planning_occ_latest_receipt_count": (
+                        current_planning_count
+                    ),
+                    "post_open_planning_occ_latest_header_seq": (
+                        current_planning_header_seq
+                    ),
+                    "post_open_planning_occ_latest_header_stamp_sec": (
+                        current_planning_header_stamp_sec
+                    ),
+                    "post_open_planning_occ_admitted_receipt_count": (
+                        None
+                        if planning_barrier is None
+                        else planning_barrier.receipt_count
+                    ),
+                    "post_open_planning_occ_admitted_header_seq": (
+                        None
+                        if planning_barrier is None
+                        else planning_barrier.header_seq
+                    ),
+                    "post_open_planning_occ_admitted_header_stamp_sec": (
+                        None
+                        if planning_barrier is None
+                        else planning_barrier.header_stamp_sec
+                    ),
+                    "post_open_planning_occ_fresh_source": (
+                        ""
+                        if planning_barrier is None
+                        else planning_barrier.planning_fresh_source
+                    ),
+                    "post_open_causal_costmap_baseline_receipt_count": (
+                        costmap_baseline_full_count
+                    ),
+                    "post_open_causal_costmap_baseline_update_receipt_count": (
+                        costmap_baseline_update_count
+                    ),
+                    # Stable primary trace keys are local incremental-update
+                    # receipt sequences; after planning OCC they are sampled
+                    # at that causal barrier instead of at action result.
+                    "baseline_global_costmap_seq": (
+                        costmap_baseline_update_count
+                    ),
+                    "observed_global_costmap_seq": current_update_count,
+                    "baseline_global_costmap_header_seq": (
+                        costmap_baseline_update_header_seq
+                    ),
+                    "observed_global_costmap_header_seq": current_update_header_seq,
+                    "baseline_global_costmap_full_seq": (
+                        costmap_baseline_full_count
+                    ),
+                    "observed_global_costmap_full_seq": current_full_count,
+                    "baseline_global_costmap_full_header_seq": (
+                        costmap_baseline_full_header_seq
+                    ),
+                    "observed_global_costmap_full_header_seq": (
+                        current_full_header_seq
+                    ),
+                    "costmap_wait_elapsed": elapsed_s,
+                    "costmap_fresh": False,
+                    "fresh_source": "",
+                }
+                if baseline is None:
+                    detail["reason"] = "post_open_costmap_baseline_missing"
+                    rospy.logwarn(
+                        "[semantic_behavior_executor] post-open traversal has "
+                        "no global-costmap baseline: portal=%s",
+                        detail["opened_portal_id"],
+                    )
+                    return False, detail
+                fresh_source = ""
+                if planning_barrier is not None:
+                    fresh_source = post_interaction_costmap_receipts_fresh_source(
+                        planning_barrier.costmap_receipt_count,
+                        planning_barrier.costmap_update_receipt_count,
+                        current_full_count,
+                        current_update_count,
+                    )
+                if fresh_source:
+                    detail["post_open_costmap_fresh"] = True
+                    detail["costmap_fresh"] = True
+                    detail["fresh_source"] = fresh_source
+                    detail["post_open_causal_map_stage"] = "ready"
+                    rospy.loginfo(
+                        "[semantic_behavior_executor] causal post-open map "
+                        "chain admits preflight: portal=%s source=%s raw=%d "
+                        "planning=%d update=%d->%d full=%d->%d wait=%.3fs",
+                        baseline.portal_id,
+                        fresh_source,
+                        raw_barrier.receipt_count if raw_barrier is not None else -1,
+                        planning_barrier.receipt_count,
+                        planning_barrier.costmap_update_receipt_count,
+                        current_update_count,
+                        planning_barrier.costmap_receipt_count,
+                        current_full_count,
+                        elapsed_s,
+                    )
+                    return True, detail
+                if not (
+                    self.selection is not None
+                    and str(self.selection.get("decision_id") or "") == decision_id
+                    and self.machine.state
+                    in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}
+                ):
+                    detail["reason"] = "post_open_costmap_wait_preempted"
+                    return False, detail
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0.0:
+                    detail["reason"] = {
+                        "waiting_raw_occupancy": "post_open_raw_occ_refresh_timeout",
+                        "waiting_planning_occupancy": (
+                            "post_open_planning_occ_refresh_timeout"
+                        ),
+                    }.get(causal_stage, "post_open_costmap_refresh_timeout")
+                    detail["post_open_costmap_fresh"] = False
+                    rospy.logwarn(
+                        "[semantic_behavior_executor] post-open causal-map "
+                        "timeout: portal=%s stage=%s raw=%d planning=%d "
+                        "update=%s->%d full=%s->%d wait=%.3fs",
+                        baseline.portal_id,
+                        causal_stage,
+                        current_raw_count,
+                        current_planning_count,
+                        str(costmap_baseline_update_count),
+                        current_update_count,
+                        str(costmap_baseline_full_count),
+                        current_full_count,
+                        elapsed_s,
+                    )
+                    return False, detail
+                self._global_costmap_condition.wait(
+                    timeout=min(
+                        remaining_s,
+                        self.post_interaction_costmap_fresh_poll_interval_s,
+                    )
+                )
+
+    def _local_plan_callback(self, message: Path) -> None:
+        # A non-empty plan is only a watchdog hint.  It is additionally scoped
+        # to the current navigation send time below, so a retained plan from a
+        # prior goal cannot suppress a genuine stall.
+        with self.lock:
+            self._latest_local_plan_received_at = time.monotonic()
+            self._latest_local_plan_pose_count = len(message.poses or [])
+
     def _verify_graph_locked(self) -> list[dict]:
         if self.machine.state != STATE_VERIFYING or self.selection is None:
             return []
@@ -721,7 +1464,20 @@ class SemanticBehaviorExecutor:
                 STATE_NAVIGATING,
                 STATE_APPROACH_INTERACTION,
             }
-            commands = self.machine.fail_timeout(reason) if reason else []
+            if reason == "drawer_scan_fresh_frame_timeout":
+                decision_id = str((self.selection or {}).get("decision_id") or "")
+                detail = self._drawer_scan_wait_detail_locked(
+                    decision_id,
+                    status="timeout",
+                    reason="drawer_scan_fresh_frame_timeout",
+                )
+                detail["reason"] = "drawer_scan_fresh_frame_timeout"
+                if decision_id:
+                    self._drawer_scan_wait_records[decision_id] = dict(detail)
+                    self._drawer_scan_wait_contexts.pop(decision_id, None)
+                commands = self.machine.on_drawer_scan_wait_failed(detail)
+            else:
+                commands = self.machine.fail_timeout(reason) if reason else []
             if (
                 not reason
                 and self.machine.state == STATE_PREPARING_EXPLORE
@@ -741,6 +1497,12 @@ class SemanticBehaviorExecutor:
                 "explore_feedback_matched_count": self._explore_feedback_matched_count,
                 "explore_feedback_ignored_count": self._explore_feedback_ignored_count,
                 "last_explore_feedback": dict(self._last_explore_feedback),
+                "drawer_scan_wait": dict(
+                    self._drawer_scan_wait_contexts.get(
+                        str((self.selection or {}).get("decision_id") or ""),
+                        {},
+                    )
+                ),
                 "timestamp": time.time(),
             }
         self.state_pub.publish(
@@ -785,6 +1547,16 @@ class SemanticBehaviorExecutor:
                     ).start()
                 else:
                     self._publish_interaction_command(command["candidate"])
+            elif kind == "wait_for_drawer_scan":
+                candidate = dict(command["candidate"])
+                decision_id = str(candidate.get("decision_id") or "")
+                threading.Thread(
+                    target=self._wait_for_fresh_drawer_scan,
+                    args=(decision_id, candidate),
+                    daemon=True,
+                ).start()
+            elif kind == "publish_drawer_scan":
+                self._publish_interaction_command(command["candidate"])
             elif kind == "terminal":
                 self._finish_terminal(command)
 
@@ -807,6 +1579,9 @@ class SemanticBehaviorExecutor:
                 "cluster_id", candidate.get("target_id", "")
             ),
             "goal_xyyaw": list(candidate.get("goal_xyyaw") or []),
+            "frontier_point": list(
+                (candidate.get("metadata") or {}).get("frontier_point") or []
+            ),
             "candidate_sequence": int(candidate.get("candidate_sequence", 0) or 0),
             "graph_revision": int(candidate.get("graph_revision", 0) or 0),
         }
@@ -1145,6 +1920,211 @@ class SemanticBehaviorExecutor:
             {},
         )
 
+    @staticmethod
+    def _public_step_or_none(value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            step = int(value)
+        except (TypeError, ValueError):
+            return None
+        return step if step >= 0 else None
+
+    def _needs_fresh_drawer_scan_locked(self) -> bool:
+        """Return whether the arrived interaction must re-ground a drawer box."""
+
+        if self.ablation.module3 != "mllm_skill_verified" or self.selection is None:
+            return False
+        if str(self.selection.get("behavior_type") or "").upper() != "INTERACT":
+            return False
+        node = self._selected_graph_node_locked(self.selection)
+        return (
+            infer_visual_interaction_target_type(self.selection, node)
+            == "drawer_container"
+        )
+
+    def _drawer_scan_wait_detail_locked(
+        self,
+        decision_id: str,
+        *,
+        status: str,
+        reason: str = "",
+        selected_capture_step: int | None = None,
+    ) -> dict:
+        """Build public diagnostics for the post-arrival drawer-frame wait."""
+
+        context = dict(self._drawer_scan_wait_contexts.get(decision_id) or {})
+        now = time.monotonic()
+        graph = self.latest_graph or {}
+        detail = {
+            "drawer_scan_wait_status": str(status),
+            "drawer_scan_wait_elapsed_s": max(
+                0.0, now - float(context.get("started_at", now) or now)
+            ),
+            "drawer_scan_wait_timeout_s": self.drawer_scan_wait_timeout_s,
+            "drawer_scan_wait_attempt_count": int(context.get("attempt_count", 0) or 0),
+            "drawer_scan_wait_last_reason": str(
+                reason or context.get("last_reason") or ""
+            ),
+            "drawer_scan_wait_target_id": str(context.get("target_id") or ""),
+            "drawer_scan_wait_baseline_capture_step": context.get(
+                "baseline_graph_capture_step"
+            ),
+            "drawer_scan_wait_latest_capture_step": self._public_step_or_none(
+                graph.get("capture_step")
+            ),
+            "drawer_scan_wait_baseline_graph_revision": context.get(
+                "baseline_graph_revision"
+            ),
+            "drawer_scan_wait_latest_graph_revision": self._public_step_or_none(
+                graph.get("graph_revision")
+            ),
+            "drawer_scan_wait_baseline_rgb_capture_step": context.get(
+                "baseline_rgb_capture_step"
+            ),
+            "drawer_scan_wait_latest_rgb_capture_step": self._latest_rgb_step_seq,
+            "drawer_scan_wait_baseline_rgb_image_sequence": context.get(
+                "baseline_rgb_image_sequence"
+            ),
+            "drawer_scan_wait_latest_rgb_image_sequence": self.latest_image_sequence,
+        }
+        if selected_capture_step is not None:
+            detail["drawer_scan_wait_selected_capture_step"] = int(
+                selected_capture_step
+            )
+        return detail
+
+    def _wait_for_fresh_drawer_scan(self, decision_id: str, candidate: dict) -> None:
+        """Wait for a post-arrival public RGB/GT frame before scanning drawers.
+
+        The evaluator only resolves a direct drawer scan if the submitted box
+        and capture step were published together on its public perception
+        stream.  Navigation may have consumed tens of seconds since the
+        candidate was selected, so deliberately discard that old graph box.
+        """
+
+        with self.lock:
+            if (
+                self.selection is None
+                or str(self.selection.get("decision_id") or "") != decision_id
+                or self.machine.state != STATE_WAITING_FOR_DRAWER_SCAN
+            ):
+                return
+            graph = self.latest_graph or {}
+            self._drawer_scan_wait_contexts[decision_id] = {
+                "started_at": time.monotonic(),
+                "deadline_at": time.monotonic() + self.drawer_scan_wait_timeout_s,
+                "target_id": str(candidate.get("target_id") or ""),
+                "baseline_graph_capture_step": self._public_step_or_none(
+                    graph.get("capture_step")
+                ),
+                "baseline_graph_revision": self._public_step_or_none(
+                    graph.get("graph_revision")
+                ),
+                "baseline_rgb_image_sequence": int(self.latest_image_sequence),
+                "baseline_rgb_capture_step": self._latest_rgb_step_seq,
+                "attempt_count": 0,
+                "last_reason": "waiting_for_fresh_public_frame",
+            }
+            baseline = dict(self._drawer_scan_wait_contexts[decision_id])
+        rospy.loginfo(
+            "[semantic_behavior_executor] WAIT_FOR_DRAWER_SCAN target=%s "
+            "after graph_capture_step=%s rgb_capture_step=%s",
+            baseline["target_id"],
+            baseline["baseline_graph_capture_step"],
+            baseline["baseline_rgb_capture_step"],
+        )
+
+        while not rospy.is_shutdown():
+            commands = []
+            with self.lock:
+                if (
+                    self.selection is None
+                    or str(self.selection.get("decision_id") or "") != decision_id
+                    or self.machine.state != STATE_WAITING_FOR_DRAWER_SCAN
+                ):
+                    return
+                context = self._drawer_scan_wait_contexts.get(decision_id)
+                if context is None:
+                    return
+                graph = self.latest_graph or {}
+                node = self._selected_graph_node_locked(candidate)
+                planned_candidate, wait_reason = fresh_direct_drawer_scan_candidate(
+                    candidate,
+                    node,
+                    graph_capture_step=graph.get("capture_step"),
+                    graph_revision=graph.get("graph_revision"),
+                    minimum_graph_capture_step=context.get(
+                        "baseline_graph_capture_step"
+                    ),
+                    minimum_graph_revision=context.get("baseline_graph_revision"),
+                    rgb_image_sequence=self.latest_image_sequence,
+                    minimum_rgb_image_sequence=context.get(
+                        "baseline_rgb_image_sequence"
+                    ),
+                    rgb_capture_step=self._latest_rgb_step_seq,
+                    minimum_rgb_capture_step=context.get(
+                        "baseline_rgb_capture_step"
+                    ),
+                )
+                context["attempt_count"] = int(context.get("attempt_count", 0)) + 1
+                context["last_reason"] = wait_reason
+                if planned_candidate is not None:
+                    interaction = dict(
+                        planned_candidate.get("interaction_command") or {}
+                    )
+                    selected_capture_step = self._public_step_or_none(
+                        interaction.get("drawer_container_capture_step")
+                    )
+                    detail = self._drawer_scan_wait_detail_locked(
+                        decision_id,
+                        status="ready",
+                        reason=wait_reason,
+                        selected_capture_step=selected_capture_step,
+                    )
+                    self._drawer_scan_wait_records[decision_id] = dict(detail)
+                    self._drawer_scan_wait_contexts.pop(decision_id, None)
+                    self.active_skill_plan = {
+                        "visual_operation_plan": dict(
+                            interaction.get("visual_operation_plan") or {}
+                        ),
+                        "subactions": [],
+                        "max_retries": 0,
+                    }
+                    self.pending_skill_actions = []
+                    commands = self.machine.on_drawer_scan_ready(
+                        planned_candidate,
+                        detail=detail,
+                    )
+                    rospy.loginfo(
+                        "[semantic_behavior_executor] fresh drawer scan frame "
+                        "ready target=%s capture_step=%s after %d checks",
+                        candidate.get("target_id", ""),
+                        selected_capture_step,
+                        detail["drawer_scan_wait_attempt_count"],
+                    )
+                elif time.monotonic() >= float(context.get("deadline_at", 0.0)):
+                    detail = self._drawer_scan_wait_detail_locked(
+                        decision_id,
+                        status="timeout",
+                        reason=wait_reason,
+                    )
+                    detail["reason"] = "drawer_scan_fresh_frame_timeout"
+                    self._drawer_scan_wait_records[decision_id] = dict(detail)
+                    self._drawer_scan_wait_contexts.pop(decision_id, None)
+                    commands = self.machine.on_drawer_scan_wait_failed(detail)
+                    rospy.logwarn(
+                        "[semantic_behavior_executor] drawer scan fresh-frame "
+                        "timeout target=%s last_reason=%s checks=%d",
+                        candidate.get("target_id", ""),
+                        wait_reason,
+                        detail["drawer_scan_wait_attempt_count"],
+                    )
+            if commands:
+                self._dispatch(commands)
+                return
+            time.sleep(self.drawer_scan_wait_poll_interval_s)
+
     def _object_crop_data_locked(self, node: dict) -> str:
         if self.latest_image is None:
             return ""
@@ -1212,6 +2192,20 @@ class SemanticBehaviorExecutor:
             return None
         yaw = tf.transformations.euler_from_quaternion(rotation)[2]
         return float(translation[0]), float(translation[1]), float(yaw)
+
+    def _has_fresh_local_plan(
+        self, navigation_started_at: float, now: float | None = None
+    ) -> bool:
+        now = time.monotonic() if now is None else float(now)
+        with self.lock:
+            received_at = self._latest_local_plan_received_at
+            pose_count = self._latest_local_plan_pose_count
+        return bool(
+            pose_count >= self.navigation_stagnation_local_plan_min_poses
+            and received_at >= float(navigation_started_at)
+            and now - received_at
+            <= self.navigation_stagnation_local_plan_max_age_s
+        )
 
     def _publish_rotation(self, angular_z: float) -> None:
         command = Twist()
@@ -1355,10 +2349,21 @@ class SemanticBehaviorExecutor:
     ) -> bool:
         if not self.rear_goal_prerotate_enabled:
             return True
+        # A navigation pre-turn must follow the first reachable segment of the
+        # global path.  When preflight did not produce a valid path (for
+        # example an EXPLORE fail-open), using the final goal can turn the base
+        # away from the path that move_base will eventually choose.
+        heading_target_xy = navigation_prerotation_heading_target(heading_target_xy)
+        if heading_target_xy is None:
+            rospy.loginfo(
+                "[semantic_behavior_executor] skipped rear-goal prerotation: "
+                "no valid path lookahead"
+            )
+            return True
         pose = self._current_pose(frame_id)
         if pose is None:
             return True
-        heading_x, heading_y = heading_target_xy or (goal_x, goal_y)
+        heading_x, heading_y = heading_target_xy
         target_yaw = math.atan2(heading_y - pose[1], heading_x - pose[0])
         error = normalize_angle(target_yaw - pose[2])
         if abs(error) <= self.rear_goal_enter_angle_rad:
@@ -1424,7 +2429,13 @@ class SemanticBehaviorExecutor:
             self.final_align_timeout_s,
         )
 
-    def _run_navigation(self, decision_id: str, candidate: dict) -> None:
+    def _run_navigation(
+        self,
+        decision_id: str,
+        candidate: dict,
+        start_goal_option_index: int = 0,
+        interaction_approach_attempts: list[dict] | None = None,
+    ) -> None:
         ready = self.move_base.wait_for_server(rospy.Duration(30.0))
         if not ready:
             self._handle_navigation_result(decision_id, False, {"reason": "move_base_unavailable"})
@@ -1437,6 +2448,18 @@ class SemanticBehaviorExecutor:
             self._handle_navigation_result(decision_id, False, {"reason": "missing_goal"})
             return
         behavior_type = str(candidate.get("behavior_type") or "")
+        start_goal_option_index = max(0, int(start_goal_option_index))
+        interaction_approach_attempts = list(interaction_approach_attempts or [])
+        if start_goal_option_index >= len(goal_options):
+            self._handle_navigation_result(
+                decision_id,
+                False,
+                {
+                    "reason": "interaction_approach_options_exhausted",
+                    "interaction_approach_attempts": interaction_approach_attempts,
+                },
+            )
+            return
         metadata = candidate.get("metadata") or {}
         interaction = candidate.get("interaction_command") or {}
         if behavior_type == "INTERACT":
@@ -1457,7 +2480,7 @@ class SemanticBehaviorExecutor:
             current_pose = self._current_pose(
                 str(metadata.get("frame_id") or self.map_frame)
             )
-            primary_x, primary_y, primary_yaw = goal_options[0]
+            primary_x, primary_y, primary_yaw = goal_options[start_goal_option_index]
             if current_pose is not None:
                 position_error = math.hypot(
                     primary_x - current_pose[0], primary_y - current_pose[1]
@@ -1482,18 +2505,47 @@ class SemanticBehaviorExecutor:
         )
         goal_frame = goal.target_pose.header.frame_id
         selected_goal = None
+        selected_goal_option_index = None
         path_lookahead = None
         attempted_goals = []
         is_explore = str(candidate.get("behavior_type") or "").upper() == "EXPLORE"
         is_post_interaction_traversal = (
             is_post_interaction_traversal_navigation(candidate)
         )
+        post_open_costmap_detail: dict = {}
+        if is_post_interaction_traversal:
+            costmap_fresh, post_open_costmap_detail = (
+                self._wait_for_post_interaction_costmap_freshness(
+                    decision_id, candidate
+                )
+            )
+            if not costmap_fresh:
+                if (
+                    str(post_open_costmap_detail.get("reason") or "")
+                    == "post_open_costmap_wait_preempted"
+                ):
+                    return
+                self._handle_navigation_result(
+                    decision_id,
+                    False,
+                    {
+                        **post_open_costmap_detail,
+                        "attempted_goal_count": 0,
+                        "attempted_goals": [],
+                        "interaction_approach_attempts": (
+                            interaction_approach_attempts
+                        ),
+                    },
+                )
+                return
         post_interaction_retry_started_at = time.monotonic()
         post_interaction_retry_deadline = (
             post_interaction_retry_started_at
             + self.post_interaction_traversal_make_plan_retry_window_s
         )
-        for option_index, (option_x, option_y, option_yaw) in enumerate(goal_options):
+        for option_index, (option_x, option_y, option_yaw) in enumerate(
+            goal_options[start_goal_option_index:], start=start_goal_option_index
+        ):
             plan_reachable = False
             option_lookahead = None
             preflight_reason = ""
@@ -1507,23 +2559,48 @@ class SemanticBehaviorExecutor:
                 ) = self._preflight_navigation_plan(
                     goal_frame, option_x, option_y, option_yaw
                 )
-                if plan_reachable or preflight_reason != "empty_plan":
+                if is_post_interaction_traversal:
+                    # Do not inherit normal-navigation's configurable
+                    # make_plan_fail_open path.  This continuation is held
+                    # specifically until a freshly rebuilt costmap has
+                    # produced a real path through the opened portal.
+                    plan_reachable = post_open_path_is_confirmed(
+                        plan_reachable, preflight_reason
+                    )
+                retryable_post_open_path = bool(
+                    is_post_interaction_traversal
+                    and post_open_path_retryable_preflight_reason(preflight_reason)
+                )
+                if plan_reachable:
+                    break
+                if is_post_interaction_traversal:
+                    if not retryable_post_open_path:
+                        break
+                elif preflight_reason != "empty_plan":
                     break
                 retry_delay_s = None
                 if is_post_interaction_traversal:
-                    retry_delay_s = bounded_empty_plan_retry_delay(
-                        time.monotonic(),
-                        post_interaction_retry_deadline,
-                        self.post_interaction_traversal_make_plan_retry_interval_s,
-                    )
+                    if len(goal_options) <= 1:
+                        retry_delay_s = bounded_empty_plan_retry_delay(
+                            time.monotonic(),
+                            post_interaction_retry_deadline,
+                            self.post_interaction_traversal_make_plan_retry_interval_s,
+                        )
+                    else:
+                        # A portal continuation now carries several preserved
+                        # far-side approach poses.  Preflight each one before
+                        # spending the bounded retry window on the first
+                        # unreachable pose; otherwise a stale/blocked option
+                        # can starve every safe doorway fallback.
+                        retry_delay_s = None
                 elif is_explore and actual_attempts <= self.make_plan_empty_retry_count:
                     retry_delay_s = self.make_plan_empty_retry_delay_s
                 if retry_delay_s is None:
                     break
                 if is_post_interaction_traversal and actual_attempts == 1:
                     rospy.loginfo(
-                        "[semantic_behavior_executor] waiting up to %.1fs for "
-                        "post-interaction traversal costmap to admit a plan",
+                        "[semantic_behavior_executor] retrying post-open "
+                        "make_plan for at most %.2fs after a fresh global costmap",
                         self.post_interaction_traversal_make_plan_retry_window_s,
                     )
                 time.sleep(retry_delay_s)
@@ -1569,20 +2646,113 @@ class SemanticBehaviorExecutor:
             )
             if plan_reachable or fail_open_empty_plan:
                 selected_goal = option_x, option_y, option_yaw
+                selected_goal_option_index = option_index
                 path_lookahead = option_lookahead
                 break
         if selected_goal is None:
+            post_open_wait_elapsed_s = max(
+                0.0, time.monotonic() - post_interaction_retry_started_at
+            )
+            post_open_path_timed_out = bool(
+                is_post_interaction_traversal
+                and any(
+                    post_open_path_retryable_preflight_reason(
+                        str(item.get("preflight_reason") or "")
+                    )
+                    for item in attempted_goals
+                )
+                and time.monotonic() >= post_interaction_retry_deadline
+            )
+            failure_detail = {
+                "reason": (
+                    "post_open_path_timeout"
+                    if post_open_path_timed_out
+                    else "make_plan_unreachable"
+                ),
+                "attempted_goal_count": len(attempted_goals),
+                "attempted_goals": attempted_goals,
+                "interaction_approach_attempts": interaction_approach_attempts,
+            }
+            if is_post_interaction_traversal:
+                with self.lock:
+                    latest_graph_revision = int(
+                        self.latest_graph.get("graph_revision", 0) or 0
+                    )
+                    latest_graph_capture_step = self.latest_graph.get("capture_step")
+                last_preflight_reason = str(
+                    attempted_goals[-1].get("preflight_reason") or ""
+                ) if attempted_goals else ""
+                failure_detail.update(
+                    {
+                        "post_open_costmap": dict(post_open_costmap_detail),
+                        "opened_portal_id": str(
+                            metadata.get("opened_portal_id")
+                            or candidate.get("target_id")
+                            or ""
+                        ),
+                        "post_open_path_wait_elapsed_s": post_open_wait_elapsed_s,
+                        "post_open_path_retry_window_s": (
+                            self.post_interaction_traversal_make_plan_retry_window_s
+                        ),
+                        "post_open_path_timed_out": post_open_path_timed_out,
+                        "post_open_path_last_preflight_reason": (
+                            last_preflight_reason
+                        ),
+                        "post_open_path_attempt_count": sum(
+                            int(item.get("preflight_attempts", 0) or 0)
+                            for item in attempted_goals
+                        ),
+                        "post_open_path_candidate_graph_revision": int(
+                            candidate.get("graph_revision", 0) or 0
+                        ),
+                        "post_open_path_latest_graph_revision": (
+                            latest_graph_revision
+                        ),
+                        "post_open_path_latest_capture_step": (
+                            latest_graph_capture_step
+                        ),
+                    }
+                )
+                for trace_key in (
+                    "baseline_global_costmap_seq",
+                    "observed_global_costmap_seq",
+                    "baseline_global_costmap_header_seq",
+                    "observed_global_costmap_header_seq",
+                    "baseline_global_costmap_full_seq",
+                    "observed_global_costmap_full_seq",
+                    "baseline_global_costmap_full_header_seq",
+                    "observed_global_costmap_full_header_seq",
+                    "costmap_wait_elapsed",
+                    "costmap_fresh",
+                    "fresh_source",
+                ):
+                    if trace_key in post_open_costmap_detail:
+                        failure_detail[trace_key] = post_open_costmap_detail[trace_key]
+                if post_open_path_timed_out:
+                    rospy.logwarn(
+                        "[semantic_behavior_executor] post-open path timeout for "
+                        "portal %s after %.2fs (%d preflight attempts)",
+                        failure_detail["opened_portal_id"],
+                        post_open_wait_elapsed_s,
+                        sum(
+                            int(item.get("preflight_attempts", 0) or 0)
+                            for item in attempted_goals
+                        ),
+                    )
             self._handle_navigation_result(
                 decision_id,
                 False,
-                {
-                    "reason": "make_plan_unreachable",
-                    "attempted_goal_count": len(attempted_goals),
-                    "attempted_goals": attempted_goals,
-                },
+                failure_detail,
             )
             return
         x, y, yaw = selected_goal
+        interaction_approach_attempt_history = list(interaction_approach_attempts)
+        if str(behavior_type).upper() == "INTERACT":
+            selected_attempt = dict(attempted_goals[-1])
+            selected_attempt["navigation_attempt"] = (
+                len(interaction_approach_attempt_history) + 1
+            )
+            interaction_approach_attempt_history.append(selected_attempt)
         if attempted_goals[-1]["index"] > 0:
             rospy.loginfo(
                 "[semantic_behavior_executor] selected interaction fallback goal %d/%d",
@@ -1610,15 +2780,25 @@ class SemanticBehaviorExecutor:
         goal.target_pose.pose.orientation.z = math.sin(0.5 * yaw)
         goal.target_pose.pose.orientation.w = math.cos(0.5 * yaw)
         self.move_base.send_goal(goal)
+        navigation_started_at = time.monotonic()
         start_pose = self._current_pose(goal_frame)
+        start_goal_distance_m = (
+            None
+            if start_pose is None
+            else math.hypot(x - start_pose[0], y - start_pose[1])
+        )
         progress_watchdog = NavigationProgressWatchdog(
             timeout_s=self.navigation_stagnation_timeout_s,
             min_displacement_m=self.navigation_stagnation_distance_m,
             min_yaw_change_rad=self.navigation_stagnation_yaw_rad,
+            min_goal_distance_reduction_m=(
+                self.navigation_stagnation_goal_distance_reduction_m
+            ),
         )
         progress_watchdog.reset(
             start_pose,
             time.monotonic(),
+            start_goal_distance_m,
         )
         navigation_timeout_s = (
             self.machine.config.interaction_navigation_timeout_s
@@ -1642,26 +2822,79 @@ class SemanticBehaviorExecutor:
             time.sleep(0.10)
             state = int(self.move_base.get_state())
             pose = self._current_pose(goal_frame)
+            now = time.monotonic()
+            goal_distance_m = (
+                None
+                if pose is None
+                else math.hypot(x - pose[0], y - pose[1])
+            )
+            local_plan_fresh = self._has_fresh_local_plan(
+                navigation_started_at, now
+            )
             near_final_yaw_alignment = bool(
                 pose is not None
                 and require_final_yaw
-                and math.hypot(x - pose[0], y - pose[1])
-                <= self.final_align_max_distance_m
+                and goal_distance_m is not None
+                and goal_distance_m <= self.final_align_max_distance_m
             )
             if not near_final_yaw_alignment and progress_watchdog.observe(
                 pose,
-                time.monotonic(),
+                now,
+                goal_distance_m=goal_distance_m,
+                local_plan_fresh=local_plan_fresh,
             ):
                 self.move_base.cancel_goal()
+                stagnation_detail = {
+                    "reason": "navigation_stagnation",
+                    "stagnation_timeout_s": self.navigation_stagnation_timeout_s,
+                    "stagnation_distance_m": self.navigation_stagnation_distance_m,
+                    "stagnation_yaw_rad": self.navigation_stagnation_yaw_rad,
+                    "stagnation_goal_distance_reduction_m": (
+                        self.navigation_stagnation_goal_distance_reduction_m
+                    ),
+                    "goal_distance_m": goal_distance_m,
+                    "goal_distance_progress_m": (
+                        progress_watchdog.goal_distance_reduction_m(goal_distance_m)
+                    ),
+                    "local_plan_fresh": local_plan_fresh,
+                    "interaction_approach_attempts": (
+                        interaction_approach_attempt_history
+                    ),
+                }
+                if is_post_interaction_traversal:
+                    stagnation_detail["post_open_costmap"] = dict(
+                        post_open_costmap_detail
+                    )
+                    for trace_key in (
+                        "baseline_global_costmap_seq",
+                        "observed_global_costmap_seq",
+                        "baseline_global_costmap_header_seq",
+                        "observed_global_costmap_header_seq",
+                        "baseline_global_costmap_full_seq",
+                        "observed_global_costmap_full_seq",
+                        "baseline_global_costmap_full_header_seq",
+                        "observed_global_costmap_full_header_seq",
+                        "costmap_wait_elapsed",
+                        "costmap_fresh",
+                        "fresh_source",
+                    ):
+                        if trace_key in post_open_costmap_detail:
+                            stagnation_detail[trace_key] = (
+                                post_open_costmap_detail[trace_key]
+                            )
+                if self._retry_interaction_approach(
+                    decision_id,
+                    candidate,
+                    selected_goal_option_index,
+                    interaction_approach_attempt_history,
+                    len(goal_options),
+                    stagnation_detail,
+                ):
+                    return
                 self._handle_navigation_result(
                     decision_id,
                     False,
-                    {
-                        "reason": "navigation_stagnation",
-                        "stagnation_timeout_s": self.navigation_stagnation_timeout_s,
-                        "stagnation_distance_m": self.navigation_stagnation_distance_m,
-                        "stagnation_yaw_rad": self.navigation_stagnation_yaw_rad,
-                    },
+                    stagnation_detail,
                 )
                 return
             if require_final_yaw:
@@ -1718,13 +2951,39 @@ class SemanticBehaviorExecutor:
                         {"reason": "navigation_timeout_final_alignment"},
                     )
                     return
-            self._handle_navigation_result(decision_id, False, {"reason": "navigation_timeout"})
+            self._handle_navigation_result(
+                decision_id,
+                False,
+                {
+                    "reason": "navigation_timeout",
+                    "interaction_approach_attempts": interaction_approach_attempt_history,
+                },
+            )
             return
         success = state == GoalStatus.SUCCEEDED
         detail = {
             "status_code": state,
             "status": self.move_base.get_goal_status_text() or str(state),
         }
+        if is_post_interaction_traversal:
+            detail["post_open_costmap"] = dict(post_open_costmap_detail)
+            for trace_key in (
+                "baseline_global_costmap_seq",
+                "observed_global_costmap_seq",
+                "baseline_global_costmap_header_seq",
+                "observed_global_costmap_header_seq",
+                "baseline_global_costmap_full_seq",
+                "observed_global_costmap_full_seq",
+                "baseline_global_costmap_full_header_seq",
+                "observed_global_costmap_full_header_seq",
+                "costmap_wait_elapsed",
+                "costmap_fresh",
+                "fresh_source",
+            ):
+                if trace_key in post_open_costmap_detail:
+                    detail[trace_key] = post_open_costmap_detail[trace_key]
+        if str(behavior_type).upper() == "INTERACT":
+            detail["interaction_approach_attempts"] = interaction_approach_attempt_history
         if success and require_final_yaw:
             aligned = self._final_align_goal(
                 decision_id,
@@ -1739,6 +2998,57 @@ class SemanticBehaviorExecutor:
             elif aligned is True:
                 detail["reason"] = "final_yaw_alignment"
         self._handle_navigation_result(decision_id, success, detail)
+
+    def _retry_interaction_approach(
+        self,
+        decision_id: str,
+        candidate: dict,
+        selected_option_index: int | None,
+        interaction_approach_attempts: list[dict],
+        goal_option_count: int,
+        failure_detail: dict,
+    ) -> bool:
+        if selected_option_index is None:
+            return False
+        next_option_index = next_interaction_approach_option_index(
+            behavior_type=str(candidate.get("behavior_type") or ""),
+            failure_detail=failure_detail,
+            selected_option_index=selected_option_index,
+            attempted_navigation_count=len(interaction_approach_attempts),
+            max_navigation_attempts=self.interaction_approach_fallback_max_attempts,
+            goal_option_count=goal_option_count,
+        )
+        if next_option_index is None:
+            return False
+        attempts = [dict(attempt) for attempt in interaction_approach_attempts]
+        if attempts:
+            attempts[-1]["outcome"] = str(failure_detail.get("reason") or "failed")
+            attempts[-1]["failure_detail"] = {
+                "goal_distance_m": failure_detail.get("goal_distance_m"),
+                "local_plan_fresh": failure_detail.get("local_plan_fresh"),
+            }
+        if not self._navigation_is_current(decision_id):
+            return True
+        if self.interaction_approach_fallback_cancel_wait_s > 0.0:
+            self.move_base.wait_for_result(
+                rospy.Duration(self.interaction_approach_fallback_cancel_wait_s)
+            )
+        if not self._navigation_is_current(decision_id):
+            return True
+        rospy.logwarn(
+            "[semantic_behavior_executor] INTERACT approach stagnated; "
+            "retrying option %d/%d (attempt %d/%d)",
+            next_option_index + 1,
+            goal_option_count,
+            len(attempts) + 1,
+            self.interaction_approach_fallback_max_attempts,
+        )
+        threading.Thread(
+            target=self._run_navigation,
+            args=(decision_id, candidate, next_option_index, attempts),
+            daemon=True,
+        ).start()
+        return True
 
     def _preflight_navigation_plan(
         self,
@@ -1812,7 +3122,14 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if self.selection is None or str(self.selection.get("decision_id") or "") != decision_id:
                 return
-            commands = self.machine.on_navigation_result(success, detail=detail)
+            wait_for_drawer_scan = bool(
+                success and self._needs_fresh_drawer_scan_locked()
+            )
+            commands = self.machine.on_navigation_result(
+                success,
+                detail=detail,
+                wait_for_drawer_scan=wait_for_drawer_scan,
+            )
             if (
                 self.machine.state == STATE_VERIFYING
                 and requires_graph_verification(
@@ -1979,12 +3296,17 @@ class SemanticBehaviorExecutor:
     def _finish_terminal(self, command: dict) -> None:
         with self.lock:
             selection = dict(self.selection or {})
+            decision_id = str(selection.get("decision_id") or "")
             was_navigating = self.machine.state in {
                 STATE_NAVIGATING,
                 STATE_APPROACH_INTERACTION,
             }
             status = "SUCCEEDED" if command.get("success") else "FAILED"
             detail = dict(command.get("detail") or {})
+            drawer_scan_wait = self._drawer_scan_wait_records.pop(decision_id, None)
+            self._drawer_scan_wait_contexts.pop(decision_id, None)
+            if drawer_scan_wait:
+                detail.setdefault("drawer_scan_wait", drawer_scan_wait)
             if self.model_events:
                 detail["mllm_events"] = list(self.model_events)
             self._publish_feedback(selection, status, bool(command.get("success")), detail)

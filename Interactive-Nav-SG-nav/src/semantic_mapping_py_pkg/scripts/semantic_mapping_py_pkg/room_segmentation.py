@@ -101,7 +101,13 @@ class RoomSegmenter:
         )
         self.state = state if state is not None else RoomSegmentationState()
 
-    def update_portal_hints(self, observations, source_mode="detector_online"):
+    def update_portal_hints(
+        self,
+        observations,
+        source_mode="detector_online",
+        *,
+        refresh_active=False,
+    ):
         if not self.room_portal_cut_enabled:
             return False
         changed = False
@@ -139,6 +145,28 @@ class RoomSegmenter:
                 }
                 self.state.portal_hints[key] = hint
             if hint["active"]:
+                # A successful interaction supplies the pre-open doorway
+                # reference geometry.  Preserve it as the virtual cut anchor:
+                # subsequent GT observations can describe the rotated door
+                # leaf instead of the doorway plane.  Ordinary detector
+                # updates intentionally retain the existing frozen behavior.
+                if refresh_active:
+                    geometry_changed = (
+                        self._distance_xy(hint["center"], center) > 1e-6
+                        or any(
+                            abs(float(hint["size"][axis]) - float(size[axis]))
+                            > 1e-6
+                            for axis in range(3)
+                        )
+                    )
+                    hint["center"] = list(center)
+                    hint["size"] = list(size)
+                    hint["candidate_center"] = list(center)
+                    hint["candidate_size"] = list(size)
+                    hint["confirmations"] = max(
+                        int(hint.get("confirmations", 0)), 1
+                    )
+                    changed = changed or geometry_changed
                 continue
             jump = self._distance_xy(hint["candidate_center"], center)
             if jump > self.room_portal_detector_max_center_jump_m:
@@ -165,7 +193,7 @@ class RoomSegmenter:
                 changed = True
         return changed
 
-    def segment(self, occ_grid):
+    def segment(self, occ_grid, *, force_stable=False):
         try:
             import cv2
         except Exception:
@@ -353,11 +381,24 @@ class RoomSegmenter:
         signature = self._grid_signature(occ_grid.info)
         self.state.prev_room_grid_signature = signature
         self.state.prev_room_ids = list(room_ids)
-        return self._stabilize_room_grid(signature, room_ids, room_conf)
+        return self._stabilize_room_grid(
+            signature,
+            room_ids,
+            room_conf,
+            force=force_stable,
+        )
 
-    def _stabilize_room_grid(self, signature, room_ids, room_conf):
+    def _stabilize_room_grid(self, signature, room_ids, room_conf, *, force=False):
         if self.state.stable_room_grid_signature != signature or self.state.stable_room_ids is None:
             self.state.stable_room_grid_signature = signature
+            self.state.stable_room_ids = list(room_ids)
+            self.state.stable_room_conf = list(room_conf)
+            self.state.candidate_room_ids = list(room_ids)
+            self.state.candidate_room_conf = list(room_conf)
+            self.state.candidate_room_count = self.room_grid_stability_frames
+            return list(room_ids), list(room_conf)
+
+        if force:
             self.state.stable_room_ids = list(room_ids)
             self.state.stable_room_conf = list(room_conf)
             self.state.candidate_room_ids = list(room_ids)

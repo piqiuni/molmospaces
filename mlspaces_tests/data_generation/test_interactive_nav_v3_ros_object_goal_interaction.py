@@ -36,9 +36,19 @@ class _FakeAdapter:
         request, self._request = self._request, None
         return request
 
-    def complete_interaction(self, command_id: str, *, success: bool) -> dict[str, str]:
+    def complete_interaction(
+        self,
+        command_id: str,
+        *,
+        success: bool,
+        status: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, str]:
         self.completions.append((command_id, success))
-        return {"status": "COMPLETED" if success else "FAILED"}
+        result = {"status": status or ("COMPLETED" if success else "FAILED")}
+        if reason:
+            result["reason"] = reason
+        return result
 
 
 def _runtime_joint(
@@ -299,6 +309,73 @@ def test_opaque_ros_object_command_keeps_private_resolution_out_of_public_attemp
     assert terminal.correct_action_count == 2
 
 
+def test_unknown_semantic_portal_is_scored_as_invalid_not_failed_skill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_id = "open-static-doorway"
+    opaque_id = "obj_000021"
+    adapter = _FakeAdapter(
+        EvaluatorInteractionRequest(
+            command_id=command_id,
+            episode_id="episode_public_invalid_portal",
+            instance_id=opaque_id,
+            action="open",
+            private_handle=None,
+            node_id="portal_obj_000021",
+            candidate_id="interaction:portal_obj_000021:open",
+            rejection_reason="unknown_instance_id",
+        )
+    )
+    runtime = SimpleNamespace(
+        adapter=adapter,
+        skill=object(),
+        opaque_to_source_name={},
+        opaque_to_joints={},
+    )
+    task = SimpleNamespace(env=object(), get_observations=lambda: {"camera": "public-observation"})
+    config = SimpleNamespace(record_video=False)
+    published_steps: list[int] = []
+    monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_publish_restricted_ros_frame",
+        lambda _runtime, _task, *, decision_index: published_steps.append(decision_index) or True,
+    )
+    monkeypatch.setattr(benchmark_runner, "_discard_task_rollout_cache", lambda _task: None)
+
+    consumed = benchmark_runner._consume_pending_ros_object_goal_interaction(
+        task=task,
+        runtime=runtime,
+        episode={"interactive_nav": {"interactions": [], "oracle_plans": []}},
+        private_attempts=[],
+        config=config,
+        decision_index=12,
+        frames=[],
+    )
+
+    assert consumed is not None
+    assert adapter.completions == [(command_id, False)]
+    assert published_steps == [12]
+    assert consumed["private_attempt"]["classification"] == "invalid"
+    assert consumed["private_attempt"]["success"] is False
+    assert consumed["private_attempt"]["metadata"]["rejection"] == {
+        "reason": "unknown_instance_id",
+        "node_id": "portal_obj_000021",
+        "candidate_id": "interaction:portal_obj_000021:open",
+        "rejected_before_execution": True,
+    }
+    assert consumed["public_attempt"] == {
+        "request_id": command_id,
+        "instance_id": opaque_id,
+        "operation": "open",
+        "status": "invalid",
+        "reason": "unknown_instance_id",
+        "decision_step": 12,
+        "simulated_seconds": 0.0,
+        "result_status": "INVALID",
+    }
+
+
 def test_drawer_scan_gate_and_scoring_ids_use_private_drawer_type_and_physical_order() -> None:
     source_name = "private_dresser_body"
     top = _runtime_joint(object_name=source_name, joint_name="top_slide", joint_index=9)
@@ -503,6 +580,8 @@ def test_partial_object_skill_result_is_reported_failed_to_ros(
     assert consumed is not None
     assert adapter.completions == [(command_id, False)]
     assert consumed["public_attempt"]["status"] == "failed"
+    assert consumed["public_attempt"]["result_status"] == "FAILED"
+    assert consumed["private_attempt"]["classification"] == "required_valid"
     assert consumed["private_attempt"]["success"] is False
     assert consumed["private_attempt"]["resolved_interaction_ids"] == ["outer"]
 

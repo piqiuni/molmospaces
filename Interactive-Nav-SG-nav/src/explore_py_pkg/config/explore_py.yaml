@@ -16,6 +16,7 @@ topics:
   behavior_command: "/explore_py/command"
   behavior_feedback: "/explore_py/behavior_feedback"
   reset: "/explore_py/reset"
+  fresh_command_gate: "/molmo_spaces/fresh_cmd_gate"
   llm_value_grid: "/explore_py/llm_value_grid"
   strategy_bias: "/explore_py/strategy_bias"
   object_map: "/semantic_mapping/obj_map"
@@ -65,10 +66,16 @@ exploration:
   active_goal_frontier_min_cells: 3
   initial_spin_enabled: false
   initial_spin_angle_rad: 6.283185307179586
-  initial_spin_angular_speed: 0.15
+  # The V3 startup scan is action-gated; at the 200 ms evaluator period this
+  # completes 2π in 26 commands and remains below the 28-command hard cap.
+  initial_spin_angular_speed: 1.25
   initial_spin_timeout_sec: 95.0
   initial_spin_settle_sec: 1.0
   initial_spin_cmd_rate_hz: 10.0
+  initial_spin_fresh_step_gate_enabled: true
+  initial_spin_fresh_command_gate_enabled: true
+  initial_spin_fresh_step_min_delay_sec: 0.0
+  initial_spin_max_control_steps: 28
   local_plan_watchdog_enabled: false
   local_plan_watchdog_sec: 12.0
   local_plan_min_poses: 3

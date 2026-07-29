@@ -320,6 +320,13 @@ class MLLMClient:
                 "interaction_parts": [],
                 "confidence": 0.0,
             }
+        if role == "room_attribute_inference":
+            return {
+                "room_id": context.get("room_id"),
+                "room_attribute": "unknown",
+                "confidence": 0.0,
+                "evidence_object_ids": [],
+            }
         if role == "skill_planning":
             expected_type = str(context.get("expected_target_type") or "unknown")
             if expected_type == "drawer_container":

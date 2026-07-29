@@ -162,6 +162,41 @@ def test_semantic_graph_exposes_inferred_room_attributes_and_unassigned_anchors(
     ]
 
 
+def test_semantic_graph_marks_graph_only_portal_child_as_unobserved() -> None:
+    graph = compact_semantic_graph(
+        {
+            "nodes": [
+                {
+                    "id": "room_1000000",
+                    "type": "room",
+                    "label": "unobserved_portal_room",
+                    "centroid": [1.0, 0.0, 0.1],
+                    "attributes": {
+                        "is_potential_room": True,
+                        "observed_free_space": False,
+                        "source_portal_id": "portal_door_1",
+                    },
+                }
+            ]
+        }
+    )
+
+    assert graph["rooms"] == [
+        {
+            "id": "room_1000000",
+            "type": "unobserved_portal_room",
+            "potential_room": True,
+            "observed_free_space": False,
+            "source_portal_id": "portal_door_1",
+        }
+    ]
+    reasoning = build_room_object_reasoning_context(
+        {"mode": "explore_all"}, graph
+    )
+    assert reasoning["observed_rooms"][0]["potential_room"] is True
+    assert reasoning["observed_rooms"][0]["observed_free_space"] is False
+
+
 def test_model_candidate_exposes_unknown_area_and_nearby_semantics() -> None:
     client = ModelPolicyClient(ModelPolicyConfig(mode="disabled"))
     candidate = BehaviorCandidate(
@@ -722,6 +757,109 @@ def test_post_interaction_traversal_guard_prevents_immediate_container_detour(
     assert "POST_INTERACTION_TRAVERSE" in instruction
     assert "Only IDs present in the current candidates array" in instruction
     assert "historical context and are forbidden" in instruction
+
+
+def test_new_room_payload_and_guard_prefer_unentered_room_without_overriding_postdoor(
+    monkeypatch,
+) -> None:
+    client = ModelPolicyClient(
+        ModelPolicyConfig(mode="mock", pre_score_guard_margin=0.75)
+    )
+    entered = BehaviorCandidate(
+        candidate_id="frontier:entered",
+        behavior_type="EXPLORE",
+        source="test",
+        target_id="entered",
+        target_name="entered",
+        goal_xyyaw=[1.0, 0.0, 0.0],
+        features={"distance_m": 1.0},
+        metadata={"room_status": "entered_room", "target_room_id": 1},
+    )
+    new_room = BehaviorCandidate(
+        candidate_id="frontier:new_room",
+        behavior_type="EXPLORE",
+        source="test",
+        target_id="new_room",
+        target_name="new_room",
+        goal_xyyaw=[3.0, 0.0, 0.0],
+        features={"distance_m": 3.0},
+        metadata={
+            "room_status": "unentered_new_room",
+            "target_room_id": 2,
+            "robot_room_id": 1,
+            "potential_room": True,
+            "source_portal_id": "portal_1",
+            "room_attribute": "kitchen",
+            "room_attribute_confidence": 0.9,
+            "room_target_affinity": 1.0,
+            "room_target_affinity_reason": "room_target_semantic_match",
+        },
+    )
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda payload, metrics_context=None: {
+            "ranked_ids": [entered.candidate_id, new_room.candidate_id],
+            "reason": "INFORMATION_GAIN",
+            "confidence": "medium",
+        },
+    )
+
+    selected = client.select(
+        [entered, new_room],
+        target_context={"enabled": True, "target_name": "apple"},
+        robot_context={
+            "entered_room_ids": ["room_1"],
+            "candidate_pre_scores": {entered.candidate_id: 0.5, new_room.candidate_id: 1.5},
+            "candidate_decision_hints": {new_room.candidate_id: "NEW_ROOM_FRONTIER"},
+        },
+    )
+
+    assert selected is new_room
+    assert client.last_reason == "PRE_SCORE_GUARD_NEW_ROOM_FRONTIER"
+    option = next(item for item in client.last_candidate_groups if item["id"] == new_room.candidate_id)
+    assert option["room_status"] == "unentered_new_room"
+    assert option["potential_room"] is True
+    assert option["room_target_affinity"] == 1.0
+    request = client.build_request(
+        [new_room],
+        {"enabled": True, "target_name": "apple"},
+        {},
+        {"entered_room_ids": ["room_1"]},
+    )
+    assert request["robot"]["entered_rooms"] == ["room_1"]
+    assert "room_status=unentered_new_room" in request["instruction"]
+
+    traversal = BehaviorCandidate(
+        candidate_id="traverse:portal_1",
+        behavior_type="NAVIGATE",
+        source="test",
+        target_id="portal_1",
+        target_name="door",
+        goal_xyyaw=[2.0, 0.0, 0.0],
+        features={"distance_m": 2.0},
+        metadata={"post_interaction_traversal": True},
+    )
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda payload, metrics_context=None: {
+            "ranked_ids": [traversal.candidate_id, new_room.candidate_id],
+            "reason": "UNLOCK_ROUTE",
+            "confidence": "high",
+        },
+    )
+    selected = client.select(
+        [traversal, new_room],
+        robot_context={
+            "candidate_pre_scores": {traversal.candidate_id: 1.0, new_room.candidate_id: 4.0},
+            "candidate_decision_hints": {
+                traversal.candidate_id: "POST_INTERACTION_TRAVERSE",
+                new_room.candidate_id: "NEW_ROOM_FRONTIER",
+            },
+        },
+    )
+    assert selected is traversal
 
 
 def test_two_stage_room_object_context_links_apple_to_observed_kitchen_fridge() -> None:

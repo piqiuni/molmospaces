@@ -18,6 +18,9 @@
   <arg name="attribute_min_bbox_area_px" default="512"/>
   <arg name="attribute_max_distance_m" default="6.0"/>
   <arg name="attribute_required_consecutive_observations" default="2"/>
+  <!-- start_attribute_inference launches both independent Module-1 lanes:
+       RGB object attributes and text-only room attributes. -->
+  <arg name="attribute_room_enabled" default="true"/>
   <arg name="object_detection_backend" default="mock_empty"/>
   <arg name="object_detection_provider" default="external_http"/>
   <arg name="object_detection_model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
@@ -96,6 +99,7 @@
       <param name="min_bbox_area_px" value="$(arg attribute_min_bbox_area_px)"/>
       <param name="max_distance_m" value="$(arg attribute_max_distance_m)"/>
       <param name="required_consecutive_observations" value="$(arg attribute_required_consecutive_observations)"/>
+      <param name="room_mllm/enabled" value="$(arg attribute_room_enabled)"/>
     </node>
   </group>
 </launch>

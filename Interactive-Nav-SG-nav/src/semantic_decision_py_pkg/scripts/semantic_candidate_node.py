@@ -37,6 +37,12 @@ class SemanticCandidateNode:
                 ),
                 max_state_age_sec=float(config.get("max_state_age_sec", 300.0)),
                 min_state_confidence=float(config.get("min_state_confidence", 0.5)),
+                portal_require_attribute_ready=bool(
+                    config.get("portal_require_attribute_ready", False)
+                ),
+                portal_allow_unknown_state=bool(
+                    config.get("portal_allow_unknown_state", True)
+                ),
                 portal_standoff_m=float(config.get("portal_standoff_m", 1.0)),
                 portal_traversal_distance_m=float(
                     config.get("portal_traversal_distance_m", 0.9)
@@ -48,7 +54,11 @@ class SemanticCandidateNode:
                     config.get("portal_traversal_completion_margin_m", 0.35)
                 ),
                 container_standoff_m=float(config.get("container_standoff_m", 1.0)),
-                drawer_standoff_m=float(config.get("drawer_standoff_m", 0.60)),
+                drawer_standoff_m=(
+                    float(config["drawer_standoff_m"])
+                    if config.get("drawer_standoff_m") is not None
+                    else None
+                ),
                 interaction_safety_margin_m=float(
                     config.get("interaction_safety_margin_m", 0.0)
                 ),

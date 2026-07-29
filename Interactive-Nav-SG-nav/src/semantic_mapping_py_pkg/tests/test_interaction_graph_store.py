@@ -688,6 +688,73 @@ def test_portal_room_ring_does_not_reach_distant_room():
     assert portal["attributes"]["connectivity_status"] == "partial"
 
 
+def test_open_partial_portal_creates_graph_only_child_room_until_far_side_is_observed():
+    """A post-open child is topology, never a fake occupied-grid label."""
+
+    scene_data = [1] * (FakeGridInfo.width * FakeGridInfo.height)
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_room_grid(FakeGridInfo(), scene_data, [100] * len(scene_data))
+    store.update_observations(
+        [
+            observation(
+                instance_id="door_partial",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=0.0,
+                position=[4.0, 4.0, 1.0],
+                aabb_center=[4.0, 4.0, 1.0],
+                aabb_size=[0.2, 1.0, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+    portal_id = next(
+        node["id"] for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+
+    assert store.update_interaction_result(
+        {
+            "node_id": portal_id,
+            "action": "open",
+            "success": True,
+            "approach_goal_xyyaw": [3.0, 4.0, 0.0],
+        }
+    )
+    graph = store.as_graph_dict()
+    portal = next(node for node in graph["nodes"] if node["id"] == portal_id)
+    child_room_id = portal["attributes"]["portal_child_room_id"]
+    child = next(node for node in graph["nodes"] if node["room_id"] == child_room_id)
+
+    assert portal["attributes"]["observed_connected_room_ids"] == [1]
+    assert portal["attributes"]["connected_room_ids"] == [1, child_room_id]
+    assert portal["attributes"]["connectivity_status"] == "potential"
+    assert child["attributes"]["is_potential_room"] is True
+    assert child["attributes"]["observed_free_space"] is False
+    assert child["attributes"]["cell_count"] == 0
+    assert child_room_id not in scene_data
+
+    # Once ordinary segmentation sees a far-side component, it replaces the
+    # synthetic child and the original room grid remains the sole occupancy
+    # evidence source.
+    observed_scene_data = []
+    for _y in range(FakeGridInfo.height):
+        observed_scene_data.extend([1, 1, 1, 1, 2, 2, 2, 2])
+    store.update_room_grid(
+        FakeGridInfo(), observed_scene_data, [100] * len(observed_scene_data)
+    )
+    graph = store.as_graph_dict()
+    portal = next(node for node in graph["nodes"] if node["id"] == portal_id)
+    retired_child = next(node for node in graph["nodes"] if node["room_id"] == child_room_id)
+    assert portal["attributes"]["connected_room_ids"] == [1, 2]
+    assert portal["attributes"]["connectivity_status"] == "connected"
+    assert portal["attributes"]["potential_room_ids"] == []
+    assert retired_child["attributes"]["active"] is False
+    assert child_room_id not in observed_scene_data
+
+
 def test_container_room_assignment_uses_nearest_segment_ring():
     scene_data = [1] * (FakeGridInfo.width * FakeGridInfo.height)
     for y in range(3, 5):
@@ -1045,6 +1112,67 @@ def test_non_articulated_portal_feedback_persists_static_capability() -> None:
         if hint["node_id"] == "portal_doorframe_static_1"
     )
     assert navigation_hint["requires_interaction"] is False
+
+
+def test_invalid_unknown_portal_result_persists_noninteractable_static_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="obj_000021",
+        semantic_name="doorway",
+        is_door=True,
+        is_articulable=False,
+    )
+    doorway["source_object_name"] = "obj_000021"
+    store.update_observations(
+        [doorway], source_mode="realtime_gt_observation", stamp=1.0
+    )
+
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_obj_000021",
+            "object_id": "obj_000021",
+            "event_id": "invalid_unknown_portal",
+            "action": "open",
+            "success": False,
+            "status": "INVALID",
+            "reason": "unknown_instance_id",
+            "source": "evaluator_object_skill",
+            "state": "static",
+            "interactable": False,
+            "interaction_capability": "static",
+        },
+        stamp=2.0,
+    )
+    # Subsequent observations and Module 1 patches must not revive this
+    # evaluator-unregistered doorway as an interaction candidate.
+    store.update_observations(
+        [doorway], source_mode="realtime_gt_observation", stamp=3.0
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "obj_000021",
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.95,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=4.0,
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=4.0)["nodes"]
+        if node["id"] == "portal_obj_000021"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "static"
+    assert interaction["is_interactable"] is False
+    assert interaction["requires_interaction"] is False
+    assert interaction["interaction_mode"] == "none"
+    assert interaction["failure_reason"] == "unknown_instance_id"
 
 
 def test_interaction_result_can_match_source_name_and_is_idempotent_by_event_id():
@@ -1498,7 +1626,7 @@ def test_attribute_patch_sets_semantic_state_and_preserves_last_seen():
     assert portal["attributes"]["attribute_updated_at"] == 20.0
 
 
-def test_superseded_attribute_frame_is_marked_stale_without_state_change():
+def test_delayed_attribute_frame_is_applied_when_current_request_matches():
     store = InteractionGraphStore(scene_id="test_scene")
     door = observation(
         instance_id="gt_000001",
@@ -1511,18 +1639,22 @@ def test_superseded_attribute_frame_is_marked_stale_without_state_change():
         frame_index=8,
     )
     store.update_observations([door], stamp=8.0, source_mode="realtime_gt_observation")
-    reopened = dict(door)
-    reopened["joint_value"] = 1.0
-    reopened["frame_index"] = 9
-    store.update_observations([reopened], stamp=9.0, source_mode="realtime_gt_observation")
-    assert store.update_interaction_result(
+    # A normal later scan must not invalidate the outstanding MLLM request.
+    # The same request sequence/signature still identifies the current visual
+    # evidence; frame age is recorded only as telemetry.
+    later_scan = dict(door)
+    later_scan["frame_index"] = 9
+    store.update_observations([later_scan], stamp=9.0, source_mode="realtime_gt_observation")
+    signature = "door-evidence-v1"
+    assert store.apply_attribute_patch(
         {
-            "instance_id": "gt_000001",
-            "event_id": "executor_opened_door",
-            "state": "open",
-            "source": "executor_verification",
+            "object_id": "gt_000001",
+            "attribute_status": "pending",
+            "request_sequence": 4,
+            "observation_frame_index": 8,
+            "observation_signature": signature,
         },
-        stamp=10.0,
+        stamp=8.0,
     )
 
     assert store.apply_attribute_patch(
@@ -1531,6 +1663,7 @@ def test_superseded_attribute_frame_is_marked_stale_without_state_change():
             "attribute_status": "ready",
             "request_sequence": 4,
             "observation_frame_index": 8,
+            "observation_signature": signature,
             "interactable": True,
             "interaction_class": "portal",
             "coarse_state": "closed",
@@ -1541,9 +1674,44 @@ def test_superseded_attribute_frame_is_marked_stale_without_state_change():
     portal = next(
         node for node in store.as_graph_dict(stamp=12.0)["nodes"] if node["type"] == "portal"
     )
-    assert portal["attributes"]["attribute_status"] == "stale"
-    assert portal["attributes"]["attribute_error"] == "observation_version_superseded"
-    assert portal["interaction"]["state"] == "open"
+    assert portal["attributes"]["attribute_status"] == "ready"
+    assert portal["attributes"]["attribute_observation_lag_steps"] == 1
+    assert portal["interaction"]["state"] == "closed"
+
+
+def test_attribute_patch_rejects_mismatched_current_evidence_signature():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="gt_000001",
+                semantic_name="door",
+                is_door=True,
+                frame_index=8,
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "gt_000001",
+            "attribute_status": "pending",
+            "request_sequence": 4,
+            "observation_signature": "door-evidence-current",
+        }
+    )
+    assert not store.apply_attribute_patch(
+        {
+            "object_id": "gt_000001",
+            "attribute_status": "ready",
+            "request_sequence": 4,
+            "observation_signature": "door-evidence-old",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "confidence": 0.9,
+        }
+    )
 
 
 def test_configured_interaction_geometry_is_recorded_for_minimal_gt_node() -> None:

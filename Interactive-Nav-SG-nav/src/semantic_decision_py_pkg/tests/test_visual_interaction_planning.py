@@ -14,6 +14,8 @@ from semantic_decision_py_pkg.visual_interaction_planning import (
     candidate_with_direct_drawer_scan,
     candidate_with_visual_operation_plan,
     current_visible_bbox_2d,
+    current_visible_bbox_capture_step,
+    fresh_direct_drawer_scan_candidate,
     infer_visual_interaction_target_type,
 )
 
@@ -118,6 +120,87 @@ def test_direct_drawer_scan_requires_a_current_valid_box() -> None:
         {"is_currently_visible": True, "bbox_2d": [0, 0, 20, 20]},
         capture_step=None,
     ) is None
+
+
+def test_direct_drawer_scan_uses_only_a_post_arrival_current_public_frame() -> None:
+    candidate = {
+        "target_id": "container_obj_000016",
+        "interaction_command": {"action": "open"},
+    }
+    node = {
+        "id": "container_obj_000016",
+        "is_currently_visible": True,
+        "attributes": {
+            "bbox_2d": [10, 20, 110, 160],
+            "last_observation_frame_index": 42,
+        },
+    }
+
+    assert current_visible_bbox_capture_step(node) == 42
+    planned, reason = fresh_direct_drawer_scan_candidate(
+        candidate,
+        node,
+        graph_capture_step=42,
+        graph_revision=19,
+        minimum_graph_capture_step=41,
+        minimum_graph_revision=18,
+        rgb_image_sequence=53,
+        minimum_rgb_image_sequence=52,
+        rgb_capture_step=42,
+        minimum_rgb_capture_step=41,
+    )
+
+    assert reason == "ready"
+    assert planned is not None
+    assert planned["interaction_command"]["drawer_container_capture_step"] == 42
+    assert planned["interaction_command"]["drawer_container_bbox_2d"] == [
+        10.0,
+        20.0,
+        110.0,
+        160.0,
+    ]
+
+
+def test_direct_drawer_scan_rejects_stale_or_nonmatching_public_bbox_frame() -> None:
+    candidate = {"interaction_command": {"action": "open"}}
+    node = {
+        "is_currently_visible": True,
+        "attributes": {
+            "bbox_2d": [10, 20, 110, 160],
+            "last_observation_frame_index": 41,
+        },
+    }
+    kwargs = {
+        "graph_capture_step": 42,
+        "graph_revision": 19,
+        "minimum_graph_capture_step": 41,
+        "minimum_graph_revision": 18,
+        "rgb_image_sequence": 53,
+        "minimum_rgb_image_sequence": 52,
+        "rgb_capture_step": 42,
+        "minimum_rgb_capture_step": 41,
+    }
+
+    planned, reason = fresh_direct_drawer_scan_candidate(candidate, node, **kwargs)
+    assert planned is None
+    assert reason == "target_not_observed_in_current_capture"
+
+    node["attributes"]["last_observation_frame_index"] = 42
+    planned, reason = fresh_direct_drawer_scan_candidate(
+        candidate,
+        node,
+        **{**kwargs, "graph_capture_step": 41},
+    )
+    assert planned is None
+    assert reason == "graph_capture_not_fresh"
+
+    planned, reason = fresh_direct_drawer_scan_candidate(
+        candidate,
+        node,
+        **{**kwargs, "rgb_image_sequence": 52},
+    )
+    assert planned is None
+    assert reason == "rgb_image_not_fresh"
 
 
 def test_model_drawer_plan_cannot_inherit_a_direct_scan_box() -> None:

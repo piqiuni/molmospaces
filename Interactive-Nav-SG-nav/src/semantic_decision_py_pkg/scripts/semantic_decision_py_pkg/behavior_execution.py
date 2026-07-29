@@ -13,6 +13,7 @@ STATE_PREPARING_EXPLORE = "PREPARING_EXPLORE"
 STATE_NAVIGATING = "NAVIGATING"
 STATE_FINALIZING_EXPLORE = "FINALIZING_EXPLORE"
 STATE_APPROACH_INTERACTION = "APPROACH_INTERACTION"
+STATE_WAITING_FOR_DRAWER_SCAN = "WAIT_FOR_DRAWER_SCAN"
 STATE_INTERACTING = "INTERACTING"
 STATE_VERIFYING = "VERIFYING"
 STATE_SUCCEEDED = "SUCCEEDED"
@@ -114,6 +115,20 @@ def path_lookahead_point(
     return float(endpoint[0]), float(endpoint[1])
 
 
+def navigation_prerotation_heading_target(
+    path_lookahead: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+    """Return a pre-turn heading only when a reachable path supplied one.
+
+    The final goal is deliberately not an input: a global path can initially
+    leave in a direction very different from its endpoint bearing.
+    """
+
+    if path_lookahead is None:
+        return None
+    return float(path_lookahead[0]), float(path_lookahead[1])
+
+
 def navigation_goal_options(candidate: dict[str, Any]) -> list[tuple[float, float, float]]:
     raw_options = [candidate.get("goal_xyyaw")]
     raw_options.extend(
@@ -172,6 +187,234 @@ def is_post_interaction_traversal_navigation(
     )
 
 
+@dataclass(frozen=True)
+class PostInteractionCostmapBaseline:
+    """Map publications observed before a successful portal continuation.
+
+    The post-open gate must follow the actual planner input, not merely a
+    convenient costmap notification: raw SLAM occupancy -> semantic planning
+    occupancy -> global costmap.  Receipt counters are local to the executor
+    rather than ROS header sequences, which can reset with move_base.
+    """
+
+    portal_id: str
+    source_event_id: str
+    receipt_count: int
+    header_seq: int | None = None
+    update_receipt_count: int = 0
+    update_header_seq: int | None = None
+    raw_occupancy_receipt_count: int = 0
+    raw_occupancy_header_seq: int | None = None
+    raw_occupancy_header_stamp_sec: float | None = None
+    planning_occupancy_receipt_count: int = 0
+    planning_occupancy_header_seq: int | None = None
+    planning_occupancy_header_stamp_sec: float | None = None
+    interaction_result_stamp_sec: float | None = None
+
+
+@dataclass(frozen=True)
+class PostInteractionRawMapBarrier:
+    """One raw map receipt admitted after a portal-open result.
+
+    ``planning_occupancy_receipt_count`` is captured in the raw-map callback,
+    so a planning map already received before this raw map can never satisfy
+    the next stage merely because the executor wakes late.
+    """
+
+    receipt_count: int
+    header_seq: int | None
+    header_stamp_sec: float | None
+    planning_occupancy_receipt_count: int
+    planning_occupancy_header_seq: int | None = None
+    planning_occupancy_header_stamp_sec: float | None = None
+
+
+@dataclass(frozen=True)
+class PostInteractionPlanningMapBarrier:
+    """One planning-map receipt after a qualifying raw map.
+
+    The costmap counters are sampled at this receipt.  A later global full or
+    incremental update is therefore causally downstream of the planner input
+    accepted by this barrier.
+    """
+
+    raw_map: PostInteractionRawMapBarrier
+    raw_fresh_source: str
+    receipt_count: int
+    header_seq: int | None
+    header_stamp_sec: float | None
+    planning_fresh_source: str
+    costmap_receipt_count: int
+    costmap_header_seq: int | None
+    costmap_update_receipt_count: int
+    costmap_update_header_seq: int | None
+
+
+def _positive_finite_stamp(value: object) -> float | None:
+    try:
+        stamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(stamp) or stamp <= 0.0:
+        return None
+    return stamp
+
+
+def post_interaction_raw_occupancy_fresh_source(
+    baseline: PostInteractionCostmapBaseline | None,
+    current_receipt_count: int,
+    current_header_stamp_sec: float | None,
+) -> str:
+    """Return how a raw OCC receipt proves it followed the open result.
+
+    When both stamps are available, require the source map's stamp to be
+    strictly newer than the evaluator result.  A zero/missing stamp falls back
+    to the executor's post-result receipt boundary and is labelled explicitly
+    for benchmark diagnostics.
+    """
+
+    if baseline is None or int(current_receipt_count) <= int(
+        baseline.raw_occupancy_receipt_count
+    ):
+        return ""
+    result_stamp = _positive_finite_stamp(baseline.interaction_result_stamp_sec)
+    raw_stamp = _positive_finite_stamp(current_header_stamp_sec)
+    if result_stamp is not None and raw_stamp is not None:
+        return "header_stamp" if raw_stamp > result_stamp else ""
+    if result_stamp is not None:
+        return "receipt_after_result_no_raw_stamp"
+    return "receipt_after_result"
+
+
+def post_interaction_planning_occupancy_fresh_source(
+    raw_barrier: PostInteractionRawMapBarrier | None,
+    current_receipt_count: int,
+    current_header_stamp_sec: float | None,
+) -> str:
+    """Return how a planning OCC receipt proves it follows the raw map.
+
+    Semantic mapping preserves the raw occupancy stamp on
+    ``planning_occ_map``.  If both stamps are present, require that source
+    relationship.  Otherwise the raw callback's receipt snapshot still
+    guarantees a strictly later local receipt.
+    """
+
+    if raw_barrier is None or int(current_receipt_count) <= int(
+        raw_barrier.planning_occupancy_receipt_count
+    ):
+        return ""
+    raw_stamp = _positive_finite_stamp(raw_barrier.header_stamp_sec)
+    planning_stamp = _positive_finite_stamp(current_header_stamp_sec)
+    if raw_stamp is not None and planning_stamp is not None:
+        # Matching is normal because semantic_mapping copies the raw header;
+        # a later stamp is also valid if a downstream map rebuild occurs.
+        return "source_header_stamp" if planning_stamp >= raw_stamp else ""
+    if raw_stamp is not None:
+        return "receipt_after_raw_no_planning_stamp"
+    return "receipt_after_raw"
+
+
+def post_interaction_costmap_is_fresh(
+    baseline: PostInteractionCostmapBaseline | None,
+    current_receipt_count: int,
+    current_update_receipt_count: int = 0,
+) -> bool:
+    """Return whether either global-map stream advanced after the open result."""
+
+    return bool(
+        post_interaction_costmap_fresh_source(
+            baseline,
+            current_receipt_count,
+            current_update_receipt_count,
+        )
+    )
+
+
+def post_interaction_costmap_fresh_source(
+    baseline: PostInteractionCostmapBaseline | None,
+    current_receipt_count: int,
+    current_update_receipt_count: int = 0,
+) -> str:
+    """Identify the stream that made a post-open planner-map gate fresh.
+
+    Prefer the costmap delta topic whenever both streams are new: it is the
+    low-latency actual update path and avoids tying correctness to expensive
+    full-grid publications.
+    """
+
+    if baseline is None:
+        return ""
+    return post_interaction_costmap_receipts_fresh_source(
+        baseline.receipt_count,
+        baseline.update_receipt_count,
+        current_receipt_count,
+        current_update_receipt_count,
+    )
+
+
+def post_interaction_costmap_receipts_fresh_source(
+    baseline_receipt_count: int,
+    baseline_update_receipt_count: int,
+    current_receipt_count: int,
+    current_update_receipt_count: int = 0,
+) -> str:
+    """Return a later costmap source from explicit receipt-counter bounds."""
+
+    if int(current_update_receipt_count) > int(baseline_update_receipt_count):
+        return "costmap_update"
+    if int(current_receipt_count) > int(baseline_receipt_count):
+        return "full"
+    return ""
+
+
+def post_interaction_costmap_baseline_keys(
+    source_event_id: object,
+    portal_id: object,
+) -> tuple[str, ...]:
+    """Return exact-event then portal fallback keys for a traversal barrier."""
+
+    event_id = str(source_event_id or "").strip()
+    normalized_portal_id = str(portal_id or "").strip()
+    keys: list[str] = []
+    if event_id:
+        keys.append(f"event:{event_id}")
+    if normalized_portal_id:
+        keys.append(f"portal:{normalized_portal_id}")
+    return tuple(keys)
+
+
+def post_open_path_retryable_preflight_reason(reason: str) -> bool:
+    """Return whether a post-open ``make_plan`` miss can heal with map updates.
+
+    The target point can briefly be outside the newly rebuilt global costmap,
+    which presents as either no path or a path whose endpoint remains short of
+    the crossing waypoint.  During ROS/costmap startup the same wait can also
+    briefly lack a transform or the make-plan service.  None of those outcomes
+    invalidates the already successful portal interaction, so wait for a
+    concrete path rather than fail-open into ``move_base``.
+    """
+
+    return str(reason or "").casefold() in {
+        "empty_plan",
+        "endpoint_mismatch",
+        "pose_unavailable",
+        "service_unavailable",
+    }
+
+
+def post_open_path_is_confirmed(plan_reachable: bool, reason: str) -> bool:
+    """Require a real make-plan result for the one-shot door crossing.
+
+    Normal navigation preserves its configurable fail-open behavior when the
+    service is temporarily unavailable.  A post-open crossing is different:
+    it is explicitly held until a path has been observed, so a fail-open
+    ``True`` paired with ``pose_unavailable`` or ``service_unavailable`` is
+    never sufficient.
+    """
+
+    return bool(plan_reachable) and str(reason or "").casefold() == "reachable"
+
+
 def bounded_empty_plan_retry_delay(
     now_s: float,
     deadline_s: float,
@@ -213,7 +456,53 @@ def target_ready_for_graph_verification(selection: dict[str, Any] | None) -> boo
 def is_stuck_recovery_failure(detail: dict[str, Any]) -> bool:
     reason = str(detail.get("reason") or "").lower()
     status = str(detail.get("status") or "").lower()
-    return reason == "navigation_stagnation" or "oscillat" in status
+    # Global preflight failures and a DWA failure to produce a local plan are
+    # both useful evidence of *no progress* when they recur across different
+    # subgoals.  Treating only the executor's own watchdog timeout as stuck
+    # made the recovery path unreachable in practice: a sequence of empty
+    # plans reset the counter before it could back the robot away from a wall.
+    return bool(
+        reason
+        in {
+            "navigation_stagnation",
+            "make_plan_unreachable",
+            "local_plan_unavailable",
+            "local_planner_unavailable",
+        }
+        or "oscillat" in status
+        or "failed to get a plan" in status
+        or "failed to produce path" in status
+    )
+
+
+def next_interaction_approach_option_index(
+    *,
+    behavior_type: str,
+    failure_detail: dict[str, Any],
+    selected_option_index: int,
+    attempted_navigation_count: int,
+    max_navigation_attempts: int,
+    goal_option_count: int,
+) -> int | None:
+    """Return one conservative INTERACT approach fallback, if available.
+
+    A semantic interaction remains committed while its approach pose changes.
+    Only a verified executor stagnation is allowed to advance to another
+    approach pose: terminal move_base failures keep their existing handling,
+    and a bounded number of actual navigation attempts prevents a large
+    candidate list from consuming the whole episode.
+    """
+
+    if str(behavior_type or "").upper() != BEHAVIOR_INTERACT:
+        return None
+    if str(failure_detail.get("reason") or "").lower() != "navigation_stagnation":
+        return None
+    if int(attempted_navigation_count) >= max(1, int(max_navigation_attempts)):
+        return None
+    next_index = int(selected_option_index) + 1
+    if next_index < 0 or next_index >= max(0, int(goal_option_count)):
+        return None
+    return next_index
 
 
 def safe_grid_motion_distance(
@@ -280,22 +569,41 @@ class NavigationProgressWatchdog:
     timeout_s: float = 12.0
     min_displacement_m: float = 0.10
     min_yaw_change_rad: float = 0.15
+    min_goal_distance_reduction_m: float = 0.02
     reference_xy: tuple[float, float] | None = None
     reference_yaw: float | None = None
+    reference_goal_distance_m: float | None = None
     last_progress_at: float | None = None
 
-    def reset(self, pose: tuple[float, ...] | None, now: float) -> None:
+    def reset(
+        self,
+        pose: tuple[float, ...] | None,
+        now: float,
+        goal_distance_m: float | None = None,
+    ) -> None:
         self.reference_xy = None if pose is None else (float(pose[0]), float(pose[1]))
         self.reference_yaw = (
             float(pose[2]) if pose is not None and len(pose) >= 3 else None
         )
+        self.reference_goal_distance_m = (
+            float(goal_distance_m)
+            if goal_distance_m is not None and math.isfinite(float(goal_distance_m))
+            else None
+        )
         self.last_progress_at = float(now) if pose is not None else None
 
-    def observe(self, pose: tuple[float, ...] | None, now: float) -> bool:
+    def observe(
+        self,
+        pose: tuple[float, ...] | None,
+        now: float,
+        *,
+        goal_distance_m: float | None = None,
+        local_plan_fresh: bool = False,
+    ) -> bool:
         if self.timeout_s <= 0.0 or pose is None:
             return False
         if self.reference_xy is None or self.last_progress_at is None:
-            self.reset(pose, now)
+            self.reset(pose, now, goal_distance_m)
             return False
         displacement = math.hypot(
             float(pose[0]) - float(self.reference_xy[0]),
@@ -308,9 +616,35 @@ class NavigationProgressWatchdog:
             displacement >= self.min_displacement_m
             or yaw_change >= self.min_yaw_change_rad
         ):
-            self.reset(pose, now)
+            self.reset(pose, now, goal_distance_m)
             return False
+        if (
+            local_plan_fresh
+            and goal_distance_m is not None
+            and math.isfinite(float(goal_distance_m))
+        ):
+            current_goal_distance_m = float(goal_distance_m)
+            if self.reference_goal_distance_m is None:
+                self.reference_goal_distance_m = current_goal_distance_m
+            elif (
+                self.reference_goal_distance_m - current_goal_distance_m
+                >= max(0.0, float(self.min_goal_distance_reduction_m))
+            ):
+                # A fresh local trajectory plus a material reduction in
+                # distance-to-goal is real progress even when DWA deliberately
+                # drives below the coarse pose-displacement threshold.
+                self.reset(pose, now, current_goal_distance_m)
+                return False
         return float(now) - self.last_progress_at >= self.timeout_s
+
+    def goal_distance_reduction_m(self, goal_distance_m: float | None) -> float:
+        if (
+            goal_distance_m is None
+            or self.reference_goal_distance_m is None
+            or not math.isfinite(float(goal_distance_m))
+        ):
+            return 0.0
+        return float(self.reference_goal_distance_m) - float(goal_distance_m)
 
 
 @dataclass
@@ -318,6 +652,7 @@ class ExecutionConfig:
     navigation_timeout_s: float = 180.0
     interaction_navigation_timeout_s: float = 180.0
     interaction_timeout_s: float = 30.0
+    drawer_scan_wait_timeout_s: float = 8.0
     verification_timeout_s: float = 30.0
     explore_prepare_timeout_s: float = 10.0
     explore_finalize_timeout_s: float = 10.0
@@ -407,7 +742,12 @@ class BehaviorExecutionStateMachine:
         return self._finish(success, detail or {}, now)
 
     def on_navigation_result(
-        self, success: bool, detail: dict[str, Any] | None = None, now: float | None = None
+        self,
+        success: bool,
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+        *,
+        wait_for_drawer_scan: bool = False,
     ) -> list[dict[str, Any]]:
         now = time.monotonic() if now is None else float(now)
         if self.state == STATE_NAVIGATING and self._behavior_type() == BEHAVIOR_EXPLORE:
@@ -433,10 +773,57 @@ class BehaviorExecutionStateMachine:
             return []
         if not success:
             return self._finish(False, detail or {}, now)
+        if wait_for_drawer_scan:
+            return self._transition(
+                STATE_WAITING_FOR_DRAWER_SCAN,
+                now,
+                {"kind": "wait_for_drawer_scan", "candidate": self.candidate},
+            )
         return self._transition(
             STATE_INTERACTING,
             now,
             {"kind": "interact", "candidate": self.candidate},
+        )
+
+    def on_drawer_scan_ready(
+        self,
+        candidate: dict[str, Any],
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Start the sealed drawer scan only after a fresh public frame.
+
+        The executor supplies a candidate whose public 2-D box and capture
+        step were both observed after navigation reached the approach pose.
+        Keeping this as an explicit state prevents a stale pre-approach box
+        from flowing into the evaluator-side direct drawer scan route.
+        """
+
+        if self.state != STATE_WAITING_FOR_DRAWER_SCAN:
+            return []
+        self.candidate = dict(candidate)
+        now = time.monotonic() if now is None else float(now)
+        return self._transition(
+            STATE_INTERACTING,
+            now,
+            {
+                "kind": "publish_drawer_scan",
+                "candidate": self.candidate,
+                "detail": detail or {},
+            },
+        )
+
+    def on_drawer_scan_wait_failed(
+        self,
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.state != STATE_WAITING_FOR_DRAWER_SCAN:
+            return []
+        return self._finish(
+            False,
+            detail or {"reason": "drawer_scan_fresh_frame_timeout"},
+            now,
         )
 
     def on_interaction_result(
@@ -513,6 +900,12 @@ class BehaviorExecutionStateMachine:
             return (
                 "interaction_navigation_timeout"
                 if elapsed > self.config.interaction_navigation_timeout_s
+                else ""
+            )
+        if self.state == STATE_WAITING_FOR_DRAWER_SCAN:
+            return (
+                "drawer_scan_fresh_frame_timeout"
+                if elapsed > self.config.drawer_scan_wait_timeout_s
                 else ""
             )
         if self.state == STATE_FINALIZING_EXPLORE:

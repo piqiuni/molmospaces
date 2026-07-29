@@ -27,10 +27,13 @@ candidate:
   max_state_age_sec: 3600.0
   container_require_same_room: true
   container_allow_connected_room: true
-  portal_standoff_m: 0.85
-  container_standoff_m: 1.0
-  drawer_standoff_m: 1.0
-  interaction_safety_margin_m: 0.25
+  # Do not turn the graph's initial unknown/default portal state into an
+  # OPEN action.  The asynchronous Module 1 object lane must first classify
+  # the visible door; a ready-but-unknown classification is also non-actionable.
+  portal_require_attribute_ready: true
+  portal_allow_unknown_state: false
+  # Inherit the Native NavToObj placement values from default.yaml:
+  # portal 0.85 + 0.25 = 1.10 m; container/drawer 0.50 + 0.25 = 0.75 m.
 
 policy:
   backend: "model"
@@ -44,6 +47,11 @@ policy:
   failure_cooldown_s: 5.0
   interaction_target_failure_cooldown_s: 60.0
   failure_retry_delay_s: 1.0
+  # Do not hold the traverse decision on asynchronous Module-1/graph state.
+  # The executor owns the only hard post-open barrier: it records the open
+  # result and waits for one newer *global costmap* publication before calling
+  # make_plan.  That is the map actually consumed by the planner.
+  post_interaction_refresh_enabled: false
   repeat_guard_enabled: true
   repeat_guard_low_gain_limit: 2
   repeat_guard_min_frontier_shrink_m: 0.15
@@ -78,6 +86,12 @@ completion:
 topics:
   # RosBridge's evaluator-step heartbeat, used only to cap V3 pre-rotation.
   step_sync: "/molmo_spaces/step_sync"
+  # The post-open executor gate follows the actual StaticLayer input before
+  # accepting a later global-costmap update.
+  raw_occupancy_grid: "/struct_mapping/occ_map"
+  planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
+  global_costmap: "/move_base/global_costmap/costmap"
+  global_costmap_updates: "/move_base/global_costmap/costmap_updates"
 
 executor:
   # V3 exposes only open(opaque_object_id); a drawer_scan visual hint remains
@@ -99,3 +113,10 @@ executor:
   rear_goal_prerotate_max_control_steps: 12
   rear_goal_prerotate_step_sync_stall_timeout_s: 2.0
   interaction_navigation_timeout_s: 180.0
+  # Require a bounded causal refresh: post-result raw OCC -> planning OCC ->
+  # global costmap update/full, then allow only a short same-goal retry.
+  # The 2 s budget is total across the three stages, not a polling loop.
+  post_interaction_costmap_fresh_timeout_s: 2.0
+  post_interaction_costmap_fresh_poll_interval_s: 0.05
+  post_interaction_traversal_make_plan_retry_window_s: 0.35
+  post_interaction_traversal_make_plan_retry_interval_s: 0.10
