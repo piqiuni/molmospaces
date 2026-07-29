@@ -159,6 +159,19 @@ class EpisodeResult:
     # Evaluator-side termination diagnostics.  A triggered guard is a normal
     # scored failure, not a runtime exception or scoring exclusion.
     early_stop: dict[str, Any] = field(default_factory=dict)
+    # Paper-facing metric provenance and per-episode quantities.  These are
+    # scalar aggregates only: evaluator-private interaction IDs remain out of
+    # restricted-policy result traces.
+    paper_metric_schema_version: str = ""
+    paper_metric_config: dict[str, Any] = field(default_factory=dict)
+    valid_interaction_attempt_count: int = 0
+    error_interaction_attempt_count: int = 0
+    task_irrelevant_interaction_attempt_count: int = 0
+    failed_interaction_attempt_count: int = 0
+    repeated_interaction_attempt_count: int = 0
+    interaction_precision_episode: float | None = None
+    episode_total_cost: float | None = None
+    episode_total_cost_breakdown: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

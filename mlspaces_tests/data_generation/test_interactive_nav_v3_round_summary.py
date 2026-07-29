@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from scripts.InteractiveNav.evaluation import v3_round_summary
 
 
@@ -250,3 +252,156 @@ def test_round_summary_supports_direct_script_execution(tmp_path: Path) -> None:
 
     assert payload["episode_count"] == 1
     assert payload["success_count"] == 1
+
+
+def test_round_summary_aggregates_persisted_paper_metrics(tmp_path: Path) -> None:
+    metric_config = {
+        "interaction_attempt_cost": 0.3,
+        "error_interaction_surcharge": 1.0,
+        "failure_penalty": 5.0,
+    }
+    saved_rows = [
+        {
+            "episode_index": 1,
+            "domains": ["channel"],
+            "interaction_requirement": "required",
+            # Deliberately disagree with nav_success: paper SR must not read
+            # the legacy interaction-conditioned success field.
+            "success": False,
+            "nav_success": True,
+            "reference_path_length_m": 4.0,
+            "navigation_path_length_m": 5.0,
+            # Deliberately stale: round aggregation must recompute SPL from
+            # NavToObj success and the two saved planar path lengths.
+            "spl": 0.0,
+            "required_interaction_success": True,
+            "interaction_precision_episode": 0.5,
+            "episode_total_cost": 1.0,
+            "interaction_action_count": 9,
+            "valid_interaction_attempt_count": 1,
+            "error_interaction_attempt_count": 8,
+        },
+        {
+            "episode_index": 2,
+            "domains": ["container"],
+            "interaction_requirement": "required",
+            "success": False,
+            "nav_success": False,
+            "reference_path_length_m": 3.0,
+            "navigation_path_length_m": 2.0,
+            "spl": 0.0,
+            "required_interaction_success": False,
+            "interaction_precision_episode": 0.0,
+            "episode_total_cost": 4.0,
+            "interaction_action_count": 1,
+            "valid_interaction_attempt_count": 0,
+            "error_interaction_attempt_count": 1,
+        },
+        {
+            "episode_index": 3,
+            "domains": ["channel", "container"],
+            "interaction_requirement": "unnecessary",
+            "success": False,
+            "nav_success": True,
+            "reference_path_length_m": 1.0,
+            "navigation_path_length_m": 2.0,
+            "spl": 0.5,
+            # This must not enter ISR's required-only denominator.
+            "required_interaction_success": True,
+            # IP is an episode macro, not 1 / (9 + 1 + 0).
+            "interaction_precision_episode": 1.0,
+            "episode_total_cost": 7.0,
+            "interaction_action_count": 0,
+            "valid_interaction_attempt_count": 0,
+            "error_interaction_attempt_count": 0,
+        },
+    ]
+    for index, result in enumerate(saved_rows):
+        _write_json(
+            tmp_path / f"worker_{index}" / "episode_result.json",
+            {
+                "result": {
+                    **result,
+                    "status": "complete",
+                    "scoring_eligible": True,
+                    "paper_metric_schema_version": (
+                        "interactive_nav_v3_paper_metrics_v1"
+                    ),
+                    "paper_metric_config": metric_config,
+                }
+            },
+        )
+
+    summary = v3_round_summary.summarise_round(tmp_path)
+    overall = summary["paper_metrics"]["groups"]["overall"]
+
+    assert overall["sr"] == pytest.approx(2 / 3)
+    assert overall["spl"] == pytest.approx(1.3 / 3)
+    assert overall["isr"] == pytest.approx(0.5)
+    assert overall["ip"] == pytest.approx(0.5)
+    assert overall["total_cost"] == pytest.approx(4.0)
+    assert overall["success_rate"] == overall["sr"]
+    assert overall["mean_spl"] == overall["spl"]
+    assert overall["required_interaction_success_rate"] == overall["isr"]
+    assert overall["interaction_precision"] == overall["ip"]
+    assert overall["mean_total_cost"] == overall["total_cost"]
+    assert overall["sr_denominator"] == 3
+    assert overall["isr_denominator"] == 2
+    assert overall["ip_denominator"] == 3
+    assert summary["paper_metrics"]["paper_metric_config"] == metric_config
+    assert summary["paper_metrics"]["groups"]["domain/mixed"]["total_cost"] == 7.0
+    unnecessary = summary["paper_metrics"]["groups"]["requirement/unnecessary"]
+    assert unnecessary["isr"] is None
+    assert unnecessary["isr_denominator"] == 0
+    assert summary["episodes"][0]["paper_metrics"][
+        "valid_interaction_attempt_count"
+    ] == 1
+    assert "paper=SR=66.7%" in v3_round_summary.render_terminal_summary(summary)
+
+
+def test_round_summary_refuses_incomplete_or_mixed_paper_metric_records(
+    tmp_path: Path,
+) -> None:
+    shared = {
+        "status": "complete",
+        "scoring_eligible": True,
+        "domains": ["channel"],
+        "interaction_requirement": "required",
+        "nav_success": True,
+        "reference_path_length_m": 1.0,
+        "navigation_path_length_m": 1.0,
+        "spl": 1.0,
+        "required_interaction_success": True,
+        "paper_metric_schema_version": "interactive_nav_v3_paper_metrics_v1",
+    }
+    _write_json(
+        tmp_path / "worker_0" / "episode_result.json",
+        {
+            **shared,
+            "interaction_precision_episode": 1.0,
+            "episode_total_cost": 2.0,
+            "paper_metric_config": {"lambda": 0.3, "mu": 1.0, "kappa": 5.0},
+        },
+    )
+    _write_json(
+        tmp_path / "worker_1" / "episode_result.json",
+        {
+            **shared,
+            # Do not silently omit this row from the IP macro average.
+            "episode_total_cost": 3.0,
+            # A different cost parameter vector makes an aggregate cost
+            # scientifically meaningless even though both scalars exist.
+            "paper_metric_config": {"lambda": 0.4, "mu": 1.0, "kappa": 5.0},
+        },
+    )
+
+    summary = v3_round_summary.summarise_round(tmp_path)
+    overall = summary["paper_metrics"]["groups"]["overall"]
+
+    assert overall["sr"] == 1.0
+    assert overall["ip"] is None
+    assert overall["ip_missing_count"] == 1
+    assert overall["total_cost"] is None
+    assert overall["total_cost_missing_count"] == 0
+    assert overall["paper_metric_config_consistent"] is False
+    assert any("Total Cost is unavailable" in warning for warning in summary["warnings"])
