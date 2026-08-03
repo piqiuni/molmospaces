@@ -1,0 +1,972 @@
+#!/usr/bin/env python3
+"""Pure PNG+JSON six-panel renderer used after a navigation run.
+
+The recorder persists only raw grids, camera PNGs and state JSON.  This module
+reconstructs the established debug renderer from those artifacts without ROS
+or a live recorder process.  Keeping all coordinate conversion here makes the
+offline frame a faithful, inspectable replay rather than a resized map image.
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import cv2
+import numpy as np
+
+
+_HELPER_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "Interactive-Nav-SG-nav"
+    / "src"
+    / "explore_py_pkg"
+    / "scripts"
+)
+if str(_HELPER_DIR) not in sys.path:
+    sys.path.insert(0, str(_HELPER_DIR))
+
+from explore_py_pkg.debug_semantic_viz import (  # noqa: E402
+    candidate_color,
+    portal_room_node_ids,
+    topology_edge_style,
+    topology_edge_visible,
+    topology_hierarchy_layout,
+    topology_node_style,
+)
+
+
+def _frame_name(value: object) -> str:
+    return str(value or "").lstrip("/")
+
+
+def _step4(value: int | float | None) -> str:
+    return f"{int(value or 0):04d}"
+
+
+def _yaw_from_origin(origin: dict | None) -> float:
+    origin = origin or {}
+    qx = float(origin.get("qx", 0.0) or 0.0)
+    qy = float(origin.get("qy", 0.0) or 0.0)
+    qz = float(origin.get("qz", 0.0) or 0.0)
+    qw = float(origin.get("qw", 1.0) or 1.0)
+    return math.atan2(
+        2.0 * (qw * qz + qx * qy),
+        1.0 - 2.0 * (qy * qy + qz * qz),
+    )
+
+
+@dataclass
+class RawGrid:
+    """A decoded OccupancyGrid image retaining its ROS world transform."""
+
+    values: np.ndarray
+    width: int
+    height: int
+    resolution: float
+    frame_id: str
+    origin_x: float
+    origin_y: float
+    origin_yaw: float
+
+    @property
+    def image_values(self) -> np.ndarray:
+        # ROS OccupancyGrid row zero is the bottom row.  OpenCV image row zero
+        # is the top row, therefore every raw PNG needs this exact flip.
+        return np.flipud(self.values)
+
+    def world_to_cell(self, x: float, y: float) -> tuple[int, int] | None:
+        if self.resolution <= 0.0:
+            return None
+        dx = float(x) - self.origin_x
+        dy = float(y) - self.origin_y
+        cos_yaw = math.cos(-self.origin_yaw)
+        sin_yaw = math.sin(-self.origin_yaw)
+        local_x = cos_yaw * dx - sin_yaw * dy
+        local_y = sin_yaw * dx + cos_yaw * dy
+        mx = int(math.floor(local_x / self.resolution))
+        my = int(math.floor(local_y / self.resolution))
+        if 0 <= mx < self.width and 0 <= my < self.height:
+            return mx, my
+        return None
+
+    def world_from_cell(self, cell_x: float, cell_y: float) -> tuple[float, float]:
+        cos_yaw = math.cos(self.origin_yaw)
+        sin_yaw = math.sin(self.origin_yaw)
+        local_x = float(cell_x) * self.resolution
+        local_y = float(cell_y) * self.resolution
+        return (
+            self.origin_x + cos_yaw * local_x - sin_yaw * local_y,
+            self.origin_y + sin_yaw * local_x + cos_yaw * local_y,
+        )
+
+
+def load_raw_grid(meta: dict | None, *, geometry: RawGrid | None = None) -> RawGrid | None:
+    """Decode one lossless recorder PNG and its JSON geometry."""
+
+    if not meta:
+        return None
+    image_path = Path(str(meta.get("image") or ""))
+    encoded = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    if encoded is None or encoded.ndim != 2:
+        return None
+    values = encoded.astype(np.int32) - int(meta.get("png_value_offset", 1) or 1)
+    height = int(meta.get("height") or values.shape[0])
+    width = int(meta.get("width") or values.shape[1])
+    if values.shape != (height, width):
+        return None
+    if geometry is not None:
+        return RawGrid(
+            values=values,
+            width=width,
+            height=height,
+            resolution=geometry.resolution,
+            frame_id=geometry.frame_id,
+            origin_x=geometry.origin_x,
+            origin_y=geometry.origin_y,
+            origin_yaw=geometry.origin_yaw,
+        )
+    origin = meta.get("origin") or {}
+    return RawGrid(
+        values=values,
+        width=width,
+        height=height,
+        resolution=float(meta.get("resolution") or 0.0),
+        frame_id=_frame_name(meta.get("frame_id")),
+        origin_x=float(origin.get("x", 0.0) or 0.0),
+        origin_y=float(origin.get("y", 0.0) or 0.0),
+        origin_yaw=_yaw_from_origin(origin),
+    )
+
+
+def _receipt_number(receipt_id: object) -> int:
+    try:
+        return int(str(receipt_id or "").rsplit(":", 1)[-1])
+    except ValueError:
+        return -1
+
+
+class GlobalCostmapReplay:
+    """Apply saved OccupancyGridUpdate PNGs to the corresponding full grid."""
+
+    def __init__(self, maps_by_id: dict[str, dict]) -> None:
+        self.maps_by_id = maps_by_id
+        self.updates = sorted(
+            (
+                record
+                for record in maps_by_id.values()
+                if str(record.get("stage") or "") == "global_costmap_update"
+            ),
+            key=lambda record: _receipt_number(record.get("receipt_id")),
+        )
+        self._base_receipt = ""
+        self._grid: RawGrid | None = None
+        self._applied_update = -1
+
+    def grid_for(self, full_meta: dict | None, update_receipt: object) -> RawGrid | None:
+        if not full_meta:
+            return None
+        full_receipt = str(full_meta.get("receipt_id") or "")
+        if full_receipt != self._base_receipt:
+            self._base_receipt = full_receipt
+            self._grid = load_raw_grid(full_meta)
+            self._applied_update = -1
+        if self._grid is None:
+            return None
+        target = _receipt_number(update_receipt)
+        if target < 0:
+            return self._grid
+        # A replay run is chronological.  Be robust if a caller seeks backwards
+        # by rebuilding from the immutable full image.
+        if target < self._applied_update:
+            self._grid = load_raw_grid(full_meta)
+            self._applied_update = -1
+        for update in self.updates:
+            index = _receipt_number(update.get("receipt_id"))
+            if index <= self._applied_update:
+                continue
+            if index > target:
+                break
+            patch = load_raw_grid(update, geometry=self._grid)
+            if patch is None:
+                continue
+            x = int(update.get("x", 0) or 0)
+            y = int(update.get("y", 0) or 0)
+            h, w = patch.values.shape
+            if x == 0 and y == 0 and (w, h) == (self._grid.width, self._grid.height):
+                self._grid.values = patch.values
+            elif x >= 0 and y >= 0 and x + w <= self._grid.width and y + h <= self._grid.height:
+                self._grid.values[y : y + h, x : x + w] = patch.values
+            self._applied_update = index
+        return self._grid
+
+
+@dataclass
+class TransformSample:
+    step_index: int
+    x: float
+    y: float
+    yaw: float
+
+
+class TransformResolver:
+    """Offline equivalent of the recorder's map<-odom TF lookup."""
+
+    def __init__(
+        self,
+        records: Iterable[TransformSample],
+        *,
+        map_frame: str,
+        odom_frame: str,
+    ) -> None:
+        self.records = sorted(records, key=lambda item: item.step_index)
+        self.map_frame = _frame_name(map_frame)
+        self.odom_frame = _frame_name(odom_frame)
+
+    @classmethod
+    def from_csv(cls, path: Path, *, map_frame: str, odom_frame: str) -> "TransformResolver":
+        records: list[TransformSample] = []
+        if path.exists():
+            with path.open(newline="", encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        records.append(
+                            TransformSample(
+                                step_index=int(row.get("step_id") or 0),
+                                x=float(row.get("x") or 0.0),
+                                y=float(row.get("y") or 0.0),
+                                yaw=float(row.get("yaw") or 0.0),
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        continue
+        return cls(records, map_frame=map_frame, odom_frame=odom_frame)
+
+    @classmethod
+    def from_step_boundaries(
+        cls,
+        steps: Iterable[dict],
+        *,
+        map_frame: str,
+        odom_frame: str,
+        fallback_csv: Path | None = None,
+    ) -> "TransformResolver":
+        records: list[TransformSample] = []
+        for index, step in enumerate(steps):
+            payload = step.get("tf_map_from_odom") or {}
+            try:
+                if not payload:
+                    continue
+                records.append(
+                    TransformSample(
+                        step_index=int(step.get("step_index", index)),
+                        x=float(payload.get("x") or 0.0),
+                        y=float(payload.get("y") or 0.0),
+                        yaw=float(payload.get("yaw") or 0.0),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        if records or fallback_csv is None:
+            return cls(records, map_frame=map_frame, odom_frame=odom_frame)
+        return cls.from_csv(fallback_csv, map_frame=map_frame, odom_frame=odom_frame)
+
+    def _sample(self, step_index: int) -> TransformSample:
+        selected = TransformSample(step_index=0, x=0.0, y=0.0, yaw=0.0)
+        for record in self.records:
+            if record.step_index > step_index:
+                break
+            selected = record
+        return selected
+
+    def transform(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        source_frame: object,
+        target_frame: object,
+        step_index: int,
+    ) -> tuple[float, float, float] | None:
+        source = _frame_name(source_frame)
+        target = _frame_name(target_frame)
+        if not source or not target or source == target:
+            return float(x), float(y), float(yaw)
+        sample = self._sample(step_index)
+        if source == self.odom_frame and target == self.map_frame:
+            cos_yaw = math.cos(sample.yaw)
+            sin_yaw = math.sin(sample.yaw)
+            return (
+                sample.x + cos_yaw * float(x) - sin_yaw * float(y),
+                sample.y + sin_yaw * float(x) + cos_yaw * float(y),
+                float(yaw) + sample.yaw,
+            )
+        if source == self.map_frame and target == self.odom_frame:
+            dx = float(x) - sample.x
+            dy = float(y) - sample.y
+            cos_yaw = math.cos(-sample.yaw)
+            sin_yaw = math.sin(-sample.yaw)
+            return (
+                cos_yaw * dx - sin_yaw * dy,
+                sin_yaw * dx + cos_yaw * dy,
+                float(yaw) - sample.yaw,
+            )
+        return None
+
+
+def _occupancy_base(grid: RawGrid) -> np.ndarray:
+    raw_values = grid.values
+    free = (raw_values >= 0) & (raw_values <= 20)
+    unknown = raw_values < 0
+    unknown_neighbor = np.zeros_like(unknown, dtype=bool)
+    unknown_neighbor[:, 1:] |= unknown[:, :-1]
+    unknown_neighbor[:, :-1] |= unknown[:, 1:]
+    unknown_neighbor[1:, :] |= unknown[:-1, :]
+    unknown_neighbor[:-1, :] |= unknown[1:, :]
+    raw_frontier = free & unknown_neighbor
+    values = np.flipud(raw_values)
+    image = np.empty((grid.height, grid.width, 3), dtype=np.uint8)
+    image[values < 0] = (178, 178, 178)
+    image[(values >= 0) & (values <= 20)] = (248, 248, 245)
+    image[(values > 20) & (values < 50)] = (118, 118, 118)
+    image[values >= 50] = (28, 30, 32)
+    image[np.flipud(raw_frontier)] = (112, 36, 170)
+    return image
+
+
+def _costmap_base(grid: RawGrid) -> np.ndarray:
+    values = grid.image_values
+    image = np.empty((grid.height, grid.width, 3), dtype=np.uint8)
+    image[values < 0] = (178, 178, 178)
+    image[values == 0] = (248, 248, 245)
+    inflated = (values > 0) & (values < 99)
+    if np.any(inflated):
+        strength = values[inflated].astype(np.float32) / 98.0
+        image[inflated, 0] = 255
+        image[inflated, 1] = np.clip(232.0 - 82.0 * strength, 0, 255).astype(np.uint8)
+        image[inflated, 2] = np.clip(110.0 - 80.0 * strength, 0, 255).astype(np.uint8)
+    image[values == 99] = (245, 92, 28)
+    image[values >= 100] = (128, 20, 28)
+    return image
+
+
+def _room_base(grid: RawGrid) -> np.ndarray:
+    values = grid.image_values
+    image = np.zeros((grid.height, grid.width, 3), dtype=np.uint8)
+    palette = (
+        (255, 185, 185),
+        (185, 220, 255),
+        (195, 245, 195),
+        (245, 220, 170),
+        (225, 195, 245),
+        (175, 235, 230),
+        (245, 195, 225),
+        (220, 220, 170),
+    )
+    valid = values >= 0
+    for room_id in np.unique(values[valid]) if np.any(valid) else []:
+        image[values == int(room_id)] = palette[int(room_id) % len(palette)]
+    return image
+
+
+def _draw_panel_title(panel: np.ndarray, title: str, step_index: int) -> None:
+    text = f"{title}  STEP={_step4(step_index)}"
+    font_scale = 0.46 if panel.shape[1] < 700 else 0.58
+    thickness = 1 if panel.shape[1] < 700 else 2
+    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+    x = max(6, panel.shape[1] - text_size[0] - 8)
+    y = max(text_size[1] + 5, 22)
+    cv2.putText(panel, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (245, 245, 245), thickness + 2, cv2.LINE_AA)
+    cv2.putText(panel, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (25, 25, 25), thickness, cv2.LINE_AA)
+
+
+def _draw_polyline(panel: np.ndarray, points: list[tuple[int, int]], color: tuple[int, int, int], thickness: int) -> None:
+    if len(points) >= 2:
+        cv2.polylines(panel, [np.asarray(points, dtype=np.int32)], False, color, thickness, cv2.LINE_AA)
+
+
+def zoom_panel(panel: np.ndarray, scale_factor: float) -> np.ndarray:
+    """Match the established global-costmap diagnostic zoom."""
+    scale_factor = max(1.0, float(scale_factor))
+    if scale_factor <= 1.0 + 1e-6:
+        return panel
+    height, width = panel.shape[:2]
+    enlarged = cv2.resize(
+        panel,
+        (max(width, int(round(width * scale_factor))), max(height, int(round(height * scale_factor)))),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    offset_x = max(0, (enlarged.shape[1] - width) // 2)
+    offset_y = max(0, (enlarged.shape[0] - height) // 2)
+    return enlarged[offset_y : offset_y + height, offset_x : offset_x + width].copy()
+
+
+def draw_task_subgoal_header(panel: np.ndarray, step: dict) -> None:
+    selection = step.get("semantic_selection") or {}
+    candidates = step.get("semantic_candidates") or {}
+    target = str((candidates.get("target_context") or {}).get("target_name") or "-")
+    behavior = str(selection.get("behavior_type") or "-")
+    name = str(selection.get("target_name") or selection.get("target_id") or selection.get("candidate_id") or "-")
+    max_chars = max(24, int(panel.shape[1] / 10))
+    if len(name) > max_chars:
+        name = name[: max_chars - 3] + "..."
+    cv2.rectangle(panel, (4, 4), (min(panel.shape[1] - 4, 460), 49), (255, 255, 255), -1)
+    for index, line in enumerate((f"TASK TARGET: {target}", f"MODULE2 SUBGOAL: {behavior} {name}")):
+        cv2.putText(panel, line, (9, 20 + index * 21), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (30, 30, 30), 1, cv2.LINE_AA)
+
+
+def _draw_robot_arrow(panel: np.ndarray, center: tuple[int, int], yaw: float, length: int) -> None:
+    cx, cy = center
+    heading = np.asarray([math.cos(yaw), -math.sin(yaw)], dtype=np.float32)
+    norm = float(np.linalg.norm(heading))
+    heading = np.asarray([1.0, 0.0], dtype=np.float32) if norm <= 1e-6 else heading / norm
+    perp = np.asarray([-heading[1], heading[0]], dtype=np.float32)
+    tip = np.asarray([cx, cy], dtype=np.float32) + heading * float(length)
+    back = np.asarray([cx, cy], dtype=np.float32) - heading * float(length * 0.55)
+    left = back + perp * float(length * 0.45)
+    right = back - perp * float(length * 0.45)
+    points = np.asarray([tip, left, right], dtype=np.int32)
+    cv2.fillConvexPoly(panel, points, (0, 88, 255), cv2.LINE_AA)
+    cv2.polylines(panel, [points], True, (0, 35, 160), 2, cv2.LINE_AA)
+
+
+def _draw_goal_arrow(panel: np.ndarray, center: tuple[int, int], yaw: float, length: int, color: tuple[int, int, int] = (230, 30, 45)) -> None:
+    cx, cy = center
+    heading = np.asarray([math.cos(yaw), -math.sin(yaw)], dtype=np.float32)
+    norm = float(np.linalg.norm(heading))
+    heading = np.asarray([1.0, 0.0], dtype=np.float32) if norm <= 1e-6 else heading / norm
+    start = np.asarray([cx, cy], dtype=np.float32) - heading * float(length * 0.45)
+    end = np.asarray([cx, cy], dtype=np.float32) + heading * float(length)
+    cv2.arrowedLine(panel, tuple(start.astype(np.int32)), tuple(end.astype(np.int32)), color, 4, cv2.LINE_AA, tipLength=0.45)
+    cv2.circle(panel, (cx, cy), max(4, length // 4), color, -1, cv2.LINE_AA)
+
+
+def _selection_target_id(selection: dict | None) -> str:
+    selection = selection or {}
+    return str(selection.get("target_id") or selection.get("object_id") or selection.get("candidate_id") or "")
+
+
+def _node_ids(node: dict) -> set[str]:
+    attributes = node.get("attributes") or {}
+    return {
+        str(value)
+        for value in (
+            attributes.get("object_id"),
+            attributes.get("source_object_name"),
+            attributes.get("instance_id"),
+            node.get("id"),
+        )
+        if value
+    }
+
+
+def _node_observed(node: dict, observed_ids: set[str]) -> bool:
+    if str(node.get("type") or "") == "room":
+        return bool((node.get("attributes") or {}).get("active", True))
+    return bool(_node_ids(node).intersection(observed_ids))
+
+
+def _node_xy(node: dict) -> tuple[float, float] | None:
+    values = node.get("aabb_center") or node.get("centroid") or []
+    if len(values) < 2:
+        return None
+    return float(values[0]), float(values[1])
+
+
+def _short_node_id(node: dict) -> str:
+    attributes = node.get("attributes") or {}
+    token = str(attributes.get("object_id") or attributes.get("source_object_name") or attributes.get("instance_id") or node.get("id") or "")
+    suffix = token.rsplit("_", 1)[-1]
+    try:
+        return f"#{int(suffix)}"
+    except ValueError:
+        return suffix[-6:]
+
+
+def _node_label(node: dict) -> str:
+    if str(node.get("type") or "") != "room":
+        return str(node.get("label") or node.get("type") or "object")
+    value = str((node.get("attributes") or {}).get("room_attribute") or "unknown").strip()
+    if value == "livingroom":
+        return "living room"
+    return f"{value} room" if value != "unknown" else "unknown room"
+
+
+def _node_color(node: dict) -> tuple[int, int, int]:
+    node_type = str(node.get("type") or "object")
+    if node_type == "room":
+        return (205, 225, 245)
+    if node_type == "portal":
+        state = str((node.get("interaction") or {}).get("state") or "unknown")
+        return (50, 190, 70) if state in {"open", "ajar"} else (235, 70, 55) if state == "closed" else (235, 175, 45)
+    if node_type == "container":
+        return (175, 75, 220)
+    if node_type == "support":
+        return (50, 125, 220)
+    return (30, 190, 195) if node.get("is_currently_visible") else (145, 145, 145)
+
+
+def _bounded_nodes(graph: dict, observed_ids: set[str], target_id: str, limit: int = 96) -> list[dict]:
+    observed = [node for node in graph.get("nodes") or [] if _node_observed(node, observed_ids)]
+    rooms = [node for node in observed if str(node.get("type") or "") == "room"]
+    others = [node for node in observed if str(node.get("type") or "") != "room"]
+    if len(others) <= limit:
+        return rooms + others
+    others.sort(
+        key=lambda node: (
+            0 if target_id and target_id in _node_ids(node) else 1,
+            0 if bool(node.get("is_currently_visible")) else 1,
+            0 if str(node.get("type") or "") == "portal" else 1,
+            0 if str(node.get("type") or "") == "container" else 1,
+            str(node.get("id") or ""),
+        )
+    )
+    return rooms + others[:limit]
+
+
+def known_world_bounds(grid: RawGrid, margin_m: float = 2.5) -> tuple[float, float, float, float] | None:
+    known = grid.values >= 0
+    rows = np.flatnonzero(np.any(known, axis=1))
+    cols = np.flatnonzero(np.any(known, axis=0))
+    if rows.size == 0 or cols.size == 0:
+        return None
+    min_x, max_x = int(np.min(cols)), int(np.max(cols) + 1)
+    min_y, max_y = int(np.min(rows)), int(np.max(rows) + 1)
+    corners = [
+        grid.world_from_cell(min_x, min_y),
+        grid.world_from_cell(max_x, min_y),
+        grid.world_from_cell(min_x, max_y),
+        grid.world_from_cell(max_x, max_y),
+    ]
+    return (
+        min(point[0] for point in corners) - margin_m,
+        min(point[1] for point in corners) - margin_m,
+        max(point[0] for point in corners) + margin_m,
+        max(point[1] for point in corners) + margin_m,
+    )
+
+
+class OfflineSixPanelRenderer:
+    """Stateful render replay sharing crop and transform rules with the old video."""
+
+    def __init__(self, *, transforms: TransformResolver) -> None:
+        self.transforms = transforms
+
+    def _world_to_image_px(self, grid: RawGrid, values: tuple[float, float, float] | None) -> tuple[int, int] | None:
+        if values is None:
+            return None
+        cell = grid.world_to_cell(values[0], values[1])
+        return None if cell is None else (cell[0], grid.height - 1 - cell[1])
+
+    def _transform(self, values: tuple[float, float, float] | list[float] | None, source: str, target: str, step: int) -> tuple[float, float, float] | None:
+        if values is None or len(values) < 2:
+            return None
+        return self.transforms.transform(
+            float(values[0]), float(values[1]), float(values[2]) if len(values) > 2 else 0.0,
+            source, target, step,
+        )
+
+    def _plan_poses(self, plan: dict | None, grid: RawGrid, step: int) -> list[tuple[float, float, float]]:
+        result = []
+        for pose in (plan or {}).get("poses") or []:
+            converted = self._transform(pose, str((plan or {}).get("frame_id") or ""), grid.frame_id, step)
+            if converted is None:
+                return []
+            result.append(converted)
+        return result
+
+    def render_map_panel(
+        self,
+        grid: RawGrid | None,
+        panel_size: tuple[int, int],
+        step: dict,
+        step_index: int,
+        *,
+        title: str,
+        kind: str,
+        world_bounds: tuple[float, float, float, float] | None = None,
+        draw_global_plan: bool = True,
+        draw_local_global_plan: bool = False,
+        draw_local_plan: bool = True,
+        draw_frontiers: bool = True,
+        draw_semantic_candidates: bool = False,
+        draw_route_plan: bool = False,
+    ) -> np.ndarray:
+        width, height = panel_size
+        if grid is None:
+            panel = np.full((height, width, 3), 235, dtype=np.uint8)
+            cv2.putText(panel, f"NO {title} YET", (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 80, 80), 2, cv2.LINE_AA)
+            return panel
+        base = _costmap_base(grid) if kind == "costmap" else _occupancy_base(grid)
+        pose = self._transform(step.get("pose"), self.transforms.odom_frame, grid.frame_id, step_index)
+        selection = step.get("semantic_selection") or {}
+        goal_values = list(selection.get("goal_xyyaw") or [])
+        active_goal = goal_values if len(goal_values) >= 2 else step.get("active_goal")
+        goal_yaw = float(goal_values[2]) if len(goal_values) > 2 else float(step.get("active_goal_yaw") or 0.0)
+        goal = self._transform(active_goal, self.transforms.map_frame, grid.frame_id, step_index)
+        trajectory = [
+            converted
+            for raw in step.get("trajectory") or []
+            if len(raw) >= 4
+            for converted in [self._transform((raw[1], raw[2], raw[3]), self.transforms.odom_frame, grid.frame_id, step_index)]
+            if converted is not None
+        ]
+        global_plan = self._plan_poses(step.get("global_plan"), grid, step_index) if draw_global_plan else []
+        local_global_plan = self._plan_poses(step.get("local_global_plan"), grid, step_index) if draw_local_global_plan else []
+        local_plan = self._plan_poses(step.get("local_plan"), grid, step_index) if draw_local_plan else []
+        if pose is not None:
+            def prune(points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+                if not points:
+                    return points
+                nearest = min(range(len(points)), key=lambda index: math.hypot(points[index][0] - pose[0], points[index][1] - pose[1]))
+                return [pose] + points[nearest:]
+            global_plan, local_global_plan, local_plan = prune(global_plan), prune(local_global_plan), prune(local_plan)
+
+        def bounds_from_world(value: tuple[float, float, float, float]) -> tuple[int, int, int, int] | None:
+            corners = [
+                self._transform((value[0], value[1], 0.0), self.transforms.map_frame, grid.frame_id, step_index),
+                self._transform((value[2], value[1], 0.0), self.transforms.map_frame, grid.frame_id, step_index),
+                self._transform((value[0], value[3], 0.0), self.transforms.map_frame, grid.frame_id, step_index),
+                self._transform((value[2], value[3], 0.0), self.transforms.map_frame, grid.frame_id, step_index),
+            ]
+            pixels = [self._world_to_image_px(grid, point) for point in corners]
+            pixels = [pixel for pixel in pixels if pixel is not None]
+            if not pixels:
+                return None
+            xs, ys = zip(*pixels)
+            return max(0, min(xs)), max(0, min(ys)), min(grid.width - 1, max(xs)), min(grid.height - 1, max(ys))
+
+        crop = bounds_from_world(world_bounds) if world_bounds is not None else None
+        if crop is None:
+            pixels = [self._world_to_image_px(grid, value) for value in [pose, goal, *trajectory, *global_plan, *local_global_plan, *local_plan]]
+            pixels = [pixel for pixel in pixels if pixel is not None]
+            if pixels:
+                margin = max(8, int(math.ceil(4.5 / max(grid.resolution, 1e-6))))
+                xs, ys = zip(*pixels)
+                crop = (max(0, min(xs) - margin), max(0, min(ys) - margin), min(grid.width - 1, max(xs) + margin), min(grid.height - 1, max(ys) + margin))
+            else:
+                crop = (0, 0, grid.width - 1, grid.height - 1)
+        min_x, min_y, max_x, max_y = crop
+        if max_x <= min_x or max_y <= min_y:
+            return np.full((height, width, 3), 235, dtype=np.uint8)
+        image_crop = base[min_y : max_y + 1, min_x : max_x + 1]
+        crop_h, crop_w = image_crop.shape[:2]
+        scale = min(width / max(crop_w, 1), height / max(crop_h, 1))
+        scaled_w, scaled_h = max(1, int(round(crop_w * scale))), max(1, int(round(crop_h * scale)))
+        panel = np.full((height, width, 3), 235, dtype=np.uint8)
+        offset_x, offset_y = (width - scaled_w) // 2, (height - scaled_h) // 2
+        panel[offset_y : offset_y + scaled_h, offset_x : offset_x + scaled_w] = cv2.resize(image_crop, (scaled_w, scaled_h), interpolation=cv2.INTER_NEAREST)
+
+        def to_panel(point: tuple[float, float, float] | None) -> tuple[int, int] | None:
+            pixel = self._world_to_image_px(grid, point)
+            if pixel is None or not (min_x <= pixel[0] <= max_x and min_y <= pixel[1] <= max_y):
+                return None
+            return int(round(offset_x + (pixel[0] - min_x) * scale)), int(round(offset_y + (pixel[1] - min_y) * scale))
+
+        if draw_frontiers and goal is not None and kind != "costmap":
+            free = (grid.values >= 0) & (grid.values <= 20)
+            unknown = grid.values < 0
+            neighbor = np.zeros_like(unknown, dtype=bool)
+            neighbor[:, 1:] |= unknown[:, :-1]
+            neighbor[:, :-1] |= unknown[:, 1:]
+            neighbor[1:, :] |= unknown[:-1, :]
+            neighbor[:-1, :] |= unknown[1:, :]
+            frontier = free & neighbor
+            goal_cell = grid.world_to_cell(goal[0], goal[1])
+            if goal_cell is not None:
+                radius = max(1, int(math.ceil(1.0 / max(grid.resolution, 1e-6))))
+                gx, gy = goal_cell
+                for cy in range(max(0, gy - radius), min(grid.height, gy + radius + 1)):
+                    for cx in range(max(0, gx - radius), min(grid.width, gx + radius + 1)):
+                        if not frontier[cy, cx]:
+                            continue
+                        point = (cx, grid.height - 1 - cy)
+                        if min_x <= point[0] <= max_x and min_y <= point[1] <= max_y:
+                            cv2.circle(panel, (int(round(offset_x + (point[0] - min_x) * scale)), int(round(offset_y + (point[1] - min_y) * scale))), max(1, int(round(2.0 * max(scale, 1.0)))), (112, 36, 170), -1, cv2.LINE_AA)
+        _draw_polyline(panel, [point for item in trajectory if (point := to_panel(item)) is not None], (20, 118, 230), 3)
+        if pose is not None and (robot_px := to_panel(pose)) is not None:
+            _draw_robot_arrow(panel, robot_px, pose[2], max(9, int(9 * scale)))
+        if draw_global_plan:
+            _draw_polyline(panel, [point for item in global_plan if (point := to_panel(item)) is not None], (40, 190, 60), 3)
+        if draw_local_global_plan:
+            _draw_polyline(panel, [point for item in local_global_plan if (point := to_panel(item)) is not None], (40, 190, 60), 3)
+        if draw_local_plan:
+            _draw_polyline(panel, [point for item in local_plan if (point := to_panel(item)) is not None], (240, 150, 20), 3)
+        if draw_semantic_candidates:
+            selected_id = str(selection.get("candidate_id") or "")
+            for candidate in (step.get("semantic_candidates") or {}).get("candidates") or []:
+                values = list(candidate.get("goal_xyyaw") or [])
+                candidate_point = self._transform(values, self.transforms.map_frame, grid.frame_id, step_index)
+                candidate_px = to_panel(candidate_point)
+                if candidate_point is None or candidate_px is None:
+                    continue
+                color = candidate_color(str(candidate.get("behavior_type") or "EXPLORE"))
+                if str(candidate.get("candidate_id") or "") == selected_id:
+                    _draw_goal_arrow(panel, candidate_px, candidate_point[2], max(9, int(9 * scale)), color)
+                else:
+                    cv2.circle(panel, candidate_px, max(2, int(round(max(scale, 1.0) * 0.8))), color, -1, cv2.LINE_AA)
+        if goal is not None and (goal_px := to_panel(goal)) is not None:
+            behavior = str(selection.get("behavior_type") or "NAVIGATE").upper()
+            _draw_goal_arrow(panel, goal_px, goal_yaw if math.isfinite(goal_yaw) else goal[2], max(9, int(9 * scale)), candidate_color(behavior))
+        _draw_panel_title(panel, title, step_index)
+        if "COSTMAP" in title.upper():
+            legend = (("LETHAL", (128, 20, 28)), ("INSCRIBED", (245, 92, 28)), ("INFLATION", (255, 190, 60)))
+            legend_y = panel.shape[0] - 10
+            cv2.rectangle(panel, (6, legend_y - 24), (min(panel.shape[1] - 6, 416), panel.shape[0] - 2), (255, 255, 255), -1)
+            legend_x = 12
+            for label, color in legend:
+                cv2.rectangle(panel, (legend_x, legend_y - 17), (legend_x + 13, legend_y - 4), color, -1)
+                cv2.putText(panel, label, (legend_x + 18, legend_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (20, 20, 20), 1, cv2.LINE_AA)
+                legend_x += 126
+        return panel
+
+    def _world_view(self, bounds: tuple[float, float, float, float], panel_size: tuple[int, int], *, margin: int, vertical_center: float = 0.5):
+        width, height = panel_size
+        min_x, min_y, max_x, max_y = bounds
+        scale = min((width - 2 * margin) / max(max_x - min_x, 1e-6), (height - 2 * margin - 20) / max(max_y - min_y, 1e-6))
+        center_x, center_y = (min_x + max_x) * 0.5, (min_y + max_y) * 0.5
+        return scale, lambda x, y: (int(width * 0.5 + (x - center_x) * scale), int(height * vertical_center - (y - center_y) * scale))
+
+    def _warp_grid(self, panel_size: tuple[int, int], grid: RawGrid | None, image: np.ndarray | None, to_px, background: tuple[int, int, int]) -> np.ndarray | None:
+        if grid is None or image is None:
+            return None
+        source = np.float32([[0.0, grid.height - 1.0], [grid.width - 1.0, grid.height - 1.0], [0.0, 0.0]])
+        destination = np.float32([
+            to_px(*grid.world_from_cell(0.0, 0.0)),
+            to_px(*grid.world_from_cell(grid.width - 1.0, 0.0)),
+            to_px(*grid.world_from_cell(0.0, grid.height - 1.0)),
+        ])
+        transform = cv2.getAffineTransform(source, destination)
+        return cv2.warpAffine(image, transform, panel_size, flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=background)
+
+    def render_room_panel(self, occupancy: RawGrid | None, room: RawGrid | None, panel_size: tuple[int, int], step: dict, step_index: int, world_bounds: tuple[float, float, float, float] | None) -> np.ndarray:
+        width, height = panel_size
+        panel = np.full((height, width, 3), 246, dtype=np.uint8)
+        reference = occupancy or room
+        if reference is None:
+            _draw_panel_title(panel, "ROOM SEGMENTS + INTERACTION", step_index)
+            return panel
+        if world_bounds is None:
+            world_bounds = known_world_bounds(reference, 0.0) or (reference.origin_x, reference.origin_y, reference.origin_x + reference.width * reference.resolution, reference.origin_y + reference.height * reference.resolution)
+        scale, to_px = self._world_view(world_bounds, panel_size, margin=18, vertical_center=0.5)
+        occ_layer = self._warp_grid(panel_size, occupancy, _occupancy_base(occupancy) if occupancy else None, to_px, (246, 246, 246))
+        if occ_layer is not None:
+            panel = cv2.addWeighted(occ_layer, 0.72, panel, 0.28, 0.0)
+        room_layer = self._warp_grid(panel_size, room, _room_base(room) if room else None, to_px, (246, 246, 246))
+        if room_layer is not None:
+            panel = cv2.addWeighted(room_layer, 0.38, panel, 0.62, 0.0)
+        graph = step.get("unified_graph") or {}
+        selection = step.get("semantic_selection") or {}
+        target_id = _selection_target_id(selection)
+        observed = {str(value) for value in step.get("observed_instance_ids") or []}
+        for node in _bounded_nodes(graph, observed, target_id):
+            if str(node.get("type") or "") not in {"portal", "container"}:
+                continue
+            center = _node_xy(node)
+            size = list(node.get("aabb_size") or [])
+            if center is None or len(size) < 2:
+                continue
+            center_px = to_px(*center)
+            half_w, half_h = max(3, int(abs(float(size[0])) * scale * 0.5)), max(3, int(abs(float(size[1])) * scale * 0.5))
+            is_target = bool(target_id and target_id in _node_ids(node))
+            color = (235, 35, 210) if is_target else _node_color(node)
+            cv2.rectangle(panel, (center_px[0] - half_w, center_px[1] - half_h), (center_px[0] + half_w, center_px[1] + half_h), color, 4 if is_target else 2, cv2.LINE_AA)
+            cv2.putText(panel, f"{'INTERACT ' if is_target else ''}{_short_node_id(node)} {node.get('label', node.get('type', ''))}", (center_px[0] + 3, center_px[1] - half_h - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.30, color, 1, cv2.LINE_AA)
+        pose = self._transform(step.get("pose"), self.transforms.odom_frame, self.transforms.map_frame, step_index)
+        if pose is not None:
+            _draw_robot_arrow(panel, to_px(pose[0], pose[1]), pose[2], 14)
+        _draw_panel_title(panel, "ROOM SEGMENTS + INTERACTION", step_index)
+        return panel
+
+    def render_semantic_xy(
+        self,
+        occupancy: RawGrid | None,
+        panel_size: tuple[int, int],
+        step: dict,
+        step_index: int,
+        world_bounds: tuple[float, float, float, float] | None,
+        *,
+        draw_object_labels: bool = True,
+        draw_support_labels: bool = True,
+    ) -> np.ndarray:
+        width, height = panel_size
+        panel = np.full((height, width, 3), 246, dtype=np.uint8)
+        graph = step.get("unified_graph") or {}
+        selection = step.get("semantic_selection") or {}
+        target_id = _selection_target_id(selection)
+        observed = {str(value) for value in step.get("observed_instance_ids") or []}
+        nodes = _bounded_nodes(graph, observed, target_id)
+        positions = [position for node in nodes if (position := _node_xy(node)) is not None]
+        pose = self._transform(step.get("pose"), self.transforms.odom_frame, self.transforms.map_frame, step_index)
+        if pose is not None:
+            positions.append((pose[0], pose[1]))
+        if not positions:
+            cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
+            _draw_panel_title(panel, "SEMANTIC XY", step_index)
+            return panel
+        if world_bounds is None:
+            min_x, max_x = min(value[0] for value in positions), max(value[0] for value in positions)
+            min_y, max_y = min(value[1] for value in positions), max(value[1] for value in positions)
+            world_bounds = (min_x, min_y, max_x, max_y)
+        scale, to_px = self._world_view(world_bounds, panel_size, margin=38, vertical_center=0.53)
+        occ_layer = self._warp_grid(panel_size, occupancy, _occupancy_base(occupancy) if occupancy else None, to_px, (246, 246, 246))
+        if occ_layer is not None:
+            panel = cv2.addWeighted(occ_layer, 0.35, panel, 0.65, 0.0)
+        min_x, min_y, max_x, max_y = world_bounds
+        for grid_x in range(math.floor(min_x), math.ceil(max_x) + 1):
+            cv2.line(panel, to_px(grid_x, min_y), to_px(grid_x, max_y), (226, 226, 226), 1)
+        for grid_y in range(math.floor(min_y), math.ceil(max_y) + 1):
+            cv2.line(panel, to_px(min_x, grid_y), to_px(max_x, grid_y), (226, 226, 226), 1)
+        lookup = {str(node.get("id") or ""): node for node in nodes}
+        for edge in graph.get("edges") or []:
+            if str(edge.get("relation") or "") not in {"connects", "contains", "supports"}:
+                continue
+            src, dst = _node_xy(lookup.get(str(edge.get("src_id") or ""), {})), _node_xy(lookup.get(str(edge.get("dst_id") or ""), {}))
+            if src is None or dst is None:
+                continue
+            relation = str(edge.get("relation") or "")
+            color = (220, 90, 45) if relation == "connects" else (170, 75, 210) if relation == "contains" else (55, 125, 220)
+            cv2.line(panel, to_px(*src), to_px(*dst), color, 2, cv2.LINE_AA)
+        for node in sorted(nodes, key=lambda item: str(item.get("type") or "") != "room"):
+            center = _node_xy(node)
+            if center is None:
+                continue
+            size = node.get("aabb_size") or [0.25, 0.25, 0.0]
+            half_w, half_h = max(3, int(max(0.08, float(size[0]) * 0.5) * scale)), max(3, int(max(0.08, float(size[1]) * 0.5) * scale))
+            pixel = to_px(*center)
+            is_target = bool(target_id and target_id in _node_ids(node))
+            color = (235, 35, 210) if is_target else _node_color(node)
+            thickness = 4 if is_target else 2 if node.get("is_currently_visible") else 1
+            if str(node.get("type") or "") == "room":
+                overlay = panel.copy()
+                cv2.rectangle(overlay, (pixel[0] - half_w, pixel[1] - half_h), (pixel[0] + half_w, pixel[1] + half_h), color, -1)
+                cv2.addWeighted(overlay, 0.35, panel, 0.65, 0, panel)
+                cv2.rectangle(panel, (pixel[0] - half_w, pixel[1] - half_h), (pixel[0] + half_w, pixel[1] + half_h), (125, 150, 175), 1)
+            else:
+                cv2.rectangle(panel, (pixel[0] - half_w, pixel[1] - half_h), (pixel[0] + half_w, pixel[1] + half_h), color, thickness)
+            node_type = str(node.get("type") or "")
+            if (
+                (node_type != "object" or draw_object_labels)
+                and (node_type != "support" or draw_support_labels)
+            ):
+                label = _node_label(node) if node_type == "room" else f"{'INTERACT ' if is_target else ''}{_short_node_id(node)} {_node_label(node)}"
+                cv2.putText(panel, label[:30], (pixel[0] + 3, pixel[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.28, color if is_target else (35, 35, 35), 1, cv2.LINE_AA)
+        if pose is not None:
+            _draw_robot_arrow(panel, to_px(pose[0], pose[1]), pose[2], 14)
+        _draw_panel_title(panel, "SEMANTIC XY", step_index)
+        return panel
+
+    def render_topology(self, panel_size: tuple[int, int], step: dict, step_index: int) -> np.ndarray:
+        width, height = panel_size
+        panel = np.full((height, width, 3), (220, 248, 255), dtype=np.uint8)
+        graph = step.get("unified_graph") or {}
+        selection = step.get("semantic_selection") or {}
+        target_id = _selection_target_id(selection)
+        observed = {str(value) for value in step.get("observed_instance_ids") or []}
+        all_nodes = _bounded_nodes(graph, observed, target_id)
+        contains = [edge for edge in graph.get("edges") or [] if str(edge.get("relation") or "") == "contains"]
+        contained = {str(edge.get("dst_id") or "") for edge in contains}
+        nodes = [node for node in all_nodes if str(node.get("type") or "") in {"room", "portal", "container"} or str(node.get("id") or "") in contained]
+        lookup = {str(node.get("id") or ""): node for node in nodes}
+        edges = [dict(edge) for edge in graph.get("edges") or [] if topology_edge_visible(edge, lookup)]
+        edge_keys = {(str(edge.get("src_id") or ""), str(edge.get("dst_id") or ""), str(edge.get("relation") or "")) for edge in edges}
+        for node in nodes:
+            node_id, node_type = str(node.get("id") or ""), str(node.get("type") or "")
+            if node_type == "portal":
+                for room_id in portal_room_node_ids(node, graph.get("edges") or []):
+                    key = (node_id, room_id, "connects")
+                    if room_id in lookup and key not in edge_keys:
+                        edges.append({"src_id": node_id, "dst_id": room_id, "relation": "connects"})
+                        edge_keys.add(key)
+            if node_type == "container":
+                room_id = node.get("room_id")
+                parent = f"room_{int(room_id)}" if room_id is not None else str(node.get("parent_id") or "")
+                key = (parent, node_id, "has_child")
+                if parent in lookup and key not in edge_keys:
+                    edges.append({"src_id": parent, "dst_id": node_id, "relation": "has_child"})
+                    edge_keys.add(key)
+        layout = topology_hierarchy_layout(nodes, edges, width, height)
+        positions, boxes, row_y = layout["positions"], layout["boxes"], layout["row_y"]
+        labels = {"room": "room level", "portal": "door level", "container": "container level", "object": "object level"}
+        for node_type, y in row_y.items():
+            cv2.line(panel, (layout["left_gutter"], y), (width - 5, y), (218, 221, 224), 1, cv2.LINE_AA)
+            cv2.putText(panel, labels[node_type], (4, min(height - 4, y + 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (120, 105, 90), 1, cv2.LINE_AA)
+        for edge in edges:
+            src_id, dst_id = str(edge.get("src_id") or ""), str(edge.get("dst_id") or "")
+            if src_id not in positions or dst_id not in positions:
+                continue
+            style = topology_edge_style(str(edge.get("relation") or ""), str((lookup.get(src_id) or {}).get("type") or ""), str((lookup.get(dst_id) or {}).get("type") or ""))
+            if style is not None:
+                cv2.line(panel, positions[src_id], positions[dst_id], style["color"], int(style["thickness"]), cv2.LINE_AA)
+        def dashed_line(start, end, color):
+            dx, dy = float(end[0] - start[0]), float(end[1] - start[1])
+            length = max(1.0, math.hypot(dx, dy))
+            cursor = 0.0
+            while cursor < length:
+                finish = min(length, cursor + 6)
+                p1 = (int(start[0] + dx * cursor / length), int(start[1] + dy * cursor / length))
+                p2 = (int(start[0] + dx * finish / length), int(start[1] + dy * finish / length))
+                cv2.line(panel, p1, p2, color, 2, cv2.LINE_AA)
+                cursor += 10
+        for node in nodes:
+            node_id = str(node.get("id") or "")
+            box = boxes.get(node_id)
+            if box is None:
+                continue
+            x1, y1, x2, y2 = box
+            style = topology_node_style(node)
+            cv2.rectangle(panel, (x1, y1), (x2, y2), style["fill"], -1)
+            if style["dashed"]:
+                dashed_line((x1, y1), (x2, y1), style["border"]); dashed_line((x2, y1), (x2, y2), style["border"]); dashed_line((x2, y2), (x1, y2), style["border"]); dashed_line((x1, y2), (x1, y1), style["border"])
+            else:
+                cv2.rectangle(panel, (x1, y1), (x2, y2), style["border"], 2, cv2.LINE_AA)
+            is_target = bool(target_id and target_id in _node_ids(node))
+            if is_target:
+                cv2.rectangle(panel, (max(1, x1 - 2), max(1, y1 - 2)), (min(width - 2, x2 + 2), min(height - 2, y2 + 2)), (235, 35, 210), 2, cv2.LINE_AA)
+            node_type = str(node.get("type") or "object")
+            state = str((node.get("interaction") or {}).get("state") or "unknown")
+            if node_type == "room":
+                room_id = node.get("room_id") if node.get("room_id") is not None else node_id.removeprefix("room_")
+                cv2.putText(panel, f"Room {room_id}"[:22], (x1 + 4, y1 + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.29, (25, 25, 25), 1, cv2.LINE_AA)
+                cv2.putText(panel, _node_label(node)[:22], (x1 + 4, y2 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (25, 25, 25), 1, cv2.LINE_AA)
+            else:
+                label = _node_label(node) if node_type == "object" else f"{_short_node_id(node)} {_node_label(node)} [{state}]"
+                text_width, text_height = cv2.getTextSize(label[:26], cv2.FONT_HERSHEY_SIMPLEX, 0.25, 1)[0]
+                cv2.putText(panel, label[:26], (x1 + max(3, (x2 - x1 - text_width) // 2), (y1 + y2 + text_height) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (25, 25, 25), 1, cv2.LINE_AA)
+        dashed_line((4, 29), (13, 29), (35, 35, 210)); dashed_line((13, 29), (13, 37), (35, 35, 210)); dashed_line((13, 37), (4, 37), (35, 35, 210)); dashed_line((4, 37), (4, 29), (35, 35, 210))
+        cv2.putText(panel, "closed", (16, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23, (65, 65, 65), 1, cv2.LINE_AA)
+        cv2.rectangle(panel, (57, 29), (66, 37), (45, 175, 70), 2)
+        cv2.putText(panel, "open", (69, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23, (65, 65, 65), 1, cv2.LINE_AA)
+        execution = str((step.get("semantic_execution_state") or {}).get("state") or "IDLE")
+        behavior = str(selection.get("behavior_type") or "-")
+        feedback = str((step.get("semantic_behavior_feedback") or {}).get("status") or "-")
+        cv2.putText(panel, f"{execution}/{behavior}  feedback={feedback}"[:72], (5, height - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.24, (55, 55, 55), 1, cv2.LINE_AA)
+        revision = int(graph.get("graph_revision", 0) or 0)
+        _draw_panel_title(panel, f"SEMANTIC INTERACTION GRAPH r{revision}", step_index)
+        return panel
+
+
+def camera_title(step: dict, step_index: int) -> str:
+    pose = step.get("pose") or []
+    goal = list((step.get("semantic_selection") or {}).get("goal_xyyaw") or step.get("active_goal") or [])
+    distance = float(step.get("distance_m") or 0.0)
+    if len(pose) >= 2 and len(goal) >= 2:
+        goal_distance = f"{math.hypot(float(pose[0]) - float(goal[0]), float(pose[1]) - float(goal[1])):.2f}m"
+    else:
+        goal_distance = "-"
+    return f"STEP={_step4(step_index)}  dist={distance:.2f}m  dist_to_goal={goal_distance}"
+
+
+def draw_camera_title(frame: np.ndarray, step: dict, step_index: int) -> None:
+    text = camera_title(step, step_index)
+    font_scale = 0.46 if frame.shape[1] < 700 else 0.58
+    thickness = 1 if frame.shape[1] < 700 else 2
+    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+    x = max(6, frame.shape[1] - text_size[0] - 8)
+    y = max(text_size[1] + 5, 22)
+    cv2.putText(frame, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (245, 245, 245), thickness + 2, cv2.LINE_AA)
+    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (25, 25, 25), thickness, cv2.LINE_AA)

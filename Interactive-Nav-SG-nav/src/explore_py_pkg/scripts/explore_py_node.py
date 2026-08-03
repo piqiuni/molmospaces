@@ -294,6 +294,7 @@ class ExplorePyNode:
         self.cancel_pub = rospy.Publisher(self.topics.get("move_base_cancel", "/move_base/cancel"), GoalID, queue_size=1)
         self.cmd_vel_pub = rospy.Publisher(self.topics.get("cmd_vel", "/cmd_vel"), Twist, queue_size=1)
         self.status_pub = rospy.Publisher(self.topics.get("status", "/explore_py/status"), String, queue_size=1)
+        self.step_ready_pub = rospy.Publisher("/semantic_decision/ready/explore_py", String, queue_size=32)
         self.behavior_feedback_pub = rospy.Publisher(
             self.topics.get("behavior_feedback", "/explore_py/behavior_feedback"),
             String,
@@ -426,6 +427,12 @@ class ExplorePyNode:
     def occupancy_callback(self, msg):
         self.latest_grid_msg = msg
         self.latest_grid = self._convert_grid(msg)
+        self.step_ready_pub.publish(String(data=json.dumps({
+            "module": "explore_py", "ready": self.latest_grid is not None,
+            "step_index": int(getattr(msg.header, "seq", -1)),
+            "stamp_sec": float(msg.header.stamp.to_sec()) if msg.header.stamp else 0.0,
+            "timestamp": time.time(),
+        }, separators=(",", ":"))))
 
     def odom_callback(self, msg):
         self.robot_xy = (float(msg.pose.pose.position.x), float(msg.pose.pose.position.y))

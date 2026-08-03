@@ -28,6 +28,7 @@ from record_explore_debug import (
     ExploreDebugRecorder,
     _FrozenVideoGrid,
     _AsyncArtifactWriter,
+    _AsyncRawRecordingWriter,
     _freeze_video_grid,
     _image_msg_to_rgb,
     _known_world_bounds_from_grid,
@@ -193,6 +194,28 @@ def test_ros_bridge_image_before_sync_contract_survives_callback_reordering() ->
     assert rgb == bytes((210, 35, 20)) * 48
     assert snapshot["camera_source"] == "exact_image"
     assert recorder.step_sync_image_match_count == 1
+    assert recorder.step_sync_placeholder_count == 0
+
+
+def test_offline_step_sync_skips_duplicate_rgb_and_queues_compact_camera_stub() -> None:
+    recorder, jobs = _recorder_stub()
+    recorder.args.offline_video_only = True
+    stamp_sec = 1_785_213_882.615378
+
+    recorder.image_callback(_rgb_message(17, stamp_sec, (210, 35, 20)))
+    assert recorder.image_callback_count == 0
+    assert recorder.step_sync_image_cache.active_size == 0
+
+    recorder.step_sync_callback(
+        String(data=json.dumps({"step_index": 17, "stamp_sec": stamp_sec}))
+    )
+
+    assert len(jobs) == 1
+    width, height, rgb, _stamp, source_seq, snapshot = jobs[0]
+    assert (width, height, source_seq) == (4, 2, 17)
+    assert rgb == b""
+    assert snapshot["camera_source"] == "sim_step_frame_offline"
+    assert recorder.step_sync_image_match_count == 0
     assert recorder.step_sync_placeholder_count == 0
 
 
@@ -644,6 +667,7 @@ def test_frozen_grid_renders_path_and_room_panels_without_cell_payload() -> None
         video_map_crop_margin_px=1,
         frontier_check_radius_m=1.0,
         plan_goal_match_tolerance_m=1.0,
+        semantic_video_max_object_nodes=96,
     )
     recorder.latest_pose = None
     recorder.latest_global_plan = None
@@ -747,3 +771,87 @@ def test_runtime_video_submission_backpressures_instead_of_dropping() -> None:
     assert not thread.is_alive()
     assert writer.submitted_video_jobs == 1
     assert writer.video_jobs.qsize() == 1
+
+
+def test_raw_writer_persists_receipts_and_step_boundary_off_callback_thread(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    writer = _AsyncRawRecordingWriter(raw_dir, max_queue=4, overflow="block")
+    try:
+        writer.note_source("raw_occ")
+        encoded = np.asarray([[0, 1, 101], [1, 51, 0]], dtype=np.uint8)
+        image_path = raw_dir / "maps" / "raw_occ_000000.png"
+        assert writer.enqueue_grid(
+            "raw_occ",
+            receipt_id="raw_occ:0",
+            path=image_path,
+            encoded=encoded,
+            record={"step_index": 7, "png_value_offset": 1},
+        )
+        assert writer.enqueue_step_boundary(
+            {
+                "step_index": 7,
+                "receipts": writer.latest_receipts_snapshot(),
+            }
+        )
+        writer.close()
+
+        stats = writer.stats_snapshot()
+        assert stats["source_received"] == {"raw_occ": 1, "step_boundary": 1}
+        assert stats["accepted"] == {"raw_occ": 1, "step_boundary": 1}
+        assert stats["persisted"] == {"raw_occ": 1, "step_boundary": 1}
+        assert stats["queue_dropped"] == {}
+        assert stats["write_failed"] == {}
+        assert image_path.exists()
+
+        map_rows = [
+            json.loads(line)
+            for line in (raw_dir / "map_manifest.jsonl").read_text().splitlines()
+            if line
+        ]
+        step_rows = [
+            json.loads(line)
+            for line in (raw_dir / "step_boundaries.jsonl").read_text().splitlines()
+            if line
+        ]
+        assert map_rows[0]["receipt_id"] == "raw_occ:0"
+        assert step_rows[0]["receipts"] == {"raw_occ": "raw_occ:0"}
+    finally:
+        writer.close()
+
+
+def test_raw_encoder_preserves_room_labels_and_costmap_values_above_100() -> None:
+    room_encoded, room_offset, room_depth = ExploreDebugRecorder._encode_raw_grid_values(
+        "room_segmentation", np.asarray([[-1, 0, 512]], dtype=np.int32)
+    )
+    costmap_encoded, costmap_offset, costmap_depth = ExploreDebugRecorder._encode_raw_grid_values(
+        "global_costmap_full", np.asarray([[0, 100, 255]], dtype=np.int32)
+    )
+
+    assert (room_offset, room_depth, room_encoded.dtype) == (1, 16, np.uint16)
+    assert (costmap_offset, costmap_depth, costmap_encoded.dtype) == (1, 16, np.uint16)
+    assert room_encoded.tolist() == [[0, 1, 513]]
+    assert costmap_encoded.tolist() == [[1, 101, 256]]
+
+
+def test_raw_writer_drop_policy_counts_an_explicit_queue_drop() -> None:
+    writer = _AsyncRawRecordingWriter.__new__(_AsyncRawRecordingWriter)
+    writer.overflow = "drop"
+    writer.jobs = queue.Queue(maxsize=1)
+    writer.jobs.put(object())
+    writer._stats_lock = threading.RLock()
+    writer._accepting = True
+    writer._closed = False
+    writer.source_received = {}
+    writer.accepted = {}
+    writer.persisted = {}
+    writer.queue_dropped = {}
+    writer.write_failed = {}
+    writer.latest_receipt_ids = {}
+    writer.queue_peak = 1
+    writer.enqueue_wait_ms_total = 0.0
+    writer.enqueue_wait_ms_max = 0.0
+    writer.errors = []
+
+    assert writer._submit("raw_occ", ("grid",)) is False
+    assert writer.queue_dropped == {"raw_occ": 1}
+    assert writer.accepted == {}

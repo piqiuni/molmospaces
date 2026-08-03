@@ -5,7 +5,12 @@ import math
 import time
 from typing import Any
 
-from .behavior_candidates import BEHAVIOR_EXPLORE, BEHAVIOR_INTERACT, BEHAVIOR_NAVIGATE
+from .behavior_candidates import (
+    BEHAVIOR_EXPLORE,
+    BEHAVIOR_INTERACT,
+    BEHAVIOR_NAVIGATE,
+    BEHAVIOR_SCAN,
+)
 
 
 STATE_IDLE = "IDLE"
@@ -14,6 +19,7 @@ STATE_NAVIGATING = "NAVIGATING"
 STATE_FINALIZING_EXPLORE = "FINALIZING_EXPLORE"
 STATE_APPROACH_INTERACTION = "APPROACH_INTERACTION"
 STATE_WAITING_FOR_DRAWER_SCAN = "WAIT_FOR_DRAWER_SCAN"
+STATE_SCANNING = "SCANNING"
 STATE_INTERACTING = "INTERACTING"
 STATE_VERIFYING = "VERIFYING"
 STATE_SUCCEEDED = "SUCCEEDED"
@@ -656,6 +662,7 @@ class ExecutionConfig:
     verification_timeout_s: float = 30.0
     explore_prepare_timeout_s: float = 10.0
     explore_finalize_timeout_s: float = 10.0
+    scan_timeout_s: float = 15.0
 
 
 class BehaviorExecutionStateMachine:
@@ -704,7 +711,23 @@ class BehaviorExecutionStateMachine:
                 now,
                 {"kind": "interact", "candidate": self.candidate},
             )
+        if behavior_type == BEHAVIOR_SCAN:
+            return self._transition(
+                STATE_SCANNING,
+                now,
+                {"kind": "scan", "candidate": self.candidate},
+            )
         raise ValueError(f"Unsupported behavior type: {behavior_type}")
+
+    def on_scan_result(
+        self,
+        success: bool,
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.state != STATE_SCANNING or self._behavior_type() != BEHAVIOR_SCAN:
+            return []
+        return self._finish(bool(success), detail or {}, now)
 
     def on_explore_ready(
         self, detail: dict[str, Any] | None = None, now: float | None = None
@@ -892,6 +915,13 @@ class BehaviorExecutionStateMachine:
             return (
                 "explore_prepare_timeout"
                 if elapsed > self.config.explore_prepare_timeout_s
+                else ""
+            )
+        if self.state == STATE_SCANNING:
+            return (
+                "scan_timeout"
+                if self.config.scan_timeout_s > 0.0
+                and elapsed > self.config.scan_timeout_s
                 else ""
             )
         if self.state == STATE_NAVIGATING:

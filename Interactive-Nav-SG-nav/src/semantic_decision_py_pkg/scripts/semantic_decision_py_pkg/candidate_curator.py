@@ -11,6 +11,9 @@ from .behavior_candidates import BehaviorCandidate
 
 
 SUPPORTED_BEHAVIOR_TYPES = ("NAVIGATE", "INTERACT", "EXPLORE")
+# SCAN is selected by the mandatory startup gate before normal candidate
+# curation, but it still must pass the common eligibility validator.
+NON_NAVIGATION_BEHAVIOR_TYPES = ("SCAN",)
 
 
 @dataclass
@@ -96,6 +99,8 @@ def _normalized_behavior_type(candidate: BehaviorCandidate) -> str:
 
 def _candidate_action(candidate: BehaviorCandidate) -> str:
     behavior_type = _normalized_behavior_type(candidate)
+    if behavior_type == "SCAN":
+        return "scan"
     if behavior_type == "INTERACT":
         return str((candidate.interaction_command or {}).get("action") or "open").casefold()
     if behavior_type == "NAVIGATE":
@@ -209,9 +214,9 @@ def candidate_rejection_reason(candidate: BehaviorCandidate) -> str:
     metadata = candidate.metadata or {}
     if not candidate_id:
         return "missing_candidate_id"
-    if behavior_type not in SUPPORTED_BEHAVIOR_TYPES:
+    if behavior_type not in (*SUPPORTED_BEHAVIOR_TYPES, *NON_NAVIGATION_BEHAVIOR_TYPES):
         return "unsupported_behavior_type"
-    if not _goal_is_finite(candidate):
+    if behavior_type not in NON_NAVIGATION_BEHAVIOR_TYPES and not _goal_is_finite(candidate):
         return "missing_or_invalid_goal_pose"
     if metadata.get("hard_constraints_passed") is False:
         return "hard_constraints_failed"
@@ -264,6 +269,8 @@ def validate_candidate_update(
         return CandidateValidationResult(False, rejection)
     if candidate_semantic_signature(latest) != candidate_semantic_signature(selected):
         return CandidateValidationResult(False, "candidate_semantics_changed")
+    if _normalized_behavior_type(latest) in NON_NAVIGATION_BEHAVIOR_TYPES:
+        return CandidateValidationResult(True, "candidate_content_compatible", latest)
     old_goal = list(selected.goal_xyyaw or [])
     new_goal = list(latest.goal_xyyaw or [])
     displacement = math.hypot(

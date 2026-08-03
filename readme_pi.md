@@ -1,6 +1,6 @@
 # 交互导航项目总览（readme_pi）
 
-最后更新：2026-06-03
+最后更新：2026-08-03
 
 ## 1. 文档定位
 
@@ -186,6 +186,28 @@
 2. 交互状态定义一致
 3. “需要交互”的判断逻辑尽量可对齐
 4. 结果表达能互相支撑，而不是彼此孤立
+
+### 5.4 当前在线闭环与可审计录像
+
+ROS 主线现在把“可复现的状态更新”和“可检查的录像”视为同一个运行时契约，而不是事后拼接的可视化。
+
+```text
+simulator observation (common step/stamp)
+→ raw OCC / semantic mapping / explore_py readiness
+→ semantic decision / executor
+→ action
+→ step_sync + raw snapshot acknowledgment
+→ next simulator step
+```
+
+- **OCC readiness**：决策侧聚合 `semantic_mapping` 与 `explore_py` 的当前 ready 状态；这保证当前地图已进入必要导航链路，但不把尚在异步运行的 room segmentation 或完整 semantic graph 误当作同步完成。
+- **交互后闭环**：planning OCC 可以在已确认的开门结果后先更新可通行区域；room topology 只在确认后的稳定分割结果上更新。因而“规划可先恢复”与“图拓扑随后确认”是有意区分的两个阶段。
+- **录像**：当前语义探索/批测主入口在运行期只保存逐 step 相机 PNG、无损地图 PNG 和 JSONL step boundary；六联图与 MP4 在 recorder 排空后离线重建。这样既能保证相机与状态的逻辑 step 对齐，也能在不重跑仿真的情况下重新生成六联图或修改布局；单 panel raw-only 导出接口仍在收敛中。
+- **审计**：每个 boundary 保存所选地图 receipt、位姿、计划、graph/selection/execution 状态和必要 TF；离线结果保存逐帧 receipt 对齐记录。录像是否有效由帧数、raw writer 的无丢失计数和 alignment sidecar 判定，而不是仅看 MP4 是否可播放。
+
+当前第一阶段 initial scan 是决策层强制的、不可中断的 `SCAN` 行为：map ready 前不发布候选，ready 后先完成 `RGB(N)+fresh-gate(N)` 的 step 配对与 2π 观测，再开放普通导航/交互。默认 `1.25 rad/s × 0.2 s`，最多 40 个控制 step；15 s timeout 按已确认 control step 的逻辑时间计算，墙钟只做 step-sync 停滞保护，因此外部仿真吞吐不会改变每步 `v×dt` 目标。它不等于 MLLM 未启动；规则 METHOD 不调用 MLLM，只有显式 `full_mllm_*` 运行才调用模型。2026-08-03 的 100-step smoke 已验证 SCAN 在 28 个确认控制 step、`6.406 rad` 后成功，并继续进入 `INTERACT` / `NAVIGATE`。
+
+目前 raw-only 离线录像已作为 `run_house7_semantic_exploration_ros_test.zsh` 与语义批测的标准路径；部分旧入口（尤其 V3 evaluator）仍保留 runtime encoder，属于待迁移的兼容路径，不应与新旧产物或性能数据混合比较。具体命令、产物和验收规则见 `test.md`。
 
 ---
 

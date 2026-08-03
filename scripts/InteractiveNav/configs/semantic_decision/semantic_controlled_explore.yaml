@@ -1,20 +1,8 @@
 exploration:
   external_behavior_control: true
-  # Complete the initial 360° scan before semantic candidate dispatch.
-  initial_spin_enabled: true
-  # At 1.25 rad/s and 200 ms evaluator actions, 26 commands cover 2π.  The
-  # fresh RGB/step-sync gate permits at most one command per action and the
-  # cap provides two steps of numerical margin without a long wall-time spin.
-  initial_spin_angular_speed: 1.25
-  initial_spin_fresh_step_gate_enabled: true
-  # RosBridge announces the start of each fresh-command wait, so one scan
-  # command is delivered in that exact evaluator action rather than relying
-  # on a wall-clock timer phase.
-  initial_spin_fresh_command_gate_enabled: true
-  initial_spin_fresh_step_min_delay_sec: 0.0
-  initial_spin_max_control_steps: 28
-  # The action cap is the hard bound.  Leave enough wall-clock slack for three
-  # simultaneous ROS workers to receive all 28 fresh-command windows.
-  initial_spin_timeout_sec: 60.0
+  # Startup observation is now an explicit semantic SCAN behavior executed by
+  # semantic_behavior_executor.  Keep ExplorePy passive in external-control
+  # mode so it never bypasses decision/execution with raw cmd_vel.
+  initial_spin_enabled: false
   local_plan_watchdog_enabled: true
   local_plan_watchdog_sec: 12.0

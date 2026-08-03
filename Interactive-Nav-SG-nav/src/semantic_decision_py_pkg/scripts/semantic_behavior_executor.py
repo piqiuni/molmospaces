@@ -23,6 +23,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_INTERACTING,
     STATE_NAVIGATING,
     STATE_PREPARING_EXPLORE,
+    STATE_SCANNING,
     STATE_WAITING_FOR_DRAWER_SCAN,
     STATE_VERIFYING,
     bounded_empty_plan_retry_delay,
@@ -48,6 +49,11 @@ from semantic_decision_py_pkg.behavior_execution import (
     safe_grid_motion_distance,
 )
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
+from semantic_decision_py_pkg.step_command_gate import StepCommandGate
+from semantic_decision_py_pkg.startup_scan_timing import (
+    startup_scan_elapsed_control_s,
+    startup_scan_timeout_reason,
+)
 from semantic_decision_py_pkg.visual_interaction_planning import (
     action_for_opaque_open_contract,
     candidate_with_direct_drawer_scan,
@@ -141,6 +147,33 @@ class SemanticBehaviorExecutor:
         self.drawer_scan_wait_poll_interval_s = max(
             0.01, float(config.get("drawer_scan_wait_poll_interval_s", 0.10))
         )
+        startup_scan_config = rospy.get_param("~startup_scan", {}) or {}
+        self.startup_scan_enabled = bool(startup_scan_config.get("enabled", False))
+        self.startup_scan_angle_rad = max(
+            0.0, float(startup_scan_config.get("angle_rad", 2.0 * math.pi))
+        )
+        self.startup_scan_angular_speed_rad_s = float(
+            startup_scan_config.get("angular_speed_rad_s", 1.25)
+        )
+        self.startup_scan_control_dt_s = max(
+            1e-3, float(startup_scan_config.get("control_dt_s", 0.2))
+        )
+        self.startup_scan_timeout_s = max(
+            0.0, float(startup_scan_config.get("timeout_s", 15.0))
+        )
+        self.startup_scan_max_control_steps = max(
+            1, int(startup_scan_config.get("max_control_steps", 40))
+        )
+        self.startup_scan_max_pending_steps = max(
+            2, int(startup_scan_config.get("max_pending_steps", 32))
+        )
+        self.startup_scan_pair_max_age_s = max(
+            0.0, float(startup_scan_config.get("pair_max_age_s", 0.75))
+        )
+        self.startup_scan_step_sync_stall_timeout_s = max(
+            0.1,
+            float(startup_scan_config.get("step_sync_stall_timeout_s", 5.0)),
+        )
         self.machine = BehaviorExecutionStateMachine(
             ExecutionConfig(
                 navigation_timeout_s=float(config.get("navigation_timeout_s", 180.0)),
@@ -156,6 +189,9 @@ class SemanticBehaviorExecutor:
                 explore_finalize_timeout_s=float(
                     config.get("explore_finalize_timeout_s", 10.0)
                 ),
+                # Startup scan timeout is evaluator control time, handled in
+                # _run_startup_scan.  Disable the generic wall-clock guard.
+                scan_timeout_s=0.0,
             )
         )
         self.map_frame = str(config.get("map_frame", "tf_frame_map"))
@@ -390,6 +426,11 @@ class SemanticBehaviorExecutor:
         self._latest_local_plan_pose_count = 0
         self._latest_step_sync_index: int | None = None
         self._latest_step_sync_received_at = 0.0
+        self._startup_scan_gate = StepCommandGate(
+            max_pending_steps=self.startup_scan_max_pending_steps,
+            max_pair_age_s=self.startup_scan_pair_max_age_s,
+        )
+        self._startup_scan_progress: dict = {}
         self._latest_rgb_step_seq: int | None = None
         self._latest_rgb_step_received_at = 0.0
         self.latest_image = None
@@ -512,12 +553,19 @@ class SemanticBehaviorExecutor:
             self._image_callback,
             queue_size=1,
         )
-        if self.rear_goal_prerotate_step_sync_enabled:
+        if self.rear_goal_prerotate_step_sync_enabled or self.startup_scan_enabled:
             rospy.Subscriber(
                 topics.get("step_sync", "/molmo_spaces/step_sync"),
                 String,
                 self._step_sync_callback,
-                queue_size=1,
+                queue_size=32,
+            )
+        if self.startup_scan_enabled:
+            rospy.Subscriber(
+                topics.get("fresh_command_gate", "/molmo_spaces/fresh_cmd_gate"),
+                String,
+                self._fresh_command_gate_callback,
+                queue_size=32,
             )
         self.timer = rospy.Timer(rospy.Duration(0.2), self._tick)
 
@@ -713,7 +761,7 @@ class SemanticBehaviorExecutor:
             self._dispatch(commands)
 
     def _step_sync_callback(self, message: String) -> None:
-        """Record evaluator progress without using TF's keepalive stream."""
+        """Record a bridge action acknowledgement keyed by evaluator step."""
 
         try:
             payload = json.loads(message.data)
@@ -723,6 +771,20 @@ class SemanticBehaviorExecutor:
         with self.lock:
             self._latest_step_sync_index = step_index
             self._latest_step_sync_received_at = time.monotonic()
+            if self.startup_scan_enabled:
+                self._startup_scan_gate.record_step_sync(
+                    step_index,
+                    action_source=str(payload.get("action_source") or ""),
+                )
+
+    def _fresh_command_gate_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+            step_index = int(payload["step_index"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        with self.lock:
+            self._startup_scan_gate.record_fresh_gate(step_index)
 
     def _image_callback(self, message: Image) -> None:
         try:
@@ -740,6 +802,8 @@ class SemanticBehaviorExecutor:
             if rgb_step_seq is not None:
                 self._latest_rgb_step_seq = rgb_step_seq
                 self._latest_rgb_step_received_at = received_at
+                if self.startup_scan_enabled:
+                    self._startup_scan_gate.record_rgb(rgb_step_seq, now=received_at)
 
     @staticmethod
     def _decode_ros_image(message: Image):
@@ -1464,7 +1528,11 @@ class SemanticBehaviorExecutor:
                 STATE_NAVIGATING,
                 STATE_APPROACH_INTERACTION,
             }
-            if reason == "drawer_scan_fresh_frame_timeout":
+            if reason == "scan_timeout":
+                detail = dict(self._startup_scan_progress)
+                detail["reason"] = "scan_timeout"
+                commands = self.machine.on_scan_result(False, detail)
+            elif reason == "drawer_scan_fresh_frame_timeout":
                 decision_id = str((self.selection or {}).get("decision_id") or "")
                 detail = self._drawer_scan_wait_detail_locked(
                     decision_id,
@@ -1503,6 +1571,7 @@ class SemanticBehaviorExecutor:
                         {},
                     )
                 ),
+                "startup_scan": dict(self._startup_scan_progress),
                 "timestamp": time.time(),
             }
         self.state_pub.publish(
@@ -1528,6 +1597,14 @@ class SemanticBehaviorExecutor:
                     success=bool(command.get("success")),
                     detail=command.get("detail") or {},
                 )
+            elif kind == "scan":
+                candidate = dict(command["candidate"])
+                decision_id = str(candidate.get("decision_id") or "")
+                threading.Thread(
+                    target=self._run_startup_scan,
+                    args=(decision_id, candidate),
+                    daemon=True,
+                ).start()
             elif kind == "navigate":
                 candidate = dict(command["candidate"])
                 decision_id = str(candidate.get("decision_id") or "")
@@ -2211,6 +2288,220 @@ class SemanticBehaviorExecutor:
         command = Twist()
         command.angular.z = float(angular_z)
         self.cmd_vel_pub.publish(command)
+
+    def _startup_scan_is_current(self, decision_id: str) -> bool:
+        with self.lock:
+            return bool(
+                self.selection is not None
+                and str(self.selection.get("decision_id") or "") == decision_id
+                and self.machine.state == STATE_SCANNING
+            )
+
+    def _startup_scan_detail(
+        self,
+        *,
+        reason: str,
+        accumulated_yaw_rad: float,
+        dispatched_control_steps: int,
+        acknowledged_control_steps: int,
+        applied_control_steps: int,
+        missed_control_steps: int,
+        started_at: float,
+    ) -> dict:
+        with self.lock:
+            gate = self._startup_scan_gate.diagnostics()
+        elapsed_control_s = startup_scan_elapsed_control_s(
+            acknowledged_control_steps, self.startup_scan_control_dt_s
+        )
+        return {
+            "reason": str(reason),
+            "target_yaw_rad": self.startup_scan_angle_rad,
+            "accumulated_yaw_rad": float(accumulated_yaw_rad),
+            "angular_speed_rad_s": self.startup_scan_angular_speed_rad_s,
+            "control_dt_s": self.startup_scan_control_dt_s,
+            "expected_yaw_per_control_step_rad": (
+                self.startup_scan_angular_speed_rad_s * self.startup_scan_control_dt_s
+            ),
+            "max_control_steps": self.startup_scan_max_control_steps,
+            "dispatched_control_steps": int(dispatched_control_steps),
+            "acknowledged_control_steps": int(acknowledged_control_steps),
+            "applied_control_steps": int(applied_control_steps),
+            "missed_control_steps": int(missed_control_steps),
+            "elapsed_sim_control_s": elapsed_control_s,
+            "elapsed_sim_s": elapsed_control_s,
+            "elapsed_wall_s": max(0.0, time.monotonic() - float(started_at)),
+            "step_sync_stall_timeout_s": self.startup_scan_step_sync_stall_timeout_s,
+            "step_gate": gate,
+        }
+
+    def _publish_startup_scan_progress(
+        self,
+        *,
+        status: str,
+        accumulated_yaw_rad: float,
+        dispatched_control_steps: int,
+        acknowledged_control_steps: int,
+        applied_control_steps: int,
+        missed_control_steps: int,
+        started_at: float,
+        reason: str = "",
+    ) -> None:
+        detail = self._startup_scan_detail(
+            reason=reason,
+            accumulated_yaw_rad=accumulated_yaw_rad,
+            dispatched_control_steps=dispatched_control_steps,
+            acknowledged_control_steps=acknowledged_control_steps,
+            applied_control_steps=applied_control_steps,
+            missed_control_steps=missed_control_steps,
+            started_at=started_at,
+        )
+        detail["status"] = str(status)
+        with self.lock:
+            self._startup_scan_progress = detail
+
+    def _handle_startup_scan_result(
+        self, decision_id: str, success: bool, detail: dict
+    ) -> None:
+        with self.lock:
+            if not self._startup_scan_is_current(decision_id):
+                return
+            commands = self.machine.on_scan_result(success, detail=detail)
+        self._dispatch(commands)
+
+    def _run_startup_scan(self, decision_id: str, _candidate: dict) -> None:
+        """Perform a mandatory 360-degree observation scan by evaluator step.
+
+        Each nonzero velocity command is emitted only for a paired RGB/fresh
+        gate step.  The bridge converts it to a fixed ``w * control_dt`` pose
+        increment; wall-clock delay only changes throughput, never the motion
+        integrated into one simulator action.  Completion remains odometry
+        based so position-controller tracking error cannot be hidden by a
+        nominal command count.
+        """
+
+        started_at = time.monotonic()
+        accumulated_yaw_rad = 0.0
+        last_yaw: float | None = None
+        dispatched_control_steps = 0
+        acknowledged_control_steps = 0
+        applied_control_steps = 0
+        missed_control_steps = 0
+        last_command_sent_at: float | None = None
+        last_progress_publish_at = 0.0
+        with self.lock:
+            self._startup_scan_gate.reset()
+            self._startup_scan_progress = {
+                "status": "SCANNING",
+                "target_yaw_rad": self.startup_scan_angle_rad,
+                "angular_speed_rad_s": self.startup_scan_angular_speed_rad_s,
+                "control_dt_s": self.startup_scan_control_dt_s,
+                "max_control_steps": self.startup_scan_max_control_steps,
+            }
+        try:
+            while (
+                not rospy.is_shutdown()
+                and self._startup_scan_is_current(decision_id)
+            ):
+                now = time.monotonic()
+                pose = self._current_pose(self.map_frame)
+                if pose is not None:
+                    if last_yaw is not None:
+                        accumulated_yaw_rad += abs(normalize_angle(pose[2] - last_yaw))
+                    last_yaw = pose[2]
+                with self.lock:
+                    acknowledgements = self._startup_scan_gate.take_acks()
+                for acknowledgement in acknowledgements:
+                    acknowledged_control_steps += 1
+                    if acknowledgement.exact_step_sync and acknowledgement.command_applied:
+                        applied_control_steps += 1
+                    else:
+                        missed_control_steps += 1
+                with self.lock:
+                    gate_state = self._startup_scan_gate.diagnostics()
+                if gate_state.get("awaiting_ack_step") is None:
+                    last_command_sent_at = None
+                if accumulated_yaw_rad >= self.startup_scan_angle_rad:
+                    detail = self._startup_scan_detail(
+                        reason="completed",
+                        accumulated_yaw_rad=accumulated_yaw_rad,
+                        dispatched_control_steps=dispatched_control_steps,
+                        acknowledged_control_steps=acknowledged_control_steps,
+                        applied_control_steps=applied_control_steps,
+                        missed_control_steps=missed_control_steps,
+                        started_at=started_at,
+                    )
+                    self._publish_startup_scan_progress(
+                        status="COMPLETED", reason="completed",
+                        accumulated_yaw_rad=accumulated_yaw_rad,
+                        dispatched_control_steps=dispatched_control_steps,
+                        acknowledged_control_steps=acknowledged_control_steps,
+                        applied_control_steps=applied_control_steps,
+                        missed_control_steps=missed_control_steps,
+                        started_at=started_at,
+                    )
+                    self._handle_startup_scan_result(decision_id, True, detail)
+                    return
+                reason = startup_scan_timeout_reason(
+                    acknowledged_control_steps=acknowledged_control_steps,
+                    control_dt_s=self.startup_scan_control_dt_s,
+                    timeout_s=self.startup_scan_timeout_s,
+                    awaiting_ack_step=gate_state.get("awaiting_ack_step"),
+                    last_command_sent_monotonic_s=last_command_sent_at,
+                    now_monotonic_s=now,
+                    step_sync_stall_timeout_s=(
+                        self.startup_scan_step_sync_stall_timeout_s
+                    ),
+                )
+                reached_step_cap = (
+                    dispatched_control_steps >= self.startup_scan_max_control_steps
+                    and gate_state.get("awaiting_ack_step") is None
+                )
+                if not reason and reached_step_cap:
+                    reason = "scan_step_cap"
+                if reason:
+                    detail = self._startup_scan_detail(
+                        reason=reason,
+                        accumulated_yaw_rad=accumulated_yaw_rad,
+                        dispatched_control_steps=dispatched_control_steps,
+                        acknowledged_control_steps=acknowledged_control_steps,
+                        applied_control_steps=applied_control_steps,
+                        missed_control_steps=missed_control_steps,
+                        started_at=started_at,
+                    )
+                    self._publish_startup_scan_progress(
+                        status="FAILED", reason=reason,
+                        accumulated_yaw_rad=accumulated_yaw_rad,
+                        dispatched_control_steps=dispatched_control_steps,
+                        acknowledged_control_steps=acknowledged_control_steps,
+                        applied_control_steps=applied_control_steps,
+                        missed_control_steps=missed_control_steps,
+                        started_at=started_at,
+                    )
+                    self._handle_startup_scan_result(decision_id, False, detail)
+                    return
+                if dispatched_control_steps < self.startup_scan_max_control_steps:
+                    with self.lock:
+                        step_index = self._startup_scan_gate.consume_step(now=now)
+                    if step_index is not None:
+                        self._publish_rotation(self.startup_scan_angular_speed_rad_s)
+                        dispatched_control_steps += 1
+                        last_command_sent_at = time.monotonic()
+                if now - last_progress_publish_at >= 0.2:
+                    self._publish_startup_scan_progress(
+                        status="SCANNING",
+                        accumulated_yaw_rad=accumulated_yaw_rad,
+                        dispatched_control_steps=dispatched_control_steps,
+                        acknowledged_control_steps=acknowledged_control_steps,
+                        applied_control_steps=applied_control_steps,
+                        missed_control_steps=missed_control_steps,
+                        started_at=started_at,
+                    )
+                    last_progress_publish_at = now
+                time.sleep(0.005)
+        finally:
+            # A zero message cannot extend a simulator action: the bridge's
+            # fresh-command rule rejects a stale publish on the next window.
+            self._publish_rotation(0.0)
 
     def _rotate_to_yaw(
         self,

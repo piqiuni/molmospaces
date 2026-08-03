@@ -13,6 +13,7 @@ if str(INTERACTIVE_NAV_SCRIPTS) not in sys.path:
 
 from wait_for_recorder_drain import (
     count_csv_frames,
+    count_jsonl_records,
     expected_frames_from_episode_result,
     expected_video_frames_from_episode_result,
     expected_video_frames_from_step_count,
@@ -196,3 +197,59 @@ def test_final_summary_validates_raw_steps_and_sampled_video_separately(
     assert "step_sync_count=3 < expected=4" in final_recorder_summary_errors(
         summary_path, 4, 2
     )
+
+
+def test_offline_raw_drain_counts_complete_jsonl_rows(tmp_path: Path) -> None:
+    manifest = tmp_path / "step_boundaries.jsonl"
+    manifest.write_text(
+        '{"step_index":0}\n{"step_index":1}\npartial',
+        encoding="utf-8",
+    )
+    assert count_jsonl_records(manifest) == 2
+
+
+def test_final_summary_validates_persisted_raw_recording_without_runtime_video(
+    tmp_path: Path,
+) -> None:
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "finalization_complete": True,
+                "offline_video_only": True,
+                "step_sync_count": 4,
+                "first_person_video_frame_count": 0,
+                "video_frame_jobs_dropped": 0,
+                "artifact_write_dropped_jobs": 0,
+                "raw_recording_stats": {
+                    "source_received": {
+                        "planning_occ": 4,
+                        "step_boundary": 4,
+                    },
+                    "accepted": {
+                        "planning_occ": 4,
+                        "step_boundary": 4,
+                    },
+                    "persisted": {
+                        "planning_occ": 4,
+                        "step_boundary": 4,
+                    },
+                    "queue_dropped": {},
+                    "write_failed": {},
+                },
+                "first_person_video_error": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert final_recorder_summary_errors(
+        summary_path, 4, 4, offline_raw_recording=True
+    ) == []
+
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    payload["raw_recording_stats"]["persisted"]["step_boundary"] = 3
+    summary_path.write_text(json.dumps(payload), encoding="utf-8")
+    errors = final_recorder_summary_errors(
+        summary_path, 4, 4, offline_raw_recording=True
+    )
+    assert "raw_step_boundary_persisted=3 < expected=4" in errors

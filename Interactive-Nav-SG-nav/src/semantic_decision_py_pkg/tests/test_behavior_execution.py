@@ -1,5 +1,11 @@
 import math
 
+from semantic_decision_py_pkg.step_command_gate import StepCommandGate
+from semantic_decision_py_pkg.startup_scan_lifecycle import StartupScanLifecycle
+from semantic_decision_py_pkg.startup_scan_timing import (
+    startup_scan_elapsed_control_s,
+    startup_scan_timeout_reason,
+)
 from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
@@ -11,6 +17,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_INTERACTING,
     STATE_NAVIGATING,
     STATE_PREPARING_EXPLORE,
+    STATE_SCANNING,
     STATE_SUCCEEDED,
     STATE_WAITING_FOR_DRAWER_SCAN,
     STATE_VERIFYING,
@@ -691,3 +698,126 @@ def test_navigation_without_visibility_requirement_finishes_immediately() -> Non
 
     assert machine.state == STATE_SUCCEEDED
     assert terminal[0]["success"] is True
+
+
+def test_mandatory_scan_runs_in_executor_and_only_completion_succeeds() -> None:
+    machine = BehaviorExecutionStateMachine(ExecutionConfig(scan_timeout_s=15.0))
+    commands = machine.start(
+        {
+            "candidate_id": "startup_scan:episode_1",
+            "behavior_type": "SCAN",
+            "metadata": {"mandatory_startup_scan": True},
+        },
+        now=0.0,
+    )
+
+    assert machine.state == STATE_SCANNING
+    assert commands == [
+        {
+            "kind": "scan",
+            "candidate": {
+                "candidate_id": "startup_scan:episode_1",
+                "behavior_type": "SCAN",
+                "metadata": {"mandatory_startup_scan": True},
+            },
+        }
+    ]
+    assert machine.timeout_reason(now=14.9) == ""
+    assert machine.timeout_reason(now=15.1) == "scan_timeout"
+
+    terminal = machine.on_scan_result(
+        True,
+        {"reason": "completed", "accumulated_yaw_rad": 6.29},
+        now=15.2,
+    )
+    assert machine.state == STATE_SUCCEEDED
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is True
+
+
+def test_step_command_gate_pairs_callbacks_by_step_and_waits_for_ack() -> None:
+    gate = StepCommandGate(max_pair_age_s=10.0)
+    # ROS may deliver the gate before its RGB callback.
+    gate.record_fresh_gate(11, now=1.0)
+    assert gate.consume_step(now=1.0) is None
+    gate.record_rgb(11, now=1.1)
+    assert gate.consume_step(now=1.1) == 11
+    # A later pair cannot be consumed until step 11 is acknowledged.
+    gate.record_rgb(12, now=1.2)
+    gate.record_fresh_gate(12, now=1.2)
+    assert gate.consume_step(now=1.2) is None
+    gate.record_step_sync(11, action_source="cmd_vel")
+    ack = gate.take_acks()
+    assert len(ack) == 1
+    assert ack[0].command_applied
+    assert gate.consume_step(now=1.3) == 12
+
+
+def test_step_command_gate_does_not_use_mismatched_latest_values() -> None:
+    gate = StepCommandGate(max_pair_age_s=10.0)
+    gate.record_rgb(20, now=1.0)
+    gate.record_fresh_gate(19, now=1.0)
+    assert gate.consume_step(now=1.0) is None
+    gate.record_fresh_gate(20, now=1.1)
+    assert gate.consume_step(now=1.1) == 20
+
+
+def test_startup_scan_lifecycle_keeps_instance_stable_until_true_episode_change() -> None:
+    lifecycle = StartupScanLifecycle(enabled=True)
+    first_candidate_id = lifecycle.candidate_id
+
+    # A map-ready stream with no graph id must still expose only SCAN.
+    assert not lifecycle.should_publish_scan(False)
+    assert lifecycle.should_publish_scan(True)
+    assert not lifecycle.observe_episode("")
+    assert lifecycle.candidate_id == first_candidate_id
+
+    lifecycle.record_feedback(first_candidate_id, "STARTED")
+    # The first non-empty graph id binds the existing scan; it is not a reset.
+    assert not lifecycle.observe_episode("episode_000002")
+    assert lifecycle.bound_episode_id == "episode_000002"
+    assert lifecycle.candidate_id == first_candidate_id
+    assert lifecycle.state == "ACTIVE"
+
+    lifecycle.record_feedback(first_candidate_id, "SUCCEEDED")
+    assert lifecycle.state == "COMPLETE"
+    # Only a distinct later episode creates a second mandatory scan instance.
+    assert lifecycle.observe_episode("episode_000003")
+    assert lifecycle.candidate_id != first_candidate_id
+    assert lifecycle.state == "PENDING"
+
+
+def test_startup_scan_timeout_uses_control_steps_not_wall_clock() -> None:
+    # 27 healthy acknowledgements may take >15 wall seconds on a loaded
+    # simulator, but represent only 5.4 seconds of evaluator control time.
+    assert startup_scan_elapsed_control_s(27, 0.2) == 5.4
+    assert startup_scan_timeout_reason(
+        acknowledged_control_steps=27,
+        control_dt_s=0.2,
+        timeout_s=15.0,
+        awaiting_ack_step=None,
+        last_command_sent_monotonic_s=None,
+        now_monotonic_s=100.0,
+        step_sync_stall_timeout_s=5.0,
+    ) == ""
+    assert startup_scan_timeout_reason(
+        acknowledged_control_steps=75,
+        control_dt_s=0.2,
+        timeout_s=15.0,
+        awaiting_ack_step=None,
+        last_command_sent_monotonic_s=None,
+        now_monotonic_s=100.0,
+        step_sync_stall_timeout_s=5.0,
+    ) == "scan_timeout"
+
+
+def test_startup_scan_reports_step_sync_stall_separately() -> None:
+    assert startup_scan_timeout_reason(
+        acknowledged_control_steps=2,
+        control_dt_s=0.2,
+        timeout_s=15.0,
+        awaiting_ack_step=9,
+        last_command_sent_monotonic_s=10.0,
+        now_monotonic_s=15.1,
+        step_sync_stall_timeout_s=5.0,
+    ) == "scan_step_sync_stall"

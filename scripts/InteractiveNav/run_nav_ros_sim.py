@@ -958,6 +958,35 @@ def parse_args():
         default="",
         help="Optional directory for asynchronous per-step RGB PNGs and a timestamp manifest.",
     )
+    parser.add_argument("--step_ready_topic", type=str, default="/semantic_decision/step_ready")
+    parser.add_argument(
+        "--step_capture_ack_topic",
+        type=str,
+        default="/molmo_spaces/step_capture_ack",
+        help="Recorder acknowledgment topic used to freeze each offline raw snapshot before simulation advances.",
+    )
+    parser.add_argument(
+        "--step_capture_ack_barrier_enabled",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument("--step_capture_ack_timeout_s", type=float, default=2.0)
+    parser.add_argument("--step_ready_barrier_enabled", type=str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument(
+        "--step_ready_warmup_skip_frames",
+        type=int,
+        default=None,
+        help="Independent readiness-barrier warmup; defaults to map_warmup_skip_frames.",
+    )
+    parser.add_argument("--step_ready_timeout_s", type=float, default=30.0)
+    parser.add_argument(
+        "--step_ready_bootstrap_timeout_s",
+        type=float,
+        default=None,
+        help="First-observation readiness wait; defaults to max(5s, step_ready_timeout_s).",
+    )
     parser.add_argument(
         "--step_frame_queue_size",
         type=int,
@@ -1322,6 +1351,14 @@ def main():
             realtime_gt_max_distance_m=args.realtime_gt_max_distance_m,
             step_frame_dir=args.step_frame_dir,
             step_frame_queue_size=args.step_frame_queue_size,
+            step_capture_ack_topic=args.step_capture_ack_topic,
+            step_capture_ack_barrier_enabled=args.step_capture_ack_barrier_enabled,
+            step_capture_ack_timeout_s=args.step_capture_ack_timeout_s,
+            step_ready_topic=args.step_ready_topic,
+            step_ready_barrier_enabled=args.step_ready_barrier_enabled,
+            step_ready_warmup_skip_frames=args.step_ready_warmup_skip_frames,
+            step_ready_timeout_s=args.step_ready_timeout_s,
+            step_ready_bootstrap_timeout_s=args.step_ready_bootstrap_timeout_s,
         )
         policy.scene_timeout_s = args.scene_timeout_s
         policy.max_consecutive_action_timeouts = args.max_consecutive_action_timeouts

@@ -1,3 +1,7 @@
+step_ready_enabled: true
+step_ready_topic: "/semantic_decision/step_ready"
+step_ready_required_modules: ["semantic_mapping", "explore_py"]
+
 topics:
   explorer_status: "/explore_py/status"
   explorer_proposals: "/explore_py/proposals"
@@ -137,6 +141,23 @@ model:
 completion:
   empty_candidate_confirmations: 3
   stagnation_failure_limit: 8
+
+startup_scan:
+  # Phase-1 bootstrap behavior: the decision layer must select SCAN before
+  # regular EXPLORE/NAVIGATE/INTERACT candidates become available.
+  enabled: true
+  angle_rad: 6.283185307179586
+  angular_speed_rad_s: 1.25
+  # RosBridge converts each accepted cmd_vel to exactly w * policy_dt.
+  control_dt_s: 0.2
+  # Logical evaluator-control time, not wall clock: this keeps slow ROS or
+  # rendering throughput from changing the executed scan trajectory.
+  timeout_s: 15.0
+  max_control_steps: 40
+  # Wall clock is only a liveness guard after a sent command receives no ack.
+  step_sync_stall_timeout_s: 5.0
+  max_pending_steps: 32
+  pair_max_age_s: 0.75
 
 executor:
   map_frame: "tf_frame_map"

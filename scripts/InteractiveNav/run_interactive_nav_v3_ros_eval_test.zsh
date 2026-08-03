@@ -1,8 +1,8 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 # Run one frozen V3 ROS object-goal episode with the required visual artifacts.
 #
 # Usage:
-#   zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+#   bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
 #     <run-output-dir> <episode-index>
 #
 # The script intentionally owns one ROS master and one recorder per episode.
@@ -11,17 +11,17 @@
 # evaluator wrapper.
 
 set -euo pipefail
-setopt null_glob
+shopt -s nullglob
 
-SCRIPT_DIR=${0:A:h}
-REPO_ROOT=${SCRIPT_DIR:h:h}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 RUN_DIR=${1:?"usage: $0 <run-output-dir> <episode-index>"}
 EPISODE_INDEX=${2:?"usage: $0 <run-output-dir> <episode-index>"}
 if [[ "${RUN_DIR}" != /* ]]; then
   RUN_DIR="${PWD}/${RUN_DIR}"
 fi
-if [[ ! "${EPISODE_INDEX}" =~ '^[0-9]+$' ]]; then
-  print -u2 -- "episode-index must be a non-negative integer: ${EPISODE_INDEX}"
+if [[ ! "${EPISODE_INDEX}" =~ ^[0-9]+$ ]]; then
+  printf '%s\n' "episode-index must be a non-negative integer: ${EPISODE_INDEX}" >&2
   exit 2
 fi
 
@@ -87,29 +87,29 @@ for required_path in "${BENCHMARK}" "${ROS_SETUP}" "${SEMANTIC_MODEL_ENV_FILE}" 
   "${SEMANTIC_DECISION_OVERRIDE}" "${SEMANTIC_MAPPING_OVERRIDE}" \
   "${EXPLORE_PY_CONFIG_OVERRIDE}" "${NAV_CONFIG_OVERRIDE}"; do
   if [[ ! -f "${required_path}" ]]; then
-    print -u2 -- "Missing required file: ${required_path}"
+    printf '%s\n' "Missing required file: ${required_path}" >&2
     exit 2
   fi
 done
 if [[ "${FAST_EVAL}" != true ]]; then
   for required_path in "${RECORDER}" "${RECORDER_DRAIN_HELPER}"; do
     if [[ ! -f "${required_path}" ]]; then
-      print -u2 -- "Missing required recorder support file: ${required_path}"
+      printf '%s\n' "Missing required recorder support file: ${required_path}" >&2
       exit 2
     fi
   done
 fi
 
 if [[ "${METHOD}" != "full_mllm_object_goal" ]]; then
-  print -u2 -- "V3 benchmark wrapper requires METHOD=full_mllm_object_goal, got: ${METHOD}"
+  printf '%s\n' "V3 benchmark wrapper requires METHOD=full_mllm_object_goal, got: ${METHOD}" >&2
   exit 2
 fi
 if [[ "${POLICY}" != "ros_object_goal_rule" ]]; then
-  print -u2 -- "V3 full-MLLM uses the ros_object_goal_rule evaluator adapter, got POLICY=${POLICY}"
+  printf '%s\n' "V3 full-MLLM uses the ros_object_goal_rule evaluator adapter, got POLICY=${POLICY}" >&2
   exit 2
 fi
-if [[ ! "${VIDEO_STEP_SAMPLE_EVERY}" =~ '^[1-9][0-9]*$' ]]; then
-  print -u2 -- "VIDEO_STEP_SAMPLE_EVERY must be a positive integer: ${VIDEO_STEP_SAMPLE_EVERY}"
+if [[ ! "${VIDEO_STEP_SAMPLE_EVERY}" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s\n' "VIDEO_STEP_SAMPLE_EVERY must be a positive integer: ${VIDEO_STEP_SAMPLE_EVERY}" >&2
   exit 2
 fi
 for required_mllm_setting in \
@@ -117,17 +117,17 @@ for required_mllm_setting in \
   'module2: "mllm_score"' \
   'module3: "mllm_skill_verified"'; do
   if ! grep -Fq -- "${required_mllm_setting}" "${SEMANTIC_DECISION_OVERRIDE}"; then
-    print -u2 -- "V3 semantic override is not the required full-MLLM method: missing ${required_mllm_setting}"
+    printf '%s\n' "V3 semantic override is not the required full-MLLM method: missing ${required_mllm_setting}" >&2
     exit 2
   fi
 done
-print -r -- "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
-print -r -- "[v3-eval] step_budget_mode=${STEP_BUDGET_MODE} min_steps=${MIN_STEPS} max_steps=${MAX_STEPS}"
-print -r -- "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY} render_queue=${VIDEO_FRAME_JOB_QUEUE_SIZE} overflow=${VIDEO_FRAME_QUEUE_OVERFLOW} occ_local_proxy=${VIDEO_SNAPSHOT_GRID_MAX_DIM}px/${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT} global_costmap=native/png crop_margin=${VIDEO_OCC_CROP_MARGIN_M}m"
+printf '%s\n' "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
+printf '%s\n' "[v3-eval] step_budget_mode=${STEP_BUDGET_MODE} min_steps=${MIN_STEPS} max_steps=${MAX_STEPS}"
+printf '%s\n' "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY} render_queue=${VIDEO_FRAME_JOB_QUEUE_SIZE} overflow=${VIDEO_FRAME_QUEUE_OVERFLOW} occ_local_proxy=${VIDEO_SNAPSHOT_GRID_MAX_DIM}px/${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT} global_costmap=native/png crop_margin=${VIDEO_OCC_CROP_MARGIN_M}m"
 
 mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}"
 if [[ -e "${RUN_DIR}/eval" ]]; then
-  print -u2 -- "Refusing to overwrite existing evaluator output: ${RUN_DIR}/eval"
+  printf '%s\n' "Refusing to overwrite existing evaluator output: ${RUN_DIR}/eval" >&2
   exit 2
 fi
 
@@ -142,15 +142,34 @@ export SEMANTIC_MODEL_METRICS_PATH="${RUN_DIR}/mllm_metrics.jsonl"
 export PYTHONUNBUFFERED=1
 
 set +u
-source /home/user/miniconda3/etc/profile.d/conda.sh
-conda activate mlspaces
-set -u
+CONDA_SH=${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}
+if [[ ! -f "${CONDA_SH}" ]]; then
+  printf '%s\n' "Missing conda initialization script: ${CONDA_SH}" >&2
+  exit 2
+fi
+source "${CONDA_SH}"
+CONDA_ENV=${CONDA_ENV:-mlspaces}
+conda activate "${CONDA_ENV}"
 source "${ROS_SETUP}"
+ROS_SOURCE_DIR=${ROS_SOURCE_DIR:-$(cd -- "$(dirname -- "${ROS_SETUP}")/../src" && pwd)}
+if [[ ! -d "${ROS_SOURCE_DIR}" ]]; then
+  printf '%s\n' "Missing ROS source directory: ${ROS_SOURCE_DIR}" >&2
+  exit 2
+fi
+PYTHON_BIN=${PYTHON_BIN:-${CONDA_ENV}/bin/python}
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  printf '%s\n' "Missing MolmoSpaces Python executable: ${PYTHON_BIN}" >&2
+  exit 2
+fi
+MLSPACES_SITE_PACKAGES="$(${PYTHON_BIN} -c 'import site; print(site.getsitepackages()[0])')"
+export PYTHONPATH="${MLSPACES_SITE_PACKAGES}:${PYTHONPATH:-}"
+export PATH="${CONDA_ENV}/bin:${PATH}"
+set -u
 # ROS setup files may restore a default master URI; keep this episode's
 # explicitly isolated master after sourcing.
 export ROS_MASTER_URI="${RUN_ROS_MASTER_URI}"
-export ROS_PACKAGE_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src:/opt/ros/noetic/share"
-export PYTHONPATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:${PYTHONPATH:-}"
+export ROS_PACKAGE_PATH="${ROS_SOURCE_DIR}:${ROS_PACKAGE_PATH#*:}"
+export PYTHONPATH="${ROS_SOURCE_DIR}/semantic_mapping_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_decision_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_mllm_py_pkg/scripts:${ROS_SOURCE_DIR}/explore_py_pkg/scripts:${PYTHONPATH:-}"
 
 cleanup_process() {
   local pid="${1:-}"
@@ -187,12 +206,12 @@ trap cleanup EXIT INT TERM
 
 MASTER_PORT=${ROS_MASTER_URI##*:}
 MASTER_PORT=${MASTER_PORT%%/*}
-if [[ ! "${MASTER_PORT}" =~ '^[0-9]+$' ]]; then
-  print -u2 -- "ROS_MASTER_URI must include a numeric port: ${ROS_MASTER_URI}"
+if [[ ! "${MASTER_PORT}" =~ ^[0-9]+$ ]]; then
+  printf '%s\n' "ROS_MASTER_URI must include a numeric port: ${ROS_MASTER_URI}" >&2
   exit 2
 fi
 if timeout 1s rosparam list >/dev/null 2>&1; then
-  print -u2 -- "Refusing to reuse an existing ROS master: ${ROS_MASTER_URI}"
+  printf '%s\n' "Refusing to reuse an existing ROS master: ${ROS_MASTER_URI}" >&2
   exit 2
 fi
 
@@ -202,7 +221,7 @@ MASTER_READY=false
 for _attempt in {1..120}; do
   if ! kill -0 "${ROSCORE_PID}" 2>/dev/null; then
     wait "${ROSCORE_PID}" 2>/dev/null || true
-    print -u2 -- "roscore exited before becoming ready; port ${MASTER_PORT} may be occupied"
+    printf '%s\n' "roscore exited before becoming ready; port ${MASTER_PORT} may be occupied" >&2
     exit 3
   fi
   if timeout 1s rosparam list >/dev/null 2>&1; then
@@ -215,11 +234,11 @@ for _attempt in {1..120}; do
   sleep 0.25
 done
 if [[ "${MASTER_READY}" != true ]]; then
-  print -u2 -- "ROS master did not become ready: ${ROS_MASTER_URI}"
+  printf '%s\n' "ROS master did not become ready: ${ROS_MASTER_URI}" >&2
   exit 3
 fi
 
-roslaunch nav_pkg molmospaces_nav_system.launch \
+roslaunch "${ROS_SOURCE_DIR}/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=false \
   start_mapping:=true \
   mapping_mode:=odom_locked \
@@ -241,7 +260,7 @@ ROSLAUNCH_PID=$!
 
 if [[ "${FAST_EVAL}" != true ]]; then
   # Start before the evaluator so every public observation/step-sync is captured.
-  PYTHONUNBUFFERED=1 python -u "${RECORDER}" \
+  PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -u "${RECORDER}" \
     --output-dir "${RUN_DIR}/debug" \
     --occupancy-grid-topic /semantic_mapping/planning_occ_map \
     --raw-occupancy-grid-topic /struct_mapping/occ_map \
@@ -275,7 +294,7 @@ if [[ "${FAST_EVAL}" != true ]]; then
 fi
 if ! kill -0 "${ROSLAUNCH_PID}" 2>/dev/null; then
   wait "${ROSLAUNCH_PID}" 2>/dev/null || true
-  print -u2 -- "roslaunch exited before the evaluator started; see ${RUN_DIR}/roslaunch.log"
+  printf '%s\n' "roslaunch exited before the evaluator started; see ${RUN_DIR}/roslaunch.log" >&2
   exit 3
 fi
 
@@ -305,7 +324,7 @@ if [[ "${RECORD_HEAD_CAMERA}" == true ]]; then
   EVAL_ARGS+=(--record-video)
 fi
 set +e
-MUJOCO_GL=egl python "${EVAL_ARGS[@]}" >"${RUN_DIR}/eval.log" 2>&1
+MUJOCO_GL=egl "${PYTHON_BIN}" "${EVAL_ARGS[@]}" >"${RUN_DIR}/eval.log" 2>&1
 EVAL_EXIT=$?
 set -e
 
@@ -315,15 +334,16 @@ if [[ "${FAST_EVAL}" == true ]]; then
   cleanup_process "${ROSCORE_PID}" 10
   ROSCORE_PID=""
 fi
-EPISODE_RESULTS=("${RUN_DIR}"/eval/episodes/${EPISODE_INDEX}_*/episode_result.json)
-if (( ${#EPISODE_RESULTS} != 1 )); then
-  print -u2 -- "Expected one completed episode result for index ${EPISODE_INDEX}; found ${#EPISODE_RESULTS}"
+EPISODE_RESULTS=()
+EPISODE_RESULTS+=("${RUN_DIR}"/eval/episodes/${EPISODE_INDEX}_*/episode_result.json)
+if (( ${#EPISODE_RESULTS[@]} != 1 )); then
+  printf '%s\n' "Expected one completed episode result for index ${EPISODE_INDEX}; found ${#EPISODE_RESULTS[@]}" >&2
   exit 4
 fi
-EPISODE_RESULT=${EPISODE_RESULTS[1]}
-EPISODE_DIR=${EPISODE_RESULT:h}
+EPISODE_RESULT=${EPISODE_RESULTS[0]}
+EPISODE_DIR=$(dirname -- "${EPISODE_RESULT}")
 if [[ "${FAST_EVAL}" == true ]]; then
-  print -r -- "[v3-ros-eval-fast] result=${EPISODE_RESULT}"
+  printf '%s\n' "[v3-ros-eval-fast] result=${EPISODE_RESULT}"
   exit "${EVAL_EXIT}"
 fi
 
@@ -331,7 +351,7 @@ fi
 # still queued.  Drain against the evaluator's exact completed-step count,
 # rather than sleeping for a fixed interval that is too short under 3 workers.
 RECORDER_DRAIN_STATUS=0
-python "${RECORDER_DRAIN_HELPER}" \
+"${PYTHON_BIN}" "${RECORDER_DRAIN_HELPER}" \
   --episode-result "${EPISODE_RESULT}" \
   --video-frames-csv "${RUN_DIR}/debug/video_frames.csv" \
   --timeout-sec "${RECORDER_DRAIN_TIMEOUT_S}" \
@@ -349,7 +369,7 @@ cleanup_process "${ROSCORE_PID}" 10
 ROSCORE_PID=""
 TOPDOWN_PATH="${EPISODE_DIR}/episode_topdown.png"
 
-MUJOCO_GL=egl python "${REPO_ROOT}/scripts/InteractiveNav/render_interactive_nav_v3_topdown.py" \
+MUJOCO_GL=egl "${PYTHON_BIN}" "${REPO_ROOT}/scripts/InteractiveNav/render_interactive_nav_v3_topdown.py" \
   --episode-result "${EPISODE_RESULT}" \
   --benchmark "${BENCHMARK}" \
   --debug-dir "${RUN_DIR}/debug" \
@@ -361,7 +381,7 @@ SIX_PANEL_PATH="${RUN_DIR}/debug/videos/overview_6panel.mp4"
 for required_artifact in "${RUN_DIR}/debug/final_occ_map.yaml" "${RUN_DIR}/debug/trajectory.csv" \
   "${SIX_PANEL_PATH}" "${TOPDOWN_PATH}"; do
   if [[ ! -s "${required_artifact}" ]]; then
-    print -u2 -- "Required visual artifact is missing or empty: ${required_artifact}"
+    printf '%s\n' "Required visual artifact is missing or empty: ${required_artifact}" >&2
     exit 4
   fi
 done
@@ -369,7 +389,7 @@ done
 # Re-check after recorder shutdown because its final join may complete the last
 # already-enqueued frame even if the live drain reached its timeout boundary.
 FINAL_DRAIN_STATUS=0
-python "${RECORDER_DRAIN_HELPER}" \
+"${PYTHON_BIN}" "${RECORDER_DRAIN_HELPER}" \
   --episode-result "${EPISODE_RESULT}" \
   --video-frames-csv "${RUN_DIR}/debug/video_frames.csv" \
   --timeout-sec 0 \
@@ -377,11 +397,11 @@ python "${RECORDER_DRAIN_HELPER}" \
   --recorder-summary "${RUN_DIR}/debug/summary.json" \
   || FINAL_DRAIN_STATUS=$?
 if (( FINAL_DRAIN_STATUS != 0 )); then
-  print -u2 -- "Recorder did not capture every completed evaluator step (live_drain_status=${RECORDER_DRAIN_STATUS})."
+  printf '%s\n' "Recorder did not capture every completed evaluator step (live_drain_status=${RECORDER_DRAIN_STATUS})." >&2
   exit 4
 fi
 
-print -r -- "[v3-ros-eval] six-panel=${SIX_PANEL_PATH}"
-print -r -- "[v3-ros-eval] topdown=${TOPDOWN_PATH}"
-print -r -- "[v3-ros-eval] result=${EPISODE_RESULT}"
+printf '%s\n' "[v3-ros-eval] six-panel=${SIX_PANEL_PATH}"
+printf '%s\n' "[v3-ros-eval] topdown=${TOPDOWN_PATH}"
+printf '%s\n' "[v3-ros-eval] result=${EPISODE_RESULT}"
 exit "${EVAL_EXIT}"

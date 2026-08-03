@@ -85,7 +85,16 @@ class RosBridgePolicy(BasePolicy):
         step_frame_dir: str = "",
         step_frame_queue_size: int = 4,
         step_sync_topic: str = "/molmo_spaces/step_sync",
+        step_capture_ack_topic: str = "/molmo_spaces/step_capture_ack",
+        step_capture_ack_barrier_enabled: bool = False,
+        step_capture_ack_timeout_s: float = 2.0,
         fresh_command_gate_topic: str = "/molmo_spaces/fresh_cmd_gate",
+        step_ready_topic: str = "/semantic_decision/step_ready",
+        step_ready_barrier_enabled: bool = False,
+        step_ready_warmup_skip_frames: int | None = None,
+        step_ready_timeout_s: float = 30.0,
+        step_ready_bootstrap_timeout_s: float | None = None,
+        step_ready_bootstrap_republish_period_s: float = 0.5,
         tf_keepalive_period_s: float = 0.25,
     ) -> None:
         super().__init__(config, task)
@@ -147,7 +156,38 @@ class RosBridgePolicy(BasePolicy):
         self.extra_image_camera_name = extra_image_camera_name
         self.step_frame_dir = Path(step_frame_dir).expanduser().resolve() if step_frame_dir else None
         self.step_sync_topic = str(step_sync_topic)
+        self.step_capture_ack_topic = str(step_capture_ack_topic)
+        self.step_capture_ack_barrier_enabled = bool(step_capture_ack_barrier_enabled)
+        self.step_capture_ack_timeout_s = max(0.0, float(step_capture_ack_timeout_s))
         self.fresh_command_gate_topic = str(fresh_command_gate_topic)
+        self.step_ready_topic = str(step_ready_topic)
+        self.step_ready_barrier_enabled = bool(step_ready_barrier_enabled)
+        self.step_ready_warmup_skip_frames = max(
+            0,
+            int(
+                self.map_warmup_skip_frames
+                if step_ready_warmup_skip_frames is None
+                else step_ready_warmup_skip_frames
+            ),
+        )
+        self.step_ready_timeout_s = max(0.0, float(step_ready_timeout_s))
+        self.step_ready_bootstrap_timeout_s = max(
+            0.0,
+            float(
+                max(5.0, self.step_ready_timeout_s)
+                if step_ready_bootstrap_timeout_s is None
+                else step_ready_bootstrap_timeout_s
+            ),
+        )
+        self.step_ready_bootstrap_republish_period_s = max(
+            0.01, float(step_ready_bootstrap_republish_period_s)
+        )
+        self._step_ready_bootstrap_complete = False
+        self._latest_step_ready: dict[str, Any] = {}
+        self._latest_step_ready_mono_s = 0.0
+        self._latest_step_capture_ack: dict[str, Any] = {}
+        self._latest_step_capture_ack_mono_s = 0.0
+        self._current_step_stamp_sec = 0.0
         self._step_frame_queue: queue.Queue = queue.Queue(
             maxsize=max(1, int(step_frame_queue_size))
         )
@@ -204,9 +244,11 @@ class RosBridgePolicy(BasePolicy):
             "pointcloud_publish": 0.0,
             "camera_info_publish": 0.0,
             "blocking_republish": 0.0,
+            "step_ready_wait": 0.0,
             "action_wait": 0.0,
             "postprocess_action": 0.0,
             "step_sync_publish": 0.0,
+            "step_capture_ack_wait": 0.0,
         }
         self._timing_samples_ms: dict[str, list[float]] = {
             key: [] for key in self._timing_acc_ms
@@ -252,7 +294,7 @@ class RosBridgePolicy(BasePolicy):
             queue_size=observation_queue_size,
         )
         self._step_sync_pub = (
-            rospy.Publisher(self.step_sync_topic, String, queue_size=32)
+            rospy.Publisher(self.step_sync_topic, String, queue_size=4096)
             if self.step_sync_topic
             else None
         )
@@ -291,6 +333,21 @@ class RosBridgePolicy(BasePolicy):
         self._tf_broadcaster = TransformBroadcaster()
         self._publish_static_tfs()
         self._action_sub = rospy.Subscriber(self.action_topic, String, self._action_callback)
+        self._step_ready_sub = (
+            rospy.Subscriber(self.step_ready_topic, String, self._step_ready_callback, queue_size=32)
+            if self.step_ready_barrier_enabled and self.step_ready_topic
+            else None
+        )
+        self._step_capture_ack_sub = (
+            rospy.Subscriber(
+                self.step_capture_ack_topic,
+                String,
+                self._step_capture_ack_callback,
+                queue_size=32,
+            )
+            if self.step_capture_ack_barrier_enabled and self.step_capture_ack_topic
+            else None
+        )
         self._cmd_vel_sub = rospy.Subscriber(self.cmd_vel_topic, TwistStamped, self._cmd_vel_callback)
         self._realtime_gt_publisher = None
         if self.publish_realtime_gt:
@@ -652,6 +709,8 @@ class RosBridgePolicy(BasePolicy):
 
     def reset(self):
         self._step_idx = 0
+        self._step_ready_bootstrap_complete = False
+        self._current_step_stamp_sec = 0.0
         self._timing_frame_count = 0
         for key in self._timing_acc_ms:
             self._timing_acc_ms[key] = 0.0
@@ -663,6 +722,10 @@ class RosBridgePolicy(BasePolicy):
             self._latest_cmd_vel = None
             self._latest_cmd_vel_mono_s = 0.0
             self._move_base_active = False
+            self._latest_step_ready = {}
+            self._latest_step_ready_mono_s = 0.0
+            self._latest_step_capture_ack = {}
+            self._latest_step_capture_ack_mono_s = 0.0
         self._last_base_position_xyz = None
         self._last_base_pose_xyyaw = None
         with self._tf_cache_lock:
@@ -738,7 +801,7 @@ class RosBridgePolicy(BasePolicy):
                 "rgb_total=%.2f/%.2fms [extract=%.2f encode=%.2f ros_pub=%.2f "
                 "frame_enqueue=%.2f/%.2f], extra_rgb=%.2fms, "
                 "depth+pcd=%.2fms, odom_tf=%.2fms, republish=%.2fms, "
-                "postprocess=%.2fms, step_sync=%.2fms, frame_queue=%d/%d peak=%d, "
+                "postprocess=%.2fms, step_sync=%.2fms, capture_ack=%.2fms, frame_queue=%d/%d peak=%d, "
                 "action_source=%s timeout=%s"
             ),
             int(n),
@@ -768,6 +831,7 @@ class RosBridgePolicy(BasePolicy):
             avg["blocking_republish"],
             avg["postprocess_action"],
             avg["step_sync_publish"],
+            avg["step_capture_ack_wait"],
             queue_size,
             queue_capacity,
             self._step_frame_queue_peak,
@@ -793,6 +857,89 @@ class RosBridgePolicy(BasePolicy):
             self._latest_action = action
             self._latest_action_step = step
             self._latest_action_mono_s = time.monotonic()
+
+    def _step_ready_callback(self, msg) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self._lock:
+            self._latest_step_ready = payload
+            self._latest_step_ready_mono_s = time.monotonic()
+
+    def _step_capture_ack_callback(self, msg) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self._lock:
+            self._latest_step_capture_ack = payload
+            self._latest_step_capture_ack_mono_s = time.monotonic()
+
+    def _wait_for_step_capture_ack(self, stamp) -> bool:
+        """Hold the simulator until recorder froze this exact step's raw state."""
+        if not self.step_capture_ack_barrier_enabled or not self.step_capture_ack_topic:
+            return True
+        expected_step = int(self._step_idx)
+        expected_stamp = float(stamp.to_sec())
+        deadline = time.monotonic() + self.step_capture_ack_timeout_s
+        while not self._rospy.is_shutdown():
+            with self._lock:
+                payload = dict(self._latest_step_capture_ack)
+            try:
+                ack_step = int(payload.get("step_index"))
+            except (TypeError, ValueError):
+                ack_step = -1
+            try:
+                ack_stamp = float(payload.get("stamp_sec", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                ack_stamp = 0.0
+            if (
+                bool(payload.get("ready"))
+                and ack_step == expected_step
+                and (ack_stamp <= 0.0 or abs(ack_stamp - expected_stamp) <= 1e-6)
+            ):
+                return True
+            if self.step_capture_ack_timeout_s <= 0.0 or time.monotonic() >= deadline:
+                self._rospy.logwarn(
+                    "RosBridgePolicy: step-capture acknowledgment timeout step=%d stamp=%.6f ack_step=%s ack_stamp=%s.",
+                    expected_step,
+                    expected_stamp,
+                    payload.get("step_index"),
+                    payload.get("stamp_sec"),
+                )
+                return False
+            time.sleep(0.001)
+        return False
+
+    def _step_ready_for_current(
+        self,
+        *,
+        ignore_warmup: bool = False,
+        require_current_stamp: bool = True,
+    ) -> bool:
+        if (
+            not self.step_ready_barrier_enabled
+            or (
+                not ignore_warmup
+                and self._step_idx < self.step_ready_warmup_skip_frames
+            )
+        ):
+            return True
+        with self._lock:
+            payload = dict(self._latest_step_ready)
+        if not bool(payload.get("ready")):
+            return False
+        if not require_current_stamp:
+            return True
+        aggregate_stamp = float(payload.get("stamp_sec", 0.0) or 0.0)
+        if aggregate_stamp > 0.0 and self._current_step_stamp_sec > 0.0:
+            return aggregate_stamp >= self._current_step_stamp_sec - 1e-6
+        return int(payload.get("step_index", -1)) >= int(self._step_idx)
 
     def _cmd_vel_callback(self, msg) -> None:
         twist = msg.twist
@@ -1428,15 +1575,18 @@ class RosBridgePolicy(BasePolicy):
         self,
         observation: Any,
         messages: dict[str, Any],
-    ) -> None:
-        stamp = self._next_common_stamp()
+        *,
+        force_pointcloud: bool = False,
+        stamp=None,
+    ):
+        stamp = self._next_common_stamp() if stamp is None else stamp
         self._publish_odom_and_tf(observation, stamp)
 
         # RGB topics are recording-only in the realtime-GT ROS pipeline. Do not
         # duplicate them while waiting for a fresh navigation command; repeated
         # large images create recorder backlog without adding mapping evidence.
         topic_messages = [(self._depth_pub, messages.get("depth"))]
-        if self.blocking_republish_pointcloud:
+        if force_pointcloud or self.blocking_republish_pointcloud:
             topic_messages.append((self._pointcloud_pub, messages.get("pointcloud")))
         for publisher, message in topic_messages:
             if publisher is None or message is None:
@@ -1450,6 +1600,78 @@ class RosBridgePolicy(BasePolicy):
             self._camera_info_pub.publish(camera_info)
             self._image_camera_info_pub.publish(camera_info)
             self._depth_camera_info_pub.publish(camera_info)
+        return stamp
+
+    def _step_ready_payload(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._latest_step_ready)
+
+    def _wait_for_step_ready(
+        self,
+        *,
+        timeout_s: float,
+        ignore_warmup: bool,
+        require_current_stamp: bool = True,
+        observation: Any | None = None,
+        messages: dict[str, Any] | None = None,
+        force_pointcloud_republish: bool = False,
+        republish_stamp=None,
+        reason: str = "barrier",
+    ) -> bool:
+        """Wait for aggregate decision readiness for the current observation.
+
+        Bootstrap resends only depth/pointcloud/camera-info at the *same* shared
+        stamp.  One bounded retry handles late subscriber connection without
+        continually advancing the required stamp faster than map consumers can
+        process it, and without duplicating RGB recordings while paused.
+        """
+
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        republish_period_s = self.step_ready_bootstrap_republish_period_s
+        remaining_republishes = 1 if observation is not None and messages is not None else 0
+        next_republish_mono = (
+            time.monotonic() + republish_period_s
+            if remaining_republishes
+            else None
+        )
+        while not self._rospy.is_shutdown():
+            if self._step_ready_for_current(
+                ignore_warmup=ignore_warmup,
+                require_current_stamp=require_current_stamp,
+            ):
+                return True
+            now_mono = time.monotonic()
+            if timeout_s <= 0.0 or now_mono >= deadline:
+                ready_payload = self._step_ready_payload()
+                self._rospy.logwarn(
+                    "RosBridgePolicy: %s step-ready timeout step=%d "
+                    "current_stamp=%.6f aggregate_ready=%s aggregate_step=%s "
+                    "aggregate_stamp=%s modules=%s.",
+                    reason,
+                    self._step_idx,
+                    self._current_step_stamp_sec,
+                    bool(ready_payload.get("ready")),
+                    ready_payload.get("step_index"),
+                    ready_payload.get("stamp_sec"),
+                    ready_payload.get("modules", {}),
+                )
+                return False
+            if next_republish_mono is not None and now_mono >= next_republish_mono:
+                stamp = self._republish_observation_messages(
+                    observation,
+                    messages,
+                    force_pointcloud=force_pointcloud_republish,
+                    stamp=republish_stamp,
+                )
+                if republish_stamp is None:
+                    self._current_step_stamp_sec = float(stamp.to_sec())
+                remaining_republishes -= 1
+                next_republish_mono = (
+                    now_mono + republish_period_s
+                    if remaining_republishes > 0
+                    else None
+                )
+            time.sleep(0.005)
 
     def _enqueue_step_frame(self, image_msg, stamp, step_index: int) -> None:
         if self._step_frame_thread is None or image_msg is None:
@@ -1471,6 +1693,13 @@ class RosBridgePolicy(BasePolicy):
         payload = {
             "step_index": int(self._step_idx),
             "stamp_sec": float(stamp.to_sec()),
+            # This lets a step-indexed controller distinguish a command that
+            # actually became evaluator action N from a late relay publish.
+            "action_source": str(self.last_action_source or ""),
+            # cmd_vel is converted to one fixed target increment per evaluator
+            # action.  Record the contract instead of inferring motion from
+            # wall-clock callback timing.
+            "cmd_vel_control_dt_s": float(self.cmd_vel_control_dt_s),
         }
         self._step_sync_pub.publish(
             self._String(data=json.dumps(payload, separators=(",", ":")))
@@ -1523,6 +1752,7 @@ class RosBridgePolicy(BasePolicy):
 
         t0 = time.perf_counter()
         common_stamp = self._next_common_stamp()
+        self._current_step_stamp_sec = float(common_stamp.to_sec())
         tf_ready = self._publish_odom_and_tf(observation, common_stamp)
         stage_ms["odom_tf"] = (time.perf_counter() - t0) * 1000.0
         if self._realtime_gt_publisher is not None:
@@ -1536,7 +1766,14 @@ class RosBridgePolicy(BasePolicy):
                 self._latest_gt_payload = gt_payload
             stage_ms["realtime_gt"] = (time.perf_counter() - t0) * 1000.0
 
-        skip_mapping_observation = self._step_idx < self.map_warmup_skip_frames or (not tf_ready)
+        bootstrap_requires_mapping = (
+            self.step_ready_barrier_enabled
+            and not self._step_ready_bootstrap_complete
+        )
+        skip_mapping_observation = (
+            (self._step_idx < self.map_warmup_skip_frames and not bootstrap_requires_mapping)
+            or (not tf_ready)
+        )
         if skip_mapping_observation:
             if self._step_idx < self.map_warmup_skip_frames:
                 self._rospy.loginfo_throttle(
@@ -1689,12 +1926,50 @@ class RosBridgePolicy(BasePolicy):
             t0_sync = time.perf_counter()
             self._publish_step_sync(common_stamp)
             stage_ms["step_sync_publish"] = (time.perf_counter() - t0_sync) * 1000.0
+            t0_capture_ack = time.perf_counter()
+            self._wait_for_step_capture_ack(common_stamp)
+            stage_ms["step_capture_ack_wait"] = (
+                time.perf_counter() - t0_capture_ack
+            ) * 1000.0
             stage_ms["total"] = (time.perf_counter() - frame_t0) * 1000.0
             self._record_timing(stage_ms)
             self._step_idx += 1
             return chosen_action
 
         t0_wait = time.perf_counter()
+        ready_wait_t0 = time.perf_counter()
+        if self.step_ready_barrier_enabled:
+            if not self._step_ready_bootstrap_complete:
+                bootstrap_ready = self._wait_for_step_ready(
+                    timeout_s=self.step_ready_bootstrap_timeout_s,
+                    ignore_warmup=True,
+                    require_current_stamp=True,
+                    observation=observation,
+                    messages=published_messages,
+                    force_pointcloud_republish=True,
+                    republish_stamp=common_stamp,
+                    reason="bootstrap",
+                )
+                if bootstrap_ready:
+                    self._step_ready_bootstrap_complete = True
+                    self._rospy.loginfo(
+                        "RosBridgePolicy: step-ready bootstrap complete at step=%d stamp=%.6f.",
+                        self._step_idx,
+                        self._current_step_stamp_sec,
+                    )
+            if self._step_ready_bootstrap_complete:
+                # A ready message from an older sensor stamp is insufficient for
+                # recording or planning this simulator frame.  Each step waits
+                # for the aggregate that covers its own published observation.
+                self._wait_for_step_ready(
+                    timeout_s=self.step_ready_timeout_s,
+                    ignore_warmup=False,
+                    require_current_stamp=True,
+                    reason="barrier",
+                )
+        stage_ms["step_ready_wait"] = (
+            time.perf_counter() - ready_wait_t0
+        ) * 1000.0
         wait_start_mono = time.monotonic()
         self._publish_fresh_command_gate(common_stamp)
         deadline = (
@@ -1794,6 +2069,11 @@ class RosBridgePolicy(BasePolicy):
         t0_sync = time.perf_counter()
         self._publish_step_sync(common_stamp)
         stage_ms["step_sync_publish"] = (time.perf_counter() - t0_sync) * 1000.0
+        t0_capture_ack = time.perf_counter()
+        self._wait_for_step_capture_ack(common_stamp)
+        stage_ms["step_capture_ack_wait"] = (
+            time.perf_counter() - t0_capture_ack
+        ) * 1000.0
         stage_ms["total"] = (time.perf_counter() - frame_t0) * 1000.0
         self._record_timing(stage_ms)
 
@@ -1814,6 +2094,12 @@ class RosBridgePolicy(BasePolicy):
         if hasattr(self, "_action_sub") and self._action_sub is not None:
             self._action_sub.unregister()
             self._action_sub = None
+        if hasattr(self, "_step_ready_sub") and self._step_ready_sub is not None:
+            self._step_ready_sub.unregister()
+            self._step_ready_sub = None
+        if hasattr(self, "_step_capture_ack_sub") and self._step_capture_ack_sub is not None:
+            self._step_capture_ack_sub.unregister()
+            self._step_capture_ack_sub = None
         if hasattr(self, "_cmd_vel_sub") and self._cmd_vel_sub is not None:
             self._cmd_vel_sub.unregister()
             self._cmd_vel_sub = None

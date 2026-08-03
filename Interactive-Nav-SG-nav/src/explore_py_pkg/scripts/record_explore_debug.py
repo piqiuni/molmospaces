@@ -503,11 +503,54 @@ def _write_png(path: Path, width: int, height: int, rgb: bytearray) -> None:
     path.write_bytes(data)
 
 
+def _write_gray_png(path: Path, gray) -> None:
+    """Write an 8- or 16-bit single-channel PNG outside ROS callback threads."""
+
+    if np is None:  # pragma: no cover - numpy is a recorder dependency in production
+        raise RuntimeError("numpy is required for grayscale PNG output")
+    values = np.asarray(gray)
+    if values.ndim != 2:
+        raise ValueError(f"expected a 2-D grayscale array, got {values.shape}")
+    height, width = [int(value) for value in values.shape]
+    if values.dtype.itemsize <= 1:
+        bit_depth = 8
+        row_bytes = values.astype(np.uint8, copy=False).tobytes()
+        stride = width
+    else:
+        bit_depth = 16
+        # PNG stores 16-bit samples in network byte order.
+        row_bytes = values.astype(">u2", copy=False).tobytes()
+        stride = width * 2
+    payload = b"".join(
+        b"\x00" + row_bytes[row * stride : (row + 1) * stride]
+        for row in range(height)
+    )
+    header = struct.pack(">IIBBBBB", width, height, bit_depth, 0, 0, 0, 0)
+    data = b"\x89PNG\r\n\x1a\n"
+    data += _chunk(b"IHDR", header)
+    data += _chunk(b"IDAT", zlib.compress(payload, 1))
+    data += _chunk(b"IEND", b"")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
 class _AsyncArtifactWriter:
-    def __init__(self, fps: float, crf: int, preset: str, max_queue: int):
+    def __init__(
+        self,
+        fps: float,
+        crf: int,
+        preset: str,
+        max_queue: int,
+        png_queue_overflow: str = "drop",
+        png_write_workers: int = 1,
+    ):
         self.fps = max(0.1, float(fps))
         self.crf = int(crf)
         self.preset = str(preset)
+        if png_queue_overflow not in {"drop", "block"}:
+            raise ValueError(f"unsupported PNG queue overflow policy: {png_queue_overflow}")
+        self.png_queue_overflow = png_queue_overflow
+        self.png_write_workers = max(1, int(png_write_workers))
         self.jobs: queue.Queue = queue.Queue(maxsize=max(8, int(max_queue)))
         self.video_jobs: queue.Queue = queue.Queue(maxsize=max(8, int(max_queue)))
         self.processes: dict[str, subprocess.Popen] = {}
@@ -524,9 +567,17 @@ class _AsyncArtifactWriter:
         self.png_write_ms_max = 0.0
         self.video_write_ms_total = 0.0
         self.video_write_ms_max = 0.0
-        self.thread = threading.Thread(target=self._run, name="explore-artifact-writer", daemon=True)
+        self.threads = [
+            threading.Thread(
+                target=self._run,
+                name=f"explore-artifact-writer-{index}",
+                daemon=True,
+            )
+            for index in range(self.png_write_workers)
+        ]
         self.video_thread = threading.Thread(target=self._run_video, name="explore-video-writer", daemon=True)
-        self.thread.start()
+        for thread in self.threads:
+            thread.start()
         self.video_thread.start()
 
     def submit_png(self, path: Path, frame) -> None:
@@ -543,6 +594,10 @@ class _AsyncArtifactWriter:
         self.video_queue_peak = max(self.video_queue_peak, self.video_jobs.qsize())
 
     def _submit(self, job) -> None:
+        if self.png_queue_overflow == "block":
+            self.jobs.put(job)
+            self.png_queue_peak = max(self.png_queue_peak, self.jobs.qsize())
+            return
         try:
             self.jobs.put_nowait(job)
             self.png_queue_peak = max(self.png_queue_peak, self.jobs.qsize())
@@ -553,6 +608,7 @@ class _AsyncArtifactWriter:
         return {
             "png_queue_size": self.jobs.qsize(),
             "png_queue_capacity": self.jobs.maxsize,
+            "png_write_workers": self.png_write_workers,
             "png_queue_peak": self.png_queue_peak,
             "video_queue_size": self.video_jobs.qsize(),
             "video_queue_capacity": self.video_jobs.maxsize,
@@ -645,8 +701,10 @@ class _AsyncArtifactWriter:
         self.video_jobs.put(None)
         self.video_thread.join(timeout=30.0)
         self.jobs.join()
-        self.jobs.put(None)
-        self.thread.join(timeout=30.0)
+        for _ in self.threads:
+            self.jobs.put(None)
+        for thread in self.threads:
+            thread.join(timeout=30.0)
         for process in self.processes.values():
             try:
                 if process.stdin is not None:
@@ -673,6 +731,237 @@ class _AsyncArtifactWriter:
                 log_handle = getattr(process, "_explore_log_handle", None)
                 if log_handle is not None:
                     log_handle.close()
+
+
+class _AsyncRawRecordingWriter:
+    """Serialize raw PNG+JSON persistence away from ROS callback threads.
+
+    A raw receipt becomes *accepted* only after its immutable raster snapshot is
+    in this queue. The writer then atomically publishes the PNG and appends its
+    JSONL manifest row. With ``overflow=block`` (the default), the callback is
+    intentionally back-pressured rather than silently dropping an observation.
+    """
+
+    def __init__(
+        self,
+        raw_recording_dir: Path,
+        *,
+        max_queue: int,
+        overflow: str = "block",
+    ) -> None:
+        if overflow not in {"block", "drop"}:
+            raise ValueError(f"unsupported raw recording overflow policy: {overflow}")
+        self.raw_recording_dir = Path(raw_recording_dir)
+        self.raw_map_dir = self.raw_recording_dir / "maps"
+        self.raw_map_dir.mkdir(parents=True, exist_ok=True)
+        self.map_manifest = (self.raw_recording_dir / "map_manifest.jsonl").open(
+            "a", buffering=1
+        )
+        self.step_manifest = (self.raw_recording_dir / "step_boundaries.jsonl").open(
+            "a", buffering=1
+        )
+        self.overflow = str(overflow)
+        self.jobs: queue.Queue = queue.Queue(maxsize=max(1, int(max_queue)))
+        self._stats_lock = threading.RLock()
+        self._accepting = True
+        self._closed = False
+        self.source_received: dict[str, int] = {}
+        self.accepted: dict[str, int] = {}
+        self.persisted: dict[str, int] = {}
+        self.queue_dropped: dict[str, int] = {}
+        self.write_failed: dict[str, int] = {}
+        self.latest_receipt_ids: dict[str, str] = {}
+        # Keep the metadata paired with each accepted receipt so a step boundary
+        # is a self-describing replay contract, not just a bag of opaque IDs.
+        self.latest_receipt_records: dict[str, dict] = {}
+        self.queue_peak = 0
+        self.enqueue_wait_ms_total = 0.0
+        self.enqueue_wait_ms_max = 0.0
+        self.errors: list[str] = []
+        self.thread = threading.Thread(
+            target=self._run,
+            name="explore-raw-recording-writer",
+            daemon=True,
+        )
+        self.thread.start()
+
+    @staticmethod
+    def _increment(counts: dict[str, int], stage: str) -> int:
+        value = int(counts.get(stage, 0)) + 1
+        counts[stage] = value
+        return value
+
+    def note_source(self, stage: str) -> None:
+        with self._stats_lock:
+            self._increment(self.source_received, str(stage))
+
+    def note_snapshot_failure(self, stage: str, error: BaseException) -> None:
+        with self._stats_lock:
+            self._increment(self.write_failed, str(stage))
+            self.errors.append(f"snapshot {stage}: {type(error).__name__}: {error}")
+
+    def _submit(self, stage: str, job) -> bool:
+        stage = str(stage)
+        enqueue_started = time.perf_counter()
+        while True:
+            with self._stats_lock:
+                accepting = self._accepting
+            if not accepting:
+                with self._stats_lock:
+                    self._increment(self.queue_dropped, stage)
+                return False
+            try:
+                if self.overflow == "drop":
+                    self.jobs.put_nowait(job)
+                else:
+                    self.jobs.put(job, timeout=0.1)
+            except queue.Full:
+                if self.overflow == "drop":
+                    with self._stats_lock:
+                        self._increment(self.queue_dropped, stage)
+                    return False
+                continue
+            elapsed_ms = (time.perf_counter() - enqueue_started) * 1000.0
+            with self._stats_lock:
+                self._increment(self.accepted, stage)
+                self.queue_peak = max(self.queue_peak, self.jobs.qsize())
+                self.enqueue_wait_ms_total += elapsed_ms
+                self.enqueue_wait_ms_max = max(self.enqueue_wait_ms_max, elapsed_ms)
+            return True
+
+    def enqueue_grid(
+        self,
+        stage: str,
+        *,
+        receipt_id: str,
+        path: Path,
+        encoded,
+        record: dict,
+    ) -> bool:
+        record = dict(record)
+        record["receipt_id"] = str(receipt_id)
+        record["stage"] = str(stage)
+        record["image"] = str(path)
+        accepted = self._submit(
+            str(stage), ("grid", str(stage), Path(path), encoded, record)
+        )
+        if accepted:
+            with self._stats_lock:
+                self.latest_receipt_ids[str(stage)] = str(receipt_id)
+                self.latest_receipt_records[str(stage)] = {
+                    key: value
+                    for key, value in record.items()
+                    if key in {
+                        "receipt_id", "stage", "source_index", "step_index",
+                        "stamp_sec", "header_seq", "frame_id", "width", "height",
+                        "resolution", "origin", "x", "y",
+                    }
+                }
+        return accepted
+
+    def enqueue_step_boundary(self, record: dict) -> bool:
+        stage = "step_boundary"
+        self.note_source(stage)
+        return self._submit(stage, ("step", stage, dict(record)))
+
+    def latest_receipts_snapshot(self) -> dict[str, str]:
+        with self._stats_lock:
+            return dict(self.latest_receipt_ids)
+
+    def latest_receipt_records_snapshot(self) -> dict[str, dict]:
+        with self._stats_lock:
+            return {
+                stage: dict(record)
+                for stage, record in self.latest_receipt_records.items()
+            }
+
+    def _write_grid(self, path: Path, encoded) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.stem}.tmp{path.suffix}")
+        if cv2 is not None:
+            if not cv2.imwrite(str(temporary), encoded):
+                raise RuntimeError(f"failed to write {temporary}")
+        else:  # pragma: no cover - OpenCV is normally available for recorder runs
+            _write_gray_png(temporary, encoded)
+        temporary.replace(path)
+
+    def _persist_grid(self, stage: str, path: Path, encoded, record: dict) -> None:
+        self._write_grid(path, encoded)
+        self.map_manifest.write(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        with self._stats_lock:
+            self._increment(self.persisted, stage)
+
+    def _persist_step(self, stage: str, record: dict) -> None:
+        self.step_manifest.write(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        with self._stats_lock:
+            self._increment(self.persisted, stage)
+
+    def _run(self) -> None:
+        while True:
+            job = self.jobs.get()
+            try:
+                if job is None:
+                    return
+                kind, stage, *payload = job
+                if kind == "grid":
+                    path, encoded, record = payload
+                    self._persist_grid(stage, path, encoded, record)
+                elif kind == "step":
+                    (record,) = payload
+                    self._persist_step(stage, record)
+                else:  # pragma: no cover - internal invariant
+                    raise RuntimeError(f"unknown raw recording job kind: {kind}")
+            except Exception as exc:  # pragma: no cover - disk failures are runtime-only
+                with self._stats_lock:
+                    self._increment(self.write_failed, str(job[1]) if job else "unknown")
+                    self.errors.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                self.jobs.task_done()
+
+    def drain(self) -> None:
+        self.jobs.join()
+        self.map_manifest.flush()
+        self.step_manifest.flush()
+
+    def stats_snapshot(self) -> dict:
+        with self._stats_lock:
+            accepted_total = sum(self.accepted.values())
+            return {
+                "source_received": dict(self.source_received),
+                "accepted": dict(self.accepted),
+                "persisted": dict(self.persisted),
+                "queue_dropped": dict(self.queue_dropped),
+                "write_failed": dict(self.write_failed),
+                "latest_receipt_ids": dict(self.latest_receipt_ids),
+                "queue_size": self.jobs.qsize(),
+                "queue_capacity": self.jobs.maxsize,
+                "queue_peak": self.queue_peak,
+                "enqueue_wait_ms_avg": self.enqueue_wait_ms_total / max(1, accepted_total),
+                "enqueue_wait_ms_max": self.enqueue_wait_ms_max,
+                "errors": list(self.errors[-10:]),
+                "overflow": self.overflow,
+                "closed": self._closed,
+            }
+
+    def close(self) -> None:
+        with self._stats_lock:
+            if self._closed:
+                return
+            self._accepting = False
+        self.drain()
+        self.jobs.put(None)
+        self.thread.join(timeout=60.0)
+        if self.thread.is_alive():
+            with self._stats_lock:
+                self.errors.append("raw_writer_shutdown_timeout")
+        self.map_manifest.close()
+        self.step_manifest.close()
+        with self._stats_lock:
+            self._closed = True
 
 
 def _video_frame_export_policy(
@@ -1357,6 +1646,17 @@ class ExploreDebugRecorder:
         self.video_external_frame_dir = self.video_dir / "external_camera_frames"
         self.video_external_overlay_frame_dir = self.video_dir / "external_camera_overlay_frames"
         self.video_external_raw_frame_dir = self.video_dir / "external_camera_raw_frames"
+        # Fully offline recording stores only source data here. Panel images and
+        # MP4 files are generated after the ROS processes have stopped.
+        self.raw_recording_dir = output_dir / "raw"
+        self.raw_map_dir = self.raw_recording_dir / "maps"
+        self.raw_json_dir = self.raw_recording_dir / "json"
+        self.raw_map_dir.mkdir(parents=True, exist_ok=True)
+        self.raw_json_dir.mkdir(parents=True, exist_ok=True)
+        self.raw_receipt_counts: dict[str, int] = {}
+        self.raw_record_lock = threading.RLock()
+        self.raw_recording_condition = threading.Condition()
+        self.raw_recording_active = 0
         self.semantic_keyframe_dir = output_dir / "semantic_keyframes"
         self.graph_dir = output_dir / "graph"
         self.panel_dir = output_dir / "subgoal_panels"
@@ -1365,6 +1665,22 @@ class ExploreDebugRecorder:
         self.graph_dir.mkdir(parents=True, exist_ok=True)
 
         self.args = args
+        self.step_capture_ack_topic = str(getattr(args, "step_capture_ack_topic", "") or "")
+        self.step_capture_ack_pub = (
+            rospy.Publisher(self.step_capture_ack_topic, String, queue_size=32)
+            if self.step_capture_ack_topic
+            else None
+        )
+        self.step_capture_ack_published_count = 0
+        self.raw_writer = _AsyncRawRecordingWriter(
+            self.raw_recording_dir,
+            max_queue=int(getattr(args, "raw_record_queue_size", 64)),
+            overflow=str(getattr(args, "raw_record_queue_overflow", "block")),
+        )
+        # Compatibility aliases for summary tooling; only the writer thread
+        # touches these handles after construction.
+        self.raw_map_manifest = self.raw_writer.map_manifest
+        self.raw_step_manifest = self.raw_writer.step_manifest
         self.tf_listener = tf.TransformListener()
         self.lock = threading.RLock()
         self.video_lock = threading.RLock()
@@ -1379,8 +1695,11 @@ class ExploreDebugRecorder:
         self.occupancy_grid_pair_count = 0
         self._unpaired_planning_grids: dict[tuple, dict] = {}
         self._unpaired_raw_grids: dict[tuple, dict] = {}
+        # Offline recording persists source maps independently. It must not
+        # retain raw/planning full-grid pairs merely for an online panel.
         self._occupancy_pairing_enabled = bool(
-            args.raw_occupancy_grid_topic
+            not bool(getattr(args, "offline_video_only", False))
+            and args.raw_occupancy_grid_topic
             and args.raw_occupancy_grid_topic != args.occupancy_grid_topic
         )
         # Semantic overlays can lag raw maps by multiple publications.  Keep a
@@ -1407,7 +1726,7 @@ class ExploreDebugRecorder:
         self.latest_grid_step = 0
         self.latest_global_costmap_step = 0
         self.latest_local_costmap_step = 0
-        self._retain_video_state_history = bool(args.first_person_video)
+        self._retain_video_state_history = bool(args.first_person_video) and not bool(getattr(args, "offline_video_only", False))
         history_size = (
             max(16, int(args.video_history_size))
             if self._retain_video_state_history
@@ -1531,6 +1850,15 @@ class ExploreDebugRecorder:
         self.cmd_vel_max_speed: dict[str, float] = {}
         self.status_counts: dict[str, int] = {}
         self.plan_message_counts = {"global": 0, "local_global": 0, "local": 0}
+        self.map_message_counts = {
+            "raw_occ": 0,
+            "planning_occ": 0,
+            "global_costmap_full": 0,
+            "global_costmap_update": 0,
+            "local_costmap_full": 0,
+            "local_costmap_update": 0,
+            "room_segmentation": 0,
+        }
         self.plan_records = {"global": [], "local_global": [], "local": []}
         self.subgoal_records: list[dict] = []
         video_stem = "overview_6panel" if args.semantic_video else "first_person"
@@ -1583,6 +1911,8 @@ class ExploreDebugRecorder:
                 crf=args.first_person_video_h264_crf,
                 preset=args.first_person_video_h264_preset,
                 max_queue=args.artifact_write_queue_size,
+                png_queue_overflow=args.artifact_write_overflow,
+                png_write_workers=args.artifact_write_workers,
             )
         self.subscribers = []
         if args.first_person_video and (cv2 is None or np is None):
@@ -1721,7 +2051,18 @@ class ExploreDebugRecorder:
         self.map_to_odom_writer.writeheader()
         self.video_frames_writer.writeheader()
 
-        self.subscribers.append(rospy.Subscriber(args.occupancy_grid_topic, OccupancyGrid, self.occupancy_callback, queue_size=1))
+        # Keep a small bounded transport backlog: callbacks only snapshot and
+        # enqueue raw payloads now, so this absorbs short disk/GC jitter without
+        # retaining an unbounded number of full OccupancyGrids.
+        map_receive_queue_size = max(1, int(getattr(args, "map_receive_queue_size", 8)))
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.occupancy_grid_topic,
+                OccupancyGrid,
+                self.occupancy_callback,
+                queue_size=map_receive_queue_size,
+            )
+        )
         if (
             args.raw_occupancy_grid_topic
             and args.raw_occupancy_grid_topic != args.occupancy_grid_topic
@@ -1731,13 +2072,41 @@ class ExploreDebugRecorder:
                     args.raw_occupancy_grid_topic,
                     OccupancyGrid,
                     self.raw_occupancy_callback,
-                    queue_size=1,
+                    queue_size=map_receive_queue_size,
                 )
             )
-        self.subscribers.append(rospy.Subscriber(args.global_costmap_topic, OccupancyGrid, self.global_costmap_callback, queue_size=1))
-        self.subscribers.append(rospy.Subscriber(args.global_costmap_updates_topic, OccupancyGridUpdate, self.global_costmap_update_callback, queue_size=20))
-        self.subscribers.append(rospy.Subscriber(args.local_costmap_topic, OccupancyGrid, self.local_costmap_callback, queue_size=1))
-        self.subscribers.append(rospy.Subscriber(args.local_costmap_updates_topic, OccupancyGridUpdate, self.local_costmap_update_callback, queue_size=50))
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.global_costmap_topic,
+                OccupancyGrid,
+                self.global_costmap_callback,
+                queue_size=map_receive_queue_size,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.global_costmap_updates_topic,
+                OccupancyGridUpdate,
+                self.global_costmap_update_callback,
+                queue_size=max(20, map_receive_queue_size),
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.local_costmap_topic,
+                OccupancyGrid,
+                self.local_costmap_callback,
+                queue_size=map_receive_queue_size,
+            )
+        )
+        self.subscribers.append(
+            rospy.Subscriber(
+                args.local_costmap_updates_topic,
+                OccupancyGridUpdate,
+                self.local_costmap_update_callback,
+                queue_size=max(50, map_receive_queue_size),
+            )
+        )
         self.subscribers.append(
             rospy.Subscriber(
                 args.image_topic,
@@ -1776,7 +2145,7 @@ class ExploreDebugRecorder:
                 args.scene_id_grid_topic,
                 OccupancyGrid,
                 self.scene_id_grid_callback,
-                queue_size=1,
+                queue_size=map_receive_queue_size,
             )
         )
         self.subscribers.append(
@@ -1932,15 +2301,269 @@ class ExploreDebugRecorder:
             image_encoding=image_encoding,
         )
 
+    def _record_map_chain_event_locked(self, stage: str, msg, *, processing_ms: float = 0.0) -> None:
+        counts = getattr(self, "map_message_counts", None)
+        if counts is None:
+            counts = {}
+            self.map_message_counts = counts
+        count = int(counts.get(stage, 0)) + 1
+        counts[stage] = count
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        try:
+            stamp_sec = float(stamp.to_sec())
+        except (AttributeError, TypeError, ValueError):
+            stamp_sec = 0.0
+        if not hasattr(self, "events_file"):
+            return
+        self._write_event(
+            "map_chain_receipt",
+            {
+                "stage": stage,
+                "receipt_count": count,
+                "header_seq": int(getattr(header, "seq", 0) or 0),
+                "header_stamp": stamp_sec,
+                "processing_ms": float(processing_ms),
+            },
+        )
+
+    def _begin_raw_recording_callback(self) -> bool:
+        condition = getattr(self, "raw_recording_condition", None)
+        if condition is None:  # lightweight unit-test stubs
+            return not bool(getattr(self, "shutting_down", False))
+        with condition:
+            if self.shutting_down:
+                return False
+            self.raw_recording_active += 1
+            return True
+
+    def _end_raw_recording_callback(self) -> None:
+        condition = getattr(self, "raw_recording_condition", None)
+        if condition is None:
+            return
+        with condition:
+            self.raw_recording_active = max(0, int(self.raw_recording_active) - 1)
+            condition.notify_all()
+
+    def _next_raw_receipt(self, stage: str) -> tuple[int, str]:
+        """Allocate a stable receipt ID before handing a snapshot to the writer."""
+
+        stage = str(stage)
+        with self.raw_record_lock:
+            count = int(self.raw_receipt_counts.get(stage, 0))
+            self.raw_receipt_counts[stage] = count + 1
+        return count, f"{stage}:{count}"
+
+    @staticmethod
+    def _message_stamp_sec(msg) -> float:
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        try:
+            return float(stamp.to_sec())
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    def _raw_step_tf_snapshot(self) -> dict:
+        """Capture the exact map<-odom SE(2) used by an offline step replay."""
+
+        listener = getattr(self, "tf_listener", None)
+        if listener is None:
+            return {}
+        try:
+            translation, rotation = listener.lookupTransform(
+                self.args.map_frame, self.args.odom_frame, rospy.Time(0)
+            )
+            stamp = listener.getLatestCommonTime(
+                self.args.map_frame, self.args.odom_frame
+            ).to_sec()
+            yaw = tf.transformations.euler_from_quaternion(rotation)[2]
+        except (
+            AttributeError,
+            tf.LookupException,
+            tf.ConnectivityException,
+            tf.ExtrapolationException,
+        ):
+            return {}
+        return {
+            "target_frame": str(self.args.map_frame),
+            "source_frame": str(self.args.odom_frame),
+            "stamp_sec": float(stamp),
+            "x": float(translation[0]),
+            "y": float(translation[1]),
+            "yaw": float(yaw),
+        }
+
+    @staticmethod
+    def _encode_raw_grid_values(stage: str, values):
+        """Encode signed occupancy/room/costmap cells without value clipping."""
+
+        values = np.asarray(values, dtype=np.int32)
+        minimum = int(values.min()) if values.size else 0
+        maximum = int(values.max()) if values.size else 0
+        offset = 1
+        shifted_maximum = maximum + offset
+        if minimum + offset < 0 or shifted_maximum > 65535:
+            raise ValueError(
+                f"{stage} values exceed lossless 16-bit PNG range: {minimum}..{maximum}"
+            )
+        if minimum >= -1 and maximum <= 100 and stage not in {"room_segmentation"}:
+            encoded = (values + offset).astype(np.uint8, copy=True)
+            bit_depth = 8
+        else:
+            encoded = (values + offset).astype(np.uint16, copy=True)
+            bit_depth = 16
+        return encoded, offset, bit_depth
+
+    def _record_raw_grid(self, stage: str, msg: OccupancyGrid) -> str | None:
+        """Queue a lossless map snapshot; PNG and JSONL I/O stay off callback threads."""
+
+        if not self._begin_raw_recording_callback():
+            return None
+        try:
+            return self._record_raw_grid_impl(stage, msg)
+        finally:
+            self._end_raw_recording_callback()
+
+    def _record_raw_grid_impl(self, stage: str, msg: OccupancyGrid) -> str | None:
+        writer = getattr(self, "raw_writer", None)
+        if writer is None:
+            return None
+        stage = str(stage)
+        count, receipt_id = self._next_raw_receipt(stage)
+        writer.note_source(stage)
+        if np is None or msg is None:
+            writer.note_snapshot_failure(stage, RuntimeError("numpy_or_map_message_unavailable"))
+            return None
+        try:
+            width = int(msg.info.width)
+            height = int(msg.info.height)
+            values = np.asarray(msg.data, dtype=np.int32).reshape((height, width))
+            # Detach the payload from the ROS message before it crosses into
+            # the writer thread.  Room labels and costmaps use 16-bit PNG when
+            # needed instead of clipping their values into occupancy range.
+            encoded, png_value_offset, png_bit_depth = self._encode_raw_grid_values(
+                stage, values
+            )
+            header = getattr(msg, "header", None)
+            origin = msg.info.origin
+            path = self.raw_map_dir / f"{stage}_{count:06d}.png"
+            record = {
+                "source_index": count,
+                "step_index": int(self.debug_step),
+                "stamp_sec": self._message_stamp_sec(msg),
+                "header_seq": int(getattr(header, "seq", 0) or 0),
+                "width": width,
+                "height": height,
+                "resolution": float(msg.info.resolution),
+                "frame_id": str(getattr(header, "frame_id", "") or ""),
+                "origin": {
+                    "x": float(origin.position.x),
+                    "y": float(origin.position.y),
+                    "z": float(origin.position.z),
+                    "qx": float(origin.orientation.x),
+                    "qy": float(origin.orientation.y),
+                    "qz": float(origin.orientation.z),
+                    "qw": float(origin.orientation.w),
+                },
+                "png_value_offset": png_value_offset,
+                "png_bit_depth": png_bit_depth,
+            }
+        except Exception as exc:
+            writer.note_snapshot_failure(stage, exc)
+            return None
+        return (
+            receipt_id
+            if writer.enqueue_grid(
+                stage,
+                receipt_id=receipt_id,
+                path=path,
+                encoded=encoded,
+                record=record,
+            )
+            else None
+        )
+
+    def _record_raw_grid_update(self, stage: str, msg: OccupancyGridUpdate) -> str | None:
+        """Queue an incremental costmap patch without blocking on disk I/O."""
+
+        if not self._begin_raw_recording_callback():
+            return None
+        try:
+            return self._record_raw_grid_update_impl(stage, msg)
+        finally:
+            self._end_raw_recording_callback()
+
+    def _record_raw_grid_update_impl(
+        self, stage: str, msg: OccupancyGridUpdate
+    ) -> str | None:
+        writer = getattr(self, "raw_writer", None)
+        if writer is None:
+            return None
+        stage = str(stage)
+        count, receipt_id = self._next_raw_receipt(stage)
+        writer.note_source(stage)
+        if np is None or msg is None:
+            writer.note_snapshot_failure(stage, RuntimeError("numpy_or_map_update_unavailable"))
+            return None
+        try:
+            width = int(msg.width)
+            height = int(msg.height)
+            values = np.asarray(msg.data, dtype=np.int32).reshape((height, width))
+            encoded, png_value_offset, png_bit_depth = self._encode_raw_grid_values(
+                stage, values
+            )
+            header = getattr(msg, "header", None)
+            path = self.raw_map_dir / f"{stage}_{count:06d}.png"
+            record = {
+                "source_index": count,
+                "step_index": int(self.debug_step),
+                "stamp_sec": self._message_stamp_sec(msg),
+                "header_seq": int(getattr(header, "seq", 0) or 0),
+                "x": int(msg.x),
+                "y": int(msg.y),
+                "width": width,
+                "height": height,
+                "png_value_offset": png_value_offset,
+                "png_bit_depth": png_bit_depth,
+            }
+        except Exception as exc:
+            writer.note_snapshot_failure(stage, exc)
+            return None
+        return (
+            receipt_id
+            if writer.enqueue_grid(
+                stage,
+                receipt_id=receipt_id,
+                path=path,
+                encoded=encoded,
+                record=record,
+            )
+            else None
+        )
+
     def occupancy_callback(self, msg: OccupancyGrid) -> None:
+        if bool(getattr(self.args, "offline_video_only", False)):
+            self._record_raw_grid("planning_occ", msg)
+            with self.lock:
+                if self.shutting_down:
+                    return
+                self._record_map_chain_event_locked("planning_occ", msg)
+                self.latest_grid = msg
+                self.latest_grid_step = self.debug_step
+            return
+        processing_t0 = time.perf_counter()
         video_grid = (
             self._freeze_grid_for_video(msg, render_kind="occupancy")
             if self._retain_video_state_history
             else None
         )
+        processing_ms = (time.perf_counter() - processing_t0) * 1000.0
         with self.lock:
             if self.shutting_down:
                 return
+            self._record_map_chain_event_locked(
+                "planning_occ", msg, processing_ms=processing_ms
+            )
             self.latest_grid = msg
             if self._occupancy_pairing_enabled:
                 self._register_occupancy_grid_pair_locked(msg, raw=False)
@@ -1962,9 +2585,12 @@ class ExploreDebugRecorder:
 
     def raw_occupancy_callback(self, msg: OccupancyGrid) -> None:
         """Retain the raw mapper output for post-run overlay diagnostics."""
+        if bool(getattr(self.args, "offline_video_only", False)):
+            self._record_raw_grid("raw_occ", msg)
         with self.lock:
             if self.shutting_down:
                 return
+            self._record_map_chain_event_locked("raw_occ", msg)
             self.latest_raw_grid = msg
             if self._occupancy_pairing_enabled:
                 self._register_occupancy_grid_pair_locked(msg, raw=True)
@@ -2063,6 +2689,18 @@ class ExploreDebugRecorder:
                 )
 
     def scene_id_grid_callback(self, msg: OccupancyGrid) -> None:
+        if bool(getattr(self.args, "offline_video_only", False)):
+            self._record_raw_grid("room_segmentation", msg)
+            # The offline builder consumes the persisted room labels directly.
+            # Do not build an online proxy or scan the full grid merely to draw
+            # a panel that will only be rendered after the run.
+            with self.lock:
+                if self.shutting_down:
+                    return
+                self.room_segment_callback_count += 1
+                self._record_map_chain_event_locked("room_segmentation", msg)
+                self.latest_scene_id_grid_step = self.debug_step
+            return
         video_grid = (
             self._freeze_grid_for_video(msg, render_kind="scene")
             if self._retain_video_state_history
@@ -2197,15 +2835,30 @@ class ExploreDebugRecorder:
         return events
 
     def global_costmap_callback(self, msg: OccupancyGrid) -> None:
+        if bool(getattr(self.args, "offline_video_only", False)):
+            self._record_raw_grid("global_costmap_full", msg)
+            # Full maps and patches are reconstructed from raw receipts offline;
+            # copying a second multi-megabyte map here serves no runtime use.
+            with self.lock:
+                if self.shutting_down:
+                    return
+                self._record_map_chain_event_locked("global_costmap_full", msg)
+                self.latest_global_costmap_step = self.debug_step
+            return
+        processing_t0 = time.perf_counter()
         copied = _copy_grid(msg)
         video_grid = (
             self._freeze_grid_for_video(copied, render_kind="global_costmap")
             if self._retain_video_state_history
             else None
         )
+        processing_ms = (time.perf_counter() - processing_t0) * 1000.0
         with self.lock:
             if self.shutting_down:
                 return
+            self._record_map_chain_event_locked(
+                "global_costmap_full", msg, processing_ms=processing_ms
+            )
             self.latest_global_costmap = copied
             self.latest_global_costmap_video_grid = video_grid
             self.latest_global_costmap_video_rgb = (
@@ -2225,8 +2878,19 @@ class ExploreDebugRecorder:
                 )
 
     def global_costmap_update_callback(self, msg: OccupancyGridUpdate) -> None:
+        if bool(getattr(self.args, "offline_video_only", False)):
+            self._record_raw_grid_update("global_costmap_update", msg)
+            with self.lock:
+                if self.shutting_down:
+                    return
+                self._record_map_chain_event_locked("global_costmap_update", msg)
+                self.latest_global_costmap_step = self.debug_step
+            return
         with self.lock:
-            if self.shutting_down or self.latest_global_costmap is None:
+            if self.shutting_down:
+                return
+            self._record_map_chain_event_locked("global_costmap_update", msg)
+            if self.latest_global_costmap is None:
                 return
             if not _apply_grid_update(self.latest_global_costmap, msg):
                 return
@@ -2258,6 +2922,14 @@ class ExploreDebugRecorder:
             )
 
     def local_costmap_callback(self, msg: OccupancyGrid) -> None:
+        if bool(getattr(self.args, "offline_video_only", False)):
+            self._record_raw_grid("local_costmap_full", msg)
+            with self.lock:
+                if self.shutting_down:
+                    return
+                self._record_map_chain_event_locked("local_costmap_full", msg)
+                self.latest_local_costmap_step = self.debug_step
+            return
         copied = _copy_grid(msg)
         video_grid = (
             self._freeze_grid_for_video(copied, render_kind="costmap")
@@ -2286,6 +2958,12 @@ class ExploreDebugRecorder:
                 )
 
     def local_costmap_update_callback(self, msg: OccupancyGridUpdate) -> None:
+        if bool(getattr(self.args, "offline_video_only", False)):
+            self._record_raw_grid_update("local_costmap_update", msg)
+            with self.lock:
+                if not self.shutting_down:
+                    self._record_map_chain_event_locked("local_costmap_update", msg)
+            return
         with self.lock:
             # Local costmap uses a rolling window. OccupancyGridUpdate does not
             # carry the updated origin, so applying patches locally can make the
@@ -2356,6 +3034,10 @@ class ExploreDebugRecorder:
     def image_callback(self, msg: Image) -> None:
         if self.shutting_down:
             return
+        if bool(getattr(self.args, "offline_video_only", False)) and self.args.video_step_sync_topic:
+            # The simulator already persists an exact RGB PNG for every step.
+            # Avoid decoding and caching a duplicate camera stream in recorder.
+            return
         step_capture = self.args.first_person_video_capture_mode == "step"
         source_stamp_ns = int(msg.header.stamp.to_nsec()) if msg.header.stamp else 0
         source_seq = int(msg.header.seq)
@@ -2382,12 +3064,14 @@ class ExploreDebugRecorder:
             self.latest_image = (stamp, width, height, rgb)
             self.latest_image_step = source_step
             self.last_image_wall_time = time.time()
-            if self.args.video_step_sync_topic:
+            if self.args.video_step_sync_topic and not bool(getattr(self.args, "offline_video_only", False)):
                 cache_for_step_sync = True
-            else:
+            elif not self.args.video_step_sync_topic:
                 snapshot = self._capture_video_snapshot_locked(stamp)
                 snapshot["source_seq"] = source_seq
                 snapshot["callback_index"] = self.image_callback_count
+        if self.args.video_step_sync_topic and bool(getattr(self.args, "offline_video_only", False)):
+            return
         if cache_for_step_sync:
             self.step_sync_image_cache.put(
                 CachedStepImage(
@@ -2405,7 +3089,38 @@ class ExploreDebugRecorder:
                 self.last_recorded_image_stamp_ns = source_stamp_ns
                 self.last_recorded_image_key = source_key
 
+    def _publish_step_capture_ack(self, step_index: int, stamp_sec: float, *, ready: bool) -> None:
+        """Acknowledge that the recorder froze the current raw replay boundary."""
+        publisher = getattr(self, "step_capture_ack_pub", None)
+        if publisher is None:
+            return
+        payload = {
+            "ready": bool(ready),
+            "step_index": int(step_index),
+            "stamp_sec": float(stamp_sec),
+            "timestamp": time.time(),
+        }
+        try:
+            publisher.publish(String(data=json.dumps(payload, separators=(",", ":"))))
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "[record_explore_debug] step-capture ack publish failed: %s", exc)
+            return
+        self.step_capture_ack_published_count += 1
+
     def step_sync_callback(self, msg: String) -> None:
+        # In offline mode this callback enqueues the causal step boundary. Track
+        # it alongside map callbacks so shutdown drains its final JSON record.
+        if not bool(getattr(self.args, "offline_video_only", False)):
+            self._step_sync_callback_impl(msg)
+            return
+        if not self._begin_raw_recording_callback():
+            return
+        try:
+            self._step_sync_callback_impl(msg)
+        finally:
+            self._end_raw_recording_callback()
+
+    def _step_sync_callback_impl(self, msg: String) -> None:
         if self.shutting_down:
             return
         try:
@@ -2416,6 +3131,7 @@ class ExploreDebugRecorder:
             return
         source_stamp_ns = int(round(stamp * 1_000_000_000.0))
         source_key = (source_seq, source_stamp_ns)
+        skipped_capture = False
         with self.lock:
             if self.shutting_down or self.last_step_sync_key == source_key:
                 return
@@ -2426,36 +3142,59 @@ class ExploreDebugRecorder:
             self.latest_image_step = source_seq
             if (callback_index - 1) % self.step_sync_capture_every:
                 self.step_sync_skipped_count += 1
-                return
-            self.step_sync_capture_count += 1
-            capture_index = self.step_sync_capture_count
-        matched_selection = self.step_sync_image_cache.wait_select(
-            source_seq,
-            source_stamp_ns,
-            timeout_sec=self.step_sync_image_wait_sec,
-            max_stamp_delta_ns=self.step_sync_image_max_stamp_delta_ns,
-            fallback_max_age_ns=self.step_sync_image_fallback_max_age_ns,
-        )
-        if matched_selection is None:
+                skipped_capture = True
+            else:
+                self.step_sync_capture_count += 1
+                capture_index = self.step_sync_capture_count
+        if skipped_capture:
+            if bool(getattr(self.args, "offline_video_only", False)):
+                self._publish_step_capture_ack(source_seq, stamp, ready=True)
+            return
+        if bool(getattr(self.args, "offline_video_only", False)):
+            # The simulator writes the authoritative per-step camera PNG. Keep
+            # recorder jobs small and let the offline builder insert that exact
+            # image instead of retaining another full RGB copy in memory.
+            matched_selection = None
             frame_width = self.step_sync_placeholder_width
             frame_height = self.step_sync_placeholder_height
-            frame_rgb = self.step_sync_placeholder_rgb
-            camera_source = "placeholder"
-            camera_stamp_delta_sec = float("inf")
+            frame_rgb = bytes()
+            camera_source = "sim_step_frame_offline"
+            camera_stamp_delta_sec = 0.0
         else:
-            matched_image = matched_selection.frame
-            frame_width = matched_image.width
-            frame_height = matched_image.height
-            frame_rgb = matched_image.rgb
-            camera_source = matched_selection.source
-            if matched_selection.reused:
-                camera_source += "_reuse"
-            camera_stamp_delta_sec = matched_selection.stamp_delta_ns / 1_000_000_000.0
+            matched_selection = self.step_sync_image_cache.wait_select(
+                source_seq,
+                source_stamp_ns,
+                timeout_sec=self.step_sync_image_wait_sec,
+                max_stamp_delta_ns=self.step_sync_image_max_stamp_delta_ns,
+                fallback_max_age_ns=self.step_sync_image_fallback_max_age_ns,
+            )
+            if matched_selection is None:
+                frame_width = self.step_sync_placeholder_width
+                frame_height = self.step_sync_placeholder_height
+                frame_rgb = self.step_sync_placeholder_rgb
+                camera_source = "placeholder"
+                camera_stamp_delta_sec = float("inf")
+            else:
+                matched_image = matched_selection.frame
+                frame_width = matched_image.width
+                frame_height = matched_image.height
+                frame_rgb = matched_image.rgb
+                camera_source = matched_selection.source
+                if matched_selection.reused:
+                    camera_source += "_reuse"
+                camera_stamp_delta_sec = matched_selection.stamp_delta_ns / 1_000_000_000.0
+        raw_step_record = None
+        raw_tf_snapshot = (
+            self._raw_step_tf_snapshot()
+            if bool(getattr(self.args, "offline_video_only", False))
+            else {}
+        )
         with self.lock:
             if self.shutting_down or self.last_recorded_image_key == source_key:
                 return
             if matched_selection is None:
-                self.step_sync_placeholder_count += 1
+                if not bool(getattr(self.args, "offline_video_only", False)):
+                    self.step_sync_placeholder_count += 1
             else:
                 self.step_sync_image_match_count += 1
                 if matched_selection.reused:
@@ -2468,6 +3207,70 @@ class ExploreDebugRecorder:
             snapshot["capture_trigger"] = "step_sync"
             snapshot["camera_source"] = camera_source
             snapshot["camera_stamp_delta_sec"] = camera_stamp_delta_sec
+            if bool(getattr(self.args, "offline_video_only", False)):
+                raw_writer = getattr(self, "raw_writer", None)
+                raw_step_record = {
+                    "step_index": int(source_seq), "stamp_sec": float(stamp),
+                    "capture_index": int(capture_index), "callback_index": int(callback_index),
+                    "camera_source": camera_source,
+                    # Only accepted receipts are eligible for an offline frame.
+                    # A queue drop is therefore visible as a missing panel plus
+                    # an explicit counter, never as a dangling receipt ID.
+                    "receipts": (
+                        raw_writer.latest_receipts_snapshot()
+                        if raw_writer is not None
+                        else {}
+                    ),
+                    "receipt_records": (
+                        raw_writer.latest_receipt_records_snapshot()
+                        if raw_writer is not None
+                        else {}
+                    ),
+                    "pose_frame_id": str(getattr(self.args, "odom_frame", "")),
+                    "goal_frame_id": str(getattr(self.args, "map_frame", "")),
+                    "graph_frame_id": str(getattr(self.args, "map_frame", "")),
+                    "tf_map_from_odom": raw_tf_snapshot,
+                    "visualization_config": {
+                        "video_occ_crop_margin_m": float(
+                            getattr(self.args, "video_occ_crop_margin_m", 2.5)
+                        ),
+                        "video_global_panel_scale": float(
+                            getattr(self.args, "video_global_panel_scale", 1.0)
+                        ),
+                        "semantic_occ_alpha": float(
+                            getattr(self.args, "semantic_occ_alpha", 0.35)
+                        ),
+                        "semantic_video_max_object_nodes": int(
+                            getattr(self.args, "semantic_video_max_object_nodes", 96)
+                        ),
+                    },
+                    "pose": snapshot.get("pose"), "trajectory": snapshot.get("trajectory"),
+                    "active_goal": snapshot.get("active_goal"), "active_goal_yaw": snapshot.get("active_goal_yaw"),
+                    "global_plan": snapshot.get("global_plan"), "local_global_plan": snapshot.get("local_global_plan"),
+                    "local_plan": snapshot.get("local_plan"), "distance_m": snapshot.get("distance_m"),
+                    "goal_count": snapshot.get("goal_count"), "stuck": snapshot.get("stuck"),
+                    "unified_graph": snapshot.get("unified_graph"), "gt_observations": snapshot.get("gt_observations"),
+                    "semantic_events": snapshot.get("semantic_events"),
+                    "observed_instance_ids": sorted(snapshot.get("observed_instance_ids") or []),
+                    "semantic_candidates": snapshot.get("semantic_candidates"),
+                    "semantic_selection": snapshot.get("semantic_selection"),
+                    "semantic_execution_state": snapshot.get("semantic_execution_state"),
+                    "semantic_behavior_feedback": snapshot.get("semantic_behavior_feedback"),
+                    "semantic_decision_trace": snapshot.get("semantic_decision_trace"),
+                    "route_phase": snapshot.get("route_phase"), "route_plan": snapshot.get("route_plan"),
+                    "route_goal": snapshot.get("route_goal"),
+                }
+                self.last_recorded_image_stamp_ns = source_stamp_ns
+                self.last_recorded_image_key = source_key
+        if raw_step_record is not None:
+            raw_writer = getattr(self, "raw_writer", None)
+            if raw_writer is not None:
+                accepted = raw_writer.enqueue_step_boundary(raw_step_record)
+                self._publish_step_capture_ack(source_seq, stamp, ready=accepted)
+                return
+            # Minimal legacy/unit-test stubs may not construct the raw writer.
+            # Preserve their compact-frame behavior rather than hiding a
+            # missing dependency behind an apparently successful recording.
         if self._enqueue_video_frame(
             (
                 frame_width,
@@ -2852,6 +3655,42 @@ class ExploreDebugRecorder:
             )
         return self.video_occupancy_world_bounds
 
+    def _bounded_observed_video_nodes(
+        self,
+        graph: dict,
+        observed_instance_ids: set[str] | None,
+        target_id: str,
+    ) -> list[dict]:
+        """Keep video panels legible and bounded as the persistent graph grows."""
+        observed_nodes = [
+            node
+            for node in graph.get("nodes") or []
+            if self._node_observed_in_recording(node, observed_instance_ids)
+        ]
+        room_nodes = [
+            node
+            for node in observed_nodes
+            if str(node.get("type") or "") == "room"
+        ]
+        interaction_nodes = [
+            node
+            for node in observed_nodes
+            if str(node.get("type") or "") != "room"
+        ]
+        limit = max(1, int(self.args.semantic_video_max_object_nodes))
+        if len(interaction_nodes) <= limit:
+            return room_nodes + interaction_nodes
+        interaction_nodes.sort(
+            key=lambda node: (
+                0 if self._node_matches_target(node, target_id) else 1,
+                0 if bool(node.get("is_currently_visible")) else 1,
+                0 if str(node.get("type") or "") == "portal" else 1,
+                0 if str(node.get("type") or "") == "container" else 1,
+                str(node.get("id") or ""),
+            )
+        )
+        return room_nodes + interaction_nodes[:limit]
+
     def _render_semantic_spatial_panel_locked(
         self,
         panel_width: int,
@@ -2868,11 +3707,11 @@ class ExploreDebugRecorder:
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
         target_id = _selection_target_id(semantic_selection)
-        nodes = [
-            node
-            for node in graph.get("nodes") or []
-            if self._node_observed_in_recording(node, observed_instance_ids)
-        ]
+        nodes = self._bounded_observed_video_nodes(
+            graph,
+            observed_instance_ids,
+            target_id,
+        )
         positions = [self._node_xy(node) for node in nodes]
         positions = [position for position in positions if position is not None]
         if pose is not None:
@@ -3138,9 +3977,12 @@ class ExploreDebugRecorder:
 
         nodes = [
             node
-            for node in graph.get("nodes") or []
+            for node in self._bounded_observed_video_nodes(
+                graph,
+                observed_instance_ids,
+                target_id,
+            )
             if node.get("type") in {"portal", "container"}
-            and self._node_observed_in_recording(node, observed_instance_ids)
         ]
         for node in nodes:
             center = self._node_xy(node)
@@ -3229,11 +4071,11 @@ class ExploreDebugRecorder:
             else semantic_decision_trace
         )
         selected_target_id = _selection_target_id(semantic_selection)
-        all_nodes = [
-            node
-            for node in graph.get("nodes") or []
-            if self._node_observed_in_recording(node, observed_instance_ids)
-        ]
+        all_nodes = self._bounded_observed_video_nodes(
+            graph,
+            observed_instance_ids,
+            selected_target_id,
+        )
         node_lookup = {
             str(node.get("id") or ""): node
             for node in all_nodes
@@ -4134,8 +4976,11 @@ class ExploreDebugRecorder:
             frame_height = int(round(height * frame_width / max(width, 1)))
             frame_width = max(1, frame_width)
             frame_height = max(1, frame_height)
-            camera_frame = np.frombuffer(bytes(rgb), dtype=np.uint8).reshape((height, width, 3))
-            camera_frame = cv2.resize(camera_frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
+            if camera_source == "sim_step_frame_offline":
+                camera_frame = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+            else:
+                camera_frame = np.frombuffer(bytes(rgb), dtype=np.uint8).reshape((height, width, 3))
+                camera_frame = cv2.resize(camera_frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
             if self.args.semantic_video:
                 self._draw_gt_observations_locked(
                     camera_frame,
@@ -4785,6 +5630,8 @@ class ExploreDebugRecorder:
         return self.first_person_video_path
 
     def _finalize_first_person_video_locked(self) -> None:
+        if bool(getattr(self.args, "offline_video_only", False)):
+            return
         if self.args.runtime_video_encode and self.artifact_writer is not None:
             return
         if self.first_person_video_writer is not None:
@@ -4902,6 +5749,8 @@ class ExploreDebugRecorder:
         self.first_person_video_frame_count = written
 
     def _finalize_external_video_locked(self) -> None:
+        if bool(getattr(self.args, "offline_video_only", False)):
+            return
         if self.args.runtime_video_encode and self.artifact_writer is not None:
             return
         if not self.args.external_video or self.external_video_frame_count <= 0:
@@ -6051,6 +6900,7 @@ class ExploreDebugRecorder:
                 return
             self.plan_message_counts[plan_type] = self.plan_message_counts.get(plan_type, 0) + 1
             message_index = self.plan_message_counts[plan_type]
+            self._record_map_chain_event_locked(f"{plan_type}_plan", msg)
             step_id = self.debug_step
             pose_count = len(msg.poses)
             frame_id = msg.header.frame_id or ""
@@ -7177,6 +8027,21 @@ class ExploreDebugRecorder:
             except Exception:
                 pass
 
+        # A callback may already be snapshotting a map when shutdown starts.
+        # Wait for those immutable snapshots to enter the raw writer before
+        # draining it, otherwise a final receipt could be counted but missing.
+        raw_writer = getattr(self, "raw_writer", None)
+        raw_recording_stats = {}
+        raw_condition = getattr(self, "raw_recording_condition", None)
+        if raw_condition is not None:
+            shutdown_deadline = time.monotonic() + 60.0
+            with raw_condition:
+                while self.raw_recording_active > 0 and time.monotonic() < shutdown_deadline:
+                    raw_condition.wait(timeout=0.25)
+        if raw_writer is not None:
+            raw_writer.close()
+            raw_recording_stats = raw_writer.stats_snapshot()
+
         # No callbacks can enqueue after shutting_down is set. Drain all frozen
         # per-step snapshots before closing the asynchronous PNG writer.
         self.video_frame_jobs.join()
@@ -7268,6 +8133,8 @@ class ExploreDebugRecorder:
                 "final_image_step": self.latest_image_step,
                 "image_callback_count": self.image_callback_count,
                 "step_sync_count": self.step_sync_count,
+                "step_capture_ack_topic": self.step_capture_ack_topic,
+                "step_capture_ack_published_count": self.step_capture_ack_published_count,
                 "step_sync_capture_every": self.step_sync_capture_every,
                 "step_sync_capture_count": self.step_sync_capture_count,
                 "step_sync_skipped_count": self.step_sync_skipped_count,
@@ -7291,6 +8158,7 @@ class ExploreDebugRecorder:
                 "cmd_vel_nonzero_counts": self.cmd_vel_nonzero_counts,
                 "cmd_vel_max_speed": self.cmd_vel_max_speed,
                 "plan_message_counts": self.plan_message_counts,
+                "map_message_counts": self.map_message_counts,
                 "stall_snapshot_count": self.stall_snapshot_count,
                 "stall_snapshots": self.stall_snapshot_records,
                 "first_pose": list(self.trajectory[0][1:]) if self.trajectory else None,
@@ -7338,6 +8206,16 @@ class ExploreDebugRecorder:
                 "video_snapshot_categorical_format": self.args.video_snapshot_categorical_format,
                 "video_occ_crop_margin_m": self.args.video_occ_crop_margin_m,
                 "runtime_video_encode": bool(self.args.runtime_video_encode),
+                "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
+                "raw_recording_format": "png_json_v1",
+                "raw_map_manifest": str(self.raw_recording_dir / "map_manifest.jsonl"),
+                "raw_step_manifest": str(self.raw_recording_dir / "step_boundaries.jsonl"),
+                # Legacy count is source callbacks received. The detailed
+                # breakdown below distinguishes queued, durable, and explicit
+                # drops/failures for every raw stream.
+                "raw_receipt_counts": dict(self.raw_receipt_counts),
+                "raw_recording_stats": raw_recording_stats,
+                "artifact_write_overflow": self.args.artifact_write_overflow,
                 "video_save_panel_frames": bool(self.args.video_save_panel_frames),
                 "video_save_composite_frames": bool(self.args.video_save_composite_frames),
             }
@@ -7367,6 +8245,8 @@ class ExploreDebugRecorder:
                 "final_image_step": self.latest_image_step,
                 "image_callback_count": self.image_callback_count,
                 "step_sync_count": self.step_sync_count,
+                "step_capture_ack_topic": self.step_capture_ack_topic,
+                "step_capture_ack_published_count": self.step_capture_ack_published_count,
                 "step_sync_capture_every": self.step_sync_capture_every,
                 "step_sync_capture_count": self.step_sync_capture_count,
                 "step_sync_skipped_count": self.step_sync_skipped_count,
@@ -7390,6 +8270,7 @@ class ExploreDebugRecorder:
                 "cmd_vel_nonzero_counts": self.cmd_vel_nonzero_counts,
                 "cmd_vel_max_speed": self.cmd_vel_max_speed,
                 "plan_message_counts": self.plan_message_counts,
+                "map_message_counts": self.map_message_counts,
                 "stall_snapshot_count": self.stall_snapshot_count,
                 "stall_snapshots": self.stall_snapshot_records,
                 "first_pose": list(self.trajectory[0][1:]) if self.trajectory else None,
@@ -7418,7 +8299,7 @@ class ExploreDebugRecorder:
                 "final_external_camera": final_external,
                 "final_first_person_stamp": 0.0 if self.latest_image is None else float(self.latest_image[0]),
                 "first_person_video": self.first_person_video_path
-                if self.first_person_video_frame_count > 0
+                if Path(self.first_person_video_path).exists()
                 else "",
                 "first_person_video_raw": self.first_person_video_raw_path
                 if Path(self.first_person_video_raw_path).exists()
@@ -7444,6 +8325,16 @@ class ExploreDebugRecorder:
                 "video_snapshot_categorical_format": self.args.video_snapshot_categorical_format,
                 "video_occ_crop_margin_m": self.args.video_occ_crop_margin_m,
                 "runtime_video_encode": bool(self.args.runtime_video_encode),
+                "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
+                "raw_recording_format": "png_json_v1",
+                "raw_map_manifest": str(self.raw_recording_dir / "map_manifest.jsonl"),
+                "raw_step_manifest": str(self.raw_recording_dir / "step_boundaries.jsonl"),
+                # Legacy count is source callbacks received. The detailed
+                # breakdown below distinguishes queued, durable, and explicit
+                # drops/failures for every raw stream.
+                "raw_receipt_counts": dict(self.raw_receipt_counts),
+                "raw_recording_stats": raw_recording_stats,
+                "artifact_write_overflow": self.args.artifact_write_overflow,
                 "video_save_panel_frames": bool(self.args.video_save_panel_frames),
                 "video_save_composite_frames": bool(self.args.video_save_composite_frames),
                 "first_person_video_map_mode": (
@@ -7522,6 +8413,24 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="Optional raw mapper OccupancyGrid saved alongside the display/planning grid at shutdown.",
     )
+    parser.add_argument(
+        "--map-receive-queue-size",
+        type=int,
+        default=8,
+        help="Bounded ROS transport backlog for full OccupancyGrid recorder inputs.",
+    )
+    parser.add_argument(
+        "--raw-record-queue-size",
+        type=int,
+        default=64,
+        help="Bounded immutable map/JSON snapshots waiting for the local raw writer.",
+    )
+    parser.add_argument(
+        "--raw-record-queue-overflow",
+        choices=("block", "drop"),
+        default="block",
+        help="Block for durable raw recordings or explicitly count dropped raw receipts.",
+    )
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--map-frame", default="tf_frame_map")
     parser.add_argument("--odom-frame", default="tf_frame_odom")
@@ -7574,6 +8483,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rosout-topic", default="/rosout_agg")
     parser.add_argument("--image-topic", default="/molmo_spaces/head_camera/image")
     parser.add_argument("--video-step-sync-topic", default="")
+    parser.add_argument(
+        "--step-capture-ack-topic",
+        default="",
+        help="Publish a per-step acknowledgment after the offline raw snapshot is queued.",
+    )
     parser.add_argument("--step-sync-queue-size", type=int, default=1024)
     parser.add_argument(
         "--step-sync-capture-every",
@@ -7740,14 +8654,38 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--semantic-occ-alpha", type=float, default=0.35)
+    parser.add_argument(
+        "--semantic-video-max-object-nodes",
+        type=int,
+        default=96,
+        help="Maximum non-room graph nodes drawn in semantic video panels.",
+    )
     parser.add_argument("--first-person-video-codec", default="mp4v")
     parser.add_argument("--first-person-video-h264", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--first-person-video-h264-crf", type=int, default=23)
     parser.add_argument("--first-person-video-h264-preset", default="veryfast")
     parser.add_argument("--first-person-video-h264-timeout-sec", type=float, default=180.0)
     parser.add_argument("--runtime-video-encode", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--offline-video-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Only save still-frame artifacts; defer every MP4 build to an offline tool.",
+    )
     parser.add_argument("--async-artifact-writes", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--artifact-write-queue-size", type=int, default=512)
+    parser.add_argument(
+        "--artifact-write-workers",
+        type=int,
+        default=1,
+        help="Number of parallel local still-image writers.",
+    )
+    parser.add_argument(
+        "--artifact-write-overflow",
+        choices=("drop", "block"),
+        default="drop",
+        help="Drop best-effort PNG jobs or block the renderer until every PNG is persisted.",
+    )
     parser.add_argument(
         "--performance-log-every-n-frames",
         type=int,
@@ -7782,8 +8720,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-match-post-goal-sec", type=float, default=60.0)
     parser.add_argument("--plan-goal-match-tolerance-m", type=float, default=1.0)
     args = parser.parse_args(rospy.myargv()[1:])
+    if args.offline_video_only and args.runtime_video_encode:
+        parser.error("--offline-video-only cannot be combined with --runtime-video-encode")
     if args.step_sync_capture_every < 1:
         parser.error("--step-sync-capture-every must be at least one")
+    if args.map_receive_queue_size < 1:
+        parser.error("--map-receive-queue-size must be at least one")
+    if args.raw_record_queue_size < 1:
+        parser.error("--raw-record-queue-size must be at least one")
+    if args.artifact_write_workers < 1:
+        parser.error("--artifact-write-workers must be at least one")
+    if args.semantic_video_max_object_nodes < 1:
+        parser.error("--semantic-video-max-object-nodes must be at least one")
     if args.video_snapshot_grid_max_dim < 16:
         parser.error("--video-snapshot-grid-max-dim must be at least 16")
     if not 1 <= args.video_snapshot_jpeg_quality <= 100:

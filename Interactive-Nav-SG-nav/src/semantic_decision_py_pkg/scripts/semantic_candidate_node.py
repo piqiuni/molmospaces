@@ -5,11 +5,14 @@ import json
 import time
 
 from semantic_decision_py_pkg.behavior_candidates import (
+    BEHAVIOR_SCAN,
+    BehaviorCandidate,
     CandidateGenerator,
     CandidateGeneratorConfig,
 )
 from semantic_decision_py_pkg.model_policy import compact_graph
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
+from semantic_decision_py_pkg.startup_scan_lifecycle import StartupScanLifecycle
 
 patch_roslogging_findcaller_for_py311()
 
@@ -23,6 +26,22 @@ class SemanticCandidateNode:
         rospy.init_node("semantic_candidate_node")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~candidate", {}) or {}
+        scan_config = rospy.get_param("~startup_scan", {}) or {}
+        self.startup_scan_enabled = bool(scan_config.get("enabled", False))
+        self.startup_scan_angle_rad = float(scan_config.get("angle_rad", 2.0 * 3.141592653589793))
+        self.startup_scan_angular_speed_rad_s = float(
+            scan_config.get("angular_speed_rad_s", 1.25)
+        )
+        self.startup_scan_control_dt_s = max(
+            1e-3, float(scan_config.get("control_dt_s", 0.2))
+        )
+        self.startup_scan_timeout_s = max(0.0, float(scan_config.get("timeout_s", 15.0)))
+        self.startup_scan_max_control_steps = max(
+            1, int(scan_config.get("max_control_steps", 40))
+        )
+        self.startup_scan_lifecycle = StartupScanLifecycle(
+            enabled=self.startup_scan_enabled
+        )
         self.generator = CandidateGenerator(
             CandidateGeneratorConfig(
                 max_frontier_candidates=int(config.get("max_frontier_candidates", 12)),
@@ -138,6 +157,13 @@ class SemanticCandidateNode:
         rospy.Subscriber(
             topics.get("odom", "/odom"), Odometry, self._odom_callback, queue_size=1
         )
+        if self.startup_scan_enabled:
+            rospy.Subscriber(
+                topics.get("behavior_feedback", "/semantic_decision/behavior_feedback"),
+                String,
+                self._startup_scan_feedback_callback,
+                queue_size=10,
+            )
         self.timer = rospy.Timer(rospy.Duration(1.0), self._publish)
 
     def _explorer_callback(self, message: String) -> None:
@@ -160,9 +186,53 @@ class SemanticCandidateNode:
 
     def _graph_callback(self, message: String) -> None:
         try:
-            self.graph = json.loads(message.data)
+            graph = json.loads(message.data)
         except json.JSONDecodeError:
             return
+        episode_id = str(graph.get("episode_id") or "")
+        self.graph = graph
+        # The first graph id can arrive after the map-ready signal.  Bind it to
+        # the existing SCAN instance; only a later different non-empty id is a
+        # new episode that must create a new mandatory scan.
+        self.startup_scan_lifecycle.observe_episode(episode_id)
+
+    def _startup_scan_candidate_id(self) -> str:
+        return self.startup_scan_lifecycle.candidate_id
+
+    def _startup_scan_candidate(self) -> BehaviorCandidate:
+        return BehaviorCandidate(
+            candidate_id=self._startup_scan_candidate_id(),
+            behavior_type=BEHAVIOR_SCAN,
+            source="mandatory_startup_scan",
+            target_id="startup_scan",
+            target_name="Initial 360-degree scan",
+            features={"priority": 1.0, "information_gain": 1.0},
+            metadata={
+                "mandatory_startup_scan": True,
+                "startup_scan_instance_id": self._startup_scan_candidate_id(),
+                "startup_scan_bound_episode_id": (
+                    self.startup_scan_lifecycle.bound_episode_id
+                ),
+                "target_angle_rad": self.startup_scan_angle_rad,
+                "angular_speed_rad_s": self.startup_scan_angular_speed_rad_s,
+                "control_dt_s": self.startup_scan_control_dt_s,
+                "timeout_s": self.startup_scan_timeout_s,
+                "max_control_steps": self.startup_scan_max_control_steps,
+            },
+        )
+
+    def _startup_scan_feedback_callback(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        if str(payload.get("behavior_type") or "").upper() != BEHAVIOR_SCAN:
+            return
+        self.startup_scan_lifecycle.record_feedback(
+            payload.get("candidate_id"),
+            payload.get("status"),
+            payload.get("detail") or {},
+        )
 
     def _target_callback(self, message: String) -> None:
         try:
@@ -184,9 +254,25 @@ class SemanticCandidateNode:
             if self.has_proposal_stream
             else self.explorer_status
         )
+        ready = bool(explorer_input.get("ready", False))
         candidates = self.generator.generate(
             explorer_input, self.graph, self.robot_xy, self.target_context
         )
+        episode_id = str(
+            self.graph.get("episode_id")
+            or self.startup_scan_lifecycle.bound_episode_id
+        )
+        # No behavior may dispatch before map readiness.  Once ready, the
+        # mandatory SCAN has a stable instance id even if the graph's episode
+        # id has not arrived yet.  A failed scan deliberately exposes no
+        # ordinary candidates, so failure can never masquerade as completion.
+        if self.startup_scan_enabled:
+            if not ready:
+                candidates = []
+            elif self.startup_scan_lifecycle.should_publish_scan(ready):
+                candidates = [self._startup_scan_candidate()]
+            elif self.startup_scan_lifecycle.blocks_regular_candidates():
+                candidates = []
         navigation_frontiers = [
             candidate for candidate in candidates if candidate.behavior_type == "EXPLORE"
         ]
@@ -198,9 +284,13 @@ class SemanticCandidateNode:
                 (candidate.metadata or {}).get("interaction_group_already_explored")
             )
         ]
-        ready = bool(explorer_input.get("ready", False))
-        initial_scan_complete = bool(
-            explorer_input.get("initial_scan_complete", True)
+        # Compatibility field consumed by mission completion: once SCAN moves
+        # to the semantic executor, it must reflect executor feedback rather
+        # than ExplorePy's deliberately disabled legacy initial_spin.
+        initial_scan_complete = (
+            self.startup_scan_lifecycle.state == "COMPLETE"
+            if self.startup_scan_enabled
+            else bool(explorer_input.get("initial_scan_complete", True))
         )
         explorer_state = explorer_input.get("state") or {}
         active_navigation_frontier = bool(
@@ -222,13 +312,17 @@ class SemanticCandidateNode:
             "schema_version": 1,
             "sequence": self.sequence,
             "timestamp": time.time(),
-            "episode_id": self.graph.get("episode_id", ""),
+            "episode_id": episode_id,
             "graph_revision": self.graph.get("graph_revision", 0),
             "robot_xy": list(self.robot_xy) if self.robot_xy is not None else None,
             "target_context": dict(self.target_context),
             "exploration_context": {
                 "ready": ready,
                 "initial_scan_complete": initial_scan_complete,
+                "startup_scan_enabled": self.startup_scan_enabled,
+                "startup_scan_state": self.startup_scan_lifecycle.state,
+                "startup_scan_failed": self.startup_scan_lifecycle.state == "FAILED",
+                "startup_scan_failure_detail": dict(self.startup_scan_lifecycle.failure_detail),
                 "frontier_exhausted": combined_frontier_exhausted,
                 "navigation_frontier_exhausted": navigation_frontier_exhausted,
                 "navigation_frontier_count": len(navigation_frontiers),

@@ -1,10 +1,20 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=${0:A:h}
-REPO_ROOT=${SCRIPT_DIR:h:h}
+# Compatibility for the small set of legacy zsh-style status writes below.
+print() {
+  local fd=1
+  if [[ "${1:-}" == "-u2" ]]; then fd=2; shift; fi
+  if [[ "${1:-}" == "-r" ]]; then shift; fi
+  if [[ "${1:-}" == "--" ]]; then shift; fi
+  printf '%s\n' "$@" >&"$fd"
+}
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 ROUTE_CONFIG=${ROUTE_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/house7_force_routes.yaml}
 VIDEO_BUILDER=${VIDEO_BUILDER:-${SCRIPT_DIR}/build_semantic_video_offline.py}
+RECORDER_DRAIN_HELPER=${RECORDER_DRAIN_HELPER:-${SCRIPT_DIR}/wait_for_recorder_drain.py}
 ROUTE_ID=${2:-${ROUTE_ID:-house7_force_route_01}}
 HOUSE_IND=${HOUSE_IND:-7}
 USE_FIXED_ROUTE=${USE_FIXED_ROUTE:-true}
@@ -14,8 +24,9 @@ OUTPUT_DIR=${1:-${REPO_ROOT}/outputs/house7_${METHOD}_${ROUTE_ID}_$(date +%Y%m%d
 if [[ "${OUTPUT_DIR}" != /* ]]; then
   OUTPUT_DIR="${PWD}/${OUTPUT_DIR}"
 fi
-ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.zsh}
+ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.bash}
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11501}
+RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
 TASK_HORIZON=${TASK_HORIZON:-1000}
 VIDEO_FPS=${VIDEO_FPS:-15}
 if [[ -z "${VIDEO_PANEL_WIDTH_PX:-}" ]]; then
@@ -25,28 +36,39 @@ if [[ -z "${VIDEO_PANEL_WIDTH_PX:-}" ]]; then
     VIDEO_PANEL_WIDTH_PX=480
   fi
 fi
-VIDEO_FRAME_JOB_QUEUE_SIZE=${VIDEO_FRAME_JOB_QUEUE_SIZE:-4}
+VIDEO_FRAME_JOB_QUEUE_SIZE=${VIDEO_FRAME_JOB_QUEUE_SIZE:-${TASK_HORIZON}}
 VIDEO_FRAME_QUEUE_OVERFLOW=${VIDEO_FRAME_QUEUE_OVERFLOW:-block}
-ARTIFACT_WRITE_QUEUE_SIZE=${ARTIFACT_WRITE_QUEUE_SIZE:-4}
-VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-16}
-IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-4}
+ARTIFACT_WRITE_QUEUE_SIZE=${ARTIFACT_WRITE_QUEUE_SIZE:-64}
+ARTIFACT_WRITE_WORKERS=${ARTIFACT_WRITE_WORKERS:-4}
+ARTIFACT_WRITE_OVERFLOW=${ARTIFACT_WRITE_OVERFLOW:-block}
+VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-256}
+SEMANTIC_VIDEO_MAX_OBJECT_NODES=${SEMANTIC_VIDEO_MAX_OBJECT_NODES:-64}
+IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-64}
 OBSERVATION_QUEUE_SIZE=${OBSERVATION_QUEUE_SIZE:-16}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
 EXTERNAL_VIDEO_WIDTH_PX=${EXTERNAL_VIDEO_WIDTH_PX:-1024}
 EXTERNAL_VIDEO_OVERLAY=${EXTERNAL_VIDEO_OVERLAY:-true}
 PAPER_FRAME_EXPORTS=${PAPER_FRAME_EXPORTS:-false}
 STEP_SYNC_QUEUE_SIZE=${STEP_SYNC_QUEUE_SIZE:-2048}
+STEP_SYNC_CAPTURE_EVERY=${STEP_SYNC_CAPTURE_EVERY:-1}
+STEP_SYNC_IMAGE_CACHE_SIZE=${STEP_SYNC_IMAGE_CACHE_SIZE:-${TASK_HORIZON}}
 EXTRA_IMAGE_QUEUE_SIZE=${EXTRA_IMAGE_QUEUE_SIZE:-16}
 TIMING_LOG_EVERY_N_STEPS=${TIMING_LOG_EVERY_N_STEPS:-50}
 RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES=${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES:-50}
-RECORDER_DRAIN_WAIT_S=${RECORDER_DRAIN_WAIT_S:-30}
-RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-180}
+RECORDER_DRAIN_TIMEOUT_S=${RECORDER_DRAIN_TIMEOUT_S:-7200}
+RECORDER_DRAIN_POLL_S=${RECORDER_DRAIN_POLL_S:-0.5}
+RECORDER_DRAIN_PROGRESS_S=${RECORDER_DRAIN_PROGRESS_S:-30}
+RECORDER_DRAIN_STALL_TIMEOUT_S=${RECORDER_DRAIN_STALL_TIMEOUT_S:-180}
+RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-600}
 GT_STEP_INTERVAL=${GT_STEP_INTERVAL:-3}
 GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-4.0}
 GT_MIN_VISIBLE_PIXELS=${GT_MIN_VISIBLE_PIXELS:-16}
 GT_MIN_VISIBLE_FRACTION=${GT_MIN_VISIBLE_FRACTION:-0.20}
 GT_REQUIRED_CONSECUTIVE_OBSERVATIONS=${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS:-2}
-MAP_WARMUP_SKIP_FRAMES=${MAP_WARMUP_SKIP_FRAMES:-10}
+# The bridge now waits for a real first-map bootstrap, so do not discard the
+# first ten simulator observations.  Override only for isolated legacy tests.
+MAP_WARMUP_SKIP_FRAMES=${MAP_WARMUP_SKIP_FRAMES:-0}
+STEP_READY_WARMUP_SKIP_FRAMES=${STEP_READY_WARMUP_SKIP_FRAMES:-0}
 GT_ROI_X_MIN_RATIO=${GT_ROI_X_MIN_RATIO:-0.10}
 GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
@@ -213,14 +235,36 @@ export SEMANTIC_DECISION_ENV_FILE="${SEMANTIC_MODEL_ENV_FILE}"
 export SEMANTIC_MODEL_METRICS_PATH="${OUTPUT_DIR}/mllm_metrics.jsonl"
 
 set +u
-source /home/user/miniconda3/etc/profile.d/conda.sh
-conda activate mlspaces
-set -u
+CONDA_SH=${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}
+if [[ ! -f "${CONDA_SH}" ]]; then
+  printf '%s\n' "Missing conda initialization script: ${CONDA_SH}" >&2
+  exit 2
+fi
+source "${CONDA_SH}"
+CONDA_ENV=${CONDA_ENV:-mlspaces}
+conda activate "${CONDA_ENV}"
+PYTHON_BIN=${PYTHON_BIN:-${CONDA_PREFIX}/bin/python}
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  printf '%s\n' "Missing MolmoSpaces Python executable: ${PYTHON_BIN}" >&2
+  exit 2
+fi
+MLSPACES_SITE_PACKAGES="$("${PYTHON_BIN}" -c 'import site; print(site.getsitepackages()[0])')"
 source "${ROS_SETUP}"
-export ROS_PACKAGE_PATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src:/opt/ros/noetic/share"
-export PYTHONPATH="${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:${PYTHONPATH:-}"
+ROS_SOURCE_DIR=${ROS_SOURCE_DIR:-$(cd -- "$(dirname -- "${ROS_SETUP}")/../src" && pwd)}
+if [[ ! -d "${ROS_SOURCE_DIR}" ]]; then
+  printf '%s\n' "Missing ROS source directory: ${ROS_SOURCE_DIR}" >&2
+  exit 2
+fi
+set -u
+# Keep each batch worker on its explicitly isolated ROS master after sourcing
+# the workspace setup, while loading OpenCV/MuJoCo from the MolmoSpaces env.
+export ROS_MASTER_URI="${RUN_ROS_MASTER_URI}"
+export ROS_PACKAGE_PATH="${ROS_SOURCE_DIR}:${ROS_PACKAGE_PATH#*:}"
+export PYTHONPATH="${ROS_SOURCE_DIR}/semantic_mapping_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_decision_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_mllm_py_pkg/scripts:${ROS_SOURCE_DIR}/explore_py_pkg/scripts:${MLSPACES_SITE_PACKAGES}:${PYTHONPATH:-}"
 
-ROS_DEVEL_ROOT=${ROS_SETUP:h}
+python() { "${PYTHON_BIN}" "$@"; }
+
+ROS_DEVEL_ROOT=$(dirname -- "${ROS_SETUP}")
 for ROS_EXECUTABLE in \
   struct_mapping_pkg/slam_gmapping \
   struct_mapping_pkg/voronoi_mapping_node \
@@ -239,13 +283,24 @@ if [[ "${USE_FIXED_ROUTE}" == true ]]; then
   FIXED_ROUTE_ARGS="--fixed_robot_xyyaw ${ROBOT_XYYAW}"
 fi
 
+signal_process_tree() {
+  local signal="$1"
+  local pid="$2"
+  local child=""
+  [[ -n "${pid}" ]] || return
+  while IFS= read -r child; do
+    [[ -n "${child}" ]] && signal_process_tree "${signal}" "${child}"
+  done < <(pgrep -P "${pid}" 2>/dev/null || true)
+  kill "-${signal}" "${pid}" 2>/dev/null || true
+}
+
 cleanup_process() {
   local pid="${1:-}"
   local grace_s="${2:-20}"
   if [[ -z "${pid}" ]] || ! kill -0 "${pid}" 2>/dev/null; then
     return
   fi
-  kill -INT "${pid}" 2>/dev/null || true
+  signal_process_tree INT "${pid}"
   local max_attempts=$((grace_s * 2))
   local _attempt=1
   while (( _attempt <= max_attempts )); do
@@ -256,9 +311,9 @@ cleanup_process() {
     sleep 0.5
     _attempt=$((_attempt + 1))
   done
-  kill -TERM "${pid}" 2>/dev/null || true
+  signal_process_tree TERM "${pid}"
   sleep 1
-  kill -KILL "${pid}" 2>/dev/null || true
+  signal_process_tree KILL "${pid}"
   wait "${pid}" 2>/dev/null || true
 }
 
@@ -319,7 +374,11 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       --raw-occupancy-grid-topic "${RAW_OCCUPANCY_GRID_TOPIC}" \
       --first-person-video-capture-mode step \
       --video-step-sync-topic /molmo_spaces/step_sync \
+      --step-capture-ack-topic /molmo_spaces/step_capture_ack \
+      --step-sync-capture-every "${STEP_SYNC_CAPTURE_EVERY}" \
+      --step-sync-image-cache-size "${STEP_SYNC_IMAGE_CACHE_SIZE}" \
       --semantic-video \
+      --semantic-video-max-object-nodes "${SEMANTIC_VIDEO_MAX_OBJECT_NODES}" \
       --first-person-video-with-map \
       --first-person-video-fps "${VIDEO_FPS}" \
       --first-person-video-width-px "${VIDEO_PANEL_WIDTH_PX}" \
@@ -329,14 +388,18 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       --video-frame-job-queue-size "${VIDEO_FRAME_JOB_QUEUE_SIZE}" \
       --video-frame-queue-overflow "${VIDEO_FRAME_QUEUE_OVERFLOW}" \
       --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
+      --artifact-write-workers "${ARTIFACT_WRITE_WORKERS}" \
+      --artifact-write-overflow "${ARTIFACT_WRITE_OVERFLOW}" \
       --performance-log-every-n-frames "${RECORDER_PERFORMANCE_LOG_EVERY_N_FRAMES}" \
       --video-history-size "${VIDEO_HISTORY_SIZE}" \
       --image-queue-size "${IMAGE_QUEUE_SIZE}" \
       --video-global-panel-scale 1.8 \
-      --runtime-video-encode \
+      --no-runtime-video-encode \
+      --offline-video-only \
       --first-person-video-h264-preset "${VIDEO_ENCODER_PRESET}" \
       "${EXTERNAL_VIDEO_ARGS[@]}" \
       --video-save-panel-frames \
+      --video-save-composite-frames \
       --no-first-person-video-h264 \
       >"${OUTPUT_DIR}/recorder.log" 2>&1 &
   else
@@ -376,7 +439,25 @@ if [[ "${ENABLE_EXTERNAL_VIDEO}" == true ]]; then
   PUBLISH_DEBUG_FRONT_CAMERA=true
   DEBUG_CAMERA_ARGS="--debug_front_camera_offset=${DEBUG_FOLLOW_CAMERA_OFFSET} --debug_front_camera_lookat_offset=${DEBUG_FOLLOW_CAMERA_LOOKAT_OFFSET} --debug_front_camera_fov_deg=${DEBUG_FOLLOW_CAMERA_FOV_DEG}"
 fi
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s 0.5 --map_warmup_skip_frames ${MAP_WARMUP_SKIP_FRAMES} ${SIM_CAPTURE_ARGS} ${DEBUG_CAMERA_ARGS} --extra_image_queue_size ${EXTRA_IMAGE_QUEUE_SIZE} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json ${RUNTIME_TARGET_SELECTION_INPUT_ARGS} --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS} --timing_log_every_n_frames ${TIMING_LOG_EVERY_N_STEPS} --sim_timing_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS}"
+STEP_READY_BARRIER_ENABLED=${STEP_READY_BARRIER_ENABLED:-true}
+# Keep readiness smoke tests bounded; the simulator remains fail-open after
+# this wait and the outer SIM_TIMEOUT_S is the hard process guard.
+STEP_READY_TIMEOUT_S=${STEP_READY_TIMEOUT_S:-2.0}
+# Only the one-time first-map bootstrap may wait longer; all later simulator
+# steps keep the bounded 2s fail-open protection above.
+STEP_READY_BOOTSTRAP_TIMEOUT_S=${STEP_READY_BOOTSTRAP_TIMEOUT_S:-10.0}
+# The recorder acknowledges each queued raw step snapshot before the simulator
+# advances. Enable this only when the offline recorder is actually running.
+if [[ "${ENABLE_RECORDING}" == true ]] && [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
+  STEP_CAPTURE_ACK_BARRIER_ENABLED=${STEP_CAPTURE_ACK_BARRIER_ENABLED:-true}
+else
+  STEP_CAPTURE_ACK_BARRIER_ENABLED=${STEP_CAPTURE_ACK_BARRIER_ENABLED:-false}
+fi
+STEP_CAPTURE_ACK_TIMEOUT_S=${STEP_CAPTURE_ACK_TIMEOUT_S:-2.0}
+# At 5 Hz, command collection cannot keep the historical 0.5s wait; 0.2s
+# keeps the bridge cadence aligned with policy_dt_ms while remaining overrideable.
+ACTION_TIMEOUT_S=${ACTION_TIMEOUT_S:-0.2}
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s ${ACTION_TIMEOUT_S} --step_capture_ack_topic /molmo_spaces/step_capture_ack --step_capture_ack_barrier_enabled ${STEP_CAPTURE_ACK_BARRIER_ENABLED} --step_capture_ack_timeout_s ${STEP_CAPTURE_ACK_TIMEOUT_S} --step_ready_barrier_enabled ${STEP_READY_BARRIER_ENABLED} --step_ready_warmup_skip_frames ${STEP_READY_WARMUP_SKIP_FRAMES} --step_ready_timeout_s ${STEP_READY_TIMEOUT_S} --step_ready_bootstrap_timeout_s ${STEP_READY_BOOTSTRAP_TIMEOUT_S} --map_warmup_skip_frames ${MAP_WARMUP_SKIP_FRAMES} ${SIM_CAPTURE_ARGS} ${DEBUG_CAMERA_ARGS} --extra_image_queue_size ${EXTRA_IMAGE_QUEUE_SIZE} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json ${RUNTIME_TARGET_SELECTION_INPUT_ARGS} --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS} --timing_log_every_n_frames ${TIMING_LOG_EVERY_N_STEPS} --sim_timing_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS}"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -447,15 +528,45 @@ if [[ "${LAUNCH_EXIT}" -ne 0 ]] && [[ "${LAUNCH_EXIT}" -ne 130 ]]; then
   fi
 fi
 
+RECORDER_DRAIN_STATUS=0
+if [[ -n "${RECORDER_PID}" ]] && [[ "${ENABLE_RECORDING}" == true ]]; then
+  "${PYTHON_BIN}" "${RECORDER_DRAIN_HELPER}" \
+    --sim-manifest "${OUTPUT_DIR}/sim_step_frames/manifest.jsonl" \
+    --video-frames-csv "${OUTPUT_DIR}/debug/video_frames.csv" \
+    --timeout-sec "${RECORDER_DRAIN_TIMEOUT_S}" \
+    --poll-sec "${RECORDER_DRAIN_POLL_S}" \
+    --progress-sec "${RECORDER_DRAIN_PROGRESS_S}" \
+    --stall-timeout-sec "${RECORDER_DRAIN_STALL_TIMEOUT_S}" \
+    --recorder-pid "${RECORDER_PID}" \
+    --step-sync-capture-every "${STEP_SYNC_CAPTURE_EVERY}" \
+    --offline-raw-recording \
+    --raw-step-manifest "${OUTPUT_DIR}/debug/raw/step_boundaries.jsonl" \
+    || RECORDER_DRAIN_STATUS=$?
+fi
 if [[ -n "${RECORDER_PID}" ]]; then
-  if [[ "${ENABLE_RECORDING}" == true ]] && (( RECORDER_DRAIN_WAIT_S > 0 )); then
-    # The simulator can finish before the recorder has consumed all queued
-    # step-sync messages. Keep ROS master alive briefly so an exact-step video
-    # is not silently completed with stale panel states.
-    sleep "${RECORDER_DRAIN_WAIT_S}"
-  fi
   cleanup_process "${RECORDER_PID}" "${RECORDER_SHUTDOWN_GRACE_S}"
   RECORDER_PID=""
+fi
+FINAL_RECORDER_DRAIN_STATUS=0
+if [[ "${ENABLE_RECORDING}" == true ]] && [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
+  "${PYTHON_BIN}" "${RECORDER_DRAIN_HELPER}" \
+    --sim-manifest "${OUTPUT_DIR}/sim_step_frames/manifest.jsonl" \
+    --video-frames-csv "${OUTPUT_DIR}/debug/video_frames.csv" \
+    --timeout-sec 0 \
+    --step-sync-capture-every "${STEP_SYNC_CAPTURE_EVERY}" \
+    --offline-raw-recording \
+    --raw-step-manifest "${OUTPUT_DIR}/debug/raw/step_boundaries.jsonl" \
+    --recorder-summary "${OUTPUT_DIR}/debug/summary.json" \
+    || FINAL_RECORDER_DRAIN_STATUS=$?
+fi
+VIDEO_STATE_ALIGNMENT=exact
+if (( FINAL_RECORDER_DRAIN_STATUS != 0 )); then
+  printf '%s\n' "Recorder finalization failed (live=${RECORDER_DRAIN_STATUS}, final=${FINAL_RECORDER_DRAIN_STATUS})." >&2
+  exit 4
+fi
+if (( RECORDER_DRAIN_STATUS != 0 )); then
+  VIDEO_STATE_ALIGNMENT=latest
+  printf '%s\n' "Recorder stopped with incomplete live state panels; using latest-state offline fallback with exact simulator camera frames." >&2
 fi
 
 if [[ "${ENABLE_RECORDING}" == true ]] && [[ "${SKIP_OFFLINE_VIDEO}" != true ]] && [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
@@ -464,7 +575,7 @@ if [[ "${ENABLE_RECORDING}" == true ]] && [[ "${SKIP_OFFLINE_VIDEO}" != true ]] 
     --scene-dir "${OUTPUT_DIR}" \
     --debug-dir "${OUTPUT_DIR}/debug" \
     --fps "${VIDEO_FPS}" \
-    --state-alignment latest \
+    --state-alignment "${VIDEO_STATE_ALIGNMENT}" \
     --output-stem overview_6panel \
     >"${OUTPUT_DIR}/offline_video.log" 2>&1
   OFFLINE_VIDEO_ELAPSED_SEC=$(python - "${OFFLINE_VIDEO_START}" <<'PY'

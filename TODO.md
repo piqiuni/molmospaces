@@ -1,6 +1,6 @@
 # 交互导航阶段分析与 TODO
 
-最后更新：2026-07-17
+最后更新：2026-08-03
 
 ## 1. 当前课题定位
 
@@ -480,6 +480,39 @@
 - [ ] 明确“交互成功后继续导航”的状态回写链路
 - [ ] 设计最小失败处理：门不可开 / 状态未知 / 交互后仍不可达
 - [ ] 定义最小日志字段，便于后续复盘每次失败点
+
+### 4.4.1 ROS 运行时启动观测与 SCAN 行为（2026-08-03）
+
+- [x] 将启动旋转从 `ExplorePy -> /cmd_vel` 的旁路逻辑收敛为
+  `semantic decision -> semantic executor -> bridge` 的显式 `SCAN` 行为；决策层只输出
+  高层 scan 目标，执行层才产生逐 step 的低层旋转命令。
+- [x] 第一阶段先实现**必选且不可中断**的 episode-start `SCAN`：在普通
+  `EXPLORE / NAVIGATE / INTERACT` 候选派发前完成整圈观测，并将 `SCANNING`、累计转角、
+  每步命令、完成原因和失败原因写入 decision trace、execution feedback 与离线录像。
+- [x] 修复 scan 的 step 事务：按 `step_index` 缓存并原子匹配 `RGB(N)` 与 action-window
+  gate `N`，每个 evaluator action 最多消费一条 scan 命令；记录乱序、过期、重复和缺失
+  token，不能再以单个 `latest_*_step` 的相等判断作为配对条件。
+- [x] 固定第一阶段的验收边界：默认目标为 `2π`，在 `1.25 rad/s × 0.2 s/action` 下正常
+  约需 26 个控制 action（最多 28 个）；只有达到转角/覆盖条件才可标记 `SCAN_COMPLETE`。
+  `timeout_s=15 s` 按已确认 evaluator control step × `dt` 的逻辑时间计算，`40 step` 为硬上限；wall-clock 只用于已发送命令未收到 step-sync 的 liveness 故障，二者都只能产生显式 `SCAN_FAILED`，不得悄悄放行普通候选。
+- [x] 为上述强制 scan 增加小范围重排/丢包单测和 100-step 运行 smoke：应从首帧起看到
+  `SCAN` selection，scan 不能由 timeout 结束，完成后才进入普通语义行为。
+- [ ] **后续阶段，暂不实现：**支持可中断 `SCAN`。达到最小转角/观测覆盖后，如决策层发现
+  高关联目标或高收益交互候选，可用带原因与证据的 preemption 将 `SCAN` 切换到目标行为；
+  需要最小覆盖、收益阈值和滞回规则，避免 scan/目标之间振荡。
+- [ ] 将普通 `move_base` 的无 step-id `latest Twist` 路径纳入逐 step 可复现性审计：记录
+  `pre/target/post pose`、`cmd_vel`、`dt`、`sim_time_delta` 与跟踪残差；评估是否也需要
+  step-indexed pull 协议。当前仅保证每个 bridge action 的目标按固定 `v × dt` 构造，
+  不保证位置 PD 下的真实位移严格相等。
+
+### 4.4.2 运行时录像统一化（2026-08-03）
+
+- [x] 统一 semantic wrapper/batch recorder：逐 step 保存原始 PNG + JSON/manifest，drain 后
+  由离线 renderer 构建 MP4；录像完整性与语义导航正确性分开验收。
+- [ ] 将仍使用 legacy runtime encoder 的 V3 evaluator 与三场景 GT 入口迁移到同一
+  raw-only recorder/drain/offline-render 流程，并补回归测试。
+- [ ] 为 raw-only renderer 增加按 panel 导出的离线接口；当前仅支持完整离线六联图，
+  不能把 legacy saved-panel 功能误认为 raw-only 功能。
 
 ## 4.5 实验与评估 TODO
 

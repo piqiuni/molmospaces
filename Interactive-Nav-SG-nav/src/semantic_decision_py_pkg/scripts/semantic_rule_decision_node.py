@@ -8,7 +8,7 @@ import os
 import threading
 import time
 
-from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate
+from semantic_decision_py_pkg.behavior_candidates import BEHAVIOR_SCAN, BehaviorCandidate
 from semantic_decision_py_pkg.candidate_curator import (
     CandidateCurator,
     CandidateCuratorConfig,
@@ -309,6 +309,16 @@ class SemanticRuleDecisionNode:
         self.cooldown_until: dict[str, float] = {}
         self.failure_counts: dict[str, int] = {}
         self.decision_index = 0
+        self.step_ready_enabled = bool(rospy.get_param("~step_ready_enabled", False))
+        self.step_ready_topic = str(rospy.get_param("~step_ready_topic", "/semantic_decision/step_ready"))
+        self.step_ready_required_modules = tuple(rospy.get_param("~step_ready_required_modules", ["semantic_mapping", "explore_py"]))
+        self.step_ready_states: dict[str, dict] = {}
+        self.step_ready_pub = rospy.Publisher(self.step_ready_topic, String, queue_size=32, latch=True)
+        self.step_ready_subscribers = []
+        if self.step_ready_enabled:
+            for module in self.step_ready_required_modules:
+                topic = f"/semantic_decision/ready/{module}"
+                self.step_ready_subscribers.append(rospy.Subscriber(topic, String, self._module_ready_callback, callback_args=str(module), queue_size=32))
         self.selected_pub = rospy.Publisher(
             topics.get("selected_behavior", "/semantic_decision/selected_behavior"),
             String,
@@ -342,6 +352,35 @@ class SemanticRuleDecisionNode:
             queue_size=10,
         )
         self.timer = rospy.Timer(rospy.Duration(0.5), self._tick)
+
+    def _module_ready_callback(self, message: String, module: str) -> None:
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self.state_lock:
+            self.step_ready_states[str(module)] = dict(payload)
+        self._publish_step_ready()
+
+    def _publish_step_ready(self) -> None:
+        if not self.step_ready_enabled:
+            return
+        with self.state_lock:
+            states = {name: dict(self.step_ready_states.get(name) or {}) for name in self.step_ready_required_modules}
+            step_indexes = [int(state.get("step_index", -1)) for state in states.values()]
+            aggregate_step = min(step_indexes) if step_indexes else -1
+            stamps = [float(state.get("stamp_sec", 0.0) or 0.0) for state in states.values()]
+            aggregate_stamp = min(stamps) if stamps else 0.0
+            missing = [name for name, state in states.items() if not bool(state.get("ready"))]
+            ready = aggregate_step >= 0 and not missing
+            payload = {
+                "ready": ready, "step_index": aggregate_step, "stamp_sec": aggregate_stamp,
+                "required_modules": list(self.step_ready_required_modules),
+                "missing_modules": missing, "modules": states, "timestamp": time.time(),
+            }
+        self.step_ready_pub.publish(String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))))
 
     def _candidate_callback(self, message: String) -> None:
         try:
@@ -769,6 +808,28 @@ class SemanticRuleDecisionNode:
         if candidate_sequence < self.minimum_candidate_sequence:
             return
         self.minimum_candidate_sequence = 0
+        exploration_context = candidate_snapshot.get("exploration_context") or {}
+        if bool(exploration_context.get("startup_scan_failed", False)):
+            detail = dict(exploration_context.get("startup_scan_failure_detail") or {})
+            detail.setdefault("reason", "startup_scan_failed")
+            detail["candidate_sequence"] = candidate_sequence
+            self.goal_complete = True
+            self._publish_goal_status("STARTUP_SCAN_FAILED", detail=detail)
+            self.trace_pub.publish(
+                String(
+                    data=json.dumps(
+                        {
+                            "timestamp": time.time(),
+                            "event": "startup_scan_failed",
+                            "episode_id": candidate_snapshot.get("episode_id", ""),
+                            "detail": detail,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+            )
+            return
         if self.mission_mode == "semantic_interaction_object_goal" and self.target_goal_complete:
             self.goal_complete = True
             return
@@ -836,7 +897,16 @@ class SemanticRuleDecisionNode:
             eligible,
             pending_post_interaction_traversal_id,
         )
-        selected = priority_target or priority_post_interaction_traversal
+        priority_startup_scan = next(
+            (
+                candidate
+                for candidate in eligible
+                if candidate.behavior_type == BEHAVIOR_SCAN
+                and bool((candidate.metadata or {}).get("mandatory_startup_scan"))
+            ),
+            None,
+        )
+        selected = priority_startup_scan or priority_target or priority_post_interaction_traversal
         if selected is None and self.policy_backend != "model":
             selected = self.policy.select(eligible)
         scored = list(eligible)
@@ -881,7 +951,9 @@ class SemanticRuleDecisionNode:
         model_selected_candidate_id = ""
         model_selection_succeeded = False
         selection_override_reason = (
-            "reliable_target_goal_priority"
+            "mandatory_startup_scan"
+            if priority_startup_scan is not None
+            else "reliable_target_goal_priority"
             if priority_target is not None
             else "post_interaction_traversal_priority"
             if priority_post_interaction_traversal is not None
@@ -891,6 +963,7 @@ class SemanticRuleDecisionNode:
             self.policy_backend == "model"
             and not model_circuit_open
             and model_candidates
+            and priority_startup_scan is None
             and priority_target is None
             and priority_post_interaction_traversal is None
         ):
@@ -949,6 +1022,12 @@ class SemanticRuleDecisionNode:
                 self.model_circuit_breaker.record_success()
             elif self.model_policy.last_error:
                 self.model_circuit_breaker.record_failure(self.model_policy.last_error, now)
+        elif priority_startup_scan is not None:
+            self.model_policy.last_error = ""
+            self.model_policy.last_result_source = "mandatory_startup_scan"
+            self.model_policy.last_reason = "Complete the mandatory initial 360-degree observation scan."
+            self.model_policy.last_confidence = "high"
+            self.model_policy.last_metrics = {}
         elif priority_target is not None:
             self.model_policy.last_error = ""
             self.model_policy.last_result_source = "rule_priority_target"
@@ -977,6 +1056,7 @@ class SemanticRuleDecisionNode:
             self.model_policy.last_metrics = {}
         if (
             not model_selection_succeeded
+            and priority_startup_scan is None
             and priority_target is None
             and priority_post_interaction_traversal is None
         ):

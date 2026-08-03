@@ -1,6 +1,6 @@
 # 交互导航开发测试手册
 
-最后更新：2026-07-26
+最后更新：2026-08-03
 
 ## 1. 文档定位
 
@@ -469,14 +469,16 @@ python scripts/InteractiveNav/run_nav_ros_sim.py \
   --house_ind 1 \
   --target_types Apple \
   --task_horizon 3000 \
-  --policy_dt_ms 100 \
+  --policy_dt_ms 200 \
   --ctrl_dt_ms 2 \
   --action_timeout_s 0 \
   --require_fresh_cmd_vel true \
   --require_move_base_active_for_cmd_vel true
 ```
 
-`action_timeout_s=0` 表示仿真阻塞等待当前观测之后产生的新 ROS 动作；等待期间会周期性重发当前观测，因此 ROS 启动和首个规划阶段不会推进空动作 step。每次 `task.step()` 固定推进 `100ms` 仿真时间，不按墙钟 10Hz sleep。
+`action_timeout_s=0` 表示仿真阻塞等待当前观测之后产生的新 ROS 动作；等待期间会周期性重发当前观测，因此 ROS 启动和首个规划阶段不会推进空动作 step。每次 `task.step()` 固定推进 `policy_dt_ms` 指定的仿真时间（上例为 `200ms`，即 5Hz），不按墙钟 sleep；`ctrl_dt_ms` 只控制单个 policy step 内的低层控制更新频率。
+
+对于 `/cmd_vel_stamped`，bridge 用当前 Twist 和 `policy_dt_ms` 生成下一个 base **位置目标**（平移/转角均按 `v × dt`）；RBY1 的 position-PD 跟踪仍可能留下物理残差，所以实际位移必须以录制的 pose/trajectory 为准，不能承诺严格等于 `v × dt`。墙钟等待不会延长单个仿真 step，但标准 `move_base` 的 latest-Twist 会在 step 边界采样，ROS 调度不同仍可能改变被选中的命令和实际轨迹。
 
 ## 5.2 带 timing 日志的仿真测试
 
@@ -618,16 +620,9 @@ python scripts/InteractiveNav/run_parallel_ros_episodes.py \
 worker_NNN/debug/
 ```
 
-主要产物包括：
+该通用入口的产物取决于 `--recorder-extra-args` 与 recorder 模式；常见文件包括 `summary.json`、`final_map_trajectory.png` 和 `recorder.log`。不要假设每次都会生成 `first_person.mp4` 或 `composite_frames/`；当前语义交互主线使用下一节的 PNG+JSON 离线流程。
 
-- `videos/composite_frames/`：第一视角、地图、规划与状态组成的逐帧四宫格PNG
-- `videos/first_person.mp4`：包含地图四宫格的H264视频
-- `videos/external_camera.mp4`：外部相机视频
-- `summary.json`：轨迹、命令、规划、视频和停滞统计
-- `final_map_trajectory.png`：最终地图与探索轨迹
-- `recorder.log`：独立recorder日志
-
-`--recorder-extra-args` 可继续传递 `record_explore_debug.py` 参数。调度器结束仿真后会先给recorder最多120秒完成异步写盘与视频编码，再关闭ROS Master。
+`--recorder-extra-args` 可继续传递 `record_explore_debug.py` 参数。调度器结束仿真后会先等待 recorder 排空异步写盘，再关闭 ROS Master；是否编码 MP4 由 recorder 的 `--runtime-video-encode` / `--offline-video-only` 显式决定。
 
 ## 5.3.2 语义交互导航与并行批测
 
@@ -650,6 +645,44 @@ run_nav_ros_sim.py
 → move_base navigation / force interaction
 → interaction_result updates graph
 ```
+
+### 5.3.2.0 当前 step 同步、OCC readiness 与录像契约
+
+`run_house7_semantic_exploration_ros_test.zsh` 及其批处理入口默认采用按 simulator step 对齐的运行方式。一个 step 的关键顺序是：
+
+1. Bridge 以同一个 stamp 发布 odom/TF、RGB、depth/pointcloud 与可选 realtime-GT。
+2. Bridge 等待 `/semantic_decision/step_ready`，再打开本 step 的 `/molmo_spaces/fresh_cmd_gate`，只接收该观察之后到达的动作。
+3. 动作执行后发布 `/molmo_spaces/step_sync`；recorder 接收该标记、提交本 step 的原始快照，并通过 `/molmo_spaces/step_capture_ack` 允许仿真进入下一 step。
+
+`step_ready` 当前聚合 `semantic_mapping` 与 `explore_py` 的 ready 消息；聚合 step/stamp 取所需模块的最小值。它保证当前 OCC 已通过这两个必要模块的接收路径，**不等价于** room worker、完整 graph 或决策已经完成。封装脚本默认设置 `MAP_WARMUP_SKIP_FRAMES=0`、`STEP_READY_WARMUP_SKIP_FRAMES=0`、启用 ready/capture-ack barrier，常规 timeout 为 `2s`，首次 map bootstrap 默认 `10s`。直接调用 `run_nav_ros_sim.py` 时，barrier 默认关闭，必须显式传参才能得到同样的契约。
+
+运行时 recorder 只保存可重放源数据，不在线合成 panel 或编码 MP4：
+
+- `sim_step_frames/manifest.jsonl` 与逐 step 相机 PNG；
+- `debug/raw/step_boundaries.jsonl`：step、位姿、轨迹、plan、语义选择/执行状态、TF 与每类地图 receipt；
+- `debug/raw/map_manifest.jsonl` 和 `debug/raw/maps/*.png`：raw/planning OCC、room segmentation、global/local costmap 及 global costmap 增量；
+- `debug/summary.json`：`raw_recording_stats`，含 source/accepted/persisted/drop/failure 计数。
+
+recorder 的 raw writer 默认以有界本地队列和 `block` 溢出策略持久化 PNG+JSON；没有 ROS bag，也不应在回调中编码视频。排空成功后，runner 调用离线构建器，以原始相机帧、step boundary 和地图 receipt 重建原有六面板风格：
+
+```bash
+python scripts/InteractiveNav/build_semantic_video_offline.py \
+  --scene-dir <OUTPUT_DIR> \
+  --debug-dir <OUTPUT_DIR>/debug \
+  --fps 5 \
+  --state-alignment exact \
+  --output-stem overview_6panel
+```
+
+产物为 `videos/overview_6panel.mp4`、`videos/offline_composite_frames/`、`offline_video_summary.json` 和 `offline_render_alignment.jsonl`。验收时要求 sim manifest、raw step boundary 与离线帧数一致，`exact_step_match_count` 等于输出帧数，且 `raw_recording_stats` 无 drop/write failure。`offline_render_alignment.jsonl` 还保留每帧实际选择的 receipt 与 source stamp；如需审计组件时间关系，应检查它和 `component_post_observation_receipt_count`，不要只凭 MP4 目测推断因果顺序。
+
+### 5.3.2.0.1 初始扫描与语义决策的关系
+
+语义控制探索默认 `external_behavior_control=true`，并关闭 ExplorePy 的 legacy `initial_spin_enabled`。启动观测由 `semantic decision -> semantic executor -> bridge` 的必选、不可中断 `SCAN` 接管：map ready 前不发布候选；ready 后只发布稳定的 `SCAN`，成功前绝不放行 `EXPLORE / NAVIGATE / INTERACT`。这不是 MLLM 未返回：`interactive_rule`、`container_exploration` / `semantic_interaction_exploration` 默认是 rule backend，只有 `full_mllm_*` METHOD 才调用 MLLM。
+
+SCAN 按 `step_index` 原子配对 `RGB(N)` 与 fresh-command gate `N`，并只在对应 `step_sync` 确认后消费下一命令。默认目标 `2π`、`1.25 rad/s`、`dt=0.2 s`、逻辑控制时间上限 `15 s`、硬上限 `40 step`；`timeout_s` 只累计已确认的 control step × `dt`，墙钟只检测命令已发出但 step-sync 不再推进的故障，不能因机器负载改变已执行轨迹。2026-08-03 的 100-step smoke 已在 28/40 个确认控制 step、`6.406 rad` 达到 `SCAN SUCCEEDED`，随后进入 `INTERACT` 和 `NAVIGATE`。调试检查 `debug/cmd_vel.csv`、`debug/events.jsonl` 的 `SCAN` feedback 与 `step_gate` 诊断。
+
+`external_behavior_control=true` 下，`INTERACT` 由 semantic behavior executor 直接驱动 `move_base`，不必写入 ExplorePy 的 `current_subgoal` / `active_goal`。视频与离线分析应优先读取 `semantic_selection.goal_xyyaw`、`semantic_execution_state` 与 `move_base` plan，而不是将空的 ExplorePy subgoal 视为决策失败。
 
 ### 5.3.2.1 METHOD 总览
 
@@ -802,7 +835,7 @@ scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge_model_mock.y
 ROS_MASTER_URI=http://127.0.0.1:11311 \
 MAX_STEPS=1000 \
 VIDEO_FPS=5 \
-zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
   outputs/v3_container_episode_1000 1000
 ```
 
@@ -821,7 +854,7 @@ zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
 
 完成后必须检查：
 
-- `debug/videos/overview_6panel.mp4`：ROS 相机、OCC、房间/交互、全局/局部代价图、语义图与拓扑图六联视频。
+- `debug/videos/overview_6panel.mp4`：ROS 相机、OCC、房间/交互、全局/局部代价图、语义图与拓扑图六联视频。该 V3 入口当前仍显式使用 legacy `--runtime-video-encode`；它不等同于上文 raw-only 离线管线，若排查录像完整性应优先迁移/复用 raw-only wrapper，而不是把两种输出目录混用。
 - `eval/episodes/<episode>/episode_topdown.png`：场景底图、真实探索轨迹、起点、GT target、GT/实际交互及 oracle 路径。
 - `eval/episodes/<episode>/episode_result.json`：冻结 V3 的正式评测结果。
 
@@ -844,7 +877,7 @@ PORT=12102
 BENCHMARK=/absolute/path/to/benchmark.json \
 ROS_MASTER_URI=http://127.0.0.1:${PORT} \
 FAST_EVAL=true \
-zsh scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
+bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
   outputs/interactive_nav_v3_fast_${IDX} ${IDX}
 ```
 
@@ -903,7 +936,13 @@ worker 0: House 0, 2, 4, 6, 8
 worker 1: House 1, 3, 5, 7, 9
 ```
 
-批量实验可通过环境变量控制录制。完整六联图实验使用 `ENABLE_RECORDING=true`；只统计成功率、覆盖率和耗时的快速实验使用：
+批量实验可通过环境变量控制录制。完整六联图实验使用 `ENABLE_RECORDING=true`，并由统一 wrapper 进入 `--offline-video-only`：运行期只保存 `sim_step_frames/` 的原始相机 PNG/manifest，以及 `debug/raw/` 下的无损地图 PNG、JSONL metadata 与 step boundary；不会写 `debug/videos/*_frames/`、运行期 composite PNG 或运行期 MP4。每个 step 的 graph、语义候选/选择/执行状态、轨迹和 plan 都写入 step boundary 或普通 debug JSON/CSV，因此之后可替换 renderer 重新构建任意 panel。
+
+runner 会先用 `wait_for_recorder_drain.py` 验证 raw receipt、step boundary 和 sim frame 完整性，再调用离线构建器输出 `videos/overview_6panel.mp4` 与 `videos/offline_composite_frames/`。正确性以 `offline_video_summary.json`（frame count、exact match、codec）和 `offline_render_alignment.jsonl`（每 step 的 receipt 选择）为准；raw 路径不采用 `latest` panel 补帧。要保存全部帧，请保持 raw queue 溢出策略为 `block`，并检查 `debug/summary.json.raw_recording_stats` 的 accepted/persisted 计数相等且 drop/write failure 为零。当前六联图默认最多绘制 `SEMANTIC_VIDEO_MAX_OBJECT_NODES=64` 个非房间交互节点；完整图数据仍保存于 debug/语义结果中。
+
+原始 PNG+JSON 已具备重绘任意 panel 的全部输入；当前 raw-only 构建器已验证并支持完整 `overview` 六联图。`--panel` 仍是 legacy 已保存 panel-frame 路径，不能用于没有 `video_frames.csv` 的 raw-only 产物；为避免误导，不要用它验证当前主线。将 raw renderer 扩展为单 panel 导出是后续工作，届时可直接复用相同 raw 数据而无需重跑仿真。
+
+只统计成功率、覆盖率和耗时的快速实验使用：
 
 ```bash
 ENABLE_RECORDING=false \
@@ -1201,7 +1240,7 @@ rosservice call /semantic_mapping/save_graph
 scripts/InteractiveNav/run_semantic_gt_three_scene_test.zsh outputs/semantic_gt_three_scene_10min
 ```
 
-六联图在线以 `1 FPS` 合成关键帧，最终每张关键帧只写入一次并编码为 `15 FPS`。因此 `600s` 测试约产生 `600` 个关键帧，合成视频约 `40s`，即约 `15` 倍加速播放，同时避免 15 Hz 在线绘图阻塞 ROS 与仿真。
+当前推荐的语义交互录像不在线合成六联图。运行时保存每个 simulator step 的原始相机与地图/语义 JSON，结束并完成 recorder drain 后再离线生成六联图；视频时长由 `frame_count / VIDEO_FPS` 决定，而不是运行时的墙钟录制秒数。历史 `run_semantic_gt_three_scene_test.zsh` 仍有 legacy recorder 参数，若继续使用它，须以该脚本生成的 `offline_video_summary.json` 和帧数校验为准，不能再把“1 FPS 在线关键帧合成”当作当前基线。
 
 前期短测可覆盖运行时间和场景：
 

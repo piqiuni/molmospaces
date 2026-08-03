@@ -4,6 +4,7 @@ import json
 import math
 import os
 import threading
+import time
 
 import rospy
 import sensor_msgs.point_cloud2 as pc2
@@ -285,6 +286,7 @@ class SemanticMappingNode:
             queue_size=2,
         )
 
+        self.step_ready_pub = rospy.Publisher("/semantic_decision/ready/semantic_mapping", String, queue_size=32)
         self.object_pub = rospy.Publisher(self.object_map_topic, String, queue_size=1)
         self.marker_pub = rospy.Publisher(self.object_markers_topic, MarkerArray, queue_size=1)
         self.scene_id_pub = rospy.Publisher(self.scene_id_grid_topic, OccupancyGrid, queue_size=1, latch=True)
@@ -785,6 +787,15 @@ class SemanticMappingNode:
         with self.lock:
             publish_bundle = self._collect_publish_bundle_locked()
         self._safe_publish_bundle(publish_bundle)
+        with self.lock:
+            source_grid = self.latest_occupancy_grid
+            ready_payload = {
+                "module": "semantic_mapping", "ready": source_grid is not None,
+                "step_index": int(getattr(getattr(source_grid, "header", None), "seq", -1) if source_grid is not None else -1),
+                "stamp_sec": float(source_grid.header.stamp.to_sec()) if source_grid is not None and source_grid.header.stamp else 0.0,
+                "timestamp": time.time(),
+            }
+        self.step_ready_pub.publish(String(data=json.dumps(ready_payload, separators=(",", ":"))))
 
     def _safe_publish_bundle(self, bundle):
         try:

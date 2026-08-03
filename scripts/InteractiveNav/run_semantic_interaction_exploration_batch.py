@@ -45,6 +45,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-timeout-s", type=float, default=1500.0)
     parser.add_argument("--memory-sample-interval-s", type=float, default=2.0)
     parser.add_argument("--runner", type=Path, default=DEFAULT_RUNNER)
+    parser.add_argument(
+        "--runner-shell",
+        choices=("bash", "zsh"),
+        default="bash",
+        help="Shell used to start --runner; the maintained runner is Bash-compatible.",
+    )
+    parser.add_argument(
+        "--keep-recording-frames",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retain recorder composite frames and snapshots for later offline rebuilds (default: true).",
+    )
+    parser.add_argument(
+        "--no-recording",
+        action="store_true",
+        help="Disable image/video recording for resource-only runs.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--allow-failures", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -264,11 +281,12 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
             "ROUTE_NAV_CONFIG": "",
             "INITIAL_DOOR_STATE": "closed",
             "FORCE_CLOSE_CONTAINERS": "true",
-            "CLEAN_INTERMEDIATE": "true",
+            "CLEAN_INTERMEDIATE": "false" if args.keep_recording_frames else "true",
+            "ENABLE_RECORDING": "false" if args.no_recording else "true",
             "PYTHONUNBUFFERED": "1",
         }
     )
-    command = ["zsh", str(args.runner.resolve()), str(scene_dir), scene_id]
+    command = [args.runner_shell, str(args.runner.resolve()), str(scene_dir), scene_id]
     if args.dry_run:
         return {
             "worker_id": worker_id,
@@ -357,12 +375,22 @@ def write_summary(output_dir: Path, results: list[dict[str, Any]]) -> None:
         values = [float(row[key]) for row in results if row.get(key) is not None]
         return sum(values) / len(values) if values else None
 
+    completed_results = [
+        row
+        for row in results
+        if row.get("exit_code") == 0 and row.get("sim_step_frames") is not None
+    ]
+    successful_scene_count = sum(bool(row.get("overall_success")) for row in results)
+    valid_step_video_count = sum(bool(row.get("valid_step_video")) for row in results)
+    exact_step_video_count = sum(bool(row.get("exact_step_video")) for row in results)
     aggregate = {
         "scene_count": len(results),
-        "completed_scene_count": sum(bool(row.get("overall_success")) for row in results),
+        "completed_scene_count": len(completed_results),
+        "successful_scene_count": successful_scene_count,
+        "valid_step_video_count": valid_step_video_count,
+        "exact_step_video_count": exact_step_video_count,
         "overall_success_rate": (
-            sum(bool(row.get("overall_success")) for row in results) / len(results)
-            if results else 0.0
+            successful_scene_count / len(results) if results else 0.0
         ),
         "target_selected_count": len(selected_results),
         "target_container_interaction_success_rate": (

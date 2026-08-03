@@ -121,3 +121,54 @@ def test_tf_keepalive_republishes_only_cached_pose_transforms() -> None:
         ("odom", tuple(float(value) for value in range(10)), "fresh-stamp"),
         ("lidar", tuple(float(value) for value in range(7)), "fresh-stamp"),
     ]
+
+
+def test_cmd_vel_action_uses_fixed_policy_dt_not_wall_clock() -> None:
+    policy = RosBridgePolicy.__new__(RosBridgePolicy)
+    policy.cmd_vel_linear_gain = 1.0
+    policy.cmd_vel_control_dt_s = 0.2
+    policy._extract_base_pose_from_observation = lambda _observation: np.array(
+        [1.0, 2.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32
+    )
+
+    action = policy._cmd_vel_to_base_action(
+        np.array([0.5, 0.0, 1.25], dtype=np.float32), object()
+    )
+
+    assert action is not None
+    np.testing.assert_allclose(action["base"], [1.1, 2.0, 0.25], atol=1e-6)
+
+
+def test_step_sync_reports_action_source_and_fixed_control_dt() -> None:
+    import json
+
+    published = []
+
+    class Publisher:
+        def publish(self, message):
+            published.append(message)
+
+    class StringMessage:
+        def __init__(self, *, data):
+            self.data = data
+
+    class Stamp:
+        def to_sec(self):
+            return 12.5
+
+    policy = RosBridgePolicy.__new__(RosBridgePolicy)
+    policy._step_sync_pub = Publisher()
+    policy._String = StringMessage
+    policy._step_idx = 7
+    policy.last_action_source = "cmd_vel"
+    policy.cmd_vel_control_dt_s = 0.2
+
+    policy._publish_step_sync(Stamp())
+
+    payload = json.loads(published[0].data)
+    assert payload == {
+        "step_index": 7,
+        "stamp_sec": 12.5,
+        "action_source": "cmd_vel",
+        "cmd_vel_control_dt_s": 0.2,
+    }
