@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -151,6 +152,58 @@ class _SceneStore:
 
     def initialize_from_occupancy_grid(self, grid) -> None:
         self.grids.append(grid)
+
+
+def test_occupancy_callback_coalesces_room_work_without_waiting_for_worker():
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node._room_work_condition = threading.Condition()
+    node._room_work_pending = None
+    node._room_worker_stopping = False
+    node._room_input_revision = 0
+    node._room_epoch = 0
+    node._post_open_planning_refresh_after_stamp_sec = None
+    node._post_open_room_refresh_result = None
+    node.scene_store = _SceneStore()
+    node._timing_counts = {}
+    node._timing_windows = {}
+    node._timing_log_every = 1000
+
+    started = threading.Event()
+    release_first = threading.Event()
+    processed = []
+
+    def process(request):
+        processed.append(request)
+        if len(processed) == 1:
+            started.set()
+            assert release_first.wait(timeout=1.0)
+
+    node._process_room_refresh_request = process
+    worker = threading.Thread(target=node._room_worker_loop, daemon=True)
+    node._room_worker_thread = worker
+    worker.start()
+    try:
+        SemanticMappingNode.occupancy_callback(node, _raw_occupancy(1.0))
+        assert started.wait(timeout=1.0)
+
+        started_at = time.monotonic()
+        SemanticMappingNode.occupancy_callback(node, _raw_occupancy(1.2))
+        assert time.monotonic() - started_at < 0.25
+        with node._room_work_condition:
+            assert node._room_work_pending is not None
+            assert node._room_work_pending["input_revision"] == 2
+
+        release_first.set()
+        deadline = time.monotonic() + 1.0
+        while len(processed) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(processed) == 2
+        assert processed[-1]["input_revision"] == 2
+    finally:
+        release_first.set()
+        SemanticMappingNode._stop_room_worker(node)
+        worker.join(timeout=1.0)
 
 
 class _EpisodeGraphStore:

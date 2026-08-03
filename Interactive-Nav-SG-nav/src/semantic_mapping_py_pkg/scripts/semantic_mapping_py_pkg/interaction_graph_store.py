@@ -4,7 +4,15 @@ import time
 import math
 from collections import defaultdict
 
-from .geometry_utils import grid_index, grid_to_world, normalize_label, world_to_grid
+import numpy as np
+
+from .geometry_utils import (
+    grid_index,
+    grid_origin_yaw,
+    grid_to_world,
+    normalize_label,
+    world_to_grid,
+)
 from .graph_rules import (
     default_interaction_payload,
     distance_xy,
@@ -1078,28 +1086,64 @@ class InteractionGraphStore:
             return
         if geometry_stability_frames is None:
             geometry_stability_frames = self.room_geometry_stability_frames
-        room_points = defaultdict(list)
-        room_conf = defaultdict(list)
+        # This path runs for every accepted room-grid revision. A typical
+        # full-size occupancy grid contains roughly four million cells, so
+        # materialising a Python tuple/list for every labelled cell makes the
+        # graph update both slow and a long critical section in the mapper.
+        # Aggregate the same world-space statistics in NumPy and only retain
+        # per-room scalar statistics in Python.
+        scene_values = np.asarray(scene_data, dtype=np.int64)
+        valid_indices = np.flatnonzero(scene_values >= 0)
+        if valid_indices.size == 0:
+            return
+
         width = int(grid_info.width)
-        for idx, scene_id in enumerate(scene_data):
-            scene_id = int(scene_id)
-            if scene_id < 0:
-                continue
-            mx = idx % width
-            my = idx // width
-            wx, wy = grid_to_world(mx, my, grid_info)
-            room_points[scene_id].append((wx, wy))
-            if idx < len(confidence_data):
-                room_conf[scene_id].append(float(confidence_data[idx]))
-        for room_id, points in room_points.items():
-            room_id = self._resolve_room_id(room_id)
+        resolution = float(grid_info.resolution)
+        if resolution <= 0.0:
+            raise ValueError("OccupancyGrid resolution must be positive")
+
+        raw_room_ids, raw_inverse = np.unique(
+            scene_values[valid_indices], return_inverse=True
+        )
+        resolved_by_raw_room_id = np.asarray(
+            [self._resolve_room_id(room_id) for room_id in raw_room_ids],
+            dtype=np.int64,
+        )
+        resolved_per_cell = resolved_by_raw_room_id[raw_inverse]
+        room_ids, room_inverse = np.unique(resolved_per_cell, return_inverse=True)
+
+        mx = (valid_indices % width).astype(np.float64) + 0.5
+        my = (valid_indices // width).astype(np.float64) + 0.5
+        local_x = mx * resolution
+        local_y = my * resolution
+        yaw = grid_origin_yaw(grid_info)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        origin = grid_info.origin.position
+        world_x = float(origin.x) + cos_yaw * local_x - sin_yaw * local_y
+        world_y = float(origin.y) + sin_yaw * local_x + cos_yaw * local_y
+
+        # Preserve the legacy behaviour for malformed/truncated confidence
+        # arrays: cells without a corresponding confidence entry are omitted
+        # from the mean instead of being padded with zeros.
+        confidence_values = np.asarray(confidence_data, dtype=np.float64)
+        confidence_available = valid_indices < confidence_values.size
+
+        for room_index, raw_room_id in enumerate(room_ids):
+            room_id = int(raw_room_id)
+            member_mask = room_inverse == room_index
+            xs = world_x[member_mask]
+            ys = world_y[member_mask]
+            cell_count = int(member_mask.sum())
             node = self._ensure_room_node(room_id)
-            xs = [point[0] for point in points]
-            ys = [point[1] for point in points]
-            center = [sum(xs) / len(xs), sum(ys) / len(ys), 0.5 * self.room_box_height]
+            center = [
+                float(xs.mean()),
+                float(ys.mean()),
+                0.5 * self.room_box_height,
+            ]
             size = [
-                max(float(grid_info.resolution), max(xs) - min(xs)),
-                max(float(grid_info.resolution), max(ys) - min(ys)),
+                max(resolution, float(xs.max() - xs.min())),
+                max(resolution, float(ys.max() - ys.min())),
                 self.room_box_height,
             ]
             stable_geometry = self._accept_room_geometry(
@@ -1110,8 +1154,15 @@ class InteractionGraphStore:
                 node.centroid = stable_center
                 node.aabb_center = stable_center
                 node.aabb_size = stable_size
-            node.confidence = max(node.confidence, sum(room_conf[room_id]) / max(len(room_conf[room_id]), 1) / 100.0)
-            node.attributes["cell_count"] = len(points)
+            room_confidence_mask = member_mask & confidence_available
+            if np.any(room_confidence_mask):
+                confidence = float(
+                    confidence_values[valid_indices[room_confidence_mask]].mean()
+                )
+            else:
+                confidence = 0.0
+            node.confidence = max(node.confidence, confidence / 100.0)
+            node.attributes["cell_count"] = cell_count
             node.attributes["active"] = True
 
     def _accept_room_geometry(self, room_id, center, size, stability_frames):

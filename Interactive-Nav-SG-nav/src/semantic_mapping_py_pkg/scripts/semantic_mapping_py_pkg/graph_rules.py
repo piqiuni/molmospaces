@@ -46,6 +46,8 @@ OPENABLE_CONTAINER_LABELS = CONTAINER_LABELS - {"box", "storage_bin"}
 HINGE_NAMES = {"hinge", "mjjnthinge"}
 SLIDE_NAMES = {"slide", "mjJNT_SLIDE", "mjjntslide"}
 
+BOX_ONLY_PERCEPTION_CONTRACT = "exact_2d_3d_boxes_only"
+
 
 def sanitize_token(value: str) -> str:
     text = normalize_label(value)
