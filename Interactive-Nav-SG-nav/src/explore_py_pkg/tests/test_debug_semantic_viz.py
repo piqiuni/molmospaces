@@ -95,6 +95,30 @@ def test_latest_state_change_and_color():
     assert interaction_state_color("closed") == (55, 70, 225)
 
 
+def test_static_open_and_blocked_portals_have_distinct_visual_states():
+    static_open_color = interaction_state_color("static_open")
+    blocked_color = interaction_state_color("blocked")
+
+    assert static_open_color == (195, 175, 35)
+    assert blocked_color == (175, 45, 185)
+    assert static_open_color not in {
+        interaction_state_color("open"),
+        interaction_state_color("closed"),
+        interaction_state_color("unknown"),
+    }
+    assert blocked_color not in {
+        interaction_state_color("open"),
+        interaction_state_color("closed"),
+        interaction_state_color("unknown"),
+    }
+    assert topology_node_style(
+        {"type": "portal", "interaction": {"state": "static_open"}}
+    )["border"] == static_open_color
+    assert topology_node_style(
+        {"type": "portal", "interaction": {"state": "blocked"}}
+    )["border"] == blocked_color
+
+
 def test_topology_projection_only_keeps_interaction_hierarchy():
     nodes = {
         "room": {"type": "room"},

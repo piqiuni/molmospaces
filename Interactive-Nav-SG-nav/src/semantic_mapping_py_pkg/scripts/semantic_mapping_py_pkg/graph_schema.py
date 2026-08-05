@@ -33,17 +33,27 @@ class SceneGraphNode:
     graph_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
+        public_label = "portal" if self.type == "portal" else self.label
+        public_name = "portal" if self.type == "portal" else self.name
+        public_attributes = {
+            key: value
+            for key, value in dict(self.attributes).items()
+            if not str(key).startswith("_private_")
+            # A restricted-GT portal has no public source-name field at all;
+            # its opaque instance_id is sufficient for action/result routing.
+            and not (self.type == "portal" and key == "source_object_name")
+        }
         return {
             "id": self.id,
             "type": self.type,
-            "label": self.label,
-            "name": self.name,
+            "label": public_label,
+            "name": public_name,
             "centroid": _as_float_list(self.centroid),
             "aabb_center": _as_float_list(self.aabb_center),
             "aabb_size": _as_float_list(self.aabb_size),
             "parent_id": self.parent_id,
             "room_id": None if self.room_id is None else int(self.room_id),
-            "attributes": dict(self.attributes),
+            "attributes": public_attributes,
             "interaction": dict(self.interaction),
             "confidence": float(self.confidence),
             "observation_count": int(self.observation_count),

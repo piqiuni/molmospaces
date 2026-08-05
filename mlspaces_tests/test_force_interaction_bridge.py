@@ -84,6 +84,48 @@ def test_controller_emits_success_result_and_behavior_feedback(monkeypatch) -> N
     assert published[1]["status"] == "SUCCEEDED"
 
 
+def test_controller_resolves_opaque_portal_id_only_for_simulator_calls(monkeypatch) -> None:
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        object_id_resolver=lambda public_id: {
+            "gt_portal_0001": "private_doorframe_root"
+        }.get(public_id, public_id),
+    )
+    prepare_calls = []
+
+    def prepare(_env, object_id, **_kwargs):
+        prepare_calls.append(object_id)
+        return {"targets": {}, "pre_joint_infos": []}
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.complete_articulation_force",
+        lambda _env, _plan, config: {
+            "pre_state": "closed",
+            "post_state": "open",
+            "success": True,
+            "physics_substeps": 1,
+            "task_steps_consumed": 1,
+        },
+    )
+    monkeypatch.setattr(controller, "_publish", lambda *_args: None)
+
+    assert controller.enqueue_command(
+        {"command_id": "opaque", "object_id": "gt_portal_0001", "action": "open"}
+    )
+    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+    assert controller.before_step(task, step=3) is None
+    result = controller.after_step(task, step=3)
+
+    assert prepare_calls == ["private_doorframe_root"]
+    assert result is not None
+    assert result["object_id"] == "gt_portal_0001"
+    assert "doorframe" not in str(result).casefold()
+
+
 def test_controller_deduplicates_command_ids() -> None:
     controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
     command = {
@@ -131,6 +173,7 @@ def test_non_articulated_object_returns_static_failure_without_crashing(
     assert result["reason"] == "non_articulated"
     assert result["interaction_capability"] == "static"
     assert result["interactable"] is False
+    assert result["retryable"] is False
     assert len(published) == 2
     assert published[1]["interaction_result"] == result
 
@@ -686,3 +729,56 @@ def test_drawer_scan_failure_best_effort_closes_and_restores_view(monkeypatch) -
     assert controller._pending is None
     assert controller.should_pause_navigation() is False
     assert len(published) == 2
+
+
+def test_force_target_failure_is_published_as_terminal_blocked(monkeypatch) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    published = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, root_name, **_kwargs: {
+            "group": {"root_body_name": root_name},
+            "targets": {"hinge": 1.0},
+            "selected_joint_names": ["hinge"],
+            "closed_joint_names": [],
+            "pre_joint_infos": [],
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.complete_articulation_force",
+        lambda _env, _plan, config: {
+            "pre_state": "closed",
+            "post_state": "ajar",
+            "success": False,
+            "physics_substeps": 1,
+            "task_steps_consumed": 1,
+        },
+    )
+    monkeypatch.setattr(
+        controller, "_publish", lambda _publisher, payload: published.append(payload)
+    )
+    assert controller.enqueue_command(
+        {
+            "command_id": "blocked_portal",
+            "candidate_id": "portal_blocked",
+            "node_id": "portal_blocked",
+            "node_type": "portal",
+            "object_id": "doorway_blocked",
+            "action": "open",
+        }
+    )
+
+    task = SimpleNamespace(env=SimpleNamespace(current_model=object(), current_data=object()))
+    assert controller.before_step(task, step=7) is None
+    result = controller.after_step(task, step=7)
+
+    assert result is not None
+    assert result["success"] is False
+    assert result["status"] == "FAILED"
+    assert result["state"] == "blocked"
+    assert result["post_state"] == "blocked"
+    assert result["interaction_capability"] == "blocked"
+    assert result["interactable"] is False
+    assert result["failure_reason"] == "force_target_not_reached"
+    assert result["retryable"] is False
+    assert published[1]["interaction_result"] == result

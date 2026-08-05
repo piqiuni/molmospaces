@@ -146,7 +146,8 @@ Initial map dimensions and resolution:
 
 SlamGMapping::SlamGMapping():
   map_to_odom_(tf::Transform(tf::createQuaternionFromRPY( 0, 0, 0 ), tf::Point(0, 0, 0 ))),
-  laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL), transform_thread_(NULL)
+  laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL),
+  organized_depth_scan_filter_sub_(NULL), organized_depth_scan_filter_(NULL), transform_thread_(NULL)
 {
   seed_ = time(NULL);
   init();
@@ -154,7 +155,8 @@ SlamGMapping::SlamGMapping():
 
 SlamGMapping::SlamGMapping(ros::NodeHandle& nh, ros::NodeHandle& pnh):
   map_to_odom_(tf::Transform(tf::createQuaternionFromRPY( 0, 0, 0 ), tf::Point(0, 0, 0 ))),
-  laser_count_(0),node_(nh), private_nh_(pnh), scan_filter_sub_(NULL), scan_filter_(NULL), transform_thread_(NULL)
+  laser_count_(0),node_(nh), private_nh_(pnh), scan_filter_sub_(NULL), scan_filter_(NULL),
+  organized_depth_scan_filter_sub_(NULL), organized_depth_scan_filter_(NULL), transform_thread_(NULL)
 {
   seed_ = time(NULL);
   init();
@@ -162,7 +164,8 @@ SlamGMapping::SlamGMapping(ros::NodeHandle& nh, ros::NodeHandle& pnh):
 
 SlamGMapping::SlamGMapping(long unsigned int seed, long unsigned int max_duration_buffer):
   map_to_odom_(tf::Transform(tf::createQuaternionFromRPY( 0, 0, 0 ), tf::Point(0, 0, 0 ))),
-  laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL), transform_thread_(NULL),
+  laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL),
+  organized_depth_scan_filter_sub_(NULL), organized_depth_scan_filter_(NULL), transform_thread_(NULL),
   seed_(seed), tf_(ros::Duration(1.0)) // 减少TF缓存时间到1秒，避免占用过多内存
 {
   init();
@@ -208,6 +211,14 @@ void SlamGMapping::init()
     scan_filter_queue_size_ = 1;
   if (scan_filter_queue_size_ < 1)
     scan_filter_queue_size_ = 1;
+  private_nh_.param("mapping_scan_source", mapping_scan_source_, std::string("pointcloud"));
+  private_nh_.param("mapping_scan_topic", mapping_scan_topic_,
+                    std::string("/molmo_spaces/organized_depth_scan"));
+  if (mapping_scan_source_ != "pointcloud" && mapping_scan_source_ != "organized_depth")
+  {
+    ROS_WARN("Unknown mapping_scan_source='%s'; falling back to pointcloud", mapping_scan_source_.c_str());
+    mapping_scan_source_ = "pointcloud";
+  }
 
   private_nh_.param("transform_publish_period", transform_publish_period_, 0.05);
 
@@ -289,24 +300,30 @@ void SlamGMapping::init()
   if(!private_nh_.getParam("filter_height_frame", filter_height_frame_))
     filter_height_frame_ = base_frame_;
   private_nh_.param("pointcloud_scan_range_max", pointcloud_scan_range_max_, 8.0);
-  private_nh_.param("pointcloud_scan_angle_increment_deg", pointcloud_scan_angle_increment_deg_, 1.0);
+  private_nh_.param("pointcloud_scan_angle_increment_deg", pointcloud_scan_angle_increment_deg_, 0.5);
   private_nh_.param("pointcloud_scan_height_min", pointcloud_scan_height_min_, 0.05);
   private_nh_.param("pointcloud_scan_height_max", pointcloud_scan_height_max_, 1.10);
   private_nh_.param("pointcloud_scan_min_points_per_beam", pointcloud_scan_min_points_per_beam_, 3);
+  private_nh_.param("pointcloud_scan_cluster_min_points", pointcloud_scan_cluster_min_points_, 6);
+  private_nh_.param("pointcloud_scan_cluster_gap_abs_m", pointcloud_scan_cluster_gap_abs_m_, 0.08);
+  private_nh_.param("pointcloud_scan_cluster_gap_rel", pointcloud_scan_cluster_gap_rel_, 0.02);
+  private_nh_.param("pointcloud_scan_cluster_quantile", pointcloud_scan_cluster_quantile_, 0.25);
   private_nh_.param("pointcloud_scan_support_bins", pointcloud_scan_support_bins_, 2);
   private_nh_.param("pointcloud_scan_min_support_neighbors", pointcloud_scan_min_support_neighbors_, 1);
-  private_nh_.param("pointcloud_scan_support_range_tolerance", pointcloud_scan_support_range_tolerance_, 0.40);
-  private_nh_.param("pointcloud_scan_neighbor_bins", pointcloud_scan_neighbor_bins_, 1);
-  private_nh_.param("pointcloud_scan_max_range_jump", pointcloud_scan_max_range_jump_, 0.75);
+  private_nh_.param("pointcloud_scan_support_tolerance_abs_m", pointcloud_scan_support_tolerance_abs_m_, 0.10);
+  private_nh_.param("pointcloud_scan_support_tolerance_rel", pointcloud_scan_support_tolerance_rel_, 0.03);
   pointcloud_scan_range_max_ = std::max(1.0, pointcloud_scan_range_max_);
   pointcloud_scan_angle_increment_deg_ = std::max(0.1, pointcloud_scan_angle_increment_deg_);
   pointcloud_scan_height_max_ = std::max(pointcloud_scan_height_min_, pointcloud_scan_height_max_);
   pointcloud_scan_min_points_per_beam_ = std::max(1, pointcloud_scan_min_points_per_beam_);
+  pointcloud_scan_cluster_min_points_ = std::max(1, pointcloud_scan_cluster_min_points_);
+  pointcloud_scan_cluster_gap_abs_m_ = std::max(0.0, pointcloud_scan_cluster_gap_abs_m_);
+  pointcloud_scan_cluster_gap_rel_ = std::max(0.0, pointcloud_scan_cluster_gap_rel_);
+  pointcloud_scan_cluster_quantile_ = std::max(0.0, std::min(1.0, pointcloud_scan_cluster_quantile_));
   pointcloud_scan_support_bins_ = std::max(0, pointcloud_scan_support_bins_);
   pointcloud_scan_min_support_neighbors_ = std::max(0, pointcloud_scan_min_support_neighbors_);
-  pointcloud_scan_support_range_tolerance_ = std::max(0.0, pointcloud_scan_support_range_tolerance_);
-  pointcloud_scan_neighbor_bins_ = std::max(0, pointcloud_scan_neighbor_bins_);
-  pointcloud_scan_max_range_jump_ = std::max(0.0, pointcloud_scan_max_range_jump_);
+  pointcloud_scan_support_tolerance_abs_m_ = std::max(0.0, pointcloud_scan_support_tolerance_abs_m_);
+  pointcloud_scan_support_tolerance_rel_ = std::max(0.0, pointcloud_scan_support_tolerance_rel_);
   
   // 障碍物膨胀参数
   if(!private_nh_.getParam("enable_obstacle_inflation", enable_obstacle_inflation_))
@@ -377,10 +394,24 @@ void SlamGMapping::startLiveSlam()
       *scan_filter_sub_, tf_, odom_frame_, scan_filter_queue_size_);
   scan_filter_->setTolerance(ros::Duration(0.03));
   scan_filter_->registerCallback([this](auto msg){ pointCloudCallback(msg); });
+  if (mapping_scan_source_ == "organized_depth")
+  {
+    organized_depth_scan_filter_sub_ = new message_filters::Subscriber<sensor_msgs::LaserScan>(
+        node_, mapping_scan_topic_, scan_filter_queue_size_);
+    organized_depth_scan_filter_ = new tf::MessageFilter<sensor_msgs::LaserScan>(
+        *organized_depth_scan_filter_sub_, tf_, odom_frame_, scan_filter_queue_size_);
+    organized_depth_scan_filter_->setTolerance(ros::Duration(0.03));
+    organized_depth_scan_filter_->registerCallback(
+        [this](const sensor_msgs::LaserScan::ConstPtr& msg) { laserCallback(msg); });
+  }
 
   transform_thread_ = new boost::thread(boost::bind(&SlamGMapping::publishLoop, this, transform_publish_period_));
   ROS_INFO("SLAM GMapping started. Waiting for TF and scan data...");
-  ROS_INFO("Subscribed to topic: /registered_scan (PointCloud2)");
+  ROS_INFO("Subscribed to topic: /registered_scan (PointCloud2) for filtered cloud/local costmap");
+  if (mapping_scan_source_ == "organized_depth")
+    ROS_INFO("Global mapping scan source: organized_depth (%s)", mapping_scan_topic_.c_str());
+  else
+    ROS_INFO("Global mapping scan source: pointcloud (/registered_scan)");
   ROS_INFO("Target odom frame: %s", odom_frame_.c_str());
   ROS_INFO("Subscribed to odom topic: %s", odom_topic_.c_str());
   ROS_INFO("Scan filter queue size: %d", scan_filter_queue_size_);
@@ -526,6 +557,10 @@ SlamGMapping::~SlamGMapping()
     delete scan_filter_;
   if (scan_filter_sub_)
     delete scan_filter_sub_;
+  if (organized_depth_scan_filter_)
+    delete organized_depth_scan_filter_;
+  if (organized_depth_scan_filter_sub_)
+    delete organized_depth_scan_filter_sub_;
 }
 
 bool
@@ -832,15 +867,17 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
     }
   }
 
-  laser_count_++;
-  if ((laser_count_ % throttle_scans_) != 0)
-    return;
+  const bool map_from_pointcloud = mapping_scan_source_ == "pointcloud";
+  if (map_from_pointcloud)
+  {
+    laser_count_++;
+    if ((laser_count_ % throttle_scans_) != 0)
+      return;
+    if(laser_count_ % 50 == 0)  // 每50帧输出一次
+      ROS_INFO("Received point cloud data, processed %d scans so far", laser_count_ / throttle_scans_);
+  }
 
   static ros::Time last_map_update(0,0);
-  
-  // 输出调试信息：接收到点云数据
-  if(laser_count_ % 50 == 0)  // 每50帧输出一次
-    ROS_INFO("Received point cloud data, processed %d scans so far", laser_count_ / throttle_scans_);
 
   // 创建点云副本用于滤波（避免修改原始消息）
   sensor_msgs::PointCloud2 filtered_cloud = *cloud;
@@ -862,6 +899,11 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
   {
     filtered_cloud_pub_.publish(filtered_cloud);
   }
+
+  // In organized-depth mode PointCloud2 remains the local-costmap input, but
+  // only the base-frame LaserScan is allowed to update global GMapping.
+  if (!map_from_pointcloud)
+    return;
 
   // Convert PointCloud2 to LaserScan
   sensor_msgs::LaserScan scan;
@@ -941,6 +983,35 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
 void
 SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
 {
+  if (mapping_scan_source_ != "organized_depth")
+    return;
+
+  if (enable_time_sync_guard_)
+  {
+    const ros::Time now = ros::Time::now();
+    if (!scan->header.stamp.isZero())
+    {
+      const double scan_age_sec = (now - scan->header.stamp).toSec();
+      if (scan_age_sec > max_cloud_age_sec_ && enforce_cloud_age_drop_)
+      {
+        ROS_WARN_THROTTLE(
+            2.0,
+            "Drop stale organized depth scan: age=%.3fs exceeds max_cloud_age_sec=%.3fs",
+            scan_age_sec, max_cloud_age_sec_);
+        return;
+      }
+    }
+    double odom_dt_sec = 0.0;
+    if (!hasMatchedOdomStamp(scan->header.stamp, &odom_dt_sec))
+    {
+      ROS_WARN_THROTTLE(
+          2.0,
+          "Drop unsynced organized depth scan: nearest odom dt=%.4fs exceeds threshold=%.4fs",
+          odom_dt_sec, max_odom_cloud_time_diff_);
+      return;
+    }
+  }
+
   laser_count_++;
   if ((laser_count_ % throttle_scans_) != 0)
     return;
@@ -1133,8 +1204,14 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan)
     inflateObstacles(map_.map);
   }
 
-  //make sure to set the header information on the map
-  map_.map.header.stamp = ros::Time::now();
+  // Preserve the scan source identity through OCC.  The semantic readiness
+  // barrier uses this exact seq/stamp watermark to prove that a simulator
+  // observation has reached room segmentation and the unified graph; stamping
+  // the map with wall time would make that proof impossible.
+  map_.map.header.seq = scan.header.seq;
+  map_.map.header.stamp = scan.header.stamp.isZero()
+      ? ros::Time::now()
+      : scan.header.stamp;
   map_.map.header.frame_id = tf_.resolve( map_frame_ );
 
   sst_.publish(map_.map);
@@ -1166,139 +1243,178 @@ void SlamGMapping::publishTransform()
 
 bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::ConstPtr& cloud, sensor_msgs::LaserScan& scan)
 {
-  // Set basic scan parameters
+  const ros::WallTime projection_started = ros::WallTime::now();
   scan.header = cloud->header;
   scan.header.frame_id = cloud->header.frame_id;
-  
-  // Project the RGB-D cloud conservatively into a planar scan. A bounded range
-  // and angular edge guard prevent sparse far returns from clearing through a
-  // thin wall or furniture edge.
-  scan.angle_min = -M_PI;
-  scan.angle_max = M_PI;
-  scan.angle_increment = pointcloud_scan_angle_increment_deg_ * M_PI / 180.0;
+
+  // Build a circular set of bin centres. Unlike the former `2*pi/inc + 1`
+  // calculation, this has no duplicate +/-pi beam.
+  const double requested_increment =
+      pointcloud_scan_angle_increment_deg_ * M_PI / 180.0;
+  const int num_beams = std::max(
+      1, static_cast<int>(std::lround((2.0 * M_PI) / requested_increment)));
+  scan.angle_increment = (2.0 * M_PI) / static_cast<double>(num_beams);
+  scan.angle_min = -M_PI + 0.5 * scan.angle_increment;
+  scan.angle_max = scan.angle_min +
+                   static_cast<double>(num_beams - 1) * scan.angle_increment;
   scan.time_increment = 0.0;
-  scan.scan_time = 0.1; // 10 Hz
+  scan.scan_time = 0.1;
   scan.range_min = 0.1;
   scan.range_max = pointcloud_scan_range_max_;
-  
-  // Calculate number of beams
-  int num_beams = (scan.angle_max - scan.angle_min) / scan.angle_increment + 1;
-  scan.ranges.resize(num_beams);
-  scan.intensities.resize(num_beams);
-  std::vector<unsigned int> beam_point_counts(num_beams, 0);
-  
-  // Keep provisional bins at max range while collecting the closest point.
-  // Unsupported bins are converted to NaN below so GMapping ignores them;
-  // they must not be interpreted as free space out to range_max.
-  std::fill(scan.ranges.begin(), scan.ranges.end(), scan.range_max);
-  std::fill(scan.intensities.begin(), scan.intensities.end(), 0.0);
-  
-  // Convert point cloud to laser scan
+  scan.ranges.assign(num_beams, std::numeric_limits<float>::quiet_NaN());
+  scan.intensities.assign(num_beams, 0.0f);
+
+  std::vector<std::vector<float> > beam_ranges(
+      static_cast<size_t>(num_beams));
+  size_t finite_points = 0;
+  size_t planar_points = 0;
+
   sensor_msgs::PointCloud2ConstIterator<float> iter_x(*cloud, "x");
   sensor_msgs::PointCloud2ConstIterator<float> iter_y(*cloud, "y");
   sensor_msgs::PointCloud2ConstIterator<float> iter_z(*cloud, "z");
-  
   for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z)
   {
-    // Skip invalid points
-    if (std::isnan(*iter_x) || std::isnan(*iter_y) || std::isnan(*iter_z))
+    if (!std::isfinite(*iter_x) || !std::isfinite(*iter_y) ||
+        !std::isfinite(*iter_z))
+      continue;
+    ++finite_points;
+
+    if (*iter_z < pointcloud_scan_height_min_ ||
+        *iter_z > pointcloud_scan_height_max_)
       continue;
 
-    // OCC represents base traversability. Do not let a return seen through a
-    // high window opening clear the wall footprint in the planar map.
-    if (*iter_z < pointcloud_scan_height_min_ || *iter_z > pointcloud_scan_height_max_)
-      continue;
-      
-    // Calculate range and angle
-    double range = sqrt(*iter_x * *iter_x + *iter_y * *iter_y);
-    double angle = atan2(*iter_y, *iter_x);
-    
-    // Skip points outside range
+    const double range = std::hypot(*iter_x, *iter_y);
     if (range < scan.range_min || range > scan.range_max)
       continue;
-    
-    // Find corresponding beam index
-    int beam_index = (angle - scan.angle_min) / scan.angle_increment;
-    
-    // Clamp beam index to valid range
-    if (beam_index < 0) beam_index = 0;
-    if (beam_index >= num_beams) beam_index = num_beams - 1;
 
-    ++beam_point_counts[beam_index];
-    
-    // Update range if this is closer
-    if (range < scan.ranges[beam_index])
-    {
-      scan.ranges[beam_index] = range;
-    }
+    double angle = std::atan2(*iter_y, *iter_x);
+    // atan2 may return +pi. Keep every return in [-pi, pi) before binning.
+    if (angle >= M_PI)
+      angle -= 2.0 * M_PI;
+    const int beam_index = std::max(
+        0, std::min(num_beams - 1, static_cast<int>(std::floor(
+            (angle + M_PI) / scan.angle_increment))));
+    beam_ranges[static_cast<size_t>(beam_index)].push_back(
+        static_cast<float>(range));
+    ++planar_points;
   }
 
-  std::vector<float> raw_ranges = scan.ranges;
-  std::vector<uint8_t> observed(num_beams, 0);
+  std::vector<float> candidate_ranges(
+      static_cast<size_t>(num_beams), std::numeric_limits<float>::quiet_NaN());
+  std::vector<uint8_t> candidate_observed(static_cast<size_t>(num_beams), 0);
+  size_t rejected_sparse = 0;
+  size_t rejected_near_cluster = 0;
+  size_t candidate_count = 0;
+
+  // Keep the nearest coherent range surface in each bearing. A sparse close
+  // pixel at a depth discontinuity must not authorize a farther background
+  // cluster, and a single close return must not become the beam range either.
   for (int i = 0; i < num_beams; ++i)
   {
-    if (beam_point_counts[i] >= static_cast<unsigned int>(pointcloud_scan_min_points_per_beam_) &&
-        std::isfinite(raw_ranges[i]) && raw_ranges[i] < scan.range_max)
+    std::vector<float>& samples = beam_ranges[static_cast<size_t>(i)];
+    if (samples.size() <
+        static_cast<size_t>(pointcloud_scan_min_points_per_beam_))
     {
-      observed[i] = 1;
+      ++rejected_sparse;
+      continue;
     }
-    else
+    std::sort(samples.begin(), samples.end());
+
+    size_t nearest_cluster_end = 1;
+    while (nearest_cluster_end < samples.size())
     {
-      scan.ranges[i] = std::numeric_limits<float>::quiet_NaN();
+      const float previous = samples[nearest_cluster_end - 1];
+      const float current = samples[nearest_cluster_end];
+      const float cluster_gap = static_cast<float>(std::max(
+          pointcloud_scan_cluster_gap_abs_m_,
+          pointcloud_scan_cluster_gap_rel_ * static_cast<double>(previous)));
+      if (current - previous > cluster_gap)
+        break;
+      ++nearest_cluster_end;
     }
+
+    if (nearest_cluster_end <
+        static_cast<size_t>(pointcloud_scan_cluster_min_points_))
+    {
+      ++rejected_near_cluster;
+      continue;
+    }
+
+    const size_t quantile_offset = std::min(
+        nearest_cluster_end - 1,
+        static_cast<size_t>(std::floor(
+            pointcloud_scan_cluster_quantile_ *
+            static_cast<double>(nearest_cluster_end - 1))));
+    candidate_ranges[static_cast<size_t>(i)] = samples[quantile_offset];
+    candidate_observed[static_cast<size_t>(i)] = 1;
+    ++candidate_count;
   }
 
-  // Reject isolated angular returns. Real surfaces occupy neighboring bearings,
-  // while depth-edge leakage typically appears as a sparse far beam between
-  // nearer wall returns.
-  if (pointcloud_scan_min_support_neighbors_ > 0)
-  {
-    const std::vector<uint8_t> initially_observed = observed;
-    for (int i = 0; i < num_beams; ++i)
-    {
-      if (!initially_observed[i])
-        continue;
-      int support_count = 0;
-      for (int offset = -pointcloud_scan_support_bins_; offset <= pointcloud_scan_support_bins_; ++offset)
-      {
-        if (offset == 0)
-          continue;
-        const int neighbor = i + offset;
-        if (neighbor < 0 || neighbor >= num_beams || !initially_observed[neighbor])
-          continue;
-        if (std::abs(raw_ranges[neighbor] - raw_ranges[i]) <= pointcloud_scan_support_range_tolerance_)
-          ++support_count;
-      }
-      if (support_count < pointcloud_scan_min_support_neighbors_)
-      {
-        observed[i] = 0;
-        scan.ranges[i] = std::numeric_limits<float>::quiet_NaN();
-      }
-    }
-  }
-
-  // At depth discontinuities, a background return can occupy the adjacent
-  // angular bin even though the nearer wall edge should occlude it. Clamp only
-  // large jumps to a supported near neighbor; normal smooth surfaces and real
-  // openings wider than the guard remain unchanged.
+  std::vector<uint8_t> observed(static_cast<size_t>(num_beams), 0);
+  size_t rejected_angular_support = 0;
   for (int i = 0; i < num_beams; ++i)
   {
-    if (!observed[i])
+    if (!candidate_observed[static_cast<size_t>(i)])
       continue;
 
-    float conservative_range = raw_ranges[i];
-    for (int offset = -pointcloud_scan_neighbor_bins_; offset <= pointcloud_scan_neighbor_bins_; ++offset)
+    if (pointcloud_scan_min_support_neighbors_ <= 0 ||
+        pointcloud_scan_support_bins_ <= 0)
     {
-      const int neighbor = i + offset;
-      if (neighbor < 0 || neighbor >= num_beams || !observed[neighbor])
-        continue;
-      if (raw_ranges[neighbor] + pointcloud_scan_max_range_jump_ < conservative_range)
-        conservative_range = raw_ranges[neighbor];
+      observed[static_cast<size_t>(i)] = 1;
+      continue;
     }
-    scan.ranges[i] = conservative_range;
-    scan.intensities[i] = 1.0;
+
+    int support_count = 0;
+    const float candidate_range = candidate_ranges[static_cast<size_t>(i)];
+    for (int offset = 1; offset <= pointcloud_scan_support_bins_; ++offset)
+    {
+      for (int direction = -1; direction <= 1; direction += 2)
+      {
+        const int neighbor =
+            (i + direction * offset + num_beams) % num_beams;
+        if (!candidate_observed[static_cast<size_t>(neighbor)])
+          continue;
+        const float neighbor_range =
+            candidate_ranges[static_cast<size_t>(neighbor)];
+        const float support_tolerance = static_cast<float>(std::max(
+            pointcloud_scan_support_tolerance_abs_m_,
+            pointcloud_scan_support_tolerance_rel_ * static_cast<double>(
+                std::max(candidate_range, neighbor_range))));
+        if (std::fabs(neighbor_range - candidate_range) <= support_tolerance)
+          ++support_count;
+      }
+    }
+
+    if (support_count >= pointcloud_scan_min_support_neighbors_)
+      observed[static_cast<size_t>(i)] = 1;
+    else
+      ++rejected_angular_support;
   }
-  
+
+  size_t accepted_beams = 0;
+  for (int i = 0; i < num_beams; ++i)
+  {
+    if (!observed[static_cast<size_t>(i)])
+      continue;
+    scan.ranges[static_cast<size_t>(i)] =
+        candidate_ranges[static_cast<size_t>(i)];
+    scan.intensities[static_cast<size_t>(i)] = 1.0f;
+    ++accepted_beams;
+  }
+
+  if (laser_count_ % 50 == 0)
+  {
+    const double projection_ms =
+        (ros::WallTime::now() - projection_started).toSec() * 1000.0;
+    ROS_INFO(
+        "PointCloud scan projection source_seq=%u beams=%d finite=%zu planar=%zu "
+        "candidates=%zu accepted=%zu rejected[sparse=%zu near_cluster=%zu "
+        "angular=%zu] elapsed=%.2fms",
+        cloud->header.seq, num_beams, finite_points, planar_points,
+        candidate_count, accepted_beams, rejected_sparse, rejected_near_cluster,
+        rejected_angular_support, projection_ms);
+  }
+
   return true;
 }
 

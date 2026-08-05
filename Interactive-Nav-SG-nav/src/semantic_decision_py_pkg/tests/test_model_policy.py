@@ -51,17 +51,49 @@ def test_compact_graph_keeps_interaction_state() -> None:
                     "centroid": [1.0, 2.0, 0.0],
                     "attributes": {"connected_room_ids": [1, 2]},
                     "interaction": {
-                        "state": "closed",
-                        "requires_interaction": True,
+                        "state": "blocked",
+                        "requires_interaction": False,
                         "traversable": False,
+                        "is_interactable": False,
+                        "capability": "blocked",
+                        "capability_source": "executor_feedback",
+                        "failure_reason": "force_target_not_reached",
                     },
                 }
             ],
             "edges": [],
         }
     )
-    assert graph["nodes"][0]["interaction_state"] == "closed"
+    assert graph["nodes"][0]["interaction_state"] == "blocked"
+    assert graph["nodes"][0]["interaction_capability"] == "blocked"
+    assert graph["nodes"][0]["interaction_failure_reason"] == "force_target_not_reached"
     assert graph["nodes"][0]["connected_room_ids"] == [1, 2]
+
+
+def test_compact_graph_redacts_portal_source_labels_from_mllm_context() -> None:
+    graph = compact_graph(
+        {
+            "nodes": [
+                {
+                    "id": "portal_gt_portal_0001",
+                    "type": "portal",
+                    "label": "doorframe",
+                    "name": "doorway_static_42",
+                    "attributes": {
+                        "source_object_name": "private_doorframe_root",
+                        "instance_id": "gt_portal_0001",
+                    },
+                    "interaction": {"state": "unknown"},
+                }
+            ]
+        }
+    )
+
+    node = graph["nodes"][0]
+    assert node["label"] == node["name"] == "portal"
+    assert "source_object_name" not in node
+    assert "doorframe" not in str(graph).casefold()
+    assert "doorway" not in str(graph).casefold()
 
 
 def test_semantic_graph_keeps_only_rooms_portals_and_containers() -> None:
@@ -103,7 +135,7 @@ def test_semantic_graph_keeps_only_rooms_portals_and_containers() -> None:
         "portals": [
             {
                 "id": "portal_1",
-                "type": "door",
+                "type": "portal",
                 "state": "closed",
                 "interaction_available": True,
                 "connects": ["room_1", "room_2"],
@@ -954,7 +986,7 @@ def test_two_stage_room_object_context_links_apple_to_observed_kitchen_fridge() 
     assert reasoning["observed_portals"] == [
         {
             "id": "portal_kitchen_bedroom",
-            "type": "door",
+            "type": "portal",
             "state": "open",
             "interaction_available": True,
             "connects": ["room_kitchen", "room_bedroom"],
@@ -972,7 +1004,7 @@ def test_room_object_reasoning_context_caps_observed_graph_evidence() -> None:
             for index in range(ROOM_OBJECT_REASONING_MAX_ROOMS + 3)
         ],
         "portals": [
-            {"id": f"portal_{index}", "type": "door", "connects": []}
+            {"id": f"portal_{index}", "type": "portal", "connects": []}
             for index in range(ROOM_OBJECT_REASONING_MAX_PORTALS + 3)
         ],
         "containers": [

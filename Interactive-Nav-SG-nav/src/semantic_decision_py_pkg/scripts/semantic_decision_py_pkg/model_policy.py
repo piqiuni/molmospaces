@@ -165,21 +165,30 @@ def compact_graph(graph: dict[str, Any], max_nodes: int = 80, max_edges: int = 1
     for node in list(graph.get("nodes") or [])[: max(0, int(max_nodes))]:
         attributes = node.get("attributes") or {}
         interaction = node.get("interaction") or {}
+        node_type = str(node.get("type") or "")
+        # Keep a portal's public class, never its simulator/asset label.  This
+        # remains a defense-in-depth boundary if an older graph producer
+        # accidentally sends ``doorframe`` or a source-derived name.
+        public_label = "portal" if node_type == "portal" else node.get("label")
+        public_name = "portal" if node_type == "portal" else node.get("name")
         nodes.append(
             {
                 "id": node.get("id"),
-                "type": node.get("type"),
-                "label": node.get("label"),
-                "name": node.get("name"),
+                "type": node_type,
+                "label": public_label,
+                "name": public_name,
                 "centroid": list(node.get("centroid") or [])[:3],
                 "room_id": node.get("room_id"),
                 "is_currently_visible": bool(node.get("is_currently_visible")),
                 "state_age_sec": node.get("state_age_sec", 0.0),
-                "source_object_name": attributes.get("source_object_name"),
                 "connected_room_ids": list(attributes.get("connected_room_ids") or []),
                 "interaction_state": interaction.get("state"),
                 "requires_interaction": interaction.get("requires_interaction"),
                 "traversable": interaction.get("traversable"),
+                "is_interactable": interaction.get("is_interactable"),
+                "interaction_capability": interaction.get("capability"),
+                "interaction_capability_source": interaction.get("capability_source"),
+                "interaction_failure_reason": interaction.get("failure_reason"),
             }
         )
     edges = [
@@ -209,8 +218,16 @@ def _room_node_id(value: Any) -> str:
 
 def _node_interaction(node: dict[str, Any]) -> dict[str, Any]:
     interaction = dict(node.get("interaction") or {})
-    for key in ("state", "requires_interaction", "traversable"):
-        compact_key = f"interaction_{key}" if key == "state" else key
+    compact_keys = {
+        "state": "interaction_state",
+        "requires_interaction": "requires_interaction",
+        "traversable": "traversable",
+        "is_interactable": "is_interactable",
+        "capability": "interaction_capability",
+        "capability_source": "interaction_capability_source",
+        "failure_reason": "interaction_failure_reason",
+    }
+    for key, compact_key in compact_keys.items():
         if key not in interaction and compact_key in node:
             interaction[key] = node.get(compact_key)
     return interaction
@@ -293,7 +310,11 @@ def compact_semantic_graph(
         attributes = node.get("attributes") or {}
         interaction = _node_interaction(node)
         node_id = str(node.get("id") or "")
-        semantic_name = str(node.get("label") or node.get("name") or node_id)
+        semantic_name = (
+            "portal"
+            if node_type == "portal"
+            else str(node.get("label") or node.get("name") or node_id)
+        )
         if node_type == "room":
             inferred_attribute = str(attributes.get("room_attribute") or "").strip()
             inferred_known = bool(
@@ -356,6 +377,12 @@ def compact_semantic_graph(
                 or interaction.get("is_interactable")
             ),
         }
+        capability = str(interaction.get("capability") or "").strip()
+        if capability and capability.casefold() != "unknown":
+            item["capability"] = capability
+        failure_reason = str(interaction.get("failure_reason") or "").strip()
+        if failure_reason:
+            item["failure_reason"] = failure_reason
         if node_type == "portal":
             connected_rooms = node.get("connected_room_ids")
             if connected_rooms is None:

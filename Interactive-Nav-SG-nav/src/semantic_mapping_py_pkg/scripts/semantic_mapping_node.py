@@ -161,6 +161,15 @@ class SemanticMappingNode:
             0.0,
             min(1.0, float(room_mllm_config.get("min_confidence", 0.55))),
         )
+        # When enabled, the mapper readiness stream is a causal watermark,
+        # rather than a heartbeat: the source OCC frame must have completed
+        # room segmentation and the corresponding unified graph publication
+        # before ``ready=true`` is emitted.  Keep the switch configurable so
+        # lightweight detector-only deployments can retain the old heartbeat
+        # contract while the strict smoke test opts in explicitly.
+        self.step_ready_require_room_graph = bool(
+            config.get("step_ready_require_room_graph", False)
+        )
         self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
         self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
         self.graph_min_observations = max(1, int(config.get("graph_min_observations", 1)))
@@ -248,6 +257,12 @@ class SemanticMappingNode:
         self._room_topology_revision = 0
         self._room_epoch = 0
         self._room_last_committed_revision = -1
+        # Causal readiness watermark for the latest room/graph commit.  The
+        # source identity is copied from the raw OCC message (seq + stamp), so
+        # a room result from an older map cannot unlock a newer simulator step.
+        self._room_last_commit = None
+        self._latest_occupancy_received_mono_s = 0.0
+        self._last_causal_ready_source = None
         self._timing_counts = {}
         self._timing_windows = {}
         self._timing_log_every = max(1, int(config.get("timing_log_every", 20)))
@@ -461,6 +476,7 @@ class SemanticMappingNode:
         force_stable=False,
         post_open_result=None,
         reason="occupancy",
+        source=None,
     ):
         """Coalesce a room refresh request without retaining stale grids.
 
@@ -480,6 +496,11 @@ class SemanticMappingNode:
         with condition:
             if self._room_worker_stopping:
                 return False
+            if source is None:
+                with self.lock:
+                    source = self._occupancy_source_identity(
+                        getattr(self, "latest_occupancy_grid", None)
+                    )
             current_revision = int(getattr(self, "_room_input_revision", 0))
             current_topology_revision = int(
                 getattr(self, "_room_topology_revision", 0)
@@ -501,6 +522,11 @@ class SemanticMappingNode:
                 "force_stable": bool(force_stable),
                 "post_open_results": post_open_results,
                 "reasons": reasons,
+                # Keep the source requested by the latest enqueue alongside
+                # the revision.  The worker may coalesce to an even newer raw
+                # grid; it records that transition instead of silently
+                # pretending it processed the old source.
+                "requested_source": dict(source or {}),
             }
             condition.notify()
         return True
@@ -554,6 +580,7 @@ class SemanticMappingNode:
 
         total_t0 = time.perf_counter()
         snapshot_t0 = time.perf_counter()
+        requested_source = dict(request.get("requested_source") or {})
         with self.lock:
             if int(request.get("epoch", -1)) != int(self._room_epoch):
                 return
@@ -561,6 +588,9 @@ class SemanticMappingNode:
             if raw is None:
                 return
             input_revision = int(self._room_input_revision)
+            occupancy_received_mono_s = float(
+                getattr(self, "_latest_occupancy_received_mono_s", 0.0)
+            )
             topology_revision = int(getattr(self, "_room_topology_revision", 0))
             epoch = int(self._room_epoch)
             graph_payload = apply_module1_ablation(
@@ -623,6 +653,7 @@ class SemanticMappingNode:
         commit_lock_t0 = time.perf_counter()
         graph_update_ms = 0.0
         committed = False
+        room_commit = None
         with self.lock:
             commit_lock_wait_ms = (time.perf_counter() - commit_lock_t0) * 1000.0
             # New raw OCC alone does not invalidate a same-geometry topology
@@ -645,6 +676,32 @@ class SemanticMappingNode:
                 )
                 graph_update_ms = (time.perf_counter() - graph_update_t0) * 1000.0
                 self._room_last_committed_revision = input_revision
+                source = self._occupancy_source_identity(raw)
+                try:
+                    graph_revision = int(
+                        getattr(self.graph_store, "graph_revision", -1)
+                    )
+                except (TypeError, ValueError):
+                    graph_revision = -1
+                room_commit = {
+                    "source": dict(source or {}),
+                    "requested_source": requested_source,
+                    "request_source_coalesced": bool(
+                        requested_source
+                        and not self._same_occupancy_source(
+                            requested_source, source
+                        )
+                    ),
+                    "input_revision": input_revision,
+                    "topology_revision": topology_revision,
+                    "epoch": epoch,
+                    "episode_id": str(
+                        getattr(self.graph_store, "episode_id", "") or ""
+                    ),
+                    "graph_revision": graph_revision,
+                    "occupancy_received_mono_s": occupancy_received_mono_s,
+                    "committed_mono_s": time.monotonic(),
+                }
                 committed = True
         commit_ms = (time.perf_counter() - commit_t0) * 1000.0
         total_ms = (time.perf_counter() - total_t0) * 1000.0
@@ -656,8 +713,227 @@ class SemanticMappingNode:
         self._record_component_timing("room_worker_graph_update", graph_update_ms)
         self._record_component_timing("room_worker_commit", commit_ms)
         self._record_component_timing("room_worker_total", total_ms)
+        if room_commit is not None:
+            room_commit["worker_total_ms"] = total_ms
+            room_commit["room_segment_ms"] = segment_ms
+            room_commit["graph_update_ms"] = graph_update_ms
+            with self.lock:
+                # The worker commit itself is the causal hand-off.  Keep a
+                # copy under the mapper lock so the next published bundle can
+                # prove that its raw source and graph revision are paired.
+                if (
+                    int(room_commit["epoch"]) == int(self._room_epoch)
+                    and int(room_commit["topology_revision"])
+                    == int(getattr(self, "_room_topology_revision", 0))
+                ):
+                    self._room_last_commit = dict(room_commit)
         if not committed:
             self._record_component_timing("room_worker_stale_discard", 0.0)
+
+    @staticmethod
+    def _occupancy_source_identity(grid):
+        """Return the stable source identity carried by an OCC-like message.
+
+        GMapping and the semantic products preserve the input header sequence
+        and stamp.  Sequence alone is not sufficient for a few ROS publishers
+        that leave it at zero, so the readiness contract prefers a non-zero
+        timestamp and falls back to the sequence when a timestamp is absent.
+        """
+
+        if grid is None:
+            return None
+        header = getattr(grid, "header", None)
+        if header is None:
+            return None
+        try:
+            step_index = int(getattr(header, "seq", -1))
+        except (TypeError, ValueError):
+            step_index = -1
+        stamp = getattr(header, "stamp", None)
+        try:
+            stamp_sec = float(stamp.to_sec()) if stamp is not None else 0.0
+        except (AttributeError, TypeError, ValueError):
+            stamp_sec = 0.0
+        return {"step_index": step_index, "stamp_sec": stamp_sec}
+
+    @staticmethod
+    def _same_occupancy_source(left, right):
+        """Whether two source identities denote the same raw OCC frame."""
+
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        try:
+            left_stamp = float(left.get("stamp_sec", 0.0) or 0.0)
+            right_stamp = float(right.get("stamp_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            left_stamp = right_stamp = 0.0
+        if left_stamp > 0.0 and right_stamp > 0.0:
+            return abs(left_stamp - right_stamp) <= 1e-6
+        try:
+            left_step = int(left.get("step_index", -1))
+            right_step = int(right.get("step_index", -1))
+        except (TypeError, ValueError):
+            return False
+        return left_step >= 0 and right_step >= 0 and left_step == right_step
+
+    def _semantic_mapping_ready_payload_for_bundle(self, bundle):
+        """Build the mapper readiness watermark for one published bundle.
+
+        The method is deliberately a small interface around the causal
+        bookkeeping.  ``publish_callback`` invokes it *after* the bundle has
+        been sent, so ``unified_graph_ready`` means that the graph associated
+        with the room commit was actually emitted, not merely changed in an
+        in-memory store.
+        """
+
+        bundle = bundle or {}
+        raw = bundle.get("raw_occupancy_grid")
+        raw_identity = self._occupancy_source_identity(raw)
+        room_grid = bundle.get("room_segment_grid")
+        room_commit = bundle.get("room_commit") or {}
+        room_identity = room_commit.get("source")
+        room_grid_identity = self._occupancy_source_identity(room_grid)
+        try:
+            room_commit_epoch = int(room_commit.get("epoch", -1))
+        except (TypeError, ValueError):
+            room_commit_epoch = -1
+        raw_occ_ready = raw_identity is not None
+        room_seg_ready = bool(
+            raw_occ_ready
+            and room_grid is not None
+            and self._same_occupancy_source(raw_identity, room_identity)
+            and self._same_occupancy_source(raw_identity, room_grid_identity)
+            and room_commit_epoch == int(getattr(self, "_room_epoch", 0))
+        )
+        graph_payload = bundle.get("graph_payload") or {}
+        try:
+            graph_revision = int(graph_payload.get("graph_revision", -1))
+        except (TypeError, ValueError):
+            graph_revision = -1
+        try:
+            commit_graph_revision = int(room_commit.get("graph_revision", -1))
+        except (TypeError, ValueError):
+            commit_graph_revision = -1
+        graph_episode = str(graph_payload.get("episode_id") or "")
+        commit_episode = str(room_commit.get("episode_id") or "")
+        unified_graph_ready = bool(
+            room_seg_ready
+            and graph_revision >= commit_graph_revision >= 0
+            and (not commit_episode or graph_episode == commit_episode)
+        )
+        strict_ready = bool(
+            raw_occ_ready and room_seg_ready and unified_graph_ready
+            if getattr(self, "step_ready_require_room_graph", False)
+            else raw_occ_ready
+        )
+        missing = []
+        if not raw_occ_ready:
+            missing.append("occupancy")
+        if getattr(self, "step_ready_require_room_graph", False):
+            if not room_seg_ready:
+                missing.append("room_segmentation")
+            if not unified_graph_ready:
+                missing.append("unified_graph")
+        received_mono = room_commit.get("occupancy_received_mono_s")
+        try:
+            received_mono = float(received_mono)
+            room_latency_ms = (
+                max(0.0, (time.monotonic() - received_mono) * 1000.0)
+                if received_mono > 0.0
+                else None
+            )
+        except (TypeError, ValueError):
+            room_latency_ms = None
+        payload = {
+            "module": "semantic_mapping",
+            "ready": bool(strict_ready),
+            "step_index": int(raw_identity.get("step_index", -1)) if raw_identity else -1,
+            "stamp_sec": float(raw_identity.get("stamp_sec", 0.0)) if raw_identity else 0.0,
+            "raw_occ_ready": bool(raw_occ_ready),
+            "room_segmentation_ready": bool(room_seg_ready),
+            "unified_graph_ready": bool(unified_graph_ready),
+            "causal_contract": (
+                "occ_room_graph_same_source"
+                if getattr(self, "step_ready_require_room_graph", False)
+                else "occ_only"
+            ),
+            "required_after_observation": [
+                "occupancy",
+                "room_segmentation",
+                "unified_graph",
+            ]
+            if getattr(self, "step_ready_require_room_graph", False)
+            else ["occupancy"],
+            "missing_stages": missing,
+            "room_commit_source": dict(room_identity or {}),
+            "unified_graph_room_source": dict(room_identity or {}),
+            "room_requested_source": dict(room_commit.get("requested_source") or {}),
+            "room_request_source_coalesced": bool(
+                room_commit.get("request_source_coalesced", False)
+            ),
+            "occupancy_source": dict(raw_identity or {}),
+            "room_segmentation_source": dict(room_grid_identity or {}),
+            "room_commit_input_revision": room_commit.get("input_revision", -1),
+            "room_commit_graph_revision": commit_graph_revision,
+            "published_graph_revision": graph_revision,
+            "published_graph_capture_step": graph_payload.get("capture_step"),
+            "published_graph_timestamp": graph_payload.get("timestamp"),
+            "room_commit_latency_ms": room_latency_ms,
+            "room_worker_total_ms": room_commit.get("worker_total_ms"),
+            "timestamp": time.time(),
+        }
+        return payload
+
+    def _record_causal_ready_once(self, payload):
+        """Emit one timing/log sample for each strict source watermark."""
+
+        if not (
+            getattr(self, "step_ready_require_room_graph", False)
+            and bool(payload.get("ready"))
+        ):
+            return
+        source = payload.get("occupancy_source") or {}
+        try:
+            source_seq = int(source.get("step_index", -1))
+        except (TypeError, ValueError):
+            source_seq = -1
+        try:
+            source_stamp = float(source.get("stamp_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            source_stamp = 0.0
+        # Header.seq can be regenerated by room/map adapters.  Match the
+        # strict aggregate contract: the nonzero shared stamp is canonical;
+        # sequence is only a fallback and remains telemetry in the log.
+        key = (
+            ("stamp", round(source_stamp, 6))
+            if source_stamp > 0.0
+            else ("seq", source_seq)
+        )
+        lock = getattr(self, "lock", None)
+        if lock is None:
+            return
+        with lock:
+            if key == getattr(self, "_last_causal_ready_source", None):
+                return
+            self._last_causal_ready_source = key
+        latency_ms = payload.get("room_commit_latency_ms")
+        if latency_ms is not None:
+            self._record_component_timing("step_ready_causal_latency", latency_ms)
+        rospy.loginfo(
+            "SemanticMappingCausalReady source_seq=%d source_stamp=%.6f "
+            "room_seq=%s room_stamp=%s graph_revision=%s capture_step=%s "
+            "room_latency_ms=%s worker_total_ms=%s",
+            source_seq,
+            source_stamp,
+            (payload.get("room_segmentation_source") or {}).get("step_index"),
+            (payload.get("room_segmentation_source") or {}).get("stamp_sec"),
+            payload.get("published_graph_revision"),
+            payload.get("published_graph_capture_step"),
+            "%.3f" % float(latency_ms) if latency_ms is not None else "missing",
+            "%.3f" % float(payload["room_worker_total_ms"])
+            if payload.get("room_worker_total_ms") is not None
+            else "missing",
+        )
 
     def _room_segmentation_occupancy_from_snapshot(self, raw, graph_payload):
         if raw is None or not self.room_segment_use_semantic_overlay:
@@ -763,6 +1039,8 @@ class SemanticMappingNode:
                 self.object_store.objects = []
                 self.object_store.next_id = 1
                 self._room_epoch = int(getattr(self, "_room_epoch", 0)) + 1
+                self._room_last_commit = None
+                self._last_causal_ready_source = None
                 self._mark_room_inputs_dirty_locked(structural=True)
             self.graph_store.update_observations(
                 observations,
@@ -975,9 +1253,14 @@ class SemanticMappingNode:
         lock_t0 = time.perf_counter()
         deferred_room_refresh_result = None
         force_stable = False
+        source_identity = self._occupancy_source_identity(msg)
         with self.lock:
             lock_wait_ms = (time.perf_counter() - lock_t0) * 1000.0
             self.latest_occupancy_grid = msg
+            # Capture receipt time next to the raw source pointer.  The room
+            # worker may process a coalesced request later, so a global timing
+            # counter would otherwise report the newer frame's latency.
+            self._latest_occupancy_received_mono_s = time.monotonic()
             self._mark_room_inputs_dirty_locked()
             post_open_t0 = time.perf_counter()
             if self._raw_occupancy_is_after_post_open_refresh_locked(msg):
@@ -1022,6 +1305,7 @@ class SemanticMappingNode:
                 deferred_room_refresh_result if force_stable else None
             ),
             reason="post_open" if deferred_room_refresh_result is not None else "occupancy",
+            source=source_identity,
         )
         room_enqueue_ms = (time.perf_counter() - enqueue_t0) * 1000.0
         total_ms = (time.perf_counter() - callback_t0) * 1000.0
@@ -1214,15 +1498,12 @@ class SemanticMappingNode:
         collect_ms = (time.perf_counter() - collect_t0) * 1000.0
         publish_t0 = time.perf_counter()
         self._safe_publish_bundle(publish_bundle)
-        with self.lock:
-            source_grid = self.latest_occupancy_grid
-            ready_payload = {
-                "module": "semantic_mapping", "ready": source_grid is not None,
-                "step_index": int(getattr(getattr(source_grid, "header", None), "seq", -1) if source_grid is not None else -1),
-                "stamp_sec": float(source_grid.header.stamp.to_sec()) if source_grid is not None and source_grid.header.stamp else 0.0,
-                "timestamp": time.time(),
-            }
+        # Publish readiness only after this exact bundle (including room grid
+        # and unified graph) has been emitted.  In strict mode the payload is a
+        # causal watermark for one raw OCC source, not a periodic heartbeat.
+        ready_payload = self._semantic_mapping_ready_payload_for_bundle(publish_bundle)
         self.step_ready_pub.publish(String(data=json.dumps(ready_payload, separators=(",", ":"))))
+        self._record_causal_ready_once(ready_payload)
         publish_ms = (time.perf_counter() - publish_t0) * 1000.0
         total_ms = (time.perf_counter() - callback_t0) * 1000.0
         self._record_component_timing("publish_lock_wait", lock_wait_ms)
@@ -1395,6 +1676,7 @@ class SemanticMappingNode:
             "scene_revision": scene_revision,
             "publish_scene_grids": publish_scene_grids,
             "room_segment_grid": self.latest_room_segment_grid,
+            "room_commit": dict(getattr(self, "_room_last_commit", None) or {}),
             "graph_payload": graph_payload,
             "raw_occupancy_grid": self.latest_occupancy_grid,
         }
@@ -1561,7 +1843,12 @@ class SemanticMappingNode:
             "scene_conf_grid": scene_conf_grid,
             "scene_revision": snapshot.get("scene_revision"),
             "room_segment_grid": snapshot.get("room_segment_grid"),
+            "room_commit": snapshot.get("room_commit") or {},
             "graph_payload": graph_payload,
+            # Keep the exact raw source in the emitted bundle.  Strict
+            # readiness is evaluated after publishing and must never read a
+            # newer ``latest_occupancy_grid`` by accident.
+            "raw_occupancy_grid": snapshot.get("raw_occupancy_grid"),
             "room_attribute_request": self._build_room_attribute_request_locked(graph_payload),
             "planning_grid": planning_grid,
             "planning_update": planning_update,

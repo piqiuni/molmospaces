@@ -16,7 +16,7 @@ from semantic_decision_py_pkg.behavior_candidates import CandidateGenerator
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
 
 
-def test_minimal_gt_portal_generates_semantic_id_and_geometry_command() -> None:
+def test_minimal_gt_portal_waits_for_visual_or_executor_state_before_interaction() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
         [
@@ -43,9 +43,32 @@ def test_minimal_gt_portal_generates_semantic_id_and_geometry_command() -> None:
         store.as_graph_dict(),
         robot_xy=(0.0, 0.0),
     )
+    assert not any(candidate.behavior_type == "INTERACT" for candidate in candidates)
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    public_id = portal["attributes"]["instance_id"]
+    assert public_id != "double_door_root"
+    assert store.apply_attribute_patch(
+        {
+            "object_id": public_id,
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.9,
+            "source": "mllm_attribute_inference",
+        }
+    )
+    candidates = CandidateGenerator().generate(
+        {"initial_scan_complete": True},
+        store.as_graph_dict(),
+        robot_xy=(0.0, 0.0),
+    )
     interaction = next(candidate for candidate in candidates if candidate.behavior_type == "INTERACT")
     command = interaction.interaction_command or {}
-    assert command["object_id"] == "double_door_root"
+    assert command["object_id"] == public_id
     assert command["action"] == "open"
     assert set(command) == {
         "node_id",
@@ -62,3 +85,4 @@ def test_minimal_gt_portal_generates_semantic_id_and_geometry_command() -> None:
     assert "joint_names" not in command
     assert "close_other_joint_names" not in command
     assert "close_other_joints" not in command
+    assert "door" not in interaction.target_name.casefold()

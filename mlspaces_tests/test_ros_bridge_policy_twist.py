@@ -13,6 +13,12 @@ def test_odom_twist_is_disabled_by_default() -> None:
     assert parameter.default is False
 
 
+def test_pointcloud_defaults_to_full_resolution() -> None:
+    parameter = inspect.signature(RosBridgePolicy.__init__).parameters["pointcloud_stride"]
+
+    assert parameter.default == 1
+
+
 def test_estimate_planar_twist_uses_body_frame() -> None:
     previous = np.array([1.0, 2.0, math.pi / 2.0], dtype=np.float32)
     current = np.array([1.0, 2.2, math.pi / 2.0], dtype=np.float32)
@@ -171,4 +177,39 @@ def test_step_sync_reports_action_source_and_fixed_control_dt() -> None:
         "stamp_sec": 12.5,
         "action_source": "cmd_vel",
         "cmd_vel_control_dt_s": 0.2,
+    }
+
+
+def test_step_ready_trace_keeps_same_source_room_graph_evidence() -> None:
+    evidence = RosBridgePolicy._step_ready_stage_evidence(
+        {
+            "ready": True,
+            "step_index": 9,
+            "stamp_sec": 4.5,
+            "source_alignment_required": True,
+            "source_aligned": True,
+            "source_tuples": {
+                "semantic_mapping": {"step_index": 9, "stamp_sec": 4.5},
+                "explore_py": {"step_index": 9, "stamp_sec": 4.5},
+            },
+            "modules": {
+                "semantic_mapping": {
+                    "causal_contract": "occ_room_graph_same_source",
+                    "raw_occ_ready": True,
+                    "room_segmentation_ready": True,
+                    "unified_graph_ready": True,
+                    "occupancy_source": {"step_index": 9, "stamp_sec": 4.5},
+                    "room_segmentation_source": {"step_index": 9, "stamp_sec": 4.5},
+                    "unified_graph_room_source": {"step_index": 9, "stamp_sec": 4.5},
+                    "published_graph_revision": 17,
+                }
+            },
+        }
+    )
+
+    assert evidence["aggregate"]["source_aligned"]
+    assert evidence["semantic_mapping"]["causal_contract"] == "occ_room_graph_same_source"
+    assert evidence["semantic_mapping"]["unified_graph_room_source"] == {
+        "step_index": 9,
+        "stamp_sec": 4.5,
     }

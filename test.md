@@ -654,7 +654,19 @@ run_nav_ros_sim.py
 2. Bridge 等待 `/semantic_decision/step_ready`，再打开本 step 的 `/molmo_spaces/fresh_cmd_gate`，只接收该观察之后到达的动作。
 3. 动作执行后发布 `/molmo_spaces/step_sync`；recorder 接收该标记、提交本 step 的原始快照，并通过 `/molmo_spaces/step_capture_ack` 允许仿真进入下一 step。
 
-`step_ready` 当前聚合 `semantic_mapping` 与 `explore_py` 的 ready 消息；聚合 step/stamp 取所需模块的最小值。它保证当前 OCC 已通过这两个必要模块的接收路径，**不等价于** room worker、完整 graph 或决策已经完成。封装脚本默认设置 `MAP_WARMUP_SKIP_FRAMES=0`、`STEP_READY_WARMUP_SKIP_FRAMES=0`、启用 ready/capture-ack barrier，常规 timeout 为 `2s`，首次 map bootstrap 默认 `10s`。直接调用 `run_nav_ros_sim.py` 时，barrier 默认关闭，必须显式传参才能得到同样的契约。
+`step_ready` 当前聚合 `semantic_mapping` 与 `explore_py` 的 ready 消息。默认快速契约仍只等待 OCC；需要因果验收时，加载 `readiness_strict_room_graph.yaml`（以及可选的 `readiness_strict_decision.yaml`），要求观测 N 的 OCC 完成 room segmentation、unified graph 更新并完成 ROS 发布后才可 ready。严格聚合以共同的非零 `stamp` 作为 source token（中间点云节点可能重写 `header.seq`；无 stamp 时才回退到 seq），并拒绝 source 不一致；不会用不同模块的最新步号取最小值伪造同一观测。每行 `sim/step_timing.jsonl` 的 `step_ready` 保存 satisfied/timeout、期望 source、三阶段 source 与 graph revision。封装脚本默认设置 `MAP_WARMUP_SKIP_FRAMES=0`、`STEP_READY_WARMUP_SKIP_FRAMES=0`、启用 ready/capture-ack barrier，常规 timeout 为 `2s`，首次 map bootstrap 默认 `10s`；严格 smoke 应将二者提高到至少 `15s`。直接调用 `run_nav_ros_sim.py` 时，barrier 默认关闭，必须显式传参才能得到同样的契约。
+
+严格 smoke 示例（脚本当前为 Bash 入口）：
+
+```bash
+METHOD=interactive_rule TASK_HORIZON=20 \
+SEMANTIC_MAPPING_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/readiness_strict_room_graph.yaml \
+SEMANTIC_DECISION_OVERRIDE=scripts/InteractiveNav/configs/semantic_decision/readiness_strict_decision.yaml \
+STEP_READY_BARRIER_ENABLED=true STEP_READY_TIMEOUT_S=15 \
+STEP_READY_BOOTSTRAP_TIMEOUT_S=15 SKIP_COVERAGE=true \
+bash scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  outputs/readiness_strict_smoke house7_force_route_01
+```
 
 运行时 recorder 只保存可重放源数据，不在线合成 panel 或编码 MP4：
 

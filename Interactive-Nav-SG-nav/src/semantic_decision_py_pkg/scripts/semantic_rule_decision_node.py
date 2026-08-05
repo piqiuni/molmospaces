@@ -61,6 +61,119 @@ import rospy
 from std_msgs.msg import String
 
 
+def aggregate_step_ready_states(
+    required_modules, states, *, require_exact_source: bool = False
+):
+    """Aggregate module watermarks without creating a fake mixed-step token.
+
+    The historical fast contract used the minimum of the latest module steps.
+    That is safe only for OCC-only heartbeats.  A strict mapping watermark
+    declares ``occ_room_graph_same_source`` and requires every participating
+    module to report one canonical raw OCC source: the shared stamp is
+    authoritative when present, otherwise the sequence is used as fallback.
+    """
+
+    required_modules = tuple(required_modules or ())
+    normalized = {
+        str(name): dict((states or {}).get(str(name)) or {})
+        for name in required_modules
+    }
+    step_indexes = []
+    stamps = []
+    source_tuples = {}
+    for name, state in normalized.items():
+        try:
+            step_index = int(state.get("step_index", -1))
+        except (TypeError, ValueError):
+            step_index = -1
+        try:
+            stamp_sec = float(state.get("stamp_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            stamp_sec = 0.0
+        step_indexes.append(step_index)
+        stamps.append(stamp_sec)
+        source_tuples[name] = {
+            "step_index": step_index,
+            "stamp_sec": stamp_sec,
+        }
+    aggregate_step = min(step_indexes) if step_indexes else -1
+    aggregate_stamp = min(stamps) if stamps else 0.0
+    missing = [name for name, state in normalized.items() if not bool(state.get("ready"))]
+    modules_ready = not missing
+    exact_source_required = bool(require_exact_source) or any(
+        str(state.get("causal_contract") or "")
+        == "occ_room_graph_same_source"
+        for state in normalized.values()
+    )
+    mismatched_sources = []
+    source_match_mode = "not_required"
+    source_identity_key = ""
+    source_identities = {}
+    if exact_source_required and modules_ready and required_modules:
+        stamp_sources = [
+            float(source_tuples[name]["stamp_sec"])
+            for name in required_modules
+        ]
+        if all(stamp > 0.0 for stamp in stamp_sources):
+            # ROS intermediate nodes routinely assign their own Header.seq.
+            # The shared observation timestamp survives those hops, so it is
+            # the canonical strict identity whenever present.
+            source_match_mode = "stamp"
+            expected_stamp = stamp_sources[0]
+            source_identity_key = f"stamp:{expected_stamp:.6f}"
+            for name, stamp in zip(required_modules, stamp_sources):
+                source_identities[name] = {
+                    "match_mode": "stamp",
+                    # Preserve the raw value in source_tuples; this canonical
+                    # key uses the first source so values inside the 1e-6
+                    # tolerance report the same matched observation.
+                    "source_identity_key": source_identity_key,
+                }
+                if abs(stamp - expected_stamp) > 1e-6:
+                    mismatched_sources.append(name)
+        elif all(stamp <= 0.0 for stamp in stamp_sources):
+            source_match_mode = "seq"
+            expected_step = source_tuples[required_modules[0]]["step_index"]
+            source_identity_key = f"seq:{expected_step}"
+            for name in required_modules:
+                step = source_tuples[name]["step_index"]
+                source_identities[name] = {
+                    "match_mode": "seq",
+                    "source_identity_key": f"seq:{step}",
+                }
+                if step != expected_step:
+                    mismatched_sources.append(name)
+        else:
+            # A stamp-bearing stream cannot be paired with a sequence-only
+            # stream without fabricating an observation identity.
+            source_match_mode = "mixed_unavailable"
+            mismatched_sources = list(required_modules)
+        if mismatched_sources:
+            # Keep required-module failures separate from a source mismatch so
+            # bridge diagnostics can distinguish "not ready" from "mixed N".
+            missing.append("source_alignment")
+    source_aligned = bool(
+        not exact_source_required or (modules_ready and not mismatched_sources)
+    )
+    ready = aggregate_step >= 0 and not missing
+    return {
+        "ready": bool(ready),
+        "step_index": aggregate_step,
+        "stamp_sec": aggregate_stamp,
+        "required_modules": list(required_modules),
+        "missing_modules": missing,
+        "modules": normalized,
+        "source_alignment_required": bool(exact_source_required),
+        "source_aligned": bool(source_aligned),
+        "source_tuples": source_tuples,
+        "source_match_mode": source_match_mode,
+        "source_identity_key": source_identity_key,
+        "source_identities": source_identities,
+        "source_mismatch_modules": mismatched_sources,
+        "timestamp": time.time(),
+    }
+
+
 class SemanticRuleDecisionNode:
     def __init__(self) -> None:
         env_path = os.environ.get("SEMANTIC_DECISION_ENV_FILE")
@@ -312,6 +425,9 @@ class SemanticRuleDecisionNode:
         self.step_ready_enabled = bool(rospy.get_param("~step_ready_enabled", False))
         self.step_ready_topic = str(rospy.get_param("~step_ready_topic", "/semantic_decision/step_ready"))
         self.step_ready_required_modules = tuple(rospy.get_param("~step_ready_required_modules", ["semantic_mapping", "explore_py"]))
+        self.step_ready_require_exact_source = bool(
+            rospy.get_param("~step_ready_require_exact_source", False)
+        )
         self.step_ready_states: dict[str, dict] = {}
         self.step_ready_pub = rospy.Publisher(self.step_ready_topic, String, queue_size=32, latch=True)
         self.step_ready_subscribers = []
@@ -369,17 +485,11 @@ class SemanticRuleDecisionNode:
             return
         with self.state_lock:
             states = {name: dict(self.step_ready_states.get(name) or {}) for name in self.step_ready_required_modules}
-            step_indexes = [int(state.get("step_index", -1)) for state in states.values()]
-            aggregate_step = min(step_indexes) if step_indexes else -1
-            stamps = [float(state.get("stamp_sec", 0.0) or 0.0) for state in states.values()]
-            aggregate_stamp = min(stamps) if stamps else 0.0
-            missing = [name for name, state in states.items() if not bool(state.get("ready"))]
-            ready = aggregate_step >= 0 and not missing
-            payload = {
-                "ready": ready, "step_index": aggregate_step, "stamp_sec": aggregate_stamp,
-                "required_modules": list(self.step_ready_required_modules),
-                "missing_modules": missing, "modules": states, "timestamp": time.time(),
-            }
+            payload = aggregate_step_ready_states(
+                self.step_ready_required_modules,
+                states,
+                require_exact_source=self.step_ready_require_exact_source,
+            )
         self.step_ready_pub.publish(String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))))
 
     def _candidate_callback(self, message: String) -> None:

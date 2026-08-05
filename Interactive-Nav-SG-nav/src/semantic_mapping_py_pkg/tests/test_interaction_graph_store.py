@@ -1051,7 +1051,7 @@ def test_failed_opaque_open_result_does_not_establish_open_state():
         node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
     )
     assert portal["interaction"]["state"] == "unknown"
-    assert portal["interaction"]["traversable"] is False
+    assert portal["interaction"]["traversable"] is None
     assert portal["interaction"]["requires_interaction"] is True
 
 
@@ -1755,3 +1755,105 @@ def test_configured_interaction_geometry_is_recorded_for_minimal_gt_node() -> No
         3.141593,
     ]
     assert node["attributes"]["interaction_geometry_source"] == "test_calibration"
+
+
+def test_blocked_portal_feedback_persists_and_cannot_be_revived() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="doorway_blocked_1",
+        semantic_name="doorway",
+        is_door=True,
+    )
+    store.update_observations(
+        [doorway], source_mode="realtime_gt_observation", stamp=1.0
+    )
+
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_doorway_blocked_1",
+            "event_id": "blocked_feedback",
+            "action": "open",
+            "success": False,
+            "state": "blocked",
+            "reason": "simulator_constraint",
+            "interaction_capability": "blocked",
+            "interactable": False,
+        },
+        stamp=2.0,
+    )
+    # Neither a later minimal-GT observation nor a delayed MLLM guess can
+    # reactivate a capability already disproved by the executor.
+    store.update_observations(
+        [doorway], source_mode="realtime_gt_observation", stamp=3.0
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "doorway_blocked_1",
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.95,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=4.0,
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=4.0)["nodes"]
+        if node["id"] == "portal_doorway_blocked_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "blocked"
+    assert interaction["capability"] == "blocked"
+    assert interaction["is_interactable"] is False
+    assert interaction["interaction_mode"] == "none"
+    assert interaction["traversable"] is False
+    assert interaction["requires_interaction"] is False
+    assert interaction["failure_reason"] == "simulator_constraint"
+
+
+def test_blocked_mllm_attribute_patch_survives_later_observation() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="doorway_mllm_blocked_1",
+        semantic_name="doorway",
+        is_door=True,
+    )
+    store.update_observations(
+        [doorway], source_mode="realtime_gt_observation", stamp=1.0
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "doorway_mllm_blocked_1",
+            "attribute_status": "ready",
+            "interactable": False,
+            "interaction_class": "portal",
+            "coarse_state": "blocked",
+            "interaction_capability": "blocked",
+            "reason": "visual_no_operable_door_leaf",
+            "confidence": 0.95,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    store.update_observations(
+        [doorway], source_mode="realtime_gt_observation", stamp=3.0
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=3.0)["nodes"]
+        if node["id"] == "portal_doorway_mllm_blocked_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "blocked"
+    assert interaction["capability"] == "blocked"
+    assert interaction["is_interactable"] is False
+    assert interaction["interaction_mode"] == "none"
+    assert interaction["traversable"] is False
+    assert interaction["requires_interaction"] is False
+    assert interaction["failure_reason"] == "visual_no_operable_door_leaf"

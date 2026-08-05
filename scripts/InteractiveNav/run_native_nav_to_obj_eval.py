@@ -225,7 +225,7 @@ class NativeRosBridgePolicy(RosBridgePolicy):
             depth_camera_name="head_camera",
             pointcloud_frame_id="tf_frame_lidar",
             optical_frame_id="head_camera_optical_frame",
-            pointcloud_stride=2,
+            pointcloud_stride=1,
             pointcloud_self_filter_radius_m=0.32,
             odom_topic="/odom",
             publish_odom=True,

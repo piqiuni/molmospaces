@@ -28,6 +28,21 @@ ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.bash}
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11501}
 RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
 TASK_HORIZON=${TASK_HORIZON:-1000}
+POINTCLOUD_STRIDE=${POINTCLOUD_STRIDE:-1}
+MAPPING_SCAN_SOURCE=${MAPPING_SCAN_SOURCE:-pointcloud}
+MAPPING_SCAN_TOPIC=${MAPPING_SCAN_TOPIC:-/molmo_spaces/organized_depth_scan}
+DEPTH_SCAN_ARGS=""
+case "${MAPPING_SCAN_SOURCE}" in
+  pointcloud)
+    ;;
+  organized_depth)
+    DEPTH_SCAN_ARGS="--publish_depth_scan --depth_scan_topic ${MAPPING_SCAN_TOPIC}"
+    ;;
+  *)
+    print -u2 -- "Unsupported MAPPING_SCAN_SOURCE=${MAPPING_SCAN_SOURCE}; expected pointcloud or organized_depth"
+    exit 2
+    ;;
+esac
 VIDEO_FPS=${VIDEO_FPS:-15}
 if [[ -z "${VIDEO_PANEL_WIDTH_PX:-}" ]]; then
   if [[ "${USE_FIXED_ROUTE}" == true ]]; then
@@ -372,6 +387,7 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       --output-dir "${OUTPUT_DIR}/debug" \
       --occupancy-grid-topic /semantic_mapping/planning_occ_map \
       --raw-occupancy-grid-topic "${RAW_OCCUPANCY_GRID_TOPIC}" \
+      --projected-scan-topic "${MAPPING_SCAN_TOPIC}" \
       --first-person-video-capture-mode step \
       --video-step-sync-topic /molmo_spaces/step_sync \
       --step-capture-ack-topic /molmo_spaces/step_capture_ack \
@@ -407,6 +423,7 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       --output-dir "${OUTPUT_DIR}/debug" \
       --occupancy-grid-topic /semantic_mapping/planning_occ_map \
       --raw-occupancy-grid-topic "${RAW_OCCUPANCY_GRID_TOPIC}" \
+      --projected-scan-topic "${MAPPING_SCAN_TOPIC}" \
       --no-first-person-video \
       --no-first-person-video-with-map \
       --no-semantic-video \
@@ -457,12 +474,14 @@ STEP_CAPTURE_ACK_TIMEOUT_S=${STEP_CAPTURE_ACK_TIMEOUT_S:-2.0}
 # At 5 Hz, command collection cannot keep the historical 0.5s wait; 0.2s
 # keeps the bridge cadence aligned with policy_dt_ms while remaining overrideable.
 ACTION_TIMEOUT_S=${ACTION_TIMEOUT_S:-0.2}
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s ${ACTION_TIMEOUT_S} --step_capture_ack_topic /molmo_spaces/step_capture_ack --step_capture_ack_barrier_enabled ${STEP_CAPTURE_ACK_BARRIER_ENABLED} --step_capture_ack_timeout_s ${STEP_CAPTURE_ACK_TIMEOUT_S} --step_ready_barrier_enabled ${STEP_READY_BARRIER_ENABLED} --step_ready_warmup_skip_frames ${STEP_READY_WARMUP_SKIP_FRAMES} --step_ready_timeout_s ${STEP_READY_TIMEOUT_S} --step_ready_bootstrap_timeout_s ${STEP_READY_BOOTSTRAP_TIMEOUT_S} --map_warmup_skip_frames ${MAP_WARMUP_SKIP_FRAMES} ${SIM_CAPTURE_ARGS} ${DEBUG_CAMERA_ARGS} --extra_image_queue_size ${EXTRA_IMAGE_QUEUE_SIZE} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json ${RUNTIME_TARGET_SELECTION_INPUT_ARGS} --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS} --timing_log_every_n_frames ${TIMING_LOG_EVERY_N_STEPS} --sim_timing_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS}"
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s ${ACTION_TIMEOUT_S} --pointcloud_stride ${POINTCLOUD_STRIDE} ${DEPTH_SCAN_ARGS} --step_capture_ack_topic /molmo_spaces/step_capture_ack --step_capture_ack_barrier_enabled ${STEP_CAPTURE_ACK_BARRIER_ENABLED} --step_capture_ack_timeout_s ${STEP_CAPTURE_ACK_TIMEOUT_S} --step_ready_barrier_enabled ${STEP_READY_BARRIER_ENABLED} --step_ready_warmup_skip_frames ${STEP_READY_WARMUP_SKIP_FRAMES} --step_ready_timeout_s ${STEP_READY_TIMEOUT_S} --step_ready_bootstrap_timeout_s ${STEP_READY_BOOTSTRAP_TIMEOUT_S} --map_warmup_skip_frames ${MAP_WARMUP_SKIP_FRAMES} ${SIM_CAPTURE_ARGS} ${DEBUG_CAMERA_ARGS} --extra_image_queue_size ${EXTRA_IMAGE_QUEUE_SIZE} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json ${RUNTIME_TARGET_SELECTION_INPUT_ARGS} --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS} --timing_log_every_n_frames ${TIMING_LOG_EVERY_N_STEPS} --sim_timing_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS}"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
   start_mapping:=true \
   mapping_mode:=odom_locked \
+  mapping_scan_source:="${MAPPING_SCAN_SOURCE}" \
+  mapping_scan_topic:="${MAPPING_SCAN_TOPIC}" \
   start_semantic_mapping:=true \
   semantic_source:=realtime_gt \
   publish_realtime_gt:=true \
@@ -614,7 +633,7 @@ else
 fi
 print -r -- "${ANALYSIS_ELAPSED_SEC}" >"${OUTPUT_DIR}/analysis_elapsed_sec.txt"
 
-python - "${OUTPUT_DIR}" "${METHOD}" "${ROUTE_ID}" "${TASK_HORIZON}" "${HOUSE_IND}" <<'PY'
+python - "${OUTPUT_DIR}" "${METHOD}" "${ROUTE_ID}" "${TASK_HORIZON}" "${HOUSE_IND}" "${POINTCLOUD_STRIDE}" "${MAPPING_SCAN_SOURCE}" <<'PY'
 import json
 import re
 from pathlib import Path
@@ -626,6 +645,8 @@ method = sys.argv[2]
 route_id = sys.argv[3]
 task_horizon = int(sys.argv[4])
 house_ind = int(sys.argv[5])
+pointcloud_stride = int(sys.argv[6])
+mapping_scan_source = sys.argv[7]
 def read_json(path):
     try:
         return json.loads(path.read_text())
@@ -758,6 +779,8 @@ result = {
     "route_id": route_id,
     "house_ind": house_ind,
     "task_horizon": task_horizon,
+    "pointcloud_stride": pointcloud_stride,
+    "mapping_scan_source": mapping_scan_source,
     "completed_early": 0 < sim_frames < task_horizon,
     "completion_requested": bool(completion.get("requested", False)),
     "completion_reason": completion.get("reason", ""),

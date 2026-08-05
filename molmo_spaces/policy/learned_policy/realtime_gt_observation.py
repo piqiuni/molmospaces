@@ -298,7 +298,13 @@ class RealtimeGTObservationPublisher:
         self.episode_id = ""
         self.frame_index = 0
         self.next_instance_index = 1
+        # Door body/source names are simulator-private.  The restricted GT
+        # stream exposes a stable opaque portal reference instead, while the
+        # simulator-side interaction bridge can resolve it through
+        # ``resolve_public_object_id`` without feeding that identity back into
+        # mapping, planning, rendering, or an MLLM prompt.
         self.instance_ids: dict[str, str] = {}
+        self._public_to_source_ids: dict[str, str] = {}
         self._episode_reset_pending = True
         self._cache_model_identity: int | None = None
         self._specs: list[_ObjectSpec] = []
@@ -318,6 +324,7 @@ class RealtimeGTObservationPublisher:
         self.frame_index = 0
         self.next_instance_index = 1
         self.instance_ids.clear()
+        self._public_to_source_ids.clear()
         self._episode_reset_pending = True
         self._cache_model_identity = None
         self._specs = []
@@ -583,9 +590,21 @@ class RealtimeGTObservationPublisher:
         size: np.ndarray,
     ) -> dict[str, Any]:
         metadata = spec.metadata
-        category = metadata.get("category") or ("Door" if spec.is_door else spec.source_name)
+        if spec.is_door:
+            # ``doorframe``, ``doorway`` and MuJoCo body names are simulator
+            # annotations, not visual observations.  Publish one generic
+            # portal class and an episode-local opaque identifier instead.
+            category = "portal"
+            public_id = (
+                self._public_instance_id(spec.source_name, prefix="gt_portal")
+                if self is not None
+                else "gt_portal_0001"
+            )
+        else:
+            category = metadata.get("category") or spec.source_name
+            public_id = spec.source_name
         return {
-            "id": spec.source_name,
+            "id": public_id,
             "name": str(category),
             "bbox_2d": list(bbox_2d),
             "visible_pixels": max(0, int(visible_pixels)),
@@ -604,6 +623,30 @@ class RealtimeGTObservationPublisher:
                 "frame_id": "world",
             },
         }
+
+    def _public_instance_id(self, source_name: str, *, prefix: str) -> str:
+        """Return a stable episode-local public identifier for a private body.
+
+        The mapping/MLLM side only needs identity continuity.  It must not
+        receive the simulator object's descriptive name in order to recognize
+        a portal or determine whether it can be opened.
+        """
+
+        source_name = str(source_name or "")
+        existing = self.instance_ids.get(source_name)
+        if existing:
+            return existing
+        public_id = f"{prefix}_{self.next_instance_index:04d}"
+        self.next_instance_index += 1
+        self.instance_ids[source_name] = public_id
+        self._public_to_source_ids[public_id] = source_name
+        return public_id
+
+    def resolve_public_object_id(self, object_id: str) -> str:
+        """Resolve an opaque portal ID only inside the simulator process."""
+
+        public_id = str(object_id or "")
+        return self._public_to_source_ids.get(public_id, public_id)
 
     @staticmethod
     def _joint_names(model, body_id: int, metadata: dict[str, Any]) -> tuple[str, ...]:

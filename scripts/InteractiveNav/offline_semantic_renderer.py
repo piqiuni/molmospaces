@@ -501,7 +501,15 @@ def _node_color(node: dict) -> tuple[int, int, int]:
     if node_type == "room":
         return (205, 225, 245)
     if node_type == "portal":
-        state = str((node.get("interaction") or {}).get("state") or "unknown")
+        state = str((node.get("interaction") or {}).get("state") or "unknown").casefold()
+        if state in {"blocked", "unsupported"}:
+            return (175, 45, 185)
+        if state == "static_open":
+            return (195, 175, 35)
+        if state == "static_closed":
+            return (150, 95, 105)
+        if state == "static":
+            return (125, 125, 125)
         return (50, 190, 70) if state in {"open", "ajar"} else (235, 70, 55) if state == "closed" else (235, 175, 45)
     if node_type == "container":
         return (175, 75, 220)
@@ -941,6 +949,10 @@ class OfflineSixPanelRenderer:
         cv2.putText(panel, "closed", (16, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23, (65, 65, 65), 1, cv2.LINE_AA)
         cv2.rectangle(panel, (57, 29), (66, 37), (45, 175, 70), 2)
         cv2.putText(panel, "open", (69, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23, (65, 65, 65), 1, cv2.LINE_AA)
+        cv2.rectangle(panel, (106, 29), (115, 37), (195, 175, 35), 2)
+        cv2.putText(panel, "static open", (118, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23, (65, 65, 65), 1, cv2.LINE_AA)
+        cv2.rectangle(panel, (193, 29), (202, 37), (175, 45, 185), 2)
+        cv2.putText(panel, "blocked", (205, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23, (65, 65, 65), 1, cv2.LINE_AA)
         execution = str((step.get("semantic_execution_state") or {}).get("state") or "IDLE")
         behavior = str(selection.get("behavior_type") or "-")
         feedback = str((step.get("semantic_behavior_feedback") or {}).get("status") or "-")

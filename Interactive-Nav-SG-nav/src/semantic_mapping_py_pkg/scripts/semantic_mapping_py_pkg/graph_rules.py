@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import math
+import re
 from typing import Any
 
 from .geometry_utils import normalize_label
 
 PORTAL_LABELS = {
+    "portal",
     "door",
     "doorframe",
     "doorway",
@@ -47,11 +50,22 @@ HINGE_NAMES = {"hinge", "mjjnthinge"}
 SLIDE_NAMES = {"slide", "mjJNT_SLIDE", "mjjntslide"}
 
 BOX_ONLY_PERCEPTION_CONTRACT = "exact_2d_3d_boxes_only"
+_PUBLIC_PORTAL_ID_RE = re.compile(r"^gt_portal_[0-9]+$")
 
 
 def sanitize_token(value: str) -> str:
     text = normalize_label(value)
     return text.replace("/", "_").replace("|", "_").replace(":", "_")
+
+
+def opaque_portal_instance_id(value: Any) -> str:
+    """Return a public portal identity without exposing a simulator source ID."""
+
+    raw = str(value or "")
+    if _PUBLIC_PORTAL_ID_RE.fullmatch(raw):
+        return raw
+    digest = hashlib.blake2s(raw.encode("utf-8"), digest_size=5).hexdigest()
+    return f"portal_ref_{digest}"
 
 
 def point3(values=None):
@@ -165,8 +179,17 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(box_3d, dict):
         box_3d = {}
     if minimal_gt:
-        semantic_name = normalize_label(observation.get("name"))
+        raw_semantic_name = normalize_label(observation.get("name"))
+        raw_instance_id = str(observation.get("id") or "")
+        is_portal = raw_semantic_name in PORTAL_LABELS
+        # A GT ``doorframe`` / ``doorway`` is an asset annotation.  Keep only
+        # the generic visual/topological class on the public wire contract.
+        semantic_name = "portal" if is_portal else raw_semantic_name
         category = semantic_name or "object"
+        instance_id = (
+            opaque_portal_instance_id(raw_instance_id) if is_portal else raw_instance_id
+        )
+        private_instance_id = raw_instance_id if is_portal else ""
         position = point3(box_3d.get("center"))
         aabb_center = point3(box_3d.get("center"))
         aabb_size = point3(box_3d.get("size"))
@@ -197,7 +220,18 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
             or observation.get("class")
             or observation.get("name")
         )
-        category = str(observation.get("category") or semantic_name or "object")
+        # Detector aliases such as ``doorframe`` are normalized into the one
+        # public portal class as well.  Their original text is not retained in
+        # node labels/names or MLLM context.
+        if semantic_name in PORTAL_LABELS:
+            semantic_name = "portal"
+        category = (
+            "portal"
+            if semantic_name == "portal"
+            else str(observation.get("category") or semantic_name or "object")
+        )
+        instance_id = str(observation.get("instance_id") or observation.get("id") or "")
+        private_instance_id = ""
         position = point3(
             observation.get("position")
             or observation.get("coord")
@@ -257,8 +291,13 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
     )
     return {
         "minimal_gt_observation": minimal_gt,
-        "observation_id": str(observation.get("id") if minimal_gt else observation.get("observation_id") or observation.get("id") or ""),
-        "instance_id": str(observation.get("id") if minimal_gt else observation.get("instance_id") or observation.get("id") or ""),
+        "observation_id": str(
+            instance_id
+            if minimal_gt
+            else observation.get("observation_id") or observation.get("id") or ""
+        ),
+        "instance_id": instance_id,
+        "private_instance_id": private_instance_id,
         "semantic_name": semantic_name or "object",
         "category": category,
         "candidate_labels": [] if minimal_gt else list(observation.get("candidate_labels") or []),
@@ -277,7 +316,11 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "is_receptacle": False if minimal_gt else bool(observation.get("is_receptacle", False)),
         "is_pickup_candidate": False if minimal_gt else bool(observation.get("is_pickup_candidate", False)),
         "is_articulable": False if minimal_gt else bool(observation.get("is_articulable", False)),
-        "is_door": semantic_name in PORTAL_LABELS if minimal_gt else bool(observation.get("is_door", semantic_name in PORTAL_LABELS)),
+        "is_door": (
+            semantic_name == "portal"
+            if minimal_gt
+            else bool(observation.get("is_door", semantic_name == "portal"))
+        ),
         "is_movable_door": False if minimal_gt else bool(observation.get("is_movable_door", False)),
         "joint_type": "none" if minimal_gt else normalize_joint_type(observation.get("joint_type")),
         "joint_range": [0.0, 0.0] if minimal_gt else point_range(observation.get("joint_range")),
@@ -287,10 +330,11 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "orientation": [0.0, 0.0, 0.0, 1.0] if minimal_gt else list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
         "interaction_approach_axis_xy": [] if minimal_gt else list(observation.get("interaction_approach_axis_xy") or []),
         "source_object_name": str(
-            observation.get("id")
+            instance_id
             if minimal_gt
             else observation.get("source_object_name") or observation.get("id") or ""
         ),
+        "private_source_object_name": private_instance_id,
         "visible_pixels": visible_pixels,
         "visible_fraction": float(visible_fraction or 0.0),
         "bbox_2d": bbox_2d,
@@ -312,13 +356,17 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         ),
         "episode_id": "" if minimal_gt else str(observation.get("episode_id") or ""),
         "source": "realtime_gt_observation" if minimal_gt else str(observation.get("source") or "detector"),
-        "name": str(
-            observation.get("name")
-            if minimal_gt
-            else observation.get("name")
-            or observation.get("object_name")
-            or semantic_name
-            or "object"
+        "name": (
+            "portal"
+            if semantic_name == "portal"
+            else str(
+                observation.get("name")
+                if minimal_gt
+                else observation.get("name")
+                or observation.get("object_name")
+                or semantic_name
+                or "object"
+            )
         ),
         "asset_id": None if minimal_gt else observation.get("asset_id"),
         "object_id": None if minimal_gt else observation.get("object_id"),
@@ -362,20 +410,59 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
         interaction_mode = "place_on"
     state = "unknown"
     is_interactable = interaction_mode != "none"
+    # Restricted realtime-GT is only a geometry/visibility contract.  A portal
+    # class is not proof of a door leaf, an operable joint, or a closed state.
+    # The rule lane therefore waits for executor feedback; the MLLM lane may
+    # replace these unknowns using image evidence through an attribute patch.
+    portal_requires_observed_evidence = bool(
+        node_type == "portal" and observation.get("minimal_gt_observation")
+    )
+    if portal_requires_observed_evidence:
+        is_interactable = False
     if node_type == "portal":
-        requires_interaction = bool(is_interactable and state not in {"open", "static_open"})
-        traversable = state in {"open", "static_open"}
+        requires_interaction = bool(
+            is_interactable and state not in {"open", "static_open"}
+        )
+        traversable = (
+            None
+            if portal_requires_observed_evidence
+            else state in {"open", "static_open"}
+        )
     else:
         requires_interaction = bool(is_interactable and state in {"closed", "unknown"})
         traversable = True if state in {"open", "ajar", "static_open"} else False if state == "closed" else None
     return {
         "is_interactable": is_interactable,
         "interaction_mode": interaction_mode,
+        # This is deliberately an ontology prior, not an articulation fact.
+        # In restricted-GT mode it is explicitly unobserved rather than a
+        # label-derived assertion that the portal is operable.
+        "capability": "unknown",
+        "capability_source": (
+            "unobserved" if portal_requires_observed_evidence else "semantic_label_prior"
+        ),
+        "capability_confidence": (
+            0.0
+            if portal_requires_observed_evidence
+            else float(observation.get("confidence", 0.0) or 0.0)
+        ),
+        "capability_observed_step": None,
+        "capability_evidence": "none",
         "state": state,
         "cost": 1.0,
         "confidence": float(observation.get("confidence", 0.0) or 0.0),
-        "state_source": "semantic_graph_default",
-        "state_confidence": float(observation.get("confidence", 0.0) or 0.0),
+        "state_source": (
+            "unobserved"
+            if portal_requires_observed_evidence
+            else "semantic_graph_default"
+        ),
+        "state_confidence": (
+            0.0
+            if portal_requires_observed_evidence
+            else float(observation.get("confidence", 0.0) or 0.0)
+        ),
+        "state_observed_step": None,
+        "state_evidence": "none",
         "interaction_cost": 1.0,
         "requires_interaction": requires_interaction,
         "traversable": traversable,

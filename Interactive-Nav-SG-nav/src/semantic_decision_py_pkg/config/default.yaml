@@ -1,6 +1,10 @@
 step_ready_enabled: true
 step_ready_topic: "/semantic_decision/step_ready"
 step_ready_required_modules: ["semantic_mapping", "explore_py"]
+# The strict semantic-mapping token also turns this on automatically.  This
+# explicit switch is useful for smoke tests that want to reject mixed sources
+# before a strict mapper token has been observed.
+step_ready_require_exact_source: false
 
 topics:
   explorer_status: "/explore_py/status"

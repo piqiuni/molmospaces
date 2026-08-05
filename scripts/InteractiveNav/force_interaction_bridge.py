@@ -6,7 +6,7 @@ import queue
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 import mujoco
 import numpy as np
@@ -122,6 +122,7 @@ class AtomicForceInteractionController:
         drawer_execution_mode: str | None = None,
         drawer_transition_steps: int | None = None,
         drawer_observation_steps: int = 1,
+        object_id_resolver: Callable[[str], str] | None = None,
     ) -> None:
         self.command_topic = str(command_topic)
         self.result_topic = str(result_topic)
@@ -141,6 +142,11 @@ class AtomicForceInteractionController:
         self.drawer_execution_mode = self.interaction_execution_mode
         self.drawer_transition_steps = self.interaction_transition_steps
         self.drawer_observation_steps = max(1, int(drawer_observation_steps))
+        # The public semantic graph may use an opaque portal ID.  Only this
+        # simulator-side controller resolves it to a MuJoCo body name; results
+        # deliberately retain the public ID so private names never flow back
+        # into the graph or MLLM context.
+        self._object_id_resolver = object_id_resolver
         self._commands: queue.Queue[dict[str, Any]] = queue.Queue()
         self._seen_command_ids: set[str] = set()
         self._event_index = 1
@@ -207,6 +213,12 @@ class AtomicForceInteractionController:
         self._seen_command_ids.add(command_id)
         command["action"] = action
         command["object_id"] = object_id
+        execution_object_id = object_id
+        if self._object_id_resolver is not None:
+            resolved = self._object_id_resolver(object_id)
+            if resolved:
+                execution_object_id = str(resolved)
+        command["_execution_object_id"] = execution_object_id
         for planner_forbidden_key in (
             "source_object_name",
             "target_root_name",
@@ -220,6 +232,27 @@ class AtomicForceInteractionController:
             command.pop(planner_forbidden_key, None)
         self._commands.put(command)
         return True
+
+    @staticmethod
+    def _execution_object_id(command: dict[str, Any]) -> str:
+        """Return the simulator-private ID for physical articulation calls."""
+
+        return str(
+            command.get("_execution_object_id")
+            or command.get("object_id")
+            or ""
+        )
+
+    @classmethod
+    def _public_error_detail(cls, command: dict[str, Any], exc: Exception) -> str:
+        """Redact a resolver-only simulator name from public ROS feedback."""
+
+        detail = str(exc)
+        execution_id = cls._execution_object_id(command)
+        public_id = str(command.get("object_id") or "")
+        if execution_id and public_id and execution_id != public_id:
+            detail = detail.replace(execution_id, public_id)
+        return detail
 
     def before_step(self, task, step: int) -> dict[str, Any] | None:
         if self._pending is not None:
@@ -273,7 +306,7 @@ class AtomicForceInteractionController:
                 }
             plan = prepare_articulation_force(
                 task.env,
-                command["object_id"],
+                self._execution_object_id(command),
             )
             if not bool(plan.get("supported", True)):
                 return self._publish_unsupported_interaction(
@@ -367,9 +400,16 @@ class AtomicForceInteractionController:
         self._event_index += 1
         stamp_sec = time.time()
         node_type = str(command.get("node_type") or "").casefold()
-        static_portal = (
-            node_type == "portal"
-            and str(interaction_capability).casefold() == "static"
+        capability = str(interaction_capability).casefold()
+        static_capability = capability == "static"
+        static_portal = node_type == "portal" and static_capability
+        terminal_blocked = not static_capability
+        semantic_state = (
+            "static_open"
+            if static_portal
+            else "static"
+            if static_capability
+            else "blocked"
         )
         result = {
             "event_id": event_id,
@@ -386,12 +426,17 @@ class AtomicForceInteractionController:
             ),
             "interaction_capability": str(interaction_capability),
             "interactable": False,
-            "state": "static_open" if static_portal else "static",
+            "state": semantic_state,
             "pre_state": "unknown",
-            "post_state": "static_open" if static_portal else "unknown",
+            "post_state": semantic_state,
             "success": static_portal,
             "status": "SUCCEEDED" if static_portal else "FAILED",
-            "reason": "" if static_portal else str(reason),
+            "reason": (
+                ""
+                if static_portal
+                else self._public_error_detail(command, ValueError(str(reason)))
+            ),
+            "retryable": False,
             "confidence": 1.0,
             "execution_cost": 0.0,
             "sim_steps_consumed": 0,
@@ -497,6 +542,8 @@ class AtomicForceInteractionController:
             event_id = str(command.get("event_id") or f"interaction_{self._event_index:06d}")
             self._event_index += 1
             stamp_sec = time.time()
+            terminal_blocked = not bool(force_result["success"])
+            semantic_state = "blocked" if terminal_blocked else str(force_result["post_state"])
             result = {
                 "event_id": event_id,
                 "command_id": str(command["command_id"]),
@@ -523,11 +570,19 @@ class AtomicForceInteractionController:
                 "view_profile_result": pending["view_result"],
                 "view_restore_result": self._last_view_restore_result,
                 "method": "xfrc_applied_group_pd",
-                "state": str(force_result["post_state"]),
+                "state": semantic_state,
                 "pre_state": str(force_result["pre_state"]),
-                "post_state": str(force_result["post_state"]),
+                "post_state": semantic_state,
                 "success": bool(force_result["success"]),
                 "status": "SUCCEEDED" if force_result["success"] else "FAILED",
+                "interaction_capability": (
+                    "blocked" if terminal_blocked else "articulated"
+                ),
+                "interactable": not terminal_blocked,
+                "failure_reason": (
+                    "force_target_not_reached" if terminal_blocked else ""
+                ),
+                "retryable": not terminal_blocked,
                 "confidence": 1.0,
                 "execution_cost": 1.0,
                 "sim_steps_consumed": int(step) - int(pending["step"]) + 1,
@@ -621,7 +676,7 @@ class AtomicForceInteractionController:
 
     def _start_drawer_sequence(self, task, command: dict[str, Any], step: int) -> None:
         articulation_groups = collect_articulation_groups(task.env)
-        articulation = articulation_groups.get(str(command["object_id"]))
+        articulation = articulation_groups.get(self._execution_object_id(command))
         if articulation is None:
             raise ValueError(
                 "drawer_scan target is not an articulated simulator object: "
@@ -705,7 +760,7 @@ class AtomicForceInteractionController:
             if phase == "open":
                 pending["phase_plan"] = prepare_articulation_state_force(
                     task.env,
-                    pending["command"]["object_id"],
+                    self._execution_object_id(pending["command"]),
                     open_joint_names=current_group["joint_names"],
                     # The prior close phase has already returned every
                     # processed drawer to its closed state.  Keep this force
@@ -716,7 +771,7 @@ class AtomicForceInteractionController:
             else:
                 pending["phase_plan"] = prepare_articulation_state_force(
                     task.env,
-                    pending["command"]["object_id"],
+                    self._execution_object_id(pending["command"]),
                     # Close the drawer that was just observed before advancing
                     # to the next one.  Do not overlap its close transition
                     # with opening the following drawer: V3 and normal ROS
@@ -844,7 +899,7 @@ class AtomicForceInteractionController:
         try:
             recovery_plan = prepare_articulation_state_force(
                 task.env,
-                command["object_id"],
+                self._execution_object_id(command),
                 close_joint_names=list(pending.get("all_joint_names") or []),
             )
             robot_lock = pending.get("robot_lock_snapshot") or _capture_robot_lock(task.env)
@@ -879,7 +934,7 @@ class AtomicForceInteractionController:
         pending = self._pending
         group = pending["groups"][int(pending["group_index"])]
         joint_infos = articulation_joint_infos(
-            task.env, pending["command"]["object_id"]
+            task.env, self._execution_object_id(pending["command"])
         )
         selected_infos = [
             info for info in joint_infos if info["joint_name"] in group["joint_names"]
@@ -905,7 +960,7 @@ class AtomicForceInteractionController:
         pending = self._pending
         command = pending["command"]
         final_joint_infos = articulation_joint_infos(
-            task.env, command["object_id"]
+            task.env, self._execution_object_id(command)
         )
         success = bool(pending["group_results"]) and all(
             bool(group.get("success")) for group in pending["group_results"]
@@ -1140,7 +1195,7 @@ class AtomicForceInteractionController:
                 command.get("interaction_pose_validation") or {}
             ),
             "error_type": type(exc).__name__,
-            "error": str(exc),
+            "error": self._public_error_detail(command, exc),
             "step": int(step),
             "stamp_sec": stamp_sec,
         }

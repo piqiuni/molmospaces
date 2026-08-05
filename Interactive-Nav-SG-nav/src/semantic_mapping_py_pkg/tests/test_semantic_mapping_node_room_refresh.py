@@ -193,6 +193,8 @@ def test_occupancy_callback_coalesces_room_work_without_waiting_for_worker():
         with node._room_work_condition:
             assert node._room_work_pending is not None
             assert node._room_work_pending["input_revision"] == 2
+            assert node._room_work_pending["requested_source"]["step_index"] == 12
+            assert node._room_work_pending["requested_source"]["stamp_sec"] == pytest.approx(1.2)
 
         release_first.set()
         deadline = time.monotonic() + 1.0
@@ -428,3 +430,123 @@ def test_room_mllm_request_contains_only_room_and_member_object_metadata():
     serialized = json.dumps(request)
     for forbidden in ("image", "crop", "aabb", "geometry", "pose"):
         assert forbidden not in serialized
+
+
+def test_strict_step_ready_requires_same_occ_room_and_graph_source():
+    node = object.__new__(SemanticMappingNode)
+    node.step_ready_require_room_graph = True
+    node._room_epoch = 0
+    raw = _raw_occupancy(20.0)
+    stale_room = _raw_occupancy(19.8)
+    base_bundle = {
+        "raw_occupancy_grid": raw,
+        "room_segment_grid": stale_room,
+        "room_commit": {
+            "source": {"step_index": raw.header.seq, "stamp_sec": 20.0},
+            "epoch": 0,
+            "graph_revision": 7,
+            "episode_id": "episode_1",
+        },
+        "graph_payload": {
+            "graph_revision": 7,
+            "episode_id": "episode_1",
+            "capture_step": 20,
+            "timestamp": 20.0,
+        },
+    }
+
+    waiting = node._semantic_mapping_ready_payload_for_bundle(base_bundle)
+    assert not waiting["ready"]
+    assert waiting["raw_occ_ready"]
+    assert not waiting["room_segmentation_ready"]
+    assert not waiting["unified_graph_ready"]
+    assert waiting["missing_stages"] == ["room_segmentation", "unified_graph"]
+
+    base_bundle["room_segment_grid"] = _raw_occupancy(20.0)
+    base_bundle["graph_payload"]["graph_revision"] = 6
+    graph_waiting = node._semantic_mapping_ready_payload_for_bundle(base_bundle)
+    assert not graph_waiting["ready"]
+    assert graph_waiting["room_segmentation_ready"]
+    assert not graph_waiting["unified_graph_ready"]
+
+    base_bundle["graph_payload"]["graph_revision"] = 7
+    ready = node._semantic_mapping_ready_payload_for_bundle(base_bundle)
+    assert ready["ready"]
+    assert ready["room_segmentation_ready"]
+    assert ready["unified_graph_ready"]
+    assert ready["occupancy_source"] == ready["room_segmentation_source"]
+
+
+def test_fast_step_ready_contract_remains_occ_only():
+    node = object.__new__(SemanticMappingNode)
+    node.step_ready_require_room_graph = False
+    node._room_epoch = 0
+    raw = _raw_occupancy(21.0)
+    payload = node._semantic_mapping_ready_payload_for_bundle(
+        {
+            "raw_occupancy_grid": raw,
+            "room_segment_grid": None,
+            "room_commit": {},
+            "graph_payload": {},
+        }
+    )
+    assert payload["ready"]
+    assert payload["causal_contract"] == "occ_only"
+
+
+def test_publish_bundle_retains_raw_occ_source_for_strict_ready():
+    node = object.__new__(SemanticMappingNode)
+    node._build_planning_products_from_snapshot = lambda raw, _graph: (
+        raw,
+        None,
+        None,
+        {},
+    )
+    node._build_room_attribute_request_locked = lambda _graph: None
+    raw = _raw_occupancy(22.0)
+    bundle = node._build_publish_bundle_from_snapshot(
+        {
+            "scene_info": None,
+            "scene_data": None,
+            "scene_confidence_data": None,
+            "scene_revision": 0,
+            "room_segment_grid": None,
+            "room_commit": {},
+            "graph_payload": {},
+            "raw_occupancy_grid": raw,
+        }
+    )
+    assert bundle["raw_occupancy_grid"] is raw
+
+
+def test_causal_ready_deduplicates_by_stamp_when_pipeline_resequences(
+    monkeypatch,
+):
+    node = object.__new__(SemanticMappingNode)
+    node.step_ready_require_room_graph = True
+    node.lock = threading.RLock()
+    node._last_causal_ready_source = None
+    recorded = []
+    logged = []
+    node._record_component_timing = lambda kind, value: recorded.append((kind, value))
+    monkeypatch.setattr(semantic_mapping_module.rospy, "loginfo", lambda *_args: logged.append(True))
+
+    payload = {
+        "ready": True,
+        "occupancy_source": {"step_index": 75, "stamp_sec": 20.0},
+        "room_segmentation_source": {"step_index": 2, "stamp_sec": 20.0},
+        "published_graph_revision": 9,
+        "published_graph_capture_step": 75,
+        "room_commit_latency_ms": 3.0,
+        "room_worker_total_ms": 2.5,
+    }
+    SemanticMappingNode._record_causal_ready_once(node, payload)
+    payload["occupancy_source"] = {"step_index": 0, "stamp_sec": 20.0}
+    SemanticMappingNode._record_causal_ready_once(node, payload)
+    assert len(recorded) == 1
+    assert len(logged) == 1
+
+    payload["occupancy_source"] = {"step_index": 0, "stamp_sec": 20.2}
+    SemanticMappingNode._record_causal_ready_once(node, payload)
+    assert len(recorded) == 2
+    assert len(logged) == 2

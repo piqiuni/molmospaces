@@ -10,6 +10,19 @@ CANDIDATE_COLORS = {
 }
 
 
+# OpenCV uses BGR tuples. Keep ordinary open/closed/unknown colors stable, but
+# reserve explicit terminal-state colors for fixed-open and blocked portals.
+INTERACTION_STATE_COLORS = {
+    "open": (55, 185, 70),
+    "static_open": (195, 175, 35),
+    "closed": (55, 70, 225),
+    "static_closed": (150, 95, 105),
+    "blocked": (175, 45, 185),
+    "unknown": (45, 180, 235),
+    "static": (125, 125, 125),
+}
+
+
 def candidate_color(behavior_type: str) -> tuple[int, int, int]:
     return CANDIDATE_COLORS.get(str(behavior_type).upper(), (100, 100, 100))
 
@@ -385,10 +398,34 @@ def topology_node_style(node: dict[str, Any]) -> dict[str, Any]:
     if node_type == "room":
         return {"fill": (235, 238, 248), "border": (45, 45, 45), "dashed": False}
     if node_type == "portal":
-        if state in {"open", "ajar", "static_open"}:
+        if state in {"blocked", "unsupported"}:
+            return {
+                "fill": (242, 235, 247),
+                "border": INTERACTION_STATE_COLORS["blocked"],
+                "dashed": False,
+            }
+        if state == "static_open":
+            return {
+                "fill": (240, 250, 235),
+                "border": INTERACTION_STATE_COLORS["static_open"],
+                "dashed": False,
+            }
+        if state in {"open", "ajar"}:
             return {"fill": (236, 250, 236), "border": (45, 175, 70), "dashed": False}
-        if state in {"closed", "static_closed"}:
+        if state == "static_closed":
+            return {
+                "fill": (244, 242, 248),
+                "border": INTERACTION_STATE_COLORS["static_closed"],
+                "dashed": True,
+            }
+        if state == "closed":
             return {"fill": (244, 244, 252), "border": (35, 35, 210), "dashed": True}
+        if state == "static":
+            return {
+                "fill": (242, 242, 242),
+                "border": INTERACTION_STATE_COLORS["static"],
+                "dashed": True,
+            }
         return {"fill": (245, 245, 245), "border": (130, 130, 130), "dashed": True}
     if node_type == "container":
         return {
@@ -408,11 +445,19 @@ def latest_state_change(events: list[dict[str, Any]] | None) -> dict[str, Any] |
 
 def interaction_state_color(state: str) -> tuple[int, int, int]:
     state = str(state).lower()
-    if state in {"open", "ajar", "static_open"}:
-        return (55, 185, 70)
+    if state == "static_open":
+        return INTERACTION_STATE_COLORS["static_open"]
+    if state in {"open", "ajar"}:
+        return INTERACTION_STATE_COLORS["open"]
+    if state in {"blocked", "unsupported"}:
+        return INTERACTION_STATE_COLORS["blocked"]
+    if state == "static_closed":
+        return INTERACTION_STATE_COLORS["static_closed"]
     if state == "closed":
-        return (55, 70, 225)
-    return (45, 180, 235)
+        return INTERACTION_STATE_COLORS["closed"]
+    if state == "static":
+        return INTERACTION_STATE_COLORS["static"]
+    return INTERACTION_STATE_COLORS["unknown"]
 
 
 def room_style_by_id(graph: dict[str, Any] | None) -> dict[int, dict[str, Any]]:

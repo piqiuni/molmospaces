@@ -358,10 +358,10 @@
 ## 4.2 建图与表征 TODO
 
 - [ ] 梳理 `interaction_graph_store.py` 当前已经表达的节点、边、状态与限制
-- [ ] 明确 door 在统一图中是否始终作为 `portal` 使用
+- [x] 明确 door 在统一图中统一作为匿名 `portal` 使用；GT/source 名称不进入公开图或 MLLM 上下文
 - [ ] 明确 room connectivity 是显式边还是由规则动态生成
-- [ ] 定义交互状态最小集合：`unknown / closed / open`，是否需要 `locked`
-- [ ] 定义第一阶段必须保留的交互属性字段，避免 schema 过重
+- [x] 定义交互状态最小集合：`unknown / open / ajar / closed / static_open / blocked`，并保留 state/capability 的 source、confidence、observed_step、evidence
+- [x] 定义第一阶段必须保留的交互属性字段，规则状态只接受 executor feedback，MLLM 可接受 visual attribute patch
 - [ ] 明确 navigation hints 是调试视图、过渡接口，还是 planner 正式输入
 - [ ] 建立更通用的交互属性分类框架：通道属性 / 容器属性
 - [ ] 将设备与开关类交互保留为后续拓展，而不是第一阶段一级分类
@@ -370,9 +370,9 @@
 
 - [ ] 明确 MolmoSpaces 侧 GT 字段到统一 observation 的映射表
 - [ ] 明确 ROS detector-only 管线需要输出哪些最小交互字段
-- [ ] 明确 door 检测成功之外还缺哪些交互属性字段
-- [ ] 明确 door state 是从关节值直接读，还是从图像/几何间接估计
-- [x] GT 快速版门状态：读取当前 `joint_infos`，过滤 handle joint，以首次有效门板关节值作为 `q_closed`，按 joint range 计算开合比例；双开门要求全部门板达到 open 阈值
+- [x] 明确 door 检测成功之外还缺少可操作性、状态、证据来源和观测步字段；初始 portal 仅是几何/可见性观测
+- [x] 明确 door state 来源边界：规则方法只由实际交互反馈更新；MLLM 方法由视觉属性 patch 或实际交互反馈更新，GT 关节状态不直接发布
+- [x] GT 快速版门状态（仅模拟器内部/evaluator，不进入实时语义输入）：读取当前 `joint_infos`，过滤 handle joint，以首次有效门板关节值作为 `q_closed`，按 joint range 计算开合比例；双开门要求全部门板达到 open 阈值
 - [ ] 真实场景门关节提取：在没有 MuJoCo joint GT 时，从多帧门板检测/跟踪与几何变化中估计 hinge/slide 类型、转轴或滑动轴、闭合参考位姿和开合比例；置信度不足时保持 `unknown`，不能直接清空 OCC
 - [ ] 明确 room_id / connectivity 的可信来源
 

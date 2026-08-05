@@ -61,6 +61,32 @@ def _resolved_interaction_state(result):
     return inferred_state, inferred_state is not None
 
 
+def _interaction_result_capability(result):
+    """Classify executor feedback without exposing simulator joint metadata."""
+
+    capability = str(result.get("interaction_capability") or "").strip().casefold()
+    state = str(result.get("state") or result.get("post_state") or "").strip().casefold()
+    reason = str(
+        result.get("reason") or result.get("failure_reason") or ""
+    ).strip().casefold()
+    if (
+        capability == "static"
+        or state in {"static", "static_open", "static_closed"}
+        or reason == "non_articulated"
+    ):
+        return "static"
+    if (
+        capability in {"blocked", "unsupported", "unavailable", "locked"}
+        or state == "blocked"
+        or result.get("interactable") is False
+    ):
+        # A non-static negative result is an executor/MLLM statement that this
+        # interaction cannot currently be used, rather than a claim that the
+        # observed portal is merely an open doorway.
+        return "blocked"
+    return "unknown"
+
+
 class InteractionGraphStore:
     def __init__(
         self,
@@ -239,8 +265,7 @@ class InteractionGraphStore:
                 (
                     candidate
                     for candidate in self.nodes.values()
-                    if str(candidate.attributes.get("instance_id") or "")
-                    == instance_id
+                    if self._node_matches_identity(candidate, instance_id)
                 ),
                 None,
             )
@@ -251,8 +276,7 @@ class InteractionGraphStore:
                 (
                     candidate
                     for candidate in self.nodes.values()
-                    if str(candidate.attributes.get("instance_id") or "")
-                    == instance_id
+                    if self._node_matches_identity(candidate, instance_id)
                 ),
                 None,
             )
@@ -263,8 +287,7 @@ class InteractionGraphStore:
                     (
                         candidate
                         for candidate in self.nodes.values()
-                        if candidate.attributes.get("source_object_name") == source_object_name
-                        or candidate.name == source_object_name
+                        if self._node_matches_identity(candidate, source_object_name)
                     ),
                     None,
                 )
@@ -273,26 +296,61 @@ class InteractionGraphStore:
         now = float(stamp if stamp is not None else time.time())
         pre_state = str(node.interaction.get("state", "unknown"))
         resolved_state, inferred_from_action = _resolved_interaction_state(result)
+        observed_step = result.get(
+            "capture_step",
+            result.get("step", result.get("result_published_step")),
+        )
+        try:
+            observed_step = int(observed_step) if observed_step is not None else None
+        except (TypeError, ValueError):
+            observed_step = None
+        result_source = str(
+            result.get("source")
+            or result.get("verification_source")
+            or "interaction_result"
+        )
         if resolved_state is not None:
             node.interaction["state"] = str(resolved_state)
             node.interaction["state_source"] = (
                 "successful_action_postcondition"
                 if inferred_from_action
-                else str(
-                    result.get("source")
-                    or result.get("verification_source")
-                    or "interaction_result"
-                )
+                else result_source
             )
             node.interaction["state_confidence"] = float(
                 result.get("confidence", 1.0)
             )
-        static_capability = bool(
-            str(result.get("interaction_capability") or "").casefold() == "static"
-            or str(result.get("reason") or "").casefold() == "non_articulated"
-            or result.get("interactable") is False
-        )
-        if static_capability:
+            node.interaction["state_observed_step"] = observed_step
+            node.interaction["state_evidence"] = (
+                f"action:{str(result.get('action') or 'unknown').casefold()}:success"
+                if inferred_from_action
+                else str(result.get("evidence") or result_source)
+            )
+        resolved_capability = _interaction_result_capability(result)
+        static_capability = resolved_capability == "static"
+        blocked_capability = resolved_capability == "blocked"
+        if (
+            resolved_state is not None
+            and result.get("success") is True
+            and not static_capability
+            and not blocked_capability
+        ):
+            # A successful physical action is the rule lane's only evidence
+            # that the portal is actually operable.  Keep this separate from
+            # the visual MLLM capability assertion.
+            node.interaction.update(
+                {
+                    "is_interactable": True,
+                    "interaction_mode": str(
+                        node.interaction.get("interaction_mode") or "open_close"
+                    ),
+                    "capability": "confirmed",
+                    "capability_source": "executor_feedback",
+                    "capability_confidence": float(result.get("confidence", 1.0)),
+                    "capability_observed_step": observed_step,
+                    "capability_evidence": "successful_interaction_feedback",
+                }
+            )
+        elif static_capability:
             node.interaction.update(
                 {
                     "is_interactable": False,
@@ -304,9 +362,41 @@ class InteractionGraphStore:
                         or "interaction_capability_check"
                     ),
                     "state_confidence": float(result.get("confidence", 1.0)),
+                    "state_observed_step": observed_step,
+                    "state_evidence": "interaction_capability_feedback",
                     "capability": "static",
+                    "capability_source": "executor_feedback",
+                    "capability_confidence": float(result.get("confidence", 1.0)),
+                    "capability_observed_step": observed_step,
+                    "capability_evidence": "interaction_capability_feedback",
                     "failure_reason": str(
                         result.get("reason") or "non_articulated"
+                    ),
+                }
+            )
+        elif blocked_capability:
+            node.interaction.update(
+                {
+                    "is_interactable": False,
+                    "interaction_mode": "none",
+                    "state": "blocked",
+                    "state_source": str(
+                        result.get("source")
+                        or result.get("verification_source")
+                        or "interaction_capability_check"
+                    ),
+                    "state_confidence": float(result.get("confidence", 1.0)),
+                    "state_observed_step": observed_step,
+                    "state_evidence": "interaction_capability_feedback",
+                    "capability": "blocked",
+                    "capability_source": "executor_feedback",
+                    "capability_confidence": float(result.get("confidence", 1.0)),
+                    "capability_observed_step": observed_step,
+                    "capability_evidence": "interaction_capability_feedback",
+                    "failure_reason": str(
+                        result.get("reason")
+                        or result.get("failure_reason")
+                        or "interaction_unavailable"
                     ),
                 }
             )
@@ -345,18 +435,24 @@ class InteractionGraphStore:
             history.append(history_entry)
         node.interaction["operation_history"] = history
         self._update_interaction_group_memory(node, result)
-        if resolved_state is not None or static_capability:
+        if resolved_state is not None or static_capability or blocked_capability:
             node.attributes["interaction_state_override"] = {
                 key: node.interaction.get(key)
                 for key in (
                     "state",
                     "state_source",
                     "state_confidence",
+                    "state_observed_step",
+                    "state_evidence",
                     "traversable",
                     "requires_interaction",
                     "is_interactable",
                     "interaction_mode",
                     "capability",
+                    "capability_source",
+                    "capability_confidence",
+                    "capability_observed_step",
+                    "capability_evidence",
                     "failure_reason",
                 )
                 if key in node.interaction
@@ -408,10 +504,16 @@ class InteractionGraphStore:
         interaction = node.interaction
         state = str(interaction.get("state") or "unknown")
         if node.type == "portal":
-            interaction["traversable"] = state in {"open", "static_open"}
+            interaction["traversable"] = (
+                True
+                if state in {"open", "ajar", "static_open"}
+                else False
+                if state in {"closed", "blocked", "static_closed"}
+                else None
+            )
             interaction["requires_interaction"] = bool(
                 interaction.get("is_interactable")
-                and state not in {"open", "static_open"}
+                and state not in {"open", "ajar", "static_open", "blocked", "static_closed"}
             )
 
             return
@@ -419,7 +521,7 @@ class InteractionGraphStore:
             True
             if state in {"open", "ajar", "static_open"}
             else False
-            if state == "closed"
+            if state in {"closed", "blocked", "static_closed"}
             else None
         )
         interaction["requires_interaction"] = bool(
@@ -456,7 +558,7 @@ class InteractionGraphStore:
                 (
                     candidate
                     for candidate in self.nodes.values()
-                    if str(candidate.attributes.get("instance_id") or "") == object_id
+                    if self._node_matches_identity(candidate, object_id)
                 ),
                 None,
             )
@@ -573,21 +675,61 @@ class InteractionGraphStore:
             ],
             default=0.0,
         )
+        patch_source = str(patch.get("source") or "mllm_attribute_inference")
+        is_visual_mllm_patch = "mllm" in patch_source.casefold()
         state_was_updated = (
             not has_verified_interaction_state
             and latest_operation_stamp <= patch_stamp
+            and is_visual_mllm_patch
         )
         if state_was_updated:
+            patch_state = str(
+                patch.get("coarse_state")
+                or node.interaction.get("state")
+                or "unknown"
+            )
+            patch_capability = str(
+                patch.get("interaction_capability")
+                or patch.get("capability")
+                or ""
+            ).strip().casefold()
+            patch_interactable = bool(patch.get("interactable", False))
+            if patch_state.casefold() == "blocked" or patch_capability in {
+                "blocked",
+                "unsupported",
+                "unavailable",
+                "locked",
+            }:
+                patch_capability = "blocked"
+                patch_interactable = False
+            elif patch_state.casefold() == "static_open":
+                patch_capability = "static"
+                patch_interactable = False
+            elif patch_capability not in {"static", "unknown"}:
+                patch_capability = "unknown"
             node.interaction.update(
                 {
-                    "is_interactable": bool(patch.get("interactable", False)),
-                    "state": str(
-                        patch.get("coarse_state")
-                        or node.interaction.get("state")
-                        or "unknown"
+                    "is_interactable": patch_interactable,
+                    "interaction_mode": (
+                        str(node.interaction.get("interaction_mode") or "none")
+                        if patch_interactable
+                        else "none"
                     ),
-                    "state_source": str(patch.get("source") or "mllm_attribute_inference"),
+                    "state": patch_state,
+                    "state_source": patch_source,
                     "state_confidence": confidence,
+                    "state_observed_step": patch_frame_index,
+                    "state_evidence": "mllm_visual_observation",
+                    "capability": patch_capability,
+                    "capability_source": patch_source,
+                    "capability_confidence": confidence,
+                    "capability_observed_step": patch_frame_index,
+                    "capability_evidence": "mllm_visual_observation",
+                    "failure_reason": str(
+                        patch.get("failure_reason")
+                        or patch.get("reason")
+                        or ""
+                    ),
                     "expected_effect": str(
                         patch.get("expected_effect")
                         or (
@@ -607,8 +749,19 @@ class InteractionGraphStore:
                     "state",
                     "state_source",
                     "state_confidence",
+                    "state_observed_step",
+                    "state_evidence",
                     "traversable",
                     "requires_interaction",
+                    "is_interactable",
+                    "interaction_mode",
+                    "capability",
+                    "capability_source",
+                    "capability_confidence",
+                    "capability_observed_step",
+                    "capability_evidence",
+                    "failure_reason",
+                    "expected_effect",
                 )
                 if key in node.interaction
             }
@@ -836,10 +989,14 @@ class InteractionGraphStore:
         self._rebuild_relations(now=now)
 
     def _find_or_create_node(self, observation):
-        instance_id = observation.get("instance_id")
-        if instance_id:
+        instance_id = str(observation.get("instance_id") or "")
+        private_instance_id = str(observation.get("private_instance_id") or "")
+        if instance_id or private_instance_id:
             for node in self.nodes.values():
-                if node.attributes.get("instance_id") == instance_id:
+                if self._node_matches_identity(node, instance_id) or (
+                    private_instance_id
+                    and self._node_matches_identity(node, private_instance_id)
+                ):
                     return node
 
         node_type = infer_node_type(observation)
@@ -867,6 +1024,22 @@ class InteractionGraphStore:
         )
         self.nodes[node_id] = node
         return node
+
+    @staticmethod
+    def _node_matches_identity(node, identity: str) -> bool:
+        """Match public or private routing IDs without exposing private IDs."""
+
+        identity = str(identity or "")
+        if not identity:
+            return False
+        attributes = node.attributes or {}
+        return identity in {
+            str(node.id or ""),
+            str(attributes.get("instance_id") or ""),
+            str(attributes.get("source_object_name") or ""),
+            str(attributes.get("_private_instance_id") or ""),
+            str(attributes.get("_private_source_object_name") or ""),
+        }
 
     def _ensure_scene_node(self):
         node_id = f"scene_{sanitize_token(self.episode_id or self.scene_id)}"
@@ -969,7 +1142,6 @@ class InteractionGraphStore:
                     observation.get("connected_room_ids") or []
                 ),
                 "source": observation.get("source"),
-                "source_object_name": observation.get("source_object_name"),
                 "visible_pixels": int(observation.get("visible_pixels", 0)),
                 "max_visible_pixels": max_visible_pixels,
                 "visible_fraction": float(
@@ -989,6 +1161,24 @@ class InteractionGraphStore:
                 "viz_aabb_center": list(observation.get("viz_aabb_center") or observation["aabb_center"]),
                 "viz_aabb_size": list(observation.get("viz_aabb_size") or observation["aabb_size"]),
             }
+        if not (minimal_gt and node.type == "portal"):
+            observation_attributes["source_object_name"] = observation.get(
+                "source_object_name"
+            )
+        else:
+            # A restricted-GT portal has an opaque public ``instance_id``.
+            # Never serialize its simulator source/body name as an attribute.
+            observation_attributes.pop("source_object_name", None)
+        private_instance_id = str(observation.get("private_instance_id") or "")
+        private_source_object_name = str(
+            observation.get("private_source_object_name") or ""
+        )
+        if private_instance_id:
+            observation_attributes["_private_instance_id"] = private_instance_id
+        if private_source_object_name:
+            observation_attributes[
+                "_private_source_object_name"
+            ] = private_source_object_name
         if not minimal_gt:
             observation_attributes.update(
                 {
@@ -1005,7 +1195,8 @@ class InteractionGraphStore:
             )
         node.attributes.update(observation_attributes)
         source_object_name = str(
-            observation.get("source_object_name")
+            observation.get("private_source_object_name")
+            or observation.get("source_object_name")
             or observation.get("instance_id")
             or node.name
             or ""
@@ -1064,11 +1255,18 @@ class InteractionGraphStore:
                 "state",
                 "state_source",
                 "state_confidence",
+                "state_observed_step",
+                "state_evidence",
                 "traversable",
                 "requires_interaction",
                 "is_interactable",
                 "interaction_mode",
                 "capability",
+                "capability_source",
+                "capability_confidence",
+                "capability_observed_step",
+                "capability_evidence",
+                "expected_effect",
                 "failure_reason",
             ):
                 if key in interaction_state_override:
@@ -1984,7 +2182,7 @@ class InteractionGraphStore:
                         bool(node.interaction.get("requires_interaction")),
                         node.id,
                         node.interaction.get("interaction_mode", "none"),
-                        "door_may_unlock_room",
+                        "portal_may_unlock_room",
                     )
                 )
                 counter += 1

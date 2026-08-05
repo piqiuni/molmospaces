@@ -214,7 +214,7 @@ def test_articulated_doorway_root_is_the_canonical_gt_spec():
     assert realtime_gt.RealtimeGTObservationPublisher._canonical_door_root_specs(model, specs) == {1: 0}
 
 
-def test_minimal_gt_observation_preserves_doorframe_category():
+def test_minimal_gt_observation_redacts_doorframe_category_and_source_id():
     spec = realtime_gt._ObjectSpec(
         "doorframe_static_1",
         {"category": "Doorframe"},
@@ -235,7 +235,45 @@ def test_minimal_gt_observation_preserves_doorframe_category():
         np.asarray([1.0, 0.2, 2.0]),
     )
 
-    assert observation["name"] == "Doorframe"
+    assert observation["name"] == "portal"
+    assert observation["id"] == "gt_portal_0001"
+    assert "doorframe" not in str(observation).casefold()
+
+
+def test_realtime_gt_portal_id_is_stable_and_resolves_only_inside_publisher():
+    publisher = realtime_gt.RealtimeGTObservationPublisher(
+        FakeRospy(), FakeString, async_processing=False
+    )
+    spec = realtime_gt._ObjectSpec(
+        "private_doorframe_root",
+        {"category": "Doorframe"},
+        1,
+        (),
+        True,
+        False,
+        False,
+        False,
+    )
+
+    first = publisher._build_observation(
+        spec,
+        [0, 0, 3, 3],
+        1,
+        np.asarray([1.0, 2.0, 1.0]),
+        np.asarray([1.0, 0.2, 2.0]),
+    )
+    second = publisher._build_observation(
+        spec,
+        [0, 0, 3, 3],
+        1,
+        np.asarray([1.0, 2.0, 1.0]),
+        np.asarray([1.0, 0.2, 2.0]),
+    )
+
+    assert first["id"] == second["id"] == "gt_portal_0001"
+    assert first["name"] == "portal"
+    assert "doorframe" not in str(first).casefold()
+    assert publisher.resolve_public_object_id(first["id"]) == "private_doorframe_root"
 
 
 def test_door_geom_mapping_excludes_unrelated_sibling_under_same_root():

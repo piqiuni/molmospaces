@@ -1,0 +1,223 @@
+"""Pure organized-depth to planar-scan projection.
+
+The module deliberately has no ROS dependency.  The bridge supplies the depth
+image, camera intrinsics, and the current base-from-lidar transform; the ROS
+adapter only wraps the returned arrays in ``sensor_msgs/LaserScan``.  Keeping
+the image organized until the continuity checks run is the important invariant:
+an unordered PointCloud2 cannot distinguish a supported surface from a depth
+edge/background mixture after flattening.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class OrganizedDepthScanConfig:
+    angle_increment_deg: float = 0.5
+    range_min_m: float = 0.1
+    range_max_m: float = 8.0
+    height_min_m: float = 0.05
+    height_max_m: float = 1.85
+    vertical_window: int = 5
+    vertical_min_cover: int = 2
+    horizontal_window: int = 3
+    horizontal_min_cover: int = 1
+    continuity_gap_abs_m: float = 0.08
+    continuity_gap_rel: float = 0.04
+    support_bins: int = 2
+    min_support_neighbors: int = 2
+    support_tolerance_abs_m: float = 0.10
+    support_tolerance_rel: float = 0.03
+
+
+@dataclass(frozen=True)
+class ProjectedPlanarScan:
+    angle_min_rad: float
+    angle_increment_rad: float
+    range_min_m: float
+    range_max_m: float
+    ranges_m: np.ndarray
+    intensities: np.ndarray
+    diagnostics: dict[str, int | float]
+
+
+class OrganizedDepthScanProjector:
+    """Project one depth image without retaining state between frames."""
+
+    def __init__(self, config: OrganizedDepthScanConfig | None = None) -> None:
+        self.config = config or OrganizedDepthScanConfig()
+        if self.config.angle_increment_deg <= 0.0:
+            raise ValueError("angle_increment_deg must be positive")
+        if self.config.range_min_m <= 0.0 or self.config.range_max_m <= self.config.range_min_m:
+            raise ValueError("invalid range limits")
+        if self.config.vertical_window < 1 or self.config.horizontal_window < 1:
+            raise ValueError("continuity windows must be positive")
+
+    @staticmethod
+    def _continuity_support(
+        depth: np.ndarray,
+        valid: np.ndarray,
+        *,
+        axis: int,
+        window: int,
+        min_cover: int,
+        gap_abs_m: float,
+        gap_rel: float,
+    ) -> np.ndarray:
+        """Return pixels covered by enough contiguous, smooth windows."""
+
+        length = depth.shape[axis]
+        support = np.zeros(depth.shape, dtype=np.int16)
+        if length < window:
+            return support.astype(bool)
+
+        windows = np.lib.stride_tricks.sliding_window_view(depth, window, axis=axis)
+        valid_windows = np.lib.stride_tricks.sliding_window_view(valid, window, axis=axis)
+        # ``sliding_window_view(..., axis)`` places the window dimension last.
+        adjacent = np.abs(np.diff(windows, axis=-1))
+        local_scale = np.minimum(windows[..., :-1], windows[..., 1:])
+        gap = np.maximum(gap_abs_m, gap_rel * local_scale)
+        good = np.all(valid_windows, axis=-1) & np.all(adjacent <= gap, axis=-1)
+
+        for offset in range(window):
+            if axis == 0:
+                support[offset : offset + good.shape[0], :] += good
+            else:
+                support[:, offset : offset + good.shape[1]] += good
+        return support >= max(1, min_cover)
+
+    def project(
+        self,
+        depth_m: np.ndarray,
+        intrinsics: tuple[float, float, float, float],
+        base_from_lidar: np.ndarray,
+    ) -> ProjectedPlanarScan:
+        """Project ``depth_m`` into a base-frame planar scan.
+
+        ``depth_m`` is metric optical-frame depth.  ``base_from_lidar`` must
+        match the robot-centric frame used by the existing PointCloud2 bridge:
+        lidar x=forward, y=left, z=up.  Invalid or rejected returns are NaN;
+        they are never converted into max-range free-space observations.
+        """
+
+        depth = np.asarray(depth_m, dtype=np.float32)
+        if depth.ndim != 2:
+            raise ValueError("depth_m must be a HxW array")
+        fx, fy, cx, cy = (float(value) for value in intrinsics)
+        if fx <= 0.0 or fy <= 0.0:
+            raise ValueError("camera focal lengths must be positive")
+        transform = np.asarray(base_from_lidar, dtype=np.float64)
+        if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+            raise ValueError("base_from_lidar must be a finite 4x4 transform")
+
+        cfg = self.config
+        valid_depth = np.isfinite(depth) & (depth >= 0.1) & (depth <= 30.0)
+        vertical_support = self._continuity_support(
+            depth,
+            valid_depth,
+            axis=0,
+            window=cfg.vertical_window,
+            min_cover=cfg.vertical_min_cover,
+            gap_abs_m=cfg.continuity_gap_abs_m,
+            gap_rel=cfg.continuity_gap_rel,
+        )
+        horizontal_support = self._continuity_support(
+            depth,
+            valid_depth,
+            axis=1,
+            window=cfg.horizontal_window,
+            min_cover=cfg.horizontal_min_cover,
+            gap_abs_m=cfg.continuity_gap_abs_m,
+            gap_rel=cfg.continuity_gap_rel,
+        )
+        supported_pixels = valid_depth & vertical_support & horizontal_support
+
+        rows, cols = np.nonzero(supported_pixels)
+        if rows.size:
+            ranges_depth = depth[rows, cols].astype(np.float64, copy=False)
+            x_lidar = ranges_depth
+            y_lidar = -((cols.astype(np.float64) - cx) / fx) * ranges_depth
+            z_lidar = -((rows.astype(np.float64) - cy) / fy) * ranges_depth
+            points_lidar = np.stack((x_lidar, y_lidar, z_lidar), axis=1)
+            rotation = transform[:3, :3]
+            translation = transform[:3, 3]
+            points_base = points_lidar @ rotation.T + translation
+            base_x = points_base[:, 0]
+            base_y = points_base[:, 1]
+            base_z = points_base[:, 2]
+            planar_range = np.hypot(base_x, base_y)
+            planar_valid = (
+                np.isfinite(planar_range)
+                & (planar_range >= cfg.range_min_m)
+                & (planar_range <= cfg.range_max_m)
+                & (base_z >= cfg.height_min_m)
+                & (base_z <= cfg.height_max_m)
+            )
+        else:
+            planar_valid = np.zeros(0, dtype=bool)
+            planar_range = np.zeros(0, dtype=np.float64)
+            base_x = np.zeros(0, dtype=np.float64)
+            base_y = np.zeros(0, dtype=np.float64)
+
+        beam_count = max(1, int(round(360.0 / cfg.angle_increment_deg)))
+        angle_increment = 2.0 * np.pi / float(beam_count)
+        angle_min = -np.pi + 0.5 * angle_increment
+        # ``np.minimum.at`` needs a finite identity; convert untouched bins to
+        # NaN only after all pixel returns have been accumulated.
+        best_ranges = np.full(beam_count, np.inf, dtype=np.float32)
+        if np.any(planar_valid):
+            angles = np.arctan2(base_y[planar_valid], base_x[planar_valid])
+            beams = np.floor((angles + np.pi) / angle_increment).astype(np.int64)
+            beams = np.clip(beams, 0, beam_count - 1)
+            np.minimum.at(best_ranges, beams, planar_range[planar_valid].astype(np.float32))
+
+        candidates = np.isfinite(best_ranges) & (best_ranges <= cfg.range_max_m)
+        support_counts = np.zeros(beam_count, dtype=np.int16)
+        if cfg.min_support_neighbors <= 0 or cfg.support_bins <= 0:
+            accepted = candidates.copy()
+        else:
+            for offset in range(1, cfg.support_bins + 1):
+                for direction in (-1, 1):
+                    neighbor = np.roll(best_ranges, direction * offset)
+                    neighbor_valid = np.isfinite(neighbor)
+                    comparable = candidates & neighbor_valid
+                    safe_current = np.where(candidates, best_ranges, 0.0)
+                    safe_neighbor = np.where(neighbor_valid, neighbor, 0.0)
+                    tolerance = np.maximum(
+                        cfg.support_tolerance_abs_m,
+                        cfg.support_tolerance_rel
+                        * np.maximum(safe_current, safe_neighbor),
+                    )
+                    range_delta = np.zeros(beam_count, dtype=np.float32)
+                    range_delta[comparable] = np.abs(
+                        best_ranges[comparable] - neighbor[comparable]
+                    )
+                    support_counts += (comparable & (range_delta <= tolerance)).astype(np.int16)
+            accepted = candidates & (support_counts >= cfg.min_support_neighbors)
+
+        ranges = np.where(accepted, best_ranges, np.nan).astype(np.float32, copy=False)
+        intensities = accepted.astype(np.float32)
+        diagnostics: dict[str, int | float] = {
+            "input_valid_pixels": int(valid_depth.sum()),
+            "vertical_supported_pixels": int((valid_depth & vertical_support).sum()),
+            "organized_supported_pixels": int(supported_pixels.sum()),
+            "planar_candidate_pixels": int(planar_valid.sum()),
+            "candidate_beams": int(candidates.sum()),
+            "accepted_beams": int(accepted.sum()),
+            "rejected_angular_support": int((candidates & ~accepted).sum()),
+            "beam_count": int(beam_count),
+            "angle_increment_deg": float(np.rad2deg(angle_increment)),
+        }
+        return ProjectedPlanarScan(
+            angle_min_rad=float(angle_min),
+            angle_increment_rad=float(angle_increment),
+            range_min_m=float(cfg.range_min_m),
+            range_max_m=float(cfg.range_max_m),
+            ranges_m=ranges,
+            intensities=intensities,
+            diagnostics=diagnostics,
+        )

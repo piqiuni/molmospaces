@@ -8,6 +8,9 @@ from typing import Any
 import numpy as np
 
 from molmo_spaces.policy.base_policy import BasePolicy
+from molmo_spaces.policy.learned_policy.organized_depth_scan import (
+    OrganizedDepthScanProjector,
+)
 from molmo_spaces.policy.learned_policy.realtime_gt_observation import RealtimeGTObservationPublisher
 from molmo_spaces.tasks.task import BaseMujocoTask
 
@@ -37,13 +40,15 @@ class RosBridgePolicy(BasePolicy):
         extra_image_queue_size: int = 16,
         publish_pointcloud: bool = True,
         publish_camera_info: bool = True,
+        publish_depth_scan: bool = False,
+        depth_scan_topic: str = "/molmo_spaces/organized_depth_scan",
         depth_camera_name: str = "head_camera",
         pointcloud_frame_id: str = "tf_frame_lidar",
         optical_frame_id: str = "head_camera_optical_frame",
         depth_fov_deg: float = 90.0,
         depth_min_m: float = 0.1,
         depth_max_m: float = 30.0,
-        pointcloud_stride: int = 2,
+        pointcloud_stride: int = 1,
         pointcloud_self_filter_radius_m: float = 0.32,
         pointcloud_roll_correction_deg: float = 0.0,
         odom_topic: str = "/odom",
@@ -118,6 +123,9 @@ class RosBridgePolicy(BasePolicy):
         self.extra_image_queue_size = int(extra_image_queue_size)
         self.publish_pointcloud = publish_pointcloud
         self.publish_camera_info = publish_camera_info
+        self.publish_depth_scan = bool(publish_depth_scan)
+        self.depth_scan_topic = str(depth_scan_topic)
+        self._organized_depth_scan_projector = OrganizedDepthScanProjector()
         self.depth_camera_name = depth_camera_name
         self.pointcloud_frame_id = pointcloud_frame_id
         self.optical_frame_id = optical_frame_id
@@ -185,6 +193,11 @@ class RosBridgePolicy(BasePolicy):
         self._step_ready_bootstrap_complete = False
         self._latest_step_ready: dict[str, Any] = {}
         self._latest_step_ready_mono_s = 0.0
+        # Per-simulator-step causal barrier evidence.  It is intentionally
+        # separate from numeric timing so the JSON timing trace can retain the
+        # source tuple and mapper stage watermarks used to unlock (or time out)
+        # a step.
+        self.last_step_ready_diagnostics: dict[str, Any] = {}
         self._latest_step_capture_ack: dict[str, Any] = {}
         self._latest_step_capture_ack_mono_s = 0.0
         self._current_step_stamp_sec = 0.0
@@ -242,9 +255,13 @@ class RosBridgePolicy(BasePolicy):
             "depth_msg_publish": 0.0,
             "pointcloud_convert": 0.0,
             "pointcloud_publish": 0.0,
+            "depth_scan_convert": 0.0,
+            "depth_scan_publish": 0.0,
             "camera_info_publish": 0.0,
             "blocking_republish": 0.0,
             "step_ready_wait": 0.0,
+            "step_ready_satisfied": 0.0,
+            "step_ready_timed_out": 0.0,
             "action_wait": 0.0,
             "postprocess_action": 0.0,
             "step_sync_publish": 0.0,
@@ -254,6 +271,7 @@ class RosBridgePolicy(BasePolicy):
             key: [] for key in self._timing_acc_ms
         }
         self.last_timing_ms: dict[str, float] = {}
+        self._latest_depth_scan_diagnostics: dict[str, int | float] = {}
         self.last_action_source: str = ""
         self._step_frame_queue_peak: int = 0
         self._lock = threading.Lock()
@@ -264,7 +282,7 @@ class RosBridgePolicy(BasePolicy):
         from geometry_msgs.msg import TransformStamped, TwistStamped
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import CameraInfo
-        from sensor_msgs.msg import Image
+        from sensor_msgs.msg import Image, LaserScan
         from sensor_msgs.msg import PointCloud2, PointField
         from std_msgs.msg import Empty, String
         from std_srvs.srv import Empty as EmptyService
@@ -274,6 +292,7 @@ class RosBridgePolicy(BasePolicy):
         self._TransformStamped = TransformStamped
         self._TwistStamped = TwistStamped
         self._Image = Image
+        self._LaserScan = LaserScan
         self._CameraInfo = CameraInfo
         self._PointCloud2 = PointCloud2
         self._PointField = PointField
@@ -319,6 +338,11 @@ class RosBridgePolicy(BasePolicy):
             )
         self._depth_pub = rospy.Publisher(self.depth_topic, Image, queue_size=self.queue_size)
         self._pointcloud_pub = rospy.Publisher(self.pointcloud_topic, PointCloud2, queue_size=self.queue_size)
+        self._depth_scan_pub = (
+            rospy.Publisher(self.depth_scan_topic, LaserScan, queue_size=self.queue_size)
+            if self.publish_depth_scan and self.depth_scan_topic
+            else None
+        )
         self._camera_info_pub = rospy.Publisher(
             self.camera_info_topic, CameraInfo, queue_size=self.queue_size
         )
@@ -724,6 +748,7 @@ class RosBridgePolicy(BasePolicy):
             self._move_base_active = False
             self._latest_step_ready = {}
             self._latest_step_ready_mono_s = 0.0
+            self.last_step_ready_diagnostics = {}
             self._latest_step_capture_ack = {}
             self._latest_step_capture_ack_mono_s = 0.0
         self._last_base_position_xyz = None
@@ -800,8 +825,10 @@ class RosBridgePolicy(BasePolicy):
                 "(%.2fHz), action_wait=%.2f/%.2f/%.2fms, gt=%.2f/%.2fms, "
                 "rgb_total=%.2f/%.2fms [extract=%.2f encode=%.2f ros_pub=%.2f "
                 "frame_enqueue=%.2f/%.2f], extra_rgb=%.2fms, "
-                "depth+pcd=%.2fms, odom_tf=%.2fms, republish=%.2fms, "
-                "postprocess=%.2fms, step_sync=%.2fms, capture_ack=%.2fms, frame_queue=%d/%d peak=%d, "
+                "depth+pcd=%.2fms, depth_scan=%.2fms [convert=%.2f pub=%.2f], "
+                "odom_tf=%.2fms, republish=%.2fms, "
+                "postprocess=%.2fms, step_ready=%.2fms sat=%.2f timeout=%.2f, "
+                "step_sync=%.2fms, capture_ack=%.2fms, frame_queue=%d/%d peak=%d, "
                 "action_source=%s timeout=%s"
             ),
             int(n),
@@ -827,9 +854,15 @@ class RosBridgePolicy(BasePolicy):
             + avg["pointcloud_convert"]
             + avg["pointcloud_publish"]
             + avg["camera_info_publish"],
+            avg["depth_scan_convert"] + avg["depth_scan_publish"],
+            avg["depth_scan_convert"],
+            avg["depth_scan_publish"],
             avg["odom_tf"],
             avg["blocking_republish"],
             avg["postprocess_action"],
+            avg["step_ready_wait"],
+            avg["step_ready_satisfied"],
+            avg["step_ready_timed_out"],
             avg["step_sync_publish"],
             avg["step_capture_ack_wait"],
             queue_size,
@@ -1274,6 +1307,7 @@ class RosBridgePolicy(BasePolicy):
             points[:, 2] = z_corr
 
         msg = self._PointCloud2()
+        msg.header.seq = int(self._step_idx)
         msg.header.stamp = stamp if stamp is not None else self._rospy.Time.now()
         msg.header.frame_id = self.pointcloud_frame_id
         msg.height = 1
@@ -1289,6 +1323,38 @@ class RosBridgePolicy(BasePolicy):
         msg.is_dense = False
         msg.data = points.tobytes()
         return msg
+
+    def _depth_to_organized_scan_msg(
+        self,
+        depth: np.ndarray,
+        intrinsics: tuple[float, float, float, float],
+        base_from_lidar: np.ndarray,
+        stamp=None,
+    ):
+        projection = self._organized_depth_scan_projector.project(
+            depth,
+            intrinsics,
+            base_from_lidar,
+        )
+        msg = self._LaserScan()
+        msg.header.seq = int(self._step_idx)
+        msg.header.stamp = stamp if stamp is not None else self._rospy.Time.now()
+        # The projection has already leveled every return in base coordinates.
+        # Publishing in base keeps GMapping's planar-laser invariant explicit.
+        msg.header.frame_id = self.base_frame_id
+        msg.angle_min = float(projection.angle_min_rad)
+        msg.angle_increment = float(projection.angle_increment_rad)
+        msg.angle_max = float(
+            projection.angle_min_rad
+            + (projection.ranges_m.size - 1) * projection.angle_increment_rad
+        )
+        msg.time_increment = 0.0
+        msg.scan_time = 0.0
+        msg.range_min = float(projection.range_min_m)
+        msg.range_max = float(projection.range_max_m)
+        msg.ranges = projection.ranges_m.tolist()
+        msg.intensities = projection.intensities.tolist()
+        return msg, projection.diagnostics
 
     def _to_depth_msg(self, depth: np.ndarray, stamp=None):
         if depth.dtype != np.float32:
@@ -1588,6 +1654,7 @@ class RosBridgePolicy(BasePolicy):
         topic_messages = [(self._depth_pub, messages.get("depth"))]
         if force_pointcloud or self.blocking_republish_pointcloud:
             topic_messages.append((self._pointcloud_pub, messages.get("pointcloud")))
+            topic_messages.append((self._depth_scan_pub, messages.get("depth_scan")))
         for publisher, message in topic_messages:
             if publisher is None or message is None:
                 continue
@@ -1605,6 +1672,80 @@ class RosBridgePolicy(BasePolicy):
     def _step_ready_payload(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._latest_step_ready)
+
+    @staticmethod
+    def _step_ready_stage_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+        """Keep the causal evidence compact enough for per-step JSON traces."""
+
+        payload = payload if isinstance(payload, dict) else {}
+        modules = payload.get("modules") or {}
+        mapping = modules.get("semantic_mapping") or {}
+        return {
+            "aggregate": {
+                "ready": bool(payload.get("ready")),
+                "step_index": payload.get("step_index"),
+                "stamp_sec": payload.get("stamp_sec"),
+                "source_alignment_required": bool(
+                    payload.get("source_alignment_required", False)
+                ),
+                "source_aligned": payload.get("source_aligned"),
+                "source_match_mode": payload.get("source_match_mode"),
+                "source_identity_key": payload.get("source_identity_key"),
+                "source_tuples": payload.get("source_tuples") or {},
+                "source_identities": payload.get("source_identities") or {},
+                "missing_modules": payload.get("missing_modules") or [],
+            },
+            "semantic_mapping": {
+                "causal_contract": mapping.get("causal_contract"),
+                "raw_occ_ready": mapping.get("raw_occ_ready"),
+                "room_segmentation_ready": mapping.get("room_segmentation_ready"),
+                "unified_graph_ready": mapping.get("unified_graph_ready"),
+                "missing_stages": mapping.get("missing_stages") or [],
+                "occupancy_source": mapping.get("occupancy_source") or {},
+                "room_segmentation_source": mapping.get(
+                    "room_segmentation_source"
+                )
+                or {},
+                "room_commit_source": mapping.get("room_commit_source") or {},
+                "unified_graph_room_source": mapping.get(
+                    "unified_graph_room_source"
+                )
+                or {},
+                "room_commit_graph_revision": mapping.get(
+                    "room_commit_graph_revision"
+                ),
+                "published_graph_revision": mapping.get(
+                    "published_graph_revision"
+                ),
+                "room_commit_latency_ms": mapping.get("room_commit_latency_ms"),
+                "room_worker_total_ms": mapping.get("room_worker_total_ms"),
+            },
+        }
+
+    def _record_step_ready_outcome(
+        self,
+        *,
+        phase: str,
+        outcome: str,
+        wait_started_mono_s: float,
+        payload: dict[str, Any],
+    ) -> None:
+        """Record the precise readiness proof or timeout for this step."""
+
+        expected = {
+            "step_index": int(self._step_idx),
+            "stamp_sec": float(self._current_step_stamp_sec),
+        }
+        self.last_step_ready_diagnostics = {
+            "enabled": bool(self.step_ready_barrier_enabled),
+            "phase": str(phase),
+            "outcome": str(outcome),
+            "ready_satisfied": str(outcome) == "satisfied",
+            "timed_out": str(outcome) == "timeout",
+            "wait_ms": max(0.0, (time.monotonic() - wait_started_mono_s) * 1000.0),
+            "expected_source": expected,
+            "stage_evidence": self._step_ready_stage_evidence(payload),
+        }
 
     def _wait_for_step_ready(
         self,
@@ -1626,7 +1767,8 @@ class RosBridgePolicy(BasePolicy):
         process it, and without duplicating RGB recordings while paused.
         """
 
-        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        wait_started_mono_s = time.monotonic()
+        deadline = wait_started_mono_s + max(0.0, float(timeout_s))
         republish_period_s = self.step_ready_bootstrap_republish_period_s
         remaining_republishes = 1 if observation is not None and messages is not None else 0
         next_republish_mono = (
@@ -1639,10 +1781,22 @@ class RosBridgePolicy(BasePolicy):
                 ignore_warmup=ignore_warmup,
                 require_current_stamp=require_current_stamp,
             ):
+                self._record_step_ready_outcome(
+                    phase=reason,
+                    outcome="satisfied",
+                    wait_started_mono_s=wait_started_mono_s,
+                    payload=self._step_ready_payload(),
+                )
                 return True
             now_mono = time.monotonic()
             if timeout_s <= 0.0 or now_mono >= deadline:
                 ready_payload = self._step_ready_payload()
+                self._record_step_ready_outcome(
+                    phase=reason,
+                    outcome="timeout",
+                    wait_started_mono_s=wait_started_mono_s,
+                    payload=ready_payload,
+                )
                 self._rospy.logwarn(
                     "RosBridgePolicy: %s step-ready timeout step=%d "
                     "current_stamp=%.6f aggregate_ready=%s aggregate_step=%s "
@@ -1753,6 +1907,19 @@ class RosBridgePolicy(BasePolicy):
         t0 = time.perf_counter()
         common_stamp = self._next_common_stamp()
         self._current_step_stamp_sec = float(common_stamp.to_sec())
+        self.last_step_ready_diagnostics = {
+            "enabled": bool(self.step_ready_barrier_enabled),
+            "phase": "not_attempted",
+            "outcome": "not_attempted",
+            "ready_satisfied": False,
+            "timed_out": False,
+            "wait_ms": 0.0,
+            "expected_source": {
+                "step_index": int(self._step_idx),
+                "stamp_sec": float(self._current_step_stamp_sec),
+            },
+            "stage_evidence": {},
+        }
         tf_ready = self._publish_odom_and_tf(observation, common_stamp)
         stage_ms["odom_tf"] = (time.perf_counter() - t0) * 1000.0
         if self._realtime_gt_publisher is not None:
@@ -1880,6 +2047,43 @@ class RosBridgePolicy(BasePolicy):
                 self._depth_pub.publish(depth_msg)
                 published_messages["depth"] = depth_msg
                 stage_ms["depth_msg_publish"] = (time.perf_counter() - t0_depth_msg) * 1000.0
+                if self._depth_scan_pub is not None:
+                    t0_depth_scan = time.perf_counter()
+                    base_from_lidar = self._extract_lidar_pose_rel_base(observation)
+                    if base_from_lidar is not None:
+                        base_from_lidar = self._apply_lidar_calibration(base_from_lidar)
+                        try:
+                            depth_scan_msg, depth_scan_diagnostics = self._depth_to_organized_scan_msg(
+                                depth,
+                                intrinsics=intrinsics,
+                                base_from_lidar=base_from_lidar,
+                                stamp=stamp,
+                            )
+                            stage_ms["depth_scan_convert"] = (
+                                time.perf_counter() - t0_depth_scan
+                            ) * 1000.0
+                            t0_depth_scan_publish = time.perf_counter()
+                            published_messages["depth_scan"] = depth_scan_msg
+                            self._depth_scan_pub.publish(depth_scan_msg)
+                            stage_ms["depth_scan_publish"] = (
+                                time.perf_counter() - t0_depth_scan_publish
+                            ) * 1000.0
+                            self._latest_depth_scan_diagnostics = depth_scan_diagnostics
+                        except (TypeError, ValueError, FloatingPointError) as exc:
+                            self._rospy.logwarn_throttle(
+                                2.0,
+                                "RosBridgePolicy: organized depth scan projection failed: %s",
+                                exc,
+                            )
+                    else:
+                        self._rospy.logwarn_throttle(
+                            2.0,
+                            "RosBridgePolicy: no current base<-lidar transform; depth scan skipped.",
+                        )
+                    if stage_ms["depth_scan_convert"] <= 0.0:
+                        stage_ms["depth_scan_convert"] = (
+                            time.perf_counter() - t0_depth_scan
+                        ) * 1000.0
                 t0_pcd_convert = time.perf_counter()
                 cloud_msg = self._depth_to_pointcloud_msg(depth, intrinsics=intrinsics, stamp=stamp)
                 stage_ms["pointcloud_convert"] = (time.perf_counter() - t0_pcd_convert) * 1000.0
@@ -1967,9 +2171,29 @@ class RosBridgePolicy(BasePolicy):
                     require_current_stamp=True,
                     reason="barrier",
                 )
+        else:
+            self.last_step_ready_diagnostics = {
+                "enabled": False,
+                "phase": "disabled",
+                "outcome": "not_required",
+                "ready_satisfied": False,
+                "timed_out": False,
+                "wait_ms": 0.0,
+                "expected_source": {
+                    "step_index": int(self._step_idx),
+                    "stamp_sec": float(self._current_step_stamp_sec),
+                },
+                "stage_evidence": {},
+            }
         stage_ms["step_ready_wait"] = (
             time.perf_counter() - ready_wait_t0
         ) * 1000.0
+        stage_ms["step_ready_satisfied"] = float(
+            bool(self.last_step_ready_diagnostics.get("ready_satisfied"))
+        )
+        stage_ms["step_ready_timed_out"] = float(
+            bool(self.last_step_ready_diagnostics.get("timed_out"))
+        )
         wait_start_mono = time.monotonic()
         self._publish_fresh_command_gate(common_stamp)
         deadline = (

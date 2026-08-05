@@ -61,7 +61,7 @@ from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
 from map_msgs.msg import OccupancyGridUpdate
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
 from rosgraph_msgs.msg import Log
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, LaserScan
 from std_msgs.msg import String
 
 try:
@@ -1665,6 +1665,7 @@ class ExploreDebugRecorder:
         self.graph_dir.mkdir(parents=True, exist_ok=True)
 
         self.args = args
+        self.projected_scan_topic = str(getattr(args, "projected_scan_topic", "") or "")
         self.step_capture_ack_topic = str(getattr(args, "step_capture_ack_topic", "") or "")
         self.step_capture_ack_pub = (
             rospy.Publisher(self.step_capture_ack_topic, String, queue_size=32)
@@ -1768,6 +1769,9 @@ class ExploreDebugRecorder:
         self.last_recorded_image_key: tuple[int, int] | None = None
         self.last_step_sync_key: tuple[int, int] | None = None
         self.image_callback_count = 0
+        self.projected_scan_callback_count = 0
+        self.projected_scan_last_source_step = 0
+        self.projected_scan_last_accepted_beams = 0
         self.step_sync_count = 0
         # A six-panel frame is substantially more expensive than a simulator
         # step.  Keep the raw step count for diagnostics while allowing the V3
@@ -2072,6 +2076,15 @@ class ExploreDebugRecorder:
                     args.raw_occupancy_grid_topic,
                     OccupancyGrid,
                     self.raw_occupancy_callback,
+                    queue_size=map_receive_queue_size,
+                )
+            )
+        if self.projected_scan_topic:
+            self.subscribers.append(
+                rospy.Subscriber(
+                    self.projected_scan_topic,
+                    LaserScan,
+                    self.projected_scan_callback,
                     queue_size=map_receive_queue_size,
                 )
             )
@@ -2594,6 +2607,51 @@ class ExploreDebugRecorder:
             self.latest_raw_grid = msg
             if self._occupancy_pairing_enabled:
                 self._register_occupancy_grid_pair_locked(msg, raw=True)
+
+    def projected_scan_callback(self, msg: LaserScan) -> None:
+        """Persist the mapper input as JSON, without recording a ROS bag."""
+        ranges = [float(value) if math.isfinite(value) else None for value in msg.ranges]
+        intensities = [
+            float(value) if math.isfinite(value) else None for value in msg.intensities
+        ]
+        accepted_beams = sum(
+            1
+            for index, value in enumerate(ranges)
+            if value is not None
+            and (
+                index >= len(intensities)
+                or (intensities[index] is not None and intensities[index] > 0.0)
+            )
+        )
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.projected_scan_callback_count += 1
+            self.projected_scan_last_source_step = int(msg.header.seq)
+            self.projected_scan_last_accepted_beams = accepted_beams
+            self._write_event(
+                "organized_depth_scan",
+                {
+                    "source_seq": int(msg.header.seq),
+                    # Preserve the bridge's exact header sequence.  The
+                    # offline renderer joins this stream to simulator frames
+                    # by stamp, because ROS header seq conventions differ
+                    # across publishers.
+                    "source_step": int(msg.header.seq),
+                    "source_step_index_hint": max(0, int(msg.header.seq) - 1),
+                    "stamp_sec": msg.header.stamp.to_sec() if msg.header.stamp else 0.0,
+                    "frame_id": str(msg.header.frame_id),
+                    "angle_min_rad": float(msg.angle_min),
+                    "angle_max_rad": float(msg.angle_max),
+                    "angle_increment_rad": float(msg.angle_increment),
+                    "range_min_m": float(msg.range_min),
+                    "range_max_m": float(msg.range_max),
+                    "beam_count": len(ranges),
+                    "accepted_beams": accepted_beams,
+                    "ranges_m": ranges,
+                    "intensities": intensities,
+                },
+            )
 
     def _register_occupancy_grid_pair_locked(self, grid: OccupancyGrid, *, raw: bool) -> None:
         """Keep the newest raw/planning grids that have an identical ROS header."""
@@ -3607,7 +3665,15 @@ class ExploreDebugRecorder:
         if node_type == "room":
             return (205, 225, 245)
         if node_type == "portal":
-            state = str((node.get("interaction") or {}).get("state", "unknown"))
+            state = str((node.get("interaction") or {}).get("state", "unknown")).casefold()
+            if state in {"blocked", "unsupported"}:
+                return (175, 45, 185)
+            if state == "static_open":
+                return (195, 175, 35)
+            if state == "static_closed":
+                return (150, 95, 105)
+            if state == "static":
+                return (125, 125, 125)
             return (50, 190, 70) if state in {"open", "ajar"} else (235, 70, 55) if state == "closed" else (235, 175, 45)
         if node_type == "container":
             return (175, 75, 220)
@@ -4365,6 +4431,16 @@ class ExploreDebugRecorder:
             panel, "open", (69, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23,
             (65, 65, 65), 1, cv2.LINE_AA,
         )
+        cv2.rectangle(panel, (106, 29), (115, 37), (195, 175, 35), 2)
+        cv2.putText(
+            panel, "static open", (118, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23,
+            (65, 65, 65), 1, cv2.LINE_AA,
+        )
+        cv2.rectangle(panel, (193, 29), (202, 37), (175, 45, 185), 2)
+        cv2.putText(
+            panel, "blocked", (205, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.23,
+            (65, 65, 65), 1, cv2.LINE_AA,
+        )
         execution_state = str(semantic_execution_state.get("state") or "IDLE")
         behavior_type = str(semantic_selection.get("behavior_type") or "-")
         feedback_status = str(semantic_behavior_feedback.get("status") or "-")
@@ -4778,8 +4854,9 @@ class ExploreDebugRecorder:
                 )
             state = str((node.get("interaction") or {}).get("state") or "unknown")
             state_label = {
-                "static_open": "open",
-                "static_closed": "closed",
+                "static_open": "static open",
+                "static_closed": "static closed",
+                "unsupported": "blocked",
             }.get(state, state)
             display_label = self._semantic_node_display_label(node)
             if node.get("type") == "room":
@@ -8132,6 +8209,10 @@ class ExploreDebugRecorder:
                 "final_grid_step": self.latest_grid_step,
                 "final_image_step": self.latest_image_step,
                 "image_callback_count": self.image_callback_count,
+                "projected_scan_topic": self.projected_scan_topic,
+                "projected_scan_callback_count": self.projected_scan_callback_count,
+                "projected_scan_last_source_step": self.projected_scan_last_source_step,
+                "projected_scan_last_accepted_beams": self.projected_scan_last_accepted_beams,
                 "step_sync_count": self.step_sync_count,
                 "step_capture_ack_topic": self.step_capture_ack_topic,
                 "step_capture_ack_published_count": self.step_capture_ack_published_count,
@@ -8244,6 +8325,10 @@ class ExploreDebugRecorder:
                 "final_grid_step": self.latest_grid_step,
                 "final_image_step": self.latest_image_step,
                 "image_callback_count": self.image_callback_count,
+                "projected_scan_topic": self.projected_scan_topic,
+                "projected_scan_callback_count": self.projected_scan_callback_count,
+                "projected_scan_last_source_step": self.projected_scan_last_source_step,
+                "projected_scan_last_accepted_beams": self.projected_scan_last_accepted_beams,
                 "step_sync_count": self.step_sync_count,
                 "step_capture_ack_topic": self.step_capture_ack_topic,
                 "step_capture_ack_published_count": self.step_capture_ack_published_count,
@@ -8412,6 +8497,11 @@ def _parse_args() -> argparse.Namespace:
         "--raw-occupancy-grid-topic",
         default="",
         help="Optional raw mapper OccupancyGrid saved alongside the display/planning grid at shutdown.",
+    )
+    parser.add_argument(
+        "--projected-scan-topic",
+        default="",
+        help="Optional organized-depth LaserScan recorded as JSONL mapper input.",
     )
     parser.add_argument(
         "--map-receive-queue-size",

@@ -11,6 +11,7 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from semantic_mapping_py_pkg.graph_rules import (
     normalize_observation,
+    opaque_portal_instance_id,
     rle_foreground_pixel_count,
 )
 from semantic_mapping_py_pkg.interaction_graph_store import InteractionGraphStore
@@ -66,8 +67,9 @@ def test_minimal_gt_is_normalized_from_only_allowed_fields() -> None:
         minimal_observation("double_door_root", "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0])
     )
 
-    assert normalized["instance_id"] == "double_door_root"
-    assert normalized["semantic_name"] == "door"
+    assert normalized["instance_id"] == opaque_portal_instance_id("double_door_root")
+    assert normalized["private_instance_id"] == "double_door_root"
+    assert normalized["semantic_name"] == "portal"
     assert normalized["aabb_center"] == [2.0, 1.0, 1.0]
     assert normalized["aabb_size"] == [0.2, 1.0, 2.0]
     assert normalized["visible_pixels"] == 100
@@ -83,7 +85,8 @@ def test_compact_mask_rle_is_counted_without_expanding_the_mask() -> None:
     assert normalized["visible_pixels"] == 6
     assert normalized["visible_fraction"] == 0.3
     assert normalized["confidence"] == 1.0
-    assert normalized["source_object_name"] == "obj_000001"
+    assert normalized["source_object_name"] == opaque_portal_instance_id("obj_000001")
+    assert normalized["private_source_object_name"] == "obj_000001"
 
 
 def test_compact_segmentation_rle_alias_is_supported() -> None:
@@ -123,7 +126,8 @@ def test_compact_minimal_gt_discards_private_routing_aliases() -> None:
 
     normalized = normalize_observation(raw)
 
-    assert normalized["source_object_name"] == "obj_000001"
+    assert normalized["source_object_name"] == opaque_portal_instance_id("obj_000001")
+    assert normalized["private_source_object_name"] == "obj_000001"
     assert normalized["visible_pixels"] == 6
     assert normalized["confidence"] == 1.0
     assert normalized["joint_infos"] == []
@@ -262,13 +266,16 @@ def test_graph_ignores_legacy_flags_parent_and_joint_state() -> None:
     )
     graph = store.as_graph_dict(stamp=1.0)
     chair_node = next(node for node in graph["nodes"] if node["id"] == "object_chair_1")
-    door_node = next(node for node in graph["nodes"] if node["id"] == "portal_door_1")
+    door_node = next(node for node in graph["nodes"] if node["type"] == "portal")
 
     assert chair_node["type"] == "object"
     assert chair_node["interaction"]["is_interactable"] is False
     assert door_node["type"] == "portal"
     assert door_node["interaction"]["state"] == "unknown"
-    assert door_node["interaction"]["requires_interaction"] is True
+    assert door_node["interaction"]["state_source"] == "unobserved"
+    assert door_node["interaction"]["is_interactable"] is False
+    assert door_node["interaction"]["requires_interaction"] is False
+    assert door_node["interaction"]["traversable"] is None
     forbidden = {"parent", "is_door", "is_articulable", "joint_infos"}
     assert forbidden.isdisjoint(chair_node["attributes"])
     assert forbidden.isdisjoint(door_node["attributes"])
@@ -287,14 +294,18 @@ def test_minimal_gt_builds_interactive_portal_without_joint_metadata() -> None:
     portal = next(
         node for node in store.as_graph_dict(stamp=2.0)["nodes"] if node["type"] == "portal"
     )
-    assert portal["id"] == "portal_double_door_root"
+    assert portal["id"] == f"portal_{opaque_portal_instance_id('double_door_root')}"
+    assert portal["name"] == "portal"
+    assert "door" not in str(portal).casefold()
     assert portal["confidence"] == 1.0
-    assert portal["interaction"]["is_interactable"] is True
+    assert portal["interaction"]["is_interactable"] is False
     assert portal["interaction"]["interaction_mode"] == "open_close"
+    assert portal["interaction"]["capability"] == "unknown"
+    assert portal["interaction"]["capability_source"] == "unobserved"
     assert portal["interaction"]["state"] == "unknown"
     assert portal["interaction"]["confidence"] == 1.0
-    assert portal["interaction"]["state_confidence"] == 1.0
-    assert portal["interaction"]["requires_interaction"] is True
+    assert portal["interaction"]["state_confidence"] == 0.0
+    assert portal["interaction"]["requires_interaction"] is False
     assert portal["attributes"]["consecutive_observations"] == 2
     forbidden = {
         "joint_infos",
@@ -309,6 +320,41 @@ def test_minimal_gt_builds_interactive_portal_without_joint_metadata() -> None:
         "interaction_approach_axis_xy",
     }
     assert forbidden.isdisjoint(portal["attributes"])
+
+
+def test_public_graph_redacts_portal_source_name_but_keeps_private_feedback_routing() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    raw_id = "doorframe_static_17"
+    store.update_observations(
+        [
+            minimal_observation(
+                raw_id,
+                "Doorway",
+                [2.0, 1.0, 1.0],
+                [0.2, 1.0, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+
+    graph = store.as_graph_dict()
+    portal = next(node for node in graph["nodes"] if node["type"] == "portal")
+    assert portal["label"] == portal["name"] == "portal"
+    assert portal["attributes"]["instance_id"].startswith("portal_ref_")
+    assert "source_object_name" not in portal["attributes"]
+    serialized = str(graph).casefold()
+    assert raw_id not in serialized
+    assert "doorframe" not in serialized
+    assert "doorway" not in serialized
+
+    assert store.update_interaction_result(
+        {"object_id": raw_id, "action": "open", "success": True, "step": 7}
+    )
+    updated = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal")
+    assert updated["interaction"]["state"] == "open"
+    assert updated["interaction"]["state_source"] == "successful_action_postcondition"
+    assert updated["interaction"]["state_observed_step"] == 7
+    assert updated["interaction"]["capability_source"] == "executor_feedback"
 
 
 def test_minimal_gt_visibility_streak_is_computed_in_graph_store() -> None:
@@ -380,7 +426,7 @@ def test_joint_only_executor_result_cannot_infer_graph_state() -> None:
 
     assert store.update_interaction_result(
         {
-            "node_id": "portal_door_1",
+            "object_id": "door_1",
             "success": True,
             "joint_infos": [
                 {
@@ -398,7 +444,8 @@ def test_joint_only_executor_result_cannot_infer_graph_state() -> None:
         node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
     )
     assert portal["interaction"]["state"] == "unknown"
-    assert portal["interaction"]["state_source"] == "semantic_graph_default"
+    assert portal["interaction"]["state_source"] == "unobserved"
+    assert portal["interaction"]["traversable"] is None
     assert "joint_infos" not in portal["attributes"]
 
 
@@ -436,4 +483,32 @@ def test_minimal_gt_id_routes_mllm_attribute_patch() -> None:
     )
     assert portal["interaction"]["state"] == "closed"
     assert portal["interaction"]["state_source"] == "mllm_attribute_inference"
+    assert portal["interaction"]["state_evidence"] == "mllm_visual_observation"
+    assert portal["interaction"]["capability_source"] == "mllm_attribute_inference"
     assert portal["attributes"]["attribute_status"] == "ready"
+
+
+def test_non_mllm_attribute_patch_cannot_write_realtime_gt_portal_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    raw_id = "doorway_opaque_1"
+    store.update_observations(
+        [minimal_observation(raw_id, "Door", [2.0, 1.0, 1.0], [0.2, 1.0, 2.0])],
+        source_mode="realtime_gt_observation",
+    )
+
+    assert store.apply_attribute_patch(
+        {
+            "object_id": raw_id,
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.9,
+            "source": "semantic_label_prior",
+        },
+        stamp=2.0,
+    )
+    portal = next(node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal")
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["interaction"]["state_source"] == "unobserved"
+    assert portal["interaction"]["is_interactable"] is False

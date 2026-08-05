@@ -143,6 +143,10 @@ semantic_map:
   publish_rate: 5.0
   # Emit component timing once per second at the normal 5 Hz cadence.
   timing_log_every: 5
+  # Default fast path: readiness means a raw OCC arrived.  Set true in the
+  # strict causal smoke override to wait for the same-source room grid and
+  # unified graph publication before the simulator may advance.
+  step_ready_require_room_graph: false
   object_match_distance: 0.5
   object_min_confirmations: 2
   graph_min_observations: 1

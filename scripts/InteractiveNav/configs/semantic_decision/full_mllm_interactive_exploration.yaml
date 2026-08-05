@@ -8,6 +8,8 @@ target:
 
 candidate:
   interaction_types: ["portal", "container"]
+  # Do not let the label-derived Door prior issue an interaction before the
+  # visual attribute module has returned a ready result.
   require_current_visibility: false
   max_state_age_sec: 3600.0
   container_require_same_room: true

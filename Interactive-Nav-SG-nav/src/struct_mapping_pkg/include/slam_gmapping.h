@@ -78,6 +78,8 @@ class SlamGMapping
     ros::ServiceServer ss_;
     ros::Subscriber reset_sub_;
     ros::Subscriber odom_sub_;
+    message_filters::Subscriber<sensor_msgs::LaserScan>* organized_depth_scan_filter_sub_;
+    tf::MessageFilter<sensor_msgs::LaserScan>* organized_depth_scan_filter_;
     tf::TransformListener tf_;
     message_filters::Subscriber<sensor_msgs::PointCloud2>* scan_filter_sub_;
     tf::MessageFilter<sensor_msgs::PointCloud2>* scan_filter_;
@@ -118,6 +120,8 @@ class SlamGMapping
     std::string odom_frame_;
     std::string reset_topic_;
     std::string odom_topic_;
+    std::string mapping_scan_source_;
+    std::string mapping_scan_topic_;
 
     void updateMap(const sensor_msgs::LaserScan& scan);
     bool getOdomPose(GMapping::OrientedPoint& gmap_pose, const ros::Time& t);
@@ -188,17 +192,20 @@ class SlamGMapping
     double filter_height_tolerance_;
     std::string filter_height_frame_;
 
-    // Conservative PointCloud2 -> planar scan projection parameters.
+    // Robust PointCloud2 -> planar scan projection parameters.
     double pointcloud_scan_range_max_;
     double pointcloud_scan_angle_increment_deg_;
     double pointcloud_scan_height_min_;
     double pointcloud_scan_height_max_;
     int pointcloud_scan_min_points_per_beam_;
+    int pointcloud_scan_cluster_min_points_;
+    double pointcloud_scan_cluster_gap_abs_m_;
+    double pointcloud_scan_cluster_gap_rel_;
+    double pointcloud_scan_cluster_quantile_;
     int pointcloud_scan_support_bins_;
     int pointcloud_scan_min_support_neighbors_;
-    double pointcloud_scan_support_range_tolerance_;
-    int pointcloud_scan_neighbor_bins_;
-    double pointcloud_scan_max_range_jump_;
+    double pointcloud_scan_support_tolerance_abs_m_;
+    double pointcloud_scan_support_tolerance_rel_;
     
     // 障碍物膨胀参数
     bool enable_obstacle_inflation_;

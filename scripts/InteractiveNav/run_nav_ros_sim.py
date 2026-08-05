@@ -678,6 +678,9 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                     {
                         "action_source": str(getattr(policy, "last_action_source", "")),
                         "action_timed_out": bool(getattr(policy, "last_action_timed_out", False)),
+                        "step_ready": dict(
+                            getattr(policy, "last_step_ready_diagnostics", {}) or {}
+                        ),
                         "step_frame_queue_size": 0 if step_frame_queue is None else step_frame_queue.qsize(),
                         "step_frame_queue_capacity": 0 if step_frame_queue is None else step_frame_queue.maxsize,
                     },
@@ -1081,7 +1084,17 @@ def parse_args():
     parser.add_argument("--debug_front_camera_fov_deg", type=float, default=65.0)
     parser.add_argument("--depth_camera_name", type=str, default="head_camera")
     parser.add_argument("--pointcloud_frame_id", type=str, default="tf_frame_lidar")
-    parser.add_argument("--pointcloud_stride", type=int, default=2)
+    parser.add_argument("--pointcloud_stride", type=int, default=1)
+    parser.add_argument(
+        "--publish_depth_scan",
+        action="store_true",
+        help="Publish an organized-depth planar LaserScan for the global OCC mapper.",
+    )
+    parser.add_argument(
+        "--depth_scan_topic",
+        type=str,
+        default="/molmo_spaces/organized_depth_scan",
+    )
     parser.add_argument("--pointcloud_self_filter_radius_m", type=float, default=0.32)
     parser.add_argument(
         "--pointcloud_roll_correction_deg",
@@ -1318,6 +1331,8 @@ def main():
             depth_camera_name=args.depth_camera_name,
             pointcloud_frame_id=args.pointcloud_frame_id,
             pointcloud_stride=args.pointcloud_stride,
+            publish_depth_scan=args.publish_depth_scan,
+            depth_scan_topic=args.depth_scan_topic,
             pointcloud_self_filter_radius_m=args.pointcloud_self_filter_radius_m,
             pointcloud_roll_correction_deg=args.pointcloud_roll_correction_deg,
             lidar_calib_x_m=args.lidar_calib_x_m,
@@ -1394,6 +1409,11 @@ def main():
             drawer_execution_mode=args.force_interaction_drawer_execution_mode,
             drawer_transition_steps=args.force_interaction_drawer_transition_steps,
             drawer_observation_steps=args.force_interaction_drawer_observation_steps,
+            object_id_resolver=(
+                getattr(policy._realtime_gt_publisher, "resolve_public_object_id", None)
+                if getattr(policy, "_realtime_gt_publisher", None) is not None
+                else None
+            ),
         )
     if args.runtime_target_selection_mode != "none":
         from std_msgs.msg import String

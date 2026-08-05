@@ -3,6 +3,10 @@ map_update_interval: 0.1
 reset_topic: "/nav_system/reset"
 odom_topic: "/odom"
 scan_filter_queue_size: 1
+# Keep the legacy PointCloud2 mapping path by default. The organized-depth POC
+# overrides this at launch; PointCloud2 is still retained for local costmap.
+mapping_scan_source: pointcloud
+mapping_scan_topic: /molmo_spaces/organized_depth_scan
 
 # GMapping核心参数
 use_odom_pose_for_mapping: true  # 仿真 odom 为真值；禁止 scan matching 旋转/平移地图
@@ -57,15 +61,24 @@ filter_height_center: 0.95
 filter_height_tolerance: 0.9
 filter_height_frame: tf_frame_base_link
 pointcloud_scan_range_max: 8.0
-pointcloud_scan_angle_increment_deg: 1.0
+# Full-resolution RGB-D supports a 0.5 degree planar projection. This stays
+# below the 0.1m map cell width through the useful indoor range.
+pointcloud_scan_angle_increment_deg: 0.5
 pointcloud_scan_height_min: 0.05
 pointcloud_scan_height_max: 1.85
+# A beam must contain enough samples and its nearest depth surface must form a
+# supported range cluster; we use a lower quantile rather than a single pixel.
 pointcloud_scan_min_points_per_beam: 3
+pointcloud_scan_cluster_min_points: 6
+pointcloud_scan_cluster_gap_abs_m: 0.08
+pointcloud_scan_cluster_gap_rel: 0.02
+pointcloud_scan_cluster_quantile: 0.25
+# Neighbor support only accepts/rejects a candidate beam. It never copies a
+# near range across a depth discontinuity into another angular bin.
 pointcloud_scan_support_bins: 2
 pointcloud_scan_min_support_neighbors: 1
-pointcloud_scan_support_range_tolerance: 0.40
-pointcloud_scan_neighbor_bins: 1
-pointcloud_scan_max_range_jump: 0.75
+pointcloud_scan_support_tolerance_abs_m: 0.10
+pointcloud_scan_support_tolerance_rel: 0.03
 
 # 障碍物膨胀参数
 enable_obstacle_inflation: true
