@@ -17,6 +17,7 @@ from .graph_rules import (
     default_interaction_payload,
     distance_xy,
     infer_node_type,
+    is_public_door_id,
     normalize_observation,
     room_node_label,
     sanitize_token,
@@ -87,6 +88,40 @@ def _interaction_result_capability(result):
     return "unknown"
 
 
+def _is_confirmed_portal_open_result(result, resolved_state):
+    """Gate synthetic post-open topology on a real confirmed open result.
+
+    A successful opaque ``open`` result is accepted as a public postcondition,
+    but explicit static/blocked capability or state always vetoes it.  In
+    particular, ``static_open`` means an already-open passage and must not
+    manufacture a far-side room merely because an interaction command was
+    issued.
+    """
+
+    if result.get("success") is not True:
+        return False
+    if str(result.get("action") or "").strip().casefold() != "open":
+        return False
+    state = str(resolved_state or "").strip().casefold()
+    capability = str(
+        result.get("interaction_capability") or result.get("capability") or ""
+    ).strip().casefold()
+    source = str(result.get("source") or "").strip().casefold()
+    if state in {"static", "static_open", "static_closed"}:
+        return False
+    if capability in {
+        "static",
+        "blocked",
+        "unsupported",
+        "unavailable",
+        "locked",
+    }:
+        return False
+    if source == "executor_static_portal":
+        return False
+    return state in {"open", "opened"}
+
+
 class InteractionGraphStore:
     def __init__(
         self,
@@ -147,6 +182,13 @@ class InteractionGraphStore:
         self.next_node_index = 1
         self.edge_counter = 1
         self.room_grid = None
+        # Statistics for the most recently accepted room grid.  Room
+        # segmentation commonly republishes the same label/confidence arrays
+        # for each newer OCC source.  Keeping the derived per-room scalars
+        # behind this private seam lets ``update_room_grid`` advance graph
+        # revision/relations without rescanning every cell on a cache hit.
+        self._room_grid_stats_cache = None
+        self.last_room_grid_cache_hit = False
         self.source_mode = "detector_online"
         self.episode_id = ""
         self.graph_revision = 0
@@ -168,6 +210,8 @@ class InteractionGraphStore:
         self.next_node_index = 1
         self.edge_counter = 1
         self.room_grid = None
+        self._room_grid_stats_cache = None
+        self.last_room_grid_cache_hit = False
         self.graph_revision = 0
         self.capture_step = None
         self.interaction_event_counter = 1
@@ -188,17 +232,54 @@ class InteractionGraphStore:
         )
         if room_id_to_name:
             self.room_id_to_name.update({int(k): str(v) for k, v in room_id_to_name.items()})
+
+        # ``scene_data`` and ``confidence_data`` are normally fresh Python
+        # lists, even when their values are unchanged from the previous OCC
+        # frame.  Compare them before copying; list equality is implemented in
+        # C and is materially cheaper than the NumPy/statistics pass below.
+        # A non-empty merge changes redirects and therefore must take the full
+        # path once so cached room statistics cannot use stale resolved IDs.
+        previous_grid = self.room_grid
+        cache_hit = bool(
+            not room_merges
+            and self._room_grid_stats_cache is not None
+            and previous_grid is not None
+            and self._room_grid_cache_matches(
+                grid_info,
+                scene_data,
+                confidence_data,
+            )
+        )
+        self.last_room_grid_cache_hit = cache_hit
+        if cache_hit:
+            # Retain the store-owned immutable copies from the previous call;
+            # this avoids two more full-grid list allocations on the hot path.
+            stored_scene_data = previous_grid["scene_data"]
+            stored_confidence_data = previous_grid["confidence_data"]
+        else:
+            stored_scene_data = self._owned_room_grid_values(scene_data)
+            stored_confidence_data = self._owned_room_grid_values(confidence_data)
         self.room_grid = {
             "info": grid_info,
-            "scene_data": list(scene_data or []),
-            "confidence_data": list(confidence_data or []),
+            "scene_data": stored_scene_data,
+            "confidence_data": stored_confidence_data,
         }
         self._apply_room_merges(room_merges or {})
-        self._refresh_room_nodes_from_grid()
+        redirects_before = self._room_redirect_signature()
+        if cache_hit:
+            self._refresh_room_nodes_from_cached_stats()
+        else:
+            self._refresh_room_nodes_from_grid()
         self._rebuild_relations()
+        # Portal-child resolution can introduce a redirect during relation
+        # rebuild.  Invalidate the cache so the next frame re-aggregates with
+        # the new resolved room IDs instead of reusing stale statistics.
+        if redirects_before != self._room_redirect_signature():
+            self._room_grid_stats_cache = None
         self._bump_revision()
 
     def set_room_geometries(self, rooms):
+        self._room_grid_stats_cache = None
         self.room_geometries = {}
         for room in rooms or []:
             room_id = room.get("room_id")
@@ -463,8 +544,7 @@ class InteractionGraphStore:
         if (
             self.portal_child_room_enabled
             and node.type == "portal"
-            and result.get("success") is not False
-            and str(state).casefold() in {"open", "static_open"}
+            and _is_confirmed_portal_open_result(result, state)
         ):
             self._ensure_open_portal_child_room(node, history)
         self._rebuild_relations(now=now)
@@ -1078,6 +1158,17 @@ class InteractionGraphStore:
     def _make_node_id(self, node_type, observation):
         instance_id = sanitize_token(observation.get("instance_id") or "")
         if instance_id:
+            # A restricted-GT door reference is already the complete public
+            # identity.  Keep the graph node aligned with it instead of
+            # emitting ``portal_door_0001`` and making every downstream
+            # consumer translate between two public names.
+            if (
+                node_type == "portal"
+                and bool(observation.get("minimal_gt_observation"))
+                and is_public_door_id(instance_id)
+            ):
+                if instance_id not in self.nodes:
+                    return instance_id
             node_id = f"{node_type}_{instance_id}"
             if node_id not in self.nodes:
                 return node_id
@@ -1179,15 +1270,24 @@ class InteractionGraphStore:
             observation_attributes[
                 "_private_source_object_name"
             ] = private_source_object_name
+        interaction_axis = list(
+            observation.get("interaction_approach_axis_xy") or []
+        )
+        if interaction_axis:
+            observation_attributes["interaction_approach_axis_xy"] = interaction_axis
+            interaction_axis_source = str(
+                observation.get("interaction_approach_axis_source") or ""
+            )
+            if interaction_axis_source:
+                observation_attributes[
+                    "interaction_approach_axis_source"
+                ] = interaction_axis_source
         if not minimal_gt:
             observation_attributes.update(
                 {
                     "asset_id": observation.get("asset_id"),
                     "object_id": observation.get("object_id"),
                     "orientation": list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
-                    "interaction_approach_axis_xy": list(
-                        observation.get("interaction_approach_axis_xy") or []
-                    ),
                     "projected_bbox_2d": list(
                         observation.get("projected_bbox_2d") or []
                     ),
@@ -1293,6 +1393,7 @@ class InteractionGraphStore:
         scene_values = np.asarray(scene_data, dtype=np.int64)
         valid_indices = np.flatnonzero(scene_values >= 0)
         if valid_indices.size == 0:
+            self._cache_room_grid_statistics(grid_info, scene_data, confidence_data, [])
             return
 
         width = int(grid_info.width)
@@ -1307,8 +1408,14 @@ class InteractionGraphStore:
             [self._resolve_room_id(room_id) for room_id in raw_room_ids],
             dtype=np.int64,
         )
-        resolved_per_cell = resolved_by_raw_room_id[raw_inverse]
-        room_ids, room_inverse = np.unique(resolved_per_cell, return_inverse=True)
+        # Resolve/unique the small set of raw room labels first, then expand
+        # the inverse map back to cells.  This is equivalent to uniquing the
+        # per-cell resolved array but avoids a second full-grid sort.
+        room_ids, raw_room_to_resolved_inverse = np.unique(
+            resolved_by_raw_room_id,
+            return_inverse=True,
+        )
+        room_inverse = raw_room_to_resolved_inverse[raw_inverse]
 
         mx = (valid_indices % width).astype(np.float64) + 0.5
         my = (valid_indices // width).astype(np.float64) + 0.5
@@ -1327,13 +1434,13 @@ class InteractionGraphStore:
         confidence_values = np.asarray(confidence_data, dtype=np.float64)
         confidence_available = valid_indices < confidence_values.size
 
+        room_statistics = []
         for room_index, raw_room_id in enumerate(room_ids):
             room_id = int(raw_room_id)
             member_mask = room_inverse == room_index
             xs = world_x[member_mask]
             ys = world_y[member_mask]
             cell_count = int(member_mask.sum())
-            node = self._ensure_room_node(room_id)
             center = [
                 float(xs.mean()),
                 float(ys.mean()),
@@ -1344,14 +1451,6 @@ class InteractionGraphStore:
                 max(resolution, float(ys.max() - ys.min())),
                 self.room_box_height,
             ]
-            stable_geometry = self._accept_room_geometry(
-                room_id, center, size, geometry_stability_frames
-            )
-            if stable_geometry is not None:
-                stable_center, stable_size = stable_geometry
-                node.centroid = stable_center
-                node.aabb_center = stable_center
-                node.aabb_size = stable_size
             room_confidence_mask = member_mask & confidence_available
             if np.any(room_confidence_mask):
                 confidence = float(
@@ -1359,9 +1458,131 @@ class InteractionGraphStore:
                 )
             else:
                 confidence = 0.0
-            node.confidence = max(node.confidence, confidence / 100.0)
-            node.attributes["cell_count"] = cell_count
-            node.attributes["active"] = True
+            statistic = {
+                "room_id": room_id,
+                "center": center,
+                "size": size,
+                "cell_count": cell_count,
+                "confidence": confidence,
+            }
+            room_statistics.append(statistic)
+            self._apply_room_grid_statistic(
+                statistic,
+                geometry_stability_frames,
+            )
+        self._cache_room_grid_statistics(
+            grid_info,
+            scene_data,
+            confidence_data,
+            room_statistics,
+        )
+
+    def _refresh_room_nodes_from_cached_stats(self, geometry_stability_frames=None):
+        cache = self._room_grid_stats_cache
+        if cache is None:
+            return self._refresh_room_nodes_from_grid(geometry_stability_frames)
+        if geometry_stability_frames is None:
+            geometry_stability_frames = self.room_geometry_stability_frames
+        for statistic in cache.get("statistics") or []:
+            self._apply_room_grid_statistic(statistic, geometry_stability_frames)
+
+    def _apply_room_grid_statistic(self, statistic, geometry_stability_frames):
+        room_id = int(statistic["room_id"])
+        center = list(statistic["center"])
+        size = list(statistic["size"])
+        node = self._ensure_room_node(room_id)
+        stable_geometry = self._accept_room_geometry(
+            room_id,
+            center,
+            size,
+            geometry_stability_frames,
+        )
+        if stable_geometry is not None:
+            stable_center, stable_size = stable_geometry
+            node.centroid = stable_center
+            node.aabb_center = stable_center
+            node.aabb_size = stable_size
+        confidence = float(statistic["confidence"])
+        node.confidence = max(node.confidence, confidence / 100.0)
+        node.attributes["cell_count"] = int(statistic["cell_count"])
+        node.attributes["active"] = True
+
+    def _cache_room_grid_statistics(
+        self,
+        grid_info,
+        scene_data,
+        confidence_data,
+        statistics,
+    ):
+        self._room_grid_stats_cache = {
+            "geometry_key": self._room_grid_geometry_key(grid_info),
+            "scene_data": scene_data,
+            "confidence_data": confidence_data,
+            "statistics": [dict(statistic) for statistic in statistics],
+            "redirect_signature": self._room_redirect_signature(),
+        }
+
+    def _room_grid_cache_matches(self, grid_info, scene_data, confidence_data):
+        cache = self._room_grid_stats_cache
+        previous_grid = self.room_grid
+        if cache is None or previous_grid is None:
+            return False
+        if cache.get("geometry_key") != self._room_grid_geometry_key(grid_info):
+            return False
+        if cache.get("redirect_signature") != self._room_redirect_signature():
+            return False
+        return self._room_grid_sequences_equal(
+            previous_grid.get("scene_data"),
+            scene_data,
+        ) and self._room_grid_sequences_equal(
+            previous_grid.get("confidence_data"),
+            confidence_data,
+        )
+
+    @staticmethod
+    def _room_grid_sequences_equal(previous, incoming):
+        if previous is incoming:
+            return True
+        if previous is None:
+            return incoming is None
+        if incoming is None:
+            return len(previous) == 0
+        if isinstance(previous, np.ndarray) or isinstance(incoming, np.ndarray):
+            return bool(np.array_equal(previous, incoming))
+        return bool(previous == incoming)
+
+    @staticmethod
+    def _owned_room_grid_values(values):
+        if values is None:
+            return []
+        # RoomTopology cache results are immutable tuples.  Retaining that
+        # exact object makes the next source-N equality check O(1), while raw
+        # list inputs keep the historical store-owned copy semantics.
+        if isinstance(values, tuple):
+            return values
+        return list(values)
+
+    def _room_grid_geometry_key(self, grid_info):
+        if grid_info is None:
+            return None
+        origin = getattr(getattr(grid_info, "origin", None), "position", None)
+        return (
+            int(getattr(grid_info, "width", 0)),
+            int(getattr(grid_info, "height", 0)),
+            float(getattr(grid_info, "resolution", 0.0)),
+            float(getattr(origin, "x", 0.0)),
+            float(getattr(origin, "y", 0.0)),
+            float(grid_origin_yaw(grid_info)),
+            float(self.room_box_height),
+        )
+
+    def _room_redirect_signature(self):
+        return tuple(
+            sorted(
+                (int(secondary), int(primary))
+                for secondary, primary in self.room_redirects.items()
+            )
+        )
 
     def _accept_room_geometry(self, room_id, center, size, stability_frames):
         candidate = self.room_geometry_candidates.get(room_id)

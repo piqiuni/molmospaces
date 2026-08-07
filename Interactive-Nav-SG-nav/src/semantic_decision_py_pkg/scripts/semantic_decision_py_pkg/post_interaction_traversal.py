@@ -19,6 +19,73 @@ def _as_int(value: object, default: int | None = None) -> int | None:
         return default
 
 
+_STATIC_PORTAL_STATES = {"static", "static_open", "static_closed"}
+_UNAVAILABLE_INTERACTION_CAPABILITIES = {
+    "static",
+    "blocked",
+    "unsupported",
+    "unavailable",
+    "locked",
+}
+
+
+def _feedback_value(
+    feedback: dict[str, Any], detail: dict[str, Any], key: str
+) -> Any:
+    value = detail.get(key)
+    if value not in (None, "", []):
+        return value
+    return feedback.get(key)
+
+
+def is_confirmed_portal_open_feedback(
+    feedback: dict[str, Any], command: dict[str, Any] | None = None
+) -> bool:
+    """Whether feedback may create a post-open portal traversal.
+
+    A successful executor ``open`` is a confirmed postcondition even when an
+    opaque backend cannot expose articulation internals.  An explicit static
+    or unavailable result always vetoes the continuation: a fixed doorway may
+    be traversable once ordinary mapping observes it, but it did not *open* a
+    new far-side navigation target.
+    """
+
+    feedback = feedback or {}
+    detail = dict(feedback.get("detail") or {})
+    status = str(feedback.get("status") or "").strip().upper()
+    success = feedback.get("success")
+    if not (status == "SUCCEEDED" or (not status and success is True)):
+        return False
+    action = str(
+        _feedback_value(feedback, detail, "action")
+        or (command or {}).get("action")
+        or ""
+    ).strip().casefold()
+    if action != "open":
+        return False
+    state = str(
+        _feedback_value(feedback, detail, "post_state")
+        or _feedback_value(feedback, detail, "state")
+        or ""
+    ).strip().casefold()
+    capability = str(
+        _feedback_value(feedback, detail, "interaction_capability")
+        or _feedback_value(feedback, detail, "capability")
+        or ""
+    ).strip().casefold()
+    source = str(_feedback_value(feedback, detail, "source") or "").strip().casefold()
+    if (
+        state in _STATIC_PORTAL_STATES
+        or capability in _UNAVAILABLE_INTERACTION_CAPABILITIES
+        or source == "executor_static_portal"
+    ):
+        return False
+    # An explicit non-open postcondition must not be turned into a fabricated
+    # beyond-door goal.  Missing state remains compatible with sealed skill
+    # backends, whose successful ``open`` is the public confirmation.
+    return not state or state in {"open", "opened"}
+
+
 def candidate_observation_step(candidate_snapshot: dict[str, Any]) -> int | None:
     """Return the public semantic-map capture step, if the publisher has one."""
 
@@ -128,7 +195,9 @@ def portal_open_confirmation(
         str(source.get("interaction_state") or source.get("state") or "").casefold()
         for source in sources
     ]
-    open_states = {"open", "static_open", "opened", "completed"}
+    # ``static_open`` proves only that this is already a fixed passage.  It is
+    # deliberately not confirmation of an articulated post-open transition.
+    open_states = {"open", "opened", "completed"}
     state_open = any(state in open_states for state in states)
     state = next((state for state in states if state in open_states), "")
     if not state:
@@ -625,17 +694,7 @@ def build_post_interaction_traversal_candidate(
         return None
     if str(metadata.get("node_type") or "").casefold() != "portal":
         return None
-    status = str(feedback.get("status") or "").upper()
-    success = feedback.get("success")
-    if not (status == "SUCCEEDED" or (not status and success is True)):
-        return None
-    action = str(
-        detail.get("action")
-        or feedback.get("action")
-        or command.get("action")
-        or ""
-    ).casefold()
-    if action != "open":
+    if not is_confirmed_portal_open_feedback(feedback, command):
         return None
 
     portal_id = str(

@@ -3,6 +3,15 @@ map_update_interval: 0.1
 reset_topic: "/nav_system/reset"
 odom_topic: "/odom"
 scan_filter_queue_size: 1
+# A positive MessageFilter tolerance requires a transform at
+# scan_stamp + tolerance. Keep the historical default; latency tests can
+# override this parameter to 0.0 without changing scan data or GMapping.
+scan_filter_tolerance_sec: 0.03
+# Observational only: emits one aggregate timing window after this many
+# delivered scan callbacks. It does not alter filtering, GMapping, or map
+# publication. Set false for baseline-throughput runs without telemetry.
+pipeline_timing_enabled: true
+pipeline_timing_log_every: 20
 # Keep the legacy PointCloud2 mapping path by default. The organized-depth POC
 # overrides this at launch; PointCloud2 is still retained for local costmap.
 mapping_scan_source: pointcloud

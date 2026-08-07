@@ -336,6 +336,7 @@ class RoomSegmenter:
                     component_cells,
                     width,
                     height,
+                    cv2=cv2,
                 ):
                     component_cells[next_temp_id] = component
                     component_confidence[next_temp_id] = (
@@ -507,6 +508,8 @@ class RoomSegmenter:
         core_component_cells,
         width,
         height,
+        *,
+        cv2=None,
     ):
         """Keep room-sized pockets that an active virtual portal cut isolated.
 
@@ -517,52 +520,106 @@ class RoomSegmenter:
         by it, and meet the ordinary minimum room area.
         """
 
-        post_components, _ = self._free_components_with_labels(
-            segmentation_free,
-            width,
-            height,
-        )
-        if len(post_components) < 2:
-            return []
-        _pre_components, pre_labels = self._free_components_with_labels(
-            pre_portal_cut_free,
-            width,
-            height,
-        )
-        seeded_cells = {
-            int(cell)
-            for component in core_component_cells.values()
-            for cell in component
-        }
-        components_by_pre_cut = {}
-        for component in post_components:
-            if not component:
-                continue
-            pre_cut_component_id = int(pre_labels[component[0]])
-            if pre_cut_component_id < 0:
-                continue
-            components_by_pre_cut.setdefault(pre_cut_component_id, []).append(
-                component
-            )
+        if cv2 is None:
+            import cv2 as cv2_module
 
-        preserved = []
-        for components in components_by_pre_cut.values():
-            if len(components) < 2:
-                continue
-            for component in components:
-                if len(component) < self.room_min_component_cells:
-                    continue
-                if any(cell in seeded_cells for cell in component):
-                    continue
-                if not self._component_touches_mask(
-                    component,
-                    portal_cut_mask,
-                    width,
-                    height,
-                ):
-                    continue
-                preserved.append(component)
-        return preserved
+            cv2 = cv2_module
+
+        # Portal pocket preservation is the only path that needs *four*
+        # connectivity.  The ordinary room seed path intentionally remains
+        # eight-connected.  This used to call the Python deque flood-fill
+        # twice over the complete grid; OpenCV labels the same components in
+        # native code, while the vectorized bookkeeping below preserves the
+        # original selection rules.
+        post_count, post_labels, post_stats, _centroids = (
+            cv2.connectedComponentsWithStats(
+                (segmentation_free > 0).astype(np.uint8),
+                connectivity=4,
+                ltype=cv2.CV_32S,
+            )
+        )
+        if int(post_count) - 1 < 2:
+            return []
+        pre_count, pre_labels, _pre_stats, _pre_centroids = (
+            cv2.connectedComponentsWithStats(
+                (pre_portal_cut_free > 0).astype(np.uint8),
+                connectivity=4,
+                ltype=cv2.CV_32S,
+            )
+        )
+
+        # OpenCV's numerical labels are implementation details.  Derive each
+        # component's first raster cell so the retained-component order is the
+        # same as the previous scan-order flood-fill, which keeps downstream
+        # temporary IDs deterministic.
+        flat_post_labels = np.asarray(post_labels, dtype=np.int32).reshape(-1)
+        flat_pre_labels = np.asarray(pre_labels, dtype=np.int32).reshape(-1)
+        component_ids = np.arange(1, int(post_count), dtype=np.int32)
+        free_indices = np.flatnonzero(flat_post_labels > 0)
+        first_indices = np.full(
+            int(post_count),
+            flat_post_labels.size,
+            dtype=np.intp,
+        )
+        np.minimum.at(
+            first_indices,
+            flat_post_labels[free_indices],
+            free_indices,
+        )
+        pre_component_ids = flat_pre_labels[first_indices[component_ids]]
+
+        # A post-cut component is eligible only if its pre-cut component was
+        # split into at least two post-cut pieces.  ``0`` is the OpenCV
+        # background label; a post-cut free cell must never map to it, but the
+        # explicit check preserves the old ``pre_label < 0`` rejection.
+        pre_split_counts = np.bincount(
+            pre_component_ids,
+            minlength=int(pre_count),
+        )
+        split_by_cut = (
+            (pre_component_ids > 0)
+            & (pre_split_counts[pre_component_ids] >= 2)
+        )
+
+        # The old helper checked each component against the eight neighbours
+        # of the portal cut.  Dilation provides exactly that relation here;
+        # including the centre has no effect because cut cells were removed
+        # from ``segmentation_free`` before components were labelled.
+        portal_neighbourhood = cv2.dilate(
+            (portal_cut_mask > 0).astype(np.uint8),
+            np.ones((3, 3), dtype=np.uint8),
+            iterations=1,
+        ).reshape(-1) > 0
+        touches_portal = np.zeros(int(post_count), dtype=bool)
+        touches_portal[np.unique(flat_post_labels[portal_neighbourhood])] = True
+        touches_portal[0] = False
+
+        seeded_cells = np.zeros(flat_post_labels.size, dtype=bool)
+        for component in core_component_cells.values():
+            indices = np.asarray(component, dtype=np.intp)
+            if indices.size:
+                seeded_cells[indices] = True
+        contains_seed = np.zeros(int(post_count), dtype=bool)
+        contains_seed[np.unique(flat_post_labels[seeded_cells])] = True
+        contains_seed[0] = False
+
+        areas = post_stats[component_ids, cv2.CC_STAT_AREA]
+        keep = (
+            (areas >= self.room_min_component_cells)
+            & split_by_cut
+            & ~contains_seed[component_ids]
+            & touches_portal[component_ids]
+        )
+        kept_component_ids = component_ids[keep]
+        if kept_component_ids.size == 0:
+            return []
+        kept_component_ids = kept_component_ids[
+            np.argsort(first_indices[kept_component_ids], kind="stable")
+        ]
+        return [
+            np.flatnonzero(flat_post_labels == component_id).astype(np.intp).tolist()
+            for component_id in kept_component_ids
+        ]
 
     def _portal_hint_key(self, observation, center):
         explicit = (

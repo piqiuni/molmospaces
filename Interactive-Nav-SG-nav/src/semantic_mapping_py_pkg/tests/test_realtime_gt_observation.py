@@ -120,6 +120,31 @@ class FakeTask:
     env = FakeEnv()
 
 
+class SnapshotEnv(FakeEnv):
+    render_calls = 0
+
+    @classmethod
+    def render_segmentation_frame(cls, _camera_name):
+        cls.render_calls += 1
+        return cls.segmentation.copy()
+
+
+class SnapshotTask:
+    def __init__(self, snapshot):
+        self.env = SnapshotEnv()
+        self._snapshot = snapshot
+        self.snapshot_requests = []
+        self.snapshot_invalidations = 0
+
+    def get_private_realtime_gt_segmentation_snapshot(self, camera_name):
+        self.snapshot_requests.append(camera_name)
+        return self._snapshot
+
+    def invalidate_private_realtime_gt_segmentation_snapshot(self):
+        self.snapshot_invalidations += 1
+        self._snapshot = None
+
+
 def _set_geom_pixels(geom_ids):
     segmentation = np.zeros((5, 5, 2), dtype=np.int32)
     segmentation[..., 1] = -1
@@ -214,7 +239,7 @@ def test_articulated_doorway_root_is_the_canonical_gt_spec():
     assert realtime_gt.RealtimeGTObservationPublisher._canonical_door_root_specs(model, specs) == {1: 0}
 
 
-def test_minimal_gt_observation_redacts_doorframe_category_and_source_id():
+def test_minimal_gt_observation_uses_generic_door_name_and_redacts_source_id():
     spec = realtime_gt._ObjectSpec(
         "doorframe_static_1",
         {"category": "Doorframe"},
@@ -235,12 +260,12 @@ def test_minimal_gt_observation_redacts_doorframe_category_and_source_id():
         np.asarray([1.0, 0.2, 2.0]),
     )
 
-    assert observation["name"] == "portal"
-    assert observation["id"] == "gt_portal_0001"
+    assert observation["name"] == observation["id"] == "door_0001"
     assert "doorframe" not in str(observation).casefold()
+    assert "gt_" not in str(observation).casefold()
 
 
-def test_realtime_gt_portal_id_is_stable_and_resolves_only_inside_publisher():
+def test_realtime_gt_door_id_is_stable_and_resolves_only_inside_publisher():
     publisher = realtime_gt.RealtimeGTObservationPublisher(
         FakeRospy(), FakeString, async_processing=False
     )
@@ -270,9 +295,10 @@ def test_realtime_gt_portal_id_is_stable_and_resolves_only_inside_publisher():
         np.asarray([1.0, 0.2, 2.0]),
     )
 
-    assert first["id"] == second["id"] == "gt_portal_0001"
-    assert first["name"] == "portal"
+    assert first["id"] == second["id"] == "door_0001"
+    assert first["name"] == "door_0001"
     assert "doorframe" not in str(first).casefold()
+    assert "gt_" not in str(first).casefold()
     assert publisher.resolve_public_object_id(first["id"]) == "private_doorframe_root"
 
 
@@ -412,6 +438,85 @@ def test_raw_gt_publisher_does_not_add_temporal_reliability_fields():
         _set_geom_pixels([0] * 6)
         after_gap = publisher.publish(FakeTask(), step_index=9)
         assert len(after_gap["observations"]) == 1
+    finally:
+        realtime_gt.body_aabb = original_aabb
+        publisher.close()
+
+
+def test_rule_oracle_gt_axis_is_opt_in_on_a_public_observation():
+    spec = realtime_gt._ObjectSpec(
+        "fridge_private",
+        {"category": "Fridge"},
+        1,
+        ("hinge",),
+        False,
+        False,
+        True,
+        False,
+    )
+    publisher = realtime_gt.RealtimeGTObservationPublisher(
+        FakeRospy(), FakeString, emit_interaction_approach_axis=True, async_processing=False
+    )
+    try:
+        observation = publisher._build_observation(
+            spec,
+            [0, 0, 3, 3],
+            16,
+            np.asarray([1.0, 2.0, 1.0]),
+            np.asarray([1.0, 1.0, 2.0]),
+            interaction_approach_axis_xy=[1.0, 0.0],
+        )
+        assert observation["interaction_approach_axis_xy"] == [1.0, 0.0]
+        assert observation["oracle_rule_gt_interaction_axis"] is True
+        assert (
+            observation["interaction_approach_axis_source"]
+            == "rule_oracle_gt_joint_geometry"
+        )
+    finally:
+        publisher.close()
+
+
+def test_realtime_gt_reuses_private_snapshot_but_force_always_renders_fresh():
+    fake_rospy = FakeRospy()
+    publisher = realtime_gt.RealtimeGTObservationPublisher(
+        fake_rospy,
+        FakeString,
+        min_visible_pixels=1,
+        min_visible_fraction=0.0,
+        required_consecutive_observations=1,
+        max_distance_m=8.0,
+        step_interval=1,
+        async_processing=False,
+    )
+    original_aabb = realtime_gt.body_aabb
+
+    def fake_aabb(_model, data, body_id, visual_only=True):
+        assert visual_only is True
+        return data.xpos[body_id].copy(), np.asarray([0.5, 0.5, 1.0])
+
+    realtime_gt.body_aabb = fake_aabb
+    try:
+        _set_geom_pixels([0] * 6)
+        SnapshotEnv.render_calls = 0
+        task = SnapshotTask(FakeEnv.segmentation.copy())
+
+        assert publisher.should_publish_step(0)
+        reused = publisher.publish(task, step_index=0)
+
+        assert reused is not None
+        assert publisher.last_snapshot_used is True
+        assert task.snapshot_requests == ["head_camera"]
+        assert SnapshotEnv.render_calls == 0
+        assert reused["source_mode"] == "geometry_observation"
+        assert "segmentation" not in reused
+        assert "segmentation" not in reused["observations"][0]
+
+        fresh = publisher.publish(task, step_index=1, force=True)
+
+        assert fresh is not None
+        assert publisher.last_snapshot_used is False
+        assert task.snapshot_invalidations == 1
+        assert SnapshotEnv.render_calls == 1
     finally:
         realtime_gt.body_aabb = original_aabb
         publisher.close()

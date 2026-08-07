@@ -21,6 +21,7 @@ rospy = pytest.importorskip("rospy")
 
 import semantic_mapping_node as semantic_mapping_module
 from semantic_mapping_node import OccupancyGrid, SemanticMappingNode
+from semantic_mapping_py_pkg.semantic_occ_overlay import SemanticOccupancyOverlay
 
 
 class _Overlay:
@@ -144,6 +145,26 @@ def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
             },
         }
     ]
+
+
+def test_static_portal_result_does_not_arm_post_open_transition() -> None:
+    static_result = {
+        "action": "open",
+        "success": True,
+        "post_state": "static_open",
+        # Deliberately omit interaction_capability: this is the compact bridge
+        # result shape consumed by the semantic mapper.
+        "source": "executor_static_portal",
+    }
+    physical_result = {
+        "action": "open",
+        "success": True,
+        "post_state": "open",
+        "interaction_capability": "articulated",
+    }
+
+    assert not SemanticMappingNode._is_successful_open_result(static_result)
+    assert SemanticMappingNode._is_successful_open_result(physical_result)
 
 
 class _SceneStore:
@@ -550,3 +571,114 @@ def test_causal_ready_deduplicates_by_stamp_when_pipeline_resequences(
     SemanticMappingNode._record_causal_ready_once(node, payload)
     assert len(recorded) == 2
     assert len(logged) == 2
+
+
+def test_room_topology_overlay_uses_raw_grid_without_confirmed_portal():
+    node = object.__new__(SemanticMappingNode)
+    node.room_segment_use_semantic_overlay = True
+    node._room_segmentation_overlay = SemanticOccupancyOverlay()
+    raw = _raw_occupancy(30.0)
+
+    effective = SemanticMappingNode._room_segmentation_occupancy_from_snapshot(
+        node, raw, {"nodes": []}
+    )
+
+    assert effective is raw
+
+
+def test_exact_room_topology_cache_reuses_content_but_not_source():
+    node = object.__new__(SemanticMappingNode)
+    node.room_topology_cache_enabled = True
+    node.room_grid_stability_frames = 1
+    node.room_free_threshold = 20
+    node._room_topology_cache = None
+    node.room_segmenter = semantic_mapping_module.RoomSegmenter(
+        room_min_component_cells=1,
+        room_core_min_component_cells=1,
+        room_core_clearance_cells=1,
+        room_remove_enclosed_occupied=False,
+        room_grid_stability_frames=1,
+    )
+    first = _raw_occupancy(31.0)
+    room_ids, room_conf = node.room_segmenter.segment(first)
+    room_merges = node.room_segmenter.consume_confirmed_merges()
+    SemanticMappingNode._store_room_topology_cache(
+        node,
+        first,
+        topology_revision=2,
+        epoch=4,
+        force_stable=False,
+        room_ids=room_ids,
+        room_conf=room_conf,
+        room_merges=room_merges,
+    )
+
+    same_content_new_source = _raw_occupancy(31.2)
+    cached, _key, _categories = SemanticMappingNode._load_room_topology_cache(
+        node,
+        same_content_new_source,
+        topology_revision=2,
+        epoch=4,
+        force_stable=False,
+    )
+    assert cached is not None
+    assert cached["room_ids"] == tuple(room_ids)
+
+    changed = _raw_occupancy(31.4)
+    changed.data[0] = 100
+    cached, _key, _categories = SemanticMappingNode._load_room_topology_cache(
+        node,
+        changed,
+        topology_revision=2,
+        epoch=4,
+        force_stable=False,
+    )
+    assert cached is None
+
+
+def test_strict_room_commit_publishes_pinned_core_bundle_immediately(monkeypatch):
+    node = object.__new__(SemanticMappingNode)
+    node.lock = threading.RLock()
+    node._publish_lock = threading.RLock()
+    node.step_ready_require_room_graph = True
+    raw = _raw_occupancy(32.0)
+    room_grid = _raw_occupancy(32.0)
+    commit = {
+        "source": {"step_index": raw.header.seq, "stamp_sec": 32.0},
+        "epoch": 0,
+        "graph_revision": 7,
+        "episode_id": "episode_1",
+    }
+    node._room_last_commit = dict(commit)
+    node.graph_store = SimpleNamespace(
+        as_graph_dict=lambda: {"graph_revision": 7, "episode_id": "episode_1"}
+    )
+    node.ablation = SimpleNamespace(module1="dynamic_rule")
+    snapshots = []
+    published = []
+    timings = []
+    node._build_publish_bundle_from_snapshot = lambda snapshot: snapshots.append(snapshot) or snapshot
+    node._publish_bundle = lambda bundle: published.append(bundle)
+    node._semantic_mapping_ready_payload_for_bundle = lambda _bundle: {"ready": True}
+    node.step_ready_pub = _Publisher()
+    node._record_causal_ready_once = lambda _payload: None
+    node._record_component_timing = lambda key, value: timings.append((key, value))
+    monkeypatch.setattr(
+        semantic_mapping_module,
+        "apply_module1_ablation",
+        lambda payload, _module: payload,
+    )
+
+    assert SemanticMappingNode._publish_causal_room_commit(
+        node, raw, room_grid, commit
+    )
+    assert published == snapshots
+    assert snapshots[0]["raw_occupancy_grid"] is raw
+    assert snapshots[0]["room_segment_grid"] is room_grid
+    assert snapshots[0]["causal_core_only"] is True
+    assert len(node.step_ready_pub.messages) == 1
+    assert {key for key, _value in timings} == {
+        "room_commit_publish_build",
+        "room_commit_publish_ros",
+        "room_commit_publish_total",
+    }

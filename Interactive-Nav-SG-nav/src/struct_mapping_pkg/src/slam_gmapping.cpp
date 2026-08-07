@@ -123,6 +123,7 @@ Initial map dimensions and resolution:
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 #include <time.h>
@@ -143,6 +144,288 @@ Initial map dimensions and resolution:
 
 // compute linear index for given map coords
 #define MAP_IDX(sx, i, j) ((sx) * (j) + (i))
+
+namespace
+{
+double wallElapsedMs(const ros::WallTime& started)
+{
+  return (ros::WallTime::now() - started).toSec() * 1000.0;
+}
+}
+
+struct SlamGMapping::PipelineTimingTrace
+{
+  PipelineTimingTrace(SlamGMapping* owner_in,
+                      const char* source_in,
+                      uint32_t source_seq_in,
+                      const ros::Time& source_stamp_in)
+    : owner(owner_in),
+      source(source_in),
+      started(ros::WallTime::now()),
+      source_seq(source_seq_in),
+      source_stamp_sec(source_stamp_in.isZero() ? 0.0 : source_stamp_in.toSec()),
+      source_age_ms(-1.0),
+      odom_delta_ms(-1.0),
+      event_mask(0),
+      active(false)
+  {
+    std::memset(stage_ms, 0, sizeof(stage_ms));
+    std::memset(stage_seen, 0, sizeof(stage_seen));
+    if (owner != NULL && owner->pipeline_timing_enabled_)
+    {
+      active = true;
+    }
+  }
+
+  ~PipelineTimingTrace()
+  {
+    if (active && owner != NULL)
+      owner->finishPipelineTiming(this);
+  }
+
+  void stage(PipelineTimingStage stage_id, double elapsed_ms)
+  {
+    if (!active || stage_id < 0 || stage_id >= PIPELINE_STAGE_COUNT)
+      return;
+    if (elapsed_ms < 0.0 || !std::isfinite(elapsed_ms))
+      return;
+    const size_t index = static_cast<size_t>(stage_id);
+    stage_ms[index] += elapsed_ms;
+    stage_seen[index] = true;
+  }
+
+  void event(PipelineTimingEvent event_id)
+  {
+    if (!active || event_id < 0 || event_id >= PIPELINE_EVENT_COUNT)
+      return;
+    event_mask |= (static_cast<uint32_t>(1) << static_cast<unsigned int>(event_id));
+  }
+
+  void observeSourceAge(double value_ms)
+  {
+    if (active && std::isfinite(value_ms))
+      source_age_ms = value_ms;
+  }
+
+  void observeOdomDelta(double value_ms)
+  {
+    if (active && std::isfinite(value_ms))
+      odom_delta_ms = value_ms;
+  }
+
+  SlamGMapping* owner;
+  const char* source;
+  ros::WallTime started;
+  uint32_t source_seq;
+  double source_stamp_sec;
+  double source_age_ms;
+  double odom_delta_ms;
+  double stage_ms[PIPELINE_STAGE_COUNT];
+  bool stage_seen[PIPELINE_STAGE_COUNT];
+  uint32_t event_mask;
+  bool active;
+};
+
+void SlamGMapping::finishPipelineTiming(PipelineTimingTrace* timing_trace)
+{
+  if (timing_trace == NULL || !timing_trace->active)
+    return;
+
+  timing_trace->stage(
+      PIPELINE_STAGE_CALLBACK_TOTAL, wallElapsedMs(timing_trace->started));
+
+  bool should_log = false;
+  uint64_t window_callbacks = 0;
+  uint64_t window_pointcloud_callbacks = 0;
+  uint64_t window_organized_depth_callbacks = 0;
+  uint64_t event_counts[PIPELINE_EVENT_COUNT];
+  uint64_t stage_counts[PIPELINE_STAGE_COUNT];
+  double stage_total_ms[PIPELINE_STAGE_COUNT];
+  double stage_max_ms[PIPELINE_STAGE_COUNT];
+  uint64_t source_age_count = 0;
+  double source_age_total_ms = 0.0;
+  double source_age_max_ms = 0.0;
+  uint64_t odom_delta_count = 0;
+  double odom_delta_total_ms = 0.0;
+  double odom_delta_max_ms = 0.0;
+
+  {
+    boost::mutex::scoped_lock lock(pipeline_timing_mutex_);
+    ++pipeline_timing_window_callbacks_;
+    if (timing_trace->source != NULL &&
+        std::strcmp(timing_trace->source, "pointcloud") == 0)
+      ++pipeline_timing_window_pointcloud_callbacks_;
+    else
+      ++pipeline_timing_window_organized_depth_callbacks_;
+
+    for (int event = 0; event < PIPELINE_EVENT_COUNT; ++event)
+    {
+      if (timing_trace->event_mask &
+          (static_cast<uint32_t>(1) << static_cast<unsigned int>(event)))
+        ++pipeline_timing_window_event_counts_[event];
+    }
+    for (int stage = 0; stage < PIPELINE_STAGE_COUNT; ++stage)
+    {
+      if (!timing_trace->stage_seen[stage])
+        continue;
+      ++pipeline_timing_window_stage_counts_[stage];
+      pipeline_timing_window_stage_total_ms_[stage] +=
+          timing_trace->stage_ms[stage];
+      pipeline_timing_window_stage_max_ms_[stage] = std::max(
+          pipeline_timing_window_stage_max_ms_[stage],
+          timing_trace->stage_ms[stage]);
+    }
+    if (timing_trace->source_age_ms >= 0.0)
+    {
+      ++pipeline_timing_window_source_age_count_;
+      pipeline_timing_window_source_age_total_ms_ +=
+          timing_trace->source_age_ms;
+      pipeline_timing_window_source_age_max_ms_ = std::max(
+          pipeline_timing_window_source_age_max_ms_,
+          timing_trace->source_age_ms);
+    }
+    if (timing_trace->odom_delta_ms >= 0.0)
+    {
+      ++pipeline_timing_window_odom_delta_count_;
+      pipeline_timing_window_odom_delta_total_ms_ +=
+          timing_trace->odom_delta_ms;
+      pipeline_timing_window_odom_delta_max_ms_ = std::max(
+          pipeline_timing_window_odom_delta_max_ms_,
+          timing_trace->odom_delta_ms);
+    }
+
+    // Finish order can differ from entry order under a multi-threaded spinner,
+    // so use the completed-window count rather than the callback sequence.
+    should_log = pipeline_timing_log_every_ > 0 &&
+                 pipeline_timing_window_callbacks_ >=
+                     static_cast<uint64_t>(pipeline_timing_log_every_);
+    if (should_log)
+    {
+      window_callbacks = pipeline_timing_window_callbacks_;
+      window_pointcloud_callbacks = pipeline_timing_window_pointcloud_callbacks_;
+      window_organized_depth_callbacks =
+          pipeline_timing_window_organized_depth_callbacks_;
+      std::memcpy(event_counts, pipeline_timing_window_event_counts_,
+                  sizeof(event_counts));
+      std::memcpy(stage_counts, pipeline_timing_window_stage_counts_,
+                  sizeof(stage_counts));
+      std::memcpy(stage_total_ms, pipeline_timing_window_stage_total_ms_,
+                  sizeof(stage_total_ms));
+      std::memcpy(stage_max_ms, pipeline_timing_window_stage_max_ms_,
+                  sizeof(stage_max_ms));
+      source_age_count = pipeline_timing_window_source_age_count_;
+      source_age_total_ms = pipeline_timing_window_source_age_total_ms_;
+      source_age_max_ms = pipeline_timing_window_source_age_max_ms_;
+      odom_delta_count = pipeline_timing_window_odom_delta_count_;
+      odom_delta_total_ms = pipeline_timing_window_odom_delta_total_ms_;
+      odom_delta_max_ms = pipeline_timing_window_odom_delta_max_ms_;
+      pipeline_timing_window_callbacks_ = 0;
+      pipeline_timing_window_pointcloud_callbacks_ = 0;
+      pipeline_timing_window_organized_depth_callbacks_ = 0;
+      std::memset(pipeline_timing_window_event_counts_, 0,
+                  sizeof(pipeline_timing_window_event_counts_));
+      std::memset(pipeline_timing_window_stage_counts_, 0,
+                  sizeof(pipeline_timing_window_stage_counts_));
+      std::memset(pipeline_timing_window_stage_total_ms_, 0,
+                  sizeof(pipeline_timing_window_stage_total_ms_));
+      std::memset(pipeline_timing_window_stage_max_ms_, 0,
+                  sizeof(pipeline_timing_window_stage_max_ms_));
+      pipeline_timing_window_source_age_count_ = 0;
+      pipeline_timing_window_source_age_total_ms_ = 0.0;
+      pipeline_timing_window_source_age_max_ms_ = 0.0;
+      pipeline_timing_window_odom_delta_count_ = 0;
+      pipeline_timing_window_odom_delta_total_ms_ = 0.0;
+      pipeline_timing_window_odom_delta_max_ms_ = 0.0;
+    }
+  }
+
+  if (!should_log)
+    return;
+
+  const double callback_avg = stage_counts[PIPELINE_STAGE_CALLBACK_TOTAL] > 0
+      ? stage_total_ms[PIPELINE_STAGE_CALLBACK_TOTAL] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_CALLBACK_TOTAL])
+      : 0.0;
+  const double filter_avg = stage_counts[PIPELINE_STAGE_FILTER] > 0
+      ? stage_total_ms[PIPELINE_STAGE_FILTER] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_FILTER])
+      : 0.0;
+  const double transform_avg = stage_counts[PIPELINE_STAGE_TRANSFORM] > 0
+      ? stage_total_ms[PIPELINE_STAGE_TRANSFORM] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_TRANSFORM])
+      : 0.0;
+  const double filtered_publish_avg =
+      stage_counts[PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH] > 0
+          ? stage_total_ms[PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH] /
+                static_cast<double>(
+                    stage_counts[PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH])
+          : 0.0;
+  const double projection_avg = stage_counts[PIPELINE_STAGE_PROJECTION] > 0
+      ? stage_total_ms[PIPELINE_STAGE_PROJECTION] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_PROJECTION])
+      : 0.0;
+  const double add_scan_avg = stage_counts[PIPELINE_STAGE_ADD_SCAN] > 0
+      ? stage_total_ms[PIPELINE_STAGE_ADD_SCAN] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_ADD_SCAN])
+      : 0.0;
+  const double update_map_avg = stage_counts[PIPELINE_STAGE_UPDATE_MAP] > 0
+      ? stage_total_ms[PIPELINE_STAGE_UPDATE_MAP] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_UPDATE_MAP])
+      : 0.0;
+  const double map_publish_avg = stage_counts[PIPELINE_STAGE_MAP_PUBLISH] > 0
+      ? stage_total_ms[PIPELINE_STAGE_MAP_PUBLISH] /
+            static_cast<double>(stage_counts[PIPELINE_STAGE_MAP_PUBLISH])
+      : 0.0;
+  const double source_age_avg = source_age_count > 0
+      ? source_age_total_ms / static_cast<double>(source_age_count)
+      : -1.0;
+  const double odom_delta_avg = odom_delta_count > 0
+      ? odom_delta_total_ms / static_cast<double>(odom_delta_count)
+      : -1.0;
+
+  ROS_INFO(
+      "[struct_mapping] pipeline_timing window=%llu callbacks"
+      "[pointcloud=%llu organized_depth=%llu] "
+      "last{source=%s seq=%u stamp=%.6f age=%.2fms odom_dt=%.2fms} "
+      "ingress_ms_avg/max{age=%.2f/%.2f odom_dt=%.2f/%.2f} "
+      "counts{processed=%llu throttled=%llu stale_drop=%llu stale_accept=%llu "
+      "unsynced_drop=%llu transform_fail=%llu projection_fail=%llu "
+      "filtered_publish=%llu mapper_init=%llu add_attempt=%llu add_ok=%llu "
+      "add_reject=%llu map_update=%llu map_publish=%llu} "
+      "ms_avg/max{callback=%.2f/%.2f filter=%.2f/%.2f "
+      "transform=%.2f/%.2f filtered_publish=%.2f/%.2f projection=%.2f/%.2f "
+      "addScan=%.2f/%.2f updateMap=%.2f/%.2f map_publish=%.2f/%.2f}",
+      static_cast<unsigned long long>(window_callbacks),
+      static_cast<unsigned long long>(window_pointcloud_callbacks),
+      static_cast<unsigned long long>(window_organized_depth_callbacks),
+      timing_trace->source != NULL ? timing_trace->source : "unknown",
+      timing_trace->source_seq, timing_trace->source_stamp_sec,
+      timing_trace->source_age_ms, timing_trace->odom_delta_ms,
+      source_age_avg, source_age_max_ms, odom_delta_avg, odom_delta_max_ms,
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_PROCESSED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_THROTTLED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_STALE_DROP]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_STALE_ACCEPTED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_UNSYNCED_DROP]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_TRANSFORM_FAILURE]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_PROJECTION_FAILURE]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_FILTERED_CLOUD_PUBLISH]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_MAPPER_INITIALIZED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_ADD_SCAN_ATTEMPT]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_ADD_SCAN_ACCEPTED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_ADD_SCAN_REJECTED]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_MAP_UPDATE]),
+      static_cast<unsigned long long>(event_counts[PIPELINE_EVENT_MAP_PUBLISHED]),
+      callback_avg, stage_max_ms[PIPELINE_STAGE_CALLBACK_TOTAL],
+      filter_avg, stage_max_ms[PIPELINE_STAGE_FILTER],
+      transform_avg, stage_max_ms[PIPELINE_STAGE_TRANSFORM],
+      filtered_publish_avg,
+      stage_max_ms[PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH],
+      projection_avg, stage_max_ms[PIPELINE_STAGE_PROJECTION],
+      add_scan_avg, stage_max_ms[PIPELINE_STAGE_ADD_SCAN],
+      update_map_avg, stage_max_ms[PIPELINE_STAGE_UPDATE_MAP],
+      map_publish_avg, stage_max_ms[PIPELINE_STAGE_MAP_PUBLISH]);
+}
 
 SlamGMapping::SlamGMapping():
   map_to_odom_(tf::Transform(tf::createQuaternionFromRPY( 0, 0, 0 ), tf::Point(0, 0, 0 ))),
@@ -211,6 +494,28 @@ void SlamGMapping::init()
     scan_filter_queue_size_ = 1;
   if (scan_filter_queue_size_ < 1)
     scan_filter_queue_size_ = 1;
+  private_nh_.param("scan_filter_tolerance_sec", scan_filter_tolerance_sec_, 0.03);
+  scan_filter_tolerance_sec_ = std::max(0.0, scan_filter_tolerance_sec_);
+  private_nh_.param("pipeline_timing_enabled", pipeline_timing_enabled_, false);
+  private_nh_.param("pipeline_timing_log_every", pipeline_timing_log_every_, 20);
+  pipeline_timing_log_every_ = std::max(1, pipeline_timing_log_every_);
+  pipeline_timing_window_callbacks_ = 0;
+  pipeline_timing_window_pointcloud_callbacks_ = 0;
+  pipeline_timing_window_organized_depth_callbacks_ = 0;
+  std::memset(pipeline_timing_window_event_counts_, 0,
+              sizeof(pipeline_timing_window_event_counts_));
+  std::memset(pipeline_timing_window_stage_counts_, 0,
+              sizeof(pipeline_timing_window_stage_counts_));
+  std::memset(pipeline_timing_window_stage_total_ms_, 0,
+              sizeof(pipeline_timing_window_stage_total_ms_));
+  std::memset(pipeline_timing_window_stage_max_ms_, 0,
+              sizeof(pipeline_timing_window_stage_max_ms_));
+  pipeline_timing_window_source_age_count_ = 0;
+  pipeline_timing_window_source_age_total_ms_ = 0.0;
+  pipeline_timing_window_source_age_max_ms_ = 0.0;
+  pipeline_timing_window_odom_delta_count_ = 0;
+  pipeline_timing_window_odom_delta_total_ms_ = 0.0;
+  pipeline_timing_window_odom_delta_max_ms_ = 0.0;
   private_nh_.param("mapping_scan_source", mapping_scan_source_, std::string("pointcloud"));
   private_nh_.param("mapping_scan_topic", mapping_scan_topic_,
                     std::string("/molmo_spaces/organized_depth_scan"));
@@ -392,7 +697,7 @@ void SlamGMapping::startLiveSlam()
       node_, "registered_scan", scan_filter_queue_size_);
   scan_filter_ = new tf::MessageFilter<sensor_msgs::PointCloud2>(
       *scan_filter_sub_, tf_, odom_frame_, scan_filter_queue_size_);
-  scan_filter_->setTolerance(ros::Duration(0.03));
+  scan_filter_->setTolerance(ros::Duration(scan_filter_tolerance_sec_));
   scan_filter_->registerCallback([this](auto msg){ pointCloudCallback(msg); });
   if (mapping_scan_source_ == "organized_depth")
   {
@@ -400,7 +705,7 @@ void SlamGMapping::startLiveSlam()
         node_, mapping_scan_topic_, scan_filter_queue_size_);
     organized_depth_scan_filter_ = new tf::MessageFilter<sensor_msgs::LaserScan>(
         *organized_depth_scan_filter_sub_, tf_, odom_frame_, scan_filter_queue_size_);
-    organized_depth_scan_filter_->setTolerance(ros::Duration(0.03));
+    organized_depth_scan_filter_->setTolerance(ros::Duration(scan_filter_tolerance_sec_));
     organized_depth_scan_filter_->registerCallback(
         [this](const sensor_msgs::LaserScan::ConstPtr& msg) { laserCallback(msg); });
   }
@@ -415,6 +720,10 @@ void SlamGMapping::startLiveSlam()
   ROS_INFO("Target odom frame: %s", odom_frame_.c_str());
   ROS_INFO("Subscribed to odom topic: %s", odom_topic_.c_str());
   ROS_INFO("Scan filter queue size: %d", scan_filter_queue_size_);
+  ROS_INFO("Scan filter TF tolerance: %.3fs", scan_filter_tolerance_sec_);
+  ROS_INFO("Pipeline timing telemetry: %s (log every %d delivered callbacks)",
+           pipeline_timing_enabled_ ? "enabled" : "disabled",
+           pipeline_timing_log_every_);
   ROS_INFO("Publishing map to topic: /struct_mapping/occ_map");
   ROS_INFO("Subscribed to reset topic: %s", reset_topic_.c_str());
 }
@@ -830,12 +1139,15 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
 void
 SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud)
 {
+  PipelineTimingTrace timing_trace(
+      this, "pointcloud", cloud->header.seq, cloud->header.stamp);
   if (enable_time_sync_guard_)
   {
     const ros::Time now = ros::Time::now();
     if (!cloud->header.stamp.isZero())
     {
       const double cloud_age_sec = (now - cloud->header.stamp).toSec();
+      timing_trace.observeSourceAge(cloud_age_sec * 1000.0);
       if (cloud_age_sec > max_cloud_age_sec_)
       {
         if (enforce_cloud_age_drop_)
@@ -845,6 +1157,7 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
               "Drop stale pointcloud: age=%.3fs exceeds max_cloud_age_sec=%.3fs",
               cloud_age_sec,
               max_cloud_age_sec_);
+          timing_trace.event(PIPELINE_EVENT_STALE_DROP);
           return;
         }
         ROS_WARN_THROTTLE(
@@ -852,17 +1165,21 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
             "Stale pointcloud accepted (no drop): age=%.3fs exceeds max_cloud_age_sec=%.3fs",
             cloud_age_sec,
             max_cloud_age_sec_);
+        timing_trace.event(PIPELINE_EVENT_STALE_ACCEPTED);
       }
     }
 
     double odom_dt_sec = 0.0;
-    if (!hasMatchedOdomStamp(cloud->header.stamp, &odom_dt_sec))
+    const bool odom_matched = hasMatchedOdomStamp(cloud->header.stamp, &odom_dt_sec);
+    timing_trace.observeOdomDelta(odom_dt_sec * 1000.0);
+    if (!odom_matched)
     {
       ROS_WARN_THROTTLE(
           2.0,
           "Drop unsynced pointcloud: nearest odom dt=%.4fs exceeds threshold=%.4fs",
           odom_dt_sec,
           max_odom_cloud_time_diff_);
+      timing_trace.event(PIPELINE_EVENT_UNSYNCED_DROP);
       return;
     }
   }
@@ -872,32 +1189,47 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
   {
     laser_count_++;
     if ((laser_count_ % throttle_scans_) != 0)
+    {
+      timing_trace.event(PIPELINE_EVENT_THROTTLED);
       return;
+    }
     if(laser_count_ % 50 == 0)  // 每50帧输出一次
       ROS_INFO("Received point cloud data, processed %d scans so far", laser_count_ / throttle_scans_);
   }
+  timing_trace.event(PIPELINE_EVENT_PROCESSED);
 
   static ros::Time last_map_update(0,0);
 
   // 创建点云副本用于滤波（避免修改原始消息）
+  const ros::WallTime filter_started = ros::WallTime::now();
   sensor_msgs::PointCloud2 filtered_cloud = *cloud;
   
   // 应用高度滤波
   filterPointCloudByHeight(filtered_cloud);
+  timing_trace.stage(PIPELINE_STAGE_FILTER, wallElapsedMs(filter_started));
 
   // GMapping only supports planar laser frames. The incoming /registered_scan may
   // follow the real head-camera pose (with pitch/roll), so we level it into the
   // robot base frame before synthesizing the 2D scan used by gmapping.
-  if(!transformPointCloudToFrame(filtered_cloud, base_frame_))
+  const ros::WallTime transform_started = ros::WallTime::now();
+  const bool transform_ok = transformPointCloudToFrame(filtered_cloud, base_frame_);
+  timing_trace.stage(PIPELINE_STAGE_TRANSFORM, wallElapsedMs(transform_started));
+  if(!transform_ok)
   {
     ROS_WARN_THROTTLE(2.0, "Failed to transform pointcloud into base frame for planar gmapping");
+    timing_trace.event(PIPELINE_EVENT_TRANSFORM_FAILURE);
     return;
   }
   
   // 发布滤波后的点云
   if (filtered_cloud_pub_.getNumSubscribers() > 0)
   {
+    const ros::WallTime filtered_publish_started = ros::WallTime::now();
     filtered_cloud_pub_.publish(filtered_cloud);
+    timing_trace.stage(
+        PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH,
+        wallElapsedMs(filtered_publish_started));
+    timing_trace.event(PIPELINE_EVENT_FILTERED_CLOUD_PUBLISH);
   }
 
   // In organized-depth mode PointCloud2 remains the local-costmap input, but
@@ -907,10 +1239,14 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
 
   // Convert PointCloud2 to LaserScan
   sensor_msgs::LaserScan scan;
+  const ros::WallTime projection_started = ros::WallTime::now();
   sensor_msgs::PointCloud2::ConstPtr filtered_cloud_ptr = boost::make_shared<sensor_msgs::PointCloud2>(filtered_cloud);
-  if(!convertPointCloudToLaserScan(filtered_cloud_ptr, scan))
+  const bool projection_ok = convertPointCloudToLaserScan(filtered_cloud_ptr, scan);
+  timing_trace.stage(PIPELINE_STAGE_PROJECTION, wallElapsedMs(projection_started));
+  if(!projection_ok)
   {
     ROS_WARN("Failed to convert point cloud to laser scan");
+    timing_trace.event(PIPELINE_EVENT_PROJECTION_FAILURE);
     return;
   }
 
@@ -924,13 +1260,19 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
       return;
     }
     got_first_scan_ = true;
+    timing_trace.event(PIPELINE_EVENT_MAPPER_INITIALIZED);
     ROS_INFO("Mapper initialized successfully!");
   }
 
   GMapping::OrientedPoint odom_pose;
 
-  if(addScan(scan, odom_pose))
+  timing_trace.event(PIPELINE_EVENT_ADD_SCAN_ATTEMPT);
+  const ros::WallTime add_scan_started = ros::WallTime::now();
+  const bool scan_accepted = addScan(scan, odom_pose);
+  timing_trace.stage(PIPELINE_STAGE_ADD_SCAN, wallElapsedMs(add_scan_started));
+  if(scan_accepted)
   {
+    timing_trace.event(PIPELINE_EVENT_ADD_SCAN_ACCEPTED);
     ROS_DEBUG("scan processed");
 
     GMapping::OrientedPoint mpose = gsp_->getParticles()[gsp_->getBestParticleIndex()].pose;
@@ -970,11 +1312,15 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
 
     if(!got_map_ || (cloud->header.stamp - last_map_update) > map_update_interval_)
     {
-      updateMap(scan);
+      timing_trace.event(PIPELINE_EVENT_MAP_UPDATE);
+      const ros::WallTime update_map_started = ros::WallTime::now();
+      updateMap(scan, &timing_trace);
+      timing_trace.stage(PIPELINE_STAGE_UPDATE_MAP, wallElapsedMs(update_map_started));
       last_map_update = cloud->header.stamp;
       ROS_INFO("Map updated at time %.2f", cloud->header.stamp.toSec());
     }
   } else {
+    timing_trace.event(PIPELINE_EVENT_ADD_SCAN_REJECTED);
     ROS_DEBUG("cannot process scan");
     ROS_WARN_THROTTLE(5.0, "Cannot process scan - check TF and odometry data");
   }
@@ -983,6 +1329,8 @@ SlamGMapping::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud
 void
 SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
 {
+  PipelineTimingTrace timing_trace(
+      this, "organized_depth", scan->header.seq, scan->header.stamp);
   if (mapping_scan_source_ != "organized_depth")
     return;
 
@@ -992,29 +1340,40 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     if (!scan->header.stamp.isZero())
     {
       const double scan_age_sec = (now - scan->header.stamp).toSec();
+      timing_trace.observeSourceAge(scan_age_sec * 1000.0);
       if (scan_age_sec > max_cloud_age_sec_ && enforce_cloud_age_drop_)
       {
         ROS_WARN_THROTTLE(
             2.0,
             "Drop stale organized depth scan: age=%.3fs exceeds max_cloud_age_sec=%.3fs",
             scan_age_sec, max_cloud_age_sec_);
+        timing_trace.event(PIPELINE_EVENT_STALE_DROP);
         return;
       }
+      if (scan_age_sec > max_cloud_age_sec_)
+        timing_trace.event(PIPELINE_EVENT_STALE_ACCEPTED);
     }
     double odom_dt_sec = 0.0;
-    if (!hasMatchedOdomStamp(scan->header.stamp, &odom_dt_sec))
+    const bool odom_matched = hasMatchedOdomStamp(scan->header.stamp, &odom_dt_sec);
+    timing_trace.observeOdomDelta(odom_dt_sec * 1000.0);
+    if (!odom_matched)
     {
       ROS_WARN_THROTTLE(
           2.0,
           "Drop unsynced organized depth scan: nearest odom dt=%.4fs exceeds threshold=%.4fs",
           odom_dt_sec, max_odom_cloud_time_diff_);
+      timing_trace.event(PIPELINE_EVENT_UNSYNCED_DROP);
       return;
     }
   }
 
   laser_count_++;
   if ((laser_count_ % throttle_scans_) != 0)
+  {
+    timing_trace.event(PIPELINE_EVENT_THROTTLED);
     return;
+  }
+  timing_trace.event(PIPELINE_EVENT_PROCESSED);
 
   static ros::Time last_map_update(0,0);
 
@@ -1024,12 +1383,18 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
     if(!initMapper(*scan))
       return;
     got_first_scan_ = true;
+    timing_trace.event(PIPELINE_EVENT_MAPPER_INITIALIZED);
   }
 
   GMapping::OrientedPoint odom_pose;
 
-  if(addScan(*scan, odom_pose))
+  timing_trace.event(PIPELINE_EVENT_ADD_SCAN_ATTEMPT);
+  const ros::WallTime add_scan_started = ros::WallTime::now();
+  const bool scan_accepted = addScan(*scan, odom_pose);
+  timing_trace.stage(PIPELINE_STAGE_ADD_SCAN, wallElapsedMs(add_scan_started));
+  if(scan_accepted)
   {
+    timing_trace.event(PIPELINE_EVENT_ADD_SCAN_ACCEPTED);
     ROS_DEBUG("scan processed");
 
     GMapping::OrientedPoint mpose = gsp_->getParticles()[gsp_->getBestParticleIndex()].pose;
@@ -1055,12 +1420,18 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
 
     if(!got_map_ || (scan->header.stamp - last_map_update) > map_update_interval_)
     {
-      updateMap(*scan);
+      timing_trace.event(PIPELINE_EVENT_MAP_UPDATE);
+      const ros::WallTime update_map_started = ros::WallTime::now();
+      updateMap(*scan, &timing_trace);
+      timing_trace.stage(PIPELINE_STAGE_UPDATE_MAP, wallElapsedMs(update_map_started));
       last_map_update = scan->header.stamp;
       ROS_DEBUG("Updated the map");
     }
   } else
+  {
+    timing_trace.event(PIPELINE_EVENT_ADD_SCAN_REJECTED);
     ROS_DEBUG("cannot process scan");
+  }
 }
 
 void SlamGMapping::odomCallback(const nav_msgs::Odometry::ConstPtr& odom)
@@ -1093,7 +1464,8 @@ SlamGMapping::computePoseEntropy()
 }
 
 void
-SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan)
+SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan,
+                        PipelineTimingTrace* timing_trace)
 {
   ROS_DEBUG("Update map");
   boost::mutex::scoped_lock map_lock (map_mutex_);
@@ -1214,8 +1586,15 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan)
       : scan.header.stamp;
   map_.map.header.frame_id = tf_.resolve( map_frame_ );
 
+  const ros::WallTime map_publish_started = ros::WallTime::now();
   sst_.publish(map_.map);
   sstm_.publish(map_.map.info);
+  if (timing_trace != NULL)
+  {
+    timing_trace->stage(
+        PIPELINE_STAGE_MAP_PUBLISH, wallElapsedMs(map_publish_started));
+    timing_trace->event(PIPELINE_EVENT_MAP_PUBLISHED);
+  }
 }
 
 bool 

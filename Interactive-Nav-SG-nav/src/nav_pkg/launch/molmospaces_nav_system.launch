@@ -7,6 +7,7 @@
   <arg name="mapping_mode" default="odom_locked"/>
   <arg name="mapping_scan_source" default="pointcloud"/>
   <arg name="mapping_scan_topic" default="/molmo_spaces/organized_depth_scan"/>
+  <arg name="scan_filter_tolerance_sec" default="0.03"/>
   <arg name="start_semantic_mapping" default="false"/>
   <arg name="semantic_planning_occ_topic" default="/semantic_mapping/planning_occ_map"/>
   <arg name="global_map_topic"
@@ -116,6 +117,7 @@
       <arg name="mapping_mode" value="$(arg mapping_mode)"/>
       <arg name="mapping_scan_source" value="$(arg mapping_scan_source)"/>
       <arg name="mapping_scan_topic" value="$(arg mapping_scan_topic)"/>
+      <arg name="scan_filter_tolerance_sec" value="$(arg scan_filter_tolerance_sec)"/>
     </include>
   </group>
 
@@ -126,6 +128,7 @@
       <arg name="start_object_detection" value="true"/>
       <arg name="start_room_attribute" value="true"/>
       <arg name="start_semantic_mapping" value="true"/>
+      <arg name="subscribe_pointcloud" value="true"/>
       <arg name="object_detection_backend" value="$(arg semantic_object_detection_backend)"/>
       <arg name="object_detection_provider" value="$(arg semantic_object_detection_provider)"/>
       <arg name="object_detection_model_path" value="$(arg semantic_object_detection_model_path)"/>
@@ -160,6 +163,9 @@
       <arg name="start_object_detection" value="false"/>
       <arg name="start_room_attribute" value="false"/>
       <arg name="start_semantic_mapping" value="true"/>
+      <!-- realtime_gt supplies semantic observations directly; no legacy
+           scene-attribute consumer needs the registered cloud. -->
+      <arg name="subscribe_pointcloud" value="false"/>
       <arg name="start_attribute_inference" value="$(arg semantic_attribute_inference)"/>
       <arg name="attribute_model_name" value="$(arg semantic_attribute_model_name)"/>
       <arg name="attribute_max_output_tokens" value="$(arg semantic_attribute_max_output_tokens)"/>
@@ -187,6 +193,7 @@
       <arg name="start_object_detection" value="false"/>
       <arg name="start_room_attribute" value="true"/>
       <arg name="start_semantic_mapping" value="true"/>
+      <arg name="subscribe_pointcloud" value="true"/>
       <arg name="room_inference_backend" value="$(arg semantic_room_inference_backend)"/>
     </include>
 

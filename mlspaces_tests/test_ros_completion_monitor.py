@@ -60,3 +60,20 @@ def test_object_goal_completion_stops_on_verified_target_success() -> None:
         }
     ) is True
     assert state.reason == "target_goal_succeeded"
+
+
+def test_semantic_completion_stops_on_confirmed_terminal_no_plan_stagnation() -> None:
+    state = CompletionState(CompletionMonitorConfig(mode="semantic"))
+
+    assert state.update_semantic(
+        {
+            "status": "EXPLORATION_STALLED",
+            "detail": {
+                "reason": "no_executable_candidates_after_terminal_interaction_no_plan",
+                "no_executable_elapsed_steps": 20,
+                "eligible_candidate_count": 0,
+            },
+        }
+    ) is True
+    assert state.reason == "no_executable_candidates_after_terminal_interaction_no_plan"
+    assert state.should_stop(42) is True

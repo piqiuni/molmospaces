@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,6 +18,7 @@ from offline_semantic_renderer import (
     GlobalCostmapReplay,
     OfflineSixPanelRenderer,
     TransformResolver,
+    active_semantic_selection,
     draw_camera_title,
     draw_task_subgoal_header,
     known_world_bounds,
@@ -43,6 +45,31 @@ def load_jsonl(path: Path) -> list[dict]:
         if line.strip():
             records.append(json.loads(line))
     return sorted(records, key=lambda record: int(record.get("step_index", 0)))
+
+
+def offline_display_config(visualization_config: dict | None) -> dict[str, float | str]:
+    """Read persisted offline panel settings with stable replay defaults."""
+    config = visualization_config or {}
+
+    def scale(key: str, default: float) -> float:
+        try:
+            value = float(config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) and value >= 1.0 else default
+
+    label_mode = str(
+        config.get("video_semantic_xy_label_mode", "interaction_target_only")
+        or "interaction_target_only"
+    ).casefold()
+    if label_mode not in {"all", "interaction_target_only", "none"}:
+        label_mode = "interaction_target_only"
+    return {
+        "global_panel_scale": scale("video_global_panel_scale", 1.8),
+        "room_panel_scale": scale("video_room_panel_scale", 1.5),
+        "semantic_xy_panel_scale": scale("video_semantic_xy_panel_scale", 1.8),
+        "semantic_xy_label_mode": label_mode,
+    }
 
 
 def load_recorder_frames(path: Path, *, source_seq_is_step_index: bool = False) -> list[dict]:
@@ -623,13 +650,17 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     global_full_meta,
                     (global_update_meta or {}).get("receipt_id") or receipts.get("global_costmap_update"),
                 )
-                visualization_config = step.get("visualization_config") or {}
+                visualization_config = offline_display_config(
+                    step.get("visualization_config") or {}
+                )
                 occ_crop_margin_m = float(
-                    visualization_config.get("video_occ_crop_margin_m", 2.5) or 2.5
+                    (step.get("visualization_config") or {}).get("video_occ_crop_margin_m", 2.5)
+                    or 2.5
                 )
-                global_panel_scale = float(
-                    visualization_config.get("video_global_panel_scale", 1.8) or 1.8
-                )
+                global_panel_scale = float(visualization_config["global_panel_scale"])
+                room_panel_scale = float(visualization_config["room_panel_scale"])
+                semantic_xy_panel_scale = float(visualization_config["semantic_xy_panel_scale"])
+                semantic_xy_label_mode = str(visualization_config["semantic_xy_label_mode"])
                 world_bounds = (
                     known_world_bounds(planning, margin_m=occ_crop_margin_m)
                     if planning is not None
@@ -643,7 +674,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     raise RuntimeError(f"Missing simulator camera image for step {step_index}")
                 camera = cv2.cvtColor(camera, cv2.COLOR_BGR2RGB)
                 camera = cv2.resize(camera, panel_size, interpolation=cv2.INTER_AREA)
-                selection = step.get("semantic_selection") or {}
+                selection = active_semantic_selection(step)
                 draw_gt(
                     camera,
                     sim_record.get("gt_observations"),
@@ -662,7 +693,13 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 )
                 draw_task_subgoal_header(occ, step)
                 room_panel = renderer.render_room_panel(
-                    planning, room, panel_size, step, step_index, world_bounds
+                    planning,
+                    room,
+                    panel_size,
+                    step,
+                    step_index,
+                    world_bounds,
+                    view_scale=room_panel_scale,
                 )
                 global_width = panel_size[0] // 2
                 global_panel = renderer.render_map_panel(
@@ -678,7 +715,13 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 )
                 costmaps = np.concatenate([global_panel, local_panel], axis=1)
                 spatial = renderer.render_semantic_xy(
-                    planning, panel_size, step, step_index, world_bounds
+                    planning,
+                    panel_size,
+                    step,
+                    step_index,
+                    world_bounds,
+                    view_scale=semantic_xy_panel_scale,
+                    label_mode=semantic_xy_label_mode,
                 )
                 topology = renderer.render_topology(panel_size, step, step_index)
                 frame = np.vstack([

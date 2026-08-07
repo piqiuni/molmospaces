@@ -90,10 +90,40 @@ def test_compact_graph_redacts_portal_source_labels_from_mllm_context() -> None:
     )
 
     node = graph["nodes"][0]
-    assert node["label"] == node["name"] == "portal"
+    assert node["id"] == "door_0001"
+    assert node["label"] == node["name"] == "door_0001"
     assert "source_object_name" not in node
     assert "doorframe" not in str(graph).casefold()
     assert "doorway" not in str(graph).casefold()
+    assert "gt_" not in str(graph).casefold()
+
+
+def test_compact_semantic_graph_redacts_legacy_portal_identity() -> None:
+    graph = compact_semantic_graph(
+        {
+            "nodes": [
+                {
+                    "id": "portal_door_x_17",
+                    "type": "portal",
+                    "label": "doorframe",
+                    "name": "door_x_17",
+                    "attributes": {
+                        "instance_id": "gt_portal_0001",
+                        "source_object_name": "private_doorframe_root",
+                        "connected_room_ids": [1],
+                    },
+                    "interaction": {"state": "unknown"},
+                }
+            ]
+        }
+    )
+
+    assert graph["portals"][0]["id"] == "door_0001"
+    assert graph["portals"][0]["type"] == "door"
+    serialized = str(graph).casefold()
+    assert "door_x_17" not in serialized
+    assert "doorframe" not in serialized
+    assert "gt_" not in serialized
 
 
 def test_semantic_graph_keeps_only_rooms_portals_and_containers() -> None:

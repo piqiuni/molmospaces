@@ -668,6 +668,105 @@ bash scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
   outputs/readiness_strict_smoke house7_force_route_01
 ```
 
+性能验收读取同一 `roslaunch.log`：`SemanticMappingTiming` 给出
+`room_worker_{overlay,segment,crop,graph_update,total}`、topology/graph cache hit 及
+commit-triggered publish 耗时；`[struct_mapping] pipeline_timing` 给出 source ingress age、
+filter、TF、projection、`addScan`、`updateMap` 与 map publish。不要再把 timer 轮询等待算作
+room segmentation：严格模式下 room commit 会立即发布 source-pinned core bundle，`room_commit_publish_total`
+应为数毫秒，且每行 `SemanticMappingCausalReady` 的 raw/room stamp 必须相同。
+
+`pipeline_timing` 的 `filter` 是 callback 内的点云高度过滤，不是 `tf::MessageFilter` 等待。
+`scan_filter_tolerance_sec=0.03` 会额外要求 `stamp + 30 ms` 的未来 TF；在 bridge 的
+250 ms TF keepalive 下可造成约 200 ms source-age。入口脚本保留历史默认值 0.03，但可在
+strict latency smoke 显式传 `SCAN_FILTER_TOLERANCE_SEC=0.0`。2026-08-06 的同条件 50-step
+测试中，ingress 两个 20-callback window 从 212.88/200.33 ms 降至 54.58/60.53 ms，50/50
+ready 且没有 transform、unsynced、stale 或 projection drop。该开关不改变点云、GMapping
+算法或 source-N readiness；在作为默认值前仍须用 recorder-enabled 固定 seed 回归 OCC/costmap。
+
+`tf_keepalive_period_s` 保持默认 0.25 s：它只在 simulator 被同步阻塞时重发 cached
+odom/base/lidar TF，不发点云。tolerance=0 后没有提高它的性能必要；若将它提高到 20–50 Hz，
+会放大 cached-pose 的“当前时间”重发与 ROS 调度负担。只有未来出现长阻塞期间的真实 TF stale
+timeout，才应以 0.25 vs 0.10 s 的固定 seed A/B 检验，而不是直接设为 0.05 s。
+
+NavToObjTask 会在一次 `get_and_cache_all_step_information()` 内将 visibility/reward 缓存为
+同一物理状态的结果，供 reward/info/success 复用，并在 `finally` 清空；不跨 simulator step
+或外部调用复用。它避免常见失败路径的约 4 次 head-camera segmentation render。2026-08-06
+的 strict 50-step smoke 中，`task_sensor_polling` 为 33.09 ms（无该缓存的相邻 0-tolerance
+smoke 为 94.47 ms）；应结合固定 seed recorder 回归确认导航轨迹与视图完全一致。
+
+对 `semantic_source=realtime_gt`，Bridge 会在 policy step `N+1` 将发布 GT 时，才请求
+`NavToObjTask` 在产生状态 `N+1` 的 metric transaction 内保留一个私有 head-camera
+segmentation snapshot。该 ndarray 不进入 observation、ROS payload、recorder manifest 或视频；
+取用前比较 model/data identity、qpos、sim time 与相机位姿，任何不一致都退回 fresh render。
+交互后的 `force=True` 则先失效快照，必定 fresh render。2026-08-06 strict 50-step smoke
+（`GT_STEP_INTERVAL=3`）中 17 个 GT 发布有 16 个 snapshot hit，活跃 GT 阶段由 83.30 ms
+降至 61.62 ms；`task_sensor_polling` 只从 33.08 到 34.69 ms。由于不同 run 的 timeout 数
+不同，应同时看正常 `cmd_vel` 子集：full step 为 304.27 → 275.29 ms。不得改回“每 step
+捕获”模式：该模式会把 task sensor 平均升至约 48 ms，抵消收益。
+
+同一 realtime-GT launch 还将 `semantic_map/subscribe_pointcloud=false`：legacy
+`scene_attribute` 流不存在时，semantic mapping 不再订阅/反序列化 `/registered_scan`；detector
+和 offline-GT 路径保持订阅。smoke 日志必须出现 `cloud=<disabled>`，且若误发 legacy scene
+消息会节流告警而不是静默使用过期点云。Bridge 的 `step_timing.jsonl` 新增
+`policy_action_wait_after_ready_ms`、`policy_fresh_cmd_after_gate_ms`、
+`policy_fresh_action_after_gate_ms` 与 `policy_realtime_gt_snapshot_hit_ms`，用于区分 readiness、
+move_base/DWA 产出命令和 GT 渲染三个阶段。
+
+`DWAPlannerROS.publish_traj_pc` 与 `publish_cost_grid_pc` 默认关闭：它们是无人订阅的纯 debug
+点云，不参与局部轨迹选择，也不被离线六面板读取。调试 DWA 内部候选轨迹时可显式重新开启；完整
+50-step A/B 结果见下一段。
+
+local costmap 10 Hz 不是默认优化项。2026-08-06 在同一 fixed route、snapshot/cloud 优化和
+DWA debug 点云关闭条件下，5 Hz control 的 `full_step_ms=355.15`、`timeout_noop=11/50`；仅将
+`local_costmap/update_frequency` 提到 10 Hz 后变为 `369.44 ms`、`20/50`。warning 数从 72 到
+121 不能直接比较（deadline 从 200 降至 100 ms），但 10 Hz 组实际 loop 中位仍为 222.1 ms，
+76 次超过 200 ms，且出现一次 1.86 s 尾部延迟，未达到 10 Hz 能力。虽然正常 `cmd_vel` 步的
+fresh-command callback 较快（36.77 → 6.44 ms），整体控制序列更容易 timeout，故保留 5 Hz。
+测试 override 为 `scripts/InteractiveNav/configs/semantic_decision/local_costmap_10hz_smoke.yaml`，
+仅覆盖 local update，不改 DWA controller 或 local costmap publish frequency。
+
+`ENABLE_COSTMAP_LATENCY_PROBE=true` 启动轻量 metadata-only probe：它不保存 PointCloud2 或
+OccupancyGrid payload，只记录 `/registered_scan`、`/filtered_pointcloud`、local costmap、local
+plan 和 `/cmd_vel` 的 stamp/receipt。2026-08-06 的 5 Hz、50-step probe 中，raw pointcloud
+header→probe receipt 为 p50 32.67 ms，raw→filtered receipt 为 p50 1.11 ms；filtered receipt
+→下一张 local costmap publish 为 p50 105.96 ms、p95 291.36 ms、max 595.81 ms。由于本仿真
+ROS stamp 与 wall-clock 同 epoch，filtered header→下一 costmap header 为 p50 170.32 ms、p95
+352.10 ms、max 760.51 ms。local costmap 实际 publish period 为 p50 223.16 ms、p95 386.88 ms。
+这些是“第一张后续地图发布”的表观端到端延迟，不是 `Costmap2DROS::updateMap()` 内部纯计算时长，
+也不能证明每张地图只消费一个点云；精确函数级耗时仍需 navigation overlay 打点。probe 增加两个
+PointCloud2 元数据订阅，故只用于诊断，不用于无扰动性能主表。
+
+1000-step house7 完整录像（`interactive_rule`、realtime-GT、strict readiness、local costmap
+5 Hz、`SCAN_FILTER_TOLERANCE_SEC=0.0`）结果保存在
+`/home/ldl/tmp/house7_interactive_rule_1000step_6panel_20260806_001`：
+`step_timing.jsonl` 连续 0–999 共 1000 行，raw recorder 的 step boundary accepted/persisted
+均为 1000、queue peak 6/64、drop/error 均为 0；离线对齐的 sim/state/input/output/exact
+均为 1000，missing indexes 为空。视频为 15 fps、1440×540、66.67 s，离线渲染耗时 158.59 s，
+离线分析耗时 15.89 s。
+
+该次运行全 step 平均 `full=527.92 ms`、`policy=421.45 ms`、`task=106.42 ms`
+（physics=63.78 ms、sensor=40.47 ms），1000 step 的累计 loop 约 527.92 s，对应 200 s
+simulated time 的 RTF 约 0.379。`step_ready` 为 1000/1000 satisfied 且 source aligned；
+action 为 `cmd_vel=400`、`timeout_noop=600`。0–399 step 尚有正常命令，约 500 step 后连续
+timeout，使后半段每 step 约 600 ms；这是当前导航执行状态，不是录像截断。realtime-GT active
+334 帧，其中 333 帧 snapshot hit，active GT 平均 52.49 ms。
+
+`timeout_noop` 是 Bridge 在本 step 打开 fresh-command gate 后、等待
+`action_timeout_s` 仍未收到新 `/cmd_vel` 时输出的安全 hold-pose action；它本身不是完成条件。
+对已知的终端交互失败，semantic decision 现有更窄的正常退出契约：仅当 `INTERACT` 的全部
+approach pose 都已被 executor 确认 `make_plan_unreachable`，且此后连续 20 个不同的
+`exploration_context.observation_step` 没有可执行替代候选（至少 3 次独立观测确认）时，发布
+`EXPLORATION_STALLED` / `no_executable_candidates_after_terminal_interaction_no_plan`。
+启动 SCAN、活动行为或任何可执行候选都会清除该 streak；`RosCompletionMonitor` 因而通过正常
+loop break 收尾 recorder、drain 和离线 MP4，而不是抛 action-timeout 异常中断录像。原 1000-step
+事件回放中，step 711 的终端交互失败会在 observation step 732 请求退出，而非空转到 step 1000。
+
+OCC pipeline 的 1000 个 pointcloud callback 全部 processed、无 stale/TF/projection drop；
+但 struct-mapping 的 `updateMap` 窗口均值从早期约 4 ms 逐步升到末段约 142 ms，应与
+local costmap 分开看。该次 5 Hz costmap warning 共 421 次（warning loop p50 249.8 ms、
+p95 381.2 ms、max 448.3 ms）；10 Hz 残留 warning 单独归为 shutdown/global context，不并入
+local 5 Hz。
+
 运行时 recorder 只保存可重放源数据，不在线合成 panel 或编码 MP4：
 
 - `sim_step_frames/manifest.jsonl` 与逐 step 相机 PNG；
@@ -687,6 +786,78 @@ python scripts/InteractiveNav/build_semantic_video_offline.py \
 ```
 
 产物为 `videos/overview_6panel.mp4`、`videos/offline_composite_frames/`、`offline_video_summary.json` 和 `offline_render_alignment.jsonl`。验收时要求 sim manifest、raw step boundary 与离线帧数一致，`exact_step_match_count` 等于输出帧数，且 `raw_recording_stats` 无 drop/write failure。`offline_render_alignment.jsonl` 还保留每帧实际选择的 receipt 与 source stamp；如需审计组件时间关系，应检查它和 `component_post_observation_receipt_count`，不要只凭 MP4 目测推断因果顺序。
+
+规则 oracle 的容器正面接近仅用于规则评测：
+`house7_channel_container_interaction_rule.yaml` 的
+`runtime.rule_oracle_gt_interaction_axis=true` 使 simulator 从**当前** container articulation joint
+推导世界坐标正面轴；不加载 House7 pose/AABB 缓存，门仍使用通用 portal 几何候选。入口脚本只允许
+`METHOD=interactive_rule` 开启该开关，MLLM/detector lane 会直接拒绝。`full_mllm_house7_mapping.yaml` 与
+`house7_interaction_geometry.yaml` 已删除。
+
+规则运行后的全图视觉 QA 使用（本地模型只接收一张带匿名框的完整 RGB；所有 GT 名称、AABB、joint
+axis 和规则选择都只写在 held-out JSON）：
+
+```bash
+/home/ldl/miniconda3/bin/conda run -p /home/ldl/miniconda3/envs/navwam \
+  python scripts/InteractiveNav/run_rule_mllm_image_qa.py \
+  --run-dir <RULE_RUN_DIR> --cases-per-stage 6 --temperature 0
+```
+
+它默认导出 `mllm_image_qa/{annotated_frames,cases.jsonl,responses.jsonl,summary.json}`（可用
+`--output-dir` 改名），按 Module 1
+视觉属性/正面证据、Module 2 匿名候选排序、Module 3 视觉交互门控抽题。只接受
+`image_step == observation_capture_step` 的图像-框配对；某个 rollout 若没有足够的新鲜决策帧，会少于
+请求数量而不会用延迟框补齐。相同 object+全图 bbox 的静止重复帧会去重；`temperature=0` 用于离线记录可复现。
+
+六联图的显示参数也随每个 raw step 的 `visualization_config` 持久化，而非一次性后处理：默认图 3（room + interaction）使用 `1.5x` 世界坐标缩放，图 5（semantic XY）使用 `1.8x`，并只标注当前交互目标和 room。`run_house7_semantic_exploration_ros_test.zsh` 可通过 `VIDEO_ROOM_PANEL_SCALE`、`VIDEO_SEMANTIC_XY_PANEL_SCALE` 与 `VIDEO_SEMANTIC_XY_LABEL_MODE` 覆盖；缩放在同一 world transform 中完成，因此 OCC、图节点、边和机器人保持对齐。
+
+实时 restricted-GT 的门公开 ID 与展示名统一为 `door_<ordinal>`（例如 `door_0001`）；`doorframe`、
+`doorway` 与 door leaf 都归一到同一个 generic door。公开图、录像和 MLLM compact context 只出现
+这个 generic ID，不能出现 subtype、MuJoCo source/body name 或 `gt_*`。图中的内部 `type=portal`
+仅是拓扑/候选分类，规则 lane 仍将未知 `door_<ordinal>` 作为一次可验证的交互假设；首次 action
+feedback 才能将状态写为 `open`、`static_open` 或 `blocked`。MLLM lane 对 unknown door 仍须先获得
+视觉 attribute patch，不能从 restricted-GT 几何推断开闭状态。私有名称只在 simulator process
+内由动作 bridge 解析。
+
+2026-08-06 的 House7 door-only rule 1000-step 验收使用
+`house7_door_interaction_rule.yaml`（只保留 portal 交互候选，不改变默认通用策略）。它在 716/1000
+step 以 `navigation_and_interaction_frontiers_exhausted` 正常退出：`door_0001`（step 73）和
+`door_0002`（step 204）均由 `closed → open`、`articulated`、`SUCCEEDED`；`door_0003` 与
+`door_0004` 分别通过动作反馈写为 `static_open`，而不是误称为可操作门体。公开 final graph
+仅有 `door_0001`–`door_0004`，不含 `doorframe`、`doorway`、`gt_portal` 或 `portal_ref`。
+recorder 的 step boundary accepted/persisted 均为 716、drop/error/write failure 均为空；离线视频
+716 帧、exact match 716、缺失 step 为空（15 fps H.264）。产物在
+`/home/ldl/tmp/house7_interactive_rule_doorx_1000step_6panel_20260806_001`。
+
+`static_open` 是动作 bridge 对“固定开口、无可操作门体”的同步终态：行为 executor 收到该反馈后立即发布终态，绝不等待 `verification_timeout_s`。它保留 `traversable=true`，供后续真实 OCC/frontier 自然穿越；但不创建 synthetic child room、不触发 post-open OCC/room refresh，也不生成强制的门后 `traverse` subgoal。
+
+2026-08-06 static-fix 1000-step horizon 回归输出在
+`/home/ldl/tmp/house7_interactive_rule_staticfix_1000step_6panel_20260806_155451`。它在 393/1000
+step 依既有无候选早停规则以 `navigation_and_interaction_frontiers_exhausted` 正常结束；`door_0003`
+于 step 340 以 `static_open`、0 sim/task/physics step 直接 `SUCCEEDED`，无 `VERIFYING`、
+`verification_timeout` 或 `traverse:door_0003:*`。393 张 raw step 与离线视频逐步 exact 对齐，所有
+raw step 均持久化图 3=1.5、图 5=1.8、`interaction_target_only`。该路线在早停前未观测到
+`door_0004`，因此本次覆盖一个 static 门的端到端回归；不应把它误称为四门全覆盖。
+
+交互接近的 pose gate 与 `verification_timeout_s` 分离：`move_base` 完成后，executor 只轮询新鲜的
+evaluator/simulator step 位姿，最多由 `interaction_approach_pose_poll_max_attempts` 限制（当前为 5），
+不使用墙钟秒数截止。每个样本都按同一距离/朝向契约验证实际位姿；失败则依次重试候选中持久化的
+fallback approach pose（当前最多 3 个）。选中的有效 fallback 会写入
+`effective_goal_xyyaw`，并作为 bridge 的 `approach_goal_xyyaw` 和离线六联图的箭头/目标位置。若全部
+pose poll 或 fallback 耗尽，决策层立即排除该 pose-sensitive candidate 并重选，而真实对象/动作失败
+仍走既有 cooldown。终态同时发布 `semantic_selection.active=false`，renderer 因而不会把旧 target
+复活到后续空闲帧。
+
+2026-08-06 的 House7 通道+容器集成回归使用
+`scripts/InteractiveNav/configs/semantic_decision/house7_channel_container_interaction_rule.yaml`，请求
+1500 step，实际在 446 step 正常早停：`door_0001`、`door_0002` 为 articulated `SUCCEEDED`，
+`door_0003`、`door_0004` 为 `static_open` `SUCCEEDED`，`refrigerator` 容器交互也为 `SUCCEEDED`。
+door_0003 的实际 fallback 是 `[6.8591, 4.9671, -1.5708]`，已从接近阶段起显示在录像中；本轮没有
+`interaction_pose_invalid`。最后一个 chest-of-drawers 的 3 个 approach pose 均为 `empty_plan`，
+故以 `no_executable_candidates_after_terminal_interaction_no_plan` 正常收尾，而非录像或 pose gate
+故障。raw recorder 的 step boundary accepted/persisted 均为 446、drop/write failure 为 0；离线视频
+446 帧且 exact match 446。产物为
+`/home/ldl/tmp/house7_channel_container_rule_1500step_20260806_run3`。
 
 ### 5.3.2.0.1 初始扫描与语义决策的关系
 
@@ -713,11 +884,11 @@ SCAN 按 `step_index` 原子配对 `RGB(N)` 与 fresh-command gate `N`，并只�
 | `container_exploration` | 与 `semantic_interaction_exploration` 相同的规则交互探索 | 三模块均为规则实现 | 无目标；按 frontier 完成 | 面向批处理脚本保留的别名，自动使用 `interactive_exploration.yaml` |
 | `full_mllm_exploration` | 全 MLLM 交互探索 | `dynamic_mllm / mllm_score / mllm_skill_verified` | 无目标；LLM 在具体 `EXPLORE / INTERACT` 候选中选择 | 自动使用 `full_mllm_interactive_exploration.yaml`、`full_mllm_mapping.yaml`，并启用属性推理 |
 | `full_mllm_object_goal` | 全 MLLM 交互目标导航 | `dynamic_mllm / mllm_score / mllm_skill_verified` | 默认运行时注入 `random_far_container_object`，只向决策侧公开目标物体类别；目标到达并通过可见性验证后完成 | 自动使用 `full_mllm_object_goal_runtime.yaml`、`full_mllm_mapping.yaml`，并启用属性推理，不需要外部配置覆盖 |
-| `full_mllm_object_goal_apple` | House 7 固定 apple 的全 MLLM 交互目标导航 | `dynamic_mllm / mllm_score / mllm_skill_verified` | 固定目标仅为 `apple`，默认禁止运行时目标覆盖，不公开冰箱或交互要求 | 自动使用 `full_mllm_object_goal_apple.yaml` 和 `full_mllm_house7_mapping.yaml`，用于 House 7 隐式容器发现回归 |
+| `full_mllm_object_goal_apple` | House 7 固定 apple 的全 MLLM 交互目标导航 | `dynamic_mllm / mllm_score / mllm_skill_verified` | 固定目标仅为 `apple`，默认禁止运行时目标覆盖，不公开冰箱或交互要求 | 自动使用 `full_mllm_object_goal_apple.yaml` 和通用 `full_mllm_mapping.yaml`；不得加载 House 7 专用交互位姿标定 |
 | `frontier_only` | 纯导航 frontier 对照 | 不启动 semantic decision | 无目标；以 frontier completion 为准 | 不执行语义候选决策和交互，用于 pure-nav baseline |
 | `semantic_interaction_object_goal` | 规则交互目标导航；`semantic_interaction_object_goal` | 默认 `dynamic_rule / rule_cost / rule_verified` | 默认运行时注入 `random_far_container_object`，决策侧只收到目标物体类别；目标到达并通过可见性验证后完成 | 自动使用 `object_goal_runtime.yaml`，强制关闭容器；可通过显式 override 切换为全 MLLM |
 | `object_goal_runtime` | 与 `semantic_interaction_object_goal` 相同的运行时目标导航 | 默认三模块规则实现 | 默认 `random_far_container_object`，公开上下文隐藏容器关系 | 面向批处理脚本保留的别名，自动使用 `object_goal_runtime.yaml` |
-| `object_goal_rule` | 配置文件固定目标的规则导航 | 三模块均为规则实现 | 默认目标为 fridge/refrigerator；可用 `SEMANTIC_DECISION_OVERRIDE` 替换为 apple 等目标 | 自动使用 `object_goal_fridge.yaml` 和 House 7 交互几何；严格目标完成配置应显式包含 `mission.mode=semantic_interaction_object_goal` |
+| `object_goal_rule` | 配置文件固定目标的规则导航 | 三模块均为规则实现 | 默认目标为 fridge/refrigerator；可用 `SEMANTIC_DECISION_OVERRIDE` 替换为 apple 等目标 | 自动使用 `object_goal_fridge.yaml`，不加载场景专用交互几何；严格目标完成配置应显式包含 `mission.mode=semantic_interaction_object_goal` |
 | `object_goal_model_mock` | 固定 fridge 目标的模型接口测试 | Module 2 使用 `model.mode=mock`，不请求真实模型 | 固定配置目标 | 自动使用 `object_goal_fridge_model_mock.yaml`，用于验证模型协议、选择和回退链路，不用于真实 MLLM 指标 |
 
 补充约定：
@@ -1427,7 +1598,7 @@ SIM_TIMEOUT_S=1800 \
   outputs/house7_full_mllm_apple_hidden_container
 ```
 
-`METHOD=full_mllm_object_goal_apple` 内部选择的 `full_mllm_object_goal_apple.yaml` 不包含 apple 实例 ID、冰箱 ID、容器类别或强制交互提示。内部选择的 `full_mllm_house7_mapping.yaml` 只在执行侧合并全 MLLM ablation 与 House 7 已校准的冰箱正面交互位姿，不把容器关系写入任务目标或 LLM prompt。运行时目标采样同样默认只向 `/semantic_decision/target` 发布目标物体类别；完整容器关系保存在 `target_selection.json` 的 `private_target_context` 和候选记录中，仅用于任务构造与离线评测。只有队列脚本显式传入 `--reveal-container-context` 时才公开容器上下文。
+`METHOD=full_mllm_object_goal_apple` 内部选择的 `full_mllm_object_goal_apple.yaml` 不包含 apple 实例 ID、冰箱 ID、容器类别或强制交互提示。它只使用通用 `full_mllm_mapping.yaml`；已删除 `full_mllm_house7_mapping.yaml` 与 `house7_interaction_geometry.yaml`，因此全 MLLM 路线不会加载 House 7 已校准的容器正面位姿、轴或 AABB。运行时目标采样同样默认只向 `/semantic_decision/target` 发布目标物体类别；完整容器关系保存在 `target_selection.json` 的 `private_target_context` 和候选记录中，仅用于任务构造与离线评测。只有队列脚本显式传入 `--reveal-container-context` 时才公开容器上下文。
 
 论文逐帧导出使用 `PAPER_FRAME_EXPORTS=true`。该模式通过
 `/molmo_spaces/step_sync` 为每个 sim step 保存一组严格对齐的图片，并区分“论文静帧”和
@@ -1449,10 +1620,11 @@ step 944 提前结束；`target_goal_success=true`、
 图 3、图 6、sim-step 与离线 composite 均保存 944 张/帧，两个写入队列丢帧数均为 0，
 离线六面板对齐为 944/944 exact step match。
 
-2026-07-27 回归：冰箱物理正面轴校准为 `+X`，节点图记录固定交互位姿
-`[8.254459, 1.053060, 3.141593]`。本次机器人实际交互位姿为
-`[8.535121, 1.075141, -2.944551]`，位置误差 `0.282 m`、朝向误差
-`0.197 rad`，通过执行端位姿门控并成功从 `closed` 切换到 `open`。后续外部相机默认
+2026-07-27 的固定 House 7 冰箱正面位姿回归已废弃：原先的场景专用标定 YAML 已删除，不得再将
+`[8.254459, 1.053060, 3.141593]` 作为加载配置。规则 oracle 评测如需正面接近，
+`house7_channel_container_interaction_rule.yaml` 可显式启用
+`runtime.rule_oracle_gt_interaction_axis=true`；运行时仅从当前仿真 articulation joint 推导容器的
+world-frame 正面轴，不存储场景 ID、固定 pose 或 AABB，且该开关会被 MLLM/detector 路线拒绝。后续外部相机默认
 采用手动调好的 `CAMERA_REL`：position `[-0.779295308248162, 0.9640243904369644,
 1.600000023841858]`、yaw `-34.729731964609215 deg`、pitch
 `-16.0519210588521 deg`、FOV `65 deg`。运行脚本中的等价 look-at offset 为

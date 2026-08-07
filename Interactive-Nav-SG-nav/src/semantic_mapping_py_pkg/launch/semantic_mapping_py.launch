@@ -5,6 +5,9 @@
   <arg name="start_object_detection" default="true"/>
   <arg name="start_room_attribute" default="true"/>
   <arg name="start_semantic_mapping" default="true"/>
+  <!-- Keep the legacy PointCloud2 scene lane on unless the parent launch
+       explicitly disables it for semantic_source=realtime_gt. -->
+  <arg name="subscribe_pointcloud" default="true"/>
   <arg name="start_attribute_inference" default="false"/>
   <arg name="attribute_model_name" default=""/>
   <arg name="attribute_max_output_tokens" default="160"/>
@@ -76,6 +79,7 @@
           respawn="true">
       <rosparam file="$(arg config_file)" command="load"/>
       <rosparam if="$(eval arg('override_config_file') != '')" file="$(arg override_config_file)" command="load"/>
+      <param name="semantic_map/subscribe_pointcloud" value="$(arg subscribe_pointcloud)" type="bool"/>
     </node>
   </group>
 

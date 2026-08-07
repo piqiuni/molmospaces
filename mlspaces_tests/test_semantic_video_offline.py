@@ -14,9 +14,17 @@ from scripts.InteractiveNav.build_semantic_video_offline import (
     align_nearest_timestamp_recorder_frames,
     gt_draw_spec,
     index_recorder_frames,
+    offline_display_config,
     panel_names,
     route_event_at_stamp,
     route_target_at_stamp,
+)
+from scripts.InteractiveNav.offline_semantic_renderer import (
+    OfflineSixPanelRenderer,
+    TransformResolver,
+    active_semantic_selection,
+    camera_title,
+    zoom_world_bounds,
 )
 
 
@@ -130,3 +138,122 @@ def test_route_target_is_carried_from_route_start_into_interaction() -> None:
     ]
     assert route_target_at_stamp(events, 7.0) == "gt_000001"
     assert route_target_at_stamp(events, 9.0) == "gt_000001"
+
+
+def test_offline_display_defaults_and_persisted_overrides() -> None:
+    assert offline_display_config({}) == {
+        "global_panel_scale": 1.8,
+        "room_panel_scale": 1.5,
+        "semantic_xy_panel_scale": 1.8,
+        "semantic_xy_label_mode": "interaction_target_only",
+    }
+    assert offline_display_config(
+        {
+            "video_global_panel_scale": 1.2,
+            "video_room_panel_scale": 1.6,
+            "video_semantic_xy_panel_scale": 2.0,
+            "video_semantic_xy_label_mode": "all",
+        }
+    ) == {
+        "global_panel_scale": 1.2,
+        "room_panel_scale": 1.6,
+        "semantic_xy_panel_scale": 2.0,
+        "semantic_xy_label_mode": "all",
+    }
+
+
+def test_world_coordinate_zoom_scales_bounds_without_post_render_crop() -> None:
+    assert zoom_world_bounds((0.0, 0.0, 12.0, 18.0), 1.5) == (2.0, 3.0, 10.0, 15.0)
+
+
+def test_semantic_xy_target_only_keeps_rooms_and_hides_non_target_labels(monkeypatch) -> None:
+    import cv2
+
+    drawn_labels: list[str] = []
+    original_put_text = cv2.putText
+
+    def capture_put_text(image, text, *args, **kwargs):
+        drawn_labels.append(str(text))
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "putText", capture_put_text)
+    renderer = OfflineSixPanelRenderer(
+        transforms=TransformResolver([], map_frame="map", odom_frame="odom")
+    )
+    step = {
+        "pose": [5.0, 5.0, 0.0],
+        "semantic_selection": {"target_id": "door_0001"},
+        "observed_instance_ids": ["door_0001", "bed_0002"],
+        "unified_graph": {
+            "nodes": [
+                {
+                    "id": "room_1",
+                    "type": "room",
+                    "centroid": [5.0, 5.0],
+                    "aabb_size": [8.0, 8.0, 0.0],
+                    "attributes": {"room_attribute": "bedroom"},
+                },
+                {
+                    "id": "door_0001",
+                    "type": "portal",
+                    "label": "door_0001",
+                    "centroid": [4.0, 5.0],
+                    "aabb_size": [0.3, 1.0, 0.0],
+                    "attributes": {"object_id": "door_0001"},
+                },
+                {
+                    "id": "bed_0002",
+                    "type": "object",
+                    "label": "bed",
+                    "centroid": [6.0, 5.0],
+                    "aabb_size": [1.5, 2.0, 0.0],
+                    "attributes": {"object_id": "bed_0002"},
+                },
+            ],
+            "edges": [],
+        },
+    }
+    renderer.render_semantic_xy(
+        None,
+        (480, 270),
+        step,
+        0,
+        (0.0, 0.0, 10.0, 10.0),
+        view_scale=1.8,
+        label_mode="interaction_target_only",
+    )
+
+    assert "bedroom room" in drawn_labels
+    assert "INTERACT #1 door_0001" in drawn_labels
+    assert "#2 bed" not in drawn_labels
+
+
+def test_terminal_selection_clears_stale_goal_from_offline_rendering() -> None:
+    step = {
+        "pose": [1.0, 1.0, 0.0],
+        "active_goal": [8.0, 8.0],
+        "semantic_selection": {
+            "active": False,
+            "candidate_id": "interaction:door_0003:open",
+            "target_id": "door_0003",
+            "goal_xyyaw": [8.0, 8.0, 0.0],
+        },
+    }
+    assert active_semantic_selection(step) == {}
+    assert "dist_to_goal=-" in camera_title(step, 12)
+
+
+def test_offline_selection_uses_executor_effective_fallback_goal() -> None:
+    step = {
+        "semantic_selection": {
+            "active": True,
+            "candidate_id": "interaction:door_0003:open",
+            "goal_xyyaw": [6.859, 4.467, -1.57],
+        },
+        "semantic_execution_state": {
+            "state": "APPROACH_INTERACTION",
+            "candidate_id": "interaction:door_0003:open",
+            "effective_goal_xyyaw": [6.859, 4.967, -1.57],
+        },
+    }
+    assert active_semantic_selection(step)["goal_xyyaw"] == [6.859, 4.967, -1.57]

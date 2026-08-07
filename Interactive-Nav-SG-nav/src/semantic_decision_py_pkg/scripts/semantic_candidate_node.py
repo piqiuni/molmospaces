@@ -26,6 +26,24 @@ class SemanticCandidateNode:
         rospy.init_node("semantic_candidate_node")
         topics = rospy.get_param("~topics", {}) or {}
         config = rospy.get_param("~candidate", {}) or {}
+        policy_config = rospy.get_param("~policy", {}) or {}
+        ablation_config = rospy.get_param("~ablation", {}) or {}
+        configured_backend = str(policy_config.get("backend", "rule")).casefold()
+        module2 = str(ablation_config.get("module2", "")).casefold()
+        effective_policy_backend = (
+            "model"
+            if module2 == "mllm_score"
+            else "rule"
+            if module2 == "rule_cost"
+            else configured_backend
+        )
+        unknown_portal_default = config.get("portal_unknown_default_interact")
+        if unknown_portal_default is None:
+            # Rule-only behavior: a restricted-GT portal remains an opaque
+            # geometry observation, so the executor (not a hidden joint
+            # state) resolves an unknown portal by attempting interaction.
+            # Full MLLM runs keep their visual-evidence gate by default.
+            unknown_portal_default = effective_policy_backend != "model"
         scan_config = rospy.get_param("~startup_scan", {}) or {}
         self.startup_scan_enabled = bool(scan_config.get("enabled", False))
         self.startup_scan_angle_rad = float(scan_config.get("angle_rad", 2.0 * 3.141592653589793))
@@ -62,6 +80,7 @@ class SemanticCandidateNode:
                 portal_allow_unknown_state=bool(
                     config.get("portal_allow_unknown_state", True)
                 ),
+                portal_unknown_default_interact=bool(unknown_portal_default),
                 portal_standoff_m=float(config.get("portal_standoff_m", 1.0)),
                 portal_traversal_distance_m=float(
                     config.get("portal_traversal_distance_m", 0.9)

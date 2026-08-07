@@ -1,7 +1,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
+
+
+_PUBLIC_SOURCE_MODE = {
+    # The mapper retains this internal token for source-specific logic, but it
+    # is not an observation a semantic policy or recorder needs to see.  A
+    # neutral public label prevents an accidental GT implementation leak.
+    "realtime_gt_observation": "geometry_observation",
+    "gt_replay": "geometry_replay",
+}
+_PUBLIC_DOOR_ID_RE = re.compile(r"^door_(?:[0-9]{1,8}|x)$")
+
+
+def _public_source(value: Any) -> Any:
+    text = str(value or "")
+    return _PUBLIC_SOURCE_MODE.get(text, value)
+
+
+def _public_portal_display_name(node_id: Any, attributes: dict[str, Any]) -> str:
+    """Return the generic restricted-GT door label, if this node has one."""
+
+    for value in (attributes.get("instance_id"), node_id):
+        candidate = str(value or "").strip().casefold()
+        if _PUBLIC_DOOR_ID_RE.fullmatch(candidate):
+            return candidate
+    return "portal"
 
 
 def _as_float_list(values, size=3):
@@ -33,10 +59,11 @@ class SceneGraphNode:
     graph_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        public_label = "portal" if self.type == "portal" else self.label
-        public_name = "portal" if self.type == "portal" else self.name
+        public_portal_name = _public_portal_display_name(self.id, self.attributes)
+        public_label = public_portal_name if self.type == "portal" else self.label
+        public_name = public_portal_name if self.type == "portal" else self.name
         public_attributes = {
-            key: value
+            key: _public_source(value) if key in {"source", "source_mode"} else value
             for key, value in dict(self.attributes).items()
             if not str(key).startswith("_private_")
             # A restricted-GT portal has no public source-name field at all;
@@ -141,7 +168,7 @@ class SceneGraphBundle:
         return {
             "scene_id": self.scene_id,
             "episode_id": self.episode_id,
-            "source_mode": self.source_mode,
+            "source_mode": _public_source(self.source_mode),
             "graph_revision": int(self.graph_revision),
             "timestamp": float(self.timestamp),
             "capture_step": self.capture_step,

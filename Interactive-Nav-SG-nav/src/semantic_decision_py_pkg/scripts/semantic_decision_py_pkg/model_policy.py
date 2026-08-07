@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 import shlex
 import subprocess
 import time
@@ -160,20 +161,71 @@ class ModelCircuitBreaker:
         return True
 
 
+_PUBLIC_DOOR_CONTEXT_ID_RE = re.compile(r"^door_(?:[0-9]{1,8}|x)$")
+_PUBLIC_DOOR_NODE_ID_RE = re.compile(r"^portal_(door_(?:[0-9]{1,8}|x))$")
+_PRIVATE_PORTAL_ID_TOKEN_RE = re.compile(
+    r"(?:^|_)(?:door|doorframe|doorway|gt|mujoco|private)(?:_|$)"
+)
+
+
+def _portal_context_id(node: dict[str, Any], ordinal: int) -> str:
+    """Return a generic door ID for MLLM-facing portal context.
+
+    The live graph supplies ``door_<ordinal>`` identities.  This small
+    defense-in-depth normalizer also prevents an older producer's
+    ``portal_doorframe_*`` or ``portal_gt_*`` node ID from reaching a prompt.
+    """
+
+    attributes = node.get("attributes") or {}
+    public_instance_id = str(attributes.get("instance_id") or "")
+    if _PUBLIC_DOOR_CONTEXT_ID_RE.fullmatch(public_instance_id.casefold()):
+        return public_instance_id
+    node_id = str(node.get("id") or "")
+    if _PUBLIC_DOOR_CONTEXT_ID_RE.fullmatch(node_id.casefold()):
+        return node_id
+    match = _PUBLIC_DOOR_NODE_ID_RE.fullmatch(node_id.casefold())
+    if match:
+        return match.group(1)
+    # Existing public graph producers may already use a stable non-descriptive
+    # portal ID (for example ``portal_1``).  Preserve it for reference
+    # continuity; only rewrite IDs carrying a clear private/GT token.
+    if node_id and not _PRIVATE_PORTAL_ID_TOKEN_RE.search(node_id.casefold()):
+        return node_id
+    return f"door_{int(ordinal) + 1:04d}"
+
+
+def _public_portal_context_ids(nodes: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        str(node.get("id") or ""): _portal_context_id(node, ordinal)
+        for ordinal, node in enumerate(nodes)
+        if str(node.get("type") or "").casefold() == "portal"
+    }
+
+
 def compact_graph(graph: dict[str, Any], max_nodes: int = 80, max_edges: int = 160) -> dict[str, Any]:
+    graph_nodes = list(graph.get("nodes") or [])[: max(0, int(max_nodes))]
+    public_portal_ids = _public_portal_context_ids(graph_nodes)
     nodes = []
-    for node in list(graph.get("nodes") or [])[: max(0, int(max_nodes))]:
+    for node in graph_nodes:
         attributes = node.get("attributes") or {}
         interaction = node.get("interaction") or {}
         node_type = str(node.get("type") or "")
-        # Keep a portal's public class, never its simulator/asset label.  This
-        # remains a defense-in-depth boundary if an older graph producer
-        # accidentally sends ``doorframe`` or a source-derived name.
-        public_label = "portal" if node_type == "portal" else node.get("label")
-        public_name = "portal" if node_type == "portal" else node.get("name")
+        public_door_id = public_portal_ids.get(str(node.get("id") or ""), "")
+        # Keep a portal's generic door reference, never its simulator/asset
+        # label.  This remains a defense-in-depth boundary if an older graph
+        # producer accidentally sends ``doorframe`` or a source-derived name.
+        public_label = (
+            public_door_id
+            if node_type == "portal"
+            and _PUBLIC_DOOR_CONTEXT_ID_RE.fullmatch(str(public_door_id).casefold())
+            else "portal"
+            if node_type == "portal"
+            else node.get("label")
+        )
+        public_name = public_label if node_type == "portal" else node.get("name")
         nodes.append(
             {
-                "id": node.get("id"),
+                "id": public_door_id or node.get("id"),
                 "type": node_type,
                 "label": public_label,
                 "name": public_name,
@@ -191,15 +243,25 @@ def compact_graph(graph: dict[str, Any], max_nodes: int = 80, max_edges: int = 1
                 "interaction_failure_reason": interaction.get("failure_reason"),
             }
         )
-    edges = [
-        {
-            "src_id": edge.get("src_id"),
-            "relation": edge.get("relation"),
-            "dst_id": edge.get("dst_id"),
-            "attributes": dict(edge.get("attributes") or {}),
-        }
-        for edge in list(graph.get("edges") or [])[: max(0, int(max_edges))]
-    ]
+    edges = []
+    for edge in list(graph.get("edges") or [])[: max(0, int(max_edges))]:
+        attributes = dict(edge.get("attributes") or {})
+        for key in ("portal_node_id", "source_portal_id"):
+            raw_value = str(attributes.get(key) or "")
+            if raw_value in public_portal_ids:
+                attributes[key] = public_portal_ids[raw_value]
+        edges.append(
+            {
+                "src_id": public_portal_ids.get(
+                    str(edge.get("src_id") or ""), edge.get("src_id")
+                ),
+                "relation": edge.get("relation"),
+                "dst_id": public_portal_ids.get(
+                    str(edge.get("dst_id") or ""), edge.get("dst_id")
+                ),
+                "attributes": attributes,
+            }
+        )
     return {
         "scene_id": graph.get("scene_id", ""),
         "episode_id": graph.get("episode_id", ""),
@@ -270,6 +332,7 @@ def compact_semantic_graph(
     anchors_by_room: dict[str, list[dict[str, Any]]] = {}
     unassigned_anchors = []
     graph_nodes = list(graph.get("nodes") or [])[: max(0, int(max_nodes))]
+    public_portal_ids = _public_portal_context_ids(graph_nodes)
     for node in graph_nodes:
         node_type = str(node.get("type") or "").casefold()
         if node_type == "room" and not bool(
@@ -309,9 +372,13 @@ def compact_semantic_graph(
             continue
         attributes = node.get("attributes") or {}
         interaction = _node_interaction(node)
-        node_id = str(node.get("id") or "")
+        raw_node_id = str(node.get("id") or "")
+        node_id = public_portal_ids.get(raw_node_id, raw_node_id)
         semantic_name = (
-            "portal"
+            "door"
+            if node_type == "portal"
+            and _PUBLIC_DOOR_CONTEXT_ID_RE.fullmatch(node_id.casefold())
+            else "portal"
             if node_type == "portal"
             else str(node.get("label") or node.get("name") or node_id)
         )
@@ -333,7 +400,10 @@ def compact_semantic_graph(
                 room["observed_free_space"] = bool(
                     attributes.get("observed_free_space", False)
                 )
-                source_portal_id = str(attributes.get("source_portal_id") or "")
+                source_portal_id = public_portal_ids.get(
+                    str(attributes.get("source_portal_id") or ""),
+                    str(attributes.get("source_portal_id") or ""),
+                )
                 if source_portal_id:
                     room["source_portal_id"] = source_portal_id
             if inferred_known:

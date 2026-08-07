@@ -22,7 +22,10 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_WAITING_FOR_DRAWER_SCAN,
     STATE_VERIFYING,
     bounded_empty_plan_retry_delay,
+    candidate_with_effective_interaction_approach,
     committed_turn_sign,
+    interaction_pose_validation,
+    is_interaction_pose_precondition_failure,
     is_post_interaction_traversal_navigation,
     navigation_goal_options,
     navigation_prerotation_heading_target,
@@ -128,6 +131,76 @@ def test_interaction_approach_fallback_is_stagnation_only_and_bounded() -> None:
             **{**kwargs, "behavior_type": "NAVIGATE"}
         )
         is None
+    )
+
+
+def test_interaction_pose_poll_failure_advances_to_next_preserved_option() -> None:
+    kwargs = {
+        "behavior_type": "INTERACT",
+        "failure_detail": {"reason": "interaction_pose_poll_exhausted"},
+        "selected_option_index": 2,
+        "attempted_navigation_count": 1,
+        "max_navigation_attempts": 3,
+        "goal_option_count": 5,
+    }
+    assert next_interaction_approach_option_index(**kwargs) == 3
+    assert (
+        next_interaction_approach_option_index(
+            **{**kwargs, "attempted_navigation_count": 3}
+        )
+        is None
+    )
+
+
+def test_effective_interaction_approach_replaces_bridge_pose_not_primary_goal() -> None:
+    primary = [6.8591275, 4.4671125, -math.pi / 2.0]
+    fallback = [6.8591275, 4.9671125, -math.pi / 2.0]
+    candidate = {
+        "candidate_id": "interaction:door_0003:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": primary,
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": primary,
+        },
+        "metadata": {"goal_xyyaw_candidates": [primary, fallback]},
+    }
+    bound = candidate_with_effective_interaction_approach(
+        candidate,
+        fallback,
+        goal_option_index=1,
+        attempts=[{"index": 1, "goal_xyyaw": fallback}],
+    )
+    assert bound["goal_xyyaw"] == primary
+    assert bound["interaction_command"]["interaction_approach_pose_xyyaw"] == fallback
+    assert bound["metadata"]["effective_interaction_approach_pose_xyyaw"] == fallback
+    assert bound["metadata"]["interaction_approach_goal_option_index"] == 1
+
+    # This is the failing House7 geometry: the robot reached the fallback,
+    # so it must be checked against the fallback rather than the primary.
+    actual = [6.6812474, 5.0013154, -1.3780854]
+    assert not interaction_pose_validation(
+        primary,
+        actual,
+        distance_tolerance_m=0.45,
+        yaw_tolerance_rad=0.55,
+    )["valid"]
+    assert interaction_pose_validation(
+        fallback,
+        actual,
+        distance_tolerance_m=0.45,
+        yaw_tolerance_rad=0.55,
+    )["valid"]
+
+
+def test_pose_precondition_failure_is_not_an_object_failure() -> None:
+    assert is_interaction_pose_precondition_failure(
+        {"failure_reason": "interaction_pose_invalid"}
+    )
+    assert is_interaction_pose_precondition_failure(
+        {"reason": "interaction_pose_poll_exhausted"}
+    )
+    assert not is_interaction_pose_precondition_failure(
+        {"failure_reason": "articulation_resolution_failed"}
     )
 
 
@@ -465,6 +538,36 @@ def test_interaction_execution_orders_approach_action_and_verification() -> None
     assert machine.state == STATE_SUCCEEDED
     assert terminal[0]["kind"] == "terminal"
     assert terminal[0]["success"] is True
+
+
+def test_static_portal_feedback_finishes_directly_without_graph_or_timeout() -> None:
+    machine = BehaviorExecutionStateMachine(
+        ExecutionConfig(verification_timeout_s=0.01)
+    )
+    candidate = interaction_candidate(requires_approach=False)
+    candidate["metadata"]["node_type"] = "portal"
+    candidate["interaction_command"]["action"] = "open"
+
+    commands = machine.start(candidate, now=0.0)
+    assert commands[0]["kind"] == "interact"
+    terminal = machine.on_interaction_result(
+        True,
+        {
+            "status": "SUCCEEDED",
+            "action": "open",
+            "post_state": "static_open",
+            # The direct executor route may omit interaction_capability; state
+            # and source are independently sufficient public evidence.
+            "source": "executor_static_portal",
+        },
+        now=1.0,
+    )
+
+    assert machine.state == STATE_SUCCEEDED
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is True
+    assert terminal[0]["detail"]["verification_mode"] == "direct_static_portal_feedback"
+    assert machine.timeout_reason(now=100.0) == ""
 
 
 def test_drawer_interaction_waits_for_post_arrival_public_scan_frame() -> None:

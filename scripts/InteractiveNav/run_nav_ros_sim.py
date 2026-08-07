@@ -584,6 +584,13 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                     flush=True,
                 )
 
+            prepare_gt_snapshot = getattr(
+                policy, "prepare_realtime_gt_snapshot_for_next_step", None
+            )
+            if callable(prepare_gt_snapshot):
+                # task.step creates the post-physics state; the next policy
+                # call publishes GT for that state when its interval is due.
+                prepare_gt_snapshot(step_idx + 1)
             task_t0 = time.perf_counter()
             task_core_t0 = time.perf_counter()
             observation, reward, terminal, truncated, infos = task.step(action_cmd)
@@ -955,6 +962,17 @@ def parse_args():
     )
     parser.add_argument("--realtime_gt_step_interval", type=int, default=3)
     parser.add_argument("--realtime_gt_max_distance_m", type=float, default=4.0)
+    parser.add_argument(
+        "--realtime_gt_emit_interaction_approach_axis",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "Explicit rule-oracle mode: publish a joint-derived container front axis. "
+            "Do not enable for detector or MLLM evaluations."
+        ),
+    )
     parser.add_argument(
         "--step_frame_dir",
         type=str,
@@ -1364,6 +1382,9 @@ def main():
             ),
             realtime_gt_step_interval=args.realtime_gt_step_interval,
             realtime_gt_max_distance_m=args.realtime_gt_max_distance_m,
+            realtime_gt_emit_interaction_approach_axis=(
+                args.realtime_gt_emit_interaction_approach_axis
+            ),
             step_frame_dir=args.step_frame_dir,
             step_frame_queue_size=args.step_frame_queue_size,
             step_capture_ack_topic=args.step_capture_ack_topic,

@@ -164,6 +164,11 @@ def _selection_target_id(selection: dict | None) -> str:
 
 def _interaction_display_selection(selection: dict, command: dict) -> dict:
     merged = dict(selection or {})
+    # A terminal selection reset deliberately wins over the latched last
+    # interaction command; otherwise offline rendering would resurrect the
+    # completed target from stale command metadata.
+    if merged.get("active") is False:
+        return merged
     if not command:
         return merged
     target_id = _selection_target_id(command)
@@ -3294,6 +3299,19 @@ class ExploreDebugRecorder:
                         ),
                         "video_global_panel_scale": float(
                             getattr(self.args, "video_global_panel_scale", 1.0)
+                        ),
+                        "video_room_panel_scale": float(
+                            getattr(self.args, "video_room_panel_scale", 1.5)
+                        ),
+                        "video_semantic_xy_panel_scale": float(
+                            getattr(self.args, "video_semantic_xy_panel_scale", 1.8)
+                        ),
+                        "video_semantic_xy_label_mode": str(
+                            getattr(
+                                self.args,
+                                "video_semantic_xy_label_mode",
+                                "interaction_target_only",
+                            )
                         ),
                         "semantic_occ_alpha": float(
                             getattr(self.args, "semantic_occ_alpha", 0.35)
@@ -8286,6 +8304,11 @@ class ExploreDebugRecorder:
                 "video_snapshot_jpeg_quality": self.args.video_snapshot_jpeg_quality,
                 "video_snapshot_categorical_format": self.args.video_snapshot_categorical_format,
                 "video_occ_crop_margin_m": self.args.video_occ_crop_margin_m,
+                "video_room_panel_scale": getattr(self.args, "video_room_panel_scale", 1.5),
+                "video_semantic_xy_panel_scale": getattr(self.args, "video_semantic_xy_panel_scale", 1.8),
+                "video_semantic_xy_label_mode": getattr(
+                    self.args, "video_semantic_xy_label_mode", "interaction_target_only"
+                ),
                 "runtime_video_encode": bool(self.args.runtime_video_encode),
                 "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
                 "raw_recording_format": "png_json_v1",
@@ -8409,6 +8432,11 @@ class ExploreDebugRecorder:
                 "video_snapshot_jpeg_quality": self.args.video_snapshot_jpeg_quality,
                 "video_snapshot_categorical_format": self.args.video_snapshot_categorical_format,
                 "video_occ_crop_margin_m": self.args.video_occ_crop_margin_m,
+                "video_room_panel_scale": getattr(self.args, "video_room_panel_scale", 1.5),
+                "video_semantic_xy_panel_scale": getattr(self.args, "video_semantic_xy_panel_scale", 1.8),
+                "video_semantic_xy_label_mode": getattr(
+                    self.args, "video_semantic_xy_label_mode", "interaction_target_only"
+                ),
                 "runtime_video_encode": bool(self.args.runtime_video_encode),
                 "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
                 "raw_recording_format": "png_json_v1",
@@ -8799,6 +8827,24 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--video-global-panel-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--video-room-panel-scale",
+        type=float,
+        default=1.5,
+        help="World-coordinate zoom for the offline room/interactions panel.",
+    )
+    parser.add_argument(
+        "--video-semantic-xy-panel-scale",
+        type=float,
+        default=1.8,
+        help="World-coordinate zoom for the offline semantic XY panel.",
+    )
+    parser.add_argument(
+        "--video-semantic-xy-label-mode",
+        choices=("all", "interaction_target_only", "none"),
+        default="interaction_target_only",
+        help="Labels in the offline semantic XY panel; rooms remain labeled in every mode.",
+    )
     parser.add_argument("--video-map-desync-step-warn", type=int, default=3)
     parser.add_argument("--video-map-max-age-sec", type=float, default=2.0)
     parser.add_argument("--video-sync-max-delta-sec", type=float, default=0.05)
@@ -8828,6 +8874,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--video-snapshot-jpeg-quality must be in [1, 100]")
     if args.video_occ_crop_margin_m < 0.0:
         parser.error("--video-occ-crop-margin-m must be non-negative")
+    if not math.isfinite(args.video_room_panel_scale) or args.video_room_panel_scale < 1.0:
+        parser.error("--video-room-panel-scale must be at least one")
+    if not math.isfinite(args.video_semantic_xy_panel_scale) or args.video_semantic_xy_panel_scale < 1.0:
+        parser.error("--video-semantic-xy-panel-scale must be at least one")
     return args
 
 

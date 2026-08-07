@@ -165,6 +165,20 @@ class SemanticOccupancyOverlay:
                 active.add(node_id)
         self.active_portal_ids = active | self.pending_portal_ids
 
+    def has_active_portals(self, *, include_pending: bool = True) -> bool:
+        """Whether this consumer needs a materialized overlay right now.
+
+        Room topology deliberately excludes optimistic, in-flight interaction
+        clears.  Keeping that distinction here lets its hot path use the raw
+        occupancy message without allocating a full data copy and zero mask.
+        """
+
+        if not self.enabled:
+            return False
+        if include_pending:
+            return bool(self.active_portal_ids)
+        return bool(self.active_portal_ids.difference(self.pending_portal_ids))
+
     def apply(
         self,
         grid_info: Any,

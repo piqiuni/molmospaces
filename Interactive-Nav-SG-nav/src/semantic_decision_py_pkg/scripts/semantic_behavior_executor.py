@@ -27,8 +27,11 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_WAITING_FOR_DRAWER_SCAN,
     STATE_VERIFYING,
     bounded_empty_plan_retry_delay,
+    candidate_with_effective_interaction_approach,
     committed_turn_sign,
+    interaction_pose_validation,
     is_post_interaction_traversal_navigation,
+    is_interaction_pose_precondition_failure,
     navigation_goal_options,
     navigation_prerotation_heading_target,
     navigation_requires_final_yaw,
@@ -45,6 +48,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     prerotation_control_step_budget,
     prerotation_rgb_step_gate,
     requires_graph_verification,
+    is_static_portal_interaction_feedback,
     is_stuck_recovery_failure,
     safe_grid_motion_distance,
 )
@@ -376,6 +380,13 @@ class SemanticBehaviorExecutor:
             0.0,
             float(config.get("interaction_approach_fallback_cancel_wait_s", 0.5)),
         )
+        # The approach precondition is evaluated on fresh simulator-step pose
+        # samples.  It has no wall-clock deadline: a bounded number of samples
+        # determines when we abandon this approach option.
+        self.interaction_approach_pose_poll_max_attempts = max(
+            1,
+            int(config.get("interaction_approach_pose_poll_max_attempts", 5)),
+        )
         self.lock = threading.RLock()
         self.selection: dict | None = None
         self.latest_graph: dict = {}
@@ -553,7 +564,11 @@ class SemanticBehaviorExecutor:
             self._image_callback,
             queue_size=1,
         )
-        if self.rear_goal_prerotate_step_sync_enabled or self.startup_scan_enabled:
+        if (
+            self.rear_goal_prerotate_step_sync_enabled
+            or self.startup_scan_enabled
+            or self.interaction_approach_pose_poll_max_attempts > 1
+        ):
             rospy.Subscriber(
                 topics.get("step_sync", "/molmo_spaces/step_sync"),
                 String,
@@ -573,6 +588,13 @@ class SemanticBehaviorExecutor:
         try:
             selection = json.loads(message.data)
         except json.JSONDecodeError:
+            return
+        # The decision node publishes an explicit inactive selection at every
+        # terminal boundary so recorders cannot retain a stale subgoal.  It is
+        # a display/state reset, never a new executable behavior.
+        if selection.get("active") is False or not str(
+            selection.get("candidate_id") or ""
+        ):
             return
         with self.lock:
             if self.machine.state != STATE_IDLE or self.selection is not None:
@@ -680,85 +702,186 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if not self._matches_active(payload):
                 return
-            self._record_post_interaction_costmap_baseline_locked(payload)
-            visual_plan = dict(self.active_skill_plan.get("visual_operation_plan") or {})
-            is_drawer_scan = str(visual_plan.get("target_type") or "") == "drawer_container"
-            if (
-                self.ablation.module3 == "mllm_skill_verified"
-                and bool(payload.get("success"))
-                and self.pending_skill_actions
-            ):
-                next_action = self.pending_skill_actions.pop(0)
-                next_candidate = self._candidate_for_skill_action(
-                    dict(self.selection or {}), next_action
-                )
-                commands = []
-            else:
+            if is_interaction_pose_precondition_failure(payload):
+                # The force bridge rejected this before it touched the object.
+                # Re-enter approach navigation; do not emit a terminal
+                # interaction failure or teach the decision node that the
+                # object is non-interactable.
                 next_candidate = None
-                commands = self.machine.on_interaction_result(
-                    bool(payload.get("success")), detail=payload
+                commands = self._retry_interaction_approach_after_pose_failure_locked(
+                    payload
                 )
-            if (
-                self.machine.state == STATE_VERIFYING
-                and self.ablation.module3 == "direct_atomic"
-            ):
-                commands.extend(
-                    self.machine.on_verification_result(
-                        bool(payload.get("success")),
-                        detail={**payload, "verification_mode": "trusted_backend_result"},
-                    )
+            else:
+                static_portal_feedback = is_static_portal_interaction_feedback(
+                    self.selection,
+                    payload,
                 )
-            elif (
-                self.machine.state == STATE_VERIFYING
-                and self.ablation.module3 == "rule_verified"
-            ):
-                commands.extend(self._verify_graph_locked())
-            elif (
-                self.machine.state == STATE_VERIFYING
-                and self.ablation.module3 == "mllm_skill_verified"
-            ):
-                if self.evaluator_opaque_open_only and bool(payload.get("success")):
-                    # The V3 evaluator exposes interaction as a sealed semantic
-                    # skill: success is the public postcondition contract.  A
-                    # second visual classifier can produce false negatives and
-                    # retry an already-open object, while no joint state is
-                    # available (or needed) outside the sealed skill.
-                    commands.extend(
-                        self.machine.on_verification_result(
-                            True,
-                            detail={
-                                **payload,
-                                "verification_mode": "evaluator_skill_postcondition",
-                            },
-                        )
+                self._record_post_interaction_costmap_baseline_locked(payload)
+                visual_plan = dict(self.active_skill_plan.get("visual_operation_plan") or {})
+                is_drawer_scan = str(visual_plan.get("target_type") or "") == "drawer_container"
+                if static_portal_feedback:
+                    # A static opening already returned its terminal public
+                    # postcondition.  It must not be treated as a successful
+                    # articulated skill step and advance an MLLM subaction plan.
+                    self.pending_skill_actions = []
+                if (
+                    self.ablation.module3 == "mllm_skill_verified"
+                    and bool(payload.get("success"))
+                    and self.pending_skill_actions
+                    and not static_portal_feedback
+                ):
+                    next_action = self.pending_skill_actions.pop(0)
+                    next_candidate = self._candidate_for_skill_action(
+                        dict(self.selection or {}), next_action
                     )
-                elif is_drawer_scan:
-                    # A drawer scan intentionally closes each drawer after its
-                    # low-view observation.  Re-checking the final exterior
-                    # crop as though it should remain open would reject a
-                    # successful scan.  The semantic map receives the frames
-                    # captured while each drawer is open instead.
-                    commands.extend(
-                        self.machine.on_verification_result(
-                            True,
-                            detail={
-                                **payload,
-                                "verification_mode": "drawer_scan_backend",
-                            },
-                        )
-                    )
+                    commands = []
                 else:
-                    decision_id = str((self.selection or {}).get("decision_id") or "")
-                    result_image_sequence = self.latest_image_sequence
-                    threading.Thread(
-                        target=self._run_visual_verification,
-                        args=(decision_id, payload, result_image_sequence),
-                        daemon=True,
-                    ).start()
+                    next_candidate = None
+                    commands = self.machine.on_interaction_result(
+                        bool(payload.get("success")), detail=payload
+                    )
+                if (
+                    self.machine.state == STATE_VERIFYING
+                    and self.ablation.module3 == "direct_atomic"
+                ):
+                    commands.extend(
+                        self.machine.on_verification_result(
+                            bool(payload.get("success")),
+                            detail={**payload, "verification_mode": "trusted_backend_result"},
+                        )
+                    )
+                elif (
+                    self.machine.state == STATE_VERIFYING
+                    and self.ablation.module3 == "rule_verified"
+                ):
+                    commands.extend(self._verify_graph_locked())
+                elif (
+                    self.machine.state == STATE_VERIFYING
+                    and self.ablation.module3 == "mllm_skill_verified"
+                ):
+                    if self.evaluator_opaque_open_only and bool(payload.get("success")):
+                        # The V3 evaluator exposes interaction as a sealed semantic
+                        # skill: success is the public postcondition contract.  A
+                        # second visual classifier can produce false negatives and
+                        # retry an already-open object, while no joint state is
+                        # available (or needed) outside the sealed skill.
+                        commands.extend(
+                            self.machine.on_verification_result(
+                                True,
+                                detail={
+                                    **payload,
+                                    "verification_mode": "evaluator_skill_postcondition",
+                                },
+                            )
+                        )
+                    elif is_drawer_scan:
+                        # A drawer scan intentionally closes each drawer after its
+                        # low-view observation.  Re-checking the final exterior
+                        # crop as though it should remain open would reject a
+                        # successful scan.  The semantic map receives the frames
+                        # captured while each drawer is open instead.
+                        commands.extend(
+                            self.machine.on_verification_result(
+                                True,
+                                detail={
+                                    **payload,
+                                    "verification_mode": "drawer_scan_backend",
+                                },
+                            )
+                        )
+                    else:
+                        decision_id = str((self.selection or {}).get("decision_id") or "")
+                        result_image_sequence = self.latest_image_sequence
+                        threading.Thread(
+                            target=self._run_visual_verification,
+                            args=(decision_id, payload, result_image_sequence),
+                            daemon=True,
+                        ).start()
         if next_candidate is not None:
             self._publish_interaction_command(next_candidate)
         else:
             self._dispatch(commands)
+
+    def _retry_interaction_approach_after_pose_failure_locked(
+        self, payload: dict
+    ) -> list[dict]:
+        """Retry a bridge-rejected pose through the next preserved approach.
+
+        This method runs while ``self.lock`` is held and intentionally has no
+        wall-clock deadline.  The bounded retry count is expressed in actual
+        approach options/pose polls so slow rendering or ROS scheduling cannot
+        turn a valid interaction into an object-level failure.
+        """
+
+        candidate = dict(self.machine.candidate or self.selection or {})
+        metadata = candidate.get("metadata") or {}
+        attempts = [
+            dict(item)
+            for item in metadata.get("interaction_approach_attempts") or []
+            if isinstance(item, dict)
+        ]
+        selected_option_index = max(
+            0, int(metadata.get("interaction_approach_goal_option_index", 0) or 0)
+        )
+        if attempts:
+            attempts[-1]["outcome"] = "interaction_pose_invalid"
+            attempts[-1]["bridge_pose_validation"] = dict(
+                payload.get("interaction_pose_validation") or {}
+            )
+        else:
+            attempts.append(
+                {
+                    "index": selected_option_index,
+                    "goal_xyyaw": list(
+                        (metadata.get("effective_interaction_approach_pose_xyyaw")
+                        or (candidate.get("interaction_command") or {}).get(
+                            "interaction_approach_pose_xyyaw"
+                        )
+                        or [])
+                    ),
+                    "outcome": "interaction_pose_invalid",
+                    "bridge_pose_validation": dict(
+                        payload.get("interaction_pose_validation") or {}
+                    ),
+                }
+            )
+        goal_option_count = len(navigation_goal_options(candidate))
+        failure_detail = {
+            "reason": "interaction_pose_invalid",
+            "interaction_pose_validation": dict(
+                payload.get("interaction_pose_validation") or {}
+            ),
+        }
+        next_option_index = next_interaction_approach_option_index(
+            behavior_type=str(candidate.get("behavior_type") or ""),
+            failure_detail=failure_detail,
+            selected_option_index=selected_option_index,
+            attempted_navigation_count=len(attempts),
+            max_navigation_attempts=self.interaction_approach_fallback_max_attempts,
+            goal_option_count=goal_option_count,
+        )
+        if next_option_index is not None:
+            rospy.logwarn(
+                "[semantic_behavior_executor] bridge pose precondition rejected "
+                "INTERACT; retrying approach option %d/%d (attempt %d/%d)",
+                next_option_index + 1,
+                goal_option_count,
+                len(attempts) + 1,
+                self.interaction_approach_fallback_max_attempts,
+            )
+            return self.machine.retry_interaction_approach(
+                start_goal_option_index=next_option_index,
+                interaction_approach_attempts=attempts,
+                detail=failure_detail,
+            )
+        exhausted_detail = {
+            **payload,
+            "reason": "interaction_approach_options_exhausted",
+            "failure_reason": "interaction_approach_options_exhausted",
+            "interaction_approach_attempts": attempts,
+            "interaction_approach_goal_option_count": goal_option_count,
+        }
+        return self.machine.on_interaction_result(False, detail=exhausted_detail)
 
     def _step_sync_callback(self, message: String) -> None:
         """Record a bridge action acknowledgement keyed by evaluator step."""
@@ -949,6 +1072,11 @@ class SemanticBehaviorExecutor:
         exact result before it asks ``make_plan``.
         """
 
+        # A static portal reports ``static_open`` synchronously but does not
+        # move geometry.  Only an articulated open can establish the causal
+        # raw OCC -> planning OCC -> costmap barrier for a forced traversal.
+        if is_static_portal_interaction_feedback(self.selection, payload):
+            return
         if not (
             payload.get("success") is True
             or str(payload.get("status") or "").upper() == "SUCCEEDED"
@@ -1610,7 +1738,12 @@ class SemanticBehaviorExecutor:
                 decision_id = str(candidate.get("decision_id") or "")
                 threading.Thread(
                     target=self._run_navigation,
-                    args=(decision_id, candidate),
+                    args=(
+                        decision_id,
+                        candidate,
+                        int(command.get("start_goal_option_index", 0) or 0),
+                        list(command.get("interaction_approach_attempts") or []),
+                    ),
                     daemon=True,
                 ).start()
             elif kind == "interact":
@@ -1702,7 +1835,11 @@ class SemanticBehaviorExecutor:
             "sequence_type": interaction.get("sequence_type", ""),
             "operation_method": interaction.get("operation_method", "unknown"),
             "open_regions": list(interaction.get("open_regions") or []),
-            "approach_goal_xyyaw": list(candidate.get("goal_xyyaw") or []),
+            "approach_goal_xyyaw": list(
+                interaction.get("interaction_approach_pose_xyyaw")
+                or candidate.get("goal_xyyaw")
+                or []
+            ),
             "visual_operation_plan": dict(
                 interaction.get("visual_operation_plan") or {}
             ),
@@ -2720,6 +2857,149 @@ class SemanticBehaviorExecutor:
             self.final_align_timeout_s,
         )
 
+    def _wait_for_next_interaction_pose_poll_step(
+        self, decision_id: str, previous_step_index: int | None
+    ) -> int | None:
+        """Wait for one fresh evaluator step with no wall-clock deadline."""
+
+        while (
+            not rospy.is_shutdown()
+            and self._navigation_is_current(decision_id)
+        ):
+            with self.lock:
+                current_step_index = self._latest_step_sync_index
+            if current_step_index is not None and current_step_index != previous_step_index:
+                return int(current_step_index)
+            time.sleep(0.005)
+        return None
+
+    def _poll_interaction_approach_pose(
+        self,
+        decision_id: str,
+        candidate: dict,
+        expected_pose_xyyaw: tuple[float, float, float],
+    ) -> tuple[bool, dict]:
+        """Poll fresh simulator-step poses, bounded by count rather than time."""
+
+        interaction = candidate.get("interaction_command") or {}
+        metadata = candidate.get("metadata") or {}
+        frame_id = str(metadata.get("frame_id") or self.map_frame)
+        distance_tolerance_m = float(
+            interaction.get("interaction_ready_distance_m", 0.45) or 0.45
+        )
+        yaw_tolerance_rad = float(
+            interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+        )
+        with self.lock:
+            observed_step_index = self._latest_step_sync_index
+        samples = []
+        for poll_index in range(self.interaction_approach_pose_poll_max_attempts):
+            actual_pose = self._current_pose(frame_id)
+            validation = interaction_pose_validation(
+                list(expected_pose_xyyaw),
+                None if actual_pose is None else list(actual_pose),
+                distance_tolerance_m=distance_tolerance_m,
+                yaw_tolerance_rad=yaw_tolerance_rad,
+            )
+            validation["poll_index"] = poll_index + 1
+            validation["step_index"] = observed_step_index
+            samples.append(validation)
+            if validation.get("valid"):
+                return True, {
+                    "interaction_pose_validation": validation,
+                    "interaction_pose_poll_count": poll_index + 1,
+                    "interaction_pose_poll_max_attempts": (
+                        self.interaction_approach_pose_poll_max_attempts
+                    ),
+                    "interaction_pose_poll_samples": samples,
+                }
+            if poll_index + 1 >= self.interaction_approach_pose_poll_max_attempts:
+                break
+            observed_step_index = self._wait_for_next_interaction_pose_poll_step(
+                decision_id, observed_step_index
+            )
+            if observed_step_index is None:
+                break
+        return False, {
+            "reason": "interaction_pose_poll_exhausted",
+            "failure_reason": "interaction_pose_poll_exhausted",
+            "interaction_pose_poll_count": len(samples),
+            "interaction_pose_poll_max_attempts": (
+                self.interaction_approach_pose_poll_max_attempts
+            ),
+            "interaction_pose_poll_samples": samples,
+            "interaction_pose_validation": dict(samples[-1]) if samples else {},
+        }
+
+    def _complete_interaction_approach_navigation(
+        self,
+        decision_id: str,
+        candidate: dict,
+        *,
+        selected_goal: tuple[float, float, float],
+        selected_goal_option_index: int,
+        interaction_approach_attempts: list[dict],
+        goal_option_count: int,
+        detail: dict,
+    ) -> None:
+        """Gate an INTERACT command on counted fresh-pose samples."""
+
+        pose_ready, poll_detail = self._poll_interaction_approach_pose(
+            decision_id,
+            candidate,
+            selected_goal,
+        )
+        detail = {
+            **detail,
+            **poll_detail,
+            "effective_interaction_approach_pose_xyyaw": list(selected_goal),
+            "interaction_approach_goal_option_index": int(
+                selected_goal_option_index
+            ),
+            "interaction_approach_attempts": [
+                dict(item) for item in interaction_approach_attempts
+            ],
+        }
+        if pose_ready:
+            self._handle_navigation_result(decision_id, True, detail)
+            return
+        if self._retry_interaction_approach(
+            decision_id,
+            candidate,
+            selected_goal_option_index,
+            interaction_approach_attempts,
+            goal_option_count,
+            detail,
+        ):
+            return
+        self._handle_navigation_result(decision_id, False, detail)
+
+    def _set_effective_interaction_approach(
+        self,
+        decision_id: str,
+        candidate: dict,
+        selected_goal: tuple[float, float, float],
+        selected_goal_option_index: int,
+        interaction_approach_attempts: list[dict],
+    ) -> None:
+        """Expose the exact move_base fallback while the approach is active."""
+
+        with self.lock:
+            if (
+                self.selection is None
+                or str(self.selection.get("decision_id") or "") != decision_id
+                or self.machine.candidate is None
+            ):
+                return
+            bound_candidate = candidate_with_effective_interaction_approach(
+                candidate,
+                list(selected_goal),
+                goal_option_index=selected_goal_option_index,
+                attempts=interaction_approach_attempts,
+            )
+            self.machine.candidate = bound_candidate
+            self.selection = dict(bound_candidate)
+
     def _run_navigation(
         self,
         decision_id: str,
@@ -2780,15 +3060,37 @@ class SemanticBehaviorExecutor:
                 if position_error <= direct_distance_tolerance and (
                     direct_yaw_tolerance <= 0.0 or yaw_error <= direct_yaw_tolerance
                 ):
-                    self._handle_navigation_result(
-                        decision_id,
-                        True,
-                        {
-                            "reason": "already_at_verified_approach_pose",
-                            "position_error_m": position_error,
-                            "yaw_error_rad": yaw_error,
-                        },
-                    )
+                    direct_detail = {
+                        "reason": "already_at_verified_approach_pose",
+                        "position_error_m": position_error,
+                        "yaw_error_rad": yaw_error,
+                    }
+                    if str(behavior_type).upper() == "INTERACT":
+                        direct_attempts = list(interaction_approach_attempts)
+                        direct_attempts.append(
+                            {
+                                "index": start_goal_option_index,
+                                "goal_xyyaw": [primary_x, primary_y, primary_yaw],
+                                "reachable": True,
+                                "navigation_attempt": len(direct_attempts) + 1,
+                                "outcome": "already_at_verified_approach_pose",
+                            }
+                        )
+                        self._complete_interaction_approach_navigation(
+                            decision_id,
+                            candidate,
+                            selected_goal=(primary_x, primary_y, primary_yaw),
+                            selected_goal_option_index=start_goal_option_index,
+                            interaction_approach_attempts=direct_attempts,
+                            goal_option_count=len(goal_options),
+                            detail=direct_detail,
+                        )
+                    else:
+                        self._handle_navigation_result(
+                            decision_id,
+                            True,
+                            direct_detail,
+                        )
                     return
         goal = MoveBaseGoal()
         goal.target_pose.header.frame_id = str(
@@ -3044,6 +3346,13 @@ class SemanticBehaviorExecutor:
                 len(interaction_approach_attempt_history) + 1
             )
             interaction_approach_attempt_history.append(selected_attempt)
+            self._set_effective_interaction_approach(
+                decision_id,
+                candidate,
+                selected_goal,
+                int(selected_goal_option_index or 0),
+                interaction_approach_attempt_history,
+            )
         if attempted_goals[-1]["index"] > 0:
             rospy.loginfo(
                 "[semantic_behavior_executor] selected interaction fallback goal %d/%d",
@@ -3211,15 +3520,31 @@ class SemanticBehaviorExecutor:
                             y,
                             yaw,
                         )
-                        self._handle_navigation_result(
-                            decision_id,
-                            bool(aligned),
-                            {
-                                "reason": "direct_final_yaw_alignment",
-                                "position_error_m": distance,
-                                "yaw_error_rad": yaw_error,
-                            },
-                        )
+                        aligned_detail = {
+                            "reason": "direct_final_yaw_alignment",
+                            "position_error_m": distance,
+                            "yaw_error_rad": yaw_error,
+                        }
+                        if bool(aligned) and str(behavior_type).upper() == "INTERACT":
+                            self._complete_interaction_approach_navigation(
+                                decision_id,
+                                candidate,
+                                selected_goal=selected_goal,
+                                selected_goal_option_index=int(
+                                    selected_goal_option_index or 0
+                                ),
+                                interaction_approach_attempts=(
+                                    interaction_approach_attempt_history
+                                ),
+                                goal_option_count=len(goal_options),
+                                detail=aligned_detail,
+                            )
+                        else:
+                            self._handle_navigation_result(
+                                decision_id,
+                                bool(aligned),
+                                aligned_detail,
+                            )
                         return
                 else:
                     near_goal_since = None
@@ -3236,11 +3561,29 @@ class SemanticBehaviorExecutor:
                     yaw,
                 )
                 if aligned is not None:
-                    self._handle_navigation_result(
-                        decision_id,
-                        bool(aligned),
-                        {"reason": "navigation_timeout_final_alignment"},
-                    )
+                    timeout_alignment_detail = {
+                        "reason": "navigation_timeout_final_alignment"
+                    }
+                    if bool(aligned) and str(behavior_type).upper() == "INTERACT":
+                        self._complete_interaction_approach_navigation(
+                            decision_id,
+                            candidate,
+                            selected_goal=selected_goal,
+                            selected_goal_option_index=int(
+                                selected_goal_option_index or 0
+                            ),
+                            interaction_approach_attempts=(
+                                interaction_approach_attempt_history
+                            ),
+                            goal_option_count=len(goal_options),
+                            detail=timeout_alignment_detail,
+                        )
+                    else:
+                        self._handle_navigation_result(
+                            decision_id,
+                            bool(aligned),
+                            timeout_alignment_detail,
+                        )
                     return
             self._handle_navigation_result(
                 decision_id,
@@ -3288,6 +3631,17 @@ class SemanticBehaviorExecutor:
                 detail["reason"] = "final_yaw_alignment_failed"
             elif aligned is True:
                 detail["reason"] = "final_yaw_alignment"
+        if success and str(behavior_type).upper() == "INTERACT":
+            self._complete_interaction_approach_navigation(
+                decision_id,
+                candidate,
+                selected_goal=selected_goal,
+                selected_goal_option_index=int(selected_goal_option_index or 0),
+                interaction_approach_attempts=interaction_approach_attempt_history,
+                goal_option_count=len(goal_options),
+                detail=detail,
+            )
+            return
         self._handle_navigation_result(decision_id, success, detail)
 
     def _retry_interaction_approach(
@@ -3320,15 +3674,22 @@ class SemanticBehaviorExecutor:
             }
         if not self._navigation_is_current(decision_id):
             return True
-        if self.interaction_approach_fallback_cancel_wait_s > 0.0:
+        pose_precondition_retry = is_interaction_pose_precondition_failure(
+            failure_detail
+        )
+        if (
+            self.interaction_approach_fallback_cancel_wait_s > 0.0
+            and not pose_precondition_retry
+        ):
             self.move_base.wait_for_result(
                 rospy.Duration(self.interaction_approach_fallback_cancel_wait_s)
             )
         if not self._navigation_is_current(decision_id):
             return True
         rospy.logwarn(
-            "[semantic_behavior_executor] INTERACT approach stagnated; "
+            "[semantic_behavior_executor] INTERACT approach %s; "
             "retrying option %d/%d (attempt %d/%d)",
+            str(failure_detail.get("reason") or "failed"),
             next_option_index + 1,
             goal_option_count,
             len(attempts) + 1,
@@ -3413,6 +3774,31 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if self.selection is None or str(self.selection.get("decision_id") or "") != decision_id:
                 return
+            if (
+                success
+                and self.machine.candidate is not None
+                and str(self.machine.candidate.get("behavior_type") or "").upper()
+                == "INTERACT"
+            ):
+                effective_pose = list(
+                    detail.get("effective_interaction_approach_pose_xyyaw") or []
+                )
+                if len(effective_pose) >= 2:
+                    bound_candidate = candidate_with_effective_interaction_approach(
+                        self.machine.candidate,
+                        effective_pose,
+                        goal_option_index=int(
+                            detail.get("interaction_approach_goal_option_index", 0)
+                            or 0
+                        ),
+                        attempts=list(
+                            detail.get("interaction_approach_attempts") or []
+                        ),
+                    )
+                    self.machine.candidate = bound_candidate
+                    # Keep executor-side feedback and bridge command metadata
+                    # coherent with the exact fallback that move_base reached.
+                    self.selection = dict(bound_candidate)
             wait_for_drawer_scan = bool(
                 success and self._needs_fresh_drawer_scan_locked()
             )

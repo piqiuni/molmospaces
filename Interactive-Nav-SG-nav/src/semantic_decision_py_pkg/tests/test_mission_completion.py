@@ -1,6 +1,8 @@
 from semantic_decision_py_pkg.mission_completion import (
     MissionCompletionConfig,
     MissionCompletionTracker,
+    TerminalInteractionNoPlanExitConfig,
+    TerminalInteractionNoPlanExitTracker,
     TargetMissionTracker,
 )
 from semantic_decision_py_pkg.behavior_candidates import BehaviorCandidate
@@ -149,6 +151,126 @@ def test_completion_requires_fifty_observation_steps_after_frontiers_empty() -> 
     assert tracker.update(
         at_limit, has_active_behavior=False, target_enabled=False
     ) is True
+
+
+def _no_executable_snapshot(sequence: int, observation_step: int) -> dict:
+    return {
+        "sequence": sequence,
+        # This mirrors the observed failure mode: the raw interaction remains
+        # visible, but its candidate-level cooldown makes the eligible set empty.
+        "candidate_count": 1,
+        "candidates": [{"candidate_id": "interaction:drawer:open"}],
+        "exploration_context": {
+            "initial_scan_complete": True,
+            "observation_step": observation_step,
+        },
+    }
+
+
+def _terminal_interaction_no_plan_feedback() -> dict:
+    return {
+        "status": "FAILED",
+        "behavior_type": "INTERACT",
+        "candidate_id": "interaction:drawer:open",
+        "decision_id": "decision_000007",
+        "detail": {
+            "reason": "make_plan_unreachable",
+            "attempted_goal_count": 3,
+        },
+    }
+
+
+def test_terminal_interaction_no_plan_exits_only_after_distinct_observation_steps() -> None:
+    tracker = TerminalInteractionNoPlanExitTracker(
+        TerminalInteractionNoPlanExitConfig(
+            enabled=True,
+            no_executable_candidate_min_steps=20,
+            no_executable_candidate_confirmations=3,
+        )
+    )
+    assert tracker.note_feedback(
+        _terminal_interaction_no_plan_feedback(), observation_step=100
+    )
+
+    assert not tracker.update(
+        _no_executable_snapshot(1, 101),
+        has_active_behavior=False,
+        has_executable_candidate=False,
+        startup_scan_pending=False,
+        eligible_candidate_count=0,
+    )
+    # Multiple ROS messages from the same simulation observation must not
+    # synthesize a no-candidate streak.
+    assert not tracker.update(
+        _no_executable_snapshot(2, 101),
+        has_active_behavior=False,
+        has_executable_candidate=False,
+        startup_scan_pending=False,
+        eligible_candidate_count=0,
+    )
+    assert not tracker.update(
+        _no_executable_snapshot(3, 119),
+        has_active_behavior=False,
+        has_executable_candidate=False,
+        startup_scan_pending=False,
+        eligible_candidate_count=0,
+    )
+    assert tracker.update(
+        _no_executable_snapshot(4, 120),
+        has_active_behavior=False,
+        has_executable_candidate=False,
+        startup_scan_pending=False,
+        eligible_candidate_count=0,
+    )
+    assert tracker.reason == (
+        "no_executable_candidates_after_terminal_interaction_no_plan"
+    )
+    assert tracker.last_detail["raw_candidate_count"] == 1
+    assert tracker.last_detail["eligible_candidate_count"] == 0
+    assert tracker.last_detail["terminal_interaction_failure"]["detail"]["reason"] == (
+        "make_plan_unreachable"
+    )
+
+
+def test_terminal_interaction_no_plan_preserves_scan_and_recovery_paths() -> None:
+    tracker = TerminalInteractionNoPlanExitTracker(
+        TerminalInteractionNoPlanExitConfig(
+            enabled=True,
+            no_executable_candidate_min_steps=1,
+            no_executable_candidate_confirmations=1,
+        )
+    )
+    assert tracker.note_feedback(
+        _terminal_interaction_no_plan_feedback(), observation_step=10
+    )
+    assert not tracker.update(
+        _no_executable_snapshot(1, 11),
+        has_active_behavior=False,
+        has_executable_candidate=False,
+        startup_scan_pending=True,
+        eligible_candidate_count=0,
+    )
+    assert tracker.terminal_failure == {}
+
+    assert tracker.note_feedback(
+        _terminal_interaction_no_plan_feedback(), observation_step=20
+    )
+    assert not tracker.update(
+        _no_executable_snapshot(2, 21),
+        has_active_behavior=False,
+        has_executable_candidate=True,
+        startup_scan_pending=False,
+        eligible_candidate_count=1,
+    )
+    assert tracker.terminal_failure == {}
+    # A past failed interaction cannot terminate a later recovery cycle.
+    assert not tracker.update(
+        _no_executable_snapshot(3, 40),
+        has_active_behavior=False,
+        has_executable_candidate=False,
+        startup_scan_pending=False,
+        eligible_candidate_count=0,
+    )
 
 
 def test_target_mission_requires_matching_interaction_after_navigation() -> None:

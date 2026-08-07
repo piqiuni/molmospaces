@@ -38,6 +38,39 @@ SPATIAL_CONTEXT_LABELS = {
 }
 
 
+def _is_confirmed_portal_open_history(
+    interaction: dict[str, Any], event: dict[str, Any]
+) -> bool:
+    """Whether an operation history entry may drive a post-open traversal.
+
+    ``static_open`` acknowledges an existing fixed passage.  It must never be
+    interpreted as a successful articulated open merely because its event uses
+    the public ``action=open`` request verb.
+    """
+
+    capability = str(interaction.get("capability") or "").strip().casefold()
+    if capability not in {"confirmed", "articulated"}:
+        return False
+    event_capability = str(
+        event.get("interaction_capability") or event.get("capability") or ""
+    ).strip().casefold()
+    event_state = str(event.get("post_state") or "").strip().casefold()
+    if event_capability in {
+        "static",
+        "blocked",
+        "unsupported",
+        "unavailable",
+        "locked",
+    } or event_state in {"static", "static_open", "static_closed"}:
+        return False
+    return bool(
+        event.get("success")
+        and str(event.get("action") or "").casefold() == "open"
+        and event_state in {"open", "opened"}
+        and len(list(event.get("approach_goal_xyyaw") or [])) >= 2
+    )
+
+
 @dataclass
 class BehaviorCandidate:
     candidate_id: str
@@ -69,6 +102,12 @@ class CandidateGeneratorConfig:
     # object so an already-open static door is not treated as a closed door.
     portal_require_attribute_ready: bool = False
     portal_allow_unknown_state: bool = True
+    # Rule-only fallback for restricted-GT portals.  Their state confidence is
+    # correctly zero while unobserved, but an unknown portal should still be
+    # tried once so executor feedback can establish open/static_open/blocked.
+    # The ROS candidate node enables this only for the rule policy lane; model
+    # policies retain the ordinary visual-evidence gate.
+    portal_unknown_default_interact: bool = False
     portal_standoff_m: float = 1.0
     portal_traversal_distance_m: float = 0.9
     portal_traversal_max_start_distance_m: float = 2.0
@@ -1054,7 +1093,17 @@ class CandidateGenerator:
                 interaction.get("state_confidence", interaction.get("confidence", node.get("confidence", 0.0)))
                 or 0.0
             )
-            if confidence < self.config.min_state_confidence:
+            unknown_portal_rule_fallback = bool(
+                node_type == "portal"
+                and node_state.casefold() == "unknown"
+                and self.config.portal_unknown_default_interact
+                and bool(interaction.get("is_interactable", False))
+                and bool(interaction.get("requires_interaction", False))
+            )
+            if (
+                confidence < self.config.min_state_confidence
+                and not unknown_portal_rule_fallback
+            ):
                 continue
             state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
             if state_age_sec > self.config.max_state_age_sec:
@@ -1388,7 +1437,7 @@ class CandidateGenerator:
                 continue
             interaction = node.get("interaction") or {}
             state = str(interaction.get("state") or "unknown").casefold()
-            if state not in {"open", "static_open"}:
+            if state != "open":
                 continue
             if interaction.get("traversable") is False:
                 continue
@@ -1397,11 +1446,7 @@ class CandidateGenerator:
                 (
                     event
                     for event in reversed(history)
-                    if bool(event.get("success"))
-                    and str(event.get("action") or "").casefold() == "open"
-                    and str(event.get("post_state") or state).casefold()
-                    in {"open", "static_open"}
-                    and len(list(event.get("approach_goal_xyyaw") or [])) >= 2
+                    if _is_confirmed_portal_open_history(interaction, event)
                 ),
                 None,
             )

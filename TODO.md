@@ -358,7 +358,8 @@
 ## 4.2 建图与表征 TODO
 
 - [ ] 梳理 `interaction_graph_store.py` 当前已经表达的节点、边、状态与限制
-- [x] 明确 door 在统一图中统一作为匿名 `portal` 使用；GT/source 名称不进入公开图或 MLLM 上下文
+- [x] 明确 restricted-GT door 在公开图中统一为 generic `door_<ordinal>`（doorframe / doorway /
+  door leaf 不再区分）；内部仍使用 `portal` 拓扑类型，GT/source 名称不进入公开图或 MLLM 上下文
 - [ ] 明确 room connectivity 是显式边还是由规则动态生成
 - [x] 定义交互状态最小集合：`unknown / open / ajar / closed / static_open / blocked`，并保留 state/capability 的 source、confidence、observed_step、evidence
 - [x] 定义第一阶段必须保留的交互属性字段，规则状态只接受 executor feedback，MLLM 可接受 visual attribute patch
@@ -372,6 +373,12 @@
 - [ ] 明确 ROS detector-only 管线需要输出哪些最小交互字段
 - [x] 明确 door 检测成功之外还缺少可操作性、状态、证据来源和观测步字段；初始 portal 仅是几何/可见性观测
 - [x] 明确 door state 来源边界：规则方法只由实际交互反馈更新；MLLM 方法由视觉属性 patch 或实际交互反馈更新，GT 关节状态不直接发布
+- [x] House7 door-only rule 验收：公开 `door_0001`–`door_0004` 均进入规则交互候选；两扇
+  articulated door 由 closed→open，两个无可操作门体的 generic door 由反馈标为 `static_open`，
+  不再泄露 `doorframe` / `doorway` 子类型
+- [x] 收敛 static portal 的执行语义：executor result 直接结束交互，不等待 verification timeout；
+  `static_open` 保持可通行但不创建 synthetic child room、不触发 post-open OCC/room/costmap 链路，
+  也不生成强制门后 traversal subgoal
 - [x] GT 快速版门状态（仅模拟器内部/evaluator，不进入实时语义输入）：读取当前 `joint_infos`，过滤 handle joint，以首次有效门板关节值作为 `q_closed`，按 joint range 计算开合比例；双开门要求全部门板达到 open 阈值
 - [ ] 真实场景门关节提取：在没有 MuJoCo joint GT 时，从多帧门板检测/跟踪与几何变化中估计 hinge/slide 类型、转轴或滑动轴、闭合参考位姿和开合比例；置信度不足时保持 `unknown`，不能直接清空 OCC
 - [ ] 明确 room_id / connectivity 的可信来源
@@ -504,15 +511,79 @@
   `pre/target/post pose`、`cmd_vel`、`dt`、`sim_time_delta` 与跟踪残差；评估是否也需要
   step-indexed pull 协议。当前仅保证每个 bridge action 的目标按固定 `v × dt` 构造，
   不保证位置 PD 下的真实位移严格相等。
+- [x] 收敛交互接近位姿契约：move_base 返回后只轮询至多 N 个 fresh evaluator/simulator step 位姿
+  （当前 N=5），不以墙钟超时判失败；按同一几何契约验证，失败时尝试候选持久化 fallback pose，
+  并将实际有效 `effective_goal_xyyaw` 同步给 bridge、状态和离线 renderer。全部 pose poll/fallback
+  耗尽时立即排除该 pose-sensitive candidate 后重选；真实对象/动作失败仍保留 cooldown。
 
 ### 4.4.2 运行时录像统一化（2026-08-03）
 
 - [x] 统一 semantic wrapper/batch recorder：逐 step 保存原始 PNG + JSON/manifest，drain 后
   由离线 renderer 构建 MP4；录像完整性与语义导航正确性分开验收。
+- [x] 将离线六联图显示参数写入 raw `visualization_config`：图 3 使用 1.5x、图 5 使用
+  1.8x 世界坐标缩放；图 5 默认仅显示交互目标和 room 标签，避免对象文本遮挡且保持图元对齐。
+- [x] 为已确认 `make_plan_unreachable` 的交互终态增加正常早停：连续 20 个 observation step
+  无可执行候选且至少 3 次独立确认时发布 `EXPLORATION_STALLED`，正常收尾 raw recorder 与
+  离线 MP4；不能以通用 `timeout_noop` 异常替代该路径。
+- [x] 终态清除活动交互选择：发布 `semantic_selection.active=false` 并保留终态 feedback/history；
+  recorder 和离线 renderer 只渲染 active selection，防止最后一个 subgoal、箭头或交互标签在
+  IDLE/FAILED 帧中残留。House7 通道+容器 1500-horizon 回归在 446 step 正常早停，446/446 raw 与
+  离线帧 exact 对齐，覆盖 4 个 generic door 和 refrigerator 交互。
 - [ ] 将仍使用 legacy runtime encoder 的 V3 evaluator 与三场景 GT 入口迁移到同一
   raw-only recorder/drain/offline-render 流程，并补回归测试。
 - [ ] 为 raw-only renderer 增加按 panel 导出的离线接口；当前仅支持完整离线六联图，
   不能把 legacy saved-panel 功能误认为 raw-only 功能。
+
+### 4.4.3 严格 OCC→room→graph 性能（2026-08-05）
+
+- [x] 将 active-portal pocket 保留路径中的两次 Python 四邻域 BFS 替换为严格等价的
+  OpenCV 四邻域 labels + NumPy 筛选；保留 scan-order、八邻域 cut-touch、stable room ID 与
+  low-confidence pocket 语义。
+- [x] room-only overlay 在没有**已确认** open portal 时直接使用 raw OCC；pending planning
+  clear 不进入 room topology，避免整图 data/mask 双拷贝。
+- [x] 增加严格 topology cache：仅在 geometry、三值 OCC、confirmed portal revision 与
+  temporal state 都稳定时复用 room result；每个 raw source N 仍提交 room/graph 并发布 ready。
+- [x] room worker commit 立即发布 source-pinned core bundle（room grid、planning OCC、unified
+  graph、ready）；可视 markers 和持久化仍由低频 timer 处理。
+- [x] graph store 缓存同一 room grid 的聚合 statistics，仍推进 geometry stability、relation
+  rebuild 与 graph revision；merge/redirect 一律失效缓存。
+- [x] 为 struct mapping 增加 pointcloud→OCC 分段 telemetry。当前 smoke 显示 GMapping
+  `updateMap` 仅约 4–7 ms；定位到 `tf::MessageFilter` 的历史 30 ms tolerance 会要求
+  `stamp + 30 ms` 的未来 TF，而 bridge keepalive 为 250 ms，从而形成约 200 ms ingress 等待。
+- [x] 将 scan MessageFilter tolerance 参数化。50-step strict smoke 以
+  `SCAN_FILTER_TOLERANCE_SEC=0.0` 将 pointcloud ingress 从约 206.6 ms 降至约 57.6 ms，
+  且 50/50 source-pinned ready、无 transform/unsynced/stale/projection drop；默认仍保留
+  0.03 以避免未经视觉回归即改变基线。
+- [ ] 用 recorder-enabled fixed-seed smoke 对比 tolerance 0.03/0.0 的 OCC、local/global
+  costmap 与轨迹；同时评估较快 OCC publish 后 costmap 5 Hz update-loop warning 的实际影响。
+- [x] 在 NavToObjTask 的单次 `get_and_cache_all_step_information()` 动态作用域内缓存
+  visibility/reward；`try/finally` 后立即清空，不跨 step 或外部状态改变复用。50-step
+  strict smoke 的 `task_sensor_polling` 从约 94.5 ms 降至约 33.1 ms；新增 unit test 覆盖
+  同事务复用、下一事务刷新与事务外实时读取。
+- [x] 保持 `tf_keepalive_period_s=0.25`，不以提高 keepalive 频率修复 ingress：tolerance=0
+  时点云已有同 stamp TF，提频只会增加 cached-pose TF/odom 流量与潜在伪静止时间戳风险。
+- [x] realtime-GT 仅在下一 policy step 到达 GT interval 时，从同一 post-physics task state
+  捕获私有 head-camera segmentation snapshot；16/17 hit 的 strict 50-step smoke 中 active GT
+  从 83.30 ms 降至 61.62 ms。snapshot 不进入 ROS/recorder，qpos/time/camera 变化或
+  `force=True` interaction observation 一律退回 fresh render；禁止每 step 捕获（会抵消收益）。
+- [x] realtime-GT 关闭 semantic mapping 的 legacy `/registered_scan` 订阅，避免无消费者的
+  PointCloud2 反序列化；detector/offline-GT 保持原行为，误发 legacy scene input 会节流告警。
+- [x] step timing 增加 ready 后等待、fresh `/cmd_vel`/action topic 延迟与 GT snapshot hit，
+  将 costmap/DWA 调度延迟与 bridge readiness 分开计量；不改变 5 Hz controller/costmap 频率。
+- [x] 关闭无人订阅的 DWA trajectory/cost-grid debug PointCloud 发布；不改变 local plan、costmap
+  或控制决策。后续如需量化其单独收益，补 DWA-debug on/off 的固定 command-stream A/B。
+- [x] 完成 local costmap 5 Hz→10 Hz 隔离 A/B（DWA controller 与 publish 仍为 5 Hz）：10 Hz
+  未达到 100 ms deadline，loop 中位约 222 ms、full-step 355.15→369.44 ms、timeout noop
+  11→20/50；因此默认继续保留 5 Hz。
+- [x] 增加 metadata-only costmap latency probe，记录 raw/filtered PointCloud2、local costmap、
+  local plan 与 cmd_vel 的 receipt/stamp；5 Hz 50-step 中 filtered cloud→下一 local costmap
+  publish 为 p50 106 ms / p95 291 ms，header→header p50 170 ms / p95 352 ms。该值是端到端
+  表观延迟，不等于 `updateMap` 内部纯耗时。
+- [x] 完成 house7 1000-step raw-only recorder + 离线六联图：1000/1000 step boundary 持久化、
+  1000/1000 exact video alignment、drop/error=0；`full_step` 平均 527.92 ms，后 500 step
+  因连续 timeout noop 约 600 ms/step。视频与原始数据位于 `/home/ldl/tmp/house7_interactive_rule_1000step_6panel_20260806_001`。
+- [ ] 如需精确拆分 `costmap_2d::updateMap` 与 `DWAPlannerROS::computeVelocityCommands`，维护
+  外部 ROS navigation overlay 的专用计时 build；仓库当前不含这些源码，不能用修改频率替代测量。
 
 ## 4.5 实验与评估 TODO
 

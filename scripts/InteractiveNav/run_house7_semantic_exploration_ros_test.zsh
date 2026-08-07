@@ -31,6 +31,7 @@ TASK_HORIZON=${TASK_HORIZON:-1000}
 POINTCLOUD_STRIDE=${POINTCLOUD_STRIDE:-1}
 MAPPING_SCAN_SOURCE=${MAPPING_SCAN_SOURCE:-pointcloud}
 MAPPING_SCAN_TOPIC=${MAPPING_SCAN_TOPIC:-/molmo_spaces/organized_depth_scan}
+SCAN_FILTER_TOLERANCE_SEC=${SCAN_FILTER_TOLERANCE_SEC:-0.03}
 DEPTH_SCAN_ARGS=""
 case "${MAPPING_SCAN_SOURCE}" in
   pointcloud)
@@ -58,6 +59,9 @@ ARTIFACT_WRITE_WORKERS=${ARTIFACT_WRITE_WORKERS:-4}
 ARTIFACT_WRITE_OVERFLOW=${ARTIFACT_WRITE_OVERFLOW:-block}
 VIDEO_HISTORY_SIZE=${VIDEO_HISTORY_SIZE:-256}
 SEMANTIC_VIDEO_MAX_OBJECT_NODES=${SEMANTIC_VIDEO_MAX_OBJECT_NODES:-64}
+VIDEO_ROOM_PANEL_SCALE=${VIDEO_ROOM_PANEL_SCALE:-1.5}
+VIDEO_SEMANTIC_XY_PANEL_SCALE=${VIDEO_SEMANTIC_XY_PANEL_SCALE:-1.8}
+VIDEO_SEMANTIC_XY_LABEL_MODE=${VIDEO_SEMANTIC_XY_LABEL_MODE:-interaction_target_only}
 IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-64}
 OBSERVATION_QUEUE_SIZE=${OBSERVATION_QUEUE_SIZE:-16}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
@@ -80,6 +84,9 @@ GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-4.0}
 GT_MIN_VISIBLE_PIXELS=${GT_MIN_VISIBLE_PIXELS:-16}
 GT_MIN_VISIBLE_FRACTION=${GT_MIN_VISIBLE_FRACTION:-0.20}
 GT_REQUIRED_CONSECUTIVE_OBSERVATIONS=${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS:-2}
+# Explicit rule-oracle mode: derive a container approach normal from live
+# simulator joints. It never loads a scene-specific world pose.
+GT_EMIT_INTERACTION_APPROACH_AXIS=${GT_EMIT_INTERACTION_APPROACH_AXIS:-}
 # The bridge now waits for a real first-map bootstrap, so do not discard the
 # first ten simulator observations.  Override only for isolated legacy tests.
 MAP_WARMUP_SKIP_FRAMES=${MAP_WARMUP_SKIP_FRAMES:-0}
@@ -132,6 +139,8 @@ RAW_OCCUPANCY_GRID_TOPIC=${RAW_OCCUPANCY_GRID_TOPIC:-/struct_mapping/occ_map}
 SKIP_DEBUG_RECORDER=${SKIP_DEBUG_RECORDER:-false}
 SKIP_OFFLINE_VIDEO=${SKIP_OFFLINE_VIDEO:-false}
 SKIP_COVERAGE=${SKIP_COVERAGE:-false}
+ENABLE_COSTMAP_LATENCY_PROBE=${ENABLE_COSTMAP_LATENCY_PROBE:-false}
+COSTMAP_LATENCY_PROBE_OUTPUT_DIR=${COSTMAP_LATENCY_PROBE_OUTPUT_DIR:-${OUTPUT_DIR}/costmap_latency}
 
 case "${METHOD}" in
   semantic_interaction_exploration)
@@ -171,7 +180,6 @@ case "${METHOD}" in
     FORCE_CLOSE_CONTAINERS=true
     COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_fridge.yaml}
-    SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/house7_interaction_geometry.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     ;;
   object_goal_model_mock)
@@ -225,7 +233,7 @@ case "${METHOD}" in
     export SEMANTIC_MODEL_TIMEOUT_S="${MLLM_DECISION_TIMEOUT_S}"
     SEMANTIC_ATTRIBUTE_MODEL_NAME=${SEMANTIC_ATTRIBUTE_MODEL_NAME:-qwen3.6-35b-a3b}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_object_goal_apple.yaml}
-    SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_house7_mapping.yaml}
+    SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
     RUNTIME_TARGET_MODE=${RUNTIME_TARGET_MODE:-none}
     ;;
@@ -278,6 +286,18 @@ export ROS_PACKAGE_PATH="${ROS_SOURCE_DIR}:${ROS_PACKAGE_PATH#*:}"
 export PYTHONPATH="${ROS_SOURCE_DIR}/semantic_mapping_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_decision_py_pkg/scripts:${ROS_SOURCE_DIR}/semantic_mllm_py_pkg/scripts:${ROS_SOURCE_DIR}/explore_py_pkg/scripts:${MLSPACES_SITE_PACKAGES}:${PYTHONPATH:-}"
 
 python() { "${PYTHON_BIN}" "$@"; }
+
+# A decision override may opt in to the dynamically derived rule-oracle axis.
+# An explicit environment value still wins, which makes the mode easy to turn
+# off in a reproduced run.  This is deliberately not a scene geometry lookup.
+if [[ -z "${GT_EMIT_INTERACTION_APPROACH_AXIS}" && -n "${SEMANTIC_DECISION_OVERRIDE}" && -f "${SEMANTIC_DECISION_OVERRIDE}" ]]; then
+  GT_EMIT_INTERACTION_APPROACH_AXIS=$(python -c 'import sys,yaml; data=yaml.safe_load(open(sys.argv[1])) or {}; value=(data.get("runtime") or {}).get("rule_oracle_gt_interaction_axis", False); print("true" if bool(value) else "false")' "${SEMANTIC_DECISION_OVERRIDE}")
+fi
+GT_EMIT_INTERACTION_APPROACH_AXIS=${GT_EMIT_INTERACTION_APPROACH_AXIS:-false}
+if [[ "${GT_EMIT_INTERACTION_APPROACH_AXIS}" == true && "${METHOD}" != interactive_rule ]]; then
+  print -u2 -- "GT_EMIT_INTERACTION_APPROACH_AXIS is restricted to METHOD=interactive_rule"
+  exit 2
+fi
 
 ROS_DEVEL_ROOT=$(dirname -- "${ROS_SETUP}")
 for ROS_EXECUTABLE in \
@@ -335,6 +355,7 @@ cleanup_process() {
 cleanup() {
   cleanup_process "${LAUNCH_PID:-}" 20
   cleanup_process "${RECORDER_PID:-}" 20
+  cleanup_process "${COSTMAP_PROBE_PID:-}" 10
   cleanup_process "${ROSCORE_PID:-}" 10
 }
 
@@ -362,6 +383,15 @@ done
 if [[ "${MASTER_READY}" != true ]]; then
   print -u2 -- "ROS master did not become ready"
   exit 3
+fi
+
+COSTMAP_PROBE_PID=""
+if [[ "${ENABLE_COSTMAP_LATENCY_PROBE}" == true ]]; then
+  PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/scripts/InteractiveNav/measure_costmap_latency.py" \
+    --output-dir "${COSTMAP_LATENCY_PROBE_OUTPUT_DIR}" \
+    >"${OUTPUT_DIR}/costmap_latency_probe.log" 2>&1 &
+  COSTMAP_PROBE_PID=$!
+  sleep 0.25
 fi
 
 RECORDER_PID=""
@@ -410,6 +440,9 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       --video-history-size "${VIDEO_HISTORY_SIZE}" \
       --image-queue-size "${IMAGE_QUEUE_SIZE}" \
       --video-global-panel-scale 1.8 \
+      --video-room-panel-scale "${VIDEO_ROOM_PANEL_SCALE}" \
+      --video-semantic-xy-panel-scale "${VIDEO_SEMANTIC_XY_PANEL_SCALE}" \
+      --video-semantic-xy-label-mode "${VIDEO_SEMANTIC_XY_LABEL_MODE}" \
       --no-runtime-video-encode \
       --offline-video-only \
       --first-person-video-h264-preset "${VIDEO_ENCODER_PRESET}" \
@@ -474,7 +507,8 @@ STEP_CAPTURE_ACK_TIMEOUT_S=${STEP_CAPTURE_ACK_TIMEOUT_S:-2.0}
 # At 5 Hz, command collection cannot keep the historical 0.5s wait; 0.2s
 # keeps the bridge cadence aligned with policy_dt_ms while remaining overrideable.
 ACTION_TIMEOUT_S=${ACTION_TIMEOUT_S:-0.2}
-SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} --action_timeout_s ${ACTION_TIMEOUT_S} --pointcloud_stride ${POINTCLOUD_STRIDE} ${DEPTH_SCAN_ARGS} --step_capture_ack_topic /molmo_spaces/step_capture_ack --step_capture_ack_barrier_enabled ${STEP_CAPTURE_ACK_BARRIER_ENABLED} --step_capture_ack_timeout_s ${STEP_CAPTURE_ACK_TIMEOUT_S} --step_ready_barrier_enabled ${STEP_READY_BARRIER_ENABLED} --step_ready_warmup_skip_frames ${STEP_READY_WARMUP_SKIP_FRAMES} --step_ready_timeout_s ${STEP_READY_TIMEOUT_S} --step_ready_bootstrap_timeout_s ${STEP_READY_BOOTSTRAP_TIMEOUT_S} --map_warmup_skip_frames ${MAP_WARMUP_SKIP_FRAMES} ${SIM_CAPTURE_ARGS} ${DEBUG_CAMERA_ARGS} --extra_image_queue_size ${EXTRA_IMAGE_QUEUE_SIZE} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json ${RUNTIME_TARGET_SELECTION_INPUT_ARGS} --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS} --timing_log_every_n_frames ${TIMING_LOG_EVERY_N_STEPS} --sim_timing_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS}"
+GT_INTERACTION_AXIS_ARGS="--realtime_gt_emit_interaction_approach_axis ${GT_EMIT_INTERACTION_APPROACH_AXIS}"
+SIM_EXTRA_ARGS="--seed ${SCENE_SEED} ${FIXED_ROUTE_ARGS} --initial_door_state ${INITIAL_DOOR_STATE} --enable_force_interaction true --force_interaction_close_all_containers_on_prepare ${FORCE_CLOSE_CONTAINERS} --force_interaction_log_path ${OUTPUT_DIR}/force_interaction_events.json --force_interaction_execution_mode ${INTERACTION_EXECUTION_MODE} --force_interaction_transition_steps ${INTERACTION_TRANSITION_STEPS} --force_interaction_drawer_execution_mode ${DRAWER_EXECUTION_MODE} --force_interaction_drawer_transition_steps ${DRAWER_TRANSITION_STEPS} --force_interaction_drawer_observation_steps ${DRAWER_OBSERVATION_STEPS} --realtime_gt_step_interval ${GT_STEP_INTERVAL} --realtime_gt_min_visible_pixels ${GT_MIN_VISIBLE_PIXELS} --realtime_gt_min_visible_fraction ${GT_MIN_VISIBLE_FRACTION} --realtime_gt_required_consecutive_observations ${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS} --realtime_gt_max_distance_m ${GT_MAX_DISTANCE_M} ${GT_INTERACTION_AXIS_ARGS} --action_timeout_s ${ACTION_TIMEOUT_S} --pointcloud_stride ${POINTCLOUD_STRIDE} ${DEPTH_SCAN_ARGS} --step_capture_ack_topic /molmo_spaces/step_capture_ack --step_capture_ack_barrier_enabled ${STEP_CAPTURE_ACK_BARRIER_ENABLED} --step_capture_ack_timeout_s ${STEP_CAPTURE_ACK_TIMEOUT_S} --step_ready_barrier_enabled ${STEP_READY_BARRIER_ENABLED} --step_ready_warmup_skip_frames ${STEP_READY_WARMUP_SKIP_FRAMES} --step_ready_timeout_s ${STEP_READY_TIMEOUT_S} --step_ready_bootstrap_timeout_s ${STEP_READY_BOOTSTRAP_TIMEOUT_S} --map_warmup_skip_frames ${MAP_WARMUP_SKIP_FRAMES} ${SIM_CAPTURE_ARGS} ${DEBUG_CAMERA_ARGS} --extra_image_queue_size ${EXTRA_IMAGE_QUEUE_SIZE} --require_move_base_active_for_cmd_vel false --no-retain_task_history --runtime_target_selection_mode ${RUNTIME_TARGET_MODE} --runtime_target_selection_top_k 3 --runtime_target_selection_path ${OUTPUT_DIR}/target_selection.json ${RUNTIME_TARGET_SELECTION_INPUT_ARGS} --completion_mode ${COMPLETION_MODE} --completion_confirmations ${COMPLETION_CONFIRMATIONS} --completion_post_hold_steps ${COMPLETION_POST_HOLD_STEPS} --completion_status_path ${OUTPUT_DIR}/completion_status.json --step_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS} --timing_log_every_n_frames ${TIMING_LOG_EVERY_N_STEPS} --sim_timing_log_every_n_steps ${TIMING_LOG_EVERY_N_STEPS}"
 
 roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_sim:=true \
@@ -482,6 +516,7 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   mapping_mode:=odom_locked \
   mapping_scan_source:="${MAPPING_SCAN_SOURCE}" \
   mapping_scan_topic:="${MAPPING_SCAN_TOPIC}" \
+  scan_filter_tolerance_sec:="${SCAN_FILTER_TOLERANCE_SEC}" \
   start_semantic_mapping:=true \
   semantic_source:=realtime_gt \
   publish_realtime_gt:=true \
@@ -545,6 +580,12 @@ if [[ "${LAUNCH_EXIT}" -ne 0 ]] && [[ "${LAUNCH_EXIT}" -ne 130 ]]; then
     print -u2 -- "Navigation launch exited with ${LAUNCH_EXIT}"
     exit "${LAUNCH_EXIT}"
   fi
+fi
+
+if [[ -n "${COSTMAP_PROBE_PID}" ]]; then
+  kill -TERM "${COSTMAP_PROBE_PID}" 2>/dev/null || true
+  wait "${COSTMAP_PROBE_PID}" 2>/dev/null || true
+  COSTMAP_PROBE_PID=""
 fi
 
 RECORDER_DRAIN_STATUS=0

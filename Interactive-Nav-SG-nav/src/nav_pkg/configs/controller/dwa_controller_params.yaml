@@ -79,6 +79,9 @@ DWAPlannerROS:
   conditional_reverse_failure_count: 3
   conditional_reverse_duration_sec: 1.0
 
-  # Debugging
-  publish_traj_pc: true
-  publish_cost_grid_pc: true
+  # These point clouds are only RViz/debug artifacts.  The exploration stack
+  # consumes local_plan and costmaps instead, so avoid constructing and
+  # serializing them on every 5 Hz DWA cycle.  Re-enable locally when directly
+  # debugging DWA trajectory/cost-grid internals.
+  publish_traj_pc: false
+  publish_cost_grid_pc: false

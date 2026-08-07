@@ -45,6 +45,7 @@
 #include "gmapping/sensor/sensor_base/sensor.h"
 
 #include <boost/thread.hpp>
+#include <stdint.h>
 #include <deque>
 #include <vector>
 
@@ -70,6 +71,40 @@ class SlamGMapping
     void publishLoop(double transform_publish_period);
 
   private:
+    enum PipelineTimingStage
+    {
+      PIPELINE_STAGE_CALLBACK_TOTAL = 0,
+      PIPELINE_STAGE_FILTER,
+      PIPELINE_STAGE_TRANSFORM,
+      PIPELINE_STAGE_FILTERED_CLOUD_PUBLISH,
+      PIPELINE_STAGE_PROJECTION,
+      PIPELINE_STAGE_ADD_SCAN,
+      PIPELINE_STAGE_UPDATE_MAP,
+      PIPELINE_STAGE_MAP_PUBLISH,
+      PIPELINE_STAGE_COUNT
+    };
+
+    enum PipelineTimingEvent
+    {
+      PIPELINE_EVENT_PROCESSED = 0,
+      PIPELINE_EVENT_THROTTLED,
+      PIPELINE_EVENT_STALE_DROP,
+      PIPELINE_EVENT_STALE_ACCEPTED,
+      PIPELINE_EVENT_UNSYNCED_DROP,
+      PIPELINE_EVENT_TRANSFORM_FAILURE,
+      PIPELINE_EVENT_PROJECTION_FAILURE,
+      PIPELINE_EVENT_FILTERED_CLOUD_PUBLISH,
+      PIPELINE_EVENT_MAPPER_INITIALIZED,
+      PIPELINE_EVENT_ADD_SCAN_ATTEMPT,
+      PIPELINE_EVENT_ADD_SCAN_ACCEPTED,
+      PIPELINE_EVENT_ADD_SCAN_REJECTED,
+      PIPELINE_EVENT_MAP_UPDATE,
+      PIPELINE_EVENT_MAP_PUBLISHED,
+      PIPELINE_EVENT_COUNT
+    };
+
+    struct PipelineTimingTrace;
+
     ros::NodeHandle node_;
     ros::Publisher entropy_publisher_;
     ros::Publisher sst_;
@@ -123,7 +158,8 @@ class SlamGMapping
     std::string mapping_scan_source_;
     std::string mapping_scan_topic_;
 
-    void updateMap(const sensor_msgs::LaserScan& scan);
+    void updateMap(const sensor_msgs::LaserScan& scan,
+                   PipelineTimingTrace* timing_trace = NULL);
     bool getOdomPose(GMapping::OrientedPoint& gmap_pose, const ros::Time& t);
     bool initMapper(const sensor_msgs::LaserScan& scan);
     bool addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoint& gmap_pose);
@@ -149,6 +185,7 @@ class SlamGMapping
     double angleDiff(double a, double b) const;
     bool worldToMap(const nav_msgs::OccupancyGrid& map, double wx, double wy, int& mx, int& my) const;
     bool hasMatchedOdomStamp(const ros::Time& stamp, double* dt_sec = NULL);
+    void finishPipelineTiming(PipelineTimingTrace* timing_trace);
     
     // Parameters used by GMapping
     double maxRange_;
@@ -239,6 +276,28 @@ class SlamGMapping
     size_t odom_stamp_buffer_size_;
     std::deque<ros::Time> odom_stamp_buffer_;
     int scan_filter_queue_size_;
+    double scan_filter_tolerance_sec_;
+
+    // Pipeline telemetry is deliberately observational: it never changes
+    // filtering, scan matching, map update, or publish scheduling.  Timings
+    // are accumulated per delivered callback and emitted periodically so an
+    // end-to-end smoke run can identify the dominant stage without log spam.
+    bool pipeline_timing_enabled_;
+    int pipeline_timing_log_every_;
+    uint64_t pipeline_timing_window_callbacks_;
+    uint64_t pipeline_timing_window_pointcloud_callbacks_;
+    uint64_t pipeline_timing_window_organized_depth_callbacks_;
+    uint64_t pipeline_timing_window_event_counts_[PIPELINE_EVENT_COUNT];
+    uint64_t pipeline_timing_window_stage_counts_[PIPELINE_STAGE_COUNT];
+    double pipeline_timing_window_stage_total_ms_[PIPELINE_STAGE_COUNT];
+    double pipeline_timing_window_stage_max_ms_[PIPELINE_STAGE_COUNT];
+    uint64_t pipeline_timing_window_source_age_count_;
+    double pipeline_timing_window_source_age_total_ms_;
+    double pipeline_timing_window_source_age_max_ms_;
+    uint64_t pipeline_timing_window_odom_delta_count_;
+    double pipeline_timing_window_odom_delta_total_ms_;
+    double pipeline_timing_window_odom_delta_max_ms_;
+    boost::mutex pipeline_timing_mutex_;
     
     ros::NodeHandle private_nh_;
     

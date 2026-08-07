@@ -138,6 +138,11 @@ room_mllm:
 semantic_map:
   enable_object_mapping: true
   enable_scene_mapping: true
+  # The legacy scene-attribute lane consumes the registered cloud.  Keep it
+  # enabled by default for detector/offline deployments; realtime_gt receives
+  # no scene-attribute stream and disables this subscription in the parent
+  # navigation launch to avoid an unused PointCloud2 deserialization path.
+  subscribe_pointcloud: true
   # A 5 Hz map/ready cadence matches the 0.2 s policy step without flooding
   # downstream full-map consumers.
   publish_rate: 5.0
@@ -180,6 +185,10 @@ semantic_map:
   # Room topology uses confirmed semantic door clears, never an in-flight
   # interaction command.  A successful open forces one immediate stable split.
   room_segment_use_semantic_overlay: true
+  # Reuse a settled room topology only when the effective ternary OCC map and
+  # confirmed portal topology are exactly unchanged.  Each raw source still
+  # receives its own room/graph commit and strict readiness watermark.
+  room_topology_cache_enabled: true
   room_post_open_force_refresh: true
   room_geometry_stability_frames: 5
   lifted_graph_frame: "tf_frame_map_graph"

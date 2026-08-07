@@ -50,6 +50,10 @@ candidate:
   min_state_confidence: 0.5
   portal_require_attribute_ready: false
   portal_allow_unknown_state: true
+  # Unset by default: the candidate node derives this as true for the rule
+  # lane (attempt an opaque unknown portal once) and false for model runs
+  # (wait for visual MLLM evidence).  An ablation may override explicitly.
+  # portal_unknown_default_interact: true
   portal_standoff_m: 0.85
   container_standoff_m: 0.5
   # Drawer containers use the same nominal approach distance as other
@@ -145,6 +149,15 @@ model:
 completion:
   empty_candidate_confirmations: 3
   stagnation_failure_limit: 8
+  # ``make_plan_unreachable`` from an INTERACT behavior means every concrete
+  # approach pose was preflighted and rejected.  If no executable replacement
+  # appears for this many simulator observations, end the exploration attempt
+  # rather than advancing silent timeout/noop steps to the task horizon.
+  # This is intentionally observation-step based (not ROS message count) and
+  # is reset as soon as a normal scan or any executable replacement appears.
+  terminal_no_plan_exit_enabled: true
+  no_executable_candidate_min_steps: 20
+  no_executable_candidate_confirmations: 3
 
 startup_scan:
   # Phase-1 bootstrap behavior: the decision layer must select SCAN before
@@ -219,6 +232,10 @@ executor:
   # poses; switch only after the current approach hits the stagnation guard.
   interaction_approach_fallback_max_attempts: 3
   interaction_approach_fallback_cancel_wait_s: 0.5
+  # Once move_base reports arrival, validate the simulator pose on this many
+  # fresh evaluator steps.  This is intentionally count-bounded, not
+  # wall-clock bounded, so slow ROS/rendering cannot manufacture a failure.
+  interaction_approach_pose_poll_max_attempts: 5
   stuck_recovery_enabled: true
   stuck_recovery_subgoal_failures: 3
   stuck_recovery_min_displacement_m: 0.10

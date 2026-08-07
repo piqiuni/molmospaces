@@ -26,6 +26,155 @@ STATE_SUCCEEDED = "SUCCEEDED"
 STATE_FAILED = "FAILED"
 
 
+def is_static_portal_interaction_feedback(
+    candidate: dict[str, Any] | None,
+    detail: dict[str, Any] | None,
+) -> bool:
+    """Return whether an interaction result identifies a non-articulated portal.
+
+    The force/evaluator bridge can establish that a portal is a fixed opening
+    in the same callback that receives the interaction command.  Such a result
+    is terminal feedback, not a request to enter graph verification.  Check all
+    public result spellings because opaque backends may omit
+    ``interaction_capability`` while still publishing ``static_open`` or the
+    explicit executor source.
+    """
+
+    candidate = candidate or {}
+    detail = detail or {}
+    metadata = candidate.get("metadata") or {}
+    command = candidate.get("interaction_command") or {}
+    node_type = str(
+        metadata.get("node_type")
+        or command.get("node_type")
+        or candidate.get("node_type")
+        or ""
+    ).strip().casefold()
+    if node_type != "portal":
+        return False
+    capability = str(
+        detail.get("interaction_capability")
+        or detail.get("capability")
+        or ""
+    ).strip().casefold()
+    state = str(
+        detail.get("state")
+        or detail.get("post_state")
+        or ""
+    ).strip().casefold()
+    source = str(detail.get("source") or "").strip().casefold()
+    return bool(
+        capability == "static"
+        or state in {"static", "static_open", "static_closed"}
+        or source == "executor_static_portal"
+    )
+
+
+def is_interaction_pose_precondition_failure(detail: dict[str, Any] | None) -> bool:
+    """Return whether no physical interaction was attempted because approach failed.
+
+    This is deliberately separate from an object/action failure.  The bridge
+    rejects such a command before applying force, so the planner must retry or
+    switch approach poses rather than learn that the object itself is blocked.
+    """
+
+    detail = detail or {}
+    failure_reason = str(
+        detail.get("failure_reason") or detail.get("reason") or ""
+    ).strip().casefold()
+    verification_source = str(detail.get("verification_source") or "").strip().casefold()
+    return bool(
+        failure_reason
+        in {
+            "interaction_pose_invalid",
+            "interaction_pose_poll_exhausted",
+            "interaction_approach_options_exhausted",
+        }
+        or verification_source == "executor_pose_precondition"
+    )
+
+
+def interaction_pose_validation(
+    expected_pose_xyyaw: list[Any] | tuple[Any, ...] | None,
+    actual_pose_xyyaw: list[Any] | tuple[Any, ...] | None,
+    *,
+    distance_tolerance_m: float,
+    yaw_tolerance_rad: float,
+) -> dict[str, Any]:
+    """Evaluate an approach pose using the same public contract as the bridge."""
+
+    expected = list(expected_pose_xyyaw or [])
+    actual = list(actual_pose_xyyaw or [])
+    if len(expected) < 3 or len(actual) < 3:
+        return {
+            "checked": False,
+            "valid": False,
+            "reason": "interaction_pose_unavailable",
+            "expected_pose_xyyaw": expected,
+            "actual_pose_xyyaw": actual,
+        }
+    expected = [float(value) for value in expected[:3]]
+    actual = [float(value) for value in actual[:3]]
+    position_error_m = math.hypot(actual[0] - expected[0], actual[1] - expected[1])
+    yaw_error_rad = abs(normalize_angle(actual[2] - expected[2]))
+    distance_tolerance_m = max(0.05, float(distance_tolerance_m))
+    yaw_tolerance_rad = max(0.05, float(yaw_tolerance_rad))
+    return {
+        "checked": True,
+        "valid": bool(
+            position_error_m <= distance_tolerance_m
+            and yaw_error_rad <= yaw_tolerance_rad
+        ),
+        "expected_pose_xyyaw": expected,
+        "actual_pose_xyyaw": actual,
+        "position_error_m": position_error_m,
+        "yaw_error_rad": yaw_error_rad,
+        "distance_tolerance_m": distance_tolerance_m,
+        "yaw_tolerance_rad": yaw_tolerance_rad,
+    }
+
+
+def candidate_with_effective_interaction_approach(
+    candidate: dict[str, Any],
+    approach_pose_xyyaw: list[Any] | tuple[Any, ...],
+    *,
+    goal_option_index: int,
+    attempts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Bind the selected navigable approach pose to an interaction command.
+
+    ``goal_xyyaw`` remains the decision-time primary goal so candidate identity
+    and its stable fallback ordering do not change.  The chosen executable
+    pose is recorded separately and becomes the bridge precondition.
+    """
+
+    result = dict(candidate or {})
+    approach = list(approach_pose_xyyaw or [])
+    if len(approach) < 2:
+        return result
+    if len(approach) < 3:
+        approach.append(0.0)
+    approach = [float(value) for value in approach[:3]]
+    interaction = dict(result.get("interaction_command") or {})
+    metadata = dict(result.get("metadata") or {})
+    planned_command_pose = list(interaction.get("interaction_approach_pose_xyyaw") or [])
+    if planned_command_pose:
+        interaction.setdefault(
+            "planned_interaction_approach_pose_xyyaw", planned_command_pose
+        )
+    interaction["interaction_approach_pose_xyyaw"] = list(approach)
+    metadata.setdefault("planned_goal_xyyaw", list(result.get("goal_xyyaw") or []))
+    metadata["effective_interaction_approach_pose_xyyaw"] = list(approach)
+    metadata["interaction_approach_goal_option_index"] = max(
+        0, int(goal_option_index)
+    )
+    if attempts is not None:
+        metadata["interaction_approach_attempts"] = [dict(item) for item in attempts]
+    result["interaction_command"] = interaction
+    result["metadata"] = metadata
+    return result
+
+
 def normalize_angle(angle: float) -> float:
     return math.atan2(math.sin(float(angle)), math.cos(float(angle)))
 
@@ -493,15 +642,19 @@ def next_interaction_approach_option_index(
     """Return one conservative INTERACT approach fallback, if available.
 
     A semantic interaction remains committed while its approach pose changes.
-    Only a verified executor stagnation is allowed to advance to another
-    approach pose: terminal move_base failures keep their existing handling,
-    and a bounded number of actual navigation attempts prevents a large
-    candidate list from consuming the whole episode.
+    A verified executor stagnation or an exhausted simulator-step pose poll is
+    allowed to advance to another approach pose.  Terminal move_base failures
+    keep their existing handling, and a bounded number of actual navigation
+    attempts prevents a large candidate list from consuming the whole episode.
     """
 
     if str(behavior_type or "").upper() != BEHAVIOR_INTERACT:
         return None
-    if str(failure_detail.get("reason") or "").lower() != "navigation_stagnation":
+    if str(failure_detail.get("reason") or "").lower() not in {
+        "navigation_stagnation",
+        "interaction_pose_poll_exhausted",
+        "interaction_pose_invalid",
+    }:
         return None
     if int(attempted_navigation_count) >= max(1, int(max_navigation_attempts)):
         return None
@@ -808,6 +961,45 @@ class BehaviorExecutionStateMachine:
             {"kind": "interact", "candidate": self.candidate},
         )
 
+    def retry_interaction_approach(
+        self,
+        *,
+        start_goal_option_index: int,
+        interaction_approach_attempts: list[dict[str, Any]],
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return from an unexecuted interaction to a bounded next approach.
+
+        The evaluator may reject an interaction command after its authoritative
+        simulator-pose check.  That is not an object failure: keep the same
+        candidate and transition back to approach navigation without emitting a
+        terminal feedback event to the decision layer.
+        """
+
+        if self.state != STATE_INTERACTING or self.candidate is None:
+            return []
+        metadata = dict(self.candidate.get("metadata") or {})
+        metadata["interaction_approach_attempts"] = [
+            dict(item) for item in interaction_approach_attempts
+        ]
+        if detail:
+            metadata["last_interaction_pose_validation"] = dict(detail)
+        self.candidate["metadata"] = metadata
+        now = time.monotonic() if now is None else float(now)
+        return self._transition(
+            STATE_APPROACH_INTERACTION,
+            now,
+            {
+                "kind": "navigate",
+                "candidate": self.candidate,
+                "start_goal_option_index": max(0, int(start_goal_option_index)),
+                "interaction_approach_attempts": [
+                    dict(item) for item in interaction_approach_attempts
+                ],
+            },
+        )
+
     def on_drawer_scan_ready(
         self,
         candidate: dict[str, Any],
@@ -855,8 +1047,26 @@ class BehaviorExecutionStateMachine:
         now = time.monotonic() if now is None else float(now)
         if self.state != STATE_INTERACTING:
             return []
+        detail = dict(detail or {})
+        if is_static_portal_interaction_feedback(self.candidate, detail):
+            # A fixed opening has no articulation transition to verify.  End
+            # the behavior from the executor result itself; otherwise the
+            # state machine would wait for a graph state of ``open`` and only
+            # resolve the already-known ``static_open`` result through the
+            # wall-clock verification timeout.
+            static_state = str(
+                detail.get("state") or detail.get("post_state") or ""
+            ).strip().casefold()
+            direct_success = bool(
+                success
+                or str(detail.get("status") or "").upper() == "SUCCEEDED"
+                or static_state == "static_open"
+            )
+            detail.setdefault("verification_mode", "direct_static_portal_feedback")
+            detail.setdefault("verification_required", False)
+            return self._finish(direct_success, detail, now)
         if not success:
-            return self._finish(False, detail or {}, now)
+            return self._finish(False, detail, now)
         return self._transition(STATE_VERIFYING, now)
 
     def on_graph_state(
@@ -864,10 +1074,23 @@ class BehaviorExecutionStateMachine:
     ) -> list[dict[str, Any]]:
         if self.state != STATE_VERIFYING or self.candidate is None:
             return []
+        graph_detail = dict(detail or {})
+        graph_detail.setdefault("state", state)
+        if is_static_portal_interaction_feedback(self.candidate, graph_detail):
+            # This is a fail-safe for a graph callback racing the direct
+            # executor result.  It is still immediate and never depends on
+            # ``verification_timeout_s``.
+            graph_detail.setdefault("verification_mode", "direct_static_portal_feedback")
+            graph_detail.setdefault("verification_required", False)
+            return self._finish(
+                str(state).strip().casefold() == "static_open",
+                graph_detail,
+                now,
+            )
         expected = str((self.candidate.get("interaction_command") or {}).get("expected_state") or "open")
         if str(state) != expected:
             return []
-        return self._finish(True, detail or {"state": state}, now)
+        return self._finish(True, graph_detail, now)
 
     def on_verification_result(
         self,
@@ -969,11 +1192,21 @@ class BehaviorExecutionStateMachine:
         return self._finish(False, {"reason": reason}, now)
 
     def summary(self) -> dict[str, Any]:
+        candidate = self.candidate or {}
+        metadata = candidate.get("metadata") or {}
         return {
             "state": self.state,
-            "candidate_id": "" if self.candidate is None else self.candidate.get("candidate_id", ""),
+            "candidate_id": candidate.get("candidate_id", ""),
             "behavior_type": self._behavior_type(),
             "error": self.error,
+            "effective_goal_xyyaw": list(
+                metadata.get("effective_interaction_approach_pose_xyyaw")
+                or candidate.get("goal_xyyaw")
+                or []
+            ),
+            "interaction_approach_goal_option_index": metadata.get(
+                "interaction_approach_goal_option_index"
+            ),
         }
 
     def _behavior_type(self) -> str:

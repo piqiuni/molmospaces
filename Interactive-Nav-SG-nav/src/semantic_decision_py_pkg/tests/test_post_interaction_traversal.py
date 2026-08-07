@@ -92,6 +92,27 @@ def test_success_feedback_builds_immediate_traversal_without_open_graph_update()
     assert candidate.metadata["decision_local_transition"] is True
 
 
+def test_static_portal_feedback_never_builds_post_interaction_traversal() -> None:
+    candidate = build_post_interaction_traversal_candidate(
+        portal_interaction_candidate(),
+        {
+            "status": "SUCCEEDED",
+            "success": True,
+            "detail": {
+                "event_id": "static_portal_000001",
+                "node_id": "portal_door_1",
+                "action": "open",
+                "post_state": "static_open",
+                # This production payload can omit interaction_capability.
+                "source": "executor_static_portal",
+            },
+        },
+        robot_xy=(-1.0, 0.0),
+    )
+
+    assert candidate is None
+
+
 def test_post_open_traversal_uses_safe_opposite_interaction_options() -> None:
     active = portal_interaction_candidate()
     active["goal_xyyaw"] = [-1.10, 0.0, 0.0]
@@ -448,3 +469,21 @@ def test_portal_confirmation_accepts_matching_connectivity_edge() -> None:
 
     assert confirmation.observed
     assert confirmation.ready
+
+
+def test_static_open_is_not_open_transition_confirmation() -> None:
+    snapshot = refresh_snapshot(
+        sequence=12,
+        graph_revision=7,
+        observation_step=23,
+        portal_id="portal_door_1",
+        portal_state="static_open",
+        traversable=True,
+        requires_interaction=False,
+    )
+
+    confirmation = portal_open_confirmation(snapshot, "portal_door_1")
+
+    assert confirmation.observed
+    assert not confirmation.state_open
+    assert not confirmation.ready

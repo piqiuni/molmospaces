@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import copy
+import hashlib
 import json
 import math
 import os
 import threading
 import time
 
+import numpy as np
 import rospy
 import sensor_msgs.point_cloud2 as pc2
 import tf
@@ -101,6 +103,12 @@ class SemanticMappingNode:
 
         self.enable_object_mapping = bool(config.get("enable_object_mapping", True))
         self.enable_scene_mapping = bool(config.get("enable_scene_mapping", True))
+        # Scene attributes are projected through ``latest_cloud``.  The
+        # realtime-GT path never publishes those legacy attributes, so its
+        # parent launch may opt out of the otherwise expensive PointCloud2
+        # subscription/deserialization.  Keep the default compatible with the
+        # detector and offline scene-mapping paths.
+        self.subscribe_pointcloud = bool(config.get("subscribe_pointcloud", True))
         self.publish_rate = float(config.get("publish_rate", 2.0))
         self.object_stale_after_sec = float(config.get("object_stale_after_sec", 0.0))
         self.scene_min_range = float(config.get("scene_min_range", 0.1))
@@ -146,6 +154,12 @@ class SemanticMappingNode:
         )
         self.room_segment_use_semantic_overlay = bool(
             config.get("room_segment_use_semantic_overlay", True)
+        )
+        # Exact topology reuse is deliberately conservative: it only applies
+        # after the RoomSegmenter temporal state has settled and the canonical
+        # free/occupied/unknown grid is byte-for-byte unchanged.
+        self.room_topology_cache_enabled = bool(
+            config.get("room_topology_cache_enabled", True)
         )
         self.room_post_open_force_refresh = bool(
             config.get("room_post_open_force_refresh", True)
@@ -247,6 +261,10 @@ class SemanticMappingNode:
         # merge confirmation).  Keep that state serial, but deliberately keep
         # it separate from the mapper's short-lived data/graph lock.
         self._room_lock = threading.RLock()
+        # ROS callbacks and the room worker may both request a bundle.  One
+        # re-entrant owner keeps a causal commit bundle contiguous through its
+        # ready watermark while preserving the legacy direct callback paths.
+        self._publish_lock = threading.RLock()
         self._room_work_condition = threading.Condition()
         self._room_work_pending = None
         self._room_worker_stopping = False
@@ -257,6 +275,7 @@ class SemanticMappingNode:
         self._room_topology_revision = 0
         self._room_epoch = 0
         self._room_last_committed_revision = -1
+        self._room_topology_cache = None
         # Causal readiness watermark for the latest room/graph commit.  The
         # source identity is copied from the raw OCC message (seq + stamp), so
         # a room result from an older map cannot unlock a newer simulator step.
@@ -314,7 +333,19 @@ class SemanticMappingNode:
 
         self.object_sub = rospy.Subscriber(self.object_detection_topic, String, self.object_callback, queue_size=10)
         self.scene_sub = rospy.Subscriber(self.scene_attribute_topic, String, self.scene_callback, queue_size=10)
-        self.cloud_sub = rospy.Subscriber(self.pointcloud_topic, PointCloud2, self.pointcloud_callback, queue_size=1)
+        self.cloud_sub = None
+        if self.subscribe_pointcloud:
+            self.cloud_sub = rospy.Subscriber(
+                self.pointcloud_topic,
+                PointCloud2,
+                self.pointcloud_callback,
+                queue_size=1,
+            )
+        else:
+            rospy.loginfo(
+                "[semantic_mapping_node.py] PointCloud2 subscription disabled; "
+                "legacy scene_attribute messages will be ignored"
+            )
         self.occ_sub = rospy.Subscriber(self.occupancy_grid_topic, OccupancyGrid, self.occupancy_callback, queue_size=1)
         self.room_context_sub = rospy.Subscriber(self.room_context_topic, String, self.room_context_callback, queue_size=1)
         self.gt_observation_sub = rospy.Subscriber(
@@ -375,9 +406,13 @@ class SemanticMappingNode:
         self._publish_lifted_graph_tf()
         self._start_room_worker()
 
-        rospy.loginfo("[semantic_mapping_node.py] object_in=%s scene_in=%s cloud=%s occ=%s",
-                      self.object_detection_topic, self.scene_attribute_topic,
-                      self.pointcloud_topic, self.occupancy_grid_topic)
+        rospy.loginfo(
+            "[semantic_mapping_node.py] object_in=%s scene_in=%s cloud=%s occ=%s",
+            self.object_detection_topic,
+            self.scene_attribute_topic,
+            self.pointcloud_topic if self.subscribe_pointcloud else "<disabled>",
+            self.occupancy_grid_topic,
+        )
 
     def _start_room_worker(self):
         """Start the coalescing room-segmentation worker.
@@ -433,10 +468,12 @@ class SemanticMappingNode:
             overlay = getattr(self, "_room_segmentation_overlay", None)
             if overlay is not None:
                 overlay.reset()
+            self._room_topology_cache = None
             return
         with room_lock:
             self.room_segmenter.state = RoomSegmentationState()
             self._room_segmentation_overlay.reset()
+            self._room_topology_cache = None
 
     def _update_room_portal_hints(self, observations, *, source_mode, refresh_active=False):
         """Mutate RoomSegmenter state without holding ``self.lock``."""
@@ -575,6 +612,151 @@ class SemanticMappingNode:
                 )
             return int(input_revision) == int(self._room_input_revision)
 
+    def _room_topology_cache_key(self, occupancy, *, topology_revision, epoch):
+        """Return an exact, source-independent topology cache key.
+
+        The room algorithm only distinguishes unknown, traversable and blocked
+        cells.  A digest is used as a cheap prefilter, while the caller retains
+        the canonical array and performs ``array_equal`` before reuse.  The raw
+        source token is intentionally absent: equivalent map content may reuse
+        computation, but each source still receives its own graph commit and
+        causal ready message.
+        """
+
+        if occupancy is None:
+            return None, None
+        width = int(getattr(occupancy.info, "width", 0))
+        height = int(getattr(occupancy.info, "height", 0))
+        if width <= 0 or height <= 0:
+            return None, None
+        values = np.asarray(getattr(occupancy, "data", ()), dtype=np.int16)
+        if values.size != width * height:
+            return None, None
+        categories = np.empty(values.shape, dtype=np.uint8)
+        categories[values < 0] = 0
+        categories[(values >= 0) & (values <= self.room_free_threshold)] = 1
+        categories[values > self.room_free_threshold] = 2
+        geometry = self._occupancy_geometry_key(occupancy)
+        segmenter = self.room_segmenter
+        config_signature = (
+            segmenter.room_free_threshold,
+            segmenter.room_unknown_id,
+            segmenter.room_min_component_cells,
+            segmenter.room_core_min_component_cells,
+            segmenter.room_core_clearance_cells,
+            segmenter.room_small_obstacle_max_cells,
+            segmenter.room_remove_enclosed_occupied,
+            segmenter.room_enclosed_occupied_max_cells,
+            segmenter.room_enclosed_occupied_max_aspect,
+            segmenter.room_enclosed_occupied_known_ring_ratio,
+            segmenter.room_enclosed_occupied_free_ring_ratio,
+            segmenter.room_fill_enclosed_obstacles,
+            segmenter.room_enclosed_obstacle_min_cells,
+            segmenter.room_enclosed_obstacle_max_cells,
+            segmenter.room_enclosed_obstacle_dominance_ratio,
+            segmenter.room_portal_cut_enabled,
+            segmenter.room_portal_cut_margin_m,
+            segmenter.room_portal_cut_thickness_cells,
+            segmenter.room_id_overlap_ratio,
+            segmenter.room_merge_confirmations,
+            segmenter.room_grid_stability_frames,
+        )
+        digest = hashlib.blake2b(
+            memoryview(categories), digest_size=16
+        ).digest()
+        return (
+            int(epoch),
+            int(topology_revision),
+            geometry,
+            config_signature,
+            digest,
+        ), categories
+
+    def _room_topology_cache_is_quiescent(self, *, force_stable):
+        """Whether skipping ``segment`` cannot change its temporal state."""
+
+        if force_stable or not getattr(self, "room_topology_cache_enabled", False):
+            return False
+        state = getattr(getattr(self, "room_segmenter", None), "state", None)
+        if state is None:
+            return False
+        if getattr(state, "stable_room_ids", None) is None:
+            return False
+        if int(getattr(state, "candidate_room_count", 0)) < int(
+            getattr(self, "room_grid_stability_frames", 1)
+        ):
+            return False
+        return not (
+            getattr(state, "pending_merges", None)
+            or getattr(state, "last_confirmed_merges", None)
+        )
+
+    def _load_room_topology_cache(
+        self, occupancy, *, topology_revision, epoch, force_stable
+    ):
+        """Return an exact cached room result or ``None``.
+
+        This method is called under ``_room_lock`` and never advances
+        RoomSegmenter state.  It therefore only admits the quiescent condition
+        above; stability/merge transitions always take the full path.
+        """
+
+        if not self._room_topology_cache_is_quiescent(force_stable=force_stable):
+            return None, None, None
+        key, categories = self._room_topology_cache_key(
+            occupancy,
+            topology_revision=topology_revision,
+            epoch=epoch,
+        )
+        entry = getattr(self, "_room_topology_cache", None)
+        if (
+            key is None
+            or not isinstance(entry, dict)
+            or entry.get("key") != key
+            or not np.array_equal(entry.get("categories"), categories)
+        ):
+            return None, key, categories
+        return entry, key, categories
+
+    def _store_room_topology_cache(
+        self,
+        occupancy,
+        *,
+        topology_revision,
+        epoch,
+        force_stable,
+        room_ids,
+        room_conf,
+        room_merges,
+        cache_key=None,
+        cache_categories=None,
+    ):
+        if room_merges or not self._room_topology_cache_is_quiescent(
+            force_stable=force_stable
+        ):
+            self._room_topology_cache = None
+            return
+        key = cache_key
+        categories = cache_categories
+        if key is None or categories is None:
+            key, categories = self._room_topology_cache_key(
+                occupancy,
+                topology_revision=topology_revision,
+                epoch=epoch,
+            )
+        if key is None:
+            self._room_topology_cache = None
+            return
+        self._room_topology_cache = {
+            "key": key,
+            "categories": categories,
+            # Tuples make the reusable state immutable to graph/crop callers.
+            # ``tuple(list)`` uses the C-level sequence copy; avoid a Python
+            # generator over every map cell on every cache refresh.
+            "room_ids": room_ids if isinstance(room_ids, tuple) else tuple(room_ids),
+            "room_conf": room_conf if isinstance(room_conf, tuple) else tuple(room_conf),
+        }
+
     def _process_room_refresh_request(self, request):
         """Build a room grid outside ``self.lock`` and commit it by revision."""
 
@@ -636,14 +818,50 @@ class SemanticMappingNode:
             self._record_component_timing("room_worker_stale_pre_segment", 0.0)
             return
 
-        segment_t0 = time.perf_counter()
+        cache_check_ms = 0.0
+        cache_store_ms = 0.0
+        segment_ms = 0.0
+        cache_hit = False
         with self._room_lock:
-            room_ids, room_conf = self._segment_rooms_from_occupancy(
+            cache_check_t0 = time.perf_counter()
+            force_stable = bool(request.get("force_stable"))
+            cached, cache_key, cache_categories = self._load_room_topology_cache(
                 room_occupancy,
-                force_stable=bool(request.get("force_stable")),
+                topology_revision=topology_revision,
+                epoch=epoch,
+                force_stable=force_stable,
             )
-            room_merges = self.room_segmenter.consume_confirmed_merges()
-        segment_ms = (time.perf_counter() - segment_t0) * 1000.0
+            cache_check_ms = (time.perf_counter() - cache_check_t0) * 1000.0
+            if cached is not None:
+                room_ids = cached["room_ids"]
+                room_conf = cached["room_conf"]
+                room_merges = {}
+                cache_hit = True
+            else:
+                # A cache entry describes the previous settled state.  Once a
+                # full segmentation runs, discard it until the new temporal
+                # state has settled and can be cached again.
+                self._room_topology_cache = None
+                segment_t0 = time.perf_counter()
+                room_ids, room_conf = self._segment_rooms_from_occupancy(
+                    room_occupancy,
+                    force_stable=force_stable,
+                )
+                room_merges = self.room_segmenter.consume_confirmed_merges()
+                segment_ms = (time.perf_counter() - segment_t0) * 1000.0
+                cache_store_t0 = time.perf_counter()
+                self._store_room_topology_cache(
+                    room_occupancy,
+                    topology_revision=topology_revision,
+                    epoch=epoch,
+                    force_stable=force_stable,
+                    room_ids=room_ids,
+                    room_conf=room_conf,
+                    room_merges=room_merges,
+                    cache_key=cache_key,
+                    cache_categories=cache_categories,
+                )
+                cache_store_ms = (time.perf_counter() - cache_store_t0) * 1000.0
 
         crop_t0 = time.perf_counter()
         room_grid = self._build_cropped_room_segment_grid(room_ids, raw=raw)
@@ -652,6 +870,7 @@ class SemanticMappingNode:
         commit_t0 = time.perf_counter()
         commit_lock_t0 = time.perf_counter()
         graph_update_ms = 0.0
+        graph_cache_hit = False
         committed = False
         room_commit = None
         with self.lock:
@@ -675,6 +894,9 @@ class SemanticMappingNode:
                     geometry_stability_frames=self.room_geometry_stability_frames,
                 )
                 graph_update_ms = (time.perf_counter() - graph_update_t0) * 1000.0
+                graph_cache_hit = bool(
+                    getattr(self.graph_store, "last_room_grid_cache_hit", False)
+                )
                 self._room_last_committed_revision = input_revision
                 source = self._occupancy_source_identity(raw)
                 try:
@@ -707,16 +929,24 @@ class SemanticMappingNode:
         total_ms = (time.perf_counter() - total_t0) * 1000.0
         self._record_component_timing("room_worker_snapshot", snapshot_ms)
         self._record_component_timing("room_worker_overlay", overlay_ms)
+        self._record_component_timing("room_worker_topology_cache_check", cache_check_ms)
+        self._record_component_timing("room_worker_topology_cache_store", cache_store_ms)
+        self._record_component_timing("room_worker_topology_cache_hit", 1.0 if cache_hit else 0.0)
         self._record_component_timing("room_worker_segment", segment_ms)
         self._record_component_timing("room_worker_crop", crop_ms)
         self._record_component_timing("room_worker_commit_lock_wait", commit_lock_wait_ms)
         self._record_component_timing("room_worker_graph_update", graph_update_ms)
+        self._record_component_timing(
+            "room_worker_graph_cache_hit", 1.0 if graph_cache_hit else 0.0
+        )
         self._record_component_timing("room_worker_commit", commit_ms)
         self._record_component_timing("room_worker_total", total_ms)
         if room_commit is not None:
             room_commit["worker_total_ms"] = total_ms
             room_commit["room_segment_ms"] = segment_ms
+            room_commit["room_topology_cache_hit"] = cache_hit
             room_commit["graph_update_ms"] = graph_update_ms
+            room_commit["room_graph_cache_hit"] = graph_cache_hit
             with self.lock:
                 # The worker commit itself is the causal hand-off.  Keep a
                 # copy under the mapper lock so the next published bundle can
@@ -727,6 +957,10 @@ class SemanticMappingNode:
                     == int(getattr(self, "_room_topology_revision", 0))
                 ):
                     self._room_last_commit = dict(room_commit)
+            # In strict mode the worker is the event that makes the causal
+            # bundle available.  Publish this exact source now instead of
+            # waiting for the next 5 Hz timer tick.
+            self._publish_causal_room_commit(raw, room_grid, room_commit)
         if not committed:
             self._record_component_timing("room_worker_stale_discard", 0.0)
 
@@ -939,6 +1173,14 @@ class SemanticMappingNode:
         if raw is None or not self.room_segment_use_semantic_overlay:
             return raw
         self._room_segmentation_overlay.update_graph(graph_payload)
+        if not self._room_segmentation_overlay.has_active_portals(
+            include_pending=False
+        ):
+            # The room worker only reads this message.  Avoid materialising a
+            # full data copy plus all-zero clear mask when no *confirmed*
+            # portal can affect room topology; pending planning clears remain
+            # intentionally excluded from this path.
+            return raw
         effective_data, _mask_data, _stats = self._room_segmentation_overlay.apply(
             raw.info,
             raw.data,
@@ -988,6 +1230,9 @@ class SemanticMappingNode:
     def scene_callback(self, msg):
         if not self.enable_scene_mapping:
             return
+        if not getattr(self, "subscribe_pointcloud", True):
+            self._warn_scene_callback_without_pointcloud()
+            return
         parsed = parse_json_object_or_text(msg.data)
         scene_name = normalize_label(parsed.get("scene_attribute", "unknown"))
         scene_name = self.synonyms.get(scene_name, scene_name)
@@ -999,6 +1244,23 @@ class SemanticMappingNode:
             cloud = self.latest_cloud
         if cloud is not None:
             self._update_scene_from_cloud(cloud, scene_id)
+
+    @staticmethod
+    def _warn_scene_callback_without_pointcloud():
+        """Warn once per throttle interval instead of silently losing scene data."""
+
+        message = (
+            "[semantic_mapping_node.py] ignoring scene_attribute because "
+            "semantic_map/subscribe_pointcloud=false; enable the PointCloud2 "
+            "subscription for legacy scene mapping"
+        )
+        logwarn_throttle = getattr(rospy, "logwarn_throttle", None)
+        if callable(logwarn_throttle):
+            logwarn_throttle(5.0, message)
+            return
+        logwarn = getattr(rospy, "logwarn", None)
+        if callable(logwarn):
+            logwarn(message)
 
     def gt_observation_callback(self, msg):
         parsed = parse_json_object_or_text(msg.data)
@@ -1317,9 +1579,34 @@ class SemanticMappingNode:
 
     @staticmethod
     def _is_successful_open_result(result):
-        return (
-            result.get("success") is True
-            and str(result.get("action") or "").casefold() == "open"
+        if (
+            result.get("success") is not True
+            or str(result.get("action") or "").casefold() != "open"
+        ):
+            return False
+        state = str(
+            result.get("state") or result.get("post_state") or ""
+        ).strip().casefold()
+        capability = str(
+            result.get("interaction_capability")
+            or result.get("capability")
+            or ""
+        ).strip().casefold()
+        source = str(result.get("source") or "").strip().casefold()
+        # ``static_open`` is an immediate capability result, not a physical
+        # transition.  Do not arm the post-open raw-OCC bridge or force a room
+        # refresh for it; ordinary occupancy updates remain responsible for
+        # discovering any traversable space beyond the opening.
+        return not (
+            state in {"static", "static_open", "static_closed"}
+            or capability in {
+                "static",
+                "blocked",
+                "unsupported",
+                "unavailable",
+                "locked",
+            }
+            or source == "executor_static_portal"
         )
 
     def _publish_post_open_raw_planning_grid_locked(self, planning_grid, *, result_stamp):
@@ -1424,7 +1711,7 @@ class SemanticMappingNode:
             ):
                 continue
             state = str((node.get("interaction") or {}).get("state") or "").casefold()
-            if state not in {"open", "ajar", "static_open"}:
+            if state not in {"open", "ajar"}:
                 continue
             center = list(
                 attributes.get("interaction_reference_aabb_center")
@@ -1461,6 +1748,8 @@ class SemanticMappingNode:
             self.graph_store.as_graph_dict(), self.ablation.module1
         )
         self.semantic_occ_overlay.update_graph(graph_payload)
+        if not self.semantic_occ_overlay.has_active_portals(include_pending=False):
+            return raw
         effective_data, _mask_data, _stats = self.semantic_occ_overlay.apply(
             raw.info,
             raw.data,
@@ -1486,9 +1775,80 @@ class SemanticMappingNode:
             geometry_stability_frames=self.room_geometry_stability_frames,
         )
 
+    def _publish_causal_room_commit(self, raw, room_grid, room_commit):
+        """Publish one exact room commit immediately in strict mode.
+
+        The normal timer remains responsible for low-priority visual products.
+        This path builds a source-pinned core bundle from the worker's ``raw``
+        and ``room_grid`` references, so a newer OCC callback cannot silently
+        replace the source between room commit and readiness.
+        """
+
+        if not getattr(self, "step_ready_require_room_graph", False):
+            return
+        if raw is None or room_grid is None or not room_commit:
+            return
+        publish_lock = getattr(self, "_publish_lock", None)
+        if publish_lock is None:
+            return self._publish_causal_room_commit_locked(raw, room_grid, room_commit)
+        with publish_lock:
+            return self._publish_causal_room_commit_locked(raw, room_grid, room_commit)
+
+    def _publish_causal_room_commit_locked(self, raw, room_grid, room_commit):
+        with self.lock:
+            current = dict(getattr(self, "_room_last_commit", None) or {})
+            if not self._same_occupancy_source(
+                current.get("source"), room_commit.get("source")
+            ):
+                return False
+            graph_payload = apply_module1_ablation(
+                self.graph_store.as_graph_dict(), self.ablation.module1
+            )
+            snapshot = {
+                "obj_map": None,
+                "scene_info": None,
+                "scene_data": None,
+                "scene_confidence_data": None,
+                "scene_revision": 0,
+                "publish_scene_grids": False,
+                "room_segment_grid": room_grid,
+                "room_commit": dict(room_commit),
+                "graph_payload": graph_payload,
+                "raw_occupancy_grid": raw,
+                "causal_core_only": True,
+            }
+        build_t0 = time.perf_counter()
+        bundle = self._build_publish_bundle_from_snapshot(snapshot)
+        build_ms = (time.perf_counter() - build_t0) * 1000.0
+        publish_t0 = time.perf_counter()
+        try:
+            self._publish_bundle(bundle)
+        except rospy.ROSException as exc:
+            if "closed topic" not in str(exc).lower() and not rospy.is_shutdown():
+                raise
+        publish_ms = (time.perf_counter() - publish_t0) * 1000.0
+        ready_payload = self._semantic_mapping_ready_payload_for_bundle(bundle)
+        self.step_ready_pub.publish(
+            String(data=json.dumps(ready_payload, separators=(",", ":")))
+        )
+        self._record_causal_ready_once(ready_payload)
+        self._record_component_timing("room_commit_publish_build", build_ms)
+        self._record_component_timing("room_commit_publish_ros", publish_ms)
+        self._record_component_timing(
+            "room_commit_publish_total", build_ms + publish_ms
+        )
+        return bool(ready_payload.get("ready"))
+
     def publish_callback(self, _event):
         if rospy.is_shutdown():
             return
+        publish_lock = getattr(self, "_publish_lock", None)
+        if publish_lock is not None:
+            with publish_lock:
+                return self._publish_callback_locked()
+        return self._publish_callback_locked()
+
+    def _publish_callback_locked(self):
         callback_t0 = time.perf_counter()
         lock_t0 = time.perf_counter()
         with self.lock:
@@ -1512,11 +1872,20 @@ class SemanticMappingNode:
         self._record_component_timing("publish_callback_total", total_ms)
 
     def _safe_publish_bundle(self, bundle):
-        try:
-            self._publish_bundle(bundle)
-        except rospy.ROSException as exc:
-            if "closed topic" not in str(exc).lower() and not rospy.is_shutdown():
-                raise
+        publish_lock = getattr(self, "_publish_lock", None)
+        if publish_lock is None:
+            try:
+                self._publish_bundle(bundle)
+            except rospy.ROSException as exc:
+                if "closed topic" not in str(exc).lower() and not rospy.is_shutdown():
+                    raise
+            return
+        with publish_lock:
+            try:
+                self._publish_bundle(bundle)
+            except rospy.ROSException as exc:
+                if "closed topic" not in str(exc).lower() and not rospy.is_shutdown():
+                    raise
 
     def _update_scene_from_cloud(self, cloud, scene_id):
         points = []
@@ -1831,6 +2200,7 @@ class SemanticMappingNode:
             else None
         )
         graph_payload = snapshot.get("graph_payload") or {}
+        causal_core_only = bool(snapshot.get("causal_core_only", False))
         planning_grid, planning_update, door_clear_mask, overlay_stats = (
             self._build_planning_products_from_snapshot(
                 snapshot.get("raw_occupancy_grid"),
@@ -1849,11 +2219,16 @@ class SemanticMappingNode:
             # readiness is evaluated after publishing and must never read a
             # newer ``latest_occupancy_grid`` by accident.
             "raw_occupancy_grid": snapshot.get("raw_occupancy_grid"),
-            "room_attribute_request": self._build_room_attribute_request_locked(graph_payload),
+            "room_attribute_request": (
+                None
+                if causal_core_only
+                else self._build_room_attribute_request_locked(graph_payload)
+            ),
             "planning_grid": planning_grid,
             "planning_update": planning_update,
             "door_clear_mask": door_clear_mask,
             "overlay_stats": overlay_stats,
+            "causal_core_only": causal_core_only,
         }
 
     def _collect_publish_bundle(self):
@@ -1892,6 +2267,7 @@ class SemanticMappingNode:
         planning_grid = bundle["planning_grid"]
         planning_update = bundle["planning_update"]
         door_clear_mask = bundle["door_clear_mask"]
+        causal_core_only = bool(bundle.get("causal_core_only", False))
         if obj_map is not None:
             self.object_pub.publish(String(data=dumps_compact(obj_map)))
             self.marker_pub.publish(self._build_object_markers(obj_map))
@@ -1916,14 +2292,17 @@ class SemanticMappingNode:
                 String(data=dumps_compact(room_attribute_request))
             )
         self.navigation_hints_pub.publish(String(data=dumps_compact(graph_payload["views"]["navigation_view"]["hints"])))
-        self.unified_graph_markers_pub.publish(build_graph_marker_array(graph_payload, self.world_frame))
-        self.unified_graph_markers_lifted_pub.publish(
-            build_graph_marker_array(
-                graph_payload,
-                self.lifted_graph_frame,
+        if not causal_core_only:
+            self.unified_graph_markers_pub.publish(
+                build_graph_marker_array(graph_payload, self.world_frame)
             )
-        )
-        self._save_graph_payload(graph_payload)
+            self.unified_graph_markers_lifted_pub.publish(
+                build_graph_marker_array(
+                    graph_payload,
+                    self.lifted_graph_frame,
+                )
+            )
+            self._save_graph_payload(graph_payload)
 
     def _build_occupancy_copy(self, data, *, raw=None):
         if raw is None:
@@ -1943,26 +2322,25 @@ class SemanticMappingNode:
             raw = self.latest_occupancy_grid
         width = int(raw.info.width)
         height = int(raw.info.height)
-        values = room_ids
-        valid_indices = [index for index, room_id in enumerate(values) if int(room_id) >= 0]
+        values = np.asarray(room_ids, dtype=np.int32)
+        if values.size != width * height:
+            raise ValueError("room grid size does not match occupancy geometry")
+        valid_indices = np.flatnonzero(values >= 0)
 
-        if valid_indices:
-            rows = [index // width for index in valid_indices]
-            cols = [index % width for index in valid_indices]
-            row_min = min(rows)
-            row_max = max(rows) + 1
-            col_min = min(cols)
-            col_max = max(cols) + 1
+        if valid_indices.size:
+            rows = valid_indices // width
+            cols = valid_indices % width
+            row_min = int(rows.min())
+            row_max = int(rows.max()) + 1
+            col_min = int(cols.min())
+            col_max = int(cols.max()) + 1
         else:
             row_min = 0
             row_max = 1
             col_min = 0
             col_max = 1
 
-        cropped = []
-        for row in range(row_min, row_max):
-            start = row * width + col_min
-            cropped.extend(values[start : start + (col_max - col_min)])
+        cropped = values.reshape(height, width)[row_min:row_max, col_min:col_max]
 
         grid = OccupancyGrid()
         grid.header.seq = raw.header.seq
@@ -1982,7 +2360,7 @@ class SemanticMappingNode:
         offset_y = float(row_min) * resolution
         origin.position.x += math.cos(yaw) * offset_x - math.sin(yaw) * offset_y
         origin.position.y += math.sin(yaw) * offset_x + math.cos(yaw) * offset_y
-        grid.data = [int(value) for value in cropped]
+        grid.data = cropped.reshape(-1).tolist()
         return grid
 
     @staticmethod

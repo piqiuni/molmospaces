@@ -405,8 +405,30 @@ def zoom_panel(panel: np.ndarray, scale_factor: float) -> np.ndarray:
     return enlarged[offset_y : offset_y + height, offset_x : offset_x + width].copy()
 
 
+def zoom_world_bounds(
+    bounds: tuple[float, float, float, float], scale_factor: float
+) -> tuple[float, float, float, float]:
+    """Zoom a semantic panel in world coordinates, keeping overlays aligned."""
+    try:
+        scale = float(scale_factor)
+    except (TypeError, ValueError):
+        scale = 1.0
+    if not math.isfinite(scale) or scale <= 1.0 + 1e-6:
+        return bounds
+    min_x, min_y, max_x, max_y = bounds
+    center_x, center_y = (min_x + max_x) * 0.5, (min_y + max_y) * 0.5
+    half_width = max(1e-6, (max_x - min_x) * 0.5 / scale)
+    half_height = max(1e-6, (max_y - min_y) * 0.5 / scale)
+    return (
+        center_x - half_width,
+        center_y - half_height,
+        center_x + half_width,
+        center_y + half_height,
+    )
+
+
 def draw_task_subgoal_header(panel: np.ndarray, step: dict) -> None:
-    selection = step.get("semantic_selection") or {}
+    selection = active_semantic_selection(step)
     candidates = step.get("semantic_candidates") or {}
     target = str((candidates.get("target_context") or {}).get("target_name") or "-")
     behavior = str(selection.get("behavior_type") or "-")
@@ -447,7 +469,37 @@ def _draw_goal_arrow(panel: np.ndarray, center: tuple[int, int], yaw: float, len
 
 def _selection_target_id(selection: dict | None) -> str:
     selection = selection or {}
+    if selection.get("active") is False:
+        return ""
     return str(selection.get("target_id") or selection.get("object_id") or selection.get("candidate_id") or "")
+
+
+def active_semantic_selection(step: dict) -> dict:
+    """Return only a live selection, with executor-selected fallback geometry.
+
+    A selection is latched for recorder discovery, so a terminal reset is
+    explicit rather than inferred from an empty candidate stream.  During an
+    active INTERACT approach the executor may choose a safe fallback pose; use
+    that same pose in offline overlays rather than the decision-time primary.
+    """
+
+    raw_selection = step.get("semantic_selection") or {}
+    if raw_selection.get("active") is False:
+        return {}
+    selection = dict(raw_selection)
+    execution = step.get("semantic_execution_state") or {}
+    if (
+        str(execution.get("candidate_id") or "")
+        and str(execution.get("candidate_id") or "")
+        == str(selection.get("candidate_id") or "")
+        and str(execution.get("state") or "")
+        in {"APPROACH_INTERACTION", "WAIT_FOR_DRAWER_SCAN", "INTERACTING", "VERIFYING"}
+    ):
+        effective_goal = list(execution.get("effective_goal_xyyaw") or [])
+        if len(effective_goal) >= 2:
+            selection["goal_xyyaw"] = effective_goal
+            selection["effective_goal_xyyaw"] = effective_goal
+    return selection
 
 
 def _node_ids(node: dict) -> set[str]:
@@ -611,9 +663,14 @@ class OfflineSixPanelRenderer:
             return panel
         base = _costmap_base(grid) if kind == "costmap" else _occupancy_base(grid)
         pose = self._transform(step.get("pose"), self.transforms.odom_frame, grid.frame_id, step_index)
-        selection = step.get("semantic_selection") or {}
+        raw_selection = step.get("semantic_selection") or {}
+        selection = active_semantic_selection(step)
         goal_values = list(selection.get("goal_xyyaw") or [])
-        active_goal = goal_values if len(goal_values) >= 2 else step.get("active_goal")
+        active_goal = (
+            None
+            if raw_selection.get("active") is False
+            else goal_values if len(goal_values) >= 2 else step.get("active_goal")
+        )
         goal_yaw = float(goal_values[2]) if len(goal_values) > 2 else float(step.get("active_goal_yaw") or 0.0)
         goal = self._transform(active_goal, self.transforms.map_frame, grid.frame_id, step_index)
         trajectory = [
@@ -704,8 +761,11 @@ class OfflineSixPanelRenderer:
             _draw_polyline(panel, [point for item in local_global_plan if (point := to_panel(item)) is not None], (40, 190, 60), 3)
         if draw_local_plan:
             _draw_polyline(panel, [point for item in local_plan if (point := to_panel(item)) is not None], (240, 150, 20), 3)
+        # Candidate yaw is a command: in panel 2 only the decision-selected
+        # candidate gets an orientation arrow; all others remain dots.
+        selected_id = str(selection.get("candidate_id") or "")
+        selected_candidate_seen = False
         if draw_semantic_candidates:
-            selected_id = str(selection.get("candidate_id") or "")
             for candidate in (step.get("semantic_candidates") or {}).get("candidates") or []:
                 values = list(candidate.get("goal_xyyaw") or [])
                 candidate_point = self._transform(values, self.transforms.map_frame, grid.frame_id, step_index)
@@ -714,10 +774,22 @@ class OfflineSixPanelRenderer:
                     continue
                 color = candidate_color(str(candidate.get("behavior_type") or "EXPLORE"))
                 if str(candidate.get("candidate_id") or "") == selected_id:
+                    selected_candidate_seen = True
                     _draw_goal_arrow(panel, candidate_px, candidate_point[2], max(9, int(9 * scale)), color)
                 else:
                     cv2.circle(panel, candidate_px, max(2, int(round(max(scale, 1.0) * 0.8))), color, -1, cv2.LINE_AA)
-        if goal is not None and (goal_px := to_panel(goal)) is not None:
+
+        # A post-interaction snapshot can omit the selected candidate.  Use the
+        # selected semantic goal once in that case; other map panels retain the
+        # established active-goal marker.
+        if (
+            goal is not None
+            and (
+                not draw_semantic_candidates
+                or (selected_id and not selected_candidate_seen)
+            )
+            and (goal_px := to_panel(goal)) is not None
+        ):
             behavior = str(selection.get("behavior_type") or "NAVIGATE").upper()
             _draw_goal_arrow(panel, goal_px, goal_yaw if math.isfinite(goal_yaw) else goal[2], max(9, int(9 * scale)), candidate_color(behavior))
         _draw_panel_title(panel, title, step_index)
@@ -751,7 +823,17 @@ class OfflineSixPanelRenderer:
         transform = cv2.getAffineTransform(source, destination)
         return cv2.warpAffine(image, transform, panel_size, flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=background)
 
-    def render_room_panel(self, occupancy: RawGrid | None, room: RawGrid | None, panel_size: tuple[int, int], step: dict, step_index: int, world_bounds: tuple[float, float, float, float] | None) -> np.ndarray:
+    def render_room_panel(
+        self,
+        occupancy: RawGrid | None,
+        room: RawGrid | None,
+        panel_size: tuple[int, int],
+        step: dict,
+        step_index: int,
+        world_bounds: tuple[float, float, float, float] | None,
+        *,
+        view_scale: float = 1.0,
+    ) -> np.ndarray:
         width, height = panel_size
         panel = np.full((height, width, 3), 246, dtype=np.uint8)
         reference = occupancy or room
@@ -760,7 +842,8 @@ class OfflineSixPanelRenderer:
             return panel
         if world_bounds is None:
             world_bounds = known_world_bounds(reference, 0.0) or (reference.origin_x, reference.origin_y, reference.origin_x + reference.width * reference.resolution, reference.origin_y + reference.height * reference.resolution)
-        scale, to_px = self._world_view(world_bounds, panel_size, margin=18, vertical_center=0.5)
+        view_bounds = zoom_world_bounds(world_bounds, view_scale)
+        scale, to_px = self._world_view(view_bounds, panel_size, margin=18, vertical_center=0.5)
         occ_layer = self._warp_grid(panel_size, occupancy, _occupancy_base(occupancy) if occupancy else None, to_px, (246, 246, 246))
         if occ_layer is not None:
             panel = cv2.addWeighted(occ_layer, 0.72, panel, 0.28, 0.0)
@@ -768,7 +851,7 @@ class OfflineSixPanelRenderer:
         if room_layer is not None:
             panel = cv2.addWeighted(room_layer, 0.38, panel, 0.62, 0.0)
         graph = step.get("unified_graph") or {}
-        selection = step.get("semantic_selection") or {}
+        selection = active_semantic_selection(step)
         target_id = _selection_target_id(selection)
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
         for node in _bounded_nodes(graph, observed, target_id):
@@ -800,11 +883,13 @@ class OfflineSixPanelRenderer:
         *,
         draw_object_labels: bool = True,
         draw_support_labels: bool = True,
+        view_scale: float = 1.0,
+        label_mode: str = "all",
     ) -> np.ndarray:
         width, height = panel_size
         panel = np.full((height, width, 3), 246, dtype=np.uint8)
         graph = step.get("unified_graph") or {}
-        selection = step.get("semantic_selection") or {}
+        selection = active_semantic_selection(step)
         target_id = _selection_target_id(selection)
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
         nodes = _bounded_nodes(graph, observed, target_id)
@@ -820,16 +905,20 @@ class OfflineSixPanelRenderer:
             min_x, max_x = min(value[0] for value in positions), max(value[0] for value in positions)
             min_y, max_y = min(value[1] for value in positions), max(value[1] for value in positions)
             world_bounds = (min_x, min_y, max_x, max_y)
-        scale, to_px = self._world_view(world_bounds, panel_size, margin=38, vertical_center=0.53)
+        view_bounds = zoom_world_bounds(world_bounds, view_scale)
+        scale, to_px = self._world_view(view_bounds, panel_size, margin=38, vertical_center=0.53)
         occ_layer = self._warp_grid(panel_size, occupancy, _occupancy_base(occupancy) if occupancy else None, to_px, (246, 246, 246))
         if occ_layer is not None:
             panel = cv2.addWeighted(occ_layer, 0.35, panel, 0.65, 0.0)
-        min_x, min_y, max_x, max_y = world_bounds
+        min_x, min_y, max_x, max_y = view_bounds
         for grid_x in range(math.floor(min_x), math.ceil(max_x) + 1):
             cv2.line(panel, to_px(grid_x, min_y), to_px(grid_x, max_y), (226, 226, 226), 1)
         for grid_y in range(math.floor(min_y), math.ceil(max_y) + 1):
             cv2.line(panel, to_px(min_x, grid_y), to_px(max_x, grid_y), (226, 226, 226), 1)
         lookup = {str(node.get("id") or ""): node for node in nodes}
+        normalized_label_mode = str(label_mode or "all").casefold()
+        if normalized_label_mode not in {"all", "interaction_target_only", "none"}:
+            normalized_label_mode = "all"
         for edge in graph.get("edges") or []:
             if str(edge.get("relation") or "") not in {"connects", "contains", "supports"}:
                 continue
@@ -857,10 +946,19 @@ class OfflineSixPanelRenderer:
             else:
                 cv2.rectangle(panel, (pixel[0] - half_w, pixel[1] - half_h), (pixel[0] + half_w, pixel[1] + half_h), color, thickness)
             node_type = str(node.get("type") or "")
-            if (
-                (node_type != "object" or draw_object_labels)
-                and (node_type != "support" or draw_support_labels)
-            ):
+            draw_label = (
+                node_type == "room"
+                or (
+                    normalized_label_mode == "interaction_target_only"
+                    and is_target
+                )
+                or (
+                    normalized_label_mode == "all"
+                    and (node_type != "object" or draw_object_labels)
+                    and (node_type != "support" or draw_support_labels)
+                )
+            )
+            if draw_label:
                 label = _node_label(node) if node_type == "room" else f"{'INTERACT ' if is_target else ''}{_short_node_id(node)} {_node_label(node)}"
                 cv2.putText(panel, label[:30], (pixel[0] + 3, pixel[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.28, color if is_target else (35, 35, 35), 1, cv2.LINE_AA)
         if pose is not None:
@@ -872,7 +970,7 @@ class OfflineSixPanelRenderer:
         width, height = panel_size
         panel = np.full((height, width, 3), (220, 248, 255), dtype=np.uint8)
         graph = step.get("unified_graph") or {}
-        selection = step.get("semantic_selection") or {}
+        selection = active_semantic_selection(step)
         target_id = _selection_target_id(selection)
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
         all_nodes = _bounded_nodes(graph, observed, target_id)
@@ -964,7 +1062,13 @@ class OfflineSixPanelRenderer:
 
 def camera_title(step: dict, step_index: int) -> str:
     pose = step.get("pose") or []
-    goal = list((step.get("semantic_selection") or {}).get("goal_xyyaw") or step.get("active_goal") or [])
+    raw_selection = step.get("semantic_selection") or {}
+    selection = active_semantic_selection(step)
+    goal = list(
+        []
+        if raw_selection.get("active") is False
+        else selection.get("goal_xyyaw") or step.get("active_goal") or []
+    )
     distance = float(step.get("distance_m") or 0.0)
     if len(pose) >= 2 and len(goal) >= 2:
         goal_distance = f"{math.hypot(float(pose[0]) - float(goal[0]), float(pose[1]) - float(goal[1])):.2f}m"

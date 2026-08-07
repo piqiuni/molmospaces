@@ -539,6 +539,88 @@ class FakeGridInfo:
     origin = Origin()
 
 
+def test_identical_room_grid_reuses_cached_statistics_and_advances_graph():
+    scene_data = [1] * (FakeGridInfo.width * FakeGridInfo.height)
+    confidence_data = [80] * len(scene_data)
+    store = InteractionGraphStore(scene_id="test_scene")
+
+    store.update_room_grid(
+        FakeGridInfo(),
+        scene_data,
+        confidence_data,
+        geometry_stability_frames=3,
+    )
+    assert store._room_grid_stats_cache is not None
+    first_revision = store.graph_revision
+
+    # New list instances model the ordinary room worker output.  A cache hit
+    # must still advance the per-room stability state and graph revision, but
+    # must not rescan all labelled cells.
+    store._refresh_room_nodes_from_grid = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("identical room grid should use cached statistics")
+    )
+    store.update_room_grid(
+        FakeGridInfo(),
+        list(scene_data),
+        list(confidence_data),
+        geometry_stability_frames=3,
+    )
+
+    room = store.nodes["room_1"]
+    assert store.graph_revision == first_revision + 1
+    assert store.room_geometry_candidates[1]["count"] == 2
+    assert room.attributes["cell_count"] == len(scene_data)
+    assert room.confidence == 0.8
+
+
+def test_room_grid_stat_cache_invalidates_when_labels_change():
+    scene_data = [1] * (FakeGridInfo.width * FakeGridInfo.height)
+    confidence_data = [100] * len(scene_data)
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_room_grid(FakeGridInfo(), scene_data, confidence_data)
+
+    full_refresh = store._refresh_room_nodes_from_grid
+    calls = []
+
+    def tracked_full_refresh(*args, **kwargs):
+        calls.append(True)
+        return full_refresh(*args, **kwargs)
+
+    store._refresh_room_nodes_from_grid = tracked_full_refresh
+    changed_scene_data = list(scene_data)
+    changed_scene_data[0] = 2
+    store.update_room_grid(FakeGridInfo(), changed_scene_data, confidence_data)
+
+    assert calls == [True]
+    assert "room_2" in store.nodes
+
+
+def test_room_grid_stat_cache_bypasses_merge_revision():
+    scene_data = [1] * 32 + [2] * 32
+    confidence_data = [100] * len(scene_data)
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_room_grid(FakeGridInfo(), scene_data, confidence_data)
+
+    full_refresh = store._refresh_room_nodes_from_grid
+    calls = []
+
+    def tracked_full_refresh(*args, **kwargs):
+        calls.append(True)
+        return full_refresh(*args, **kwargs)
+
+    store._refresh_room_nodes_from_grid = tracked_full_refresh
+    store.update_room_grid(
+        FakeGridInfo(),
+        list(scene_data),
+        list(confidence_data),
+        room_merges={2: 1},
+    )
+
+    assert calls == [True]
+    assert store.room_redirects[2] == 1
+    assert store.nodes["room_2"].attributes["active"] is False
+
+
 def test_realtime_visibility_age_and_episode_reset():
     store = InteractionGraphStore(scene_id="test_scene")
     store.reset("episode_000001", source_mode="realtime_gt_observation")
@@ -720,6 +802,7 @@ def test_open_partial_portal_creates_graph_only_child_room_until_far_side_is_obs
             "node_id": portal_id,
             "action": "open",
             "success": True,
+            "interaction_capability": "articulated",
             "approach_goal_xyyaw": [3.0, 4.0, 0.0],
         }
     )
@@ -753,6 +836,55 @@ def test_open_partial_portal_creates_graph_only_child_room_until_far_side_is_obs
     assert portal["attributes"]["potential_room_ids"] == []
     assert retired_child["attributes"]["active"] is False
     assert child_room_id not in observed_scene_data
+
+
+def test_static_open_portal_does_not_create_synthetic_child_room() -> None:
+    scene_data = [1] * (FakeGridInfo.width * FakeGridInfo.height)
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_room_grid(FakeGridInfo(), scene_data, [100] * len(scene_data))
+    store.update_observations(
+        [
+            observation(
+                instance_id="door_static_open",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=False,
+                position=[4.0, 4.0, 1.0],
+                aabb_center=[4.0, 4.0, 1.0],
+                aabb_size=[0.2, 1.0, 2.0],
+            )
+        ],
+        source_mode="realtime_gt_observation",
+    )
+    portal_id = next(
+        node["id"] for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+
+    assert store.update_interaction_result(
+        {
+            "node_id": portal_id,
+            "action": "open",
+            "success": True,
+            "post_state": "static_open",
+            # Exercise the real bridge spelling where the static capability
+            # can be omitted from the direct result.
+            "source": "executor_static_portal",
+            "approach_goal_xyyaw": [3.0, 4.0, 0.0],
+        }
+    )
+
+    graph = store.as_graph_dict()
+    portal = next(node for node in graph["nodes"] if node["id"] == portal_id)
+    interaction = portal["interaction"]
+    assert interaction["state"] == "static_open"
+    assert interaction["capability"] == "static"
+    assert interaction["traversable"] is True
+    assert interaction["requires_interaction"] is False
+    assert "portal_child_room_id" not in portal["attributes"]
+    assert not any(
+        node.get("attributes", {}).get("is_potential_room")
+        for node in graph["nodes"]
+    )
 
 
 def test_container_room_assignment_uses_nearest_segment_ring():

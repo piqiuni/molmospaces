@@ -28,6 +28,182 @@ class NavToObjTask(BaseMujocoTask):
 
         self.nav_objs = self._get_nav_objects()
 
+        # BaseMujocoTask queries reward/terminal/info/success together for one
+        # MuJoCo state. Keep the expensive segmentation-based visibility result
+        # only for that dynamic scope, so external calls always observe live state.
+        self._visibility_reward_cache_active = False
+        self._visibility_cache: dict[int, bool] = {}
+        self._reward_cache_for_current_state: np.ndarray | None = None
+        # A segmentation frame produced while evaluating this task state can be
+        # consumed by the simulator-local realtime-GT publisher.  Keep it
+        # private to the task/publisher boundary: it is never put in an
+        # observation, ROS payload, or recorder manifest.  The state token is
+        # checked before every reuse so an external qpos edit cannot make GT
+        # consume an old image.
+        self._realtime_gt_segmentation_snapshot: np.ndarray | None = None
+        self._realtime_gt_segmentation_snapshot_token: dict[str, Any] | None = None
+        # The bridge requests this only when its next policy frame will publish
+        # realtime-GT.  Leaving it false preserves the normal visibility path
+        # and avoids copying a segmentation frame on non-GT steps.
+        self._realtime_gt_snapshot_requested = False
+
+    def _invalidate_visibility_reward_cache(self) -> None:
+        """Discard metrics tied to the current simulated state."""
+        self._visibility_cache = {}
+        self._reward_cache_for_current_state = None
+
+    def invalidate_private_realtime_gt_segmentation_snapshot(self) -> None:
+        """Invalidate the simulator-local GT segmentation snapshot.
+
+        Interaction helpers that edit MuJoCo state outside ``task.step`` may
+        call this hook explicitly.  Normal task stepping/resetting also calls
+        it, while the state-token check below provides a defensive fallback.
+        """
+        self._realtime_gt_segmentation_snapshot = None
+        self._realtime_gt_segmentation_snapshot_token = None
+
+    def request_private_realtime_gt_segmentation_snapshot(self, requested: bool) -> None:
+        """Enable same-state snapshot capture for the next metric transaction.
+
+        This is a simulator-local scheduling hint from ``RosBridgePolicy``.
+        It is deliberately opt-in: only steps that will immediately publish a
+        realtime-GT frame pay the copy/state-token cost.
+        """
+        self._realtime_gt_snapshot_requested = bool(requested)
+        if not requested:
+            self.invalidate_private_realtime_gt_segmentation_snapshot()
+
+    def _segmentation_snapshot_state_token(
+        self, camera_name: str, batch_index: int
+    ) -> dict[str, Any] | None:
+        """Capture the minimal state needed to prove a segmentation is fresh."""
+        env = self._env
+        try:
+            model = env.current_model
+            current_batch_index = int(getattr(env, "current_batch_index", batch_index))
+            if current_batch_index != int(batch_index):
+                return None
+            data = env.current_data
+            camera = env.camera_manager.registry[camera_name]
+            qpos = np.asarray(data.qpos, dtype=np.float64).copy()
+            data_time = getattr(data, "time", None)
+            data_time = None if data_time is None else float(data_time)
+            return {
+                "model_id": id(model),
+                "data_id": id(data),
+                "batch_index": int(batch_index),
+                "camera_name": str(camera_name),
+                "data_time": data_time,
+                "qpos": qpos,
+                "camera_pos": np.asarray(camera.pos, dtype=np.float64).copy(),
+                "camera_forward": np.asarray(camera.forward, dtype=np.float64).copy(),
+                "camera_up": np.asarray(camera.up, dtype=np.float64).copy(),
+                "camera_fov": float(getattr(camera, "fov", 0.0)),
+            }
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _segmentation_snapshot_tokens_equal(
+        first: dict[str, Any] | None, second: dict[str, Any] | None
+    ) -> bool:
+        if first is None or second is None:
+            return False
+        if (
+            first["model_id"] != second.get("model_id")
+            or first["data_id"] != second.get("data_id")
+            or first["batch_index"] != second.get("batch_index")
+            or first["camera_name"] != second.get("camera_name")
+            or first["data_time"] != second.get("data_time")
+            or first["camera_fov"] != second.get("camera_fov")
+        ):
+            return False
+        return all(
+            np.array_equal(first[key], second[key])
+            for key in ("qpos", "camera_pos", "camera_forward", "camera_up")
+        )
+
+    def _segmentation_snapshot_matches_current_state(
+        self, token: dict[str, Any] | None
+    ) -> bool:
+        if token is None:
+            return False
+        current = self._segmentation_snapshot_state_token(
+            str(token.get("camera_name", "")), int(token.get("batch_index", 0))
+        )
+        return self._segmentation_snapshot_tokens_equal(token, current)
+
+    def _capture_private_realtime_gt_segmentation(
+        self, camera_name: str = "head_camera", batch_index: int | None = None
+    ) -> np.ndarray | None:
+        """Render and retain one private segmentation frame for this state."""
+        env = self._env
+        if batch_index is None:
+            batch_index = int(getattr(env, "current_batch_index", 0))
+        token_before = self._segmentation_snapshot_state_token(camera_name, int(batch_index))
+        if token_before is None or not hasattr(env, "render_segmentation_frame"):
+            return None
+        try:
+            frame = np.asarray(env.render_segmentation_frame(camera_name))
+            if frame.ndim < 3 or frame.shape[-1] < 2:
+                return None
+            # Renderer buffers are implementation-defined; own a read-only
+            # copy so a later render cannot mutate the GT input asynchronously.
+            snapshot = np.ascontiguousarray(frame[..., :2]).copy()
+            snapshot.setflags(write=False)
+        except Exception:
+            return None
+        token_after = self._segmentation_snapshot_state_token(camera_name, int(batch_index))
+        if not self._segmentation_snapshot_tokens_equal(token_before, token_after):
+            return None
+        self._realtime_gt_segmentation_snapshot = snapshot
+        self._realtime_gt_segmentation_snapshot_token = token_after
+        return snapshot
+
+    def get_private_realtime_gt_segmentation_snapshot(
+        self, camera_name: str = "head_camera"
+    ) -> np.ndarray | None:
+        """Return a fresh same-state frame for the realtime-GT publisher only.
+
+        This method intentionally exposes no snapshot metadata and the caller
+        must not serialize the returned array.  A state mismatch invalidates
+        the frame and returns ``None`` so the publisher falls back to a fresh
+        render.
+        """
+        if camera_name != "head_camera":
+            return None
+        snapshot = getattr(self, "_realtime_gt_segmentation_snapshot", None)
+        token = getattr(self, "_realtime_gt_segmentation_snapshot_token", None)
+        if snapshot is None or not self._segmentation_snapshot_matches_current_state(token):
+            self.invalidate_private_realtime_gt_segmentation_snapshot()
+            return None
+        return snapshot
+
+    def get_and_cache_all_step_information(self):
+        """Cache navigation metrics only while BaseMujocoTask reads one state."""
+        # A new metric snapshot follows the current state.  Keep the new
+        # segmentation frame alive after this method returns so policy GT can
+        # consume it before the next physics step.
+        self.invalidate_private_realtime_gt_segmentation_snapshot()
+        self._invalidate_visibility_reward_cache()
+        self._visibility_reward_cache_active = True
+        try:
+            return super().get_and_cache_all_step_information()
+        finally:
+            self._visibility_reward_cache_active = False
+            self._invalidate_visibility_reward_cache()
+
+    def reset(self):
+        self._realtime_gt_snapshot_requested = False
+        self.invalidate_private_realtime_gt_segmentation_snapshot()
+        return super().reset()
+
+    def step(self, action):
+        # Invalidate before any first-step observation checks or physics work;
+        # the post-physics metric pass will create the next valid snapshot.
+        self.invalidate_private_realtime_gt_segmentation_snapshot()
+        return super().step(action)
+
     def _selection_mode(self) -> str:
         return getattr(self.config.task_config, "selection_mode", "any_candidate")
 
@@ -256,11 +432,39 @@ class NavToObjTask(BaseMujocoTask):
 
     def check_object_visible(self, index: int) -> bool:
         """Check if the nearest navigation object is visible from head camera."""
+        if self._visibility_reward_cache_active:
+            cached_visibility = self._visibility_cache.get(index)
+            if cached_visibility is not None:
+                return cached_visibility
+
         nearest_obj = self.get_nearest_nav_object(index)
 
-        # Use 'head_camera' (registry name), not 'robot_0/head_camera' (MJCF name)
-        visibility = self._env.check_visibility("head_camera", nearest_obj.name)
-        return visibility > 0.0  # Any non-zero visibility fraction
+        # Use 'head_camera' (registry name), not 'robot_0/head_camera' (MJCF
+        # name).  During the task metric transaction, retain the exact frame
+        # used for this visibility query so realtime GT can reuse it.  For
+        # unsupported/batched fake environments, preserve the generic env API.
+        segmentation = None
+        if (
+            self._visibility_reward_cache_active
+            and bool(getattr(self, "_realtime_gt_snapshot_requested", False))
+            and int(
+                getattr(self._env, "current_batch_index", index)
+            ) == int(index)
+        ):
+            segmentation = self._capture_private_realtime_gt_segmentation(
+                "head_camera", batch_index=index
+            )
+        if segmentation is not None and hasattr(self._env, "segmentation_fraction"):
+            try:
+                visibility = self._env.segmentation_fraction(segmentation, nearest_obj.name)
+            except Exception:
+                visibility = 0.0
+        else:
+            visibility = self._env.check_visibility("head_camera", nearest_obj.name)
+        object_visible = visibility > 0.0  # Any non-zero visibility fraction
+        if self._visibility_reward_cache_active:
+            self._visibility_cache[index] = object_visible
+        return object_visible
 
     def get_reward(self) -> np.ndarray:
         """Calculate reward based on distance to target object.
@@ -268,6 +472,10 @@ class NavToObjTask(BaseMujocoTask):
         Returns:
             Array of rewards for each environment in the batch
         """
+        if self._visibility_reward_cache_active and self._reward_cache_for_current_state is not None:
+            # Preserve the previous API behavior: callers receive a fresh array.
+            return self._reward_cache_for_current_state.copy()
+
         rewards = []
 
         for i in range(self._env.n_batch):
@@ -286,7 +494,11 @@ class NavToObjTask(BaseMujocoTask):
 
             rewards.append(reward)
 
-        return np.array(rewards, dtype=np.float32)
+        reward_array = np.array(rewards, dtype=np.float32)
+        if self._visibility_reward_cache_active:
+            self._reward_cache_for_current_state = reward_array
+            return reward_array.copy()
+        return reward_array
 
     def judge_success(self) -> bool:
         """Judge whether the task is successfully completed.

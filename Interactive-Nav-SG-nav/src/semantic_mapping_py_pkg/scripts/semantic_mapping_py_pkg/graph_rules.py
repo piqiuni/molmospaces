@@ -12,6 +12,7 @@ PORTAL_LABELS = {
     "door",
     "doorframe",
     "doorway",
+    "door_leaf",
     "gate",
     "entrance",
 }
@@ -50,7 +51,17 @@ HINGE_NAMES = {"hinge", "mjjnthinge"}
 SLIDE_NAMES = {"slide", "mjJNT_SLIDE", "mjjntslide"}
 
 BOX_ONLY_PERCEPTION_CONTRACT = "exact_2d_3d_boxes_only"
-_PUBLIC_PORTAL_ID_RE = re.compile(r"^gt_portal_[0-9]+$")
+# Restricted-GT doors use one deliberately boring public identity.  The
+# suffix is an episode-local ordinal allocated by the publisher (``door_0001``
+# etc.); ``door_x`` is also accepted as a compact fixture token.  Never expose
+# a source/body name such as ``doorframe_static_17`` on the public wire.
+_PUBLIC_DOOR_ID_RE = re.compile(r"^door_(?:[0-9]{1,8}|x)$")
+
+
+def is_public_door_id(value: Any) -> bool:
+    """Return whether *value* is one of our generic public door references."""
+
+    return bool(_PUBLIC_DOOR_ID_RE.fullmatch(str(value or "").strip().casefold()))
 
 
 def sanitize_token(value: str) -> str:
@@ -58,14 +69,38 @@ def sanitize_token(value: str) -> str:
     return text.replace("/", "_").replace("|", "_").replace(":", "_")
 
 
-def opaque_portal_instance_id(value: Any) -> str:
-    """Return a public portal identity without exposing a simulator source ID."""
+def opaque_door_instance_id(value: Any) -> str:
+    """Return a generic, stable door identity for legacy/raw observations.
 
-    raw = str(value or "")
-    if _PUBLIC_PORTAL_ID_RE.fullmatch(raw):
+    Live restricted-GT observations already carry the publisher-assigned
+    ordinal.  This fallback is used by older producers and unit fixtures.  It
+    hashes a canonicalized alias token into a numeric suffix, so ``doorframe``,
+    ``doorway`` and ``door_leaf`` variants of the same source token converge
+    without putting the source text on the wire.
+    """
+
+    raw = str(value or "").strip().casefold()
+    if is_public_door_id(raw):
         return raw
-    digest = hashlib.blake2s(raw.encode("utf-8"), digest_size=5).hexdigest()
-    return f"portal_ref_{digest}"
+    canonical = normalize_label(raw)
+    # These are geometry/asset aliases, not distinct semantic objects.  Remove
+    # them before hashing so frame/leaf/doorway names receive the same public
+    # identity when an old producer sends more than one alias.
+    canonical = re.sub(
+        r"(?:^|_)(?:doorframe|doorway|door_leaf|door|portal)(?=_|$)",
+        "_",
+        canonical,
+    )
+    canonical = re.sub(r"_+", "_", canonical).strip("_") or "door"
+    digest = hashlib.blake2s(canonical.encode("utf-8"), digest_size=4).digest()
+    ordinal = int.from_bytes(digest, "big") % 9_999 + 1
+    return f"door_{ordinal:04d}"
+
+
+# Keep the old helper name as a source-compatible alias for downstream tools;
+# its return value now follows the generic ``door_<ordinal>`` contract.
+def opaque_portal_instance_id(value: Any) -> str:
+    return opaque_door_instance_id(value)
 
 
 def point3(values=None):
@@ -79,6 +114,22 @@ def point3(values=None):
     if len(vals) < 3:
         vals.extend([0.0] * (3 - len(vals)))
     return [float(vals[0]), float(vals[1]), float(vals[2])]
+
+
+def unit_axis_xy(values: Any) -> list[float]:
+    """Normalize an explicit interaction normal without accepting bad input."""
+
+    raw = list(values or [])
+    if len(raw) < 2:
+        return []
+    try:
+        x, y = float(raw[0]), float(raw[1])
+    except (TypeError, ValueError):
+        return []
+    norm = math.hypot(x, y)
+    if not math.isfinite(norm) or norm <= 1e-6:
+        return []
+    return [x / norm, y / norm]
 
 
 def segmentation_pixel_count(segmentation: Any) -> int:
@@ -181,13 +232,18 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
     if minimal_gt:
         raw_semantic_name = normalize_label(observation.get("name"))
         raw_instance_id = str(observation.get("id") or "")
-        is_portal = raw_semantic_name in PORTAL_LABELS
-        # A GT ``doorframe`` / ``doorway`` is an asset annotation.  Keep only
-        # the generic visual/topological class on the public wire contract.
+        is_portal = raw_semantic_name in PORTAL_LABELS or is_public_door_id(raw_instance_id)
+        # A GT ``doorframe`` / ``doorway`` / ``door_leaf`` is an asset
+        # annotation.  Keep one generic door identity and the internal portal
+        # topology class on the public wire contract.
         semantic_name = "portal" if is_portal else raw_semantic_name
-        category = semantic_name or "object"
+        category = "door" if is_portal else semantic_name or "object"
         instance_id = (
-            opaque_portal_instance_id(raw_instance_id) if is_portal else raw_instance_id
+            raw_instance_id
+            if is_public_door_id(raw_instance_id)
+            else opaque_door_instance_id(raw_instance_id)
+            if is_portal
+            else raw_instance_id
         )
         private_instance_id = raw_instance_id if is_portal else ""
         position = point3(box_3d.get("center"))
@@ -213,6 +269,21 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
                 visible_fraction = (
                     min(1.0, float(visible_pixels) / area) if area > 0.0 else 0.0
                 )
+        # Normal restricted-GT messages remain axis-free.  A rule-only run can
+        # opt in to a live joint-derived normal without loading scene poses.
+        oracle_rule_gt_axis = bool(
+            observation.get("oracle_rule_gt_interaction_axis", False)
+        )
+        interaction_approach_axis_xy = (
+            unit_axis_xy(observation.get("interaction_approach_axis_xy"))
+            if oracle_rule_gt_axis
+            else []
+        )
+        interaction_approach_axis_source = (
+            str(observation.get("interaction_approach_axis_source") or "")
+            if interaction_approach_axis_xy
+            else ""
+        )
     else:
         semantic_name = normalize_label(
             observation.get("semantic_name")
@@ -266,6 +337,12 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
             visible_fraction = (
                 min(1.0, float(visible_pixels) / area) if area > 0.0 else 0.0
             )
+        interaction_approach_axis_xy = unit_axis_xy(
+            observation.get("interaction_approach_axis_xy")
+        )
+        interaction_approach_axis_source = str(
+            observation.get("interaction_approach_axis_source") or ""
+        )
     connected_room_ids = [] if minimal_gt else observation.get("connected_room_ids") or []
     room_id = None if minimal_gt else observation.get("room_id")
 
@@ -328,7 +405,8 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "joint_infos": [] if minimal_gt else list(observation.get("joint_infos") or []),
         "primary_joint_name": "" if minimal_gt else str(observation.get("primary_joint_name") or ""),
         "orientation": [0.0, 0.0, 0.0, 1.0] if minimal_gt else list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
-        "interaction_approach_axis_xy": [] if minimal_gt else list(observation.get("interaction_approach_axis_xy") or []),
+        "interaction_approach_axis_xy": interaction_approach_axis_xy,
+        "interaction_approach_axis_source": interaction_approach_axis_source,
         "source_object_name": str(
             instance_id
             if minimal_gt
@@ -357,8 +435,8 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "episode_id": "" if minimal_gt else str(observation.get("episode_id") or ""),
         "source": "realtime_gt_observation" if minimal_gt else str(observation.get("source") or "detector"),
         "name": (
-            "portal"
-            if semantic_name == "portal"
+            instance_id
+            if minimal_gt and semantic_name == "portal"
             else str(
                 observation.get("name")
                 if minimal_gt
@@ -412,13 +490,12 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
     is_interactable = interaction_mode != "none"
     # Restricted realtime-GT is only a geometry/visibility contract.  A portal
     # class is not proof of a door leaf, an operable joint, or a closed state.
-    # The rule lane therefore waits for executor feedback; the MLLM lane may
-    # replace these unknowns using image evidence through an attribute patch.
+    # It is nevertheless a valid *interaction hypothesis*: the rule lane must
+    # try an unknown portal once and learn ``open/static_open/blocked`` only
+    # from executor feedback.  This is an ontology prior, not articulation GT.
     portal_requires_observed_evidence = bool(
         node_type == "portal" and observation.get("minimal_gt_observation")
     )
-    if portal_requires_observed_evidence:
-        is_interactable = False
     if node_type == "portal":
         requires_interaction = bool(
             is_interactable and state not in {"open", "static_open"}
@@ -435,8 +512,8 @@ def default_interaction_payload(node_type: str, observation: dict[str, Any]) -> 
         "is_interactable": is_interactable,
         "interaction_mode": interaction_mode,
         # This is deliberately an ontology prior, not an articulation fact.
-        # In restricted-GT mode it is explicitly unobserved rather than a
-        # label-derived assertion that the portal is operable.
+        # In restricted-GT mode the real capability remains explicitly
+        # unobserved until the executor returns an action result.
         "capability": "unknown",
         "capability_source": (
             "unobserved" if portal_requires_observed_evidence else "semantic_label_prior"

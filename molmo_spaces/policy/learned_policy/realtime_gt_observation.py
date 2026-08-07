@@ -279,6 +279,7 @@ class RealtimeGTObservationPublisher:
         required_consecutive_observations: int = 2,
         max_distance_m: float = 4.0,
         step_interval: int = 3,
+        emit_interaction_approach_axis: bool = False,
         queue_size: int = 1,
         async_processing: bool = True,
     ) -> None:
@@ -293,6 +294,9 @@ class RealtimeGTObservationPublisher:
         )
         self.max_distance_m = max(0.0, float(max_distance_m))
         self.step_interval = max(1, int(step_interval))
+        # Explicit rule-oracle mode for evaluating a dynamically derived joint
+        # frame.  Detector and MLLM lanes must keep this disabled.
+        self.emit_interaction_approach_axis = bool(emit_interaction_approach_axis)
         self.publisher = self._rospy.Publisher(self.topic, self._String, queue_size=queue_size)
         self.episode_index = 0
         self.episode_id = ""
@@ -309,6 +313,10 @@ class RealtimeGTObservationPublisher:
         self._cache_model_identity: int | None = None
         self._specs: list[_ObjectSpec] = []
         self._geom_to_spec = np.empty(0, dtype=np.int32)
+        # Per-publish diagnostic consumed by the bridge timing record.  It is
+        # intentionally scalar-only; the raw segmentation never leaves this
+        # simulator-local path.
+        self.last_snapshot_used = False
         self._async_processing = bool(async_processing)
         self._publish_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
@@ -329,7 +337,15 @@ class RealtimeGTObservationPublisher:
         self._cache_model_identity = None
         self._specs = []
         self._geom_to_spec = np.empty(0, dtype=np.int32)
+        self.last_snapshot_used = False
         self._clear_queue()
+
+    def should_publish_step(self, step_index: int) -> bool:
+        """Whether a normal (non-force) publish is due for this policy step."""
+        return bool(
+            self._episode_reset_pending
+            or int(step_index) % self.step_interval == 0
+        )
 
     def close(self) -> None:
         if self._worker is None:
@@ -344,21 +360,44 @@ class RealtimeGTObservationPublisher:
         self._worker = None
 
     def publish(self, task, stamp=None, step_index: int | None = None, force: bool = False) -> dict[str, Any] | None:
+        self.last_snapshot_used = False
         if task is None or getattr(task, "env", None) is None:
             return None
         capture_step = int(self.frame_index if step_index is None else step_index)
-        if not force and not self._episode_reset_pending and capture_step % self.step_interval != 0:
+        if not force and not self.should_publish_step(capture_step):
             return None
         env = task.env
         if self.camera_name not in env.camera_manager.registry:
             self._rospy.logwarn_throttle(2.0, "RealtimeGTObservationPublisher: camera %s not found", self.camera_name)
             return None
         self._ensure_cache(env)
-        try:
-            segmentation = np.asarray(env.render_segmentation_frame(self.camera_name))[..., :2]
-        except Exception as exc:
-            self._rospy.logwarn_throttle(2.0, "Realtime GT segmentation failed: %s", exc)
-            return None
+        segmentation = None
+        if force:
+            # Interaction paths may have changed qpos outside task.step.  A
+            # forced post-interaction observation must always be a new render,
+            # never a task snapshot from the pre-interaction state.
+            invalidate_snapshot = getattr(
+                task, "invalidate_private_realtime_gt_segmentation_snapshot", None
+            )
+            if callable(invalidate_snapshot):
+                invalidate_snapshot()
+        else:
+            get_snapshot = getattr(task, "get_private_realtime_gt_segmentation_snapshot", None)
+            if callable(get_snapshot):
+                try:
+                    segmentation = get_snapshot(self.camera_name)
+                    self.last_snapshot_used = segmentation is not None
+                except Exception:
+                    # Snapshot reuse is an optional local optimization.  Never
+                    # let it change the GT publisher's existing render path.
+                    segmentation = None
+                    self.last_snapshot_used = False
+        if segmentation is None:
+            try:
+                segmentation = np.asarray(env.render_segmentation_frame(self.camera_name))[..., :2]
+            except Exception as exc:
+                self._rospy.logwarn_throttle(2.0, "Realtime GT segmentation failed: %s", exc)
+                return None
         visible = self._visible_instances(segmentation)
         model = env.current_model
         data = env.current_data
@@ -373,6 +412,20 @@ class RealtimeGTObservationPublisher:
             if self.max_distance_m > 0.0 and distance_m > self.max_distance_m:
                 continue
             center, size = _safe_body_aabb(model, data, spec.body_id)
+            interaction_approach_axis_xy = None
+            if (
+                self.emit_interaction_approach_axis
+                and spec.is_articulable
+                and not spec.is_door
+            ):
+                try:
+                    interaction_approach_axis_xy = _interaction_approach_axis_xy(
+                        model,
+                        data,
+                        self._joint_infos(model, data, spec.joint_names),
+                    )
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    interaction_approach_axis_xy = None
             observations.append(
                 self._build_observation(
                     spec,
@@ -380,6 +433,7 @@ class RealtimeGTObservationPublisher:
                     visible_pixels,
                     center,
                     size,
+                    interaction_approach_axis_xy=interaction_approach_axis_xy,
                 )
             )
         capture_stamp_sec = (
@@ -393,7 +447,10 @@ class RealtimeGTObservationPublisher:
             "camera_name": self.camera_name,
             "stamp_sec": capture_stamp_sec,
             "capture_stamp_sec": capture_stamp_sec,
-            "source_mode": "realtime_gt_observation",
+            # Public telemetry names the observation contract rather than the
+            # evaluator implementation.  The mapping callback already knows
+            # this arrives on its dedicated realtime-GT subscription.
+            "source_mode": "geometry_observation",
             "observation_performed": True,
             "image_size": image_size,
             "observations": observations,
@@ -588,22 +645,24 @@ class RealtimeGTObservationPublisher:
         visible_pixels: int,
         center: np.ndarray,
         size: np.ndarray,
+        interaction_approach_axis_xy: list[float] | None = None,
     ) -> dict[str, Any]:
         metadata = spec.metadata
         if spec.is_door:
-            # ``doorframe``, ``doorway`` and MuJoCo body names are simulator
-            # annotations, not visual observations.  Publish one generic
-            # portal class and an episode-local opaque identifier instead.
-            category = "portal"
+            # ``doorframe``, ``doorway`` and door-leaf body names are private
+            # simulator annotations.  Publish one generic door reference for
+            # the whole canonical doorway; the mapping side keeps its internal
+            # ``portal`` topology type without exposing a subtype.
             public_id = (
-                self._public_instance_id(spec.source_name, prefix="gt_portal")
+                self._public_instance_id(spec.source_name, prefix="door")
                 if self is not None
-                else "gt_portal_0001"
+                else "door_0001"
             )
+            category = public_id
         else:
             category = metadata.get("category") or spec.source_name
             public_id = spec.source_name
-        return {
+        observation = {
             "id": public_id,
             "name": str(category),
             "bbox_2d": list(bbox_2d),
@@ -623,6 +682,15 @@ class RealtimeGTObservationPublisher:
                 "frame_id": "world",
             },
         }
+        if interaction_approach_axis_xy is not None:
+            observation["interaction_approach_axis_xy"] = [
+                float(value) for value in interaction_approach_axis_xy[:2]
+            ]
+            observation["oracle_rule_gt_interaction_axis"] = True
+            observation["interaction_approach_axis_source"] = (
+                "rule_oracle_gt_joint_geometry"
+            )
+        return observation
 
     def _public_instance_id(self, source_name: str, *, prefix: str) -> str:
         """Return a stable episode-local public identifier for a private body.

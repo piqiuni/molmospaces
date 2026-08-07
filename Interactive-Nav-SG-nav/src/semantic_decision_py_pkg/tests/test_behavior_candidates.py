@@ -102,6 +102,7 @@ def test_successfully_opened_portal_generates_one_way_traversal_goal() -> None:
                     "requires_interaction": False,
                     "state": "open",
                     "state_confidence": 1.0,
+                    "capability": "confirmed",
                     "traversable": True,
                     "operation_history": [
                         {
@@ -141,6 +142,53 @@ def test_successfully_opened_portal_generates_one_way_traversal_goal() -> None:
     assert math.isclose(opposite_axis.goal_xyyaw[0], 0.0, abs_tol=1e-6)
     assert math.isclose(opposite_axis.goal_xyyaw[1], -0.9, abs_tol=1e-6)
     assert math.isclose(opposite_axis.goal_xyyaw[2], -math.pi / 2.0, abs_tol=1e-6)
+
+
+def test_static_portal_history_never_generates_a_post_interaction_traversal() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("portal",))
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_static_1",
+                "type": "portal",
+                "aabb_center": [0.0, 0.0, 1.0],
+                "attributes": {
+                    "interaction_reference_aabb_center": [0.0, 0.0, 1.0],
+                    # Simulate the stale graph-only child left by the old
+                    # implementation; it cannot revive a traverse candidate.
+                    "portal_child_room_id": 1000000,
+                    "potential_room_ids": [1000000],
+                },
+                "interaction": {
+                    "state": "static_open",
+                    "capability": "static",
+                    "traversable": True,
+                    "requires_interaction": False,
+                    "operation_history": [
+                        {
+                            "event_id": "static_event_1",
+                            "action": "open",
+                            "success": True,
+                            "post_state": "static_open",
+                            "approach_goal_xyyaw": [-1.0, 0.0, 0.0],
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+    assert generator.generate({}, graph, robot_xy=(-1.0, 0.0)) == []
+
+    # Guard the historical route too: even a stale graph whose current state
+    # was later overwritten to open cannot reinterpret its static event as an
+    # articulated transition.
+    graph["nodes"][0]["interaction"].update(
+        {"state": "open", "capability": "confirmed"}
+    )
+    assert generator.generate({}, graph, robot_xy=(-1.0, 0.0)) == []
 
 
 def test_frontier_just_beyond_opened_portal_keeps_potential_room_identity() -> None:

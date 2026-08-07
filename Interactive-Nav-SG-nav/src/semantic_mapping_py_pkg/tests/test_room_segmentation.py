@@ -1,9 +1,11 @@
 import math
+from collections import deque
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 
 PACKAGE_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -60,15 +62,16 @@ def _room_count(room_ids):
 
 
 def _segmenter(**kwargs):
-    return RoomSegmenter(
-        room_min_component_cells=4,
-        room_core_min_component_cells=4,
-        room_core_clearance_cells=1,
-        room_remove_enclosed_occupied=False,
-        room_portal_cut_margin_m=0.0,
-        room_portal_cut_thickness_cells=1,
-        **kwargs,
-    )
+    config = {
+        "room_min_component_cells": 4,
+        "room_core_min_component_cells": 4,
+        "room_core_clearance_cells": 1,
+        "room_remove_enclosed_occupied": False,
+        "room_portal_cut_margin_m": 0.0,
+        "room_portal_cut_thickness_cells": 1,
+    }
+    config.update(kwargs)
+    return RoomSegmenter(**config)
 
 
 def test_realtime_gt_portal_hint_splits_connected_occupancy_immediately():
@@ -131,6 +134,187 @@ def _small_portal_pocket_grid():
     )
     info = SimpleNamespace(width=width, height=height, resolution=1.0, origin=origin)
     return SimpleNamespace(info=info, data=values.reshape(-1).tolist())
+
+
+def _legacy_free_components_with_labels(segmentation_free):
+    """Reference for the pre-P0 Python four-connected flood-fill."""
+
+    height, width = segmentation_free.shape
+    flat = segmentation_free.reshape(height * width)
+    visited = np.zeros(height * width, dtype=bool)
+    labels = np.full(height * width, -1, dtype=np.int32)
+    components = []
+    for index in range(height * width):
+        if visited[index] or flat[index] <= 0:
+            continue
+        visited[index] = True
+        queue = deque([index])
+        component = [index]
+        component_id = len(components)
+        labels[index] = component_id
+        while queue:
+            current = queue.popleft()
+            x = current % width
+            y = current // width
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx = x + dx
+                ny = y + dy
+                if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                    continue
+                next_index = ny * width + nx
+                if visited[next_index] or flat[next_index] <= 0:
+                    continue
+                visited[next_index] = True
+                labels[next_index] = component_id
+                component.append(next_index)
+                queue.append(next_index)
+        components.append(component)
+    return components, labels
+
+
+def _legacy_portal_separated_small_components(
+    segmenter,
+    segmentation_free,
+    pre_portal_cut_free,
+    portal_cut_mask,
+    core_component_cells,
+):
+    """Reference selection semantics before native four-labeling replaced BFS."""
+
+    height, width = segmentation_free.shape
+    post_components, _ = _legacy_free_components_with_labels(segmentation_free)
+    if len(post_components) < 2:
+        return []
+    _pre_components, pre_labels = _legacy_free_components_with_labels(
+        pre_portal_cut_free
+    )
+    seeded_cells = {
+        int(cell)
+        for component in core_component_cells.values()
+        for cell in component
+    }
+    components_by_pre_cut = {}
+    for component in post_components:
+        pre_cut_component_id = int(pre_labels[component[0]])
+        if pre_cut_component_id < 0:
+            continue
+        components_by_pre_cut.setdefault(pre_cut_component_id, []).append(component)
+
+    preserved = []
+    for components in components_by_pre_cut.values():
+        if len(components) < 2:
+            continue
+        for component in components:
+            if len(component) < segmenter.room_min_component_cells:
+                continue
+            if any(cell in seeded_cells for cell in component):
+                continue
+            if not segmenter._component_touches_mask(
+                component,
+                portal_cut_mask,
+                width,
+                height,
+            ):
+                continue
+            preserved.append(component)
+    return preserved
+
+
+def _portal_cut_fixture():
+    """Two sides of one cut plus an unrelated free component."""
+
+    pre = np.zeros((12, 20), dtype=np.uint8)
+    pre[1:11, 1:19] = 1
+    # The upper-right island was never connected to the cut room.
+    pre[0, 0] = 1
+
+    portal_cut = np.zeros_like(pre)
+    portal_cut[1:11, 10] = 1
+    post = pre.copy()
+    post[portal_cut > 0] = 0
+    seeded_left_room_cell = 4 * pre.shape[1] + 4
+    return pre, post, portal_cut, {1: [seeded_left_room_cell]}
+
+
+def test_portal_pocket_native_four_labels_match_legacy_selection():
+    cv2 = pytest.importorskip("cv2")
+    segmenter = _segmenter(room_min_component_cells=12)
+    pre, post, portal_cut, core_component_cells = _portal_cut_fixture()
+
+    expected = _legacy_portal_separated_small_components(
+        segmenter,
+        post,
+        pre,
+        portal_cut,
+        core_component_cells,
+    )
+    actual = segmenter._portal_separated_small_components(
+        post,
+        pre,
+        portal_cut,
+        core_component_cells,
+        post.shape[1],
+        post.shape[0],
+        cv2=cv2,
+    )
+
+    # Cell visitation order is deliberately not an implementation contract;
+    # retained components and their scan order are.
+    assert [set(component) for component in actual] == [
+        set(component) for component in expected
+    ]
+
+
+def test_portal_pocket_native_labels_are_strictly_four_connected():
+    cv2 = pytest.importorskip("cv2")
+    segmenter = _segmenter(room_min_component_cells=1)
+    pre = np.ones((3, 3), dtype=np.uint8)
+    portal_cut = np.zeros_like(pre)
+    portal_cut[0, 1] = 1
+    portal_cut[1, :] = 1
+    portal_cut[2, 1] = 1
+    post = pre.copy()
+    post[portal_cut > 0] = 0
+
+    actual = segmenter._portal_separated_small_components(
+        post,
+        pre,
+        portal_cut,
+        {},
+        post.shape[1],
+        post.shape[0],
+        cv2=cv2,
+    )
+
+    # Four diagonal cells are one component under 8-connectivity but four
+    # distinct components under the portal pocket's required 4-connectivity.
+    assert [set(component) for component in actual] == [{0}, {2}, {6}, {8}]
+
+
+def test_portal_pocket_native_labels_do_not_call_python_flood_fill(monkeypatch):
+    cv2 = pytest.importorskip("cv2")
+    segmenter = _segmenter(room_min_component_cells=12)
+    pre, post, portal_cut, core_component_cells = _portal_cut_fixture()
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("portal pocket path must not use Python BFS")
+
+    monkeypatch.setattr(
+        RoomSegmenter,
+        "_free_components_with_labels",
+        staticmethod(fail_if_called),
+    )
+    result = segmenter._portal_separated_small_components(
+        post,
+        pre,
+        portal_cut,
+        core_component_cells,
+        post.shape[1],
+        post.shape[0],
+        cv2=cv2,
+    )
+
+    assert len(result) == 1
 
 
 def test_portal_separated_small_free_space_becomes_low_confidence_room():

@@ -87,6 +87,7 @@ class RosBridgePolicy(BasePolicy):
         realtime_gt_required_consecutive_observations: int = 2,
         realtime_gt_step_interval: int = 3,
         realtime_gt_max_distance_m: float = 4.0,
+        realtime_gt_emit_interaction_approach_axis: bool = False,
         step_frame_dir: str = "",
         step_frame_queue_size: int = 4,
         step_sync_topic: str = "/molmo_spaces/step_sync",
@@ -243,6 +244,7 @@ class RosBridgePolicy(BasePolicy):
             "total": 0.0,
             "odom_tf": 0.0,
             "realtime_gt": 0.0,
+            "realtime_gt_snapshot_hit": 0.0,
             "rgb_extract": 0.0,
             "rgb_encode": 0.0,
             "rgb_ros_publish": 0.0,
@@ -263,6 +265,13 @@ class RosBridgePolicy(BasePolicy):
             "step_ready_satisfied": 0.0,
             "step_ready_timed_out": 0.0,
             "action_wait": 0.0,
+            # Separate navigation-side scheduling from the mandatory readiness
+            # barrier.  The two fresh-command fields use the command callback
+            # timestamp, so they reveal whether an observed delay is before or
+            # after move_base/DWA actually produced a command.
+            "action_wait_after_ready": 0.0,
+            "fresh_cmd_after_gate": 0.0,
+            "fresh_action_after_gate": 0.0,
             "postprocess_action": 0.0,
             "step_sync_publish": 0.0,
             "step_capture_ack_wait": 0.0,
@@ -385,6 +394,9 @@ class RosBridgePolicy(BasePolicy):
                 required_consecutive_observations=realtime_gt_required_consecutive_observations,
                 step_interval=realtime_gt_step_interval,
                 max_distance_m=realtime_gt_max_distance_m,
+                emit_interaction_approach_axis=(
+                    realtime_gt_emit_interaction_approach_axis
+                ),
                 # GT is a latest-state stream.  A deep ROS queue makes newly
                 # revealed container contents wait behind stale observations.
                 queue_size=1,
@@ -775,6 +787,28 @@ class RosBridgePolicy(BasePolicy):
             self._latest_gt_payload = payload
         return payload
 
+    def prepare_realtime_gt_snapshot_for_next_step(self, next_step_index: int) -> None:
+        """Request a private task snapshot only when the next GT frame is due.
+
+        The task evaluates visibility during ``task.step`` and this policy
+        publishes realtime-GT immediately afterward.  Scheduling the request
+        here avoids deep-copying a segmentation image on the intervening
+        non-GT steps while preserving the exact same-state reuse guarantee.
+        """
+        task = self.task
+        request_snapshot = getattr(
+            task, "request_private_realtime_gt_segmentation_snapshot", None
+        )
+        if not callable(request_snapshot):
+            return
+        publisher = self._realtime_gt_publisher
+        should_publish_step = getattr(publisher, "should_publish_step", None)
+        due = bool(
+            callable(should_publish_step)
+            and should_publish_step(int(next_step_index))
+        )
+        request_snapshot(due)
+
     def prepare_episode_reset(self) -> None:
         self._episode_count += 1
         if self._episode_count <= 1:
@@ -822,7 +856,8 @@ class RosBridgePolicy(BasePolicy):
         self._rospy.loginfo(
             (
                 "RosBridgePolicy timing window=%d: total avg/p95/max=%.2f/%.2f/%.2fms "
-                "(%.2fHz), action_wait=%.2f/%.2f/%.2fms, gt=%.2f/%.2fms, "
+                "(%.2fHz), action_wait=%.2f/%.2f/%.2fms post_ready=%.2fms "
+                "fresh_cmd=%.2fms fresh_action=%.2fms, gt=%.2f/%.2fms hit=%.2f, "
                 "rgb_total=%.2f/%.2fms [extract=%.2f encode=%.2f ros_pub=%.2f "
                 "frame_enqueue=%.2f/%.2f], extra_rgb=%.2fms, "
                 "depth+pcd=%.2fms, depth_scan=%.2fms [convert=%.2f pub=%.2f], "
@@ -839,8 +874,12 @@ class RosBridgePolicy(BasePolicy):
             avg["action_wait"],
             p95["action_wait"],
             max_values["action_wait"],
+            avg["action_wait_after_ready"],
+            avg["fresh_cmd_after_gate"],
+            avg["fresh_action_after_gate"],
             avg["realtime_gt"],
             p95["realtime_gt"],
+            avg["realtime_gt_snapshot_hit"],
             avg["rgb_publish"],
             p95["rgb_publish"],
             avg["rgb_extract"],
@@ -1932,6 +1971,9 @@ class RosBridgePolicy(BasePolicy):
             if gt_payload is not None:
                 self._latest_gt_payload = gt_payload
             stage_ms["realtime_gt"] = (time.perf_counter() - t0) * 1000.0
+            stage_ms["realtime_gt_snapshot_hit"] = float(
+                bool(getattr(self._realtime_gt_publisher, "last_snapshot_used", False))
+            )
 
         bootstrap_requires_mapping = (
             self.step_ready_barrier_enabled
@@ -2222,6 +2264,9 @@ class RosBridgePolicy(BasePolicy):
                         # Allow action payloads without explicit step field.
                         chosen_action = self._latest_action
                         self.last_action_source = "action_topic"
+                        stage_ms["fresh_action_after_gate"] = max(
+                            0.0, (action_ts - wait_start_mono) * 1000.0
+                        )
                         self._last_consumed_action_step += 1
                         break
                     if (
@@ -2230,6 +2275,9 @@ class RosBridgePolicy(BasePolicy):
                     ):
                         chosen_action = self._latest_action
                         self.last_action_source = "action_topic"
+                        stage_ms["fresh_action_after_gate"] = max(
+                            0.0, (action_ts - wait_start_mono) * 1000.0
+                        )
                         self._last_consumed_action_step = self._latest_action_step
                         break
                 cmd_vel = self._latest_cmd_vel
@@ -2246,6 +2294,9 @@ class RosBridgePolicy(BasePolicy):
                 if cmd_action is not None:
                     chosen_action = cmd_action
                     self.last_action_source = "cmd_vel"
+                    stage_ms["fresh_cmd_after_gate"] = max(
+                        0.0, (cmd_vel_ts - wait_start_mono) * 1000.0
+                    )
                     break
 
             if next_republish_mono is not None and now_mono >= next_republish_mono:
@@ -2261,6 +2312,9 @@ class RosBridgePolicy(BasePolicy):
                 )
             time.sleep(0.005)
         stage_ms["action_wait"] = (time.perf_counter() - t0_wait) * 1000.0
+        stage_ms["action_wait_after_ready"] = max(
+            0.0, stage_ms["action_wait"] - stage_ms["step_ready_wait"]
+        )
 
         if chosen_action is None:
             if self._rospy.is_shutdown():

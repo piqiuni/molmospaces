@@ -68,7 +68,7 @@ class CompletionState:
             if mission_mode in {"object_goal", "semantic_interaction_object_goal"}:
                 self.request("target_goal_succeeded", detail)
                 return self.requested
-        if status == "EXPLORATION_EXHAUSTED" or (
+        if status in {"EXPLORATION_EXHAUSTED", "EXPLORATION_STALLED"} or (
             status == "SUCCEEDED"
             and reason
             in {

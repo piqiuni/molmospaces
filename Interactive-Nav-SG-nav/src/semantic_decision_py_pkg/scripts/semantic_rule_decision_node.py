@@ -17,6 +17,9 @@ from semantic_decision_py_pkg.candidate_curator import (
     preserve_missing_explore_candidate_update,
     validate_candidate_update,
 )
+from semantic_decision_py_pkg.behavior_execution import (
+    is_interaction_pose_precondition_failure,
+)
 from semantic_decision_py_pkg.env_config import apply_model_env_overrides, load_env_file
 from semantic_decision_py_pkg.interaction_outcome_beliefs import (
     InteractionOutcomeBeliefStore,
@@ -25,6 +28,8 @@ from semantic_decision_py_pkg.interaction_outcome_beliefs import (
 from semantic_decision_py_pkg.mission_completion import (
     MissionCompletionConfig,
     MissionCompletionTracker,
+    TerminalInteractionNoPlanExitConfig,
+    TerminalInteractionNoPlanExitTracker,
     TargetMissionTracker,
 )
 from semantic_decision_py_pkg.model_policy import (
@@ -391,6 +396,29 @@ class SemanticRuleDecisionNode:
                 ),
             )
         )
+        self.terminal_no_plan_exit_tracker = TerminalInteractionNoPlanExitTracker(
+            TerminalInteractionNoPlanExitConfig(
+                enabled=bool(
+                    completion_config.get("terminal_no_plan_exit_enabled", True)
+                ),
+                no_executable_candidate_min_steps=max(
+                    0,
+                    int(
+                        completion_config.get(
+                            "no_executable_candidate_min_steps", 20
+                        )
+                    ),
+                ),
+                no_executable_candidate_confirmations=max(
+                    1,
+                    int(
+                        completion_config.get(
+                            "no_executable_candidate_confirmations", 3
+                        )
+                    ),
+                ),
+            )
+        )
         self.target_mission = TargetMissionTracker()
         self.state_lock = threading.RLock()
         self.latest_candidates_payload: dict = {}
@@ -421,6 +449,10 @@ class SemanticRuleDecisionNode:
         self.preempt_requested_for_decision_id = ""
         self.cooldown_until: dict[str, float] = {}
         self.failure_counts: dict[str, int] = {}
+        # Count-bounded executor approach attempts are not object failures.
+        # Suppress only the identical candidate fingerprint so another
+        # interaction subgoal can be selected immediately, without a timer.
+        self.approach_exhausted_fingerprints: set[str] = set()
         self.decision_index = 0
         self.step_ready_enabled = bool(rospy.get_param("~step_ready_enabled", False))
         self.step_ready_topic = str(rospy.get_param("~step_ready_topic", "/semantic_decision/step_ready"))
@@ -519,6 +551,7 @@ class SemanticRuleDecisionNode:
                 self.interaction_outcome_beliefs.clear()
                 self.cooldown_until.clear()
                 self.failure_counts.clear()
+                self.approach_exhausted_fingerprints.clear()
                 self.decision_history.clear()
                 self.group_history.clear()
                 self.region_history.clear()
@@ -530,6 +563,7 @@ class SemanticRuleDecisionNode:
                     cooldown_s=self.model_circuit_breaker.cooldown_s,
                 )
                 self.completion_tracker.reset()
+                self.terminal_no_plan_exit_tracker.reset()
             target_context = payload.get("target_context") or {}
             target_key = json.dumps(target_context, ensure_ascii=False, sort_keys=True)
             previous_target_key = json.dumps(
@@ -611,13 +645,24 @@ class SemanticRuleDecisionNode:
             )
         self._record_decision_result(payload)
         detail = payload.get("detail") or {}
+        approach_precondition_failed = bool(
+            status != "SUCCEEDED"
+            and self.active_behavior_type == "INTERACT"
+            and is_interaction_pose_precondition_failure(detail)
+        )
         preempted_by_target = bool(
             status == "CANCELED"
             and str(detail.get("reason") or "") == "preempted_by_target"
         )
         if not preempted_by_target:
             self.completion_tracker.note_feedback(payload)
-        if candidate_id and not preempted_by_target:
+            self.terminal_no_plan_exit_tracker.note_feedback(
+                payload,
+                observation_step=self._observation_step(
+                    self.latest_candidates_payload
+                ),
+            )
+        if candidate_id and not preempted_by_target and not approach_precondition_failed:
             if status == "SUCCEEDED":
                 self.failure_counts.pop(candidate_id, None)
                 cooldown_s = self.success_cooldown_s
@@ -629,17 +674,27 @@ class SemanticRuleDecisionNode:
                     failure_count,
                 )
             self.cooldown_until[candidate_id] = time.monotonic() + cooldown_s
+        elif candidate_id and approach_precondition_failed:
+            fingerprint = self._candidate_fingerprint_for_id(candidate_id)
+            if fingerprint:
+                self.approach_exhausted_fingerprints.add(fingerprint)
         if (
             status != "SUCCEEDED"
             and not preempted_by_target
             and self.active_behavior_type == "INTERACT"
+            and not approach_precondition_failed
         ):
             target_id = self._interaction_target_id(candidate_id)
             if target_id:
                 self.cooldown_until[target_id] = time.monotonic() + max(
                     0.0, self.interaction_target_failure_cooldown_s
                 )
-        if status != "SUCCEEDED" and not preempted_by_target:
+        if approach_precondition_failed:
+            # No wall-clock cooldown: the executor already consumed its finite
+            # per-option pose-poll budget.  Move directly to another eligible
+            # subgoal (or finish if there is none).
+            self.next_decision_time = 0.0
+        elif status != "SUCCEEDED" and not preempted_by_target:
             self.next_decision_time = time.monotonic() + self.failure_retry_delay_s
         active_behavior_type = self.active_behavior_type
         pending_traversal_id = str(
@@ -766,6 +821,53 @@ class SemanticRuleDecisionNode:
         self.active_interaction_candidate = {}
         self.active_target_goal = False
         self.preempt_requested_for_decision_id = ""
+        self._publish_inactive_selection(payload)
+
+    def _candidate_fingerprint_for_id(self, candidate_id: str) -> str:
+        """Return the current pose-sensitive fingerprint for an active candidate."""
+
+        for raw_candidate in self.latest_candidates_payload.get("candidates") or []:
+            if str(raw_candidate.get("candidate_id") or "") != candidate_id:
+                continue
+            try:
+                return candidate_fingerprint(BehaviorCandidate(**raw_candidate))
+            except TypeError:
+                return ""
+        return ""
+
+    def _publish_inactive_selection(self, feedback: dict) -> None:
+        """Clear the latched active selection without deleting terminal history."""
+
+        terminal = {
+            "decision_id": str(feedback.get("decision_id") or ""),
+            "candidate_id": str(feedback.get("candidate_id") or ""),
+            "behavior_type": str(feedback.get("behavior_type") or ""),
+            "target_id": str(feedback.get("target_id") or ""),
+            "target_name": str(feedback.get("target_name") or ""),
+            "status": str(feedback.get("status") or ""),
+            "success": feedback.get("success"),
+        }
+        payload = {
+            "active": False,
+            "selection_state": "inactive",
+            "decision_id": "",
+            "candidate_id": "",
+            "behavior_type": "",
+            "target_id": "",
+            "target_name": "",
+            "goal_xyyaw": [],
+            "episode_id": str(
+                self.latest_candidates_payload.get("episode_id") or ""
+            ),
+            "graph_revision": int(
+                self.latest_candidates_payload.get("graph_revision", 0) or 0
+            ),
+            "cleared_at": time.time(),
+            "terminal": terminal,
+        }
+        self.selected_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        )
 
     def _publish_post_interaction_refresh_trace(
         self, phase: str, refresh_status: PostInteractionRefreshStatus
@@ -978,6 +1080,7 @@ class SemanticRuleDecisionNode:
             now=now,
             region_history=region_history,
         )
+        execution_eligible_candidate_count = len(eligible)
         priority_target = next(
             (
                 candidate
@@ -1219,6 +1322,7 @@ class SemanticRuleDecisionNode:
                     now=time.monotonic(),
                     region_history=latest_region_history,
                 )
+                execution_eligible_candidate_count = len(latest_eligible)
                 latest_selection_pool = latest_eligible
                 if (
                     self.policy_backend == "model"
@@ -1298,6 +1402,21 @@ class SemanticRuleDecisionNode:
                         )
                         if repeat_reason:
                             selection_override_reason += f":{repeat_reason}"
+        execution_exploration_context = (
+            execution_snapshot.get("exploration_context") or {}
+        )
+        terminal_no_plan_exit = self.terminal_no_plan_exit_tracker.update(
+            execution_snapshot,
+            has_active_behavior=bool(self.active_candidate_id),
+            has_executable_candidate=selected is not None,
+            startup_scan_pending=(
+                priority_startup_scan is not None
+                or not bool(
+                    execution_exploration_context.get("initial_scan_complete", True)
+                )
+            ),
+            eligible_candidate_count=execution_eligible_candidate_count,
+        )
         executed_group_id = (
             candidate_group_id(
                 selected,
@@ -1364,6 +1483,14 @@ class SemanticRuleDecisionNode:
             "stale_selected_candidate": stale_selected,
             "stale_fallback_used": stale_fallback_used,
             "candidate_validation_reason": candidate_validation_reason,
+            "terminal_no_plan_exit": {
+                "armed": bool(
+                    self.terminal_no_plan_exit_tracker.terminal_failure
+                ),
+                "complete": bool(terminal_no_plan_exit),
+                "reason": self.terminal_no_plan_exit_tracker.reason,
+                "detail": dict(self.terminal_no_plan_exit_tracker.last_detail),
+            },
             "input_selected_fingerprint": input_selected_fingerprint,
             "publish_selected_fingerprint": (
                 candidate_fingerprint(selected) if selected is not None else ""
@@ -1377,6 +1504,12 @@ class SemanticRuleDecisionNode:
         self.trace_pub.publish(
             String(data=json.dumps(trace, ensure_ascii=False, separators=(",", ":")))
         )
+        if terminal_no_plan_exit:
+            self.goal_complete = True
+            detail = dict(self.terminal_no_plan_exit_tracker.last_detail)
+            detail["eligibility_rejections"] = dict(eligibility_rejections)
+            self._publish_goal_status("EXPLORATION_STALLED", detail=detail)
+            return
         if selected is None:
             return
         with self.state_lock:
@@ -1385,6 +1518,8 @@ class SemanticRuleDecisionNode:
             selection = selected.to_dict()
             selection.update(
                 {
+                    "active": True,
+                    "selection_state": "active",
                     "decision_id": decision_id,
                     "selected_at": time.time(),
                     "episode_id": execution_snapshot.get("episode_id", ""),
@@ -1542,6 +1677,9 @@ class SemanticRuleDecisionNode:
     ) -> tuple[list[BehaviorCandidate], dict[str, str]]:
         with self.state_lock:
             cooldown_until = dict(self.cooldown_until)
+            approach_exhausted_fingerprints = set(
+                self.approach_exhausted_fingerprints
+            )
             target_goal_complete = bool(self.target_goal_complete)
             terminal_post_interaction_traversal_ids = set(
                 self.terminal_post_interaction_traversal_ids
@@ -1571,11 +1709,16 @@ class SemanticRuleDecisionNode:
                 rejected[candidate_id] = "target_goal_already_complete"
                 continue
             try:
-                candidates.append(BehaviorCandidate(**payload))
+                candidate = BehaviorCandidate(**payload)
             except TypeError:
                 rejected[candidate_id or f"invalid_{len(rejected)}"] = (
                     "invalid_candidate_payload"
                 )
+                continue
+            if candidate_fingerprint(candidate) in approach_exhausted_fingerprints:
+                rejected[candidate_id] = "interaction_approach_attempts_exhausted"
+                continue
+            candidates.append(candidate)
         candidates, curator_rejections = self.candidate_curator.filter_candidates(
             candidates,
             graph=candidate_snapshot.get("graph_context") or {},

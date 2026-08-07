@@ -13,6 +13,183 @@ class MissionCompletionConfig:
     stagnation_failure_limit: int = 0
 
 
+@dataclass
+class TerminalInteractionNoPlanExitConfig:
+    """Bounded exit after an interaction exhausts all of its plan options.
+
+    This is deliberately narrower than generic action-timeout handling.  A
+    missing ``cmd_vel`` can be a transient ROS/costmap scheduling issue, while
+    ``make_plan_unreachable`` is emitted only after the interaction executor
+    has tried every concrete approach goal.  We still require several later
+    *observation steps* with no executable replacement before ending the
+    episode, so ordinary cooldown/recovery and the mandatory startup scan are
+    not converted into terminal outcomes.
+    """
+
+    enabled: bool = False
+    no_executable_candidate_min_steps: int = 20
+    no_executable_candidate_confirmations: int = 3
+
+
+class TerminalInteractionNoPlanExitTracker:
+    """Track a confirmed no-local-subgoal streak after terminal interaction planning.
+
+    The decision node can receive multiple candidate messages for one simulator
+    observation.  Therefore confirmations are keyed by
+    ``exploration_context.observation_step``, never by ROS message count.
+    """
+
+    REASON = "no_executable_candidates_after_terminal_interaction_no_plan"
+
+    def __init__(
+        self, config: TerminalInteractionNoPlanExitConfig | None = None
+    ) -> None:
+        self.config = config or TerminalInteractionNoPlanExitConfig()
+        self.reset()
+
+    def reset(self) -> None:
+        self.complete = False
+        self.reason = ""
+        self.terminal_failure: dict[str, Any] = {}
+        self.terminal_failure_observation_step: int | None = None
+        self.no_executable_since_observation_step: int | None = None
+        self.last_counted_observation_step: int | None = None
+        self.no_executable_observation_confirmations = 0
+        self.last_detail: dict[str, Any] = {}
+
+    @staticmethod
+    def is_terminal_interaction_no_plan(feedback: dict[str, Any]) -> bool:
+        """Return true only for an executor-confirmed failed interaction plan."""
+
+        status = str(feedback.get("status") or "").upper()
+        behavior_type = str(feedback.get("behavior_type") or "").upper()
+        detail = feedback.get("detail") or {}
+        reason = str(detail.get("reason") or "").casefold()
+        return (
+            status in {"FAILED", "REJECTED"}
+            and behavior_type == "INTERACT"
+            and reason == "make_plan_unreachable"
+        )
+
+    def note_feedback(
+        self, feedback: dict[str, Any], *, observation_step: int | None
+    ) -> bool:
+        """Arm the streak only after a confirmed terminal interaction failure."""
+
+        if not self.config.enabled or not self.is_terminal_interaction_no_plan(feedback):
+            return False
+        detail = dict(feedback.get("detail") or {})
+        self.complete = False
+        self.reason = ""
+        self.terminal_failure = {
+            "candidate_id": str(feedback.get("candidate_id") or ""),
+            "decision_id": str(feedback.get("decision_id") or ""),
+            "behavior_type": str(feedback.get("behavior_type") or ""),
+            "status": str(feedback.get("status") or ""),
+            "detail": detail,
+        }
+        self.terminal_failure_observation_step = observation_step
+        self.no_executable_since_observation_step = observation_step
+        self.last_counted_observation_step = None
+        self.no_executable_observation_confirmations = 0
+        self.last_detail = {}
+        return True
+
+    def clear_for_recovery(self) -> None:
+        """Forget an old terminal failure once an executable replacement exists."""
+
+        self.reset()
+
+    @staticmethod
+    def _observation_step(candidate_snapshot: dict[str, Any]) -> int | None:
+        exploration = candidate_snapshot.get("exploration_context") or {}
+        try:
+            return int(exploration.get("observation_step"))
+        except (TypeError, ValueError):
+            return None
+
+    def update(
+        self,
+        candidate_snapshot: dict[str, Any],
+        *,
+        has_active_behavior: bool,
+        has_executable_candidate: bool,
+        startup_scan_pending: bool,
+        eligible_candidate_count: int,
+    ) -> bool:
+        """Advance only on distinct post-failure simulator observations."""
+
+        if self.complete:
+            return True
+        if not self.config.enabled or not self.terminal_failure:
+            return False
+        if has_active_behavior or has_executable_candidate or startup_scan_pending:
+            self.clear_for_recovery()
+            return False
+
+        observation_step = self._observation_step(candidate_snapshot)
+        # A missing observation-step token cannot establish a simulator-step
+        # streak safely.  This avoids treating bursts of ROS candidate messages
+        # as elapsed simulation time.
+        if observation_step is None:
+            return False
+        if (
+            self.terminal_failure_observation_step is not None
+            and observation_step <= self.terminal_failure_observation_step
+        ):
+            return False
+        if (
+            self.last_counted_observation_step is not None
+            and observation_step <= self.last_counted_observation_step
+        ):
+            return False
+
+        self.last_counted_observation_step = observation_step
+        if self.no_executable_since_observation_step is None:
+            self.no_executable_since_observation_step = observation_step
+        self.no_executable_observation_confirmations += 1
+        elapsed_steps = max(
+            0,
+            observation_step - int(self.no_executable_since_observation_step),
+        )
+        raw_candidate_count = int(
+            candidate_snapshot.get(
+                "candidate_count", len(candidate_snapshot.get("candidates") or [])
+            )
+            or 0
+        )
+        self.last_detail = {
+            "reason": self.REASON,
+            "candidate_sequence": int(candidate_snapshot.get("sequence", 0) or 0),
+            "observation_step": observation_step,
+            "no_executable_since_observation_step": (
+                self.no_executable_since_observation_step
+            ),
+            "no_executable_elapsed_steps": elapsed_steps,
+            "no_executable_observation_confirmations": (
+                self.no_executable_observation_confirmations
+            ),
+            "no_executable_candidate_min_steps": max(
+                0, int(self.config.no_executable_candidate_min_steps)
+            ),
+            "no_executable_candidate_confirmations_required": max(
+                1, int(self.config.no_executable_candidate_confirmations)
+            ),
+            "raw_candidate_count": raw_candidate_count,
+            "eligible_candidate_count": max(0, int(eligible_candidate_count)),
+            "terminal_interaction_failure": dict(self.terminal_failure),
+        }
+        self.complete = (
+            elapsed_steps
+            >= max(0, int(self.config.no_executable_candidate_min_steps))
+            and self.no_executable_observation_confirmations
+            >= max(1, int(self.config.no_executable_candidate_confirmations))
+        )
+        if self.complete:
+            self.reason = self.REASON
+        return self.complete
+
+
 class MissionCompletionTracker:
     def __init__(self, config: MissionCompletionConfig | None = None) -> None:
         self.config = config or MissionCompletionConfig()
