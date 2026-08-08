@@ -70,6 +70,10 @@ filter_height_center: 0.95
 filter_height_tolerance: 0.9
 filter_height_frame: tf_frame_base_link
 pointcloud_scan_range_max: 8.0
+# A finite RGB-D surface beyond range_max still proves the ray is clear to the
+# mapping horizon. Encode it as a no-return ray just below range_max but above
+# maxUrange (7.9 m), so GMapping clears the ray without an occupied endpoint.
+pointcloud_scan_no_return_margin_m: 0.05
 # Full-resolution RGB-D supports a 0.5 degree planar projection. This stays
 # below the 0.1m map cell width through the useful indoor range.
 pointcloud_scan_angle_increment_deg: 0.5

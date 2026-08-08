@@ -25,6 +25,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_PREPARING_EXPLORE,
     STATE_SCANNING,
     STATE_WAITING_FOR_DRAWER_SCAN,
+    STATE_WAITING_FOR_INTERACTION_OBSERVATION,
     STATE_VERIFYING,
     bounded_empty_plan_retry_delay,
     candidate_with_effective_interaction_approach,
@@ -46,7 +47,6 @@ from semantic_decision_py_pkg.behavior_execution import (
     post_interaction_planning_occupancy_fresh_source,
     post_interaction_raw_occupancy_fresh_source,
     prerotation_control_step_budget,
-    prerotation_rgb_step_gate,
     requires_graph_verification,
     is_static_portal_interaction_feedback,
     is_stuck_recovery_failure,
@@ -73,6 +73,8 @@ from semantic_mllm_py_pkg.interaction_prompt import (
     visual_interaction_planning_context,
 )
 from semantic_mllm_py_pkg.schemas import (
+    build_visual_interaction_plan_response_schema,
+    build_visual_verification_response_schema,
     validate_visual_interaction_plan,
     validate_visual_verification,
 )
@@ -83,7 +85,7 @@ import actionlib
 import rospy
 import tf
 from actionlib_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
 from map_msgs.msg import OccupancyGridUpdate
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from nav_msgs.msg import OccupancyGrid, Path
@@ -102,6 +104,242 @@ TERMINAL_STATES = {
 }
 
 
+def _rotation_arc_for_sign(
+    current_yaw: float, target_yaw: float, turn_sign: int
+) -> float:
+    """Return the non-negative CW/CCW arc from ``current`` to ``target``.
+
+    ``angular.z > 0`` is counter-clockwise.  We keep the two arcs separate
+    instead of normalising to the shortest one because a collision-safe turn
+    may have to use the non-shortest side.  The caller still bounds the arc by
+    its finite evaluator-step budget.
+    """
+
+    full_turn = 2.0 * math.pi
+    if int(turn_sign) >= 0:
+        return float((float(target_yaw) - float(current_yaw)) % full_turn)
+    return float((float(current_yaw) - float(target_yaw)) % full_turn)
+
+
+def _costmap_origin_yaw(occupancy: OccupancyGrid) -> float:
+    orientation = occupancy.info.origin.orientation
+    return math.atan2(
+        2.0
+        * (
+            float(orientation.w) * float(orientation.z)
+            + float(orientation.x) * float(orientation.y)
+        ),
+        1.0
+        - 2.0
+        * (
+            float(orientation.y) * float(orientation.y)
+            + float(orientation.z) * float(orientation.z)
+        ),
+    )
+
+
+def circular_costmap_footprint_is_clear(
+    data: list[int] | tuple[int, ...],
+    width: int,
+    height: int,
+    resolution: float,
+    origin_xy: tuple[float, float],
+    origin_yaw: float,
+    center_xy: tuple[float, float],
+    robot_radius_m: float,
+    safety_margin_m: float,
+    *,
+    occupied_threshold: int = 50,
+    unknown_is_blocked: bool = True,
+) -> bool:
+    """Conservatively check the configured circular local-costmap footprint.
+
+    The running stack exposes ``robot_radius`` (0.25 m), not a polygonal
+    footprint.  A disc is therefore the only public footprint contract that
+    can be evaluated consistently by the executor.  Unknown/out-of-map cells
+    are intentionally rejected for direct bridge control.
+    """
+
+    width = int(width)
+    height = int(height)
+    resolution = float(resolution)
+    clearance = max(0.0, float(robot_radius_m) + float(safety_margin_m))
+    if width <= 0 or height <= 0 or resolution <= 0.0:
+        return False
+    if len(data) < width * height:
+        return False
+    origin_x, origin_y = float(origin_xy[0]), float(origin_xy[1])
+    center_x, center_y = float(center_xy[0]), float(center_xy[1])
+    cosine = math.cos(float(origin_yaw))
+    sine = math.sin(float(origin_yaw))
+
+    # Convert the world-space centre to the grid's possibly rotated frame.
+    delta_x = center_x - origin_x
+    delta_y = center_y - origin_y
+    local_center_x = cosine * delta_x + sine * delta_y
+    local_center_y = -sine * delta_x + cosine * delta_y
+    center_col = int(math.floor(local_center_x / resolution))
+    center_row = int(math.floor(local_center_y / resolution))
+    footprint_cells = int(math.ceil(clearance / resolution))
+    for row in range(center_row - footprint_cells, center_row + footprint_cells + 1):
+        for col in range(center_col - footprint_cells, center_col + footprint_cells + 1):
+            local_cell_x = (float(col) + 0.5) * resolution
+            local_cell_y = (float(row) + 0.5) * resolution
+            if math.hypot(local_cell_x - local_center_x, local_cell_y - local_center_y) > clearance:
+                continue
+            if col < 0 or row < 0 or col >= width or row >= height:
+                return False
+            value = int(data[row * width + col])
+            if value >= int(occupied_threshold) or (
+                bool(unknown_is_blocked) and value < 0
+            ):
+                return False
+    return True
+
+
+def circular_costmap_rotation_sweep_is_clear(
+    data: list[int] | tuple[int, ...],
+    width: int,
+    height: int,
+    resolution: float,
+    origin_xy: tuple[float, float],
+    origin_yaw: float,
+    center_xy: tuple[float, float],
+    rotation_arc_rad: float,
+    sweep_step_rad: float,
+    robot_radius_m: float,
+    safety_margin_m: float,
+    *,
+    occupied_threshold: int = 50,
+    unknown_is_blocked: bool = True,
+) -> bool:
+    """Check every sampled pose of a bounded in-place rotation sweep.
+
+    With the currently configured circular footprint the occupied cells are
+    orientation invariant, but we still iterate the requested angular sweep.
+    That keeps the control contract explicit and makes the method safe to
+    replace with a public polygon footprint later without changing callers.
+    """
+
+    arc = max(0.0, float(rotation_arc_rad))
+    step = max(1e-3, float(sweep_step_rad))
+    sample_count = max(1, int(math.ceil(arc / step)))
+    for _sample_index in range(sample_count + 1):
+        if not circular_costmap_footprint_is_clear(
+            data,
+            width,
+            height,
+            resolution,
+            origin_xy,
+            origin_yaw,
+            center_xy,
+            robot_radius_m,
+            safety_margin_m,
+            occupied_threshold=occupied_threshold,
+            unknown_is_blocked=unknown_is_blocked,
+        ):
+            return False
+    return True
+
+
+def circular_costmap_linear_sweep_distance(
+    data: list[int] | tuple[int, ...],
+    width: int,
+    height: int,
+    resolution: float,
+    origin_xy: tuple[float, float],
+    origin_yaw: float,
+    start_xyyaw: tuple[float, float, float],
+    direction_sign: float,
+    requested_distance_m: float,
+    robot_radius_m: float,
+    safety_margin_m: float,
+    *,
+    occupied_threshold: int = 50,
+    unknown_is_blocked: bool = True,
+) -> float:
+    """Return the collision-checked distance of a straight local backoff."""
+
+    requested = max(0.0, float(requested_distance_m))
+    resolution = float(resolution)
+    if requested <= 0.0 or resolution <= 0.0:
+        return 0.0
+    start_x, start_y, yaw = (float(value) for value in start_xyyaw)
+    if not circular_costmap_footprint_is_clear(
+        data,
+        width,
+        height,
+        resolution,
+        origin_xy,
+        origin_yaw,
+        (start_x, start_y),
+        robot_radius_m,
+        safety_margin_m,
+        occupied_threshold=occupied_threshold,
+        unknown_is_blocked=unknown_is_blocked,
+    ):
+        return 0.0
+    sample_step = max(0.02, 0.5 * resolution)
+    direction = 1.0 if float(direction_sign) >= 0.0 else -1.0
+    safe_distance = 0.0
+    distance = min(sample_step, requested)
+    while distance <= requested + 1e-9:
+        center = (
+            start_x + direction * distance * math.cos(yaw),
+            start_y + direction * distance * math.sin(yaw),
+        )
+        if not circular_costmap_footprint_is_clear(
+            data,
+            width,
+            height,
+            resolution,
+            origin_xy,
+            origin_yaw,
+            center,
+            robot_radius_m,
+            safety_margin_m,
+            occupied_threshold=occupied_threshold,
+            unknown_is_blocked=unknown_is_blocked,
+        ):
+            break
+        safe_distance = min(distance, requested)
+        if safe_distance >= requested:
+            break
+        distance = min(requested, distance + sample_step)
+    return safe_distance
+
+
+def rear_dwa_oscillation_detected(
+    samples: list[dict] | tuple[dict, ...],
+    *,
+    minimum_samples: int,
+    minimum_sign_flips: int,
+    displacement_m: float,
+    maximum_displacement_m: float,
+    goal_distance_reduction_m: float,
+    minimum_goal_distance_reduction_m: float,
+) -> bool:
+    """Detect left/right DWA churn only when it has made no real progress."""
+
+    relevant = [
+        sample
+        for sample in samples
+        if abs(float(sample.get("angular_z", 0.0))) > 1e-6
+    ]
+    if len(relevant) < max(2, int(minimum_samples)):
+        return False
+    signs = [1 if float(sample["angular_z"]) > 0.0 else -1 for sample in relevant]
+    sign_flips = sum(
+        1 for previous, current in zip(signs, signs[1:]) if previous != current
+    )
+    return bool(
+        sign_flips >= max(1, int(minimum_sign_flips))
+        and float(displacement_m) < max(0.0, float(maximum_displacement_m))
+        and float(goal_distance_reduction_m)
+        < max(0.0, float(minimum_goal_distance_reduction_m))
+    )
+
+
 class SemanticBehaviorExecutor:
     def __init__(self) -> None:
         env_path = os.environ.get("SEMANTIC_DECISION_ENV_FILE")
@@ -118,7 +356,14 @@ class SemanticBehaviorExecutor:
             module3=str(ablation_config.get("module3", "rule_verified")),
         )
         model_config = rospy.get_param("~model", {}) or {}
-        model_name = str(model_config.get("model", "") or "")
+        # The explicitly selected semantic-model env file is the cross-module
+        # source of truth.  It must override a legacy nonempty YAML model name
+        # so Module 3 follows the same local endpoint/model as Modules 1 and 2.
+        model_name = str(
+            os.environ.get("SEMANTIC_MODEL_NAME")
+            or model_config.get("model", "")
+            or ""
+        )
         self.mllm_client = MLLMClient(
             client_config_from_env(
                 model=model_name or None,
@@ -130,8 +375,8 @@ class SemanticBehaviorExecutor:
             int(model_config.get("skill_max_output_tokens", min(self.mllm_client.config.max_tokens, 256))),
         )
         self.verification_max_output_tokens = max(
-            64,
-            int(model_config.get("verification_max_output_tokens", min(self.mllm_client.config.max_tokens, 192))),
+            128,
+            int(model_config.get("verification_max_output_tokens", min(self.mllm_client.config.max_tokens, 256))),
         )
         self.skill_timeout_s = max(
             0.1, float(model_config.get("skill_timeout_s", 4.0))
@@ -145,11 +390,24 @@ class SemanticBehaviorExecutor:
         self.mllm_crop_max_side_px = max(
             128, int(model_config.get("crop_max_side_px", 512))
         )
+        self.mllm_full_image_max_side_px = max(
+            256, int(model_config.get("full_image_max_side_px", 960))
+        )
         self.drawer_scan_wait_timeout_s = max(
             0.1, float(config.get("drawer_scan_wait_timeout_s", 8.0))
         )
         self.drawer_scan_wait_poll_interval_s = max(
             0.01, float(config.get("drawer_scan_wait_poll_interval_s", 0.10))
+        )
+        # A targeted M1 refresh is an observation barrier, not a simulator
+        # motion timeout.  It waits for a later RGB+detection pair and then
+        # consumes the public attribute patch; physical actions remain step
+        # gated elsewhere.
+        self.interaction_observation_timeout_s = max(
+            0.1, float(config.get("interaction_observation_timeout_s", 30.0))
+        )
+        self.interaction_observation_poll_interval_s = max(
+            0.01, float(config.get("interaction_observation_poll_interval_s", 0.05))
         )
         startup_scan_config = rospy.get_param("~startup_scan", {}) or {}
         self.startup_scan_enabled = bool(startup_scan_config.get("enabled", False))
@@ -186,6 +444,7 @@ class SemanticBehaviorExecutor:
                 ),
                 interaction_timeout_s=float(config.get("interaction_timeout_s", 30.0)),
                 drawer_scan_wait_timeout_s=self.drawer_scan_wait_timeout_s,
+                interaction_observation_timeout_s=self.interaction_observation_timeout_s,
                 verification_timeout_s=float(config.get("verification_timeout_s", 30.0)),
                 explore_prepare_timeout_s=float(
                     config.get("explore_prepare_timeout_s", 10.0)
@@ -203,8 +462,12 @@ class SemanticBehaviorExecutor:
         self.rear_goal_prerotate_enabled = bool(
             config.get("rear_goal_prerotate_enabled", True)
         )
-        self.rear_goal_enter_angle_rad = float(
-            config.get("rear_goal_enter_angle_rad", 1.75)
+        self.rear_goal_enter_angle_rad = min(
+            math.pi,
+            max(
+                0.0,
+                float(config.get("rear_goal_enter_angle_rad", math.pi / 2.0)),
+            ),
         )
         self.rear_goal_exit_angle_rad = float(
             config.get("rear_goal_exit_angle_rad", 0.34)
@@ -216,7 +479,7 @@ class SemanticBehaviorExecutor:
             config.get("rear_goal_prerotate_timeout_s", 12.0)
         )
         self.rear_goal_prerotate_step_sync_enabled = bool(
-            config.get("rear_goal_prerotate_step_sync_enabled", False)
+            config.get("rear_goal_prerotate_step_sync_enabled", True)
         )
         self.rear_goal_prerotate_control_dt_s = max(
             1e-3,
@@ -224,11 +487,29 @@ class SemanticBehaviorExecutor:
         )
         self.rear_goal_prerotate_max_control_steps = max(
             1,
-            int(config.get("rear_goal_prerotate_max_control_steps", 12)),
+            int(config.get("rear_goal_prerotate_max_control_steps", 14)),
         )
         self.rear_goal_prerotate_step_sync_stall_timeout_s = max(
             0.1,
             float(config.get("rear_goal_prerotate_step_sync_stall_timeout_s", 2.0)),
+        )
+        # Rear-goal pre-rotation is an evaluator-synchronous cmd_vel behavior,
+        # like the mandatory startup scan.  Keep its event buffer independent
+        # so an old scan acknowledgement can never authorize a later turn.
+        self.rear_goal_prerotate_gate_max_pending_steps = max(
+            2,
+            int(config.get("rear_goal_prerotate_gate_max_pending_steps", 32)),
+        )
+        self.rear_goal_prerotate_gate_pair_max_age_s = max(
+            0.0,
+            float(config.get("rear_goal_prerotate_gate_pair_max_age_s", 0.75)),
+        )
+        # A lost ROS relay delivery may consume one evaluator action as a
+        # timeout noop.  Retry a small, explicit number of *delivery* windows
+        # without allowing yaw-only control to become an unbounded loop.
+        self.rear_goal_prerotate_delivery_retry_steps = max(
+            0,
+            int(config.get("rear_goal_prerotate_delivery_retry_steps", 2)),
         )
         self.rear_goal_lookahead_m = float(
             config.get("rear_goal_lookahead_m", 0.75)
@@ -239,21 +520,155 @@ class SemanticBehaviorExecutor:
         self.rear_goal_pi_turn_sign = int(
             config.get("rear_goal_pi_turn_sign", -1)
         )
+        # Direct base actions bypass DWA's trajectory checker.  They are
+        # therefore admitted only against a recent local OccupancyGrid and a
+        # conservative public circular footprint (the current costmap exposes
+        # robot_radius, not a polygon footprint).
+        self.rear_goal_local_costmap_max_age_s = max(
+            0.0,
+            float(config.get("rear_goal_local_costmap_max_age_s", 0.75)),
+        )
+        self.rear_goal_robot_radius_m = max(
+            0.0,
+            float(config.get("rear_goal_robot_radius_m", 0.25)),
+        )
+        self.rear_goal_safety_margin_m = max(
+            0.0,
+            float(config.get("rear_goal_safety_margin_m", 0.05)),
+        )
+        self.rear_goal_costmap_occupied_threshold = int(
+            config.get("rear_goal_costmap_occupied_threshold", 50)
+        )
+        self.rear_goal_unknown_is_blocked = bool(
+            config.get("rear_goal_unknown_is_blocked", True)
+        )
+        self.rear_goal_rotation_sweep_step_rad = max(
+            1e-3,
+            float(config.get("rear_goal_rotation_sweep_step_rad", 0.10)),
+        )
+        self.rear_goal_cmd_vel_cancel_wait_s = max(
+            0.0,
+            float(config.get("rear_goal_cmd_vel_cancel_wait_s", 0.50)),
+        )
+        self.rear_goal_oscillation_window_steps = max(
+            2,
+            int(config.get("rear_goal_oscillation_window_steps", 4)),
+        )
+        self.rear_goal_oscillation_min_sign_flips = max(
+            1,
+            int(config.get("rear_goal_oscillation_min_sign_flips", 2)),
+        )
+        self.rear_goal_oscillation_max_displacement_m = max(
+            0.0,
+            float(config.get("rear_goal_oscillation_max_displacement_m", 0.05)),
+        )
+        self.rear_goal_oscillation_min_goal_reduction_m = max(
+            0.0,
+            float(config.get("rear_goal_oscillation_min_goal_reduction_m", 0.02)),
+        )
+        self.rear_goal_cmd_vel_max_age_s = max(
+            0.0,
+            float(config.get("rear_goal_cmd_vel_max_age_s", 0.50)),
+        )
+        self.rear_goal_reverse_enabled = bool(
+            config.get("rear_goal_reverse_enabled", True)
+        )
+        self.rear_goal_reverse_distance_m = max(
+            0.0,
+            float(config.get("rear_goal_reverse_distance_m", 0.15)),
+        )
+        self.rear_goal_reverse_min_distance_m = max(
+            0.0,
+            float(config.get("rear_goal_reverse_min_distance_m", 0.05)),
+        )
+        self.rear_goal_reverse_speed_mps = max(
+            1e-3,
+            float(config.get("rear_goal_reverse_speed_mps", 0.10)),
+        )
+        self.rear_goal_reverse_max_control_steps = max(
+            1,
+            int(config.get("rear_goal_reverse_max_control_steps", 10)),
+        )
         self.final_align_enabled = bool(config.get("final_align_enabled", True))
         self.final_align_max_distance_m = float(
-            config.get("final_align_max_distance_m", config.get("interaction_final_align_max_distance_m", 0.12))
+            config.get("final_align_max_distance_m", 0.12)
         )
         self.final_align_yaw_tolerance_rad = float(
-            config.get("final_align_yaw_tolerance_rad", config.get("interaction_final_align_yaw_tolerance_rad", 0.15))
+            config.get("final_align_yaw_tolerance_rad", 0.15)
         )
         self.final_align_rotate_speed_rad_s = float(
-            config.get("final_align_rotate_speed_rad_s", config.get("interaction_final_align_rotate_speed_rad_s", 0.30))
+            config.get("final_align_rotate_speed_rad_s", 0.30)
         )
         self.final_align_trigger_delay_s = float(
-            config.get("final_align_trigger_delay_s", config.get("interaction_final_align_trigger_delay_s", 2.0))
+            config.get("final_align_trigger_delay_s", 2.0)
         )
         self.final_align_timeout_s = float(
-            config.get("final_align_timeout_s", config.get("interaction_final_align_timeout_s", 15.0))
+            config.get("final_align_timeout_s", 15.0)
+        )
+        # Interaction approaches have a different terminal geometry contract:
+        # their safe standoff and desired facing direction are part of the
+        # public bridge precondition.  Keep this independently configurable so
+        # enabling it cannot re-enable final yaw control for ordinary NAVIGATE
+        # or EXPLORE behaviours.
+        self.interaction_final_align_enabled = bool(
+            config.get("interaction_final_align_enabled", True)
+        )
+        self.interaction_final_align_max_distance_m = max(
+            0.05,
+            float(config.get("interaction_final_align_max_distance_m", 0.35)),
+        )
+        self.interaction_final_align_yaw_tolerance_rad = max(
+            0.05,
+            float(config.get("interaction_final_align_yaw_tolerance_rad", 0.15)),
+        )
+        self.interaction_final_align_rotate_speed_rad_s = float(
+            config.get("interaction_final_align_rotate_speed_rad_s", 0.30)
+        )
+        self.interaction_final_align_trigger_delay_s = max(
+            0.0,
+            float(config.get("interaction_final_align_trigger_delay_s", 2.0)),
+        )
+        self.interaction_final_align_timeout_s = max(
+            0.1,
+            float(config.get("interaction_final_align_timeout_s", 15.0)),
+        )
+        # Cmd_vel is admitted by the simulator only in an RGB/fresh-command
+        # window.  Keep interaction final alignment on its own gate so an old
+        # navigation/scan command can never be reused to rotate at a bridge
+        # interaction pose.
+        self.interaction_final_align_step_sync_enabled = bool(
+            config.get("interaction_final_align_step_sync_enabled", True)
+        )
+        self.interaction_final_align_control_dt_s = max(
+            1e-3,
+            float(config.get("interaction_final_align_control_dt_s", 0.2)),
+        )
+        self.interaction_final_align_max_control_steps = max(
+            1,
+            # At 0.30 rad/s × 0.20 s, a raw full-pi turn spans 53 discrete
+            # command windows.  Keep a small tracking margin while retaining
+            # a strict finite interaction-only cap.
+            int(config.get("interaction_final_align_max_control_steps", 56)),
+        )
+        self.interaction_final_align_step_sync_stall_timeout_s = max(
+            0.1,
+            float(
+                config.get(
+                    "interaction_final_align_step_sync_stall_timeout_s", 2.0
+                )
+            ),
+        )
+        self.interaction_final_align_gate_max_pending_steps = max(
+            2,
+            int(config.get("interaction_final_align_gate_max_pending_steps", 32)),
+        )
+        self.interaction_final_align_gate_pair_max_age_s = max(
+            0.0,
+            float(config.get("interaction_final_align_gate_pair_max_age_s", 0.75)),
+        )
+        self.interaction_final_align_delivery_retry_steps = max(
+            0,
+            int(config.get("interaction_final_align_delivery_retry_steps", 2)),
         )
         self.evaluator_opaque_open_only = bool(
             config.get("evaluator_opaque_open_only", False)
@@ -343,7 +758,7 @@ class SemanticBehaviorExecutor:
             config.get("stuck_recovery_obstacle_escape_distance_m", 0.35)
         )
         self.stuck_recovery_robot_radius_m = float(
-            config.get("stuck_recovery_robot_radius_m", 0.30)
+            config.get("stuck_recovery_robot_radius_m", 0.25)
         )
         self.stuck_recovery_safety_margin_m = float(
             config.get("stuck_recovery_safety_margin_m", 0.05)
@@ -374,7 +789,7 @@ class SemanticBehaviorExecutor:
         )
         self.interaction_approach_fallback_max_attempts = max(
             1,
-            int(config.get("interaction_approach_fallback_max_attempts", 3)),
+            int(config.get("interaction_approach_fallback_max_attempts", 4)),
         )
         self.interaction_approach_fallback_cancel_wait_s = max(
             0.0,
@@ -390,6 +805,8 @@ class SemanticBehaviorExecutor:
         self.lock = threading.RLock()
         self.selection: dict | None = None
         self.latest_graph: dict = {}
+        self._interaction_observation_requests: dict[str, dict] = {}
+        self._latest_attribute_updates: dict[str, dict] = {}
         self._last_explore_reservation_publish_at = 0.0
         self._explore_reservation_publish_count = 0
         self._explore_feedback_received_count = 0
@@ -399,6 +816,12 @@ class SemanticBehaviorExecutor:
         self._stuck_failure_origin_xy: tuple[float, float] | None = None
         self._stuck_failure_candidate_ids: set[str] = set()
         self._latest_occupancy: OccupancyGrid | None = None
+        self._latest_occupancy_received_at = 0.0
+        self._latest_cmd_vel_stamped: dict | None = None
+        self._rear_goal_turn_locks: dict[str, dict] = {}
+        self._rear_dwa_monitor: dict | None = None
+        self._executor_cmd_vel_lease_mode = ""
+        self._last_rear_goal_recovery_detail: dict = {}
         # The post-open continuation is a causal map pipeline, not simply a
         # new global-costmap notification: raw SLAM OCC -> semantic planning
         # OCC (the StaticLayer input) -> global costmap.  Counters are local
@@ -441,6 +864,14 @@ class SemanticBehaviorExecutor:
             max_pending_steps=self.startup_scan_max_pending_steps,
             max_pair_age_s=self.startup_scan_pair_max_age_s,
         )
+        self._rear_goal_prerotate_gate = StepCommandGate(
+            max_pending_steps=self.rear_goal_prerotate_gate_max_pending_steps,
+            max_pair_age_s=self.rear_goal_prerotate_gate_pair_max_age_s,
+        )
+        self._interaction_final_align_gate = StepCommandGate(
+            max_pending_steps=self.interaction_final_align_gate_max_pending_steps,
+            max_pair_age_s=self.interaction_final_align_gate_pair_max_age_s,
+        )
         self._startup_scan_progress: dict = {}
         self._latest_rgb_step_seq: int | None = None
         self._latest_rgb_step_received_at = 0.0
@@ -452,6 +883,7 @@ class SemanticBehaviorExecutor:
         self.active_skill_plan: dict = {}
         self.pending_skill_actions: list[dict] = []
         self.interaction_command_sequence = 0
+        self.interaction_observation_sequence = 0
         self.verification_retries = 0
         self.model_events: list[dict] = []
         self.feedback_pub = rospy.Publisher(
@@ -477,6 +909,14 @@ class SemanticBehaviorExecutor:
             String,
             queue_size=4,
             latch=True,
+        )
+        self.attribute_refresh_request_pub = rospy.Publisher(
+            topics.get(
+                "attribute_refresh_requests",
+                "/semantic_mapping/attribute_refresh_requests",
+            ),
+            String,
+            queue_size=8,
         )
         self.cmd_vel_pub = rospy.Publisher(
             topics.get("cmd_vel", "/cmd_vel"), Twist, queue_size=2
@@ -511,6 +951,12 @@ class SemanticBehaviorExecutor:
             queue_size=10,
         )
         rospy.Subscriber(
+            topics.get("attribute_updates", "/semantic_mapping/attribute_updates"),
+            String,
+            self._attribute_update_callback,
+            queue_size=16,
+        )
+        rospy.Subscriber(
             topics.get("unified_graph", "/semantic_mapping/unified_graph"),
             String,
             self._graph_callback,
@@ -521,6 +967,16 @@ class SemanticBehaviorExecutor:
             OccupancyGrid,
             self._occupancy_callback,
             queue_size=1,
+        )
+        # The bridge publishes the command actually eligible for the next
+        # simulator action here.  We only use it while a move_base goal owns
+        # navigation, to detect DWA left/right churn; executor-originated
+        # recovery commands are gated separately and never enter that monitor.
+        rospy.Subscriber(
+            topics.get("cmd_vel_stamped", "/cmd_vel_stamped"),
+            TwistStamped,
+            self._cmd_vel_stamped_callback,
+            queue_size=16,
         )
         rospy.Subscriber(
             topics.get("raw_occupancy_grid", "/struct_mapping/occ_map"),
@@ -567,6 +1023,10 @@ class SemanticBehaviorExecutor:
         if (
             self.rear_goal_prerotate_step_sync_enabled
             or self.startup_scan_enabled
+            or (
+                self.interaction_final_align_enabled
+                and self.interaction_final_align_step_sync_enabled
+            )
             or self.interaction_approach_pose_poll_max_attempts > 1
         ):
             rospy.Subscriber(
@@ -575,7 +1035,14 @@ class SemanticBehaviorExecutor:
                 self._step_sync_callback,
                 queue_size=32,
             )
-        if self.startup_scan_enabled:
+        if (
+            self.startup_scan_enabled
+            or self.rear_goal_prerotate_step_sync_enabled
+            or (
+                self.interaction_final_align_enabled
+                and self.interaction_final_align_step_sync_enabled
+            )
+        ):
             rospy.Subscriber(
                 topics.get("fresh_command_gate", "/molmo_spaces/fresh_cmd_gate"),
                 String,
@@ -604,12 +1071,14 @@ class SemanticBehaviorExecutor:
             self.active_skill_plan = {}
             self.pending_skill_actions = []
             self.interaction_command_sequence = 0
+            self.interaction_observation_sequence = 0
             self.verification_retries = 0
             self.model_events = []
             decision_id = str(selection.get("decision_id") or "")
             if decision_id:
                 self._drawer_scan_wait_contexts.pop(decision_id, None)
                 self._drawer_scan_wait_records.pop(decision_id, None)
+                self._interaction_observation_requests.pop(decision_id, None)
             commands = self.machine.start(selection)
             if self.machine.state == STATE_VERIFYING and requires_graph_verification(
                 self.ablation.module3, selection
@@ -694,6 +1163,74 @@ class SemanticBehaviorExecutor:
                 return
         self._dispatch(commands)
 
+    def _attribute_update_callback(self, message: String) -> None:
+        """Consume only the exact fresh M1 response requested by this executor.
+
+        Attribute discovery normally updates the graph asynchronously and must
+        never advance an active interaction.  This path is different: an
+        unknown portal has reached an observation pose and explicitly asked M1
+        for a post-pose RGB+detection pair.  Match the opaque request ID and
+        preserve failed responses as a bounded re-observation attempt.
+        """
+
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        updates = payload.get("updates") if isinstance(payload, dict) else None
+        if not isinstance(updates, list):
+            return
+        commands: list[dict] = []
+        with self.lock:
+            if (
+                self.selection is None
+                or self.machine.state != STATE_WAITING_FOR_INTERACTION_OBSERVATION
+            ):
+                return
+            decision_id = str(self.selection.get("decision_id") or "")
+            request = dict(self._interaction_observation_requests.get(decision_id) or {})
+            if not request:
+                return
+            active_episode = str(self.selection.get("episode_id") or "")
+            payload_episode = str(payload.get("episode_id") or "")
+            if active_episode and payload_episode and active_episode != payload_episode:
+                return
+            for raw_update in updates:
+                if not isinstance(raw_update, dict):
+                    continue
+                update = dict(raw_update)
+                object_id = str(update.get("object_id") or "")
+                if object_id:
+                    self._latest_attribute_updates[object_id] = update
+                if not bool(update.get("targeted_refresh", False)):
+                    continue
+                if str(update.get("targeted_refresh_request_id") or "") != str(
+                    request.get("request_id") or ""
+                ):
+                    continue
+                expected_object_ids = {
+                    str(request.get("object_id") or ""),
+                    str(request.get("node_id") or ""),
+                }
+                expected_object_ids.discard("")
+                if expected_object_ids and object_id not in expected_object_ids:
+                    continue
+                # pending is an acknowledgement that the fresh pair was
+                # queued, not a new visual judgement. Wait for ready/failed.
+                status = str(update.get("attribute_status") or "").casefold()
+                if status == "pending":
+                    return
+                update.setdefault("attribute_source", update.get("source") or "")
+                update.setdefault("attribute_capture_step", update.get("observation_capture_step"))
+                if status == "ready":
+                    # The targeted request itself can only be consumed by a
+                    # later visible detection; do not require a hidden GT flag.
+                    update.setdefault("is_currently_visible", True)
+                commands = self.machine.on_interaction_observation_result(update)
+                self._interaction_observation_requests.pop(decision_id, None)
+                break
+        self._dispatch(commands)
+
     def _interaction_result_callback(self, message: String) -> None:
         try:
             payload = json.loads(message.data)
@@ -759,22 +1296,7 @@ class SemanticBehaviorExecutor:
                     self.machine.state == STATE_VERIFYING
                     and self.ablation.module3 == "mllm_skill_verified"
                 ):
-                    if self.evaluator_opaque_open_only and bool(payload.get("success")):
-                        # The V3 evaluator exposes interaction as a sealed semantic
-                        # skill: success is the public postcondition contract.  A
-                        # second visual classifier can produce false negatives and
-                        # retry an already-open object, while no joint state is
-                        # available (or needed) outside the sealed skill.
-                        commands.extend(
-                            self.machine.on_verification_result(
-                                True,
-                                detail={
-                                    **payload,
-                                    "verification_mode": "evaluator_skill_postcondition",
-                                },
-                            )
-                        )
-                    elif is_drawer_scan:
+                    if is_drawer_scan:
                         # A drawer scan intentionally closes each drawer after its
                         # low-view observation.  Re-checking the final exterior
                         # crop as though it should remain open would reject a
@@ -883,6 +1405,86 @@ class SemanticBehaviorExecutor:
         }
         return self.machine.on_interaction_result(False, detail=exhausted_detail)
 
+    def _retry_interaction_approach_after_visual_gate_locked(
+        self, payload: dict
+    ) -> list[dict]:
+        """Re-observe a container from the next stored approach viewpoint.
+
+        Module 3's side-view rejection happens before the bridge receives an
+        action.  It is therefore an approach/viewpoint failure, not evidence
+        that the container itself is non-interactable.
+        """
+
+        candidate = dict(self.machine.candidate or self.selection or {})
+        metadata = candidate.get("metadata") or {}
+        attempts = [
+            dict(item)
+            for item in metadata.get("interaction_approach_attempts") or []
+            if isinstance(item, dict)
+        ]
+        selected_option_index = max(
+            0, int(metadata.get("interaction_approach_goal_option_index", 0) or 0)
+        )
+        visual_plan = dict(payload.get("visual_plan") or {})
+        if attempts:
+            attempts[-1]["outcome"] = "visual_reposition_required"
+            attempts[-1]["visual_gate"] = visual_plan
+        else:
+            attempts.append(
+                {
+                    "index": selected_option_index,
+                    "goal_xyyaw": list(
+                        metadata.get("effective_interaction_approach_pose_xyyaw")
+                        or (candidate.get("interaction_command") or {}).get(
+                            "interaction_approach_pose_xyyaw"
+                        )
+                        or []
+                    ),
+                    "outcome": "visual_reposition_required",
+                    "visual_gate": visual_plan,
+                }
+            )
+        goal_option_count = len(navigation_goal_options(candidate))
+        failure_detail = {
+            "reason": "visual_reposition_required",
+            "failure_reason": "visual_reposition_required",
+            "visual_plan": visual_plan,
+            "target_bbox_available": bool(payload.get("target_bbox_available")),
+        }
+        next_option_index = next_interaction_approach_option_index(
+            behavior_type=str(candidate.get("behavior_type") or ""),
+            failure_detail=failure_detail,
+            selected_option_index=selected_option_index,
+            attempted_navigation_count=len(attempts),
+            max_navigation_attempts=self.interaction_approach_fallback_max_attempts,
+            goal_option_count=goal_option_count,
+        )
+        self.active_skill_plan = {}
+        self.pending_skill_actions = []
+        if next_option_index is not None:
+            rospy.loginfo(
+                "[semantic_behavior_executor] M3 requested container re-observation; "
+                "retrying approach option %d/%d (attempt %d/%d)",
+                next_option_index + 1,
+                goal_option_count,
+                len(attempts) + 1,
+                self.interaction_approach_fallback_max_attempts,
+            )
+            return self.machine.retry_interaction_approach(
+                start_goal_option_index=next_option_index,
+                interaction_approach_attempts=attempts,
+                detail=failure_detail,
+            )
+        exhausted_detail = {
+            **payload,
+            "reason": "interaction_approach_options_exhausted",
+            "failure_reason": "interaction_approach_options_exhausted",
+            "failure_stage": "interaction_approach_navigation",
+            "interaction_approach_attempts": attempts,
+            "interaction_approach_goal_option_count": goal_option_count,
+        }
+        return self.machine.on_interaction_result(False, detail=exhausted_detail)
+
     def _step_sync_callback(self, message: String) -> None:
         """Record a bridge action acknowledgement keyed by evaluator step."""
 
@@ -893,12 +1495,49 @@ class SemanticBehaviorExecutor:
             return
         with self.lock:
             self._latest_step_sync_index = step_index
-            self._latest_step_sync_received_at = time.monotonic()
+            received_at = time.monotonic()
+            self._latest_step_sync_received_at = received_at
+            action_source = str(payload.get("action_source") or "")
             if self.startup_scan_enabled:
                 self._startup_scan_gate.record_step_sync(
                     step_index,
-                    action_source=str(payload.get("action_source") or ""),
+                    action_source=action_source,
                 )
+            if self.rear_goal_prerotate_step_sync_enabled:
+                self._rear_goal_prerotate_gate.record_step_sync(
+                    step_index,
+                    action_source=action_source,
+                )
+            if (
+                self.interaction_final_align_enabled
+                and self.interaction_final_align_step_sync_enabled
+            ):
+                self._interaction_final_align_gate.record_step_sync(
+                    step_index,
+                    action_source=action_source,
+                )
+            monitor = getattr(self, "_rear_dwa_monitor", None)
+            latest_cmd = getattr(self, "_latest_cmd_vel_stamped", None)
+            if (
+                monitor is not None
+                and action_source == "cmd_vel"
+                and latest_cmd is not None
+                and float(latest_cmd.get("received_at", 0.0))
+                >= float(monitor.get("started_at", 0.0))
+                and received_at - float(latest_cmd.get("received_at", 0.0))
+                <= float(getattr(self, "rear_goal_cmd_vel_max_age_s", 0.50))
+            ):
+                history = monitor.get("samples")
+                if isinstance(history, deque) and (
+                    not history or int(history[-1].get("step_index", -1)) != step_index
+                ):
+                    history.append(
+                        {
+                            "step_index": step_index,
+                            "linear_x": float(latest_cmd.get("linear_x", 0.0)),
+                            "angular_z": float(latest_cmd.get("angular_z", 0.0)),
+                        }
+                    )
 
     def _fresh_command_gate_callback(self, message: String) -> None:
         try:
@@ -907,7 +1546,15 @@ class SemanticBehaviorExecutor:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return
         with self.lock:
-            self._startup_scan_gate.record_fresh_gate(step_index)
+            if self.startup_scan_enabled:
+                self._startup_scan_gate.record_fresh_gate(step_index)
+            if self.rear_goal_prerotate_step_sync_enabled:
+                self._rear_goal_prerotate_gate.record_fresh_gate(step_index)
+            if (
+                self.interaction_final_align_enabled
+                and self.interaction_final_align_step_sync_enabled
+            ):
+                self._interaction_final_align_gate.record_fresh_gate(step_index)
 
     def _image_callback(self, message: Image) -> None:
         try:
@@ -927,6 +1574,17 @@ class SemanticBehaviorExecutor:
                 self._latest_rgb_step_received_at = received_at
                 if self.startup_scan_enabled:
                     self._startup_scan_gate.record_rgb(rgb_step_seq, now=received_at)
+                if self.rear_goal_prerotate_step_sync_enabled:
+                    self._rear_goal_prerotate_gate.record_rgb(
+                        rgb_step_seq, now=received_at
+                    )
+                if (
+                    self.interaction_final_align_enabled
+                    and self.interaction_final_align_step_sync_enabled
+                ):
+                    self._interaction_final_align_gate.record_rgb(
+                        rgb_step_seq, now=received_at
+                    )
 
     @staticmethod
     def _decode_ros_image(message: Image):
@@ -974,6 +1632,23 @@ class SemanticBehaviorExecutor:
     def _occupancy_callback(self, message: OccupancyGrid) -> None:
         with self.lock:
             self._latest_occupancy = message
+            self._latest_occupancy_received_at = time.monotonic()
+
+    def _cmd_vel_stamped_callback(self, message: TwistStamped) -> None:
+        """Keep the latest relay command for step-indexed DWA diagnostics."""
+
+        try:
+            twist = message.twist
+            linear_x = float(twist.linear.x)
+            angular_z = float(twist.angular.z)
+        except (AttributeError, TypeError, ValueError):
+            return
+        with self.lock:
+            self._latest_cmd_vel_stamped = {
+                "linear_x": linear_x,
+                "angular_z": angular_z,
+                "received_at": time.monotonic(),
+            }
 
     @staticmethod
     def _map_header_fields(
@@ -1747,16 +2422,12 @@ class SemanticBehaviorExecutor:
                     daemon=True,
                 ).start()
             elif kind == "interact":
-                if self.ablation.module3 == "mllm_skill_verified":
-                    candidate = dict(command["candidate"])
-                    decision_id = str(candidate.get("decision_id") or "")
-                    threading.Thread(
-                        target=self._plan_and_publish_interaction,
-                        args=(decision_id, candidate),
-                        daemon=True,
-                    ).start()
-                else:
-                    self._publish_interaction_command(command["candidate"])
+                # M1 owns the pre-interaction visual state and approach
+                # readiness. M3 is strictly a post-action audit, so it must
+                # never delay or reinterpret this command before execution.
+                self._publish_interaction_command(command["candidate"])
+            elif kind == "request_interaction_observation":
+                self._publish_interaction_observation_request(command)
             elif kind == "wait_for_drawer_scan":
                 candidate = dict(command["candidate"])
                 decision_id = str(candidate.get("decision_id") or "")
@@ -1769,6 +2440,79 @@ class SemanticBehaviorExecutor:
                 self._publish_interaction_command(command["candidate"])
             elif kind == "terminal":
                 self._finish_terminal(command)
+
+    def _publish_interaction_observation_request(self, command: dict) -> None:
+        """Ask M1 for a causally later public view of an unknown portal."""
+
+        candidate = dict(command.get("candidate") or {})
+        decision_id = str(candidate.get("decision_id") or "")
+        if not decision_id:
+            return
+        with self.lock:
+            if (
+                self.selection is None
+                or str(self.selection.get("decision_id") or "") != decision_id
+                or self.machine.state != STATE_WAITING_FOR_INTERACTION_OBSERVATION
+            ):
+                return
+            interaction = candidate.get("interaction_command") or {}
+            object_id = str(
+                command.get("object_id")
+                or interaction.get("object_id")
+                or candidate.get("target_id")
+                or ""
+            )
+            node_id = str(command.get("node_id") or candidate.get("target_id") or "")
+            if not object_id:
+                return
+            minimum_capture_step = command.get("min_capture_step")
+            try:
+                minimum_capture_step = int(minimum_capture_step)
+            except (TypeError, ValueError):
+                minimum_capture_step = self._public_step_or_none(
+                    (self.latest_graph or {}).get("capture_step")
+                )
+            if minimum_capture_step is None:
+                minimum_capture_step = max(0, int(self._latest_rgb_step_seq or 0))
+            if self.machine.candidate is not None:
+                metadata = dict(self.machine.candidate.get("metadata") or {})
+                metadata["interaction_observation_min_capture_step"] = int(
+                    minimum_capture_step
+                )
+                self.machine.candidate["metadata"] = metadata
+            self.interaction_observation_sequence += 1
+            request_id = (
+                f"{decision_id}:m1:{self.interaction_observation_sequence:03d}"
+            )[:96]
+            episode_id = str(
+                candidate.get("episode_id")
+                or self.selection.get("episode_id")
+                or (self.latest_graph or {}).get("episode_id")
+                or ""
+            )
+            request = {
+                "object_id": object_id,
+                "episode_id": episode_id,
+                "minimum_capture_step": int(minimum_capture_step),
+                "reason": str(command.get("reason") or "mllm_portal_state_unknown")[:160],
+                "request_id": request_id,
+            }
+            self._interaction_observation_requests[decision_id] = {
+                **request,
+                "node_id": node_id,
+                "attempt": int(command.get("attempt", 0) or 0),
+                "requested_at": time.monotonic(),
+            }
+        self.attribute_refresh_request_pub.publish(
+            String(data=json.dumps(request, ensure_ascii=False, separators=(",", ":")))
+        )
+        rospy.loginfo(
+            "[semantic_behavior_executor] requested fresh M1 interaction view "
+            "target=%s after_capture_step=%d attempt=%s",
+            object_id,
+            minimum_capture_step,
+            command.get("attempt", ""),
+        )
 
     def _publish_explore_command(
         self,
@@ -1856,6 +2600,16 @@ class SemanticBehaviorExecutor:
                 interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
             ),
         }
+        # The bridge accepts only this compact public geometry contract for a
+        # fixed portal.  Do not forward graph internals, source object names,
+        # joints, or asset identifiers with the interaction command.
+        aperture_observation = interaction.get("portal_aperture_observation")
+        if payload["node_type"] == "portal" and isinstance(aperture_observation, dict):
+            payload["portal_aperture_observation"] = {
+                key: aperture_observation[key]
+                for key in ("door_leaf", "connectivity", "confidence")
+                if key in aperture_observation
+            }
         if str(interaction.get("sequence_type") or "").casefold() == "drawer_scan":
             drawer_box = interaction.get("drawer_container_bbox_2d")
             if isinstance(drawer_box, (list, tuple)):
@@ -1909,18 +2663,36 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if not self._interaction_is_current(decision_id):
                 return
-            image_data = self._object_crop_data_locked(node)
+            visual_images, target_bbox, full_image_size = (
+                self._visual_interaction_images_locked(node)
+            )
+            metadata = candidate.get("metadata") or {}
+            labels = list(metadata.get("interaction_approach_pose_labels") or [])
+            option_index = max(
+                0,
+                int(metadata.get("interaction_approach_goal_option_index", 0) or 0),
+            )
+            approach_pose_label = (
+                str(labels[option_index])
+                if option_index < len(labels)
+                else ""
+            )
         context = visual_interaction_planning_context(
             object_id=str(candidate.get("target_id") or ""),
             object_name=str(candidate.get("target_name") or ""),
             expected_target_type=expected_target_type,
             requested_action=requested_action,
+            target_bbox_xyxy=target_bbox,
+            full_image_size=full_image_size,
+            approach_pose_label=approach_pose_label,
+            alternate_view_count=max(0, len(labels) - option_index - 1),
         )
         response = self.mllm_client.request_json(
             role="skill_planning",
             instruction=VISUAL_INTERACTION_PLANNING_INSTRUCTION,
             context=context,
-            images=[image_data] if image_data else [],
+            images=visual_images,
+            response_schema=build_visual_interaction_plan_response_schema(),
             timeout_s=self.skill_timeout_s,
             max_tokens=self.skill_max_output_tokens,
             metrics_context=self._model_metrics_context(
@@ -1929,6 +2701,7 @@ class SemanticBehaviorExecutor:
         )
         planned_candidate = dict(candidate)
         result_source = "rule_fallback_model_error"
+        plan: dict | None = None
         if response.payload is not None and not response.error:
             try:
                 plan = validate_visual_interaction_plan(
@@ -1936,19 +2709,62 @@ class SemanticBehaviorExecutor:
                     expected_target_type=expected_target_type,
                     requested_action=requested_action,
                 )
-                planned_candidate = candidate_with_visual_operation_plan(
-                    planned_candidate, plan
-                )
                 result_source = "model"
-                with self.lock:
-                    self.active_skill_plan = {
-                        "visual_operation_plan": plan,
-                        "subactions": [],
-                        "max_retries": 0,
-                    }
-                    self.pending_skill_actions = []
             except ValueError:
                 result_source = "rule_fallback_invalid_response"
+        if expected_target_type == "other_container":
+            # Containers are never opened from a guessed side view.  Missing
+            # public box evidence is itself a request for another approach.
+            if plan is not None and target_bbox is None:
+                plan = {
+                    **plan,
+                    "approach_ready": False,
+                    "reposition_required": True,
+                    "view_state": "unknown",
+                    "open_regions": [],
+                    "operation_method": "unknown",
+                    "reason": "target_box_unavailable_in_current_headcam",
+                }
+                result_source = "model_reposition_missing_target_box"
+            if plan is None or not bool(plan.get("approach_ready")) or bool(
+                plan.get("reposition_required")
+            ):
+                if plan is None and not result_source.startswith("rule_fallback"):
+                    result_source = "model_reposition_required"
+                elif plan is None:
+                    result_source = f"{result_source}:reobserve_container"
+                commands: list[dict] = []
+                with self.lock:
+                    self._append_model_event_locked(
+                        "skill_planning",
+                        response,
+                        decision_id,
+                        candidate,
+                        result_source,
+                    )
+                    if self._interaction_is_current(decision_id):
+                        commands = self._retry_interaction_approach_after_visual_gate_locked(
+                            {
+                                "reason": "visual_reposition_required",
+                                "failure_reason": "visual_reposition_required",
+                                "visual_plan": dict(plan or {}),
+                                "model_result_source": result_source,
+                                "target_bbox_available": target_bbox is not None,
+                            }
+                        )
+                self._dispatch(commands)
+                return
+        if plan is not None:
+            planned_candidate = candidate_with_visual_operation_plan(
+                planned_candidate, plan
+            )
+            with self.lock:
+                self.active_skill_plan = {
+                    "visual_operation_plan": plan,
+                    "subactions": [],
+                    "max_retries": 0,
+                }
+                self.pending_skill_actions = []
         with self.lock:
             self._append_model_event_locked(
                 "skill_planning",
@@ -2001,19 +2817,34 @@ class SemanticBehaviorExecutor:
             node = self._selected_graph_node_locked(selection)
             after = self._object_crop_data_locked(node)
             max_retries = int(self.active_skill_plan.get("max_retries", 1) or 0)
+        execution_status = {
+            "backend_success": bool(backend_payload.get("success")),
+            "status": str(backend_payload.get("status") or ""),
+            "failure_reason": str(
+                backend_payload.get("failure_reason")
+                or backend_payload.get("reason")
+                or ""
+            )[:160],
+            "post_state": str(
+                backend_payload.get("post_state") or backend_payload.get("state") or ""
+            )[:64],
+        }
         response = self.mllm_client.request_json(
             role="visual_verification",
             instruction=(
-                "Inspect the current cropped image of the interaction target after execution. "
+                "Inspect only the current cropped image of the interaction target after execution. "
                 "Determine whether it now matches the requested state using the expected action "
-                "and visible evidence only. Return exactly one compact JSON object with success, "
+                "and visible evidence only. Do not infer a before-image or an approach view. "
+                "Return exactly one compact JSON object with success, "
                 "confidence, reason, observed_states, new_contents_visible, and retry_action. "
-                "Use a reason no longer than twelve words; do not output markdown or extra fields."
+                "Set observed_states.target_state to open, closed, ajar, unchanged, or unknown; "
+                "set observed_states.visible_change to yes, no, or unknown; and set retry_action "
+                "to none, retry, reposition, or rescan. Use a reason no longer than twelve words; "
+                "do not output markdown or extra fields."
             ),
             context={
                 "target": {
-                    "id": str(selection.get("target_id") or ""),
-                    "name": str(selection.get("target_name") or ""),
+                    "id": "target",
                     "expected_action": str(
                         (selection.get("interaction_command") or {}).get("action")
                         or "open"
@@ -2027,11 +2858,10 @@ class SemanticBehaviorExecutor:
                         or ""
                     ),
                 },
-                "pre_interaction_skill": {
-                    "subactions": list(self.active_skill_plan.get("subactions") or []),
-                },
+                "execution": execution_status,
             },
             images=[after] if after else [],
+            response_schema=build_visual_verification_response_schema(),
             timeout_s=self.verification_timeout_s,
             max_tokens=self.verification_max_output_tokens,
             metrics_context=self._model_metrics_context(
@@ -2049,6 +2879,7 @@ class SemanticBehaviorExecutor:
                     detail={
                         "verification_mode": "mllm_visual_unavailable",
                         "reason": str(response.error or "empty_model_response"),
+                        "execution": execution_status,
                         "model_metrics": response.metrics(),
                     },
                 )
@@ -2060,8 +2891,9 @@ class SemanticBehaviorExecutor:
                     commands = self.machine.on_verification_result(
                         False,
                         detail={
-                            "verification_mode": "mllm_visual_invalid",
-                            "reason": f"invalid_model_response: {exc}",
+                        "verification_mode": "mllm_visual_invalid",
+                        "reason": f"invalid_model_response: {exc}",
+                        "execution": execution_status,
                             "model_metrics": response.metrics(),
                         },
                     )
@@ -2079,6 +2911,7 @@ class SemanticBehaviorExecutor:
                         detail={
                             **verification,
                             "verification_mode": "mllm_visual",
+                            "execution": execution_status,
                             "model_metrics": response.metrics(),
                         },
                         retry=retry,
@@ -2147,7 +2980,7 @@ class SemanticBehaviorExecutor:
     def _needs_fresh_drawer_scan_locked(self) -> bool:
         """Return whether the arrived interaction must re-ground a drawer box."""
 
-        if self.ablation.module3 != "mllm_skill_verified" or self.selection is None:
+        if self.selection is None:
             return False
         if str(self.selection.get("behavior_type") or "").upper() != "INTERACT":
             return False
@@ -2339,9 +3172,11 @@ class SemanticBehaviorExecutor:
                 return
             time.sleep(self.drawer_scan_wait_poll_interval_s)
 
-    def _object_crop_data_locked(self, node: dict) -> str:
+    def _target_bbox_pixels_locked(self, node: dict) -> list[int] | None:
+        """Return one clamped public target box in the current head-camera frame."""
+
         if self.latest_image is None:
-            return ""
+            return None
         attributes = node.get("attributes") or {}
         box = (
             attributes.get("projected_bbox_2d")
@@ -2350,43 +3185,234 @@ class SemanticBehaviorExecutor:
             or node.get("bbox_2d")
         )
         if not isinstance(box, (list, tuple)) or len(box) < 4:
-            return ""
-        image = self.latest_image
-        height, width = image.shape[:2]
-        raw_x0, raw_y0, raw_x1, raw_y1 = [
-            int(round(float(value))) for value in box[:4]
-        ]
+            return None
+        try:
+            values = [float(value) for value in box[:4]]
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in values):
+            return None
+        height, width = self.latest_image.shape[:2]
+        if width <= 1 or height <= 1:
+            return None
+        raw_x0, raw_y0, raw_x1, raw_y1 = [int(round(value)) for value in values]
         left, right = sorted((raw_x0, raw_x1))
         top, bottom = sorted((raw_y0, raw_y1))
-        margin_x = int(round((right - left) * self.mllm_crop_margin_ratio))
-        margin_y = int(round((bottom - top) * self.mllm_crop_margin_ratio))
-        left = max(0, min(width - 1, left - margin_x))
-        right = min(width, max(left + 1, right + margin_x))
-        top = max(0, min(height - 1, top - margin_y))
-        bottom = min(height, max(top + 1, bottom + margin_y))
-        crop = image[top:bottom, left:right]
-        if crop.size == 0:
+        left = max(0, min(width - 1, left))
+        right = max(left + 1, min(width, right))
+        top = max(0, min(height - 1, top))
+        bottom = max(top + 1, min(height, bottom))
+        if right - left < 1 or bottom - top < 1:
+            return None
+        return [left, top, right, bottom]
+
+    @staticmethod
+    def _encode_jpeg_data(image: np.ndarray, max_side_px: int) -> str:
+        if image is None or image.size == 0:
             return ""
-        crop_height, crop_width = crop.shape[:2]
-        scale = min(
-            1.0,
-            float(self.mllm_crop_max_side_px) / max(crop_width, crop_height),
-        )
+        height, width = image.shape[:2]
+        if height <= 0 or width <= 0:
+            return ""
+        scale = min(1.0, float(max(1, max_side_px)) / max(width, height))
         if scale < 1.0:
-            crop = cv2.resize(
-                crop,
+            image = cv2.resize(
+                image,
                 (
-                    max(1, int(round(crop_width * scale))),
-                    max(1, int(round(crop_height * scale))),
+                    max(1, int(round(width * scale))),
+                    max(1, int(round(height * scale))),
                 ),
                 interpolation=cv2.INTER_AREA,
             )
         ok, encoded = cv2.imencode(
-            ".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+            ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
         )
         if not ok:
             return ""
         return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
+
+    def _padded_target_crop_locked(self, bbox: list[int]) -> np.ndarray | None:
+        if self.latest_image is None:
+            return None
+        left, top, right, bottom = bbox
+        margin_x = int(round((right - left) * self.mllm_crop_margin_ratio))
+        margin_y = int(round((bottom - top) * self.mllm_crop_margin_ratio))
+        height, width = self.latest_image.shape[:2]
+        left = max(0, min(width - 1, left - margin_x))
+        right = min(width, max(left + 1, right + margin_x))
+        top = max(0, min(height - 1, top - margin_y))
+        bottom = min(height, max(top + 1, bottom + margin_y))
+        crop = self.latest_image[top:bottom, left:right]
+        return crop.copy() if crop.size else None
+
+    def _object_crop_data_locked(self, node: dict) -> str:
+        bbox = self._target_bbox_pixels_locked(node)
+        if bbox is None:
+            return ""
+        crop = self._padded_target_crop_locked(bbox)
+        if crop is None:
+            return ""
+        return self._encode_jpeg_data(
+            crop,
+            self.mllm_crop_max_side_px,
+        )
+
+    @staticmethod
+    def _rect_overlap_area(
+        left: int,
+        top: int,
+        right: int,
+        bottom: int,
+        other_left: int,
+        other_top: int,
+        other_right: int,
+        other_bottom: int,
+    ) -> int:
+        return max(0, min(right, other_right) - max(left, other_left)) * max(
+            0, min(bottom, other_bottom) - max(top, other_top)
+        )
+
+    def _compose_visual_interaction_evidence_locked(
+        self,
+        image: np.ndarray,
+        bbox: list[int],
+    ) -> np.ndarray:
+        """Make one M3-compatible image containing full context and local detail."""
+
+        left, top, right, bottom = bbox
+        composite = image.copy()
+        cv2.rectangle(
+            composite,
+            (left, top),
+            (max(left, right - 1), max(top, bottom - 1)),
+            (0, 255, 255),
+            2,
+        )
+        cv2.putText(
+            composite,
+            "selected target",
+            (left, max(14, top - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        crop = self._padded_target_crop_locked(bbox)
+        if crop is None:
+            return composite
+        image_height, image_width = composite.shape[:2]
+        # Keep the full headcam legible. The inset consumes at most about a
+        # third of the frame and is placed where it hides the least target-box
+        # evidence. This satisfies image=1 servers while retaining M3's global
+        # frontality and local-handle evidence.
+        title_height = min(20, max(12, image_height // 14))
+        border = max(2, min(5, image_width // 160))
+        max_inset_width = min(
+            max(0, image_width - 2 * border - 8),
+            max(32, int(image_width * 0.38)),
+        )
+        max_inset_height = min(
+            max(0, image_height - title_height - 2 * border - 8),
+            max(32, int(image_height * 0.46)),
+        )
+        if max_inset_width < 16 or max_inset_height < 16:
+            return composite
+        crop_height, crop_width = crop.shape[:2]
+        scale = min(
+            float(max_inset_width) / max(1, crop_width),
+            float(max_inset_height) / max(1, crop_height),
+        )
+        # Tiny distant targets need a useful close-up; do not blow an inset up
+        # without bound because it would consume the full contextual frame.
+        scale = max(0.25, min(4.0, scale))
+        inset_width = max(1, int(round(crop_width * scale)))
+        inset_height = max(1, int(round(crop_height * scale)))
+        inset = cv2.resize(
+            crop,
+            (inset_width, inset_height),
+            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
+        )
+        panel_width = inset_width + 2 * border
+        panel_height = inset_height + title_height + 2 * border
+        padding = max(4, border * 2)
+        corners = (
+            (padding, padding),
+            (max(padding, image_width - panel_width - padding), padding),
+            (padding, max(padding, image_height - panel_height - padding)),
+            (
+                max(padding, image_width - panel_width - padding),
+                max(padding, image_height - panel_height - padding),
+            ),
+        )
+        panel_left, panel_top = min(
+            corners,
+            key=lambda corner: self._rect_overlap_area(
+                corner[0],
+                corner[1],
+                corner[0] + panel_width,
+                corner[1] + panel_height,
+                left,
+                top,
+                right,
+                bottom,
+            ),
+        )
+        panel_right = min(image_width, panel_left + panel_width)
+        panel_bottom = min(image_height, panel_top + panel_height)
+        cv2.rectangle(
+            composite,
+            (panel_left, panel_top),
+            (max(panel_left, panel_right - 1), max(panel_top, panel_bottom - 1)),
+            (18, 18, 18),
+            -1,
+        )
+        cv2.rectangle(
+            composite,
+            (panel_left, panel_top),
+            (max(panel_left, panel_right - 1), max(panel_top, panel_bottom - 1)),
+            (255, 255, 255),
+            border,
+        )
+        cv2.putText(
+            composite,
+            "target crop",
+            (panel_left + border, panel_top + max(11, title_height - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        crop_left = panel_left + border
+        crop_top = panel_top + title_height + border
+        composite[
+            crop_top : crop_top + inset_height,
+            crop_left : crop_left + inset_width,
+        ] = inset
+        return composite
+
+    def _visual_interaction_images_locked(
+        self, node: dict
+    ) -> tuple[list[str], list[int] | None, list[int] | None]:
+        """Build one M3 image with full-view context and a padded crop inset.
+
+        The outline is deliberately rendered on a copy of the public headcam
+        image rather than exposing an object pose or private asset metadata. A
+        single image is required by the deployed Qwen vLLM image=1 setting.
+        """
+
+        if self.latest_image is None:
+            return [], None, None
+        image = self.latest_image.copy()
+        height, width = image.shape[:2]
+        bbox = self._target_bbox_pixels_locked(node)
+        if bbox is None:
+            return [], None, [width, height]
+        composite = self._compose_visual_interaction_evidence_locked(image, bbox)
+        evidence = self._encode_jpeg_data(
+            composite, self.mllm_full_image_max_side_px
+        )
+        return ([evidence] if evidence else []), bbox, [width, height]
 
     def _interaction_is_current(self, decision_id: str) -> bool:
         return bool(
@@ -2425,6 +3451,572 @@ class SemanticBehaviorExecutor:
         command = Twist()
         command.angular.z = float(angular_z)
         self.cmd_vel_pub.publish(command)
+
+    def _fresh_rear_local_costmap_snapshot(self) -> tuple[OccupancyGrid | None, dict]:
+        """Return a recent local costmap or a fail-closed diagnostic."""
+
+        now = time.monotonic()
+        with self.lock:
+            occupancy = getattr(self, "_latest_occupancy", None)
+            received_at = float(getattr(self, "_latest_occupancy_received_at", 0.0))
+        if occupancy is None or not getattr(occupancy, "data", None):
+            return None, {
+                "reason": "rear_goal_local_costmap_unavailable",
+                "costmap_age_s": None,
+            }
+        age_s = max(0.0, now - received_at) if received_at > 0.0 else math.inf
+        if age_s > float(self.rear_goal_local_costmap_max_age_s):
+            return None, {
+                "reason": "rear_goal_local_costmap_stale",
+                "costmap_age_s": age_s,
+                "costmap_max_age_s": float(self.rear_goal_local_costmap_max_age_s),
+            }
+        try:
+            width = int(occupancy.info.width)
+            height = int(occupancy.info.height)
+            resolution = float(occupancy.info.resolution)
+            frame_id = str(occupancy.header.frame_id or "")
+            if width <= 0 or height <= 0 or resolution <= 0.0 or not frame_id:
+                raise ValueError("invalid local costmap geometry")
+            if len(occupancy.data) < width * height:
+                raise ValueError("short local costmap data")
+            origin_xy = (
+                float(occupancy.info.origin.position.x),
+                float(occupancy.info.origin.position.y),
+            )
+            origin_yaw = _costmap_origin_yaw(occupancy)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return None, {
+                "reason": "rear_goal_local_costmap_invalid",
+                "costmap_age_s": age_s,
+            }
+        return occupancy, {
+            "reason": "fresh_local_costmap",
+            "costmap_age_s": age_s,
+            "costmap_frame": frame_id,
+            "costmap_width": width,
+            "costmap_height": height,
+            "costmap_resolution_m": resolution,
+            "costmap_origin_xy": list(origin_xy),
+            "costmap_origin_yaw": origin_yaw,
+        }
+
+    def _acquire_rear_goal_cmd_vel_lease(self, decision_id: str) -> bool:
+        """Cancel DWA and prove it is no longer active before direct control."""
+
+        if not self.rear_goal_prerotate_step_sync_enabled:
+            self._last_rear_goal_recovery_detail = {
+                "reason": "rear_goal_step_gate_disabled",
+                "decision_id": decision_id,
+            }
+            return False
+        self._clear_rear_dwa_monitor(decision_id)
+        try:
+            self.move_base.cancel_goal()
+            self.move_base.wait_for_result(
+                rospy.Duration(self.rear_goal_cmd_vel_cancel_wait_s)
+            )
+            state = int(self.move_base.get_state())
+        except Exception as exc:
+            self._last_rear_goal_recovery_detail = {
+                "reason": "rear_goal_cmd_vel_lease_unconfirmed",
+                "decision_id": decision_id,
+                "error": str(exc),
+            }
+            return False
+        # actionlib status values: PENDING, ACTIVE, PREEMPTING, RECALLING.
+        # Any of these means move_base may still publish a command, so direct
+        # executor control fails closed instead of racing the local planner.
+        if state in {0, 1, 6, 7}:
+            self._last_rear_goal_recovery_detail = {
+                "reason": "rear_goal_cmd_vel_lease_busy",
+                "decision_id": decision_id,
+                "move_base_state": state,
+            }
+            return False
+        with self.lock:
+            self._executor_cmd_vel_lease_mode = "rear_goal"
+        return True
+
+    def _release_rear_goal_cmd_vel_lease(self) -> None:
+        with self.lock:
+            self._executor_cmd_vel_lease_mode = ""
+
+    def _clear_rear_dwa_monitor(self, decision_id: str | None = None) -> None:
+        with self.lock:
+            monitor = getattr(self, "_rear_dwa_monitor", None)
+            if monitor is None:
+                return
+            if decision_id is None or str(monitor.get("decision_id") or "") == str(
+                decision_id or ""
+            ):
+                self._rear_dwa_monitor = None
+
+    def _rear_goal_rotation_choice(
+        self,
+        decision_id: str,
+        frame_id: str,
+        heading_target_xy: tuple[float, float] | None,
+    ) -> tuple[dict | None, dict]:
+        """Choose a fresh-map-safe, finite CW/CCW rear turn and lock it."""
+
+        if heading_target_xy is None:
+            return None, {"reason": "rear_goal_heading_unavailable"}
+        pose = self._current_pose(frame_id)
+        if pose is None:
+            return None, {"reason": "rear_goal_pose_unavailable"}
+        target_yaw = math.atan2(
+            float(heading_target_xy[1]) - float(pose[1]),
+            float(heading_target_xy[0]) - float(pose[0]),
+        )
+        angular_error = normalize_angle(target_yaw - float(pose[2]))
+        if abs(angular_error) < float(self.rear_goal_enter_angle_rad):
+            return {"status": "not_rear", "target_yaw": target_yaw}, {
+                "reason": "rear_goal_forward_sector",
+                "angular_error_rad": angular_error,
+            }
+        occupancy, costmap_detail = self._fresh_rear_local_costmap_snapshot()
+        if occupancy is None:
+            return None, {
+                **costmap_detail,
+                "angular_error_rad": angular_error,
+            }
+        costmap_frame = str(costmap_detail["costmap_frame"])
+        costmap_pose = self._current_pose(costmap_frame)
+        if costmap_pose is None:
+            return None, {
+                "reason": "rear_goal_costmap_pose_unavailable",
+                **costmap_detail,
+                "angular_error_rad": angular_error,
+            }
+        info = occupancy.info
+        choices: list[dict] = []
+        rejected: list[dict] = []
+        angular_step = abs(
+            float(self.rear_goal_rotate_speed_rad_s)
+            * float(self.rear_goal_prerotate_control_dt_s)
+        )
+        for sign in (-1, 1):
+            arc = _rotation_arc_for_sign(float(pose[2]), target_yaw, sign)
+            required_steps = (
+                0
+                if arc <= float(self.rear_goal_exit_angle_rad)
+                else int(
+                    math.ceil(
+                        (arc - float(self.rear_goal_exit_angle_rad))
+                        / max(1e-6, angular_step)
+                    )
+                )
+            )
+            candidate_detail = {
+                "turn_sign": sign,
+                "direction": "ccw" if sign > 0 else "cw",
+                "arc_rad": arc,
+                "required_control_steps": required_steps,
+            }
+            if required_steps > int(self.rear_goal_prerotate_max_control_steps):
+                rejected.append({**candidate_detail, "reason": "control_budget"})
+                continue
+            clear = circular_costmap_rotation_sweep_is_clear(
+                occupancy.data,
+                int(info.width),
+                int(info.height),
+                float(info.resolution),
+                (
+                    float(info.origin.position.x),
+                    float(info.origin.position.y),
+                ),
+                float(costmap_detail["costmap_origin_yaw"]),
+                (float(costmap_pose[0]), float(costmap_pose[1])),
+                arc,
+                float(self.rear_goal_rotation_sweep_step_rad),
+                float(self.rear_goal_robot_radius_m),
+                float(self.rear_goal_safety_margin_m),
+                occupied_threshold=int(self.rear_goal_costmap_occupied_threshold),
+                unknown_is_blocked=bool(self.rear_goal_unknown_is_blocked),
+            )
+            if clear:
+                choices.append(candidate_detail)
+            else:
+                rejected.append({**candidate_detail, "reason": "footprint_collision"})
+        if not choices:
+            reason = (
+                "rear_goal_both_turn_sweeps_blocked"
+                if any(item.get("reason") == "footprint_collision" for item in rejected)
+                else "rear_goal_rotation_control_budget"
+            )
+            return None, {
+                "reason": reason,
+                "angular_error_rad": angular_error,
+                "target_yaw": target_yaw,
+                "rejected_turns": rejected,
+                **costmap_detail,
+            }
+        with self.lock:
+            previous_lock = dict(self._rear_goal_turn_locks.get(decision_id) or {})
+        locked_sign = previous_lock.get("turn_sign")
+        selected = next(
+            (choice for choice in choices if choice["turn_sign"] == locked_sign),
+            None,
+        )
+        if selected is None:
+            tie_sign = int(self.rear_goal_pi_turn_sign)
+            selected = sorted(
+                choices,
+                key=lambda choice: (
+                    float(choice["arc_rad"]),
+                    0 if int(choice["turn_sign"]) == tie_sign else 1,
+                ),
+            )[0]
+        selected = {
+            **selected,
+            "status": "selected",
+            "target_yaw": target_yaw,
+            "costmap_frame": costmap_frame,
+        }
+        with self.lock:
+            self._rear_goal_turn_locks[decision_id] = {
+                "turn_sign": int(selected["turn_sign"]),
+                "target_yaw": float(target_yaw),
+            }
+        return selected, {
+            "reason": "rear_goal_turn_selected",
+            "angular_error_rad": angular_error,
+            "target_yaw": target_yaw,
+            "selected_turn": selected["direction"],
+            "selected_turn_sign": int(selected["turn_sign"]),
+            "selected_arc_rad": float(selected["arc_rad"]),
+            "selected_control_steps": int(selected["required_control_steps"]),
+            "rejected_turns": rejected,
+            **costmap_detail,
+        }
+
+    def _drive_rear_goal_reverse_step_gated(
+        self,
+        decision_id: str,
+        costmap_frame: str,
+        target_distance_m: float,
+    ) -> tuple[bool, dict]:
+        """Execute only a short, fresh-costmap-checked reverse action."""
+
+        gate = self._rear_goal_prerotate_gate
+        with self.lock:
+            gate.reset()
+        dt = float(self.rear_goal_prerotate_control_dt_s)
+        speed = abs(float(self.rear_goal_reverse_speed_mps))
+        max_commands = max(
+            1,
+            int(self.rear_goal_reverse_max_control_steps)
+            + int(self.rear_goal_prerotate_delivery_retry_steps),
+        )
+        start = self._current_pose(costmap_frame)
+        if start is None:
+            return False, {"reason": "rear_goal_reverse_pose_unavailable"}
+        sent = 0
+        applied = 0
+        missed = 0
+        last_sent_at: float | None = None
+        last_progress_at = time.monotonic()
+        previous_signature: tuple | None = None
+        stall_timeout = max(
+            0.1, float(self.rear_goal_prerotate_step_sync_stall_timeout_s)
+        )
+        try:
+            while (
+                not rospy.is_shutdown()
+                and self._navigation_is_current(decision_id)
+            ):
+                now = time.monotonic()
+                with self.lock:
+                    acknowledgements = gate.take_acks()
+                    diagnostics = gate.diagnostics()
+                for acknowledgement in acknowledgements:
+                    if acknowledgement.exact_step_sync and acknowledgement.command_applied:
+                        applied += 1
+                    else:
+                        missed += 1
+                signature = (
+                    tuple(diagnostics.get("pending_rgb_steps") or []),
+                    tuple(diagnostics.get("pending_fresh_gate_steps") or []),
+                    diagnostics.get("last_sent_step"),
+                    diagnostics.get("awaiting_ack_step"),
+                    diagnostics.get("last_step_sync"),
+                )
+                if signature != previous_signature:
+                    previous_signature = signature
+                    last_progress_at = now
+                awaiting = diagnostics.get("awaiting_ack_step")
+                if (
+                    awaiting is not None
+                    and last_sent_at is not None
+                    and now - last_sent_at >= stall_timeout
+                ):
+                    return False, {
+                        "reason": "rear_goal_reverse_step_sync_stall",
+                        "dispatched_control_steps": sent,
+                        "applied_control_steps": applied,
+                    }
+                if awaiting is None and now - last_progress_at >= stall_timeout:
+                    return False, {
+                        "reason": "rear_goal_reverse_fresh_gate_stall",
+                        "dispatched_control_steps": sent,
+                        "applied_control_steps": applied,
+                    }
+                pose = self._current_pose(costmap_frame)
+                if pose is None:
+                    return False, {"reason": "rear_goal_reverse_pose_lost"}
+                traveled = math.hypot(
+                    float(pose[0]) - float(start[0]),
+                    float(pose[1]) - float(start[1]),
+                )
+                if traveled >= max(0.0, float(target_distance_m) - 0.5 * speed * dt):
+                    return True, {
+                        "reason": "rear_goal_reverse_complete",
+                        "distance_m": traveled,
+                        "dispatched_control_steps": sent,
+                        "applied_control_steps": applied,
+                    }
+                occupancy, costmap_detail = self._fresh_rear_local_costmap_snapshot()
+                if occupancy is None:
+                    return False, {
+                        **costmap_detail,
+                        "reason": "rear_goal_reverse_costmap_not_fresh",
+                    }
+                info = occupancy.info
+                remaining = max(0.0, float(target_distance_m) - traveled)
+                safe = circular_costmap_linear_sweep_distance(
+                    occupancy.data,
+                    int(info.width),
+                    int(info.height),
+                    float(info.resolution),
+                    (
+                        float(info.origin.position.x),
+                        float(info.origin.position.y),
+                    ),
+                    float(costmap_detail["costmap_origin_yaw"]),
+                    tuple(float(value) for value in pose),
+                    -1.0,
+                    remaining,
+                    float(self.rear_goal_robot_radius_m),
+                    float(self.rear_goal_safety_margin_m),
+                    occupied_threshold=int(self.rear_goal_costmap_occupied_threshold),
+                    unknown_is_blocked=bool(self.rear_goal_unknown_is_blocked),
+                )
+                if safe < min(remaining, self.rear_goal_reverse_min_distance_m):
+                    return False, {
+                        "reason": "rear_goal_reverse_sweep_blocked",
+                        "safe_distance_m": safe,
+                        **costmap_detail,
+                    }
+                if sent >= max_commands:
+                    return False, {
+                        "reason": "rear_goal_reverse_control_step_budget",
+                        "dispatched_control_steps": sent,
+                        "applied_control_steps": applied,
+                    }
+                with self.lock:
+                    step_index = gate.consume_step(now=now)
+                if step_index is None:
+                    time.sleep(0.01)
+                    continue
+                command = Twist()
+                command.linear.x = -speed
+                self.cmd_vel_pub.publish(command)
+                sent += 1
+                last_sent_at = now
+                time.sleep(0.05)
+        finally:
+            self.cmd_vel_pub.publish(Twist())
+        return False, {
+            "reason": "rear_goal_reverse_preempted_or_shutdown",
+            "dispatched_control_steps": sent,
+            "applied_control_steps": applied,
+        }
+
+    def _rear_goal_rotation_command_safe(self) -> bool:
+        """Recheck the current circular footprint before every gated turn step."""
+
+        occupancy, costmap_detail = self._fresh_rear_local_costmap_snapshot()
+        if occupancy is None:
+            self._last_rear_goal_recovery_detail = dict(costmap_detail)
+            return False
+        costmap_frame = str(costmap_detail["costmap_frame"])
+        pose = self._current_pose(costmap_frame)
+        if pose is None:
+            self._last_rear_goal_recovery_detail = {
+                "reason": "rear_goal_costmap_pose_unavailable",
+                **costmap_detail,
+            }
+            return False
+        info = occupancy.info
+        clear = circular_costmap_footprint_is_clear(
+            occupancy.data,
+            int(info.width),
+            int(info.height),
+            float(info.resolution),
+            (
+                float(info.origin.position.x),
+                float(info.origin.position.y),
+            ),
+            float(costmap_detail["costmap_origin_yaw"]),
+            (float(pose[0]), float(pose[1])),
+            float(self.rear_goal_robot_radius_m),
+            float(self.rear_goal_safety_margin_m),
+            occupied_threshold=int(self.rear_goal_costmap_occupied_threshold),
+            unknown_is_blocked=bool(self.rear_goal_unknown_is_blocked),
+        )
+        if not clear:
+            self._last_rear_goal_recovery_detail = {
+                "reason": "rear_goal_rotation_footprint_blocked",
+                **costmap_detail,
+            }
+        return bool(clear)
+
+    def _attempt_rear_goal_reverse(self, decision_id: str) -> tuple[bool, dict]:
+        if not self.rear_goal_reverse_enabled:
+            return False, {"reason": "rear_goal_reverse_disabled"}
+        occupancy, costmap_detail = self._fresh_rear_local_costmap_snapshot()
+        if occupancy is None:
+            return False, {
+                **costmap_detail,
+                "reason": "rear_goal_reverse_requires_fresh_costmap",
+            }
+        costmap_frame = str(costmap_detail["costmap_frame"])
+        pose = self._current_pose(costmap_frame)
+        if pose is None:
+            return False, {"reason": "rear_goal_reverse_pose_unavailable"}
+        info = occupancy.info
+        safe = circular_costmap_linear_sweep_distance(
+            occupancy.data,
+            int(info.width),
+            int(info.height),
+            float(info.resolution),
+            (
+                float(info.origin.position.x),
+                float(info.origin.position.y),
+            ),
+            float(costmap_detail["costmap_origin_yaw"]),
+            tuple(float(value) for value in pose),
+            -1.0,
+            float(self.rear_goal_reverse_distance_m),
+            float(self.rear_goal_robot_radius_m),
+            float(self.rear_goal_safety_margin_m),
+            occupied_threshold=int(self.rear_goal_costmap_occupied_threshold),
+            unknown_is_blocked=bool(self.rear_goal_unknown_is_blocked),
+        )
+        if safe < float(self.rear_goal_reverse_min_distance_m):
+            return False, {
+                "reason": "rear_goal_reverse_no_safe_distance",
+                "safe_distance_m": safe,
+                **costmap_detail,
+            }
+        target = min(float(self.rear_goal_reverse_distance_m), safe)
+        if not self._acquire_rear_goal_cmd_vel_lease(decision_id):
+            return False, dict(self._last_rear_goal_recovery_detail)
+        try:
+            success, detail = self._drive_rear_goal_reverse_step_gated(
+                decision_id,
+                costmap_frame,
+                target,
+            )
+        finally:
+            self._release_rear_goal_cmd_vel_lease()
+        return success, {
+            "rear_goal_reverse": True,
+            "target_distance_m": target,
+            **costmap_detail,
+            **detail,
+        }
+
+    def _start_rear_dwa_monitor(
+        self,
+        decision_id: str,
+        frame_id: str,
+        heading_target_xy: tuple[float, float] | None,
+        start_pose: tuple[float, ...] | None,
+        start_goal_distance_m: float | None,
+    ) -> None:
+        with self.lock:
+            self._rear_dwa_monitor = {
+                "decision_id": decision_id,
+                "frame_id": frame_id,
+                "heading_target_xy": heading_target_xy,
+                "started_at": time.monotonic(),
+                "start_pose": None if start_pose is None else tuple(start_pose),
+                "start_goal_distance_m": start_goal_distance_m,
+                "samples": deque(
+                    maxlen=max(
+                        2,
+                        int(
+                            getattr(
+                                self,
+                                "rear_goal_oscillation_window_steps",
+                                4,
+                            )
+                        ),
+                    )
+                ),
+            }
+
+    def _rear_dwa_oscillation_detail(
+        self,
+        decision_id: str,
+        frame_id: str,
+        heading_target_xy: tuple[float, float] | None,
+        pose: tuple[float, ...] | None,
+        goal_distance_m: float | None,
+    ) -> dict | None:
+        if pose is None or heading_target_xy is None:
+            return None
+        with self.lock:
+            monitor = self._rear_dwa_monitor
+            if (
+                monitor is None
+                or str(monitor.get("decision_id") or "") != str(decision_id)
+            ):
+                return None
+            samples = list(monitor.get("samples") or [])
+            start_pose = monitor.get("start_pose")
+            start_goal_distance_m = monitor.get("start_goal_distance_m")
+        target_yaw = math.atan2(
+            float(heading_target_xy[1]) - float(pose[1]),
+            float(heading_target_xy[0]) - float(pose[0]),
+        )
+        angular_error = normalize_angle(target_yaw - float(pose[2]))
+        if abs(angular_error) < float(self.rear_goal_enter_angle_rad):
+            return None
+        displacement = 0.0
+        if start_pose is not None and len(start_pose) >= 2:
+            displacement = math.hypot(
+                float(pose[0]) - float(start_pose[0]),
+                float(pose[1]) - float(start_pose[1]),
+            )
+        goal_reduction = 0.0
+        if start_goal_distance_m is not None and goal_distance_m is not None:
+            goal_reduction = float(start_goal_distance_m) - float(goal_distance_m)
+        if not rear_dwa_oscillation_detected(
+            samples,
+            minimum_samples=self.rear_goal_oscillation_window_steps,
+            minimum_sign_flips=self.rear_goal_oscillation_min_sign_flips,
+            displacement_m=displacement,
+            maximum_displacement_m=self.rear_goal_oscillation_max_displacement_m,
+            goal_distance_reduction_m=goal_reduction,
+            minimum_goal_distance_reduction_m=(
+                self.rear_goal_oscillation_min_goal_reduction_m
+            ),
+        ):
+            return None
+        with self.lock:
+            if self._rear_dwa_monitor is not None:
+                self._rear_dwa_monitor["samples"].clear()
+        return {
+            "reason": "rear_goal_dwa_oscillation",
+            "angular_error_rad": angular_error,
+            "dwa_samples": samples,
+            "dwa_displacement_m": displacement,
+            "dwa_goal_distance_reduction_m": goal_reduction,
+            "frame_id": frame_id,
+        }
 
     def _startup_scan_is_current(self, decision_id: str) -> bool:
         with self.lock:
@@ -2651,32 +4243,64 @@ class SemanticBehaviorExecutor:
         turn_sign: int | None = None,
         max_prerotate_control_steps: int | None = None,
         step_sync_stall_timeout_s: float | None = None,
+        step_command_gate: StepCommandGate | None = None,
+        delivery_retry_steps: int | None = None,
+        rotation_label: str = "pre-rotation",
+        step_sync_budget_authoritative: bool = False,
+        command_guard=None,
     ) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         committed_sign = turn_sign
-        with self.lock:
-            last_step_sync_index = self._latest_step_sync_index
-            last_step_sync_at = self._latest_step_sync_received_at
-            start_rgb_step_seq = self._latest_rgb_step_seq
-            last_sent_rgb_step_seq = start_rgb_step_seq
-            start_rgb_received_at = self._latest_rgb_step_received_at
+        gated_prerotation = max_prerotate_control_steps is not None
+        budget_authoritative = bool(
+            gated_prerotation and step_sync_budget_authoritative
+        )
+        active_step_gate = (
+            self._rear_goal_prerotate_gate
+            if step_command_gate is None
+            else step_command_gate
+        )
+        active_delivery_retry_steps = (
+            self.rear_goal_prerotate_delivery_retry_steps
+            if delivery_retry_steps is None
+            else max(0, int(delivery_retry_steps))
+        )
         nonzero_commands_sent = 0
-        saw_new_rgb_step = False
-        last_rgb_step_advance_at = time.monotonic()
-        last_step_sync_progress_at = time.monotonic()
+        acknowledged_control_steps = 0
+        missed_control_steps = 0
+        last_command_sent_at: float | None = None
+        last_gate_progress_at = time.monotonic()
+        previous_gate_signature: tuple | None = None
         gate_stall_timeout_s = max(
             0.1, float(step_sync_stall_timeout_s or 2.0)
         )
+        delivery_attempt_budget = None
+        if gated_prerotation:
+            delivery_attempt_budget = max(
+                1,
+                int(max_prerotate_control_steps)
+                + active_delivery_retry_steps,
+            )
+            # A bridge action window opens only after the observation and
+            # readiness barrier.  Reset before collecting the next RGB/gate
+            # pair; otherwise a cmd_vel published from an earlier RGB callback
+            # is intentionally rejected as stale by RosBridgePolicy.
+            with self.lock:
+                active_step_gate.reset()
 
         def finish_prerotation(reason: str, success: bool) -> bool:
-            if max_prerotate_control_steps is not None:
+            if gated_prerotation:
+                with self.lock:
+                    gate_diagnostics = active_step_gate.diagnostics()
                 rospy.loginfo(
-                    "[semantic_behavior_executor] pre-rotation finished "
-                    "reason=%s nonzero_commands=%d start_rgb_seq=%s last_rgb_seq=%s",
+                    "[semantic_behavior_executor] %s finished "
+                    "reason=%s dispatched=%d applied=%d missed=%d gate=%s",
+                    rotation_label,
                     reason,
                     nonzero_commands_sent,
-                    start_rgb_step_seq,
-                    last_sent_rgb_step_seq,
+                    acknowledged_control_steps,
+                    missed_control_steps,
+                    gate_diagnostics,
                 )
             return success
 
@@ -2684,56 +4308,43 @@ class SemanticBehaviorExecutor:
             while (
                 not rospy.is_shutdown()
                 and self._navigation_is_current(decision_id)
-                and time.monotonic() < deadline
+                and (budget_authoritative or time.monotonic() < deadline)
             ):
-                current_rgb_step_seq = None
-                if max_prerotate_control_steps is not None:
+                now = time.monotonic()
+                if gated_prerotation:
                     with self.lock:
-                        current_step_sync_index = self._latest_step_sync_index
-                        current_step_sync_at = self._latest_step_sync_received_at
-                        current_rgb_step_seq = self._latest_rgb_step_seq
-                    if current_step_sync_at > last_step_sync_at:
+                        acknowledgements = active_step_gate.take_acks()
+                        gate_diagnostics = active_step_gate.diagnostics()
+                    for acknowledgement in acknowledgements:
                         if (
-                            last_step_sync_index is not None
-                            and (
-                                current_step_sync_index is None
-                                or current_step_sync_index < last_step_sync_index
-                            )
+                            acknowledgement.exact_step_sync
+                            and acknowledgement.command_applied
                         ):
-                            return finish_prerotation("sync_reset", False)
-                        last_step_sync_index = current_step_sync_index
-                        last_step_sync_at = current_step_sync_at
-                        last_step_sync_progress_at = time.monotonic()
-                    now = time.monotonic()
-                    if not saw_new_rgb_step and (
-                        start_rgb_received_at <= 0.0
-                        or now - start_rgb_received_at
-                        >= gate_stall_timeout_s
-                    ):
-                        return finish_prerotation("rgb_stale_at_start", False)
-                    if current_rgb_step_seq is not None:
-                        if (
-                            last_sent_rgb_step_seq is not None
-                            and current_rgb_step_seq < last_sent_rgb_step_seq
-                        ):
-                            return finish_prerotation("rgb_reset", False)
-                        if (
-                            last_sent_rgb_step_seq is None
-                            or current_rgb_step_seq > last_sent_rgb_step_seq
-                        ):
-                            saw_new_rgb_step = True
-                            last_rgb_step_advance_at = now
+                            acknowledged_control_steps += 1
+                        else:
+                            missed_control_steps += 1
+                    gate_signature = (
+                        tuple(gate_diagnostics.get("pending_rgb_steps") or []),
+                        tuple(gate_diagnostics.get("pending_fresh_gate_steps") or []),
+                        gate_diagnostics.get("last_sent_step"),
+                        gate_diagnostics.get("awaiting_ack_step"),
+                        gate_diagnostics.get("last_step_sync"),
+                    )
+                    if gate_signature != previous_gate_signature:
+                        previous_gate_signature = gate_signature
+                        last_gate_progress_at = now
+                    awaiting_ack_step = gate_diagnostics.get("awaiting_ack_step")
                     if (
-                        nonzero_commands_sent > 0
-                        and now - last_step_sync_progress_at
-                        >= gate_stall_timeout_s
+                        awaiting_ack_step is not None
+                        and last_command_sent_at is not None
+                        and now - last_command_sent_at >= gate_stall_timeout_s
                     ):
                         return finish_prerotation("step_sync_stall", False)
                     if (
-                        now - last_rgb_step_advance_at
-                        >= gate_stall_timeout_s
+                        awaiting_ack_step is None
+                        and now - last_gate_progress_at >= gate_stall_timeout_s
                     ):
-                        return finish_prerotation("rgb_step_stall", False)
+                        return finish_prerotation("fresh_command_gate_stall", False)
                 pose = self._current_pose(frame_id)
                 if pose is None:
                     time.sleep(0.05)
@@ -2747,25 +4358,32 @@ class SemanticBehaviorExecutor:
                         self.rear_goal_pi_tie_tolerance_rad,
                         self.rear_goal_pi_turn_sign,
                     )
-                if max_prerotate_control_steps is not None:
-                    gate = prerotation_rgb_step_gate(
-                        last_sent_rgb_step_seq=last_sent_rgb_step_seq,
-                        current_rgb_step_seq=current_rgb_step_seq,
-                        nonzero_commands_sent=nonzero_commands_sent,
-                        max_control_steps=max_prerotate_control_steps,
-                    )
-                    if gate == "stop":
-                        return finish_prerotation("rgb_step_budget", False)
-                    if gate == "wait":
+                if gated_prerotation:
+                    if command_guard is not None and not bool(command_guard()):
+                        return finish_prerotation("safety_guard", False)
+                    if nonzero_commands_sent >= int(delivery_attempt_budget):
+                        reason = (
+                            "cmd_vel_not_applied"
+                            if acknowledged_control_steps == 0 and missed_control_steps
+                            else "control_step_budget"
+                        )
+                        return finish_prerotation(reason, False)
+                    with self.lock:
+                        command_step_index = active_step_gate.consume_step(
+                            now=now
+                        )
+                    if command_step_index is None:
                         time.sleep(0.01)
                         continue
-                    last_sent_rgb_step_seq = current_rgb_step_seq
                     nonzero_commands_sent += 1
+                    last_command_sent_at = now
                 self._publish_rotation(float(committed_sign) * abs(float(speed_rad_s)))
                 time.sleep(0.05)
         finally:
             self._publish_rotation(0.0)
-        return False
+        if budget_authoritative:
+            return finish_prerotation("preempted_or_shutdown", False)
+        return finish_prerotation("wall_timeout", False)
 
     def _prerotate_for_rear_goal(
         self,
@@ -2774,8 +4392,15 @@ class SemanticBehaviorExecutor:
         goal_x: float,
         goal_y: float,
         heading_target_xy: tuple[float, float] | None = None,
+        *,
+        trigger_source: str = "initial_rear_goal",
     ) -> bool:
+        self._last_rear_goal_recovery_detail = {}
         if not self.rear_goal_prerotate_enabled:
+            self._last_rear_goal_recovery_detail = {
+                "reason": "rear_goal_prerotation_disabled",
+                "trigger_source": trigger_source,
+            }
             return True
         # A navigation pre-turn must follow the first reachable segment of the
         # global path.  When preflight did not produce a valid path (for
@@ -2783,48 +4408,76 @@ class SemanticBehaviorExecutor:
         # away from the path that move_base will eventually choose.
         heading_target_xy = navigation_prerotation_heading_target(heading_target_xy)
         if heading_target_xy is None:
-            rospy.loginfo(
-                "[semantic_behavior_executor] skipped rear-goal prerotation: "
-                "no valid path lookahead"
-            )
-            return True
-        pose = self._current_pose(frame_id)
-        if pose is None:
-            return True
-        heading_x, heading_y = heading_target_xy
-        target_yaw = math.atan2(heading_y - pose[1], heading_x - pose[0])
-        error = normalize_angle(target_yaw - pose[2])
-        if abs(error) <= self.rear_goal_enter_angle_rad:
-            return True
-        turn_sign = committed_turn_sign(
-            error,
-            self.rear_goal_pi_tie_tolerance_rad,
-            self.rear_goal_pi_turn_sign,
-        )
-        max_prerotate_control_steps = None
-        step_sync_stall_timeout_s = None
-        if self.rear_goal_prerotate_step_sync_enabled:
-            max_prerotate_control_steps = prerotation_control_step_budget(
-                error,
-                self.rear_goal_exit_angle_rad,
-                self.rear_goal_rotate_speed_rad_s,
-                self.rear_goal_prerotate_control_dt_s,
-                self.rear_goal_prerotate_max_control_steps,
-            )
-            step_sync_stall_timeout_s = self.rear_goal_prerotate_step_sync_stall_timeout_s
-            if max_prerotate_control_steps <= 0:
-                return True
-        return self._rotate_to_yaw(
+            self._last_rear_goal_recovery_detail = {
+                "reason": "rear_goal_heading_unavailable",
+                "trigger_source": trigger_source,
+            }
+            return False
+        choice, detail = self._rear_goal_rotation_choice(
             decision_id,
             frame_id,
-            target_yaw,
-            self.rear_goal_exit_angle_rad,
-            self.rear_goal_rotate_speed_rad_s,
-            self.rear_goal_prerotate_timeout_s,
-            turn_sign=turn_sign,
-            max_prerotate_control_steps=max_prerotate_control_steps,
-            step_sync_stall_timeout_s=step_sync_stall_timeout_s,
+            heading_target_xy,
         )
+        detail = {**detail, "trigger_source": trigger_source}
+        if choice is not None and choice.get("status") == "not_rear":
+            self._last_rear_goal_recovery_detail = detail
+            return True
+        if choice is None:
+            # A short reverse is allowed only when both turn sweeps were
+            # explicitly rejected by the same fresh local costmap.  Missing
+            # pose/map information is never converted into a blind backoff.
+            if detail.get("reason") == "rear_goal_both_turn_sweeps_blocked":
+                backed_off, reverse_detail = self._attempt_rear_goal_reverse(
+                    decision_id
+                )
+                self._last_rear_goal_recovery_detail = {
+                    **detail,
+                    "rear_goal_reverse_detail": reverse_detail,
+                    "reason": (
+                        "rear_goal_reverse_complete_replan"
+                        if backed_off
+                        else "rear_goal_no_safe_turn_or_reverse"
+                    ),
+                }
+                return False
+            self._last_rear_goal_recovery_detail = detail
+            return False
+        if not self._acquire_rear_goal_cmd_vel_lease(decision_id):
+            self._last_rear_goal_recovery_detail = {
+                **detail,
+                **self._last_rear_goal_recovery_detail,
+            }
+            return False
+        try:
+            rotated = self._rotate_to_yaw(
+                decision_id,
+                frame_id,
+                float(choice["target_yaw"]),
+                self.rear_goal_exit_angle_rad,
+                self.rear_goal_rotate_speed_rad_s,
+                self.rear_goal_prerotate_timeout_s,
+                turn_sign=int(choice["turn_sign"]),
+                max_prerotate_control_steps=int(choice["required_control_steps"]),
+                step_sync_stall_timeout_s=(
+                    self.rear_goal_prerotate_step_sync_stall_timeout_s
+                ),
+                step_command_gate=self._rear_goal_prerotate_gate,
+                delivery_retry_steps=self.rear_goal_prerotate_delivery_retry_steps,
+                rotation_label="rear-goal-safe-turn",
+                # The bridge applies exactly one fixed-dt target increment per
+                # gate/ack pair; do not let slow ROS wall time alter this path.
+                step_sync_budget_authoritative=True,
+                command_guard=self._rear_goal_rotation_command_safe,
+            )
+        finally:
+            self._release_rear_goal_cmd_vel_lease()
+        turn_failure_detail = dict(self._last_rear_goal_recovery_detail)
+        self._last_rear_goal_recovery_detail = {
+            **detail,
+            "reason": "rear_goal_turn_complete" if rotated else "rear_goal_turn_failed",
+            **({"turn_failure_detail": turn_failure_detail} if not rotated else {}),
+        }
+        return bool(rotated)
 
     def _final_align_goal(
         self,
@@ -2855,6 +4508,94 @@ class SemanticBehaviorExecutor:
             self.final_align_yaw_tolerance_rad,
             self.final_align_rotate_speed_rad_s,
             self.final_align_timeout_s,
+        )
+
+    def _final_align_interaction_goal(
+        self,
+        decision_id: str,
+        frame_id: str,
+        goal_x: float,
+        goal_y: float,
+        goal_yaw: float,
+        *,
+        ready_distance_m: float,
+    ) -> bool | None:
+        """Bounded final yaw alignment for a bridge-validated INTERACT pose.
+
+        The controller is allowed only inside both the configured interaction
+        final-align radius and the candidate's bridge-ready distance.  It is
+        intentionally independent of generic ``final_align_enabled``.
+        """
+
+        if not self.interaction_final_align_enabled:
+            return None
+        pose = self._current_pose(frame_id)
+        if pose is None:
+            return None
+        allowed_distance_m = min(
+            self.interaction_final_align_max_distance_m,
+            max(0.05, float(ready_distance_m)),
+        )
+        distance = math.hypot(goal_x - pose[0], goal_y - pose[1])
+        if distance > allowed_distance_m:
+            return None
+        if (
+            abs(normalize_angle(goal_yaw - pose[2]))
+            <= self.interaction_final_align_yaw_tolerance_rad
+        ):
+            return True
+        self.move_base.cancel_goal()
+        self.move_base.wait_for_result(
+            rospy.Duration(max(0.0, self.final_align_cancel_wait_s))
+        )
+        rotation_kwargs: dict = {}
+        if self.interaction_final_align_step_sync_enabled:
+            yaw_error = normalize_angle(goal_yaw - pose[2])
+            control_step_budget = prerotation_control_step_budget(
+                yaw_error,
+                self.interaction_final_align_yaw_tolerance_rad,
+                self.interaction_final_align_rotate_speed_rad_s,
+                self.interaction_final_align_control_dt_s,
+                self.interaction_final_align_max_control_steps,
+            )
+            if control_step_budget <= 0:
+                return True
+            rospy.loginfo(
+                "[semantic_behavior_executor] interaction final-align "
+                "yaw_error=%.3f budget=%d cap=%d dt=%.3f speed=%.3f tol=%.3f",
+                yaw_error,
+                control_step_budget,
+                self.interaction_final_align_max_control_steps,
+                self.interaction_final_align_control_dt_s,
+                self.interaction_final_align_rotate_speed_rad_s,
+                self.interaction_final_align_yaw_tolerance_rad,
+            )
+            rotation_kwargs = {
+                # The shared yaw controller retains this legacy parameter name,
+                # but the dedicated gate makes it an interaction-final-align
+                # control budget rather than a rear-goal pre-rotation budget.
+                "max_prerotate_control_steps": control_step_budget,
+                "step_sync_stall_timeout_s": (
+                    self.interaction_final_align_step_sync_stall_timeout_s
+                ),
+                "step_command_gate": self._interaction_final_align_gate,
+                "delivery_retry_steps": (
+                    self.interaction_final_align_delivery_retry_steps
+                ),
+                "rotation_label": "interaction-final-align",
+                # Fixed-dt simulator actions, acknowledgements, the finite
+                # control budget and gate-stall timeout—not ROS wall time—own
+                # completion for this gated interaction turn.
+                "step_sync_budget_authoritative": True,
+            }
+        return self._rotate_to_yaw(
+            decision_id,
+            frame_id,
+            goal_yaw,
+            self.interaction_final_align_yaw_tolerance_rad,
+            self.interaction_final_align_rotate_speed_rad_s,
+            self.interaction_final_align_timeout_s,
+            **rotation_kwargs,
         )
 
     def _wait_for_next_interaction_pose_poll_step(
@@ -3370,8 +5111,15 @@ class SemanticBehaviorExecutor:
             )
         if not prerotated:
             rospy.logwarn(
-                "[semantic_behavior_executor] rear-goal prerotation timed out; sending move_base goal"
+                "[semantic_behavior_executor] rear-goal safe recovery refused direct navigation: %s",
+                self._last_rear_goal_recovery_detail,
             )
+            self._handle_navigation_result(
+                decision_id,
+                False,
+                dict(self._last_rear_goal_recovery_detail),
+            )
+            return
         if not self._navigation_is_current(decision_id):
             return
         goal.target_pose.header.stamp = rospy.Time.now()
@@ -3387,6 +5135,13 @@ class SemanticBehaviorExecutor:
             if start_pose is None
             else math.hypot(x - start_pose[0], y - start_pose[1])
         )
+        self._start_rear_dwa_monitor(
+            decision_id,
+            goal_frame,
+            path_lookahead,
+            start_pose,
+            start_goal_distance_m,
+        )
         progress_watchdog = NavigationProgressWatchdog(
             timeout_s=self.navigation_stagnation_timeout_s,
             min_displacement_m=self.navigation_stagnation_distance_m,
@@ -3394,6 +5149,7 @@ class SemanticBehaviorExecutor:
             min_goal_distance_reduction_m=(
                 self.navigation_stagnation_goal_distance_reduction_m
             ),
+            allow_yaw_progress=False,
         )
         progress_watchdog.reset(
             start_pose,
@@ -3431,6 +5187,176 @@ class SemanticBehaviorExecutor:
             local_plan_fresh = self._has_fresh_local_plan(
                 navigation_started_at, now
             )
+            # move_base can stop publishing a fresh local plan after it has
+            # already brought the base to a valid interaction approach pose.
+            # Do not let the semantic watchdog turn that safe, ready pose into
+            # ``navigation_stagnation`` just because the planner receipt is
+            # stale.  Validate against the *selected* fallback pose (rather
+            # than the primary decision goal) using the same public distance /
+            # yaw contract that gates the bridge interaction command.  This
+            # keeps a wrong side or heading from being accepted.
+            if str(behavior_type).upper() == "INTERACT" and pose is not None:
+                interaction_pose_detail = interaction_pose_validation(
+                    list((x, y, yaw)),
+                    list(pose),
+                    distance_tolerance_m=direct_distance_tolerance,
+                    yaw_tolerance_rad=direct_yaw_tolerance,
+                )
+                if bool(interaction_pose_detail.get("valid")):
+                    self.move_base.cancel_goal()
+                    arrival_detail = {
+                        "reason": "interaction_approach_pose_tolerance",
+                        "goal_distance_m": goal_distance_m,
+                        "local_plan_fresh": local_plan_fresh,
+                        "interaction_approach_arrival_without_fresh_local_plan": (
+                            not local_plan_fresh
+                        ),
+                        "interaction_pose_validation": interaction_pose_detail,
+                    }
+                    self._complete_interaction_approach_navigation(
+                        decision_id,
+                        candidate,
+                        selected_goal=selected_goal,
+                        selected_goal_option_index=int(
+                            selected_goal_option_index or 0
+                        ),
+                        interaction_approach_attempts=(
+                            interaction_approach_attempt_history
+                        ),
+                        goal_option_count=len(goal_options),
+                        detail=arrival_detail,
+                    )
+                    return
+                # ``final_align_max_distance_m`` is deliberately tight for
+                # ordinary navigation (0.12 m by default), whereas the
+                # bridge's public INTERACT contract permits a safe standoff
+                # such as 0.45 m.  Once this *selected* approach pose is
+                # position-ready but its heading is not, use the same bounded
+                # final-align controller, capped by its interaction-specific
+                # configured radius and the bridge-ready standoff.
+                # Do not relax yaw tolerance or issue an action here: after
+                # the turn, _complete_interaction_approach_navigation still
+                # rechecks a fresh simulator-step pose before the bridge sees
+                # the command.
+                position_ready = bool(
+                    interaction_pose_detail.get("checked")
+                    and float(interaction_pose_detail.get("position_error_m", math.inf))
+                    <= float(interaction_pose_detail.get("distance_tolerance_m", 0.0))
+                )
+                yaw_needs_alignment = bool(
+                    position_ready
+                    and float(interaction_pose_detail.get("yaw_error_rad", 0.0))
+                    > float(interaction_pose_detail.get("yaw_tolerance_rad", math.inf))
+                )
+                if yaw_needs_alignment and self.interaction_final_align_enabled:
+                    aligned = self._final_align_interaction_goal(
+                        decision_id,
+                        goal_frame,
+                        x,
+                        y,
+                        yaw,
+                        ready_distance_m=float(
+                            interaction_pose_detail.get(
+                                "distance_tolerance_m", direct_distance_tolerance
+                            )
+                        ),
+                    )
+                    alignment_detail = {
+                        "reason": "interaction_approach_final_yaw_alignment",
+                        "goal_distance_m": goal_distance_m,
+                        "local_plan_fresh": local_plan_fresh,
+                        "interaction_pose_validation_before_final_align": (
+                            interaction_pose_detail
+                        ),
+                    }
+                    if aligned is True:
+                        self._complete_interaction_approach_navigation(
+                            decision_id,
+                            candidate,
+                            selected_goal=selected_goal,
+                            selected_goal_option_index=int(
+                                selected_goal_option_index or 0
+                            ),
+                            interaction_approach_attempts=(
+                                interaction_approach_attempt_history
+                            ),
+                            goal_option_count=len(goal_options),
+                            detail=alignment_detail,
+                        )
+                        return
+                    if aligned is False:
+                        alignment_detail["reason"] = "final_yaw_alignment_failed"
+                        if self._retry_interaction_approach(
+                            decision_id,
+                            candidate,
+                            selected_goal_option_index,
+                            interaction_approach_attempt_history,
+                            len(goal_options),
+                            alignment_detail,
+                        ):
+                            return
+                        self._handle_navigation_result(
+                            decision_id, False, alignment_detail
+                        )
+                        return
+            rear_oscillation = self._rear_dwa_oscillation_detail(
+                decision_id,
+                goal_frame,
+                path_lookahead,
+                pose,
+                goal_distance_m,
+            )
+            if rear_oscillation is not None:
+                rospy.logwarn(
+                    "[semantic_behavior_executor] rear DWA oscillation; taking exclusive safe turn: %s",
+                    rear_oscillation,
+                )
+                recovered = self._prerotate_for_rear_goal(
+                    decision_id,
+                    goal_frame,
+                    x,
+                    y,
+                    heading_target_xy=path_lookahead,
+                    trigger_source="dwa_left_right_oscillation",
+                )
+                if not recovered:
+                    self.move_base.cancel_goal()
+                    self._handle_navigation_result(
+                        decision_id,
+                        False,
+                        {
+                            **rear_oscillation,
+                            **self._last_rear_goal_recovery_detail,
+                            "rear_goal_recovery": True,
+                        },
+                    )
+                    return
+                if not self._navigation_is_current(decision_id):
+                    return
+                goal.target_pose.header.stamp = rospy.Time.now()
+                self.move_base.send_goal(goal)
+                navigation_started_at = time.monotonic()
+                start_pose = self._current_pose(goal_frame)
+                start_goal_distance_m = (
+                    None
+                    if start_pose is None
+                    else math.hypot(x - start_pose[0], y - start_pose[1])
+                )
+                progress_watchdog.reset(
+                    start_pose,
+                    navigation_started_at,
+                    start_goal_distance_m,
+                )
+                self._start_rear_dwa_monitor(
+                    decision_id,
+                    goal_frame,
+                    path_lookahead,
+                    start_pose,
+                    start_goal_distance_m,
+                )
+                near_goal_since = None
+                state = int(self.move_base.get_state())
+                continue
             near_final_yaw_alignment = bool(
                 pose is not None
                 and require_final_yaw
@@ -3585,20 +5511,28 @@ class SemanticBehaviorExecutor:
                             timeout_alignment_detail,
                         )
                     return
-            self._handle_navigation_result(
+            timeout_detail = {
+                "reason": "navigation_timeout",
+                "interaction_approach_attempts": interaction_approach_attempt_history,
+            }
+            if self._retry_interaction_approach(
                 decision_id,
-                False,
-                {
-                    "reason": "navigation_timeout",
-                    "interaction_approach_attempts": interaction_approach_attempt_history,
-                },
-            )
+                candidate,
+                selected_goal_option_index,
+                interaction_approach_attempt_history,
+                len(goal_options),
+                timeout_detail,
+            ):
+                return
+            self._handle_navigation_result(decision_id, False, timeout_detail)
             return
         success = state == GoalStatus.SUCCEEDED
         detail = {
             "status_code": state,
             "status": self.move_base.get_goal_status_text() or str(state),
         }
+        if not success:
+            detail["reason"] = "navigation_terminal_failure"
         if is_post_interaction_traversal:
             detail["post_open_costmap"] = dict(post_open_costmap_detail)
             for trace_key in (
@@ -3641,6 +5575,18 @@ class SemanticBehaviorExecutor:
                 goal_option_count=len(goal_options),
                 detail=detail,
             )
+            return
+        if (
+            not success
+            and self._retry_interaction_approach(
+                decision_id,
+                candidate,
+                selected_goal_option_index,
+                interaction_approach_attempt_history,
+                len(goal_options),
+                detail,
+            )
+        ):
             return
         self._handle_navigation_result(decision_id, success, detail)
 
@@ -3768,12 +5714,63 @@ class SemanticBehaviorExecutor:
     def _handle_navigation_result(
         self, decision_id: str, success: bool, detail: dict
     ) -> None:
-        recovery_detail = self._maybe_run_stuck_recovery(decision_id, success, detail)
+        detail = dict(detail or {})
+        self._clear_rear_dwa_monitor(decision_id)
+        with self.lock:
+            locks = getattr(self, "_rear_goal_turn_locks", None)
+            if isinstance(locks, dict):
+                locks.pop(decision_id, None)
+        # A failed rear-goal safety gate already means "replan/no motion".
+        # Do not fall through to the legacy ungated stuck-recovery backoff.
+        rear_safe_failure = bool(detail.get("rear_goal_recovery")) or str(
+            detail.get("reason") or ""
+        ).startswith("rear_goal_")
+        recovery_detail = (
+            {}
+            if rear_safe_failure
+            else self._maybe_run_stuck_recovery(decision_id, success, detail)
+        )
         if recovery_detail:
             detail = {**detail, **recovery_detail}
         with self.lock:
             if self.selection is None or str(self.selection.get("decision_id") or "") != decision_id:
                 return
+            if (
+                not success
+                and self.machine.candidate is not None
+                and str(self.machine.candidate.get("behavior_type") or "").upper()
+                == "INTERACT"
+            ):
+                # This is executor-navigation failure, not a statement about
+                # the object's physical state.  The decision node uses it for
+                # bounded, episode-local approach reachability memory.
+                detail.setdefault(
+                    "failure_stage", "interaction_approach_navigation"
+                )
+                approach_reason = str(
+                    detail.get("failure_reason") or detail.get("reason") or ""
+                ).casefold()
+                if approach_reason in {
+                    "make_plan_unreachable",
+                    "navigation_stagnation",
+                    "navigation_timeout",
+                    "navigation_terminal_failure",
+                    "final_yaw_alignment_failed",
+                    "interaction_pose_poll_exhausted",
+                    "interaction_pose_invalid",
+                    "visual_reposition_required",
+                }:
+                    # Exhausting a finite set of *poses* says nothing about
+                    # the object's physical state.  The decision node records
+                    # candidate-local approach memory for this normalized
+                    # reason and deliberately avoids a target-wide cooldown.
+                    detail.setdefault(
+                        "interaction_approach_terminal_reason", approach_reason
+                    )
+                    detail["reason"] = "interaction_approach_options_exhausted"
+                    detail["failure_reason"] = (
+                        "interaction_approach_options_exhausted"
+                    )
             if (
                 success
                 and self.machine.candidate is not None

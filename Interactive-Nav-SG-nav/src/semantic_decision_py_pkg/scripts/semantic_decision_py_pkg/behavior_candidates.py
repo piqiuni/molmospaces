@@ -108,11 +108,22 @@ class CandidateGeneratorConfig:
     # The ROS candidate node enables this only for the rule policy lane; model
     # policies retain the ordinary visual-evidence gate.
     portal_unknown_default_interact: bool = False
+    # A visual Module-1 ``unknown`` is neither an open command nor an absent
+    # candidate.  It navigates to the normal portal standoff and asks for one
+    # or more fresh observations before an action can be dispatched.
+    portal_unknown_observation_max_attempts: int = 2
     portal_standoff_m: float = 1.0
     portal_traversal_distance_m: float = 0.9
     portal_traversal_max_start_distance_m: float = 2.0
     portal_traversal_completion_margin_m: float = 0.35
     container_standoff_m: float = 1.0
+    # A remembered container AABB has no reliable semantic "front" when the
+    # perception stream did not publish one.  Keep several physically distinct
+    # standoff viewpoints so Module 3 can reject an oblique/side view and ask
+    # the executor to re-observe from the next one instead of opening from a
+    # radial guess.
+    container_multiview_enabled: bool = True
+    container_multiview_face_count: int = 4
     # ``None`` means drawers inherit ``container_standoff_m``.  The shipped
     # YAML makes the equivalence explicit (both are 0.50 m), while preserving
     # an opt-in per-drawer adjustment for a future task.
@@ -1083,12 +1094,24 @@ class CandidateGenerator:
             if node_type not in allowed_types:
                 continue
             interaction = node.get("interaction") or {}
-            if not bool(interaction.get("is_interactable", False)):
+            node_state = str(interaction.get("state") or "unknown")
+            attributes = node.get("attributes") or {}
+            visual_unknown_portal_reobserve = bool(
+                node_type == "portal"
+                and not self.config.portal_unknown_default_interact
+                and self._is_ready_visual_unknown_portal(
+                    node,
+                    interaction,
+                    attributes,
+                    node_state,
+                )
+            )
+            if not bool(interaction.get("is_interactable", False)) and not (
+                visual_unknown_portal_reobserve
+            ):
                 continue
             if node_type == "container" and not self._is_openable_container(node):
                 continue
-            node_state = str(interaction.get("state") or "unknown")
-            attributes = node.get("attributes") or {}
             confidence = float(
                 interaction.get("state_confidence", interaction.get("confidence", node.get("confidence", 0.0)))
                 or 0.0
@@ -1103,6 +1126,7 @@ class CandidateGenerator:
             if (
                 confidence < self.config.min_state_confidence
                 and not unknown_portal_rule_fallback
+                and not visual_unknown_portal_reobserve
             ):
                 continue
             state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
@@ -1110,7 +1134,10 @@ class CandidateGenerator:
                 continue
             if node_type == "portal":
                 if (
-                    not bool(interaction.get("requires_interaction"))
+                    (
+                        not bool(interaction.get("requires_interaction"))
+                        and not visual_unknown_portal_reobserve
+                    )
                     or node_state not in {"closed", "ajar", "unknown"}
                 ):
                     continue
@@ -1131,7 +1158,18 @@ class CandidateGenerator:
                 if (
                     node_state == "unknown"
                     and not self.config.portal_allow_unknown_state
+                    and not visual_unknown_portal_reobserve
                 ):
+                    continue
+                if (
+                    node_state == "unknown"
+                    and not unknown_portal_rule_fallback
+                    and not visual_unknown_portal_reobserve
+                ):
+                    # A graph-default/restricted-GT unknown must not become a
+                    # model-lane physical action.  The only model-lane unknown
+                    # admitted here is an explicit, current Module-1 visual
+                    # observation, and it is marked for re-observation below.
                     continue
             if self.config.require_current_visibility and not bool(node.get("is_currently_visible")):
                 continue
@@ -1176,6 +1214,11 @@ class CandidateGenerator:
             else:
                 standoff = self.config.container_standoff_m
                 standoff_source = "container"
+            visual_container_axis = (
+                self._mllm_current_view_approach_axis(node, robot_xy, position)
+                if node_type == "container"
+                else None
+            )
             node_id = str(node.get("id") or "")
             source_object_name = str(
                 attributes.get("source_object_name") or node.get("name") or node_id
@@ -1199,14 +1242,20 @@ class CandidateGenerator:
                 attributes.get("instance_id") or source_object_name or node_id
             )
             interaction_standoff = standoff + self.config.interaction_safety_margin_m
-            goal_candidates = self._approach_candidates(
+            goal_candidates, approach_pose_labels = self._approach_candidates(
                 robot_xy,
                 position,
                 node,
                 interaction_standoff,
                 node_type,
+                visual_container_axis=visual_container_axis,
             )
             approach = goal_candidates[0]
+            portal_aperture_observation = (
+                self._portal_aperture_observation(node)
+                if node_type == "portal"
+                else None
+            )
             portal_aabb_center_xy: list[float] = []
             portal_aabb_size_xy: list[float] = []
             portal_clearance_aabb_center_xy: list[float] = []
@@ -1271,12 +1320,20 @@ class CandidateGenerator:
                 ),
                 "expected_state": "open",
                 "interaction_approach_pose_xyyaw": list(approach),
-                "interaction_approach_axis_xy": list(
-                    self._container_approach_axis(node) or []
-                ),
+                # An interaction candidate must not turn a scene-specific
+                # geometry/oracle axis into a physical precondition.  The only
+                # declared container front accepted here comes from a current,
+                # ready M1 view; otherwise the executor receives a bounded
+                # observation ring below.
+                "interaction_approach_axis_xy": list(visual_container_axis or []),
+                "interaction_approach_pose_labels": list(approach_pose_labels),
                 "interaction_ready_distance_m": self.config.interaction_ready_distance_m,
                 "interaction_ready_yaw_tolerance_rad": 0.55,
             }
+            if portal_aperture_observation is not None:
+                interaction_command["portal_aperture_observation"] = dict(
+                    portal_aperture_observation
+                )
             candidates.append(
                 BehaviorCandidate(
                     candidate_id=f"interaction:{node_id}:open",
@@ -1338,19 +1395,45 @@ class CandidateGenerator:
                             "portal_aabb_normal"
                             if node_type == "portal"
                             else (
-                                "container_explicit_pose"
-                                if self._container_approach_pose(node) is not None
-                                else (
-                                    "container_front_axis"
-                                    if self._container_approach_axis(node) is not None
-                                    else "radial_standoff"
-                                )
+                                "container_mllm_current_view"
+                                if visual_container_axis is not None
+                                else "container_multiview_reobserve"
+                                if self.config.container_multiview_enabled
+                                else "radial_standoff"
                             )
                         ),
-                        "interaction_approach_axis_xy": self._container_approach_axis(
-                            node
+                        "interaction_approach_axis_xy": list(
+                            visual_container_axis or []
                         ),
                         "goal_xyyaw_candidates": goal_candidates,
+                        "interaction_approach_pose_labels": approach_pose_labels,
+                        "interaction_multiview_reobserve": bool(
+                            node_type == "container"
+                            and len(goal_candidates) > 1
+                            and visual_container_axis is None
+                        ),
+                        # Keep the candidate ID/action stable so M2 history
+                        # and cooldowns refer to the same portal.  The state
+                        # machine treats this as a navigation-to-observe phase,
+                        # not an authorization to publish a physical ``open``.
+                        "observation_required": bool(
+                            visual_unknown_portal_reobserve
+                        ),
+                        "reobserve": bool(visual_unknown_portal_reobserve),
+                        "observation_reason": (
+                            "mllm_portal_state_unknown"
+                            if visual_unknown_portal_reobserve
+                            else ""
+                        ),
+                        "interaction_observation_max_attempts": max(
+                            1,
+                            int(self.config.portal_unknown_observation_max_attempts),
+                        ),
+                        "interaction_observation_source": (
+                            "mllm_attribute_inference"
+                            if visual_unknown_portal_reobserve
+                            else ""
+                        ),
                         # Preserve the geometry used to construct the two-sided
                         # approach options.  The post-open continuation uses it
                         # to select an AABB-clear goal on the far side instead
@@ -1363,11 +1446,97 @@ class CandidateGenerator:
                         "portal_clearance_aabb_size_xy": (
                             portal_clearance_aabb_size_xy
                         ),
+                        "portal_aperture_observation": (
+                            dict(portal_aperture_observation)
+                            if portal_aperture_observation is not None
+                            else {}
+                        ),
                     },
 
                 )
             )
         return candidates
+
+    @staticmethod
+    def _is_ready_visual_unknown_portal(
+        node: dict[str, Any],
+        interaction: dict[str, Any],
+        attributes: dict[str, Any],
+        node_state: str,
+    ) -> bool:
+        """Whether Module 1, rather than GT/default graph state, saw unknown.
+
+        This is intentionally stricter than a generic portal ``unknown``:
+        model runs must never approach an unobserved restricted-GT doorway and
+        then blindly issue an open command.  A ready visual M1 result on a
+        currently visible object is useful, however—it grants a stable
+        *re-observation* candidate with the normal interaction geometry.
+        """
+
+        if str(node_state or "").strip().casefold() != "unknown":
+            return False
+        if not bool(node.get("is_currently_visible")):
+            return False
+        if str(attributes.get("attribute_status") or "").strip().casefold() != "ready":
+            return False
+        sources = (
+            attributes.get("attribute_source"),
+            interaction.get("state_source"),
+            (attributes.get("interaction_state_override") or {}).get("state_source"),
+        )
+        return any("mllm" in str(source or "").casefold() for source in sources)
+
+    @staticmethod
+    def _portal_aperture_observation(node: dict[str, Any]) -> dict[str, Any] | None:
+        """Combine public visual morphology with independent room/OCC evidence.
+
+        Module 1 supplies ``door_leaf`` from the current RGB observation.  The
+        mapping side supplies connectivity only when two observed room
+        endpoints are connected (and no synthetic/potential room is involved).
+        Missing evidence is intentionally represented as ``unknown``; the
+        force bridge then returns a terminal ``unavailable`` result.
+        """
+
+        attributes = node.get("attributes") or {}
+        morphology = attributes.get("portal_morphology")
+        if not isinstance(morphology, dict):
+            return None
+        leaf = str(
+            morphology.get("door_leaf") or morphology.get("leaf") or "unknown"
+        ).strip().casefold()
+        if leaf in {"absent", "none", "missing", "no_leaf", "no_door"}:
+            leaf = "absent"
+        elif leaf in {"present", "leaf", "door", "door_leaf", "visible"}:
+            leaf = "present"
+        else:
+            leaf = "unknown"
+        try:
+            morphology_confidence = max(
+                0.0, min(1.0, float(morphology.get("confidence", 0.0)))
+            )
+        except (TypeError, ValueError):
+            morphology_confidence = 0.0
+        observed_room_ids = {
+            str(room_id)
+            for room_id in (attributes.get("observed_connected_room_ids") or [])
+            if room_id is not None and str(room_id)
+        }
+        topology_connected = bool(
+            node.get("is_currently_visible") is True
+            and str(attributes.get("connectivity_status") or "").casefold()
+            == "connected"
+            and len(observed_room_ids) >= 2
+            and not bool(attributes.get("potential_room_ids"))
+        )
+        return {
+            "door_leaf": leaf,
+            "connectivity": "open" if topology_connected else "unknown",
+            "confidence": (
+                min(morphology_confidence, 0.8)
+                if topology_connected
+                else morphology_confidence
+            ),
+        }
 
     def _has_verified_pending_portal_state(
         self,
@@ -1556,79 +1725,80 @@ class CandidateGenerator:
             )
         return candidates
 
-    @classmethod
+    @staticmethod
+    def _mllm_current_view_approach_axis(
+        node: dict[str, Any],
+        robot_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+    ) -> tuple[float, float] | None:
+        """Return a container approach axis only from a fresh M1 view contract.
+
+        ``interaction_approach_axis_xy`` and
+        ``interaction_approach_pose_xyyaw`` are intentionally excluded here:
+        they may be supplied by scene geometry or an oracle.  M1 instead says
+        whether the *current* camera view is front/oblique enough to approach;
+        the actual axis is then the normalized object-to-robot direction.
+        """
+
+        attributes = node.get("attributes") or {}
+        if not bool(node.get("is_currently_visible")):
+            return None
+        if str(attributes.get("attribute_status") or "").strip().casefold() != "ready":
+            return None
+        sources = (
+            attributes.get("attribute_source"),
+            attributes.get("view_state_source"),
+            attributes.get("approach_source"),
+        )
+        if not any("mllm" in str(source or "").casefold() for source in sources):
+            return None
+        if attributes.get("attribute_is_current") is False:
+            return None
+        view_state = str(
+            attributes.get("view_state")
+            or attributes.get("interaction_view_state")
+            or ""
+        ).strip().casefold()
+        if view_state not in {"front", "oblique"}:
+            return None
+        if not CandidateGenerator._truthy_mllm_attribute(
+            attributes.get("front_surface_visible")
+        ):
+            return None
+        if not CandidateGenerator._truthy_mllm_attribute(
+            attributes.get("approach_ready")
+        ):
+            return None
+        axis_x = float(robot_xy[0]) - float(target_xy[0])
+        axis_y = float(robot_xy[1]) - float(target_xy[1])
+        norm = math.hypot(axis_x, axis_y)
+        if norm <= 1e-6:
+            return None
+        return axis_x / norm, axis_y / norm
+
+    @staticmethod
+    def _truthy_mllm_attribute(value: Any) -> bool:
+        return value is True or str(value or "").strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+        }
+
     def _approach_candidates(
-        cls,
+        self,
         robot_xy: tuple[float, float],
         target_xy: tuple[float, float],
         node: dict[str, Any],
         standoff_m: float,
         node_type: str,
-    ) -> list[list[float]]:
+        *,
+        visual_container_axis: tuple[float, float] | None = None,
+    ) -> tuple[list[list[float]], list[str]]:
         candidates: list[list[float]] = []
-        if node_type == "portal":
-            # A single radial approach can put all fallbacks on the blocked
-            # side of a doorway.  Keep the original (robot-side, zero-offset)
-            # candidates first, then try small tangential offsets and the
-            # opposite doorway side.  The executor preflights these in order
-            # and stops at the first reachable pose.
-            for side_multiplier in (1.0, -1.0):
-                for tangent_offset_m in (0.0, 0.20, -0.20):
-                    for extra_standoff in (0.0, 0.25, 0.50):
-                        candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
-                        pose = cls._portal_approach_pose(
-                            robot_xy,
-                            target_xy,
-                            node,
-                            candidate_standoff,
-                            side_multiplier=side_multiplier,
-                            tangent_offset_m=tangent_offset_m,
-                        )
-                        if not any(
-                            math.hypot(pose[0] - previous[0], pose[1] - previous[1]) <= 1e-6
-                            and abs(
-                                math.atan2(
-                                    math.sin(pose[2] - previous[2]),
-                                    math.cos(pose[2] - previous[2]),
-                                )
-                            )
-                            <= 1e-6
-                            for previous in candidates
-                        ):
-                            candidates.append(pose)
-            return candidates
+        labels: list[str] = []
 
-        for extra_standoff in (0.0, 0.25, 0.50):
-            candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
-            if node_type == "portal":
-                # Kept unreachable by the branch above; this guard makes the
-                # non-portal path below explicit if node types are extended.
-                pose = cls._portal_approach_pose(
-                    robot_xy, target_xy, node, candidate_standoff
-                )
-            else:
-                explicit_pose = cls._container_approach_pose(node)
-                if explicit_pose is not None:
-                    axis = cls._container_approach_axis(node)
-                    if axis is None:
-                        axis = (
-                            math.cos(float(explicit_pose[2]) + math.pi),
-                            math.sin(float(explicit_pose[2]) + math.pi),
-                        )
-                    pose = [
-                        float(explicit_pose[0]) + axis[0] * extra_standoff,
-                        float(explicit_pose[1]) + axis[1] * extra_standoff,
-                        float(explicit_pose[2]),
-                    ]
-                else:
-                    pose = cls._approach_pose(
-                        robot_xy,
-                        target_xy,
-                        candidate_standoff,
-                        node=node,
-                        fixed_axis=cls._container_approach_axis(node),
-                    )
-            if not any(
+        def append_unique(pose: list[float], label: str) -> None:
+            if any(
                 math.hypot(pose[0] - previous[0], pose[1] - previous[1]) <= 1e-6
                 and abs(
                     math.atan2(
@@ -1639,8 +1809,99 @@ class CandidateGenerator:
                 <= 1e-6
                 for previous in candidates
             ):
-                candidates.append(pose)
-        return candidates
+                return
+            candidates.append(pose)
+            labels.append(str(label))
+
+        if node_type == "portal":
+            # A single radial approach can put all fallbacks on the blocked
+            # side of a doorway.  Keep the original (robot-side, zero-offset)
+            # candidates first, then try small tangential offsets and the
+            # opposite doorway side.  The executor preflights these in order
+            # and stops at the first reachable pose.
+            for side_multiplier in (1.0, -1.0):
+                for tangent_offset_m in (0.0, 0.20, -0.20):
+                    for extra_standoff in (0.0, 0.25, 0.50):
+                        candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
+                        pose = self._portal_approach_pose(
+                            robot_xy,
+                            target_xy,
+                            node,
+                            candidate_standoff,
+                            side_multiplier=side_multiplier,
+                            tangent_offset_m=tangent_offset_m,
+                        )
+                        append_unique(
+                            pose,
+                            "portal_source_side"
+                            if side_multiplier > 0.0
+                            else "portal_opposite_side",
+                        )
+            return candidates, labels
+
+        # M1 may explicitly say that the current RGB view contains the front
+        # (or an adequate oblique face) of a container.  Derive the outward
+        # approach axis from the actual robot--object geometry at that fresh
+        # observation.  Do not read interaction_approach_axis_xy or an
+        # interaction pose here: both can originate from GT/oracle geometry.
+        if visual_container_axis is not None:
+            for extra_standoff in (0.0, 0.25, 0.50):
+                candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
+                pose = self._approach_pose(
+                    robot_xy,
+                    target_xy,
+                    candidate_standoff,
+                    node=node,
+                    fixed_axis=visual_container_axis,
+                )
+                append_unique(pose, "mllm_current_view")
+            return candidates, labels
+
+        if not self.config.container_multiview_enabled:
+            append_unique(
+                self._approach_pose(
+                    robot_xy,
+                    target_xy,
+                    max(0.0, float(standoff_m)),
+                    node=node,
+                ),
+                "current_view",
+            )
+            return candidates, labels
+
+        # No fresh M1 front observation was available.  The first pose retains
+        # the current radial side, then the executor may re-observe from three
+        # orthogonal faces.  These labels describe only the candidate-ring
+        # order; they do not assert a semantic front or reuse oracle geometry.
+        dx = float(robot_xy[0]) - float(target_xy[0])
+        dy = float(robot_xy[1]) - float(target_xy[1])
+        distance = math.hypot(dx, dy)
+        radial_axis = (-1.0, 0.0) if distance <= 1e-6 else (dx / distance, dy / distance)
+        axes = (
+            radial_axis,
+            (-radial_axis[1], radial_axis[0]),
+            (radial_axis[1], -radial_axis[0]),
+            (-radial_axis[0], -radial_axis[1]),
+        )
+        face_labels = (
+            "current_view",
+            "quarter_turn_left",
+            "quarter_turn_right",
+            "opposite_view",
+        )
+        face_count = max(1, min(len(axes), int(self.config.container_multiview_face_count)))
+        for axis, label in zip(axes[:face_count], face_labels[:face_count]):
+            append_unique(
+                self._approach_pose(
+                    robot_xy,
+                    target_xy,
+                    max(0.0, float(standoff_m)),
+                    node=node,
+                    fixed_axis=axis,
+                ),
+                label,
+            )
+        return candidates, labels
 
     @staticmethod
     def _is_drawer_container(node: dict[str, Any]) -> bool:

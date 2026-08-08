@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import cv2
 import mujoco
 import numpy as np
 
@@ -167,6 +168,45 @@ def _bbox_area(bbox: list[float] | list[int]) -> float:
         return 0.0
     return max(0.0, float(bbox[2]) - float(bbox[0]) + 1.0) * max(
         0.0, float(bbox[3]) - float(bbox[1]) + 1.0
+    )
+
+
+def _largest_connected_component_bbox(
+    xs: np.ndarray, ys: np.ndarray
+) -> tuple[int, list[int]] | None:
+    """Return the dominant 8-connected visible component for one object.
+
+    MuJoCo's segmentation image is exact at the geom level, but an object can
+    contribute several disconnected pixel islands after occlusion or an overly
+    broad body-to-object association.  A union bounding box over those islands
+    can cover unrelated furniture.  The public 2-D observation must represent
+    one visually grounded target, so retain its largest visible component.
+    """
+
+    if xs.size == 0 or ys.size == 0:
+        return None
+    min_x = int(np.min(xs))
+    min_y = int(np.min(ys))
+    max_x = int(np.max(xs))
+    max_y = int(np.max(ys))
+    mask = np.zeros((max_y - min_y + 1, max_x - min_x + 1), dtype=np.uint8)
+    mask[ys - min_y, xs - min_x] = 1
+    component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
+    if component_count <= 1:
+        return None
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    # Stable tie-break: OpenCV labels components in raster order, so argmax
+    # deterministically retains the upper-left component when areas tie.
+    component_index = 1 + int(np.argmax(areas))
+    left = int(stats[component_index, cv2.CC_STAT_LEFT])
+    top = int(stats[component_index, cv2.CC_STAT_TOP])
+    width = int(stats[component_index, cv2.CC_STAT_WIDTH])
+    height = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+    return (
+        int(stats[component_index, cv2.CC_STAT_AREA]),
+        [min_x + left, min_y + top, min_x + left + width - 1, min_y + top + height - 1],
     )
 
 
@@ -412,6 +452,28 @@ class RealtimeGTObservationPublisher:
             if self.max_distance_m > 0.0 and distance_m > self.max_distance_m:
                 continue
             center, size = _safe_body_aabb(model, data, spec.body_id)
+            if self.min_visible_fraction > 0.0:
+                try:
+                    observed_extent_fraction, projected_bbox = _visible_fraction(
+                        bbox_2d,
+                        camera_position,
+                        np.asarray(camera.forward, dtype=np.float64),
+                        np.asarray(camera.up, dtype=np.float64),
+                        float(camera.fov),
+                        image_size,
+                        center,
+                        size,
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    # Keep the geometry observation usable for custom cameras
+                    # that cannot provide an AABB projection contract.
+                    projected_bbox = None
+                    observed_extent_fraction = 1.0
+                if (
+                    projected_bbox is not None
+                    and observed_extent_fraction < self.min_visible_fraction
+                ):
+                    continue
             interaction_approach_axis_xy = None
             if (
                 self.emit_interaction_approach_axis
@@ -619,21 +681,25 @@ class RealtimeGTObservationPublisher:
         if spec_indices.size == 0:
             return []
         counts = np.bincount(spec_indices, minlength=len(self._specs))
-        min_x = np.full(len(self._specs), segmentation.shape[1], dtype=np.int32)
-        min_y = np.full(len(self._specs), segmentation.shape[0], dtype=np.int32)
-        max_x = np.full(len(self._specs), -1, dtype=np.int32)
-        max_y = np.full(len(self._specs), -1, dtype=np.int32)
-        np.minimum.at(min_x, spec_indices, xs)
-        np.minimum.at(min_y, spec_indices, ys)
-        np.maximum.at(max_x, spec_indices, xs)
-        np.maximum.at(max_y, spec_indices, ys)
         result = []
         for spec_index in np.flatnonzero(counts >= self.min_visible_pixels):
+            component = _largest_connected_component_bbox(
+                xs[spec_indices == spec_index],
+                ys[spec_indices == spec_index],
+            )
+            if component is None:
+                continue
+            component_pixels, bbox_2d = component
+            # Do not combine two individually invisible islands merely because
+            # they share a GT object ID.  This prevents a tiny pair of door
+            # fragments from becoming a large box over unrelated objects.
+            if component_pixels < self.min_visible_pixels:
+                continue
             result.append(
                 (
                     int(spec_index),
-                    int(counts[spec_index]),
-                    [int(min_x[spec_index]), int(min_y[spec_index]), int(max_x[spec_index]), int(max_y[spec_index])],
+                    int(component_pixels),
+                    bbox_2d,
                 )
             )
         return result

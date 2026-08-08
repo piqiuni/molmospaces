@@ -2,6 +2,7 @@ import json
 import threading
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 pytest.importorskip("rospy")
@@ -16,6 +17,34 @@ class RecordingQueue:
 
     def discard(self, object_id, request_sequence=None) -> None:
         self.discarded.append((object_id, request_sequence))
+
+
+class RecordingClient:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(model="test-mllm")
+        self.calls = []
+
+    def request_json(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            error="",
+            payload={
+                "object_id": "target",
+                "interactable": True,
+                "interaction_class": "container",
+                "coarse_state": "closed",
+                "portal_morphology": None,
+                "portal_aperture_evidence": None,
+                "view_state": "front",
+                "view_state_confidence": 0.9,
+                "front_surface_visible": True,
+                "front_surface_confidence": 0.9,
+                "approach_ready": True,
+                "needs_reobserve": False,
+                "interaction_parts": [],
+                "confidence": 0.9,
+            },
+        )
 
 
 def test_initial_generation_zero_request_is_current() -> None:
@@ -113,3 +142,168 @@ def test_uncertain_portal_result_retries_after_short_refresh_interval(
             "confidence": 0.2,
         },
     ) == 5.0
+
+
+def test_targeted_refresh_requires_later_capture_and_rgb_sequence() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.aliases = {"alias_1": "object_1", "object_1": "object_1"}
+    node.targeted_refresh_requests = {
+        "object_1": {
+            "object_id": "alias_1",
+            "episode_id": "episode_1",
+            "minimum_capture_step": 12,
+            "minimum_image_sequence": 7,
+            "refresh_sequence": 3,
+            "reason": "need_front_view",
+        }
+    }
+    detection = {"id": "alias_1", "bbox_2d": [10, 10, 40, 40]}
+
+    assert (
+        node._targeted_refresh_for_detection(
+            "object_1",
+            detection,
+            episode_id="episode_1",
+            capture_step=12,
+            image_sequence=8,
+        )
+        is None
+    )
+    assert (
+        node._targeted_refresh_for_detection(
+            "object_1",
+            detection,
+            episode_id="episode_1",
+            capture_step=13,
+            image_sequence=7,
+        )
+        is None
+    )
+    matched = node._targeted_refresh_for_detection(
+        "object_1",
+        detection,
+        episode_id="episode_1",
+        capture_step=13,
+        image_sequence=8,
+    )
+    assert matched is not None
+    assert matched["reason"] == "need_front_view"
+
+
+def test_targeted_refresh_replaces_stale_request_and_keeps_tracking_fields() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.pending = {"object_1": {"request_sequence": 4, "generation": 2}}
+    node.generations = {"object_1": 2}
+    node.completed = {"object_1": {"signature": "old"}}
+    node.last_request = {"object_1": 1.0}
+    node.request_sequence = 5
+    node.request_queue = RecordingQueue()
+    node.filter_counts = {"targeted_refresh_matched": 0}
+    refresh = {
+        "request_key": "object_1",
+        "request_id": "refresh_9",
+        "refresh_sequence": 9,
+        "reason": "need_front_view",
+        "minimum_capture_step": 20,
+    }
+
+    reservation = node._force_reserve_targeted_refresh(
+        "object_1", "fresh", "episode_1", refresh
+    )
+
+    assert reservation == {"generation": 3, "request_sequence": 6}
+    assert node.request_queue.discarded == [("object_1", 4)]
+    assert node.pending["object_1"]["targeted_refresh"]["request_id"] == "refresh_9"
+    status = node._attribute_status_patch(
+        {
+            "object_id": "object_1",
+            "frame_id": "21",
+            "image_sequence": 18,
+            "request_sequence": 6,
+            "signature": "fresh",
+            "targeted_refresh": refresh,
+        },
+        "ready",
+    )
+    assert status["targeted_refresh"] is True
+    assert status["targeted_refresh_request_id"] == "refresh_9"
+    assert status["targeted_refresh_image_sequence"] == 18
+
+
+def test_attribute_visual_evidence_is_full_image_with_target_outline_and_inset() -> None:
+    image = np.zeros((100, 160, 3), dtype=np.uint8)
+    image[25:85, 60:110] = (30, 100, 200)
+    evidence = InteractionAttributeInferenceNode._compose_attribute_visual_evidence(
+        image,
+        {"bbox_2d": [60, 25, 110, 85]},
+        margin_ratio=0.10,
+    )
+
+    assert evidence is not None
+    assert evidence.shape == image.shape
+    assert not np.array_equal(evidence, image)
+    # The BGR yellow outline gives an unambiguous target anchor to M1.
+    assert np.any(np.all(evidence == np.array([0, 255, 255]), axis=2))
+
+
+def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.pending = {
+        "object_1": {
+            "request_sequence": 1,
+            "generation": 0,
+            "episode_id": "episode_1",
+        }
+    }
+    node.generations = {"object_1": 0}
+    node.last_request = {}
+    node.completed = {}
+    node.filter_counts = {"started": 0, "stale": 0, "completed": 0, "failed": 0}
+    node.visual_evidence_max_side_px = 0
+    node.request_timeout_s = 1.0
+    node.max_output_tokens = 256
+    node.success_refresh_interval_s = 120.0
+    node.client = RecordingClient()
+    published = []
+    node._publish_updates = lambda episode_id, stamp, updates: published.append(updates)
+    node._publish_status = lambda: None
+    image = np.zeros((80, 120, 3), dtype=np.uint8)
+    visual_evidence = node._compose_attribute_visual_evidence(
+        image,
+        {"bbox_2d": [30, 15, 90, 70]},
+        margin_ratio=0.08,
+    )
+    assert visual_evidence is not None
+
+    node._infer(
+        object_id="object_1",
+        detection={
+            "name": "fridge",
+            "category": "private_gt_category",
+            "position": [9.0, 8.0, 7.0],
+        },
+        visual_evidence=visual_evidence,
+        episode_id="episode_1",
+        frame_id="14",
+        image_sequence=22,
+        stamp=10.0,
+        signature="fresh",
+        generation=0,
+        request_sequence=1,
+        enqueued_at=0.0,
+        targeted_refresh={},
+    )
+
+    request = node.client.calls[0]
+    assert request["context"] == {"object_id": "target"}
+    assert len(request["images"]) == 1
+    assert request["response_schema"]["schema"]["properties"]["object_id"]["enum"] == [
+        "target"
+    ]
+    assert published[0][0]["object_id"] == "object_1"
+    assert published[0][0]["approach_ready"] is True

@@ -75,12 +75,20 @@ ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11311}
 RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
 ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.zsh}
 SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${REPO_ROOT}/.env}
+# Keep V3's Module-1 cap explicit as well: the portal visual evidence fields
+# can exceed the historical 160-token launch default when the model uses
+# pretty-printed JSON.
+SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-256}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_v3_full_mllm.yaml}
 SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
 NAV_CONFIG_OVERRIDE=${NAV_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 RECORDER=${RECORDER:-${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py}
 RECORDER_DRAIN_HELPER=${RECORDER_DRAIN_HELPER:-${SCRIPT_DIR}/wait_for_recorder_drain.py}
+VIDEO_BUILDER=${VIDEO_BUILDER:-${SCRIPT_DIR}/build_semantic_video_offline.py}
+STEP_FRAME_QUEUE_SIZE=${STEP_FRAME_QUEUE_SIZE:-4}
+STEP_CAPTURE_ACK_TIMEOUT_S=${STEP_CAPTURE_ACK_TIMEOUT_S:-2.0}
+RECORDER_DRAIN_STALL_TIMEOUT_S=${RECORDER_DRAIN_STALL_TIMEOUT_S:-300}
 SHARED_MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/molmospaces-matplotlib-${UID}}
 
 for required_path in "${BENCHMARK}" "${ROS_SETUP}" "${SEMANTIC_MODEL_ENV_FILE}" \
@@ -92,7 +100,7 @@ for required_path in "${BENCHMARK}" "${ROS_SETUP}" "${SEMANTIC_MODEL_ENV_FILE}" 
   fi
 done
 if [[ "${FAST_EVAL}" != true ]]; then
-  for required_path in "${RECORDER}" "${RECORDER_DRAIN_HELPER}"; do
+  for required_path in "${RECORDER}" "${RECORDER_DRAIN_HELPER}" "${VIDEO_BUILDER}"; do
     if [[ ! -f "${required_path}" ]]; then
       printf '%s\n' "Missing required recorder support file: ${required_path}" >&2
       exit 2
@@ -112,6 +120,10 @@ if [[ ! "${VIDEO_STEP_SAMPLE_EVERY}" =~ ^[1-9][0-9]*$ ]]; then
   printf '%s\n' "VIDEO_STEP_SAMPLE_EVERY must be a positive integer: ${VIDEO_STEP_SAMPLE_EVERY}" >&2
   exit 2
 fi
+if [[ "${FAST_EVAL}" != true && "${VIDEO_STEP_SAMPLE_EVERY}" -ne 1 ]]; then
+  printf '%s\n' "Exact offline V3 six-panel recording requires VIDEO_STEP_SAMPLE_EVERY=1, got: ${VIDEO_STEP_SAMPLE_EVERY}" >&2
+  exit 2
+fi
 for required_mllm_setting in \
   'module1: "dynamic_mllm"' \
   'module2: "mllm_score"' \
@@ -125,7 +137,7 @@ printf '%s\n' "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
 printf '%s\n' "[v3-eval] step_budget_mode=${STEP_BUDGET_MODE} min_steps=${MIN_STEPS} max_steps=${MAX_STEPS}"
 printf '%s\n' "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY} render_queue=${VIDEO_FRAME_JOB_QUEUE_SIZE} overflow=${VIDEO_FRAME_QUEUE_OVERFLOW} occ_local_proxy=${VIDEO_SNAPSHOT_GRID_MAX_DIM}px/${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT} global_costmap=native/png crop_margin=${VIDEO_OCC_CROP_MARGIN_M}m"
 
-mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}"
+mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/sim_step_frames" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}"
 if [[ -e "${RUN_DIR}/eval" ]]; then
   printf '%s\n' "Refusing to overwrite existing evaluator output: ${RUN_DIR}/eval" >&2
   exit 2
@@ -251,6 +263,7 @@ roslaunch "${ROS_SOURCE_DIR}/nav_pkg/launch/molmospaces_nav_system.launch" \
   start_semantic_decision:=true \
   semantic_attribute_inference:=true \
   semantic_attribute_model_name:= \
+  semantic_attribute_max_output_tokens:="${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS}" \
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
   semantic_config_override_file:="${SEMANTIC_MAPPING_OVERRIDE}" \
   explore_py_config_override_file:="${EXPLORE_PY_CONFIG_OVERRIDE}" \
@@ -283,9 +296,12 @@ if [[ "${FAST_EVAL}" != true ]]; then
     --video-frame-queue-overflow "${VIDEO_FRAME_QUEUE_OVERFLOW}" \
     --video-history-size "${VIDEO_HISTORY_SIZE}" \
     --artifact-write-queue-size "${ARTIFACT_WRITE_QUEUE_SIZE}" \
-    --runtime-video-encode \
+    --step-capture-ack-topic /molmo_spaces/step_capture_ack \
+    --no-runtime-video-encode \
+    --offline-video-only \
     --no-video-save-panel-frames \
     --no-video-save-composite-frames \
+    --no-first-person-video-h264 \
     --interaction-result-topic /semantic_mapping/interaction_result \
     --no-external-video \
     >"${RUN_DIR}/recorder.log" 2>&1 &
@@ -317,6 +333,11 @@ EVAL_ARGS=(
   --ros-action-timeout-s 1.0
   --no-ros-require-move-base-active
   --ros-map-warmup-skip-frames 0
+  --ros-step-frame-dir "${RUN_DIR}/sim_step_frames"
+  --ros-step-frame-queue-size "${STEP_FRAME_QUEUE_SIZE}"
+  --ros-step-capture-ack-topic /molmo_spaces/step_capture_ack
+  --ros-step-capture-ack-barrier-enabled
+  --ros-step-capture-ack-timeout-s "${STEP_CAPTURE_ACK_TIMEOUT_S}"
   --video-fps "${VIDEO_FPS}"
   --progress-every 1
 )
@@ -347,18 +368,22 @@ if [[ "${FAST_EVAL}" == true ]]; then
   exit "${EVAL_EXIT}"
 fi
 
-# The evaluator may finish while step-sync callbacks or six-panel renders are
-# still queued.  Drain against the evaluator's exact completed-step count,
-# rather than sleeping for a fixed interval that is too short under 3 workers.
+# The evaluator may finish while bridge PNG writes or recorder raw receipts are
+# still queued.  The bridge manifest is the authoritative source of recordable
+# sensor steps: an interaction can complete between two policy calls, so an
+# evaluator decision count is not necessarily a camera-frame count.
 RECORDER_DRAIN_STATUS=0
 "${PYTHON_BIN}" "${RECORDER_DRAIN_HELPER}" \
-  --episode-result "${EPISODE_RESULT}" \
+  --sim-manifest "${RUN_DIR}/sim_step_frames/manifest.jsonl" \
   --video-frames-csv "${RUN_DIR}/debug/video_frames.csv" \
   --timeout-sec "${RECORDER_DRAIN_TIMEOUT_S}" \
   --poll-sec "${RECORDER_DRAIN_POLL_S}" \
   --progress-sec "${RECORDER_DRAIN_PROGRESS_S}" \
+  --stall-timeout-sec "${RECORDER_DRAIN_STALL_TIMEOUT_S}" \
   --recorder-pid "${RECORDER_PID}" \
   --step-sync-capture-every "${VIDEO_STEP_SAMPLE_EVERY}" \
+  --offline-raw-recording \
+  --raw-step-manifest "${RUN_DIR}/debug/raw/step_boundaries.jsonl" \
   || RECORDER_DRAIN_STATUS=$?
 
 cleanup_process "${RECORDER_PID}" "${RECORDER_SHUTDOWN_GRACE_S}"
@@ -367,8 +392,56 @@ cleanup_process "${ROSLAUNCH_PID}" 20
 ROSLAUNCH_PID=""
 cleanup_process "${ROSCORE_PID}" 10
 ROSCORE_PID=""
-TOPDOWN_PATH="${EPISODE_DIR}/episode_topdown.png"
+# Re-check after recorder shutdown because its final join may complete the last
+# raw receipt even if the live drain reached its timeout boundary.
+FINAL_DRAIN_STATUS=0
+"${PYTHON_BIN}" "${RECORDER_DRAIN_HELPER}" \
+  --sim-manifest "${RUN_DIR}/sim_step_frames/manifest.jsonl" \
+  --video-frames-csv "${RUN_DIR}/debug/video_frames.csv" \
+  --timeout-sec 0 \
+  --step-sync-capture-every "${VIDEO_STEP_SAMPLE_EVERY}" \
+  --offline-raw-recording \
+  --raw-step-manifest "${RUN_DIR}/debug/raw/step_boundaries.jsonl" \
+  --recorder-summary "${RUN_DIR}/debug/summary.json" \
+  || FINAL_DRAIN_STATUS=$?
+if (( FINAL_DRAIN_STATUS != 0 )); then
+  printf '%s\n' "Recorder did not capture every completed evaluator step (live_drain_status=${RECORDER_DRAIN_STATUS})." >&2
+  exit 4
+fi
 
+"${PYTHON_BIN}" "${VIDEO_BUILDER}" \
+  --scene-dir "${RUN_DIR}" \
+  --debug-dir "${RUN_DIR}/debug" \
+  --fps "${VIDEO_FPS}" \
+  --state-alignment exact \
+  --output-stem overview_6panel \
+  >"${RUN_DIR}/offline_video.log" 2>&1
+
+SIX_PANEL_PATH="${RUN_DIR}/videos/overview_6panel.mp4"
+"${PYTHON_BIN}" - "${RUN_DIR}/sim_step_frames/manifest.jsonl" "${RUN_DIR}/offline_video_summary.json" "${SIX_PANEL_PATH}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path, summary_path, video_path = map(Path, sys.argv[1:])
+expected = sum(
+    bool(line.strip()) and line.endswith("\n")
+    for line in manifest_path.read_text(encoding="utf-8").splitlines(keepends=True)
+)
+summary = json.loads(summary_path.read_text(encoding="utf-8"))
+actual = int(summary.get("output_frame_count", -1))
+exact = int(summary.get("exact_step_match_count", -1))
+missing = list(summary.get("missing_sim_step_indexes") or []) + list(summary.get("missing_raw_step_indexes") or [])
+if expected <= 0 or actual != expected or exact != expected or missing:
+    raise SystemExit(
+        "offline V3 video alignment failed: "
+        f"expected={expected} output={actual} exact={exact} missing={missing[:8]}"
+    )
+if not video_path.is_file() or video_path.stat().st_size <= 0:
+    raise SystemExit(f"offline V3 video is missing or empty: {video_path}")
+PY
+
+TOPDOWN_PATH="${EPISODE_DIR}/episode_topdown.png"
 MUJOCO_GL=egl "${PYTHON_BIN}" "${REPO_ROOT}/scripts/InteractiveNav/render_interactive_nav_v3_topdown.py" \
   --episode-result "${EPISODE_RESULT}" \
   --benchmark "${BENCHMARK}" \
@@ -377,29 +450,13 @@ MUJOCO_GL=egl "${PYTHON_BIN}" "${REPO_ROOT}/scripts/InteractiveNav/render_intera
   --output "${TOPDOWN_PATH}" \
   >"${RUN_DIR}/topdown.log" 2>&1
 
-SIX_PANEL_PATH="${RUN_DIR}/debug/videos/overview_6panel.mp4"
 for required_artifact in "${RUN_DIR}/debug/final_occ_map.yaml" "${RUN_DIR}/debug/trajectory.csv" \
-  "${SIX_PANEL_PATH}" "${TOPDOWN_PATH}"; do
+  "${RUN_DIR}/offline_video_summary.json" "${SIX_PANEL_PATH}" "${TOPDOWN_PATH}"; do
   if [[ ! -s "${required_artifact}" ]]; then
     printf '%s\n' "Required visual artifact is missing or empty: ${required_artifact}" >&2
     exit 4
   fi
 done
-
-# Re-check after recorder shutdown because its final join may complete the last
-# already-enqueued frame even if the live drain reached its timeout boundary.
-FINAL_DRAIN_STATUS=0
-"${PYTHON_BIN}" "${RECORDER_DRAIN_HELPER}" \
-  --episode-result "${EPISODE_RESULT}" \
-  --video-frames-csv "${RUN_DIR}/debug/video_frames.csv" \
-  --timeout-sec 0 \
-  --step-sync-capture-every "${VIDEO_STEP_SAMPLE_EVERY}" \
-  --recorder-summary "${RUN_DIR}/debug/summary.json" \
-  || FINAL_DRAIN_STATUS=$?
-if (( FINAL_DRAIN_STATUS != 0 )); then
-  printf '%s\n' "Recorder did not capture every completed evaluator step (live_drain_status=${RECORDER_DRAIN_STATUS})." >&2
-  exit 4
-fi
 
 printf '%s\n' "[v3-ros-eval] six-panel=${SIX_PANEL_PATH}"
 printf '%s\n' "[v3-ros-eval] topdown=${TOPDOWN_PATH}"

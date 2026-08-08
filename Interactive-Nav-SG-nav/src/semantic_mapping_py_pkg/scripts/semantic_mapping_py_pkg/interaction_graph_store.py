@@ -67,17 +67,18 @@ def _interaction_result_capability(result):
 
     capability = str(result.get("interaction_capability") or "").strip().casefold()
     state = str(result.get("state") or result.get("post_state") or "").strip().casefold()
-    reason = str(
-        result.get("reason") or result.get("failure_reason") or ""
-    ).strip().casefold()
     if (
         capability == "static"
         or state in {"static", "static_open", "static_closed"}
-        or reason == "non_articulated"
     ):
         return "static"
+    if capability == "unavailable" or state == "unavailable":
+        # A missing articulation identifies an unavailable executor target,
+        # not a fixed open passage.  Preserve that distinction so later visual
+        # observations cannot turn a failed action into ``static_open``.
+        return "unavailable"
     if (
-        capability in {"blocked", "unsupported", "unavailable", "locked"}
+        capability in {"blocked", "unsupported", "locked"}
         or state == "blocked"
         or result.get("interactable") is False
     ):
@@ -86,6 +87,114 @@ def _interaction_result_capability(result):
         # observed portal is merely an open doorway.
         return "blocked"
     return "unknown"
+
+
+def _public_portal_morphology(patch):
+    """Return a compact visual-only portal morphology, if supplied.
+
+    Attribute updates normally pass through the MLLM schema validator, but the
+    graph store also accepts replay/test payloads directly.  Normalize again at
+    this boundary so no arbitrary model text becomes part of the public graph.
+    """
+
+    raw = patch.get("portal_morphology")
+    if not isinstance(raw, dict):
+        return None
+    leaf = str(raw.get("door_leaf") or raw.get("leaf") or "unknown").strip().casefold()
+    if leaf in {"absent", "none", "missing", "no_leaf", "no_door"}:
+        leaf = "absent"
+    elif leaf in {"present", "leaf", "door", "door_leaf", "visible"}:
+        leaf = "present"
+    else:
+        leaf = "unknown"
+    try:
+        confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return {"door_leaf": leaf, "confidence": confidence}
+
+
+def _public_portal_aperture_evidence(patch):
+    """Return the bounded, visual-only opening evidence from a MLLM patch."""
+
+    raw = patch.get("portal_aperture_evidence")
+    if not isinstance(raw, dict):
+        return None
+    aperture = str(
+        raw.get("open_aperture") or raw.get("aperture") or raw.get("opening") or "unknown"
+    ).strip().casefold()
+    if raw.get("opening_visible") is True or raw.get("aperture_open") is True:
+        aperture = "visible"
+    elif raw.get("opening_visible") is False or raw.get("aperture_open") is False:
+        aperture = "not_visible"
+    if aperture in {"visible", "open", "opening_visible", "clear_gap", "gap"}:
+        aperture = "visible"
+    elif aperture in {"not_visible", "closed", "occluded", "no_gap", "not_open"}:
+        aperture = "not_visible"
+    else:
+        aperture = "unknown"
+    try:
+        confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return {"open_aperture": aperture, "confidence": confidence}
+
+
+def _portal_has_observed_open_connectivity(node):
+    """Whether mapping, not a synthetic post-open hypothesis, saw both sides."""
+
+    attributes = node.attributes or {}
+    observed_room_ids = {
+        str(room_id)
+        for room_id in (attributes.get("observed_connected_room_ids") or [])
+        if room_id is not None and str(room_id)
+    }
+    return bool(
+        node.is_currently_visible
+        and str(attributes.get("connectivity_status") or "").casefold()
+        == "connected"
+        and len(observed_room_ids) >= 2
+        and not bool(attributes.get("potential_room_ids"))
+    )
+
+
+def _portal_visual_state_gate(node, state, morphology, aperture_evidence):
+    """Gate MLLM portal state claims on direct visual aperture evidence.
+
+    A visual class can identify a door but cannot by itself establish that its
+    leaf moved.  This prevents a single hallucinated ``open`` from suppressing
+    the required first interaction.  ``static_open`` has the stricter
+    morphology + independently observed map-connectivity gate.
+    """
+
+    requested = str(state or "unknown").strip().casefold()
+    if node.type != "portal" or requested not in {"open", "ajar", "static_open"}:
+        return True, "not_applicable"
+    aperture_visible = bool(
+        isinstance(aperture_evidence, dict)
+        and aperture_evidence.get("open_aperture") == "visible"
+        and float(aperture_evidence.get("confidence", 0.0) or 0.0) >= 0.70
+    )
+    if requested in {"open", "ajar"}:
+        return (
+            aperture_visible,
+            "visual_open_aperture_confirmed"
+            if aperture_visible
+            else "missing_visual_open_aperture_evidence",
+        )
+    fixed_opening = bool(
+        isinstance(morphology, dict)
+        and morphology.get("door_leaf") == "absent"
+        and float(morphology.get("confidence", 0.0) or 0.0) >= 0.70
+        and aperture_visible
+        and _portal_has_observed_open_connectivity(node)
+    )
+    return (
+        fixed_opening,
+        "fixed_opening_visual_and_map_confirmed"
+        if fixed_opening
+        else "missing_fixed_opening_evidence",
+    )
 
 
 def _is_confirmed_portal_open_result(result, resolved_state):
@@ -409,6 +518,7 @@ class InteractionGraphStore:
         resolved_capability = _interaction_result_capability(result)
         static_capability = resolved_capability == "static"
         blocked_capability = resolved_capability == "blocked"
+        unavailable_capability = resolved_capability == "unavailable"
         if (
             resolved_state is not None
             and result.get("success") is True
@@ -455,12 +565,15 @@ class InteractionGraphStore:
                     ),
                 }
             )
-        elif blocked_capability:
+        elif blocked_capability or unavailable_capability:
+            terminal_state = (
+                "unavailable" if unavailable_capability else "blocked"
+            )
             node.interaction.update(
                 {
                     "is_interactable": False,
                     "interaction_mode": "none",
-                    "state": "blocked",
+                    "state": terminal_state,
                     "state_source": str(
                         result.get("source")
                         or result.get("verification_source")
@@ -469,7 +582,7 @@ class InteractionGraphStore:
                     "state_confidence": float(result.get("confidence", 1.0)),
                     "state_observed_step": observed_step,
                     "state_evidence": "interaction_capability_feedback",
-                    "capability": "blocked",
+                    "capability": resolved_capability,
                     "capability_source": "executor_feedback",
                     "capability_confidence": float(result.get("confidence", 1.0)),
                     "capability_observed_step": observed_step,
@@ -516,7 +629,12 @@ class InteractionGraphStore:
             history.append(history_entry)
         node.interaction["operation_history"] = history
         self._update_interaction_group_memory(node, result)
-        if resolved_state is not None or static_capability or blocked_capability:
+        if (
+            resolved_state is not None
+            or static_capability
+            or blocked_capability
+            or unavailable_capability
+        ):
             node.attributes["interaction_state_override"] = {
                 key: node.interaction.get(key)
                 for key in (
@@ -588,12 +706,20 @@ class InteractionGraphStore:
                 True
                 if state in {"open", "ajar", "static_open"}
                 else False
-                if state in {"closed", "blocked", "static_closed"}
+                if state in {"closed", "blocked", "static_closed", "unavailable"}
                 else None
             )
             interaction["requires_interaction"] = bool(
                 interaction.get("is_interactable")
-                and state not in {"open", "ajar", "static_open", "blocked", "static_closed"}
+                and state
+                not in {
+                    "open",
+                    "ajar",
+                    "static_open",
+                    "blocked",
+                    "static_closed",
+                    "unavailable",
+                }
             )
 
             return
@@ -601,7 +727,7 @@ class InteractionGraphStore:
             True
             if state in {"open", "ajar", "static_open"}
             else False
-            if state in {"closed", "blocked", "static_closed"}
+            if state in {"closed", "blocked", "static_closed", "unavailable"}
             else None
         )
         interaction["requires_interaction"] = bool(
@@ -746,6 +872,52 @@ class InteractionGraphStore:
                 "mllm_interaction_parts": parts,
             }
         )
+        # M1 owns the pre-interaction visual state. Persist its compact public
+        # contract so candidate generation can derive an approach from the
+        # observed view rather than from a simulator/oracle orientation.
+        for key in (
+            "view_state",
+            "view_state_confidence",
+            "front_surface_visible",
+            "front_surface_confidence",
+            "approach_ready",
+            "needs_reobserve",
+        ):
+            if key in patch:
+                node.attributes[key] = patch.get(key)
+        if any(
+            key in patch
+            for key in (
+                "view_state",
+                "front_surface_visible",
+                "approach_ready",
+                "needs_reobserve",
+            )
+        ):
+            node.attributes["view_state_source"] = str(
+                patch.get("source") or "mllm_attribute_inference"
+            )
+            node.attributes["approach_source"] = node.attributes["view_state_source"]
+            node.attributes["attribute_is_current"] = True
+        for key in (
+            "targeted_refresh",
+            "targeted_refresh_request_id",
+            "targeted_refresh_sequence",
+            "targeted_refresh_reason",
+            "targeted_refresh_minimum_capture_step",
+            "targeted_refresh_image_sequence",
+        ):
+            if key in patch:
+                node.attributes[key] = patch.get(key)
+        portal_morphology = _public_portal_morphology(patch)
+        portal_aperture_evidence = _public_portal_aperture_evidence(patch)
+        if node.type == "portal" and portal_morphology is not None:
+            node.attributes["portal_morphology"] = portal_morphology
+        if node.type == "portal" and portal_aperture_evidence is not None:
+            node.attributes["portal_aperture_evidence"] = portal_aperture_evidence
+        elif node.type != "portal":
+            node.attributes.pop("portal_morphology", None)
+            node.attributes.pop("portal_aperture_evidence", None)
         previous_history = list(node.interaction.get("operation_history") or [])
         latest_operation_stamp = max(
             [
@@ -768,6 +940,26 @@ class InteractionGraphStore:
                 or node.interaction.get("state")
                 or "unknown"
             )
+            portal_state_allowed, portal_state_gate_reason = _portal_visual_state_gate(
+                node,
+                patch_state,
+                portal_morphology,
+                portal_aperture_evidence,
+            )
+            if node.type == "portal":
+                node.attributes["portal_state_gate"] = {
+                    "accepted": bool(portal_state_allowed),
+                    "requested_state": str(patch_state).casefold(),
+                    "reason": portal_state_gate_reason,
+                    "observation_capture_step": patch_frame_index,
+                }
+            if not portal_state_allowed:
+                # Preserve the preceding closed/unknown state rather than
+                # turning a weak MLLM "open" into a route-opening claim.
+                # The candidate layer will then request a real, one-shot
+                # interaction whose public feedback owns the terminal state.
+                state_was_updated = False
+        if state_was_updated:
             patch_capability = str(
                 patch.get("interaction_capability")
                 or patch.get("capability")
@@ -1294,6 +1486,24 @@ class InteractionGraphStore:
                 }
             )
         node.attributes.update(observation_attributes)
+        # A new RGB/detection observation can make the previous M1 visual
+        # judgment stale. Keep the judgment for diagnostics, but advertise it
+        # as current only for a small causal capture window.
+        attribute_capture_step = node.attributes.get(
+            "attribute_observation_frame_index"
+        )
+        try:
+            attribute_capture_step = int(attribute_capture_step)
+            current_capture_step = int(observation.get("frame_index", 0) or 0)
+            attribute_is_current = (
+                str(node.attributes.get("attribute_status") or "").casefold()
+                == "ready"
+                and current_capture_step >= attribute_capture_step
+                and current_capture_step - attribute_capture_step <= 2
+            )
+        except (TypeError, ValueError):
+            attribute_is_current = False
+        node.attributes["attribute_is_current"] = bool(attribute_is_current)
         source_object_name = str(
             observation.get("private_source_object_name")
             or observation.get("source_object_name")

@@ -1187,6 +1187,62 @@ def test_failed_opaque_open_result_does_not_establish_open_state():
     assert portal["interaction"]["requires_interaction"] is True
 
 
+def test_attribute_patch_persists_m1_view_contract_with_capture_freshness() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    fridge = observation(
+        instance_id="fridge_1",
+        semantic_name="fridge",
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="hinge",
+        joint_range=[0.0, 1.0],
+        frame_index=10,
+        position=[1.0, 0.0, 1.0],
+        aabb_center=[1.0, 0.0, 1.0],
+        aabb_size=[1.0, 0.8, 2.0],
+    )
+    store.update_observations([fridge], source_mode="realtime_gt_observation", stamp=1.0)
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "fridge_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 10,
+            "interactable": True,
+            "interaction_class": "container",
+            "coarse_state": "closed",
+            "confidence": 0.9,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+            "view_state": "front",
+            "view_state_confidence": 0.9,
+            "front_surface_visible": True,
+            "front_surface_confidence": 0.9,
+            "approach_ready": True,
+            "needs_reobserve": False,
+            "targeted_refresh": True,
+            "targeted_refresh_request_id": "req-1",
+            "targeted_refresh_image_sequence": 12,
+        },
+        stamp=2.0,
+    )
+    node = next(
+        item for item in store.as_graph_dict(stamp=2.0)["nodes"] if item["id"] == "container_fridge_1"
+    )
+    attrs = node["attributes"]
+    assert attrs["view_state"] == "front"
+    assert attrs["front_surface_visible"] is True
+    assert attrs["approach_ready"] is True
+    assert attrs["attribute_is_current"] is True
+    assert attrs["targeted_refresh_request_id"] == "req-1"
+
+    fridge["frame_index"] = 13
+    store.update_observations([fridge], source_mode="realtime_gt_observation", stamp=3.0)
+    node = next(
+        item for item in store.as_graph_dict(stamp=3.0)["nodes"] if item["id"] == "container_fridge_1"
+    )
+    assert node["attributes"]["attribute_is_current"] is False
+
+
 def test_non_articulated_portal_feedback_persists_static_capability() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     doorframe = observation(
@@ -1244,6 +1300,72 @@ def test_non_articulated_portal_feedback_persists_static_capability() -> None:
         if hint["node_id"] == "portal_doorframe_static_1"
     )
     assert navigation_hint["requires_interaction"] is False
+
+
+def test_unavailable_portal_feedback_is_terminal_and_not_static_open() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="door_opaque_1",
+        semantic_name="door",
+        is_door=True,
+    )
+    store.update_observations(
+        [doorway], source_mode="realtime_gt_observation", stamp=1.0
+    )
+
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_opaque_1",
+            "object_id": "door_opaque_1",
+            "event_id": "unavailable_feedback",
+            "action": "open",
+            "success": False,
+            "state": "unavailable",
+            "interaction_capability": "unavailable",
+            "interactable": False,
+            "retryable": False,
+            "reason": "non_articulated",
+            "source": "force_interaction_capability_check",
+        },
+        stamp=2.0,
+    )
+    # The terminal executor result is stronger than later visual attributes;
+    # it must not be revived into a portal-interaction candidate.
+    store.update_observations(
+        [doorway], source_mode="realtime_gt_observation", stamp=3.0
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_opaque_1",
+            "attribute_status": "ready",
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "portal_morphology": {"door_leaf": "absent", "confidence": 0.9},
+            "confidence": 0.95,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=4.0,
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=4.0)["nodes"]
+        if node["id"] == "portal_door_opaque_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "unavailable"
+    assert interaction["capability"] == "unavailable"
+    assert interaction["is_interactable"] is False
+    assert interaction["interaction_mode"] == "none"
+    assert interaction["traversable"] is False
+    assert interaction["requires_interaction"] is False
+    assert interaction["failure_reason"] == "non_articulated"
+    assert portal["attributes"]["portal_morphology"] == {
+        "door_leaf": "absent",
+        "confidence": 0.9,
+    }
 
 
 def test_invalid_unknown_portal_result_persists_noninteractable_static_state() -> None:
@@ -1742,6 +1864,11 @@ def test_attribute_patch_sets_semantic_state_and_preserves_last_seen():
             "interactable": True,
             "interaction_class": "portal",
             "coarse_state": "open",
+            "portal_morphology": {"door_leaf": "present", "confidence": 0.9},
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.9,
+            },
             "confidence": 0.9,
             "interaction_parts": [{"part_id": "door", "type": "door"}],
         },
@@ -1756,6 +1883,107 @@ def test_attribute_patch_sets_semantic_state_and_preserves_last_seen():
     assert "observation_evidence" not in portal["attributes"]
     assert portal["last_seen"] == 10.0
     assert portal["attributes"]["attribute_updated_at"] == 20.0
+
+
+def test_portal_open_without_visible_aperture_does_not_override_closed_state():
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="door_0008",
+        semantic_name="door",
+        is_door=True,
+        frame_index=3,
+    )
+    store.update_observations(
+        [door], stamp=3.0, source_mode="realtime_gt_observation"
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_0008",
+            "attribute_status": "ready",
+            "observation_frame_index": 3,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "portal_morphology": {"door_leaf": "present", "confidence": 0.95},
+            "portal_aperture_evidence": {
+                "open_aperture": "not_visible",
+                "confidence": 0.95,
+            },
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=4.0,
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_0008",
+            "attribute_status": "ready",
+            "observation_frame_index": 3,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "portal_morphology": {"door_leaf": "present", "confidence": 0.95},
+            "portal_aperture_evidence": {
+                "open_aperture": "unknown",
+                "confidence": 0.95,
+            },
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=5.0,
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict(stamp=5.0)["nodes"] if node["id"] == "portal_door_0008"
+    )
+    assert portal["interaction"]["state"] == "closed"
+    assert portal["interaction"]["requires_interaction"] is True
+    assert portal["attributes"]["portal_state_gate"] == {
+        "accepted": False,
+        "requested_state": "open",
+        "reason": "missing_visual_open_aperture_evidence",
+        "observation_capture_step": 3,
+    }
+
+
+def test_mllm_static_open_requires_absent_leaf_and_observed_map_connectivity():
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="door_0009",
+        semantic_name="door",
+        is_door=True,
+        frame_index=4,
+    )
+    door["connected_room_ids"] = [1]
+    store.update_observations(
+        [door], stamp=4.0, source_mode="realtime_gt_observation"
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_0009",
+            "attribute_status": "ready",
+            "observation_frame_index": 4,
+            "interactable": False,
+            "interaction_class": "portal",
+            "coarse_state": "static_open",
+            "portal_morphology": {"door_leaf": "absent", "confidence": 0.95},
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.95,
+            },
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=5.0,
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict(stamp=5.0)["nodes"] if node["id"] == "portal_door_0009"
+    )
+    assert portal["interaction"]["state"] == "unknown"
+    assert portal["interaction"]["traversable"] is not True
+    assert portal["attributes"]["portal_state_gate"]["accepted"] is False
+    assert portal["attributes"]["portal_state_gate"]["reason"] == "missing_fixed_opening_evidence"
 
 
 def test_delayed_attribute_frame_is_applied_when_current_request_matches():

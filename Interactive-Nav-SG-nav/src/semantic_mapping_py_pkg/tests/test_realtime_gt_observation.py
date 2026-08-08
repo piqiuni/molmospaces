@@ -326,6 +326,76 @@ def test_door_geom_mapping_excludes_unrelated_sibling_under_same_root():
     )
 
 
+def _visible_instance_publisher(min_visible_pixels: int):
+    publisher = object.__new__(realtime_gt.RealtimeGTObservationPublisher)
+    publisher._specs = [object()]
+    publisher._geom_to_spec = np.asarray([0], dtype=np.int32)
+    publisher.min_visible_pixels = min_visible_pixels
+    return publisher
+
+
+def _segmentation_for_geom_pixels(shape, pixels):
+    segmentation = np.zeros((*shape, 2), dtype=np.int32)
+    segmentation[..., 1] = -1
+    for y, x in pixels:
+        segmentation[y, x, 0] = 0
+        segmentation[y, x, 1] = int(mujoco.mjtObj.mjOBJ_GEOM)
+    return segmentation
+
+
+def test_visible_instances_uses_dominant_connected_component_bbox():
+    publisher = _visible_instance_publisher(min_visible_pixels=4)
+    dominant = [(y, x) for y in range(1, 5) for x in range(1, 5)]
+    detached = [(10, 10), (10, 11), (11, 10), (11, 11)]
+    segmentation = _segmentation_for_geom_pixels((16, 16), dominant + detached)
+
+    visible = publisher._visible_instances(segmentation)
+
+    assert visible == [(0, 16, [1, 1, 4, 4])]
+
+
+def test_visible_instances_does_not_sum_disconnected_fragments_to_pass_threshold():
+    publisher = _visible_instance_publisher(min_visible_pixels=12)
+    first = [(y, x) for y in range(1, 4) for x in range(1, 4)]
+    second = [(y, x) for y in range(10, 13) for x in range(10, 13)]
+    segmentation = _segmentation_for_geom_pixels((16, 16), first + second)
+
+    assert publisher._visible_instances(segmentation) == []
+
+
+def test_publisher_applies_min_visible_fraction_to_projected_object_extent():
+    publisher = realtime_gt.RealtimeGTObservationPublisher(
+        FakeRospy(),
+        FakeString,
+        min_visible_pixels=1,
+        min_visible_fraction=0.2,
+        required_consecutive_observations=1,
+        max_distance_m=8.0,
+        step_interval=1,
+        async_processing=False,
+    )
+    original_aabb = realtime_gt.body_aabb
+
+    def fake_aabb(_model, data, body_id, visual_only=True):
+        assert visual_only is True
+        return data.xpos[body_id].copy(), np.asarray([1.0, 1.0, 1.0])
+
+    realtime_gt.body_aabb = fake_aabb
+    try:
+        # One segmentation pixel is materially smaller than the visible AABB
+        # projection.  It must not become a public interaction observation.
+        _set_geom_pixels([0])
+        publisher.reset()
+
+        payload = publisher.publish(FakeTask(), step_index=0)
+
+        assert payload is not None
+        assert payload["observations"] == []
+    finally:
+        realtime_gt.body_aabb = original_aabb
+        publisher.close()
+
+
 def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
     fake_rospy = FakeRospy()
     publisher = realtime_gt.RealtimeGTObservationPublisher(

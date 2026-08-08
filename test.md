@@ -902,26 +902,35 @@ SCAN 按 `step_index` 原子配对 `RGB(N)` 与 fresh-command gate `N`，并只�
 
 ### 5.3.2.2 全 LLM 交互探索
 
-该模式不创建 object goal，模块 1、2、3 全部使用 MLLM：
+该模式不创建 object goal，模块 1、2、3 全部使用 MLLM。下面是当前仓库可直接执行的单场景命令（使用本机路径、纯离线视频录制和本地 Qwen；`13500` 需确认未被占用）：
 
 ```bash
-cd /home/user/ldl/molmospaces-semantic-decision
-conda activate mlspaces
+cd /home/ldl/molmospaces-exp-setting
+RUN=/home/ldl/outputs/interactive-nav/manual_house0000_mllm_$(date +%Y%m%d_%H%M%S)
+mkdir -p /home/ldl/tmp/interactive_nav_manual /home/ldl/.cache/interactive_nav_manual
 
-ROS_MASTER_URI=http://127.0.0.1:12835 \
-SEMANTIC_MODEL_ENV_FILE=$PWD/.env \
+TMPDIR=/home/ldl/tmp/interactive_nav_manual \
+XDG_CACHE_HOME=/home/ldl/.cache/interactive_nav_manual \
+CONDA_ENV=/home/ldl/conda_envs/mlspaces \
+PYTHON_BIN=/home/ldl/conda_envs/mlspaces/bin/python \
+SEMANTIC_MODEL_ENV_FILE=/home/ldl/molmospaces-exp-setting/.env \
+MLLM_DECISION_TIMEOUT_S=30 \
+SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=30 \
+ROS_MASTER_URI=http://127.0.0.1:13500 \
 METHOD=full_mllm_exploration \
-HOUSE_IND=7 \
-SCENE_SEED=7 \
-USE_FIXED_ROUTE=false \
-RUNTIME_TARGET_MODE=none \
-TASK_HORIZON=1000 \
-INITIAL_DOOR_STATE=closed \
+HOUSE_IND=0 SCENE_SEED=0 ROUTE_ID=house_0000 \
+USE_FIXED_ROUTE=false ROUTE_NAV_CONFIG='' RUNTIME_TARGET_MODE=none \
+TASK_HORIZON=500 SIM_TIMEOUT_S=3600 \
+MAPPING_SCAN_SOURCE=pointcloud POINTCLOUD_STRIDE=1 \
+INITIAL_DOOR_STATE=closed FORCE_CLOSE_CONTAINERS=true \
 ENABLE_RECORDING=true \
-SIM_TIMEOUT_S=1800 \
-zsh scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
-outputs/house7_full_mllm_exploration
+bash scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh "$RUN" house_0000
 ```
+
+脚本结束后会自动完成离线合成；视频为
+`$RUN/videos/overview_6panel.mp4`，原始逐步图片在 `$RUN/sim_step_frames/`，链路日志和
+`semantic_exploration_result.json` 在 `$RUN/` 与 `$RUN/debug/` 下。要换场景只需同时修改
+`HOUSE_IND`、`SCENE_SEED`、第二个位置参数和未占用的 `ROS_MASTER_URI` 端口。
 
 自动设置：
 

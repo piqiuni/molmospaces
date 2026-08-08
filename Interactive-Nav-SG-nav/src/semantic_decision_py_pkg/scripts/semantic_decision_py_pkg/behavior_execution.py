@@ -19,6 +19,7 @@ STATE_NAVIGATING = "NAVIGATING"
 STATE_FINALIZING_EXPLORE = "FINALIZING_EXPLORE"
 STATE_APPROACH_INTERACTION = "APPROACH_INTERACTION"
 STATE_WAITING_FOR_DRAWER_SCAN = "WAIT_FOR_DRAWER_SCAN"
+STATE_WAITING_FOR_INTERACTION_OBSERVATION = "WAITING_FOR_INTERACTION_OBSERVATION"
 STATE_SCANNING = "SCANNING"
 STATE_INTERACTING = "INTERACTING"
 STATE_VERIFYING = "VERIFYING"
@@ -92,6 +93,45 @@ def is_interaction_pose_precondition_failure(detail: dict[str, Any] | None) -> b
         }
         or verification_source == "executor_pose_precondition"
     )
+
+
+def interaction_observation_disposition(
+    detail: dict[str, Any] | None,
+) -> str:
+    """Classify a fresh M1 portal observation without issuing an action.
+
+    The values are deliberately command-neutral.  The ROS executor owns image
+    acquisition and M1 invocation; this pure function only maps its public
+    result to the next state-machine branch.
+    """
+
+    detail = detail or {}
+    attributes = detail.get("attributes")
+    merged = dict(attributes) if isinstance(attributes, dict) else {}
+    merged.update(detail)
+    attribute_status = str(
+        merged.get("attribute_status") or merged.get("mllm_status") or "ready"
+    ).strip().casefold()
+    visible = merged.get(
+        "is_currently_visible",
+        merged.get("currently_visible", merged.get("visible")),
+    )
+    if attribute_status != "ready" or visible is not True:
+        return "retry"
+    state = str(
+        merged.get("state")
+        or merged.get("interaction_state")
+        or merged.get("coarse_state")
+        or merged.get("post_state")
+        or "unknown"
+    ).strip().casefold()
+    if state in {"closed", "ajar"}:
+        return "execute"
+    if state in {"open", "opened", "static_open", "static"}:
+        return "finish_without_action"
+    if state in {"blocked", "unavailable", "static_closed", "locked"}:
+        return "terminal"
+    return "retry"
 
 
 def interaction_pose_validation(
@@ -310,9 +350,22 @@ def navigation_goal_options(candidate: dict[str, Any]) -> list[tuple[float, floa
 
 
 def navigation_should_prerotate(behavior_type: str) -> bool:
-    """Keep exploration goals responsive while preserving precise skill approaches."""
+    """Return whether a path-backed rear-goal pre-turn is permitted.
 
-    return str(behavior_type or "").upper() != BEHAVIOR_EXPLORE
+    Frontier execution used to skip this stage in an attempt to start moving
+    sooner.  That hands a roughly-behind frontier straight to DWA, which can
+    alternate its turn direction without translating.  The executor now uses
+    the first segment of a verified global plan and a bounded control-step
+    budget for *all* navigation behaviours, including EXPLORE.  This is still
+    deliberately independent of final-yaw alignment: a frontier does not need
+    to finish at its requested viewing yaw.
+    """
+
+    return str(behavior_type or "").upper() in {
+        BEHAVIOR_EXPLORE,
+        BEHAVIOR_INTERACT,
+        BEHAVIOR_NAVIGATE,
+    }
 
 
 def navigation_requires_final_yaw(
@@ -642,10 +695,10 @@ def next_interaction_approach_option_index(
     """Return one conservative INTERACT approach fallback, if available.
 
     A semantic interaction remains committed while its approach pose changes.
-    A verified executor stagnation or an exhausted simulator-step pose poll is
-    allowed to advance to another approach pose.  Terminal move_base failures
-    keep their existing handling, and a bounded number of actual navigation
-    attempts prevents a large candidate list from consuming the whole episode.
+    A verified executor stagnation, an exhausted simulator-step pose poll, or
+    a visual frontality gate is allowed to advance to another approach pose.
+    A bounded number of actual navigation attempts prevents a large candidate
+    list from consuming the whole episode.
     """
 
     if str(behavior_type or "").upper() != BEHAVIOR_INTERACT:
@@ -654,6 +707,10 @@ def next_interaction_approach_option_index(
         "navigation_stagnation",
         "interaction_pose_poll_exhausted",
         "interaction_pose_invalid",
+        "visual_reposition_required",
+        "navigation_timeout",
+        "navigation_terminal_failure",
+        "final_yaw_alignment_failed",
     }:
         return None
     if int(attempted_navigation_count) >= max(1, int(max_navigation_attempts)):
@@ -729,6 +786,12 @@ class NavigationProgressWatchdog:
     min_displacement_m: float = 0.10
     min_yaw_change_rad: float = 0.15
     min_goal_distance_reduction_m: float = 0.02
+    # A deliberate rear-goal rotation is handled before move_base with its own
+    # finite action budget.  During ordinary navigation, yaw-only movement is
+    # not progress: otherwise a DWA left/right oscillation can reset this
+    # watchdog forever while the robot stays in place.  Keep the legacy
+    # default for callers that explicitly use a rotation-only phase.
+    allow_yaw_progress: bool = True
     reference_xy: tuple[float, float] | None = None
     reference_yaw: float | None = None
     reference_goal_distance_m: float | None = None
@@ -771,9 +834,8 @@ class NavigationProgressWatchdog:
         yaw_change = 0.0
         if len(pose) >= 3 and self.reference_yaw is not None:
             yaw_change = abs(normalize_angle(float(pose[2]) - self.reference_yaw))
-        if (
-            displacement >= self.min_displacement_m
-            or yaw_change >= self.min_yaw_change_rad
+        if displacement >= self.min_displacement_m or (
+            self.allow_yaw_progress and yaw_change >= self.min_yaw_change_rad
         ):
             self.reset(pose, now, goal_distance_m)
             return False
@@ -812,6 +874,7 @@ class ExecutionConfig:
     interaction_navigation_timeout_s: float = 180.0
     interaction_timeout_s: float = 30.0
     drawer_scan_wait_timeout_s: float = 8.0
+    interaction_observation_timeout_s: float = 8.0
     verification_timeout_s: float = 30.0
     explore_prepare_timeout_s: float = 10.0
     explore_finalize_timeout_s: float = 10.0
@@ -859,6 +922,8 @@ class BehaviorExecutionStateMachine:
                     now,
                     {"kind": "navigate", "candidate": self.candidate},
                 )
+            if self._interaction_requires_observation():
+                return self._request_interaction_observation({}, now)
             return self._transition(
                 STATE_INTERACTING,
                 now,
@@ -949,6 +1014,8 @@ class BehaviorExecutionStateMachine:
             return []
         if not success:
             return self._finish(False, detail or {}, now)
+        if self._interaction_requires_observation():
+            return self._request_interaction_observation(detail or {}, now)
         if wait_for_drawer_scan:
             return self._transition(
                 STATE_WAITING_FOR_DRAWER_SCAN,
@@ -959,6 +1026,196 @@ class BehaviorExecutionStateMachine:
             STATE_INTERACTING,
             now,
             {"kind": "interact", "candidate": self.candidate},
+        )
+
+    def on_interaction_observation_result(
+        self,
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Consume one fresh M1 re-observation before a physical interaction.
+
+        This method is intentionally ROS-free.  The executor responds to the
+        ``request_interaction_observation`` command, invokes M1 on a fresh
+        current frame, and calls this method with its public attributes.
+        """
+
+        if (
+            self.state != STATE_WAITING_FOR_INTERACTION_OBSERVATION
+            or self.candidate is None
+        ):
+            return []
+        now = time.monotonic() if now is None else float(now)
+        observation = self._normalized_interaction_observation(detail)
+        metadata = dict(self.candidate.get("metadata") or {})
+        metadata["last_interaction_observation"] = dict(observation)
+        self.candidate["metadata"] = metadata
+
+        disposition = interaction_observation_disposition(observation)
+        required_source = str(
+            metadata.get("interaction_observation_source") or ""
+        ).strip().casefold()
+        observation_source = str(
+            observation.get("attribute_source")
+            or observation.get("state_source")
+            or ""
+        ).strip().casefold()
+        if required_source and required_source not in observation_source:
+            observation.setdefault("reason", "interaction_observation_wrong_source")
+            disposition = "retry"
+        minimum_capture_step = metadata.get("interaction_observation_min_capture_step")
+        capture_step = self._interaction_observation_capture_step(observation)
+        if minimum_capture_step is not None and (
+            capture_step is None or capture_step < int(minimum_capture_step)
+        ):
+            observation.setdefault("reason", "interaction_observation_not_fresh")
+            disposition = "retry"
+
+        if disposition == "execute":
+            metadata["observation_required"] = False
+            metadata["reobserve"] = False
+            metadata["interaction_observation_resolved"] = True
+            self.candidate["metadata"] = metadata
+            return self._transition(
+                STATE_INTERACTING,
+                now,
+                {
+                    "kind": "interact",
+                    "candidate": self.candidate,
+                    "observation": observation,
+                },
+            )
+        if disposition == "finish_without_action":
+            return self._finish(
+                True,
+                {
+                    **observation,
+                    "action_executed": False,
+                    "observation_outcome": "finish_without_action",
+                    "reason": "interaction_not_required_after_observation",
+                },
+                now,
+            )
+        if disposition == "terminal":
+            return self._finish(
+                False,
+                {
+                    **observation,
+                    "action_executed": False,
+                    "observation_outcome": "terminal",
+                    "reason": str(
+                        observation.get("reason")
+                        or "interaction_unavailable_after_observation"
+                    ),
+                },
+                now,
+            )
+
+        attempts = int(metadata.get("interaction_observation_attempts", 0) or 0)
+        max_attempts = self._interaction_observation_max_attempts()
+        if attempts < max_attempts:
+            return self._request_interaction_observation(observation, now)
+        return self._finish(
+            False,
+            {
+                **observation,
+                "action_executed": False,
+                "observation_outcome": "terminal_unresolved",
+                "observation_attempts": attempts,
+                "reason": "interaction_observation_unresolved",
+            },
+            now,
+        )
+
+    def _interaction_requires_observation(self) -> bool:
+        metadata = (self.candidate or {}).get("metadata") or {}
+        return bool(
+            self._behavior_type() == BEHAVIOR_INTERACT
+            and metadata.get("observation_required", False)
+        )
+
+    def _interaction_observation_max_attempts(self) -> int:
+        metadata = (self.candidate or {}).get("metadata") or {}
+        try:
+            return max(1, int(metadata.get("interaction_observation_max_attempts", 2)))
+        except (TypeError, ValueError):
+            return 2
+
+    @staticmethod
+    def _interaction_observation_capture_step(
+        detail: dict[str, Any] | None,
+    ) -> int | None:
+        detail = detail or {}
+        for key in (
+            "observation_capture_step",
+            "attribute_capture_step",
+            "capture_step",
+            "rgb_step_seq",
+            "current_rgb_step_seq",
+            "step",
+        ):
+            value = detail.get(key)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _normalized_interaction_observation(
+        detail: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        detail = dict(detail or {})
+        attributes = detail.get("attributes")
+        normalized = dict(attributes) if isinstance(attributes, dict) else {}
+        normalized.update(detail)
+        return normalized
+
+    def _request_interaction_observation(
+        self,
+        detail: dict[str, Any],
+        now: float,
+    ) -> list[dict[str, Any]]:
+        if self.candidate is None:
+            return []
+        metadata = dict(self.candidate.get("metadata") or {})
+        previous_capture_step = self._interaction_observation_capture_step(detail)
+        baseline_capture_step = metadata.get("interaction_observation_after_capture_step")
+        if baseline_capture_step is None and previous_capture_step is not None:
+            baseline_capture_step = previous_capture_step
+            metadata["interaction_observation_after_capture_step"] = baseline_capture_step
+        attempts = int(metadata.get("interaction_observation_attempts", 0) or 0) + 1
+        metadata["interaction_observation_attempts"] = attempts
+        minimum_capture_step = (
+            int(baseline_capture_step) + 1
+            if baseline_capture_step is not None
+            else None
+        )
+        metadata["interaction_observation_min_capture_step"] = minimum_capture_step
+        self.candidate["metadata"] = metadata
+        interaction = self.candidate.get("interaction_command") or {}
+        return self._transition(
+            STATE_WAITING_FOR_INTERACTION_OBSERVATION,
+            now,
+            {
+                "kind": "request_interaction_observation",
+                "candidate": self.candidate,
+                "node_id": interaction.get("node_id") or self.candidate.get("target_id"),
+                "object_id": interaction.get("object_id") or self.candidate.get("target_name"),
+                "attempt": attempts,
+                "max_attempts": self._interaction_observation_max_attempts(),
+                "min_capture_step": minimum_capture_step,
+                "require_current_visibility": True,
+                "require_attribute_status": "ready",
+                "required_attribute_source": metadata.get(
+                    "interaction_observation_source", "mllm_attribute_inference"
+                ),
+                "reason": metadata.get(
+                    "observation_reason", "mllm_portal_state_unknown"
+                ),
+            },
         )
 
     def retry_interaction_approach(
@@ -1042,18 +1299,28 @@ class BehaviorExecutionStateMachine:
         )
 
     def on_interaction_result(
-        self, success: bool, detail: dict[str, Any] | None = None, now: float | None = None
+        self,
+        success: bool,
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+        *,
+        backend_success: bool | None = None,
     ) -> list[dict[str, Any]]:
         now = time.monotonic() if now is None else float(now)
         if self.state != STATE_INTERACTING:
             return []
         detail = dict(detail or {})
+        backend_success = bool(success) if backend_success is None else bool(backend_success)
+        if is_interaction_pose_precondition_failure(detail):
+            # No force/action reached the object.  The executor may instead
+            # call retry_interaction_approach while still in INTERACTING; if it
+            # reports this terminally, do not send it through post-action M3.
+            return self._finish(False, detail, now)
         if is_static_portal_interaction_feedback(self.candidate, detail):
-            # A fixed opening has no articulation transition to verify.  End
-            # the behavior from the executor result itself; otherwise the
-            # state machine would wait for a graph state of ``open`` and only
-            # resolve the already-known ``static_open`` result through the
-            # wall-clock verification timeout.
+            # A public fixed-open aperture is already a terminal no-action
+            # observation. A failed/non-open bridge response, however, still
+            # gets M3's *post-action-only* audit below; it must not be silently
+            # collapsed into static_open by the executor feedback spelling.
             static_state = str(
                 detail.get("state") or detail.get("post_state") or ""
             ).strip().casefold()
@@ -1062,12 +1329,30 @@ class BehaviorExecutionStateMachine:
                 or str(detail.get("status") or "").upper() == "SUCCEEDED"
                 or static_state == "static_open"
             )
-            detail.setdefault("verification_mode", "direct_static_portal_feedback")
-            detail.setdefault("verification_required", False)
-            return self._finish(direct_success, detail, now)
-        if not success:
-            return self._finish(False, detail, now)
-        return self._transition(STATE_VERIFYING, now)
+            if direct_success and static_state in {"static", "static_open"}:
+                detail.setdefault("verification_mode", "direct_static_portal_feedback")
+                detail.setdefault("verification_required", False)
+                detail.setdefault("backend_success", direct_success)
+                return self._finish(True, detail, now)
+        metadata = dict(self.candidate.get("metadata") or {})
+        metadata["interaction_backend_success"] = backend_success
+        metadata["interaction_backend_result"] = dict(detail)
+        self.candidate["metadata"] = metadata
+        # Every physical result (including a failed action) gets one explicit
+        # post-action verification request.  A failed backend result is kept
+        # as an immutable fact; M3 may explain it or request a bounded retry,
+        # but it cannot turn it into a successful terminal outcome.
+        return self._transition(
+            STATE_VERIFYING,
+            now,
+            {
+                "kind": "verify_interaction",
+                "candidate": self.candidate,
+                "verification_phase": "post_interaction",
+                "backend_success": backend_success,
+                "interaction_result": detail,
+            },
+        )
 
     def on_graph_state(
         self, state: str, detail: dict[str, Any] | None = None, now: float | None = None
@@ -1090,7 +1375,7 @@ class BehaviorExecutionStateMachine:
         expected = str((self.candidate.get("interaction_command") or {}).get("expected_state") or "open")
         if str(state) != expected:
             return []
-        return self._finish(True, graph_detail, now)
+        return self._finish_verified_interaction(True, graph_detail, now)
 
     def on_verification_result(
         self,
@@ -1103,14 +1388,61 @@ class BehaviorExecutionStateMachine:
             return []
         now = time.monotonic() if now is None else float(now)
         if success:
-            return self._finish(True, detail or {"verified": True}, now)
+            return self._finish_verified_interaction(
+                True, detail or {"verified": True}, now
+            )
         if retry:
+            if not self._interaction_backend_succeeded():
+                return self._finish(
+                    False,
+                    {
+                        **(detail or {}),
+                        "backend_success": False,
+                        "reason": "interaction_backend_failed",
+                    },
+                    now,
+                )
             return self._transition(
                 STATE_INTERACTING,
                 now,
                 {"kind": "interact", "candidate": self.candidate, "retry": True},
             )
         return self._finish(False, detail or {"reason": "verification_failed"}, now)
+
+    def _interaction_backend_succeeded(self) -> bool:
+        metadata = (self.candidate or {}).get("metadata") or {}
+        return bool(metadata.get("interaction_backend_success", True))
+
+    def _finish_verified_interaction(
+        self,
+        verification_success: bool,
+        detail: dict[str, Any],
+        now: float | None,
+    ) -> list[dict[str, Any]]:
+        """Merge M3 with the immutable backend result.
+
+        In particular, ``verification_success=True`` cannot resurrect a
+        physical action for which the backend reported failure.
+        """
+
+        if not verification_success:
+            return self._finish(False, detail, now)
+        if not self._interaction_backend_succeeded():
+            return self._finish(
+                False,
+                {
+                    **detail,
+                    "backend_success": False,
+                    "verification_success": True,
+                    "reason": "interaction_backend_failed",
+                },
+                now,
+            )
+        return self._finish(
+            True,
+            {**detail, "backend_success": True, "verification_success": True},
+            now,
+        )
 
     def on_target_visibility(
         self,
@@ -1161,6 +1493,12 @@ class BehaviorExecutionStateMachine:
                 if elapsed > self.config.drawer_scan_wait_timeout_s
                 else ""
             )
+        if self.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION:
+            return (
+                "interaction_observation_timeout"
+                if elapsed > self.config.interaction_observation_timeout_s
+                else ""
+            )
         if self.state == STATE_FINALIZING_EXPLORE:
             return (
                 "explore_finalize_timeout"
@@ -1206,6 +1544,12 @@ class BehaviorExecutionStateMachine:
             ),
             "interaction_approach_goal_option_index": metadata.get(
                 "interaction_approach_goal_option_index"
+            ),
+            "interaction_observation_attempts": metadata.get(
+                "interaction_observation_attempts", 0
+            ),
+            "interaction_backend_success": metadata.get(
+                "interaction_backend_success"
             ),
         }
 

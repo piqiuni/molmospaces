@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
+
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts" / "InteractiveNav"
@@ -12,18 +15,25 @@ for path in (REPO_ROOT, SCRIPT_ROOT):
 from scripts.InteractiveNav.build_semantic_video_offline import (
     align_exact_sim_records,
     align_nearest_timestamp_recorder_frames,
+    episode_trajectory_prefix,
     gt_draw_spec,
     index_recorder_frames,
+    load_episode_trajectory,
     offline_display_config,
     panel_names,
+    resolve_episode_trajectory_path,
     route_event_at_stamp,
     route_target_at_stamp,
 )
+import scripts.InteractiveNav.offline_semantic_renderer as offline_renderer
 from scripts.InteractiveNav.offline_semantic_renderer import (
     OfflineSixPanelRenderer,
+    RawGrid,
     TransformResolver,
+    TransformSample,
     active_semantic_selection,
     camera_title,
+    candidate_matches_canonical_selection,
     zoom_world_bounds,
 )
 
@@ -257,3 +267,129 @@ def test_offline_selection_uses_executor_effective_fallback_goal() -> None:
         },
     }
     assert active_semantic_selection(step)["goal_xyyaw"] == [6.859, 4.967, -1.57]
+
+
+def test_episode_trajectory_csv_is_causal_and_raw_reference_is_resolved(tmp_path: Path) -> None:
+    debug_dir = tmp_path / "debug"
+    raw_dir = debug_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    trajectory_path = debug_dir / "trajectory.csv"
+    trajectory_path.write_text(
+        "step_id,elapsed_sec,stamp,x,y,yaw\n"
+        "0,0.0,10.0,1.0,2.0,0.1\n"
+        "2,0.2,10.2,2.0,3.0,0.2\n"
+        "5,0.5,10.5,5.0,6.0,0.5\n",
+        encoding="utf-8",
+    )
+    trajectory = load_episode_trajectory(trajectory_path)
+    assert episode_trajectory_prefix(trajectory, 1) == [(0, 1.0, 2.0, 0.1)]
+    assert episode_trajectory_prefix(trajectory, 2) == [
+        (0, 1.0, 2.0, 0.1),
+        (2, 2.0, 3.0, 0.2),
+    ]
+    assert resolve_episode_trajectory_path(
+        raw_dir,
+        debug_dir,
+        [{"trajectory_reference": "../trajectory.csv"}],
+    ) == trajectory_path
+
+
+def test_stale_same_id_candidate_never_replaces_canonical_goal(monkeypatch) -> None:
+    canonical = {
+        "active": True,
+        "candidate_id": "frontier:1:9",
+        "behavior_type": "EXPLORE",
+        "goal_xyyaw": [1.0, 1.0, 0.0],
+        "candidate_revision": "new-geometry",
+    }
+    stale_candidate = {
+        "candidate_id": "frontier:1:9",
+        "behavior_type": "EXPLORE",
+        "goal_xyyaw": [3.0, 2.0, 0.0],
+        "candidate_revision": "old-geometry",
+    }
+    assert not candidate_matches_canonical_selection(canonical, stale_candidate)
+
+    arrows: list[tuple[tuple[int, int], float]] = []
+
+    def capture_arrow(_panel, center, yaw, _length, _color):
+        arrows.append((center, yaw))
+
+    monkeypatch.setattr(offline_renderer, "_draw_goal_arrow", capture_arrow)
+    grid = RawGrid(
+        values=np.zeros((120, 120), dtype=np.int32),
+        width=120,
+        height=120,
+        resolution=0.1,
+        frame_id="odom",
+        origin_x=-6.0,
+        origin_y=-6.0,
+        origin_yaw=0.0,
+    )
+    renderer = OfflineSixPanelRenderer(
+        transforms=TransformResolver(
+            [TransformSample(step_index=0, x=1.0, y=0.0, yaw=math.pi / 2.0)],
+            map_frame="map",
+            odom_frame="odom",
+        )
+    )
+    renderer.render_map_panel(
+        grid,
+        (480, 270),
+        {
+            "pose": [0.0, 0.0, 0.0],
+            "semantic_selection": canonical,
+            "semantic_candidates": {"candidates": [stale_candidate]},
+        },
+        0,
+        title="OCC",
+        kind="occupancy",
+        # One transformed corner lies just outside this grid. The renderer
+        # must still clip the world bounds and retain the canonical goal.
+        world_bounds=(-5.0, -5.0, 5.0, 5.0),
+        draw_semantic_candidates=True,
+    )
+    # There is one arrow, from the canonical map goal transformed into odom.
+    # Its yaw proves that local panels use the transformed, not map-frame yaw.
+    assert len(arrows) == 1
+    assert math.isclose(arrows[0][1], -math.pi / 2.0, abs_tol=1e-6)
+
+
+def test_renderer_uses_episode_trajectory_instead_of_boundary_history(monkeypatch) -> None:
+    captured: list[list[tuple[int, int]]] = []
+
+    def capture_trail(_panel, points, *_args, **_kwargs):
+        captured.append(points)
+
+    monkeypatch.setattr(offline_renderer, "_draw_faded_trajectory", capture_trail)
+    grid = RawGrid(
+        values=np.zeros((100, 100), dtype=np.int32),
+        width=100,
+        height=100,
+        resolution=0.1,
+        frame_id="map",
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+    )
+    renderer = OfflineSixPanelRenderer(
+        transforms=TransformResolver([], map_frame="map", odom_frame="map")
+    )
+    renderer.render_map_panel(
+        grid,
+        (480, 270),
+        {
+            "pose": [0.2, 0.2, 0.0],
+            "trajectory": [(0.0, 0.2, 0.2, 0.0)],
+        },
+        2,
+        title="OCC",
+        kind="occupancy",
+        episode_trajectory=[
+            (0, 0.1, 0.1, 0.0),
+            (1, 0.2, 0.2, 0.0),
+            (2, 0.3, 0.3, 0.0),
+        ],
+    )
+    assert len(captured) == 1
+    assert len(captured[0]) == 3

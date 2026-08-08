@@ -538,6 +538,7 @@ def _topology_hints(
     route outrank a nearby but irrelevant container without leaking GT.
     """
     candidates = list(candidates)
+    interaction_coverage_mission = not bool((target_context or {}).get("enabled"))
     target_rooms: set[str] = set()
     current_rooms: set[str] = set()
     for candidate in candidates:
@@ -616,6 +617,17 @@ def _topology_hints(
             hint = "TARGET_CONTAINER"
             topology_bonus = 0.95
         elif (
+            interaction_coverage_mission
+            and behavior_type == "INTERACT"
+            and str(metadata.get("node_type") or "").casefold() == "container"
+        ):
+            # Target-disabled interaction exploration should still cover
+            # globally remembered, route-reachable containers.  M3 will
+            # validate view/frontality after approach; this is only a graph
+            # prior and never claims a handle orientation.
+            hint = "INTERACTION_COVERAGE_CONTAINER"
+            topology_bonus = 0.80
+        elif (
             behavior_type == "INTERACT"
             and str(metadata.get("node_type") or "").casefold() == "portal"
         ):
@@ -647,6 +659,13 @@ def _topology_hints(
             elif endpoints:
                 hint = "REMOTE_PORTAL"
                 topology_bonus = 0.15
+            if interaction_coverage_mission and hint in {
+                "NEXT_ROUTE_PORTAL",
+                "LOCAL_ROUTE_PORTAL",
+                "REMOTE_PORTAL",
+            }:
+                hint = "INTERACTION_COVERAGE_PORTAL"
+                topology_bonus = max(topology_bonus, 0.70)
         elif behavior_type == "EXPLORE":
             room = _candidate_room(
                 metadata.get("target_room_id") or metadata.get("room_id")

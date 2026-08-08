@@ -72,6 +72,185 @@ def _coarse_interaction_state(value: Any) -> str:
     return "unknown"
 
 
+def _portal_morphology(value: Any) -> dict[str, Any]:
+    """Normalize a purely visual door-leaf observation.
+
+    This is intentionally morphology only: an RGB model may identify whether
+    a leaf is visible, but it must not claim world connectivity or simulator
+    articulation.  The latter is supplied independently by occupancy/room
+    observations before a fixed passage is accepted.
+    """
+
+    raw = value if isinstance(value, dict) else {}
+    leaf = _normalized_token(raw.get("door_leaf") or raw.get("leaf") or "unknown")
+    if leaf in {"absent", "none", "missing", "no_leaf", "no_door"}:
+        leaf = "absent"
+    elif leaf in {"present", "leaf", "door", "door_leaf", "visible"}:
+        leaf = "present"
+    else:
+        leaf = "unknown"
+    return {
+        "door_leaf": leaf,
+        "confidence": _confidence(raw.get("confidence"), 0.0),
+    }
+
+
+def _portal_aperture_evidence(value: Any) -> dict[str, Any]:
+    """Normalize visual evidence that an opening is actually visible.
+
+    This remains an image-only statement.  It cannot establish map
+    connectivity, joint capability, or a hidden door state; graph policy uses
+    it only to decide whether an MLLM ``open``/``ajar`` claim is admissible.
+    """
+
+    raw = value if isinstance(value, dict) else {}
+    aperture = _normalized_token(
+        raw.get("open_aperture")
+        or raw.get("aperture")
+        or raw.get("opening")
+        or "unknown"
+    )
+    if raw.get("opening_visible") is True or raw.get("aperture_open") is True:
+        aperture = "visible"
+    elif raw.get("opening_visible") is False or raw.get("aperture_open") is False:
+        aperture = "not_visible"
+    if aperture in {"visible", "open", "opening_visible", "clear_gap", "gap"}:
+        aperture = "visible"
+    elif aperture in {
+        "not_visible",
+        "closed",
+        "occluded",
+        "no_gap",
+        "not_open",
+    }:
+        aperture = "not_visible"
+    else:
+        aperture = "unknown"
+    return {
+        "open_aperture": aperture,
+        "confidence": _confidence(raw.get("confidence"), 0.0),
+    }
+
+
+def build_attribute_patch_response_schema(object_id: str) -> dict[str, Any]:
+    """Return the strict wire schema for one Module-1 object observation.
+
+    The portal-only fields remain semantically optional by being nullable.  A
+    strict OpenAI-compatible schema requires each top-level property to be
+    present, so non-portal observations must emit ``null`` for those fields
+    instead of inventing door evidence.  This keeps the payload bounded while
+    avoiding conditional/``oneOf`` schemas that are less portable across local
+    OpenAI-compatible servers.
+    """
+
+    normalized_object_id = str(object_id or "").strip()
+    if not normalized_object_id:
+        raise ValueError("attribute response schema requires an object_id")
+
+    confidence = {"type": "number", "minimum": 0.0, "maximum": 1.0}
+    nullable_portal_morphology = {
+        "type": ["object", "null"],
+        "additionalProperties": False,
+        "properties": {
+            "door_leaf": {
+                "type": "string",
+                "enum": ["absent", "present", "unknown"],
+            },
+            "confidence": confidence,
+        },
+        "required": ["door_leaf", "confidence"],
+    }
+    nullable_portal_aperture_evidence = {
+        "type": ["object", "null"],
+        "additionalProperties": False,
+        "properties": {
+            "open_aperture": {
+                "type": "string",
+                "enum": ["visible", "not_visible", "unknown"],
+            },
+            "confidence": confidence,
+        },
+        "required": ["open_aperture", "confidence"],
+    }
+    return {
+        "name": "attribute_inference",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "object_id": {
+                    "type": "string",
+                    "enum": [normalized_object_id],
+                },
+                "interactable": {"type": "boolean"},
+                "interaction_class": {
+                    "type": "string",
+                    "enum": ["portal", "container", "none", "unknown"],
+                },
+                "coarse_state": {
+                    "type": "string",
+                    "enum": ["open", "closed", "ajar", "static_open", "unknown"],
+                },
+                "portal_morphology": nullable_portal_morphology,
+                "portal_aperture_evidence": nullable_portal_aperture_evidence,
+                # These fields belong to Module 1's pre-interaction visual
+                # observation.  They deliberately describe only what is
+                # visible from the current camera pose; no world-space axis or
+                # simulator geometry is requested from the model.
+                "view_state": {
+                    "type": "string",
+                    "enum": ["front", "oblique", "side_or_back", "occluded", "unknown"],
+                },
+                "view_state_confidence": confidence,
+                "front_surface_visible": {"type": "boolean"},
+                "front_surface_confidence": confidence,
+                "approach_ready": {"type": "boolean"},
+                "needs_reobserve": {"type": "boolean"},
+                "interaction_parts": {
+                    "type": "array",
+                    "maxItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "part_id": {"type": "string", "maxLength": 32},
+                            "type": {"type": "string", "maxLength": 32},
+                            "state": {"type": "string", "maxLength": 32},
+                            "handle_visible": {"type": "boolean"},
+                            "confidence": confidence,
+                        },
+                        "required": [
+                            "part_id",
+                            "type",
+                            "state",
+                            "handle_visible",
+                            "confidence",
+                        ],
+                    },
+                },
+                "confidence": confidence,
+            },
+            "required": [
+                "object_id",
+                "interactable",
+                "interaction_class",
+                "coarse_state",
+                "portal_morphology",
+                "portal_aperture_evidence",
+                "view_state",
+                "view_state_confidence",
+                "front_surface_visible",
+                "front_surface_confidence",
+                "approach_ready",
+                "needs_reobserve",
+                "interaction_parts",
+                "confidence",
+            ],
+        },
+    }
+
+
 def validate_attribute_patch(value: Any) -> dict[str, Any]:
     result = parse_json_object(value)
     if not str(result.get("object_id") or ""):
@@ -79,6 +258,16 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
     result["interactable"] = bool(result.get("interactable", False))
     result["interaction_class"] = _interaction_class(result.get("interaction_class"))
     result["coarse_state"] = _coarse_interaction_state(result.get("coarse_state"))
+    if result["interaction_class"] == "portal":
+        result["portal_morphology"] = _portal_morphology(
+            result.get("portal_morphology")
+        )
+        result["portal_aperture_evidence"] = _portal_aperture_evidence(
+            result.get("portal_aperture_evidence")
+        )
+    else:
+        result.pop("portal_morphology", None)
+        result.pop("portal_aperture_evidence", None)
     parts = result.get("interaction_parts") or []
     if not isinstance(parts, list):
         raise ValueError("interaction_parts must be a list")
@@ -103,6 +292,42 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
     result["confidence"] = _confidence(
         result.get("confidence"),
         part_confidence,
+    )
+    view_state = _view_state(result.get("view_state"))
+    view_state_confidence = _confidence(
+        result.get("view_state_confidence"), result["confidence"]
+    )
+    front_surface_visible = _boolean(
+        result.get("front_surface_visible"), default=False
+    )
+    front_surface_confidence = _confidence(
+        result.get("front_surface_confidence"), view_state_confidence
+    )
+    approach_ready = _boolean(result.get("approach_ready"), default=False)
+    needs_reobserve = _boolean(
+        result.get("needs_reobserve"), default=not approach_ready
+    )
+    # A front-facing interaction pose is a safety-critical visual claim.  Be
+    # conservative if the model reports a side/occluded/unknown view, omits a
+    # visible front surface, or asks for another observation.  The planner may
+    # derive a world-space approach pose later from this image observation and
+    # calibrated robot geometry; Module 1 never authors that pose directly.
+    if (
+        view_state in {"side_or_back", "occluded", "unknown"}
+        or not front_surface_visible
+        or needs_reobserve
+    ):
+        approach_ready = False
+        needs_reobserve = True
+    result.update(
+        {
+            "view_state": view_state,
+            "view_state_confidence": view_state_confidence,
+            "front_surface_visible": front_surface_visible,
+            "front_surface_confidence": front_surface_confidence,
+            "approach_ready": approach_ready,
+            "needs_reobserve": needs_reobserve,
+        }
     )
     result["evidence_frame_ids"] = [str(item) for item in result.get("evidence_frame_ids") or []]
     return result
@@ -239,6 +464,41 @@ _OPERATION_METHOD_ALIASES = {
     "unknown": "unknown",
 }
 
+_VIEW_STATE_ALIASES = {
+    "front": "front",
+    "front_facing": "front",
+    "frontal": "front",
+    "oblique": "oblique",
+    "angled": "oblique",
+    "side": "side_or_back",
+    "side_on": "side_or_back",
+    "side_or_back": "side_or_back",
+    "rear": "side_or_back",
+    "back": "side_or_back",
+    "occluded": "occluded",
+    "blocked": "occluded",
+    "unknown": "unknown",
+}
+
+
+def _view_state(value: Any) -> str:
+    return _VIEW_STATE_ALIASES.get(
+        str(value or "unknown").strip().casefold(), "unknown"
+    )
+
+
+def _boolean(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    token = _normalized_token(value)
+    if token in {"true", "yes", "ready", "required"}:
+        return True
+    if token in {"false", "no", "not_ready", "none", ""}:
+        return False
+    return bool(default)
+
 
 def _normalized_center(value: Any) -> list[float] | None:
     if isinstance(value, dict):
@@ -298,6 +558,30 @@ def validate_visual_interaction_plan(
     elif target_type == "door" and operation_method == "pull":
         operation_method = "hinged_pull"
 
+    raw_view_state = str(result.get("view_state") or "unknown").strip().casefold()
+    view_state = _VIEW_STATE_ALIASES.get(raw_view_state, "unknown")
+    # A container must explicitly establish a usable front-facing view before
+    # the backend receives an open command.  This makes older/partial M3
+    # replies conservative rather than silently retaining the radial-side
+    # behavior that caused side-view refrigerator interactions.
+    container_target = expected == "other_container" or target_type == "other_container"
+    approach_ready = _boolean(
+        result.get("approach_ready"),
+        default=not container_target,
+    )
+    reposition_required = _boolean(
+        result.get("reposition_required"),
+        default=container_target and not approach_ready,
+    )
+    if container_target and (
+        not approach_ready
+        or reposition_required
+        or view_state in {"side_or_back", "occluded", "unknown"}
+    ):
+        approach_ready = False
+        reposition_required = True
+        operation_method = "unknown"
+
     raw_regions = (
         result.get("open_regions")
         or result.get("interaction_points")
@@ -327,6 +611,8 @@ def validate_visual_interaction_plan(
         if len(normalized_regions) >= max(1, int(max_regions)):
             break
     normalized_regions.sort(key=lambda item: (item["center"][1], item["center"][0]))
+    if container_target and not approach_ready:
+        normalized_regions = []
 
     return {
         "target_type": target_type,
@@ -335,7 +621,138 @@ def validate_visual_interaction_plan(
         "open_regions": normalized_regions,
         "confidence": _confidence(result.get("confidence"), 0.0),
         "reason": str(result.get("reason") or "")[:160],
+        "view_state": view_state,
+        "approach_ready": approach_ready,
+        "reposition_required": reposition_required,
         "coordinate_frame": "normalized_target_crop",
+    }
+
+
+def build_visual_interaction_plan_response_schema() -> dict[str, Any]:
+    """Return the strict wire schema shared by the post-arrival M3 call.
+
+    It purposefully contains no simulator-specific fields.  The executor still
+    validates semantic consistency against the selected graph node after the
+    response is decoded.
+    """
+
+    return {
+        "name": "visual_interaction_plan",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "target_type": {
+                    "type": "string",
+                    "enum": ["door", "drawer_container", "other_container", "unknown"],
+                },
+                "action": {"type": "string", "enum": ["open", "scan"]},
+                "operation_method": {
+                    "type": "string",
+                    "enum": [
+                        "hinged_push",
+                        "hinged_pull",
+                        "hinged_unknown",
+                        "double_hinged",
+                        "slide_left",
+                        "slide_right",
+                        "pull",
+                        "unknown",
+                    ],
+                },
+                "view_state": {
+                    "type": "string",
+                    "enum": ["front", "oblique", "side_or_back", "occluded", "unknown"],
+                },
+                "approach_ready": {"type": "boolean"},
+                "reposition_required": {"type": "boolean"},
+                "open_regions": {
+                    "type": "array",
+                    "maxItems": 12,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "center": {
+                                "type": "array",
+                                "items": {"type": "number"},
+                                "minItems": 2,
+                                "maxItems": 2,
+                            },
+                            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        },
+                        "required": ["center", "confidence"],
+                    },
+                },
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "reason": {"type": "string", "maxLength": 160},
+            },
+            "required": [
+                "target_type",
+                "action",
+                "operation_method",
+                "view_state",
+                "approach_ready",
+                "reposition_required",
+                "open_regions",
+                "confidence",
+                "reason",
+            ],
+        },
+    }
+
+
+def build_visual_verification_response_schema() -> dict[str, Any]:
+    """Return the compact strict wire schema for post-action visual feedback.
+
+    Verification is consumed only as a success/retry signal, so its evidence
+    must stay bounded.  In particular, do not leave ``observed_states`` as an
+    open-ended model-authored object: a verbose explanation previously consumed
+    the small completion budget and could truncate the enclosing JSON object.
+    """
+
+    confidence = {"type": "number", "minimum": 0.0, "maximum": 1.0}
+    return {
+        "name": "visual_verification",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "success": {"type": "boolean"},
+                "confidence": confidence,
+                "reason": {"type": "string", "maxLength": 96},
+                "observed_states": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "target_state": {
+                            "type": "string",
+                            "enum": ["open", "closed", "ajar", "unchanged", "unknown"],
+                        },
+                        "visible_change": {
+                            "type": "string",
+                            "enum": ["yes", "no", "unknown"],
+                        },
+                    },
+                    "required": ["target_state", "visible_change"],
+                },
+                "new_contents_visible": {"type": "boolean"},
+                "retry_action": {
+                    "type": "string",
+                    "enum": ["none", "retry", "reposition", "rescan"],
+                },
+            },
+            "required": [
+                "success",
+                "confidence",
+                "reason",
+                "observed_states",
+                "new_contents_visible",
+                "retry_action",
+            ],
+        },
     }
 
 

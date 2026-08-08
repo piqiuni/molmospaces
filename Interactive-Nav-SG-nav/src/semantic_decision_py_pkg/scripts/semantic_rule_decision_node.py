@@ -26,6 +26,8 @@ from semantic_decision_py_pkg.interaction_outcome_beliefs import (
     uses_direct_atomic_outcome_beliefs,
 )
 from semantic_decision_py_pkg.mission_completion import (
+    InteractionApproachFailureLimitConfig,
+    InteractionApproachFailureLimitTracker,
     MissionCompletionConfig,
     MissionCompletionTracker,
     TerminalInteractionNoPlanExitConfig,
@@ -419,6 +421,15 @@ class SemanticRuleDecisionNode:
                 ),
             )
         )
+        self.interaction_failure_tracker = InteractionApproachFailureLimitTracker(
+            InteractionApproachFailureLimitConfig(
+                failure_limit=int(
+                    completion_config.get(
+                        "interaction_approach_failure_limit", 3
+                    )
+                )
+            )
+        )
         self.target_mission = TargetMissionTracker()
         self.state_lock = threading.RLock()
         self.latest_candidates_payload: dict = {}
@@ -552,6 +563,7 @@ class SemanticRuleDecisionNode:
                 self.cooldown_until.clear()
                 self.failure_counts.clear()
                 self.approach_exhausted_fingerprints.clear()
+                self.interaction_failure_tracker.reset()
                 self.decision_history.clear()
                 self.group_history.clear()
                 self.region_history.clear()
@@ -643,8 +655,7 @@ class SemanticRuleDecisionNode:
             self.interaction_outcome_beliefs.record_success(
                 self.active_interaction_candidate
             )
-        self._record_decision_result(payload)
-        detail = payload.get("detail") or {}
+        detail = dict(payload.get("detail") or {})
         approach_precondition_failed = bool(
             status != "SUCCEEDED"
             and self.active_behavior_type == "INTERACT"
@@ -654,6 +665,25 @@ class SemanticRuleDecisionNode:
             status == "CANCELED"
             and str(detail.get("reason") or "") == "preempted_by_target"
         )
+        terminal_interaction_failure: dict = {}
+        if (
+            self.active_behavior_type == "INTERACT"
+            and not preempted_by_target
+            and (status == "SUCCEEDED" or not approach_precondition_failed)
+        ):
+            terminal_interaction_failure = (
+                self.interaction_failure_tracker.note_feedback(
+                    candidate_id=candidate_id,
+                    behavior_type=self.active_behavior_type,
+                    status=status,
+                    failure_stage=str(detail.get("failure_stage") or ""),
+                )
+                or {}
+            )
+        if terminal_interaction_failure:
+            detail.update(terminal_interaction_failure)
+            payload = {**payload, "detail": detail}
+        self._record_decision_result(payload)
         if not preempted_by_target:
             self.completion_tracker.note_feedback(payload)
             self.terminal_no_plan_exit_tracker.note_feedback(
@@ -662,7 +692,12 @@ class SemanticRuleDecisionNode:
                     self.latest_candidates_payload
                 ),
             )
-        if candidate_id and not preempted_by_target and not approach_precondition_failed:
+        if (
+            candidate_id
+            and not preempted_by_target
+            and not approach_precondition_failed
+            and not terminal_interaction_failure
+        ):
             if status == "SUCCEEDED":
                 self.failure_counts.pop(candidate_id, None)
                 cooldown_s = self.success_cooldown_s
@@ -683,16 +718,27 @@ class SemanticRuleDecisionNode:
             and not preempted_by_target
             and self.active_behavior_type == "INTERACT"
             and not approach_precondition_failed
+            and not terminal_interaction_failure
         ):
             target_id = self._interaction_target_id(candidate_id)
             if target_id:
                 self.cooldown_until[target_id] = time.monotonic() + max(
                     0.0, self.interaction_target_failure_cooldown_s
                 )
-        if approach_precondition_failed:
+        if terminal_interaction_failure:
+            # This is candidate-local planning memory, not a target/object
+            # state.  Do not let a transient target-wide cooldown suppress a
+            # separate global candidate while the terminal ID is excluded.
+            self.failure_counts.pop(candidate_id, None)
+            self.cooldown_until.pop(candidate_id, None)
+            target_id = self._interaction_target_id(candidate_id)
+            if target_id:
+                self.cooldown_until.pop(target_id, None)
+        if approach_precondition_failed or terminal_interaction_failure:
             # No wall-clock cooldown: the executor already consumed its finite
-            # per-option pose-poll budget.  Move directly to another eligible
-            # subgoal (or finish if there is none).
+            # pose-poll budget, or this candidate has exhausted its configured
+            # execution-failure budget. Move directly to another eligible
+            # subgoal (or let the terminal no-plan tracker finish if none).
             self.next_decision_time = 0.0
         elif status != "SUCCEEDED" and not preempted_by_target:
             self.next_decision_time = time.monotonic() + self.failure_retry_delay_s
@@ -941,6 +987,84 @@ class SemanticRuleDecisionNode:
             with self.state_lock:
                 self.decision_in_flight = False
 
+    def _completion_snapshot_without_terminal_interactions(
+        self, candidate_snapshot: dict
+    ) -> tuple[dict, list[str]]:
+        """Build an ephemeral completion view after episode-local exclusions.
+
+        Candidate generation and the interaction graph stay untouched: a failed
+        move-base approach says nothing about the object's physical state.
+        Completion, however, must not keep an episode alive just because the
+        raw producer continues to advertise an interaction the planner has
+        already declared terminally unreachable.
+        """
+
+        with self.state_lock:
+            terminal_ids = set(
+                self.interaction_failure_tracker.terminal_candidate_ids
+            )
+        if not terminal_ids:
+            return candidate_snapshot, []
+
+        retained_candidates = []
+        excluded_candidate_ids = []
+        for payload in candidate_snapshot.get("candidates") or []:
+            candidate_id = str(payload.get("candidate_id") or "")
+            is_interaction = (
+                str(payload.get("behavior_type") or "").upper() == "INTERACT"
+            )
+            if is_interaction and candidate_id in terminal_ids:
+                excluded_candidate_ids.append(candidate_id)
+                continue
+            retained_candidates.append(payload)
+        if not excluded_candidate_ids:
+            return candidate_snapshot, []
+
+        completion_snapshot = copy.deepcopy(candidate_snapshot)
+        completion_snapshot["candidates"] = retained_candidates
+        completion_snapshot["candidate_count"] = len(retained_candidates)
+        exploration_context = dict(
+            completion_snapshot.get("exploration_context") or {}
+        )
+        fallback_navigation_frontier_count = sum(
+            str(candidate.get("behavior_type") or "").upper() == "EXPLORE"
+            for candidate in retained_candidates
+        )
+        navigation_frontier_count = int(
+            exploration_context.get(
+                "navigation_frontier_count", fallback_navigation_frontier_count
+            )
+            or 0
+        )
+        navigation_frontier_exhausted = bool(
+            exploration_context.get(
+                "navigation_frontier_exhausted",
+                navigation_frontier_count == 0,
+            )
+        )
+        interaction_frontier_count = sum(
+            str(candidate.get("behavior_type") or "").upper() == "INTERACT"
+            and not bool(
+                (candidate.get("metadata") or {}).get(
+                    "interaction_group_already_explored"
+                )
+            )
+            for candidate in retained_candidates
+        )
+        interaction_frontier_exhausted = interaction_frontier_count == 0
+        exploration_context.update(
+            {
+                "interaction_frontier_count": interaction_frontier_count,
+                "interaction_frontier_exhausted": interaction_frontier_exhausted,
+                "combined_frontier_count": navigation_frontier_count
+                + interaction_frontier_count,
+                "frontier_exhausted": navigation_frontier_exhausted
+                and interaction_frontier_exhausted,
+            }
+        )
+        completion_snapshot["exploration_context"] = exploration_context
+        return completion_snapshot, excluded_candidate_ids
+
     def _decide_from_snapshot(self, candidate_snapshot: dict) -> None:
         with self.state_lock:
             pending_post_interaction_traversal = copy.deepcopy(
@@ -1016,6 +1140,12 @@ class SemanticRuleDecisionNode:
                     }
                 )
                 candidate_snapshot["exploration_context"] = exploration_context
+        (
+            completion_snapshot,
+            terminal_completion_excluded_candidate_ids,
+        ) = self._completion_snapshot_without_terminal_interactions(
+            candidate_snapshot
+        )
         candidate_sequence = int(candidate_snapshot.get("sequence", 0) or 0)
         if candidate_sequence < self.minimum_candidate_sequence:
             return
@@ -1046,12 +1176,12 @@ class SemanticRuleDecisionNode:
             self.goal_complete = True
             return
         if self.completion_tracker.update(
-            candidate_snapshot,
+            completion_snapshot,
             has_active_behavior=bool(self.active_candidate_id),
             target_enabled=bool(self.target_context.get("enabled")),
         ):
             exploration_context = (
-                candidate_snapshot.get("exploration_context") or {}
+                completion_snapshot.get("exploration_context") or {}
             )
             self.goal_complete = True
             self._publish_goal_status(
@@ -1068,6 +1198,9 @@ class SemanticRuleDecisionNode:
                     "interaction_frontier_count": int(
                         exploration_context.get("interaction_frontier_count", 0)
                         or 0
+                    ),
+                    "terminal_interaction_excluded_candidate_ids": (
+                        terminal_completion_excluded_candidate_ids
                     ),
                 },
             )
@@ -1476,6 +1609,9 @@ class SemanticRuleDecisionNode:
             "candidate_curation": curation.trace(),
             "entered_room_ids": list(curation.entered_room_ids),
             "eligibility_rejections": eligibility_rejections,
+            "terminal_interaction_completion_excluded_candidate_ids": (
+                terminal_completion_excluded_candidate_ids
+            ),
             "executed_candidate_id": selected.candidate_id if selected is not None else "",
             "executed_group_id": executed_group_id,
             "executed_history_key": executed_history_key,
@@ -1680,6 +1816,9 @@ class SemanticRuleDecisionNode:
             approach_exhausted_fingerprints = set(
                 self.approach_exhausted_fingerprints
             )
+            terminal_interaction_candidate_ids = set(
+                self.interaction_failure_tracker.terminal_candidate_ids
+            )
             target_goal_complete = bool(self.target_goal_complete)
             terminal_post_interaction_traversal_ids = set(
                 self.terminal_post_interaction_traversal_ids
@@ -1688,6 +1827,11 @@ class SemanticRuleDecisionNode:
         rejected: dict[str, str] = {}
         for payload in candidate_snapshot.get("candidates") or []:
             candidate_id = str(payload.get("candidate_id") or "")
+            if candidate_id in terminal_interaction_candidate_ids:
+                rejected[candidate_id] = (
+                    InteractionApproachFailureLimitTracker.REASON
+                )
+                continue
             target_cooldown_key = self._interaction_target_id(candidate_id)
             if now < cooldown_until.get(candidate_id, 0.0) or (
                 target_cooldown_key

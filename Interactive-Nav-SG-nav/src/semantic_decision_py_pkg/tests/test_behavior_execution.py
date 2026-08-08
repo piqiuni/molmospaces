@@ -20,6 +20,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_SCANNING,
     STATE_SUCCEEDED,
     STATE_WAITING_FOR_DRAWER_SCAN,
+    STATE_WAITING_FOR_INTERACTION_OBSERVATION,
     STATE_VERIFYING,
     bounded_empty_plan_retry_delay,
     candidate_with_effective_interaction_approach,
@@ -62,6 +63,16 @@ def test_navigation_progress_watchdog_resets_on_translation_or_rotation() -> Non
     watchdog.reset((0.0, 0.0, 0.0), now=0.0)
     assert not watchdog.observe((0.0, 0.0, 0.16), now=11.0)
     assert not watchdog.observe((0.0, 0.0, 0.17), now=22.0)
+    bounded = NavigationProgressWatchdog(
+        timeout_s=12.0,
+        min_displacement_m=0.10,
+        allow_yaw_progress=False,
+    )
+    bounded.reset((0.0, 0.0, 0.0), now=0.0)
+    assert not bounded.observe((0.0, 0.0, 0.40), now=11.9)
+    # A yaw-only DWA oscillation must eventually cancel/replan instead of
+    # resetting the ordinary navigation watchdog.
+    assert bounded.observe((0.0, 0.0, -0.40), now=12.0)
 
 
 def test_navigation_progress_watchdog_keeps_a_fresh_local_plan_making_goal_progress() -> None:
@@ -147,6 +158,24 @@ def test_interaction_pose_poll_failure_advances_to_next_preserved_option() -> No
     assert (
         next_interaction_approach_option_index(
             **{**kwargs, "attempted_navigation_count": 3}
+        )
+        is None
+    )
+
+
+def test_visual_reposition_advances_to_next_preserved_option() -> None:
+    kwargs = {
+        "behavior_type": "INTERACT",
+        "failure_detail": {"reason": "visual_reposition_required"},
+        "selected_option_index": 0,
+        "attempted_navigation_count": 1,
+        "max_navigation_attempts": 4,
+        "goal_option_count": 4,
+    }
+    assert next_interaction_approach_option_index(**kwargs) == 1
+    assert (
+        next_interaction_approach_option_index(
+            **{**kwargs, "attempted_navigation_count": 4}
         )
         is None
     )
@@ -256,6 +285,27 @@ def interaction_candidate(requires_approach=True):
     }
 
 
+def observation_required_interaction_candidate(requires_approach=True):
+    candidate = interaction_candidate(requires_approach=requires_approach)
+    candidate["candidate_id"] = "interaction:portal_1:open"
+    candidate["target_id"] = "portal_1"
+    candidate["target_name"] = "door_0001"
+    candidate["interaction_command"].update(
+        {"node_id": "portal_1", "object_id": "door_0001", "action": "open"}
+    )
+    candidate["metadata"].update(
+        {
+            "node_type": "portal",
+            "observation_required": True,
+            "reobserve": True,
+            "observation_reason": "mllm_portal_state_unknown",
+            "interaction_observation_max_attempts": 2,
+            "interaction_observation_source": "mllm_attribute_inference",
+        }
+    )
+    return candidate
+
+
 def test_committed_turn_sign_is_stable_at_pi_boundary() -> None:
     assert committed_turn_sign(math.pi - 0.05) == -1
     assert committed_turn_sign(-math.pi + 0.05) == -1
@@ -286,6 +336,36 @@ def test_prerotation_step_budget_uses_only_required_v3_control_steps() -> None:
         control_dt_s=0.2,
         max_control_steps=12,
     ) == 0
+
+
+def test_interaction_final_align_budget_covers_a_near_door_turn_without_rear_cap() -> None:
+    """A slow final-align controller needs more windows than rear pre-turning."""
+
+    # Live failure shape: 2.237 rad initial error, .30 rad/s, fixed .20 s
+    # actions, and .15 rad terminal tolerance => ceil(2.087 / .06) = 35.
+    assert prerotation_control_step_budget(
+        2.237,
+        0.15,
+        speed_rad_s=0.30,
+        control_dt_s=0.20,
+        max_control_steps=56,
+    ) == 35
+    # The dedicated hard cap accommodates a worst-case pi turn with margin;
+    # it remains finite and is not the rear-prerotation 12-step cap.
+    assert prerotation_control_step_budget(
+        math.pi,
+        0.15,
+        speed_rad_s=0.30,
+        control_dt_s=0.20,
+        max_control_steps=56,
+    ) == 50
+    assert prerotation_control_step_budget(
+        math.pi,
+        0.15,
+        speed_rad_s=0.30,
+        control_dt_s=0.20,
+        max_control_steps=12,
+    ) == 12
 
 
 def test_prerotation_rgb_step_gate_allows_one_command_per_evaluator_step() -> None:
@@ -356,8 +436,8 @@ def test_navigation_goal_options_preserve_nearest_first_and_remove_duplicates() 
     ]
 
 
-def test_explore_navigation_skips_prerotation_and_final_yaw_alignment() -> None:
-    assert not navigation_should_prerotate("EXPLORE")
+def test_explore_navigation_uses_bounded_prerotation_without_final_yaw_alignment() -> None:
+    assert navigation_should_prerotate("EXPLORE")
     assert navigation_should_prerotate("INTERACT")
     assert navigation_should_prerotate("NAVIGATE")
 
@@ -531,13 +611,123 @@ def test_interaction_execution_orders_approach_action_and_verification() -> None
     commands = machine.on_navigation_result(True, now=1.0)
     assert machine.state == STATE_INTERACTING
     assert commands[0]["kind"] == "interact"
-    assert machine.on_interaction_result(True, now=2.0) == []
+    verification = machine.on_interaction_result(True, now=2.0)
     assert machine.state == STATE_VERIFYING
+    assert verification[0]["kind"] == "verify_interaction"
+    assert verification[0]["backend_success"] is True
     assert machine.on_graph_state("closed", now=3.0) == []
     terminal = machine.on_graph_state("open", now=4.0)
     assert machine.state == STATE_SUCCEEDED
     assert terminal[0]["kind"] == "terminal"
     assert terminal[0]["success"] is True
+
+
+def test_unknown_portal_reobserves_after_approach_before_physical_action() -> None:
+    machine = BehaviorExecutionStateMachine()
+    commands = machine.start(observation_required_interaction_candidate(), now=0.0)
+    assert commands[0]["kind"] == "navigate"
+
+    commands = machine.on_navigation_result(
+        True, {"capture_step": 10}, now=1.0
+    )
+    assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    assert commands[0]["kind"] == "request_interaction_observation"
+    assert commands[0]["attempt"] == 1
+    assert commands[0]["min_capture_step"] == 11
+    assert commands[0]["require_current_visibility"] is True
+    assert commands[0]["required_attribute_source"] == "mllm_attribute_inference"
+
+    commands = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "attribute_capture_step": 11,
+        },
+        now=2.0,
+    )
+    assert machine.state == STATE_INTERACTING
+    assert commands[0]["kind"] == "interact"
+    assert commands[0]["observation"]["state"] == "closed"
+    assert machine.candidate["metadata"]["observation_required"] is False
+
+
+def test_unknown_portal_open_observation_finishes_without_action() -> None:
+    machine = BehaviorExecutionStateMachine()
+    commands = machine.start(
+        observation_required_interaction_candidate(requires_approach=False), now=0.0
+    )
+    assert commands[0]["kind"] == "request_interaction_observation"
+
+    terminal = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "static_open",
+            "attribute_capture_step": 1,
+        },
+        now=1.0,
+    )
+    assert machine.state == STATE_SUCCEEDED
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is True
+    assert terminal[0]["detail"]["action_executed"] is False
+    assert terminal[0]["detail"]["observation_outcome"] == "finish_without_action"
+
+
+def test_unknown_portal_observation_retries_then_terminates_unresolved() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(observation_required_interaction_candidate(requires_approach=False), now=0.0)
+
+    commands = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "unknown",
+            "attribute_capture_step": 1,
+        },
+        now=1.0,
+    )
+    assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    assert commands[0]["kind"] == "request_interaction_observation"
+    assert commands[0]["attempt"] == 2
+
+    terminal = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "unknown",
+            "attribute_capture_step": 2,
+        },
+        now=2.0,
+    )
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is False
+    assert terminal[0]["detail"]["reason"] == "interaction_observation_unresolved"
+
+
+def test_real_interaction_backend_failure_still_requests_post_action_verification() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(interaction_candidate(requires_approach=False), now=0.0)
+
+    commands = machine.on_interaction_result(
+        False, {"reason": "force_no_effect"}, now=1.0
+    )
+    assert machine.state == STATE_VERIFYING
+    assert commands[0]["kind"] == "verify_interaction"
+    assert commands[0]["backend_success"] is False
+
+    terminal = machine.on_verification_result(
+        True, {"m3_state": "open", "verified": True}, now=2.0
+    )
+    assert machine.state != STATE_SUCCEEDED
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is False
+    assert terminal[0]["detail"]["reason"] == "interaction_backend_failed"
 
 
 def test_static_portal_feedback_finishes_directly_without_graph_or_timeout() -> None:
@@ -854,6 +1044,26 @@ def test_step_command_gate_pairs_callbacks_by_step_and_waits_for_ack() -> None:
     assert len(ack) == 1
     assert ack[0].command_applied
     assert gate.consume_step(now=1.3) == 12
+
+
+def test_step_command_gate_retries_after_timeout_noop_without_reusing_stale_step() -> None:
+    gate = StepCommandGate(max_pair_age_s=10.0)
+    gate.record_rgb(21, now=2.0)
+    gate.record_fresh_gate(21, now=2.0)
+    assert gate.consume_step(now=2.0) == 21
+
+    # A bridge action timeout acknowledges the evaluator step but must not
+    # count as an applied turn. The next command can only use a new RGB/gate
+    # pair, never the stale step 21 pair.
+    gate.record_step_sync(21, action_source="timeout_noop")
+    acknowledgement = gate.take_acks()
+    assert len(acknowledgement) == 1
+    assert not acknowledgement[0].command_applied
+    assert gate.consume_step(now=2.1) is None
+
+    gate.record_rgb(22, now=2.2)
+    gate.record_fresh_gate(22, now=2.2)
+    assert gate.consume_step(now=2.2) == 22
 
 
 def test_step_command_gate_does_not_use_mismatched_latest_values() -> None:

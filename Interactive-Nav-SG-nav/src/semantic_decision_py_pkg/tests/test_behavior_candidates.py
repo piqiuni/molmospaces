@@ -71,6 +71,58 @@ def test_generator_combines_frontiers_and_closed_portals() -> None:
     assert interaction.metadata["requires_approach"] is True
 
 
+def test_portal_candidate_forwards_only_visual_leaf_and_observed_connectivity() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("portal",))
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_fixed_opening",
+                "type": "portal",
+                "name": "door_0002",
+                "centroid": [2.0, 0.0, 1.0],
+                "state_age_sec": 1.0,
+                "is_currently_visible": True,
+                "attributes": {
+                    "instance_id": "door_0002",
+                    "connected_room_ids": [1, 2],
+                    "observed_connected_room_ids": [1, 2],
+                    "potential_room_ids": [],
+                    "connectivity_status": "connected",
+                    "portal_morphology": {
+                        "door_leaf": "absent",
+                        "confidence": 0.9,
+                    },
+                },
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                    "interaction_mode": "open_close",
+                },
+            }
+        ]
+    }
+
+    candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
+
+    assert len(candidates) == 1
+    assert candidates[0].interaction_command["portal_aperture_observation"] == {
+        "door_leaf": "absent",
+        "connectivity": "open",
+        "confidence": 0.8,
+    }
+    # A partial map cannot create a fixed-open claim merely from a missing
+    # visible leaf; it is intentionally routed as unknown to the bridge.
+    graph["nodes"][0]["attributes"]["connectivity_status"] = "partial"
+    unknown = generator.generate({}, graph, robot_xy=(0.0, 0.0))[0]
+    assert unknown.interaction_command["portal_aperture_observation"][
+        "connectivity"
+    ] == "unknown"
+
+
 def test_successfully_opened_portal_generates_one_way_traversal_goal() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(
@@ -368,12 +420,17 @@ def test_generator_does_not_use_object_name_to_reject_portal_fixture() -> None:
                 "attributes": {
                     "source_object_name": "doorframe_static_1",
                     "connected_room_ids": [1, 2],
+                    "attribute_status": "ready",
+                    "attribute_source": "mllm_attribute_inference",
                 },
                 "interaction": {
                     "is_interactable": True,
                     "requires_interaction": True,
                     "state": "unknown",
-                    "state_confidence": 1.0,
+                    # A ready visual unknown intentionally bypasses the normal
+                    # confidence floor, but only as a re-observation candidate.
+                    "state_confidence": 0.0,
+                    "state_source": "mllm_attribute_inference",
                 },
             }
         ]
@@ -382,6 +439,66 @@ def test_generator_does_not_use_object_name_to_reject_portal_fixture() -> None:
     candidates = generator.generate({}, graph, robot_xy=(0.0, 0.0))
     assert len(candidates) == 1
     assert candidates[0].target_id == "portal_doorframe_1"
+    assert candidates[0].candidate_id == "interaction:portal_doorframe_1:open"
+    assert candidates[0].metadata["observation_required"] is True
+    assert candidates[0].metadata["reobserve"] is True
+
+
+def test_mllm_unknown_portal_requires_current_ready_visual_observation() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_require_attribute_ready=True,
+            portal_allow_unknown_state=False,
+        )
+    )
+    node = {
+        "id": "portal_1",
+        "type": "portal",
+        "centroid": [2.0, 0.0, 1.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "attributes": {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "unknown",
+            "state_confidence": 0.0,
+            "state_source": "mllm_attribute_inference",
+        },
+    }
+
+    candidates = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0))
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "interaction:portal_1:open"
+    ]
+    assert candidates[0].metadata["interaction_observation_max_attempts"] == 2
+    assert candidates[0].interaction_command["action"] == "open"
+
+    # M1 may see a portal but deliberately decline to guess whether its
+    # articulation is usable. The unknown-state path is an observation
+    # candidate, not a physical action authorization, so it remains eligible.
+    node["interaction"]["is_interactable"] = False
+    node["interaction"]["requires_interaction"] = False
+    candidates = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0))
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "interaction:portal_1:open"
+    ]
+    node["interaction"]["is_interactable"] = True
+    node["interaction"]["requires_interaction"] = True
+
+    node["is_currently_visible"] = False
+    assert generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0)) == []
+    node["is_currently_visible"] = True
+    node["attributes"]["attribute_status"] = "pending"
+    assert generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0)) == []
+    node["attributes"]["attribute_status"] = "ready"
+    node["attributes"]["attribute_source"] = "restricted_gt"
+    node["interaction"]["state_source"] = "restricted_gt"
+    assert generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0)) == []
 
 
 def test_portal_open_waits_for_ready_module1_state_in_full_mllm_mode() -> None:
@@ -1465,7 +1582,7 @@ def test_aabb_approach_standoff_is_outside_container_box() -> None:
     assert math.isclose(candidate.goal_xyyaw[1], 2.0, abs_tol=1e-6)
 
 
-def test_container_front_axis_overrides_nearest_radial_side() -> None:
+def test_container_mllm_front_view_derives_axis_from_current_robot_side() -> None:
     node = {
         "id": "container_fridge",
         "type": "container",
@@ -1476,6 +1593,13 @@ def test_container_front_axis_overrides_nearest_radial_side() -> None:
         "is_currently_visible": True,
         "attributes": {
             "visible_pixels": 32,
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            # Deliberately conflicting scene/oracle geometry.  Interaction
+            # candidates must ignore it and use the current robot side.
             "interaction_approach_axis_xy": [0.0, -1.0],
         },
         "interaction": {
@@ -1485,25 +1609,32 @@ def test_container_front_axis_overrides_nearest_radial_side() -> None:
             "state_confidence": 1.0,
         },
     }
-    target = CandidateGenerator().generate(
-        {},
-        {"nodes": [node]},
-        robot_xy=(4.0, 4.0),
-        target_context={"enabled": True, "object_labels": ["fridge"]},
-    )[0]
     interaction = CandidateGenerator(
         CandidateGeneratorConfig(interaction_types=("container",))
     ).generate({}, {"nodes": [node]}, robot_xy=(4.0, 4.0))[0]
 
-    for candidate in (target, interaction):
-        expected_y = 0.0
-        assert math.isclose(candidate.goal_xyyaw[0], 4.0, abs_tol=1e-6)
-        assert math.isclose(candidate.goal_xyyaw[1], expected_y, abs_tol=1e-6)
-        assert math.isclose(candidate.goal_xyyaw[2], math.pi / 2.0, abs_tol=1e-6)
-        assert candidate.metadata["interaction_approach_axis_xy"] == (0.0, -1.0)
+    # The physical interaction candidate is bound to M1's current view, not
+    # to the conflicting scene/oracle axis above.
+
+    expected_axis = (0.0, 1.0)
+    assert interaction.metadata["approach_strategy"] == "container_mllm_current_view"
+    assert interaction.metadata["interaction_approach_axis_xy"] == list(expected_axis)
+    assert interaction.interaction_command["interaction_approach_axis_xy"] == list(
+        expected_axis
+    )
+    goal_dx = interaction.goal_xyyaw[0] - 4.0
+    goal_dy = interaction.goal_xyyaw[1] - 2.0
+    goal_norm = math.hypot(goal_dx, goal_dy)
+    assert math.isclose(goal_dx / goal_norm, expected_axis[0], abs_tol=1e-6)
+    assert math.isclose(goal_dy / goal_norm, expected_axis[1], abs_tol=1e-6)
+    assert math.isclose(
+        interaction.goal_xyyaw[2],
+        math.atan2(2.0 - interaction.goal_xyyaw[1], 4.0 - interaction.goal_xyyaw[0]),
+        abs_tol=1e-6,
+    )
 
 
-def test_container_explicit_interaction_pose_overrides_live_aabb() -> None:
+def test_container_oracle_pose_is_ignored_without_fresh_mllm_front_view() -> None:
     node = {
         "id": "container_fridge",
         "type": "container",
@@ -1529,14 +1660,60 @@ def test_container_explicit_interaction_pose_overrides_live_aabb() -> None:
         CandidateGeneratorConfig(interaction_types=("container",))
     ).generate({}, {"nodes": [node]}, robot_xy=(4.0, 4.0))[0]
 
-    assert candidate.goal_xyyaw == [8.25, 1.05, math.pi]
-    assert candidate.metadata["approach_strategy"] == "container_explicit_pose"
-    assert candidate.metadata["goal_xyyaw_candidates"][1] == [8.5, 1.05, math.pi]
-    assert candidate.interaction_command["interaction_approach_pose_xyyaw"] == [
-        8.25,
-        1.05,
-        math.pi,
+    assert candidate.metadata["approach_strategy"] == "container_multiview_reobserve"
+    assert candidate.metadata["interaction_approach_axis_xy"] == []
+    assert candidate.interaction_command["interaction_approach_axis_xy"] == []
+    assert candidate.metadata["interaction_approach_pose_labels"] == [
+        "current_view",
+        "quarter_turn_left",
+        "quarter_turn_right",
+        "opposite_view",
     ]
+    assert candidate.goal_xyyaw != [8.25, 1.05, math.pi]
+
+
+def test_container_without_front_axis_keeps_bounded_reobservation_ring() -> None:
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_multiview_enabled=True,
+            container_multiview_face_count=4,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    assert candidate.metadata["approach_strategy"] == "container_multiview_reobserve"
+    assert candidate.metadata["interaction_approach_pose_labels"] == [
+        "current_view",
+        "quarter_turn_left",
+        "quarter_turn_right",
+        "opposite_view",
+    ]
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+    assert len(goals) == 4
+    assert len({(round(goal[0], 6), round(goal[1], 6)) for goal in goals}) == 4
+    for goal_x, goal_y, goal_yaw in goals:
+        expected_yaw = math.atan2(2.0 - goal_y, 4.0 - goal_x)
+        assert math.isclose(
+            math.atan2(math.sin(goal_yaw - expected_yaw), math.cos(goal_yaw - expected_yaw)),
+            0.0,
+            abs_tol=1e-6,
+        )
 
 
 def test_target_current_visibility_can_be_required() -> None:

@@ -10,7 +10,7 @@
   <arg name="subscribe_pointcloud" default="true"/>
   <arg name="start_attribute_inference" default="false"/>
   <arg name="attribute_model_name" default=""/>
-  <arg name="attribute_max_output_tokens" default="160"/>
+  <arg name="attribute_max_output_tokens" default="256"/>
   <arg name="attribute_request_timeout_s" default="8.0"/>
   <arg name="attribute_min_interval_s" default="2.0"/>
   <arg name="attribute_worker_count" default="1"/>
@@ -21,6 +21,7 @@
   <arg name="attribute_min_bbox_area_px" default="512"/>
   <arg name="attribute_max_distance_m" default="6.0"/>
   <arg name="attribute_required_consecutive_observations" default="2"/>
+  <arg name="attribute_targeted_refresh_topic" default="/semantic_mapping/attribute_refresh_requests"/>
   <!-- start_attribute_inference launches both independent Module-1 lanes:
        RGB object attributes and text-only room attributes. -->
   <arg name="attribute_room_enabled" default="true"/>
@@ -103,6 +104,7 @@
       <param name="min_bbox_area_px" value="$(arg attribute_min_bbox_area_px)"/>
       <param name="max_distance_m" value="$(arg attribute_max_distance_m)"/>
       <param name="required_consecutive_observations" value="$(arg attribute_required_consecutive_observations)"/>
+      <param name="topics/attribute_refresh_requests" value="$(arg attribute_targeted_refresh_topic)"/>
       <param name="room_mllm/enabled" value="$(arg attribute_room_enabled)"/>
     </node>
   </group>

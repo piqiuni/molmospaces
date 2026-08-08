@@ -168,6 +168,70 @@ def test_restricted_gt_filters_by_camera_distance_and_projected_bbox_area() -> N
     ]
 
 
+def test_restricted_gt_keeps_only_largest_connected_component_for_bbox_and_mask() -> None:
+    segmentation = np.zeros((18, 24, 2), dtype=np.int32)
+    segmentation[..., 1] = -1
+    # One private object appears as a tiny fragment and a larger, disconnected
+    # fragment.  The former implementation exposed their union as one box.
+    segmentation[1:3, 1:3, 0] = 7
+    segmentation[1:3, 1:3, 1] = 42
+    segmentation[9:13, 15:20, 0] = 7
+    segmentation[9:13, 15:20, 1] = 42
+
+    payload = build_restricted_gt_frame(
+        segmentation=segmentation,
+        registry=OpaqueEpisodeRegistry(),
+        candidates=[
+            PrivateObjectSpec(
+                source_name="private_fridge",
+                semantic_category="Fridge",
+                geom_ids=(7,),
+            )
+        ],
+        geom_object_type=42,
+        min_visible_pixels=1,
+        min_bbox_area_pixels=1,
+    )
+
+    observation = payload["observations"][0]
+    assert observation["bbox_2d_xyxy"] == [15, 9, 19, 12]
+    mask = decode_binary_mask_rle(observation["mask_rle"])
+    assert int(mask.sum()) == 20
+    assert not bool(mask[1:3, 1:3].any())
+    assert bool(mask[9:13, 15:20].all())
+
+
+def test_restricted_gt_filters_tiny_extent_against_projected_aabb() -> None:
+    segmentation = np.zeros((100, 100, 2), dtype=np.int32)
+    segmentation[..., 1] = -1
+    segmentation[48:53, 48:53, 0] = 8
+    segmentation[48:53, 48:53, 1] = 42
+
+    payload = build_restricted_gt_frame(
+        segmentation=segmentation,
+        registry=OpaqueEpisodeRegistry(),
+        candidates=[
+            PrivateObjectSpec(
+                source_name="private_large_fridge",
+                semantic_category="Fridge",
+                geom_ids=(8,),
+                aabb_center=(0.0, 0.0, 5.0),
+                aabb_size=(2.0, 2.0, 2.0),
+            )
+        ],
+        geom_object_type=42,
+        min_visible_pixels=1,
+        min_bbox_area_pixels=1,
+        min_visible_fraction=0.2,
+        camera_position=(0.0, 0.0, 0.0),
+        camera_forward=(0.0, 0.0, 1.0),
+        camera_up=(0.0, 1.0, 0.0),
+        camera_fov_deg=90.0,
+    )
+
+    assert payload["observations"] == []
+
+
 def test_registry_can_start_from_the_evaluator_episode_index() -> None:
     registry = OpaqueEpisodeRegistry(initial_episode_index=42)
 

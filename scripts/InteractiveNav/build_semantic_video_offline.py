@@ -9,6 +9,7 @@ import json
 import math
 import shutil
 import subprocess
+from bisect import bisect_right
 from pathlib import Path
 
 import cv2
@@ -45,6 +46,69 @@ def load_jsonl(path: Path) -> list[dict]:
         if line.strip():
             records.append(json.loads(line))
     return sorted(records, key=lambda record: int(record.get("step_index", 0)))
+
+
+def load_episode_trajectory(path: Path) -> list[tuple[int, float, float, float]]:
+    """Load the recorder's lightweight, episode-level odom trajectory.
+
+    ``step_boundaries.jsonl`` intentionally describes a single causal replay
+    frame.  Its legacy ``trajectory`` field is a bounded diagnostic history and
+    must not be treated as durable episode history.  The recorder's CSV is
+    append-only, compact, and has one row per sampled odom pose, which is the
+    correct source for an offline full-trail replay.
+    """
+
+    if not path.exists():
+        return []
+    records: list[tuple[int, float, float, float]] = []
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    records.append(
+                        (
+                            int(row.get("step_id") or 0),
+                            float(row["x"]),
+                            float(row["y"]),
+                            float(row.get("yaw") or 0.0),
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+    except OSError:
+        return []
+    return sorted(records, key=lambda record: record[0])
+
+
+def episode_trajectory_prefix(
+    trajectory: list[tuple[int, float, float, float]], step_index: int
+) -> list[tuple[int, float, float, float]]:
+    """Return only poses observed no later than this simulator boundary."""
+
+    if not trajectory:
+        return []
+    end = bisect_right(
+        trajectory,
+        (int(step_index), float("inf"), float("inf"), float("inf")),
+    )
+    return trajectory[:end]
+
+
+def resolve_episode_trajectory_path(
+    raw_dir: Path, debug_dir: Path, steps: list[dict]
+) -> Path:
+    """Resolve the self-describing raw reference, with legacy CSV fallback."""
+
+    for step in steps:
+        reference = str(step.get("trajectory_reference") or "").strip()
+        if not reference:
+            continue
+        candidate = Path(reference).expanduser()
+        if not candidate.is_absolute():
+            candidate = raw_dir / candidate
+        if candidate.exists():
+            return candidate.resolve()
+    return debug_dir / "trajectory.csv"
 
 
 def offline_display_config(visualization_config: dict | None) -> dict[str, float | str]:
@@ -548,6 +612,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     maps = load_jsonl(raw_dir / "map_manifest.jsonl")
     if not steps or not maps:
         raise RuntimeError(f"Raw PNG+JSON recording is incomplete under {raw_dir}")
+    trajectory_path = resolve_episode_trajectory_path(raw_dir, debug_dir, steps)
+    episode_trajectory = load_episode_trajectory(trajectory_path)
+    trajectory_source = "episode_trajectory_csv" if episode_trajectory else "legacy_step_boundary"
     maps_by_id = {str(record.get("receipt_id")): record for record in maps}
     maps_by_stage: dict[str, list[dict]] = {}
     for record in maps:
@@ -653,6 +720,11 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 visualization_config = offline_display_config(
                     step.get("visualization_config") or {}
                 )
+                trajectory = (
+                    episode_trajectory_prefix(episode_trajectory, step_index)
+                    if episode_trajectory
+                    else list(step.get("trajectory") or [])
+                )
                 occ_crop_margin_m = float(
                     (step.get("visualization_config") or {}).get("video_occ_crop_margin_m", 2.5)
                     or 2.5
@@ -690,6 +762,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     planning, panel_size, step, step_index, title="OCC", kind="occupancy",
                     world_bounds=world_bounds, draw_global_plan=True, draw_local_plan=True,
                     draw_frontiers=True, draw_semantic_candidates=True, draw_route_plan=True,
+                    episode_trajectory=trajectory,
                 )
                 draw_task_subgoal_header(occ, step)
                 room_panel = renderer.render_room_panel(
@@ -706,12 +779,14 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     global_grid, (global_width, panel_size[1]), step, step_index,
                     title="GLOBAL COSTMAP", kind="costmap", world_bounds=world_bounds,
                     draw_global_plan=True, draw_local_plan=False, draw_frontiers=False,
+                    episode_trajectory=trajectory,
                 )
                 global_panel = zoom_panel(global_panel, global_panel_scale)
                 local_panel = renderer.render_map_panel(
                     local, (panel_size[0] - global_width, panel_size[1]), step, step_index,
                     title="LOCAL COSTMAP", kind="costmap", draw_global_plan=False,
                     draw_local_global_plan=True, draw_local_plan=True, draw_frontiers=False,
+                    episode_trajectory=trajectory,
                 )
                 costmaps = np.concatenate([global_panel, local_panel], axis=1)
                 spatial = renderer.render_semantic_xy(
@@ -777,6 +852,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         "max_stamp_delta_sec": 0.0,
         "component_post_observation_receipt_count": component_post_observation_receipt_count,
         "component_alignment": "step_boundary_receipts",
+        "trajectory_source": trajectory_source,
+        "trajectory_path": str(trajectory_path),
+        "episode_trajectory_sample_count": len(episode_trajectory),
         "alignment_jsonl": str(alignment_path),
         "fps": float(args.fps),
         "codec": codec,

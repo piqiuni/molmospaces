@@ -19,6 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
+import cv2
 import numpy as np
 
 
@@ -259,6 +260,129 @@ class PrivateObjectSpec:
     geom_ids: tuple[int, ...] = ()
     aabb_center: tuple[float, float, float] | None = None
     aabb_size: tuple[float, float, float] | None = None
+
+
+def _bbox_area_xyxy(bbox: Sequence[int] | Sequence[float] | None) -> float:
+    if bbox is None or len(bbox) < 4:
+        return 0.0
+    return max(0.0, float(bbox[2]) - float(bbox[0]) + 1.0) * max(
+        0.0, float(bbox[3]) - float(bbox[1]) + 1.0
+    )
+
+
+def _largest_connected_component(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    *,
+    height: int,
+    width: int,
+) -> tuple[np.ndarray, int, tuple[int, int, int, int]] | None:
+    """Return one visually grounded 8-connected component for an object.
+
+    A body/geom association can contain several disconnected image islands.
+    Publishing their union as one target box makes the policy associate an
+    object with unrelated furniture between those islands.  Retain only the
+    dominant island, matching the realtime-GT observation contract.
+    """
+
+    if xs.size == 0 or ys.size == 0:
+        return None
+    min_x = int(np.min(xs))
+    min_y = int(np.min(ys))
+    max_x = int(np.max(xs))
+    max_y = int(np.max(ys))
+    cropped = np.zeros((max_y - min_y + 1, max_x - min_x + 1), dtype=np.uint8)
+    cropped[ys - min_y, xs - min_x] = 1
+    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        cropped, connectivity=8
+    )
+    if component_count <= 1:
+        return None
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    # OpenCV assigns labels in raster order; np.argmax gives a stable tie-break.
+    component_index = 1 + int(np.argmax(areas))
+    component_pixels = int(stats[component_index, cv2.CC_STAT_AREA])
+    left = int(stats[component_index, cv2.CC_STAT_LEFT])
+    top = int(stats[component_index, cv2.CC_STAT_TOP])
+    component_width = int(stats[component_index, cv2.CC_STAT_WIDTH])
+    component_height = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+    component_mask = np.zeros((height, width), dtype=bool)
+    local_ys, local_xs = np.nonzero(labels == component_index)
+    component_mask[min_y + local_ys, min_x + local_xs] = True
+    return (
+        component_mask,
+        component_pixels,
+        (
+            min_x + left,
+            min_y + top,
+            min_x + left + component_width - 1,
+            min_y + top + component_height - 1,
+        ),
+    )
+
+
+def _project_aabb_bbox(
+    *,
+    camera_position: Sequence[float],
+    camera_forward: Sequence[float],
+    camera_up: Sequence[float],
+    fov_deg: float,
+    image_width: int,
+    image_height: int,
+    center: Sequence[float],
+    size: Sequence[float],
+) -> tuple[float, float, float, float] | None:
+    """Project a world AABB into the camera image for an extent sanity check."""
+
+    if image_width <= 1 or image_height <= 1:
+        return None
+    forward = np.asarray(camera_forward, dtype=np.float64).copy()
+    up = np.asarray(camera_up, dtype=np.float64).copy()
+    forward_norm = float(np.linalg.norm(forward))
+    up_norm = float(np.linalg.norm(up))
+    if forward_norm <= 1e-8 or up_norm <= 1e-8:
+        return None
+    forward /= forward_norm
+    up /= up_norm
+    right = np.cross(forward, up)
+    right_norm = float(np.linalg.norm(right))
+    if right_norm <= 1e-8:
+        return None
+    right /= right_norm
+    up = np.cross(right, forward)
+    up /= max(float(np.linalg.norm(up)), 1e-8)
+    half = 0.5 * np.abs(np.asarray(size, dtype=np.float64))
+    offsets = np.asarray(
+        [
+            [sx * half[0], sy * half[1], sz * half[2]]
+            for sx in (-1.0, 1.0)
+            for sy in (-1.0, 1.0)
+            for sz in (-1.0, 1.0)
+        ],
+        dtype=np.float64,
+    )
+    relative = (
+        np.asarray(center, dtype=np.float64)[None, :]
+        + offsets
+        - np.asarray(camera_position, dtype=np.float64)[None, :]
+    )
+    depth = relative @ forward
+    valid = depth > 1e-3
+    if int(np.count_nonzero(valid)) < 2:
+        return None
+    relative = relative[valid]
+    depth = depth[valid]
+    fov_rad = np.deg2rad(min(179.0, max(1.0, float(fov_deg))))
+    focal = 0.5 * float(image_height) / max(np.tan(0.5 * fov_rad), 1e-6)
+    xs = 0.5 * float(image_width - 1) + (relative @ right) / depth * focal
+    ys = 0.5 * float(image_height - 1) - (relative @ up) / depth * focal
+    min_x = max(0.0, float(np.min(xs)))
+    min_y = max(0.0, float(np.min(ys)))
+    max_x = min(float(image_width - 1), float(np.max(xs)))
+    max_y = min(float(image_height - 1), float(np.max(ys)))
+    if max_x < min_x or max_y < min_y:
+        return None
+    return min_x, min_y, max_x, max_y
 
 
 class OpaqueEpisodeRegistry:
@@ -715,8 +839,12 @@ def build_restricted_gt_frame(
     episode_reset: bool = False,
     min_visible_pixels: int = 1,
     min_bbox_area_pixels: int = 1,
+    min_visible_fraction: float = 0.0,
     max_distance_m: float = 0.0,
     camera_position: Sequence[float] | None = None,
+    camera_forward: Sequence[float] | None = None,
+    camera_up: Sequence[float] | None = None,
+    camera_fov_deg: float | None = None,
     frame_id: str = "world",
     geom_object_type: int | None = None,
     geom_to_spec: np.ndarray | None = None,
@@ -738,6 +866,11 @@ def build_restricted_gt_frame(
         raise ValueError("min_visible_pixels must be >= 1")
     if int(min_bbox_area_pixels) < 1:
         raise ValueError("min_bbox_area_pixels must be >= 1")
+    if (
+        not math.isfinite(float(min_visible_fraction))
+        or not 0.0 <= float(min_visible_fraction) <= 1.0
+    ):
+        raise ValueError("min_visible_fraction must be finite and in [0, 1]")
     if not math.isfinite(float(max_distance_m)) or float(max_distance_m) < 0.0:
         raise ValueError("max_distance_m must be finite and non-negative")
     if float(max_distance_m) > 0.0 and camera_position is None:
@@ -773,14 +906,19 @@ def build_restricted_gt_frame(
             visible_count = int(np.count_nonzero(selection))
             if visible_count < int(min_visible_pixels):
                 continue
-            mask = np.zeros((height, width), dtype=bool)
-            mask[ys[selection], xs[selection]] = True
-            object_ys, object_xs = np.nonzero(mask)
-            center, size = _runtime_aabb(spec, model, data)
-            bbox_area = int(object_xs.max() - object_xs.min() + 1) * int(
-                object_ys.max() - object_ys.min() + 1
+            component = _largest_connected_component(
+                xs[selection],
+                ys[selection],
+                height=height,
+                width=width,
             )
-            if bbox_area < int(min_bbox_area_pixels):
+            if component is None:
+                continue
+            mask, visible_count, bbox_2d = component
+            if visible_count < int(min_visible_pixels):
+                continue
+            center, size = _runtime_aabb(spec, model, data)
+            if _bbox_area_xyxy(bbox_2d) < int(min_bbox_area_pixels):
                 continue
             if (
                 camera_xyz is not None
@@ -788,16 +926,36 @@ def build_restricted_gt_frame(
                 and math.dist(center, camera_xyz) > float(max_distance_m)
             ):
                 continue
+            if (
+                float(min_visible_fraction) > 0.0
+                and camera_xyz is not None
+                and camera_forward is not None
+                and camera_up is not None
+                and camera_fov_deg is not None
+            ):
+                projected_bbox = _project_aabb_bbox(
+                    camera_position=camera_xyz,
+                    camera_forward=camera_forward,
+                    camera_up=camera_up,
+                    fov_deg=float(camera_fov_deg),
+                    image_width=width,
+                    image_height=height,
+                    center=center,
+                    size=size,
+                )
+                projected_area = _bbox_area_xyxy(projected_bbox)
+                if projected_area > 1e-6:
+                    observed_extent_fraction = min(
+                        1.0,
+                        _bbox_area_xyxy(bbox_2d) / projected_area,
+                    )
+                    if observed_extent_fraction < float(min_visible_fraction):
+                        continue
             observations.append(
                 RestrictedObservation(
                     instance_id=registry.public_id_for(spec.source_name),
                     name=normalize_semantic_category(spec.semantic_category, fallback_source_name=spec.source_name),
-                    bbox_2d_xyxy=(
-                        int(object_xs.min()),
-                        int(object_ys.min()),
-                        int(object_xs.max()),
-                        int(object_ys.max()),
-                    ),
+                    bbox_2d_xyxy=bbox_2d,
                     mask_rle=MaskRLE.from_mask(mask),
                     bbox_3d=BoundingBox3D(center=center, size=size, frame_id=str(frame_id)),
                 )
@@ -825,6 +983,7 @@ class RestrictedGTPerceptionPublisher:
         topic: str = "/semantic_mapping/gt_observations",
         min_visible_pixels: int = 16,
         min_bbox_area_pixels: int = 512,
+        min_visible_fraction: float = 0.2,
         max_distance_m: float = 4.0,
         step_interval: int = 1,
         frame_id: str = "world",
@@ -837,6 +996,11 @@ class RestrictedGTPerceptionPublisher:
             raise ValueError("min_visible_pixels must be >= 1")
         if int(min_bbox_area_pixels) < 1:
             raise ValueError("min_bbox_area_pixels must be >= 1")
+        if (
+            not math.isfinite(float(min_visible_fraction))
+            or not 0.0 <= float(min_visible_fraction) <= 1.0
+        ):
+            raise ValueError("min_visible_fraction must be finite and in [0, 1]")
         if not math.isfinite(float(max_distance_m)) or float(max_distance_m) < 0.0:
             raise ValueError("max_distance_m must be finite and non-negative")
         if int(step_interval) < 1:
@@ -847,6 +1011,7 @@ class RestrictedGTPerceptionPublisher:
         self.topic = str(topic)
         self.min_visible_pixels = int(min_visible_pixels)
         self.min_bbox_area_pixels = int(min_bbox_area_pixels)
+        self.min_visible_fraction = float(min_visible_fraction)
         self.max_distance_m = float(max_distance_m)
         self.step_interval = int(step_interval)
         self.frame_id = str(frame_id)
@@ -919,7 +1084,10 @@ class RestrictedGTPerceptionPublisher:
             except Exception as exc:
                 raise RuntimeError(f"Restricted GT segmentation render failed: {type(exc).__name__}: {exc}") from exc
         camera_position = None
-        if self.max_distance_m > 0.0:
+        camera_forward = None
+        camera_up = None
+        camera_fov_deg = None
+        if self.max_distance_m > 0.0 or self.min_visible_fraction > 0.0:
             try:
                 camera = env.camera_manager.registry[self.camera_name]
                 camera_position = _triplet(
@@ -928,8 +1096,29 @@ class RestrictedGTPerceptionPublisher:
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    "Restricted GT camera position is required for distance filtering"
+                    "Restricted GT camera position is required for visibility filtering"
                 ) from exc
+            if self.min_visible_fraction > 0.0:
+                try:
+                    camera_forward = _triplet(
+                        camera.forward,
+                        path="private_runtime.camera_forward",
+                    )
+                    camera_up = _triplet(
+                        camera.up,
+                        path="private_runtime.camera_up",
+                    )
+                    camera_fov_deg = _json_number(
+                        camera.fov,
+                        path="private_runtime.camera_fov_deg",
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    # Some custom camera adapters expose a position but not a
+                    # full projection contract.  Preserve their existing
+                    # restricted-GT behavior rather than discarding all boxes.
+                    camera_forward = None
+                    camera_up = None
+                    camera_fov_deg = None
         model = getattr(env, "current_model", None)
         data = getattr(env, "current_data", None)
         if candidates is None:
@@ -949,8 +1138,12 @@ class RestrictedGTPerceptionPublisher:
             episode_reset=self._episode_reset_pending,
             min_visible_pixels=self.min_visible_pixels,
             min_bbox_area_pixels=self.min_bbox_area_pixels,
+            min_visible_fraction=self.min_visible_fraction,
             max_distance_m=self.max_distance_m,
             camera_position=camera_position,
+            camera_forward=camera_forward,
+            camera_up=camera_up,
+            camera_fov_deg=camera_fov_deg,
             frame_id=self.frame_id,
             geom_to_spec=mapping,
         )

@@ -370,6 +370,11 @@ def build_ros_bridge_policy(
     cmd_vel_linear_gain: float,
     require_move_base_active: bool,
     map_warmup_skip_frames: int,
+    step_frame_dir: str = "",
+    step_frame_queue_size: int = 4,
+    step_capture_ack_topic: str = "/molmo_spaces/step_capture_ack",
+    step_capture_ack_barrier_enabled: bool = False,
+    step_capture_ack_timeout_s: float = 2.0,
     name: str = "ros_bridge",
 ) -> RosBridgePolicyAdapter:
     """Attach to an already-running ROS graph with no live task reference."""
@@ -390,5 +395,10 @@ def build_ros_bridge_policy(
         require_move_base_active_for_cmd_vel=bool(require_move_base_active),
         map_warmup_skip_frames=int(map_warmup_skip_frames),
         publish_realtime_gt=False,
+        step_frame_dir=str(step_frame_dir),
+        step_frame_queue_size=int(step_frame_queue_size),
+        step_capture_ack_topic=str(step_capture_ack_topic),
+        step_capture_ack_barrier_enabled=bool(step_capture_ack_barrier_enabled),
+        step_capture_ack_timeout_s=float(step_capture_ack_timeout_s),
     )
     return RosBridgePolicyAdapter(policy, name=str(name))

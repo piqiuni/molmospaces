@@ -1,4 +1,6 @@
 from semantic_decision_py_pkg.mission_completion import (
+    InteractionApproachFailureLimitConfig,
+    InteractionApproachFailureLimitTracker,
     MissionCompletionConfig,
     MissionCompletionTracker,
     TerminalInteractionNoPlanExitConfig,
@@ -156,8 +158,8 @@ def test_completion_requires_fifty_observation_steps_after_frontiers_empty() -> 
 def _no_executable_snapshot(sequence: int, observation_step: int) -> dict:
     return {
         "sequence": sequence,
-        # This mirrors the observed failure mode: the raw interaction remains
-        # visible, but its candidate-level cooldown makes the eligible set empty.
+        # The raw producer may continue to advertise a terminal interaction,
+        # while episode-local reachability memory makes the eligible set empty.
         "candidate_count": 1,
         "candidates": [{"candidate_id": "interaction:drawer:open"}],
         "exploration_context": {
@@ -174,10 +176,88 @@ def _terminal_interaction_no_plan_feedback() -> dict:
         "candidate_id": "interaction:drawer:open",
         "decision_id": "decision_000007",
         "detail": {
-            "reason": "make_plan_unreachable",
-            "attempted_goal_count": 3,
+            "reason": InteractionApproachFailureLimitTracker.REASON,
+            "interaction_failure_count": 3,
+            "interaction_failure_limit": 3,
         },
     }
+
+
+def test_interaction_approach_failures_become_terminal_only_at_limit() -> None:
+    tracker = InteractionApproachFailureLimitTracker(
+        InteractionApproachFailureLimitConfig(failure_limit=3)
+    )
+    candidate_id = "interaction:container_drawer:open"
+
+    # Action/verification failures are not navigation approach failures.
+    assert tracker.note_feedback(
+        candidate_id=candidate_id,
+        behavior_type="INTERACT",
+        status="FAILED",
+        failure_stage="interaction_verification",
+    ) is None
+    assert tracker.failure_counts == {}
+
+    assert tracker.note_feedback(
+        candidate_id=candidate_id,
+        behavior_type="INTERACT",
+        status="FAILED",
+        failure_stage="interaction_approach_navigation",
+    ) is None
+    assert tracker.note_feedback(
+        candidate_id="interaction:other:open",
+        behavior_type="INTERACT",
+        status="REJECTED",
+        failure_stage="interaction_approach_navigation",
+    ) is None
+    assert tracker.note_feedback(
+        candidate_id=candidate_id,
+        behavior_type="INTERACT",
+        status="REJECTED",
+        failure_stage="interaction_approach_navigation",
+    ) is None
+
+    terminal = tracker.note_feedback(
+        candidate_id=candidate_id,
+        behavior_type="INTERACT",
+        status="FAILED",
+        failure_stage="interaction_approach_navigation",
+    )
+    assert terminal == {
+        "reason": InteractionApproachFailureLimitTracker.REASON,
+        "interaction_failure_count": 3,
+        "interaction_failure_limit": 3,
+        "terminal_candidate_exclusion": True,
+    }
+    assert tracker.terminal_candidate_ids == {candidate_id}
+    assert tracker.failure_counts["interaction:other:open"] == 1
+
+    # Terminal means terminal for this episode: duplicate late success feedback
+    # cannot make the same candidate selectable again.
+    assert tracker.note_feedback(
+        candidate_id=candidate_id,
+        behavior_type="INTERACT",
+        status="SUCCEEDED",
+    ) is None
+    assert tracker.terminal_candidate_ids == {candidate_id}
+    tracker.reset()
+    assert tracker.terminal_candidate_ids == set()
+
+
+def test_single_make_plan_failure_does_not_bypass_approach_failure_limit() -> None:
+    tracker = TerminalInteractionNoPlanExitTracker(
+        TerminalInteractionNoPlanExitConfig(enabled=True)
+    )
+    assert not tracker.note_feedback(
+        {
+            "status": "FAILED",
+            "behavior_type": "INTERACT",
+            "candidate_id": "interaction:drawer:open",
+            "detail": {"reason": "make_plan_unreachable"},
+        },
+        observation_step=10,
+    )
+    assert tracker.terminal_failure == {}
 
 
 def test_terminal_interaction_no_plan_exits_only_after_distinct_observation_steps() -> None:
@@ -228,7 +308,7 @@ def test_terminal_interaction_no_plan_exits_only_after_distinct_observation_step
     assert tracker.last_detail["raw_candidate_count"] == 1
     assert tracker.last_detail["eligible_candidate_count"] == 0
     assert tracker.last_detail["terminal_interaction_failure"]["detail"]["reason"] == (
-        "make_plan_unreachable"
+        InteractionApproachFailureLimitTracker.REASON
     )
 
 

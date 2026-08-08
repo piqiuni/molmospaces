@@ -178,7 +178,7 @@ def test_non_articulated_object_returns_static_failure_without_crashing(
     assert published[1]["interaction_result"] == result
 
 
-def test_non_articulated_portal_is_marked_static_open_from_graph_type(
+def test_non_articulated_portal_is_terminally_unavailable_without_aperture_evidence(
     monkeypatch,
 ) -> None:
     controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
@@ -209,14 +209,102 @@ def test_non_articulated_portal_is_marked_static_open_from_graph_type(
     result = controller.before_step(SimpleNamespace(env=SimpleNamespace()), step=10)
 
     assert result is not None
+    assert result["status"] == "FAILED"
+    assert result["success"] is False
+    assert result["post_state"] == "unavailable"
+    assert result["interaction_capability"] == "unavailable"
+    assert result["interactable"] is False
+    assert result["retryable"] is False
+    assert result["source"] == "force_interaction_capability_check"
+    assert published[1]["status"] == "FAILED"
+
+
+def test_non_articulated_portal_is_static_open_only_with_public_aperture_evidence(
+    monkeypatch,
+) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, root_name, **_kwargs: {
+            "supported": False,
+            "reason": "non_articulated",
+            "interaction_capability": "unavailable",
+            "object_name": root_name,
+        },
+    )
+    monkeypatch.setattr(controller, "_publish", lambda *_args: None)
+    assert controller.enqueue_command(
+        {
+            "command_id": "fixed_opening",
+            "candidate_id": "portal_candidate",
+            "node_id": "graph_node_17",
+            "node_type": "portal",
+            "object_id": "visual_instance_17",
+            "action": "open",
+            "portal_aperture_observation": {
+                "door_leaf": "absent",
+                "connectivity": "open",
+                "confidence": 0.9,
+            },
+        }
+    )
+
+    result = controller.before_step(SimpleNamespace(env=SimpleNamespace()), step=10)
+
+    assert result is not None
     assert result["status"] == "SUCCEEDED"
     assert result["success"] is True
     assert result["post_state"] == "static_open"
+    assert result["interaction_capability"] == "static"
     assert result["source"] == "executor_static_portal"
-    assert published[1]["status"] == "SUCCEEDED"
+    assert result["portal_aperture_observation"] == {
+        "door_leaf": "absent",
+        "connectivity": "open",
+        "confidence": 0.9,
+    }
 
 
-def test_prepare_articulation_force_reports_missing_group_as_static(monkeypatch) -> None:
+def test_non_articulated_portal_with_leaf_and_blocked_aperture_is_static_closed(
+    monkeypatch,
+) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        lambda _env, root_name, **_kwargs: {
+            "supported": False,
+            "reason": "non_articulated",
+            "interaction_capability": "unavailable",
+            "object_name": root_name,
+        },
+    )
+    monkeypatch.setattr(controller, "_publish", lambda *_args: None)
+    assert controller.enqueue_command(
+        {
+            "command_id": "fixed_closed_leaf",
+            "node_type": "portal",
+            "object_id": "visual_instance_18",
+            "action": "open",
+            "portal_aperture_observation": {
+                "door_leaf": "present",
+                "connectivity": "blocked",
+                "confidence": 0.9,
+            },
+        }
+    )
+
+    result = controller.before_step(SimpleNamespace(env=SimpleNamespace()), step=11)
+
+    assert result is not None
+    assert result["status"] == "FAILED"
+    assert result["success"] is False
+    assert result["post_state"] == "static_closed"
+    assert result["interaction_capability"] == "static"
+    assert result["interactable"] is False
+    assert result["retryable"] is False
+    assert result["reason"] == "non_articulated_closed_portal"
+
+
+def test_prepare_articulation_force_reports_missing_group_as_unavailable(monkeypatch) -> None:
     monkeypatch.setattr(
         force_interaction_runtime, "collect_articulation_groups", lambda _env: {}
     )
@@ -228,7 +316,7 @@ def test_prepare_articulation_force_reports_missing_group_as_static(monkeypatch)
     assert plan == {
         "supported": False,
         "reason": "non_articulated",
-        "interaction_capability": "static",
+        "interaction_capability": "unavailable",
         "object_name": "doorframe_static_1",
         "available_object_names": [],
     }
@@ -241,8 +329,13 @@ def test_controller_requires_canonical_object_id() -> None:
         )
 
 
-def test_missing_portal_articulation_is_marked_static_open(monkeypatch) -> None:
-    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+def test_missing_portal_articulation_is_terminally_unavailable(monkeypatch) -> None:
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        object_id_resolver=lambda public_id: {
+            "door_0001": "private_doorframe_without_joint"
+        }.get(public_id, public_id),
+    )
     published = []
     monkeypatch.setattr(
         "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
@@ -263,7 +356,7 @@ def test_missing_portal_articulation_is_marked_static_open(monkeypatch) -> None:
             "candidate_id": "interaction:missing_door:open",
             "decision_id": "decision_missing",
             "node_id": "portal_doorframe_without_joint",
-            "object_id": "doorframe_without_joint",
+            "object_id": "door_0001",
             "node_type": "portal",
             "action": "open",
         }
@@ -273,17 +366,21 @@ def test_missing_portal_articulation_is_marked_static_open(monkeypatch) -> None:
     result = controller.before_step(task, step=210)
 
     assert result is not None
-    assert result["status"] == "SUCCEEDED"
-    assert result["success"] is True
-    assert result["post_state"] == "static_open"
-    assert result["source"] == "executor_static_portal"
+    assert result["status"] == "FAILED"
+    assert result["success"] is False
+    assert result["post_state"] == "unavailable"
+    assert result["interaction_capability"] == "unavailable"
+    assert result["interactable"] is False
+    assert result["retryable"] is False
+    assert result["source"] == "force_interaction_rejected"
     assert result["verification_source"] == "simulator_no_articulation"
-    assert result["object_id"] == "doorframe_without_joint"
+    assert result["object_id"] == "door_0001"
+    assert "private_doorframe_without_joint" not in str(result)
     assert controller.should_pause_navigation() is False
     assert controller.after_step(task, step=210) is None
     assert len(published) == 2
     assert published[1]["behavior_type"] == "INTERACT"
-    assert published[1]["status"] == "SUCCEEDED"
+    assert published[1]["status"] == "FAILED"
 
 
 def test_missing_container_articulation_remains_a_recoverable_failure(monkeypatch) -> None:

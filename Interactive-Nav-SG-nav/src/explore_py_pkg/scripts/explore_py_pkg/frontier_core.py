@@ -85,7 +85,7 @@ class FrontierConfig:
     far_cluster_penalty_saturation_m: float = 4.0
     min_obstacle_clearance_m: float = 0.25
     max_clearance_check_m: float = 0.8
-    robot_radius_m: float = 0.35
+    robot_radius_m: float = 0.25
     footprint_safety_margin_m: float = 0.10
     require_footprint_free: bool = True
     footprint_unknown_is_free: bool = False

@@ -51,6 +51,11 @@ def create_current_ros_navigation_policy(
     cmd_vel_linear_gain: float = 3.0,
     require_move_base_active: bool = True,
     map_warmup_skip_frames: int = 0,
+    step_frame_dir: str = "",
+    step_frame_queue_size: int = 4,
+    step_capture_ack_topic: str = "/molmo_spaces/step_capture_ack",
+    step_capture_ack_barrier_enabled: bool = False,
+    step_capture_ack_timeout_s: float = 2.0,
 ) -> RosBridgePolicyAdapter:
     """Return a GT-free adapter to an already-running ROS navigation graph.
 
@@ -68,6 +73,11 @@ def create_current_ros_navigation_policy(
         cmd_vel_linear_gain=float(cmd_vel_linear_gain),
         require_move_base_active=bool(require_move_base_active),
         map_warmup_skip_frames=int(map_warmup_skip_frames),
+        step_frame_dir=str(step_frame_dir),
+        step_frame_queue_size=int(step_frame_queue_size),
+        step_capture_ack_topic=str(step_capture_ack_topic),
+        step_capture_ack_barrier_enabled=bool(step_capture_ack_barrier_enabled),
+        step_capture_ack_timeout_s=float(step_capture_ack_timeout_s),
     )
 
 

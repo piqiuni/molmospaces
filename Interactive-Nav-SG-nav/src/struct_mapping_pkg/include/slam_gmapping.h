@@ -231,6 +231,7 @@ class SlamGMapping
 
     // Robust PointCloud2 -> planar scan projection parameters.
     double pointcloud_scan_range_max_;
+    double pointcloud_scan_no_return_margin_m_;
     double pointcloud_scan_angle_increment_deg_;
     double pointcloud_scan_height_min_;
     double pointcloud_scan_height_max_;

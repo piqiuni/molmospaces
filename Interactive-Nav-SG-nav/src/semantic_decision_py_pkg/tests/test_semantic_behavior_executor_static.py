@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
+import math
 import sys
 import threading
 import types
@@ -9,6 +11,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import cv2
+import numpy as np
+import yaml
 
 
 PACKAGE_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -69,7 +74,13 @@ def _install_ros_import_stubs(monkeypatch) -> None:
         ),
     )
     _stub_module(monkeypatch, "geometry_msgs")
-    _stub_module(monkeypatch, "geometry_msgs.msg", PoseStamped=_Placeholder, Twist=_Placeholder)
+    _stub_module(
+        monkeypatch,
+        "geometry_msgs.msg",
+        PoseStamped=_Placeholder,
+        Twist=_Placeholder,
+        TwistStamped=_Placeholder,
+    )
     _stub_module(monkeypatch, "map_msgs")
     _stub_module(monkeypatch, "map_msgs.msg", OccupancyGridUpdate=_Placeholder)
     _stub_module(monkeypatch, "move_base_msgs")
@@ -188,3 +199,964 @@ def test_static_portal_result_skips_mllm_continuation_and_costmap_baseline(
     assert dispatched[0]["kind"] == "terminal"
     assert dispatched[0]["success"] is True
     assert dispatched[0]["detail"]["verification_mode"] == "direct_static_portal_feedback"
+
+
+def test_failed_interaction_navigation_is_marked_for_bounded_reachability(
+    executor_module,
+) -> None:
+    selection = _portal_selection()
+    selection["metadata"] = {**selection["metadata"], "requires_approach": True}
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = selection
+    executor.ablation = SimpleNamespace(module3="rule_verified")
+    executor.stuck_recovery_enabled = False
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    executor.machine.start(selection, now=0.0)
+    dispatched = []
+    executor._dispatch = lambda commands: dispatched.extend(commands)
+
+    executor._handle_navigation_result(
+        "decision_static", False, {"reason": "navigation_timeout"}
+    )
+
+    assert len(dispatched) == 1
+    assert dispatched[0]["kind"] == "terminal"
+    assert dispatched[0]["success"] is False
+    assert dispatched[0]["detail"]["failure_stage"] == (
+        "interaction_approach_navigation"
+    )
+
+
+def test_portal_aperture_observation_is_forwarded_without_private_metadata(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.evaluator_opaque_open_only = False
+    executor.interaction_command_sequence = 0
+    executor.latest_image_sequence = 0
+    executor._command_id = lambda _candidate: "portal-command"
+    published = []
+    executor.interaction_command_pub = SimpleNamespace(
+        publish=lambda message: published.append(json.loads(message.data))
+    )
+    candidate = _portal_selection()
+    candidate["interaction_command"]["portal_aperture_observation"] = {
+        "door_leaf": "absent",
+        "connectivity": "open",
+        "confidence": 0.8,
+        "private_joint_name": "must_not_escape",
+    }
+
+    executor._publish_interaction_command(candidate)
+
+    assert published[0]["portal_aperture_observation"] == {
+        "door_leaf": "absent",
+        "connectivity": "open",
+        "confidence": 0.8,
+    }
+    assert "private_joint_name" not in published[0]["portal_aperture_observation"]
+
+
+def test_unknown_portal_waits_for_its_matching_fresh_m1_update(
+    executor_module,
+) -> None:
+    selection = _portal_selection()
+    selection["episode_id"] = "episode_1"
+    selection["metadata"] = {
+        **selection["metadata"],
+        "observation_required": True,
+        "reobserve": True,
+        "interaction_observation_source": "mllm_attribute_inference",
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = selection
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    commands = executor.machine.start(selection, now=0.0)
+    assert executor.machine.state == "WAITING_FOR_INTERACTION_OBSERVATION"
+    assert commands[0]["kind"] == "request_interaction_observation"
+    executor.latest_graph = {"capture_step": 42, "episode_id": "episode_1"}
+    executor._latest_rgb_step_seq = 42
+    executor.interaction_observation_sequence = 0
+    executor._interaction_observation_requests = {}
+    executor._latest_attribute_updates = {}
+    published = []
+    executor.attribute_refresh_request_pub = SimpleNamespace(
+        publish=lambda message: published.append(json.loads(message.data))
+    )
+    executor._publish_interaction_observation_request(commands[0])
+
+    assert published == [
+        {
+            "object_id": "door_0003",
+            "episode_id": "episode_1",
+            "minimum_capture_step": 42,
+            "reason": "mllm_portal_state_unknown",
+            "request_id": "decision_static:m1:001",
+        }
+    ]
+    dispatched = []
+    executor._dispatch = lambda next_commands: dispatched.extend(next_commands)
+
+    # A pending acknowledgement and an unrelated targeted response cannot
+    # authorize the interaction.
+    executor._attribute_update_callback(
+        SimpleNamespace(
+            data=json.dumps(
+                {
+                    "episode_id": "episode_1",
+                    "updates": [
+                        {
+                            "object_id": "door_0003",
+                            "attribute_status": "pending",
+                            "targeted_refresh": True,
+                            "targeted_refresh_request_id": "decision_static:m1:001",
+                        }
+                    ],
+                }
+            )
+        )
+    )
+    assert dispatched == []
+    executor._attribute_update_callback(
+        SimpleNamespace(
+            data=json.dumps(
+                {
+                    "episode_id": "episode_1",
+                    "updates": [
+                        {
+                            "object_id": "door_0003",
+                            "attribute_status": "ready",
+                            "targeted_refresh": True,
+                            "targeted_refresh_request_id": "other-request",
+                            "observation_capture_step": 43,
+                            "source": "mllm_attribute_inference",
+                            "coarse_state": "closed",
+                        }
+                    ],
+                }
+            )
+        )
+    )
+    assert dispatched == []
+
+    executor._attribute_update_callback(
+        SimpleNamespace(
+            data=json.dumps(
+                {
+                    "episode_id": "episode_1",
+                    "updates": [
+                        {
+                            "object_id": "door_0003",
+                            "attribute_status": "ready",
+                            "targeted_refresh": True,
+                            "targeted_refresh_request_id": "decision_static:m1:001",
+                            "observation_capture_step": 43,
+                            "source": "mllm_attribute_inference",
+                            "coarse_state": "closed",
+                        }
+                    ],
+                }
+            )
+        )
+    )
+    assert executor.machine.state == "INTERACTING"
+    assert [command["kind"] for command in dispatched] == ["interact"]
+    assert executor._interaction_observation_requests == {}
+
+
+def test_mllm_module3_dispatches_interaction_without_preaction_planning(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.ablation = SimpleNamespace(module3="mllm_skill_verified")
+    published = []
+    executor._publish_interaction_command = lambda candidate: published.append(candidate)
+    executor._plan_and_publish_interaction = lambda *_args: pytest.fail(
+        "M3 must not plan a pre-action approach"
+    )
+    candidate = _portal_selection()
+
+    executor._dispatch([{"kind": "interact", "candidate": candidate}])
+
+    assert published == [candidate]
+
+
+def test_m3_composite_evidence_uses_one_image_with_full_frame_and_target_box(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.latest_image = np.full((120, 200, 3), (12, 34, 56), dtype=np.uint8)
+    executor.mllm_crop_margin_ratio = 0.10
+    executor.mllm_crop_max_side_px = 512
+    executor.mllm_full_image_max_side_px = 960
+    node = {
+        "attributes": {
+            "projected_bbox_2d": [85, 35, 125, 85],
+        }
+    }
+
+    images, bbox, full_size = executor._visual_interaction_images_locked(node)
+
+    assert len(images) == 1
+    assert images[0].startswith("data:image/jpeg;base64,")
+    assert bbox == [85, 35, 125, 85]
+    assert full_size == [200, 120]
+    encoded = images[0].split(",", 1)[1]
+    decoded = cv2.imdecode(
+        np.frombuffer(base64.b64decode(encoded), dtype=np.uint8),
+        cv2.IMREAD_COLOR,
+    )
+    assert decoded.shape[:2] == (120, 200)
+    # A distant untouched pixel proves the full headcam remains the canvas.
+    assert np.allclose(decoded[110, 180], (12, 34, 56), atol=8)
+    # The outlined target survives in the composite (yellow in BGR).
+    assert decoded[35, 85, 1] > 140
+    assert decoded[35, 85, 2] > 140
+    assert decoded[35, 85, 0] < 120
+    # The crop inset is visibly framed in the same single image.
+    assert decoded[4, 4].min() > 150
+
+
+def test_rear_rotation_sweep_and_reverse_helpers_fail_closed_on_obstacle(
+    executor_module,
+) -> None:
+    width = height = 20
+    resolution = 0.1
+    free = [0] * (width * height)
+    assert executor_module.circular_costmap_rotation_sweep_is_clear(
+        free,
+        width,
+        height,
+        resolution,
+        (0.0, 0.0),
+        0.0,
+        (1.0, 1.0),
+        math.pi,
+        0.1,
+        0.20,
+        0.05,
+    )
+    # The obstacle is on the straight reverse ray and must prevent the whole
+    # requested backoff, rather than allowing a blind partial command.
+    blocked = list(free)
+    blocked[10 * width + 7] = 100
+    assert executor_module.circular_costmap_linear_sweep_distance(
+        blocked,
+        width,
+        height,
+        resolution,
+        (0.0, 0.0),
+        0.0,
+        (1.0, 1.0, 0.0),
+        -1.0,
+        0.5,
+        0.20,
+        0.05,
+    ) == pytest.approx(0.0)
+
+
+def test_rear_turn_choice_locks_deterministic_side_on_fresh_costmap(
+    executor_module,
+) -> None:
+    class _Orientation:
+        x = y = z = 0.0
+        w = 1.0
+
+    occupancy = SimpleNamespace(
+        data=[0] * (20 * 20),
+        header=SimpleNamespace(frame_id="map"),
+        info=SimpleNamespace(
+            width=20,
+            height=20,
+            resolution=0.1,
+            origin=SimpleNamespace(
+                position=SimpleNamespace(x=0.0, y=0.0),
+                orientation=_Orientation(),
+            ),
+        ),
+    )
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor._latest_occupancy = occupancy
+    executor._latest_occupancy_received_at = executor_module.time.monotonic()
+    executor._rear_goal_turn_locks = {}
+    executor.rear_goal_local_costmap_max_age_s = 1.0
+    executor.rear_goal_enter_angle_rad = math.pi / 2.0
+    executor.rear_goal_exit_angle_rad = 0.20
+    executor.rear_goal_rotate_speed_rad_s = 1.25
+    executor.rear_goal_prerotate_control_dt_s = 0.2
+    executor.rear_goal_prerotate_max_control_steps = 14
+    executor.rear_goal_robot_radius_m = 0.20
+    executor.rear_goal_safety_margin_m = 0.05
+    executor.rear_goal_costmap_occupied_threshold = 50
+    executor.rear_goal_unknown_is_blocked = True
+    executor.rear_goal_rotation_sweep_step_rad = 0.10
+    executor.rear_goal_pi_turn_sign = -1
+    executor._current_pose = lambda _frame: (1.0, 1.0, 0.0)
+
+    choice, detail = executor._rear_goal_rotation_choice(
+        "decision-rear", "map", (-1.0, 1.0)
+    )
+    assert choice is not None
+    assert choice["direction"] == "cw"
+    assert detail["selected_turn"] == "cw"
+    # A later re-evaluation retains the selected side even though both arcs
+    # remain geometrically equivalent.
+    choice_again, _detail_again = executor._rear_goal_rotation_choice(
+        "decision-rear", "map", (-1.0, 1.0)
+    )
+    assert choice_again is not None
+    assert choice_again["turn_sign"] == choice["turn_sign"]
+
+
+def test_rear_dwa_detector_requires_flips_and_no_progress(executor_module) -> None:
+    alternating = [
+        {"angular_z": 1.0},
+        {"angular_z": -1.0},
+        {"angular_z": 1.0},
+        {"angular_z": -1.0},
+    ]
+    assert executor_module.rear_dwa_oscillation_detected(
+        alternating,
+        minimum_samples=4,
+        minimum_sign_flips=2,
+        displacement_m=0.01,
+        maximum_displacement_m=0.05,
+        goal_distance_reduction_m=0.0,
+        minimum_goal_distance_reduction_m=0.02,
+    )
+    assert not executor_module.rear_dwa_oscillation_detected(
+        alternating,
+        minimum_samples=4,
+        minimum_sign_flips=2,
+        displacement_m=0.10,
+        maximum_displacement_m=0.05,
+        goal_distance_reduction_m=0.0,
+        minimum_goal_distance_reduction_m=0.02,
+    )
+
+
+def test_rear_prerotate_refuses_blind_command_without_fresh_costmap(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.rear_goal_prerotate_enabled = True
+    executor.rear_goal_enter_angle_rad = math.pi / 2.0
+    executor.rear_goal_local_costmap_max_age_s = 0.75
+    executor._latest_occupancy = None
+    executor._latest_occupancy_received_at = 0.0
+    executor._rear_goal_turn_locks = {}
+    executor._last_rear_goal_recovery_detail = {}
+    executor._current_pose = lambda _frame: (1.0, 1.0, 0.0)
+
+    assert not executor._prerotate_for_rear_goal(
+        "decision-no-map",
+        "map",
+        -1.0,
+        1.0,
+        heading_target_xy=(-1.0, 1.0),
+    )
+    assert executor._last_rear_goal_recovery_detail["reason"] == (
+        "rear_goal_local_costmap_unavailable"
+    )
+
+
+def test_rear_prerotate_pairs_rgb_with_the_fresh_bridge_window(
+    executor_module,
+) -> None:
+    """Rear pre-turns must publish after the bridge opens its fresh-cmd gate."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.startup_scan_enabled = False
+    executor.rear_goal_prerotate_step_sync_enabled = True
+    executor.interaction_final_align_enabled = True
+    executor.interaction_final_align_step_sync_enabled = True
+    executor._startup_scan_gate = executor_module.StepCommandGate(max_pair_age_s=10.0)
+    executor._rear_goal_prerotate_gate = executor_module.StepCommandGate(
+        max_pair_age_s=10.0
+    )
+    executor._interaction_final_align_gate = executor_module.StepCommandGate(
+        max_pair_age_s=10.0
+    )
+    executor._latest_step_sync_index = None
+    executor._latest_step_sync_received_at = 0.0
+    executor.latest_image_sequence = 0
+    executor.latest_image = None
+    executor._latest_rgb_step_seq = None
+    executor._latest_rgb_step_received_at = 0.0
+    image = SimpleNamespace(
+        header=SimpleNamespace(seq=37),
+        encoding="bgr8",
+        height=1,
+        width=1,
+        step=3,
+        data=bytes((10, 20, 30)),
+    )
+
+    executor._image_callback(image)
+    assert executor._rear_goal_prerotate_gate.consume_step() is None
+    executor._fresh_command_gate_callback(
+        SimpleNamespace(data=json.dumps({"step_index": 37}))
+    )
+    assert executor._rear_goal_prerotate_gate.consume_step() == 37
+    assert executor._interaction_final_align_gate.consume_step() == 37
+
+    # The bridge's step-sync acknowledgement unlocks exactly one later window.
+    executor._step_sync_callback(
+        SimpleNamespace(
+            data=json.dumps({"step_index": 37, "action_source": "cmd_vel"})
+        )
+    )
+    acknowledgements = executor._rear_goal_prerotate_gate.take_acks()
+    assert len(acknowledgements) == 1
+    assert acknowledgements[0].command_applied
+    interaction_acknowledgements = executor._interaction_final_align_gate.take_acks()
+    assert len(interaction_acknowledgements) == 1
+    assert interaction_acknowledgements[0].command_applied
+
+
+def test_rear_prerotate_converts_one_fresh_window_to_one_yaw_step(
+    executor_module,
+) -> None:
+    """Minimal bridge/executor reproduction for the former timeout-noop race."""
+
+    class PrimedGate(executor_module.StepCommandGate):
+        prime_on_reset = False
+
+        def reset(self) -> None:
+            super().reset()
+            if self.prime_on_reset:
+                self.record_rgb(41)
+                self.record_fresh_gate(41)
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    gate = PrimedGate(max_pair_age_s=10.0)
+    gate.prime_on_reset = True
+    executor._rear_goal_prerotate_gate = gate
+    executor.rear_goal_prerotate_delivery_retry_steps = 0
+    executor.rear_goal_pi_tie_tolerance_rad = 0.20
+    executor.rear_goal_pi_turn_sign = -1
+    executor._navigation_is_current = lambda _decision_id: True
+    pose = [0.0, 0.0, 0.0]
+    executor._current_pose = lambda _frame_id: tuple(pose)
+    published = []
+
+    def publish_rotation(angular_z: float) -> None:
+        published.append(float(angular_z))
+        if abs(angular_z) <= 1e-9:
+            return
+        # This is the RosBridgePolicy fixed-dt yaw target that the simulator
+        # applies after accepting the fresh cmd_vel in evaluator step 41.
+        pose[2] += float(angular_z) * 0.2
+        gate.record_step_sync(41, action_source="cmd_vel")
+
+    executor._publish_rotation = publish_rotation
+
+    assert executor._rotate_to_yaw(
+        "decision-41",
+        "tf_frame_map",
+        target_yaw=0.25,
+        tolerance_rad=0.02,
+        speed_rad_s=1.25,
+        timeout_s=1.0,
+        turn_sign=1,
+        max_prerotate_control_steps=1,
+        step_sync_stall_timeout_s=0.2,
+    )
+    assert published == [1.25, 0.0]
+    assert pose[2] == pytest.approx(0.25)
+
+
+def test_interaction_arrival_tolerance_completes_selected_fallback_when_plan_is_stale(
+    executor_module, monkeypatch
+) -> None:
+    """A ready fallback pose must not be retried solely for a stale DWA plan."""
+
+    class _Goal:
+        def __init__(self) -> None:
+            self.target_pose = SimpleNamespace(
+                header=SimpleNamespace(frame_id="", stamp=None),
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=SimpleNamespace(z=0.0, w=1.0),
+                ),
+            )
+
+    class _MoveBase:
+        def __init__(self) -> None:
+            self.cancel_count = 0
+            self.sent_goals = []
+
+        def wait_for_server(self, _timeout) -> bool:
+            return True
+
+        def send_goal(self, goal) -> None:
+            self.sent_goals.append(goal)
+
+        def get_state(self) -> int:
+            return 0  # ACTIVE, intentionally non-terminal.
+
+        def cancel_goal(self) -> None:
+            self.cancel_count += 1
+
+    monkeypatch.setattr(executor_module, "MoveBaseGoal", _Goal)
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    monkeypatch.setattr(
+        executor_module.rospy, "Time", SimpleNamespace(now=lambda: 0.0)
+    )
+    monkeypatch.setattr(executor_module.rospy, "is_shutdown", lambda: False)
+    monkeypatch.setattr(executor_module.time, "sleep", lambda _seconds: None)
+
+    # The primary candidate is intentionally different.  Navigation starts at
+    # fallback #1 and the actual base pose is only valid for that selected
+    # fallback, which guards against accepting an approach on the wrong side.
+    primary = [2.0, 0.0, 0.0]
+    selected_fallback = [1.0, 0.0, 0.0]
+    candidate = {
+        "candidate_id": "interaction:door:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": primary,
+        "metadata": {
+            "frame_id": "map",
+            "goal_xyyaw_candidates": [primary, selected_fallback],
+        },
+        "interaction_command": {
+            "interaction_ready_distance_m": 0.45,
+            "interaction_ready_yaw_tolerance_rad": 0.55,
+        },
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor.move_base = _MoveBase()
+    executor.machine = SimpleNamespace(
+        config=SimpleNamespace(
+            interaction_navigation_timeout_s=10.0,
+            navigation_timeout_s=10.0,
+        )
+    )
+    executor.navigation_stagnation_timeout_s = 12.0
+    executor.navigation_stagnation_distance_m = 0.10
+    executor.navigation_stagnation_yaw_rad = 0.15
+    executor.navigation_stagnation_goal_distance_reduction_m = 0.02
+    executor.final_align_enabled = True
+    executor.final_align_max_distance_m = 0.12
+    executor.post_interaction_traversal_make_plan_retry_window_s = 0.0
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._preflight_navigation_plan = lambda *_args: (
+        True,
+        (1.0, 0.0),
+        "reachable",
+    )
+    executor._prerotate_for_rear_goal = lambda *_args, **_kwargs: True
+    executor._set_effective_interaction_approach = lambda *_args, **_kwargs: None
+    executor._has_fresh_local_plan = lambda *_args, **_kwargs: False
+    poses = iter(
+        [
+            (0.0, 0.0, 0.0),  # initial direct-arrival check: not ready
+            (0.80, 0.0, 0.0),  # start-pose bookkeeping after sending the goal
+            (0.80, 0.0, 0.0),  # ready for fallback #1, local plan stale
+        ]
+    )
+    executor._current_pose = lambda _frame_id: next(poses)
+    completed = []
+    executor._complete_interaction_approach_navigation = (
+        lambda *args, **kwargs: completed.append((args, kwargs))
+    )
+
+    executor._run_navigation("decision-1", candidate, start_goal_option_index=1)
+
+    assert executor.move_base.cancel_count == 1
+    assert len(completed) == 1
+    _args, kwargs = completed[0]
+    assert kwargs["selected_goal"] == tuple(selected_fallback)
+    assert kwargs["selected_goal_option_index"] == 1
+    assert kwargs["detail"]["reason"] == "interaction_approach_pose_tolerance"
+    assert kwargs["detail"]["local_plan_fresh"] is False
+    assert kwargs["detail"]["interaction_pose_validation"]["valid"] is True
+
+
+def test_interaction_arrival_tolerance_still_requires_selected_heading() -> None:
+    """Position tolerance alone must not accept an approach from the wrong heading."""
+
+    from semantic_decision_py_pkg.behavior_execution import interaction_pose_validation
+
+    validation = interaction_pose_validation(
+        [1.0, 0.0, 0.0],
+        [0.80, 0.0, 0.60],
+        distance_tolerance_m=0.45,
+        yaw_tolerance_rad=0.55,
+    )
+    assert validation["position_error_m"] < validation["distance_tolerance_m"]
+    assert validation["yaw_error_rad"] > validation["yaw_tolerance_rad"]
+    assert validation["valid"] is False
+
+
+def test_interaction_ready_standoff_runs_bounded_selected_yaw_alignment(
+    executor_module, monkeypatch
+) -> None:
+    """At a ready standoff, rotate toward the selected fallback before acting."""
+
+    class _Goal:
+        def __init__(self) -> None:
+            self.target_pose = SimpleNamespace(
+                header=SimpleNamespace(frame_id="", stamp=None),
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=SimpleNamespace(z=0.0, w=1.0),
+                ),
+            )
+
+    class _MoveBase:
+        def __init__(self) -> None:
+            self.cancel_count = 0
+            self.cancel_waits = []
+
+        def wait_for_server(self, _timeout) -> bool:
+            return True
+
+        def send_goal(self, _goal) -> None:
+            return None
+
+        def get_state(self) -> int:
+            return 0  # ACTIVE, intentionally non-terminal.
+
+        def cancel_goal(self) -> None:
+            self.cancel_count += 1
+
+        def wait_for_result(self, timeout) -> None:
+            self.cancel_waits.append(timeout)
+
+    monkeypatch.setattr(executor_module, "MoveBaseGoal", _Goal)
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    monkeypatch.setattr(
+        executor_module.rospy, "Time", SimpleNamespace(now=lambda: 0.0)
+    )
+    monkeypatch.setattr(executor_module.rospy, "is_shutdown", lambda: False)
+    monkeypatch.setattr(executor_module.time, "sleep", lambda _seconds: None)
+
+    primary = [2.0, 0.0, 0.0]
+    selected_fallback = [1.0, 0.0, math.pi]
+    candidate = {
+        "candidate_id": "interaction:door:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": primary,
+        "metadata": {
+            "frame_id": "map",
+            "goal_xyyaw_candidates": [primary, selected_fallback],
+        },
+        "interaction_command": {
+            "interaction_ready_distance_m": 0.45,
+            "interaction_ready_yaw_tolerance_rad": 0.55,
+        },
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor.move_base = _MoveBase()
+    executor.machine = SimpleNamespace(
+        config=SimpleNamespace(
+            interaction_navigation_timeout_s=10.0,
+            navigation_timeout_s=10.0,
+        )
+    )
+    executor.navigation_stagnation_timeout_s = 12.0
+    executor.navigation_stagnation_distance_m = 0.10
+    executor.navigation_stagnation_yaw_rad = 0.15
+    executor.navigation_stagnation_goal_distance_reduction_m = 0.02
+    # Generic NAVIGATE/EXPLORE final alignment stays disabled.  The selected
+    # INTERACT fallback must use only its independent controller.
+    executor.final_align_enabled = False
+    executor.final_align_max_distance_m = 0.12
+    executor.interaction_final_align_enabled = True
+    executor.interaction_final_align_max_distance_m = 0.35
+    executor.interaction_final_align_yaw_tolerance_rad = 0.15
+    executor.interaction_final_align_rotate_speed_rad_s = 0.30
+    executor.interaction_final_align_timeout_s = 15.0
+    executor.interaction_final_align_step_sync_enabled = True
+    executor.interaction_final_align_control_dt_s = 0.2
+    executor.interaction_final_align_max_control_steps = 56
+    executor.interaction_final_align_step_sync_stall_timeout_s = 2.0
+    executor.interaction_final_align_delivery_retry_steps = 2
+    executor._interaction_final_align_gate = executor_module.StepCommandGate(
+        max_pair_age_s=10.0
+    )
+    executor.final_align_cancel_wait_s = 0.0
+    executor.post_interaction_traversal_make_plan_retry_window_s = 0.0
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._preflight_navigation_plan = lambda *_args: (
+        True,
+        (1.0, 0.0),
+        "reachable",
+    )
+    executor._prerotate_for_rear_goal = lambda *_args, **_kwargs: True
+    executor._set_effective_interaction_approach = lambda *_args, **_kwargs: None
+    executor._has_fresh_local_plan = lambda *_args, **_kwargs: False
+    # 18.6 cm from selected fallback, but 0.60 rad away from its required yaw:
+    # inside the bridge distance contract and outside its yaw contract.
+    ready_but_misaligned = (0.814, 0.0, 2.54)
+    poses = iter(
+        [
+            (0.0, 0.0, 0.0),
+            ready_but_misaligned,
+            ready_but_misaligned,
+            ready_but_misaligned,
+        ]
+    )
+    executor._current_pose = lambda _frame_id: next(poses)
+    rotate_calls = []
+    executor._rotate_to_yaw = (
+        lambda *args, **kwargs: rotate_calls.append((args, kwargs)) or True
+    )
+    completed = []
+    executor._complete_interaction_approach_navigation = (
+        lambda *args, **kwargs: completed.append((args, kwargs))
+    )
+
+    executor._run_navigation("decision-2", candidate, start_goal_option_index=1)
+
+    assert executor.move_base.cancel_count == 1
+    assert executor.move_base.cancel_waits == [0.0]
+    assert len(rotate_calls) == 1
+    rotate_args, rotate_kwargs = rotate_calls[0]
+    assert rotate_args[2] == pytest.approx(math.pi)
+    assert rotate_args[3] == pytest.approx(0.15)
+    assert rotate_kwargs["step_command_gate"] is executor._interaction_final_align_gate
+    assert rotate_kwargs["rotation_label"] == "interaction-final-align"
+    assert rotate_kwargs["max_prerotate_control_steps"] == 8
+    assert rotate_kwargs["step_sync_budget_authoritative"] is True
+    assert len(completed) == 1
+    _args, kwargs = completed[0]
+    assert kwargs["selected_goal"] == tuple(selected_fallback)
+    assert kwargs["detail"]["reason"] == "interaction_approach_final_yaw_alignment"
+    before = kwargs["detail"]["interaction_pose_validation_before_final_align"]
+    assert before["position_error_m"] < before["distance_tolerance_m"]
+    assert before["yaw_error_rad"] > before["yaw_tolerance_rad"]
+    assert before["valid"] is False
+
+
+def test_interaction_final_align_rotation_waits_for_its_own_fresh_step_gate(
+    executor_module,
+) -> None:
+    """Final-align cmd_vel must not reuse a window from rear pre-rotation."""
+
+    class PrimedGate(executor_module.StepCommandGate):
+        prime_on_reset = False
+
+        def reset(self) -> None:
+            super().reset()
+            if self.prime_on_reset:
+                self.record_rgb(73)
+                self.record_fresh_gate(73)
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    gate = PrimedGate(max_pair_age_s=10.0)
+    # An old pair exists before final alignment starts.  reset() must discard
+    # it and wait for the newly paired step 73 instead.
+    gate.record_rgb(41)
+    gate.record_fresh_gate(41)
+    gate.prime_on_reset = True
+    executor._interaction_final_align_gate = gate
+    executor.rear_goal_prerotate_delivery_retry_steps = 0
+    executor.rear_goal_pi_tie_tolerance_rad = 0.20
+    executor.rear_goal_pi_turn_sign = -1
+    executor._navigation_is_current = lambda _decision_id: True
+    pose = [0.0, 0.0, 0.0]
+    executor._current_pose = lambda _frame_id: tuple(pose)
+    published = []
+
+    def publish_rotation(angular_z: float) -> None:
+        published.append(float(angular_z))
+        if abs(angular_z) <= 1e-9:
+            return
+        pose[2] += float(angular_z) * 0.2
+        gate.record_step_sync(73, action_source="cmd_vel")
+
+    executor._publish_rotation = publish_rotation
+
+    assert executor._rotate_to_yaw(
+        "decision-73",
+        "tf_frame_map",
+        target_yaw=0.25,
+        tolerance_rad=0.02,
+        speed_rad_s=1.25,
+        timeout_s=1.0,
+        turn_sign=1,
+        max_prerotate_control_steps=1,
+        step_sync_stall_timeout_s=0.2,
+        step_command_gate=gate,
+        delivery_retry_steps=0,
+        rotation_label="interaction-final-align",
+    )
+    assert published == [1.25, 0.0]
+    assert pose[2] == pytest.approx(0.25)
+    diagnostics = gate.diagnostics()
+    assert diagnostics["last_sent_step"] == 73
+    assert diagnostics["awaiting_ack_step"] is None
+
+
+def test_interaction_final_align_uses_acknowledged_step_budget_over_wall_timeout(
+    executor_module, monkeypatch
+) -> None:
+    """Slow simulator-step delivery must not truncate an active gated turn."""
+
+    class PrimedGate(executor_module.StepCommandGate):
+        def reset(self) -> None:
+            super().reset()
+            self.record_rgb(1)
+            self.record_fresh_gate(1)
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        executor_module.time,
+        "sleep",
+        lambda _seconds: clock.__setitem__("now", clock["now"] + 1.0),
+    )
+    monkeypatch.setattr(executor_module.rospy, "is_shutdown", lambda: False)
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.rear_goal_prerotate_delivery_retry_steps = 0
+    executor.rear_goal_pi_tie_tolerance_rad = 0.20
+    executor.rear_goal_pi_turn_sign = -1
+    executor._navigation_is_current = lambda _decision_id: True
+    gate = PrimedGate(max_pair_age_s=120.0)
+    pose = [0.0, 0.0, 0.0]
+    executor._current_pose = lambda _frame_id: tuple(pose)
+    step = [1]
+    published = []
+
+    def publish_rotation(angular_z: float) -> None:
+        published.append(float(angular_z))
+        if abs(angular_z) <= 1e-9:
+            return
+        pose[2] += float(angular_z) * 0.2
+        gate.record_step_sync(step[0], action_source="cmd_vel")
+        step[0] += 1
+        gate.record_rgb(step[0])
+        gate.record_fresh_gate(step[0])
+
+    executor._publish_rotation = publish_rotation
+
+    # ceil((1.960 - .150) / (.300 * .200)) == 31.  Each acknowledged
+    # simulator action takes one synthetic wall-second, deliberately exceeding
+    # the legacy 15 s timeout while making real step progress.
+    assert executor._rotate_to_yaw(
+        "decision-slow-steps",
+        "tf_frame_map",
+        target_yaw=1.960,
+        tolerance_rad=0.150,
+        speed_rad_s=0.300,
+        timeout_s=15.0,
+        turn_sign=1,
+        max_prerotate_control_steps=31,
+        step_sync_stall_timeout_s=2.0,
+        step_command_gate=gate,
+        delivery_retry_steps=0,
+        rotation_label="interaction-final-align",
+        step_sync_budget_authoritative=True,
+    )
+    assert len([value for value in published if abs(value) > 1e-9]) == 31
+    assert clock["now"] > 15.0
+    assert abs(1.960 - pose[2]) <= 0.150
+
+
+def test_interaction_final_align_acknowledged_no_progress_stays_step_bounded(
+    executor_module, monkeypatch
+) -> None:
+    """Authoritative step timing does not make a non-moving turn unbounded."""
+
+    class PrimedGate(executor_module.StepCommandGate):
+        def reset(self) -> None:
+            super().reset()
+            self.record_rgb(1)
+            self.record_fresh_gate(1)
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        executor_module.time,
+        "sleep",
+        lambda _seconds: clock.__setitem__("now", clock["now"] + 1.0),
+    )
+    monkeypatch.setattr(executor_module.rospy, "is_shutdown", lambda: False)
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.rear_goal_prerotate_delivery_retry_steps = 0
+    executor.rear_goal_pi_tie_tolerance_rad = 0.20
+    executor.rear_goal_pi_turn_sign = -1
+    executor._navigation_is_current = lambda _decision_id: True
+    gate = PrimedGate(max_pair_age_s=120.0)
+    executor._current_pose = lambda _frame_id: (0.0, 0.0, 0.0)
+    step = [1]
+    published = []
+
+    def publish_without_motion(angular_z: float) -> None:
+        published.append(float(angular_z))
+        if abs(angular_z) <= 1e-9:
+            return
+        gate.record_step_sync(step[0], action_source="cmd_vel")
+        step[0] += 1
+        gate.record_rgb(step[0])
+        gate.record_fresh_gate(step[0])
+
+    executor._publish_rotation = publish_without_motion
+
+    assert not executor._rotate_to_yaw(
+        "decision-no-progress",
+        "tf_frame_map",
+        target_yaw=1.960,
+        tolerance_rad=0.150,
+        speed_rad_s=0.300,
+        timeout_s=15.0,
+        turn_sign=1,
+        max_prerotate_control_steps=3,
+        step_sync_stall_timeout_s=2.0,
+        step_command_gate=gate,
+        delivery_retry_steps=0,
+        rotation_label="interaction-final-align",
+        step_sync_budget_authoritative=True,
+    )
+    assert len([value for value in published if abs(value) > 1e-9]) == 3
+    assert clock["now"] <= 4.0
+
+
+def test_full_mllm_interaction_final_align_is_opted_in_without_generic_align() -> None:
+    """The full MLLM lane enables only the interaction-specific controller."""
+
+    default_config = yaml.safe_load(
+        (PACKAGE_SCRIPTS.parent / "config" / "default.yaml").read_text()
+    )
+    override_config = yaml.safe_load(
+        (
+            PACKAGE_SCRIPTS.parents[3]
+            / "scripts"
+            / "InteractiveNav"
+            / "configs"
+            / "semantic_decision"
+            / "full_mllm_interactive_exploration.yaml"
+        ).read_text()
+    )
+    assert default_config["executor"]["final_align_enabled"] is False
+    assert default_config["executor"]["interaction_final_align_enabled"] is False
+    executor_override = override_config["executor"]
+    assert executor_override["interaction_final_align_enabled"] is True
+    assert executor_override["interaction_final_align_max_distance_m"] == 0.35
+    assert executor_override["interaction_final_align_yaw_tolerance_rad"] == 0.15
+    assert executor_override["interaction_final_align_rotate_speed_rad_s"] == 0.30
+    assert executor_override["interaction_final_align_timeout_s"] == 15.0
+    assert executor_override["interaction_final_align_step_sync_enabled"] is True
+    assert executor_override["interaction_final_align_control_dt_s"] == 0.2
+    assert executor_override["interaction_final_align_max_control_steps"] == 56
+    assert executor_override["interaction_final_align_max_control_steps"] >= (
+        math.ceil(math.pi / (0.30 * 0.20)) + 3
+    )

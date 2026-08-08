@@ -6,6 +6,9 @@ from semantic_mllm_py_pkg import client as client_module
 from semantic_mllm_py_pkg.ablation import AblationConfig
 from semantic_mllm_py_pkg.client import MLLMClient, MLLMClientConfig
 from semantic_mllm_py_pkg.schemas import (
+    build_attribute_patch_response_schema,
+    build_visual_interaction_plan_response_schema,
+    build_visual_verification_response_schema,
     validate_attribute_patch,
     validate_room_attribute_patch,
     validate_skill_action,
@@ -114,6 +117,125 @@ def test_attribute_patch_normalizes_model_interaction_labels() -> None:
     assert closed["coarse_state"] == "closed"
 
 
+def test_attribute_patch_keeps_visual_portal_morphology_separate_from_state() -> None:
+    attribute = validate_attribute_patch(
+        {
+            "object_id": "door_3",
+            "interactable": False,
+            "interaction_class": "portal",
+            "coarse_state": "unknown",
+            "portal_morphology": {"door_leaf": "No Leaf", "confidence": 1.2},
+            "portal_aperture_evidence": {
+                "open_aperture": "Clear Gap",
+                "confidence": 1.2,
+            },
+        }
+    )
+
+    assert attribute["portal_morphology"] == {
+        "door_leaf": "absent",
+        "confidence": 1.0,
+    }
+    assert attribute["portal_aperture_evidence"] == {
+        "open_aperture": "visible",
+        "confidence": 1.0,
+    }
+
+
+def test_attribute_patch_response_schema_binds_target_and_bounds_portal_evidence() -> None:
+    schema = build_attribute_patch_response_schema("door_0001")
+    body = schema["schema"]
+    properties = body["properties"]
+
+    assert schema["name"] == "attribute_inference"
+    assert schema["strict"] is True
+    assert body["additionalProperties"] is False
+    assert properties["object_id"] == {
+        "type": "string",
+        "enum": ["door_0001"],
+    }
+    assert properties["portal_morphology"]["type"] == ["object", "null"]
+    assert properties["portal_morphology"]["properties"]["door_leaf"]["enum"] == [
+        "absent",
+        "present",
+        "unknown",
+    ]
+    assert properties["portal_aperture_evidence"]["properties"][
+        "open_aperture"
+    ]["enum"] == ["visible", "not_visible", "unknown"]
+    assert properties["interaction_parts"]["maxItems"] == 1
+    assert set(body["required"]) == {
+        "object_id",
+        "interactable",
+        "interaction_class",
+        "coarse_state",
+        "portal_morphology",
+        "portal_aperture_evidence",
+        "view_state",
+        "view_state_confidence",
+        "front_surface_visible",
+        "front_surface_confidence",
+        "approach_ready",
+        "needs_reobserve",
+        "interaction_parts",
+        "confidence",
+    }
+    with pytest.raises(ValueError, match="object_id"):
+        build_attribute_patch_response_schema("")
+
+    non_portal = validate_attribute_patch(
+        {
+            "object_id": "fridge_1",
+            "interactable": True,
+            "interaction_class": "container",
+            "coarse_state": "closed",
+            "portal_morphology": None,
+            "portal_aperture_evidence": None,
+            "interaction_parts": [],
+            "confidence": 0.9,
+        }
+    )
+    assert "portal_morphology" not in non_portal
+    assert "portal_aperture_evidence" not in non_portal
+
+
+def test_attribute_patch_front_view_fields_are_conservatively_normalized() -> None:
+    side_view = validate_attribute_patch(
+        {
+            "object_id": "target",
+            "interactable": True,
+            "interaction_class": "container",
+            "coarse_state": "closed",
+            "view_state": "side",
+            "view_state_confidence": 0.9,
+            "front_surface_visible": True,
+            "front_surface_confidence": 0.9,
+            "approach_ready": True,
+            "needs_reobserve": False,
+        }
+    )
+    assert side_view["view_state"] == "side_or_back"
+    assert side_view["approach_ready"] is False
+    assert side_view["needs_reobserve"] is True
+
+    front_view = validate_attribute_patch(
+        {
+            "object_id": "target",
+            "interactable": True,
+            "interaction_class": "container",
+            "coarse_state": "closed",
+            "view_state": "front",
+            "view_state_confidence": 0.9,
+            "front_surface_visible": True,
+            "front_surface_confidence": 0.9,
+            "approach_ready": True,
+            "needs_reobserve": False,
+        }
+    )
+    assert front_view["approach_ready"] is True
+    assert front_view["needs_reobserve"] is False
+
+
 def test_room_attribute_patch_is_separate_from_object_patch() -> None:
     room = validate_room_attribute_patch(
         {
@@ -182,6 +304,139 @@ def test_visual_interaction_plan_uses_expected_type_when_image_is_ambiguous() ->
 
     assert plan["target_type"] == "door"
     assert plan["operation_method"] == "unknown"
+
+
+def test_container_side_view_requires_reposition_and_drops_guessed_handle() -> None:
+    plan = validate_visual_interaction_plan(
+        {
+            "target_type": "other_container",
+            "action": "open",
+            "operation_method": "pull",
+            "view_state": "side_or_back",
+            "approach_ready": True,
+            "reposition_required": False,
+            "open_regions": [{"center": [0.8, 0.5], "confidence": 0.9}],
+            "confidence": 0.9,
+            "reason": "side view",
+        },
+        expected_target_type="other_container",
+    )
+
+    assert plan["approach_ready"] is False
+    assert plan["reposition_required"] is True
+    assert plan["operation_method"] == "unknown"
+    assert plan["open_regions"] == []
+
+
+def test_visual_interaction_plan_schema_requires_frontality_contract() -> None:
+    schema = build_visual_interaction_plan_response_schema()
+    assert schema["name"] == "visual_interaction_plan"
+    assert schema["strict"] is True
+    assert schema["schema"]["required"] == [
+        "target_type",
+        "action",
+        "operation_method",
+        "view_state",
+        "approach_ready",
+        "reposition_required",
+        "open_regions",
+        "confidence",
+        "reason",
+    ]
+
+
+def test_visual_verification_schema_is_strict_and_bounded() -> None:
+    schema = build_visual_verification_response_schema()
+    body = schema["schema"]
+    properties = body["properties"]
+
+    assert schema["name"] == "visual_verification"
+    assert schema["strict"] is True
+    assert body["additionalProperties"] is False
+    assert body["required"] == [
+        "success",
+        "confidence",
+        "reason",
+        "observed_states",
+        "new_contents_visible",
+        "retry_action",
+    ]
+    assert properties["reason"]["maxLength"] == 96
+    assert properties["observed_states"]["additionalProperties"] is False
+    assert properties["observed_states"]["required"] == [
+        "target_state",
+        "visible_change",
+    ]
+    assert properties["retry_action"]["enum"] == [
+        "none",
+        "retry",
+        "reposition",
+        "rescan",
+    ]
+
+
+def test_visual_verification_schema_is_sent_as_openai_json_schema(monkeypatch) -> None:
+    captured = {}
+    raw_response = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"success":true,"confidence":0.9,"reason":"door open",'
+                            '"observed_states":{"target_state":"open",'
+                            '"visible_change":"yes"},"new_contents_visible":false,'
+                            '"retry_action":"none"}'
+                        )
+                    }
+                }
+            ]
+        }
+    )
+
+    class FakeResponse:
+        def read(self):
+            return raw_response.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request_object, timeout):
+        captured["payload"] = json.loads(request_object.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(client_module.request, "urlopen", fake_urlopen)
+    schema = build_visual_verification_response_schema()
+    response = MLLMClient(
+        MLLMClientConfig(
+            mode="http",
+            endpoint="http://localhost:8317/v1",
+            protocol="openai_chat",
+        )
+    ).request_json(
+        role="visual_verification",
+        instruction="verify",
+        context={"target": {}},
+        response_schema=schema,
+        max_tokens=256,
+    )
+
+    assert captured["payload"]["max_tokens"] == 256
+    assert captured["payload"]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": schema,
+    }
+    assert response.payload == {
+        "success": True,
+        "confidence": 0.9,
+        "reason": "door open",
+        "observed_states": {"target_state": "open", "visible_change": "yes"},
+        "new_contents_visible": False,
+        "retry_action": "none",
+    }
 
 
 def test_openai_base_endpoint_is_resolved() -> None:
@@ -311,3 +566,66 @@ def test_openai_chat_reasoning_off_uses_enable_thinking(monkeypatch) -> None:
     assert captured["payload"]["reasoning_effort"] == "none"
     assert "/no_think" in captured["payload"]["messages"][1]["content"][0]["text"]
     assert response.payload == {"candidate_id": "candidate_1"}
+
+
+def test_openai_chat_uses_json_schema_when_supplied(monkeypatch) -> None:
+    captured = {}
+    raw_response = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"ranked_ids":["frontier:a"],"reason":"INFORMATION_GAIN","confidence":"high"}'
+                    }
+                }
+            ]
+        }
+    )
+
+    class FakeResponse:
+        def read(self):
+            return raw_response.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request_object, timeout):
+        captured["payload"] = json.loads(request_object.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(client_module.request, "urlopen", fake_urlopen)
+    schema = {
+        "name": "subgoal_selection",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "ranked_ids": {"type": "array"},
+                "reason": {"type": "string"},
+                "confidence": {"type": "string"},
+            },
+            "required": ["ranked_ids", "reason", "confidence"],
+        },
+    }
+    response = MLLMClient(
+        MLLMClientConfig(
+            mode="http",
+            endpoint="http://localhost:8317/v1",
+            protocol="openai_chat",
+        )
+    ).request_json(
+        role="subgoal_selection",
+        instruction="select",
+        context={"candidates": [{"id": "frontier:a"}]},
+        response_schema=schema,
+    )
+
+    assert captured["payload"]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": schema,
+    }
+    assert response.payload["ranked_ids"] == ["frontier:a"]

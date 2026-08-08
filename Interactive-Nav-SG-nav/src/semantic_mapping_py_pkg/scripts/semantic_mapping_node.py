@@ -2360,7 +2360,26 @@ class SemanticMappingNode:
         offset_y = float(row_min) * resolution
         origin.position.x += math.cos(yaw) * offset_x - math.sin(yaw) * offset_y
         origin.position.y += math.sin(yaw) * offset_x + math.cos(yaw) * offset_y
-        grid.data = cropped.reshape(-1).tolist()
+        # ``nav_msgs/OccupancyGrid.data`` is signed int8.  Stable room IDs are
+        # deliberately monotonically allocated and can exceed 127 during a
+        # long, changing episode; publishing those internal IDs directly makes
+        # rospy reject the *entire* room-grid message.  The ROS grid is only a
+        # visualization/debug label raster (the graph keeps the full stable
+        # IDs), so remap the currently visible positive labels to a compact
+        # int8 palette only when necessary.  Keep the ordinary small-ID path
+        # byte-for-byte compatible for consumers that inspect it.
+        flat = cropped.reshape(-1)
+        if np.any(flat > 127) or np.any(flat < -128):
+            encoded = np.full(flat.shape, -1, dtype=np.int16)
+            visible_ids = np.unique(flat[flat >= 0])
+            for palette_index, stable_id in enumerate(visible_ids.tolist()):
+                # A room-grid render can display at most 127 distinct positive
+                # labels.  Collisions beyond that are visual-only; graph data
+                # remains lossless and continues to use ``stable_id``.
+                encoded[flat == stable_id] = 1 + (palette_index % 127)
+            grid.data = encoded.tolist()
+        else:
+            grid.data = flat.astype(np.int16, copy=False).tolist()
         return grid
 
     @staticmethod

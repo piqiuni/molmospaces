@@ -77,7 +77,7 @@ model:
   skill_timeout_s: 4.0
   skill_max_output_tokens: 256
   verification_timeout_s: 4.0
-  verification_max_output_tokens: 160
+  verification_max_output_tokens: 256
 
 completion:
   empty_candidate_confirmations: 3

@@ -23,6 +23,7 @@ from semantic_mllm_py_pkg import load_env_file
 from semantic_mllm_py_pkg.client import MLLMClient
 from semantic_mllm_py_pkg.env import client_config_from_env
 from semantic_mllm_py_pkg.schemas import (
+    build_attribute_patch_response_schema,
     validate_attribute_patch,
     validate_room_attribute_patch,
 )
@@ -46,6 +47,7 @@ class InteractionAttributeInferenceNode:
         patch_roslogging_findcaller_for_py311()
         rospy.init_node("interaction_attribute_inference_node")
         topics = get_nested_param(rospy, "topics", {}) or {}
+        attribute_config = get_nested_param(rospy, "attribute_inference", {}) or {}
         room_mllm_config = get_nested_param(rospy, "room_mllm", {}) or {}
         self.image_topic = topics.get("rgb_image", "/molmo_spaces/head_camera/image")
         self.detection_topic = topics.get(
@@ -56,6 +58,10 @@ class InteractionAttributeInferenceNode:
         )
         self.output_topic = topics.get(
             "attribute_updates", "/semantic_mapping/attribute_updates"
+        )
+        self.targeted_refresh_topic = topics.get(
+            "attribute_refresh_requests",
+            "/semantic_mapping/attribute_refresh_requests",
         )
         self.room_request_topic = topics.get(
             "room_attribute_requests", "/semantic_mapping/room_attribute_requests"
@@ -123,17 +129,44 @@ class InteractionAttributeInferenceNode:
             )
             if str(value).strip()
         )
-        self.model_name = str(rospy.get_param("~model_name", "") or "")
+        # Keep Module 1 on the same explicitly selected local/remote model as
+        # Modules 2 and 3.  Legacy launch arguments may still contain an old
+        # model name, but an env-file choice is intentional and takes priority.
+        self.model_name = str(
+            os.environ.get("SEMANTIC_MODEL_NAME")
+            or rospy.get_param("~model_name", "")
+            or ""
+        )
         self.client = MLLMClient(client_config_from_env(model=self.model_name or None))
         self.request_timeout_s = max(
             0.1, float(rospy.get_param("~request_timeout_s", 8.0))
         )
         self.max_output_tokens = max(
             32,
-            int(rospy.get_param("~max_output_tokens", min(self.client.config.max_tokens, 160))),
+            int(rospy.get_param("~max_output_tokens", min(self.client.config.max_tokens, 256))),
         )
         self.crop_margin_ratio = max(
             0.0, float(rospy.get_param("~crop_margin_ratio", 0.08))
+        )
+        self.visual_evidence_max_side_px = max(
+            0,
+            int(
+                rospy.get_param(
+                    "~visual_evidence_max_side_px",
+                    attribute_config.get("visual_evidence_max_side_px", 1024),
+                )
+            ),
+        )
+        # Explicit decision-layer refreshes must overtake discovery work, but
+        # they still wait for a later RGB + detection observation.
+        self.targeted_refresh_priority = max(
+            1.0,
+            float(
+                rospy.get_param(
+                    "~targeted_refresh_priority",
+                    attribute_config.get("targeted_refresh_priority", 1000.0),
+                )
+            ),
         )
         self.room_enabled = bool(room_mllm_config.get("enabled", True))
         self.room_worker_count = max(
@@ -175,6 +208,7 @@ class InteractionAttributeInferenceNode:
         self.lock = threading.Lock()
         self.latest_image = None
         self.latest_stamp = 0.0
+        self.latest_image_sequence = 0
         self.pending_detection_payload: dict | None = None
         self.filter_counts = {
             "messages_received": 0,
@@ -187,6 +221,11 @@ class InteractionAttributeInferenceNode:
             "failed": 0,
             "filtered": 0,
             "missing_image": 0,
+            "targeted_refresh_received": 0,
+            "targeted_refresh_armed": 0,
+            "targeted_refresh_matched": 0,
+            "targeted_refresh_enqueued": 0,
+            "targeted_refresh_rejected": 0,
         }
         self.room_counts = {
             "messages_received": 0,
@@ -206,6 +245,8 @@ class InteractionAttributeInferenceNode:
         self.completed: dict[str, dict] = {}
         self.generations: dict[str, int] = {}
         self.aliases: dict[str, str] = {}
+        self.targeted_refresh_sequence = 0
+        self.targeted_refresh_requests: dict[str, dict] = {}
         self.request_queue = LatestPriorityRequestQueue(self.max_queue_size)
         self.room_request_sequence = 0
         self.room_last_request: dict[str, float] = {}
@@ -240,6 +281,12 @@ class InteractionAttributeInferenceNode:
             self._interaction_result_callback,
             queue_size=10,
         )
+        rospy.Subscriber(
+            self.targeted_refresh_topic,
+            String,
+            self._targeted_refresh_callback,
+            queue_size=10,
+        )
         if self.room_enabled:
             rospy.Subscriber(
                 self.room_request_topic,
@@ -248,10 +295,11 @@ class InteractionAttributeInferenceNode:
                 queue_size=4,
             )
         rospy.loginfo(
-            "[interaction_attribute_inference] image=%s detections=%s object_output=%s room=%s room_output=%s model=%s object_workers=%d room_workers=%d",
+            "[interaction_attribute_inference] image=%s detections=%s object_output=%s targeted_refresh=%s room=%s room_output=%s model=%s object_workers=%d room_workers=%d",
             self.image_topic,
             self.detection_topic,
             self.output_topic,
+            self.targeted_refresh_topic,
             self.room_enabled,
             self.room_output_topic,
             self.client.config.model,
@@ -269,6 +317,7 @@ class InteractionAttributeInferenceNode:
         with self.lock:
             self.latest_image = image.copy()
             self.latest_stamp = message.header.stamp.to_sec() or time.time()
+            self.latest_image_sequence += 1
         self._process_pending_detections()
 
     @staticmethod
@@ -346,6 +395,7 @@ class InteractionAttributeInferenceNode:
             payload = self.pending_detection_payload
             image = None if self.latest_image is None else self.latest_image.copy()
             image_stamp = self.latest_stamp
+            image_sequence = int(self.latest_image_sequence)
             if isinstance(payload, dict) and image is not None:
                 self.pending_detection_payload = None
         if not isinstance(payload, dict) or image is None:
@@ -369,12 +419,6 @@ class InteractionAttributeInferenceNode:
                 continue
             with self.lock:
                 self.filter_counts["received"] += 1
-            if not self._passes_observation_filter(detection):
-                with self.lock:
-                    self.filter_counts["filtered"] += 1
-                continue
-            with self.lock:
-                self.filter_counts["eligible"] += 1
             object_id = str(
                 detection.get("instance_id")
                 or detection.get("id")
@@ -383,29 +427,63 @@ class InteractionAttributeInferenceNode:
                 or detection.get("name")
                 or ""
             )
-            self._register_aliases(object_id, detection)
-            signature = self._state_signature(detection)
-            self._invalidate_if_state_changed(object_id, signature, episode_id)
-            reservation = self._try_reserve(object_id, signature)
-            if not object_id or reservation is None:
+            if not object_id:
+                with self.lock:
+                    self.filter_counts["filtered"] += 1
                 continue
-            crop = self._crop(image, detection, self.crop_margin_ratio)
-            if crop is None:
-                self._release(object_id, reservation["request_sequence"])
+            self._register_aliases(object_id, detection)
+            targeted_refresh = self._targeted_refresh_for_detection(
+                object_id,
+                detection,
+                episode_id=episode_id,
+                capture_step=capture_step,
+                image_sequence=image_sequence,
+            )
+            if not self._passes_observation_filter(detection):
+                with self.lock:
+                    self.filter_counts["filtered"] += 1
+                continue
+            with self.lock:
+                self.filter_counts["eligible"] += 1
+            signature = self._state_signature(detection)
+            visual_evidence = self._compose_attribute_visual_evidence(
+                image,
+                detection,
+                margin_ratio=self.crop_margin_ratio,
+            )
+            if visual_evidence is None:
+                continue
+            if targeted_refresh is None:
+                self._invalidate_if_state_changed(object_id, signature, episode_id)
+                reservation = self._try_reserve(object_id, signature)
+            else:
+                reservation = self._force_reserve_targeted_refresh(
+                    object_id,
+                    signature,
+                    episode_id,
+                    targeted_refresh,
+                )
+            if reservation is None:
                 continue
             requests.append(
                 {
-                    "priority": self._priority(detection),
+                    "priority": (
+                        self.targeted_refresh_priority
+                        if targeted_refresh is not None
+                        else self._priority(detection)
+                    ),
                     "object_id": object_id,
                     "detection": dict(detection),
-                    "crop": crop,
+                    "visual_evidence": visual_evidence,
                     "episode_id": episode_id,
                     "frame_id": frame_id,
+                    "image_sequence": image_sequence,
                     "stamp": observation_stamp,
                     "signature": signature,
                     "generation": reservation["generation"],
                     "request_sequence": reservation["request_sequence"],
                     "enqueued_at": time.monotonic(),
+                    "targeted_refresh": dict(targeted_refresh or {}),
                 }
             )
         for request_payload in sorted(
@@ -415,6 +493,10 @@ class InteractionAttributeInferenceNode:
             if accepted:
                 with self.lock:
                     self.filter_counts["enqueued"] += 1
+                    if request_payload.get("targeted_refresh"):
+                        self.filter_counts["targeted_refresh_enqueued"] += 1
+                if request_payload.get("targeted_refresh"):
+                    self._consume_targeted_refresh(request_payload["targeted_refresh"])
                 if displaced is not None:
                     self._release(
                         str(displaced.get("object_id") or ""),
@@ -424,37 +506,22 @@ class InteractionAttributeInferenceNode:
                         str(displaced.get("episode_id") or ""),
                         float(displaced.get("stamp", request_payload["stamp"])),
                         [
-                            {
-                                "object_id": str(displaced.get("object_id") or ""),
-                                "attribute_status": "stale",
-                                "observation_capture_step": self._frame_index(
-                                    str(displaced.get("frame_id") or "")
-                                ),
-                                "request_sequence": int(
-                                    displaced.get("request_sequence", 0) or 0
-                                ),
-                                "source": "mllm_attribute_inference",
-                                "error": "queue_replaced_by_higher_priority_request",
-                            }
+                            self._attribute_status_patch(
+                                displaced,
+                                "stale",
+                                error="queue_replaced_by_higher_priority_request",
+                            )
                         ],
                     )
                 self._publish_updates(
                     str(request_payload["episode_id"]),
                     float(request_payload["stamp"]),
-                    [
-                        {
-                            "object_id": request_payload["object_id"],
-                            "attribute_status": "pending",
-                            "observation_capture_step": self._frame_index(
-                                request_payload["frame_id"]
-                            ),
-                            "request_sequence": request_payload["request_sequence"],
-                            "observation_signature": request_payload["signature"],
-                            "source": "mllm_attribute_inference",
-                        }
-                    ],
+                    [self._attribute_status_patch(request_payload, "pending")],
                 )
             else:
+                if request_payload.get("targeted_refresh"):
+                    with self.lock:
+                        self.filter_counts["targeted_refresh_rejected"] += 1
                 self._release(
                     str(request_payload["object_id"]),
                     int(request_payload["request_sequence"]),
@@ -708,7 +775,10 @@ class InteractionAttributeInferenceNode:
                 "room_queue_size": len(self.room_request_queue),
                 "room_pending_requests": len(self.room_pending),
                 "has_latest_image": self.latest_image is not None,
+                "latest_image_sequence": int(self.latest_image_sequence),
                 "has_pending_detection": self.pending_detection_payload is not None,
+                "targeted_refresh_topic": self.targeted_refresh_topic,
+                "targeted_refresh_pending": len(self.targeted_refresh_requests),
             }
         self.status_publisher.publish(
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -738,6 +808,7 @@ class InteractionAttributeInferenceNode:
             self.room_pending.clear()
             self.room_completed.clear()
             self.room_generations.clear()
+            self.targeted_refresh_requests.clear()
         for object_id, request_sequence in stale_request_ids:
             self.request_queue.discard(object_id, request_sequence)
         for room_key, request_sequence in stale_room_request_ids:
@@ -782,6 +853,235 @@ class InteractionAttributeInferenceNode:
                 self.pending.pop(object_id, None)
         for object_id in object_ids:
             self.request_queue.discard(object_id)
+
+    @staticmethod
+    def _parse_targeted_refresh_payload(payload: object) -> dict | None:
+        """Validate the compact public request for a fresh Module-1 view.
+
+        The request intentionally carries no image, pose, category, or private
+        simulator data.  It only identifies the object and the earliest
+        acceptable public capture step; the node waits for a later local RGB +
+        detection pair before creating an inference request.
+        """
+
+        if not isinstance(payload, dict):
+            return None
+        object_id = str(payload.get("object_id") or "").strip()
+        if not object_id:
+            return None
+        try:
+            minimum_capture_step = int(payload.get("minimum_capture_step"))
+        except (TypeError, ValueError):
+            return None
+        if minimum_capture_step < 0:
+            return None
+        return {
+            "object_id": object_id,
+            "episode_id": str(payload.get("episode_id") or "").strip(),
+            "minimum_capture_step": minimum_capture_step,
+            "reason": str(payload.get("reason") or "targeted_refresh").strip()[:160]
+            or "targeted_refresh",
+            "request_id": str(payload.get("request_id") or "").strip()[:96],
+        }
+
+    def _targeted_refresh_callback(self, message: String) -> None:
+        with self.lock:
+            self.filter_counts["targeted_refresh_received"] += 1
+        try:
+            payload = json.loads(message.data)
+        except json.JSONDecodeError:
+            with self.lock:
+                self.filter_counts["targeted_refresh_rejected"] += 1
+            self._publish_status()
+            return
+        request = self._parse_targeted_refresh_payload(payload)
+        if request is None:
+            with self.lock:
+                self.filter_counts["targeted_refresh_rejected"] += 1
+            self._publish_status()
+            return
+        requested_episode = str(request["episode_id"])
+        with self.lock:
+            current_episode = self.current_episode_id
+        if requested_episode and current_episode and requested_episode != current_episode:
+            with self.lock:
+                self.filter_counts["targeted_refresh_rejected"] += 1
+            rospy.logwarn(
+                "[interaction_attribute_inference] rejected targeted refresh for %s: "
+                "episode %s != current %s",
+                request["object_id"],
+                requested_episode,
+                current_episode,
+            )
+            self._publish_status()
+            return
+        if requested_episode and not current_episode:
+            self._set_episode(requested_episode)
+        with self.lock:
+            canonical_object_id = self.aliases.get(
+                request["object_id"], request["object_id"]
+            )
+            self.targeted_refresh_sequence += 1
+            refresh_sequence = self.targeted_refresh_sequence
+            self.targeted_refresh_requests[canonical_object_id] = {
+                **request,
+                "request_key": canonical_object_id,
+                "refresh_sequence": refresh_sequence,
+                # Require an RGB image that arrived after this request, even
+                # if an old detection packet is still waiting to be consumed.
+                "minimum_image_sequence": int(self.latest_image_sequence),
+                "armed_at_monotonic": time.monotonic(),
+            }
+            self.filter_counts["targeted_refresh_armed"] += 1
+        rospy.loginfo(
+            "[interaction_attribute_inference] armed targeted refresh object=%s "
+            "minimum_capture_step=%d reason=%s",
+            request["object_id"],
+            request["minimum_capture_step"],
+            request["reason"],
+        )
+        self._publish_status()
+
+    def _targeted_refresh_for_detection(
+        self,
+        object_id: str,
+        detection: dict,
+        *,
+        episode_id: str,
+        capture_step: int | None,
+        image_sequence: int,
+    ) -> dict | None:
+        """Return an armed request only for a strictly later RGB/detection view."""
+
+        if capture_step is None:
+            return None
+        identifiers = {
+            str(object_id),
+            str(detection.get("instance_id") or ""),
+            str(detection.get("id") or ""),
+            str(detection.get("object_id") or ""),
+            str(detection.get("source_object_name") or ""),
+            str(detection.get("name") or ""),
+        }
+        identifiers.discard("")
+        with self.lock:
+            canonical_identifiers = {
+                self.aliases.get(identifier, identifier) for identifier in identifiers
+            }
+            for request_key, request in sorted(
+                self.targeted_refresh_requests.items(),
+                key=lambda item: int(item[1].get("refresh_sequence", 0) or 0),
+                reverse=True,
+            ):
+                requested_episode = str(request.get("episode_id") or "")
+                if requested_episode and requested_episode != str(episode_id or ""):
+                    continue
+                requested_object_id = str(request.get("object_id") or "")
+                if (
+                    request_key not in canonical_identifiers
+                    and requested_object_id not in identifiers
+                    and requested_object_id not in canonical_identifiers
+                ):
+                    continue
+                try:
+                    minimum_capture_step = int(request.get("minimum_capture_step", -1))
+                    minimum_image_sequence = int(
+                        request.get("minimum_image_sequence", -1)
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if int(capture_step) <= minimum_capture_step:
+                    continue
+                if int(image_sequence) <= minimum_image_sequence:
+                    continue
+                return dict(request)
+        return None
+
+    def _force_reserve_targeted_refresh(
+        self,
+        object_id: str,
+        signature: str,
+        episode_id: str,
+        refresh: dict,
+    ) -> dict | None:
+        """Replace stale discovery work with the explicitly requested view."""
+
+        previous_request_sequence: int | None = None
+        with self.lock:
+            if episode_id and self.current_episode_id and episode_id != self.current_episode_id:
+                return None
+            previous = self.pending.get(object_id)
+            if previous is not None:
+                previous_request_sequence = int(
+                    previous.get("request_sequence", 0) or 0
+                )
+            # A running old request cannot be removed from a worker thread, so
+            # move the generation first.  Its response is then rejected by the
+            # normal current-request guard before it can publish stale state.
+            self.generations[object_id] = self.generations.get(object_id, 0) + 1
+            generation = self.generations[object_id]
+            self.completed.pop(object_id, None)
+            self.last_request.pop(object_id, None)
+            self.request_sequence += 1
+            request_sequence = self.request_sequence
+            self.pending[object_id] = {
+                "request_sequence": request_sequence,
+                "signature": signature,
+                "generation": generation,
+                "episode_id": self.current_episode_id,
+                "targeted_refresh": dict(refresh),
+            }
+            self.filter_counts["targeted_refresh_matched"] += 1
+        if previous_request_sequence is not None:
+            self.request_queue.discard(object_id, previous_request_sequence)
+        return {"generation": generation, "request_sequence": request_sequence}
+
+    def _consume_targeted_refresh(self, refresh: dict) -> None:
+        request_key = str(refresh.get("request_key") or "")
+        refresh_sequence = int(refresh.get("refresh_sequence", 0) or 0)
+        if not request_key or refresh_sequence <= 0:
+            return
+        with self.lock:
+            current = self.targeted_refresh_requests.get(request_key) or {}
+            if int(current.get("refresh_sequence", 0) or 0) == refresh_sequence:
+                self.targeted_refresh_requests.pop(request_key, None)
+
+    @classmethod
+    def _attribute_status_patch(
+        cls, request_payload: dict, status: str, error: str = ""
+    ) -> dict:
+        patch = {
+            "object_id": str(request_payload.get("object_id") or ""),
+            "attribute_status": str(status),
+            "observation_capture_step": cls._frame_index(
+                str(request_payload.get("frame_id") or "")
+            ),
+            "request_sequence": int(request_payload.get("request_sequence", 0) or 0),
+            "observation_signature": str(request_payload.get("signature") or ""),
+            "source": "mllm_attribute_inference",
+            "error": str(error)[:240],
+        }
+        refresh = request_payload.get("targeted_refresh") or {}
+        if isinstance(refresh, dict) and refresh:
+            patch.update(
+                {
+                    "targeted_refresh": True,
+                    "targeted_refresh_request_id": str(
+                        refresh.get("request_id") or ""
+                    ),
+                    "targeted_refresh_sequence": int(
+                        refresh.get("refresh_sequence", 0) or 0
+                    ),
+                    "targeted_refresh_reason": str(refresh.get("reason") or ""),
+                    "targeted_refresh_minimum_capture_step": int(
+                        refresh.get("minimum_capture_step", -1)
+                    ),
+                    "targeted_refresh_image_sequence": int(
+                        request_payload.get("image_sequence", -1)
+                    ),
+                }
+            )
+        return patch
 
     @staticmethod
     def _observation_stamp(payload: object, fallback: float) -> float:
@@ -1074,14 +1374,16 @@ class InteractionAttributeInferenceNode:
         self,
         object_id: str,
         detection: dict,
-        crop,
+        visual_evidence: np.ndarray,
         episode_id: str,
         frame_id: str,
+        image_sequence: int,
         stamp: float,
         signature: str,
         generation: int,
         request_sequence: int,
         enqueued_at: float,
+        targeted_refresh: dict,
     ) -> None:
         request_started = time.monotonic()
         queue_lag_sec = max(0.0, request_started - float(enqueued_at))
@@ -1097,36 +1399,57 @@ class InteractionAttributeInferenceNode:
             ):
                 outcome_status = "stale"
                 return
-            encoded = self._encode_jpeg(crop)
+            encoded = self._encode_jpeg(
+                self._resize_visual_evidence(
+                    visual_evidence, self.visual_evidence_max_side_px
+                )
+            )
             if not encoded:
                 return
             image_data = "data:image/jpeg;base64," + __import__("base64").b64encode(encoded).decode("ascii")
             response = self.client.request_json(
                 role="attribute_inference",
                 instruction=(
-                    "Infer only visible interaction attributes. Return exactly one compact, "
-                    "single-line JSON object with only object_id, interactable, "
-                    "interaction_class, coarse_state, interaction_parts, and confidence. "
+                    "Infer the outlined target's pre-interaction visual attributes using "
+                    "only pixels in the one supplied composite image. The composite shows "
+                    "the complete head-camera image, a target outline, and a padded target "
+                    "crop inset. Do not use object IDs, prior state, category names, map "
+                    "geometry, simulator knowledge, or hidden properties. Return exactly one "
+                    "compact, single-line JSON object with only object_id, interactable, "
+                    "interaction_class, coarse_state, portal_morphology, "
+                    "portal_aperture_evidence, view_state, view_state_confidence, "
+                    "front_surface_visible, front_surface_confidence, approach_ready, "
+                    "needs_reobserve, interaction_parts, and confidence. "
                     "interaction_class is portal, container, none, or unknown. "
+                    "For a portal only, portal_morphology is {door_leaf: absent|present|unknown, "
+                    "confidence: 0..1}; report absent only when the image visibly shows a clear "
+                    "opening with no door leaf. It is visual morphology only: never infer "
+                    "traversability, simulator joints, asset names, or hidden geometry. "
+                    "For a portal only, portal_aperture_evidence is {open_aperture: "
+                    "visible|not_visible|unknown, confidence: 0..1}; use visible only when "
+                    "a real gap/open passage is directly visible in the image. Do not claim "
+                    "open or ajar from the class label, handle, or a guessed hidden state. "
+                    "For a non-portal, set portal_morphology and "
+                    "portal_aperture_evidence to null. "
+                    "view_state is front, oblique, side_or_back, occluded, or unknown and "
+                    "describes only the current camera view of the outlined target. "
+                    "front_surface_visible is true only when its usable front surface is "
+                    "directly visible. Set approach_ready true only for a sufficiently clear "
+                    "front-facing or usable oblique visual view; for side_or_back, occluded, "
+                    "or unknown views, set approach_ready false and needs_reobserve true. "
                     "interaction_parts has at most one item with part_id, type, state, "
                     "handle_visible, and confidence. Use a short generic part_id such as "
                     "part_1; never copy simulator body or joint identifiers. Do not output "
                     "markdown, explanations, geometry, axes, ranges, trajectories, or extra keys."
                 ),
                 context={
-                    "object_id": object_id,
-                    "name": detection.get("name") or detection.get("semantic_name"),
-                    "category": detection.get("category"),
-                    "geometry": {
-                        "position": detection.get("position")
-                        or (detection.get("box_3d") or {}).get("center"),
-                        "aabb_size": detection.get("aabb_size")
-                        or (detection.get("box_3d") or {}).get("size"),
-                    },
-                    "episode_id": episode_id,
-                    "frame_id": frame_id,
+                    # Keep semantic identifiers and scene geometry outside the
+                    # M1 prompt.  ``target`` is an opaque response-routing token
+                    # which the caller replaces with the real object ID.
+                    "object_id": "target",
                 },
                 images=[image_data],
+                response_schema=build_attribute_patch_response_schema("target"),
                 timeout_s=self.request_timeout_s,
                 max_tokens=self.max_output_tokens,
                 metrics_context={
@@ -1134,8 +1457,10 @@ class InteractionAttributeInferenceNode:
                     "object_id": object_id,
                     "observation_frame_index": self._frame_index(frame_id),
                     "observation_capture_step": self._frame_index(frame_id),
+                    "observation_image_sequence": int(image_sequence),
                     "request_sequence": request_sequence,
                     "queue_lag_sec": queue_lag_sec,
+                    "targeted_refresh": bool(targeted_refresh),
                 },
             )
             if response.error or response.payload is None:
@@ -1158,6 +1483,7 @@ class InteractionAttributeInferenceNode:
                     "observation_stamp_sec": stamp,
                     "observation_frame_index": self._frame_index(frame_id),
                     "observation_capture_step": self._frame_index(frame_id),
+                    "observation_image_sequence": int(image_sequence),
                     "observation_signature": signature,
                     "source": "mllm_attribute_inference",
                     "model_name": self.client.config.model,
@@ -1168,6 +1494,19 @@ class InteractionAttributeInferenceNode:
                     "response_lag_sec": max(0.0, time.monotonic() - request_started),
                     "total_lag_sec": max(0.0, time.monotonic() - float(enqueued_at)),
                 }
+            )
+            patch.update(
+                self._attribute_status_patch(
+                    {
+                        "object_id": object_id,
+                        "frame_id": frame_id,
+                        "image_sequence": image_sequence,
+                        "request_sequence": request_sequence,
+                        "signature": signature,
+                        "targeted_refresh": targeted_refresh,
+                    },
+                    "ready",
+                )
             )
             self._publish_updates(episode_id, stamp, [patch])
             succeeded = True
@@ -1195,17 +1534,24 @@ class InteractionAttributeInferenceNode:
                 ):
                     publish_status = True
             if publish_status:
+                failure_payload = {
+                    "object_id": object_id,
+                    "frame_id": frame_id,
+                    "image_sequence": image_sequence,
+                    "request_sequence": request_sequence,
+                    "signature": signature,
+                    "targeted_refresh": targeted_refresh,
+                }
                 self._publish_updates(
                     episode_id,
                     stamp,
                     [
-                        {
-                            "object_id": object_id,
-                            "attribute_status": outcome_status,
-                            "observation_capture_step": self._frame_index(frame_id),
-                            "request_sequence": request_sequence,
-                            "source": "mllm_attribute_inference",
-                            "error": outcome_error[:240],
+                        self._attribute_status_patch(
+                            failure_payload,
+                            outcome_status,
+                            error=outcome_error,
+                        )
+                        | {
                             "queue_lag_sec": queue_lag_sec,
                             "response_lag_sec": max(0.0, time.monotonic() - request_started),
                             "total_lag_sec": max(
@@ -1267,7 +1613,8 @@ class InteractionAttributeInferenceNode:
                     "Infer the likely room attribute using only the supplied room ID and "
                     "its currently known in-room object labels. Return exactly one compact, "
                     "single-line JSON object with only room_id, room_attribute, confidence, "
-                    "and evidence_object_ids. Do not assume an image was provided. Do not "
+                    "and evidence_object_ids. Include at most two strongest evidence_object_ids. "
+                    "Do not assume an image was provided. Do not "
                     "output markdown, explanations, geometry, poses, simulator identifiers, "
                     "or any extra keys. If the object evidence is insufficient, return unknown "
                     "with low confidence."
@@ -1424,7 +1771,7 @@ class InteractionAttributeInferenceNode:
         )
 
     @staticmethod
-    def _crop(image, detection, margin_ratio=0.0):
+    def _bbox_pixels(image: np.ndarray, detection: dict) -> tuple[int, int, int, int] | None:
         box = (
             detection.get("bbox_2d")
             or detection.get("projected_bbox_2d")
@@ -1434,6 +1781,19 @@ class InteractionAttributeInferenceNode:
             return None
         height, width = image.shape[:2]
         x0, y0, x1, y1 = [int(round(float(value))) for value in box[:4]]
+        x0, x1 = max(0, min(x0, x1)), min(width, max(x0, x1))
+        y0, y1 = max(0, min(y0, y1)), min(height, max(y0, y1))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
+
+    @classmethod
+    def _crop(cls, image, detection, margin_ratio=0.0):
+        bbox = cls._bbox_pixels(image, detection)
+        if bbox is None:
+            return None
+        height, width = image.shape[:2]
+        x0, y0, x1, y1 = bbox
         margin_x = int(round(abs(x1 - x0) * max(0.0, float(margin_ratio))))
         margin_y = int(round(abs(y1 - y0) * max(0.0, float(margin_ratio))))
         x0 -= margin_x
@@ -1445,6 +1805,148 @@ class InteractionAttributeInferenceNode:
         if x1 <= x0 or y1 <= y0:
             return None
         return image[y0:y1, x0:x1]
+
+    @staticmethod
+    def _resize_nearest(image: np.ndarray, width: int, height: int) -> np.ndarray:
+        """Resize without making M1 depend on an OpenCV-enabled ROS build."""
+
+        source_height, source_width = image.shape[:2]
+        if source_height <= 0 or source_width <= 0:
+            return image
+        width = max(1, int(width))
+        height = max(1, int(height))
+        if width == source_width and height == source_height:
+            return image.copy()
+        if cv2 is not None:
+            return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+        source_y = np.linspace(0, source_height - 1, height).astype(np.intp)
+        source_x = np.linspace(0, source_width - 1, width).astype(np.intp)
+        return image[source_y][:, source_x].copy()
+
+    @classmethod
+    def _resize_visual_evidence(
+        cls, image: np.ndarray, max_side_px: int
+    ) -> np.ndarray:
+        max_side_px = int(max_side_px)
+        if max_side_px <= 0:
+            return image
+        height, width = image.shape[:2]
+        largest_side = max(height, width)
+        if largest_side <= max_side_px:
+            return image
+        scale = float(max_side_px) / float(largest_side)
+        return cls._resize_nearest(
+            image,
+            max(1, int(round(width * scale))),
+            max(1, int(round(height * scale))),
+        )
+
+    @staticmethod
+    def _draw_rectangle(
+        image: np.ndarray,
+        left: int,
+        top: int,
+        right: int,
+        bottom: int,
+        color: tuple[int, int, int],
+        thickness: int = 2,
+    ) -> None:
+        height, width = image.shape[:2]
+        left, right = max(0, left), min(width, right)
+        top, bottom = max(0, top), min(height, bottom)
+        if right <= left or bottom <= top:
+            return
+        thickness = max(1, min(int(thickness), max(1, (right - left) // 2), max(1, (bottom - top) // 2)))
+        image[top : min(bottom, top + thickness), left:right] = color
+        image[max(top, bottom - thickness) : bottom, left:right] = color
+        image[top:bottom, left : min(right, left + thickness)] = color
+        image[top:bottom, max(left, right - thickness) : right] = color
+
+    @staticmethod
+    def _rect_overlap_area(
+        first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+    ) -> int:
+        left = max(first[0], second[0])
+        top = max(first[1], second[1])
+        right = min(first[2], second[2])
+        bottom = min(first[3], second[3])
+        return max(0, right - left) * max(0, bottom - top)
+
+    @classmethod
+    def _compose_attribute_visual_evidence(
+        cls, image: np.ndarray, detection: dict, *, margin_ratio: float
+    ) -> np.ndarray | None:
+        """Build M1's one-image visual observation without textual/GT context.
+
+        The target outline anchors which item the model must judge, while a
+        padded crop inset preserves detail that would be too small in the full
+        head-camera view.  The source image itself remains the full camera
+        observation, so the model can use surrounding visual context only.
+        """
+
+        if not isinstance(image, np.ndarray) or image.ndim != 3:
+            return None
+        bbox = cls._bbox_pixels(image, detection)
+        crop = cls._crop(image, detection, margin_ratio=margin_ratio)
+        if bbox is None or crop is None or crop.size == 0:
+            return None
+        composite = image.copy()
+        height, width = composite.shape[:2]
+        target_left, target_top, target_right, target_bottom = bbox
+        outline_color = (0, 255, 255)
+        cls._draw_rectangle(
+            composite,
+            target_left,
+            target_top,
+            target_right,
+            target_bottom,
+            outline_color,
+            thickness=max(2, min(width, height) // 240),
+        )
+
+        max_panel_width = max(1, min(width, max(32, int(round(width * 0.38)))))
+        max_panel_height = max(1, min(height, max(32, int(round(height * 0.46)))))
+        crop_height, crop_width = crop.shape[:2]
+        scale = min(
+            float(max_panel_width) / float(max(1, crop_width)),
+            float(max_panel_height) / float(max(1, crop_height)),
+        )
+        panel_width = max(1, min(max_panel_width, int(round(crop_width * scale))))
+        panel_height = max(1, min(max_panel_height, int(round(crop_height * scale))))
+        resized_crop = cls._resize_nearest(crop, panel_width, panel_height)
+        border = 3
+        right_origin = max(0, width - panel_width)
+        bottom_origin = max(0, height - panel_height)
+        candidates = [
+            (0, 0),
+            (right_origin, 0),
+            (0, bottom_origin),
+            (right_origin, bottom_origin),
+        ]
+        panel_left, panel_top = min(
+            candidates,
+            key=lambda item: cls._rect_overlap_area(
+                (item[0], item[1], item[0] + panel_width, item[1] + panel_height),
+                bbox,
+            ),
+        )
+        panel_left = max(0, panel_left)
+        panel_top = max(0, panel_top)
+        panel_right = min(width, panel_left + panel_width)
+        panel_bottom = min(height, panel_top + panel_height)
+        composite[panel_top:panel_bottom, panel_left:panel_right] = resized_crop[
+            : panel_bottom - panel_top, : panel_right - panel_left
+        ]
+        cls._draw_rectangle(
+            composite,
+            panel_left - border,
+            panel_top - border,
+            panel_right + border,
+            panel_bottom + border,
+            outline_color,
+            thickness=border,
+        )
+        return composite
 
 
 if __name__ == "__main__":

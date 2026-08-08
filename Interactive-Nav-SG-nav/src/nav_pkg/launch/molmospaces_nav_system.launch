@@ -22,7 +22,7 @@
   <arg name="semantic_source" default="detector"/>
   <arg name="semantic_attribute_inference" default="false"/>
   <arg name="semantic_attribute_model_name" default=""/>
-  <arg name="semantic_attribute_max_output_tokens" default="160"/>
+  <arg name="semantic_attribute_max_output_tokens" default="256"/>
   <arg name="semantic_attribute_request_timeout_s" default="8.0"/>
   <arg name="semantic_attribute_worker_count" default="1"/>
   <arg name="semantic_attribute_max_queue_size" default="8"/>
@@ -33,6 +33,7 @@
   <arg name="semantic_attribute_min_bbox_area_px" default="512"/>
   <arg name="semantic_attribute_max_distance_m" default="6.0"/>
   <arg name="semantic_attribute_required_consecutive_observations" default="2"/>
+  <arg name="semantic_attribute_targeted_refresh_topic" default="/semantic_mapping/attribute_refresh_requests"/>
   <arg name="semantic_attribute_room_enabled" default="true"/>
   <arg name="publish_realtime_gt" default="false"/>
   <arg name="initial_door_state" default="keep"/>
@@ -152,6 +153,7 @@
       <arg name="attribute_min_bbox_area_px" value="$(arg semantic_attribute_min_bbox_area_px)"/>
       <arg name="attribute_max_distance_m" value="$(arg semantic_attribute_max_distance_m)"/>
       <arg name="attribute_required_consecutive_observations" value="$(arg semantic_attribute_required_consecutive_observations)"/>
+      <arg name="attribute_targeted_refresh_topic" value="$(arg semantic_attribute_targeted_refresh_topic)"/>
       <arg name="attribute_room_enabled" value="$(arg semantic_attribute_room_enabled)"/>
     </include>
   </group>
@@ -179,6 +181,7 @@
       <arg name="attribute_min_bbox_area_px" value="$(arg semantic_attribute_min_bbox_area_px)"/>
       <arg name="attribute_max_distance_m" value="$(arg semantic_attribute_max_distance_m)"/>
       <arg name="attribute_required_consecutive_observations" value="$(arg semantic_attribute_required_consecutive_observations)"/>
+      <arg name="attribute_targeted_refresh_topic" value="$(arg semantic_attribute_targeted_refresh_topic)"/>
       <!-- realtime_gt intentionally leaves the legacy scene-wide rule node
            off, but start_attribute_inference still starts the new no-image
            room lane inside interaction_attribute_inference_node.py. -->

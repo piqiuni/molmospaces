@@ -31,8 +31,9 @@ candidate:
 
 policy:
   backend: "rule"
-  # Keep the two interaction classes comparable; proximity and semantic gain
-  # decide among currently visible doors, fridges, cabinets, and drawers.
+  # Keep the two interaction classes comparable across the global graph;
+  # proximity and semantic gain decide among doors, fridges, cabinets, and
+  # drawers without requiring current visibility or same-room membership.
   portal_bonus: 1.0
   container_bonus: 1.0
   interaction_priority_bonus: 5.0
@@ -45,6 +46,9 @@ policy:
 completion:
   empty_candidate_confirmations: 3
   stagnation_failure_limit: 8
+  # Keep global (including non-visible / cross-room) containers eligible until
+  # this concrete approach has failed three terminal navigation attempts.
+  interaction_approach_failure_limit: 3
 
 executor:
   # The post-arrival pose gate is bounded by fresh simulator-step samples, not

@@ -20,6 +20,14 @@ class OrganizedDepthScanConfig:
     angle_increment_deg: float = 0.5
     range_min_m: float = 0.1
     range_max_m: float = 8.0
+    # A finite depth surface farther than the mapping horizon proves that the
+    # ray is free up to that horizon.  Keep its synthetic no-return value below
+    # the LaserScan maximum and above the default 7.9 m usable GMapping range.
+    no_return_margin_m: float = 0.05
+    # Match the PointCloud pseudo-scan contract: a no-return ray requires more
+    # than one far pixel in the same angular bin, so an isolated depth outlier
+    # never clears map space.
+    min_no_return_samples_per_beam: int = 3
     height_min_m: float = 0.05
     height_max_m: float = 1.85
     vertical_window: int = 5
@@ -54,6 +62,10 @@ class OrganizedDepthScanProjector:
             raise ValueError("angle_increment_deg must be positive")
         if self.config.range_min_m <= 0.0 or self.config.range_max_m <= self.config.range_min_m:
             raise ValueError("invalid range limits")
+        if not 0.0 < self.config.no_return_margin_m < self.config.range_max_m - self.config.range_min_m:
+            raise ValueError("invalid no_return_margin_m")
+        if self.config.min_no_return_samples_per_beam < 1:
+            raise ValueError("min_no_return_samples_per_beam must be positive")
         if self.config.vertical_window < 1 or self.config.horizontal_window < 1:
             raise ValueError("continuity windows must be positive")
 
@@ -100,8 +112,10 @@ class OrganizedDepthScanProjector:
 
         ``depth_m`` is metric optical-frame depth.  ``base_from_lidar`` must
         match the robot-centric frame used by the existing PointCloud2 bridge:
-        lidar x=forward, y=left, z=up.  Invalid or rejected returns are NaN;
-        they are never converted into max-range free-space observations.
+        lidar x=forward, y=left, z=up. Invalid or rejected returns are NaN.
+        A valid, continuous depth surface beyond ``range_max_m`` is distinct:
+        it emits a finite no-return beam that clears free cells up to the
+        mapping horizon without creating an occupied endpoint.
         """
 
         depth = np.asarray(depth_m, dtype=np.float32)
@@ -150,15 +164,18 @@ class OrganizedDepthScanProjector:
             base_y = points_base[:, 1]
             base_z = points_base[:, 2]
             planar_range = np.hypot(base_x, base_y)
-            planar_valid = (
+            planar_geometry_valid = (
                 np.isfinite(planar_range)
                 & (planar_range >= cfg.range_min_m)
-                & (planar_range <= cfg.range_max_m)
                 & (base_z >= cfg.height_min_m)
                 & (base_z <= cfg.height_max_m)
             )
+            planar_hit_valid = planar_geometry_valid & (planar_range < cfg.range_max_m)
+            planar_no_return = planar_geometry_valid & (planar_range >= cfg.range_max_m)
         else:
-            planar_valid = np.zeros(0, dtype=bool)
+            planar_geometry_valid = np.zeros(0, dtype=bool)
+            planar_hit_valid = np.zeros(0, dtype=bool)
+            planar_no_return = np.zeros(0, dtype=bool)
             planar_range = np.zeros(0, dtype=np.float64)
             base_x = np.zeros(0, dtype=np.float64)
             base_y = np.zeros(0, dtype=np.float64)
@@ -167,26 +184,61 @@ class OrganizedDepthScanProjector:
         angle_increment = 2.0 * np.pi / float(beam_count)
         angle_min = -np.pi + 0.5 * angle_increment
         # ``np.minimum.at`` needs a finite identity; convert untouched bins to
-        # NaN only after all pixel returns have been accumulated.
-        best_ranges = np.full(beam_count, np.inf, dtype=np.float32)
-        if np.any(planar_valid):
-            angles = np.arctan2(base_y[planar_valid], base_x[planar_valid])
+        # NaN only after all pixel returns have been accumulated.  Keep far
+        # evidence separately: a reliable near surface wins, but a near depth
+        # edge which later fails angular support must not hide a continuous far
+        # free-space observation in the same bearing.
+        best_hit_ranges = np.full(beam_count, np.inf, dtype=np.float32)
+        no_return_counts = np.zeros(beam_count, dtype=np.int32)
+        if np.any(planar_geometry_valid):
+            angles = np.arctan2(
+                base_y[planar_geometry_valid], base_x[planar_geometry_valid]
+            )
             beams = np.floor((angles + np.pi) / angle_increment).astype(np.int64)
             beams = np.clip(beams, 0, beam_count - 1)
-            np.minimum.at(best_ranges, beams, planar_range[planar_valid].astype(np.float32))
+            geometry_ranges = planar_range[planar_geometry_valid]
+            geometry_hits = planar_hit_valid[planar_geometry_valid]
+            geometry_no_returns = planar_no_return[planar_geometry_valid]
+            if np.any(geometry_hits):
+                np.minimum.at(
+                    best_hit_ranges,
+                    beams[geometry_hits],
+                    geometry_ranges[geometry_hits].astype(np.float32),
+                )
+            if np.any(geometry_no_returns):
+                np.add.at(
+                    no_return_counts,
+                    beams[geometry_no_returns],
+                    1,
+                )
 
-        candidates = np.isfinite(best_ranges) & (best_ranges <= cfg.range_max_m)
-        support_counts = np.zeros(beam_count, dtype=np.int16)
-        if cfg.min_support_neighbors <= 0 or cfg.support_bins <= 0:
-            accepted = candidates.copy()
-        else:
+        hit_candidates = np.isfinite(best_hit_ranges)
+        no_return_candidates = (
+            no_return_counts >= cfg.min_no_return_samples_per_beam
+        )
+        # The no-return value is below scan.range_max but above the default
+        # usable mapping range, so GMapping ray-traces it as free space.
+        no_return_range = np.float32(cfg.range_max_m - cfg.no_return_margin_m)
+        no_return_ranges = np.full(beam_count, np.nan, dtype=np.float32)
+        no_return_ranges[no_return_candidates] = no_return_range
+
+        def _angularly_supported(
+            candidate_ranges: np.ndarray, candidates: np.ndarray
+        ) -> np.ndarray:
+            """Accept same-kind neighboring evidence without mixing hit/free rays."""
+
+            if cfg.min_support_neighbors <= 0 or cfg.support_bins <= 0:
+                return candidates.copy()
+            support_counts = np.zeros(beam_count, dtype=np.int16)
             for offset in range(1, cfg.support_bins + 1):
                 for direction in (-1, 1):
-                    neighbor = np.roll(best_ranges, direction * offset)
-                    neighbor_valid = np.isfinite(neighbor)
-                    comparable = candidates & neighbor_valid
-                    safe_current = np.where(candidates, best_ranges, 0.0)
-                    safe_neighbor = np.where(neighbor_valid, neighbor, 0.0)
+                    neighbor_ranges = np.roll(candidate_ranges, direction * offset)
+                    neighbor_candidates = np.roll(candidates, direction * offset)
+                    comparable = candidates & neighbor_candidates
+                    safe_current = np.where(candidates, candidate_ranges, 0.0)
+                    safe_neighbor = np.where(
+                        neighbor_candidates, neighbor_ranges, 0.0
+                    )
                     tolerance = np.maximum(
                         cfg.support_tolerance_abs_m,
                         cfg.support_tolerance_rel
@@ -194,21 +246,47 @@ class OrganizedDepthScanProjector:
                     )
                     range_delta = np.zeros(beam_count, dtype=np.float32)
                     range_delta[comparable] = np.abs(
-                        best_ranges[comparable] - neighbor[comparable]
+                        candidate_ranges[comparable] - neighbor_ranges[comparable]
                     )
                     support_counts += (comparable & (range_delta <= tolerance)).astype(np.int16)
-            accepted = candidates & (support_counts >= cfg.min_support_neighbors)
+            return candidates & (support_counts >= cfg.min_support_neighbors)
 
-        ranges = np.where(accepted, best_ranges, np.nan).astype(np.float32, copy=False)
-        intensities = accepted.astype(np.float32)
+        accepted_hits = _angularly_supported(best_hit_ranges, hit_candidates)
+        accepted_no_returns = _angularly_supported(
+            no_return_ranges, no_return_candidates
+        )
+        # An accepted obstacle endpoint always wins.  If no such surface exists
+        # (or it was rejected as an angularly isolated depth edge), retain the
+        # independently supported far evidence as a free-space-only ray.
+        no_return_selected = accepted_no_returns & ~accepted_hits
+        accepted = accepted_hits | no_return_selected
+        ranges = np.full(beam_count, np.nan, dtype=np.float32)
+        ranges[accepted_hits] = best_hit_ranges[accepted_hits]
+        ranges[no_return_selected] = no_return_range
+        # 1.0 is an obstacle return, 2.0 a supported no-return free-space ray.
+        # Both are observations; downstream consumers can avoid treating the
+        # latter as an occupied endpoint.
+        intensities = np.where(
+            accepted,
+            np.where(no_return_selected, 2.0, 1.0),
+            0.0,
+        ).astype(np.float32, copy=False)
         diagnostics: dict[str, int | float] = {
             "input_valid_pixels": int(valid_depth.sum()),
             "vertical_supported_pixels": int((valid_depth & vertical_support).sum()),
             "organized_supported_pixels": int(supported_pixels.sum()),
-            "planar_candidate_pixels": int(planar_valid.sum()),
-            "candidate_beams": int(candidates.sum()),
+            "planar_candidate_pixels": int(planar_hit_valid.sum()),
+            "no_return_pixels": int(planar_no_return.sum()),
+            "candidate_beams": int((hit_candidates | no_return_candidates).sum()),
             "accepted_beams": int(accepted.sum()),
-            "rejected_angular_support": int((candidates & ~accepted).sum()),
+            "accepted_hit_beams": int(accepted_hits.sum()),
+            "accepted_no_return_beams": int((accepted & no_return_selected).sum()),
+            "fallback_no_return_beams": int(
+                (no_return_selected & hit_candidates).sum()
+            ),
+            "rejected_angular_support": int(
+                ((hit_candidates | no_return_candidates) & ~accepted).sum()
+            ),
             "beam_count": int(beam_count),
             "angle_increment_deg": float(np.rad2deg(angle_increment)),
         }

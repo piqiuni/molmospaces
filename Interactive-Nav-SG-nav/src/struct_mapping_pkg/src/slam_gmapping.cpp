@@ -605,6 +605,7 @@ void SlamGMapping::init()
   if(!private_nh_.getParam("filter_height_frame", filter_height_frame_))
     filter_height_frame_ = base_frame_;
   private_nh_.param("pointcloud_scan_range_max", pointcloud_scan_range_max_, 8.0);
+  private_nh_.param("pointcloud_scan_no_return_margin_m", pointcloud_scan_no_return_margin_m_, 0.05);
   private_nh_.param("pointcloud_scan_angle_increment_deg", pointcloud_scan_angle_increment_deg_, 0.5);
   private_nh_.param("pointcloud_scan_height_min", pointcloud_scan_height_min_, 0.05);
   private_nh_.param("pointcloud_scan_height_max", pointcloud_scan_height_max_, 1.10);
@@ -618,6 +619,9 @@ void SlamGMapping::init()
   private_nh_.param("pointcloud_scan_support_tolerance_abs_m", pointcloud_scan_support_tolerance_abs_m_, 0.10);
   private_nh_.param("pointcloud_scan_support_tolerance_rel", pointcloud_scan_support_tolerance_rel_, 0.03);
   pointcloud_scan_range_max_ = std::max(1.0, pointcloud_scan_range_max_);
+  pointcloud_scan_no_return_margin_m_ = std::max(
+      1e-3, std::min(pointcloud_scan_no_return_margin_m_,
+                      pointcloud_scan_range_max_ - 1e-3));
   pointcloud_scan_angle_increment_deg_ = std::max(0.1, pointcloud_scan_angle_increment_deg_);
   pointcloud_scan_height_max_ = std::max(pointcloud_scan_height_min_, pointcloud_scan_height_max_);
   pointcloud_scan_min_points_per_beam_ = std::max(1, pointcloud_scan_min_points_per_beam_);
@@ -1089,10 +1093,11 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
                              scan.intensities[src_idx] > 0.0f);
       const float r = scan.ranges[src_idx];
 
-      // For a forward RGB-D pseudo scan, a missing beam is outside the
-      // camera FoV (or lacks reliable depth), not a max-range free-space ray.
-      // GMapping explicitly ignores NaN readings, whereas a range above
-      // maxRange is ray-traced as free space by its map registration path.
+      // For a forward RGB-D pseudo scan, a missing beam is outside the camera
+      // FoV (or lacks reliable depth), not a max-range free-space ray.  The
+      // projector explicitly encodes a *supported far return* as a finite
+      // no-return value with intensity=2; only that value is allowed to clear
+      // free space.  An unobserved NaN remains ignored by GMapping.
       if (!observed || !std::isfinite(r) || r < scan.range_min)
         ranges_double[i] = std::numeric_limits<double>::quiet_NaN();
       else
@@ -1645,8 +1650,15 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
 
   std::vector<std::vector<float> > beam_ranges(
       static_cast<size_t>(num_beams));
+  // A far finite point is not a hit in the local map, but it is valid evidence
+  // that the camera ray stayed clear all the way to our mapping horizon. Keep
+  // that evidence separate from finite in-range obstacle samples; a completely
+  // empty bin still remains unknown because it may be outside the camera FoV.
+  std::vector<size_t> beam_no_return_samples(
+      static_cast<size_t>(num_beams), 0);
   size_t finite_points = 0;
   size_t planar_points = 0;
+  size_t no_return_points = 0;
 
   sensor_msgs::PointCloud2ConstIterator<float> iter_x(*cloud, "x");
   sensor_msgs::PointCloud2ConstIterator<float> iter_y(*cloud, "y");
@@ -1663,7 +1675,7 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
       continue;
 
     const double range = std::hypot(*iter_x, *iter_y);
-    if (range < scan.range_min || range > scan.range_max)
+    if (range < scan.range_min)
       continue;
 
     double angle = std::atan2(*iter_y, *iter_x);
@@ -1673,6 +1685,12 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     const int beam_index = std::max(
         0, std::min(num_beams - 1, static_cast<int>(std::floor(
             (angle + M_PI) / scan.angle_increment))));
+    if (range >= scan.range_max)
+    {
+      ++beam_no_return_samples[static_cast<size_t>(beam_index)];
+      ++no_return_points;
+      continue;
+    }
     beam_ranges[static_cast<size_t>(beam_index)].push_back(
         static_cast<float>(range));
     ++planar_points;
@@ -1681,20 +1699,43 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
   std::vector<float> candidate_ranges(
       static_cast<size_t>(num_beams), std::numeric_limits<float>::quiet_NaN());
   std::vector<uint8_t> candidate_observed(static_cast<size_t>(num_beams), 0);
+  std::vector<uint8_t> candidate_no_return(static_cast<size_t>(num_beams), 0);
   size_t rejected_sparse = 0;
   size_t rejected_near_cluster = 0;
+  size_t no_return_fallbacks = 0;
   size_t candidate_count = 0;
+  const float no_return_range = static_cast<float>(
+      scan.range_max - pointcloud_scan_no_return_margin_m_);
 
-  // Keep the nearest coherent range surface in each bearing. A sparse close
-  // pixel at a depth discontinuity must not authorize a farther background
-  // cluster, and a single close return must not become the beam range either.
+  // Keep the nearest coherent range surface in each bearing.  An unreliable
+  // close edge must not suppress separately supported far free-space evidence,
+  // but a coherent near cluster always wins over that farther background.
   for (int i = 0; i < num_beams; ++i)
   {
     std::vector<float>& samples = beam_ranges[static_cast<size_t>(i)];
+    const bool has_supported_far =
+        beam_no_return_samples[static_cast<size_t>(i)] >=
+        static_cast<size_t>(pointcloud_scan_min_points_per_beam_);
+    const auto select_no_return_fallback = [&]()
+    {
+      candidate_ranges[static_cast<size_t>(i)] = no_return_range;
+      candidate_observed[static_cast<size_t>(i)] = 1;
+      candidate_no_return[static_cast<size_t>(i)] = 1;
+      ++candidate_count;
+      ++no_return_fallbacks;
+    };
+
     if (samples.size() <
         static_cast<size_t>(pointcloud_scan_min_points_per_beam_))
     {
-      ++rejected_sparse;
+      // A supported set of far finite samples authorizes free-space carving.
+      // Sparse in-range points are usually mixed edge/background pixels, not a
+      // reliable obstacle surface.  They must not suppress continuous far
+      // evidence, but a coherent near cluster below still always wins.
+      if (has_supported_far)
+        select_no_return_fallback();
+      else
+        ++rejected_sparse;
       continue;
     }
     std::sort(samples.begin(), samples.end());
@@ -1715,7 +1756,15 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     if (nearest_cluster_end <
         static_cast<size_t>(pointcloud_scan_cluster_min_points_))
     {
-      ++rejected_near_cluster;
+      // Several in-range samples without a coherent nearest cluster are not a
+      // verified obstacle.  If this angular bin also has enough continuous
+      // depth beyond the scan horizon, retain the latter as a no-return ray.
+      // This avoids leaving an observed free corridor unknown merely because
+      // of a few depth-edge samples in the same 0.5-degree bin.
+      if (has_supported_far)
+        select_no_return_fallback();
+      else
+        ++rejected_near_cluster;
       continue;
     }
 
@@ -1771,14 +1820,21 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
   }
 
   size_t accepted_beams = 0;
+  size_t accepted_no_return_beams = 0;
   for (int i = 0; i < num_beams; ++i)
   {
     if (!observed[static_cast<size_t>(i)])
       continue;
     scan.ranges[static_cast<size_t>(i)] =
         candidate_ranges[static_cast<size_t>(i)];
-    scan.intensities[static_cast<size_t>(i)] = 1.0f;
+    // Intensities encode source semantics for local overwrite consumers:
+    // 1.0 = obstacle hit, 2.0 = supported no-return/free-space ray. GMapping
+    // treats both as observed finite beams.
+    scan.intensities[static_cast<size_t>(i)] =
+        candidate_no_return[static_cast<size_t>(i)] ? 2.0f : 1.0f;
     ++accepted_beams;
+    if (candidate_no_return[static_cast<size_t>(i)])
+      ++accepted_no_return_beams;
   }
 
   if (laser_count_ % 50 == 0)
@@ -1786,11 +1842,13 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     const double projection_ms =
         (ros::WallTime::now() - projection_started).toSec() * 1000.0;
     ROS_INFO(
-        "PointCloud scan projection source_seq=%u beams=%d finite=%zu planar=%zu "
-        "candidates=%zu accepted=%zu rejected[sparse=%zu near_cluster=%zu "
+        "PointCloud scan projection source_seq=%u beams=%d finite=%zu planar=%zu far=%zu "
+        "candidates=%zu accepted=%zu no_return=%zu fallback_no_return=%zu rejected[sparse=%zu near_cluster=%zu "
         "angular=%zu] elapsed=%.2fms",
-        cloud->header.seq, num_beams, finite_points, planar_points,
-        candidate_count, accepted_beams, rejected_sparse, rejected_near_cluster,
+        cloud->header.seq, num_beams, finite_points, planar_points, no_return_points,
+        candidate_count, accepted_beams, accepted_no_return_beams,
+        no_return_fallbacks,
+        rejected_sparse, rejected_near_cluster,
         rejected_angular_support, projection_ms);
   }
 
@@ -2285,7 +2343,11 @@ void SlamGMapping::updateOverwriteLayer(const nav_msgs::OccupancyGrid& map,
     if (!std::isfinite(measured_range) || measured_range < scan.range_min)
       continue;
 
-    const bool valid_hit = measured_range < scan.range_max;
+    // The point-cloud pseudo scan reserves intensity=2 for a valid depth
+    // no-return ray: it clears free cells but must never create an occupied
+    // endpoint. Keep legacy intensity=1 beams as obstacle returns.
+    const bool no_return = scan.intensities[i] >= 1.5f;
+    const bool valid_hit = !no_return && measured_range < scan.range_max;
     const double trace_range = std::min(measured_range, usable_radius);
     if (trace_range <= 0.0)
       continue;

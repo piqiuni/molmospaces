@@ -6,10 +6,14 @@ from semantic_decision_py_pkg.model_policy import (
     ROOM_OBJECT_REASONING_MAX_CONTAINERS,
     ROOM_OBJECT_REASONING_MAX_PORTALS,
     ROOM_OBJECT_REASONING_MAX_ROOMS,
+    SUBGOAL_CONFIDENCE_CODES,
+    SUBGOAL_REASON_CODES,
+    build_subgoal_selection_response_schema,
     build_room_object_reasoning_context,
     compact_graph,
     compact_semantic_graph,
 )
+from semantic_mllm_py_pkg.client import MLLMResponse
 
 
 def make_candidate(candidate_id: str, target_relevance: float, distance_m: float) -> BehaviorCandidate:
@@ -36,6 +40,48 @@ def test_mock_model_selects_target_relevant_candidate() -> None:
         graph={},
     )
     assert selected.candidate_id == "target"
+
+
+def test_subgoal_http_schema_is_strict_and_candidate_bounded(monkeypatch) -> None:
+    candidate_a = make_candidate("frontier:a", 0.0, 1.0)
+    candidate_b = make_candidate("interaction:fridge:open", 0.5, 2.0)
+    client = ModelPolicyClient(ModelPolicyConfig(mode="http"))
+    payload = client.build_request(
+        [candidate_a, candidate_b],
+        {"enabled": True, "target_name": "apple"},
+        {},
+    )
+    captured = {}
+
+    def fake_request_json(**kwargs):
+        captured.update(kwargs)
+        return MLLMResponse(
+            payload={
+                "ranked_ids": [candidate_a.candidate_id],
+                "reason": "INFORMATION_GAIN",
+                "confidence": "high",
+            },
+            latency_s=0.001,
+        )
+
+    monkeypatch.setattr(client._mllm_client, "request_json", fake_request_json)
+    response = client._request_http(payload)
+    schema = captured["response_schema"]
+    body_schema = schema["schema"]
+    assert response["ranked_ids"] == [candidate_a.candidate_id]
+    assert schema["name"] == "subgoal_selection"
+    assert schema["strict"] is True
+    assert body_schema["additionalProperties"] is False
+    assert body_schema["required"] == ["ranked_ids", "reason", "confidence"]
+    assert body_schema["properties"]["ranked_ids"]["items"]["enum"] == [
+        candidate_a.candidate_id,
+        candidate_b.candidate_id,
+    ]
+    assert body_schema["properties"]["reason"]["enum"] == list(SUBGOAL_REASON_CODES)
+    assert body_schema["properties"]["confidence"]["enum"] == list(SUBGOAL_CONFIDENCE_CODES)
+    # M2 ranks compact graph/candidate text only.  Visual evidence belongs to
+    # M3 after the approach has selected a concrete interaction target.
+    assert "images" not in captured
 
 
 def test_compact_graph_keeps_interaction_state() -> None:
@@ -400,6 +446,10 @@ def test_exploration_candidates_are_sent_as_concrete_subgoals() -> None:
             "room_id": "room_1",
         },
     ]
+    assert request["mission"] == {"mode": "interaction_coverage_exploration"}
+    assert "interaction-coverage exploration mission" in request["instruction"]
+    assert "text-only decision" in request["instruction"]
+    assert "INTERACTION_COVERAGE" in SUBGOAL_REASON_CODES
 
 
 def test_model_selection_returns_the_exact_frontier_id(monkeypatch) -> None:

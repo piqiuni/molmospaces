@@ -107,6 +107,86 @@ def _apply_robot_lock(task_env, snapshot: dict[str, Any] | None) -> None:
         return
 
 
+def _portal_aperture_feedback(
+    command: dict[str, Any],
+) -> tuple[str, str, dict[str, Any] | None]:
+    """Resolve a fixed portal state from public geometry evidence only.
+
+    A failed articulation lookup is ambiguous: both a fixed open doorway and
+    a non-articulated door leaf have no MuJoCo joint.  The bridge therefore
+    accepts an optional, *public* observation produced by mapping/perception.
+    It must explicitly report both the door-leaf status and aperture
+    connectivity before ``static_open`` can be emitted.  No simulator body,
+    asset, or joint name is read or copied into the result.
+
+    The compact wire contract is::
+
+        {"door_leaf": "absent|present|unknown",
+         "connectivity": "open|blocked|unknown",
+         "confidence": 0.0..1.0}
+
+    Boolean aliases are accepted for producers that already expose
+    ``no_door_leaf``/``aperture_connected`` or ``traversable``.  Missing or
+    contradictory evidence remains ``unavailable`` and is terminal.
+    """
+
+    node_type = str(command.get("node_type") or "").strip().casefold()
+    if node_type != "portal":
+        return "", "", None
+    raw = command.get("portal_aperture_observation")
+    if not isinstance(raw, dict):
+        return "unavailable", "unavailable", None
+
+    leaf = str(raw.get("door_leaf") or raw.get("leaf") or "unknown").strip().casefold()
+    if raw.get("no_door_leaf") is True or raw.get("door_leaf_present") is False:
+        leaf = "absent"
+    elif raw.get("door_leaf_present") is True:
+        leaf = "present"
+    if leaf in {"none", "missing", "no_leaf", "no_door", "open_aperture"}:
+        leaf = "absent"
+    elif leaf in {"leaf", "door", "present_leaf", "closed_leaf"}:
+        leaf = "present"
+    elif leaf not in {"absent", "present", "unknown"}:
+        leaf = "unknown"
+
+    connectivity = str(
+        raw.get("connectivity")
+        or raw.get("aperture_state")
+        or raw.get("passage_state")
+        or "unknown"
+    ).strip().casefold()
+    if raw.get("aperture_connected") is True or raw.get("traversable") is True:
+        connectivity = "open"
+    elif raw.get("aperture_connected") is False or raw.get("traversable") is False:
+        connectivity = "blocked"
+    if connectivity in {"connected", "traversable", "free", "open_aperture"}:
+        connectivity = "open"
+    elif connectivity in {"closed", "blocked", "occluded", "not_traversable", "unconnected"}:
+        connectivity = "blocked"
+    elif connectivity not in {"open", "blocked", "unknown"}:
+        connectivity = "unknown"
+
+    try:
+        confidence = max(0.0, min(1.0, float(raw.get("confidence", 1.0))))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    evidence = {
+        "door_leaf": leaf,
+        "connectivity": connectivity,
+        "confidence": confidence,
+    }
+    # ``static_open`` is deliberately a two-factor result.  A single visual
+    # class or a missing simulator joint is never enough to mark a passage
+    # traversable.
+    if confidence >= 0.5 and leaf == "absent" and connectivity == "open":
+        return "static_open", "static", evidence
+    if confidence >= 0.5 and leaf == "present" and connectivity == "blocked":
+        return "static_closed", "static", evidence
+    if confidence >= 0.5 and connectivity == "blocked":
+        return "blocked", "blocked", evidence
+    return "unavailable", "unavailable", evidence
+
+
 class AtomicForceInteractionController:
     def __init__(
         self,
@@ -401,16 +481,39 @@ class AtomicForceInteractionController:
         stamp_sec = time.time()
         node_type = str(command.get("node_type") or "").casefold()
         capability = str(interaction_capability).casefold()
-        static_capability = capability == "static"
-        static_portal = node_type == "portal" and static_capability
-        terminal_blocked = not static_capability
-        semantic_state = (
-            "static_open"
-            if static_portal
-            else "static"
-            if static_capability
-            else "blocked"
+        aperture_state, aperture_capability, aperture_evidence = _portal_aperture_feedback(
+            command
         )
+        # ``static`` was the legacy spelling returned by the runtime whenever
+        # articulation resolution failed.  It is not a passage observation.
+        # For portals, downgrade it to unavailable unless the public aperture
+        # observation proves a fixed opening (or a fixed/blocked closure).
+        if node_type == "portal" and capability in {
+            "static",
+            "unavailable",
+            "unsupported",
+        }:
+            resolved_capability = aperture_capability
+            semantic_state = aperture_state
+        else:
+            resolved_capability = capability or "unavailable"
+            semantic_state = (
+                "static"
+                if resolved_capability == "static"
+                else "blocked"
+                if resolved_capability in {"blocked", "unsupported", "locked"}
+                else "unavailable"
+            )
+        static_open_portal = (
+            node_type == "portal"
+            and semantic_state == "static_open"
+            and resolved_capability == "static"
+        )
+        reason_detail = ""
+        if not static_open_portal:
+            reason_detail = self._public_error_detail(command, ValueError(str(reason)))
+        if semantic_state == "static_closed":
+            reason_detail = "non_articulated_closed_portal"
         result = {
             "event_id": event_id,
             "command_id": str(command["command_id"]),
@@ -424,20 +527,16 @@ class AtomicForceInteractionController:
             "interaction_group_id": str(
                 command.get("interaction_group_id") or "all"
             ),
-            "interaction_capability": str(interaction_capability),
+            "interaction_capability": resolved_capability,
             "interactable": False,
             "state": semantic_state,
             "pre_state": "unknown",
             "post_state": semantic_state,
-            "success": static_portal,
-            "status": "SUCCEEDED" if static_portal else "FAILED",
-            "reason": (
-                ""
-                if static_portal
-                else self._public_error_detail(command, ValueError(str(reason)))
-            ),
+            "success": static_open_portal,
+            "status": "SUCCEEDED" if static_open_portal else "FAILED",
+            "reason": reason_detail,
             "retryable": False,
-            "confidence": 1.0,
+            "confidence": float((aperture_evidence or {}).get("confidence", 1.0)),
             "execution_cost": 0.0,
             "sim_steps_consumed": 0,
             "physics_substeps": 0,
@@ -445,15 +544,21 @@ class AtomicForceInteractionController:
             "result_published_step": int(step),
             "source": (
                 "executor_static_portal"
-                if static_portal
+                if static_open_portal
                 else "force_interaction_capability_check"
             ),
-            "verification_source": "mujoco_articulation_registry",
+            "verification_source": (
+                "observed_aperture_geometry"
+                if aperture_evidence is not None
+                else "mujoco_articulation_registry"
+            ),
             "view_profile": str(command.get("view_profile") or "default"),
             "view_profile_result": view_result,
             "step": int(step),
             "stamp_sec": stamp_sec,
         }
+        if aperture_evidence is not None:
+            result["portal_aperture_observation"] = aperture_evidence
         feedback = {
             "command_id": result["command_id"],
             "candidate_id": result["candidate_id"],
@@ -1135,7 +1240,21 @@ class AtomicForceInteractionController:
         missing_articulation = str(exc).startswith("Articulated object not found:")
         invalid_interaction_pose = str(exc).startswith("Interaction pose invalid:")
         drawer_scan_execution_failed = str(exc).startswith("drawer_scan_execution_failed:")
-        static_portal = missing_articulation and node_type == "portal"
+        portal_missing_articulation = missing_articulation and node_type == "portal"
+        aperture_state, aperture_capability, aperture_evidence = _portal_aperture_feedback(
+            command
+        )
+        if portal_missing_articulation:
+            semantic_state = aperture_state
+            resolved_capability = aperture_capability
+        else:
+            semantic_state = "unknown"
+            resolved_capability = "unknown"
+        static_open_portal = (
+            portal_missing_articulation
+            and semantic_state == "static_open"
+            and resolved_capability == "static"
+        )
         try:
             view_restore_result = self._head_view_controller.restore(task.env)
         except (AttributeError, KeyError, ValueError):
@@ -1143,9 +1262,28 @@ class AtomicForceInteractionController:
                 "applied": False,
                 "reason": "environment_view_restore_unavailable",
             }
-        if static_portal:
-            verification_source = "simulator_no_articulation"
+        if static_open_portal:
+            verification_source = (
+                "observed_aperture_geometry"
+                if aperture_evidence is not None
+                else "simulator_no_articulation"
+            )
             failure_reason = ""
+        elif portal_missing_articulation:
+            verification_source = (
+                "observed_aperture_geometry"
+                if aperture_evidence is not None
+                else "simulator_no_articulation"
+            )
+            failure_reason = (
+                "non_articulated_closed_portal"
+                if semantic_state == "static_closed"
+                else "non_articulated"
+                if semantic_state == "unavailable"
+                else "non_articulated_blocked_portal"
+                if semantic_state == "blocked"
+                else "non_articulated"
+            )
         elif drawer_scan_execution_failed:
             verification_source = "executor_drawer_sequence_failure"
             failure_reason = "drawer_scan_execution_failed"
@@ -1171,13 +1309,16 @@ class AtomicForceInteractionController:
             "view_profile": str(command.get("view_profile") or "default"),
             "view_profile_result": view_result,
             "view_restore_result": view_restore_result,
-            "state": "static_open" if static_portal else "unknown",
+            "interaction_capability": resolved_capability,
+            "interactable": False if portal_missing_articulation else None,
+            "retryable": False if portal_missing_articulation else None,
+            "state": semantic_state,
             "pre_state": "unknown",
-            "post_state": "static_open" if static_portal else "unknown",
-            "success": static_portal,
-            "status": "SUCCEEDED" if static_portal else "FAILED",
-            "confidence": 1.0,
-            "execution_cost": 0.0 if static_portal else 1.0,
+            "post_state": semantic_state,
+            "success": static_open_portal,
+            "status": "SUCCEEDED" if static_open_portal else "FAILED",
+            "confidence": float((aperture_evidence or {}).get("confidence", 1.0)),
+            "execution_cost": 0.0 if static_open_portal else 1.0,
             "sim_steps_consumed": 0,
             "physics_substeps": 0,
             "task_steps_consumed": 0,
@@ -1186,7 +1327,7 @@ class AtomicForceInteractionController:
             "interaction_transition_steps": 0,
             "source": (
                 "executor_static_portal"
-                if static_portal
+                if static_open_portal
                 else "force_interaction_rejected"
             ),
             "verification_source": verification_source,
@@ -1195,10 +1336,16 @@ class AtomicForceInteractionController:
                 command.get("interaction_pose_validation") or {}
             ),
             "error_type": type(exc).__name__,
-            "error": self._public_error_detail(command, exc),
+            "error": (
+                failure_reason
+                if portal_missing_articulation
+                else self._public_error_detail(command, exc)
+            ),
             "step": int(step),
             "stamp_sec": stamp_sec,
         }
+        if aperture_evidence is not None:
+            result["portal_aperture_observation"] = aperture_evidence
         feedback = {
             "command_id": result["command_id"],
             "candidate_id": result["candidate_id"],

@@ -14,16 +14,87 @@ class MissionCompletionConfig:
 
 
 @dataclass
+class InteractionApproachFailureLimitConfig:
+    """Bound repeated navigation failures for one concrete interaction approach."""
+
+    failure_limit: int = 3
+
+
+class InteractionApproachFailureLimitTracker:
+    """Mark an interaction candidate terminal after a bounded number of failures.
+
+    The key is the concrete candidate ID rather than a room/visibility filter:
+    remote containers remain valid global-planning candidates until the executor
+    has actually failed them repeatedly.  Once terminal, a candidate stays
+    excluded until the next episode; late or duplicate feedback must not make
+    the same unreachable subgoal selectable again.
+    """
+
+    REASON = "interaction_approach_terminal_unreachable"
+
+    def __init__(
+        self, config: InteractionApproachFailureLimitConfig | None = None
+    ) -> None:
+        self.config = config or InteractionApproachFailureLimitConfig()
+        self.reset()
+
+    def reset(self) -> None:
+        self.failure_counts: dict[str, int] = {}
+        self.terminal_candidate_ids: set[str] = set()
+
+    @property
+    def failure_limit(self) -> int:
+        return max(0, int(self.config.failure_limit))
+
+    def note_feedback(
+        self,
+        *,
+        candidate_id: str,
+        behavior_type: str,
+        status: str,
+        failure_stage: str = "",
+    ) -> dict[str, Any] | None:
+        """Record one terminal feedback and return detail when the limit is met."""
+
+        candidate_id = str(candidate_id or "")
+        if not candidate_id or str(behavior_type or "").upper() != "INTERACT":
+            return None
+        normalized_status = str(status or "").upper()
+        if candidate_id in self.terminal_candidate_ids:
+            return None
+        if normalized_status == "SUCCEEDED":
+            self.failure_counts.pop(candidate_id, None)
+            return None
+        if (
+            normalized_status not in {"FAILED", "REJECTED"}
+            or str(failure_stage or "") != "interaction_approach_navigation"
+            or self.failure_limit <= 0
+        ):
+            return None
+        count = self.failure_counts.get(candidate_id, 0) + 1
+        self.failure_counts[candidate_id] = count
+        if count < self.failure_limit:
+            return None
+        self.terminal_candidate_ids.add(candidate_id)
+        return {
+            "reason": self.REASON,
+            "interaction_failure_count": count,
+            "interaction_failure_limit": self.failure_limit,
+            "terminal_candidate_exclusion": True,
+        }
+
+
+@dataclass
 class TerminalInteractionNoPlanExitConfig:
-    """Bounded exit after an interaction exhausts all of its plan options.
+    """Bounded exit after repeated interaction approaches become terminal.
 
     This is deliberately narrower than generic action-timeout handling.  A
-    missing ``cmd_vel`` can be a transient ROS/costmap scheduling issue, while
-    ``make_plan_unreachable`` is emitted only after the interaction executor
-    has tried every concrete approach goal.  We still require several later
-    *observation steps* with no executable replacement before ending the
-    episode, so ordinary cooldown/recovery and the mandatory startup scan are
-    not converted into terminal outcomes.
+    missing ``cmd_vel`` and a single failed preflight can be transient
+    ROS/costmap scheduling issues.  The decision layer first requires a
+    concrete interaction candidate to reach its bounded approach-failure
+    limit, then requires several later *observation steps* with no executable
+    replacement before ending the episode.  Ordinary cooldown/recovery and the
+    mandatory startup scan are therefore not converted into terminal outcomes.
     """
 
     enabled: bool = False
@@ -40,6 +111,9 @@ class TerminalInteractionNoPlanExitTracker:
     """
 
     REASON = "no_executable_candidates_after_terminal_interaction_no_plan"
+    TERMINAL_INTERACTION_REASONS = {
+        InteractionApproachFailureLimitTracker.REASON,
+    }
 
     def __init__(
         self, config: TerminalInteractionNoPlanExitConfig | None = None
@@ -68,7 +142,7 @@ class TerminalInteractionNoPlanExitTracker:
         return (
             status in {"FAILED", "REJECTED"}
             and behavior_type == "INTERACT"
-            and reason == "make_plan_unreachable"
+            and reason in TerminalInteractionNoPlanExitTracker.TERMINAL_INTERACTION_REASONS
         )
 
     def note_feedback(

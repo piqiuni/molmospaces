@@ -3320,7 +3320,13 @@ class ExploreDebugRecorder:
                             getattr(self.args, "semantic_video_max_object_nodes", 96)
                         ),
                     },
-                    "pose": snapshot.get("pose"), "trajectory": snapshot.get("trajectory"),
+                    "pose": snapshot.get("pose"),
+                    # A complete odom trail is recorded once in the compact
+                    # episode CSV.  Do not duplicate a bounded rolling trail
+                    # into every raw boundary: the offline renderer resolves
+                    # this reference and selects the causal prefix by step.
+                    "trajectory_reference": "../trajectory.csv",
+                    "trajectory_prefix_step_index": int(source_seq),
                     "active_goal": snapshot.get("active_goal"), "active_goal_yaw": snapshot.get("active_goal_yaw"),
                     "global_plan": snapshot.get("global_plan"), "local_global_plan": snapshot.get("local_global_plan"),
                     "local_plan": snapshot.get("local_plan"), "distance_m": snapshot.get("distance_m"),

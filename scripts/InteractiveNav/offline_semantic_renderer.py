@@ -79,7 +79,7 @@ class RawGrid:
         # is the top row, therefore every raw PNG needs this exact flip.
         return np.flipud(self.values)
 
-    def world_to_cell(self, x: float, y: float) -> tuple[int, int] | None:
+    def world_to_cell_unbounded(self, x: float, y: float) -> tuple[int, int] | None:
         if self.resolution <= 0.0:
             return None
         dx = float(x) - self.origin_x
@@ -90,6 +90,13 @@ class RawGrid:
         local_y = sin_yaw * dx + cos_yaw * dy
         mx = int(math.floor(local_x / self.resolution))
         my = int(math.floor(local_y / self.resolution))
+        return mx, my
+
+    def world_to_cell(self, x: float, y: float) -> tuple[int, int] | None:
+        cell = self.world_to_cell_unbounded(x, y)
+        if cell is None:
+            return None
+        mx, my = cell
         if 0 <= mx < self.width and 0 <= my < self.height:
             return mx, my
         return None
@@ -389,6 +396,50 @@ def _draw_polyline(panel: np.ndarray, points: list[tuple[int, int]], color: tupl
         cv2.polylines(panel, [np.asarray(points, dtype=np.int32)], False, color, thickness, cv2.LINE_AA)
 
 
+def _draw_faded_trajectory(
+    panel: np.ndarray,
+    points: list[tuple[int, int]],
+    color: tuple[int, int, int],
+    thickness: int,
+    *,
+    oldest_alpha: float = 0.14,
+    newest_alpha: float = 0.95,
+    buckets: int = 8,
+) -> None:
+    """Draw a chronological trail without hiding its older portions.
+
+    Raw trajectories can contain one sample for nearly every simulator step.
+    Rendering every segment with a separate alpha blend is unnecessarily slow,
+    so consecutive segments are grouped into a small number of age buckets.
+    The visual result remains a monotonic old-to-new fade while staying cheap
+    enough for long offline replays.
+    """
+
+    if len(points) < 2:
+        return
+    compact = [points[0]]
+    compact.extend(point for point in points[1:] if point != compact[-1])
+    if len(compact) < 2:
+        return
+    segment_count = len(compact) - 1
+    bucket_count = max(1, min(int(buckets), segment_count))
+    for bucket_index in range(bucket_count):
+        first_segment = int(math.floor(bucket_index * segment_count / bucket_count))
+        last_segment = int(math.floor((bucket_index + 1) * segment_count / bucket_count))
+        if last_segment <= first_segment:
+            continue
+        fraction = (bucket_index + 1) / bucket_count
+        alpha = oldest_alpha + (newest_alpha - oldest_alpha) * fraction
+        overlay = panel.copy()
+        _draw_polyline(
+            overlay,
+            compact[first_segment : last_segment + 1],
+            color,
+            thickness,
+        )
+        cv2.addWeighted(overlay, float(alpha), panel, float(1.0 - alpha), 0.0, panel)
+
+
 def zoom_panel(panel: np.ndarray, scale_factor: float) -> np.ndarray:
     """Match the established global-costmap diagnostic zoom."""
     scale_factor = max(1.0, float(scale_factor))
@@ -472,6 +523,73 @@ def _selection_target_id(selection: dict | None) -> str:
     if selection.get("active") is False:
         return ""
     return str(selection.get("target_id") or selection.get("object_id") or selection.get("candidate_id") or "")
+
+
+def _selection_revision(record: dict | None) -> str:
+    """Read any supported immutable candidate-geometry revision field."""
+
+    record = record or {}
+    for key in (
+        "selected_candidate_revision",
+        "candidate_revision",
+        "geometry_revision",
+        "goal_revision",
+        "revision",
+    ):
+        value = record.get(key)
+        if value not in {None, ""}:
+            return str(value)
+    return ""
+
+
+def candidate_matches_canonical_selection(
+    selection: dict | None,
+    candidate: dict | None,
+    *,
+    position_tolerance_m: float = 0.03,
+    yaw_tolerance_rad: float = math.radians(5.0),
+) -> bool:
+    """Return whether a candidate snapshot represents the live selection.
+
+    Candidate lists are asynchronous diagnostics.  An unchanged string ID is
+    not enough: a frontier can be re-centred after mapping updates.  The live
+    selection is the replay authority, and an older candidate may only receive
+    selected styling when its immutable revision (when available) and geometry
+    agree with that selection.
+    """
+
+    selection = selection or {}
+    candidate = candidate or {}
+    selected_id = str(selection.get("candidate_id") or "")
+    if not selected_id or selected_id != str(candidate.get("candidate_id") or ""):
+        return False
+    selected_revision = _selection_revision(selection)
+    candidate_revision = _selection_revision(candidate)
+    if selected_revision and candidate_revision and selected_revision != candidate_revision:
+        return False
+    selected_goal = list(selection.get("goal_xyyaw") or [])
+    candidate_goal = list(candidate.get("goal_xyyaw") or [])
+    if len(selected_goal) < 2 or len(candidate_goal) < 2:
+        return False
+    try:
+        position_error = math.hypot(
+            float(selected_goal[0]) - float(candidate_goal[0]),
+            float(selected_goal[1]) - float(candidate_goal[1]),
+        )
+    except (TypeError, ValueError):
+        return False
+    if position_error > float(position_tolerance_m):
+        return False
+    if len(selected_goal) < 3 or len(candidate_goal) < 3:
+        return True
+    try:
+        yaw_error = math.atan2(
+            math.sin(float(selected_goal[2]) - float(candidate_goal[2])),
+            math.cos(float(selected_goal[2]) - float(candidate_goal[2])),
+        )
+    except (TypeError, ValueError):
+        return False
+    return abs(yaw_error) <= float(yaw_tolerance_rad)
 
 
 def active_semantic_selection(step: dict) -> dict:
@@ -655,6 +773,7 @@ class OfflineSixPanelRenderer:
         draw_frontiers: bool = True,
         draw_semantic_candidates: bool = False,
         draw_route_plan: bool = False,
+        episode_trajectory: list[tuple[float, float, float, float]] | None = None,
     ) -> np.ndarray:
         width, height = panel_size
         if grid is None:
@@ -673,9 +792,14 @@ class OfflineSixPanelRenderer:
         )
         goal_yaw = float(goal_values[2]) if len(goal_values) > 2 else float(step.get("active_goal_yaw") or 0.0)
         goal = self._transform(active_goal, self.transforms.map_frame, grid.frame_id, step_index)
+        trajectory_source = (
+            episode_trajectory
+            if episode_trajectory is not None
+            else step.get("trajectory") or []
+        )
         trajectory = [
             converted
-            for raw in step.get("trajectory") or []
+            for raw in trajectory_source
             if len(raw) >= 4
             for converted in [self._transform((raw[1], raw[2], raw[3]), self.transforms.odom_frame, grid.frame_id, step_index)]
             if converted is not None
@@ -698,14 +822,48 @@ class OfflineSixPanelRenderer:
                 self._transform((value[0], value[3], 0.0), self.transforms.map_frame, grid.frame_id, step_index),
                 self._transform((value[2], value[3], 0.0), self.transforms.map_frame, grid.frame_id, step_index),
             ]
-            pixels = [self._world_to_image_px(grid, point) for point in corners]
-            pixels = [pixel for pixel in pixels if pixel is not None]
+            pixels = []
+            for point in corners:
+                if point is None:
+                    continue
+                cell = grid.world_to_cell_unbounded(point[0], point[1])
+                if cell is not None:
+                    pixels.append((cell[0], grid.height - 1 - cell[1]))
             if not pixels:
                 return None
             xs, ys = zip(*pixels)
-            return max(0, min(xs)), max(0, min(ys)), min(grid.width - 1, max(xs)), min(grid.height - 1, max(ys))
+            return (
+                max(0, min(grid.width - 1, min(xs))),
+                max(0, min(grid.height - 1, min(ys))),
+                max(0, min(grid.width - 1, max(xs))),
+                max(0, min(grid.height - 1, max(ys))),
+            )
 
+        trajectory_pixels = [
+            pixel
+            for point in trajectory
+            for pixel in [self._world_to_image_px(grid, point)]
+            if pixel is not None
+        ]
         crop = bounds_from_world(world_bounds) if world_bounds is not None else None
+        # The established OCC/global bounds track known map extents, while the
+        # episode trajectory can begin outside a newly cropped local extent.
+        # Include every still-representable historic point so offline replay
+        # never silently drops early path history.
+        if crop is not None and trajectory_pixels:
+            margin = max(8, int(math.ceil(4.5 / max(grid.resolution, 1e-6))))
+            xs, ys = zip(*trajectory_pixels)
+            crop = (
+                max(0, min(crop[0], min(xs) - margin)),
+                max(0, min(crop[1], min(ys) - margin)),
+                min(grid.width - 1, max(crop[2], max(xs) + margin)),
+                min(grid.height - 1, max(crop[3], max(ys) + margin)),
+            )
+        if crop is not None and (crop[2] <= crop[0] or crop[3] <= crop[1]):
+            # A transformed global-map viewport can lie wholly outside a
+            # smaller grid. Use the live overlays below rather than producing
+            # a blank panel because the requested bounds have no local area.
+            crop = None
         if crop is None:
             pixels = [self._world_to_image_px(grid, value) for value in [pose, goal, *trajectory, *global_plan, *local_global_plan, *local_plan]]
             pixels = [pixel for pixel in pixels if pixel is not None]
@@ -752,7 +910,12 @@ class OfflineSixPanelRenderer:
                         point = (cx, grid.height - 1 - cy)
                         if min_x <= point[0] <= max_x and min_y <= point[1] <= max_y:
                             cv2.circle(panel, (int(round(offset_x + (point[0] - min_x) * scale)), int(round(offset_y + (point[1] - min_y) * scale))), max(1, int(round(2.0 * max(scale, 1.0)))), (112, 36, 170), -1, cv2.LINE_AA)
-        _draw_polyline(panel, [point for item in trajectory if (point := to_panel(item)) is not None], (20, 118, 230), 3)
+        _draw_faded_trajectory(
+            panel,
+            [point for item in trajectory if (point := to_panel(item)) is not None],
+            (20, 118, 230),
+            3,
+        )
         if pose is not None and (robot_px := to_panel(pose)) is not None:
             _draw_robot_arrow(panel, robot_px, pose[2], max(9, int(9 * scale)))
         if draw_global_plan:
@@ -761,37 +924,38 @@ class OfflineSixPanelRenderer:
             _draw_polyline(panel, [point for item in local_global_plan if (point := to_panel(item)) is not None], (40, 190, 60), 3)
         if draw_local_plan:
             _draw_polyline(panel, [point for item in local_plan if (point := to_panel(item)) is not None], (240, 150, 20), 3)
-        # Candidate yaw is a command: in panel 2 only the decision-selected
-        # candidate gets an orientation arrow; all others remain dots.
+        # Candidate lists are diagnostic dots. The live semantic selection gets
+        # the only goal arrow, so every map panel has one canonical command.
         selected_id = str(selection.get("candidate_id") or "")
-        selected_candidate_seen = False
+        selected_candidate_stale = False
         if draw_semantic_candidates:
             for candidate in (step.get("semantic_candidates") or {}).get("candidates") or []:
                 values = list(candidate.get("goal_xyyaw") or [])
                 candidate_point = self._transform(values, self.transforms.map_frame, grid.frame_id, step_index)
                 candidate_px = to_panel(candidate_point)
-                if candidate_point is None or candidate_px is None:
-                    continue
                 color = candidate_color(str(candidate.get("behavior_type") or "EXPLORE"))
                 if str(candidate.get("candidate_id") or "") == selected_id:
-                    selected_candidate_seen = True
-                    _draw_goal_arrow(panel, candidate_px, candidate_point[2], max(9, int(9 * scale)), color)
-                else:
+                    if candidate_matches_canonical_selection(selection, candidate):
+                        if candidate_px is not None:
+                            cv2.circle(panel, candidate_px, max(5, int(round(3.0 * max(scale, 1.0)))), color, 2, cv2.LINE_AA)
+                    else:
+                        selected_candidate_stale = True
+                if candidate_point is not None and candidate_px is not None and str(candidate.get("candidate_id") or "") != selected_id:
                     cv2.circle(panel, candidate_px, max(2, int(round(max(scale, 1.0) * 0.8))), color, -1, cv2.LINE_AA)
 
-        # A post-interaction snapshot can omit the selected candidate.  Use the
-        # selected semantic goal once in that case; other map panels retain the
-        # established active-goal marker.
+        # The live semantic selection (including an executor fallback) is the
+        # only authority for the goal arrow. Candidate lists are merely a
+        # diagnostic snapshot and must never substitute same-ID stale geometry.
         if (
             goal is not None
-            and (
-                not draw_semantic_candidates
-                or (selected_id and not selected_candidate_seen)
-            )
             and (goal_px := to_panel(goal)) is not None
         ):
             behavior = str(selection.get("behavior_type") or "NAVIGATE").upper()
-            _draw_goal_arrow(panel, goal_px, goal_yaw if math.isfinite(goal_yaw) else goal[2], max(9, int(9 * scale)), candidate_color(behavior))
+            transformed_goal_yaw = goal[2] if math.isfinite(goal[2]) else goal_yaw
+            _draw_goal_arrow(panel, goal_px, transformed_goal_yaw, max(9, int(9 * scale)), candidate_color(behavior))
+        if selected_candidate_stale:
+            cv2.rectangle(panel, (6, 56), (160, 75), (255, 255, 255), -1)
+            cv2.putText(panel, "CANDIDATES STALE", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (55, 55, 170), 1, cv2.LINE_AA)
         _draw_panel_title(panel, title, step_index)
         if "COSTMAP" in title.upper():
             legend = (("LETHAL", (128, 20, 28)), ("INSCRIBED", (245, 92, 28)), ("INFLATION", (255, 190, 60)))

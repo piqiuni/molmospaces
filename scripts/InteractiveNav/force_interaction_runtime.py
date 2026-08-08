@@ -450,7 +450,13 @@ def open_articulation_with_force(
         return {
             "supported": False,
             "reason": "non_articulated",
-            "interaction_capability": "static",
+            # Missing a simulator articulation only proves that this command
+            # cannot be executed by the force backend.  It does *not* prove
+            # that the portal is an already-open passage: a fixed door leaf
+            # and a fixed opening have the same articulation lookup result.
+            # Keep the capability explicitly unavailable until a public
+            # aperture/occupancy observation establishes the passage state.
+            "interaction_capability": "unavailable",
             "object_name": str(object_name),
             "available_object_names": sorted(groups),
         }
@@ -519,7 +525,7 @@ def prepare_articulation_force(
         return {
             "supported": False,
             "reason": "non_articulated",
-            "interaction_capability": "static",
+            "interaction_capability": "unavailable",
             "object_name": str(object_name),
             "available_object_names": sorted(groups),
         }

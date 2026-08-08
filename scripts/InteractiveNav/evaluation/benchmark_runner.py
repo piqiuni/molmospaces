@@ -146,6 +146,15 @@ class BenchmarkEvaluationConfig:
     ros_cmd_vel_linear_gain: float = 3.0
     ros_require_move_base_active: bool = True
     ros_map_warmup_skip_frames: int = 0
+    # Optional evaluator-owned RGB persistence for exact offline six-panel
+    # reconstruction.  This remains outside the public policy contract: the
+    # bridge writes only the already-published head-camera frame plus a step
+    # manifest, while the recorder retains raw map/graph JSON.
+    ros_step_frame_dir: str = ""
+    ros_step_frame_queue_size: int = 4
+    ros_step_capture_ack_topic: str = "/molmo_spaces/step_capture_ack"
+    ros_step_capture_ack_barrier_enabled: bool = False
+    ros_step_capture_ack_timeout_s: float = 2.0
     ros_target_topic: str = "/semantic_decision/target"
     ros_restricted_gt_topic: str = "/semantic_mapping/gt_observations"
     ros_interaction_command_topic: str = "/semantic_decision/interaction_command"
@@ -157,6 +166,7 @@ class BenchmarkEvaluationConfig:
     ros_stall_min_no_progress_steps: int = 20
     restricted_gt_min_visible_pixels: int = 16
     restricted_gt_min_bbox_area_pixels: int = 512
+    restricted_gt_min_visible_fraction: float = 0.2
     restricted_gt_max_distance_m: float = 4.0
     quality_gate_only: bool = False
     runtime_joint_position_tolerance: float = 0.02
@@ -236,6 +246,15 @@ class BenchmarkEvaluationConfig:
             raise ValueError("restricted_gt_min_visible_pixels must be >= 1")
         if self.restricted_gt_min_bbox_area_pixels < 1:
             raise ValueError("restricted_gt_min_bbox_area_pixels must be >= 1")
+        if (
+            not math.isfinite(float(self.restricted_gt_min_visible_fraction))
+            or not 0.0 <= float(self.restricted_gt_min_visible_fraction) <= 1.0
+        ):
+            raise ValueError("restricted_gt_min_visible_fraction must be in [0, 1]")
+        if self.ros_step_frame_queue_size < 1:
+            raise ValueError("ros_step_frame_queue_size must be >= 1")
+        if self.ros_step_capture_ack_timeout_s < 0.0:
+            raise ValueError("ros_step_capture_ack_timeout_s must be non-negative")
         if (
             not math.isfinite(float(self.restricted_gt_max_distance_m))
             or self.restricted_gt_max_distance_m < 0.0
@@ -603,6 +622,7 @@ def _build_restricted_ros_object_goal_runtime(
         camera_name="head_camera",
         min_visible_pixels=int(config.restricted_gt_min_visible_pixels),
         min_bbox_area_pixels=int(config.restricted_gt_min_bbox_area_pixels),
+        min_visible_fraction=float(getattr(config, "restricted_gt_min_visible_fraction", 0.2)),
         max_distance_m=float(config.restricted_gt_max_distance_m),
         step_interval=1,
         frame_id="world",
@@ -1198,6 +1218,11 @@ def _build_policy(config: BenchmarkEvaluationConfig, public: PublicEpisode) -> B
             cmd_vel_linear_gain=config.ros_cmd_vel_linear_gain,
             require_move_base_active=config.ros_require_move_base_active,
             map_warmup_skip_frames=config.ros_map_warmup_skip_frames,
+            step_frame_dir=config.ros_step_frame_dir,
+            step_frame_queue_size=config.ros_step_frame_queue_size,
+            step_capture_ack_topic=config.ros_step_capture_ack_topic,
+            step_capture_ack_barrier_enabled=config.ros_step_capture_ack_barrier_enabled,
+            step_capture_ack_timeout_s=config.ros_step_capture_ack_timeout_s,
             name=config.policy,
         )
     raise ValueError(f"Unsupported policy: {config.policy}")
@@ -2937,6 +2962,7 @@ def evaluate_episode(
                 "camera_name": "head_camera",
                 "minimum_visible_pixels": int(config.restricted_gt_min_visible_pixels),
                 "minimum_bbox_area_pixels": int(config.restricted_gt_min_bbox_area_pixels),
+                "minimum_visible_fraction": float(config.restricted_gt_min_visible_fraction),
                 "maximum_distance_m": float(config.restricted_gt_max_distance_m),
                 "interaction_endpoint": "opaque_object_open",
             }
@@ -3793,6 +3819,23 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--ros-cmd-vel-linear-gain", type=float, default=3.0)
     parser.add_argument("--ros-require-move-base-active", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ros-map-warmup-skip-frames", type=int, default=0)
+    parser.add_argument(
+        "--ros-step-frame-dir",
+        default="",
+        help="Optional evaluator-owned directory for exact per-step RGB PNGs and manifest.jsonl.",
+    )
+    parser.add_argument("--ros-step-frame-queue-size", type=int, default=4)
+    parser.add_argument(
+        "--ros-step-capture-ack-topic",
+        default="/molmo_spaces/step_capture_ack",
+    )
+    parser.add_argument(
+        "--ros-step-capture-ack-barrier-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Wait until the recorder queues each raw step boundary before advancing the V3 bridge.",
+    )
+    parser.add_argument("--ros-step-capture-ack-timeout-s", type=float, default=2.0)
     parser.add_argument("--ros-target-topic", default="/semantic_decision/target")
     parser.add_argument("--ros-restricted-gt-topic", default="/semantic_mapping/gt_observations")
     parser.add_argument("--ros-interaction-command-topic", default="/semantic_decision/interaction_command")
@@ -3812,6 +3855,12 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--ros-stall-min-no-progress-steps", type=int, default=20)
     parser.add_argument("--restricted-gt-min-visible-pixels", type=int, default=16)
     parser.add_argument("--restricted-gt-min-bbox-area-pixels", type=int, default=512)
+    parser.add_argument(
+        "--restricted-gt-min-visible-fraction",
+        type=float,
+        default=0.2,
+        help="Minimum observed 2-D extent divided by the projected 3-D AABB extent; zero disables this sanity filter.",
+    )
     parser.add_argument(
         "--restricted-gt-max-distance-m",
         type=float,
@@ -3888,6 +3937,11 @@ def parse_args() -> BenchmarkEvaluationConfig:
         ros_cmd_vel_linear_gain=args.ros_cmd_vel_linear_gain,
         ros_require_move_base_active=args.ros_require_move_base_active,
         ros_map_warmup_skip_frames=args.ros_map_warmup_skip_frames,
+        ros_step_frame_dir=args.ros_step_frame_dir,
+        ros_step_frame_queue_size=args.ros_step_frame_queue_size,
+        ros_step_capture_ack_topic=args.ros_step_capture_ack_topic,
+        ros_step_capture_ack_barrier_enabled=args.ros_step_capture_ack_barrier_enabled,
+        ros_step_capture_ack_timeout_s=args.ros_step_capture_ack_timeout_s,
         ros_target_topic=args.ros_target_topic,
         ros_restricted_gt_topic=args.ros_restricted_gt_topic,
         ros_interaction_command_topic=args.ros_interaction_command_topic,
@@ -3899,6 +3953,7 @@ def parse_args() -> BenchmarkEvaluationConfig:
         ros_stall_min_no_progress_steps=args.ros_stall_min_no_progress_steps,
         restricted_gt_min_visible_pixels=args.restricted_gt_min_visible_pixels,
         restricted_gt_min_bbox_area_pixels=args.restricted_gt_min_bbox_area_pixels,
+        restricted_gt_min_visible_fraction=args.restricted_gt_min_visible_fraction,
         restricted_gt_max_distance_m=args.restricted_gt_max_distance_m,
         quality_gate_only=args.quality_gate_only,
         runtime_joint_position_tolerance=args.runtime_joint_position_tolerance,

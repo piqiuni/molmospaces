@@ -132,7 +132,14 @@ fi
 DRAWER_OBSERVATION_STEPS=${DRAWER_OBSERVATION_STEPS:-1}
 ENABLE_ATTRIBUTE_INFERENCE=${ENABLE_ATTRIBUTE_INFERENCE:-false}
 SEMANTIC_ATTRIBUTE_MODEL_NAME=${SEMANTIC_ATTRIBUTE_MODEL_NAME:-}
-SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-8.0}
+# Portal observations now include bounded visual morphology and aperture
+# evidence.  160 tokens can truncate a valid pretty-printed response, so keep
+# a per-run override while making the full-MLLM default safely large enough.
+SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-256}
+# Keep this unset until the method is selected: full-MLLM runs must give the
+# attribute lane the same server-queue budget as Modules 2/3.  Other modes
+# retain the historical 8 s default below.
+SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-}
 SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-}
 SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${REPO_ROOT}/.env}
 RAW_OCCUPANCY_GRID_TOPIC=${RAW_OCCUPANCY_GRID_TOPIC:-/struct_mapping/occ_map}
@@ -204,8 +211,8 @@ case "${METHOD}" in
     FORCE_CLOSE_CONTAINERS=true
     ENABLE_ATTRIBUTE_INFERENCE=true
     MLLM_DECISION_TIMEOUT_S=${MLLM_DECISION_TIMEOUT_S:-3.0}
+    SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-${MLLM_DECISION_TIMEOUT_S}}
     export SEMANTIC_MODEL_TIMEOUT_S="${MLLM_DECISION_TIMEOUT_S}"
-    SEMANTIC_ATTRIBUTE_MODEL_NAME=${SEMANTIC_ATTRIBUTE_MODEL_NAME:-qwen3.6-35b-a3b}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_interactive_exploration.yaml}
     SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
@@ -217,8 +224,8 @@ case "${METHOD}" in
     COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
     ENABLE_ATTRIBUTE_INFERENCE=true
     MLLM_DECISION_TIMEOUT_S=${MLLM_DECISION_TIMEOUT_S:-3.0}
+    SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-${MLLM_DECISION_TIMEOUT_S}}
     export SEMANTIC_MODEL_TIMEOUT_S="${MLLM_DECISION_TIMEOUT_S}"
-    SEMANTIC_ATTRIBUTE_MODEL_NAME=${SEMANTIC_ATTRIBUTE_MODEL_NAME:-qwen3.6-35b-a3b}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_object_goal_runtime.yaml}
     SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
@@ -230,8 +237,8 @@ case "${METHOD}" in
     COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-10}
     ENABLE_ATTRIBUTE_INFERENCE=true
     MLLM_DECISION_TIMEOUT_S=${MLLM_DECISION_TIMEOUT_S:-3.0}
+    SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-${MLLM_DECISION_TIMEOUT_S}}
     export SEMANTIC_MODEL_TIMEOUT_S="${MLLM_DECISION_TIMEOUT_S}"
-    SEMANTIC_ATTRIBUTE_MODEL_NAME=${SEMANTIC_ATTRIBUTE_MODEL_NAME:-qwen3.6-35b-a3b}
     SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_object_goal_apple.yaml}
     SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
     EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
@@ -242,6 +249,8 @@ case "${METHOD}" in
     exit 2
     ;;
 esac
+
+SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-8.0}
 
 COMPLETION_POST_HOLD_STEPS=${COMPLETION_POST_HOLD_STEPS:-0}
 
@@ -259,6 +268,19 @@ export SEMANTIC_MODEL_METRICS_PATH="${OUTPUT_DIR}/mllm_metrics.jsonl"
 
 set +u
 CONDA_SH=${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}
+# Batch workers can be launched by a service account while the shared Conda
+# installation belongs to the experiment user.  Prefer an explicit CONDA_SH,
+# but otherwise discover the active `conda` executable before rejecting the
+# run instead of assuming that $HOME owns the installation.
+if [[ ! -f "${CONDA_SH}" ]]; then
+  CONDA_BIN=$(command -v conda 2>/dev/null || true)
+  if [[ -n "${CONDA_BIN}" ]]; then
+    CONDA_SH_CANDIDATE="$(cd -- "$(dirname -- "${CONDA_BIN}")/.." && pwd)/etc/profile.d/conda.sh"
+    if [[ -f "${CONDA_SH_CANDIDATE}" ]]; then
+      CONDA_SH="${CONDA_SH_CANDIDATE}"
+    fi
+  fi
+fi
 if [[ ! -f "${CONDA_SH}" ]]; then
   printf '%s\n' "Missing conda initialization script: ${CONDA_SH}" >&2
   exit 2
@@ -527,6 +549,7 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   start_semantic_decision:="${START_SEMANTIC_DECISION}" \
   semantic_attribute_inference:="${ENABLE_ATTRIBUTE_INFERENCE}" \
   semantic_attribute_model_name:="${SEMANTIC_ATTRIBUTE_MODEL_NAME}" \
+  semantic_attribute_max_output_tokens:="${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS}" \
   semantic_attribute_request_timeout_s:="${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S}" \
   semantic_decision_config_file:="${SEMANTIC_DECISION_CONFIG}" \
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \

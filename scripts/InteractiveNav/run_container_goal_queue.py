@@ -60,7 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decision-override", type=Path)
     parser.add_argument("--mapping-override", type=Path)
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--attribute-model-name", default="qwen3.6-35b-a3b")
+    parser.add_argument(
+        "--attribute-model-name",
+        default="",
+        help=(
+            "Legacy Module-1 override. Leave empty to use the selected "
+            "SEMANTIC_MODEL_ENV_FILE model (the default)."
+        ),
+    )
     parser.add_argument("--recording", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reveal-container-context", action="store_true")
     parser.add_argument("--resume", action="store_true")

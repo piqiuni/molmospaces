@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import threading
@@ -46,6 +47,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-sample-interval-s", type=float, default=2.0)
     parser.add_argument("--runner", type=Path, default=DEFAULT_RUNNER)
     parser.add_argument(
+        "--model-endpoints",
+        nargs="+",
+        metavar="URL",
+        help=(
+            "Optional local MLLM endpoint URLs. Workers are assigned URLs round-robin; "
+            "each scene receives a derived dotenv file with its assigned endpoint."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-model-env-file",
+        type=Path,
+        help=(
+            "Base dotenv file for semantic MLLM configuration. When --model-endpoints "
+            "is set, it is copied per scene and the endpoint is overridden."
+        ),
+    )
+    parser.add_argument(
+        "--mujoco-egl-devices",
+        nargs="+",
+        metavar="DEVICE_ID",
+        help=(
+            "Optional EGL device IDs assigned to workers round-robin. This keeps "
+            "MuJoCo rendering distributed when the MLLM services occupy both GPUs."
+        ),
+    )
+    parser.add_argument(
         "--runner-shell",
         choices=("bash", "zsh"),
         default="bash",
@@ -73,6 +100,41 @@ def read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def assigned_model_endpoint(worker_id: int, args: argparse.Namespace) -> str | None:
+    endpoints = args.model_endpoints
+    if not endpoints:
+        return None
+    return str(endpoints[worker_id % len(endpoints)])
+
+
+def assigned_mujoco_egl_device(worker_id: int, args: argparse.Namespace) -> str | None:
+    devices = args.mujoco_egl_devices
+    if not devices:
+        return None
+    return str(devices[worker_id % len(devices)])
+
+
+def derive_scene_model_env_file(
+    scene_dir: Path,
+    source_env_file: Path,
+    endpoint: str,
+) -> Path:
+    """Create a scene-local dotenv whose final endpoint wins under override=True."""
+    source_text = source_env_file.read_text(encoding="utf-8")
+    if source_text and not source_text.endswith("\n"):
+        source_text += "\n"
+    derived_path = scene_dir / "semantic_model.env"
+    derived_text = (
+        source_text
+        + "\n# Generated for this batch scene; do not edit during an active run.\n"
+        + f"SEMANTIC_MODEL_ENDPOINT={shlex.quote(endpoint)}\n"
+    )
+    temporary_path = derived_path.with_suffix(".env.tmp")
+    temporary_path.write_text(derived_text, encoding="utf-8")
+    temporary_path.replace(derived_path)
+    return derived_path
 
 
 def terminate_group(process: subprocess.Popen[bytes], grace_s: float = 30.0) -> None:
@@ -261,10 +323,20 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
     scene_id = f"house_{house_ind:04d}"
     scene_dir = args.output_dir / scene_id
     result_path = scene_dir / "semantic_exploration_result.json"
+    model_endpoint = assigned_model_endpoint(worker_id, args)
+    mujoco_egl_device = assigned_mujoco_egl_device(worker_id, args)
     if args.resume and result_path.exists():
         result = read_json(result_path)
         if result:
-            result.update({"worker_id": worker_id, "resumed": True, "exit_code": 0})
+            result.update(
+                {
+                    "worker_id": worker_id,
+                    "resumed": True,
+                    "exit_code": 0,
+                    "model_endpoint": model_endpoint,
+                    "mujoco_egl_device": mujoco_egl_device,
+                }
+            )
             return result
     scene_dir.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
@@ -286,6 +358,19 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
             "PYTHONUNBUFFERED": "1",
         }
     )
+    if mujoco_egl_device is not None:
+        environment["MUJOCO_EGL_DEVICE_ID"] = mujoco_egl_device
+    scene_model_env_file: Path | None = None
+    if model_endpoint is not None:
+        assert args.semantic_model_env_file is not None
+        scene_model_env_file = derive_scene_model_env_file(
+            scene_dir,
+            args.semantic_model_env_file,
+            model_endpoint,
+        )
+        environment["SEMANTIC_MODEL_ENV_FILE"] = str(scene_model_env_file)
+    elif args.semantic_model_env_file is not None:
+        environment["SEMANTIC_MODEL_ENV_FILE"] = str(args.semantic_model_env_file)
     command = [args.runner_shell, str(args.runner.resolve()), str(scene_dir), scene_id]
     if args.dry_run:
         return {
@@ -294,6 +379,9 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
             "output_dir": str(scene_dir),
             "command": command,
             "ros_master_uri": environment["ROS_MASTER_URI"],
+            "model_endpoint": model_endpoint,
+            "mujoco_egl_device": mujoco_egl_device,
+            "semantic_model_env_file": environment.get("SEMANTIC_MODEL_ENV_FILE"),
             "dry_run": True,
         }
     started = time.monotonic()
@@ -337,6 +425,9 @@ def run_scene(worker_id: int, house_ind: int, args: argparse.Namespace) -> dict[
             "house_ind": house_ind,
             "output_dir": str(scene_dir),
             "ros_master_uri": environment["ROS_MASTER_URI"],
+            "model_endpoint": model_endpoint,
+            "mujoco_egl_device": mujoco_egl_device,
+            "semantic_model_env_file": environment.get("SEMANTIC_MODEL_ENV_FILE"),
             "exit_code": exit_code,
             "elapsed_sec": time.monotonic() - started,
             "resumed": False,
@@ -430,6 +521,9 @@ def write_summary(output_dir: Path, results: list[dict[str, Any]]) -> None:
     fields = [
         "house_ind",
         "worker_id",
+        "model_endpoint",
+        "mujoco_egl_device",
+        "semantic_model_env_file",
         "exit_code",
         "elapsed_sec",
         "completed_early",
@@ -477,6 +571,30 @@ def main() -> int:
     args = parse_args()
     args.output_dir = args.output_dir.expanduser().resolve()
     args.runner = args.runner.expanduser().resolve()
+    if args.model_endpoints:
+        args.model_endpoints = [endpoint.strip() for endpoint in args.model_endpoints]
+        if any(not endpoint for endpoint in args.model_endpoints):
+            raise ValueError("--model-endpoints must not contain an empty URL")
+    if args.mujoco_egl_devices:
+        args.mujoco_egl_devices = [device.strip() for device in args.mujoco_egl_devices]
+        if any(not device.isdigit() for device in args.mujoco_egl_devices):
+            raise ValueError("--mujoco-egl-devices values must be non-negative integer IDs")
+    if args.semantic_model_env_file is not None:
+        args.semantic_model_env_file = args.semantic_model_env_file.expanduser().resolve()
+        if not args.semantic_model_env_file.is_file():
+            raise FileNotFoundError(args.semantic_model_env_file)
+    elif args.model_endpoints:
+        inherited_env_file = os.environ.get("SEMANTIC_MODEL_ENV_FILE")
+        args.semantic_model_env_file = (
+            Path(inherited_env_file).expanduser().resolve()
+            if inherited_env_file
+            else (REPO_ROOT / ".env").resolve()
+        )
+        if not args.semantic_model_env_file.is_file():
+            raise FileNotFoundError(
+                "--model-endpoints requires a readable --semantic-model-env-file "
+                f"(or {args.semantic_model_env_file})"
+            )
     if args.workers < 1:
         raise ValueError("--workers must be positive")
     if not args.runner.exists():

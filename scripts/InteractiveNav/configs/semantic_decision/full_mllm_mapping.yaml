@@ -8,3 +8,8 @@ ablation:
 # room + in-room object metadata only (no RGB/crop).
 room_mllm:
   enabled: true
+  # Long simulator object IDs can make the compact evidence list exceed the
+  # historical 96-token cap.  This lane is text-only and independently queued,
+  # so raise only its budget; successful results are then cached rather than
+  # retried on every mapping refresh.
+  max_output_tokens: 192

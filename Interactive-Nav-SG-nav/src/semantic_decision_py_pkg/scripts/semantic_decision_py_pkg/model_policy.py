@@ -50,6 +50,72 @@ ROOM_OBJECT_REASONING_MAX_CONTAINERS = 12
 ROOM_OBJECT_REASONING_MAX_ANCHORS_PER_ROOM = 4
 ROOM_OBJECT_REASONING_MAX_LABELS = 6
 
+# The M2 protocol is intentionally a small categorical response.  Keeping the
+# vocabulary in one place lets the request schema and the prompt stay aligned.
+SUBGOAL_REASON_CODES = (
+    "TARGET_VISIBLE",
+    "REVEAL_TARGET_CONTAINER",
+    "UNLOCK_ROUTE",
+    "EXPLORE_TARGET_ROOM",
+    "INFORMATION_GAIN",
+    "INTERACTION_COVERAGE",
+    "RECOVERY_DIVERSIFICATION",
+    "DISTANCE_TIEBREAK",
+    "NO_SEMANTIC_PREFERENCE",
+)
+SUBGOAL_CONFIDENCE_CODES = ("low", "medium", "high")
+
+
+def build_subgoal_selection_response_schema(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the strict OpenAI JSON-schema descriptor for an M2 response.
+
+    Candidate IDs are copied from the compact, current request only.  This
+    makes an echoed historical graph or mission unable to satisfy structured
+    decoding.  An empty candidate pool cannot produce an executable M2 result,
+    so fail before constructing an unconstrained schema.
+    """
+
+    candidate_ids: list[str] = []
+    for candidate in payload.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("id") or "").strip()
+        if candidate_id and candidate_id not in candidate_ids:
+            candidate_ids.append(candidate_id)
+    if not candidate_ids:
+        raise ValueError("subgoal response schema requires at least one candidate ID")
+    ranked_items: dict[str, Any] = {
+        "type": "string",
+        "enum": candidate_ids,
+    }
+    return {
+        "name": "subgoal_selection",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "ranked_ids": {
+                    "type": "array",
+                    "items": ranked_items,
+                    "minItems": 1,
+                    "maxItems": 3,
+                },
+                "reason": {
+                    "type": "string",
+                    "enum": list(SUBGOAL_REASON_CODES),
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": list(SUBGOAL_CONFIDENCE_CODES),
+                },
+            },
+            "required": ["ranked_ids", "reason", "confidence"],
+        },
+    }
+
 # Semantic priors guide the model toward observed rooms and containers, but
 # must never be treated as proof that an unobserved object is present there.
 TARGET_ROOM_OBJECT_PRIORS = (
@@ -487,7 +553,11 @@ def compact_semantic_graph(
 
 def compact_target_context(target_context: dict[str, Any]) -> dict[str, Any]:
     if not bool(target_context.get("enabled")):
-        return {"mode": "explore_all"}
+        # A target-disabled episode is still an interaction-exploration
+        # mission, not a generic frontier-only walk.  This explicit mode keeps
+        # M2 from suppressing untried viable containers behind an arbitrary
+        # object-goal prompt.
+        return {"mode": "interaction_coverage_exploration"}
     labels = [str(value) for value in target_context.get("object_labels") or [] if value]
     target_name = str(
         target_context.get("target_name")
@@ -1322,6 +1392,8 @@ class ModelPolicyClient:
             "POST_INTERACTION_TRAVERSE",
             "TARGET_CONTAINER",
             "NEXT_ROUTE_PORTAL",
+            "INTERACTION_COVERAGE_CONTAINER",
+            "INTERACTION_COVERAGE_PORTAL",
         }
         protected = [
             candidate_id
@@ -1434,6 +1506,10 @@ class ModelPolicyClient:
             mission,
             semantic_graph,
         )
+        interaction_coverage_mission = (
+            str(mission.get("mode") or "").casefold()
+            == "interaction_coverage_exploration"
+        )
         if self.config.selection_granularity.casefold() == "room":
             instruction = (
                 "Rank the room-level exploration groups and concrete interaction or navigation actions "
@@ -1442,12 +1518,37 @@ class ModelPolicyClient:
                 "object with ranked_ids containing at most three IDs, a short reason code, and confidence "
                 "set to low, medium, or high. Do not return prose, scores, markdown, or additional keys."
             )
+        elif interaction_coverage_mission:
+            instruction = (
+                "Rank the concrete subgoals for an interaction-coverage exploration mission. "
+                "Each ID is an executable navigation, interaction, or frontier action and must be "
+                "returned unchanged. This is a text-only decision: do not infer object geometry, "
+                "view direction, handles, or actions not explicitly represented by the candidates. "
+                "Only IDs present in the current candidates array may appear in ranked_ids; IDs in "
+                "history or graph are historical context and are forbidden. Apply this order: (1) "
+                "POST_INTERACTION_TRAVERSE immediately after a successful portal interaction; "
+                "(2) an untried viable interaction candidate that changes connectivity or reveals "
+                "contents, favoring a graph-reachable container or portal with an "
+                "INTERACTION_COVERAGE_* decision_hint; (3) a useful frontier; (4) a repeated or "
+                "previously failed action only after alternatives. A failed approach pose or visual "
+                "frontality check does not prove the object non-interactable: another listed "
+                "approach/viewpoint can remain viable, so do not globally reject that object. Do not "
+                "repeat a successful interaction. Use candidate history, decision_hint, pre_score, "
+                "and observed graph state only. Return exactly one compact JSON object with ranked_ids "
+                "containing at most three IDs, reason set to INTERACTION_COVERAGE, UNLOCK_ROUTE, "
+                "INFORMATION_GAIN, RECOVERY_DIVERSIFICATION, DISTANCE_TIEBREAK, or "
+                "NO_SEMANTIC_PREFERENCE, and confidence set to low, medium, or high. Do not return "
+                "prose, scores, markdown, or additional keys. Output must begin exactly as a compact "
+                "object whose first key is ranked_ids; never echo the supplied context."
+            )
         else:
             instruction = (
                 "Rank the concrete subgoals for the object-goal mission. Each ID is an executable navigation, "
                 "interaction, or frontier action and must be returned unchanged. Only IDs present in the "
                 "current candidates array may appear in ranked_ids; IDs mentioned only in recent_decisions, "
-                "history, or graph are historical context and are forbidden. Use one internal two-stage "
+                "history, or graph are historical context and are forbidden. Your response must begin with "
+                "the key ranked_ids; never copy, serialize, or summarize the input mission, robot, graph, "
+                "room_object_reasoning, candidates, or recent_decisions fields. Use one internal two-stage "
                 "process and return only the final Stage 2 JSON. STAGE 1 "
                 "(OBSERVED_ROOM_OBJECT_PLAUSIBILITY): read room_object_reasoning before ranking. Treat "
                 "observed_rooms, anchor_objects, observed_containers, and observed_portals as graph evidence. "
@@ -1483,9 +1584,10 @@ class ModelPolicyClient:
                 "Do not invent geometry, actions, containment, or candidate IDs. "
                 "Return exactly one compact JSON object with ranked_ids containing at most three IDs, "
                 "reason set to TARGET_VISIBLE, REVEAL_TARGET_CONTAINER, UNLOCK_ROUTE, EXPLORE_TARGET_ROOM, "
-                "INFORMATION_GAIN, RECOVERY_DIVERSIFICATION, DISTANCE_TIEBREAK, or "
+                "INFORMATION_GAIN, INTERACTION_COVERAGE, RECOVERY_DIVERSIFICATION, DISTANCE_TIEBREAK, or "
                 "NO_SEMANTIC_PREFERENCE, and confidence set to low, medium, or high. Do not return prose, "
-                "scores, markdown, or additional keys."
+                "scores, markdown, or additional keys. Output must begin exactly as a compact object whose "
+                "first key is ranked_ids; never echo the supplied context."
             )
         return {
             "schema_version": 4,
@@ -1561,6 +1663,7 @@ class ModelPolicyClient:
                 "candidates": payload.get("candidates") or [],
                 "recent_decisions": payload.get("recent_decisions") or [],
             },
+            response_schema=build_subgoal_selection_response_schema(payload),
             timeout_s=self.config.timeout_s,
             max_tokens=self.config.max_tokens,
             metrics_context=metrics_context,

@@ -221,7 +221,7 @@ class ExplorePyNode:
             far_cluster_penalty_saturation_m=float(frontier_cfg.get("far_cluster_penalty_saturation_m", 4.0)),
             min_obstacle_clearance_m=float(frontier_cfg.get("min_obstacle_clearance_m", 0.25)),
             max_clearance_check_m=float(frontier_cfg.get("max_clearance_check_m", 0.8)),
-            robot_radius_m=float(frontier_cfg.get("robot_radius_m", 0.35)),
+            robot_radius_m=float(frontier_cfg.get("robot_radius_m", 0.25)),
             footprint_safety_margin_m=float(frontier_cfg.get("footprint_safety_margin_m", 0.10)),
             require_footprint_free=bool(frontier_cfg.get("require_footprint_free", True)),
             footprint_unknown_is_free=bool(frontier_cfg.get("footprint_unknown_is_free", True)),

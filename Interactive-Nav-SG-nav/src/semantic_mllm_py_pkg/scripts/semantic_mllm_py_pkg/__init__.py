@@ -6,6 +6,7 @@ from .interaction_prompt import (
     visual_interaction_planning_context,
 )
 from .schemas import (
+    build_visual_verification_response_schema,
     validate_attribute_patch,
     validate_room_attribute_patch,
     validate_skill_action,
@@ -24,6 +25,7 @@ __all__ = [
     "load_env_file",
     "VISUAL_INTERACTION_PLANNING_INSTRUCTION",
     "visual_interaction_planning_context",
+    "build_visual_verification_response_schema",
     "validate_attribute_patch",
     "validate_room_attribute_patch",
     "validate_skill_action",

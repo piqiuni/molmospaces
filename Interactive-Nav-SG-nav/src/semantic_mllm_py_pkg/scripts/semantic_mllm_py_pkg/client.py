@@ -188,11 +188,21 @@ class MLLMClient:
             content: list[dict[str, Any]] = [{"type": "text", "text": request_instruction + "\n" + json.dumps(context, ensure_ascii=False)}]
             for image in images:
                 content.append({"type": "image_url", "image_url": {"url": self._image_url(image)}})
+            response_format: dict[str, Any] = {"type": "json_object"}
+            if response_schema:
+                # OpenAI-compatible servers (including vLLM) accept the
+                # complete JSON-schema descriptor under ``json_schema``.
+                # Keep the legacy json_object fallback for roles that do not
+                # provide a schema or for older endpoints.
+                response_format = {
+                    "type": "json_schema",
+                    "json_schema": response_schema,
+                }
             body_payload = {
                 "model": config.model,
                 "temperature": config.temperature,
                 "max_tokens": config.max_tokens,
-                "response_format": {"type": "json_object"},
+                "response_format": response_format,
                 "messages": [
                     {"role": "system", "content": "Return only a valid JSON object."},
                     {"role": "user", "content": content},
@@ -317,6 +327,14 @@ class MLLMClient:
                 "interactable": False,
                 "interaction_class": "unknown",
                 "coarse_state": "unknown",
+                "portal_morphology": None,
+                "portal_aperture_evidence": None,
+                "view_state": "unknown",
+                "view_state_confidence": 0.0,
+                "front_surface_visible": False,
+                "front_surface_confidence": 0.0,
+                "approach_ready": False,
+                "needs_reobserve": True,
                 "interaction_parts": [],
                 "confidence": 0.0,
             }
@@ -334,6 +352,9 @@ class MLLMClient:
                     "target_type": "drawer_container",
                     "action": "scan",
                     "operation_method": "pull",
+                    "view_state": "front",
+                    "approach_ready": True,
+                    "reposition_required": False,
                     "open_regions": [
                         {"center": [0.5, 0.25], "confidence": 0.5},
                         {"center": [0.5, 0.75], "confidence": 0.5},
@@ -345,6 +366,9 @@ class MLLMClient:
                 "target_type": "door" if expected_type == "door" else expected_type,
                 "action": str(context.get("requested_action") or "open"),
                 "operation_method": "hinged_unknown" if expected_type == "door" else "unknown",
+                "view_state": "front",
+                "approach_ready": True,
+                "reposition_required": False,
                 "open_regions": [],
                 "confidence": 0.5,
                 "reason": "mock operation plan",

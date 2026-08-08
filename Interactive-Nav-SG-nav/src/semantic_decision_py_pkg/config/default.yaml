@@ -22,8 +22,11 @@ topics:
   explore_feedback: "/explore_py/behavior_feedback"
   interaction_command: "/semantic_decision/interaction_command"
   interaction_result: "/semantic_mapping/interaction_result"
+  attribute_updates: "/semantic_mapping/attribute_updates"
+  attribute_refresh_requests: "/semantic_mapping/attribute_refresh_requests"
   move_base: "/move_base"
   cmd_vel: "/cmd_vel"
+  cmd_vel_stamped: "/cmd_vel_stamped"
   occupancy: "/move_base/local_costmap/costmap"
   # Raw SLAM source and the semantic StaticLayer input used by the global
   # planner.  A post-open traversal gates across both before reading costmap.
@@ -73,6 +76,10 @@ candidate:
   target_min_visible_fraction: 0.2
   target_min_consecutive_observations: 2
   target_arrival_tolerance_m: 0.35
+  # Containers without a fresh M1 front/oblique view are approached from a
+  # bounded four-view ring; M1 then refreshes the visible state at the pose.
+  container_multiview_enabled: true
+  container_multiview_face_count: 4
 
 policy:
   backend: "rule"
@@ -145,14 +152,19 @@ model:
   history_region_size_m: 1.0
   stale_goal_position_tolerance_m: 0.35
   stale_goal_yaw_tolerance_rad: 0.50
+  full_image_max_side_px: 960
+  crop_max_side_px: 512
 
 completion:
   empty_candidate_confirmations: 3
   stagnation_failure_limit: 8
-  # ``make_plan_unreachable`` from an INTERACT behavior means every concrete
-  # approach pose was preflighted and rejected.  If no executable replacement
-  # appears for this many simulator observations, end the exploration attempt
-  # rather than advancing silent timeout/noop steps to the task horizon.
+  # Three terminal move-base approach failures make one concrete interaction
+  # subgoal planner-unreachable for the rest of this episode.
+  interaction_approach_failure_limit: 3
+  # Once a concrete INTERACT candidate reaches the failure limit above, if no
+  # executable replacement appears for this many simulator observations, end
+  # the exploration attempt rather than advancing silent timeout/noop steps to
+  # the task horizon.
   # This is intentionally observation-step based (not ROS message count) and
   # is reset as soon as a normal scan or any executable replacement appears.
   terminal_no_plan_exit_enabled: true
@@ -182,26 +194,78 @@ executor:
   navigation_timeout_s: 180.0
   interaction_navigation_timeout_s: 180.0
   interaction_timeout_s: 30.0
+  interaction_observation_timeout_s: 30.0
+  interaction_observation_poll_interval_s: 0.05
   verification_timeout_s: 30.0
   explore_prepare_timeout_s: 3.0
   explore_finalize_timeout_s: 10.0
   explore_reservation_retry_sec: 0.25
   graph_poll_rate_hz: 5.0
   rear_goal_prerotate_enabled: true
-  rear_goal_enter_angle_rad: 1.75
+  # A path heading at or beyond 90 degrees is treated as rear navigation and
+  # never handed straight to an unmodified DWA turn cycle.
+  rear_goal_enter_angle_rad: 1.5707963267948966
   rear_goal_exit_angle_rad: 0.20
   rear_goal_rotate_speed_rad_s: 1.25
   rear_goal_prerotate_timeout_s: 12.0
+  rear_goal_prerotate_step_sync_enabled: true
+  rear_goal_prerotate_control_dt_s: 0.2
+  # 14 leaves two fixed-dt windows beyond the theoretical pi-to-exit turn.
+  rear_goal_prerotate_max_control_steps: 14
+  rear_goal_prerotate_step_sync_stall_timeout_s: 2.0
+  # Pair the already-published RGB with the bridge's later fresh-cmd window;
+  # one acknowledged cmd_vel becomes one fixed 0.2 s simulator action.
+  rear_goal_prerotate_gate_max_pending_steps: 32
+  rear_goal_prerotate_gate_pair_max_age_s: 0.75
+  # Bounded delivery retries only for a bridge timeout noop, never an
+  # unbounded yaw-only DWA fallback.
+  rear_goal_prerotate_delivery_retry_steps: 2
   rear_goal_lookahead_m: 0.75
   rear_goal_pi_tie_tolerance_rad: 0.20
   rear_goal_pi_turn_sign: -1
+  # Direct turns/backoffs require a fresh local costmap and the public
+  # robot_radius footprint.  Unknown/out-of-map cells are blocked.
+  rear_goal_local_costmap_max_age_s: 0.75
+  rear_goal_robot_radius_m: 0.25
+  rear_goal_safety_margin_m: 0.05
+  rear_goal_costmap_occupied_threshold: 50
+  rear_goal_unknown_is_blocked: true
+  rear_goal_rotation_sweep_step_rad: 0.10
+  rear_goal_cmd_vel_cancel_wait_s: 0.50
+  # A DWA window is considered oscillatory only after four applied cmd_vel
+  # steps contain two sign flips and no measurable translation/goal progress.
+  rear_goal_oscillation_window_steps: 4
+  rear_goal_oscillation_min_sign_flips: 2
+  rear_goal_oscillation_max_displacement_m: 0.05
+  rear_goal_oscillation_min_goal_reduction_m: 0.02
+  rear_goal_cmd_vel_max_age_s: 0.50
+  # If both turn sweeps are occupied, a short reverse is attempted only when
+  # the same fresh-grid circular-footprint test proves its full distance.
+  rear_goal_reverse_enabled: true
+  rear_goal_reverse_distance_m: 0.15
+  rear_goal_reverse_min_distance_m: 0.05
+  rear_goal_reverse_speed_mps: 0.10
+  rear_goal_reverse_max_control_steps: 10
   final_align_enabled: false
+  # Interaction-only final yaw correction is opt-in per task lane.  It never
+  # enables generic NAVIGATE/EXPLORE final alignment.
   interaction_final_align_enabled: false
   interaction_final_align_max_distance_m: 0.35
   interaction_final_align_yaw_tolerance_rad: 0.15
   interaction_final_align_rotate_speed_rad_s: 0.30
   interaction_final_align_trigger_delay_s: 2.0
   interaction_final_align_timeout_s: 15.0
+  # When interaction final-align is enabled by a task override, emit each
+  # rotation only inside a same-step RGB/fresh-command window.
+  interaction_final_align_step_sync_enabled: true
+  interaction_final_align_control_dt_s: 0.2
+  # 56 = ceil(pi / (0.30 * 0.20)) + 3 tracking-margin windows; the runtime
+  # still budgets only the steps required by the current yaw error.
+  interaction_final_align_max_control_steps: 56
+  interaction_final_align_step_sync_stall_timeout_s: 2.0
+  interaction_final_align_gate_max_pending_steps: 32
+  interaction_final_align_gate_pair_max_age_s: 0.75
+  interaction_final_align_delivery_retry_steps: 2
   final_align_cancel_wait_s: 1.0
   make_plan_preflight_enabled: true
   make_plan_service: "/move_base/make_plan"
@@ -230,7 +294,7 @@ executor:
   navigation_stagnation_local_plan_min_poses: 2
   # An INTERACT command remains committed across a small set of approach
   # poses; switch only after the current approach hits the stagnation guard.
-  interaction_approach_fallback_max_attempts: 3
+  interaction_approach_fallback_max_attempts: 4
   interaction_approach_fallback_cancel_wait_s: 0.5
   # Once move_base reports arrival, validate the simulator pose on this many
   # fresh evaluator steps.  This is intentionally count-bounded, not
@@ -243,6 +307,6 @@ executor:
   stuck_recovery_speed_mps: 0.12
   stuck_recovery_timeout_s: 8.0
   stuck_recovery_obstacle_escape_distance_m: 0.35
-  stuck_recovery_robot_radius_m: 0.30
+  stuck_recovery_robot_radius_m: 0.25
   stuck_recovery_safety_margin_m: 0.05
   stuck_recovery_unknown_is_blocked: true

@@ -118,7 +118,7 @@ frontier:
   far_cluster_penalty_saturation_m: 4.0
   min_obstacle_clearance_m: 0.35
   max_clearance_check_m: 1.2
-  robot_radius_m: 0.30
+  robot_radius_m: 0.25
   footprint_safety_margin_m: 0.15
   require_footprint_free: true
   footprint_unknown_is_free: false
