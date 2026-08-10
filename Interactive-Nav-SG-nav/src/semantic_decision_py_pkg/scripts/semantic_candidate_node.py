@@ -175,6 +175,10 @@ class SemanticCandidateNode:
                 interaction_ready_distance_m=float(
                     config.get("interaction_ready_distance_m", 0.45)
                 ),
+                interaction_ready_yaw_tolerance_rad=max(
+                    0.05,
+                    float(config.get("interaction_ready_yaw_tolerance_rad", 0.55)),
+                ),
                 require_current_visibility=bool(
                     config.get("require_current_visibility", False)
                 ),

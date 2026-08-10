@@ -1807,6 +1807,7 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
             container_pre_action_mllm=True,
             container_standoff_m=0.40,
             interaction_safety_margin_m=0.10,
+            interaction_ready_yaw_tolerance_rad=0.35,
             container_observation_standoff_m=0.70,
             container_safe_staging_outer_offset_m=0.30,
             container_safe_staging_arrival_tolerance_m=0.25,
@@ -1860,6 +1861,7 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
     assert math.isclose(action_goals[0][0], 3.0, abs_tol=1e-6)
     assert math.isclose(action_goals[0][1], 2.0, abs_tol=1e-6)
     assert candidate.interaction_command["interaction_ready_distance_m"] == 0.25
+    assert candidate.interaction_command["interaction_ready_yaw_tolerance_rad"] == 0.35
     assert candidate.interaction_command[
         "container_staging_ready_distance_m"
     ] == 0.25

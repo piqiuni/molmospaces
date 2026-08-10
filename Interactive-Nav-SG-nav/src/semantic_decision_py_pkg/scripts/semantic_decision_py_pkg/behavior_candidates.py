@@ -177,6 +177,10 @@ class CandidateGeneratorConfig:
     container_interaction_ready_distance_m: float = 0.18
     interaction_safety_margin_m: float = 0.0
     interaction_ready_distance_m: float = 0.45
+    # This is the public yaw gate shared by final approach validation and the
+    # physical bridge.  Keep the conservative legacy default while allowing a
+    # policy YAML to require a more front-facing interaction pose.
+    interaction_ready_yaw_tolerance_rad: float = 0.55
     require_current_visibility: bool = False
     target_standoff_m: float = 1.0
     target_max_state_age_sec: float = 300.0
@@ -1483,7 +1487,9 @@ class CandidateGenerator:
                     if container_two_stage_requested
                     else 0.0
                 ),
-                "interaction_ready_yaw_tolerance_rad": 0.55,
+                "interaction_ready_yaw_tolerance_rad": max(
+                    0.05, float(self.config.interaction_ready_yaw_tolerance_rad)
+                ),
                 "container_kind": (
                     "drawer"
                     if is_drawer_container
