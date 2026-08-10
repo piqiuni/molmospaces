@@ -235,8 +235,11 @@ class SemanticMappingNode:
         )
         self.semantic_occ_overlay = SemanticOccupancyOverlay(
             enabled=overlay_config.get("enabled", True),
-            clear_padding_m=overlay_config.get("clear_padding_m", 0.10),
+            clear_padding_m=overlay_config.get("clear_padding_m", -0.05),
             open_states=overlay_config.get("open_states", ["open"]),
+            max_aperture_thickness_m=overlay_config.get(
+                "max_aperture_thickness_m", 0.25
+            ),
         )
         # Room segmentation consumes the same graph snapshot as the planning
         # overlay, but it must not share the mutable planning-overlay instance:
@@ -244,8 +247,11 @@ class SemanticMappingNode:
         # continues to update the planning overlay under that lock.
         self._room_segmentation_overlay = SemanticOccupancyOverlay(
             enabled=overlay_config.get("enabled", True),
-            clear_padding_m=overlay_config.get("clear_padding_m", 0.10),
+            clear_padding_m=overlay_config.get("clear_padding_m", -0.05),
             open_states=overlay_config.get("open_states", ["open"]),
+            max_aperture_thickness_m=overlay_config.get(
+                "max_aperture_thickness_m", 0.25
+            ),
         )
         self.semantic_occ_update_tracker = OverlayUpdateRegionTracker()
         # Planning overlay state is shared by interaction callbacks and the

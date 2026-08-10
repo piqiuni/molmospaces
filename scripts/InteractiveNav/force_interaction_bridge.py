@@ -187,6 +187,123 @@ def _portal_aperture_feedback(
     return "unavailable", "unavailable", evidence
 
 
+def _refrigerator_open_sweep_preflight(
+    task_env,
+    plan: dict[str, Any],
+    *,
+    sample_count: int = 6,
+    recommended_retreat_m: float = 0.25,
+) -> dict[str, Any]:
+    """Privately check whether opening a refrigerator leaf hits the robot.
+
+    This is intentionally a small kinematic MuJoCo sweep, not an additional
+    planner.  It snapshots the simulator, interpolates only the selected
+    articulation joints, checks the robot collision predicate, and restores the
+    exact preflight state before returning.  The result is deliberately public
+    and compact: no joint, body, or asset identifiers can leave this boundary.
+
+    Missing collision support is a fail-open ``checked=False`` outcome.  It
+    preserves compatibility with lightweight test environments and cannot turn
+    a capability probe into a long-running interaction timeout.
+    """
+
+    model = getattr(task_env, "current_model", None)
+    data = getattr(task_env, "current_data", None)
+    collision_check = getattr(task_env, "check_robot_collision_in_current_pose", None)
+    if (
+        model is None
+        or data is None
+        or not callable(collision_check)
+        or not hasattr(data, "qpos")
+        or not hasattr(data, "qvel")
+        or not hasattr(model, "jnt_qposadr")
+        or not hasattr(model, "jnt_dofadr")
+    ):
+        return {"checked": False, "safe": True}
+
+    targets = dict(plan.get("targets") or {})
+    group = dict(plan.get("group") or {})
+    joints_by_name = {
+        str(item.get("joint_name") or ""): dict(item)
+        for item in group.get("joints") or []
+        if isinstance(item, dict) and str(item.get("joint_name") or "")
+    }
+    sweep_joints: list[tuple[int, int, float]] = []
+    try:
+        for joint_name, target in targets.items():
+            joint = joints_by_name.get(str(joint_name)) or {}
+            joint_id = joint.get("joint_id")
+            if joint_id is None:
+                joint_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_JOINT, str(joint_name)
+                )
+            joint_id = int(joint_id)
+            if joint_id < 0:
+                return {"checked": False, "safe": True}
+            qpos_addr = int(model.jnt_qposadr[joint_id])
+            dof_addr = int(model.jnt_dofadr[joint_id])
+            sweep_joints.append((qpos_addr, dof_addr, float(target)))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {"checked": False, "safe": True}
+    if not sweep_joints:
+        return {"checked": False, "safe": True}
+
+    snapshots: dict[str, np.ndarray] = {}
+    for field in ("qpos", "qvel", "act", "ctrl", "xfrc_applied"):
+        value = getattr(data, field, None)
+        if isinstance(value, np.ndarray):
+            snapshots[field] = value.copy()
+    if "qpos" not in snapshots or "qvel" not in snapshots:
+        return {"checked": False, "safe": True}
+    try:
+        baseline_collision = bool(collision_check())
+    except Exception:
+        return {"checked": False, "safe": True}
+    start_values = [float(data.qpos[qpos_addr]) for qpos_addr, _, _ in sweep_joints]
+    try:
+        # Exclude 0.0: baseline is checked separately, and a true starting
+        # collision must not be attributed to a refrigerator opening sweep.
+        for fraction in np.linspace(1.0 / max(1, int(sample_count)), 1.0, max(1, int(sample_count))):
+            for (qpos_addr, dof_addr, target), start in zip(sweep_joints, start_values):
+                data.qpos[qpos_addr] = start + (target - start) * float(fraction)
+                data.qvel[dof_addr] = 0.0
+            mujoco.mj_forward(model, data)
+            if not baseline_collision and bool(collision_check()):
+                return {
+                    "checked": True,
+                    "safe": False,
+                    "reason": "unsafe_open_sweep",
+                    "recommended_retreat_m": max(0.05, float(recommended_retreat_m)),
+                }
+    except Exception:
+        # A preflight is advisory safety instrumentation.  Do not reject a
+        # command merely because an optional simulator collision API is absent
+        # or a reduced test environment cannot forward dynamics.
+        return {"checked": False, "safe": True}
+    finally:
+        for field, snapshot in snapshots.items():
+            try:
+                getattr(data, field)[...] = snapshot
+            except (AttributeError, TypeError, ValueError):
+                pass
+        try:
+            mujoco.mj_forward(model, data)
+        except Exception:
+            pass
+    return {"checked": True, "safe": True}
+
+
+def _requires_refrigerator_open_sweep(command: dict[str, Any]) -> bool:
+    """Use only the public type tag emitted by the semantic executor."""
+
+    return bool(
+        str(command.get("node_type") or "").casefold() == "container"
+        and str(command.get("action") or "open").casefold() == "open"
+        and str(command.get("container_kind") or "").casefold()
+        in {"fridge", "refrigerator"}
+    )
+
+
 class AtomicForceInteractionController:
     def __init__(
         self,
@@ -202,6 +319,7 @@ class AtomicForceInteractionController:
         drawer_execution_mode: str | None = None,
         drawer_transition_steps: int | None = None,
         drawer_observation_steps: int = 1,
+        drawer_view_restore_settle_steps: int = 0,
         object_id_resolver: Callable[[str], str] | None = None,
     ) -> None:
         self.command_topic = str(command_topic)
@@ -222,6 +340,10 @@ class AtomicForceInteractionController:
         self.drawer_execution_mode = self.interaction_execution_mode
         self.drawer_transition_steps = self.interaction_transition_steps
         self.drawer_observation_steps = max(1, int(drawer_observation_steps))
+        # This is a visual settle only; it does not add a semantic state.
+        self.drawer_view_restore_settle_steps = max(
+            0, int(drawer_view_restore_settle_steps)
+        )
         # The public semantic graph may use an opaque portal ID.  Only this
         # simulator-side controller resolves it to a MuJoCo body name; results
         # deliberately retain the public ID so private names never flow back
@@ -401,6 +523,20 @@ class AtomicForceInteractionController:
                     ),
                     view_result=view_result,
                 )
+            if _requires_refrigerator_open_sweep(command):
+                preflight = _refrigerator_open_sweep_preflight(task.env, plan)
+                if bool(preflight.get("checked")) and not bool(preflight.get("safe", True)):
+                    # No force has been applied.  Keep the simulator-only
+                    # sweep private and publish only the public retry contract.
+                    command["_open_sweep_preflight"] = preflight
+                    self._commands.task_done()
+                    return self._publish_command_failure(
+                        task,
+                        command,
+                        step,
+                        ValueError("unsafe_open_sweep"),
+                        view_result=view_result,
+                    )
             execution_mode = str(
                 command.get("interaction_execution_mode")
                 or self.interaction_execution_mode
@@ -854,6 +990,17 @@ class AtomicForceInteractionController:
             "physics_substeps": 0,
             "view_result": None,
             "view_restore_result": None,
+            "view_restore_settle_steps": max(
+                0,
+                int(
+                    command.get(
+                        "drawer_view_restore_settle_steps",
+                        self.drawer_view_restore_settle_steps,
+                    )
+                    or 0
+                ),
+            ),
+            "remaining_view_restore_settle_steps": 0,
             # Filled after the low view is applied, then reasserted around
             # every internal force substep for the whole drawer macro.
             "robot_lock_snapshot": None,
@@ -865,6 +1012,11 @@ class AtomicForceInteractionController:
         if pending is None or pending.get("kind") != "drawer_sequence":
             return
         phase = str(pending["phase"])
+        if phase == "restore_settle":
+            # The restore command has already moved head/torso to the normal
+            # view.  Reserve these task steps for a visible camera settle.
+            self._force_observation_requested = True
+            return
         if phase == "observe":
             # The drawer is physically compliant.  Keep the already-open
             # selected front at its target during the low-view dwell rather
@@ -966,6 +1118,12 @@ class AtomicForceInteractionController:
         phase = str(pending["phase"])
         mode = self.interaction_execution_mode
         transition_steps = int(pending["transition_steps"]) if mode == "smooth" else 1
+        if phase == "restore_settle":
+            pending["remaining_view_restore_settle_steps"] -= 1
+            self._force_observation_requested = True
+            if int(pending["remaining_view_restore_settle_steps"]) > 0:
+                return None
+            return self._finish_drawer_sequence(task, step)
         if phase in {"open", "close"} and int(pending["phase_step"]) < transition_steps:
             return None
         if phase == "open":
@@ -1014,6 +1172,12 @@ class AtomicForceInteractionController:
             # restoring the head/torso is a separate final action.
             pending["robot_lock_snapshot"] = None
             pending["view_restore_result"] = self._head_view_controller.restore(task.env)
+            settle_steps = int(pending.get("view_restore_settle_steps", 0) or 0)
+            if settle_steps > 0:
+                pending["phase"] = "restore_settle"
+                pending["remaining_view_restore_settle_steps"] = settle_steps
+                self._force_observation_requested = True
+                return None
             return self._finish_drawer_sequence(task, step)
         return None
 
@@ -1256,6 +1420,9 @@ class AtomicForceInteractionController:
             "drawer_execution_mode": self.interaction_execution_mode,
             "drawer_transition_steps": int(pending["transition_steps"]),
             "drawer_observation_steps": int(pending["observation_steps"]),
+            "drawer_view_restore_settle_steps": int(
+                pending.get("view_restore_settle_steps", 0) or 0
+            ),
             "transition_log": list(pending["transition_log"]),
             "state": "open" if preserve_open else "closed",
             "pre_state": "closed",
@@ -1380,6 +1547,7 @@ class AtomicForceInteractionController:
         node_type = str(command.get("node_type") or "").casefold()
         missing_articulation = str(exc).startswith("Articulated object not found:")
         invalid_interaction_pose = str(exc).startswith("Interaction pose invalid:")
+        unsafe_open_sweep = str(exc).strip() == "unsafe_open_sweep"
         drawer_sequence_type = str(command.get("sequence_type") or "").casefold()
         drawer_sequence_execution_failed = str(exc).startswith(
             "drawer_scan_execution_failed:"
@@ -1391,6 +1559,11 @@ class AtomicForceInteractionController:
         if portal_missing_articulation:
             semantic_state = aperture_state
             resolved_capability = aperture_capability
+        elif unsafe_open_sweep:
+            # Articulation lookup succeeded; only the private simulated sweep
+            # rejected this robot stance.  Do not leak the selected leaf/joint.
+            semantic_state = "unknown"
+            resolved_capability = "articulated"
         else:
             semantic_state = "unknown"
             resolved_capability = "unknown"
@@ -1428,6 +1601,9 @@ class AtomicForceInteractionController:
                 if semantic_state == "blocked"
                 else "non_articulated"
             )
+        elif unsafe_open_sweep:
+            verification_source = "executor_open_sweep_preflight"
+            failure_reason = "unsafe_open_sweep"
         elif drawer_sequence_execution_failed:
             verification_source = "executor_drawer_sequence_failure"
             failure_reason = f"{drawer_sequence_type or 'drawer'}_execution_failed"
@@ -1454,15 +1630,27 @@ class AtomicForceInteractionController:
             "view_profile_result": view_result,
             "view_restore_result": view_restore_result,
             "interaction_capability": resolved_capability,
-            "interactable": False if portal_missing_articulation else None,
-            "retryable": False if portal_missing_articulation else None,
+            "interactable": (
+                False
+                if portal_missing_articulation
+                else True
+                if unsafe_open_sweep
+                else None
+            ),
+            "retryable": (
+                False
+                if portal_missing_articulation
+                else True
+                if unsafe_open_sweep
+                else None
+            ),
             "state": semantic_state,
             "pre_state": "unknown",
             "post_state": semantic_state,
             "success": static_open_portal,
             "status": "SUCCEEDED" if static_open_portal else "FAILED",
             "confidence": float((aperture_evidence or {}).get("confidence", 1.0)),
-            "execution_cost": 0.0 if static_open_portal else 1.0,
+            "execution_cost": 0.0 if static_open_portal or unsafe_open_sweep else 1.0,
             "sim_steps_consumed": 0,
             "physics_substeps": 0,
             "task_steps_consumed": 0,
@@ -1472,6 +1660,8 @@ class AtomicForceInteractionController:
             "source": (
                 "executor_static_portal"
                 if static_open_portal
+                else "force_interaction_open_sweep_preflight"
+                if unsafe_open_sweep
                 else "force_interaction_rejected"
             ),
             "verification_source": verification_source,
@@ -1482,12 +1672,19 @@ class AtomicForceInteractionController:
             "error_type": type(exc).__name__,
             "error": (
                 failure_reason
-                if portal_missing_articulation
+                if portal_missing_articulation or unsafe_open_sweep
                 else self._public_error_detail(command, exc)
             ),
             "step": int(step),
             "stamp_sec": stamp_sec,
         }
+        if unsafe_open_sweep:
+            result["recommended_retreat_m"] = float(
+                (command.get("_open_sweep_preflight") or {}).get(
+                    "recommended_retreat_m", 0.25
+                )
+                or 0.25
+            )
         if aperture_evidence is not None:
             result["portal_aperture_observation"] = aperture_evidence
         feedback = {

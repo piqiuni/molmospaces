@@ -90,6 +90,11 @@ def is_interaction_pose_precondition_failure(detail: dict[str, Any] | None) -> b
             "interaction_pose_invalid",
             "interaction_pose_poll_exhausted",
             "interaction_approach_options_exhausted",
+            # A refrigerator sweep is checked privately by the simulator before
+            # force is applied.  Treat it like an approach precondition: retry
+            # another safe public ring pose rather than mark the appliance
+            # permanently non-interactable.
+            "unsafe_open_sweep",
         }
         or verification_source == "executor_pose_precondition"
     )
@@ -756,6 +761,7 @@ def next_interaction_approach_option_index(
         "navigation_stagnation",
         "interaction_pose_poll_exhausted",
         "interaction_pose_invalid",
+        "unsafe_open_sweep",
         "visual_reposition_required",
         "navigation_timeout",
         "navigation_terminal_failure",

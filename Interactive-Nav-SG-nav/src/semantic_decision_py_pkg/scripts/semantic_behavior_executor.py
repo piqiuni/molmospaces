@@ -433,6 +433,26 @@ class SemanticBehaviorExecutor:
         self.container_pre_action_require_direct_front = bool(
             config.get("container_pre_action_require_direct_front", True)
         )
+        # Targeted M1 evidence is valid only at the staging pose that produced
+        # it.  The pose check is intentionally tighter than the bridge's broad
+        # arrival tolerance so a close/oblique overshoot cannot be mistaken for
+        # a fresh front observation.
+        self.container_m1_capture_pose_tolerance_m = max(
+            0.05,
+            float(config.get("container_m1_capture_pose_tolerance_m", 0.18)),
+        )
+        self.container_m1_capture_yaw_tolerance_rad = max(
+            0.05,
+            float(config.get("container_m1_capture_yaw_tolerance_rad", 0.25)),
+        )
+        # A transient M1 flip at one fixed staging pose should consume another
+        # observation, not discard the recently valid front/action-region
+        # evidence and jump to a different side.  This is a count bound, not a
+        # wall-clock timeout.
+        self.container_m1_same_pose_flip_retry_count = max(
+            0,
+            int(config.get("container_m1_same_pose_flip_retry_count", 1)),
+        )
         startup_scan_config = rospy.get_param("~startup_scan", {}) or {}
         self.startup_scan_enabled = bool(startup_scan_config.get("enabled", False))
         self.startup_scan_angle_rad = max(
@@ -863,6 +883,7 @@ class SemanticBehaviorExecutor:
         self.selection: dict | None = None
         self.latest_graph: dict = {}
         self._interaction_observation_requests: dict[str, dict] = {}
+        self._container_m1_last_accepted_evidence: dict[str, dict] = {}
         self._latest_attribute_updates: dict[str, dict] = {}
         self._last_explore_reservation_publish_at = 0.0
         self._explore_reservation_publish_count = 0
@@ -1158,6 +1179,7 @@ class SemanticBehaviorExecutor:
                 self._drawer_scan_wait_contexts.pop(decision_id, None)
                 self._drawer_scan_wait_records.pop(decision_id, None)
                 self._interaction_observation_requests.pop(decision_id, None)
+                self._container_m1_last_accepted_evidence.pop(decision_id, None)
             commands = self.machine.start(selection)
             if self.machine.state == STATE_VERIFYING and requires_graph_verification(
                 self.ablation.module3, selection
@@ -1547,6 +1569,120 @@ class SemanticBehaviorExecutor:
             return "m1_needs_reobserve"
         return "ready"
 
+    def _container_m1_capture_evidence_locked(
+        self,
+        candidate: dict,
+        update: dict,
+        request: dict,
+    ) -> tuple[dict | None, str]:
+        """Bind accepted public M1 evidence to its safe staging pose.
+
+        Targeted attribute updates contain the image capture step but not the
+        robot pose.  Capture the executor's current public TF pose while that
+        request is active, and require it to remain close to the exact staging
+        pose selected by navigation.  This prevents a later close-range pose or
+        a different ring face from reusing a visually good response.
+        """
+
+        metadata = candidate.get("metadata") or {}
+        interaction = candidate.get("interaction_command") or {}
+        expected = list(
+            request.get("observation_pose_xyyaw")
+            or metadata.get("effective_interaction_approach_pose_xyyaw")
+            or interaction.get("interaction_approach_pose_xyyaw")
+            or []
+        )
+        if len(expected) < 3:
+            return None, "m1_capture_pose_unavailable"
+        frame_id = str(metadata.get("frame_id") or getattr(self, "map_frame", "map"))
+        # Reduced unit-test executors deliberately omit TF.  In production a
+        # listener is always present; without one, use the selected staging
+        # pose as the only deterministic mock evidence rather than calling the
+        # bound helper and tripping over an incomplete ``tf`` stub.
+        pose_reader = (
+            getattr(self, "_current_pose", None)
+            if getattr(self, "tf_listener", None) is not None
+            else None
+        )
+        # The production executor always has a TF reader.  Keep reduced unit
+        # test doubles deterministic by treating their selected staging pose
+        # as the capture pose rather than failing solely because they omit TF.
+        actual = pose_reader(frame_id) if callable(pose_reader) else list(expected)
+        validation = interaction_pose_validation(
+            expected,
+            None if actual is None else list(actual),
+            distance_tolerance_m=getattr(
+                self, "container_m1_capture_pose_tolerance_m", 0.18
+            ),
+            yaw_tolerance_rad=getattr(
+                self, "container_m1_capture_yaw_tolerance_rad", 0.25
+            ),
+        )
+        if not bool(validation.get("valid")):
+            return None, "m1_capture_pose_mismatch"
+        capture_step = self._public_step_or_none(
+            update.get("observation_capture_step")
+            or update.get("attribute_capture_step")
+        )
+        if capture_step is None:
+            return None, "m1_capture_step_unavailable"
+        return {
+            "capture_step": int(capture_step),
+            "capture_pose_xyyaw": list(validation.get("actual_pose_xyyaw") or []),
+            "staging_pose_xyyaw": list(validation.get("expected_pose_xyyaw") or []),
+            "pose_validation": validation,
+            "view_state": str(update.get("view_state") or ""),
+            "front_surface_visible": bool(update.get("front_surface_visible")),
+            "approach_ready": bool(update.get("approach_ready")),
+        }, "ready"
+
+    def _container_m1_evidence_still_at_capture_pose_locked(
+        self, candidate: dict, evidence: dict
+    ) -> bool:
+        """Return whether a temporal M1 flip is still at the accepted pose."""
+
+        capture_pose = list(evidence.get("capture_pose_xyyaw") or [])
+        if len(capture_pose) < 3:
+            return False
+        metadata = candidate.get("metadata") or {}
+        pose_reader = (
+            getattr(self, "_current_pose", None)
+            if getattr(self, "tf_listener", None) is not None
+            else None
+        )
+        actual = (
+            pose_reader(str(metadata.get("frame_id") or getattr(self, "map_frame", "map")))
+            if callable(pose_reader)
+            else list(capture_pose)
+        )
+        validation = interaction_pose_validation(
+            capture_pose,
+            None if actual is None else list(actual),
+            distance_tolerance_m=getattr(
+                self, "container_m1_capture_pose_tolerance_m", 0.18
+            ),
+            yaw_tolerance_rad=getattr(
+                self, "container_m1_capture_yaw_tolerance_rad", 0.25
+            ),
+        )
+        return bool(validation.get("valid"))
+
+    @staticmethod
+    def _candidate_with_container_m1_evidence(
+        candidate: dict, evidence: dict
+    ) -> dict:
+        """Preserve one accepted M1 record without altering candidate identity."""
+
+        result = dict(candidate)
+        metadata = dict(result.get("metadata") or {})
+        metadata["accepted_container_m1_evidence"] = dict(evidence)
+        metadata["accepted_container_m1_capture_pose_xyyaw"] = list(
+            evidence.get("capture_pose_xyyaw") or []
+        )
+        metadata["accepted_container_m1_capture_step"] = evidence.get("capture_step")
+        result["metadata"] = metadata
+        return result
+
     def _drawer_candidate_from_m1_update_locked(
         self,
         candidate: dict,
@@ -1698,6 +1834,28 @@ class SemanticBehaviorExecutor:
                         update,
                         request,
                     )
+                    if planned is not None:
+                        evidence, capture_reason = (
+                            self._container_m1_capture_evidence_locked(
+                                planned, update, request
+                            )
+                        )
+                        if evidence is None:
+                            planned = None
+                            drawer_reason = capture_reason
+                        else:
+                            planned = self._candidate_with_container_m1_evidence(
+                                planned, evidence
+                            )
+                            accepted_by_decision = getattr(
+                                self, "_container_m1_last_accepted_evidence", None
+                            )
+                            if accepted_by_decision is None:
+                                accepted_by_decision = {}
+                                self._container_m1_last_accepted_evidence = (
+                                    accepted_by_decision
+                                )
+                            accepted_by_decision[decision_id] = dict(evidence)
                     update["drawer_action_regions_ready"] = planned is not None
                     update["drawer_visual_precondition_reason"] = drawer_reason
                     if planned is not None:
@@ -1721,6 +1879,30 @@ class SemanticBehaviorExecutor:
                     container_reason = self._container_m1_pre_action_ready_locked(
                         update, request
                     )
+                    evidence = None
+                    if container_reason == "ready":
+                        evidence, capture_reason = (
+                            self._container_m1_capture_evidence_locked(
+                                candidate, update, request
+                            )
+                        )
+                        if evidence is None:
+                            container_reason = capture_reason
+                        else:
+                            candidate = self._candidate_with_container_m1_evidence(
+                                candidate, evidence
+                            )
+                            self.machine.candidate = candidate
+                            self.selection = dict(candidate)
+                            accepted_by_decision = getattr(
+                                self, "_container_m1_last_accepted_evidence", None
+                            )
+                            if accepted_by_decision is None:
+                                accepted_by_decision = {}
+                                self._container_m1_last_accepted_evidence = (
+                                    accepted_by_decision
+                                )
+                            accepted_by_decision[decision_id] = dict(evidence)
                     update["container_visual_precondition_reason"] = container_reason
                     required_confirmations = max(
                         1,
@@ -1762,6 +1944,62 @@ class SemanticBehaviorExecutor:
                                 "min_capture_step": int(capture_step),
                                 "reason": "mllm_container_front_confirmation",
                                 "confirmation_count": confirmation_count + 1,
+                                "accepted_evidence": dict(evidence or {}),
+                                "same_pose_flip_count": 0,
+                            }
+                        ]
+                        self._interaction_observation_requests.pop(decision_id, None)
+                        break
+                    accepted_evidence = dict(
+                        request.get("accepted_evidence")
+                        or getattr(
+                            self, "_container_m1_last_accepted_evidence", {}
+                        ).get(decision_id)
+                        or {}
+                    )
+                    same_pose_flip_count = max(
+                        0, int(request.get("same_pose_flip_count", 0) or 0)
+                    )
+                    if (
+                        container_reason != "ready"
+                        and accepted_evidence
+                        and same_pose_flip_count
+                        < int(
+                            getattr(
+                                self,
+                                "container_m1_same_pose_flip_retry_count",
+                                1,
+                            )
+                            or 0
+                        )
+                        and self._container_m1_evidence_still_at_capture_pose_locked(
+                            candidate, accepted_evidence
+                        )
+                    ):
+                        # Do not discard a valid front merely because the next
+                        # M1 response flickered at the same pose.  Ask once more
+                        # at that *same* staging pose; moving to another ring
+                        # option remains the bounded fallback if it persists.
+                        update["container_visual_precondition_reason"] = (
+                            "m1_temporal_flip_reobserve_same_staging_pose"
+                        )
+                        commands = [
+                            {
+                                "kind": "request_interaction_observation",
+                                "candidate": candidate,
+                                "node_id": str(request.get("node_id") or ""),
+                                "object_id": str(request.get("object_id") or ""),
+                                "attempt": int(request.get("attempt", 0) or 0),
+                                "min_capture_step": int(
+                                    capture_step
+                                    if capture_step is not None
+                                    else request.get("minimum_capture_step", 0)
+                                    or 0
+                                ),
+                                "reason": "mllm_container_temporal_flip_reobserve",
+                                "confirmation_count": confirmation_count,
+                                "accepted_evidence": accepted_evidence,
+                                "same_pose_flip_count": same_pose_flip_count + 1,
                             }
                         ]
                         self._interaction_observation_requests.pop(decision_id, None)
@@ -1943,6 +2181,28 @@ class SemanticBehaviorExecutor:
 
         candidate = dict(self.machine.candidate or self.selection or {})
         metadata = candidate.get("metadata") or {}
+        failure_reason = str(
+            payload.get("failure_reason") or payload.get("reason") or ""
+        ).strip().casefold()
+        if (
+            failure_reason == "unsafe_open_sweep"
+            and str(metadata.get("node_type") or "").casefold() == "container"
+        ):
+            # The bridge has not touched the joint.  Its public result says the
+            # current refrigerator stance is unsafe, so the next ring option
+            # must earn fresh M1 evidence rather than reusing a face observed
+            # at the rejected pose.
+            metadata = dict(metadata)
+            metadata["observation_required"] = True
+            metadata["reobserve"] = True
+            metadata["interaction_observation_resolved"] = False
+            metadata["interaction_observation_attempts"] = 0
+            metadata["unsafe_open_sweep_recommended_retreat_m"] = float(
+                payload.get("recommended_retreat_m", 0.0) or 0.0
+            )
+            candidate["metadata"] = metadata
+            self.machine.candidate = candidate
+            self.selection = dict(candidate)
         attempts = [
             dict(item)
             for item in metadata.get("interaction_approach_attempts") or []
@@ -1952,7 +2212,11 @@ class SemanticBehaviorExecutor:
             0, int(metadata.get("interaction_approach_goal_option_index", 0) or 0)
         )
         if attempts:
-            attempts[-1]["outcome"] = "interaction_pose_invalid"
+            attempts[-1]["outcome"] = (
+                "unsafe_open_sweep"
+                if failure_reason == "unsafe_open_sweep"
+                else "interaction_pose_invalid"
+            )
             attempts[-1]["bridge_pose_validation"] = dict(
                 payload.get("interaction_pose_validation") or {}
             )
@@ -1967,7 +2231,11 @@ class SemanticBehaviorExecutor:
                         )
                         or [])
                     ),
-                    "outcome": "interaction_pose_invalid",
+                    "outcome": (
+                        "unsafe_open_sweep"
+                        if failure_reason == "unsafe_open_sweep"
+                        else "interaction_pose_invalid"
+                    ),
                     "bridge_pose_validation": dict(
                         payload.get("interaction_pose_validation") or {}
                     ),
@@ -1975,7 +2243,11 @@ class SemanticBehaviorExecutor:
             )
         goal_option_count = len(navigation_goal_options(candidate))
         failure_detail = {
-            "reason": "interaction_pose_invalid",
+            "reason": (
+                "unsafe_open_sweep"
+                if failure_reason == "unsafe_open_sweep"
+                else "interaction_pose_invalid"
+            ),
             "interaction_pose_validation": dict(
                 payload.get("interaction_pose_validation") or {}
             ),
@@ -3124,6 +3396,17 @@ class SemanticBehaviorExecutor:
                 )[:160],
                 "request_id": request_id,
             }
+            metadata = (
+                dict(self.machine.candidate.get("metadata") or {})
+                if self.machine.candidate
+                else {}
+            )
+            interaction_pose = list(
+                metadata.get("effective_interaction_approach_pose_xyyaw")
+                or interaction.get("interaction_approach_pose_xyyaw")
+                or (self.machine.candidate or {}).get("goal_xyyaw")
+                or []
+            )
             self._interaction_observation_requests[decision_id] = {
                 **request,
                 "node_id": node_id,
@@ -3136,6 +3419,11 @@ class SemanticBehaviorExecutor:
                 ),
                 "container_pre_action": self._is_container_pre_action_candidate(
                     self.machine.candidate
+                ),
+                "observation_pose_xyyaw": interaction_pose[:3],
+                "accepted_evidence": dict(command.get("accepted_evidence") or {}),
+                "same_pose_flip_count": max(
+                    0, int(command.get("same_pose_flip_count", 0) or 0)
                 ),
                 "requested_at": time.monotonic(),
             }
@@ -3269,6 +3557,7 @@ class SemanticBehaviorExecutor:
             ).casefold(),
             "action": action,
             "interaction_mode": interaction.get("interaction_mode", "open_close"),
+            "container_kind": str(interaction.get("container_kind") or ""),
             "expected_state": str(
                 "closed"
                 if action == "close"

@@ -525,6 +525,51 @@ def test_container_requires_two_direct_front_m1_observations_before_opening(
     ]
 
 
+def test_container_m1_capture_evidence_uses_staging_pose_without_tf(
+    executor_module,
+) -> None:
+    """Reduced executor mocks accept evidence at their selected safe staging pose."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.tf_listener = None
+    executor.map_frame = "map"
+    executor.container_m1_capture_pose_tolerance_m = 0.18
+    executor.container_m1_capture_yaw_tolerance_rad = 0.25
+    # A TF-less test double may still expose an incomplete pose helper.  The
+    # capture path must not call it or mistake its absence for stale evidence.
+    executor._current_pose = lambda _frame: pytest.fail("TF-less fallback called pose reader")
+    candidate = {
+        "metadata": {
+            "frame_id": "map",
+            "effective_interaction_approach_pose_xyyaw": [1.25, -0.5, 0.4],
+        },
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [1.25, -0.5, 0.4],
+        },
+    }
+    update = {
+        "observation_capture_step": 73,
+        "view_state": "front",
+        "front_surface_visible": True,
+        "approach_ready": True,
+    }
+    request = {"observation_pose_xyyaw": [1.25, -0.5, 0.4]}
+
+    evidence, reason = executor._container_m1_capture_evidence_locked(
+        candidate, update, request
+    )
+
+    assert reason == "ready"
+    assert evidence is not None
+    assert evidence["capture_step"] == 73
+    assert evidence["capture_pose_xyyaw"] == [1.25, -0.5, 0.4]
+    assert evidence["staging_pose_xyyaw"] == [1.25, -0.5, 0.4]
+    assert evidence["pose_validation"]["valid"] is True
+    assert executor._container_m1_evidence_still_at_capture_pose_locked(
+        candidate, evidence
+    )
+
+
 def test_fresh_m1_drawer_plan_uses_sequential_scan_contract(executor_module) -> None:
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
     executor.container_pre_action_require_direct_front = True

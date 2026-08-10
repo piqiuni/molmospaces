@@ -25,6 +25,7 @@ from offline_semantic_renderer import (
     draw_camera_title,
     draw_map_snapshot_note,
     draw_task_subgoal_header,
+    extend_world_bounds_lower,
     known_world_bounds,
     load_raw_grid,
     selection_target_ids,
@@ -264,6 +265,13 @@ def offline_display_config(
             return default
         return value if math.isfinite(value) and value >= 1.0 else default
 
+    def nonnegative_distance(key: str, default: float) -> float:
+        try:
+            value = float(config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) and value >= 0.0 else default
+
     label_mode = str(
         config.get("video_semantic_xy_label_mode", "interaction_target_only")
         or "interaction_target_only"
@@ -274,6 +282,11 @@ def offline_display_config(
         "global_panel_scale": scale("video_global_panel_scale", 1.8),
         "room_panel_scale": scale("video_room_panel_scale", 1.5),
         "semantic_xy_panel_scale": scale("video_semantic_xy_panel_scale", 1.8),
+        # Panel 2 needs a small persistent lower margin to retain the area
+        # below the active map envelope. This is not a detail-panel zoom.
+        "occ_lower_margin_m": nonnegative_distance(
+            "video_occ_lower_margin_m", 1.0
+        ),
         "semantic_xy_label_mode": label_mode,
         # The overview inset is presentation-only and can hide graph content.
         # Do not replay a historical recorder preference by default; it is an
@@ -911,6 +924,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 global_panel_scale = float(visualization_config["global_panel_scale"])
                 room_panel_scale = float(visualization_config["room_panel_scale"])
                 semantic_xy_panel_scale = float(visualization_config["semantic_xy_panel_scale"])
+                occ_lower_margin_m = float(visualization_config["occ_lower_margin_m"])
                 semantic_xy_label_mode = str(visualization_config["semantic_xy_label_mode"])
                 semantic_xy_overview_inset = bool(
                     getattr(args, "semantic_xy_overview_inset", False)
@@ -919,6 +933,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     known_world_bounds(planning, margin_m=occ_crop_margin_m)
                     if planning is not None
                     else None
+                )
+                occ_world_bounds = extend_world_bounds_lower(
+                    world_bounds, occ_lower_margin_m
                 )
                 camera = cv2.imread(
                     str(resolve_path(str(sim_record.get("frame") or ""), scene_dir)),
@@ -936,7 +953,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 draw_camera_title(camera, step, step_index)
                 occ = renderer.render_map_panel(
                     planning, panel_size, step, step_index, title="OCC", kind="occupancy",
-                    world_bounds=world_bounds, draw_global_plan=True, draw_local_plan=True,
+                    world_bounds=occ_world_bounds, draw_global_plan=True, draw_local_plan=True,
                     draw_frontiers=True, draw_semantic_candidates=True, draw_route_plan=True,
                     episode_trajectory=trajectory,
                     snapshot_meta=planning_meta,

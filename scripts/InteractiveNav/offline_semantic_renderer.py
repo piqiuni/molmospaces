@@ -512,13 +512,18 @@ def _draw_costmap_legend(panel: np.ndarray) -> None:
         cv2.putText(panel, label, (x0 + 18, baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.31, (20, 20, 20), 1, cv2.LINE_AA)
 
 
-def _draw_occupancy_candidate_legend(panel: np.ndarray) -> None:
-    """Explain raw frontiers versus unselected explore candidate locations."""
+def _draw_occupancy_candidate_legend(
+    panel: np.ndarray, live_behavior_type: str = ""
+) -> None:
+    """Explain raw frontiers, explore options, and the current live subgoal."""
 
+    live_behavior = str(live_behavior_type or "").upper()
+    if live_behavior not in {"EXPLORE", "NAVIGATE", "INTERACT"}:
+        live_behavior = "NAVIGATE"
     legend = (
         ("RAW FRONTIER", RAW_FRONTIER_COLOR),
         ("EXPLORE OPTION", UNSELECTED_EXPLORE_COLOR),
-        ("LIVE SUBGOAL", candidate_color("EXPLORE")),
+        (f"LIVE {live_behavior}", candidate_color(live_behavior)),
     )
     height, width = panel.shape[:2]
     overlay = panel.copy()
@@ -531,6 +536,164 @@ def _draw_occupancy_candidate_legend(panel: np.ndarray) -> None:
         cv2.circle(panel, (x + 6, y0 + 8), 5, color, -1, cv2.LINE_AA)
         cv2.putText(panel, label, (x + 15, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.29, (20, 20, 20), 1, cv2.LINE_AA)
         x += 104
+
+
+def _nonnegative_int(value: object, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, int(default))
+
+
+def terminal_status_summary(step: dict) -> dict[str, object]:
+    """Return a display-only summary of the recorded terminal progress.
+
+    The renderer must not infer a new terminal condition.  It only surfaces
+    fields already published by the candidate/decision streams.  A later
+    recorder may include a completion-monitor snapshot; old recordings still
+    show the known exhausted counts and the terminal-no-plan tracker when it is
+    present in the decision trace.
+    """
+
+    candidates = step.get("semantic_candidates") or {}
+    exploration = candidates.get("exploration_context") or {}
+    trace = step.get("semantic_decision_trace") or {}
+    terminal_no_plan = trace.get("terminal_no_plan_exit") or {}
+    completion = (
+        step.get("completion_status")
+        or trace.get("completion_status")
+        or candidates.get("completion_status")
+        or {}
+    )
+    if not isinstance(completion, dict):
+        completion = {}
+
+    navigation_count = _nonnegative_int(
+        exploration.get("navigation_frontier_count")
+    )
+    interaction_count = _nonnegative_int(
+        exploration.get("interaction_frontier_count")
+    )
+    exhausted = bool(exploration.get("frontier_exhausted", False))
+    has_context = bool(exploration)
+
+    if bool(terminal_no_plan.get("armed", False)) or bool(
+        terminal_no_plan.get("complete", False)
+    ):
+        detail = terminal_no_plan.get("detail") or {}
+        elapsed = _nonnegative_int(detail.get("no_executable_elapsed_steps"))
+        min_steps = _nonnegative_int(
+            detail.get("no_executable_candidate_min_steps")
+        )
+        confirmations = _nonnegative_int(
+            detail.get("no_executable_observation_confirmations")
+        )
+        required_confirmations = max(
+            1,
+            _nonnegative_int(
+                detail.get("no_executable_candidate_confirmations_required"), 1
+            ),
+        )
+        remaining_steps = max(0, min_steps - elapsed)
+        remaining_confirmations = max(0, required_confirmations - confirmations)
+        if bool(terminal_no_plan.get("complete", False)):
+            label = "TERMINAL NO-PLAN EXIT CONFIRMED"
+        else:
+            label = (
+                "TERMINAL NO-PLAN: "
+                f"STEP {elapsed}/{min_steps} · OBS {confirmations}/{required_confirmations} "
+                f"· REM {remaining_steps} STEP / {remaining_confirmations} OBS"
+            )
+        return {
+            "label": label,
+            "color": (55, 70, 225),
+            "navigation_frontier_count": navigation_count,
+            "interaction_frontier_count": interaction_count,
+            "remaining_steps": remaining_steps,
+            "remaining_confirmations": remaining_confirmations,
+        }
+
+    completion_config = completion.get("config") or {}
+    confirmations = _nonnegative_int(
+        completion.get(
+            "frontier_confirmations",
+            exploration.get("completion_confirmations", 0),
+        )
+    )
+    required_confirmations = _nonnegative_int(
+        completion_config.get(
+            "frontier_confirmations",
+            completion.get(
+                "frontier_confirmations_required",
+                exploration.get("completion_confirmations_required", 0),
+            ),
+        )
+    )
+    remaining_steps = _nonnegative_int(
+        completion.get(
+            "remaining_steps",
+            exploration.get("completion_remaining_steps", 0),
+        )
+    )
+    if bool(completion.get("requested", False)):
+        label = "COMPLETION REQUESTED"
+    elif exhausted:
+        label = (
+            f"FRONTIERS EXHAUSTED: NAV {navigation_count} · INTERACT {interaction_count}"
+        )
+        if required_confirmations:
+            label += (
+                f" · CONF {confirmations}/{required_confirmations}"
+                f" · REM {max(0, required_confirmations - confirmations)} OBS"
+            )
+        if remaining_steps:
+            label += f" / {remaining_steps} STEP"
+    else:
+        label = ""
+    if not label and not has_context:
+        return {}
+    return {
+        "label": label,
+        "color": (95, 70, 190),
+        "navigation_frontier_count": navigation_count,
+        "interaction_frontier_count": interaction_count,
+        "remaining_steps": remaining_steps,
+        "remaining_confirmations": max(0, required_confirmations - confirmations),
+    }
+
+
+def draw_terminal_status(panel: np.ndarray, step: dict, *, baseline_y: int = 77) -> None:
+    """Draw the recorded exhaustion/terminal progress without hiding the OCC."""
+
+    summary = terminal_status_summary(step)
+    label = str(summary.get("label") or "")
+    if not label:
+        return
+    font_scale = 0.30 if panel.shape[1] < 360 else 0.33
+    thickness = 1
+    text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+    x0 = 6
+    y0 = max(text_size[1] + 4, int(baseline_y))
+    x1 = min(panel.shape[1] - 5, x0 + text_size[0] + 10)
+    overlay = panel.copy()
+    cv2.rectangle(
+        overlay,
+        (x0 - 2, y0 - text_size[1] - 5),
+        (x1, y0 + 4),
+        (255, 255, 255),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.78, panel, 0.22, 0.0, panel)
+    cv2.putText(
+        panel,
+        label,
+        (x0 + 2, y0),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        tuple(summary.get("color") or (55, 55, 170)),
+        thickness,
+        cv2.LINE_AA,
+    )
 
 
 def _draw_polyline(panel: np.ndarray, points: list[tuple[int, int]], color: tuple[int, int, int], thickness: int) -> None:
@@ -618,6 +781,29 @@ def zoom_world_bounds(
         center_x + half_width,
         center_y + half_height,
     )
+
+
+def extend_world_bounds_lower(
+    bounds: tuple[float, float, float, float] | None,
+    lower_margin_m: float,
+) -> tuple[float, float, float, float] | None:
+    """Reserve extra map-frame space below the OCC panel without zoom settings.
+
+    The extra interval is intentionally applied only to Panel 2's world bounds.
+    It does not change the configured detail zoom for the room, semantic-XY, or
+    costmap panels.
+    """
+
+    if bounds is None:
+        return None
+    try:
+        margin = float(lower_margin_m)
+    except (TypeError, ValueError):
+        return bounds
+    if not math.isfinite(margin) or margin <= 0.0:
+        return bounds
+    min_x, min_y, max_x, max_y = bounds
+    return (min_x, min_y - margin, max_x, max_y)
 
 
 def draw_task_subgoal_header(
@@ -1255,11 +1441,11 @@ class OfflineSixPanelRenderer:
             transformed_goal_yaw = goal[2] if math.isfinite(goal[2]) else goal_yaw
             _draw_goal_arrow(panel, goal_px, transformed_goal_yaw, max(9, int(9 * scale)), candidate_color(behavior))
         if selected_candidate_stale:
-            cv2.rectangle(panel, (6, 78), (min(panel.shape[1] - 6, 302), 97), (255, 255, 255), -1)
+            cv2.rectangle(panel, (6, 101), (min(panel.shape[1] - 6, 302), 120), (255, 255, 255), -1)
             cv2.putText(
                 panel,
                 "CANDIDATE SNAPSHOT OUTDATED (LIVE GOAL SHOWN)",
-                (10, 92),
+                (10, 115),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.30,
                 (55, 55, 170),
@@ -1277,7 +1463,11 @@ class OfflineSixPanelRenderer:
         if "COSTMAP" in title.upper():
             _draw_costmap_legend(panel)
         elif draw_semantic_candidates:
-            _draw_occupancy_candidate_legend(panel)
+            draw_terminal_status(panel, step)
+            _draw_occupancy_candidate_legend(
+                panel,
+                str(selection.get("behavior_type") or ""),
+            )
         return panel
 
     def _world_view(self, bounds: tuple[float, float, float, float], panel_size: tuple[int, int], *, margin: int, vertical_center: float = 0.5):

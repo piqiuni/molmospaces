@@ -18,12 +18,19 @@ candidate:
   container_require_same_room: false
   container_allow_connected_room: true
   portal_standoff_m: 0.85
-  # ``_approach_pose`` already starts from the observed AABB surface.  The old
-  # 1.0 + 0.25 m extra clearance placed the base roughly 1.4--1.8 m from a
-  # drawer/fridge center, beyond a usable interaction view.  Keep enough room
-  # for the 0.25 m base while allowing fresh M1 to see the actual front.
+  # ``_approach_pose`` already starts from the observed AABB surface.  Keep
+  # drawers close enough for the scan macro, but use a type-specific larger
+  # refrigerator clearance because its hinged leaf sweeps toward the robot.
   container_standoff_m: 0.40
   drawer_standoff_m: 0.40
+  fridge_standoff_m: 0.80
+  # M1 is sampled at the interaction staging pose, before the bridge command.
+  # These floors prevent a final pose tolerance from placing the camera at a
+  # too-close perspective; the drawer macro itself remains unchanged.
+  container_observation_standoff_m: 0.70
+  drawer_observation_standoff_m: 0.65
+  fridge_observation_standoff_m: 0.80
+  container_interaction_ready_distance_m: 0.18
   interaction_safety_margin_m: 0.10
   interaction_ready_distance_m: 0.30
   interaction_ready_yaw_tolerance_rad: 0.35
@@ -44,8 +51,8 @@ policy:
   repeat_guard_min_frontier_shrink_m: 0.15
 
 model:
-  # Dual local Qwen endpoints (24 sequences each) measured <=2.03 s visual
-  # P95 at 48 aggregate requests; 12 s keeps a large real-navigation margin
+  # The local Qwen service may data-parallel across both GPUs; 12 s keeps a
+  # large real-navigation margin
   # while preventing a stalled endpoint from freezing a scene for 30 seconds.
   timeout_s: 12.0
   # Module 2 normally returns a tiny ranking.  Keep enough headroom to recover

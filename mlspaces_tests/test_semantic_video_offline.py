@@ -36,6 +36,8 @@ from scripts.InteractiveNav.offline_semantic_renderer import (
     active_semantic_selection,
     camera_title,
     candidate_matches_canonical_selection,
+    extend_world_bounds_lower,
+    terminal_status_summary,
     zoom_world_bounds,
 )
 
@@ -157,6 +159,7 @@ def test_offline_display_defaults_and_persisted_overrides() -> None:
         "global_panel_scale": 1.8,
         "room_panel_scale": 1.5,
         "semantic_xy_panel_scale": 1.8,
+        "occ_lower_margin_m": 1.0,
         "semantic_xy_label_mode": "interaction_target_only",
         "semantic_xy_overview_inset": False,
     }
@@ -165,6 +168,7 @@ def test_offline_display_defaults_and_persisted_overrides() -> None:
             "video_global_panel_scale": 1.2,
             "video_room_panel_scale": 1.6,
             "video_semantic_xy_panel_scale": 2.0,
+            "video_occ_lower_margin_m": 1.25,
             "video_semantic_xy_label_mode": "all",
             "video_semantic_xy_overview_inset": True,
         }
@@ -172,6 +176,7 @@ def test_offline_display_defaults_and_persisted_overrides() -> None:
         "global_panel_scale": 1.2,
         "room_panel_scale": 1.6,
         "semantic_xy_panel_scale": 2.0,
+        "occ_lower_margin_m": 1.25,
         "semantic_xy_label_mode": "all",
         # A historical recorder setting cannot re-enable the obstructive inset;
         # the offline CLI flag is the explicit opt-in.
@@ -181,6 +186,21 @@ def test_offline_display_defaults_and_persisted_overrides() -> None:
 
 def test_world_coordinate_zoom_scales_bounds_without_post_render_crop() -> None:
     assert zoom_world_bounds((0.0, 0.0, 12.0, 18.0), 1.5) == (2.0, 3.0, 10.0, 15.0)
+
+
+def test_occ_lower_margin_extends_only_the_lower_world_bound() -> None:
+    assert extend_world_bounds_lower((1.0, 2.0, 7.0, 9.0), 1.25) == (
+        1.0,
+        0.75,
+        7.0,
+        9.0,
+    )
+    assert extend_world_bounds_lower((1.0, 2.0, 7.0, 9.0), 0.0) == (
+        1.0,
+        2.0,
+        7.0,
+        9.0,
+    )
 
 
 def test_semantic_xy_target_only_keeps_rooms_and_hides_non_target_labels(monkeypatch) -> None:
@@ -579,3 +599,84 @@ def test_stale_candidate_text_explains_live_goal_is_authoritative(monkeypatch) -
         draw_semantic_candidates=True,
     )
     assert "CANDIDATE SNAPSHOT OUTDATED (LIVE GOAL SHOWN)" in labels
+
+
+def test_interaction_subgoal_is_true_orange_and_legend_uses_live_behavior(monkeypatch) -> None:
+    import cv2
+
+    labels: list[str] = []
+    original_put_text = cv2.putText
+
+    def capture_put_text(image, text, *args, **kwargs):
+        labels.append(str(text))
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "putText", capture_put_text)
+    assert offline_renderer.candidate_color("EXPLORE") != offline_renderer.candidate_color(
+        "NAVIGATE"
+    )
+    assert offline_renderer.candidate_color("INTERACT") == (0, 140, 255)
+    grid = RawGrid(
+        values=np.zeros((100, 100), dtype=np.int32),
+        width=100,
+        height=100,
+        resolution=0.1,
+        frame_id="map",
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+    )
+    renderer = OfflineSixPanelRenderer(
+        transforms=TransformResolver([], map_frame="map", odom_frame="map")
+    )
+    renderer.render_map_panel(
+        grid,
+        (480, 270),
+        {
+            "pose": [5.0, 5.0, 0.0],
+            "semantic_selection": {
+                "active": True,
+                "candidate_id": "interaction:fridge:open",
+                "behavior_type": "INTERACT",
+                "goal_xyyaw": [6.0, 6.0, 0.0],
+            },
+            "semantic_candidates": {"candidates": []},
+        },
+        0,
+        title="OCC",
+        kind="occupancy",
+        world_bounds=(0.0, 0.0, 10.0, 10.0),
+        draw_semantic_candidates=True,
+    )
+    assert "LIVE INTERACT" in labels
+
+
+def test_terminal_status_uses_recorded_no_plan_countdown_only() -> None:
+    summary = terminal_status_summary(
+        {
+            "semantic_candidates": {
+                "exploration_context": {
+                    "frontier_exhausted": True,
+                    "navigation_frontier_count": 0,
+                    "interaction_frontier_count": 0,
+                }
+            },
+            "semantic_decision_trace": {
+                "terminal_no_plan_exit": {
+                    "armed": True,
+                    "complete": False,
+                    "detail": {
+                        "no_executable_elapsed_steps": 17,
+                        "no_executable_candidate_min_steps": 20,
+                        "no_executable_observation_confirmations": 2,
+                        "no_executable_candidate_confirmations_required": 3,
+                    },
+                }
+            },
+        }
+    )
+    assert summary["remaining_steps"] == 3
+    assert summary["remaining_confirmations"] == 1
+    assert "STEP 17/20" in str(summary["label"])
+    assert "REM 3 STEP / 1 OBS" in str(summary["label"])
+    assert terminal_status_summary({}) == {}

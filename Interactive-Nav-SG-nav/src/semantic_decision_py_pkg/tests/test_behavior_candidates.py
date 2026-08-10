@@ -987,7 +987,7 @@ def test_native_interaction_standoffs_keep_drawers_with_containers() -> None:
     assert math.isclose(
         candidates["fridge_1"].metadata["interaction_standoff_m"], 0.75
     )
-    assert candidates["fridge_1"].metadata["interaction_standoff_source"] == "container"
+    assert candidates["fridge_1"].metadata["interaction_standoff_source"] == "refrigerator"
     assert math.isclose(
         candidates["drawer_1"].metadata["interaction_standoff_m"], 0.75
     )

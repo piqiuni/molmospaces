@@ -1069,6 +1069,9 @@ def parse_args():
     parser.add_argument("--force_interaction_drawer_transition_steps", type=int, default=5)
     parser.add_argument("--force_interaction_drawer_observation_steps", type=int, default=1)
     parser.add_argument(
+        "--force_interaction_drawer_view_restore_settle_steps", type=int, default=2
+    )
+    parser.add_argument(
         "--completion_mode",
         choices=["disabled", "frontier", "semantic"],
         default="disabled",
@@ -1448,6 +1451,9 @@ def main():
             drawer_execution_mode=args.force_interaction_drawer_execution_mode,
             drawer_transition_steps=args.force_interaction_drawer_transition_steps,
             drawer_observation_steps=args.force_interaction_drawer_observation_steps,
+            drawer_view_restore_settle_steps=(
+                args.force_interaction_drawer_view_restore_settle_steps
+            ),
             object_id_resolver=(
                 getattr(policy._realtime_gt_publisher, "resolve_public_object_id", None)
                 if getattr(policy, "_realtime_gt_publisher", None) is not None

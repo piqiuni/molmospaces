@@ -549,10 +549,18 @@ class InteractionAttributeInferenceNode:
                 if request_payload.get("targeted_refresh"):
                     with self.lock:
                         self.filter_counts["targeted_refresh_rejected"] += 1
-                self._release(
-                    str(request_payload["object_id"]),
-                    int(request_payload["request_sequence"]),
-                )
+                # The deadline can elapse after the pre-admission check but
+                # before the queue lock is acquired.  Preserve the terminal
+                # expiry status instead of silently releasing the reservation.
+                if self._remaining_request_timeout(
+                    request_payload.get("deadline_monotonic"), self.request_timeout_s
+                ) <= 0.0:
+                    self._expire_attribute_request(request_payload)
+                else:
+                    self._release(
+                        str(request_payload["object_id"]),
+                        int(request_payload["request_sequence"]),
+                    )
         self._publish_status()
         rospy.loginfo_throttle(
             10.0,
@@ -655,7 +663,15 @@ class InteractionAttributeInferenceNode:
             accepted, displaced = self.room_request_queue.put(request_payload)
             room_key = str(request_payload["object_id"])
             if not accepted:
-                self._release_room(room_key, int(request_payload["request_sequence"]))
+                # Match the object lane: an item can expire while waiting for
+                # the queue lock, and must be reported as expired rather than
+                # disappearing as an unclassified rejection.
+                if self._remaining_request_timeout(
+                    request_payload.get("deadline_monotonic"), self.room_request_timeout_s
+                ) <= 0.0:
+                    self._expire_room_request(request_payload)
+                else:
+                    self._release_room(room_key, int(request_payload["request_sequence"]))
                 continue
             with self.lock:
                 self.room_counts["enqueued"] += 1
@@ -756,7 +772,11 @@ class InteractionAttributeInferenceNode:
             self.room_generations[room_key] = self.room_generations.get(room_key, 0) + 1
             self.room_pending.pop(room_key, None)
             self.room_last_request.pop(room_key, None)
-        self.room_request_queue.discard(room_key, request_sequence)
+        discarded = self.room_request_queue.discard(room_key, request_sequence)
+        self._publish_discarded_room_requests(
+            discarded,
+            error="queue_replaced_by_newer_room_evidence",
+        )
 
     def _try_reserve_room(self, room_key: str, signature: str) -> dict | None:
         now = time.monotonic()
@@ -808,6 +828,28 @@ class InteractionAttributeInferenceNode:
             "source": "mllm_room_attribute_inference",
             "error": str(error)[:240],
         }
+
+    def _publish_discarded_room_requests(
+        self,
+        requests: list[dict] | None,
+        *,
+        error: str,
+    ) -> None:
+        """Give directly discarded queued room requests a terminal status."""
+
+        discarded = [dict(item) for item in (requests or []) if isinstance(item, dict)]
+        if not discarded:
+            return
+        with self.lock:
+            self.room_counts["coalesced"] = (
+                self.room_counts.get("coalesced", 0) + len(discarded)
+            )
+        for request_payload in discarded:
+            self._publish_room_updates(
+                str(request_payload.get("episode_id") or ""),
+                float(request_payload.get("stamp", time.time()) or time.time()),
+                [self._room_status_patch(request_payload, "stale", error=error)],
+            )
 
     def _publish_status(self) -> None:
         with self.lock:
@@ -1053,11 +1095,13 @@ class InteractionAttributeInferenceNode:
         """Replace stale discovery work with the explicitly requested view."""
 
         previous_request_sequence: int | None = None
+        previous_snapshot: dict | None = None
         with self.lock:
             if episode_id and self.current_episode_id and episode_id != self.current_episode_id:
                 return None
             previous = self.pending.get(object_id)
             if previous is not None:
+                previous_snapshot = dict(previous)
                 previous_request_sequence = int(
                     previous.get("request_sequence", 0) or 0
                 )
@@ -1079,7 +1123,27 @@ class InteractionAttributeInferenceNode:
             }
             self.filter_counts["targeted_refresh_matched"] += 1
         if previous_request_sequence is not None:
-            self.request_queue.discard(object_id, previous_request_sequence)
+            discarded = self.request_queue.discard(
+                object_id, previous_request_sequence
+            )
+            if not discarded and previous_snapshot is not None:
+                discarded = [
+                    {
+                        **previous_snapshot,
+                        "object_id": object_id,
+                        "episode_id": previous_snapshot.get("episode_id")
+                        or episode_id,
+                        "stamp": previous_snapshot.get("stamp", time.time()),
+                        "frame_id": previous_snapshot.get("frame_id", ""),
+                        "signature": previous_snapshot.get("signature", ""),
+                        "targeted_refresh": previous_snapshot.get("targeted_refresh")
+                        or {},
+                    }
+                ]
+            self._publish_discarded_attribute_requests(
+                discarded,
+                error="queue_replaced_by_newer_object_evidence",
+            )
         return {"generation": generation, "request_sequence": request_sequence}
 
     def _consume_targeted_refresh(self, refresh: dict) -> None:
@@ -1129,6 +1193,28 @@ class InteractionAttributeInferenceNode:
             )
         return patch
 
+    def _publish_discarded_attribute_requests(
+        self,
+        requests: list[dict] | None,
+        *,
+        error: str,
+    ) -> None:
+        """Give directly discarded queued M1 requests a terminal status."""
+
+        discarded = [dict(item) for item in (requests or []) if isinstance(item, dict)]
+        if not discarded:
+            return
+        with self.lock:
+            self.filter_counts["coalesced"] = (
+                self.filter_counts.get("coalesced", 0) + len(discarded)
+            )
+        for request_payload in discarded:
+            self._publish_updates(
+                str(request_payload.get("episode_id") or ""),
+                float(request_payload.get("stamp", time.time()) or time.time()),
+                [self._attribute_status_patch(request_payload, "stale", error=error)],
+            )
+
     @staticmethod
     def _observation_stamp(payload: object, fallback: float) -> float:
         if isinstance(payload, dict):
@@ -1159,17 +1245,39 @@ class InteractionAttributeInferenceNode:
         if not object_id:
             return
         request_sequence = 0
+        pending_snapshot: dict | None = None
         with self.lock:
             pending = self.pending.get(object_id)
             if pending is None or str(pending.get("signature") or "") == signature:
                 return
             if episode_id and str(pending.get("episode_id") or "") not in {"", episode_id}:
                 return
+            pending_snapshot = dict(pending)
             request_sequence = int(pending.get("request_sequence", 0) or 0)
             self.generations[object_id] = self.generations.get(object_id, 0) + 1
             self.pending.pop(object_id, None)
             self.last_request.pop(object_id, None)
-        self.request_queue.discard(object_id, request_sequence)
+        discarded = self.request_queue.discard(object_id, request_sequence)
+        if not discarded and pending_snapshot is not None:
+            # A worker may already have removed the item from the local queue.
+            # Publish a synthetic terminal record so the public state cannot
+            # remain ``pending`` while the in-flight response is suppressed by
+            # the generation guard.
+            discarded = [
+                {
+                    **pending_snapshot,
+                    "object_id": object_id,
+                    "episode_id": pending_snapshot.get("episode_id") or episode_id,
+                    "stamp": pending_snapshot.get("stamp", time.time()),
+                    "frame_id": pending_snapshot.get("frame_id", ""),
+                    "signature": pending_snapshot.get("signature", ""),
+                    "targeted_refresh": pending_snapshot.get("targeted_refresh") or {},
+                }
+            ]
+        self._publish_discarded_attribute_requests(
+            discarded,
+            error="queue_replaced_by_newer_object_evidence",
+        )
 
     def _passes_observation_filter(self, detection: dict) -> bool:
         if not is_interaction_attribute_candidate(

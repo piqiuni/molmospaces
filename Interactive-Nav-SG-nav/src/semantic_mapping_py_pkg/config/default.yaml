@@ -223,7 +223,10 @@ interaction_graph:
 
 semantic_occ_overlay:
   enabled: true
-  clear_padding_m: 0.10
+  # Signed aperture inset: negative contracts the closed-door reference so a
+  # rotating door leaf cannot clear adjacent wall cells in the planning map.
+  clear_padding_m: -0.05
+  max_aperture_thickness_m: 0.25
   open_states: ["ajar", "open"]
 
 scene_types:

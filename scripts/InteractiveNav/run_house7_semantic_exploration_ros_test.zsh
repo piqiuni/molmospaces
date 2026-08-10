@@ -104,7 +104,7 @@ GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
 # Keep the launch-time override consistent with the checked-in global/local
 # costmap configs.  A stale 0.30 default here silently defeated the requested
 # 0.40 m local inflation in every house-run smoke.
-LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.40}
+LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.50}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-}

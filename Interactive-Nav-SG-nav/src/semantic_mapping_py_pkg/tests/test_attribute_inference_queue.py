@@ -1,3 +1,5 @@
+import time
+
 from semantic_mapping_py_pkg.attribute_inference_queue import LatestPriorityRequestQueue
 
 
@@ -50,19 +52,32 @@ def test_queue_does_not_replace_newer_same_object_with_late_old_request() -> Non
 
 def test_queue_drops_expired_items_before_new_work_is_admitted() -> None:
     queue = LatestPriorityRequestQueue(max_size=2)
-    queue.put(request("door", 10.0, 1, deadline_monotonic=9.0))
-    queue.put(request("cabinet", 5.0, 2, deadline_monotonic=11.0))
+    now = time.monotonic()
+    queue.put(request("door", 10.0, 1, deadline_monotonic=now + 1.0))
+    queue.put(request("cabinet", 5.0, 2, deadline_monotonic=now + 3.0))
 
-    expired = queue.drop_expired(now=10.0)
+    expired = queue.drop_expired(now=now + 2.0)
 
     assert [item["object_id"] for item in expired] == ["door"]
     accepted, displaced = queue.put(
-        request("door", 8.0, 3, deadline_monotonic=12.0)
+        request("door", 8.0, 3, deadline_monotonic=now + 4.0)
     )
     assert accepted is True
     assert displaced is None
     assert queue.get(0.0)["object_id"] == "door"
     assert queue.get(0.0)["object_id"] == "cabinet"
+
+
+def test_queue_rejects_request_already_expired_at_admission() -> None:
+    queue = LatestPriorityRequestQueue(max_size=2)
+
+    accepted, rejected = queue.put(
+        request("door", 10.0, 1, deadline_monotonic=0.0)
+    )
+
+    assert accepted is False
+    assert rejected["object_id"] == "door"
+    assert len(queue) == 0
 
 
 def test_queue_close_discards_pending_requests_and_rejects_new_work() -> None:

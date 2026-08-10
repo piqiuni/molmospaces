@@ -338,6 +338,7 @@ def _freeze_video_grid(
     known_world_bounds: tuple[float, float, float, float] | None = None,
     content_cell_bounds: tuple[int, int, int, int] | None = None,
     visual_crop_margin_m: float = 0.0,
+    visual_lower_margin_m: float = 0.0,
     categorical: bool = False,
     image_encoding: str = "jpeg",
 ) -> _FrozenVideoGrid:
@@ -362,8 +363,14 @@ def _freeze_video_grid(
             0,
             int(math.ceil(max(0.0, float(visual_crop_margin_m)) / source_resolution)),
         )
+        lower_margin_cells = max(
+            0,
+            int(math.ceil(max(0.0, float(visual_lower_margin_m)) / source_resolution)),
+        )
         crop_min_x = max(0, int(min_x) - margin_cells)
-        crop_min_y = max(0, int(min_y) - margin_cells)
+        # Keep extra map-frame space below Panel 2's known envelope.  This is
+        # a render-proxy crop only; mapping and planner occupancy are unchanged.
+        crop_min_y = max(0, int(min_y) - margin_cells - lower_margin_cells)
         crop_max_x = min(source_width, int(max_x) + margin_cells)
         crop_max_y = min(source_height, int(max_y) + margin_cells)
         if crop_max_x <= crop_min_x or crop_max_y <= crop_min_y:
@@ -2277,6 +2284,10 @@ class ExploreDebugRecorder:
                 0.0,
                 float(getattr(self.args, "video_occ_crop_margin_m", 2.5)),
             )
+            visual_lower_margin_m = max(
+                0.0,
+                float(getattr(self.args, "video_occ_lower_margin_m", 1.0)),
+            )
             categorical = True
             image_encoding = categorical_encoding
         elif render_kind == "scene":
@@ -2284,6 +2295,7 @@ class ExploreDebugRecorder:
             known_world_bounds = None
             known_cell_bounds = None
             visual_crop_margin_m = 0.0
+            visual_lower_margin_m = 0.0
             categorical = True
             image_encoding = categorical_encoding
         elif render_kind == "global_costmap":
@@ -2296,6 +2308,7 @@ class ExploreDebugRecorder:
             known_world_bounds = None
             known_cell_bounds = None
             visual_crop_margin_m = 0.0
+            visual_lower_margin_m = 0.0
             categorical = False
             image_encoding = "png"
             max_dimension = max(int(grid.info.width), int(grid.info.height), 1)
@@ -2304,6 +2317,7 @@ class ExploreDebugRecorder:
             known_world_bounds = None
             known_cell_bounds = None
             visual_crop_margin_m = 0.0
+            visual_lower_margin_m = 0.0
             categorical = False
             image_encoding = "jpeg"
             max_dimension = int(self.args.video_snapshot_grid_max_dim)
@@ -2315,6 +2329,7 @@ class ExploreDebugRecorder:
             known_world_bounds=known_world_bounds,
             content_cell_bounds=known_cell_bounds,
             visual_crop_margin_m=visual_crop_margin_m,
+            visual_lower_margin_m=visual_lower_margin_m,
             categorical=categorical,
             image_encoding=image_encoding,
         )
@@ -3296,6 +3311,9 @@ class ExploreDebugRecorder:
                     "visualization_config": {
                         "video_occ_crop_margin_m": float(
                             getattr(self.args, "video_occ_crop_margin_m", 2.5)
+                        ),
+                        "video_occ_lower_margin_m": float(
+                            getattr(self.args, "video_occ_lower_margin_m", 1.0)
                         ),
                         "video_global_panel_scale": float(
                             getattr(self.args, "video_global_panel_scale", 1.0)
@@ -8317,6 +8335,7 @@ class ExploreDebugRecorder:
                 "video_snapshot_jpeg_quality": self.args.video_snapshot_jpeg_quality,
                 "video_snapshot_categorical_format": self.args.video_snapshot_categorical_format,
                 "video_occ_crop_margin_m": self.args.video_occ_crop_margin_m,
+                "video_occ_lower_margin_m": getattr(self.args, "video_occ_lower_margin_m", 1.0),
                 "video_room_panel_scale": getattr(self.args, "video_room_panel_scale", 1.5),
                 "video_semantic_xy_panel_scale": getattr(self.args, "video_semantic_xy_panel_scale", 1.8),
                 "video_semantic_xy_label_mode": getattr(
@@ -8448,6 +8467,7 @@ class ExploreDebugRecorder:
                 "video_snapshot_jpeg_quality": self.args.video_snapshot_jpeg_quality,
                 "video_snapshot_categorical_format": self.args.video_snapshot_categorical_format,
                 "video_occ_crop_margin_m": self.args.video_occ_crop_margin_m,
+                "video_occ_lower_margin_m": getattr(self.args, "video_occ_lower_margin_m", 1.0),
                 "video_room_panel_scale": getattr(self.args, "video_room_panel_scale", 1.5),
                 "video_semantic_xy_panel_scale": getattr(self.args, "video_semantic_xy_panel_scale", 1.8),
                 "video_semantic_xy_label_mode": getattr(
@@ -8845,6 +8865,15 @@ def _parse_args() -> argparse.Namespace:
             "before proxy downsampling and is invariant to proxy resolution."
         ),
     )
+    parser.add_argument(
+        "--video-occ-lower-margin-m",
+        type=float,
+        default=1.0,
+        help=(
+            "Additional map-frame padding below the OCC panel's known extent; "
+            "applies only to the render proxy, never planning occupancy."
+        ),
+    )
     parser.add_argument("--video-global-panel-scale", type=float, default=1.0)
     parser.add_argument(
         "--video-room-panel-scale",
@@ -8899,6 +8928,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--video-snapshot-jpeg-quality must be in [1, 100]")
     if args.video_occ_crop_margin_m < 0.0:
         parser.error("--video-occ-crop-margin-m must be non-negative")
+    if not math.isfinite(args.video_occ_lower_margin_m) or args.video_occ_lower_margin_m < 0.0:
+        parser.error("--video-occ-lower-margin-m must be finite and non-negative")
     if not math.isfinite(args.video_room_panel_scale) or args.video_room_panel_scale < 1.0:
         parser.error("--video-room-panel-scale must be at least one")
     if not math.isfinite(args.video_semantic_xy_panel_scale) or args.video_semantic_xy_panel_scale < 1.0:

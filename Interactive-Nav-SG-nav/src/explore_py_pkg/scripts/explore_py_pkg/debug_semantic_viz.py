@@ -4,9 +4,11 @@ from typing import Any
 
 
 CANDIDATE_COLORS = {
+    # OpenCV uses BGR. Keep navigation/exploration visibly distinct in every
+    # map panel and reserve true orange (B=0, G=140, R=255) for interaction.
     "EXPLORE": (230, 40, 40),
-    "INTERACT": (255, 140, 0),
-    "NAVIGATE": (230, 40, 40),
+    "INTERACT": (0, 140, 255),
+    "NAVIGATE": (70, 180, 70),
 }
 
 

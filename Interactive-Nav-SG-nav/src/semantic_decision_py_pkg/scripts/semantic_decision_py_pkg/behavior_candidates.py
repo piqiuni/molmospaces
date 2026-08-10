@@ -117,6 +117,10 @@ class CandidateGeneratorConfig:
     portal_traversal_max_start_distance_m: float = 2.0
     portal_traversal_completion_margin_m: float = 0.35
     container_standoff_m: float = 1.0
+    # Refrigerator leaves need more clearance than a drawer front.  This is a
+    # public type-level safety policy, not an oracle hinge direction: the
+    # simulator still decides whether the actual leaf sweep is safe.
+    fridge_standoff_m: float | None = None
     # A remembered container AABB has no reliable semantic "front" when the
     # perception stream did not publish one.  Keep several physically distinct
     # standoff viewpoints so fresh Module 1 can reject an oblique/side view and
@@ -135,9 +139,18 @@ class CandidateGeneratorConfig:
     container_pre_action_mllm: bool = False
     container_pre_action_observation_max_attempts: int = 4
     # ``None`` means drawers inherit ``container_standoff_m``.  The shipped
-    # YAML makes the equivalence explicit (both are 0.50 m), while preserving
-    # an opt-in per-drawer adjustment for a future task.
+    # YAML may opt into a type-specific drawer/fridge policy while the default
+    # remains backwards compatible for rule-only callers.
     drawer_standoff_m: float | None = None
+    # M1 is a visual front/action-region gate.  Do not collect that evidence
+    # from an arbitrarily close final-tolerance pose, where perspective and
+    # detector boxes are unstable.  In model lanes the interaction pose itself
+    # becomes a safe staging pose; the force bridge can act from that pose, so
+    # no second close-range M1 call is needed.
+    container_observation_standoff_m: float = 0.7
+    drawer_observation_standoff_m: float = 0.65
+    fridge_observation_standoff_m: float = 0.8
+    container_interaction_ready_distance_m: float = 0.18
     interaction_safety_margin_m: float = 0.0
     interaction_ready_distance_m: float = 0.45
     require_current_visibility: bool = False
@@ -1214,6 +1227,9 @@ class CandidateGenerator:
             is_drawer_container = bool(
                 node_type == "container" and self._is_drawer_container(node)
             )
+            is_refrigerator_container = bool(
+                node_type == "container" and self._is_refrigerator_container(node)
+            )
             container_pre_action = bool(
                 node_type == "container" and self.config.container_pre_action_mllm
             )
@@ -1230,6 +1246,13 @@ class CandidateGenerator:
                     else self.config.container_standoff_m
                 )
                 standoff_source = "drawer"
+            elif is_refrigerator_container:
+                standoff = (
+                    self.config.fridge_standoff_m
+                    if self.config.fridge_standoff_m is not None
+                    else self.config.container_standoff_m
+                )
+                standoff_source = "refrigerator"
             else:
                 standoff = self.config.container_standoff_m
                 standoff_source = "container"
@@ -1261,11 +1284,31 @@ class CandidateGenerator:
                 attributes.get("instance_id") or source_object_name or node_id
             )
             interaction_standoff = standoff + self.config.interaction_safety_margin_m
+            observation_standoff = interaction_standoff
+            if node_type == "container" and (
+                container_pre_action or drawer_pre_action
+            ):
+                if is_drawer_container:
+                    minimum_observation_standoff = (
+                        self.config.drawer_observation_standoff_m
+                    )
+                elif is_refrigerator_container:
+                    minimum_observation_standoff = (
+                        self.config.fridge_observation_standoff_m
+                    )
+                else:
+                    minimum_observation_standoff = (
+                        self.config.container_observation_standoff_m
+                    )
+                observation_standoff = max(
+                    interaction_standoff,
+                    max(0.0, float(minimum_observation_standoff)),
+                )
             goal_candidates, approach_pose_labels = self._approach_candidates(
                 robot_xy,
                 position,
                 node,
-                interaction_standoff,
+                observation_standoff,
                 node_type,
                 visual_container_axis=visual_container_axis,
             )
@@ -1346,8 +1389,25 @@ class CandidateGenerator:
                 # observation ring below.
                 "interaction_approach_axis_xy": list(visual_container_axis or []),
                 "interaction_approach_pose_labels": list(approach_pose_labels),
-                "interaction_ready_distance_m": self.config.interaction_ready_distance_m,
+                "interaction_ready_distance_m": (
+                    min(
+                        self.config.interaction_ready_distance_m,
+                        self.config.container_interaction_ready_distance_m,
+                    )
+                    if node_type == "container"
+                    and (container_pre_action or drawer_pre_action)
+                    else self.config.interaction_ready_distance_m
+                ),
                 "interaction_ready_yaw_tolerance_rad": 0.55,
+                "container_kind": (
+                    "drawer"
+                    if is_drawer_container
+                    else "refrigerator"
+                    if is_refrigerator_container
+                    else "container"
+                    if node_type == "container"
+                    else ""
+                ),
             }
             if portal_aperture_observation is not None:
                 interaction_command["portal_aperture_observation"] = dict(
@@ -1404,9 +1464,29 @@ class CandidateGenerator:
                         "room_transition_required": room_hops not in {None, 0},
                         "room_hops": room_hops,
                         "room_reachable": room_hops is not None,
-                        "interaction_standoff_m": interaction_standoff,
+                        "interaction_standoff_m": observation_standoff,
+                        "configured_interaction_standoff_m": interaction_standoff,
                         "interaction_standoff_source": standoff_source,
                         "interaction_safety_margin_m": self.config.interaction_safety_margin_m,
+                        "container_kind": (
+                            "drawer"
+                            if is_drawer_container
+                            else "refrigerator"
+                            if is_refrigerator_container
+                            else "container"
+                            if node_type == "container"
+                            else ""
+                        ),
+                        "m1_observation_staging_required": bool(
+                            node_type == "container"
+                            and (container_pre_action or drawer_pre_action)
+                        ),
+                        "m1_observation_standoff_m": (
+                            observation_standoff
+                            if node_type == "container"
+                            and (container_pre_action or drawer_pre_action)
+                            else 0.0
+                        ),
                         "target_enabled": bool(target_context.get("enabled")),
                         "target_match": explicit_target_reinteraction,
                         "requires_approach": True,
@@ -1992,6 +2072,24 @@ class CandidateGenerator:
             marker in str(label or "").casefold()
             for label in labels
             for marker in ("drawer", "dresser", "chest_of_drawers", "chestofdrawers")
+        )
+
+    @staticmethod
+    def _is_refrigerator_container(node: dict[str, Any]) -> bool:
+        """Identify refrigerator-like hinged containers for clearance policy."""
+
+        attributes = node.get("attributes") or {}
+        labels = (
+            node.get("label"),
+            node.get("name"),
+            attributes.get("semantic_name"),
+            attributes.get("category"),
+            attributes.get("source_object_name"),
+        )
+        return any(
+            marker in str(label or "").casefold()
+            for label in labels
+            for marker in ("refrigerator", "fridge")
         )
 
     @staticmethod

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts" / "InteractiveNav"
@@ -15,6 +16,7 @@ for path in (REPO_ROOT, SCRIPT_ROOT):
 from scripts.InteractiveNav import force_interaction_runtime
 from scripts.InteractiveNav.force_interaction_bridge import (
     AtomicForceInteractionController,
+    _refrigerator_open_sweep_preflight,
     ground_drawer_open_regions,
 )
 
@@ -1081,3 +1083,220 @@ def test_force_target_failure_is_published_as_terminal_blocked(monkeypatch) -> N
     assert result["failure_reason"] == "force_target_not_reached"
     assert result["retryable"] is False
     assert published[1]["interaction_result"] == result
+
+
+def test_refrigerator_open_sweep_preflight_blocks_collision_and_restores_state(
+    monkeypatch,
+) -> None:
+    """The simulator-only refrigerator probe must leave no mutated state behind."""
+
+    model = SimpleNamespace(
+        jnt_qposadr=np.asarray([0], dtype=int),
+        jnt_dofadr=np.asarray([0], dtype=int),
+    )
+    data = SimpleNamespace(
+        qpos=np.asarray([0.0, 7.0]),
+        qvel=np.asarray([0.4]),
+        act=np.asarray([1.5]),
+        ctrl=np.asarray([2.5]),
+        xfrc_applied=np.asarray([[3.5, 4.5, 5.5]]),
+    )
+    forward_qpos = []
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.mujoco.mj_forward",
+        lambda _model, current_data: forward_qpos.append(current_data.qpos.copy()),
+    )
+    env = SimpleNamespace(
+        current_model=model,
+        current_data=data,
+        check_robot_collision_in_current_pose=lambda: bool(data.qpos[0] >= 0.5),
+    )
+    before = {
+        "qpos": data.qpos.copy(),
+        "qvel": data.qvel.copy(),
+        "act": data.act.copy(),
+        "ctrl": data.ctrl.copy(),
+        "xfrc_applied": data.xfrc_applied.copy(),
+    }
+
+    result = _refrigerator_open_sweep_preflight(
+        env,
+        {
+            "targets": {"private_fridge_hinge": 1.0},
+            "group": {
+                "joints": [
+                    {"joint_name": "private_fridge_hinge", "joint_id": 0}
+                ]
+            },
+        },
+        sample_count=4,
+        recommended_retreat_m=0.37,
+    )
+
+    assert result == {
+        "checked": True,
+        "safe": False,
+        "reason": "unsafe_open_sweep",
+        "recommended_retreat_m": pytest.approx(0.37),
+    }
+    assert any(float(sample[0]) >= 0.5 for sample in forward_qpos)
+    for field, expected in before.items():
+        assert np.array_equal(getattr(data, field), expected)
+    # The helper's public contract cannot reveal private simulator joint names.
+    assert "private_fridge_hinge" not in str(result)
+
+
+def test_refrigerator_sweep_rejection_returns_retryable_public_result(monkeypatch) -> None:
+    controller = AtomicForceInteractionController(close_all_doors_on_prepare=False)
+    published = []
+    prepare_calls = []
+
+    def prepare(_env, object_id, **_kwargs):
+        prepare_calls.append(object_id)
+        return {
+            "group": {"root_body_name": "private_fridge_root", "joints": []},
+            "targets": {"private_fridge_hinge": 1.0},
+            "selected_joint_names": ["private_fridge_hinge"],
+            "closed_joint_names": [],
+            "pre_joint_infos": [],
+        }
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_force",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge._refrigerator_open_sweep_preflight",
+        lambda *_args, **_kwargs: {
+            "checked": True,
+            "safe": False,
+            "reason": "unsafe_open_sweep",
+            "recommended_retreat_m": 0.31,
+        },
+    )
+    controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore = lambda *_args, **_kwargs: {"restored": True}
+    monkeypatch.setattr(controller, "_publish", lambda _publisher, payload: published.append(payload))
+
+    assert controller.enqueue_command(
+        {
+            "command_id": "refrigerator_sweep",
+            "candidate_id": "interaction:fridge_public:open",
+            "decision_id": "decision_refrigerator_sweep",
+            "node_id": "fridge_public",
+            "object_id": "fridge_public",
+            "node_type": "container",
+            "container_kind": "refrigerator",
+            "action": "open",
+        }
+    )
+    result = controller.before_step(SimpleNamespace(env=SimpleNamespace()), step=31)
+
+    assert prepare_calls == ["fridge_public"]
+    assert result is not None
+    assert result["status"] == "FAILED"
+    assert result["success"] is False
+    assert result["failure_reason"] == "unsafe_open_sweep"
+    assert result["verification_source"] == "executor_open_sweep_preflight"
+    assert result["interaction_capability"] == "articulated"
+    assert result["interactable"] is True
+    assert result["retryable"] is True
+    assert result["recommended_retreat_m"] == pytest.approx(0.31)
+    assert result["post_state"] == "unknown"
+    assert result["source"] == "force_interaction_open_sweep_preflight"
+    assert len(published) == 2
+    assert all("private_fridge" not in str(payload) for payload in published)
+
+
+def test_drawer_scan_waits_for_view_restore_settle_without_new_semantic_state(
+    monkeypatch,
+) -> None:
+    """Restore waits renderable task steps but keeps the scan's public state closed."""
+
+    state = {"drawer": 0.0}
+    joints = [{"joint_name": "drawer", "joint_type": "slide", "joint_id": 0}]
+    view_events = []
+
+    def prepare(_env, _root, open_joint_names=None, close_joint_names=None):
+        targets = {name: 1.0 for name in open_joint_names or []}
+        targets.update({name: 0.0 for name in close_joint_names or []})
+        return {
+            "group": {"joints": []},
+            "targets": targets,
+            "pre_joint_infos": [
+                {"joint_name": name, "joint_value": state[name]}
+                for name in targets
+            ],
+        }
+
+    def advance(_env, plan, **_kwargs):
+        state.update(plan["targets"])
+        return {"physics_substeps": 1, "fallback": False}
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_state_force",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.advance_articulation_force",
+        advance,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.articulation_joint_infos",
+        lambda _env, _root: [
+            {"joint_name": name, "open_fraction": value, "joint_value": value}
+            for name, value in state.items()
+        ],
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.collect_articulation_groups",
+        lambda _env: {"dresser_root": {"joints": joints}},
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge._capture_robot_lock",
+        lambda _env: None,
+    )
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        drawer_execution_mode="fast",
+        drawer_observation_steps=1,
+        drawer_view_restore_settle_steps=2,
+    )
+    controller._head_view_controller.command = (
+        lambda _env, profile, **_kwargs: view_events.append(profile) or {"applied": True}
+    )
+    controller._head_view_controller.restore = (
+        lambda _env: view_events.append("restore") or {"restored": True}
+    )
+    controller._publish = lambda *_args, **_kwargs: None
+    assert controller.enqueue_command(
+        {
+            "command_id": "drawer_scan_restore_settle",
+            "object_id": "dresser_root",
+            "action": "scan",
+            "sequence_type": "drawer_scan",
+            "open_regions": [{"center": [0.5, 0.5]}],
+        }
+    )
+    task = SimpleNamespace(
+        env=SimpleNamespace(
+            current_model=SimpleNamespace(jnt_bodyid=[0]),
+            current_data=SimpleNamespace(xpos=[[0.0, 0.0, 0.5]]),
+        )
+    )
+
+    results = []
+    for step in range(5):
+        assert controller.before_step(task, step=step) is None
+        results.append(controller.after_step(task, step=step))
+
+    assert results[:4] == [None, None, None, None]
+    result = results[4]
+    assert result is not None
+    assert view_events == ["drawer_low_view", "restore"]
+    assert result["drawer_view_restore_settle_steps"] == 2
+    assert result["task_steps_consumed"] == 5
+    assert result["state"] == "closed"
+    assert result["post_state"] == "closed"
+    assert "restore_settle" not in {result["state"], result["post_state"]}
+    assert controller.should_pause_navigation() is False

@@ -42,6 +42,12 @@ class LatestPriorityRequestQueue:
         with self._condition:
             if self._closed:
                 return False, payload
+            # Keep the admission check under the queue lock.  Callers check the
+            # deadline before entering ``put``, but it can elapse while they are
+            # waiting for this condition; such work must never occupy a slot or
+            # displace a still-valid request.
+            if self._is_expired(payload, time.monotonic()):
+                return False, payload
             object_id = str(payload.get("object_id") or "")
             replaced = None
             for index, queued in enumerate(self._items):

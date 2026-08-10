@@ -212,8 +212,48 @@ def test_overlay_reports_the_small_door_update_region():
     overlay.update_graph(graph(portal("open")))
     _planning, mask, stats = overlay.apply(GridInfo(), raw)
 
-    assert stats["update_bounds"] == {"x": 5, "y": 9, "width": 9, "height": 2}
-    assert sum(value > 0 for value in mask) == 18
+    # A cell must be centred in the doorway slab.  The former overlap-based
+    # fill also cleared the two cells touching the door's lateral AABB edge.
+    assert stats["update_bounds"] == {"x": 6, "y": 9, "width": 8, "height": 2}
+    assert sum(value > 0 for value in mask) == 16
+
+
+def test_open_portal_insets_reference_and_preserves_adjacent_wall_cells():
+    overlay = SemanticOccupancyOverlay(clear_padding_m=-0.05)
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    overlay.update_graph(graph(portal("closed")))
+    overlay.update_graph(graph(portal("open")))
+
+    planning, mask, stats = overlay.apply(GridInfo(), raw)
+
+    assert stats["active_portal_ids"] == ["portal_door"]
+    # The 80 cm reference opening is inset to 70 cm, so the wall cells just
+    # outside its lateral endpoints remain occupied.
+    assert planning[10 * GridInfo.width + 5] == 100
+    assert planning[10 * GridInfo.width + 14] == 100
+    assert planning[10 * GridInfo.width + 10] == 0
+    assert sum(value > 0 for value in mask) == 16
+
+
+def test_wide_portal_reference_is_limited_to_a_narrow_doorway_slab():
+    overlay = SemanticOccupancyOverlay(
+        clear_padding_m=0.0,
+        max_aperture_thickness_m=0.25,
+    )
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    wide_portal = portal("closed", size=(0.8, 0.8, 2.0))
+    overlay.update_graph(graph(wide_portal))
+    wide_portal["interaction"] = {"state": "open"}
+    overlay.update_graph(graph(wide_portal))
+
+    planning, mask, stats = overlay.apply(GridInfo(), raw)
+
+    assert stats["active_portal_ids"] == ["portal_door"]
+    assert planning[10 * GridInfo.width + 10] == 0
+    # A coarse/square reference must not clear the entire area around a door.
+    assert planning[6 * GridInfo.width + 10] == 100
+    assert planning[13 * GridInfo.width + 10] == 100
+    assert sum(value > 0 for value in mask) < 32
 
 
 def test_update_region_is_persistent_and_restores_previous_door_region_on_close():

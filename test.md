@@ -1500,7 +1500,7 @@ HOUSE_INDS="4" RECORD_SEC=60 TASK_HORIZON=800 \
   scripts/InteractiveNav/run_semantic_gt_three_scene_test.zsh outputs/semantic_gt_debug_short
 ```
 
-开启 semantic mapping 后，global costmap 自动改读 `/semantic_mapping/planning_occ_map`；semantic 节点仍从原始 `/struct_mapping/occ_map` 构建房间与语义信息，避免处理后的地图反馈回自身。门状态达到 `open` 后，semantic 层会在每一帧原始 OCC 上持续清空缓存的闭合门整体 AABB，并同时发布 `/semantic_mapping/door_clear_mask`。为了让 move_base 的 static layer 立即消费门洞变化，还会持续发布小范围 `/semantic_mapping/planning_occ_map_updates`；门关闭后，原门区恢复值会短期重复发布，覆盖 global costmap 的低频更新周期。已确认的交互关节读回状态优先于后续不稳定的视觉 GT 状态，直到下一次交互结果更新。
+开启 semantic mapping 后，global costmap 自动改读 `/semantic_mapping/planning_occ_map`；semantic 节点仍从原始 `/struct_mapping/occ_map` 构建房间与语义信息，避免处理后的地图反馈回自身。确认的 portal 达到 `open` 后，semantic 层只会在 planning OCC 上清除内缩的窄门洞 slab（默认参考 AABB 内缩 5 cm、厚度上限 25 cm），不会清空整块门叶 AABB、不会改写 raw OCC，也不会为冰箱/抽屉等 container 生成清除掩码。`/semantic_mapping/door_clear_mask` 与小范围 `/semantic_mapping/planning_occ_map_updates` 仅传播这个门洞区域；门关闭后，原区域会短期重复发布以覆盖 global costmap 的低频更新周期。已确认的交互结果优先于后续不稳定的视觉状态，直到下一次交互结果更新。
 
 ## 8.5 门状态与语义 OCC 快速测试
 

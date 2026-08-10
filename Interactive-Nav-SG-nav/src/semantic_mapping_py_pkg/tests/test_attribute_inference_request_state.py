@@ -12,11 +12,13 @@ from interaction_attribute_inference_node import InteractionAttributeInferenceNo
 
 
 class RecordingQueue:
-    def __init__(self) -> None:
+    def __init__(self, discarded_payloads=None) -> None:
         self.discarded = []
+        self.discarded_payloads = list(discarded_payloads or [])
 
-    def discard(self, object_id, request_sequence=None) -> None:
+    def discard(self, object_id, request_sequence=None):
         self.discarded.append((object_id, request_sequence))
+        return list(self.discarded_payloads)
 
 
 class RecordingClient:
@@ -224,6 +226,8 @@ def test_targeted_refresh_replaces_stale_request_and_keeps_tracking_fields() -> 
     node.request_sequence = 5
     node.request_queue = RecordingQueue()
     node.filter_counts = {"targeted_refresh_matched": 0}
+    published = []
+    node._publish_updates = lambda _episode, _stamp, updates: published.extend(updates)
     refresh = {
         "request_key": "object_1",
         "request_id": "refresh_9",
@@ -239,6 +243,8 @@ def test_targeted_refresh_replaces_stale_request_and_keeps_tracking_fields() -> 
     assert reservation == {"generation": 3, "request_sequence": 6}
     assert node.request_queue.discarded == [("object_1", 4)]
     assert node.pending["object_1"]["targeted_refresh"]["request_id"] == "refresh_9"
+    assert published[0]["attribute_status"] == "stale"
+    assert published[0]["request_sequence"] == 4
     status = node._attribute_status_patch(
         {
             "object_id": "object_1",
@@ -253,6 +259,53 @@ def test_targeted_refresh_replaces_stale_request_and_keeps_tracking_fields() -> 
     assert status["targeted_refresh"] is True
     assert status["targeted_refresh_request_id"] == "refresh_9"
     assert status["targeted_refresh_image_sequence"] == 18
+
+
+def test_changed_state_marks_discarded_queued_request_stale() -> None:
+    old_request = {
+        "object_id": "object_1",
+        "episode_id": "episode_1",
+        "frame_id": "8",
+        "image_sequence": 9,
+        "stamp": 10.0,
+        "signature": "old",
+        "generation": 0,
+        "request_sequence": 4,
+        "enqueued_at": 1.0,
+        "targeted_refresh": {},
+    }
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.pending = {
+        "object_1": {
+            "request_sequence": 4,
+            "signature": "old",
+            "generation": 0,
+            "episode_id": "episode_1",
+        }
+    }
+    node.generations = {"object_1": 0}
+    node.last_request = {"object_1": 1.0}
+    node.filter_counts = {"coalesced": 0}
+    node.request_queue = RecordingQueue([old_request])
+    published = []
+    node._publish_updates = lambda _episode, _stamp, updates: published.extend(updates)
+
+    node._invalidate_if_state_changed("object_1", "new", "episode_1")
+
+    assert node.request_queue.discarded == [("object_1", 4)]
+    assert node.filter_counts["coalesced"] == 1
+    assert published == [
+        {
+            "object_id": "object_1",
+            "attribute_status": "stale",
+            "observation_capture_step": 8,
+            "request_sequence": 4,
+            "observation_signature": "old",
+            "source": "mllm_attribute_inference",
+            "error": "queue_replaced_by_newer_object_evidence",
+        }
+    ]
 
 
 def test_attribute_visual_evidence_is_full_image_with_target_outline_and_inset() -> None:

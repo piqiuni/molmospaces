@@ -112,11 +112,30 @@ class OverlayUpdateRegionTracker:
 
 
 class SemanticOccupancyOverlay:
-    """Persistently clear open portal AABBs from a raw occupancy grid."""
+    """Persistently clear narrow, verified portal apertures for planning.
 
-    def __init__(self, enabled=True, clear_padding_m=0.10, open_states=None):
+    The raw occupancy map is never changed.  This overlay is deliberately more
+    conservative than the old ``open portal AABB -> free`` rule: an open door
+    contributes only an inset doorway slab.  In particular, the broad AABB of
+    a rotating door leaf must not erase either of the walls next to the door.
+    """
+
+    def __init__(
+        self,
+        enabled=True,
+        clear_padding_m=-0.05,
+        open_states=None,
+        max_aperture_thickness_m=0.25,
+    ):
         self.enabled = bool(enabled)
-        self.clear_padding_m = max(0.0, float(clear_padding_m))
+        # This is a *signed* inset/outset applied to the immutable closed-door
+        # reference.  The safe default is an inset of 5 cm on every side.  A
+        # positive value remains supported for legacy configs, but the slab
+        # thickness cap below still prevents it from clearing a whole wall.
+        self.clear_padding_m = float(clear_padding_m)
+        self.max_aperture_thickness_m = max(
+            0.0, float(max_aperture_thickness_m)
+        )
         self.open_states = set(open_states or ["open"])
         self.reference_aabbs: dict[str, tuple[list[float], list[float]]] = {}
         # A pending interaction command can arrive before its result, but it
@@ -296,8 +315,13 @@ class SemanticOccupancyOverlay:
             if reference is None:
                 continue
             center, size = reference
-            half_x = 0.5 * float(size[0]) + self.clear_padding_m
-            half_y = 0.5 * float(size[1]) + self.clear_padding_m
+            half_x, half_y = self._aperture_half_extents(
+                float(size[0]),
+                float(size[1]),
+                resolution,
+            )
+            if half_x <= 0.0 or half_y <= 0.0:
+                continue
             local_corners = []
             for wx in (float(center[0]) - half_x, float(center[0]) + half_x):
                 for wy in (float(center[1]) - half_y, float(center[1]) + half_y):
@@ -316,22 +340,42 @@ class SemanticOccupancyOverlay:
             row_max = min(height - 1, int(math.ceil(max_y / resolution) - 1))
             if col_min > col_max or row_min > row_max:
                 continue
-            applied_ids.append(node_id)
-            portal_bounds = {
-                "x": col_min,
-                "y": row_min,
-                "width": col_max - col_min + 1,
-                "height": row_max - row_min + 1,
-            }
-            bounds = OverlayUpdateRegionTracker._union_bounds(bounds, portal_bounds)
+            selected_cols = []
+            selected_rows = []
             for row in range(row_min, row_max + 1):
                 offset = row * width
                 for col in range(col_min, col_max + 1):
+                    # Bounds above are deliberately conservative so that a
+                    # rotated occupancy-grid origin cannot clip the aperture.
+                    # Clear only cells whose *centres* lie in the narrow world
+                    # doorway slab.  This avoids freeing neighbouring wall
+                    # cells merely because their square overlaps a thin door.
+                    local_x = (float(col) + 0.5) * resolution
+                    local_y = (float(row) + 0.5) * resolution
+                    world_x = origin_x + cos_yaw * local_x - sin_yaw * local_y
+                    world_y = origin_y + sin_yaw * local_x + cos_yaw * local_y
+                    if (
+                        abs(world_x - float(center[0])) > half_x + 1e-9
+                        or abs(world_y - float(center[1])) > half_y + 1e-9
+                    ):
+                        continue
                     index = offset + col
                     if result[index] != 0:
                         cleared_cells += 1
                     result[index] = 0
                     mask[index] = 100
+                    selected_cols.append(col)
+                    selected_rows.append(row)
+            if not selected_cols:
+                continue
+            applied_ids.append(node_id)
+            portal_bounds = {
+                "x": min(selected_cols),
+                "y": min(selected_rows),
+                "width": max(selected_cols) - min(selected_cols) + 1,
+                "height": max(selected_rows) - min(selected_rows) + 1,
+            }
+            bounds = OverlayUpdateRegionTracker._union_bounds(bounds, portal_bounds)
         return result, mask, {
             "active_portal_ids": applied_ids,
             "cleared_cells": cleared_cells,
@@ -348,6 +392,49 @@ class SemanticOccupancyOverlay:
             return [float(vals[0]), float(vals[1]), float(vals[2])]
         except (TypeError, ValueError):
             return None
+
+    def _aperture_half_extents(
+        self,
+        size_x: float,
+        size_y: float,
+        resolution: float,
+    ) -> tuple[float, float]:
+        """Return an inset, thin doorway slab for an axis-aligned reference.
+
+        The immutable reference AABB stores the closed doorway.  Its longer
+        horizontal axis is the opening width; its shorter axis is the wall/door
+        thickness.  A 5 cm inset is applied to both, but a rasterized aperture
+        must retain at least one map cell or it could disappear entirely for a
+        thin reference.  The thickness is also capped, which is the fail-safe
+        for coarse or nearly square source AABBs.
+        """
+
+        extent_x = self._inset_extent(size_x, resolution)
+        extent_y = self._inset_extent(size_y, resolution)
+        if extent_x <= 0.0 or extent_y <= 0.0:
+            return 0.0, 0.0
+
+        # Use the smaller source axis as the normal/thickness direction.  This
+        # preserves the doorway's long-axis opening even when a positive legacy
+        # padding value is still present in an old launch configuration.
+        if size_x >= size_y:
+            extent_y = min(extent_y, self._thickness_limit(resolution))
+        else:
+            extent_x = min(extent_x, self._thickness_limit(resolution))
+        return 0.5 * extent_x, 0.5 * extent_y
+
+    def _inset_extent(self, source_extent: float, resolution: float) -> float:
+        source_extent = max(0.0, float(source_extent))
+        if source_extent <= 0.0:
+            return 0.0
+        inset_extent = source_extent + 2.0 * self.clear_padding_m
+        # A negative padding must never erase the portal just because the
+        # closed leaf is thinner than twice the requested 5 cm inset.  One map
+        # cell is the smallest meaningful clearance in the planning grid.
+        return max(float(resolution), inset_extent)
+
+    def _thickness_limit(self, resolution: float) -> float:
+        return max(float(resolution), self.max_aperture_thickness_m)
 
     @staticmethod
     def _quaternion_yaw(quaternion: Any) -> float:

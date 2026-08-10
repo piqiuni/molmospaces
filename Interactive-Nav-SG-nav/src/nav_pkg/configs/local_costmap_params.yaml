@@ -41,6 +41,10 @@ local_costmap:
        min_obstacle_height: 0.05
 
    inflation_layer:
-     inflation_radius: 0.40
+     # Keep the rolling local planner a further 10 cm from walls than the
+     # global map.  The global layer stays at 0.40 m so it can still route
+     # through narrow passages; this local 0.50 m buffer rejects the
+     # wall-hugging trajectories seen in interaction exploration.
+     inflation_radius: 0.50
      cost_scaling_factor: 10.0
    

@@ -44,7 +44,7 @@ def test_candidate_overlays_prefers_unified_semantic_candidates():
             "target_name": "door",
             "goal_xyyaw": [1.0, 2.0, 0.5],
             "frame_id": "",
-            "color": (255, 140, 0),
+            "color": (0, 140, 255),
             "source": "semantic_decision",
         }
     ]

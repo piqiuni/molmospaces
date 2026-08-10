@@ -105,6 +105,11 @@ class SemanticCandidateNode:
                     config.get("portal_traversal_completion_margin_m", 0.35)
                 ),
                 container_standoff_m=float(config.get("container_standoff_m", 1.0)),
+                fridge_standoff_m=(
+                    float(config["fridge_standoff_m"])
+                    if config.get("fridge_standoff_m") is not None
+                    else None
+                ),
                 drawer_pre_action_mllm=bool(drawer_pre_action_mllm),
                 drawer_pre_action_observation_max_attempts=max(
                     1,
@@ -127,6 +132,18 @@ class SemanticCandidateNode:
                     float(config["drawer_standoff_m"])
                     if config.get("drawer_standoff_m") is not None
                     else None
+                ),
+                container_observation_standoff_m=float(
+                    config.get("container_observation_standoff_m", 0.7)
+                ),
+                drawer_observation_standoff_m=float(
+                    config.get("drawer_observation_standoff_m", 0.65)
+                ),
+                fridge_observation_standoff_m=float(
+                    config.get("fridge_observation_standoff_m", 0.8)
+                ),
+                container_interaction_ready_distance_m=float(
+                    config.get("container_interaction_ready_distance_m", 0.18)
                 ),
                 interaction_safety_margin_m=float(
                     config.get("interaction_safety_margin_m", 0.0)

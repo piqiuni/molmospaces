@@ -366,6 +366,8 @@
 - [ ] 明确 navigation hints 是调试视图、过渡接口，还是 planner 正式输入
 - [ ] 建立更通用的交互属性分类框架：通道属性 / 容器属性
 - [ ] 将设备与开关类交互保留为后续拓展，而不是第一阶段一级分类
+- [ ] 为房间拓扑新增独立的 height-banded `topology_occ`：仅供 `RoomSegmenter` 使用，保留约
+  `1.0–1.85 m` 的结构性点云层，避免低矮家具把自由空间切成暂态 room；不得替代导航 raw/planning OCC。
 
 ## 4.3 感知与状态来源 TODO
 
@@ -382,6 +384,8 @@
 - [x] GT 快速版门状态（仅模拟器内部/evaluator，不进入实时语义输入）：读取当前 `joint_infos`，过滤 handle joint，以首次有效门板关节值作为 `q_closed`，按 joint range 计算开合比例；双开门要求全部门板达到 open 阈值
 - [ ] 真实场景门关节提取：在没有 MuJoCo joint GT 时，从多帧门板检测/跟踪与几何变化中估计 hinge/slide 类型、转轴或滑动轴、闭合参考位姿和开合比例；置信度不足时保持 `unknown`，不能直接清空 OCC
 - [ ] 明确 room_id / connectivity 的可信来源
+- [ ] 定义 post-open 门后 free-space 证据：只接受相机视锥内的有限回波或有支持的 no-return ray；
+  开门后用有界回望/扇扫补观测，绝不由 local costmap 或门状态直接把全局未知区域置 free。
 
 ## 4.4 已梳理的 MolmoSpaces GT / 交互接口
 

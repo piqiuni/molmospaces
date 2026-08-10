@@ -83,6 +83,47 @@ def test_openai_chat_stream_timeout_closes_response(monkeypatch) -> None:
     assert events["client_closed"] is True
 
 
+def test_openai_chat_stream_timeout_before_headers_closes_client(monkeypatch) -> None:
+    events = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            events["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            events["client_closed"] = True
+
+        def build_request(self, method, endpoint, **kwargs):
+            events["request"] = {"method": method, "endpoint": endpoint, **kwargs}
+            return object()
+
+        async def send(self, _request, stream=False):
+            events["stream"] = stream
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                events["send_cancelled"] = True
+                raise
+
+    monkeypatch.setattr(client_module.httpx, "AsyncClient", FakeAsyncClient)
+    response = MLLMClient(
+        MLLMClientConfig(
+            mode="http",
+            endpoint="http://127.0.0.1:8317/v1",
+            timeout_s=0.05,
+        )
+    ).request_json(role="subgoal_selection", instruction="select", context={})
+
+    assert response.payload is None
+    assert response.error == "timed out"
+    assert events["stream"] is True
+    assert events["send_cancelled"] is True
+    assert events["client_closed"] is True
+
+
 def test_openai_chat_stream_assembles_content_and_usage(monkeypatch) -> None:
     events = {}
 
