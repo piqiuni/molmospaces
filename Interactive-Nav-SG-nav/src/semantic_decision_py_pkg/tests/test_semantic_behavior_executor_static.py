@@ -740,6 +740,59 @@ def test_two_stage_inner_drawer_bypasses_close_range_regrounding(executor_module
     assert executor._needs_fresh_drawer_scan_locked() is False
 
 
+def test_drawer_scan_wait_uses_finite_simulator_step_budget_not_wall_time(
+    executor_module,
+) -> None:
+    candidate = {
+        "decision_id": "decision-drawer-budget",
+        "candidate_id": "interaction:drawer-budget:scan",
+        "behavior_type": "INTERACT",
+        "metadata": {"requires_approach": False},
+        "interaction_command": {"sequence_type": "drawer_scan"},
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.selection = candidate
+    executor.machine = executor_module.BehaviorExecutionStateMachine(
+        executor_module.ExecutionConfig(interaction_timeout_s=30.0)
+    )
+    executor.machine.start(candidate, now=0.0)
+    assert executor.machine.state == executor_module.STATE_INTERACTING
+    executor.drawer_scan_execution_step_budget_authoritative = True
+    executor.drawer_scan_execution_max_task_steps = 120
+    executor.drawer_scan_execution_step_budget_margin = 8
+    executor.drawer_scan_execution_step_sync_stall_timeout_s = 5.0
+    executor.drawer_scan_execution_wall_cap_s = 180.0
+    executor._latest_step_sync_index = 141
+    executor._latest_step_sync_received_at = 55.0
+    executor._drawer_scan_execution_wait = {
+        "command_id": "drawer-command",
+        "decision_id": "decision-drawer-budget",
+        "candidate_id": "interaction:drawer-budget:scan",
+        "sequence_type": "drawer_scan",
+        "started_step_index": 100,
+        "started_at_monotonic_s": 0.0,
+        "max_task_steps": 120,
+        "step_budget_margin": 8,
+    }
+
+    # The exact house2 macro is still progressing after 41 simulator steps,
+    # despite having exceeded the old 30-second host-time timeout.
+    assert executor.machine.timeout_reason(now=55.0) == "interaction_timeout"
+    assert executor._drawer_scan_execution_timeout_reason_locked(now=55.0) == ""
+    assert executor._effective_timeout_reason_locked(now=55.0) == ""
+
+    executor._latest_step_sync_index = 229
+    executor._latest_step_sync_received_at = 56.0
+    assert (
+        executor._drawer_scan_execution_timeout_reason_locked(now=56.0)
+        == "drawer_scan_execution_step_budget_exhausted"
+    )
+    assert (
+        executor._effective_timeout_reason_locked(now=56.0)
+        == "drawer_scan_execution_step_budget_exhausted"
+    )
+
+
 def test_executor_inner_navigation_failure_dispatches_next_outer_staging(
     executor_module,
 ) -> None:

@@ -414,6 +414,31 @@ class SemanticBehaviorExecutor:
         self.drawer_scan_wait_poll_interval_s = max(
             0.01, float(config.get("drawer_scan_wait_poll_interval_s", 0.10))
         )
+        # A grounded drawer scan is a finite simulator macro (open -> observe
+        # -> close per selected front, then restore the view).  Its completion
+        # must not depend on host/render wall time.  Keep a hard step budget and
+        # a no-step liveness guard; ordinary portal/fridge interactions retain
+        # the generic wall-clock timeout below.
+        self.drawer_scan_execution_step_budget_authoritative = bool(
+            config.get("drawer_scan_execution_step_budget_authoritative", True)
+        )
+        self.drawer_scan_execution_max_task_steps = max(
+            1, int(config.get("drawer_scan_execution_max_task_steps", 120))
+        )
+        self.drawer_scan_execution_step_budget_margin = max(
+            0, int(config.get("drawer_scan_execution_step_budget_margin", 8))
+        )
+        self.drawer_scan_execution_step_sync_stall_timeout_s = max(
+            0.1,
+            float(
+                config.get(
+                    "drawer_scan_execution_step_sync_stall_timeout_s", 5.0
+                )
+            ),
+        )
+        self.drawer_scan_execution_wall_cap_s = max(
+            1.0, float(config.get("drawer_scan_execution_wall_cap_s", 180.0))
+        )
         # A targeted M1 refresh is an observation barrier, not a simulator
         # motion timeout.  It waits for a later RGB+detection pair and then
         # consumes the public attribute patch; physical actions remain step
@@ -967,6 +992,10 @@ class SemanticBehaviorExecutor:
         self.pre_interaction_image_sequence = 0
         self._drawer_scan_wait_contexts: dict[str, dict] = {}
         self._drawer_scan_wait_records: dict[str, dict] = {}
+        # Set only after a visual-contract-valid drawer scan command is
+        # published.  It binds the finite bridge macro to simulator steps, not
+        # wall-clock scheduler throughput.
+        self._drawer_scan_execution_wait: dict[str, object] = {}
         self.active_skill_plan: dict = {}
         self.pending_skill_actions: list[dict] = []
         self.interaction_command_sequence = 0
@@ -1127,6 +1156,7 @@ class SemanticBehaviorExecutor:
                 self.interaction_final_align_enabled
                 and self.interaction_final_align_step_sync_enabled
             )
+            or self.drawer_scan_execution_step_budget_authoritative
             or self.interaction_approach_pose_poll_max_attempts > 1
         ):
             rospy.Subscriber(
@@ -1170,6 +1200,7 @@ class SemanticBehaviorExecutor:
             self.selection = selection
             self.active_skill_plan = {}
             self.pending_skill_actions = []
+            self._clear_drawer_scan_execution_wait_locked()
             self.interaction_command_sequence = 0
             self.interaction_observation_sequence = 0
             self.verification_retries = 0
@@ -2128,6 +2159,12 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if not self._matches_active(payload):
                 return
+            if str(payload.get("command_id") or "") == str(
+                (getattr(self, "_drawer_scan_execution_wait", {}) or {}).get(
+                    "command_id", ""
+                )
+            ):
+                self._clear_drawer_scan_execution_wait_locked()
             if is_interaction_pose_precondition_failure(payload):
                 # The force bridge rejected this before it touched the object.
                 # Re-enter approach navigation; do not emit a terminal
@@ -2565,6 +2602,96 @@ class SemanticBehaviorExecutor:
                             "angular_z": float(latest_cmd.get("angular_z", 0.0)),
                         }
                     )
+
+    def _arm_drawer_scan_execution_wait_locked(self, payload: dict) -> None:
+        """Bind a visual-grounded drawer macro to finite simulator progress."""
+
+        if not self.drawer_scan_execution_step_budget_authoritative:
+            self._drawer_scan_execution_wait = {}
+            return
+        self._drawer_scan_execution_wait = {
+            "command_id": str(payload.get("command_id") or ""),
+            "decision_id": str(payload.get("decision_id") or ""),
+            "candidate_id": str(payload.get("candidate_id") or ""),
+            "sequence_type": "drawer_scan",
+            "started_step_index": self._latest_step_sync_index,
+            "started_at_monotonic_s": time.monotonic(),
+            "max_task_steps": int(self.drawer_scan_execution_max_task_steps),
+            "step_budget_margin": int(self.drawer_scan_execution_step_budget_margin),
+        }
+
+    def _clear_drawer_scan_execution_wait_locked(self) -> None:
+        self._drawer_scan_execution_wait = {}
+
+    def _drawer_scan_execution_wait_summary_locked(self) -> dict:
+        context = dict(getattr(self, "_drawer_scan_execution_wait", {}) or {})
+        if not context:
+            return {}
+        started_step = self._public_step_or_none(context.get("started_step_index"))
+        latest_step = self._public_step_or_none(self._latest_step_sync_index)
+        if started_step is not None and latest_step is not None:
+            context["elapsed_task_steps"] = max(0, int(latest_step) - int(started_step))
+        context["latest_step_index"] = latest_step
+        return context
+
+    def _drawer_scan_execution_timeout_reason_locked(
+        self, now: float | None = None
+    ) -> str:
+        """Return a bounded drawer-specific timeout reason, or ``""`` to wait.
+
+        The bridge macro advances synchronously with evaluator steps.  As long
+        as that finite step stream progresses below its cap, a slow host must
+        not invalidate an action that the simulator is still executing.
+        """
+
+        context = dict(getattr(self, "_drawer_scan_execution_wait", {}) or {})
+        if not context:
+            return "interaction_timeout"
+        candidate = self.machine.candidate or self.selection or {}
+        interaction = dict(candidate.get("interaction_command") or {})
+        if (
+            self.machine.state != STATE_INTERACTING
+            or str(interaction.get("sequence_type") or "").casefold()
+            != "drawer_scan"
+            or str(context.get("decision_id") or "")
+            != str(candidate.get("decision_id") or "")
+        ):
+            self._clear_drawer_scan_execution_wait_locked()
+            return "interaction_timeout"
+        now = time.monotonic() if now is None else float(now)
+        started_at = float(context.get("started_at_monotonic_s", now) or now)
+        if now - started_at > self.drawer_scan_execution_wall_cap_s:
+            return "drawer_scan_execution_wall_cap"
+        started_step = self._public_step_or_none(context.get("started_step_index"))
+        latest_step = self._public_step_or_none(self._latest_step_sync_index)
+        if started_step is None or latest_step is None:
+            # Do not extend the generic timeout without a public evaluator-step
+            # clock.  This preserves a bounded failure for a missing bridge.
+            return "interaction_timeout"
+        if latest_step <= started_step:
+            if now - started_at >= self.drawer_scan_execution_step_sync_stall_timeout_s:
+                return "drawer_scan_execution_step_sync_stall"
+            return ""
+        if (
+            now - float(self._latest_step_sync_received_at or started_at)
+            >= self.drawer_scan_execution_step_sync_stall_timeout_s
+        ):
+            return "drawer_scan_execution_step_sync_stall"
+        elapsed_steps = int(latest_step) - int(started_step)
+        allowed_steps = int(context.get("max_task_steps", 0) or 0) + int(
+            context.get("step_budget_margin", 0) or 0
+        )
+        if elapsed_steps > max(1, allowed_steps):
+            return "drawer_scan_execution_step_budget_exhausted"
+        return ""
+
+    def _effective_timeout_reason_locked(self, now: float | None = None) -> str:
+        reason = self.machine.timeout_reason(now=now)
+        if reason != "interaction_timeout":
+            return reason
+        # A finite, advancing drawer macro owns its timeout in simulator steps.
+        # Every other interaction retains the existing wall-clock behavior.
+        return self._drawer_scan_execution_timeout_reason_locked(now=now)
 
     def _fresh_command_gate_callback(self, message: String) -> None:
         try:
@@ -3351,7 +3478,7 @@ class SemanticBehaviorExecutor:
     def _tick(self, _event) -> None:
         reservation_retry = None
         with self.lock:
-            reason = self.machine.timeout_reason()
+            reason = self._effective_timeout_reason_locked()
             if reason in {"navigation_timeout", "interaction_navigation_timeout"}:
                 reason = ""
             cancel_navigation = bool(reason) and self.machine.state in {
@@ -3410,6 +3537,7 @@ class SemanticBehaviorExecutor:
                         {},
                     )
                 ),
+                "drawer_scan_execution_wait": self._drawer_scan_execution_wait_summary_locked(),
                 "startup_scan": dict(self._startup_scan_progress),
                 "post_interaction_visual_audit_count": len(
                     getattr(self, "_post_interaction_visual_audits", ())
@@ -3763,6 +3891,8 @@ class SemanticBehaviorExecutor:
                 payload["drawer_container_capture_step"] = drawer_capture_step
         with self.lock:
             self.pre_interaction_image_sequence = self.latest_image_sequence
+            if drawer_sequence_type == "drawer_scan":
+                self._arm_drawer_scan_execution_wait_locked(payload)
         self.interaction_command_pub.publish(
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
@@ -7927,6 +8057,7 @@ class SemanticBehaviorExecutor:
                 detail["mllm_events"] = list(self.model_events)
             self._publish_feedback(selection, status, bool(command.get("success")), detail)
             self.selection = None
+            self._clear_drawer_scan_execution_wait_locked()
             self.machine.reset()
         if was_navigating:
             self.move_base.cancel_goal()

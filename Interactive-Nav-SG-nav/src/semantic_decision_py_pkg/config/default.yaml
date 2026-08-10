@@ -200,6 +200,15 @@ executor:
   navigation_timeout_s: 180.0
   interaction_navigation_timeout_s: 180.0
   interaction_timeout_s: 30.0
+  # A grounded drawer scan has a finite evaluator-step macro.  While those
+  # steps keep arriving, do not let host/render wall time turn it into a false
+  # failure.  The cap covers the strict public schema maximum of eight regions
+  # at smooth(5)+observe(3)+close(5), plus bounded delivery slack.
+  drawer_scan_execution_step_budget_authoritative: true
+  drawer_scan_execution_max_task_steps: 120
+  drawer_scan_execution_step_budget_margin: 8
+  drawer_scan_execution_step_sync_stall_timeout_s: 5.0
+  drawer_scan_execution_wall_cap_s: 180.0
   interaction_observation_timeout_s: 30.0
   interaction_observation_poll_interval_s: 0.05
   # A container only reaches the physical backend after two causally later M1

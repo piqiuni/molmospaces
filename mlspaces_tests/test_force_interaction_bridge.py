@@ -17,6 +17,7 @@ from scripts.InteractiveNav import force_interaction_runtime
 from scripts.InteractiveNav.force_interaction_bridge import (
     AtomicForceInteractionController,
     _refrigerator_open_sweep_preflight,
+    drawer_sequence_task_step_budget,
     ground_drawer_open_regions,
 )
 
@@ -979,6 +980,19 @@ def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -
     assert result["success"] is True
     assert result["drawer_transition_steps"] == 3
     assert result["task_steps_consumed"] == 14
+    assert result["expected_task_steps"] == 14
+
+
+def test_drawer_scan_step_budget_matches_smooth_close_restore_macro() -> None:
+    # Three grounded regions in the production contract: each has 5 open,
+    # 3 low-view observation, 5 close steps, then two restore-settle steps.
+    assert drawer_sequence_task_step_budget(3, 5, 3, 2) == 41
+    # The public M1 schema allows up to eight regions.  This remains a finite
+    # upper bound that the executor can use without inspecting private joints.
+    assert drawer_sequence_task_step_budget(8, 5, 3, 2) == 106
+    assert drawer_sequence_task_step_budget(
+        3, 5, 3, 2, preserve_open=True
+    ) == 24
 
 
 def test_drawer_scan_failure_best_effort_closes_and_restores_view(monkeypatch) -> None:

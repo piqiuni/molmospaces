@@ -34,6 +34,32 @@ from scripts.InteractiveNav.force_interaction_runtime import (
 )
 
 
+def drawer_sequence_task_step_budget(
+    group_count: int,
+    transition_steps: int,
+    observation_steps: int,
+    restore_settle_steps: int,
+    *,
+    preserve_open: bool = False,
+) -> int:
+    """Return the finite simulator-step budget of a grounded drawer macro.
+
+    This deliberately describes task steps rather than host time.  A scan
+    opens, observes, and closes each grounded drawer; an exploration open omits
+    the close phase.  The value is public execution progress, not simulator
+    topology or joint metadata.
+    """
+
+    groups = max(0, int(group_count))
+    transition = max(1, int(transition_steps))
+    observation = max(1, int(observation_steps))
+    settle = max(0, int(restore_settle_steps))
+    per_group = transition + observation
+    if not preserve_open:
+        per_group += transition
+    return groups * per_group + (0 if preserve_open else settle)
+
+
 def _capture_robot_lock(task_env) -> dict[str, Any] | None:
     """Snapshot base and upper body after the drawer low-view posture is set."""
 
@@ -958,6 +984,25 @@ class AtomicForceInteractionController:
         sequence_type = str(command.get("sequence_type") or "drawer_scan").casefold()
         if sequence_type not in {"drawer_scan", "drawer_open"}:
             raise ValueError(f"Unsupported drawer interaction sequence: {sequence_type}")
+        preserve_open = sequence_type == "drawer_open"
+        transition_steps = max(
+            1,
+            int(command.get("drawer_transition_steps", self.drawer_transition_steps)),
+        )
+        observation_steps = max(
+            1,
+            int(command.get("drawer_observation_steps", self.drawer_observation_steps)),
+        )
+        restore_settle_steps = max(
+            0,
+            int(
+                command.get(
+                    "drawer_view_restore_settle_steps",
+                    self.drawer_view_restore_settle_steps,
+                )
+                or 0
+            ),
+        )
         self._pending = {
             "kind": "drawer_sequence",
             "command": command,
@@ -970,18 +1015,12 @@ class AtomicForceInteractionController:
             # restores every selected drawer to closed.  ``drawer_open`` is
             # normal interactive exploration: selected, M1-grounded drawers
             # remain open so subsequent RGB/map updates can expose contents.
-            "preserve_open": sequence_type == "drawer_open",
+            "preserve_open": preserve_open,
             "all_joint_names": [
                 name for group in groups for name in group["joint_names"]
             ],
-            "transition_steps": max(
-                1,
-                int(command.get("drawer_transition_steps", self.drawer_transition_steps)),
-            ),
-            "observation_steps": max(
-                1,
-                int(command.get("drawer_observation_steps", self.drawer_observation_steps)),
-            ),
+            "transition_steps": transition_steps,
+            "observation_steps": observation_steps,
             "remaining_observation_steps": 0,
             "phase_plan": None,
             "phase_start_values": {},
@@ -990,15 +1029,13 @@ class AtomicForceInteractionController:
             "physics_substeps": 0,
             "view_result": None,
             "view_restore_result": None,
-            "view_restore_settle_steps": max(
-                0,
-                int(
-                    command.get(
-                        "drawer_view_restore_settle_steps",
-                        self.drawer_view_restore_settle_steps,
-                    )
-                    or 0
-                ),
+            "view_restore_settle_steps": restore_settle_steps,
+            "expected_task_steps": drawer_sequence_task_step_budget(
+                len(groups),
+                transition_steps,
+                observation_steps,
+                restore_settle_steps,
+                preserve_open=preserve_open,
             ),
             "remaining_view_restore_settle_steps": 0,
             # Filled after the low view is applied, then reasserted around
@@ -1423,6 +1460,7 @@ class AtomicForceInteractionController:
             "drawer_view_restore_settle_steps": int(
                 pending.get("view_restore_settle_steps", 0) or 0
             ),
+            "expected_task_steps": int(pending.get("expected_task_steps", 0) or 0),
             "transition_log": list(pending["transition_log"]),
             "state": "open" if preserve_open else "closed",
             "pre_state": "closed",
