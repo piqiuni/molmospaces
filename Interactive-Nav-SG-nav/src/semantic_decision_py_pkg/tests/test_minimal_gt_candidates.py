@@ -109,6 +109,7 @@ def test_minimal_gt_unknown_portal_defaults_to_rule_interaction_only() -> None:
         "expected_state",
         "interaction_approach_pose_xyyaw",
         "interaction_approach_axis_xy",
+        "interaction_approach_pose_labels",
         "interaction_ready_distance_m",
         "interaction_ready_yaw_tolerance_rad",
     }

@@ -119,20 +119,41 @@ class SemanticOccupancyOverlay:
         self.clear_padding_m = max(0.0, float(clear_padding_m))
         self.open_states = set(open_states or ["open"])
         self.reference_aabbs: dict[str, tuple[list[float], list[float]]] = {}
+        # A pending interaction command can arrive before its result, but it
+        # must never be enough to turn an arbitrary openable object into a map
+        # opening.  Keep the current graph's topology-qualified portal IDs
+        # separately from the mutable presentation ``node.type`` field.
+        self.known_portal_ids: set[str] = set()
         self.active_portal_ids: set[str] = set()
         self.pending_portal_ids: set[str] = set()
 
     def reset(self) -> None:
         self.reference_aabbs.clear()
+        self.known_portal_ids.clear()
         self.active_portal_ids.clear()
         self.pending_portal_ids.clear()
 
-    def set_interaction_pending(self, node_id: str, pending: bool) -> bool:
+    def set_interaction_pending(
+        self, node_id: str, pending: bool, *, node_type: str | None = None
+    ) -> bool:
+        """Record an in-flight *portal* open, never a generic container open.
+
+        ``node_type`` is optional because the normal graph refresh has already
+        established ``known_portal_ids``.  Callers that have a freshly checked
+        portal command may pass it while the next graph snapshot is still in
+        flight.  A non-portal hint is deliberately fail-closed.
+        """
+
         node_id = str(node_id or "")
         if not node_id:
             return False
         before = set(self.pending_portal_ids)
         if pending:
+            normalized_type = str(node_type or "").strip().casefold()
+            if normalized_type and normalized_type != "portal":
+                return False
+            if not normalized_type and node_id not in self.known_portal_ids:
+                return False
             self.pending_portal_ids.add(node_id)
         else:
             self.pending_portal_ids.discard(node_id)
@@ -140,10 +161,13 @@ class SemanticOccupancyOverlay:
 
     def update_graph(self, graph_payload: dict[str, Any]) -> None:
         active = set()
+        known = set()
         for node in graph_payload.get("nodes") or []:
-            if node.get("type") != "portal":
+            if not self._is_topology_portal(node):
                 continue
             node_id = str(node.get("id") or "")
+            if node_id:
+                known.add(node_id)
             attributes = node.get("attributes") or {}
             # The visual AABB can follow a rotating door leaf.  A semantic
             # portal is anchored to the immutable pre-open doorway geometry
@@ -163,7 +187,38 @@ class SemanticOccupancyOverlay:
                 self.reference_aabbs[node_id] = (center, size)
             if state in self.open_states and node_id in self.reference_aabbs:
                 active.add(node_id)
+        self.known_portal_ids = known
+        # A node that was reclassified from a transient MLLM portal proposal
+        # to a source-observed container must immediately lose both its cached
+        # doorway AABB and optimistic pending clear.
+        self.reference_aabbs = {
+            node_id: reference
+            for node_id, reference in self.reference_aabbs.items()
+            if node_id in known
+        }
+        self.pending_portal_ids.intersection_update(known)
         self.active_portal_ids = active | self.pending_portal_ids
+
+    @staticmethod
+    def _is_topology_portal(node: dict[str, Any]) -> bool:
+        """Return whether a graph node is eligible to clear occupancy.
+
+        Module 1 may suggest a semantic class while looking at a partial box.
+        It must not promote a source-observed container into a topological
+        portal for planning.  Newer graph payloads carry the immutable
+        ``topology_type`` / ``observation_node_type`` provenance; legacy
+        payloads without either key retain their historical portal behavior.
+        """
+
+        if str(node.get("type") or "").casefold() != "portal":
+            return False
+        attributes = node.get("attributes") or {}
+        source_type = str(
+            attributes.get("topology_type")
+            or attributes.get("observation_node_type")
+            or ""
+        ).strip().casefold()
+        return source_type in {"", "portal"}
 
     def has_active_portals(self, *, include_pending: bool = True) -> bool:
         """Whether this consumer needs a materialized overlay right now.

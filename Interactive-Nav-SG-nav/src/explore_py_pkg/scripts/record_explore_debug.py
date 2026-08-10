@@ -3313,6 +3313,13 @@ class ExploreDebugRecorder:
                                 "interaction_target_only",
                             )
                         ),
+                        "video_semantic_xy_overview_inset": bool(
+                            getattr(
+                                self.args,
+                                "video_semantic_xy_overview_inset",
+                                False,
+                            )
+                        ),
                         "semantic_occ_alpha": float(
                             getattr(self.args, "semantic_occ_alpha", 0.35)
                         ),
@@ -8315,6 +8322,9 @@ class ExploreDebugRecorder:
                 "video_semantic_xy_label_mode": getattr(
                     self.args, "video_semantic_xy_label_mode", "interaction_target_only"
                 ),
+                "video_semantic_xy_overview_inset": bool(
+                    getattr(self.args, "video_semantic_xy_overview_inset", False)
+                ),
                 "runtime_video_encode": bool(self.args.runtime_video_encode),
                 "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
                 "raw_recording_format": "png_json_v1",
@@ -8442,6 +8452,9 @@ class ExploreDebugRecorder:
                 "video_semantic_xy_panel_scale": getattr(self.args, "video_semantic_xy_panel_scale", 1.8),
                 "video_semantic_xy_label_mode": getattr(
                     self.args, "video_semantic_xy_label_mode", "interaction_target_only"
+                ),
+                "video_semantic_xy_overview_inset": bool(
+                    getattr(self.args, "video_semantic_xy_overview_inset", False)
                 ),
                 "runtime_video_encode": bool(self.args.runtime_video_encode),
                 "offline_video_only": bool(getattr(self.args, "offline_video_only", False)),
@@ -8850,6 +8863,12 @@ def _parse_args() -> argparse.Namespace:
         choices=("all", "interaction_target_only", "none"),
         default="interaction_target_only",
         help="Labels in the offline semantic XY panel; rooms remain labeled in every mode.",
+    )
+    parser.add_argument(
+        "--video-semantic-xy-overview-inset",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Persist a full-map overview inset for the offline semantic XY panel.",
     )
     parser.add_argument("--video-map-desync-step-warn", type=int, default=3)
     parser.add_argument("--video-map-max-age-sec", type=float, default=2.0)

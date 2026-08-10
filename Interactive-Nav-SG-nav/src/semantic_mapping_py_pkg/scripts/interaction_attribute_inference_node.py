@@ -215,9 +215,11 @@ class InteractionAttributeInferenceNode:
             "received": 0,
             "eligible": 0,
             "enqueued": 0,
+            "coalesced": 0,
             "started": 0,
             "completed": 0,
             "stale": 0,
+            "expired": 0,
             "failed": 0,
             "filtered": 0,
             "missing_image": 0,
@@ -232,9 +234,11 @@ class InteractionAttributeInferenceNode:
             "received": 0,
             "eligible": 0,
             "enqueued": 0,
+            "coalesced": 0,
             "started": 0,
             "completed": 0,
             "stale": 0,
+            "expired": 0,
             "failed": 0,
             "filtered": 0,
         }
@@ -413,6 +417,8 @@ class InteractionAttributeInferenceNode:
         observation_stamp = self._observation_stamp(payload, image_stamp)
         if episode_id:
             self._set_episode(episode_id)
+        for expired in self.request_queue.drop_expired():
+            self._expire_attribute_request(expired)
         requests = []
         for detection in detections:
             if not isinstance(detection, dict):
@@ -465,6 +471,7 @@ class InteractionAttributeInferenceNode:
                 )
             if reservation is None:
                 continue
+            enqueued_at = time.monotonic()
             requests.append(
                 {
                     "priority": (
@@ -482,13 +489,21 @@ class InteractionAttributeInferenceNode:
                     "signature": signature,
                     "generation": reservation["generation"],
                     "request_sequence": reservation["request_sequence"],
-                    "enqueued_at": time.monotonic(),
+                    "enqueued_at": enqueued_at,
+                    "deadline_monotonic": enqueued_at + self.request_timeout_s,
                     "targeted_refresh": dict(targeted_refresh or {}),
                 }
             )
+        for expired in self.request_queue.drop_expired():
+            self._expire_attribute_request(expired)
         for request_payload in sorted(
             requests, key=lambda item: (-float(item["priority"]), item["object_id"])
         ):
+            if self._remaining_request_timeout(
+                request_payload.get("deadline_monotonic"), self.request_timeout_s
+            ) <= 0.0:
+                self._expire_attribute_request(request_payload)
+                continue
             accepted, displaced = self.request_queue.put(request_payload)
             if accepted:
                 with self.lock:
@@ -498,6 +513,14 @@ class InteractionAttributeInferenceNode:
                 if request_payload.get("targeted_refresh"):
                     self._consume_targeted_refresh(request_payload["targeted_refresh"])
                 if displaced is not None:
+                    same_object = str(displaced.get("object_id") or "") == str(
+                        request_payload.get("object_id") or ""
+                    )
+                    if same_object:
+                        with self.lock:
+                            self.filter_counts["coalesced"] = (
+                                self.filter_counts.get("coalesced", 0) + 1
+                            )
                     self._release(
                         str(displaced.get("object_id") or ""),
                         int(displaced.get("request_sequence", 0) or 0),
@@ -509,7 +532,11 @@ class InteractionAttributeInferenceNode:
                             self._attribute_status_patch(
                                 displaced,
                                 "stale",
-                                error="queue_replaced_by_higher_priority_request",
+                                error=(
+                                    "queue_replaced_by_newer_object_evidence"
+                                    if same_object
+                                    else "queue_replaced_by_higher_priority_request"
+                                ),
                             )
                         ],
                     )
@@ -529,10 +556,13 @@ class InteractionAttributeInferenceNode:
         self._publish_status()
         rospy.loginfo_throttle(
             10.0,
-            "[interaction_attribute_inference] received=%d eligible=%d enqueued=%d filtered=%d missing_image=%d queue=%d",
+            "[interaction_attribute_inference] received=%d eligible=%d enqueued=%d "
+            "coalesced=%d expired=%d filtered=%d missing_image=%d queue=%d",
             self.filter_counts["received"],
             self.filter_counts["eligible"],
             self.filter_counts["enqueued"],
+            self.filter_counts.get("coalesced", 0),
+            self.filter_counts.get("expired", 0),
             self.filter_counts["filtered"],
             self.filter_counts["missing_image"],
             len(self.request_queue),
@@ -557,6 +587,8 @@ class InteractionAttributeInferenceNode:
         episode_id = str(payload.get("episode_id") or "")
         if episode_id:
             self._set_episode(episode_id)
+        for expired in self.room_request_queue.drop_expired():
+            self._expire_room_request(expired)
         capture_step = self._capture_step(payload)
         stamp = self._observation_stamp(payload, time.time())
         requests = []
@@ -587,6 +619,7 @@ class InteractionAttributeInferenceNode:
                 continue
             with self.lock:
                 self.room_counts["eligible"] += 1
+            enqueued_at = time.monotonic()
             requests.append(
                 {
                     # LatestPriorityRequestQueue deliberately uses object_id as
@@ -604,13 +637,21 @@ class InteractionAttributeInferenceNode:
                     "signature": signature,
                     "generation": reservation["generation"],
                     "request_sequence": reservation["request_sequence"],
-                    "enqueued_at": time.monotonic(),
+                    "enqueued_at": enqueued_at,
+                    "deadline_monotonic": enqueued_at + self.room_request_timeout_s,
                 }
             )
+        for expired in self.room_request_queue.drop_expired():
+            self._expire_room_request(expired)
         for request_payload in sorted(
             requests,
             key=lambda item: (-float(item["priority"]), item["object_id"]),
         ):
+            if self._remaining_request_timeout(
+                request_payload.get("deadline_monotonic"), self.room_request_timeout_s
+            ) <= 0.0:
+                self._expire_room_request(request_payload)
+                continue
             accepted, displaced = self.room_request_queue.put(request_payload)
             room_key = str(request_payload["object_id"])
             if not accepted:
@@ -621,6 +662,11 @@ class InteractionAttributeInferenceNode:
             if displaced is not None:
                 displaced_key = str(displaced.get("object_id") or "")
                 displaced_sequence = int(displaced.get("request_sequence", 0) or 0)
+                if displaced_key == room_key:
+                    with self.lock:
+                        self.room_counts["coalesced"] = (
+                            self.room_counts.get("coalesced", 0) + 1
+                        )
                 self._release_room(displaced_key, displaced_sequence)
                 self._publish_room_updates(
                     str(displaced.get("episode_id") or ""),
@@ -1167,6 +1213,29 @@ class InteractionAttributeInferenceNode:
         return abs(x1 - x0) * abs(y1 - y0) >= self.min_bbox_area_px
 
     @staticmethod
+    def _public_detection_bbox(detection: dict) -> list[float] | None:
+        """Return one finite public detector box for a completed M1 patch."""
+
+        raw = (
+            detection.get("bbox_2d")
+            or detection.get("projected_bbox_2d")
+            or detection.get("bbox")
+        )
+        if not isinstance(raw, (list, tuple)) or len(raw) < 4:
+            return None
+        try:
+            x0, y0, x1, y1 = (float(value) for value in raw[:4])
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (x0, y0, x1, y1)):
+            return None
+        left, right = sorted((x0, x1))
+        top, bottom = sorted((y0, y1))
+        if right - left < 1.0 or bottom - top < 1.0:
+            return None
+        return [left, top, right, bottom]
+
+    @staticmethod
     def _state_signature(detection: dict) -> str:
         """Use stable identity plus coarse, material view evidence.
 
@@ -1310,12 +1379,118 @@ class InteractionAttributeInferenceNode:
             ) == int(request_sequence):
                 self.pending.pop(object_id, None)
 
+    @staticmethod
+    def _remaining_request_timeout(
+        deadline_monotonic: float | None,
+        fallback_timeout_s: float,
+    ) -> float:
+        """Return the remaining end-to-end budget, including queue wait."""
+
+        if deadline_monotonic is None:
+            return max(0.01, float(fallback_timeout_s))
+        try:
+            return max(0.0, float(deadline_monotonic) - time.monotonic())
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _expire_attribute_request(self, request_payload: dict) -> None:
+        """Drop a stale queued M1 request without contacting the model."""
+
+        object_id = str(request_payload.get("object_id") or "")
+        episode_id = str(request_payload.get("episode_id") or "")
+        generation = int(request_payload.get("generation", 0) or 0)
+        request_sequence = int(request_payload.get("request_sequence", 0) or 0)
+        current = False
+        now = time.monotonic()
+        with self.lock:
+            current = self._is_current_request_locked(
+                object_id, episode_id, generation, request_sequence
+            )
+            if current:
+                self.pending.pop(object_id, None)
+            self.filter_counts["expired"] = self.filter_counts.get("expired", 0) + 1
+        if current:
+            failure_payload = {
+                "object_id": object_id,
+                "frame_id": request_payload.get("frame_id", ""),
+                "image_sequence": request_payload.get("image_sequence", -1),
+                "request_sequence": request_sequence,
+                "signature": str(request_payload.get("signature") or ""),
+                "targeted_refresh": request_payload.get("targeted_refresh") or {},
+            }
+            enqueued_at = float(request_payload.get("enqueued_at", now) or now)
+            stamp = float(request_payload.get("stamp", time.time()) or time.time())
+            self._publish_updates(
+                episode_id,
+                stamp,
+                [
+                    self._attribute_status_patch(
+                        failure_payload,
+                        "failed",
+                        error="queue_deadline_expired_before_send",
+                    )
+                    | {
+                        "queue_lag_sec": max(0.0, now - enqueued_at),
+                        "response_lag_sec": 0.0,
+                        "total_lag_sec": max(0.0, now - enqueued_at),
+                    }
+                ],
+            )
+        self._publish_status()
+
+    def _expire_room_request(self, request_payload: dict) -> None:
+        """Drop a stale queued room request without contacting the model."""
+
+        room_key = str(
+            request_payload.get("object_id")
+            or request_payload.get("room_node_id")
+            or ""
+        )
+        episode_id = str(request_payload.get("episode_id") or "")
+        generation = int(request_payload.get("generation", 0) or 0)
+        request_sequence = int(request_payload.get("request_sequence", 0) or 0)
+        current = False
+        now = time.monotonic()
+        with self.lock:
+            current = self._is_current_room_request_locked(
+                room_key, episode_id, generation, request_sequence
+            )
+            if current:
+                self.room_pending.pop(room_key, None)
+            self.room_counts["expired"] = self.room_counts.get("expired", 0) + 1
+        if current:
+            request_payload = dict(request_payload)
+            enqueued_at = float(request_payload.get("enqueued_at", now) or now)
+            stamp = float(request_payload.get("stamp", time.time()) or time.time())
+            self._publish_room_updates(
+                episode_id,
+                stamp,
+                [
+                    self._room_status_patch(
+                        request_payload,
+                        "failed",
+                        error="queue_deadline_expired_before_send",
+                    )
+                    | {
+                        "queue_lag_sec": max(0.0, now - enqueued_at),
+                        "response_lag_sec": 0.0,
+                        "total_lag_sec": max(0.0, now - enqueued_at),
+                    }
+                ],
+            )
+        self._publish_status()
+
     def _worker_loop(self) -> None:
         while not self.shutdown_event.is_set() and not rospy.is_shutdown():
             request_payload = self.request_queue.get(timeout_s=0.5)
             if request_payload is None:
                 continue
             request_payload.pop("priority", None)
+            if self._remaining_request_timeout(
+                request_payload.get("deadline_monotonic"), self.request_timeout_s
+            ) <= 0.0:
+                self._expire_attribute_request(request_payload)
+                continue
             self._infer(**request_payload)
 
     def _room_worker_loop(self) -> None:
@@ -1324,6 +1499,11 @@ class InteractionAttributeInferenceNode:
             if request_payload is None:
                 continue
             request_payload.pop("priority", None)
+            if self._remaining_request_timeout(
+                request_payload.get("deadline_monotonic"), self.room_request_timeout_s
+            ) <= 0.0:
+                self._expire_room_request(request_payload)
+                continue
             room_key = str(request_payload.pop("object_id") or "")
             self._infer_room(room_key=room_key, **request_payload)
 
@@ -1384,10 +1564,13 @@ class InteractionAttributeInferenceNode:
         request_sequence: int,
         enqueued_at: float,
         targeted_refresh: dict,
+        deadline_monotonic: float | None = None,
     ) -> None:
         request_started = time.monotonic()
         queue_lag_sec = max(0.0, request_started - float(enqueued_at))
         succeeded = False
+        deadline_expired = False
+        model_call_started = False
         outcome_status = "failed"
         outcome_error = ""
         refresh_interval_s = self.success_refresh_interval_s
@@ -1407,6 +1590,14 @@ class InteractionAttributeInferenceNode:
             if not encoded:
                 return
             image_data = "data:image/jpeg;base64," + __import__("base64").b64encode(encoded).decode("ascii")
+            remaining_timeout_s = self._remaining_request_timeout(
+                deadline_monotonic, self.request_timeout_s
+            )
+            if remaining_timeout_s <= 0.0:
+                deadline_expired = True
+                outcome_error = "queue_deadline_expired_before_send"
+                return
+            model_call_started = True
             response = self.client.request_json(
                 role="attribute_inference",
                 instruction=(
@@ -1419,7 +1610,7 @@ class InteractionAttributeInferenceNode:
                     "interaction_class, coarse_state, portal_morphology, "
                     "portal_aperture_evidence, view_state, view_state_confidence, "
                     "front_surface_visible, front_surface_confidence, approach_ready, "
-                    "needs_reobserve, interaction_parts, and confidence. "
+                    "needs_reobserve, action_regions, interaction_parts, and confidence. "
                     "interaction_class is portal, container, none, or unknown. "
                     "For a portal only, portal_morphology is {door_leaf: absent|present|unknown, "
                     "confidence: 0..1}; report absent only when the image visibly shows a clear "
@@ -1432,11 +1623,21 @@ class InteractionAttributeInferenceNode:
                     "For a non-portal, set portal_morphology and "
                     "portal_aperture_evidence to null. "
                     "view_state is front, oblique, side_or_back, occluded, or unknown and "
-                    "describes only the current camera view of the outlined target. "
+                    "describes only the current camera view of the outlined target. Use front "
+                    "only for a nearly head-on, broad usable face: both lateral boundaries and "
+                    "the main face must be visible without a dominant receding side plane. A "
+                    "narrow silhouette, a visibly receding side/top, a single dark slab, or a "
+                    "guess from object shape is not front. "
                     "front_surface_visible is true only when its usable front surface is "
-                    "directly visible. Set approach_ready true only for a sufficiently clear "
-                    "front-facing or usable oblique visual view; for side_or_back, occluded, "
-                    "or unknown views, set approach_ready false and needs_reobserve true. "
+                    "directly visible. For a container, set approach_ready true only for that "
+                    "direct front view; an oblique, side_or_back, occluded, or unknown view "
+                    "must set approach_ready false and needs_reobserve true. "
+                    "action_regions is an ordered list of visible actionable centers, in "
+                    "normalized coordinates of the padded target-crop inset (x=0 left, y=0 top). "
+                    "For a visibly front-facing drawer-like container, include each visible "
+                    "drawer front or handle from top to bottom. For side, occluded, unknown, "
+                    "or non-drawer targets, return an empty list. Never invent hidden drawers "
+                    "or use full-image coordinates. "
                     "interaction_parts has at most one item with part_id, type, state, "
                     "handle_visible, and confidence. Use a short generic part_id such as "
                     "part_1; never copy simulator body or joint identifiers. Do not output "
@@ -1450,7 +1651,7 @@ class InteractionAttributeInferenceNode:
                 },
                 images=[image_data],
                 response_schema=build_attribute_patch_response_schema("target"),
-                timeout_s=self.request_timeout_s,
+                timeout_s=remaining_timeout_s,
                 max_tokens=self.max_output_tokens,
                 metrics_context={
                     "episode_id": episode_id,
@@ -1495,6 +1696,25 @@ class InteractionAttributeInferenceNode:
                     "total_lag_sec": max(0.0, time.monotonic() - float(enqueued_at)),
                 }
             )
+            # M1 does not receive detector geometry in its prompt.  A targeted
+            # drawer scan nevertheless needs the exact public box paired with
+            # this RGB frame, so attach that sensor-side evidence only after
+            # model inference returns.
+            observed_bbox = self._public_detection_bbox(detection)
+            if observed_bbox is not None:
+                patch["observed_bbox_2d"] = observed_bbox
+            # Keep this detector fact separate from the M1 answer.  Portal
+            # state still treats any clipped side as incomplete evidence.  For
+            # a container contact view, the executor can distinguish a missing
+            # *lateral* boundary (unsafe frontality) from a low camera view
+            # that clips only the top/bottom while retaining a grounded handle
+            # region.
+            truncated_edges = self._detection_bbox_border_edges(
+                visual_evidence, detection
+            )
+            patch["visual_evidence_truncated_edges"] = truncated_edges
+            patch["visual_evidence_truncated"] = bool(truncated_edges)
+            patch["is_currently_visible"] = True
             patch.update(
                 self._attribute_status_patch(
                     {
@@ -1521,7 +1741,8 @@ class InteractionAttributeInferenceNode:
                 )
                 if current_request:
                     self.pending.pop(object_id, None)
-                    self.last_request[object_id] = time.monotonic()
+                    if model_call_started:
+                        self.last_request[object_id] = time.monotonic()
                 if succeeded and current_request:
                     self.completed[object_id] = {
                         "signature": signature,
@@ -1565,6 +1786,10 @@ class InteractionAttributeInferenceNode:
                     self.filter_counts["stale"] += 1
                 elif succeeded:
                     self.filter_counts["completed"] += 1
+                elif deadline_expired:
+                    self.filter_counts["expired"] = (
+                        self.filter_counts.get("expired", 0) + 1
+                    )
                 else:
                     self.filter_counts["failed"] += 1
             self._publish_status()
@@ -1582,12 +1807,15 @@ class InteractionAttributeInferenceNode:
         generation: int,
         request_sequence: int,
         enqueued_at: float,
+        deadline_monotonic: float | None = None,
     ) -> None:
         """Run text-only room inference in a queue independent of RGB crops."""
 
         request_started = time.monotonic()
         queue_lag_sec = max(0.0, request_started - float(enqueued_at))
         succeeded = False
+        deadline_expired = False
+        model_call_started = False
         outcome_status = "failed"
         outcome_error = ""
         request_payload = {
@@ -1607,6 +1835,14 @@ class InteractionAttributeInferenceNode:
             ):
                 outcome_status = "stale"
                 return
+            remaining_timeout_s = self._remaining_request_timeout(
+                deadline_monotonic, self.room_request_timeout_s
+            )
+            if remaining_timeout_s <= 0.0:
+                deadline_expired = True
+                outcome_error = "queue_deadline_expired_before_send"
+                return
+            model_call_started = True
             response = self.client.request_json(
                 role="room_attribute_inference",
                 instruction=(
@@ -1625,7 +1861,7 @@ class InteractionAttributeInferenceNode:
                     "objects": objects,
                     "episode_id": episode_id,
                 },
-                timeout_s=self.room_request_timeout_s,
+                timeout_s=remaining_timeout_s,
                 max_tokens=self.room_max_output_tokens,
                 metrics_context={
                     "episode_id": episode_id,
@@ -1681,7 +1917,8 @@ class InteractionAttributeInferenceNode:
                 )
                 if current_request:
                     self.room_pending.pop(room_key, None)
-                    self.room_last_request[room_key] = time.monotonic()
+                    if model_call_started:
+                        self.room_last_request[room_key] = time.monotonic()
                 if succeeded and current_request:
                     self.room_completed[room_key] = {
                         "signature": signature,
@@ -1716,6 +1953,10 @@ class InteractionAttributeInferenceNode:
                     self.room_counts["stale"] += 1
                 elif succeeded:
                     self.room_counts["completed"] += 1
+                elif deadline_expired:
+                    self.room_counts["expired"] = (
+                        self.room_counts.get("expired", 0) + 1
+                    )
                 else:
                     self.room_counts["failed"] += 1
             self._publish_status()
@@ -1786,6 +2027,50 @@ class InteractionAttributeInferenceNode:
         if x1 <= x0 or y1 <= y0:
             return None
         return x0, y0, x1, y1
+
+    @classmethod
+    def _detection_bbox_touches_image_border(
+        cls,
+        image: np.ndarray,
+        detection: dict,
+        *,
+        margin_px: int = 2,
+    ) -> bool:
+        """Return whether the public detection is clipped by this RGB frame."""
+
+        return bool(cls._detection_bbox_border_edges(image, detection, margin_px=margin_px))
+
+    @classmethod
+    def _detection_bbox_border_edges(
+        cls,
+        image: np.ndarray,
+        detection: dict,
+        *,
+        margin_px: int = 2,
+    ) -> list[str]:
+        """Return public image sides touched by a detector box.
+
+        This remains a sensor-side fact rather than an M1 judgement.  ``unknown``
+        deliberately fails closed for callers that cannot establish a valid
+        detector rectangle.
+        """
+
+        bbox = cls._bbox_pixels(image, detection)
+        if bbox is None:
+            return ["unknown"]
+        height, width = image.shape[:2]
+        x0, y0, x1, y1 = bbox
+        margin = max(0, int(margin_px))
+        edges: list[str] = []
+        if x0 <= margin:
+            edges.append("left")
+        if x1 >= max(0, width - margin):
+            edges.append("right")
+        if y0 <= margin:
+            edges.append("top")
+        if y1 >= max(0, height - margin):
+            edges.append("bottom")
+        return edges
 
     @classmethod
     def _crop(cls, image, detection, margin_ratio=0.0):

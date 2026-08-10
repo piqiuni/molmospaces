@@ -956,6 +956,18 @@ def parse_args():
     parser.add_argument("--realtime_gt_topic", type=str, default="/semantic_mapping/gt_observations")
     parser.add_argument("--realtime_gt_camera_name", type=str, default="head_camera")
     parser.add_argument("--realtime_gt_min_visible_pixels", type=int, default=16)
+    parser.add_argument(
+        "--realtime_gt_min_visible_bbox_short_side_px",
+        type=int,
+        default=1,
+        help="Reject public GT components whose shorter 2-D box side is below this many pixels.",
+    )
+    parser.add_argument(
+        "--realtime_gt_min_portal_bbox_short_side_px",
+        type=int,
+        default=8,
+        help="Stricter short-side gate for doors/portals; rejects one-pixel wall-edge leakage.",
+    )
     parser.add_argument("--realtime_gt_min_visible_fraction", type=float, default=0.2)
     parser.add_argument(
         "--realtime_gt_required_consecutive_observations", type=int, default=2
@@ -1376,6 +1388,12 @@ def main():
             realtime_gt_topic=args.realtime_gt_topic,
             realtime_gt_camera_name=args.realtime_gt_camera_name,
             realtime_gt_min_visible_pixels=args.realtime_gt_min_visible_pixels,
+            realtime_gt_min_visible_bbox_short_side_px=(
+                args.realtime_gt_min_visible_bbox_short_side_px
+            ),
+            realtime_gt_min_portal_bbox_short_side_px=(
+                args.realtime_gt_min_portal_bbox_short_side_px
+            ),
             realtime_gt_min_visible_fraction=args.realtime_gt_min_visible_fraction,
             realtime_gt_required_consecutive_observations=(
                 args.realtime_gt_required_consecutive_observations

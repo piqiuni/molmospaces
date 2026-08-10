@@ -62,6 +62,9 @@ SEMANTIC_VIDEO_MAX_OBJECT_NODES=${SEMANTIC_VIDEO_MAX_OBJECT_NODES:-64}
 VIDEO_ROOM_PANEL_SCALE=${VIDEO_ROOM_PANEL_SCALE:-1.5}
 VIDEO_SEMANTIC_XY_PANEL_SCALE=${VIDEO_SEMANTIC_XY_PANEL_SCALE:-1.8}
 VIDEO_SEMANTIC_XY_LABEL_MODE=${VIDEO_SEMANTIC_XY_LABEL_MODE:-interaction_target_only}
+# Keep the complete known-map context visible in the six-panel output.  The
+# recorder persists this setting so rebuilding the video later keeps the view.
+VIDEO_SEMANTIC_XY_OVERVIEW_INSET=${VIDEO_SEMANTIC_XY_OVERVIEW_INSET:-false}
 IMAGE_QUEUE_SIZE=${IMAGE_QUEUE_SIZE:-64}
 OBSERVATION_QUEUE_SIZE=${OBSERVATION_QUEUE_SIZE:-16}
 VIDEO_ENCODER_PRESET=${VIDEO_ENCODER_PRESET:-ultrafast}
@@ -80,7 +83,11 @@ RECORDER_DRAIN_PROGRESS_S=${RECORDER_DRAIN_PROGRESS_S:-30}
 RECORDER_DRAIN_STALL_TIMEOUT_S=${RECORDER_DRAIN_STALL_TIMEOUT_S:-180}
 RECORDER_SHUTDOWN_GRACE_S=${RECORDER_SHUTDOWN_GRACE_S:-600}
 GT_STEP_INTERVAL=${GT_STEP_INTERVAL:-3}
-GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-4.0}
+# Keep semantic object discovery more conservative than the 8 m mapping scan,
+# but let an actually visible container be recognised before it has already
+# fallen out of a practical interaction-staging range.  Occlusion, box-area,
+# and consecutive-frame gates still apply.
+GT_MAX_DISTANCE_M=${GT_MAX_DISTANCE_M:-5.0}
 GT_MIN_VISIBLE_PIXELS=${GT_MIN_VISIBLE_PIXELS:-16}
 GT_MIN_VISIBLE_FRACTION=${GT_MIN_VISIBLE_FRACTION:-0.20}
 GT_REQUIRED_CONSECUTIVE_OBSERVATIONS=${GT_REQUIRED_CONSECUTIVE_OBSERVATIONS:-2}
@@ -94,7 +101,10 @@ STEP_READY_WARMUP_SKIP_FRAMES=${STEP_READY_WARMUP_SKIP_FRAMES:-0}
 GT_ROI_X_MIN_RATIO=${GT_ROI_X_MIN_RATIO:-0.10}
 GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
-LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.30}
+# Keep the launch-time override consistent with the checked-in global/local
+# costmap configs.  A stale 0.30 default here silently defeated the requested
+# 0.40 m local inflation in every house-run smoke.
+LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.40}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-}
@@ -114,7 +124,10 @@ DEBUG_FOLLOW_CAMERA_FOV_DEG=${DEBUG_FOLLOW_CAMERA_FOV_DEG:-65.0}
 if [[ -z "${INTERACTION_EXECUTION_MODE:-}" ]]; then
   if [[ -n "${DRAWER_EXECUTION_MODE:-}" ]]; then
     INTERACTION_EXECUTION_MODE=${DRAWER_EXECUTION_MODE}
-  elif [[ "${ENABLE_RECORDING}" == true ]]; then
+  # Full semantic/MLLM interaction runs must keep the same physical action
+  # timing with or without video recording.  In particular, a drawer scan is
+  # an open -> low-view dwell -> close macro, not a one-step state flip.
+  elif [[ "${METHOD}" == full_mllm_exploration || "${METHOD}" == semantic_interaction_* || "${ENABLE_RECORDING}" == true ]]; then
     INTERACTION_EXECUTION_MODE=smooth
   else
     INTERACTION_EXECUTION_MODE=fast
@@ -129,13 +142,16 @@ fi
 if [[ -z "${DRAWER_TRANSITION_STEPS:-}" ]]; then
   DRAWER_TRANSITION_STEPS=${INTERACTION_TRANSITION_STEPS}
 fi
-DRAWER_OBSERVATION_STEPS=${DRAWER_OBSERVATION_STEPS:-1}
+# Each M1-grounded drawer front gets a short but visible dwell while the head
+# is low.  The scan macro then closes it before advancing to the next front.
+DRAWER_OBSERVATION_STEPS=${DRAWER_OBSERVATION_STEPS:-3}
 ENABLE_ATTRIBUTE_INFERENCE=${ENABLE_ATTRIBUTE_INFERENCE:-false}
 SEMANTIC_ATTRIBUTE_MODEL_NAME=${SEMANTIC_ATTRIBUTE_MODEL_NAME:-}
 # Portal observations now include bounded visual morphology and aperture
-# evidence.  160 tokens can truncate a valid pretty-printed response, so keep
-# a per-run override while making the full-MLLM default safely large enough.
-SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-256}
+# evidence.  A 256-token structured reply can still truncate a multi-region
+# drawer/front observation; use the same 384-token M1 budget as V3 while
+# leaving room/M2/M3 budgets independently configured.
+SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-384}
 # Keep this unset until the method is selected: full-MLLM runs must give the
 # attribute lane the same server-queue budget as Modules 2/3.  Other modes
 # retain the historical 8 s default below.
@@ -435,6 +451,10 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
         --step-sync-queue-size "${STEP_SYNC_QUEUE_SIZE}"
       )
     fi
+    RECORDER_SEMANTIC_XY_INSET_ARGS=(--no-video-semantic-xy-overview-inset)
+    if [[ "${VIDEO_SEMANTIC_XY_OVERVIEW_INSET}" == true ]]; then
+      RECORDER_SEMANTIC_XY_INSET_ARGS=(--video-semantic-xy-overview-inset)
+    fi
     PYTHONUNBUFFERED=1 python -u "${REPO_ROOT}/Interactive-Nav-SG-nav/src/explore_py_pkg/scripts/record_explore_debug.py" \
       --output-dir "${OUTPUT_DIR}/debug" \
       --occupancy-grid-topic /semantic_mapping/planning_occ_map \
@@ -465,6 +485,7 @@ if [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
       --video-room-panel-scale "${VIDEO_ROOM_PANEL_SCALE}" \
       --video-semantic-xy-panel-scale "${VIDEO_SEMANTIC_XY_PANEL_SCALE}" \
       --video-semantic-xy-label-mode "${VIDEO_SEMANTIC_XY_LABEL_MODE}" \
+      "${RECORDER_SEMANTIC_XY_INSET_ARGS[@]}" \
       --no-runtime-video-encode \
       --offline-video-only \
       --first-person-video-h264-preset "${VIDEO_ENCODER_PRESET}" \
@@ -654,12 +675,17 @@ fi
 
 if [[ "${ENABLE_RECORDING}" == true ]] && [[ "${SKIP_OFFLINE_VIDEO}" != true ]] && [[ "${SKIP_DEBUG_RECORDER}" != true ]]; then
   OFFLINE_VIDEO_START=$(python -c 'import time; print(time.perf_counter())')
+  OFFLINE_VIDEO_INSET_ARGS=()
+  if [[ "${VIDEO_SEMANTIC_XY_OVERVIEW_INSET}" == true ]]; then
+    OFFLINE_VIDEO_INSET_ARGS=(--semantic-xy-overview-inset)
+  fi
   python "${VIDEO_BUILDER}" \
     --scene-dir "${OUTPUT_DIR}" \
     --debug-dir "${OUTPUT_DIR}/debug" \
     --fps "${VIDEO_FPS}" \
     --state-alignment "${VIDEO_STATE_ALIGNMENT}" \
     --output-stem overview_6panel \
+    "${OFFLINE_VIDEO_INSET_ARGS[@]}" \
     >"${OUTPUT_DIR}/offline_video.log" 2>&1
   OFFLINE_VIDEO_ELAPSED_SEC=$(python - "${OFFLINE_VIDEO_START}" <<'PY'
 import sys

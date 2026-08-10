@@ -130,6 +130,51 @@ def test_pending_open_interaction_clears_before_result_and_rolls_back():
     assert restored_stats["active_portal_ids"] == []
 
 
+def test_container_open_and_pending_command_never_clear_occupancy():
+    overlay = SemanticOccupancyOverlay(clear_padding_m=0.0)
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    fridge = {
+        "id": "container_fridge_1",
+        "type": "container",
+        "aabb_center": [1.0, 1.0, 1.0],
+        "aabb_size": [0.8, 0.8, 2.0],
+        "interaction": {"state": "open"},
+        "attributes": {"topology_type": "container"},
+    }
+
+    overlay.update_graph(graph(fridge))
+    # A generic open command must never create an optimistic doorway clear.
+    assert not overlay.set_interaction_pending("container_fridge_1", True)
+    assert not overlay.set_interaction_pending(
+        "container_fridge_1", True, node_type="container"
+    )
+    planning, mask, stats = overlay.apply(GridInfo(), raw)
+    assert planning == raw
+    assert max(mask) == 0
+    assert stats["active_portal_ids"] == []
+
+
+def test_mllm_portal_label_cannot_promote_source_container_to_overlay_portal():
+    overlay = SemanticOccupancyOverlay(clear_padding_m=0.0)
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    transient_label = {
+        "id": "container_fridge_1",
+        # This is the historical bad shape: presentation type changed by M1,
+        # while source observation provenance still says container.
+        "type": "portal",
+        "aabb_center": [1.0, 1.0, 1.0],
+        "aabb_size": [0.8, 0.8, 2.0],
+        "interaction": {"state": "open"},
+        "attributes": {"topology_type": "container"},
+    }
+
+    overlay.update_graph(graph(transient_label))
+    planning, mask, stats = overlay.apply(GridInfo(), raw)
+    assert planning == raw
+    assert max(mask) == 0
+    assert stats["active_portal_ids"] == []
+
+
 def test_ajar_portal_keeps_semantic_clearance():
     overlay = SemanticOccupancyOverlay(
         clear_padding_m=0.0,

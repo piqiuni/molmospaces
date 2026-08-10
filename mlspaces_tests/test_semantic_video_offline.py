@@ -21,9 +21,11 @@ from scripts.InteractiveNav.build_semantic_video_offline import (
     load_episode_trajectory,
     offline_display_config,
     panel_names,
+    receipt_is_causal_at_boundary,
     resolve_episode_trajectory_path,
     route_event_at_stamp,
     route_target_at_stamp,
+    select_causal_receipt,
 )
 import scripts.InteractiveNav.offline_semantic_renderer as offline_renderer
 from scripts.InteractiveNav.offline_semantic_renderer import (
@@ -156,6 +158,7 @@ def test_offline_display_defaults_and_persisted_overrides() -> None:
         "room_panel_scale": 1.5,
         "semantic_xy_panel_scale": 1.8,
         "semantic_xy_label_mode": "interaction_target_only",
+        "semantic_xy_overview_inset": False,
     }
     assert offline_display_config(
         {
@@ -163,12 +166,16 @@ def test_offline_display_defaults_and_persisted_overrides() -> None:
             "video_room_panel_scale": 1.6,
             "video_semantic_xy_panel_scale": 2.0,
             "video_semantic_xy_label_mode": "all",
+            "video_semantic_xy_overview_inset": True,
         }
     ) == {
         "global_panel_scale": 1.2,
         "room_panel_scale": 1.6,
         "semantic_xy_panel_scale": 2.0,
         "semantic_xy_label_mode": "all",
+        # A historical recorder setting cannot re-enable the obstructive inset;
+        # the offline CLI flag is the explicit opt-in.
+        "semantic_xy_overview_inset": False,
     }
 
 
@@ -393,3 +400,182 @@ def test_renderer_uses_episode_trajectory_instead_of_boundary_history(monkeypatc
     )
     assert len(captured) == 1
     assert len(captured[0]) == 3
+
+
+def test_future_map_receipt_falls_back_to_last_causal_receipt() -> None:
+    prior = {
+        "receipt_id": "planning_occ:8",
+        "stage": "planning_occ",
+        "step_index": 8,
+        "stamp_sec": 9.95,
+        "source_index": 8,
+    }
+    future = {
+        "receipt_id": "planning_occ:9",
+        "stage": "planning_occ",
+        "step_index": 9,
+        "stamp_sec": 10.25,
+        "source_index": 9,
+    }
+    assert receipt_is_causal_at_boundary(
+        prior,
+        boundary_stamp_sec=10.0,
+        boundary_step_index=10,
+    )
+    assert not receipt_is_causal_at_boundary(
+        future,
+        boundary_stamp_sec=10.0,
+        boundary_step_index=10,
+    )
+    selected = select_causal_receipt(
+        stage="planning_occ",
+        requested_receipt="planning_occ:9",
+        maps_by_id={prior["receipt_id"]: prior, future["receipt_id"]: future},
+        stage_records=[prior, future],
+        boundary_stamp_sec=10.0,
+        boundary_step_index=10,
+    )
+    assert selected.requested_receipt_was_future
+    assert selected.used_causal_fallback
+    assert selected.reason == "requested_future_fallback"
+    assert selected.selected_meta == prior
+
+
+def test_costmap_palette_keeps_soft_inscribed_and_lethal_distinct() -> None:
+    grid = RawGrid(
+        values=np.asarray([[0, 1, 98, 99, 100]], dtype=np.int32),
+        width=5,
+        height=1,
+        resolution=0.1,
+        frame_id="map",
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+    )
+    image = offline_renderer._costmap_base(grid)
+    assert tuple(image[0, 2]) == offline_renderer.COSTMAP_SOFT_DARK_COLOR
+    assert tuple(image[0, 3]) == offline_renderer.COSTMAP_INSCRIBED_COLOR
+    assert tuple(image[0, 4]) == offline_renderer.COSTMAP_LETHAL_COLOR
+    assert tuple(image[0, 1]) != tuple(image[0, 2])
+    assert len(
+        {
+            tuple(image[0, 2]),
+            tuple(image[0, 3]),
+            tuple(image[0, 4]),
+        }
+    ) == 3
+
+
+def test_unselected_explore_candidates_use_pale_purple(monkeypatch) -> None:
+    import cv2
+
+    colors: list[tuple[int, int, int]] = []
+    original_circle = cv2.circle
+
+    def capture_circle(image, center, radius, color, *args, **kwargs):
+        colors.append(tuple(color))
+        return original_circle(image, center, radius, color, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "circle", capture_circle)
+    grid = RawGrid(
+        values=np.zeros((100, 100), dtype=np.int32),
+        width=100,
+        height=100,
+        resolution=0.1,
+        frame_id="map",
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+    )
+    renderer = OfflineSixPanelRenderer(
+        transforms=TransformResolver([], map_frame="map", odom_frame="map")
+    )
+    renderer.render_map_panel(
+        grid,
+        (480, 270),
+        {
+            "pose": [5.0, 5.0, 0.0],
+            "semantic_selection": {
+                "active": True,
+                "candidate_id": "frontier:selected",
+                "behavior_type": "EXPLORE",
+                "goal_xyyaw": [6.0, 6.0, 0.0],
+            },
+            "semantic_candidates": {
+                "candidates": [
+                    {
+                        "candidate_id": "frontier:selected",
+                        "behavior_type": "EXPLORE",
+                        "goal_xyyaw": [6.0, 6.0, 0.0],
+                    },
+                    {
+                        "candidate_id": "frontier:other",
+                        "behavior_type": "EXPLORE",
+                        "goal_xyyaw": [4.0, 4.0, 0.0],
+                    },
+                ]
+            },
+        },
+        0,
+        title="OCC",
+        kind="occupancy",
+        world_bounds=(0.0, 0.0, 10.0, 10.0),
+        draw_semantic_candidates=True,
+    )
+    assert offline_renderer.UNSELECTED_EXPLORE_COLOR in colors
+
+
+def test_stale_candidate_text_explains_live_goal_is_authoritative(monkeypatch) -> None:
+    import cv2
+
+    labels: list[str] = []
+    original_put_text = cv2.putText
+
+    def capture_put_text(image, text, *args, **kwargs):
+        labels.append(str(text))
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "putText", capture_put_text)
+    grid = RawGrid(
+        values=np.zeros((100, 100), dtype=np.int32),
+        width=100,
+        height=100,
+        resolution=0.1,
+        frame_id="map",
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+    )
+    renderer = OfflineSixPanelRenderer(
+        transforms=TransformResolver([], map_frame="map", odom_frame="map")
+    )
+    renderer.render_map_panel(
+        grid,
+        (480, 270),
+        {
+            "pose": [5.0, 5.0, 0.0],
+            "semantic_selection": {
+                "active": True,
+                "candidate_id": "frontier:1:9",
+                "behavior_type": "EXPLORE",
+                "goal_xyyaw": [6.0, 6.0, 0.0],
+                "candidate_revision": "current",
+            },
+            "semantic_candidates": {
+                "candidates": [
+                    {
+                        "candidate_id": "frontier:1:9",
+                        "behavior_type": "EXPLORE",
+                        "goal_xyyaw": [4.0, 4.0, 0.0],
+                        "candidate_revision": "old",
+                    }
+                ]
+            },
+        },
+        0,
+        title="OCC",
+        kind="occupancy",
+        world_bounds=(0.0, 0.0, 10.0, 10.0),
+        draw_semantic_candidates=True,
+    )
+    assert "CANDIDATE SNAPSHOT OUTDATED (LIVE GOAL SHOWN)" in labels

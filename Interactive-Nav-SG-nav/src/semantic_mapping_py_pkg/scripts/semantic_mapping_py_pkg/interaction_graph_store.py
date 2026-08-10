@@ -158,7 +158,14 @@ def _portal_has_observed_open_connectivity(node):
     )
 
 
-def _portal_visual_state_gate(node, state, morphology, aperture_evidence):
+def _portal_visual_state_gate(
+    node,
+    state,
+    morphology,
+    aperture_evidence,
+    *,
+    visual_evidence_truncated=False,
+):
     """Gate MLLM portal state claims on direct visual aperture evidence.
 
     A visual class can identify a door but cannot by itself establish that its
@@ -170,17 +177,29 @@ def _portal_visual_state_gate(node, state, morphology, aperture_evidence):
     requested = str(state or "unknown").strip().casefold()
     if node.type != "portal" or requested not in {"open", "ajar", "static_open"}:
         return True, "not_applicable"
+    if bool(visual_evidence_truncated):
+        return False, "truncated_visual_evidence"
     aperture_visible = bool(
         isinstance(aperture_evidence, dict)
         and aperture_evidence.get("open_aperture") == "visible"
         and float(aperture_evidence.get("confidence", 0.0) or 0.0) >= 0.70
     )
     if requested in {"open", "ajar"}:
+        # A head-camera aperture is only a local appearance claim.  It becomes
+        # a navigable portal state once the occupancy/room observation has
+        # independently seen free connectivity on both sides.  This is also a
+        # fail-safe for boxes clipped at the image border: an apparent dark gap
+        # must not suppress the first open interaction or create a route.
+        map_connected = _portal_has_observed_open_connectivity(node)
         return (
-            aperture_visible,
-            "visual_open_aperture_confirmed"
-            if aperture_visible
-            else "missing_visual_open_aperture_evidence",
+            aperture_visible and map_connected,
+            "visual_open_aperture_and_map_confirmed"
+            if aperture_visible and map_connected
+            else (
+                "missing_visual_open_aperture_evidence"
+                if not aperture_visible
+                else "missing_observed_open_connectivity"
+            ),
         )
     fixed_opening = bool(
         isinstance(morphology, dict)
@@ -379,6 +398,12 @@ class InteractionGraphStore:
             self._refresh_room_nodes_from_cached_stats()
         else:
             self._refresh_room_nodes_from_grid()
+        # A force-stable room refresh can legitimately publish a grid where a
+        # previously named room has disappeared before the temporal merge
+        # confirmation is emitted.  Do not leave that room selectable merely
+        # because no formal redirect has been committed yet.  Existing child
+        # nodes are re-grounded against this latest grid below when possible.
+        self._retire_absent_room_nodes_from_current_grid()
         self._rebuild_relations()
         # Portal-child resolution can introduce a redirect during relation
         # rebuild.  Invalidate the cache so the next frame re-aggregates with
@@ -847,10 +872,26 @@ class InteractionGraphStore:
         )
         confidence = float(patch.get("confidence", 0.0) or 0.0)
         interaction_class = normalize_label(patch.get("interaction_class"))
+        observed_topology_type = str(
+            node.attributes.get("topology_type")
+            or node.attributes.get("observation_node_type")
+            or ""
+        ).strip().casefold()
+        # M1 classifies a visual crop, while a portal changes map topology.
+        # In particular, never let one delayed M1 response promote a
+        # source-observed container/support/object to a portal: that formerly
+        # let an opened fridge inherit a pending doorway clear.  Non-topology
+        # refinements (for example generic object -> container) remain allowed.
+        portal_promotion_rejected = bool(
+            interaction_class == "portal"
+            and observed_topology_type
+            and observed_topology_type != "portal"
+        )
         if (
             not has_verified_interaction_state
             and confidence >= 0.5
             and interaction_class in {"portal", "container", "support", "object"}
+            and not portal_promotion_rejected
         ):
             node.type = interaction_class
         parts = list(patch.get("interaction_parts") or [])
@@ -866,6 +907,8 @@ class InteractionGraphStore:
                 "attribute_source": str(patch.get("source") or "mllm"),
                 "attribute_model": str(patch.get("model_name") or ""),
                 "attribute_confidence": confidence,
+                "mllm_interaction_class": interaction_class,
+                "mllm_portal_promotion_rejected": portal_promotion_rejected,
                 "evidence_frame_ids": list(patch.get("evidence_frame_ids") or []),
                 "affordances": list(patch.get("affordances") or []),
                 "interaction_parts": parts,
@@ -882,6 +925,8 @@ class InteractionGraphStore:
             "front_surface_confidence",
             "approach_ready",
             "needs_reobserve",
+            "visual_evidence_truncated",
+            "visual_evidence_truncated_edges",
         ):
             if key in patch:
                 node.attributes[key] = patch.get(key)
@@ -945,6 +990,9 @@ class InteractionGraphStore:
                 patch_state,
                 portal_morphology,
                 portal_aperture_evidence,
+                visual_evidence_truncated=bool(
+                    patch.get("visual_evidence_truncated", False)
+                ),
             )
             if node.type == "portal":
                 node.attributes["portal_state_gate"] = {
@@ -1376,7 +1424,8 @@ class InteractionGraphStore:
         interaction_state_override = dict(
             node.attributes.get("interaction_state_override") or {}
         )
-        node.type = infer_node_type(observation)
+        observed_node_type = infer_node_type(observation)
+        node.type = observed_node_type
         node.label = normalize_label(observation.get("semantic_name")) or node.type
         node.name = str(observation.get("name") or node.label or node.type)
         node.centroid = self._ground_non_room_centroid(observation["position"], observation["aabb_size"])
@@ -1412,6 +1461,13 @@ class InteractionGraphStore:
         )
 
         observation_attributes = {
+                # Source observations, rather than an asynchronous M1 class
+                # proposal, own the topology class.  The public graph still
+                # records M1's proposed class separately for diagnostics and
+                # non-topological container refinement.
+                "observation_node_type": observed_node_type,
+                "topology_type": observed_node_type,
+                "topology_type_source": "source_observation",
                 "instance_id": observation.get("instance_id") or node.attributes.get("instance_id") or "",
                 "category": observation.get("category"),
                 "candidate_labels": list(observation.get("candidate_labels") or []),
@@ -1716,6 +1772,63 @@ class InteractionGraphStore:
         node.confidence = max(node.confidence, confidence / 100.0)
         node.attributes["cell_count"] = int(statistic["cell_count"])
         node.attributes["active"] = True
+        node.attributes["room_lifecycle"] = "active"
+        node.attributes.pop("retired_reason", None)
+        node.attributes.pop("retired_graph_revision", None)
+
+    def _retire_absent_room_nodes_from_current_grid(self):
+        """Retire rooms absent from the latest accepted room grid.
+
+        ``RoomSegmenter`` normally delays a merge until it is stable, but a
+        forced refresh and some topology transitions can still transiently
+        publish a room grid with only the surviving room.  Keeping the vanished
+        room node active produces stale room candidates and orphaned graph
+        relations.  Retiring it is reversible: if the same room label appears
+        again on a later grid, ``_apply_room_grid_statistic`` reactivates it.
+        Formal merge redirects remain the only permanent aliases.
+        """
+
+        if not self.room_grid:
+            return
+        scene_data = self.room_grid.get("scene_data")
+        if scene_data is None or len(scene_data) == 0:
+            return
+        active_room_ids = {
+            self._resolve_room_id(room_id)
+            for room_id in scene_data
+            if int(room_id) >= 0
+        }
+        # An all-unknown grid has no evidence that a previously observed room
+        # vanished, so retain the previous lifecycle in that case.
+        if not active_room_ids:
+            return
+        for node in self.nodes.values():
+            if node.type != "room" or node.room_id is None:
+                continue
+            room_id = int(node.room_id)
+            if room_id in active_room_ids:
+                continue
+            if node.attributes.get("is_potential_room", False):
+                continue
+            # A confirmed merge carries stronger provenance than a temporary
+            # absence; do not replace its explicit alias metadata.
+            if room_id in self.room_redirects:
+                node.attributes["active"] = False
+                continue
+            node.attributes["active"] = False
+            node.attributes["room_lifecycle"] = "retired"
+            node.attributes["retired_reason"] = "absent_from_latest_room_grid"
+            node.attributes["retired_graph_revision"] = int(self.graph_revision) + 1
+
+    def _room_node_is_active(self, room_id):
+        if room_id is None:
+            return False
+        try:
+            resolved_room_id = self._resolve_room_id(room_id)
+        except (TypeError, ValueError):
+            return False
+        node = self.nodes.get(f"room_{resolved_room_id}")
+        return bool(node is not None and node.attributes.get("active", True))
 
     def _cache_room_grid_statistics(
         self,
@@ -2234,10 +2347,21 @@ class InteractionGraphStore:
             if node.type == "portal":
                 node.parent_id = scene_node.id
             room_id = node.room_id
-            if room_id is None:
-                room_id = self._infer_room_id_from_node(node)
-                node.room_id = room_id
-            if room_id is not None:
+            # A node can retain a room label from a previous segmentation
+            # revision even after that room has been retired.  Re-sample the
+            # current room grid before building relations so candidates do not
+            # keep targeting an absent ``room_N``.  This is deliberately
+            # reversible; a confirmed merge still owns the persistent alias.
+            if room_id is None or not self._room_node_is_active(room_id):
+                inferred_room_id = self._infer_room_id_from_node(node)
+                if inferred_room_id is not None:
+                    room_id = self._resolve_room_id(inferred_room_id)
+                    node.room_id = room_id
+                    node.attributes["room_assignment_source"] = "latest_room_grid"
+                    node.attributes.pop("room_assignment_stale", None)
+                elif room_id is not None:
+                    node.attributes["room_assignment_stale"] = True
+            if room_id is not None and self._room_node_is_active(room_id):
                 room_id = self._resolve_room_id(room_id)
                 node.room_id = room_id
                 room_node = self._ensure_room_node(room_id)
@@ -2245,6 +2369,10 @@ class InteractionGraphStore:
                     node.parent_id = room_node.id
                 self._upsert_edge(node.id, "in_room", room_node.id, now=now)
                 self._upsert_edge(room_node.id, "has_child", node.id, now=now)
+            elif node.type != "portal":
+                # Avoid an in-room edge to a retired node when the current map
+                # has no grounded alternative for this object yet.
+                node.parent_id = scene_node.id
 
         for node in non_rooms:
             if node.type == "portal":

@@ -18,9 +18,15 @@ candidate:
   container_require_same_room: false
   container_allow_connected_room: true
   portal_standoff_m: 0.85
-  container_standoff_m: 1.0
-  drawer_standoff_m: 1.0
-  interaction_safety_margin_m: 0.25
+  # ``_approach_pose`` already starts from the observed AABB surface.  The old
+  # 1.0 + 0.25 m extra clearance placed the base roughly 1.4--1.8 m from a
+  # drawer/fridge center, beyond a usable interaction view.  Keep enough room
+  # for the 0.25 m base while allowing fresh M1 to see the actual front.
+  container_standoff_m: 0.40
+  drawer_standoff_m: 0.40
+  interaction_safety_margin_m: 0.10
+  interaction_ready_distance_m: 0.30
+  interaction_ready_yaw_tolerance_rad: 0.35
 
 policy:
   backend: "model"
@@ -38,19 +44,19 @@ policy:
   repeat_guard_min_frontier_shrink_m: 0.15
 
 model:
-  # The local Qwen endpoint is shared by parallel scene workers.  Keep each
-  # request pending long enough for a serialized server response instead of
-  # silently switching the MLLM ablation back to its rule fallback.
-  timeout_s: 30.0
+  # Dual local Qwen endpoints (24 sequences each) measured <=2.03 s visual
+  # P95 at 48 aggregate requests; 12 s keeps a large real-navigation margin
+  # while preventing a stalled endpoint from freezing a scene for 30 seconds.
+  timeout_s: 12.0
   # Module 2 normally returns a tiny ranking.  Keep enough headroom to recover
   # from a local Qwen response that starts to serialize long candidate context
   # instead of silently truncating its JSON and falling back to rules.
   max_tokens: 384
   consecutive_timeout_limit: 2
   timeout_cooldown_s: 60.0
-  skill_timeout_s: 30.0
+  skill_timeout_s: 12.0
   skill_max_output_tokens: 256
-  verification_timeout_s: 30.0
+  verification_timeout_s: 12.0
   # Visual verification has a strict, compact JSON schema, but reserve enough
   # completion headroom so a local MLLM cannot cut off the enclosing object.
   verification_max_output_tokens: 256
@@ -61,14 +67,20 @@ completion:
 
 executor:
   interaction_navigation_timeout_s: 180.0
-  interaction_observation_timeout_s: 30.0
+  interaction_observation_timeout_s: 12.0
   # Full-MLLM runs use the same safe rear-navigation controller as the rule
   # lane: a fresh local-grid sweep chooses and locks a turn side before DWA.
   rear_goal_enter_angle_rad: 1.5707963267948966
-  rear_goal_prerotate_max_control_steps: 14
+  # Leave room for a costmap-safe wrapped opposite turn when the shortest
+  # direction is blocked; the action count remains finite and step-synced.
+  rear_goal_prerotate_max_control_steps: 28
+  rear_goal_prerotate_post_budget_settle_steps: 3
   rear_goal_local_costmap_max_age_s: 0.75
   rear_goal_robot_radius_m: 0.25
   rear_goal_safety_margin_m: 0.05
+  # Do not turn ordinary inflation costs into hard obstacles in the executor;
+  # only costmap inscribed/lethal cells block the radius-aware safety sweep.
+  rear_goal_costmap_occupied_threshold: 253
   rear_goal_unknown_is_blocked: true
   rear_goal_rotation_sweep_step_rad: 0.10
   rear_goal_oscillation_window_steps: 4
@@ -90,5 +102,6 @@ executor:
   # Hard cap only; the actual count is derived from yaw error, .30 rad/s,
   # .20 s fixed simulator actions, and the .15 rad terminal tolerance.
   interaction_final_align_max_control_steps: 56
+  interaction_final_align_post_budget_settle_steps: 3
   interaction_final_align_step_sync_stall_timeout_s: 2.0
   interaction_final_align_delivery_retry_steps: 2

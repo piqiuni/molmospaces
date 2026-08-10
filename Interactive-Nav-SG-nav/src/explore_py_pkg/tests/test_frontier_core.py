@@ -704,3 +704,113 @@ def test_llm_value_grid_changes_candidate_ranking_without_generating_goal():
     assert chosen is not None
     assert grid.cell(*chosen.subgoal_cell) == 0
     assert chosen.score_terms["llm"] > 0.0
+
+
+def test_configured_min_cluster_cells_is_the_actual_extraction_gate():
+    data = [-1] * (12 * 12)
+    for cell in ((4, 5), (5, 5), (6, 5)):
+        data[cell[1] * 12 + cell[0]] = 0
+    grid = OccupancyGridData(GridSpec(12, 12, 1.0, 0.0, 0.0, "map"), data)
+    core = FrontierExplorerCore(
+        FrontierConfig(
+            hard_min_cluster_cells=3,
+            min_cluster_cells=6,
+            require_footprint_free=False,
+            require_turning_clearance=False,
+        )
+    )
+
+    clusters = core.extract_frontier_clusters(grid, robot_xy=(1.5, 5.5))
+
+    assert clusters == []
+    assert core.last_debug_stats["min_cluster_cells"] == 6
+    assert core.last_debug_stats["dropped_tiny"] == 1
+
+
+def test_los_rejects_viewpoint_separated_from_frontier_by_wall():
+    width, height = 15, 9
+    data = [100] * (width * height)
+    for x in range(1, 5):
+        data[4 * width + x] = 0
+    data[4 * width + 10] = 0  # The frontier itself; x=11 remains unknown.
+    grid = OccupancyGridData(GridSpec(width, height, 1.0, 0.0, 0.0, "map"), data)
+    core = FrontierExplorerCore(
+        FrontierConfig(
+            min_cluster_cells=1,
+            hard_min_cluster_cells=1,
+            subgoal_search_radius_cells=8,
+            min_viewpoint_frontier_distance_m=2.0,
+            max_viewpoint_frontier_distance_m=5.0,
+            min_subgoal_distance_m=0.5,
+            hard_min_subgoal_distance_m=0.5,
+            require_footprint_free=False,
+            require_turning_clearance=False,
+            los_enabled=True,
+        )
+    )
+
+    cluster = core._build_cluster(grid, [(10, 4)], robot_xy=(2.5, 4.5))
+
+    assert cluster is None
+    assert core._visibility_stats["los_dropped"] == 1
+
+
+def _region_cluster(
+    cluster_id: str,
+    centroid: tuple[float, float],
+    signature: tuple[tuple[int, int], ...],
+    unknown_area: float,
+) -> FrontierCluster:
+    return FrontierCluster(
+        cluster_id=cluster_id,
+        cells=[(1, 1)] * 12,
+        centroid_cell=centroid,
+        centroid_world=centroid,
+        subgoal_cell=(1, 1),
+        subgoal_world=centroid,
+        subgoal_yaw=0.0,
+        information_gain=12.0,
+        distance_to_robot=1.0,
+        unknown_component_area_m2=unknown_area,
+        source_cluster_id=cluster_id,
+        region_id=cluster_id,
+        region_signature=signature,
+    )
+
+
+def test_region_memory_suppresses_adjacent_recluster_until_unknown_grows():
+    state = ExplorerState(
+        ExplorerStateConfig(
+            frontier_region_match_distance_m=3.0,
+            frontier_region_overlap_threshold=0.20,
+            frontier_region_reactivate_unknown_growth_ratio=0.20,
+            frontier_region_reactivate_unknown_growth_m2=0.5,
+        )
+    )
+    first = _region_cluster(
+        "35:15", (10.0, 5.0), ((10, 5), (11, 5), (12, 5)), 2.0
+    )
+    state.resolve_frontier_region(first)
+    state.note_frontier_observation(first, now=1.0)
+    state.start_goal(first, robot_xy=(9.0, 5.0), now=2.0)
+    state.mark_active_reached(now=3.0)
+
+    reclustered = _region_cluster(
+        "35:12", (11.4, 5.2), ((11, 5), (12, 5), (13, 5)), 2.1
+    )
+    state.resolve_frontier_region(reclustered)
+    state.note_frontier_observation(reclustered, now=4.0)
+
+    assert reclustered.region_id == first.region_id
+    assert reclustered.region_overlap >= 0.20
+    assert not state.is_cluster_available(reclustered, now=4.0)
+
+    grown = _region_cluster(
+        "35:10", (11.6, 5.3), ((11, 5), (12, 5), (13, 5)), 3.0
+    )
+    state.resolve_frontier_region(grown)
+    state.note_frontier_observation(grown, now=5.0)
+
+    assert grown.region_id == first.region_id
+    assert grown.region_coverage_delta_m2 >= 0.5
+    assert state.is_cluster_available(grown, now=5.0)

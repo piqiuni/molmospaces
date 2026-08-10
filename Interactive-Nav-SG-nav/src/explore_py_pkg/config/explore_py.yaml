@@ -15,6 +15,8 @@ topics:
   current_subgoal: "/explore_py/current_subgoal"
   behavior_command: "/explore_py/command"
   behavior_feedback: "/explore_py/behavior_feedback"
+  recovery_request: "/semantic_decision/recovery_request"
+  recovery_feedback: "/semantic_decision/recovery_feedback"
   reset: "/explore_py/reset"
   fresh_command_gate: "/molmo_spaces/fresh_cmd_gate"
   llm_value_grid: "/explore_py/llm_value_grid"
@@ -27,6 +29,16 @@ topics:
 
 exploration:
   external_behavior_control: false
+  # In external-control mode only: report a failed frontier preflight to the
+  # executor. ExplorePy never publishes a recovery cmd_vel or cancels its goal.
+  external_recovery_request_enabled: true
+  external_recovery_preflight_enabled: true
+  external_recovery_plan_grace_sec: 16.0
+  external_recovery_request_cooldown_sec: 2.0
+  # A request can arrive before the executor observes the matching reservation.
+  # Resend once for that explicit transient rejection; ExplorePy never drives cmd_vel.
+  external_recovery_request_retry_limit: 1
+  external_recovery_request_retry_delay_sec: 0.5
   tick_rate_hz: 1.0
   goal_republish_interval_sec: 0.0
   goal_reach_tolerance_m: 0.35
@@ -98,6 +110,7 @@ frontier:
   free_max: 20
   occupied_min: 50
   hard_min_cluster_cells: 3
+  # This is the actual extraction gate (not only score normalization).
   min_cluster_cells: 12
   connect_8: true
   candidate_top_k: 12
@@ -128,6 +141,21 @@ frontier:
   relaxed_min_viewpoint_frontier_distance_m: 0.35
   initial_local_radius_m: 2.2
   initial_backward_weight: 0.35
+  # Bounded LOS checks reject a stand-off pose whose view is occluded by a
+  # wall, while preserving a small fixed ray budget per frontier update.
+  los_enabled: true
+  los_max_viewpoint_candidates: 12
+  los_frontier_samples: 12
+  los_unknown_samples: 48
+  los_min_visible_frontier_samples: 1
+  # Adjacent re-clusters of the same unknown component share a persistent
+  # region memory.  A covered region reopens only after material new unknown.
+  frontier_region_match_distance_m: 3.0
+  frontier_region_overlap_threshold: 0.20
+  frontier_region_reactivate_unknown_growth_ratio: 0.25
+  frontier_region_reactivate_unknown_growth_m2: 0.25
+  region_signature_max_cells: 96
+  region_signature_quantization_m: 0.50
 
 scoring:
   information_weight: 1.0

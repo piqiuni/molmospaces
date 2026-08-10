@@ -26,6 +26,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     candidate_with_effective_interaction_approach,
     committed_turn_sign,
     interaction_pose_validation,
+    interaction_observation_disposition,
     is_interaction_pose_precondition_failure,
     is_post_interaction_traversal_navigation,
     navigation_goal_options,
@@ -301,6 +302,65 @@ def observation_required_interaction_candidate(requires_approach=True):
             "observation_reason": "mllm_portal_state_unknown",
             "interaction_observation_max_attempts": 2,
             "interaction_observation_source": "mllm_attribute_inference",
+        }
+    )
+    return candidate
+
+
+def drawer_pre_action_candidate(requires_approach=False):
+    candidate = interaction_candidate(requires_approach=requires_approach)
+    candidate["candidate_id"] = "interaction:drawer_1:open"
+    candidate["target_id"] = "drawer_1"
+    candidate["target_name"] = "chestofdrawers_asset"
+    candidate["interaction_command"].update(
+        {
+            "node_id": "drawer_1",
+            "object_id": "drawer_1",
+            "action": "scan",
+            "sequence_type": "drawer_scan",
+        }
+    )
+    candidate["metadata"].update(
+        {
+            "node_type": "container",
+            "observation_required": True,
+            "reobserve": True,
+            "drawer_pre_action_observation": True,
+            "interaction_observation_max_attempts": 2,
+            "interaction_observation_source": "mllm_attribute_inference",
+        }
+    )
+    if requires_approach:
+        candidate["metadata"]["goal_xyyaw_candidates"] = [
+            [1.0, 2.0, 0.0],
+            [2.0, 2.0, 1.57],
+            [2.0, 3.0, 3.14],
+        ]
+    return candidate
+
+
+def container_pre_action_candidate(requires_approach=True):
+    candidate = interaction_candidate(requires_approach=requires_approach)
+    candidate["candidate_id"] = "interaction:fridge_1:open"
+    candidate["target_id"] = "fridge_1"
+    candidate["target_name"] = "refrigerator_asset"
+    candidate["interaction_command"].update(
+        {"node_id": "fridge_1", "object_id": "fridge_1", "action": "open"}
+    )
+    candidate["metadata"].update(
+        {
+            "node_type": "container",
+            "observation_required": True,
+            "reobserve": True,
+            "container_pre_action_observation": True,
+            "interaction_observation_max_attempts": 4,
+            "interaction_observation_source": "mllm_attribute_inference",
+            "goal_xyyaw_candidates": [
+                [1.0, 2.0, 0.0],
+                [2.0, 2.0, 1.57],
+                [2.0, 3.0, 3.14],
+                [1.0, 3.0, -1.57],
+            ],
         }
     )
     return candidate
@@ -622,6 +682,24 @@ def test_interaction_execution_orders_approach_action_and_verification() -> None
     assert terminal[0]["success"] is True
 
 
+def test_backend_success_finishes_without_waiting_for_visual_audit() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(interaction_candidate(requires_approach=False), now=0.0)
+    assert machine.state == STATE_INTERACTING
+    machine.on_interaction_result(True, {"post_state": "open"}, now=1.0)
+    assert machine.state == STATE_VERIFYING
+
+    terminal = machine.on_backend_result(
+        True,
+        {"post_state": "open", "event_id": "interaction_001"},
+        now=1.1,
+    )
+    assert machine.state == STATE_SUCCEEDED
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is True
+    assert terminal[0]["detail"]["visual_audit_pending"] is True
+
+
 def test_unknown_portal_reobserves_after_approach_before_physical_action() -> None:
     machine = BehaviorExecutionStateMachine()
     commands = machine.start(observation_required_interaction_candidate(), now=0.0)
@@ -708,6 +786,167 @@ def test_unknown_portal_observation_retries_then_terminates_unresolved() -> None
     assert terminal[0]["kind"] == "terminal"
     assert terminal[0]["success"] is False
     assert terminal[0]["detail"]["reason"] == "interaction_observation_unresolved"
+
+
+def test_container_pre_action_requires_fresh_front_and_moves_to_next_view() -> None:
+    machine = BehaviorExecutionStateMachine()
+    commands = machine.start(container_pre_action_candidate(), now=0.0)
+    assert commands[0]["kind"] == "navigate"
+    request = machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+    assert request[0]["kind"] == "request_interaction_observation"
+    assert request[0]["min_capture_step"] == 11
+
+    retry = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "view_state": "side_or_back",
+            "front_surface_visible": False,
+            "approach_ready": False,
+            "attribute_capture_step": 11,
+            "container_visual_precondition_reason": "m1_view_state_side_or_back",
+        },
+        now=1.0,
+    )
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert retry[0]["kind"] == "navigate"
+    assert retry[0]["start_goal_option_index"] == 1
+    assert retry[0]["reason"] == "container_visual_reobserve_next_approach"
+
+    second_request = machine.on_navigation_result(
+        True, {"capture_step": 20}, now=1.5
+    )
+    assert second_request[0]["kind"] == "request_interaction_observation"
+    execute = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "observed_bbox_2d": [10, 10, 80, 120],
+            "attribute_capture_step": 21,
+            "container_visual_precondition_reason": "ready",
+        },
+        now=2.0,
+    )
+    assert machine.state == STATE_INTERACTING
+    assert execute[0]["kind"] == "interact"
+
+
+def test_container_visual_open_without_fresh_bbox_is_reobserved() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(container_pre_action_candidate(), now=0.0)
+    machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+    retry = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "open",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "attribute_capture_step": 11,
+            "container_visual_precondition_reason": "m1_public_bbox_unavailable",
+        },
+        now=1.0,
+    )
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert retry[0]["kind"] == "navigate"
+    assert retry[0]["start_goal_option_index"] == 1
+
+
+def test_drawer_pre_action_reobserves_then_emits_terminal_visual_failure() -> None:
+    machine = BehaviorExecutionStateMachine()
+    commands = machine.start(drawer_pre_action_candidate(requires_approach=True), now=0.0)
+    assert commands[0]["kind"] == "navigate"
+    initial_observation = machine.on_navigation_result(
+        True, {"capture_step": 10}, now=0.5
+    )
+    assert initial_observation[0]["kind"] == "request_interaction_observation"
+    assert initial_observation[0]["attempt"] == 1
+    assert initial_observation[0]["min_capture_step"] == 11
+
+    retry = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "view_state": "side",
+            "front_surface_visible": False,
+            "approach_ready": False,
+            "drawer_action_regions_ready": False,
+            "attribute_capture_step": 11,
+        },
+        now=1.0,
+    )
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert retry[0]["kind"] == "navigate"
+    assert retry[0]["start_goal_option_index"] == 1
+    assert retry[0]["reason"] == "drawer_visual_reobserve_next_approach"
+
+    # The second M1 request is emitted only after navigation reaches the next
+    # preserved ring pose, and it must be newer than both views seen so far.
+    second_observation = machine.on_navigation_result(
+        True, {"capture_step": 20}, now=1.5
+    )
+    assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    assert second_observation[0]["kind"] == "request_interaction_observation"
+    assert second_observation[0]["attempt"] == 2
+    assert second_observation[0]["min_capture_step"] == 21
+
+    terminal = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "drawer_action_regions_ready": False,
+            "attribute_capture_step": 21,
+        },
+        now=2.0,
+    )
+    assert machine.state != STATE_VERIFYING
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is False
+    assert terminal[0]["detail"]["failure_stage"] == "interaction_visual_precondition"
+    assert terminal[0]["detail"]["terminal_candidate_exclusion"] is True
+
+
+def test_drawer_execution_terminal_failure_skips_post_action_verification() -> None:
+    machine = BehaviorExecutionStateMachine()
+    machine.start(drawer_pre_action_candidate(), now=0.0)
+    machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "drawer_action_regions_ready": True,
+            "attribute_capture_step": 1,
+        },
+        now=1.0,
+    )
+    terminal = machine.on_interaction_result(
+        False,
+        {
+            "reason": "drawer_interaction_execution_unavailable",
+            "failure_stage": "interaction_execution",
+        },
+        now=2.0,
+    )
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is False
+    assert machine.state != STATE_VERIFYING
 
 
 def test_real_interaction_backend_failure_still_requests_post_action_verification() -> None:

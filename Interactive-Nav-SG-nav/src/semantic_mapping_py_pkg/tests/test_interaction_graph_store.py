@@ -1243,6 +1243,47 @@ def test_attribute_patch_persists_m1_view_contract_with_capture_freshness() -> N
     assert node["attributes"]["attribute_is_current"] is False
 
 
+def test_mllm_cannot_promote_source_container_to_topological_portal() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    fridge = observation(
+        instance_id="fridge_1",
+        semantic_name="fridge",
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="hinge",
+        frame_index=10,
+        position=[1.0, 0.0, 1.0],
+        aabb_center=[1.0, 0.0, 1.0],
+        aabb_size=[1.0, 0.8, 2.0],
+    )
+    store.update_observations([fridge], source_mode="realtime_gt_observation", stamp=1.0)
+
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "fridge_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 10,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "confidence": 0.95,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+
+    node = next(
+        item
+        for item in store.as_graph_dict(stamp=2.0)["nodes"]
+        if item["id"] == "container_fridge_1"
+    )
+    assert node["type"] == "container"
+    assert node["attributes"]["topology_type"] == "container"
+    assert node["attributes"]["mllm_interaction_class"] == "portal"
+    assert node["attributes"]["mllm_portal_promotion_rejected"] is True
+
+
 def test_non_articulated_portal_feedback_persists_static_capability() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     doorframe = observation(
@@ -1643,6 +1684,57 @@ def test_room_merge_retires_secondary_room_and_migrates_children() -> None:
     )
 
 
+def test_absent_room_is_retired_and_child_is_regrounded_before_merge_confirmation() -> None:
+    """A force-stable grid must not leave an active stale room candidate."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="cup_1",
+                semantic_name="cup",
+                room_id=2,
+                position=[2.5, 0.5, 0.1],
+                aabb_center=[2.5, 0.5, 0.1],
+            )
+        ]
+    )
+    info = type("Info", (), {"width": 4, "height": 1, "resolution": 1.0})()
+    info.origin = type(
+        "Origin", (), {"position": type("Position", (), {"x": 0.0, "y": 0.0})()}
+    )()
+
+    # Initial split: the cup is grounded in room 2.
+    store.update_room_grid(
+        info,
+        [1, 1, 2, 2],
+        [100, 100, 100, 100],
+        geometry_stability_frames=1,
+    )
+    # A later forced/current grid has only room 1, but no formal merge alias
+    # has been supplied yet.  The store must neither retain room_2 as active
+    # nor keep the cup attached to the vanished room.
+    store.update_room_grid(
+        info,
+        [1, 1, 1, 1],
+        [100, 100, 100, 100],
+        geometry_stability_frames=1,
+    )
+
+    graph = store.as_graph_dict()
+    cup = next(node for node in graph["nodes"] if node["id"] == "object_cup_1")
+    room_two = next(node for node in graph["nodes"] if node["id"] == "room_2")
+    assert cup["room_id"] == 1
+    assert cup["attributes"]["room_assignment_source"] == "latest_room_grid"
+    assert room_two["attributes"]["active"] is False
+    assert room_two["attributes"]["room_lifecycle"] == "retired"
+    assert room_two["attributes"]["retired_reason"] == "absent_from_latest_room_grid"
+    assert not any(
+        edge["src_id"] == "scene_test_scene" and edge["dst_id"] == "room_2"
+        for edge in graph["edges"]
+    )
+
+
 def test_declared_parent_does_not_override_geometric_container_relation() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
@@ -1852,9 +1944,10 @@ def test_attribute_patch_sets_semantic_state_and_preserves_last_seen():
         joint_type="hinge",
         joint_range=[0.0, 1.0],
         joint_value=0.0,
+        connected_room_ids=[1, 2],
         frame_index=7,
     )
-    store.update_observations([door], stamp=10.0, source_mode="realtime_gt_observation")
+    store.update_observations([door], stamp=10.0, source_mode="gt_replay")
     assert store.apply_attribute_patch(
         {
             "object_id": "gt_000001",
@@ -1883,6 +1976,60 @@ def test_attribute_patch_sets_semantic_state_and_preserves_last_seen():
     assert "observation_evidence" not in portal["attributes"]
     assert portal["last_seen"] == 10.0
     assert portal["attributes"]["attribute_updated_at"] == 20.0
+
+
+def test_clipped_portal_visual_open_does_not_override_closed_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="door_clipped_1",
+        semantic_name="door",
+        is_door=True,
+        connected_room_ids=[1, 2],
+        frame_index=7,
+    )
+    store.update_observations([door], stamp=1.0, source_mode="gt_replay")
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_clipped_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 7,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "closed",
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_clipped_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 8,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "portal_morphology": {"door_leaf": "absent", "confidence": 0.95},
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.95,
+            },
+            "visual_evidence_truncated": True,
+            "visual_evidence_truncated_edges": ["right"],
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=3.0,
+    )
+    portal = next(
+        item
+        for item in store.as_graph_dict(stamp=3.0)["nodes"]
+        if item["id"] == "portal_door_clipped_1"
+    )
+    assert portal["interaction"]["state"] == "closed"
+    assert portal["attributes"]["visual_evidence_truncated"] is True
+    assert portal["attributes"]["visual_evidence_truncated_edges"] == ["right"]
+    assert portal["attributes"]["portal_state_gate"]["reason"] == "truncated_visual_evidence"
 
 
 def test_portal_open_without_visible_aperture_does_not_override_closed_state():

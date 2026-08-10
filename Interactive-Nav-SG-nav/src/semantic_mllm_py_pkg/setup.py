@@ -6,4 +6,5 @@ setup(
     version="0.1.0",
     package_dir={"": "scripts"},
     packages=find_packages("scripts"),
+    install_requires=["httpx>=0.22,<1"],
 )

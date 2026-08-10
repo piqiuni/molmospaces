@@ -244,6 +244,81 @@ def test_interaction_approach_failures_become_terminal_only_at_limit() -> None:
     assert tracker.terminal_candidate_ids == set()
 
 
+def test_visual_and_execution_terminal_feedback_exclude_candidate_immediately() -> None:
+    tracker = InteractionApproachFailureLimitTracker(
+        InteractionApproachFailureLimitConfig(failure_limit=3)
+    )
+    visual = tracker.note_feedback(
+        candidate_id="interaction:drawer:open",
+        behavior_type="INTERACT",
+        status="FAILED",
+        failure_stage="interaction_visual_precondition",
+    )
+    assert visual["reason"] == (
+        InteractionApproachFailureLimitTracker.VISUAL_PRECONDITION_REASON
+    )
+    assert tracker.terminal_candidate_ids == {"interaction:drawer:open"}
+
+    tracker.reset()
+    execution = tracker.note_feedback(
+        candidate_id="interaction:drawer:open",
+        behavior_type="INTERACT",
+        status="REJECTED",
+        failure_stage="interaction_execution",
+    )
+    assert execution["reason"] == (
+        InteractionApproachFailureLimitTracker.EXECUTION_REASON
+    )
+    assert execution["interaction_failure_limit"] == 1
+
+
+def test_all_interaction_approach_poses_exhausted_is_terminal_immediately() -> None:
+    tracker = InteractionApproachFailureLimitTracker(
+        InteractionApproachFailureLimitConfig(failure_limit=3)
+    )
+
+    terminal = tracker.note_feedback(
+        candidate_id="interaction:fridge:open",
+        behavior_type="INTERACT",
+        status="FAILED",
+        failure_stage=InteractionApproachFailureLimitTracker.APPROACH_EXHAUSTED_STAGE,
+    )
+
+    assert terminal is not None
+    assert terminal["reason"] == InteractionApproachFailureLimitTracker.REASON
+    assert terminal["interaction_approach_options_exhausted"] is True
+    assert terminal["terminal_candidate_exclusion"] is True
+    assert tracker.terminal_candidate_ids == {"interaction:fridge:open"}
+
+
+def test_raw_frontier_candidate_prevents_false_exhaustion_from_stale_counts() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(empty_candidate_confirmations=1, empty_candidate_min_steps=0)
+    )
+    snapshot = {
+        "sequence": 1,
+        "candidate_count": 1,
+        "candidates": [{"candidate_id": "frontier:1:2", "behavior_type": "EXPLORE"}],
+        "exploration_context": {
+            "initial_scan_complete": True,
+            "observation_step": 10,
+            # Simulate a producer counter reset racing one still-live raw
+            # frontier candidate.
+            "frontier_exhausted": True,
+            "navigation_frontier_exhausted": True,
+            "navigation_frontier_count": 0,
+            "interaction_frontier_exhausted": True,
+            "interaction_frontier_count": 0,
+            "combined_frontier_count": 0,
+        },
+    }
+
+    assert not tracker.update(
+        snapshot, has_active_behavior=False, target_enabled=False
+    )
+    assert tracker.complete is False
+
+
 def test_single_make_plan_failure_does_not_bypass_approach_failure_limit() -> None:
     tracker = TerminalInteractionNoPlanExitTracker(
         TerminalInteractionNoPlanExitConfig(enabled=True)
@@ -258,6 +333,26 @@ def test_single_make_plan_failure_does_not_bypass_approach_failure_limit() -> No
         observation_step=10,
     )
     assert tracker.terminal_failure == {}
+
+
+def test_terminal_no_plan_tracker_accepts_visual_and_execution_reasons() -> None:
+    tracker = TerminalInteractionNoPlanExitTracker(
+        TerminalInteractionNoPlanExitConfig(enabled=True)
+    )
+    for reason in (
+        InteractionApproachFailureLimitTracker.VISUAL_PRECONDITION_REASON,
+        InteractionApproachFailureLimitTracker.EXECUTION_REASON,
+    ):
+        assert tracker.note_feedback(
+            {
+                "status": "FAILED",
+                "behavior_type": "INTERACT",
+                "candidate_id": "interaction:drawer:open",
+                "detail": {"reason": reason},
+            },
+            observation_step=10,
+        )
+        tracker.reset()
 
 
 def test_terminal_interaction_no_plan_exits_only_after_distinct_observation_steps() -> None:

@@ -109,6 +109,28 @@ def test_rle_only_minimal_gt_detection_passes_attribute_visibility_filter() -> N
     ) == 17
 
 
+def test_public_detector_border_flag_marks_only_clipped_boxes() -> None:
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    assert InteractionAttributeInferenceNode._detection_bbox_touches_image_border(
+        image, {"bbox_2d": [40, 20, 160, 80]}
+    ) is False
+    assert InteractionAttributeInferenceNode._detection_bbox_touches_image_border(
+        image, {"bbox_2d": [0, 20, 80, 80]}
+    ) is True
+    assert InteractionAttributeInferenceNode._detection_bbox_touches_image_border(
+        image, {"bbox_2d": [120, 20, 200, 80]}
+    ) is True
+    assert InteractionAttributeInferenceNode._detection_bbox_border_edges(
+        image, {"bbox_2d": [40, 20, 160, 80]}
+    ) == []
+    assert InteractionAttributeInferenceNode._detection_bbox_border_edges(
+        image, {"bbox_2d": [0, 20, 80, 80]}
+    ) == ["left"]
+    assert InteractionAttributeInferenceNode._detection_bbox_border_edges(
+        image, {"bbox_2d": [40, 70, 160, 100]}
+    ) == ["bottom"]
+
+
 def test_uncertain_portal_result_retries_after_short_refresh_interval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -307,3 +329,57 @@ def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> Non
     ]
     assert published[0][0]["object_id"] == "object_1"
     assert published[0][0]["approach_ready"] is True
+
+
+def test_m1_request_expired_in_local_queue_is_not_sent() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.pending = {
+        "object_1": {
+            "request_sequence": 1,
+            "generation": 0,
+            "episode_id": "episode_1",
+        }
+    }
+    node.generations = {"object_1": 0}
+    node.last_request = {}
+    node.completed = {}
+    node.filter_counts = {
+        "started": 0,
+        "stale": 0,
+        "completed": 0,
+        "expired": 0,
+        "failed": 0,
+    }
+    node.visual_evidence_max_side_px = 0
+    node.request_timeout_s = 1.0
+    node.max_output_tokens = 256
+    node.success_refresh_interval_s = 120.0
+    node.client = RecordingClient()
+    published = []
+    node._publish_updates = lambda _episode, _stamp, updates: published.extend(updates)
+    node._publish_status = lambda: None
+
+    node._infer(
+        object_id="object_1",
+        detection={"name": "fridge"},
+        visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+        episode_id="episode_1",
+        frame_id="4",
+        image_sequence=5,
+        stamp=10.0,
+        signature="fresh",
+        generation=0,
+        request_sequence=1,
+        enqueued_at=attribute_module.time.monotonic() - 2.0,
+        targeted_refresh={},
+        deadline_monotonic=attribute_module.time.monotonic() - 1.0,
+    )
+
+    assert node.client.calls == []
+    assert node.filter_counts["expired"] == 1
+    assert node.filter_counts["failed"] == 0
+    assert node.last_request == {}
+    assert published[-1]["attribute_status"] == "failed"
+    assert published[-1]["error"] == "queue_deadline_expired_before_send"

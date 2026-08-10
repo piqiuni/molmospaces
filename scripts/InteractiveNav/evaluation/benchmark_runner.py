@@ -16,6 +16,7 @@ import json
 import math
 import multiprocessing
 import os
+import re
 import shutil
 import time
 import traceback
@@ -89,6 +90,8 @@ from .trusted_interaction_skill import (
     OpenPostconditionSpec,
     TrustedInteractionSkill,
 )
+
+from semantic_mapping_py_pkg.graph_rules import opaque_door_instance_id
 
 
 PROTOCOL_VERSION = "interactive_nav_v3_benchmark_eval_v10"
@@ -166,6 +169,8 @@ class BenchmarkEvaluationConfig:
     ros_stall_min_no_progress_steps: int = 20
     restricted_gt_min_visible_pixels: int = 16
     restricted_gt_min_bbox_area_pixels: int = 512
+    restricted_gt_min_bbox_short_side_pixels: int = 1
+    restricted_gt_min_portal_bbox_short_side_pixels: int = 8
     restricted_gt_min_visible_fraction: float = 0.2
     restricted_gt_max_distance_m: float = 4.0
     quality_gate_only: bool = False
@@ -246,6 +251,16 @@ class BenchmarkEvaluationConfig:
             raise ValueError("restricted_gt_min_visible_pixels must be >= 1")
         if self.restricted_gt_min_bbox_area_pixels < 1:
             raise ValueError("restricted_gt_min_bbox_area_pixels must be >= 1")
+        if self.restricted_gt_min_bbox_short_side_pixels < 1:
+            raise ValueError("restricted_gt_min_bbox_short_side_pixels must be >= 1")
+        if (
+            self.restricted_gt_min_portal_bbox_short_side_pixels
+            < self.restricted_gt_min_bbox_short_side_pixels
+        ):
+            raise ValueError(
+                "restricted_gt_min_portal_bbox_short_side_pixels must be >= "
+                "restricted_gt_min_bbox_short_side_pixels"
+            )
         if (
             not math.isfinite(float(self.restricted_gt_min_visible_fraction))
             or not 0.0 <= float(self.restricted_gt_min_visible_fraction) <= 1.0
@@ -555,6 +570,34 @@ def _perception_source_skill_aliases(
         skill_source = skill_source_by_root.get(root_id)
         if skill_source is not None:
             aliases[source_name] = skill_source
+
+    # Some ProcTHOR doorway assets put the render/root body and the articulated
+    # leaf in different MuJoCo body roots.  Their stable asset instance stem is
+    # still shared (for example ``doorway_<hash>_1_0_2`` and
+    # ``doorway_<hash>_1_2_2``).  Preserve the outer instance identifiers and
+    # drop only the root/leaf hierarchy index, so two copies of the same asset
+    # do not collapse into one candidate.  Use that evaluator-private relation
+    # only as a conservative fallback, and only when exactly one channel skill
+    # owns the key.  This repairs routability without granting a container a
+    # door alias.
+    def instance_stem(source_name: str) -> str:
+        value = str(source_name)
+        match = re.match(r"^(.*)_(\d+)_\d+_(\d+)$", value)
+        if match:
+            return f"{match.group(1)}_{match.group(2)}_{match.group(3)}"
+        return value
+
+    channel_by_stem: dict[str, set[str]] = {}
+    for source_name, joints in joints_by_object.items():
+        if any(joint.domain == "channel" for joint in joints):
+            channel_by_stem.setdefault(instance_stem(source_name), set()).add(source_name)
+    for spec in private_specs:
+        source_name = str(getattr(spec, "source_name", "") or "")
+        if not source_name or source_name in aliases:
+            continue
+        candidates = channel_by_stem.get(instance_stem(source_name), set())
+        if len(candidates) == 1:
+            aliases[source_name] = next(iter(candidates))
     return aliases
 
 
@@ -622,6 +665,12 @@ def _build_restricted_ros_object_goal_runtime(
         camera_name="head_camera",
         min_visible_pixels=int(config.restricted_gt_min_visible_pixels),
         min_bbox_area_pixels=int(config.restricted_gt_min_bbox_area_pixels),
+        min_bbox_short_side_pixels=int(
+            getattr(config, "restricted_gt_min_bbox_short_side_pixels", 2)
+        ),
+        min_portal_bbox_short_side_pixels=int(
+            getattr(config, "restricted_gt_min_portal_bbox_short_side_pixels", 8)
+        ),
         min_visible_fraction=float(getattr(config, "restricted_gt_min_visible_fraction", 0.2)),
         max_distance_m=float(config.restricted_gt_max_distance_m),
         step_interval=1,
@@ -725,6 +774,42 @@ def _build_restricted_ros_object_goal_runtime(
         public.instruction,
     )
     target_name = str(language_target.get("target_name") or public.instruction or "object")
+    # The public semantic mapper intentionally normalizes a portal's opaque
+    # ``obj_######`` identity to a generic ``door_####`` token.  Keep that
+    # normalization evaluator-private: register the derived token as an alias
+    # for the canonical opaque object, without publishing source/body names.
+    instance_aliases: dict[str, str] = {}
+    alias_collisions: set[str] = set()
+    for canonical_id, joints in opaque_to_joints.items():
+        # The public graph can only emit this form after classifying the same
+        # public observation as a portal.  Use the sealed joint domain rather
+        # than root/leaf scene metadata, which often disagrees about a door.
+        # A container must never acquire a door alias merely because its node
+        # was misclassified upstream.  Unregistered geometry-only doorways
+        # also remain evaluator-invalid by design.
+        if not any(joint.domain == "channel" for joint in joints):
+            continue
+        alias = opaque_door_instance_id(canonical_id)
+        previous = instance_aliases.get(alias)
+        if previous is None:
+            instance_aliases[alias] = canonical_id
+        elif previous != canonical_id:
+            # The public generic token has only a four-digit hash suffix.  On
+            # a collision, fail closed rather than route an interaction to a
+            # different physical portal.
+            alias_collisions.add(alias)
+    for alias in alias_collisions:
+        instance_aliases.pop(alias, None)
+    # This evaluator-only startup diagnostic contains public generic door
+    # tokens only.  It lets a short smoke confirm routing coverage without
+    # exposing source-body or joint names to ROS or the semantic policy.
+    print(
+        "[v3-interaction-routing] "
+        f"registered_channel_alias_count={len(instance_aliases)} "
+        f"collision_count={len(alias_collisions)} "
+        f"aliases={','.join(sorted(instance_aliases))}"
+    )
+
     adapter.reset(
         episode_id=perception.episode_id,
         target_context=build_ros_target_context(
@@ -742,6 +827,7 @@ def _build_restricted_ros_object_goal_runtime(
         # This mapping is evaluator-private.  The adapter uses its keys only to
         # validate opaque IDs from ROS interaction commands.
         private_instances={opaque_id: opaque_id for opaque_id in opaque_to_source_name},
+        instance_aliases=instance_aliases,
     )
     initial_frame = perception.build(task, force=True)
     if initial_frame is not None:
@@ -3856,6 +3942,18 @@ def parse_args() -> BenchmarkEvaluationConfig:
     parser.add_argument("--restricted-gt-min-visible-pixels", type=int, default=16)
     parser.add_argument("--restricted-gt-min-bbox-area-pixels", type=int, default=512)
     parser.add_argument(
+        "--restricted-gt-min-bbox-short-side-pixels",
+        type=int,
+        default=1,
+        help="Reject restricted-GT components thinner than this many pixels.",
+    )
+    parser.add_argument(
+        "--restricted-gt-min-portal-bbox-short-side-pixels",
+        type=int,
+        default=8,
+        help="Stricter restricted-GT short-side gate for door/portal observations.",
+    )
+    parser.add_argument(
         "--restricted-gt-min-visible-fraction",
         type=float,
         default=0.2,
@@ -3953,6 +4051,12 @@ def parse_args() -> BenchmarkEvaluationConfig:
         ros_stall_min_no_progress_steps=args.ros_stall_min_no_progress_steps,
         restricted_gt_min_visible_pixels=args.restricted_gt_min_visible_pixels,
         restricted_gt_min_bbox_area_pixels=args.restricted_gt_min_bbox_area_pixels,
+        restricted_gt_min_bbox_short_side_pixels=(
+            args.restricted_gt_min_bbox_short_side_pixels
+        ),
+        restricted_gt_min_portal_bbox_short_side_pixels=(
+            args.restricted_gt_min_portal_bbox_short_side_pixels
+        ),
         restricted_gt_min_visible_fraction=args.restricted_gt_min_visible_fraction,
         restricted_gt_max_distance_m=args.restricted_gt_max_distance_m,
         quality_gate_only=args.quality_gate_only,

@@ -171,6 +171,24 @@ def _bbox_area(bbox: list[float] | list[int]) -> float:
     )
 
 
+def _bbox_short_side_pixels(bbox: list[float] | list[int]) -> int:
+    """Return the shorter inclusive pixel extent of a 2-D bounding box.
+
+    A one-pixel-wide segmentation sliver can have many visible pixels while
+    still being visually unidentifiable.  In particular, treating such a
+    sliver as a doorway leaks a simulator object behind an occluding wall into
+    the public geometry-observation stream.  Area alone cannot catch that
+    failure mode, so retain this small shape check next to the segmentation
+    component logic.
+    """
+
+    if len(bbox) < 4:
+        return 0
+    width = max(0, int(round(float(bbox[2]) - float(bbox[0]) + 1.0)))
+    height = max(0, int(round(float(bbox[3]) - float(bbox[1]) + 1.0)))
+    return min(width, height)
+
+
 def _largest_connected_component_bbox(
     xs: np.ndarray, ys: np.ndarray
 ) -> tuple[int, list[int]] | None:
@@ -315,6 +333,8 @@ class RealtimeGTObservationPublisher:
         topic: str = "/semantic_mapping/gt_observations",
         camera_name: str = "head_camera",
         min_visible_pixels: int = 16,
+        min_visible_bbox_short_side_px: int = 1,
+        min_portal_bbox_short_side_px: int = 8,
         min_visible_fraction: float = 0.2,
         required_consecutive_observations: int = 2,
         max_distance_m: float = 4.0,
@@ -328,6 +348,16 @@ class RealtimeGTObservationPublisher:
         self.topic = str(topic)
         self.camera_name = str(camera_name)
         self.min_visible_pixels = max(1, int(min_visible_pixels))
+        self.min_visible_bbox_short_side_px = max(
+            1, int(min_visible_bbox_short_side_px)
+        )
+        # Door/portal observations affect topology and planning, so require a
+        # visibly two-dimensional component rather than accepting a long wall
+        # edge.  Keep this stricter than the generic object gate by default.
+        self.min_portal_bbox_short_side_px = max(
+            self.min_visible_bbox_short_side_px,
+            int(min_portal_bbox_short_side_px),
+        )
         self.min_visible_fraction = min(1.0, max(0.0, float(min_visible_fraction)))
         self.required_consecutive_observations = max(
             1, int(required_consecutive_observations)
@@ -694,6 +724,14 @@ class RealtimeGTObservationPublisher:
             # they share a GT object ID.  This prevents a tiny pair of door
             # fragments from becoming a large box over unrelated objects.
             if component_pixels < self.min_visible_pixels:
+                continue
+            spec = self._specs[int(spec_index)]
+            minimum_short_side = (
+                self.min_portal_bbox_short_side_px
+                if bool(getattr(spec, "is_door", False))
+                else self.min_visible_bbox_short_side_px
+            )
+            if _bbox_short_side_pixels(bbox_2d) < minimum_short_side:
                 continue
             result.append(
                 (

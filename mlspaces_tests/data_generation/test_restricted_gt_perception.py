@@ -232,6 +232,46 @@ def test_restricted_gt_filters_tiny_extent_against_projected_aabb() -> None:
     assert payload["observations"] == []
 
 
+def test_restricted_gt_rejects_degenerate_portal_sliver_before_publication() -> None:
+    segmentation = np.zeros((64, 20, 2), dtype=np.int32)
+    segmentation[..., 1] = -1
+    # A long one-pixel fragment is enough to pass a visible-pixel or box-area
+    # test.  It must not become a policy-visible door/portal observation.
+    segmentation[4:56, 7, 0] = 11
+    segmentation[4:56, 7, 1] = 42
+    # A genuine, visually resolved portal in the same frame remains valid.
+    segmentation[8:20, 10:18, 0] = 12
+    segmentation[8:20, 10:18, 1] = 42
+
+    registry = OpaqueEpisodeRegistry()
+    payload = build_restricted_gt_frame(
+        segmentation=segmentation,
+        registry=registry,
+        candidates=[
+            PrivateObjectSpec(
+                source_name="private_door_edge",
+                semantic_category="Door",
+                geom_ids=(11,),
+            ),
+            PrivateObjectSpec(
+                source_name="private_door_visible",
+                semantic_category="Door",
+                geom_ids=(12,),
+            ),
+        ],
+        geom_object_type=42,
+        min_visible_pixels=16,
+        min_bbox_area_pixels=1,
+        min_bbox_short_side_pixels=2,
+        min_portal_bbox_short_side_pixels=8,
+    )
+
+    assert [item["name"] for item in payload["observations"]] == ["door"]
+    assert payload["observations"][0]["bbox_2d_xyxy"] == [10, 8, 17, 19]
+    # The rejected edge must not even consume a public opaque ID.
+    assert payload["observations"][0]["instance_id"] == "obj_000001"
+
+
 def test_registry_can_start_from_the_evaluator_episode_index() -> None:
     registry = OpaqueEpisodeRegistry(initial_episode_index=42)
 

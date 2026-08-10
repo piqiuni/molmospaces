@@ -10,6 +10,7 @@ import math
 import shutil
 import subprocess
 from bisect import bisect_right
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -20,12 +21,151 @@ from offline_semantic_renderer import (
     OfflineSixPanelRenderer,
     TransformResolver,
     active_semantic_selection,
+    canonical_object_id_variants,
     draw_camera_title,
+    draw_map_snapshot_note,
     draw_task_subgoal_header,
     known_world_bounds,
     load_raw_grid,
-    zoom_panel,
+    selection_target_ids,
 )
+
+
+_CAUSAL_RECEIPT_EPSILON_SEC = 1e-6
+
+
+def _receipt_stamp_sec(record: dict | None) -> float:
+    try:
+        return float((record or {}).get("stamp_sec") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_step_index(record: dict | None) -> int | None:
+    value = (record or {}).get("step_index")
+    if value in {None, ""}:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def receipt_is_causal_at_boundary(
+    record: dict | None,
+    *,
+    boundary_stamp_sec: float,
+    boundary_step_index: int,
+) -> bool:
+    """Return whether a saved map receipt was available at a video boundary.
+
+    ``step_boundaries.jsonl`` can reference a receipt which the recorder got
+    shortly *after* it captured the matching simulator RGB frame.  Such a
+    receipt is valid runtime data but is future information for an offline
+    replay frame.  Prefer recorder receipt time when it exists; legacy records
+    without timestamps retain their monotonic step-index fallback.
+    """
+
+    if record is None:
+        return False
+    receipt_stamp = _receipt_stamp_sec(record)
+    if boundary_stamp_sec > 0.0 and receipt_stamp > 0.0:
+        if receipt_stamp > boundary_stamp_sec + _CAUSAL_RECEIPT_EPSILON_SEC:
+            return False
+    record_step = _record_step_index(record)
+    return record_step is None or record_step <= int(boundary_step_index)
+
+
+def _receipt_sort_key(record: dict) -> tuple[float, int, int]:
+    stamp = _receipt_stamp_sec(record)
+    record_step = _record_step_index(record)
+    try:
+        source_index = int(record.get("source_index") or 0)
+    except (TypeError, ValueError):
+        source_index = 0
+    # Timestamped receipts sort by availability.  Legacy zero-stamp records
+    # preserve the recorder's source index and step order.
+    return (
+        stamp if stamp > 0.0 else float("-inf"),
+        record_step if record_step is not None else -1,
+        source_index,
+    )
+
+
+@dataclass(frozen=True)
+class CausalReceiptSelection:
+    """One map stage's receipt selected for a simulator-frame replay."""
+
+    stage: str
+    requested_receipt: str
+    requested_meta: dict | None
+    selected_meta: dict | None
+    reason: str
+
+    @property
+    def used_causal_fallback(self) -> bool:
+        return self.reason.endswith("_fallback")
+
+    @property
+    def requested_receipt_was_future(self) -> bool:
+        return self.reason.startswith("requested_future")
+
+
+def select_causal_receipt(
+    *,
+    stage: str,
+    requested_receipt: object,
+    maps_by_id: dict[str, dict],
+    stage_records: list[dict],
+    boundary_stamp_sec: float,
+    boundary_step_index: int,
+) -> CausalReceiptSelection:
+    """Choose the latest map receipt available no later than a frame boundary.
+
+    Receipt IDs remain the preferred source when they are causal.  If an exact
+    receipt belongs to the future, the renderer uses the latest receipt of the
+    same stage that was actually available and records that fallback in the
+    alignment JSON.  It never chooses a later map merely for visual freshness.
+    """
+
+    requested = str(requested_receipt or "")
+    requested_meta = maps_by_id.get(requested) if requested else None
+    if requested_meta is not None and receipt_is_causal_at_boundary(
+        requested_meta,
+        boundary_stamp_sec=boundary_stamp_sec,
+        boundary_step_index=boundary_step_index,
+    ):
+        return CausalReceiptSelection(
+            stage=stage,
+            requested_receipt=requested,
+            requested_meta=requested_meta,
+            selected_meta=requested_meta,
+            reason="requested",
+        )
+
+    causal_records = [
+        record
+        for record in stage_records
+        if receipt_is_causal_at_boundary(
+            record,
+            boundary_stamp_sec=boundary_stamp_sec,
+            boundary_step_index=boundary_step_index,
+        )
+    ]
+    selected_meta = max(causal_records, key=_receipt_sort_key) if causal_records else None
+    if requested_meta is not None:
+        reason = "requested_future_fallback" if selected_meta is not None else "requested_future_no_causal_receipt"
+    elif requested:
+        reason = "requested_missing_fallback" if selected_meta is not None else "requested_missing_no_causal_receipt"
+    else:
+        reason = "latest_causal" if selected_meta is not None else "no_receipt"
+    return CausalReceiptSelection(
+        stage=stage,
+        requested_receipt=requested,
+        requested_meta=requested_meta,
+        selected_meta=selected_meta,
+        reason=reason,
+    )
 
 
 def load_json(path: Path) -> dict:
@@ -111,7 +251,9 @@ def resolve_episode_trajectory_path(
     return debug_dir / "trajectory.csv"
 
 
-def offline_display_config(visualization_config: dict | None) -> dict[str, float | str]:
+def offline_display_config(
+    visualization_config: dict | None,
+) -> dict[str, float | str | bool]:
     """Read persisted offline panel settings with stable replay defaults."""
     config = visualization_config or {}
 
@@ -133,6 +275,10 @@ def offline_display_config(visualization_config: dict | None) -> dict[str, float
         "room_panel_scale": scale("video_room_panel_scale", 1.5),
         "semantic_xy_panel_scale": scale("video_semantic_xy_panel_scale", 1.8),
         "semantic_xy_label_mode": label_mode,
+        # The overview inset is presentation-only and can hide graph content.
+        # Do not replay a historical recorder preference by default; it is an
+        # explicit offline CLI opt-in when a coverage diagnostic is wanted.
+        "semantic_xy_overview_inset": False,
     }
 
 
@@ -286,7 +432,7 @@ def gt_draw_spec(
     frame_shape: tuple[int, ...],
     payload: dict,
     observation: dict,
-    target_object_id: str = "",
+    target_object_id: str | set[str] = "",
 ) -> dict | None:
     bbox = observation.get("bbox_2d") or []
     image_size = observation.get("image_size") or payload.get("image_size") or []
@@ -309,7 +455,15 @@ def gt_draw_spec(
     object_id = str(observation.get("id") or observation.get("instance_id") or "")
     name = str(observation.get("name") or observation.get("semantic_name") or "object")
     normalized_name = name.lower()
-    is_target = bool(target_object_id and object_id == target_object_id)
+    target_ids = (
+        set(target_object_id)
+        if isinstance(target_object_id, set)
+        else canonical_object_id_variants(target_object_id)
+    )
+    observation_ids = canonical_object_id_variants(object_id)
+    if not observation_ids:
+        observation_ids = canonical_object_id_variants(name)
+    is_target = bool(target_ids and target_ids.intersection(observation_ids))
     is_door = "door" in normalized_name
     is_container = any(
         token in normalized_name
@@ -341,7 +495,11 @@ def gt_draw_spec(
     }
 
 
-def draw_gt(frame, payload: dict | None, target_object_id: str = "") -> None:
+def draw_gt(
+    frame,
+    payload: dict | None,
+    target_object_id: str | set[str] = "",
+) -> None:
     if not payload:
         return
     observations = list(payload.get("observations") or [])
@@ -649,18 +807,6 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     renderer = OfflineSixPanelRenderer(transforms=transforms)
     global_replay = GlobalCostmapReplay(maps_by_id)
 
-    def receipt_meta(step: dict, stage: str) -> dict | None:
-        receipt = str((step.get("receipts") or {}).get(stage) or "")
-        record = maps_by_id.get(receipt)
-        if record is not None:
-            return record
-        stamp = float(step.get("stamp_sec", 0.0) or 0.0)
-        eligible = [
-            item for item in maps_by_stage.get(stage, [])
-            if float(item.get("stamp_sec", 0.0) or 0.0) <= stamp
-        ]
-        return eligible[-1] if eligible else None
-
     panel_size = (480, 270)
     videos_dir = scene_dir / "videos"
     frames_dir = videos_dir / "offline_composite_frames"
@@ -679,6 +825,8 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         raise RuntimeError("Cannot open raw offline video writer")
     written = 0
     component_post_observation_receipt_count = 0
+    component_causal_fallback_count = 0
+    requested_future_receipt_count = 0
     try:
         with alignment_path.open("w", encoding="utf-8") as alignment_file:
             for step in steps:
@@ -690,11 +838,33 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     continue
                 sim_stamp = float(sim_record.get("stamp_sec", step.get("stamp_sec", 0.0)) or 0.0)
                 receipts = step.get("receipts") or {}
-                planning_meta = receipt_meta(step, "planning_occ")
-                room_meta = receipt_meta(step, "room_segmentation")
-                global_full_meta = receipt_meta(step, "global_costmap_full")
-                global_update_meta = receipt_meta(step, "global_costmap_update")
-                local_meta = receipt_meta(step, "local_costmap_full")
+                stage_selections = {
+                    stage: select_causal_receipt(
+                        stage=stage,
+                        requested_receipt=receipts.get(stage),
+                        maps_by_id=maps_by_id,
+                        stage_records=maps_by_stage.get(stage, []),
+                        boundary_stamp_sec=sim_stamp,
+                        boundary_step_index=step_index,
+                    )
+                    for stage in (
+                        "planning_occ",
+                        "room_segmentation",
+                        "global_costmap_full",
+                        "global_costmap_update",
+                        "local_costmap_full",
+                    )
+                }
+                planning_selection = stage_selections["planning_occ"]
+                room_selection = stage_selections["room_segmentation"]
+                global_full_selection = stage_selections["global_costmap_full"]
+                global_update_selection = stage_selections["global_costmap_update"]
+                local_selection = stage_selections["local_costmap_full"]
+                planning_meta = planning_selection.selected_meta
+                room_meta = room_selection.selected_meta
+                global_full_meta = global_full_selection.selected_meta
+                global_update_meta = global_update_selection.selected_meta
+                local_meta = local_selection.selected_meta
                 selected = {
                     "planning_occ": planning_meta,
                     "room_segmentation": room_meta,
@@ -710,12 +880,21 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     bool(sim_stamp and value and value > sim_stamp + 1e-6)
                     for value in receipt_stamps.values()
                 )
+                component_causal_fallback_count += sum(
+                    selection.used_causal_fallback
+                    for selection in stage_selections.values()
+                )
+                requested_future_receipt_count += sum(
+                    selection.requested_receipt_was_future
+                    for selection in stage_selections.values()
+                )
                 planning = load_raw_grid(planning_meta)
                 room = load_raw_grid(room_meta)
                 local = load_raw_grid(local_meta)
                 global_grid = global_replay.grid_for(
                     global_full_meta,
-                    (global_update_meta or {}).get("receipt_id") or receipts.get("global_costmap_update"),
+                    (global_update_meta or {}).get("receipt_id"),
+                    max_stamp_sec=sim_stamp,
                 )
                 visualization_config = offline_display_config(
                     step.get("visualization_config") or {}
@@ -733,6 +912,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 room_panel_scale = float(visualization_config["room_panel_scale"])
                 semantic_xy_panel_scale = float(visualization_config["semantic_xy_panel_scale"])
                 semantic_xy_label_mode = str(visualization_config["semantic_xy_label_mode"])
+                semantic_xy_overview_inset = bool(
+                    getattr(args, "semantic_xy_overview_inset", False)
+                )
                 world_bounds = (
                     known_world_bounds(planning, margin_m=occ_crop_margin_m)
                     if planning is not None
@@ -744,18 +926,12 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 )
                 if camera is None:
                     raise RuntimeError(f"Missing simulator camera image for step {step_index}")
-                camera = cv2.cvtColor(camera, cv2.COLOR_BGR2RGB)
                 camera = cv2.resize(camera, panel_size, interpolation=cv2.INTER_AREA)
                 selection = active_semantic_selection(step)
                 draw_gt(
                     camera,
                     sim_record.get("gt_observations"),
-                    str(
-                        selection.get("target_id")
-                        or selection.get("object_id")
-                        or selection.get("candidate_id")
-                        or ""
-                    ),
+                    selection_target_ids(selection),
                 )
                 draw_camera_title(camera, step, step_index)
                 occ = renderer.render_map_panel(
@@ -763,8 +939,29 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     world_bounds=world_bounds, draw_global_plan=True, draw_local_plan=True,
                     draw_frontiers=True, draw_semantic_candidates=True, draw_route_plan=True,
                     episode_trajectory=trajectory,
+                    snapshot_meta=planning_meta,
+                    display_stamp_sec=sim_stamp,
+                    snapshot_selection_reason=planning_selection.reason,
                 )
-                draw_task_subgoal_header(occ, step)
+                # Panel 2 keeps the task text readable without obscuring the
+                # OCC map: the new compact banner is half the prior width and
+                # blends with the map beneath it.
+                draw_task_subgoal_header(
+                    occ,
+                    step,
+                    box_width_px=panel_size[0] // 2 - 10,
+                    background_alpha=0.55,
+                )
+                # The task banner is intentionally drawn last, so redraw the
+                # causal receipt note afterwards rather than allowing it to be
+                # hidden under the banner at the top-left of Panel 2.
+                draw_map_snapshot_note(
+                    occ,
+                    planning_meta,
+                    display_stamp_sec=sim_stamp,
+                    selection_reason=planning_selection.reason,
+                    y=57,
+                )
                 room_panel = renderer.render_room_panel(
                     planning,
                     room,
@@ -773,6 +970,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     step_index,
                     world_bounds,
                     view_scale=room_panel_scale,
+                    snapshot_meta=room_meta,
+                    display_stamp_sec=sim_stamp,
+                    snapshot_selection_reason=room_selection.reason,
                 )
                 global_width = panel_size[0] // 2
                 global_panel = renderer.render_map_panel(
@@ -780,13 +980,23 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     title="GLOBAL COSTMAP", kind="costmap", world_bounds=world_bounds,
                     draw_global_plan=True, draw_local_plan=False, draw_frontiers=False,
                     episode_trajectory=trajectory,
+                    view_scale=global_panel_scale,
+                    snapshot_meta=global_update_meta or global_full_meta,
+                    display_stamp_sec=sim_stamp,
+                    snapshot_selection_reason=(
+                        global_update_selection.reason
+                        if global_update_meta is not None
+                        else global_full_selection.reason
+                    ),
                 )
-                global_panel = zoom_panel(global_panel, global_panel_scale)
                 local_panel = renderer.render_map_panel(
                     local, (panel_size[0] - global_width, panel_size[1]), step, step_index,
                     title="LOCAL COSTMAP", kind="costmap", draw_global_plan=False,
                     draw_local_global_plan=True, draw_local_plan=True, draw_frontiers=False,
                     episode_trajectory=trajectory,
+                    snapshot_meta=local_meta,
+                    display_stamp_sec=sim_stamp,
+                    snapshot_selection_reason=local_selection.reason,
                 )
                 costmaps = np.concatenate([global_panel, local_panel], axis=1)
                 spatial = renderer.render_semantic_xy(
@@ -797,6 +1007,10 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     world_bounds,
                     view_scale=semantic_xy_panel_scale,
                     label_mode=semantic_xy_label_mode,
+                    draw_overview_inset=semantic_xy_overview_inset,
+                    snapshot_meta=planning_meta,
+                    display_stamp_sec=sim_stamp,
+                    snapshot_selection_reason=planning_selection.reason,
                 )
                 topology = renderer.render_topology(panel_size, step, step_index)
                 frame = np.vstack([
@@ -804,7 +1018,11 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     np.concatenate([costmaps, spatial, topology], axis=1),
                 ])
                 output_path = frames_dir / f"frame_{written + 1:06d}_composite.png"
-                encoded_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # Every offline panel is rendered with OpenCV's native BGR
+                # convention, just like the camera PNG.  Converting the whole
+                # composite as RGB here swaps the semantic-map palette (and
+                # made panel 4's cost colors look unlike the runtime view).
+                encoded_frame = frame
                 if not cv2.imwrite(str(output_path), encoded_frame):
                     raise RuntimeError(f"Failed to write offline frame {written + 1}")
                 writer.write(encoded_frame)
@@ -812,6 +1030,14 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     "step_index": step_index,
                     "sim_stamp_sec": sim_stamp,
                     "receipts": {stage: (meta or {}).get("receipt_id", "") for stage, meta in selected.items()},
+                    "requested_receipts": {
+                        stage: selection.requested_receipt
+                        for stage, selection in stage_selections.items()
+                    },
+                    "receipt_selection_reason": {
+                        stage: selection.reason
+                        for stage, selection in stage_selections.items()
+                    },
                     "receipt_stamp_sec": receipt_stamps,
                     "output_frame": str(output_path),
                 }, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -851,7 +1077,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         "missing_raw_step_indexes": missing_raw_step_indexes,
         "max_stamp_delta_sec": 0.0,
         "component_post_observation_receipt_count": component_post_observation_receipt_count,
-        "component_alignment": "step_boundary_receipts",
+        "component_causal_fallback_count": component_causal_fallback_count,
+        "requested_future_receipt_count": requested_future_receipt_count,
+        "component_alignment": "causal_receipt_at_or_before_sim_stamp",
         "trajectory_source": trajectory_source,
         "trajectory_path": str(trajectory_path),
         "episode_trajectory_sample_count": len(episode_trajectory),
@@ -881,6 +1109,11 @@ def main() -> None:
         default="exact",
     )
     parser.add_argument("--output-stem", default="overview_6panel")
+    parser.add_argument(
+        "--semantic-xy-overview-inset",
+        action="store_true",
+        help="Overlay a full-known-map coverage inset on the semantic XY panel.",
+    )
     parser.add_argument(
         "--panel",
         choices=("overview", *PANEL_FIELDS),

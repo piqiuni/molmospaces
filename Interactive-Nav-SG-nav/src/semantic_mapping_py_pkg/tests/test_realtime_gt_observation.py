@@ -326,11 +326,19 @@ def test_door_geom_mapping_excludes_unrelated_sibling_under_same_root():
     )
 
 
-def _visible_instance_publisher(min_visible_pixels: int):
+def _visible_instance_publisher(
+    min_visible_pixels: int,
+    *,
+    is_door: bool = False,
+    min_visible_bbox_short_side_px: int = 2,
+    min_portal_bbox_short_side_px: int = 8,
+):
     publisher = object.__new__(realtime_gt.RealtimeGTObservationPublisher)
-    publisher._specs = [object()]
+    publisher._specs = [type("VisibleSpec", (), {"is_door": bool(is_door)})()]
     publisher._geom_to_spec = np.asarray([0], dtype=np.int32)
     publisher.min_visible_pixels = min_visible_pixels
+    publisher.min_visible_bbox_short_side_px = min_visible_bbox_short_side_px
+    publisher.min_portal_bbox_short_side_px = min_portal_bbox_short_side_px
     return publisher
 
 
@@ -361,6 +369,33 @@ def test_visible_instances_does_not_sum_disconnected_fragments_to_pass_threshold
     segmentation = _segmentation_for_geom_pixels((16, 16), first + second)
 
     assert publisher._visible_instances(segmentation) == []
+
+
+def test_realtime_gt_rejects_one_pixel_portal_sliver_before_publication():
+    publisher = _visible_instance_publisher(
+        min_visible_pixels=16,
+        is_door=True,
+        min_portal_bbox_short_side_px=8,
+    )
+    # This mirrors the House 4 leakage: a 1x52 wall-edge fragment has enough
+    # segmentation pixels to pass an area-only gate but is not identifiable as
+    # a doorway in the RGB image.
+    sliver = [(y, 4) for y in range(2, 54)]
+    segmentation = _segmentation_for_geom_pixels((64, 16), sliver)
+
+    assert publisher._visible_instances(segmentation) == []
+
+
+def test_realtime_gt_keeps_visually_resolved_portal_component():
+    publisher = _visible_instance_publisher(
+        min_visible_pixels=16,
+        is_door=True,
+        min_portal_bbox_short_side_px=8,
+    )
+    pixels = [(y, x) for y in range(4, 16) for x in range(3, 11)]
+    segmentation = _segmentation_for_geom_pixels((24, 16), pixels)
+
+    assert publisher._visible_instances(segmentation) == [(0, 96, [3, 4, 10, 15])]
 
 
 def test_publisher_applies_min_visible_fraction_to_projected_object_extent():

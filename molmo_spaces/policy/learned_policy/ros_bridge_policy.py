@@ -83,6 +83,8 @@ class RosBridgePolicy(BasePolicy):
         realtime_gt_topic: str = "/semantic_mapping/gt_observations",
         realtime_gt_camera_name: str = "head_camera",
         realtime_gt_min_visible_pixels: int = 16,
+        realtime_gt_min_visible_bbox_short_side_px: int = 1,
+        realtime_gt_min_portal_bbox_short_side_px: int = 8,
         realtime_gt_min_visible_fraction: float = 0.2,
         realtime_gt_required_consecutive_observations: int = 2,
         realtime_gt_step_interval: int = 3,
@@ -390,6 +392,12 @@ class RosBridgePolicy(BasePolicy):
                 topic=realtime_gt_topic,
                 camera_name=realtime_gt_camera_name,
                 min_visible_pixels=realtime_gt_min_visible_pixels,
+                min_visible_bbox_short_side_px=(
+                    realtime_gt_min_visible_bbox_short_side_px
+                ),
+                min_portal_bbox_short_side_px=(
+                    realtime_gt_min_portal_bbox_short_side_px
+                ),
                 min_visible_fraction=realtime_gt_min_visible_fraction,
                 required_consecutive_observations=realtime_gt_required_consecutive_observations,
                 step_interval=realtime_gt_step_interval,

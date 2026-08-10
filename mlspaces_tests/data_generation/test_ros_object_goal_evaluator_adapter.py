@@ -221,6 +221,36 @@ def test_object_level_command_uses_private_handle_but_redacts_force_result() -> 
     assert published == result
 
 
+def test_public_portal_alias_resolves_to_the_canonical_opaque_id() -> None:
+    """A generic public door token must not lose its evaluator skill route."""
+
+    private_handle = object()
+    adapter, _rospy = _adapter()
+    adapter.reset(
+        episode_id="eval_000042",
+        target_context=build_public_target_context(
+            episode_id="eval_000042",
+            target_name="door",
+        ),
+        private_instances={"obj_000017": private_handle},
+        instance_aliases={"door_7031": "obj_000017"},
+    )
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "decision:open-generic-door",
+            "node_id": "door_7031",
+            "object_id": "door_7031",
+            "node_type": "portal",
+            "action": "open",
+        }
+    )
+
+    assert request is not None
+    assert request.private_handle is private_handle
+    assert request.instance_id == "obj_000017"
+
+
 def test_drawer_scan_visual_hint_is_sanitized_but_never_emitted_in_result() -> None:
     adapter, rospy = _adapter()
     _reset(adapter, {"obj_000017": object()})

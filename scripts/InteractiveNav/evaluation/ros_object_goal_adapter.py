@@ -784,6 +784,11 @@ class RosObjectGoalEvaluatorAdapter:
         self._episode_id = ""
         self._episode_generation = 0
         self._private_instances: dict[str, Any] = {}
+        # Public aliases can be introduced by a compatibility layer that
+        # deliberately normalizes an opaque object ID (for example an
+        # ``obj_000017`` portal represented to the semantic graph as a generic
+        # ``door_1234``).  They resolve only inside this evaluator bridge.
+        self._canonical_instance_ids: dict[str, str] = {}
         self._pending_by_command_id: dict[str, EvaluatorInteractionRequest] = {}
         self._pending_order: deque[str] = deque()
         self._seen_command_ids: set[str] = set()
@@ -868,11 +873,15 @@ class RosObjectGoalEvaluatorAdapter:
         episode_id: str,
         target_context: Mapping[str, Any],
         private_instances: Mapping[str, Any],
+        instance_aliases: Mapping[str, str] | None = None,
     ) -> None:
         """Reset public ROS state and replace the evaluator-private ID mapping.
 
         ``private_instances`` is never serialised.  Its keys must be the same
         opaque IDs that appear in :class:`RestrictedGTObservation` records.
+        ``instance_aliases`` is an optional evaluator-private normalization
+        map whose values must name one of those opaque IDs; aliases never reach
+        the target or observation ROS topics.
         """
 
         self.start()
@@ -889,11 +898,28 @@ class RosObjectGoalEvaluatorAdapter:
             if not opaque_id:
                 raise RestrictedGTContractError("private_instances cannot contain an empty opaque id")
             normalized_instances[opaque_id] = private_handle
+        normalized_aliases = {opaque_id: opaque_id for opaque_id in normalized_instances}
+        for raw_alias, raw_canonical_id in dict(instance_aliases or {}).items():
+            alias = str(raw_alias).strip()
+            canonical_id = str(raw_canonical_id).strip()
+            if not alias or not canonical_id:
+                raise RestrictedGTContractError("instance_aliases cannot contain an empty ID")
+            if canonical_id not in normalized_instances:
+                raise RestrictedGTContractError(
+                    "instance_aliases must resolve to a registered opaque ID"
+                )
+            existing = normalized_aliases.get(alias)
+            if existing is not None and existing != canonical_id:
+                raise RestrictedGTContractError(
+                    "instance_aliases cannot map one public alias to multiple opaque IDs"
+                )
+            normalized_aliases[alias] = canonical_id
         with self._lock:
             self._episode_generation += 1
             episode_generation = self._episode_generation
             self._episode_id = normalized_episode_id
             self._private_instances = normalized_instances
+            self._canonical_instance_ids = normalized_aliases
             self._pending_by_command_id.clear()
             self._pending_order.clear()
             self._seen_command_ids.clear()
@@ -1143,6 +1169,11 @@ class RosObjectGoalEvaluatorAdapter:
                         # determines the opaque object for this direct scan.
                         instance_id = matched_instance_id
                         direct_bbox_drawer_scan = True
+            # Commands may contain a semantic graph's public compatibility
+            # alias.  Resolve it here, before the private-registry lookup, so
+            # downstream evaluator scoring and force execution use the one
+            # canonical opaque object identity.
+            instance_id = self._canonical_instance_ids.get(instance_id, instance_id)
             private_handle = self._private_instances.get(instance_id)
             episode_id = self._episode_id
             episode_generation = self._episode_generation

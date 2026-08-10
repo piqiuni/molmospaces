@@ -13,6 +13,39 @@ from scripts.InteractiveNav.evaluation import EvaluationConfig
 from scripts.InteractiveNav.evaluation import benchmark_runner
 
 
+def test_v3_runner_keeps_the_expanded_m1_budget_isolated() -> None:
+    """M1 JSON headroom must not silently retune M2, M3, or room inference."""
+
+    runner = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "InteractiveNav"
+        / "run_interactive_nav_v3_ros_eval_test.zsh"
+    )
+    source = runner.read_text(encoding="utf-8")
+
+    assert "SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-384}" in source
+    assert 'semantic_attribute_max_output_tokens:="${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS}"' in source
+    assert "m1_attribute_max_output_tokens=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS}" in source
+    assert "object_goal_v3_full_mllm.yaml and room MLLM keeps its own mapping config cap" in source
+
+
+def test_v3_runner_matches_zero_padded_episode_result_directory() -> None:
+    """The evaluator writes ``0000_<case>`` directories, not ``0_<case>``."""
+
+    runner = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "InteractiveNav"
+        / "run_interactive_nav_v3_ros_eval_test.zsh"
+    )
+    source = runner.read_text(encoding="utf-8")
+
+    assert 'EPISODE_INDEX_PADDED=$(printf \'%04d\' "${EPISODE_INDEX}")' in source
+    assert '${EPISODE_INDEX_PADDED}_*/episode_result.json' in source
+    assert '${EPISODE_INDEX}_*/episode_result.json' not in source
+
+
 def test_public_v3_cli_routes_to_canonical_benchmark_runner() -> None:
     """Keep formal V3 evaluation off the legacy compatibility runner."""
 

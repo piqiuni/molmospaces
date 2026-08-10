@@ -47,6 +47,22 @@ class ClusterRecord:
 
 
 @dataclass
+class FrontierRegionRecord:
+    """Persistent observation-region memory across small frontier re-clusters."""
+
+    region_id: str
+    centroid_world: tuple[float, float] = (0.0, 0.0)
+    signature: tuple[tuple[int, int], ...] = ()
+    unknown_component_area_m2: float = 0.0
+    visible_unknown_area_m2: float = 0.0
+    status: str = CLUSTER_ACTIVE
+    visit_count: int = 0
+    failure_count: int = 0
+    last_seen: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass
 class ActiveGoal:
     cluster_id: str
     point: tuple[float, float]
@@ -60,6 +76,7 @@ class ActiveGoal:
     goal_id: str = ""
     status: str = SUBGOAL_SENT
     frontier_gone_count: int = 0
+    region_id: str = ""
 
 
 @dataclass
@@ -85,12 +102,18 @@ class ExplorerStateConfig:
     visit_viewpoint_once: bool = False
     visited_viewpoint_radius_m: float = 0.50
     unreachable_frontier_radius_m: float = 1.0
+    frontier_region_match_distance_m: float = 3.0
+    frontier_region_overlap_threshold: float = 0.20
+    frontier_region_reactivate_unknown_growth_ratio: float = 0.25
+    frontier_region_reactivate_unknown_growth_m2: float = 0.25
 
 
 @dataclass
 class ExplorerState:
     config: ExplorerStateConfig = field(default_factory=ExplorerStateConfig)
     records: dict[str, ClusterRecord] = field(default_factory=dict)
+    frontier_regions: dict[str, FrontierRegionRecord] = field(default_factory=dict)
+    _next_frontier_region_index: int = 1
     active_goal: ActiveGoal | None = None
     blocked_goal_points: list[BlockedGoalPoint] = field(default_factory=list)
     visited_viewpoints: list[tuple[float, float]] = field(default_factory=list)
@@ -105,6 +128,8 @@ class ExplorerState:
     def update_seen_clusters(self, clusters, now: float | None = None) -> None:
         now = self._now(now)
         for cluster in clusters:
+            self.resolve_frontier_region(cluster)
+            self.note_frontier_observation(cluster, now=now)
             record = self.records.get(cluster.cluster_id)
             if record is None:
                 record = ClusterRecord(cluster_id=cluster.cluster_id)
@@ -113,14 +138,101 @@ class ExplorerState:
             record.subgoal_world = cluster.subgoal_world
             record.last_seen = now
             record.updated_at = now
-            if record.status == CLUSTER_COVERED:
-                record.status = CLUSTER_ACTIVE
             if record.status == CLUSTER_FAILED and now >= record.blacklist_until:
                 record.status = CLUSTER_ACTIVE
+
+    def resolve_frontier_region(self, cluster) -> str:
+        """Attach a stable region ID without changing the public candidate ID.
+
+        The candidate may retain a useful local centroid bucket for navigation,
+        while this method merges successive versions of the same unknown-space
+        boundary through a compact signature and a bounded spatial match.
+        """
+
+        signature = tuple(getattr(cluster, "region_signature", ()) or ())
+        centroid = tuple(getattr(cluster, "centroid_world", (0.0, 0.0)))
+        source_id = str(getattr(cluster, "source_cluster_id", "") or cluster.cluster_id)
+        match_distance = max(0.0, self.config.frontier_region_match_distance_m)
+        overlap_threshold = min(
+            1.0,
+            max(0.0, self.config.frontier_region_overlap_threshold),
+        )
+        signature_set = set(signature)
+        best: tuple[float, float, FrontierRegionRecord] | None = None
+        for record in self.frontier_regions.values():
+            distance = hypot(
+                float(centroid[0]) - float(record.centroid_world[0]),
+                float(centroid[1]) - float(record.centroid_world[1]),
+            )
+            if match_distance > 0.0 and distance > match_distance:
+                continue
+            overlap = self._signature_overlap(signature_set, set(record.signature))
+            if overlap < overlap_threshold:
+                continue
+            candidate = (overlap, -distance, record)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+        if best is None:
+            region_id = f"region_{self._next_frontier_region_index:05d}"
+            self._next_frontier_region_index += 1
+            self.frontier_regions[region_id] = FrontierRegionRecord(
+                region_id=region_id,
+                centroid_world=(float(centroid[0]), float(centroid[1])),
+                signature=signature,
+            )
+            overlap = 1.0
+        else:
+            overlap, _neg_distance, record = best
+            region_id = record.region_id
+        cluster.region_id = region_id
+        cluster.region_overlap = float(overlap)
+        return region_id
+
+    def note_frontier_observation(self, cluster, now: float | None = None) -> None:
+        """Update region memory and reactivate only on material new unknown area."""
+
+        now = self._now(now)
+        region_id = str(getattr(cluster, "region_id", "") or cluster.cluster_id)
+        record = self.frontier_regions.get(region_id)
+        if record is None:
+            record = FrontierRegionRecord(region_id=region_id)
+            self.frontier_regions[region_id] = record
+        current_unknown_area = max(
+            0.0,
+            float(getattr(cluster, "unknown_component_area_m2", 0.0) or 0.0),
+        )
+        previous_unknown_area = max(0.0, float(record.unknown_component_area_m2))
+        delta = current_unknown_area - previous_unknown_area
+        cluster.region_coverage_delta_m2 = float(delta)
+        growth_ratio = delta / max(previous_unknown_area, 1e-6)
+        material_growth = (
+            delta >= max(0.0, self.config.frontier_region_reactivate_unknown_growth_m2)
+            and growth_ratio
+            >= max(0.0, self.config.frontier_region_reactivate_unknown_growth_ratio)
+        )
+        if record.status == CLUSTER_COVERED and material_growth:
+            record.status = CLUSTER_ACTIVE
+        centroid = tuple(getattr(cluster, "centroid_world", record.centroid_world))
+        record.centroid_world = (float(centroid[0]), float(centroid[1]))
+        record.signature = tuple(getattr(cluster, "region_signature", ()) or ())
+        record.unknown_component_area_m2 = current_unknown_area
+        record.visible_unknown_area_m2 = max(
+            0.0,
+            float(getattr(cluster, "visible_unknown_area_m2", 0.0) or 0.0),
+        )
+        record.last_seen = now
+        record.updated_at = now
 
     def is_cluster_available(self, cluster, now: float | None = None) -> bool:
         now = self._now(now)
         if self.is_frontier_unreachable(cluster.centroid_world):
+            return False
+        region_id = str(getattr(cluster, "region_id", "") or cluster.cluster_id)
+        region = self.frontier_regions.get(region_id)
+        if region is not None and region.status in {
+            CLUSTER_COVERED,
+            CLUSTER_UNREACHABLE,
+        }:
             return False
         record = self.records.get(cluster.cluster_id)
         if record is None:
@@ -154,6 +266,7 @@ class ExplorerState:
             last_robot_yaw=robot_yaw,
             goal_id=goal_id,
             status=SUBGOAL_SENT,
+            region_id=str(getattr(cluster, "region_id", "") or cluster.cluster_id),
         )
         record = self._record_for(cluster.cluster_id)
         record.status = CLUSTER_ACTIVE
@@ -161,6 +274,10 @@ class ExplorerState:
         record.subgoal_world = cluster.subgoal_world
         record.visit_count += 1
         record.updated_at = now
+        region = self.frontier_regions.get(self.active_goal.region_id)
+        if region is not None:
+            region.visit_count += 1
+            region.updated_at = now
         self.last_subgoal_world = cluster.subgoal_world
         self.last_event = "goal_sent"
         return self.active_goal
@@ -181,6 +298,10 @@ class ExplorerState:
         record = self._record_for(self.active_goal.cluster_id)
         record.status = CLUSTER_COVERED
         record.updated_at = now
+        region = self.frontier_regions.get(self.active_goal.region_id)
+        if region is not None:
+            region.status = CLUSTER_COVERED
+            region.updated_at = now
         self.clear_active_goal(SUBGOAL_REACHED, now)
 
     def mark_active_reached_pose_only(self, now: float | None = None) -> None:
@@ -222,6 +343,10 @@ class ExplorerState:
         record = self._record_for(self.active_goal.cluster_id)
         record.status = CLUSTER_UNREACHABLE
         record.updated_at = now
+        region = self.frontier_regions.get(self.active_goal.region_id)
+        if region is not None:
+            region.status = CLUSTER_UNREACHABLE
+            region.updated_at = now
         self.clear_active_goal(
             SUBGOAL_REACHED_POSE_ONLY,
             now,
@@ -405,9 +530,14 @@ class ExplorerState:
 
     def revisit_penalty(self, cluster) -> float:
         record = self.records.get(cluster.cluster_id)
-        if record is None:
-            return 0.0
-        return min(1.0, 0.25 * float(record.visit_count))
+        candidate_penalty = (
+            0.0 if record is None else 0.25 * float(record.visit_count)
+        )
+        region = self.frontier_regions.get(
+            str(getattr(cluster, "region_id", "") or cluster.cluster_id)
+        )
+        region_penalty = 0.0 if region is None else 0.25 * float(region.visit_count)
+        return min(1.0, max(candidate_penalty, region_penalty))
 
     def failure_penalty(self, cluster) -> float:
         record = self.records.get(cluster.cluster_id)
@@ -436,6 +566,10 @@ class ExplorerState:
             "blocked_goal_points": len(self.blocked_goal_points),
             "visited_viewpoints": [list(point) for point in self.visited_viewpoints],
             "unreachable_frontiers": len(self.unreachable_frontiers),
+            "frontier_regions": {
+                "count": len(self.frontier_regions),
+                "statuses": self._frontier_region_status_counts(),
+            },
             "last_subgoal_world": None if self.last_subgoal_world is None else list(self.last_subgoal_world),
             "last_event": self.last_event,
             "last_failure_reason": self.last_failure_reason,
@@ -450,6 +584,21 @@ class ExplorerState:
             record = ClusterRecord(cluster_id=cluster_id)
             self.records[cluster_id] = record
         return record
+
+    @staticmethod
+    def _signature_overlap(
+        current: set[tuple[int, int]], previous: set[tuple[int, int]]
+    ) -> float:
+        if not current or not previous:
+            return 0.0
+        union = current | previous
+        return float(len(current & previous)) / float(max(1, len(union)))
+
+    def _frontier_region_status_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for record in self.frontier_regions.values():
+            counts[record.status] = counts.get(record.status, 0) + 1
+        return counts
 
     @staticmethod
     def _now(now: float | None = None) -> float:

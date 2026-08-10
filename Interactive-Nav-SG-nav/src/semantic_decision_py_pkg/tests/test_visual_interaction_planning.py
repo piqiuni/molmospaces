@@ -12,6 +12,8 @@ if str(DECISION_SCRIPTS) not in sys.path:
 from semantic_decision_py_pkg.visual_interaction_planning import (
     action_for_opaque_open_contract,
     candidate_with_direct_drawer_scan,
+    candidate_with_visual_drawer_open,
+    candidate_with_visual_drawer_scan,
     candidate_with_visual_operation_plan,
     current_visible_bbox_2d,
     current_visible_bbox_capture_step,
@@ -217,3 +219,58 @@ def test_model_drawer_plan_cannot_inherit_a_direct_scan_box() -> None:
         },
     )
     assert "drawer_container_bbox_2d" not in planned["interaction_command"]
+
+
+def test_fresh_visual_drawer_scan_requires_visible_regions_and_pairs_them_with_box() -> None:
+    candidate = {"interaction_command": {"action": "open"}}
+    assert (
+        candidate_with_visual_drawer_scan(
+            candidate,
+            drawer_bbox_2d=[10, 20, 110, 160],
+            capture_step=42,
+            action_regions=[],
+        )
+        is None
+    )
+
+    planned = candidate_with_visual_drawer_scan(
+        candidate,
+        drawer_bbox_2d=[110, 160, 10, 20],
+        capture_step=42,
+        action_regions=[
+            {"center": [0.50, 0.72], "confidence": 0.7},
+            {"center": [0.50, 0.23], "confidence": 0.9},
+        ],
+    )
+    assert planned is not None
+    command = planned["interaction_command"]
+    assert command["sequence_type"] == "drawer_scan"
+    assert command["drawer_container_bbox_2d"] == [10.0, 20.0, 110.0, 160.0]
+    assert command["drawer_container_capture_step"] == 42
+    assert command["open_regions"] == [
+        {"center": [0.5, 0.23], "confidence": 0.9},
+        {"center": [0.5, 0.72], "confidence": 0.7},
+    ]
+
+
+def test_fresh_visual_drawer_open_has_persistent_open_contract() -> None:
+    candidate = {"interaction_command": {"action": "open"}}
+    planned = candidate_with_visual_drawer_open(
+        candidate,
+        drawer_bbox_2d=[110, 160, 10, 20],
+        capture_step=42,
+        action_regions=[
+            {"center": [0.50, 0.72], "confidence": 0.7},
+            {"center": [0.50, 0.23], "confidence": 0.9},
+        ],
+    )
+    assert planned is not None
+    command = planned["interaction_command"]
+    assert command["action"] == "open"
+    assert command["interaction_mode"] == "drawer_open"
+    assert command["sequence_type"] == "drawer_open"
+    assert command["drawer_container_capture_step"] == 42
+    assert command["open_regions"] == [
+        {"center": [0.5, 0.23], "confidence": 0.9},
+        {"center": [0.5, 0.72], "confidence": 0.7},
+    ]

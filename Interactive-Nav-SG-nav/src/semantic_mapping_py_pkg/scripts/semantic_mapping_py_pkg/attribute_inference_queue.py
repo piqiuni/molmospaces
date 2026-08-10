@@ -18,6 +18,25 @@ class LatestPriorityRequestQueue:
             -int(item.get("request_sequence", 0) or 0),
         )
 
+    @staticmethod
+    def _freshness_key(item: dict) -> tuple[int, float]:
+        """Order coalesced requests by reservation sequence, then enqueue time."""
+
+        return (
+            int(item.get("request_sequence", 0) or 0),
+            float(item.get("enqueued_at", 0.0) or 0.0),
+        )
+
+    @staticmethod
+    def _is_expired(item: dict, now: float) -> bool:
+        deadline = item.get("deadline_monotonic")
+        if deadline is None:
+            return False
+        try:
+            return float(deadline) <= now
+        except (TypeError, ValueError):
+            return True
+
     def put(self, item: dict) -> tuple[bool, dict | None]:
         payload = dict(item)
         with self._condition:
@@ -27,6 +46,10 @@ class LatestPriorityRequestQueue:
             replaced = None
             for index, queued in enumerate(self._items):
                 if object_id and str(queued.get("object_id") or "") == object_id:
+                    # A delayed callback must not put an older observation back
+                    # in front of a newer reservation for the same object.
+                    if self._freshness_key(payload) <= self._freshness_key(queued):
+                        return False, payload
                     replaced = self._items.pop(index)
                     self._items.append(payload)
                     self._condition.notify()
@@ -44,6 +67,20 @@ class LatestPriorityRequestQueue:
             self._items[weakest_index] = payload
             self._condition.notify()
             return True, weakest
+
+    def drop_expired(self, now: float | None = None) -> list[dict]:
+        """Remove queued items whose absolute deadline has already elapsed."""
+
+        current_time = time.monotonic() if now is None else float(now)
+        with self._condition:
+            expired = [item for item in self._items if self._is_expired(item, current_time)]
+            if not expired:
+                return []
+            self._items = [
+                item for item in self._items if not self._is_expired(item, current_time)
+            ]
+            self._condition.notify_all()
+            return expired
 
     def discard(self, object_id: str, request_sequence: int | None = None) -> list[dict]:
         object_id = str(object_id or "")

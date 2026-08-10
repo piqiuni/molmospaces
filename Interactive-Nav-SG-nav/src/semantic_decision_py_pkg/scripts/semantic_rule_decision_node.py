@@ -51,6 +51,7 @@ from semantic_decision_py_pkg.post_interaction_traversal import (
     inject_pending_traversal,
     is_terminal_post_interaction_traversal_failure,
     pending_priority_candidate,
+    post_interaction_traversal_event_key,
     portal_center_xy,
     reproject_post_interaction_traversal_candidate,
 )
@@ -449,6 +450,7 @@ class SemanticRuleDecisionNode:
         self.active_interaction_candidate: dict = {}
         self.pending_post_interaction_traversal: dict = {}
         self.terminal_post_interaction_traversal_ids: set[str] = set()
+        self.completed_post_interaction_traversal_event_keys: set[str] = set()
         self.minimum_candidate_sequence = 0
         self.next_decision_time = 0.0
         self.goal_complete = False
@@ -551,6 +553,7 @@ class SemanticRuleDecisionNode:
                 self.pending_post_interaction_traversal = {}
                 self.post_interaction_refresh_gate.clear()
                 self.terminal_post_interaction_traversal_ids.clear()
+                self.completed_post_interaction_traversal_event_keys.clear()
                 self.minimum_candidate_sequence = 0
                 self.next_decision_time = 0.0
                 self.goal_complete = False
@@ -656,6 +659,24 @@ class SemanticRuleDecisionNode:
                 self.active_interaction_candidate
             )
         detail = dict(payload.get("detail") or {})
+        # The executor has a finite set of preserved approach poses. Once that
+        # set is exhausted, the outcome is a terminal *candidate-local*
+        # reachability fact even though no force reached the object. Keep it
+        # distinct from an ordinary bridge pose rejection, which still permits
+        # another approach pose inside the executor.
+        approach_options_exhausted = bool(
+            self.active_behavior_type == "INTERACT"
+            and str(
+                detail.get("failure_reason") or detail.get("reason") or ""
+            ).strip().casefold()
+            == "interaction_approach_options_exhausted"
+        )
+        if approach_options_exhausted:
+            detail.setdefault(
+                "failure_stage",
+                InteractionApproachFailureLimitTracker.APPROACH_EXHAUSTED_STAGE,
+            )
+            payload = {**payload, "detail": detail}
         approach_precondition_failed = bool(
             status != "SUCCEEDED"
             and self.active_behavior_type == "INTERACT"
@@ -669,7 +690,11 @@ class SemanticRuleDecisionNode:
         if (
             self.active_behavior_type == "INTERACT"
             and not preempted_by_target
-            and (status == "SUCCEEDED" or not approach_precondition_failed)
+            and (
+                status == "SUCCEEDED"
+                or not approach_precondition_failed
+                or approach_options_exhausted
+            )
         ):
             terminal_interaction_failure = (
                 self.interaction_failure_tracker.note_feedback(
@@ -709,7 +734,11 @@ class SemanticRuleDecisionNode:
                     failure_count,
                 )
             self.cooldown_until[candidate_id] = time.monotonic() + cooldown_s
-        elif candidate_id and approach_precondition_failed:
+        elif (
+            candidate_id
+            and approach_precondition_failed
+            and not approach_options_exhausted
+        ):
             fingerprint = self._candidate_fingerprint_for_id(candidate_id)
             if fingerprint:
                 self.approach_exhausted_fingerprints.add(fingerprint)
@@ -743,6 +772,9 @@ class SemanticRuleDecisionNode:
         elif status != "SUCCEEDED" and not preempted_by_target:
             self.next_decision_time = time.monotonic() + self.failure_retry_delay_s
         active_behavior_type = self.active_behavior_type
+        active_traversal_metadata = self._post_interaction_traversal_metadata(
+            candidate_id
+        )
         pending_traversal_id = str(
             self.pending_post_interaction_traversal.get("candidate_id") or ""
         )
@@ -767,6 +799,15 @@ class SemanticRuleDecisionNode:
             # post-open path; remove it only once the crossing actually
             # completes, rather than as soon as it is selected.
             self.pending_post_interaction_traversal = {}
+        if status == "SUCCEEDED" and active_behavior_type == "NAVIGATE":
+            traversal_key = post_interaction_traversal_event_key(
+                candidate_id,
+                active_traversal_metadata,
+            )
+            if traversal_key:
+                self.completed_post_interaction_traversal_event_keys.add(
+                    traversal_key
+                )
         target_interaction_succeeded = (
             status == "SUCCEEDED"
             and active_behavior_type == "INTERACT"
@@ -826,36 +867,43 @@ class SemanticRuleDecisionNode:
             )
             if post_interaction_traversal is not None:
                 pending_payload = post_interaction_traversal.to_dict()
-                pending_payload.setdefault("metadata", {})["source_episode_id"] = str(
-                    self.latest_candidates_payload.get("episode_id") or ""
+                traversal_key = post_interaction_traversal_event_key(
+                    str(pending_payload.get("candidate_id") or ""),
+                    pending_payload.get("metadata") or {},
                 )
-                self.pending_post_interaction_traversal = pending_payload
-                refresh_status = self.post_interaction_refresh_gate.begin(
-                    self.latest_candidates_payload,
-                    portal_id=str(post_interaction_traversal.target_id or ""),
-                    now=time.monotonic(),
-                )
-                pending_payload.setdefault("metadata", {}).update(
-                    {
-                        "post_interaction_refresh_enabled": bool(
-                            refresh_status.active
-                        ),
-                        "post_interaction_refresh_baseline_sequence": (
-                            refresh_status.baseline_sequence
-                        ),
-                        "post_interaction_refresh_baseline_graph_revision": (
-                            refresh_status.baseline_graph_revision
-                        ),
-                        "post_interaction_refresh_baseline_observation_step": (
-                            refresh_status.baseline_observation_step
-                        ),
-                    }
-                )
-                self._publish_post_interaction_refresh_trace(
-                    "started", refresh_status
-                )
-                self.minimum_candidate_sequence = 0
-                self.next_decision_time = 0.0
+                if traversal_key in self.completed_post_interaction_traversal_event_keys:
+                    post_interaction_traversal = None
+                else:
+                    pending_payload.setdefault("metadata", {})["source_episode_id"] = str(
+                        self.latest_candidates_payload.get("episode_id") or ""
+                    )
+                    self.pending_post_interaction_traversal = pending_payload
+                    refresh_status = self.post_interaction_refresh_gate.begin(
+                        self.latest_candidates_payload,
+                        portal_id=str(post_interaction_traversal.target_id or ""),
+                        now=time.monotonic(),
+                    )
+                    pending_payload.setdefault("metadata", {}).update(
+                        {
+                            "post_interaction_refresh_enabled": bool(
+                                refresh_status.active
+                            ),
+                            "post_interaction_refresh_baseline_sequence": (
+                                refresh_status.baseline_sequence
+                            ),
+                            "post_interaction_refresh_baseline_graph_revision": (
+                                refresh_status.baseline_graph_revision
+                            ),
+                            "post_interaction_refresh_baseline_observation_step": (
+                                refresh_status.baseline_observation_step
+                            ),
+                        }
+                    )
+                    self._publish_post_interaction_refresh_trace(
+                        "started", refresh_status
+                    )
+                    self.minimum_candidate_sequence = 0
+                    self.next_decision_time = 0.0
         if status == "SUCCEEDED" and post_interaction_traversal is None:
             self.minimum_candidate_sequence = max(
                 self.minimum_candidate_sequence,
@@ -880,6 +928,23 @@ class SemanticRuleDecisionNode:
             except TypeError:
                 return ""
         return ""
+
+    def _post_interaction_traversal_metadata(self, candidate_id: str) -> dict:
+        """Find traversal metadata from either the live snapshot or cache."""
+
+        if str(
+            self.pending_post_interaction_traversal.get("candidate_id") or ""
+        ) == candidate_id:
+            return dict(
+                self.pending_post_interaction_traversal.get("metadata") or {}
+            )
+        for candidate in self.latest_candidates_payload.get("candidates") or []:
+            if str(candidate.get("candidate_id") or "") != candidate_id:
+                continue
+            metadata = dict(candidate.get("metadata") or {})
+            if metadata.get("post_interaction_traversal"):
+                return metadata
+        return {}
 
     def _publish_inactive_selection(self, feedback: dict) -> None:
         """Clear the latched active selection without deleting terminal history."""
@@ -1269,6 +1334,16 @@ class SemanticRuleDecisionNode:
             if self.model_policy.config.selection_granularity.casefold() == "room"
             else list(curation.candidates)
         )
+        # Curation is an M2 context/ranking aid, not a declaration that the
+        # raw map frontier vanished. If all otherwise eligible candidates are
+        # filtered from the compact model view, use the deterministic policy
+        # over the eligible pool rather than silently emitting no subgoal (or
+        # falsely allowing completion from stale producer counters).
+        curation_empty_with_eligible = bool(
+            self.policy_backend == "model"
+            and not model_candidates
+            and bool(eligible)
+        )
         room_frontier_lengths = aggregate_room_frontier_lengths(
             eligible,
             candidate_snapshot.get("graph_context") or {},
@@ -1305,6 +1380,7 @@ class SemanticRuleDecisionNode:
             if priority_post_interaction_traversal is not None
             else ""
         )
+        curation_empty_fallback_used = False
         if (
             self.policy_backend == "model"
             and not model_circuit_open
@@ -1407,14 +1483,22 @@ class SemanticRuleDecisionNode:
             and priority_post_interaction_traversal is None
         ):
             fallback_pool = (
-                model_candidates if self.policy_backend == "model" else eligible
+                eligible
+                if curation_empty_with_eligible
+                else model_candidates
+                if self.policy_backend == "model"
+                else eligible
             )
             selected = self.policy.select(fallback_pool)
             if self.policy_backend == "model" and selected is not None:
-                selection_override_reason = (
-                    "curated_rule_fallback:"
-                    f"{self.model_policy.last_result_source or 'model_unavailable'}"
-                )
+                if curation_empty_with_eligible:
+                    curation_empty_fallback_used = True
+                    selection_override_reason = "uncurated_rule_fallback:curation_empty"
+                else:
+                    selection_override_reason = (
+                        "curated_rule_fallback:"
+                        f"{self.model_policy.last_result_source or 'model_unavailable'}"
+                    )
             selected, repeat_reason = self._apply_repeat_guard(
                 selected,
                 fallback_pool,
@@ -1607,6 +1691,8 @@ class SemanticRuleDecisionNode:
             "candidate_groups": list(self.model_policy.last_candidate_groups),
             "model_candidate_options": list(self.model_policy.last_candidate_groups),
             "candidate_curation": curation.trace(),
+            "curation_empty_with_eligible": curation_empty_with_eligible,
+            "curation_empty_fallback_used": curation_empty_fallback_used,
             "entered_room_ids": list(curation.entered_room_ids),
             "eligibility_rejections": eligibility_rejections,
             "terminal_interaction_completion_excluded_candidate_ids": (
@@ -1823,6 +1909,9 @@ class SemanticRuleDecisionNode:
             terminal_post_interaction_traversal_ids = set(
                 self.terminal_post_interaction_traversal_ids
             )
+            completed_post_interaction_traversal_event_keys = set(
+                self.completed_post_interaction_traversal_event_keys
+            )
         candidates = []
         rejected: dict[str, str] = {}
         for payload in candidate_snapshot.get("candidates") or []:
@@ -1840,6 +1929,18 @@ class SemanticRuleDecisionNode:
                 rejected[candidate_id] = "candidate_cooldown"
                 continue
             metadata = payload.get("metadata") or {}
+            traversal_event_key = post_interaction_traversal_event_key(
+                candidate_id,
+                metadata,
+            )
+            if (
+                traversal_event_key
+                and traversal_event_key
+                in completed_post_interaction_traversal_event_keys
+                and bool(metadata.get("post_interaction_traversal"))
+            ):
+                rejected[candidate_id] = "post_interaction_traversal_completed"
+                continue
             if (
                 candidate_id in terminal_post_interaction_traversal_ids
                 and bool(metadata.get("post_interaction_traversal"))

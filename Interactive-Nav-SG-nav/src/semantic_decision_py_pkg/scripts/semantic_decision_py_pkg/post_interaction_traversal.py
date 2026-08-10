@@ -1023,6 +1023,30 @@ def pending_priority_candidate(
     )
 
 
+def post_interaction_traversal_event_key(
+    candidate_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Return a portal/open-event tombstone key independent of transient IDs.
+
+    Candidate generators can republish the same opened portal after a map
+    revision with a different candidate wrapper.  Completion must therefore
+    tombstone the physical ``portal + open event`` rather than only one exact
+    candidate ID.
+    """
+
+    metadata = dict(metadata or {})
+    portal_id = str(metadata.get("opened_portal_id") or "")
+    event_id = str(metadata.get("source_interaction_event_id") or "")
+    parts = str(candidate_id or "").split(":", 2)
+    if len(parts) == 3 and parts[0] == "traverse":
+        portal_id = portal_id or parts[1]
+        event_id = event_id or parts[2]
+    if not portal_id or not event_id:
+        return ""
+    return f"{portal_id}|{event_id}"
+
+
 def is_terminal_post_interaction_traversal_failure(
     candidate_id: str,
     behavior_type: str,

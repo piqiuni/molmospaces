@@ -693,6 +693,208 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     assert len(lock_calls) >= 12
 
 
+def test_drawer_scan_reasserts_open_force_at_capture_after_passive_recoil(monkeypatch) -> None:
+    """A compliant drawer must still be open when its post-step RGB is sampled."""
+
+    state = {"drawer": 0.0}
+    joints = [{"joint_name": "drawer", "joint_type": "slide", "joint_id": 0}]
+
+    def prepare(_env, _root, open_joint_names=None, close_joint_names=None):
+        targets = {name: 1.0 for name in open_joint_names or []}
+        targets.update({name: 0.0 for name in close_joint_names or []})
+        return {
+            "group": {"joints": []},
+            "targets": targets,
+            "pre_joint_infos": [
+                {"joint_name": name, "joint_value": state[name]}
+                for name in targets
+            ],
+        }
+
+    def advance(_env, plan, **_kwargs):
+        state.update(plan["targets"])
+        return {"physics_substeps": 1, "fallback": False}
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_state_force",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.advance_articulation_force",
+        advance,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.articulation_joint_infos",
+        lambda _env, _root: [
+            {"joint_name": name, "open_fraction": value, "joint_value": value}
+            for name, value in state.items()
+        ],
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.collect_articulation_groups",
+        lambda _env: {"dresser_root": {"joints": joints}},
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge._capture_robot_lock",
+        lambda _env: {"locked": True},
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge._apply_robot_lock",
+        lambda *_args: None,
+    )
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        drawer_execution_mode="fast",
+        drawer_observation_steps=2,
+    )
+    controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    controller._publish = lambda *_args, **_kwargs: None
+    assert controller.enqueue_command(
+        {
+            "command_id": "drawer_scan_recoil",
+            "object_id": "dresser_root",
+            "action": "scan",
+            "sequence_type": "drawer_scan",
+            "open_regions": [{"center": [0.5, 0.5]}],
+        }
+    )
+    task = SimpleNamespace(
+        env=SimpleNamespace(
+            current_model=SimpleNamespace(jnt_bodyid=[0]),
+            current_data=SimpleNamespace(xpos=[[0.0, 0.0, 0.5]]),
+        )
+    )
+    result = None
+    for step in range(8):
+        controller.before_step(task, step=step)
+        if (
+            controller._pending is not None
+            and controller._pending.get("phase") == "observe"
+        ):
+            # Simulate a passive spring-back during the task physics step.
+            state["drawer"] = 0.0
+        result = controller.after_step(task, step=step)
+        if result is not None:
+            break
+
+    assert result is not None
+    assert result["success"] is True
+    assert result["region_results"][0]["success"] is True
+    assert result["region_results"][0]["observed_open_fractions"] == {"drawer": 1.0}
+    assert any(
+        item["phase"] == "observe_capture_hold"
+        for item in result["transition_log"]
+    )
+
+
+def test_drawer_open_fast_mode_leaves_visual_drawers_open(monkeypatch) -> None:
+    """The exploration contract is distinct from V3's scan-and-close macro."""
+
+    state = {"drawer_top": 0.0, "drawer_bottom": 0.0}
+    prepared_targets = []
+    joints = [
+        {"joint_name": "drawer_top", "joint_type": "slide", "joint_id": 0},
+        {"joint_name": "drawer_bottom", "joint_type": "slide", "joint_id": 1},
+    ]
+
+    def prepare(_env, _root, open_joint_names=None, close_joint_names=None):
+        prepared_targets.append(
+            (tuple(open_joint_names or []), tuple(close_joint_names or []))
+        )
+        targets = {name: 1.0 for name in open_joint_names or []}
+        targets.update({name: 0.0 for name in close_joint_names or []})
+        return {
+            "group": {"joints": []},
+            "targets": targets,
+            "pre_joint_infos": [
+                {"joint_name": name, "joint_value": state[name]}
+                for name in targets
+            ],
+        }
+
+    def advance(_env, plan, **_kwargs):
+        state.update(plan["targets"])
+        return {"physics_substeps": 1, "fallback": False}
+
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.prepare_articulation_state_force",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.advance_articulation_force",
+        advance,
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.articulation_joint_infos",
+        lambda _env, _root: [
+            {"joint_name": name, "open_fraction": value, "joint_value": value}
+            for name, value in state.items()
+        ],
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.collect_articulation_groups",
+        lambda _env: {"dresser_root": {"joints": joints}},
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge._capture_robot_lock",
+        lambda _env: {"locked": True},
+    )
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge._apply_robot_lock",
+        lambda *_args: None,
+    )
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        drawer_execution_mode="fast",
+        drawer_observation_steps=1,
+    )
+    controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    controller._publish = lambda *_args, **_kwargs: None
+    assert controller.enqueue_command(
+        {
+            "command_id": "drawer_open_fast",
+            "object_id": "dresser_root",
+            "action": "open",
+            "interaction_mode": "drawer_open",
+            "sequence_type": "drawer_open",
+            "open_regions": [
+                {"center": [0.5, 0.2]},
+                {"center": [0.5, 0.8]},
+            ],
+        }
+    )
+    task = SimpleNamespace(
+        env=SimpleNamespace(
+            current_model=SimpleNamespace(jnt_bodyid=[0, 1]),
+            current_data=SimpleNamespace(
+                xpos=[[0.0, 0.0, 1.0], [0.0, 0.0, 0.2]]
+            ),
+        )
+    )
+    result = None
+    for step in range(8):
+        controller.before_step(task, step=step)
+        result = controller.after_step(task, step=step)
+        if result is not None:
+            break
+
+    assert result is not None
+    assert result["success"] is True
+    assert result["state"] == "open"
+    assert result["post_state"] == "open"
+    assert result["action"] == "open"
+    assert result["sequence_type"] == "drawer_open"
+    assert result["final_open_success"] is True
+    assert result["final_close_success"] is None
+    assert state == {"drawer_top": 1.0, "drawer_bottom": 1.0}
+    assert prepared_targets == [
+        (("drawer_top",), ()),
+        (("drawer_bottom",), ()),
+    ]
+
+
 def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -> None:
     state = {"drawer_top": 0.0, "drawer_bottom": 0.0}
     joints = [

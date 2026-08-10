@@ -30,6 +30,7 @@ class SemanticCandidateNode:
         ablation_config = rospy.get_param("~ablation", {}) or {}
         configured_backend = str(policy_config.get("backend", "rule")).casefold()
         module2 = str(ablation_config.get("module2", "")).casefold()
+        module1 = str(ablation_config.get("module1", "")).casefold()
         effective_policy_backend = (
             "model"
             if module2 == "mllm_score"
@@ -44,6 +45,18 @@ class SemanticCandidateNode:
             # state) resolves an unknown portal by attempting interaction.
             # Full MLLM runs keep their visual-evidence gate by default.
             unknown_portal_default = effective_policy_backend != "model"
+        drawer_pre_action_mllm = config.get("drawer_pre_action_mllm")
+        if drawer_pre_action_mllm is None:
+            # Only the MLLM lane owns an image-derived drawer-front contract.
+            # Rule baselines retain their existing explicit configuration rather
+            # than silently depending on a disabled M1 worker.
+            drawer_pre_action_mllm = module1 == "dynamic_mllm"
+        container_pre_action_mllm = config.get("container_pre_action_mllm")
+        if container_pre_action_mllm is None:
+            # A model-run container needs a causally later visual front check
+            # at the arrived ring pose.  Rule baselines keep their explicit
+            # geometry/oracle configuration and do not depend on M1.
+            container_pre_action_mllm = module1 == "dynamic_mllm"
         scan_config = rospy.get_param("~startup_scan", {}) or {}
         self.startup_scan_enabled = bool(scan_config.get("enabled", False))
         self.startup_scan_angle_rad = float(scan_config.get("angle_rad", 2.0 * 3.141592653589793))
@@ -92,6 +105,24 @@ class SemanticCandidateNode:
                     config.get("portal_traversal_completion_margin_m", 0.35)
                 ),
                 container_standoff_m=float(config.get("container_standoff_m", 1.0)),
+                drawer_pre_action_mllm=bool(drawer_pre_action_mllm),
+                drawer_pre_action_observation_max_attempts=max(
+                    1,
+                    int(
+                        config.get(
+                            "drawer_pre_action_observation_max_attempts", 2
+                        )
+                    ),
+                ),
+                container_pre_action_mllm=bool(container_pre_action_mllm),
+                container_pre_action_observation_max_attempts=max(
+                    1,
+                    int(
+                        config.get(
+                            "container_pre_action_observation_max_attempts", 4
+                        )
+                    ),
+                ),
                 drawer_standoff_m=(
                     float(config["drawer_standoff_m"])
                     if config.get("drawer_standoff_m") is not None

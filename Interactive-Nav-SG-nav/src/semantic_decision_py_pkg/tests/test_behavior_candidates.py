@@ -1672,6 +1672,36 @@ def test_container_oracle_pose_is_ignored_without_fresh_mllm_front_view() -> Non
     assert candidate.goal_xyyaw != [8.25, 1.05, math.pi]
 
 
+def test_oblique_mllm_container_view_uses_reobservation_ring_not_contact_axis() -> None:
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "attributes": {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "view_state": "oblique",
+            "front_surface_visible": True,
+            "approach_ready": True,
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("container",))
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+    assert candidate.metadata["approach_strategy"] == "container_multiview_reobserve"
+    assert candidate.metadata["interaction_approach_axis_xy"] == []
+
+
 def test_container_without_front_axis_keeps_bounded_reobservation_ring() -> None:
     node = {
         "id": "container_fridge",
@@ -1714,6 +1744,36 @@ def test_container_without_front_axis_keeps_bounded_reobservation_ring() -> None
             0.0,
             abs_tol=1e-6,
         )
+
+
+def test_mllm_container_requires_fresh_front_observation_before_opening() -> None:
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_pre_action_mllm=True,
+            container_pre_action_observation_max_attempts=4,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    assert candidate.metadata["container_pre_action_observation"] is True
+    assert candidate.metadata["observation_required"] is True
+    assert candidate.metadata["interaction_observation_max_attempts"] == 4
+    assert candidate.metadata["observation_reason"] == "mllm_container_pre_action_visual"
 
 
 def test_target_current_visibility_can_be_required() -> None:

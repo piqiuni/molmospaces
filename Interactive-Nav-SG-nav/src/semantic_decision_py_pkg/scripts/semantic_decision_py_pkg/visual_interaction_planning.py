@@ -59,13 +59,31 @@ def candidate_with_visual_operation_plan(candidate: dict, plan: dict) -> dict:
     # box field.
     interaction.pop("drawer_container_bbox_2d", None)
     if str(plan.get("target_type") or "") == "drawer_container":
-        interaction.update(
-            {
-                "action": "scan",
-                "interaction_mode": "drawer_scan",
-                "sequence_type": "drawer_scan",
-            }
-        )
+        # ``drawer_scan`` is the evaluator/V3 macro: each visible drawer is
+        # opened for an observation and then closed again.  Normal semantic
+        # exploration needs a different postcondition: the selected drawer(s)
+        # stay open so the graph can expose newly visible contents.  Keep the
+        # distinction explicit in the public command instead of inferring it
+        # from the action after the command reaches the bridge.
+        sequence_type = str(
+            plan.get("drawer_sequence_type") or plan.get("sequence_type") or "drawer_scan"
+        ).strip().casefold()
+        if sequence_type == "drawer_open":
+            interaction.update(
+                {
+                    "action": "open",
+                    "interaction_mode": "drawer_open",
+                    "sequence_type": "drawer_open",
+                }
+            )
+        else:
+            interaction.update(
+                {
+                    "action": "scan",
+                    "interaction_mode": "drawer_scan",
+                    "sequence_type": "drawer_scan",
+                }
+            )
     else:
         interaction["action"] = str(
             plan.get("action") or interaction.get("action") or "open"
@@ -170,6 +188,167 @@ def candidate_with_direct_drawer_scan(
     interaction = dict(planned.get("interaction_command") or {})
     interaction["drawer_container_bbox_2d"] = box
     interaction["drawer_container_capture_step"] = public_capture_step
+    planned["interaction_command"] = interaction
+    return planned
+
+
+def _normalized_visible_drawer_regions(value: object) -> list[dict]:
+    """Normalize public M1 crop-relative regions without inventing drawers."""
+
+    if not isinstance(value, list):
+        return []
+    regions: list[dict] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        center = raw.get("center")
+        if not isinstance(center, (list, tuple)) or len(center) < 2:
+            continue
+        try:
+            x, y = float(center[0]), float(center[1])
+            confidence = float(raw.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(confidence)):
+            continue
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            continue
+        normalized = {
+            "center": [round(x, 4), round(y, 4)],
+            "confidence": max(0.0, min(1.0, confidence)),
+        }
+        if any(
+            (normalized["center"][0] - item["center"][0]) ** 2
+            + (normalized["center"][1] - item["center"][1]) ** 2
+            < 0.0016
+            for item in regions
+        ):
+            continue
+        regions.append(normalized)
+        if len(regions) >= 8:
+            break
+    return sorted(regions, key=lambda item: (item["center"][1], item["center"][0]))
+
+
+def candidate_with_visual_drawer_scan(
+    candidate: dict,
+    *,
+    drawer_bbox_2d: object,
+    capture_step: object,
+    action_regions: object,
+    visual_plan: dict | None = None,
+) -> dict | None:
+    """Build a sealed drawer scan only from one fresh, front M1 observation.
+
+    ``drawer_bbox_2d`` and ``capture_step`` are public detector evidence paired
+    with the M1 image.  ``action_regions`` are crop-relative points the model
+    actually saw.  Returning ``None`` on any missing part is intentional: no
+    caller may turn a side/occluded/empty visual observation into a bridge call.
+    """
+
+    if not isinstance(drawer_bbox_2d, (list, tuple)) or len(drawer_bbox_2d) < 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(value) for value in drawer_bbox_2d[:4])
+        public_capture_step = int(capture_step)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (x0, y0, x1, y1)):
+        return None
+    left, right = sorted((x0, x1))
+    top, bottom = sorted((y0, y1))
+    if public_capture_step < 0 or right - left < 1.0 or bottom - top < 1.0:
+        return None
+    regions = _normalized_visible_drawer_regions(action_regions)
+    if not regions:
+        return None
+    plan = {
+        "target_type": "drawer_container",
+        "action": "scan",
+        "operation_method": "pull",
+        "drawer_sequence_type": "drawer_scan",
+        "open_regions": regions,
+        "coordinate_frame": "normalized_target_crop",
+        **dict(visual_plan or {}),
+    }
+    # The action contract cannot be overridden by a partial M1 patch.
+    plan.update(
+        {
+            "target_type": "drawer_container",
+            "action": "scan",
+            "operation_method": "pull",
+            "drawer_sequence_type": "drawer_scan",
+            "open_regions": regions,
+            "coordinate_frame": "normalized_target_crop",
+        }
+    )
+    planned = candidate_with_visual_operation_plan(candidate, plan)
+    interaction = dict(planned.get("interaction_command") or {})
+    interaction["drawer_container_bbox_2d"] = [left, top, right, bottom]
+    interaction["drawer_container_capture_step"] = public_capture_step
+    interaction["visual_operation_plan"] = plan
+    planned["interaction_command"] = interaction
+    return planned
+
+
+def candidate_with_visual_drawer_open(
+    candidate: dict,
+    *,
+    drawer_bbox_2d: object,
+    capture_step: object,
+    action_regions: object,
+    visual_plan: dict | None = None,
+) -> dict | None:
+    """Build a normal-exploration drawer-open command from fresh M1 evidence.
+
+    This is intentionally separate from :func:`candidate_with_visual_drawer_scan`.
+    The latter is a sealed benchmark macro whose observable contract is
+    open/observe/close.  The normal interactive-exploration contract instead
+    leaves the grounded drawer fronts open after the action, allowing a later
+    RGB/graph update to reveal container contents.
+    """
+
+    if not isinstance(drawer_bbox_2d, (list, tuple)) or len(drawer_bbox_2d) < 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(value) for value in drawer_bbox_2d[:4])
+        public_capture_step = int(capture_step)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (x0, y0, x1, y1)):
+        return None
+    left, right = sorted((x0, x1))
+    top, bottom = sorted((y0, y1))
+    if public_capture_step < 0 or right - left < 1.0 or bottom - top < 1.0:
+        return None
+    regions = _normalized_visible_drawer_regions(action_regions)
+    if not regions:
+        return None
+    plan = {
+        "target_type": "drawer_container",
+        "action": "open",
+        "operation_method": "pull",
+        "drawer_sequence_type": "drawer_open",
+        "open_regions": regions,
+        "coordinate_frame": "normalized_target_crop",
+        **dict(visual_plan or {}),
+    }
+    # The public contract cannot be overridden by a partial M1 response.
+    plan.update(
+        {
+            "target_type": "drawer_container",
+            "action": "open",
+            "operation_method": "pull",
+            "drawer_sequence_type": "drawer_open",
+            "open_regions": regions,
+            "coordinate_frame": "normalized_target_crop",
+        }
+    )
+    planned = candidate_with_visual_operation_plan(candidate, plan)
+    interaction = dict(planned.get("interaction_command") or {})
+    interaction["drawer_container_bbox_2d"] = [left, top, right, bottom]
+    interaction["drawer_container_capture_step"] = public_capture_step
+    interaction["visual_operation_plan"] = plan
     planned["interaction_command"] = interaction
     return planned
 

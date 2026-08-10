@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -17,6 +18,125 @@ from semantic_mllm_py_pkg.schemas import (
     validate_visual_interaction_plan,
     validate_visual_verification,
 )
+
+
+def _patch_openai_stream(monkeypatch, raw_response: str, captured: dict | None = None):
+    captured = {} if captured is None else captured
+
+    def fake_stream(self, endpoint, body_payload, headers, *, timeout_s):
+        captured["endpoint"] = endpoint
+        captured["payload"] = dict(body_payload)
+        captured["headers"] = dict(headers)
+        captured["timeout"] = timeout_s
+        return json.loads(raw_response), raw_response
+
+    monkeypatch.setattr(MLLMClient, "_request_openai_chat_stream", fake_stream)
+    return captured
+
+
+def test_openai_chat_stream_timeout_closes_response(monkeypatch) -> None:
+    events = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"{"}}]}'
+            await asyncio.sleep(10.0)
+
+        async def aclose(self):
+            events["response_closed"] = True
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            events["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            events["client_closed"] = True
+
+        def build_request(self, method, endpoint, **kwargs):
+            events["request"] = {"method": method, "endpoint": endpoint, **kwargs}
+            return object()
+
+        async def send(self, _request, stream=False):
+            events["stream"] = stream
+            return FakeResponse()
+
+    monkeypatch.setattr(client_module.httpx, "AsyncClient", FakeAsyncClient)
+    response = MLLMClient(
+        MLLMClientConfig(
+            mode="http",
+            endpoint="http://127.0.0.1:8317/v1",
+            timeout_s=0.05,
+        )
+    ).request_json(role="subgoal_selection", instruction="select", context={})
+
+    assert response.payload is None
+    assert response.error == "timed out"
+    assert events["stream"] is True
+    assert events["request"]["json"]["stream"] is True
+    assert events["request"]["headers"]["Accept"] == "text/event-stream"
+    assert events["response_closed"] is True
+    assert events["client_closed"] is True
+
+
+def test_openai_chat_stream_assembles_content_and_usage(monkeypatch) -> None:
+    events = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"role":"assistant"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"{\\"candidate_id\\":"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"\\"candidate_1\\"}"}}]}'
+            yield (
+                'data: {"choices":[],"usage":{"prompt_tokens":3,'
+                '"completion_tokens":5,"total_tokens":8}}'
+            )
+            yield "data: [DONE]"
+            await asyncio.sleep(10.0)
+
+        async def aclose(self):
+            events["response_closed"] = True
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            events["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            events["client_closed"] = True
+
+        def build_request(self, method, endpoint, **kwargs):
+            events["request"] = {"method": method, "endpoint": endpoint, **kwargs}
+            return object()
+
+        async def send(self, _request, stream=False):
+            events["stream"] = stream
+            return FakeResponse()
+
+    monkeypatch.setattr(client_module.httpx, "AsyncClient", FakeAsyncClient)
+    response = MLLMClient(
+        MLLMClientConfig(
+            mode="http",
+            endpoint="http://127.0.0.1:8317/v1",
+            timeout_s=1.0,
+        )
+    ).request_json(role="subgoal_selection", instruction="select", context={})
+
+    assert response.payload == {"candidate_id": "candidate_1"}
+    assert response.prompt_tokens == 3
+    assert response.completion_tokens == 5
+    assert response.total_tokens == 8
+    assert events["stream"] is True
+    assert events["response_closed"] is True
+    assert events["client_closed"] is True
 
 
 def test_ablation_modes_are_independent() -> None:
@@ -178,6 +298,7 @@ def test_attribute_patch_response_schema_binds_target_and_bounds_portal_evidence
         "approach_ready",
         "needs_reobserve",
         "interaction_parts",
+        "action_regions",
         "confidence",
     }
     with pytest.raises(ValueError, match="object_id"):
@@ -394,21 +515,7 @@ def test_visual_verification_schema_is_sent_as_openai_json_schema(monkeypatch) -
         }
     )
 
-    class FakeResponse:
-        def read(self):
-            return raw_response.encode("utf-8")
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-    def fake_urlopen(request_object, timeout):
-        captured["payload"] = json.loads(request_object.data.decode("utf-8"))
-        return FakeResponse()
-
-    monkeypatch.setattr(client_module.request, "urlopen", fake_urlopen)
+    _patch_openai_stream(monkeypatch, raw_response, captured)
     schema = build_visual_verification_response_schema()
     response = MLLMClient(
         MLLMClientConfig(
@@ -425,6 +532,8 @@ def test_visual_verification_schema_is_sent_as_openai_json_schema(monkeypatch) -
     )
 
     assert captured["payload"]["max_tokens"] == 256
+    assert captured["payload"]["stream"] is True
+    assert captured["payload"]["stream_options"] == {"include_usage": True}
     assert captured["payload"]["response_format"] == {
         "type": "json_schema",
         "json_schema": schema,
@@ -502,17 +611,7 @@ def test_invalid_http_json_keeps_raw_text_and_usage(monkeypatch) -> None:
         }
     )
 
-    class FakeResponse:
-        def read(self):
-            return raw_response.encode("utf-8")
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-    monkeypatch.setattr(client_module.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    _patch_openai_stream(monkeypatch, raw_response)
     response = MLLMClient(
         MLLMClientConfig(mode="http", endpoint="http://localhost:8317/v1")
     ).request_json(role="skill_planning", instruction="plan", context={})
@@ -530,22 +629,7 @@ def test_openai_chat_reasoning_off_uses_enable_thinking(monkeypatch) -> None:
         '"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}'
     )
 
-    class FakeResponse:
-        def read(self):
-            return raw_response.encode("utf-8")
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-    def fake_urlopen(request_object, timeout):
-        captured["payload"] = json.loads(request_object.data.decode("utf-8"))
-        captured["endpoint"] = request_object.full_url
-        return FakeResponse()
-
-    monkeypatch.setattr(client_module.request, "urlopen", fake_urlopen)
+    _patch_openai_stream(monkeypatch, raw_response, captured)
     client = MLLMClient(
         MLLMClientConfig(
             mode="http",
@@ -582,21 +666,7 @@ def test_openai_chat_uses_json_schema_when_supplied(monkeypatch) -> None:
         }
     )
 
-    class FakeResponse:
-        def read(self):
-            return raw_response.encode("utf-8")
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-    def fake_urlopen(request_object, timeout):
-        captured["payload"] = json.loads(request_object.data.decode("utf-8"))
-        return FakeResponse()
-
-    monkeypatch.setattr(client_module.request, "urlopen", fake_urlopen)
+    _patch_openai_stream(monkeypatch, raw_response, captured)
     schema = {
         "name": "subgoal_selection",
         "strict": True,

@@ -52,6 +52,7 @@ from explore_py_pkg.nav_client import TERMINAL_FAILURE, TERMINAL_SUCCESS, status
 from explore_py_pkg.skill_api import ExplorationSkillApi
 from explore_py_pkg.state import ExplorerState, ExplorerStateConfig, SUBGOAL_REACHED, SUBGOAL_WAITING
 from explore_py_pkg.value_maps import ValueMapFusion
+from semantic_decision_py_pkg.external_recovery import recovery_feedback_allows_retry
 
 
 class ExplorePyNode:
@@ -66,6 +67,31 @@ class ExplorePyNode:
         self.map_frame = self.frames.get("map_frame", "tf_frame_map")
         self.external_behavior_control = bool(
             exploration_cfg.get("external_behavior_control", False)
+        )
+        # In semantic-control mode the executor remains the sole velocity
+        # owner.  ExplorePy may only report a repeated planning failure over a
+        # narrow, command/decision keyed JSON seam.
+        self.external_recovery_request_enabled = bool(
+            exploration_cfg.get("external_recovery_request_enabled", True)
+        )
+        self.external_recovery_preflight_enabled = bool(
+            exploration_cfg.get("external_recovery_preflight_enabled", True)
+        )
+        self.external_recovery_plan_grace_sec = max(
+            0.0,
+            float(exploration_cfg.get("external_recovery_plan_grace_sec", 16.0)),
+        )
+        self.external_recovery_request_cooldown_sec = max(
+            0.0,
+            float(exploration_cfg.get("external_recovery_request_cooldown_sec", 2.0)),
+        )
+        self.external_recovery_request_retry_limit = max(
+            0,
+            int(exploration_cfg.get("external_recovery_request_retry_limit", 1)),
+        )
+        self.external_recovery_request_retry_delay_sec = max(
+            0.0,
+            float(exploration_cfg.get("external_recovery_request_retry_delay_sec", 0.5)),
         )
         self.tick_rate_hz = float(exploration_cfg.get("tick_rate_hz", 1.0))
         self.goal_republish_interval_sec = float(exploration_cfg.get("goal_republish_interval_sec", 2.0))
@@ -243,6 +269,21 @@ class ExplorePyNode:
             ),
             initial_local_radius_m=float(frontier_cfg.get("initial_local_radius_m", 2.2)),
             initial_backward_weight=float(frontier_cfg.get("initial_backward_weight", 0.35)),
+            los_enabled=bool(frontier_cfg.get("los_enabled", True)),
+            los_max_viewpoint_candidates=int(
+                frontier_cfg.get("los_max_viewpoint_candidates", 12)
+            ),
+            los_frontier_samples=int(frontier_cfg.get("los_frontier_samples", 12)),
+            los_unknown_samples=int(frontier_cfg.get("los_unknown_samples", 48)),
+            los_min_visible_frontier_samples=int(
+                frontier_cfg.get("los_min_visible_frontier_samples", 1)
+            ),
+            region_signature_max_cells=int(
+                frontier_cfg.get("region_signature_max_cells", 96)
+            ),
+            region_signature_quantization_m=float(
+                frontier_cfg.get("region_signature_quantization_m", 0.50)
+            ),
         )
         state_config = ExplorerStateConfig(
             goal_reach_tolerance_m=float(exploration_cfg.get("goal_reach_tolerance_m", 0.35)),
@@ -266,6 +307,22 @@ class ExplorePyNode:
             visit_viewpoint_once=bool(exploration_cfg.get("visit_viewpoint_once", False)),
             visited_viewpoint_radius_m=float(exploration_cfg.get("visited_viewpoint_radius_m", 0.50)),
             unreachable_frontier_radius_m=float(exploration_cfg.get("unreachable_frontier_radius_m", 1.0)),
+            frontier_region_match_distance_m=float(
+                frontier_cfg.get("frontier_region_match_distance_m", 3.0)
+            ),
+            frontier_region_overlap_threshold=float(
+                frontier_cfg.get("frontier_region_overlap_threshold", 0.20)
+            ),
+            frontier_region_reactivate_unknown_growth_ratio=float(
+                frontier_cfg.get(
+                    "frontier_region_reactivate_unknown_growth_ratio", 0.25
+                )
+            ),
+            frontier_region_reactivate_unknown_growth_m2=float(
+                frontier_cfg.get(
+                    "frontier_region_reactivate_unknown_growth_m2", 0.25
+                )
+            ),
         )
 
         self.core = FrontierExplorerCore(core_config)
@@ -289,6 +346,20 @@ class ExplorePyNode:
         self.external_reservation_last_cluster_id = ""
         self.external_reservation_last_status = ""
         self.external_reservation_last_detail = {}
+        self.external_recovery_request_sequence = 0
+        self.external_recovery_request_count = 0
+        self.external_recovery_plan_failure_count = 0
+        self.external_recovery_last_request_at = 0.0
+        self.external_recovery_last_command_id = ""
+        self.external_recovery_last_request_id = ""
+        self.external_recovery_last_detail = {}
+        self.external_recovery_requested_commands = set()
+        self.external_recovery_retry_counts_by_command = {}
+        self.external_recovery_retry_not_before_at = 0.0
+        self.external_recovery_feedback_received_count = 0
+        self.external_recovery_feedback_matched_count = 0
+        self.external_recovery_feedback_ignored_count = 0
+        self.external_recovery_last_feedback = {}
 
         self.goal_pub = rospy.Publisher(self.topics.get("goal", "/move_base_simple/goal"), PoseStamped, queue_size=1)
         self.cancel_pub = rospy.Publisher(self.topics.get("move_base_cancel", "/move_base/cancel"), GoalID, queue_size=1)
@@ -300,6 +371,13 @@ class ExplorePyNode:
             String,
             queue_size=4,
             latch=True,
+        )
+        self.external_recovery_pub = rospy.Publisher(
+            self.topics.get(
+                "recovery_request", "/semantic_decision/recovery_request"
+            ),
+            String,
+            queue_size=4,
         )
         self.frontier_pub = rospy.Publisher(self.topics.get("frontiers", "/explore_py/frontiers"), MarkerArray, queue_size=1)
         self.subgoal_pub = rospy.Publisher(
@@ -334,6 +412,14 @@ class ExplorePyNode:
             String,
             self.behavior_command_callback,
             queue_size=4,
+        )
+        rospy.Subscriber(
+            self.topics.get(
+                "recovery_feedback", "/semantic_decision/recovery_feedback"
+            ),
+            String,
+            self.external_recovery_feedback_callback,
+            queue_size=8,
         )
         if self.initial_spin_fresh_step_gate_enabled:
             rospy.Subscriber(
@@ -385,6 +471,20 @@ class ExplorePyNode:
         self.external_reservation_last_cluster_id = ""
         self.external_reservation_last_status = ""
         self.external_reservation_last_detail = {}
+        self.external_recovery_request_sequence = 0
+        self.external_recovery_request_count = 0
+        self.external_recovery_plan_failure_count = 0
+        self.external_recovery_last_request_at = 0.0
+        self.external_recovery_last_command_id = ""
+        self.external_recovery_last_request_id = ""
+        self.external_recovery_last_detail = {}
+        self.external_recovery_requested_commands.clear()
+        self.external_recovery_retry_counts_by_command.clear()
+        self.external_recovery_retry_not_before_at = 0.0
+        self.external_recovery_feedback_received_count = 0
+        self.external_recovery_feedback_matched_count = 0
+        self.external_recovery_feedback_ignored_count = 0
+        self.external_recovery_last_feedback = {}
         self.latest_global_plan_pose_count = 0
         self.latest_global_plan_length_m = 0.0
         self.latest_global_plan_time = 0.0
@@ -550,6 +650,37 @@ class ExplorePyNode:
         self.latest_local_plan_pose_count = len(msg.poses)
         self.latest_local_plan_length_m = self._path_length(msg)
         self.latest_local_plan_time = time.time()
+
+    def external_recovery_feedback_callback(self, message: String) -> None:
+        """Record executor ACK/progress only; recovery control stays external."""
+
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, json.JSONDecodeError):
+            return
+        self.external_recovery_feedback_received_count += 1
+        request_id = str(payload.get("request_id") or "")
+        if request_id and request_id == self.external_recovery_last_request_id:
+            self.external_recovery_feedback_matched_count += 1
+            self.external_recovery_last_feedback = dict(payload)
+            command_id = self.external_recovery_last_command_id
+            retry_count = int(self.external_recovery_retry_counts_by_command.get(command_id, 0))
+            if command_id and recovery_feedback_allows_retry(
+                payload,
+                retry_count=retry_count,
+                retry_limit=self.external_recovery_request_retry_limit,
+            ):
+                # The executor rejected only because it had not observed the
+                # same EXPLORE transition yet.  Let the regular tick resend a
+                # new idempotent request after a tiny bounded delay.
+                self.external_recovery_retry_counts_by_command[command_id] = retry_count + 1
+                self.external_recovery_requested_commands.discard(command_id)
+                self.external_recovery_retry_not_before_at = max(
+                    self.external_recovery_retry_not_before_at,
+                    time.time() + self.external_recovery_request_retry_delay_sec,
+                )
+            return
+        self.external_recovery_feedback_ignored_count += 1
 
     @staticmethod
     def _path_length(msg: NavPath) -> float:
@@ -760,6 +891,26 @@ class ExplorePyNode:
         """
         if self.external_reserved_command is None or self.state.active_goal is None:
             return
+        if (
+            not self.external_recovery_request_enabled
+            or not self.external_recovery_preflight_enabled
+        ):
+            return
+        command_id = str(self.external_reserved_command.get("command_id") or "")
+        if not command_id or command_id in self.external_recovery_requested_commands:
+            return
+        goal_age = time.time() - float(self.active_goal_publish_wall_time or 0.0)
+        if goal_age < self.external_recovery_plan_grace_sec:
+            return
+        # Do not consume or cancel the semantic executor's navigation here.
+        # A second failed preflight only asks its single owner to perform the
+        # existing, costmap-gated reverse/replan recovery.
+        if not self._preflight_cluster_plan(self.external_reserved_cluster):
+            self._publish_external_recovery_request(
+                self.external_reserved_command,
+                self.external_reserved_cluster,
+                reason="global_plan_missing_after_grace",
+            )
 
     def _fail_if_global_plan_not_current_goal(self):
         if not self.global_plan_current_goal_check_enabled or self.state.active_goal is None:
@@ -883,6 +1034,23 @@ class ExplorePyNode:
                 "last_status": self.external_reservation_last_status,
                 "last_detail": dict(self.external_reservation_last_detail),
             },
+            "external_recovery": {
+                "enabled": bool(
+                    self.external_behavior_control
+                    and self.external_recovery_request_enabled
+                ),
+                "preflight_enabled": self.external_recovery_preflight_enabled,
+                "plan_grace_sec": self.external_recovery_plan_grace_sec,
+                "request_count": self.external_recovery_request_count,
+                "plan_failure_count": self.external_recovery_plan_failure_count,
+                "last_command_id": self.external_recovery_last_command_id,
+                "last_request_id": self.external_recovery_last_request_id,
+                "last_detail": dict(self.external_recovery_last_detail),
+                "feedback_received_count": self.external_recovery_feedback_received_count,
+                "feedback_matched_count": self.external_recovery_feedback_matched_count,
+                "feedback_ignored_count": self.external_recovery_feedback_ignored_count,
+                "last_feedback": dict(self.external_recovery_last_feedback),
+            },
         }
         if self.state.active_goal is not None:
             payload["active_goal_distance"] = self._active_goal_distance()
@@ -985,6 +1153,16 @@ class ExplorePyNode:
         self.external_reserved_command = dict(command)
         self.last_selected_cluster = cluster
         self.active_goal_publish_wall_time = time.time()
+        if (
+            self.external_recovery_request_enabled
+            and self.external_recovery_preflight_enabled
+            and not self._preflight_cluster_plan(cluster)
+        ):
+            self._publish_external_recovery_request(
+                command,
+                cluster,
+                reason="reserve_make_plan_unreachable",
+            )
         if self.robot_xy is not None:
             self.state.start_goal(
                 cluster,
@@ -1026,6 +1204,71 @@ class ExplorePyNode:
             frontier_missing_goal_preserved,
         )
         self._publish_behavior_feedback(command, "READY", None, detail)
+
+    def _publish_external_recovery_request(self, command, cluster, *, reason: str) -> bool:
+        """Ask the semantic executor for one owned safe-reverse/replan attempt.
+
+        This method deliberately has no move_base cancel or cmd_vel side effect.
+        The request is one-shot per external reservation command so a stalled
+        planner cannot turn an exploration update loop into a recovery loop.
+        """
+
+        if not self.external_behavior_control or not self.external_recovery_request_enabled:
+            return False
+        command_id = str(command.get("command_id") or "")
+        candidate_id = str(command.get("candidate_id") or "")
+        decision_id = str(command.get("decision_id") or "")
+        if (
+            not command_id
+            or not candidate_id
+            or not decision_id
+            or command_id in self.external_recovery_requested_commands
+        ):
+            return False
+        now = time.time()
+        if now < self.external_recovery_retry_not_before_at:
+            return False
+        if (
+            self.external_recovery_last_request_at > 0.0
+            and now - self.external_recovery_last_request_at
+            < self.external_recovery_request_cooldown_sec
+        ):
+            return False
+        self.external_recovery_request_sequence += 1
+        request_id = (
+            f"{decision_id}:{candidate_id}:recovery:{self.external_recovery_request_sequence:03d}"
+        )[:128]
+        payload = {
+            "request_id": request_id,
+            "source": "explore_py",
+            "recovery": "safe_reverse_replan",
+            "decision_id": decision_id,
+            "candidate_id": candidate_id,
+            "cluster_id": str(command.get("cluster_id") or cluster.cluster_id),
+            "goal_xyyaw": [
+                float(cluster.subgoal_world[0]),
+                float(cluster.subgoal_world[1]),
+                float(cluster.subgoal_yaw),
+            ],
+            "reason": str(reason),
+            "timestamp": now,
+        }
+        self.external_recovery_requested_commands.add(command_id)
+        self.external_recovery_request_count += 1
+        self.external_recovery_plan_failure_count += 1
+        self.external_recovery_last_request_at = now
+        self.external_recovery_last_command_id = command_id
+        self.external_recovery_last_request_id = request_id
+        self.external_recovery_last_detail = dict(payload)
+        self.external_recovery_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        )
+        rospy.logwarn(
+            "[explore_py] requested executor-owned safe reverse/replan: command=%s reason=%s",
+            command_id,
+            reason,
+        )
+        return True
 
     def _finalize_external_frontier(self, command):
         cluster = self.external_reserved_cluster
@@ -1659,6 +1902,29 @@ class ExplorePyNode:
             ),
             "expected_visible_unknown_area_m2": float(
                 getattr(cluster, "expected_visible_unknown_area_m2", 0.0) or 0.0
+            ),
+            "source_cluster_id": str(
+                getattr(cluster, "source_cluster_id", "") or ""
+            ),
+            "region_id": str(getattr(cluster, "region_id", "") or ""),
+            "region_overlap": float(getattr(cluster, "region_overlap", 0.0) or 0.0),
+            "region_coverage_delta_m2": float(
+                getattr(cluster, "region_coverage_delta_m2", 0.0) or 0.0
+            ),
+            "visible_frontier_sample_count": int(
+                getattr(cluster, "visible_frontier_sample_count", 0) or 0
+            ),
+            "visible_frontier_count": int(
+                getattr(cluster, "visible_frontier_count", 0) or 0
+            ),
+            "visible_unknown_sample_count": int(
+                getattr(cluster, "visible_unknown_sample_count", 0) or 0
+            ),
+            "visible_unknown_cell_count": int(
+                getattr(cluster, "visible_unknown_cell_count", 0) or 0
+            ),
+            "visible_unknown_area_m2": float(
+                getattr(cluster, "visible_unknown_area_m2", 0.0) or 0.0
             ),
             "score": cluster.score,
             "score_terms": cluster.score_terms,

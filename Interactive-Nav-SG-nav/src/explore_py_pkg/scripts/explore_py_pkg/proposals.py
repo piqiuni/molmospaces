@@ -45,6 +45,26 @@ def cluster_to_proposal(cluster: Any, frame_id: str) -> dict[str, Any]:
             "expected_visible_unknown_area_m2": float(
                 getattr(cluster, "expected_visible_unknown_area_m2", 0.0) or 0.0
             ),
+            "visible_unknown_area_m2": float(
+                getattr(cluster, "visible_unknown_area_m2", 0.0) or 0.0
+            ),
+            "visible_unknown_cell_count": int(
+                getattr(cluster, "visible_unknown_cell_count", 0) or 0
+            ),
+            "visible_unknown_sample_count": int(
+                getattr(cluster, "visible_unknown_sample_count", 0) or 0
+            ),
+            "visible_frontier_count": int(
+                getattr(cluster, "visible_frontier_count", 0) or 0
+            ),
+            "visible_frontier_sample_count": int(
+                getattr(cluster, "visible_frontier_sample_count", 0) or 0
+            ),
+            "region_id": str(getattr(cluster, "region_id", "") or ""),
+            "region_overlap": float(getattr(cluster, "region_overlap", 0.0) or 0.0),
+            "region_coverage_delta_m2": float(
+                getattr(cluster, "region_coverage_delta_m2", 0.0) or 0.0
+            ),
         },
         "geometry": {
             "proposal_score": float(cluster.score),

@@ -10,6 +10,7 @@ from semantic_decision_py_pkg.post_interaction_traversal import (
     inject_pending_traversal,
     is_terminal_post_interaction_traversal_failure,
     pending_priority_candidate,
+    post_interaction_traversal_event_key,
     portal_center_xy,
     portal_open_confirmation,
     reproject_post_interaction_traversal_candidate,
@@ -350,6 +351,21 @@ def test_failed_one_shot_traversal_is_terminal_but_target_preemption_is_not() ->
     assert not is_terminal_post_interaction_traversal_failure(
         "frontier:1", "NAVIGATE", "FAILED"
     )
+
+
+def test_traversal_event_key_is_stable_when_candidate_wrapper_changes() -> None:
+    metadata = {
+        "post_interaction_traversal": True,
+        "opened_portal_id": "portal_1",
+        "source_interaction_event_id": "open_event_1",
+    }
+
+    assert post_interaction_traversal_event_key(
+        "traverse:portal_1:old-wrapper", metadata
+    ) == "portal_1|open_event_1"
+    assert post_interaction_traversal_event_key(
+        "traverse:portal_1:open_event_1"
+    ) == "portal_1|open_event_1"
 
 
 def test_post_interaction_refresh_gate_waits_for_opened_portal_graph_and_observation() -> None:

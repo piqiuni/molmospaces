@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import asyncio
 import base64
+import contextlib
 import fcntl
 import json
 import mimetypes
@@ -14,6 +16,10 @@ import time
 from typing import Any, Iterable
 from urllib import error as urllib_error
 from urllib import request
+from urllib.parse import urlparse
+import uuid
+
+import httpx
 
 
 @dataclass
@@ -76,7 +82,7 @@ class MLLMResponse:
 
 
 class MLLMClient:
-    """Small dependency-free client shared by all MLLM roles."""
+    """Small client shared by all MLLM roles."""
 
     def __init__(self, config: MLLMClientConfig | None = None) -> None:
         self.config = config or MLLMClientConfig()
@@ -99,7 +105,7 @@ class MLLMClient:
         config = self.config
         overrides: dict[str, Any] = {}
         if timeout_s is not None:
-            overrides["timeout_s"] = max(0.1, float(timeout_s))
+            overrides["timeout_s"] = max(0.0, float(timeout_s))
         if max_tokens is not None:
             overrides["max_tokens"] = max(1, int(max_tokens))
         if overrides:
@@ -146,6 +152,8 @@ class MLLMClient:
         started: float,
         config: MLLMClientConfig,
     ) -> MLLMResponse:
+        if config.timeout_s <= 0.0:
+            raise TimeoutError("timed out")
         protocol = str(config.protocol or "openai_chat").casefold()
         request_instruction = self._instruction_for_request(instruction, config)
         if protocol in {"generic", "interactive_navigation"}:
@@ -213,16 +221,31 @@ class MLLMClient:
                 body_payload["reasoning_effort"] = reasoning_effort
             if self._thinking_disabled(config):
                 body_payload["enable_thinking"] = False
-        body = json.dumps(body_payload, ensure_ascii=False).encode("utf-8")
+        is_openai_chat = protocol in {"openai_chat", "chat_completions", "openai"}
+        if is_openai_chat:
+            body_payload["stream"] = True
+            body_payload["stream_options"] = {"include_usage": True}
         headers = {"Content-Type": "application/json"}
+        if is_openai_chat:
+            headers["Accept"] = "text/event-stream"
         api_key = os.environ.get(config.api_key_env, "") if config.api_key_env else ""
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        headers["X-Request-Id"] = f"mllm-{uuid.uuid4().hex}"
         endpoint = self._resolved_endpoint(protocol, endpoint=config.endpoint)
-        req = request.Request(endpoint, data=body, headers=headers, method="POST")
-        with request.urlopen(req, timeout=config.timeout_s) as response_obj:
-            raw = response_obj.read().decode("utf-8")
-        envelope = json.loads(raw)
+        if is_openai_chat:
+            envelope, raw = self._request_openai_chat_stream(
+                endpoint,
+                body_payload,
+                headers,
+                timeout_s=config.timeout_s,
+            )
+        else:
+            body = json.dumps(body_payload, ensure_ascii=False).encode("utf-8")
+            req = request.Request(endpoint, data=body, headers=headers, method="POST")
+            with request.urlopen(req, timeout=config.timeout_s) as response_obj:
+                raw = response_obj.read().decode("utf-8")
+            envelope = json.loads(raw)
         usage = envelope.get("usage") or {}
         output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
         raw_text = self._extract_text(envelope)
@@ -252,6 +275,112 @@ class MLLMClient:
             usage=dict(usage),
             error=parse_error,
         )
+
+    def _request_openai_chat_stream(
+        self,
+        endpoint: str,
+        body_payload: dict[str, Any],
+        headers: dict[str, str],
+        *,
+        timeout_s: float,
+    ) -> tuple[dict[str, Any], str]:
+        """Consume OpenAI SSE and explicitly close it when the deadline expires."""
+
+        async def consume() -> tuple[dict[str, Any], str]:
+            parsed_endpoint = urlparse(endpoint)
+            trust_env = parsed_endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}
+            response: httpx.Response | None = None
+            raw_lines: list[str] = []
+            non_sse_lines: list[str] = []
+            content_parts: list[str] = []
+            usage: dict[str, Any] = {}
+            try:
+                async with httpx.AsyncClient(timeout=None, trust_env=trust_env) as client:
+                    stream_request = client.build_request(
+                        "POST",
+                        endpoint,
+                        json=body_payload,
+                        headers=headers,
+                    )
+                    response = await client.send(stream_request, stream=True)
+                    if response.status_code >= 400:
+                        error_body = (await response.aread()).decode(
+                            "utf-8", errors="replace"
+                        )
+                        raise RuntimeError(
+                            f"HTTP {response.status_code}: {error_body[:1000]}"
+                        )
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        raw_lines.append(line)
+                        if not line.startswith("data:"):
+                            non_sse_lines.append(line)
+                            continue
+                        data = line[5:].strip()
+                        if not data:
+                            continue
+                        if data == "[DONE]":
+                            break
+                        chunk = json.loads(data)
+                        if not isinstance(chunk, dict):
+                            raise ValueError("MLLM stream chunk must be a JSON object")
+                        stream_error = chunk.get("error")
+                        if stream_error:
+                            if isinstance(stream_error, dict):
+                                stream_error = stream_error.get("message") or stream_error
+                            raise RuntimeError(str(stream_error))
+                        if isinstance(chunk.get("usage"), dict):
+                            usage.update(chunk["usage"])
+                        choices = chunk.get("choices") or []
+                        if (
+                            not isinstance(choices, list)
+                            or not choices
+                            or not isinstance(choices[0], dict)
+                        ):
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        content = delta.get("content") if isinstance(delta, dict) else ""
+                        if isinstance(content, str):
+                            content_parts.append(content)
+                        elif isinstance(content, list):
+                            content_parts.extend(
+                                str(item.get("text") or "")
+                                for item in content
+                                if isinstance(item, dict)
+                            )
+            finally:
+                if response is not None:
+                    await response.aclose()
+
+            if non_sse_lines and not content_parts:
+                raw_response = "\n".join(non_sse_lines)
+                envelope = json.loads(raw_response)
+                if not isinstance(envelope, dict):
+                    raise ValueError("MLLM response envelope must be a JSON object")
+                return envelope, raw_response
+            envelope = {
+                "choices": [{"message": {"content": "".join(content_parts)}}],
+                "usage": usage,
+            }
+            return envelope, "\n".join(raw_lines)
+
+        async def run_with_deadline() -> tuple[dict[str, Any], str]:
+            task = asyncio.create_task(consume())
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(task), timeout=float(timeout_s)
+                )
+            except asyncio.TimeoutError as exc:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                raise TimeoutError("timed out") from exc
+
+        try:
+            return asyncio.run(run_with_deadline())
+        except httpx.HTTPError as exc:
+            raise OSError(str(exc)) from exc
 
     def _request_command(
         self,
@@ -335,6 +464,7 @@ class MLLMClient:
                 "front_surface_confidence": 0.0,
                 "approach_ready": False,
                 "needs_reobserve": True,
+                "action_regions": [],
                 "interaction_parts": [],
                 "confidence": 0.0,
             }

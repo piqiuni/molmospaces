@@ -97,6 +97,9 @@ def is_interaction_pose_precondition_failure(detail: dict[str, Any] | None) -> b
 
 def interaction_observation_disposition(
     detail: dict[str, Any] | None,
+    *,
+    drawer_pre_action: bool = False,
+    container_pre_action: bool = False,
 ) -> str:
     """Classify a fresh M1 portal observation without issuing an action.
 
@@ -118,6 +121,52 @@ def interaction_observation_disposition(
     )
     if attribute_status != "ready" or visible is not True:
         return "retry"
+    if drawer_pre_action:
+        view_state = str(merged.get("view_state") or "unknown").strip().casefold()
+        front_visible = merged.get("front_surface_visible") is True
+        approach_ready = merged.get("approach_ready") is True
+        regions_ready = merged.get("drawer_action_regions_ready") is True
+        if not regions_ready:
+            # The executor validates crop-relative centers and the paired
+            # detector box before setting this flag.  The state machine still
+            # requires the M1 frontality contract here so an empty or side-view
+            # observation can only request another view, never a bridge call.
+            return "retry"
+        if (
+            view_state not in {"front", "oblique"}
+            or not front_visible
+            or not approach_ready
+            or bool(merged.get("needs_reobserve", False))
+        ):
+            return "retry"
+        return "execute"
+
+    if container_pre_action:
+        # A container's remembered map/AABB is useful only to reach a
+        # re-observation pose.  Opening is authorized by the *fresh* M1 view
+        # at that pose, not by the ring geometry or an older crop.
+        state = str(
+            merged.get("state")
+            or merged.get("interaction_state")
+            or merged.get("coarse_state")
+            or "unknown"
+        ).strip().casefold()
+        if state in {"open", "opened", "static_open", "static"}:
+            return "finish_without_action"
+        if state in {"blocked", "unavailable", "static_closed", "locked"}:
+            return "terminal"
+        if state not in {"closed", "ajar"}:
+            return "retry"
+        view_state = str(merged.get("view_state") or "unknown").strip().casefold()
+        if (
+            view_state not in {"front", "oblique"}
+            or merged.get("front_surface_visible") is not True
+            or merged.get("approach_ready") is not True
+            or bool(merged.get("needs_reobserve", False))
+        ):
+            return "retry"
+        return "execute"
+
     state = str(
         merged.get("state")
         or merged.get("interaction_state")
@@ -1051,7 +1100,15 @@ class BehaviorExecutionStateMachine:
         metadata["last_interaction_observation"] = dict(observation)
         self.candidate["metadata"] = metadata
 
-        disposition = interaction_observation_disposition(observation)
+        drawer_pre_action = bool(metadata.get("drawer_pre_action_observation"))
+        container_pre_action = bool(
+            metadata.get("container_pre_action_observation")
+        )
+        disposition = interaction_observation_disposition(
+            observation,
+            drawer_pre_action=drawer_pre_action,
+            container_pre_action=container_pre_action,
+        )
         required_source = str(
             metadata.get("interaction_observation_source") or ""
         ).strip().casefold()
@@ -1069,6 +1126,21 @@ class BehaviorExecutionStateMachine:
             capture_step is None or capture_step < int(minimum_capture_step)
         ):
             observation.setdefault("reason", "interaction_observation_not_fresh")
+            disposition = "retry"
+        if (
+            container_pre_action
+            and str(
+                observation.get("container_visual_precondition_reason") or "ready"
+            ).casefold()
+            != "ready"
+        ):
+            # The executor has already rejected a stale/truncated/non-front
+            # targeted M1 update.  In particular, do not let an untrusted
+            # `open` label bypass the front-surface contract.
+            observation.setdefault(
+                "reason",
+                str(observation.get("container_visual_precondition_reason")),
+            )
             disposition = "retry"
 
         if disposition == "execute":
@@ -1114,7 +1186,28 @@ class BehaviorExecutionStateMachine:
         attempts = int(metadata.get("interaction_observation_attempts", 0) or 0)
         max_attempts = self._interaction_observation_max_attempts()
         if attempts < max_attempts:
+            if drawer_pre_action or container_pre_action:
+                return self._advance_interaction_reobservation_approach(
+                    observation,
+                    now,
+                    drawer_pre_action=drawer_pre_action,
+                )
             return self._request_interaction_observation(observation, now)
+        if drawer_pre_action or container_pre_action:
+            precondition_kind = "drawer" if drawer_pre_action else "container"
+            return self._finish(
+                False,
+                {
+                    **observation,
+                    "action_executed": False,
+                    "observation_outcome": "terminal_visual_precondition",
+                    "observation_attempts": attempts,
+                    "failure_stage": "interaction_visual_precondition",
+                    "terminal_candidate_exclusion": True,
+                    "reason": f"{precondition_kind}_visual_precondition_unresolved",
+                },
+                now,
+            )
         return self._finish(
             False,
             {
@@ -1140,6 +1233,92 @@ class BehaviorExecutionStateMachine:
             return max(1, int(metadata.get("interaction_observation_max_attempts", 2)))
         except (TypeError, ValueError):
             return 2
+
+    def _advance_interaction_reobservation_approach(
+        self,
+        observation: dict[str, Any],
+        now: float,
+        *,
+        drawer_pre_action: bool,
+    ) -> list[dict[str, Any]]:
+        """Move to the next preserved container viewpoint before another M1 call.
+
+        Repeating M1 at the same side/occluded pose cannot make a usable
+        container front appear.  A retry consumes the next navigation-ring
+        option; exhausting it is a terminal visual precondition rather than an
+        unbounded same-pose polling loop.
+        """
+
+        if self.candidate is None:
+            return []
+        metadata = dict(self.candidate.get("metadata") or {})
+        goal_options = navigation_goal_options(self.candidate)
+        try:
+            selected_index = max(
+                0,
+                int(metadata.get("interaction_approach_goal_option_index", 0)),
+            )
+        except (TypeError, ValueError):
+            selected_index = 0
+        next_index = selected_index + 1
+        precondition_kind = "drawer" if drawer_pre_action else "container"
+        if next_index >= len(goal_options):
+            return self._finish(
+                False,
+                {
+                    **observation,
+                    "action_executed": False,
+                    "observation_outcome": "terminal_visual_precondition",
+                    "observation_attempts": int(
+                        metadata.get("interaction_observation_attempts", 0)
+                        or 0
+                    ),
+                    "failure_stage": "interaction_visual_precondition",
+                    "terminal_candidate_exclusion": True,
+                    "reason": f"{precondition_kind}_visual_precondition_no_alternate_viewpoint",
+                    "interaction_approach_goal_option_index": selected_index,
+                    "interaction_approach_goal_option_count": len(goal_options),
+                },
+                now,
+            )
+        capture_step = self._interaction_observation_capture_step(observation)
+        previous_baseline = self._interaction_observation_capture_step(
+            {"capture_step": metadata.get("interaction_observation_after_capture_step")}
+        )
+        if capture_step is not None and (
+            previous_baseline is None or capture_step > previous_baseline
+        ):
+            metadata["interaction_observation_after_capture_step"] = capture_step
+        metadata["interaction_visual_reobserve_count"] = int(
+            metadata.get("interaction_visual_reobserve_count", 0) or 0
+        ) + 1
+        metadata["interaction_visual_reobserve_from_goal_option_index"] = selected_index
+        metadata["interaction_visual_reobserve_next_goal_option_index"] = next_index
+        metadata["last_interaction_visual_precondition"] = dict(observation)
+        if drawer_pre_action:
+            # Preserve these existing diagnostics for drawer-specific reports.
+            metadata["drawer_visual_reobserve_count"] = int(
+                metadata.get("drawer_visual_reobserve_count", 0) or 0
+            ) + 1
+            metadata["drawer_visual_reobserve_from_goal_option_index"] = selected_index
+            metadata["drawer_visual_reobserve_next_goal_option_index"] = next_index
+            metadata["last_drawer_visual_precondition"] = dict(observation)
+        self.candidate["metadata"] = metadata
+        return self._transition(
+            STATE_APPROACH_INTERACTION,
+            now,
+            {
+                "kind": "navigate",
+                "candidate": self.candidate,
+                "start_goal_option_index": next_index,
+                "interaction_approach_attempts": [
+                    dict(item)
+                    for item in metadata.get("interaction_approach_attempts") or []
+                    if isinstance(item, dict)
+                ],
+                "reason": f"{precondition_kind}_visual_reobserve_next_approach",
+            },
+        )
 
     @staticmethod
     def _interaction_observation_capture_step(
@@ -1182,8 +1361,13 @@ class BehaviorExecutionStateMachine:
             return []
         metadata = dict(self.candidate.get("metadata") or {})
         previous_capture_step = self._interaction_observation_capture_step(detail)
-        baseline_capture_step = metadata.get("interaction_observation_after_capture_step")
-        if baseline_capture_step is None and previous_capture_step is not None:
+        baseline_capture_step = self._interaction_observation_capture_step(
+            {"capture_step": metadata.get("interaction_observation_after_capture_step")}
+        )
+        if previous_capture_step is not None and (
+            baseline_capture_step is None
+            or previous_capture_step > baseline_capture_step
+        ):
             baseline_capture_step = previous_capture_step
             metadata["interaction_observation_after_capture_step"] = baseline_capture_step
         attempts = int(metadata.get("interaction_observation_attempts", 0) or 0) + 1
@@ -1311,6 +1495,14 @@ class BehaviorExecutionStateMachine:
             return []
         detail = dict(detail or {})
         backend_success = bool(success) if backend_success is None else bool(backend_success)
+        if str(detail.get("failure_stage") or "") in {
+            "interaction_visual_precondition",
+            "interaction_execution",
+        }:
+            # These outcomes have already consumed their bounded observation or
+            # execution contract.  They are terminal semantic failures, not
+            # physical states for M3 to reinterpret or retry.
+            return self._finish(False, detail, now)
         if is_interaction_pose_precondition_failure(detail):
             # No force/action reached the object.  The executor may instead
             # call retry_interaction_approach while still in INTERACTING; if it
@@ -1408,6 +1600,32 @@ class BehaviorExecutionStateMachine:
                 {"kind": "interact", "candidate": self.candidate, "retry": True},
             )
         return self._finish(False, detail or {"reason": "verification_failed"}, now)
+
+    def on_backend_result(
+        self,
+        success: bool,
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Commit the sealed executor result without waiting for M3.
+
+        The simulator/evaluator is authoritative about whether an interaction
+        command was executed.  M3 is a post-action visual audit and therefore
+        must not be able to replay a command (or hold the state machine in
+        ``VERIFYING``) after a successful backend result.  Callers may launch
+        that audit separately and attach its bounded re-observation request to
+        telemetry.
+        """
+
+        if self.state != STATE_VERIFYING or self.candidate is None:
+            return []
+        now = time.monotonic() if now is None else float(now)
+        detail = dict(detail or {})
+        detail.setdefault("backend_success", bool(success))
+        detail.setdefault("verification_required", False)
+        detail.setdefault("verification_mode", "backend_postcondition")
+        detail.setdefault("visual_audit_pending", True)
+        return self._finish(bool(success), detail, now)
 
     def _interaction_backend_succeeded(self) -> bool:
         metadata = (self.candidate or {}).get("metadata") or {}

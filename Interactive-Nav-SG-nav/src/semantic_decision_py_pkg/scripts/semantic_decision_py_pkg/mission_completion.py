@@ -31,6 +31,13 @@ class InteractionApproachFailureLimitTracker:
     """
 
     REASON = "interaction_approach_terminal_unreachable"
+    VISUAL_PRECONDITION_REASON = "interaction_visual_precondition_terminal"
+    EXECUTION_REASON = "interaction_execution_terminal_failed"
+    APPROACH_EXHAUSTED_STAGE = "interaction_approach_exhausted"
+    _IMMEDIATE_TERMINAL_REASONS = {
+        "interaction_visual_precondition": VISUAL_PRECONDITION_REASON,
+        "interaction_execution": EXECUTION_REASON,
+    }
 
     def __init__(
         self, config: InteractionApproachFailureLimitConfig | None = None
@@ -65,9 +72,40 @@ class InteractionApproachFailureLimitTracker:
         if normalized_status == "SUCCEEDED":
             self.failure_counts.pop(candidate_id, None)
             return None
+        if normalized_status not in {"FAILED", "REJECTED"}:
+            return None
+        normalized_stage = str(failure_stage or "").strip().casefold()
+        if normalized_stage == self.APPROACH_EXHAUSTED_STAGE:
+            # The executor has already tried every preserved approach pose for
+            # this concrete candidate. Requiring several complete rings used
+            # to leave an unexecutable raw interaction alive indefinitely.
+            # This is only episode-local reachability memory; it says nothing
+            # about the physical state of the object.
+            count = self.failure_counts.get(candidate_id, 0) + 1
+            self.failure_counts[candidate_id] = count
+            self.terminal_candidate_ids.add(candidate_id)
+            return {
+                "reason": self.REASON,
+                "interaction_failure_count": count,
+                "interaction_failure_limit": count,
+                "interaction_approach_options_exhausted": True,
+                "terminal_candidate_exclusion": True,
+            }
+        immediate_reason = self._IMMEDIATE_TERMINAL_REASONS.get(normalized_stage)
+        if immediate_reason:
+            # The executor has already consumed the bounded visual gate or a
+            # concrete drawer execution attempt.  Do not send the same
+            # impossible candidate back through generic cooldown/reselection.
+            self.terminal_candidate_ids.add(candidate_id)
+            self.failure_counts[candidate_id] = 1
+            return {
+                "reason": immediate_reason,
+                "interaction_failure_count": 1,
+                "interaction_failure_limit": 1,
+                "terminal_candidate_exclusion": True,
+            }
         if (
-            normalized_status not in {"FAILED", "REJECTED"}
-            or str(failure_stage or "") != "interaction_approach_navigation"
+            normalized_stage != "interaction_approach_navigation"
             or self.failure_limit <= 0
         ):
             return None
@@ -113,6 +151,8 @@ class TerminalInteractionNoPlanExitTracker:
     REASON = "no_executable_candidates_after_terminal_interaction_no_plan"
     TERMINAL_INTERACTION_REASONS = {
         InteractionApproachFailureLimitTracker.REASON,
+        InteractionApproachFailureLimitTracker.VISUAL_PRECONDITION_REASON,
+        InteractionApproachFailureLimitTracker.EXECUTION_REASON,
     }
 
     def __init__(
@@ -308,11 +348,14 @@ class MissionCompletionTracker:
         exploration = candidates_payload.get("exploration_context") or {}
         initial_scan_complete = bool(exploration.get("initial_scan_complete", True))
         candidates = list(candidates_payload.get("candidates") or [])
-        fallback_navigation_count = sum(
+        # A producer counter can lag or reset while a candidate snapshot is
+        # still live. Treat the raw snapshot as a conservative lower bound so
+        # completion cannot report exhaustion while a visible frontier remains.
+        raw_navigation_count = sum(
             str(candidate.get("behavior_type") or "") == "EXPLORE"
             for candidate in candidates
         )
-        fallback_interaction_count = sum(
+        raw_interaction_count = sum(
             str(candidate.get("behavior_type") or "") == "INTERACT"
             and not bool(
                 (candidate.get("metadata") or {}).get(
@@ -327,17 +370,23 @@ class MissionCompletionTracker:
         navigation_frontier_count = int(
             exploration.get(
                 "navigation_frontier_count",
-                fallback_navigation_count
+                raw_navigation_count
                 if candidates
                 else fallback_candidate_count,
             )
             or 0
         )
+        navigation_frontier_count = max(
+            navigation_frontier_count, raw_navigation_count
+        )
         interaction_frontier_count = int(
             exploration.get(
-                "interaction_frontier_count", fallback_interaction_count
+                "interaction_frontier_count", raw_interaction_count
             )
             or 0
+        )
+        interaction_frontier_count = max(
+            interaction_frontier_count, raw_interaction_count
         )
         combined_frontier_count = int(
             exploration.get(
@@ -345,6 +394,10 @@ class MissionCompletionTracker:
                 navigation_frontier_count + interaction_frontier_count,
             )
             or 0
+        )
+        combined_frontier_count = max(
+            combined_frontier_count,
+            navigation_frontier_count + interaction_frontier_count,
         )
         navigation_frontier_exhausted = bool(
             exploration.get(
@@ -364,6 +417,14 @@ class MissionCompletionTracker:
                 navigation_frontier_exhausted and interaction_frontier_exhausted,
             )
         )
+        if raw_navigation_count or raw_interaction_count:
+            navigation_frontier_exhausted = (
+                navigation_frontier_exhausted and raw_navigation_count == 0
+            )
+            interaction_frontier_exhausted = (
+                interaction_frontier_exhausted and raw_interaction_count == 0
+            )
+            exhausted = False
         ready_to_complete = (
             not has_active_behavior
             and initial_scan_complete

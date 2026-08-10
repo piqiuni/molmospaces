@@ -1332,7 +1332,20 @@ class SemanticMappingNode:
         opening = str(parsed.get("action") or "").casefold() == "open"
         with self.lock:
             self._remember_interaction_command_locked(parsed)
-        changed = self._set_planning_interaction_pending(parsed.get("node_id"), True) if opening else False
+            # An optimistic planning clear is reserved for a graph-qualified
+            # portal.  A container can be successfully opened without ever
+            # altering reachability, so treating every ``open`` command as a
+            # pending doorway was able to erase a fridge from OCC.
+            pending_portal = opening and self._result_references_topology_portal_locked(
+                parsed
+            )
+        changed = (
+            self._set_planning_interaction_pending(
+                parsed.get("node_id"), True, node_type="portal"
+            )
+            if pending_portal
+            else False
+        )
         if changed:
             self._safe_publish_bundle(self._collect_publish_bundle())
 
@@ -1352,16 +1365,17 @@ class SemanticMappingNode:
             pending_node_id = str(parsed.get("node_id") or "")
             changed = self.graph_store.update_interaction_result(parsed, stamp=stamp)
             successful_open = self._is_successful_open_result(parsed)
-            node_type = str(parsed.get("node_type") or "").casefold()
             portal_reference = (
                 self._confirmed_open_portal_reference_locked(parsed)
-                if successful_open and node_type != "portal"
+                if successful_open
+                and self._result_references_topology_portal_locked(parsed)
                 else None
             )
-            is_portal_open = successful_open and (
-                node_type == "portal"
-                or portal_reference is not None
-            )
+            # The stable portal reference is the topology authority.  Do not
+            # arm raw-OCC/room work solely because a result carried
+            # ``node_type=portal``: a stale M1 type patch can otherwise turn a
+            # container result into a doorway clear.
+            is_portal_open = successful_open and portal_reference is not None
             if is_portal_open:
                 # This must not depend on ``changed``.  A result can arrive
                 # after the graph has already been updated, while the next
@@ -1377,23 +1391,11 @@ class SemanticMappingNode:
                     str(parsed.get("node_id") or ""),
                     str(parsed.get("node_type") or ""),
                     changed,
-                    portal_reference is not None,
+                    True,
                 )
-            elif changed and self.room_post_open_force_refresh:
-                # Preserve the old non-portal recovery behavior, but queue the
-                # expensive topology rebuild instead of running it in this ROS
-                # callback while the mapper lock is held.
-                deferred_room_refresh_result = dict(parsed)
-                self._mark_room_inputs_dirty_locked(structural=True)
         pending_changed = self._set_planning_interaction_pending(
             pending_node_id, False
         )
-        if deferred_room_refresh_result is not None:
-            self._enqueue_room_refresh(
-                force_stable=True,
-                post_open_result=deferred_room_refresh_result,
-                reason="interaction_result",
-            )
         if (changed or pending_changed) and not is_portal_open:
             self._safe_publish_bundle(self._collect_publish_bundle())
 
@@ -1678,6 +1680,50 @@ class SemanticMappingNode:
         self._run_sync_room_refresh_for_compat(force_stable=True)
         return True
 
+    @staticmethod
+    def _node_is_topology_portal(node):
+        """Return whether a graph node may affect occupancy topology.
+
+        ``node.type`` can be an MLLM-facing semantic label.  A source-observed
+        container is never allowed to gain portal topology from one delayed
+        attribute patch.  Legacy graph payloads without provenance retain their
+        original portal behavior for replay compatibility.
+        """
+
+        if str((node or {}).get("type") or "").casefold() != "portal":
+            return False
+        attributes = (node or {}).get("attributes") or {}
+        source_type = str(
+            attributes.get("topology_type")
+            or attributes.get("observation_node_type")
+            or ""
+        ).strip().casefold()
+        return source_type in {"", "portal"}
+
+    def _result_references_topology_portal_locked(self, result):
+        """Match a command/result only to a source-qualified portal node."""
+
+        requested_node_id = str((result or {}).get("node_id") or "")
+        requested_object_id = str(
+            (result or {}).get("object_id")
+            or (result or {}).get("instance_id")
+            or ""
+        )
+        for node in self.graph_store.as_graph_dict().get("nodes") or []:
+            if not self._node_is_topology_portal(node):
+                continue
+            attributes = node.get("attributes") or {}
+            instance_id = str(attributes.get("instance_id") or "")
+            source_object_name = str(attributes.get("source_object_name") or "")
+            if requested_node_id and str(node.get("id") or "") == requested_node_id:
+                return True
+            if requested_object_id and requested_object_id in {
+                instance_id,
+                source_object_name,
+            }:
+                return True
+        return False
+
     def _confirmed_open_portal_reference_locked(self, result):
         """Build a stable, closed-door geometry observation for a result."""
 
@@ -1686,7 +1732,7 @@ class SemanticMappingNode:
             result.get("object_id") or result.get("instance_id") or ""
         )
         for node in self.graph_store.as_graph_dict().get("nodes") or []:
-            if node.get("type") != "portal":
+            if not self._node_is_topology_portal(node):
                 continue
             attributes = node.get("attributes") or {}
             instance_id = str(attributes.get("instance_id") or "")
@@ -2050,12 +2096,20 @@ class SemanticMappingNode:
             "raw_occupancy_grid": self.latest_occupancy_grid,
         }
 
-    def _set_planning_interaction_pending(self, node_id, pending):
+    def _set_planning_interaction_pending(self, node_id, pending, *, node_type=None):
         overlay_lock = getattr(self, "_planning_overlay_lock", None)
+        def set_pending():
+            try:
+                return self.semantic_occ_overlay.set_interaction_pending(
+                    node_id, pending, node_type=node_type
+                )
+            except TypeError:
+                # Minimal test doubles predate the optional topology hint.
+                return self.semantic_occ_overlay.set_interaction_pending(node_id, pending)
         if overlay_lock is None:
-            return self.semantic_occ_overlay.set_interaction_pending(node_id, pending)
+            return set_pending()
         with overlay_lock:
-            return self.semantic_occ_overlay.set_interaction_pending(node_id, pending)
+            return set_pending()
 
     def _reset_planning_overlay_state(self):
         overlay_lock = getattr(self, "_planning_overlay_lock", None)

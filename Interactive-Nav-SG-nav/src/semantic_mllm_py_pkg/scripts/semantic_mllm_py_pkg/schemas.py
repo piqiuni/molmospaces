@@ -207,6 +207,33 @@ def build_attribute_patch_response_schema(object_id: str) -> dict[str, Any]:
                 "front_surface_confidence": confidence,
                 "approach_ready": {"type": "boolean"},
                 "needs_reobserve": {"type": "boolean"},
+                # These are visual points on the padded target-crop inset in
+                # the single M1 composite image.  They are deliberately
+                # image-relative: downstream code may use them to ground a
+                # visible drawer scan, but never to infer simulator joints or
+                # hidden drawer locations.
+                "action_regions": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "center": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": {
+                                    "type": "number",
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                },
+                            },
+                            "confidence": confidence,
+                        },
+                        "required": ["center", "confidence"],
+                    },
+                },
                 "interaction_parts": {
                     "type": "array",
                     "maxItems": 1,
@@ -244,6 +271,7 @@ def build_attribute_patch_response_schema(object_id: str) -> dict[str, Any]:
                 "front_surface_confidence",
                 "approach_ready",
                 "needs_reobserve",
+                "action_regions",
                 "interaction_parts",
                 "confidence",
             ],
@@ -268,6 +296,31 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
     else:
         result.pop("portal_morphology", None)
         result.pop("portal_aperture_evidence", None)
+    raw_action_regions = result.get("action_regions") or []
+    if not isinstance(raw_action_regions, list):
+        raise ValueError("attribute patch action_regions must be a list")
+    action_regions: list[dict[str, Any]] = []
+    for raw_region in raw_action_regions:
+        center = _normalized_center(raw_region)
+        if center is None:
+            continue
+        if any(
+            (center[0] - item["center"][0]) ** 2
+            + (center[1] - item["center"][1]) ** 2
+            < 0.0016
+            for item in action_regions
+        ):
+            continue
+        confidence = (
+            _confidence(raw_region.get("confidence"), _confidence(result.get("confidence")))
+            if isinstance(raw_region, dict)
+            else _confidence(result.get("confidence"))
+        )
+        action_regions.append({"center": center, "confidence": confidence})
+        if len(action_regions) >= 8:
+            break
+    action_regions.sort(key=lambda item: (item["center"][1], item["center"][0]))
+
     parts = result.get("interaction_parts") or []
     if not isinstance(parts, list):
         raise ValueError("interaction_parts must be a list")
@@ -319,6 +372,7 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
     ):
         approach_ready = False
         needs_reobserve = True
+        action_regions = []
     result.update(
         {
             "view_state": view_state,
@@ -327,6 +381,7 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
             "front_surface_confidence": front_surface_confidence,
             "approach_ready": approach_ready,
             "needs_reobserve": needs_reobserve,
+            "action_regions": action_regions,
         }
     )
     result["evidence_frame_ids"] = [str(item) for item in result.get("evidence_frame_ids") or []]

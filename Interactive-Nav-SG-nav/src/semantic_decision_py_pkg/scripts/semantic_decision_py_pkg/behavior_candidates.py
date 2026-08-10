@@ -119,11 +119,21 @@ class CandidateGeneratorConfig:
     container_standoff_m: float = 1.0
     # A remembered container AABB has no reliable semantic "front" when the
     # perception stream did not publish one.  Keep several physically distinct
-    # standoff viewpoints so Module 3 can reject an oblique/side view and ask
-    # the executor to re-observe from the next one instead of opening from a
-    # radial guess.
+    # standoff viewpoints so fresh Module 1 can reject an oblique/side view and
+    # ask the executor to re-observe from the next one instead of opening from
+    # a radial guess.
     container_multiview_enabled: bool = True
     container_multiview_face_count: int = 4
+    # Full-MLLM drawer scans require one targeted, causally later M1 view at
+    # the arrived approach pose.  That view supplies frontality plus visible
+    # drawer action regions; it is never replaced with a scene/joint fallback.
+    drawer_pre_action_mllm: bool = False
+    drawer_pre_action_observation_max_attempts: int = 2
+    # Containers use the same fresh-view contract before a physical open.  A
+    # remembered AABB/ring pose may be useful to obtain a view, but is never by
+    # itself authorization to pull/open a fridge, cabinet, or drawer.
+    container_pre_action_mllm: bool = False
+    container_pre_action_observation_max_attempts: int = 4
     # ``None`` means drawers inherit ``container_standoff_m``.  The shipped
     # YAML makes the equivalence explicit (both are 0.50 m), while preserving
     # an opt-in per-drawer adjustment for a future task.
@@ -1201,10 +1211,19 @@ class CandidateGenerator:
             if position is None:
                 continue
             object_distance = math.hypot(position[0] - robot_xy[0], position[1] - robot_xy[1])
+            is_drawer_container = bool(
+                node_type == "container" and self._is_drawer_container(node)
+            )
+            container_pre_action = bool(
+                node_type == "container" and self.config.container_pre_action_mllm
+            )
+            drawer_pre_action = bool(
+                is_drawer_container and self.config.drawer_pre_action_mllm
+            )
             if node_type == "portal":
                 standoff = self.config.portal_standoff_m
                 standoff_source = "portal"
-            elif self._is_drawer_container(node):
+            elif is_drawer_container:
                 standoff = (
                     self.config.drawer_standoff_m
                     if self.config.drawer_standoff_m is not None
@@ -1418,22 +1437,41 @@ class CandidateGenerator:
                         # not an authorization to publish a physical ``open``.
                         "observation_required": bool(
                             visual_unknown_portal_reobserve
+                            or container_pre_action
                         ),
-                        "reobserve": bool(visual_unknown_portal_reobserve),
+                        "reobserve": bool(
+                            visual_unknown_portal_reobserve
+                            or container_pre_action
+                        ),
                         "observation_reason": (
                             "mllm_portal_state_unknown"
                             if visual_unknown_portal_reobserve
+                            else "mllm_drawer_pre_action_visual"
+                            if drawer_pre_action
+                            else "mllm_container_pre_action_visual"
+                            if container_pre_action
                             else ""
                         ),
                         "interaction_observation_max_attempts": max(
                             1,
-                            int(self.config.portal_unknown_observation_max_attempts),
+                            int(
+                                self.config.drawer_pre_action_observation_max_attempts
+                                if drawer_pre_action
+                                else self.config.container_pre_action_observation_max_attempts
+                                if container_pre_action
+                                else self.config.portal_unknown_observation_max_attempts
+                            ),
                         ),
                         "interaction_observation_source": (
                             "mllm_attribute_inference"
-                            if visual_unknown_portal_reobserve
+                            if (
+                                visual_unknown_portal_reobserve
+                                or container_pre_action
+                            )
                             else ""
                         ),
+                        "drawer_pre_action_observation": drawer_pre_action,
+                        "container_pre_action_observation": container_pre_action,
                         # Preserve the geometry used to construct the two-sided
                         # approach options.  The post-open continuation uses it
                         # to select an AABB-clear goal on the far side instead
@@ -1608,7 +1646,10 @@ class CandidateGenerator:
             state = str(interaction.get("state") or "unknown").casefold()
             if state != "open":
                 continue
-            if interaction.get("traversable") is False:
+            # Do not treat a missing/unknown traversability bit as a valid
+            # post-open route.  Only a confirmed backend result or an OCC/room
+            # connectivity observation may create a traversal candidate.
+            if interaction.get("traversable") is not True:
                 continue
             history = list(interaction.get("operation_history") or [])
             open_event = next(
@@ -1754,12 +1795,18 @@ class CandidateGenerator:
             return None
         if attributes.get("attribute_is_current") is False:
             return None
+        if attributes.get("visual_evidence_truncated") is True:
+            return None
         view_state = str(
             attributes.get("view_state")
             or attributes.get("interaction_view_state")
             or ""
         ).strip().casefold()
-        if view_state not in {"front", "oblique"}:
+        # A side/oblique image can identify a container but cannot establish a
+        # contact face.  Keep it as a re-observation cue and use the ring
+        # viewpoints instead; only a direct frontal M1 judgment can seed a
+        # contact-axis pose.
+        if view_state != "front":
             return None
         if not CandidateGenerator._truthy_mllm_attribute(
             attributes.get("front_surface_visible")

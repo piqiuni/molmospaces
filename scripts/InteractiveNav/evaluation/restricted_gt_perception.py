@@ -270,6 +270,22 @@ def _bbox_area_xyxy(bbox: Sequence[int] | Sequence[float] | None) -> float:
     )
 
 
+def _bbox_short_side_pixels(bbox: Sequence[int] | Sequence[float] | None) -> int:
+    """Return the shorter inclusive 2-D extent, or zero for an invalid box.
+
+    A long one-pixel segmentation sliver is not a visually grounded object
+    observation.  This is especially important for doors: a wall-edge sliver
+    otherwise acquires a public portal identity and changes the navigation
+    graph despite not being recognizable in the policy-visible RGB frame.
+    """
+
+    if bbox is None or len(bbox) < 4:
+        return 0
+    width = max(0, int(round(float(bbox[2]) - float(bbox[0]) + 1.0)))
+    height = max(0, int(round(float(bbox[3]) - float(bbox[1]) + 1.0)))
+    return min(width, height)
+
+
 def _largest_connected_component(
     xs: np.ndarray,
     ys: np.ndarray,
@@ -839,6 +855,8 @@ def build_restricted_gt_frame(
     episode_reset: bool = False,
     min_visible_pixels: int = 1,
     min_bbox_area_pixels: int = 1,
+    min_bbox_short_side_pixels: int = 1,
+    min_portal_bbox_short_side_pixels: int = 8,
     min_visible_fraction: float = 0.0,
     max_distance_m: float = 0.0,
     camera_position: Sequence[float] | None = None,
@@ -866,6 +884,12 @@ def build_restricted_gt_frame(
         raise ValueError("min_visible_pixels must be >= 1")
     if int(min_bbox_area_pixels) < 1:
         raise ValueError("min_bbox_area_pixels must be >= 1")
+    if int(min_bbox_short_side_pixels) < 1:
+        raise ValueError("min_bbox_short_side_pixels must be >= 1")
+    if int(min_portal_bbox_short_side_pixels) < int(min_bbox_short_side_pixels):
+        raise ValueError(
+            "min_portal_bbox_short_side_pixels must be >= min_bbox_short_side_pixels"
+        )
     if (
         not math.isfinite(float(min_visible_fraction))
         or not 0.0 <= float(min_visible_fraction) <= 1.0
@@ -920,6 +944,17 @@ def build_restricted_gt_frame(
             center, size = _runtime_aabb(spec, model, data)
             if _bbox_area_xyxy(bbox_2d) < int(min_bbox_area_pixels):
                 continue
+            semantic_name = normalize_semantic_category(
+                spec.semantic_category,
+                fallback_source_name=spec.source_name,
+            )
+            minimum_short_side = (
+                int(min_portal_bbox_short_side_pixels)
+                if semantic_name == "door"
+                else int(min_bbox_short_side_pixels)
+            )
+            if _bbox_short_side_pixels(bbox_2d) < minimum_short_side:
+                continue
             if (
                 camera_xyz is not None
                 and float(max_distance_m) > 0.0
@@ -954,7 +989,7 @@ def build_restricted_gt_frame(
             observations.append(
                 RestrictedObservation(
                     instance_id=registry.public_id_for(spec.source_name),
-                    name=normalize_semantic_category(spec.semantic_category, fallback_source_name=spec.source_name),
+                    name=semantic_name,
                     bbox_2d_xyxy=bbox_2d,
                     mask_rle=MaskRLE.from_mask(mask),
                     bbox_3d=BoundingBox3D(center=center, size=size, frame_id=str(frame_id)),
@@ -983,6 +1018,8 @@ class RestrictedGTPerceptionPublisher:
         topic: str = "/semantic_mapping/gt_observations",
         min_visible_pixels: int = 16,
         min_bbox_area_pixels: int = 512,
+        min_bbox_short_side_pixels: int = 1,
+        min_portal_bbox_short_side_pixels: int = 8,
         min_visible_fraction: float = 0.2,
         max_distance_m: float = 4.0,
         step_interval: int = 1,
@@ -996,6 +1033,12 @@ class RestrictedGTPerceptionPublisher:
             raise ValueError("min_visible_pixels must be >= 1")
         if int(min_bbox_area_pixels) < 1:
             raise ValueError("min_bbox_area_pixels must be >= 1")
+        if int(min_bbox_short_side_pixels) < 1:
+            raise ValueError("min_bbox_short_side_pixels must be >= 1")
+        if int(min_portal_bbox_short_side_pixels) < int(min_bbox_short_side_pixels):
+            raise ValueError(
+                "min_portal_bbox_short_side_pixels must be >= min_bbox_short_side_pixels"
+            )
         if (
             not math.isfinite(float(min_visible_fraction))
             or not 0.0 <= float(min_visible_fraction) <= 1.0
@@ -1011,6 +1054,10 @@ class RestrictedGTPerceptionPublisher:
         self.topic = str(topic)
         self.min_visible_pixels = int(min_visible_pixels)
         self.min_bbox_area_pixels = int(min_bbox_area_pixels)
+        self.min_bbox_short_side_pixels = int(min_bbox_short_side_pixels)
+        self.min_portal_bbox_short_side_pixels = int(
+            min_portal_bbox_short_side_pixels
+        )
         self.min_visible_fraction = float(min_visible_fraction)
         self.max_distance_m = float(max_distance_m)
         self.step_interval = int(step_interval)
@@ -1138,6 +1185,10 @@ class RestrictedGTPerceptionPublisher:
             episode_reset=self._episode_reset_pending,
             min_visible_pixels=self.min_visible_pixels,
             min_bbox_area_pixels=self.min_bbox_area_pixels,
+            min_bbox_short_side_pixels=self.min_bbox_short_side_pixels,
+            min_portal_bbox_short_side_pixels=(
+                self.min_portal_bbox_short_side_pixels
+            ),
             min_visible_fraction=self.min_visible_fraction,
             max_distance_m=self.max_distance_m,
             camera_position=camera_position,

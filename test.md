@@ -1037,6 +1037,12 @@ bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
 其他 policy。需要替换 MLLM 配置时，可传 `SEMANTIC_DECISION_OVERRIDE` 与
 `SEMANTIC_MAPPING_OVERRIDE`，但脚本会校验三模块仍为完整 MLLM。
 
+V3 入口将 M1（object attribute）输出上限独立默认设为
+`SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=384`，可用同名环境变量显式覆盖；该值只传给
+`semantic_attribute_max_output_tokens`，不改动 M2 的 `model.max_tokens`、M3 的
+`skill_max_output_tokens`/`verification_max_output_tokens`，也不改动
+`full_mllm_mapping.yaml` 中 room MLLM 的 `room_mllm.max_output_tokens`。
+
 对抽屉目标，MLLM 输出的是高层 `drawer_scan` 宏动作和可见抽屉的归一化区域；V3 对外
 仍只发送 opaque `open(object_id)`，由可信评测侧私有执行“低头 → 从上到下逐格打开 →
 观察/更新受限感知 → 关闭 → 下一格 → 恢复视角”。扫描期间已验证的开度和目标可见性会
@@ -1071,6 +1077,59 @@ ROS_MASTER_URI=http://127.0.0.1:${PORT} \
 FAST_EVAL=true \
 bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
   outputs/interactive_nav_v3_fast_${IDX} ${IDX}
+```
+
+V3 三类 benchmark 的批量成功率测试必须显式传入 benchmark 文件；`--no-recording`
+是 `--fast-eval` 的别名，只保留 `episode_result.json` 和资源遥测，不启动 recorder、
+不等待 `step_capture_ack`，因此不需要 MP4。两个本地 Qwen 副本按逻辑 worker 轮询，
+每个 episode 的 dotenv 会复制 `.env` 后覆盖 `SEMANTIC_MODEL_ENDPOINT`：
+
+```bash
+V3_ROOT=/absolute/path/to/v3_release/benchmark
+COMMON=(
+  --workers 10
+  --base-master-port 12600
+  --episode-indices $(seq 0 49)
+  --max-steps 2000
+  # 先保守设置；完成小批 p95 后再按实际时长收紧。
+  --scene-timeout-s 7200
+  --model-endpoints http://127.0.0.1:8000/v1 http://127.0.0.1:8001/v1
+  --semantic-model-env-file "$PWD/.env"
+  --mujoco-egl-devices 0 1
+  --no-recording
+)
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_batch.py \
+  --benchmark "$V3_ROOT/channel.json" \
+  --output-dir /home/ldl/outputs/v3_channel_50 \
+  "${COMMON[@]}"
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_batch.py \
+  --benchmark "$V3_ROOT/container.json" \
+  --output-dir /home/ldl/outputs/v3_container_50 \
+  "${COMMON[@]}"
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_batch.py \
+  --benchmark "$V3_ROOT/mixed.json" \
+  --output-dir /home/ldl/outputs/v3_mixed_50 \
+  "${COMMON[@]}"
+```
+
+若三类要同时跑，不要把上述三个命令都设为 10 worker（那会启动 30 个 simulator）。
+当前双卡开发机可先采用总计 10 个 worker：channel=4（端口基址 12600）、container=3
+（12610）、mixed=3（12620）；mixed 的 endpoint 顺序写成 `8001 8000`，其余两个使用
+`8000 8001`，可得到约 5:5 的模型请求分配。三批输出目录各自保留
+`resource_telemetry.csv` 和 `aggregate_metrics.json`。
+
+若已有运行中的任意批次 PID，需要额外记录整批 CPU/RAM/每卡显存和 GPU 利用率，可
+并行启动：
+
+```bash
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/monitor_batch_resources.py \
+  --pid "$BATCH_PID" \
+  --output-dir /home/ldl/outputs/<batch-name> \
+  --interval-s 2
 ```
 
 原生入口把逐 step 分项耗时写到 `debug/step_timing.jsonl`，并生成 `debug/step_timing_summary.json`；V3 入口把汇总写入 `episode_result.json` 的 `result.timing_summary`，逐决策分项位于 `trace[].timing_ms`。优先比较 `policy_act`、`base_action`、`step_precheck`、ROS action wait、传感器和 task step 的 p50/p95，以定位未知 step 耗时。

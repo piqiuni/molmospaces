@@ -54,6 +54,10 @@ from semantic_decision_py_pkg.behavior_execution import (
 )
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.step_command_gate import StepCommandGate
+from semantic_decision_py_pkg.external_recovery import (
+    normalize_recovery_request,
+    recovery_request_matches_selection,
+)
 from semantic_decision_py_pkg.startup_scan_timing import (
     startup_scan_elapsed_control_s,
     startup_scan_timeout_reason,
@@ -61,6 +65,7 @@ from semantic_decision_py_pkg.startup_scan_timing import (
 from semantic_decision_py_pkg.visual_interaction_planning import (
     action_for_opaque_open_contract,
     candidate_with_direct_drawer_scan,
+    candidate_with_visual_drawer_scan,
     candidate_with_visual_operation_plan,
     fresh_direct_drawer_scan_candidate,
     infer_visual_interaction_target_type,
@@ -384,6 +389,15 @@ class SemanticBehaviorExecutor:
         self.verification_timeout_s = max(
             0.1, float(model_config.get("verification_timeout_s", 4.0))
         )
+        # M3 is now an audit after the sealed backend result.  Keep one short
+        # wait for a post-action image and at most one M1 re-observation when
+        # it disagrees; neither setting is allowed to stall execution.
+        self.post_interaction_visual_audit_wait_s = max(
+            0.0, float(config.get("post_interaction_visual_audit_wait_s", 2.0))
+        )
+        self.post_interaction_visual_audit_max_reobserves = max(
+            0, int(config.get("post_interaction_visual_audit_max_reobserves", 1))
+        )
         self.mllm_crop_margin_ratio = max(
             0.0, float(model_config.get("crop_margin_ratio", 0.10))
         )
@@ -408,6 +422,16 @@ class SemanticBehaviorExecutor:
         )
         self.interaction_observation_poll_interval_s = max(
             0.01, float(config.get("interaction_observation_poll_interval_s", 0.05))
+        )
+        # A single M1 response can flip between ``oblique`` and ``front`` at
+        # the same ring pose.  Container contact is stricter than ordinary
+        # detection: require two later, direct-front observations before the
+        # physical backend is called.  This remains public RGB evidence only.
+        self.container_pre_action_confirmation_count = max(
+            1, int(config.get("container_pre_action_confirmation_count", 2))
+        )
+        self.container_pre_action_require_direct_front = bool(
+            config.get("container_pre_action_require_direct_front", True)
         )
         startup_scan_config = rospy.get_param("~startup_scan", {}) or {}
         self.startup_scan_enabled = bool(startup_scan_config.get("enabled", False))
@@ -487,7 +511,11 @@ class SemanticBehaviorExecutor:
         )
         self.rear_goal_prerotate_max_control_steps = max(
             1,
-            int(config.get("rear_goal_prerotate_max_control_steps", 14)),
+            int(config.get("rear_goal_prerotate_max_control_steps", 28)),
+        )
+        self.rear_goal_prerotate_post_budget_settle_steps = max(
+            0,
+            int(config.get("rear_goal_prerotate_post_budget_settle_steps", 3)),
         )
         self.rear_goal_prerotate_step_sync_stall_timeout_s = max(
             0.1,
@@ -537,7 +565,7 @@ class SemanticBehaviorExecutor:
             float(config.get("rear_goal_safety_margin_m", 0.05)),
         )
         self.rear_goal_costmap_occupied_threshold = int(
-            config.get("rear_goal_costmap_occupied_threshold", 50)
+            config.get("rear_goal_costmap_occupied_threshold", 253)
         )
         self.rear_goal_unknown_is_blocked = bool(
             config.get("rear_goal_unknown_is_blocked", True)
@@ -650,6 +678,14 @@ class SemanticBehaviorExecutor:
             # a strict finite interaction-only cap.
             int(config.get("interaction_final_align_max_control_steps", 56)),
         )
+        self.interaction_final_align_post_budget_settle_steps = max(
+            0,
+            int(
+                config.get(
+                    "interaction_final_align_post_budget_settle_steps", 3
+                )
+            ),
+        )
         self.interaction_final_align_step_sync_stall_timeout_s = max(
             0.1,
             float(
@@ -735,6 +771,27 @@ class SemanticBehaviorExecutor:
         self.explore_reservation_retry_sec = float(
             config.get("explore_reservation_retry_sec", 0.25)
         )
+        # ExplorePy reports repeated make_plan failures here; the executor
+        # remains the only owner allowed to cancel navigation and publish the
+        # existing costmap-gated rear reverse command.
+        self.external_recovery_request_enabled = bool(
+            config.get("external_recovery_request_enabled", True)
+        )
+        self.external_recovery_request_max_age_s = max(
+            0.0,
+            float(config.get("external_recovery_request_max_age_s", 20.0)),
+        )
+        # A single active move_base goal can become ABORTED or make no progress
+        # without producing three distinct failed subgoals. Run at most one
+        # executor-owned, fresh-costmap-gated reverse/replan for that decision
+        # before reporting the normal terminal failure.
+        self.navigation_failure_recovery_enabled = bool(
+            config.get("navigation_failure_recovery_enabled", True)
+        )
+        self.navigation_failure_recovery_max_attempts = max(
+            0,
+            int(config.get("navigation_failure_recovery_max_attempts", 1)),
+        )
         self.final_align_cancel_wait_s = float(
             config.get("final_align_cancel_wait_s", 1.0)
         )
@@ -813,6 +870,14 @@ class SemanticBehaviorExecutor:
         self._explore_feedback_matched_count = 0
         self._explore_feedback_ignored_count = 0
         self._last_explore_feedback = {}
+        self._external_recovery_requests: dict[str, dict] = {}
+        self._external_recovery_consumed_ids: set[str] = set()
+        self._external_recovery_received_count = 0
+        self._external_recovery_accepted_count = 0
+        self._external_recovery_rejected_count = 0
+        self._external_recovery_consumed_count = 0
+        self._external_recovery_last_feedback: dict = {}
+        self._navigation_failure_recovery_attempts: dict[str, int] = {}
         self._stuck_failure_origin_xy: tuple[float, float] | None = None
         self._stuck_failure_candidate_ids: set[str] = set()
         self._latest_occupancy: OccupancyGrid | None = None
@@ -886,11 +951,18 @@ class SemanticBehaviorExecutor:
         self.interaction_observation_sequence = 0
         self.verification_retries = 0
         self.model_events: list[dict] = []
+        self._post_interaction_visual_audits: deque[dict] = deque(maxlen=128)
+        self._post_interaction_visual_audit_reobserve_counts: dict[str, int] = {}
         self.feedback_pub = rospy.Publisher(
             topics.get("behavior_feedback", "/semantic_decision/behavior_feedback"),
             String,
             queue_size=10,
             latch=True,
+        )
+        self.external_recovery_feedback_pub = rospy.Publisher(
+            topics.get("recovery_feedback", "/semantic_decision/recovery_feedback"),
+            String,
+            queue_size=8,
         )
         self.state_pub = rospy.Publisher(
             topics.get("execution_state", "/semantic_decision/execution_state"),
@@ -943,6 +1015,12 @@ class SemanticBehaviorExecutor:
             String,
             self._explore_feedback_callback,
             queue_size=10,
+        )
+        rospy.Subscriber(
+            topics.get("recovery_request", "/semantic_decision/recovery_request"),
+            String,
+            self._external_recovery_request_callback,
+            queue_size=8,
         )
         rospy.Subscriber(
             topics.get("interaction_result", "/semantic_mapping/interaction_result"),
@@ -1076,6 +1154,7 @@ class SemanticBehaviorExecutor:
             self.model_events = []
             decision_id = str(selection.get("decision_id") or "")
             if decision_id:
+                self._navigation_failure_recovery_attempts.pop(decision_id, None)
                 self._drawer_scan_wait_contexts.pop(decision_id, None)
                 self._drawer_scan_wait_records.pop(decision_id, None)
                 self._interaction_observation_requests.pop(decision_id, None)
@@ -1163,13 +1242,399 @@ class SemanticBehaviorExecutor:
                 return
         self._dispatch(commands)
 
+    def _external_recovery_request_callback(self, message: String) -> None:
+        """Accept only a request bound to the current EXPLORE reservation.
+
+        The ROS callback records intent and returns immediately.  It never
+        drives the base; `_run_navigation` consumes the request from the
+        executor-owned navigation thread, where the normal fresh-costmap and
+        single cmd_vel lease checks are available.
+        """
+
+        try:
+            raw_payload = json.loads(message.data)
+        except (TypeError, json.JSONDecodeError):
+            return
+        request = normalize_recovery_request(raw_payload)
+        if request is None:
+            return
+        request_id = str(request["request_id"])
+        accepted = False
+        status = "REJECTED"
+        detail: dict = {}
+        with self.lock:
+            self._external_recovery_received_count += 1
+            if not self.external_recovery_request_enabled:
+                self._external_recovery_rejected_count += 1
+                detail = {"reason": "external_recovery_disabled"}
+            elif not recovery_request_matches_selection(request, self.selection):
+                self._external_recovery_rejected_count += 1
+                detail = {"reason": "recovery_request_not_active_explore"}
+            elif self.machine.state not in {STATE_PREPARING_EXPLORE, STATE_NAVIGATING}:
+                self._external_recovery_rejected_count += 1
+                detail = {"reason": "recovery_request_wrong_executor_state"}
+            elif request_id in self._external_recovery_consumed_ids:
+                accepted = True
+                status = "DUPLICATE"
+                detail = {"reason": "recovery_request_already_consumed"}
+            elif request_id in self._external_recovery_requests:
+                accepted = True
+                status = "DUPLICATE"
+                detail = {"reason": "recovery_request_already_pending"}
+            else:
+                request["received_at_monotonic"] = time.monotonic()
+                self._external_recovery_requests[request_id] = request
+                self._external_recovery_accepted_count += 1
+                accepted = True
+                status = "ACCEPTED"
+                detail = {"reason": "queued_for_executor_navigation"}
+        self._publish_external_recovery_feedback(
+            request,
+            status=status,
+            accepted=accepted,
+            detail=detail,
+        )
+
+    def _publish_external_recovery_feedback(
+        self,
+        request: dict,
+        *,
+        status: str,
+        accepted: bool | None,
+        detail: dict | None = None,
+    ) -> None:
+        payload = {
+            "request_id": request.get("request_id", ""),
+            "source": "semantic_behavior_executor",
+            "decision_id": request.get("decision_id", ""),
+            "candidate_id": request.get("candidate_id", ""),
+            "recovery": request.get("recovery", ""),
+            "status": str(status),
+            "accepted": accepted,
+            "detail": dict(detail or {}),
+            "timestamp": time.time(),
+        }
+        with self.lock:
+            self._external_recovery_last_feedback = dict(payload)
+        self.external_recovery_feedback_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        )
+
+    def _take_external_recovery_request(
+        self, decision_id: str, candidate: dict
+    ) -> dict | None:
+        """Claim one current request; a request may drive at most one reverse."""
+
+        now = time.monotonic()
+        with self.lock:
+            stale_ids = [
+                request_id
+                for request_id, request in self._external_recovery_requests.items()
+                if (
+                    self.external_recovery_request_max_age_s > 0.0
+                    and now - float(request.get("received_at_monotonic", now))
+                    > self.external_recovery_request_max_age_s
+                )
+            ]
+            for request_id in stale_ids:
+                self._external_recovery_requests.pop(request_id, None)
+            selection = self.selection
+            for request_id, request in list(self._external_recovery_requests.items()):
+                if (
+                    str(request.get("decision_id") or "") != str(decision_id)
+                    or not recovery_request_matches_selection(request, selection)
+                    or str(candidate.get("candidate_id") or "")
+                    != str(request.get("candidate_id") or "")
+                ):
+                    continue
+                self._external_recovery_requests.pop(request_id, None)
+                self._external_recovery_consumed_ids.add(request_id)
+                # Bounded bookkeeping: only the latest request identities are
+                # needed to make duplicate ROS deliveries idempotent.
+                if len(self._external_recovery_consumed_ids) > 128:
+                    self._external_recovery_consumed_ids = set(
+                        list(self._external_recovery_consumed_ids)[-64:]
+                    )
+                self._external_recovery_consumed_count += 1
+                return dict(request)
+        return None
+
+    def _consume_external_recovery_if_needed(
+        self,
+        decision_id: str,
+        candidate: dict,
+        *,
+        preflight_failed: bool,
+        start_goal_option_index: int,
+        interaction_approach_attempts: list[dict],
+    ) -> bool:
+        """Run at most one queued safe reverse, solely from the executor.
+
+        Return ``True`` when this navigation worker has handed off or finished
+        the request.  A currently reachable path simply resolves a stale
+        explorer report without moving the base.
+        """
+
+        request = self._take_external_recovery_request(decision_id, candidate)
+        if request is None:
+            return False
+        if not preflight_failed:
+            self._publish_external_recovery_feedback(
+                request,
+                status="NOT_NEEDED",
+                accepted=True,
+                detail={"reason": "executor_make_plan_reachable"},
+            )
+            return False
+        self._publish_external_recovery_feedback(
+            request,
+            status="EXECUTING",
+            accepted=True,
+            detail={"reason": "executor_owned_safe_reverse_replan"},
+        )
+        recovered, recovery_detail = self._attempt_rear_goal_reverse(
+            decision_id,
+            allow_idle_action_client=True,
+        )
+        recovery_detail = {
+            "request_id": request.get("request_id", ""),
+            "request_reason": request.get("reason", ""),
+            **dict(recovery_detail or {}),
+        }
+        if recovered and self._navigation_is_current(decision_id):
+            self._publish_external_recovery_feedback(
+                request,
+                status="SUCCEEDED",
+                accepted=True,
+                detail=recovery_detail,
+            )
+            threading.Thread(
+                target=self._run_navigation,
+                args=(
+                    decision_id,
+                    candidate,
+                    int(start_goal_option_index),
+                    list(interaction_approach_attempts),
+                ),
+                daemon=True,
+            ).start()
+            return True
+        self._publish_external_recovery_feedback(
+            request,
+            status="FAILED",
+            accepted=True,
+            detail=recovery_detail,
+        )
+        self._handle_navigation_result(
+            decision_id,
+            False,
+            {
+                "reason": "external_recovery_failed",
+                "external_recovery": True,
+                # Avoid falling through to legacy ungated stuck recovery.
+                "rear_goal_recovery": True,
+                "external_recovery_detail": recovery_detail,
+            },
+        )
+        return True
+
+    @staticmethod
+    def _finite_public_bbox(value: object) -> list[float] | None:
+        """Normalize one detector box carried by a targeted M1 update."""
+
+        if not isinstance(value, (list, tuple)) or len(value) < 4:
+            return None
+        try:
+            x0, y0, x1, y1 = (float(item) for item in value[:4])
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(item) for item in (x0, y0, x1, y1)):
+            return None
+        left, right = sorted((x0, x1))
+        top, bottom = sorted((y0, y1))
+        if right - left < 1.0 or bottom - top < 1.0:
+            return None
+        return [left, top, right, bottom]
+
+    @staticmethod
+    def _is_drawer_pre_action_candidate(candidate: dict | None) -> bool:
+        return bool(
+            ((candidate or {}).get("metadata") or {}).get(
+                "drawer_pre_action_observation", False
+            )
+        )
+
+    @staticmethod
+    def _is_container_pre_action_candidate(candidate: dict | None) -> bool:
+        return bool(
+            ((candidate or {}).get("metadata") or {}).get(
+                "container_pre_action_observation", False
+            )
+        )
+
+    @staticmethod
+    def _container_visual_truncation_reason(update: dict) -> str:
+        """Reject only missing lateral contact evidence for a container.
+
+        A low camera can clip the bottom of a tall drawer/fridge box while the
+        front plane and all model-provided action regions remain visible.  That
+        is different from clipping the left/right boundary, which prevents a
+        reliable frontality judgement.  Older messages without the public edge
+        list remain fail-closed.
+        """
+
+        if not bool(update.get("visual_evidence_truncated", False)):
+            return ""
+        raw_edges = update.get("visual_evidence_truncated_edges")
+        if not isinstance(raw_edges, (list, tuple, set)):
+            return "m1_visual_evidence_truncated"
+        edges = {str(edge).strip().casefold() for edge in raw_edges}
+        if not edges:
+            return "m1_visual_evidence_truncated"
+        if edges.intersection({"left", "right", "unknown"}):
+            return "m1_visual_evidence_laterally_truncated"
+        return ""
+
+    def _container_m1_pre_action_ready_locked(
+        self,
+        update: dict,
+        request: dict,
+    ) -> str:
+        """Validate the public fresh-M1 contract before opening a container.
+
+        The state machine makes the final transition.  This helper only turns
+        malformed/stale updates into an ordinary bounded re-observation rather
+        than allowing a ring pose or stale detector frame to reach the bridge.
+        """
+
+        status = str(update.get("attribute_status") or "").strip().casefold()
+        if status != "ready":
+            return f"m1_attribute_status_{status or 'missing'}"
+        if update.get("is_currently_visible") is not True:
+            return "m1_target_not_currently_visible"
+        truncation_reason = self._container_visual_truncation_reason(update)
+        if truncation_reason:
+            return truncation_reason
+        if self._finite_public_bbox(update.get("observed_bbox_2d")) is None:
+            return "m1_public_bbox_unavailable"
+        capture_step = self._public_step_or_none(
+            update.get("observation_capture_step")
+            or update.get("attribute_capture_step")
+        )
+        if capture_step is None:
+            return "m1_capture_step_unavailable"
+        minimum_capture_step = self._public_step_or_none(
+            request.get("minimum_capture_step")
+        )
+        if (
+            minimum_capture_step is not None
+            and capture_step <= minimum_capture_step
+        ):
+            return "m1_capture_not_fresh"
+        view_state = str(update.get("view_state") or "unknown").strip().casefold()
+        allowed_views = (
+            {"front"}
+            if bool(getattr(self, "container_pre_action_require_direct_front", True))
+            else {"front", "oblique"}
+        )
+        if view_state not in allowed_views:
+            return f"m1_view_state_{view_state}"
+        if update.get("front_surface_visible") is not True:
+            return "m1_front_surface_not_visible"
+        if update.get("approach_ready") is not True:
+            return "m1_approach_not_ready"
+        if bool(update.get("needs_reobserve", False)):
+            return "m1_needs_reobserve"
+        return "ready"
+
+    def _drawer_candidate_from_m1_update_locked(
+        self,
+        candidate: dict,
+        update: dict,
+        request: dict,
+    ) -> tuple[dict | None, str]:
+        """Ground a drawer scan in one fresh M1 observation or reject it.
+
+        The box is an output-side public detector record paired with the M1
+        image.  The model supplies only crop-relative visible action regions;
+        no graph pose, joint, or hidden drawer information can enter here.
+        """
+
+        status = str(update.get("attribute_status") or "").strip().casefold()
+        if status != "ready":
+            return None, f"m1_attribute_status_{status or 'missing'}"
+        if update.get("is_currently_visible") is not True:
+            return None, "m1_target_not_currently_visible"
+        truncation_reason = self._container_visual_truncation_reason(update)
+        if truncation_reason:
+            return None, truncation_reason
+        view_state = str(update.get("view_state") or "unknown").strip().casefold()
+        allowed_views = (
+            {"front"}
+            if bool(getattr(self, "container_pre_action_require_direct_front", True))
+            else {"front", "oblique"}
+        )
+        if view_state not in allowed_views:
+            return None, f"m1_view_state_{view_state}"
+        if update.get("front_surface_visible") is not True:
+            return None, "m1_front_surface_not_visible"
+        if update.get("approach_ready") is not True:
+            return None, "m1_approach_not_ready"
+        if bool(update.get("needs_reobserve", False)):
+            return None, "m1_needs_reobserve"
+        bbox = self._finite_public_bbox(update.get("observed_bbox_2d"))
+        if bbox is None:
+            return None, "m1_public_bbox_unavailable"
+        capture_step = self._public_step_or_none(
+            update.get("observation_capture_step")
+            or update.get("attribute_capture_step")
+        )
+        if capture_step is None:
+            return None, "m1_capture_step_unavailable"
+        minimum_capture_step = self._public_step_or_none(
+            request.get("minimum_capture_step")
+        )
+        if (
+            minimum_capture_step is not None
+            and capture_step <= minimum_capture_step
+        ):
+            return None, "m1_capture_not_fresh"
+        visual_plan = {
+            "target_type": "drawer_container",
+            # A visible drawer set is an inspection macro, not a persistent
+            # multi-drawer opening.  The force bridge keeps the low view while
+            # it opens, observes, and closes one M1-grounded drawer before the
+            # next.  This prevents two drawers from remaining open together
+            # and gives the interaction a real bounded simulator-step cost.
+            "action": "scan",
+            "operation_method": "pull",
+            "drawer_sequence_type": "drawer_scan",
+            "view_state": view_state,
+            "approach_ready": True,
+            "reposition_required": False,
+            "confidence": float(update.get("confidence", 0.0) or 0.0),
+            "reason": "fresh_m1_drawer_action_regions",
+            "source": str(update.get("source") or "mllm_attribute_inference"),
+            "capture_step": capture_step,
+        }
+        planned = candidate_with_visual_drawer_scan(
+            candidate,
+            drawer_bbox_2d=bbox,
+            capture_step=capture_step,
+            action_regions=update.get("action_regions"),
+            visual_plan=visual_plan,
+        )
+        if planned is None:
+            return None, "m1_visible_drawer_action_regions_missing"
+        return planned, "ready"
+
     def _attribute_update_callback(self, message: String) -> None:
         """Consume only the exact fresh M1 response requested by this executor.
 
         Attribute discovery normally updates the graph asynchronously and must
-        never advance an active interaction.  This path is different: an
-        unknown portal has reached an observation pose and explicitly asked M1
-        for a post-pose RGB+detection pair.  Match the opaque request ID and
+        never advance an active interaction.  This path is different: a
+        portal re-observation or drawer pre-action gate explicitly asked M1 for
+        a post-pose RGB+detection pair.  Match the opaque request ID and
         preserve failed responses as a bounded re-observation attempt.
         """
 
@@ -1226,6 +1691,81 @@ class SemanticBehaviorExecutor:
                     # The targeted request itself can only be consumed by a
                     # later visible detection; do not require a hidden GT flag.
                     update.setdefault("is_currently_visible", True)
+                candidate = dict(self.machine.candidate or self.selection or {})
+                if self._is_drawer_pre_action_candidate(candidate):
+                    planned, drawer_reason = self._drawer_candidate_from_m1_update_locked(
+                        candidate,
+                        update,
+                        request,
+                    )
+                    update["drawer_action_regions_ready"] = planned is not None
+                    update["drawer_visual_precondition_reason"] = drawer_reason
+                    if planned is not None:
+                        self.machine.candidate = planned
+                        # The selection is the recorder/feedback authority;
+                        # retain the exact fresh box+region command that will
+                        # be sent if the state machine accepts this M1 view.
+                        self.selection = dict(planned)
+                        interaction = dict(
+                            planned.get("interaction_command") or {}
+                        )
+                        self.active_skill_plan = {
+                            "visual_operation_plan": dict(
+                                interaction.get("visual_operation_plan") or {}
+                            ),
+                            "subactions": [],
+                            "max_retries": 0,
+                        }
+                        self.pending_skill_actions = []
+                elif self._is_container_pre_action_candidate(candidate):
+                    container_reason = self._container_m1_pre_action_ready_locked(
+                        update, request
+                    )
+                    update["container_visual_precondition_reason"] = container_reason
+                    required_confirmations = max(
+                        1,
+                        int(
+                            getattr(
+                                self,
+                                "container_pre_action_confirmation_count",
+                                2,
+                            )
+                            or 1
+                        ),
+                    )
+                    confirmation_count = max(
+                        0, int(request.get("confirmation_count", 0) or 0)
+                    )
+                    capture_step = self._public_step_or_none(
+                        update.get("observation_capture_step")
+                        or update.get("attribute_capture_step")
+                    )
+                    if (
+                        container_reason == "ready"
+                        and capture_step is not None
+                        and confirmation_count + 1 < required_confirmations
+                    ):
+                        # Keep the robot at this observation pose and ask for a
+                        # causally later RGB+detection pair.  Do not let a
+                        # transient one-frame "front" judgement open a
+                        # container from a side view.
+                        update["container_visual_precondition_reason"] = (
+                            "m1_front_confirmation_pending"
+                        )
+                        commands = [
+                            {
+                                "kind": "request_interaction_observation",
+                                "candidate": candidate,
+                                "node_id": str(request.get("node_id") or ""),
+                                "object_id": str(request.get("object_id") or ""),
+                                "attempt": int(request.get("attempt", 0) or 0),
+                                "min_capture_step": int(capture_step),
+                                "reason": "mllm_container_front_confirmation",
+                                "confirmation_count": confirmation_count + 1,
+                            }
+                        ]
+                        self._interaction_observation_requests.pop(decision_id, None)
+                        break
                 commands = self.machine.on_interaction_observation_result(update)
                 self._interaction_observation_requests.pop(decision_id, None)
                 break
@@ -1236,6 +1776,10 @@ class SemanticBehaviorExecutor:
             payload = json.loads(message.data)
         except json.JSONDecodeError:
             return
+        # M3 is launched as a post-action audit.  Keep a complete immutable
+        # snapshot here because the backend result may finish the state machine
+        # (and clear ``self.selection``) before the model response arrives.
+        audit_task = None
         with self.lock:
             if not self._matches_active(payload):
                 return
@@ -1255,7 +1799,40 @@ class SemanticBehaviorExecutor:
                 )
                 self._record_post_interaction_costmap_baseline_locked(payload)
                 visual_plan = dict(self.active_skill_plan.get("visual_operation_plan") or {})
-                is_drawer_scan = str(visual_plan.get("target_type") or "") == "drawer_container"
+                selected_interaction = dict(
+                    (self.selection or {}).get("interaction_command") or {}
+                )
+                drawer_sequence_type = str(
+                    selected_interaction.get("sequence_type") or ""
+                ).casefold()
+                is_drawer_scan = drawer_sequence_type == "drawer_scan"
+                is_drawer_interaction = (
+                    str(visual_plan.get("target_type") or "") == "drawer_container"
+                    or drawer_sequence_type in {"drawer_scan", "drawer_open"}
+                )
+                drawer_failure_reason = str(
+                    payload.get("failure_reason") or payload.get("reason") or ""
+                ).strip().casefold()
+                if (
+                    is_drawer_interaction
+                    and not bool(payload.get("success"))
+                    and drawer_failure_reason
+                    in {
+                        "drawer_scan_execution_failed",
+                        "drawer_open_execution_failed",
+                        "articulation_resolution_failed",
+                    }
+                ):
+                    # The M1-gated command had a fresh visible front/region;
+                    # an executor rejection at this point is a concrete
+                    # candidate-level failure, not a stale visual observation
+                    # to send back through M3 or a generic cooldown.
+                    payload = {
+                        **payload,
+                        "failure_stage": "interaction_execution",
+                        "terminal_candidate_exclusion": True,
+                        "reason": "drawer_interaction_execution_unavailable",
+                    }
                 if static_portal_feedback:
                     # A static opening already returned its terminal public
                     # postcondition.  It must not be treated as a successful
@@ -1274,8 +1851,12 @@ class SemanticBehaviorExecutor:
                     commands = []
                 else:
                     next_candidate = None
+                    backend_success = bool(
+                        payload.get("success")
+                        or str(payload.get("status") or "").upper() == "SUCCEEDED"
+                    )
                     commands = self.machine.on_interaction_result(
-                        bool(payload.get("success")), detail=payload
+                        backend_success, detail=payload
                     )
                 if (
                     self.machine.state == STATE_VERIFYING
@@ -1283,7 +1864,7 @@ class SemanticBehaviorExecutor:
                 ):
                     commands.extend(
                         self.machine.on_verification_result(
-                            bool(payload.get("success")),
+                            backend_success,
                             detail={**payload, "verification_mode": "trusted_backend_result"},
                         )
                     )
@@ -1303,8 +1884,8 @@ class SemanticBehaviorExecutor:
                         # successful scan.  The semantic map receives the frames
                         # captured while each drawer is open instead.
                         commands.extend(
-                            self.machine.on_verification_result(
-                                True,
+                            self.machine.on_backend_result(
+                                backend_success,
                                 detail={
                                     **payload,
                                     "verification_mode": "drawer_scan_backend",
@@ -1312,17 +1893,42 @@ class SemanticBehaviorExecutor:
                             )
                         )
                     else:
+                        # A successful/failed sealed backend result is already
+                        # the execution fact.  Finish immediately so a slow or
+                        # mistaken M3 response cannot replay this command.  The
+                        # visual request below is deliberately detached from the
+                        # state machine and can only record/re-observe.
                         decision_id = str((self.selection or {}).get("decision_id") or "")
-                        result_image_sequence = self.latest_image_sequence
-                        threading.Thread(
-                            target=self._run_visual_verification,
-                            args=(decision_id, payload, result_image_sequence),
-                            daemon=True,
-                        ).start()
+                        audit_selection = dict(self.selection or {})
+                        audit_node = self._selected_graph_node_locked(audit_selection)
+                        audit_task = (
+                            decision_id,
+                            dict(payload),
+                            int(self.latest_image_sequence),
+                            audit_selection,
+                            audit_node,
+                        )
+                        commands.extend(
+                            self.machine.on_backend_result(
+                                backend_success,
+                                detail={
+                                    **payload,
+                                    "backend_success": backend_success,
+                                    "verification_mode": "backend_postcondition",
+                                    "visual_audit_pending": True,
+                                },
+                            )
+                        )
         if next_candidate is not None:
             self._publish_interaction_command(next_candidate)
         else:
             self._dispatch(commands)
+        if audit_task is not None:
+            threading.Thread(
+                target=self._run_visual_verification_audit,
+                args=audit_task,
+                daemon=True,
+            ).start()
 
     def _retry_interaction_approach_after_pose_failure_locked(
         self, payload: dict
@@ -1400,6 +2006,7 @@ class SemanticBehaviorExecutor:
             **payload,
             "reason": "interaction_approach_options_exhausted",
             "failure_reason": "interaction_approach_options_exhausted",
+            "failure_stage": "interaction_approach_exhausted",
             "interaction_approach_attempts": attempts,
             "interaction_approach_goal_option_count": goal_option_count,
         }
@@ -1479,7 +2086,7 @@ class SemanticBehaviorExecutor:
             **payload,
             "reason": "interaction_approach_options_exhausted",
             "failure_reason": "interaction_approach_options_exhausted",
-            "failure_stage": "interaction_approach_navigation",
+            "failure_stage": "interaction_approach_exhausted",
             "interaction_approach_attempts": attempts,
             "interaction_approach_goal_option_count": goal_option_count,
         }
@@ -2368,6 +2975,15 @@ class SemanticBehaviorExecutor:
                 "explore_feedback_matched_count": self._explore_feedback_matched_count,
                 "explore_feedback_ignored_count": self._explore_feedback_ignored_count,
                 "last_explore_feedback": dict(self._last_explore_feedback),
+                "external_recovery": {
+                    "enabled": self.external_recovery_request_enabled,
+                    "pending_count": len(self._external_recovery_requests),
+                    "received_count": self._external_recovery_received_count,
+                    "accepted_count": self._external_recovery_accepted_count,
+                    "rejected_count": self._external_recovery_rejected_count,
+                    "consumed_count": self._external_recovery_consumed_count,
+                    "last_feedback": dict(self._external_recovery_last_feedback),
+                },
                 "drawer_scan_wait": dict(
                     self._drawer_scan_wait_contexts.get(
                         str((self.selection or {}).get("decision_id") or ""),
@@ -2375,6 +2991,14 @@ class SemanticBehaviorExecutor:
                     )
                 ),
                 "startup_scan": dict(self._startup_scan_progress),
+                "post_interaction_visual_audit_count": len(
+                    getattr(self, "_post_interaction_visual_audits", ())
+                ),
+                "post_interaction_visual_audit_last": (
+                    dict(getattr(self, "_post_interaction_visual_audits", ())[-1])
+                    if getattr(self, "_post_interaction_visual_audits", ())
+                    else {}
+                ),
                 "timestamp": time.time(),
             }
         self.state_pub.publish(
@@ -2442,7 +3066,7 @@ class SemanticBehaviorExecutor:
                 self._finish_terminal(command)
 
     def _publish_interaction_observation_request(self, command: dict) -> None:
-        """Ask M1 for a causally later public view of an unknown portal."""
+        """Ask M1 for a causally later portal or drawer visual view."""
 
         candidate = dict(command.get("candidate") or {})
         decision_id = str(candidate.get("decision_id") or "")
@@ -2494,13 +3118,25 @@ class SemanticBehaviorExecutor:
                 "object_id": object_id,
                 "episode_id": episode_id,
                 "minimum_capture_step": int(minimum_capture_step),
-                "reason": str(command.get("reason") or "mllm_portal_state_unknown")[:160],
+                "reason": str(
+                    command.get("reason")
+                    or "mllm_portal_state_unknown"
+                )[:160],
                 "request_id": request_id,
             }
             self._interaction_observation_requests[decision_id] = {
                 **request,
                 "node_id": node_id,
                 "attempt": int(command.get("attempt", 0) or 0),
+                "confirmation_count": max(
+                    0, int(command.get("confirmation_count", 0) or 0)
+                ),
+                "drawer_pre_action": self._is_drawer_pre_action_candidate(
+                    self.machine.candidate
+                ),
+                "container_pre_action": self._is_container_pre_action_candidate(
+                    self.machine.candidate
+                ),
                 "requested_at": time.monotonic(),
             }
         self.attribute_refresh_request_pub.publish(
@@ -2547,9 +3183,73 @@ class SemanticBehaviorExecutor:
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
 
+    @staticmethod
+    def _has_valid_drawer_visual_contract(interaction: dict) -> bool:
+        regions = interaction.get("open_regions")
+        if not isinstance(regions, list) or not regions:
+            return False
+        valid_region = False
+        for region in regions:
+            if not isinstance(region, dict):
+                continue
+            center = region.get("center")
+            if not isinstance(center, (list, tuple)) or len(center) < 2:
+                continue
+            try:
+                x, y = float(center[0]), float(center[1])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(x) and math.isfinite(y) and 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+                valid_region = True
+                break
+        if not valid_region:
+            return False
+        if SemanticBehaviorExecutor._finite_public_bbox(
+            interaction.get("drawer_container_bbox_2d")
+        ) is None:
+            return False
+        return SemanticBehaviorExecutor._public_step_or_none(
+            interaction.get("drawer_container_capture_step")
+        ) is not None
+
+    def _reject_drawer_command_without_visual_contract(
+        self, candidate: dict, reason: str
+    ) -> None:
+        """Fail locally before an empty/ungrounded drawer command reaches bridge."""
+
+        commands: list[dict] = []
+        with self.lock:
+            if (
+                self.selection is None
+                or str(self.selection.get("decision_id") or "")
+                != str(candidate.get("decision_id") or "")
+                or self.machine.state != STATE_INTERACTING
+            ):
+                return
+            commands = self.machine.on_interaction_result(
+                False,
+                detail={
+                    "reason": reason,
+                    "failure_stage": "interaction_visual_precondition",
+                    "terminal_candidate_exclusion": True,
+                    "action_executed": False,
+                },
+            )
+        self._dispatch(commands)
+
     def _publish_interaction_command(self, candidate: dict) -> None:
         interaction = candidate.get("interaction_command") or {}
         metadata = candidate.get("metadata") or {}
+        drawer_sequence_type = str(
+            interaction.get("sequence_type") or ""
+        ).casefold()
+        if drawer_sequence_type in {"drawer_scan", "drawer_open"}:
+            if not self._has_valid_drawer_visual_contract(interaction):
+                self._reject_drawer_command_without_visual_contract(
+                    candidate,
+                    "drawer_visual_contract_missing_before_bridge",
+                )
+                return
         action = action_for_opaque_open_contract(
             interaction.get("action", "open"),
             enabled=self.evaluator_opaque_open_only,
@@ -2610,7 +3310,7 @@ class SemanticBehaviorExecutor:
                 for key in ("door_leaf", "connectivity", "confidence")
                 if key in aperture_observation
             }
-        if str(interaction.get("sequence_type") or "").casefold() == "drawer_scan":
+        if drawer_sequence_type in {"drawer_scan", "drawer_open"}:
             drawer_box = interaction.get("drawer_container_bbox_2d")
             if isinstance(drawer_box, (list, tuple)):
                 payload["drawer_container_bbox_2d"] = list(drawer_box)
@@ -2924,6 +3624,208 @@ class SemanticBehaviorExecutor:
                 result_source,
             )
         self._dispatch(commands)
+
+    def _run_visual_verification_audit(
+        self,
+        decision_id: str,
+        backend_payload: dict,
+        result_image_sequence: int,
+        selection: dict,
+        node: dict,
+    ) -> None:
+        """Audit a sealed interaction result without re-entering the FSM.
+
+        The backend/evaluator owns execution success.  This background M3 call
+        is useful for debugging visual disagreement and can request one fresh
+        Module-1 observation, but it has no path back to ``interact`` and thus
+        can never replay a command that the backend already accepted.
+        """
+
+        required_sequence = int(result_image_sequence or 0)
+        wait_s = max(
+            0.0, float(getattr(self, "post_interaction_visual_audit_wait_s", 2.0))
+        )
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline and not rospy.is_shutdown():
+            with self.lock:
+                if int(getattr(self, "latest_image_sequence", 0) or 0) > required_sequence:
+                    break
+            time.sleep(0.05)
+
+        with self.lock:
+            after = self._object_crop_data_locked(dict(node or {}))
+            image_sequence = int(getattr(self, "latest_image_sequence", 0) or 0)
+            capture_step = self._public_step_or_none(
+                getattr(self, "_latest_rgb_step_seq", None)
+            )
+
+        execution_status = {
+            "backend_success": bool(
+                backend_payload.get("success")
+                or str(backend_payload.get("status") or "").upper() == "SUCCEEDED"
+            ),
+            "status": str(backend_payload.get("status") or ""),
+            "failure_reason": str(
+                backend_payload.get("failure_reason")
+                or backend_payload.get("reason")
+                or ""
+            )[:160],
+            "post_state": str(
+                backend_payload.get("post_state") or backend_payload.get("state") or ""
+            )[:64],
+        }
+        result_source = "model"
+        model_metrics: dict = {}
+        verification: dict | None = None
+        if not after:
+            result_source = "post_action_image_unavailable"
+        else:
+            response = self.mllm_client.request_json(
+                role="visual_verification",
+                instruction=(
+                    "Inspect only the current cropped image of the interaction target after execution. "
+                    "Determine whether it now matches the requested state using visible evidence only. "
+                    "This is an audit: never request an action. Return exactly one compact JSON object "
+                    "with success, confidence, reason, observed_states, new_contents_visible, and retry_action. "
+                    "Set observed_states.target_state to open, closed, ajar, unchanged, or unknown; "
+                    "set observed_states.visible_change to yes, no, or unknown; retry_action to none, retry, "
+                    "reposition, or rescan; no markdown or extra fields."
+                ),
+                context={
+                    "target": {
+                        "id": "target",
+                        "expected_action": str(
+                            (selection.get("interaction_command") or {}).get("action")
+                            or "open"
+                        ),
+                        "expected_state": str(
+                            (selection.get("interaction_command") or {}).get("expected_state")
+                            or "open"
+                        ),
+                    },
+                    "execution": execution_status,
+                },
+                images=[after],
+                response_schema=build_visual_verification_response_schema(),
+                timeout_s=self.verification_timeout_s,
+                max_tokens=self.verification_max_output_tokens,
+                metrics_context=self._model_metrics_context(
+                    "visual_verification_audit", decision_id, selection
+                ),
+            )
+            model_metrics = response.metrics()
+            if response.payload is None or response.error:
+                result_source = "model_error"
+                verification = {
+                    "success": False,
+                    "reason": str(response.error or "empty_model_response")[:160],
+                    "retry_action": "rescan",
+                }
+            else:
+                try:
+                    verification = validate_visual_verification(response.payload)
+                except ValueError as exc:
+                    result_source = "model_invalid_response"
+                    verification = {
+                        "success": False,
+                        "reason": f"invalid_model_response: {exc}"[:160],
+                        "retry_action": "rescan",
+                    }
+
+        audit_success = bool((verification or {}).get("success"))
+        interaction = dict(selection.get("interaction_command") or {})
+        command_id = self._command_id(selection)
+        audit_event = {
+            "command_id": command_id,
+            "decision_id": decision_id,
+            "candidate_id": str(selection.get("candidate_id") or ""),
+            "target_id": str(selection.get("target_id") or ""),
+            "backend_success": execution_status["backend_success"],
+            "audit_success": audit_success,
+            "result_source": result_source,
+            "reason": str((verification or {}).get("reason") or "")[:160],
+            "retry_action": str((verification or {}).get("retry_action") or "none"),
+            "required_image_sequence": required_sequence,
+            "observed_image_sequence": image_sequence,
+            "observed_capture_step": capture_step,
+            "model_metrics": model_metrics,
+            "timestamp": time.time(),
+        }
+        refresh_request = None
+        with self.lock:
+            audits = getattr(self, "_post_interaction_visual_audits", None)
+            if audits is None:
+                audits = deque(maxlen=128)
+                self._post_interaction_visual_audits = audits
+            # The graph-facing M1 update is intentionally bounded per sealed
+            # command.  It refreshes evidence only; no state-machine retry is
+            # created from an audit disagreement.
+            audit_counts = getattr(
+                self, "_post_interaction_visual_audit_reobserve_counts", None
+            )
+            if audit_counts is None:
+                audit_counts = {}
+                self._post_interaction_visual_audit_reobserve_counts = audit_counts
+            max_reobserves = max(
+                0,
+                int(
+                    getattr(
+                        self,
+                        "post_interaction_visual_audit_max_reobserves",
+                        1,
+                    )
+                    or 0
+                ),
+            )
+            attempted = int(audit_counts.get(command_id, 0) or 0)
+            object_id = str(
+                interaction.get("object_id")
+                or selection.get("target_id")
+                or ""
+            )
+            if not audit_success and object_id and attempted < max_reobserves:
+                attempted += 1
+                audit_counts[command_id] = attempted
+                latest_step = self._public_step_or_none(
+                    getattr(self, "_latest_rgb_step_seq", None)
+                )
+                refresh_request = {
+                    "object_id": object_id,
+                    "episode_id": str(
+                        selection.get("episode_id")
+                        or (getattr(self, "latest_graph", {}) or {}).get("episode_id")
+                        or ""
+                    ),
+                    "minimum_capture_step": max(0, int(latest_step or 0)),
+                    "reason": "post_interaction_visual_audit_mismatch",
+                    "request_id": f"{command_id}:m3audit:{attempted}"[:96],
+                }
+                audit_event["reobserve_requested"] = True
+            else:
+                audit_event["reobserve_requested"] = False
+            audits.append(dict(audit_event))
+
+        if refresh_request is not None:
+            publisher = getattr(self, "attribute_refresh_request_pub", None)
+            if publisher is not None:
+                publisher.publish(
+                    String(
+                        data=json.dumps(
+                            refresh_request,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                )
+        rospy.loginfo(
+            "[semantic_behavior_executor] M3 post-action audit command=%s "
+            "backend_success=%s audit_success=%s source=%s reobserve=%s",
+            command_id,
+            execution_status["backend_success"],
+            audit_success,
+            result_source,
+            bool(refresh_request),
+        )
 
     def _model_metrics_context(
         self, role: str, decision_id: str, candidate: dict
@@ -3501,9 +4403,20 @@ class SemanticBehaviorExecutor:
             "costmap_origin_yaw": origin_yaw,
         }
 
-    def _acquire_rear_goal_cmd_vel_lease(self, decision_id: str) -> bool:
+    def _acquire_rear_goal_cmd_vel_lease(
+        self, decision_id: str, *, allow_idle_action_client: bool = False
+    ) -> bool:
         """Cancel DWA and prove it is no longer active before direct control."""
 
+        with self.lock:
+            active_lease = str(getattr(self, "_executor_cmd_vel_lease_mode", "") or "")
+        if active_lease:
+            self._last_rear_goal_recovery_detail = {
+                "reason": "rear_goal_cmd_vel_lease_already_owned",
+                "decision_id": decision_id,
+                "active_lease": active_lease,
+            }
+            return False
         if not self.rear_goal_prerotate_step_sync_enabled:
             self._last_rear_goal_recovery_detail = {
                 "reason": "rear_goal_step_gate_disabled",
@@ -3527,7 +4440,9 @@ class SemanticBehaviorExecutor:
         # actionlib status values: PENDING, ACTIVE, PREEMPTING, RECALLING.
         # Any of these means move_base may still publish a command, so direct
         # executor control fails closed instead of racing the local planner.
-        if state in {0, 1, 6, 7}:
+        if state in {0, 1, 6, 7} and not (
+            allow_idle_action_client and state == 0
+        ):
             self._last_rear_goal_recovery_detail = {
                 "reason": "rear_goal_cmd_vel_lease_busy",
                 "decision_id": decision_id,
@@ -3872,7 +4787,9 @@ class SemanticBehaviorExecutor:
             }
         return bool(clear)
 
-    def _attempt_rear_goal_reverse(self, decision_id: str) -> tuple[bool, dict]:
+    def _attempt_rear_goal_reverse(
+        self, decision_id: str, *, allow_idle_action_client: bool = False
+    ) -> tuple[bool, dict]:
         if not self.rear_goal_reverse_enabled:
             return False, {"reason": "rear_goal_reverse_disabled"}
         occupancy, costmap_detail = self._fresh_rear_local_costmap_snapshot()
@@ -3911,7 +4828,9 @@ class SemanticBehaviorExecutor:
                 **costmap_detail,
             }
         target = min(float(self.rear_goal_reverse_distance_m), safe)
-        if not self._acquire_rear_goal_cmd_vel_lease(decision_id):
+        if not self._acquire_rear_goal_cmd_vel_lease(
+            decision_id, allow_idle_action_client=allow_idle_action_client
+        ):
             return False, dict(self._last_rear_goal_recovery_detail)
         try:
             success, detail = self._drive_rear_goal_reverse_step_gated(
@@ -4245,6 +5164,7 @@ class SemanticBehaviorExecutor:
         step_sync_stall_timeout_s: float | None = None,
         step_command_gate: StepCommandGate | None = None,
         delivery_retry_steps: int | None = None,
+        post_budget_settle_steps: int = 0,
         rotation_label: str = "pre-rotation",
         step_sync_budget_authoritative: bool = False,
         command_guard=None,
@@ -4265,6 +5185,12 @@ class SemanticBehaviorExecutor:
             if delivery_retry_steps is None
             else max(0, int(delivery_retry_steps))
         )
+        # A fixed-dt command is acknowledged when the bridge closes its action
+        # window, but the pose callback can lag that acknowledgement by a few
+        # evaluator steps.  Do not declare a perfectly applied final command a
+        # failure before observing that bounded causal tail.  This never emits
+        # an additional non-zero command after the finite control budget.
+        active_post_budget_settle_steps = max(0, int(post_budget_settle_steps))
         nonzero_commands_sent = 0
         acknowledged_control_steps = 0
         missed_control_steps = 0
@@ -4359,15 +5285,31 @@ class SemanticBehaviorExecutor:
                         self.rear_goal_pi_turn_sign,
                     )
                 if gated_prerotation:
-                    if command_guard is not None and not bool(command_guard()):
-                        return finish_prerotation("safety_guard", False)
                     if nonzero_commands_sent >= int(delivery_attempt_budget):
                         reason = (
                             "cmd_vel_not_applied"
                             if acknowledged_control_steps == 0 and missed_control_steps
                             else "control_step_budget"
                         )
+                        if reason == "cmd_vel_not_applied":
+                            return finish_prerotation(reason, False)
+                        if active_post_budget_settle_steps:
+                            last_sent_step = gate_diagnostics.get("last_sent_step")
+                            last_sync_step = gate_diagnostics.get("last_step_sync")
+                            if (
+                                last_sent_step is None
+                                or last_sync_step is None
+                                or int(last_sync_step)
+                                < int(last_sent_step)
+                                + active_post_budget_settle_steps
+                            ):
+                                # Keep accepting the causal pose stream, but
+                                # never consume another RGB/fresh command pair.
+                                time.sleep(0.005)
+                                continue
                         return finish_prerotation(reason, False)
+                    if command_guard is not None and not bool(command_guard()):
+                        return finish_prerotation("safety_guard", False)
                     with self.lock:
                         command_step_index = active_step_gate.consume_step(
                             now=now
@@ -4394,6 +5336,7 @@ class SemanticBehaviorExecutor:
         heading_target_xy: tuple[float, float] | None = None,
         *,
         trigger_source: str = "initial_rear_goal",
+        allow_reverse: bool = True,
     ) -> bool:
         self._last_rear_goal_recovery_detail = {}
         if not self.rear_goal_prerotate_enabled:
@@ -4426,7 +5369,10 @@ class SemanticBehaviorExecutor:
             # A short reverse is allowed only when both turn sweeps were
             # explicitly rejected by the same fresh local costmap.  Missing
             # pose/map information is never converted into a blind backoff.
-            if detail.get("reason") == "rear_goal_both_turn_sweeps_blocked":
+            if (
+                allow_reverse
+                and detail.get("reason") == "rear_goal_both_turn_sweeps_blocked"
+            ):
                 backed_off, reverse_detail = self._attempt_rear_goal_reverse(
                     decision_id
                 )
@@ -4463,6 +5409,11 @@ class SemanticBehaviorExecutor:
                 ),
                 step_command_gate=self._rear_goal_prerotate_gate,
                 delivery_retry_steps=self.rear_goal_prerotate_delivery_retry_steps,
+                post_budget_settle_steps=(
+                    getattr(
+                        self, "rear_goal_prerotate_post_budget_settle_steps", 3
+                    )
+                ),
                 rotation_label="rear-goal-safe-turn",
                 # The bridge applies exactly one fixed-dt target increment per
                 # gate/ack pair; do not let slow ROS wall time alter this path.
@@ -4581,6 +5532,13 @@ class SemanticBehaviorExecutor:
                 "step_command_gate": self._interaction_final_align_gate,
                 "delivery_retry_steps": (
                     self.interaction_final_align_delivery_retry_steps
+                ),
+                "post_budget_settle_steps": (
+                    getattr(
+                        self,
+                        "interaction_final_align_post_budget_settle_steps",
+                        3,
+                    )
                 ),
                 "rotation_label": "interaction-final-align",
                 # Fixed-dt simulator actions, acknowledgements, the finite
@@ -4768,6 +5726,8 @@ class SemanticBehaviorExecutor:
                 False,
                 {
                     "reason": "interaction_approach_options_exhausted",
+                    "failure_reason": "interaction_approach_options_exhausted",
+                    "failure_stage": "interaction_approach_exhausted",
                     "interaction_approach_attempts": interaction_approach_attempts,
                 },
             )
@@ -4983,6 +5943,25 @@ class SemanticBehaviorExecutor:
                 selected_goal_option_index = option_index
                 path_lookahead = option_lookahead
                 break
+        # An ExplorePy request is only acted on after this executor has made
+        # its own preflight decision.  If the plan has become reachable, the
+        # request is acknowledged as unnecessary; otherwise the sole executor
+        # runs one existing costmap-gated reverse/replan attempt.
+        preflight_failed = bool(
+            selected_goal is None
+            or (
+                attempted_goals
+                and bool(attempted_goals[-1].get("fail_open_after_empty_plan"))
+            )
+        )
+        if is_explore and self._consume_external_recovery_if_needed(
+            decision_id,
+            candidate,
+            preflight_failed=preflight_failed,
+            start_goal_option_index=start_goal_option_index,
+            interaction_approach_attempts=interaction_approach_attempts,
+        ):
+            return
         if selected_goal is None:
             post_open_wait_elapsed_s = max(
                 0.0, time.monotonic() - post_interaction_retry_started_at
@@ -5128,6 +6107,18 @@ class SemanticBehaviorExecutor:
         goal.target_pose.pose.orientation.z = math.sin(0.5 * yaw)
         goal.target_pose.pose.orientation.w = math.cos(0.5 * yaw)
         self.move_base.send_goal(goal)
+        # The two ROS callbacks may race by one scheduling turn: if ExplorePy
+        # published its request just after the preflight branch above, claim it
+        # immediately after this executor-owned goal is active, then cancel it
+        # through the same exclusive lease before any direct reverse command.
+        if is_explore and self._consume_external_recovery_if_needed(
+            decision_id,
+            candidate,
+            preflight_failed=preflight_failed,
+            start_goal_option_index=start_goal_option_index,
+            interaction_approach_attempts=interaction_approach_attempts,
+        ):
+            return
         navigation_started_at = time.monotonic()
         start_pose = self._current_pose(goal_frame)
         start_goal_distance_m = (
@@ -5176,6 +6167,14 @@ class SemanticBehaviorExecutor:
             and time.monotonic() < deadline
         ):
             time.sleep(0.10)
+            if is_explore and self._consume_external_recovery_if_needed(
+                decision_id,
+                candidate,
+                preflight_failed=preflight_failed,
+                start_goal_option_index=start_goal_option_index,
+                interaction_approach_attempts=interaction_approach_attempts,
+            ):
+                return
             state = int(self.move_base.get_state())
             pose = self._current_pose(goal_frame)
             now = time.monotonic()
@@ -5711,6 +6710,176 @@ class SemanticBehaviorExecutor:
         )
         return reachable, lookahead, "reachable" if reachable else "endpoint_mismatch"
 
+    @staticmethod
+    def _single_goal_recovery_failure(detail: dict) -> bool:
+        """Return whether one active move_base goal deserves a safe retry.
+
+        This deliberately excludes generic preflight failures and post-open
+        traversal failures.  Those paths have their own causal-map contracts;
+        this guard addresses the observed case where one ACTIVE goal reaches
+        ABORTED or makes no progress before the legacy three-subgoal watchdog
+        can fire.
+        """
+
+        detail = detail or {}
+        reason = str(detail.get("reason") or "").strip().casefold()
+        if reason == "navigation_stagnation":
+            return True
+        if reason != "navigation_terminal_failure":
+            return False
+        try:
+            status_code = int(detail.get("status_code"))
+        except (TypeError, ValueError):
+            status_code = None
+        status = str(detail.get("status") or "").strip().casefold()
+        return bool(
+            status_code == GoalStatus.ABORTED
+            or status == "aborted"
+            or "aborted" in status
+        )
+
+    def _attempt_single_goal_navigation_recovery(
+        self,
+        decision_id: str,
+        success: bool,
+        detail: dict,
+    ) -> tuple[dict | None, dict]:
+        """Try one executor-owned reverse/replan for an active failed goal.
+
+        The direct command uses the same fresh local-costmap sweep, action
+        lease, and step gate as rear-goal recovery.  ExplorePy remains only a
+        reservation/request source in external-control mode; it never shares
+        ``cmd_vel`` ownership with this path.
+
+        Returns ``(restart, detail)``.  ``restart`` is non-None only after a
+        safe reverse completed and the caller should relaunch navigation.
+        ``detail`` is empty when this failure is not eligible for recovery.
+        """
+
+        if success or not bool(
+            getattr(self, "navigation_failure_recovery_enabled", False)
+        ):
+            return None, {}
+        if not self._single_goal_recovery_failure(detail):
+            return None, {}
+        with self.lock:
+            selection = dict(self.selection or {})
+            candidate = dict(self.machine.candidate or selection)
+            active_state = self.machine.state
+            attempts_by_decision = getattr(
+                self, "_navigation_failure_recovery_attempts", {}
+            )
+            attempt_count = int(attempts_by_decision.get(decision_id, 0) or 0)
+        if (
+            not selection
+            or str(selection.get("decision_id") or "") != str(decision_id)
+            or active_state not in {STATE_NAVIGATING, STATE_APPROACH_INTERACTION}
+            # INTERACT already owns a bounded ring of approach poses. Its
+            # terminal path must remain candidate-local and deterministic;
+            # adding a generic same-pose recovery after that ring is exhausted
+            # would resurrect the exact loop this guard is meant to remove.
+            or str(candidate.get("behavior_type") or "").upper() == "INTERACT"
+            or is_post_interaction_traversal_navigation(candidate)
+            or attempt_count
+            >= int(getattr(self, "navigation_failure_recovery_max_attempts", 0))
+        ):
+            return None, {}
+
+        with self.lock:
+            attempts_by_decision = getattr(
+                self, "_navigation_failure_recovery_attempts", None
+            )
+            if attempts_by_decision is None:
+                attempts_by_decision = {}
+                self._navigation_failure_recovery_attempts = attempts_by_decision
+            attempts_by_decision[decision_id] = attempt_count + 1
+
+        request = None
+        is_explore = str(candidate.get("behavior_type") or "").upper() == "EXPLORE"
+        if is_explore:
+            request = self._take_external_recovery_request(decision_id, candidate)
+            if request is not None:
+                self._publish_external_recovery_feedback(
+                    request,
+                    status="EXECUTING",
+                    accepted=True,
+                    detail={"reason": "executor_owned_active_goal_recovery"},
+                )
+
+        recovered, reverse_detail = self._attempt_rear_goal_reverse(decision_id)
+        recovery_detail = {
+            "recovery_owner": "semantic_behavior_executor",
+            "recovery_trigger": str(detail.get("reason") or ""),
+            "navigation_recovery_attempt": attempt_count + 1,
+            "navigation_recovery_attempt_limit": (
+                int(getattr(self, "navigation_failure_recovery_max_attempts", 0))
+            ),
+            "reverse": dict(reverse_detail or {}),
+        }
+        if not recovered or not self._navigation_is_current(decision_id):
+            recovery_detail["recovered"] = False
+            recovery_detail["rear_goal_recovery"] = True
+            if request is not None:
+                self._publish_external_recovery_feedback(
+                    request,
+                    status="FAILED",
+                    accepted=True,
+                    detail=recovery_detail,
+                )
+            return None, recovery_detail
+
+        metadata = candidate.get("metadata") or {}
+        try:
+            start_goal_option_index = max(
+                0, int(metadata.get("interaction_approach_goal_option_index", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            start_goal_option_index = 0
+        approach_attempts = [
+            dict(item)
+            for item in metadata.get("interaction_approach_attempts") or []
+            if isinstance(item, dict)
+        ]
+        goal_options = navigation_goal_options(candidate)
+        turn_attempted = False
+        turn_completed = True
+        if goal_options:
+            selected_index = min(start_goal_option_index, len(goal_options) - 1)
+            goal_x, goal_y, _goal_yaw = goal_options[selected_index]
+            turn_attempted = True
+            # This routine only rotates when the replanned direction is rear.
+            # It rechecks the fresh circular footprint and is prevented from
+            # issuing a second reverse because this recovery already moved.
+            turn_completed = self._prerotate_for_rear_goal(
+                decision_id,
+                str(metadata.get("frame_id") or self.map_frame),
+                goal_x,
+                goal_y,
+                heading_target_xy=(goal_x, goal_y),
+                trigger_source="active_goal_recovery",
+                allow_reverse=False,
+            )
+        recovery_detail.update(
+            {
+                "recovered": True,
+                "turn_attempted": turn_attempted,
+                "turn_completed": bool(turn_completed),
+                "turn_detail": dict(self._last_rear_goal_recovery_detail),
+            }
+        )
+        if request is not None:
+            self._publish_external_recovery_feedback(
+                request,
+                status="SUCCEEDED",
+                accepted=True,
+                detail=recovery_detail,
+            )
+        return {
+            "candidate": candidate,
+            "start_goal_option_index": start_goal_option_index,
+            "interaction_approach_attempts": approach_attempts,
+        }, recovery_detail
+
     def _handle_navigation_result(
         self, decision_id: str, success: bool, detail: dict
     ) -> None:
@@ -5720,6 +6889,30 @@ class SemanticBehaviorExecutor:
             locks = getattr(self, "_rear_goal_turn_locks", None)
             if isinstance(locks, dict):
                 locks.pop(decision_id, None)
+        restart, active_goal_recovery_detail = (
+            self._attempt_single_goal_navigation_recovery(
+                decision_id, success, detail
+            )
+        )
+        if restart is not None:
+            rospy.logwarn(
+                "[semantic_behavior_executor] recovered active navigation goal; "
+                "replanning once: %s",
+                active_goal_recovery_detail,
+            )
+            threading.Thread(
+                target=self._run_navigation,
+                args=(
+                    decision_id,
+                    dict(restart["candidate"]),
+                    int(restart["start_goal_option_index"]),
+                    list(restart["interaction_approach_attempts"]),
+                ),
+                daemon=True,
+            ).start()
+            return
+        if active_goal_recovery_detail:
+            detail = {**detail, "active_goal_recovery": active_goal_recovery_detail}
         # A failed rear-goal safety gate already means "replan/no motion".
         # Do not fall through to the legacy ungated stuck-recovery backoff.
         rear_safe_failure = bool(detail.get("rear_goal_recovery")) or str(
@@ -5771,6 +6964,13 @@ class SemanticBehaviorExecutor:
                     detail["failure_reason"] = (
                         "interaction_approach_options_exhausted"
                     )
+                    detail["failure_stage"] = "interaction_approach_exhausted"
+                elif approach_reason == "interaction_approach_options_exhausted":
+                    # A previous fallback branch has already consumed every
+                    # approach. Preserve that stronger terminal contract rather
+                    # than treating the feedback as one more ordinary approach
+                    # failure in the decision layer.
+                    detail["failure_stage"] = "interaction_approach_exhausted"
             if (
                 success
                 and self.machine.candidate is not None
@@ -5977,6 +7177,8 @@ class SemanticBehaviorExecutor:
             }
             status = "SUCCEEDED" if command.get("success") else "FAILED"
             detail = dict(command.get("detail") or {})
+            if decision_id:
+                self._navigation_failure_recovery_attempts.pop(decision_id, None)
             drawer_scan_wait = self._drawer_scan_wait_records.pop(decision_id, None)
             self._drawer_scan_wait_contexts.pop(decision_id, None)
             if drawer_scan_wait:

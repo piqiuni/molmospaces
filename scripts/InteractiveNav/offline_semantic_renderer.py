@@ -174,7 +174,13 @@ class GlobalCostmapReplay:
         self._grid: RawGrid | None = None
         self._applied_update = -1
 
-    def grid_for(self, full_meta: dict | None, update_receipt: object) -> RawGrid | None:
+    def grid_for(
+        self,
+        full_meta: dict | None,
+        update_receipt: object,
+        *,
+        max_stamp_sec: float = 0.0,
+    ) -> RawGrid | None:
         if not full_meta:
             return None
         full_receipt = str(full_meta.get("receipt_id") or "")
@@ -198,6 +204,16 @@ class GlobalCostmapReplay:
                 continue
             if index > target:
                 break
+            update_stamp = 0.0
+            try:
+                update_stamp = float(update.get("stamp_sec") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            # The selected receipt is normally already causal.  Keep this
+            # second guard in the replay itself so an out-of-order manifest or
+            # a legacy caller cannot accidentally apply a future patch.
+            if max_stamp_sec > 0.0 and update_stamp > max_stamp_sec + 1e-6:
+                continue
             patch = load_raw_grid(update, geometry=self._grid)
             if patch is None:
                 continue
@@ -325,6 +341,18 @@ class TransformResolver:
         return None
 
 
+# OpenCV uses BGR tuples.  Keep the colours as named constants because the
+# replay is a debugging surface: a colour must retain one stable semantic
+# meaning between runs.
+RAW_FRONTIER_COLOR = (112, 36, 170)
+UNSELECTED_EXPLORE_COLOR = (225, 185, 215)
+UNSELECTED_EXPLORE_BORDER_COLOR = (178, 122, 170)
+COSTMAP_SOFT_LIGHT_COLOR = (196, 248, 255)
+COSTMAP_SOFT_DARK_COLOR = (65, 190, 255)
+COSTMAP_INSCRIBED_COLOR = (25, 105, 255)
+COSTMAP_LETHAL_COLOR = (30, 30, 150)
+
+
 def _occupancy_base(grid: RawGrid) -> np.ndarray:
     raw_values = grid.values
     free = (raw_values >= 0) & (raw_values <= 20)
@@ -341,7 +369,7 @@ def _occupancy_base(grid: RawGrid) -> np.ndarray:
     image[(values >= 0) & (values <= 20)] = (248, 248, 245)
     image[(values > 20) & (values < 50)] = (118, 118, 118)
     image[values >= 50] = (28, 30, 32)
-    image[np.flipud(raw_frontier)] = (112, 36, 170)
+    image[np.flipud(raw_frontier)] = RAW_FRONTIER_COLOR
     return image
 
 
@@ -353,11 +381,15 @@ def _costmap_base(grid: RawGrid) -> np.ndarray:
     inflated = (values > 0) & (values < 99)
     if np.any(inflated):
         strength = values[inflated].astype(np.float32) / 98.0
-        image[inflated, 0] = 255
-        image[inflated, 1] = np.clip(232.0 - 82.0 * strength, 0, 255).astype(np.uint8)
-        image[inflated, 2] = np.clip(110.0 - 80.0 * strength, 0, 255).astype(np.uint8)
-    image[values == 99] = (245, 92, 28)
-    image[values >= 100] = (128, 20, 28)
+        low = np.asarray(COSTMAP_SOFT_LIGHT_COLOR, dtype=np.float32)
+        high = np.asarray(COSTMAP_SOFT_DARK_COLOR, dtype=np.float32)
+        colors = low + (high - low) * strength[:, None]
+        image[inflated] = np.clip(colors, 0, 255).astype(np.uint8)
+    # Values 1--98 are traversable soft inflation, 99 is an inscribed-footprint
+    # collision, and >=100 is lethal.  Use visibly separated yellow/orange/red
+    # bands so a display cannot make an inflated cost look impassable.
+    image[values == 99] = COSTMAP_INSCRIBED_COLOR
+    image[values >= 100] = COSTMAP_LETHAL_COLOR
     return image
 
 
@@ -389,6 +421,116 @@ def _draw_panel_title(panel: np.ndarray, title: str, step_index: int) -> None:
     y = max(text_size[1] + 5, 22)
     cv2.putText(panel, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (245, 245, 245), thickness + 2, cv2.LINE_AA)
     cv2.putText(panel, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (25, 25, 25), thickness, cv2.LINE_AA)
+
+
+def draw_map_snapshot_note(
+    panel: np.ndarray,
+    snapshot_meta: dict | None,
+    *,
+    display_stamp_sec: float = 0.0,
+    selection_reason: str = "",
+    y: int = 57,
+) -> None:
+    """Annotate a map which is intentionally older than the displayed frame.
+
+    The replay must never borrow a receipt from the future just to make a map
+    look up-to-date.  When a component has not published by the simulator-frame
+    boundary, this compact label makes the resulting legitimate map lag visible
+    instead of presenting it as a current-step map.
+    """
+
+    if not snapshot_meta:
+        return
+    try:
+        snapshot_stamp = float(snapshot_meta.get("stamp_sec") or 0.0)
+        display_stamp = float(display_stamp_sec or 0.0)
+    except (TypeError, ValueError):
+        return
+    age_sec = display_stamp - snapshot_stamp if display_stamp and snapshot_stamp else 0.0
+    reason = str(selection_reason or "")
+    # A receipt selected through the causal fallback is worth surfacing even
+    # when its timestamps round to the same video frame.
+    if age_sec <= 0.05 and reason in {"requested", "latest_causal"}:
+        return
+    if age_sec > 0.0:
+        label = f"MAP AS-OF {age_sec:.2f}s EARLIER"
+    elif reason.startswith("requested_future"):
+        label = "MAP AS-OF PRIOR CAUSAL RECEIPT"
+    elif reason:
+        label = "MAP SNAPSHOT SELECTED CAUSALLY"
+    else:
+        return
+    font_scale = 0.31 if panel.shape[1] < 360 else 0.36
+    thickness = 1
+    text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+    x0, y0 = 6, max(15, int(y))
+    x1 = min(panel.shape[1] - 5, x0 + text_size[0] + 10)
+    overlay = panel.copy()
+    cv2.rectangle(overlay, (x0 - 2, y0 - text_size[1] - 5), (x1, y0 + 4), (255, 255, 255), -1)
+    cv2.addWeighted(overlay, 0.78, panel, 0.22, 0.0, panel)
+    cv2.putText(
+        panel,
+        label,
+        (x0 + 2, y0),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (55, 55, 115),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_costmap_legend(panel: np.ndarray) -> None:
+    """Draw the cost semantics without conflating soft and collision costs."""
+
+    legend = (
+        ("SOFT 1-98", COSTMAP_SOFT_DARK_COLOR),
+        ("INSCRIBED 99", COSTMAP_INSCRIBED_COLOR),
+        ("LETHAL 100+", COSTMAP_LETHAL_COLOR),
+    )
+    height, width = panel.shape[:2]
+    overlay = panel.copy()
+    if width >= 390:
+        x0, y0 = 6, height - 26
+        cv2.rectangle(overlay, (x0 - 2, y0 - 3), (min(width - 4, 414), height - 3), (255, 255, 255), -1)
+        cv2.addWeighted(overlay, 0.82, panel, 0.18, 0.0, panel)
+        x = x0 + 4
+        for label, color in legend:
+            cv2.rectangle(panel, (x, y0 + 2), (x + 12, y0 + 14), color, -1)
+            cv2.putText(panel, label, (x + 17, y0 + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (20, 20, 20), 1, cv2.LINE_AA)
+            x += 132
+        return
+    # The two costmap panels are each 240 px wide in the standard layout.
+    # A short stacked legend remains readable instead of clipping a horizontal
+    # three-way legend beyond the panel edge.
+    x0, y0 = 6, height - 48
+    cv2.rectangle(overlay, (x0 - 2, y0 - 3), (min(width - 4, x0 + 116), height - 3), (255, 255, 255), -1)
+    cv2.addWeighted(overlay, 0.82, panel, 0.18, 0.0, panel)
+    for index, (label, color) in enumerate(legend):
+        baseline = y0 + 12 + index * 14
+        cv2.rectangle(panel, (x0 + 3, baseline - 10), (x0 + 13, baseline), color, -1)
+        cv2.putText(panel, label, (x0 + 18, baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.31, (20, 20, 20), 1, cv2.LINE_AA)
+
+
+def _draw_occupancy_candidate_legend(panel: np.ndarray) -> None:
+    """Explain raw frontiers versus unselected explore candidate locations."""
+
+    legend = (
+        ("RAW FRONTIER", RAW_FRONTIER_COLOR),
+        ("EXPLORE OPTION", UNSELECTED_EXPLORE_COLOR),
+        ("LIVE SUBGOAL", candidate_color("EXPLORE")),
+    )
+    height, width = panel.shape[:2]
+    overlay = panel.copy()
+    x0, y0 = 6, height - 25
+    box_width = min(width - 4, 325)
+    cv2.rectangle(overlay, (x0 - 2, y0 - 3), (box_width, height - 3), (255, 255, 255), -1)
+    cv2.addWeighted(overlay, 0.82, panel, 0.18, 0.0, panel)
+    x = x0 + 4
+    for label, color in legend:
+        cv2.circle(panel, (x + 6, y0 + 8), 5, color, -1, cv2.LINE_AA)
+        cv2.putText(panel, label, (x + 15, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.29, (20, 20, 20), 1, cv2.LINE_AA)
+        x += 104
 
 
 def _draw_polyline(panel: np.ndarray, points: list[tuple[int, int]], color: tuple[int, int, int], thickness: int) -> None:
@@ -478,18 +620,48 @@ def zoom_world_bounds(
     )
 
 
-def draw_task_subgoal_header(panel: np.ndarray, step: dict) -> None:
+def draw_task_subgoal_header(
+    panel: np.ndarray,
+    step: dict,
+    *,
+    box_width_px: int | None = None,
+    background_alpha: float = 1.0,
+) -> None:
+    """Draw the OCC task/subgoal banner with configurable compact opacity."""
+
     selection = active_semantic_selection(step)
     candidates = step.get("semantic_candidates") or {}
     target = str((candidates.get("target_context") or {}).get("target_name") or "-")
     behavior = str(selection.get("behavior_type") or "-")
     name = str(selection.get("target_name") or selection.get("target_id") or selection.get("candidate_id") or "-")
-    max_chars = max(24, int(panel.shape[1] / 10))
-    if len(name) > max_chars:
-        name = name[: max_chars - 3] + "..."
-    cv2.rectangle(panel, (4, 4), (min(panel.shape[1] - 4, 460), 49), (255, 255, 255), -1)
+    box_width = min(
+        panel.shape[1] - 4,
+        max(120, int(box_width_px if box_width_px is not None else 460)),
+    )
+    max_chars = max(13, int((box_width - 16) / 7.0))
+    def clipped(value: str, prefix: str) -> str:
+        available = max(4, max_chars - len(prefix))
+        return value if len(value) <= available else value[: max(1, available - 3)] + "..."
+    overlay = panel.copy()
+    cv2.rectangle(overlay, (4, 4), (box_width, 49), (255, 255, 255), -1)
+    alpha = max(0.0, min(1.0, float(background_alpha)))
+    if alpha >= 1.0:
+        panel[:] = overlay
+    elif alpha > 0.0:
+        cv2.addWeighted(overlay, alpha, panel, 1.0 - alpha, 0.0, panel)
     for index, line in enumerate((f"TASK TARGET: {target}", f"MODULE2 SUBGOAL: {behavior} {name}")):
-        cv2.putText(panel, line, (9, 20 + index * 21), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (30, 30, 30), 1, cv2.LINE_AA)
+        prefix = "TASK TARGET: " if index == 0 else "MODULE2: "
+        value = target if index == 0 else f"{behavior} {name}"
+        cv2.putText(
+            panel,
+            prefix + clipped(value, prefix),
+            (9, 20 + index * 21),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (30, 30, 30),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def _draw_robot_arrow(panel: np.ndarray, center: tuple[int, int], yaw: float, length: int) -> None:
@@ -523,6 +695,109 @@ def _selection_target_id(selection: dict | None) -> str:
     if selection.get("active") is False:
         return ""
     return str(selection.get("target_id") or selection.get("object_id") or selection.get("candidate_id") or "")
+
+
+_CANONICAL_ID_PREFIXES = (
+    "interaction_",
+    "target_",
+    "container_",
+    "object_",
+    "instance_",
+    "portal_",
+    "doorframe_",
+)
+_CANONICAL_CONTAINER_ALIASES = (
+    ("chest_of_drawers", "drawer"),
+    ("chestofdrawers", "drawer"),
+    ("chest_drawers", "drawer"),
+    ("dresser", "drawer"),
+)
+
+
+def canonical_object_id_variants(value: object) -> set[str]:
+    """Return stable ID aliases shared by recorder selection and graph nodes.
+
+    Runtime graph IDs can carry ``container_``/``object_``/``portal_`` source
+    prefixes while the executor selection carries a candidate or simulator
+    object ID.  Rendering must compare the semantic identity, not the producer
+    prefix.  The alias normalization is intentionally identifier-only; it does
+    not use GT class metadata to manufacture a match.
+    """
+
+    raw = str(value or "").strip().casefold()
+    if not raw:
+        return set()
+    candidates = {raw}
+    # Candidate IDs commonly look like interaction:<object>:open.  Keep the
+    # object segment as an alias while retaining the full token for diagnostics.
+    parts = [part.strip() for part in raw.split(":") if part.strip()]
+    if len(parts) >= 2 and parts[0] in {"interaction", "target", "candidate"}:
+        candidates.add(parts[1])
+    variants: set[str] = set()
+    for candidate in candidates:
+        token = candidate.replace("-", "_").replace(" ", "_")
+        token = "_".join(part for part in token.split("_") if part)
+        variants.add(token)
+        stripped = token
+        changed = True
+        while changed:
+            changed = False
+            for prefix in _CANONICAL_ID_PREFIXES:
+                if stripped.startswith(prefix):
+                    stripped = stripped[len(prefix) :]
+                    changed = True
+                    break
+        for source, replacement in _CANONICAL_CONTAINER_ALIASES:
+            stripped = stripped.replace(source, replacement)
+        stripped = "_".join(part for part in stripped.split("_") if part)
+        if stripped:
+            variants.add(stripped)
+    return {variant for variant in variants if variant}
+
+
+def selection_target_ids(selection: dict | None) -> set[str]:
+    """Collect canonical IDs for the live selection and its interaction command."""
+
+    selection = selection or {}
+    if selection.get("active") is False:
+        return set()
+    values = [
+        selection.get("target_id"),
+        selection.get("object_id"),
+        selection.get("candidate_id"),
+        (selection.get("interaction_command") or {}).get("node_id"),
+        (selection.get("interaction_command") or {}).get("object_id"),
+    ]
+    identifiers: set[str] = set()
+    for value in values:
+        identifiers.update(canonical_object_id_variants(value))
+    # A name is a last-resort fallback for old recorder snapshots that carried
+    # no object/node ID at all.  Prefer an exact ID whenever one exists.
+    if not identifiers:
+        identifiers.update(canonical_object_id_variants(selection.get("target_name")))
+    return identifiers
+
+
+def _node_selection_ids(node: dict) -> set[str]:
+    attributes = node.get("attributes") or {}
+    values = (
+        attributes.get("object_id"),
+        attributes.get("source_object_name"),
+        attributes.get("instance_id"),
+        node.get("object_id"),
+        node.get("id"),
+        node.get("name"),
+    )
+    identifiers: set[str] = set()
+    for value in values:
+        identifiers.update(canonical_object_id_variants(value))
+    return identifiers
+
+
+def node_matches_selection(node: dict, target_ids: set[str]) -> bool:
+    """Match a graph node against canonical live-selection IDs."""
+
+    return bool(target_ids and target_ids.intersection(_node_selection_ids(node)))
 
 
 def _selection_revision(record: dict | None) -> str:
@@ -688,15 +963,26 @@ def _node_color(node: dict) -> tuple[int, int, int]:
     return (30, 190, 195) if node.get("is_currently_visible") else (145, 145, 145)
 
 
-def _bounded_nodes(graph: dict, observed_ids: set[str], target_id: str, limit: int = 96) -> list[dict]:
-    observed = [node for node in graph.get("nodes") or [] if _node_observed(node, observed_ids)]
+def _bounded_nodes(
+    graph: dict, observed_ids: set[str], target_ids: set[str], limit: int = 96
+) -> list[dict]:
+    # The current interaction target remains a diagnostic overlay even when a
+    # live selection has just moved it out of the camera's observed-ID set.
+    # Otherwise a remote drawer can be selected correctly but disappear from
+    # the replay panel before its canonical INTERACT highlight is drawn.
+    observed = [
+        node
+        for node in graph.get("nodes") or []
+        if _node_observed(node, observed_ids)
+        or node_matches_selection(node, target_ids)
+    ]
     rooms = [node for node in observed if str(node.get("type") or "") == "room"]
     others = [node for node in observed if str(node.get("type") or "") != "room"]
     if len(others) <= limit:
         return rooms + others
     others.sort(
         key=lambda node: (
-            0 if target_id and target_id in _node_ids(node) else 1,
+            0 if node_matches_selection(node, target_ids) else 1,
             0 if bool(node.get("is_currently_visible")) else 1,
             0 if str(node.get("type") or "") == "portal" else 1,
             0 if str(node.get("type") or "") == "container" else 1,
@@ -774,6 +1060,10 @@ class OfflineSixPanelRenderer:
         draw_semantic_candidates: bool = False,
         draw_route_plan: bool = False,
         episode_trajectory: list[tuple[float, float, float, float]] | None = None,
+        view_scale: float = 1.0,
+        snapshot_meta: dict | None = None,
+        display_stamp_sec: float = 0.0,
+        snapshot_selection_reason: str = "",
     ) -> np.ndarray:
         width, height = panel_size
         if grid is None:
@@ -845,7 +1135,12 @@ class OfflineSixPanelRenderer:
             for pixel in [self._world_to_image_px(grid, point)]
             if pixel is not None
         ]
-        crop = bounds_from_world(world_bounds) if world_bounds is not None else None
+        view_bounds = (
+            zoom_world_bounds(world_bounds, view_scale)
+            if world_bounds is not None
+            else None
+        )
+        crop = bounds_from_world(view_bounds) if view_bounds is not None else None
         # The established OCC/global bounds track known map extents, while the
         # episode trajectory can begin outside a newly cropped local extent.
         # Include every still-representable historic point so offline replay
@@ -933,7 +1228,8 @@ class OfflineSixPanelRenderer:
                 values = list(candidate.get("goal_xyyaw") or [])
                 candidate_point = self._transform(values, self.transforms.map_frame, grid.frame_id, step_index)
                 candidate_px = to_panel(candidate_point)
-                color = candidate_color(str(candidate.get("behavior_type") or "EXPLORE"))
+                behavior_type = str(candidate.get("behavior_type") or "EXPLORE").upper()
+                color = candidate_color(behavior_type)
                 if str(candidate.get("candidate_id") or "") == selected_id:
                     if candidate_matches_canonical_selection(selection, candidate):
                         if candidate_px is not None:
@@ -941,7 +1237,12 @@ class OfflineSixPanelRenderer:
                     else:
                         selected_candidate_stale = True
                 if candidate_point is not None and candidate_px is not None and str(candidate.get("candidate_id") or "") != selected_id:
-                    cv2.circle(panel, candidate_px, max(2, int(round(max(scale, 1.0) * 0.8))), color, -1, cv2.LINE_AA)
+                    if behavior_type == "EXPLORE":
+                        radius = max(3, int(round(1.3 * max(scale, 1.0))))
+                        cv2.circle(panel, candidate_px, radius, UNSELECTED_EXPLORE_COLOR, -1, cv2.LINE_AA)
+                        cv2.circle(panel, candidate_px, radius, UNSELECTED_EXPLORE_BORDER_COLOR, 1, cv2.LINE_AA)
+                    else:
+                        cv2.circle(panel, candidate_px, max(2, int(round(max(scale, 1.0) * 0.8))), color, -1, cv2.LINE_AA)
 
         # The live semantic selection (including an executor fallback) is the
         # only authority for the goal arrow. Candidate lists are merely a
@@ -954,18 +1255,29 @@ class OfflineSixPanelRenderer:
             transformed_goal_yaw = goal[2] if math.isfinite(goal[2]) else goal_yaw
             _draw_goal_arrow(panel, goal_px, transformed_goal_yaw, max(9, int(9 * scale)), candidate_color(behavior))
         if selected_candidate_stale:
-            cv2.rectangle(panel, (6, 56), (160, 75), (255, 255, 255), -1)
-            cv2.putText(panel, "CANDIDATES STALE", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (55, 55, 170), 1, cv2.LINE_AA)
+            cv2.rectangle(panel, (6, 78), (min(panel.shape[1] - 6, 302), 97), (255, 255, 255), -1)
+            cv2.putText(
+                panel,
+                "CANDIDATE SNAPSHOT OUTDATED (LIVE GOAL SHOWN)",
+                (10, 92),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.30,
+                (55, 55, 170),
+                1,
+                cv2.LINE_AA,
+            )
         _draw_panel_title(panel, title, step_index)
+        draw_map_snapshot_note(
+            panel,
+            snapshot_meta,
+            display_stamp_sec=display_stamp_sec,
+            selection_reason=snapshot_selection_reason,
+            y=57 if kind != "costmap" else 42,
+        )
         if "COSTMAP" in title.upper():
-            legend = (("LETHAL", (128, 20, 28)), ("INSCRIBED", (245, 92, 28)), ("INFLATION", (255, 190, 60)))
-            legend_y = panel.shape[0] - 10
-            cv2.rectangle(panel, (6, legend_y - 24), (min(panel.shape[1] - 6, 416), panel.shape[0] - 2), (255, 255, 255), -1)
-            legend_x = 12
-            for label, color in legend:
-                cv2.rectangle(panel, (legend_x, legend_y - 17), (legend_x + 13, legend_y - 4), color, -1)
-                cv2.putText(panel, label, (legend_x + 18, legend_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (20, 20, 20), 1, cv2.LINE_AA)
-                legend_x += 126
+            _draw_costmap_legend(panel)
+        elif draw_semantic_candidates:
+            _draw_occupancy_candidate_legend(panel)
         return panel
 
     def _world_view(self, bounds: tuple[float, float, float, float], panel_size: tuple[int, int], *, margin: int, vertical_center: float = 0.5):
@@ -987,6 +1299,82 @@ class OfflineSixPanelRenderer:
         transform = cv2.getAffineTransform(source, destination)
         return cv2.warpAffine(image, transform, panel_size, flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=background)
 
+    def _draw_world_overview_inset(
+        self,
+        panel: np.ndarray,
+        occupancy: RawGrid | None,
+        overview_bounds: tuple[float, float, float, float],
+        detail_bounds: tuple[float, float, float, float],
+        pose: tuple[float, float, float] | None,
+    ) -> None:
+        """Overlay a stable full-known-map inset and its current detailed view.
+
+        The inset is derived only from the causal occupancy snapshot already
+        used by the panel.  It is an offline diagnostic of explored coverage,
+        not an oracle floorplan or a future map extent.
+        """
+
+        panel_h, panel_w = panel.shape[:2]
+        inset_w = max(96, min(154, panel_w // 3))
+        inset_h = max(72, min(112, panel_h // 3))
+        inset = np.full((inset_h, inset_w, 3), 248, dtype=np.uint8)
+        scale, to_px = self._world_view(
+            overview_bounds,
+            (inset_w, inset_h),
+            margin=5,
+            vertical_center=0.54,
+        )
+        if occupancy is not None:
+            layer = self._warp_grid(
+                (inset_w, inset_h),
+                occupancy,
+                _occupancy_base(occupancy),
+                to_px,
+                (248, 248, 248),
+            )
+            if layer is not None:
+                inset = cv2.addWeighted(layer, 0.70, inset, 0.30, 0.0)
+        cv2.rectangle(inset, (0, 0), (inset_w - 1, inset_h - 1), (55, 55, 55), 1)
+        detail_min_x, detail_min_y, detail_max_x, detail_max_y = detail_bounds
+        viewport = [
+            to_px(detail_min_x, detail_min_y),
+            to_px(detail_max_x, detail_min_y),
+            to_px(detail_max_x, detail_max_y),
+            to_px(detail_min_x, detail_max_y),
+        ]
+        cv2.polylines(
+            inset,
+            [np.asarray(viewport, dtype=np.int32)],
+            True,
+            (230, 30, 45),
+            1,
+            cv2.LINE_AA,
+        )
+        if pose is not None:
+            _draw_robot_arrow(inset, to_px(pose[0], pose[1]), pose[2], 7)
+        cv2.rectangle(inset, (3, 3), (inset_w - 4, 16), (255, 255, 255), -1)
+        cv2.putText(
+            inset,
+            "MAP OVERVIEW",
+            (6, 13),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.28,
+            (35, 35, 35),
+            1,
+            cv2.LINE_AA,
+        )
+        x0, y0 = panel_w - inset_w - 7, panel_h - inset_h - 7
+        backdrop = panel.copy()
+        cv2.rectangle(
+            backdrop,
+            (x0 - 2, y0 - 2),
+            (x0 + inset_w + 2, y0 + inset_h + 2),
+            (255, 255, 255),
+            -1,
+        )
+        cv2.addWeighted(backdrop, 0.70, panel, 0.30, 0.0, panel)
+        panel[y0 : y0 + inset_h, x0 : x0 + inset_w] = inset
+
     def render_room_panel(
         self,
         occupancy: RawGrid | None,
@@ -997,6 +1385,9 @@ class OfflineSixPanelRenderer:
         world_bounds: tuple[float, float, float, float] | None,
         *,
         view_scale: float = 1.0,
+        snapshot_meta: dict | None = None,
+        display_stamp_sec: float = 0.0,
+        snapshot_selection_reason: str = "",
     ) -> np.ndarray:
         width, height = panel_size
         panel = np.full((height, width, 3), 246, dtype=np.uint8)
@@ -1016,9 +1407,9 @@ class OfflineSixPanelRenderer:
             panel = cv2.addWeighted(room_layer, 0.38, panel, 0.62, 0.0)
         graph = step.get("unified_graph") or {}
         selection = active_semantic_selection(step)
-        target_id = _selection_target_id(selection)
+        target_ids = selection_target_ids(selection)
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
-        for node in _bounded_nodes(graph, observed, target_id):
+        for node in _bounded_nodes(graph, observed, target_ids):
             if str(node.get("type") or "") not in {"portal", "container"}:
                 continue
             center = _node_xy(node)
@@ -1027,7 +1418,7 @@ class OfflineSixPanelRenderer:
                 continue
             center_px = to_px(*center)
             half_w, half_h = max(3, int(abs(float(size[0])) * scale * 0.5)), max(3, int(abs(float(size[1])) * scale * 0.5))
-            is_target = bool(target_id and target_id in _node_ids(node))
+            is_target = node_matches_selection(node, target_ids)
             color = (235, 35, 210) if is_target else _node_color(node)
             cv2.rectangle(panel, (center_px[0] - half_w, center_px[1] - half_h), (center_px[0] + half_w, center_px[1] + half_h), color, 4 if is_target else 2, cv2.LINE_AA)
             cv2.putText(panel, f"{'INTERACT ' if is_target else ''}{_short_node_id(node)} {node.get('label', node.get('type', ''))}", (center_px[0] + 3, center_px[1] - half_h - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.30, color, 1, cv2.LINE_AA)
@@ -1035,6 +1426,13 @@ class OfflineSixPanelRenderer:
         if pose is not None:
             _draw_robot_arrow(panel, to_px(pose[0], pose[1]), pose[2], 14)
         _draw_panel_title(panel, "ROOM SEGMENTS + INTERACTION", step_index)
+        draw_map_snapshot_note(
+            panel,
+            snapshot_meta,
+            display_stamp_sec=display_stamp_sec,
+            selection_reason=snapshot_selection_reason,
+            y=42,
+        )
         return panel
 
     def render_semantic_xy(
@@ -1049,14 +1447,18 @@ class OfflineSixPanelRenderer:
         draw_support_labels: bool = True,
         view_scale: float = 1.0,
         label_mode: str = "all",
+        draw_overview_inset: bool = False,
+        snapshot_meta: dict | None = None,
+        display_stamp_sec: float = 0.0,
+        snapshot_selection_reason: str = "",
     ) -> np.ndarray:
         width, height = panel_size
         panel = np.full((height, width, 3), 246, dtype=np.uint8)
         graph = step.get("unified_graph") or {}
         selection = active_semantic_selection(step)
-        target_id = _selection_target_id(selection)
+        target_ids = selection_target_ids(selection)
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
-        nodes = _bounded_nodes(graph, observed, target_id)
+        nodes = _bounded_nodes(graph, observed, target_ids)
         positions = [position for node in nodes if (position := _node_xy(node)) is not None]
         pose = self._transform(step.get("pose"), self.transforms.odom_frame, self.transforms.map_frame, step_index)
         if pose is not None:
@@ -1099,7 +1501,7 @@ class OfflineSixPanelRenderer:
             size = node.get("aabb_size") or [0.25, 0.25, 0.0]
             half_w, half_h = max(3, int(max(0.08, float(size[0]) * 0.5) * scale)), max(3, int(max(0.08, float(size[1]) * 0.5) * scale))
             pixel = to_px(*center)
-            is_target = bool(target_id and target_id in _node_ids(node))
+            is_target = node_matches_selection(node, target_ids)
             color = (235, 35, 210) if is_target else _node_color(node)
             thickness = 4 if is_target else 2 if node.get("is_currently_visible") else 1
             if str(node.get("type") or "") == "room":
@@ -1127,7 +1529,22 @@ class OfflineSixPanelRenderer:
                 cv2.putText(panel, label[:30], (pixel[0] + 3, pixel[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.28, color if is_target else (35, 35, 35), 1, cv2.LINE_AA)
         if pose is not None:
             _draw_robot_arrow(panel, to_px(pose[0], pose[1]), pose[2], 14)
+        if draw_overview_inset:
+            self._draw_world_overview_inset(
+                panel,
+                occupancy,
+                world_bounds,
+                view_bounds,
+                pose,
+            )
         _draw_panel_title(panel, "SEMANTIC XY", step_index)
+        draw_map_snapshot_note(
+            panel,
+            snapshot_meta,
+            display_stamp_sec=display_stamp_sec,
+            selection_reason=snapshot_selection_reason,
+            y=42,
+        )
         return panel
 
     def render_topology(self, panel_size: tuple[int, int], step: dict, step_index: int) -> np.ndarray:
@@ -1135,9 +1552,9 @@ class OfflineSixPanelRenderer:
         panel = np.full((height, width, 3), (220, 248, 255), dtype=np.uint8)
         graph = step.get("unified_graph") or {}
         selection = active_semantic_selection(step)
-        target_id = _selection_target_id(selection)
+        target_ids = selection_target_ids(selection)
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
-        all_nodes = _bounded_nodes(graph, observed, target_id)
+        all_nodes = _bounded_nodes(graph, observed, target_ids)
         contains = [edge for edge in graph.get("edges") or [] if str(edge.get("relation") or "") == "contains"]
         contained = {str(edge.get("dst_id") or "") for edge in contains}
         nodes = [node for node in all_nodes if str(node.get("type") or "") in {"room", "portal", "container"} or str(node.get("id") or "") in contained]
@@ -1194,7 +1611,7 @@ class OfflineSixPanelRenderer:
                 dashed_line((x1, y1), (x2, y1), style["border"]); dashed_line((x2, y1), (x2, y2), style["border"]); dashed_line((x2, y2), (x1, y2), style["border"]); dashed_line((x1, y2), (x1, y1), style["border"])
             else:
                 cv2.rectangle(panel, (x1, y1), (x2, y2), style["border"], 2, cv2.LINE_AA)
-            is_target = bool(target_id and target_id in _node_ids(node))
+            is_target = node_matches_selection(node, target_ids)
             if is_target:
                 cv2.rectangle(panel, (max(1, x1 - 2), max(1, y1 - 2)), (min(width - 2, x2 + 2), min(height - 2, y2 + 2)), (235, 35, 210), 2, cv2.LINE_AA)
             node_type = str(node.get("type") or "object")

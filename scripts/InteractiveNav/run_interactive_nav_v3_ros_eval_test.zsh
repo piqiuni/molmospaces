@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Run one frozen V3 ROS object-goal episode with the required visual artifacts.
+# Run one frozen V3 ROS object-goal episode.
 #
 # Usage:
 #   bash scripts/InteractiveNav/run_interactive_nav_v3_ros_eval_test.zsh \
 #     <run-output-dir> <episode-index>
 #
-# The script intentionally owns one ROS master and one recorder per episode.
-# A recorder directory cannot be attributed safely to multiple sequential V3
-# episodes, so this is a single-episode test entry point rather than a batch
-# evaluator wrapper.
+# The script intentionally owns one ROS master per episode.  In normal mode it
+# also owns a recorder; FAST_EVAL=true is evaluator-only and deliberately has
+# neither a recorder nor a recorder acknowledgement barrier.
 
 set -euo pipefail
 shopt -s nullglob
@@ -62,6 +61,10 @@ VIDEO_SNAPSHOT_GRID_MAX_DIM=${VIDEO_SNAPSHOT_GRID_MAX_DIM:-512}
 VIDEO_SNAPSHOT_JPEG_QUALITY=${VIDEO_SNAPSHOT_JPEG_QUALITY:-90}
 VIDEO_SNAPSHOT_CATEGORICAL_FORMAT=${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT:-png}
 VIDEO_OCC_CROP_MARGIN_M=${VIDEO_OCC_CROP_MARGIN_M:-2.5}
+# Keep the full-known-map coverage inset enabled for the maintained offline
+# six-panel artifact.  It can be disabled for a compact legacy replay with
+# VIDEO_SEMANTIC_XY_OVERVIEW_INSET=false.
+VIDEO_SEMANTIC_XY_OVERVIEW_INSET=${VIDEO_SEMANTIC_XY_OVERVIEW_INSET:-false}
 ARTIFACT_WRITE_QUEUE_SIZE=${ARTIFACT_WRITE_QUEUE_SIZE:-256}
 # Full per-step composites may take substantially longer than the simulator;
 # let the recorder finish them before teardown.
@@ -73,12 +76,16 @@ RECORD_HEAD_CAMERA=${RECORD_HEAD_CAMERA:-false}
 FAST_EVAL=${FAST_EVAL:-false}
 ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11311}
 RUN_ROS_MASTER_URI=${ROS_MASTER_URI}
-ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.zsh}
+# This entry point is a Bash script (despite its historical .zsh suffix), so
+# source the Bash ROS environment by default.  Sourcing setup.zsh under Bash
+# can fail before the evaluator starts (e.g. zsh's `cd -q` syntax).
+ROS_SETUP=${ROS_SETUP:-${REPO_ROOT}/Interactive-Nav-SG-nav/devel/setup.bash}
 SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${REPO_ROOT}/.env}
-# Keep V3's Module-1 cap explicit as well: the portal visual evidence fields
-# can exceed the historical 160-token launch default when the model uses
-# pretty-printed JSON.
-SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-256}
+# Keep V3's Module-1 cap explicit as well: portal visual-evidence JSON can
+# exceed the historical 256-token budget when the model pretty-prints fields.
+# This launch argument reaches only the object-attribute (M1) lane; M2/M3 use
+# object_goal_v3_full_mllm.yaml and room MLLM keeps its own mapping config cap.
+SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-384}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_v3_full_mllm.yaml}
 SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
@@ -89,7 +96,11 @@ VIDEO_BUILDER=${VIDEO_BUILDER:-${SCRIPT_DIR}/build_semantic_video_offline.py}
 STEP_FRAME_QUEUE_SIZE=${STEP_FRAME_QUEUE_SIZE:-4}
 STEP_CAPTURE_ACK_TIMEOUT_S=${STEP_CAPTURE_ACK_TIMEOUT_S:-2.0}
 RECORDER_DRAIN_STALL_TIMEOUT_S=${RECORDER_DRAIN_STALL_TIMEOUT_S:-300}
-SHARED_MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/molmospaces-matplotlib-${UID}}
+# Keep defaults on the large /home volume even when this runner is invoked
+# directly rather than through the batch wrapper.
+SHARED_MPLCONFIGDIR=${MPLCONFIGDIR:-/home/ldl/.cache/molmospaces/matplotlib-${UID}}
+RUNTIME_TMPDIR=${TMPDIR:-/home/ldl/tmp/molmospaces-v3-${UID}}
+RUNTIME_XDG_CACHE_HOME=${XDG_CACHE_HOME:-/home/ldl/.cache}
 
 for required_path in "${BENCHMARK}" "${ROS_SETUP}" "${SEMANTIC_MODEL_ENV_FILE}" \
   "${SEMANTIC_DECISION_OVERRIDE}" "${SEMANTIC_MAPPING_OVERRIDE}" \
@@ -135,9 +146,18 @@ for required_mllm_setting in \
 done
 printf '%s\n' "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
 printf '%s\n' "[v3-eval] step_budget_mode=${STEP_BUDGET_MODE} min_steps=${MIN_STEPS} max_steps=${MAX_STEPS}"
-printf '%s\n' "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY} render_queue=${VIDEO_FRAME_JOB_QUEUE_SIZE} overflow=${VIDEO_FRAME_QUEUE_OVERFLOW} occ_local_proxy=${VIDEO_SNAPSHOT_GRID_MAX_DIM}px/${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT} global_costmap=native/png crop_margin=${VIDEO_OCC_CROP_MARGIN_M}m"
+printf '%s\n' "[v3-eval] m1_attribute_max_output_tokens=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS}"
+if [[ "${FAST_EVAL}" == true ]]; then
+  printf '%s\n' "[v3-eval] fast_eval=true recorder_enabled=false step_capture_ack_barrier=false"
+else
+  printf '%s\n' "[v3-eval] fast_eval=false recorder_enabled=true step_capture_ack_barrier=true"
+fi
+printf '%s\n' "[v3-eval] video_fps=${VIDEO_FPS} video_step_sample_every=${VIDEO_STEP_SAMPLE_EVERY} render_queue=${VIDEO_FRAME_JOB_QUEUE_SIZE} overflow=${VIDEO_FRAME_QUEUE_OVERFLOW} occ_local_proxy=${VIDEO_SNAPSHOT_GRID_MAX_DIM}px/${VIDEO_SNAPSHOT_CATEGORICAL_FORMAT} global_costmap=native/png crop_margin=${VIDEO_OCC_CROP_MARGIN_M}m semantic_xy_overview_inset=${VIDEO_SEMANTIC_XY_OVERVIEW_INSET}"
 
-mkdir -p "${RUN_DIR}" "${RUN_DIR}/debug" "${RUN_DIR}/sim_step_frames" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}"
+mkdir -p "${RUN_DIR}" "${RUN_DIR}/ros_home/log" "${SHARED_MPLCONFIGDIR}" "${RUNTIME_TMPDIR}" "${RUNTIME_XDG_CACHE_HOME}"
+if [[ "${FAST_EVAL}" != true ]]; then
+  mkdir -p "${RUN_DIR}/debug" "${RUN_DIR}/sim_step_frames"
+fi
 if [[ -e "${RUN_DIR}/eval" ]]; then
   printf '%s\n' "Refusing to overwrite existing evaluator output: ${RUN_DIR}/eval" >&2
   exit 2
@@ -149,18 +169,22 @@ export ROS_HOSTNAME=${ROS_HOSTNAME:-127.0.0.1}
 export ROS_HOME="${RUN_DIR}/ros_home"
 export ROS_LOG_DIR="${RUN_DIR}/ros_home/log"
 export MPLCONFIGDIR="${SHARED_MPLCONFIGDIR}"
+export TMPDIR="${RUNTIME_TMPDIR}"
+export XDG_CACHE_HOME="${RUNTIME_XDG_CACHE_HOME}"
 export SEMANTIC_DECISION_ENV_FILE="${SEMANTIC_MODEL_ENV_FILE}"
 export SEMANTIC_MODEL_METRICS_PATH="${RUN_DIR}/mllm_metrics.jsonl"
 export PYTHONUNBUFFERED=1
 
 set +u
-CONDA_SH=${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}
+CONDA_SH=${CONDA_SH:-/home/ldl/miniconda3/etc/profile.d/conda.sh}
 if [[ ! -f "${CONDA_SH}" ]]; then
   printf '%s\n' "Missing conda initialization script: ${CONDA_SH}" >&2
   exit 2
 fi
 source "${CONDA_SH}"
-CONDA_ENV=${CONDA_ENV:-mlspaces}
+# Use an absolute default.  The old default "mlspaces/bin/python" was a
+# relative path when CONDA_ENV was a name and could select the wrong Python.
+CONDA_ENV=${CONDA_ENV:-/home/ldl/conda_envs/mlspaces}
 conda activate "${CONDA_ENV}"
 source "${ROS_SETUP}"
 ROS_SOURCE_DIR=${ROS_SOURCE_DIR:-$(cd -- "$(dirname -- "${ROS_SETUP}")/../src" && pwd)}
@@ -168,14 +192,19 @@ if [[ ! -d "${ROS_SOURCE_DIR}" ]]; then
   printf '%s\n' "Missing ROS source directory: ${ROS_SOURCE_DIR}" >&2
   exit 2
 fi
-PYTHON_BIN=${PYTHON_BIN:-${CONDA_ENV}/bin/python}
+ACTIVE_CONDA_PREFIX=${CONDA_PREFIX:-}
+if [[ -z "${ACTIVE_CONDA_PREFIX}" || ! -d "${ACTIVE_CONDA_PREFIX}" ]]; then
+  printf '%s\n' "Conda activation did not provide an absolute CONDA_PREFIX: ${ACTIVE_CONDA_PREFIX}" >&2
+  exit 2
+fi
+PYTHON_BIN=${PYTHON_BIN:-${ACTIVE_CONDA_PREFIX}/bin/python}
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   printf '%s\n' "Missing MolmoSpaces Python executable: ${PYTHON_BIN}" >&2
   exit 2
 fi
 MLSPACES_SITE_PACKAGES="$(${PYTHON_BIN} -c 'import site; print(site.getsitepackages()[0])')"
 export PYTHONPATH="${MLSPACES_SITE_PACKAGES}:${PYTHONPATH:-}"
-export PATH="${CONDA_ENV}/bin:${PATH}"
+export PATH="${ACTIVE_CONDA_PREFIX}/bin:${PATH}"
 set -u
 # ROS setup files may restore a default master URI; keep this episode's
 # explicitly isolated master after sourcing.
@@ -333,15 +362,22 @@ EVAL_ARGS=(
   --ros-action-timeout-s 1.0
   --no-ros-require-move-base-active
   --ros-map-warmup-skip-frames 0
-  --ros-step-frame-dir "${RUN_DIR}/sim_step_frames"
-  --ros-step-frame-queue-size "${STEP_FRAME_QUEUE_SIZE}"
-  --ros-step-capture-ack-topic /molmo_spaces/step_capture_ack
-  --ros-step-capture-ack-barrier-enabled
-  --ros-step-capture-ack-timeout-s "${STEP_CAPTURE_ACK_TIMEOUT_S}"
   --video-fps "${VIDEO_FPS}"
   --progress-every 1
 )
-if [[ "${RECORD_HEAD_CAMERA}" == true ]]; then
+if [[ "${FAST_EVAL}" != true ]]; then
+  # Frame persistence and the acknowledgement barrier are inseparable in the
+  # recordable protocol.  Do not pass either in FAST_EVAL: no recorder exists
+  # to acknowledge, and a queue/writer would only add avoidable CPU and I/O.
+  EVAL_ARGS+=(
+    --ros-step-frame-dir "${RUN_DIR}/sim_step_frames"
+    --ros-step-frame-queue-size "${STEP_FRAME_QUEUE_SIZE}"
+    --ros-step-capture-ack-topic /molmo_spaces/step_capture_ack
+    --ros-step-capture-ack-barrier-enabled
+    --ros-step-capture-ack-timeout-s "${STEP_CAPTURE_ACK_TIMEOUT_S}"
+  )
+fi
+if [[ "${FAST_EVAL}" != true && "${RECORD_HEAD_CAMERA}" == true ]]; then
   EVAL_ARGS+=(--record-video)
 fi
 set +e
@@ -356,7 +392,8 @@ if [[ "${FAST_EVAL}" == true ]]; then
   ROSCORE_PID=""
 fi
 EPISODE_RESULTS=()
-EPISODE_RESULTS+=("${RUN_DIR}"/eval/episodes/${EPISODE_INDEX}_*/episode_result.json)
+EPISODE_INDEX_PADDED=$(printf '%04d' "${EPISODE_INDEX}")
+EPISODE_RESULTS+=("${RUN_DIR}"/eval/episodes/${EPISODE_INDEX_PADDED}_*/episode_result.json)
 if (( ${#EPISODE_RESULTS[@]} != 1 )); then
   printf '%s\n' "Expected one completed episode result for index ${EPISODE_INDEX}; found ${#EPISODE_RESULTS[@]}" >&2
   exit 4
@@ -364,6 +401,25 @@ fi
 EPISODE_RESULT=${EPISODE_RESULTS[0]}
 EPISODE_DIR=$(dirname -- "${EPISODE_RESULT}")
 if [[ "${FAST_EVAL}" == true ]]; then
+  "${PYTHON_BIN}" - "${EPISODE_RESULT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    document = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError) as exc:
+    raise SystemExit(f"fast-eval result is unreadable: {path}: {exc}")
+result = document.get("result") if isinstance(document, dict) else None
+if not isinstance(result, dict):
+    result = document if isinstance(document, dict) else {}
+if document.get("status") != "complete" or result.get("status") != "complete":
+    raise SystemExit(
+        f"fast-eval result is not complete: document={document.get('status')!r} "
+        f"result={result.get('status')!r}"
+    )
+PY
   printf '%s\n' "[v3-ros-eval-fast] result=${EPISODE_RESULT}"
   exit "${EVAL_EXIT}"
 fi
@@ -409,12 +465,18 @@ if (( FINAL_DRAIN_STATUS != 0 )); then
   exit 4
 fi
 
-"${PYTHON_BIN}" "${VIDEO_BUILDER}" \
-  --scene-dir "${RUN_DIR}" \
-  --debug-dir "${RUN_DIR}/debug" \
-  --fps "${VIDEO_FPS}" \
-  --state-alignment exact \
-  --output-stem overview_6panel \
+VIDEO_BUILDER_ARGS=(
+  "${VIDEO_BUILDER}"
+  --scene-dir "${RUN_DIR}"
+  --debug-dir "${RUN_DIR}/debug"
+  --fps "${VIDEO_FPS}"
+  --state-alignment exact
+  --output-stem overview_6panel
+)
+if [[ "${VIDEO_SEMANTIC_XY_OVERVIEW_INSET}" == true ]]; then
+  VIDEO_BUILDER_ARGS+=(--semantic-xy-overview-inset)
+fi
+"${PYTHON_BIN}" "${VIDEO_BUILDER_ARGS[@]}" \
   >"${RUN_DIR}/offline_video.log" 2>&1
 
 SIX_PANEL_PATH="${RUN_DIR}/videos/overview_6panel.mp4"

@@ -57,11 +57,12 @@ def _runtime_joint(
     joint_name: str,
     joint_index: int,
     body_id: int = 1,
+    domain: str = "container",
 ) -> benchmark_runner.RuntimeJoint:
     return benchmark_runner.RuntimeJoint(
         object_name=object_name,
         object_category="Fridge",
-        domain="container",
+        domain=domain,
         joint_name=joint_name,
         joint_index=joint_index,
         body_id=body_id,
@@ -101,6 +102,66 @@ def test_restricted_gt_root_body_alias_resolves_to_articulated_object_skill() ->
     }
 
 
+def test_door_instance_stem_fallback_resolves_when_body_roots_disagree() -> None:
+    """Door root/leaf asset suffixes can differ while the private skill is unique."""
+
+    model = SimpleNamespace(
+        body_parentid=np.asarray([0, 0, 0]),
+        body_rootid=np.asarray([0, 1, 2]),
+    )
+    leaf = _runtime_joint(
+        object_name="doorway_hash_1_2_2",
+        joint_name="private_hinge",
+        joint_index=0,
+        body_id=2,
+        domain="channel",
+    )
+    aliases = benchmark_runner._perception_source_skill_aliases(
+        model=model,
+        private_specs=[SimpleNamespace(source_name="doorway_hash_1_0_2", body_id=1)],
+        joints_by_object={leaf.object_name: [leaf]},
+    )
+    assert aliases == {"doorway_hash_1_0_2": "doorway_hash_1_2_2"}
+
+
+def test_door_instance_stem_fallback_keeps_same_asset_instances_separate() -> None:
+    """The fallback must not merge two doorway copies sharing one asset hash."""
+
+    model = SimpleNamespace(
+        body_parentid=np.asarray([0, 0, 0, 0, 0]),
+        body_rootid=np.asarray([0, 1, 2, 3, 4]),
+    )
+    first_leaf = _runtime_joint(
+        object_name="doorway_hash_1_2_2",
+        joint_name="first_hinge",
+        joint_index=0,
+        body_id=2,
+        domain="channel",
+    )
+    second_leaf = _runtime_joint(
+        object_name="doorway_hash_2_2_2",
+        joint_name="second_hinge",
+        joint_index=1,
+        body_id=4,
+        domain="channel",
+    )
+    aliases = benchmark_runner._perception_source_skill_aliases(
+        model=model,
+        private_specs=[
+            SimpleNamespace(source_name="doorway_hash_1_0_2", body_id=1),
+            SimpleNamespace(source_name="doorway_hash_2_0_2", body_id=3),
+        ],
+        joints_by_object={
+            first_leaf.object_name: [first_leaf],
+            second_leaf.object_name: [second_leaf],
+        },
+    )
+    assert aliases == {
+        "doorway_hash_1_0_2": "doorway_hash_1_2_2",
+        "doorway_hash_2_0_2": "doorway_hash_2_2_2",
+    }
+
+
 def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -109,26 +170,38 @@ def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
     class _FakeAdapter:
         def __init__(self, **_kwargs) -> None:
             self.private_instances: dict[str, str] = {}
+            self.instance_aliases: dict[str, str] = {}
 
-        def reset(self, *, private_instances, **_kwargs) -> None:
+        def reset(self, *, private_instances, instance_aliases=None, **_kwargs) -> None:
             self.private_instances = dict(private_instances)
+            self.instance_aliases = dict(instance_aliases or {})
 
         def publish_restricted_gt_frame(self, *_args, **_kwargs) -> None:
             return None
 
+    # Deliberately place the render/root body and the articulated leaf in
+    # separate MuJoCo roots; this mirrors the ProcTHOR doorway asset seam.
     model = SimpleNamespace(
-        body_parentid=np.asarray([0, 0, 1]),
-        body_rootid=np.asarray([0, 1, 1]),
+        body_parentid=np.asarray([0, 0, 0, 0]),
+        body_rootid=np.asarray([0, 1, 2, 3]),
     )
     leaf = _runtime_joint(
-        object_name="private_door_leaf",
+        object_name="doorway_hash_1_2_2",
         joint_name="private_hinge",
         joint_index=0,
         body_id=2,
+        domain="channel",
+    )
+    fridge = _runtime_joint(
+        object_name="private_fridge",
+        joint_name="private_fridge_hinge",
+        joint_index=1,
+        body_id=3,
     )
     specs = [
-        SimpleNamespace(source_name="private_door_root", body_id=1),
-        SimpleNamespace(source_name="private_door_leaf", body_id=2),
+        SimpleNamespace(source_name="doorway_hash_1_0_2", body_id=1),
+        SimpleNamespace(source_name="doorway_hash_1_2_2", body_id=2),
+        SimpleNamespace(source_name="private_fridge", body_id=3),
     ]
     monkeypatch.setattr(benchmark_runner, "RosObjectGoalEvaluatorAdapter", _FakeAdapter)
     monkeypatch.setattr(
@@ -144,7 +217,7 @@ def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
 
     runtime = benchmark_runner._build_restricted_ros_object_goal_runtime(
         task=SimpleNamespace(env=SimpleNamespace(current_model=model)),
-        catalog=SimpleNamespace(joints=[leaf]),
+        catalog=SimpleNamespace(joints=[leaf, fridge]),
         episode={"interactive_nav": {"interactions": [], "oracle_plans": []}},
         public=SimpleNamespace(instruction="find the apple"),
         config=SimpleNamespace(
@@ -159,13 +232,21 @@ def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
         episode_index=0,
     )
 
-    root_opaque_id = runtime.perception.registry.public_id_for("private_door_root")
-    leaf_opaque_id = runtime.perception.registry.public_id_for("private_door_leaf")
-    assert runtime.opaque_to_source_name[root_opaque_id] == "private_door_leaf"
+    root_opaque_id = runtime.perception.registry.public_id_for("doorway_hash_1_0_2")
+    leaf_opaque_id = runtime.perception.registry.public_id_for("doorway_hash_1_2_2")
+    assert runtime.opaque_to_source_name[root_opaque_id] == "doorway_hash_1_2_2"
     assert runtime.opaque_to_joints[root_opaque_id] == (leaf,)
-    assert runtime.opaque_to_source_name[leaf_opaque_id] == "private_door_leaf"
+    assert runtime.opaque_to_source_name[leaf_opaque_id] == "doorway_hash_1_2_2"
     assert root_opaque_id in runtime.adapter.private_instances
     assert leaf_opaque_id in runtime.adapter.private_instances
+    assert runtime.adapter.instance_aliases[
+        benchmark_runner.opaque_door_instance_id(root_opaque_id)
+    ] == root_opaque_id
+    assert runtime.adapter.instance_aliases[
+        benchmark_runner.opaque_door_instance_id(leaf_opaque_id)
+    ] == leaf_opaque_id
+    fridge_opaque_id = runtime.perception.registry.public_id_for("private_fridge")
+    assert benchmark_runner.opaque_door_instance_id(fridge_opaque_id) not in runtime.adapter.instance_aliases
 
 
 def test_opaque_ros_object_command_keeps_private_resolution_out_of_public_attempt(
