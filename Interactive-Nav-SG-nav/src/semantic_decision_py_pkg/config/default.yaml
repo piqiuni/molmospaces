@@ -347,6 +347,10 @@ executor:
   # An INTERACT command remains committed across a small set of approach
   # poses; switch only after the current approach hits the stagnation guard.
   interaction_approach_fallback_max_attempts: 4
+  # Two-stage container interaction advertises up to three rings x four faces.
+  # Keep the broader sequence bounded, but do not truncate it to the portal
+  # fallback budget before a different M1 observation can be tried.
+  container_two_stage_fallback_max_attempts: 12
   interaction_approach_fallback_cancel_wait_s: 0.5
   # Once move_base reports arrival, validate the simulator pose on this many
   # fresh evaluator steps.  This is intentionally count-bounded, not

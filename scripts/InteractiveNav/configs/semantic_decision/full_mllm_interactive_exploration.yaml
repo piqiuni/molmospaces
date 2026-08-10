@@ -83,6 +83,9 @@ completion:
 executor:
   interaction_navigation_timeout_s: 180.0
   interaction_observation_timeout_s: 12.0
+  # A two-stage container has a finite twelve-pose M1 staging sequence; retain
+  # that bounded coverage after an inner action-pose failure.
+  container_two_stage_fallback_max_attempts: 12
   # M1 is sampled at the outer safe staging pose.  A single strict direct-front
   # observation is enough to enter the paired inner action pose; the simulator
   # still checks the public pose contract and refrigerator sweep before force.

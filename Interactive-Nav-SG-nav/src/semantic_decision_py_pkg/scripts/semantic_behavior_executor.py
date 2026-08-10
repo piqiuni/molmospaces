@@ -904,6 +904,15 @@ class SemanticBehaviorExecutor:
             1,
             int(config.get("interaction_approach_fallback_max_attempts", 4)),
         )
+        # A two-stage container candidate deliberately exposes a finite set of
+        # outer observation poses (currently three rings x four faces).  Do not
+        # silently truncate that set to the generic portal fallback budget: an
+        # inner action-pose failure must still be allowed to earn a different
+        # outer M1 observation.  The cap remains explicit and bounded.
+        self.container_two_stage_fallback_max_attempts = max(
+            1,
+            int(config.get("container_two_stage_fallback_max_attempts", 12)),
+        )
         self.interaction_approach_fallback_cancel_wait_s = max(
             0.0,
             float(config.get("interaction_approach_fallback_cancel_wait_s", 0.5)),
@@ -2396,6 +2405,7 @@ class SemanticBehaviorExecutor:
                 }
             )
         goal_option_count = len(navigation_goal_options(candidate))
+        approach_attempt_limit = self._interaction_approach_attempt_limit(candidate)
         failure_detail = {
             "reason": (
                 "unsafe_open_sweep"
@@ -2424,7 +2434,7 @@ class SemanticBehaviorExecutor:
             next_staging_index = completed_staging_index + 1
             if (
                 next_staging_index < len(staging_goals)
-                and len(attempts) < self.interaction_approach_fallback_max_attempts
+                and len(attempts) < approach_attempt_limit
             ):
                 rospy.logwarn(
                     "[semantic_behavior_executor] bridge rejected inner container "
@@ -2452,7 +2462,7 @@ class SemanticBehaviorExecutor:
             failure_detail=failure_detail,
             selected_option_index=selected_option_index,
             attempted_navigation_count=len(attempts),
-            max_navigation_attempts=self.interaction_approach_fallback_max_attempts,
+            max_navigation_attempts=approach_attempt_limit,
             goal_option_count=goal_option_count,
         )
         if next_option_index is not None:
@@ -2462,7 +2472,7 @@ class SemanticBehaviorExecutor:
                 next_option_index + 1,
                 goal_option_count,
                 len(attempts) + 1,
-                self.interaction_approach_fallback_max_attempts,
+                approach_attempt_limit,
             )
             return self.machine.retry_interaction_approach(
                 start_goal_option_index=next_option_index,
@@ -2519,6 +2529,7 @@ class SemanticBehaviorExecutor:
                 }
             )
         goal_option_count = len(navigation_goal_options(candidate))
+        approach_attempt_limit = self._interaction_approach_attempt_limit(candidate)
         failure_detail = {
             "reason": "visual_reposition_required",
             "failure_reason": "visual_reposition_required",
@@ -2530,7 +2541,7 @@ class SemanticBehaviorExecutor:
             failure_detail=failure_detail,
             selected_option_index=selected_option_index,
             attempted_navigation_count=len(attempts),
-            max_navigation_attempts=self.interaction_approach_fallback_max_attempts,
+            max_navigation_attempts=approach_attempt_limit,
             goal_option_count=goal_option_count,
         )
         self.active_skill_plan = {}
@@ -2542,7 +2553,7 @@ class SemanticBehaviorExecutor:
                 next_option_index + 1,
                 goal_option_count,
                 len(attempts) + 1,
-                self.interaction_approach_fallback_max_attempts,
+                approach_attempt_limit,
             )
             return self.machine.retry_interaction_approach(
                 start_goal_option_index=next_option_index,
@@ -7435,6 +7446,36 @@ class SemanticBehaviorExecutor:
             return
         self._handle_navigation_result(decision_id, success, detail)
 
+    def _interaction_approach_attempt_limit(self, candidate: dict | None) -> int:
+        """Return the finite retry budget appropriate to this approach shape.
+
+        Portal and legacy interaction candidates retain the small generic
+        budget.  A two-stage container has a separately bounded outer staging
+        sequence, so its physical-pose or visual failure may advance through
+        that advertised sequence instead of terminating after four attempts.
+        """
+
+        metadata = (candidate or {}).get("metadata") or {}
+        if bool(metadata.get("container_two_stage_approach", False)):
+            staging_goals = list(
+                metadata.get("container_staging_goal_xyyaw_candidates") or []
+            )
+            if staging_goals:
+                return max(
+                    1,
+                    min(
+                        len(staging_goals),
+                        int(
+                            getattr(
+                                self,
+                                "container_two_stage_fallback_max_attempts",
+                                self.interaction_approach_fallback_max_attempts,
+                            )
+                        ),
+                    ),
+                )
+        return max(1, int(self.interaction_approach_fallback_max_attempts))
+
     def _retry_interaction_approach(
         self,
         decision_id: str,
@@ -7445,6 +7486,7 @@ class SemanticBehaviorExecutor:
         failure_detail: dict,
     ) -> bool:
         attempts = [dict(attempt) for attempt in interaction_approach_attempts]
+        approach_attempt_limit = self._interaction_approach_attempt_limit(candidate)
         if attempts:
             attempts[-1]["outcome"] = str(failure_detail.get("reason") or "failed")
             attempts[-1]["failure_detail"] = {
@@ -7470,7 +7512,7 @@ class SemanticBehaviorExecutor:
             next_staging_index = completed_staging_index + 1
             if (
                 next_staging_index >= len(staging_goals)
-                or len(attempts) >= self.interaction_approach_fallback_max_attempts
+                or len(attempts) >= approach_attempt_limit
                 or not self._navigation_is_current(decision_id)
             ):
                 return False
@@ -7481,7 +7523,7 @@ class SemanticBehaviorExecutor:
                 next_staging_index + 1,
                 len(staging_goals),
                 len(attempts) + 1,
-                self.interaction_approach_fallback_max_attempts,
+                approach_attempt_limit,
             )
             with self.lock:
                 if not self._navigation_is_current(decision_id):
@@ -7509,7 +7551,7 @@ class SemanticBehaviorExecutor:
             failure_detail=failure_detail,
             selected_option_index=selected_option_index,
             attempted_navigation_count=len(interaction_approach_attempts),
-            max_navigation_attempts=self.interaction_approach_fallback_max_attempts,
+            max_navigation_attempts=approach_attempt_limit,
             goal_option_count=goal_option_count,
         )
         if next_option_index is None:
@@ -7535,7 +7577,7 @@ class SemanticBehaviorExecutor:
             next_option_index + 1,
             goal_option_count,
             len(attempts) + 1,
-            self.interaction_approach_fallback_max_attempts,
+            approach_attempt_limit,
         )
         threading.Thread(
             target=self._run_navigation,

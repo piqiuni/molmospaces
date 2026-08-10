@@ -811,6 +811,7 @@ def test_executor_inner_navigation_failure_dispatches_next_outer_staging(
     executor.lock = threading.RLock()
     executor.machine = executor_module.BehaviorExecutionStateMachine()
     executor.interaction_approach_fallback_max_attempts = 4
+    executor.container_two_stage_fallback_max_attempts = 12
     executor._navigation_is_current = lambda _decision_id: True
     dispatched = []
     executor._dispatch = lambda commands: dispatched.extend(commands)
@@ -832,15 +833,32 @@ def test_executor_inner_navigation_failure_dispatches_next_outer_staging(
             "requires_approach": True,
             "container_two_stage_approach": True,
             "container_two_stage_phase": "physical_action",
-            "container_two_stage_staging_goal_option_index": 0,
+            # The generic portal budget is four fallbacks, but a two-stage
+            # container must be able to reach a later advertised outer face.
+            "container_two_stage_staging_goal_option_index": 4,
             "container_staging_goal_xyyaw_candidates": [
                 [1.0, 2.0, 0.0],
                 [2.0, 2.0, 1.57],
+                [3.0, 2.0, 3.14],
+                [4.0, 2.0, -1.57],
+                [5.0, 2.0, 0.0],
+                [6.0, 2.0, 1.57],
             ],
-            "container_staging_pose_labels": ["safe_outer", "safe_far"],
+            "container_staging_pose_labels": [
+                "safe_outer",
+                "safe_left",
+                "safe_right",
+                "safe_back",
+                "safe_far",
+                "safe_far_left",
+            ],
             "container_action_goal_xyyaw_by_staging_index": [
                 [3.0, 2.0, 0.0],
                 [4.0, 2.0, 1.57],
+                [5.0, 2.0, 3.14],
+                [6.0, 2.0, -1.57],
+                [7.0, 2.0, 0.0],
+                [8.0, 2.0, 1.57],
             ],
             "container_two_stage_staging_observation_required": True,
             "container_two_stage_staging_container_pre_action_observation": True,
@@ -858,14 +876,20 @@ def test_executor_inner_navigation_failure_dispatches_next_outer_staging(
         "decision-inner",
         candidate,
         0,
-        [{"index": 0, "phase": "physical_action"}],
+        [
+            {"index": 0, "phase": "staging"},
+            {"index": 1, "phase": "staging"},
+            {"index": 2, "phase": "staging"},
+            {"index": 3, "phase": "staging"},
+            {"index": 4, "phase": "physical_action"},
+        ],
         1,
         {"reason": "navigation_stagnation"},
     )
 
     assert retried is True
     assert [command["kind"] for command in dispatched] == ["navigate"]
-    assert dispatched[0]["start_goal_option_index"] == 1
+    assert dispatched[0]["start_goal_option_index"] == 5
     assert executor.machine.candidate["metadata"]["container_two_stage_phase"] == (
         "staging"
     )
