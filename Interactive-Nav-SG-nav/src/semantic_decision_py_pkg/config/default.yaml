@@ -211,9 +211,11 @@ executor:
   drawer_scan_execution_wall_cap_s: 180.0
   interaction_observation_timeout_s: 30.0
   interaction_observation_poll_interval_s: 0.05
-  # A container only reaches the physical backend after two causally later M1
-  # observations agree that its broad usable face is directly in view.
-  container_pre_action_confirmation_count: 2
+  # A container reaches the paired inner action pose only after one causally
+  # later, direct-front M1 observation at the *outer* safe staging pose.  The
+  # physical bridge still validates pose/sweep safety; deployments that need a
+  # temporal visual vote can explicitly raise this to two or more.
+  container_pre_action_confirmation_count: 1
   container_pre_action_require_direct_front: true
   verification_timeout_s: 30.0
   explore_prepare_timeout_s: 3.0

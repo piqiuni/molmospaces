@@ -429,8 +429,10 @@ def test_unknown_portal_waits_for_its_matching_fresh_m1_update(
     assert executor._interaction_observation_requests == {}
 
 
-def test_container_requires_two_direct_front_m1_observations_before_opening(
+@pytest.mark.parametrize("confirmation_count", [None, 2])
+def test_container_direct_front_confirmation_count_is_configurable(
     executor_module,
+    confirmation_count: int | None,
 ) -> None:
     selection = _portal_selection()
     selection.update(
@@ -465,7 +467,8 @@ def test_container_requires_two_direct_front_m1_observations_before_opening(
     executor.interaction_observation_sequence = 0
     executor._interaction_observation_requests = {}
     executor._latest_attribute_updates = {}
-    executor.container_pre_action_confirmation_count = 2
+    if confirmation_count is not None:
+        executor.container_pre_action_confirmation_count = confirmation_count
     executor.container_pre_action_require_direct_front = True
     published = []
     executor.attribute_refresh_request_pub = SimpleNamespace(
@@ -501,6 +504,14 @@ def test_container_requires_two_direct_front_m1_observations_before_opening(
     executor._attribute_update_callback(
         SimpleNamespace(data=json.dumps({"episode_id": "episode_1", "updates": [first_ready]}))
     )
+
+    if confirmation_count is None:
+        # The executor fallback is the production default: one strict fresh
+        # front view at the safe outer pose advances to action (or the paired
+        # inner pose for a two-stage candidate), not a second M1 vote.
+        assert executor.machine.state == "INTERACTING"
+        assert [command["kind"] for command in dispatched] == ["interact"]
+        return
 
     assert executor.machine.state == "WAITING_FOR_INTERACTION_OBSERVATION"
     assert [command["kind"] for command in dispatched] == [

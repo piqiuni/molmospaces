@@ -449,12 +449,14 @@ class SemanticBehaviorExecutor:
         self.interaction_observation_poll_interval_s = max(
             0.01, float(config.get("interaction_observation_poll_interval_s", 0.05))
         )
-        # A single M1 response can flip between ``oblique`` and ``front`` at
-        # the same ring pose.  Container contact is stricter than ordinary
-        # detection: require two later, direct-front observations before the
-        # physical backend is called.  This remains public RGB evidence only.
+        # The physical action is already separated from perception: M1 runs at
+        # a farther outer staging pose, while the bridge later validates the
+        # nearer pose and refrigerator sweep privately.  One fresh *direct*
+        # front observation is therefore the useful default; requiring two
+        # made harmless front/oblique model flicker suppress every action.
+        # Deployments can still opt into a temporal vote through config.
         self.container_pre_action_confirmation_count = max(
-            1, int(config.get("container_pre_action_confirmation_count", 2))
+            1, int(config.get("container_pre_action_confirmation_count", 1))
         )
         self.container_pre_action_require_direct_front = bool(
             config.get("container_pre_action_require_direct_front", True)
@@ -2056,7 +2058,7 @@ class SemanticBehaviorExecutor:
                             getattr(
                                 self,
                                 "container_pre_action_confirmation_count",
-                                2,
+                                1,
                             )
                             or 1
                         ),
