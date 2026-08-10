@@ -1289,6 +1289,117 @@ def test_interaction_arrival_tolerance_completes_selected_fallback_when_plan_is_
     assert kwargs["detail"]["interaction_pose_validation"]["valid"] is True
 
 
+def test_terminal_move_base_success_preserves_safe_staging_arrival_pose(
+    executor_module, monkeypatch
+) -> None:
+    """A terminal action-client success must retain its valid staging sample.
+
+    The executor used to sample the valid outer container pose only in the
+    non-terminal loop.  If move_base completed between loop samples, the later
+    post-cancel polling path could lose that pose and consume its bounded
+    retries before targeted M1 was requested.
+    """
+
+    class _Goal:
+        def __init__(self) -> None:
+            self.target_pose = SimpleNamespace(
+                header=SimpleNamespace(frame_id="", stamp=None),
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=SimpleNamespace(z=0.0, w=1.0),
+                ),
+            )
+
+    class _MoveBase:
+        def wait_for_server(self, _timeout) -> bool:
+            return True
+
+        def send_goal(self, _goal) -> None:
+            return None
+
+        def get_state(self) -> int:
+            return executor_module.GoalStatus.SUCCEEDED
+
+        def get_goal_status_text(self) -> str:
+            return "succeeded"
+
+    monkeypatch.setattr(executor_module, "MoveBaseGoal", _Goal)
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    monkeypatch.setattr(
+        executor_module.rospy, "Time", SimpleNamespace(now=lambda: 0.0)
+    )
+    monkeypatch.setattr(executor_module.rospy, "is_shutdown", lambda: False)
+
+    primary = [2.0, 0.0, 0.0]
+    selected_staging_goal = [1.0, 0.0, 0.0]
+    candidate = {
+        "candidate_id": "interaction:container:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": primary,
+        "metadata": {
+            "frame_id": "map",
+            "m1_observation_staging_required": True,
+            "m1_safe_staging_outer_offset_m": 0.30,
+            "m1_safe_staging_arrival_tolerance_m": 0.25,
+            "goal_xyyaw_candidates": [primary, selected_staging_goal],
+        },
+        "interaction_command": {
+            "interaction_ready_distance_m": 0.25,
+            "interaction_ready_yaw_tolerance_rad": 0.25,
+        },
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor.move_base = _MoveBase()
+    executor.machine = SimpleNamespace(
+        config=SimpleNamespace(
+            interaction_navigation_timeout_s=10.0,
+            navigation_timeout_s=10.0,
+        )
+    )
+    executor.navigation_stagnation_timeout_s = 12.0
+    executor.navigation_stagnation_distance_m = 0.10
+    executor.navigation_stagnation_yaw_rad = 0.15
+    executor.navigation_stagnation_goal_distance_reduction_m = 0.02
+    executor.final_align_enabled = False
+    executor.post_interaction_traversal_make_plan_retry_window_s = 0.0
+    executor._latest_step_sync_index = 73
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._preflight_navigation_plan = lambda *_args: (
+        True,
+        (1.0, 0.0),
+        "reachable",
+    )
+    executor._prerotate_for_rear_goal = lambda *_args, **_kwargs: True
+    executor._set_effective_interaction_approach = lambda *_args, **_kwargs: None
+    executor._start_rear_dwa_monitor = lambda *_args, **_kwargs: None
+    poses = iter(
+        [
+            (0.0, 0.0, 0.0),  # direct-arrival check: not ready
+            (0.0, 0.0, 0.0),  # start-pose bookkeeping after send_goal
+            (1.0, 0.0, 0.0),  # terminal move_base success at staging pose
+        ]
+    )
+    executor._current_pose = lambda _frame_id: next(poses)
+    completed = []
+    executor._complete_interaction_approach_navigation = (
+        lambda *args, **kwargs: completed.append((args, kwargs))
+    )
+
+    executor._run_navigation("decision-terminal", candidate, start_goal_option_index=1)
+
+    assert len(completed) == 1
+    _args, kwargs = completed[0]
+    assert kwargs["selected_goal"] == tuple(selected_staging_goal)
+    assert kwargs["detail"]["interaction_pose_validation_source"] == (
+        "move_base_terminal"
+    )
+    assert kwargs["detail"]["interaction_arrival_step_index"] == 73
+    assert kwargs["detail"]["interaction_pose_validation"]["valid"] is True
+    assert kwargs["detail"]["goal_distance_m"] == pytest.approx(0.0)
+
+
 def test_interaction_arrival_tolerance_still_requires_selected_heading() -> None:
     """Position tolerance alone must not accept an approach from the wrong heading."""
 

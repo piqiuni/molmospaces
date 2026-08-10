@@ -7126,6 +7126,30 @@ class SemanticBehaviorExecutor:
                     detail[trace_key] = post_open_costmap_detail[trace_key]
         if str(behavior_type).upper() == "INTERACT":
             detail["interaction_approach_attempts"] = interaction_approach_attempt_history
+        if success and str(behavior_type).upper() == "INTERACT":
+            # A move_base terminal success may arrive between two polling-loop
+            # samples.  Preserve one pose checked against this exact selected
+            # approach goal so an outer container staging pose is not discarded
+            # by the post-cancel TF poll.  The same public distance/yaw contract
+            # still applies; this only carries the already-observed evidence
+            # into _complete_interaction_approach_navigation.
+            terminal_pose = self._current_pose(goal_frame)
+            terminal_validation = interaction_pose_validation(
+                [x, y, yaw],
+                None if terminal_pose is None else list(terminal_pose),
+                distance_tolerance_m=direct_distance_tolerance,
+                yaw_tolerance_rad=direct_yaw_tolerance,
+            )
+            with self.lock:
+                arrival_step_index = getattr(self, "_latest_step_sync_index", None)
+            detail.update(
+                {
+                    "goal_distance_m": terminal_validation.get("position_error_m"),
+                    "interaction_pose_validation": terminal_validation,
+                    "interaction_arrival_step_index": arrival_step_index,
+                    "interaction_pose_validation_source": "move_base_terminal",
+                }
+            )
         if success and require_final_yaw:
             aligned = self._final_align_goal(
                 decision_id,
