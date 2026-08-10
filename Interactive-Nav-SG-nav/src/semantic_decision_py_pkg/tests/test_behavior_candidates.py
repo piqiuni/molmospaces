@@ -1868,6 +1868,68 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
     assert candidate.metadata["m1_safe_staging_arrival_tolerance_m"] == 0.25
 
 
+def test_container_safe_outer_uses_visible_aabb_anchor_without_m1_axis() -> None:
+    """A current-view ring must aim at the observed box, not a stale centroid.
+
+    The first outer point is still only an M1 re-observation.  In particular,
+    no graph/oracle front axis is accepted merely because the AABB is fresher
+    than the semantic centroid.
+    """
+
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        # Simulate a remembered semantic centroid which lagged the freshly
+        # observed visual box by six metres along the current viewing ray.
+        "centroid": [10.0, 2.0, 1.0],
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "attributes": {
+            # A deliberately conflicting non-M1 geometry hint must remain
+            # unavailable to this path.
+            "interaction_approach_axis_xy": [0.0, 1.0],
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_pre_action_mllm=True,
+            container_standoff_m=0.40,
+            interaction_safety_margin_m=0.10,
+            fridge_observation_standoff_m=0.80,
+            container_safe_staging_outer_offset_m=0.30,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    labels = candidate.metadata["interaction_approach_pose_labels"]
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+    assert labels[:4] == [
+        "current_view_safe_outer",
+        "quarter_turn_left_safe_outer",
+        "quarter_turn_right_safe_outer",
+        "opposite_view_safe_outer",
+    ]
+    assert len(goals) == 12
+    # AABB left surface x=3.5, then 0.80 m observation clearance and 0.30 m
+    # outer safety offset.  This is not the stale centroid-based x=8.4 point.
+    assert math.isclose(goals[0][0], 2.4, abs_tol=1e-6)
+    assert math.isclose(goals[0][1], 2.0, abs_tol=1e-6)
+    expected_yaw = math.atan2(2.0 - goals[0][1], 4.0 - goals[0][0])
+    assert math.isclose(goals[0][2], expected_yaw, abs_tol=1e-6)
+    assert candidate.metadata["interaction_approach_axis_xy"] == []
+    assert candidate.interaction_command["interaction_approach_axis_xy"] == []
+    assert candidate.metadata["observation_required"] is True
+
+
 def test_non_model_container_keeps_original_four_pose_ring() -> None:
     """Rule-only callers do not silently inherit model M1 staging geometry."""
 

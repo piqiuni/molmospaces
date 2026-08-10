@@ -1238,7 +1238,18 @@ class CandidateGenerator:
                 and not (allow_connected_room and room_hops is not None)
             ):
                 continue
-            position = self._node_xy(node)
+            # Container staging/physical rings are defined against the current
+            # visible AABB.  ``centroid`` can be a retained semantic/object
+            # point and may drift from that box; mixing the two made a
+            # ``current_view_safe_outer`` pose face the centroid while its
+            # clearance was computed from the AABB.  Use one geometry anchor
+            # for both the robot-side radial axis and the AABB surface offset.
+            # This remains only a visual re-observation pose when M1 lacks a
+            # front axis; it does not consume an oracle/front-direction field.
+            position = self._node_xy(
+                node,
+                prefer_aabb=(node_type == "container"),
+            )
             if position is None:
                 continue
             object_distance = math.hypot(position[0] - robot_xy[0], position[1] - robot_xy[1])
