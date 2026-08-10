@@ -190,11 +190,44 @@ def is_completed_drawer_scan_candidate(
     """Whether a drawer-scan candidate was already completed this episode."""
 
     interaction = payload.get("interaction_command") or {}
-    if str(interaction.get("sequence_type") or "").casefold() != "drawer_scan":
+    if not is_drawer_scan_interaction(interaction):
         return False
     candidate_id = str(payload.get("candidate_id") or "")
     target_id = str(payload.get("target_id") or "")
     return candidate_id in completed_candidate_ids or target_id in completed_target_ids
+
+
+def is_drawer_scan_interaction(interaction: dict | None) -> bool:
+    """Recognize both a dispatched drawer_scan and its pre-M1 candidate form."""
+
+    interaction = interaction or {}
+    sequence_type = str(interaction.get("sequence_type") or "").casefold()
+    if sequence_type:
+        return sequence_type == "drawer_scan"
+    return bool(
+        str(interaction.get("container_kind") or "").casefold() == "drawer"
+        and str(interaction.get("action") or "").casefold() in {"open", "scan"}
+    )
+
+
+def successful_drawer_scan_feedback(
+    payload: dict, active_candidate: dict | None
+) -> bool:
+    """Identify a completed scan from the executor result, not stale selection data."""
+
+    if str(payload.get("status") or "") != "SUCCEEDED":
+        return False
+    detail = payload.get("detail") or {}
+    result = payload.get("interaction_result") or {}
+    explicit_sequence_types = [
+        str(value.get("sequence_type") or "").casefold()
+        for value in (detail, result)
+        if isinstance(value, dict) and value.get("sequence_type")
+    ]
+    if explicit_sequence_types:
+        return "drawer_scan" in explicit_sequence_types
+    active_command = dict((active_candidate or {}).get("interaction_command") or {})
+    return is_drawer_scan_interaction(active_command)
 
 
 class SemanticRuleDecisionNode:
@@ -709,19 +742,18 @@ class SemanticRuleDecisionNode:
             and str(detail.get("reason") or "") == "preempted_by_target"
         )
         terminal_interaction_failure: dict = {}
-        active_interaction_command = dict(
-            self.active_interaction_candidate.get("interaction_command") or {}
-        )
         successful_drawer_scan = bool(
-            status == "SUCCEEDED"
-            and self.active_behavior_type == "INTERACT"
-            and str(active_interaction_command.get("sequence_type") or "").casefold()
-            == "drawer_scan"
+            self.active_behavior_type == "INTERACT"
+            and successful_drawer_scan_feedback(
+                payload, self.active_interaction_candidate
+            )
         )
         if successful_drawer_scan:
             self.completed_drawer_scan_candidate_ids.add(candidate_id)
             target_id = str(
-                self.active_interaction_candidate.get("target_id")
+                payload.get("target_id")
+                or detail.get("node_id")
+                or self.active_interaction_candidate.get("target_id")
                 or self._interaction_target_id(candidate_id)
                 or ""
             )

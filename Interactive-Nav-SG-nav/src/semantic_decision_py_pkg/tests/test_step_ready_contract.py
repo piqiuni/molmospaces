@@ -18,6 +18,7 @@ pytest.importorskip("rospy")
 from semantic_rule_decision_node import (
     aggregate_step_ready_states,
     is_completed_drawer_scan_candidate,
+    successful_drawer_scan_feedback,
 )
 
 
@@ -104,4 +105,29 @@ def test_completed_drawer_scan_rejects_rebuilt_candidate_for_same_target():
         },
         completed_candidate_ids,
         completed_target_ids,
+    )
+
+
+def test_completed_drawer_scan_recognizes_pre_m1_drawer_candidate_shape():
+    candidate = {
+        "candidate_id": "interaction:drawer_1:open",
+        "target_id": "drawer_1",
+        "interaction_command": {"container_kind": "drawer", "action": "open"},
+    }
+    assert is_completed_drawer_scan_candidate(
+        candidate, set(), {"drawer_1"}
+    )
+
+
+def test_drawer_scan_success_uses_executor_detail_over_stale_candidate_shape():
+    active_candidate = {
+        "interaction_command": {"container_kind": "drawer", "action": "open"}
+    }
+    assert successful_drawer_scan_feedback(
+        {"status": "SUCCEEDED", "detail": {"sequence_type": "drawer_scan"}},
+        active_candidate,
+    )
+    assert not successful_drawer_scan_feedback(
+        {"status": "SUCCEEDED", "detail": {"sequence_type": "drawer_open"}},
+        active_candidate,
     )
