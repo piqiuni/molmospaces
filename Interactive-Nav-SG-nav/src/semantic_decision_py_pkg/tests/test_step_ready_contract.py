@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ if str(MLLM_SCRIPTS) not in sys.path:
 pytest.importorskip("rospy")
 
 from semantic_rule_decision_node import (
+    SemanticRuleDecisionNode,
     aggregate_step_ready_states,
     is_completed_drawer_scan_candidate,
     successful_drawer_scan_feedback,
@@ -130,4 +132,77 @@ def test_drawer_scan_success_uses_executor_detail_over_stale_candidate_shape():
     assert not successful_drawer_scan_feedback(
         {"status": "SUCCEEDED", "detail": {"sequence_type": "drawer_open"}},
         active_candidate,
+    )
+
+
+def test_feedback_tombstones_real_drawer_result_before_candidate_rebuild():
+    candidate_id = "interaction:drawer_1:open"
+    target_id = "drawer_1"
+    node = SimpleNamespace(
+        active_decision_id="decision_1",
+        active_behavior_type="INTERACT",
+        active_interaction_candidate={
+            "candidate_id": candidate_id,
+            "target_id": target_id,
+            # This is the pre-M1 candidate shape retained by the decision node.
+            "interaction_command": {"container_kind": "drawer", "action": "open"},
+        },
+        ablation=SimpleNamespace(module3="mllm_skill_verified"),
+        direct_atomic_outcome_belief_enabled=False,
+        interaction_failure_tracker=SimpleNamespace(note_feedback=lambda **_: {}),
+        completion_tracker=SimpleNamespace(note_feedback=lambda _: None),
+        terminal_no_plan_exit_tracker=SimpleNamespace(
+            note_feedback=lambda *_args, **_kwargs: None
+        ),
+        latest_candidates_payload={"sequence": 7, "candidates": [], "robot_xy": []},
+        failure_counts={},
+        cooldown_until={},
+        success_cooldown_s=0.0,
+        failure_cooldown_schedule_s=(),
+        interaction_target_failure_cooldown_s=0.0,
+        failure_retry_delay_s=0.0,
+        next_decision_time=0.0,
+        pending_post_interaction_traversal={},
+        terminal_post_interaction_traversal_ids=set(),
+        completed_post_interaction_traversal_event_keys=set(),
+        completed_drawer_scan_candidate_ids=set(),
+        completed_drawer_scan_target_ids=set(),
+        target_mission=SimpleNamespace(matches_target_interaction=lambda **_: False),
+        target_context={},
+        active_target_goal=False,
+        target_goal_complete=False,
+        goal_complete=False,
+        mission_mode="semantic_exploration",
+        portal_traversal_distance_m=1.0,
+        minimum_candidate_sequence=0,
+        active_candidate_id=candidate_id,
+        preempt_requested_for_decision_id="",
+        _record_decision_result=lambda _: None,
+        _observation_step=lambda _: 0,
+        _interaction_target_id=lambda _: target_id,
+        _post_interaction_traversal_metadata=lambda _: {},
+        _publish_inactive_selection=lambda _: None,
+    )
+    feedback = {
+        "status": "SUCCEEDED",
+        "behavior_type": "INTERACT",
+        "candidate_id": candidate_id,
+        "decision_id": "decision_1",
+        "target_id": target_id,
+        # The executor result is the only place sequence_type is guaranteed.
+        "detail": {"sequence_type": "drawer_scan", "node_id": target_id},
+    }
+
+    SemanticRuleDecisionNode._handle_feedback(node, feedback)
+
+    assert node.completed_drawer_scan_candidate_ids == {candidate_id}
+    assert node.completed_drawer_scan_target_ids == {target_id}
+    assert is_completed_drawer_scan_candidate(
+        {
+            "candidate_id": candidate_id,
+            "target_id": target_id,
+            "interaction_command": {"container_kind": "drawer", "action": "open"},
+        },
+        node.completed_drawer_scan_candidate_ids,
+        node.completed_drawer_scan_target_ids,
     )
