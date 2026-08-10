@@ -132,7 +132,9 @@ def _portal_aperture_evidence(value: Any) -> dict[str, Any]:
     }
 
 
-def build_attribute_patch_response_schema(object_id: str) -> dict[str, Any]:
+def build_attribute_patch_response_schema(
+    object_id: str, *, expected_node_type: str | None = None
+) -> dict[str, Any]:
     """Return the strict wire schema for one Module-1 object observation.
 
     The portal-only fields remain semantically optional by being nullable.  A
@@ -146,6 +148,12 @@ def build_attribute_patch_response_schema(object_id: str) -> dict[str, Any]:
     normalized_object_id = str(object_id or "").strip()
     if not normalized_object_id:
         raise ValueError("attribute response schema requires an object_id")
+    normalized_expected_type = str(expected_node_type or "").strip().casefold()
+    if normalized_expected_type not in {"", "container", "portal"}:
+        raise ValueError(
+            "attribute response schema expected_node_type must be container or portal"
+        )
+    container_only = normalized_expected_type == "container"
 
     confidence = {"type": "number", "minimum": 0.0, "maximum": 1.0}
     nullable_portal_morphology = {
@@ -186,14 +194,30 @@ def build_attribute_patch_response_schema(object_id: str) -> dict[str, Any]:
                 "interactable": {"type": "boolean"},
                 "interaction_class": {
                     "type": "string",
-                    "enum": ["portal", "container", "none", "unknown"],
+                    "enum": (
+                        ["container"]
+                        if container_only
+                        else ["portal", "container", "none", "unknown"]
+                    ),
                 },
                 "coarse_state": {
                     "type": "string",
-                    "enum": ["open", "closed", "ajar", "static_open", "unknown"],
+                    "enum": (
+                        ["open", "closed", "ajar", "unknown"]
+                        if container_only
+                        else ["open", "closed", "ajar", "static_open", "unknown"]
+                    ),
                 },
-                "portal_morphology": nullable_portal_morphology,
-                "portal_aperture_evidence": nullable_portal_aperture_evidence,
+                "portal_morphology": (
+                    {"type": "null"}
+                    if container_only
+                    else nullable_portal_morphology
+                ),
+                "portal_aperture_evidence": (
+                    {"type": "null"}
+                    if container_only
+                    else nullable_portal_aperture_evidence
+                ),
                 # These fields belong to Module 1's pre-interaction visual
                 # observation.  They deliberately describe only what is
                 # visible from the current camera pose; no world-space axis or

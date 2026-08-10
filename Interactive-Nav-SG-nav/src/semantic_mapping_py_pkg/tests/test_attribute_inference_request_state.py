@@ -215,6 +215,32 @@ def test_targeted_refresh_requires_later_capture_and_rgb_sequence() -> None:
     assert matched["reason"] == "need_front_view"
 
 
+def test_targeted_refresh_parses_only_public_container_or_portal_constraints() -> None:
+    valid = InteractionAttributeInferenceNode._parse_targeted_refresh_payload(
+        {
+            "object_id": "fridge_1",
+            "episode_id": "episode_1",
+            "minimum_capture_step": 12,
+            "reason": "mllm_container_pre_action_visual",
+            "request_id": "decision_1:m1:001",
+            "expected_node_type": "CONTAINER",
+        }
+    )
+
+    assert valid is not None
+    assert valid["expected_node_type"] == "container"
+    assert (
+        InteractionAttributeInferenceNode._parse_targeted_refresh_payload(
+            {
+                "object_id": "fridge_1",
+                "minimum_capture_step": 12,
+                "expected_node_type": "room",
+            }
+        )
+        is None
+    )
+
+
 def test_targeted_refresh_replaces_stale_request_and_keeps_tracking_fields() -> None:
     node = object.__new__(InteractionAttributeInferenceNode)
     node.lock = threading.Lock()
@@ -382,6 +408,96 @@ def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> Non
     ]
     assert published[0][0]["object_id"] == "object_1"
     assert published[0][0]["approach_ready"] is True
+
+
+def test_targeted_container_refresh_constrains_class_without_supplying_view() -> None:
+    class PortalFallbackClient(RecordingClient):
+        def request_json(self, **kwargs):
+            self.calls.append(kwargs)
+            # Deliberately violate the targeted strict schema to exercise the
+            # compatibility guard used with older OpenAI-compatible servers.
+            return SimpleNamespace(
+                error="",
+                payload={
+                    "object_id": "target",
+                    "interactable": True,
+                    "interaction_class": "portal",
+                    "coarse_state": "static_open",
+                    "portal_morphology": {"door_leaf": "absent", "confidence": 0.9},
+                    "portal_aperture_evidence": {
+                        "open_aperture": "visible",
+                        "confidence": 0.9,
+                    },
+                    "view_state": "front",
+                    "view_state_confidence": 0.9,
+                    "front_surface_visible": True,
+                    "front_surface_confidence": 0.9,
+                    "approach_ready": True,
+                    "needs_reobserve": False,
+                    "interaction_parts": [],
+                    "confidence": 0.9,
+                },
+            )
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.pending = {
+        "fridge_1": {
+            "request_sequence": 1,
+            "generation": 0,
+            "episode_id": "episode_1",
+        }
+    }
+    node.generations = {"fridge_1": 0}
+    node.last_request = {}
+    node.completed = {}
+    node.filter_counts = {"started": 0, "stale": 0, "completed": 0, "failed": 0}
+    node.visual_evidence_max_side_px = 0
+    node.request_timeout_s = 1.0
+    node.max_output_tokens = 256
+    node.success_refresh_interval_s = 120.0
+    node.client = PortalFallbackClient()
+    published = []
+    node._publish_updates = lambda _episode, _stamp, updates: published.extend(updates)
+    node._publish_status = lambda: None
+
+    node._infer(
+        object_id="fridge_1",
+        detection={"name": "fridge"},
+        visual_evidence=np.zeros((40, 60, 3), dtype=np.uint8),
+        episode_id="episode_1",
+        frame_id="14",
+        image_sequence=22,
+        stamp=10.0,
+        signature="fresh",
+        generation=0,
+        request_sequence=1,
+        enqueued_at=0.0,
+        targeted_refresh={
+            "request_id": "decision_1:m1:001",
+            "refresh_sequence": 1,
+            "reason": "mllm_container_pre_action_visual",
+            "minimum_capture_step": 12,
+            "expected_node_type": "container",
+        },
+    )
+
+    request = node.client.calls[0]
+    assert request["context"] == {
+        "object_id": "target",
+        "expected_node_type": "container",
+    }
+    properties = request["response_schema"]["schema"]["properties"]
+    assert properties["interaction_class"]["enum"] == ["container"]
+    assert properties["portal_morphology"] == {"type": "null"}
+    patch = published[0]
+    assert patch["interaction_class"] == "container"
+    assert patch["coarse_state"] == "unknown"
+    assert patch["m1_reported_interaction_class"] == "portal"
+    assert patch["view_state"] == "front"
+    assert "portal_morphology" not in patch
+    assert "portal_aperture_evidence" not in patch
 
 
 def test_m1_request_expired_in_local_queue_is_not_sent() -> None:

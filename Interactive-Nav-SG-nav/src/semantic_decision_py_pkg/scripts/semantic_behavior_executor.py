@@ -3491,6 +3491,11 @@ class SemanticBehaviorExecutor:
                 )[:160],
                 "request_id": request_id,
             }
+            if self._is_container_pre_action_candidate(self.machine.candidate):
+                # Public graph/candidate semantics constrain only the M1 class
+                # contract for this targeted re-observation.  M1 still decides
+                # visual state and frontality from the new RGB image itself.
+                request["expected_node_type"] = "container"
             metadata = (
                 dict(self.machine.candidate.get("metadata") or {})
                 if self.machine.candidate

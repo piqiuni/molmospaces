@@ -361,6 +361,30 @@ def test_attribute_patch_response_schema_binds_target_and_bounds_portal_evidence
     assert "portal_aperture_evidence" not in non_portal
 
 
+def test_container_targeted_attribute_schema_locks_class_but_not_visual_state() -> None:
+    schema = build_attribute_patch_response_schema(
+        "fridge_1", expected_node_type="container"
+    )
+    properties = schema["schema"]["properties"]
+
+    assert properties["interaction_class"] == {"type": "string", "enum": ["container"]}
+    assert properties["coarse_state"]["enum"] == ["open", "closed", "ajar", "unknown"]
+    assert properties["portal_morphology"] == {"type": "null"}
+    assert properties["portal_aperture_evidence"] == {"type": "null"}
+    # View/frontality are intentionally still M1 image judgements rather than
+    # being supplied by the stable graph node type.
+    assert properties["view_state"]["enum"] == [
+        "front",
+        "oblique",
+        "side_or_back",
+        "occluded",
+        "unknown",
+    ]
+
+    with pytest.raises(ValueError, match="expected_node_type"):
+        build_attribute_patch_response_schema("fridge_1", expected_node_type="room")
+
+
 def test_attribute_patch_front_view_fields_are_conservatively_normalized() -> None:
     side_view = validate_attribute_patch(
         {

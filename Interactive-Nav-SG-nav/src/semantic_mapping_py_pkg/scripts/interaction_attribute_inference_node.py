@@ -963,6 +963,9 @@ class InteractionAttributeInferenceNode:
             return None
         if minimum_capture_step < 0:
             return None
+        expected_node_type = str(payload.get("expected_node_type") or "").strip().casefold()
+        if expected_node_type not in {"", "container", "portal"}:
+            return None
         return {
             "object_id": object_id,
             "episode_id": str(payload.get("episode_id") or "").strip(),
@@ -970,6 +973,7 @@ class InteractionAttributeInferenceNode:
             "reason": str(payload.get("reason") or "targeted_refresh").strip()[:160]
             or "targeted_refresh",
             "request_id": str(payload.get("request_id") or "").strip()[:96],
+            "expected_node_type": expected_node_type,
         }
 
     def _targeted_refresh_callback(self, message: String) -> None:
@@ -1705,21 +1709,30 @@ class InteractionAttributeInferenceNode:
                 deadline_expired = True
                 outcome_error = "queue_deadline_expired_before_send"
                 return
-            model_call_started = True
-            response = self.client.request_json(
-                role="attribute_inference",
-                instruction=(
-                    "Infer the outlined target's pre-interaction visual attributes using "
-                    "only pixels in the one supplied composite image. The composite shows "
-                    "the complete head-camera image, a target outline, and a padded target "
-                    "crop inset. Do not use object IDs, prior state, category names, map "
-                    "geometry, simulator knowledge, or hidden properties. Return exactly one "
-                    "compact, single-line JSON object with only object_id, interactable, "
-                    "interaction_class, coarse_state, portal_morphology, "
-                    "portal_aperture_evidence, view_state, view_state_confidence, "
-                    "front_surface_visible, front_surface_confidence, approach_ready, "
-                    "needs_reobserve, action_regions, interaction_parts, and confidence. "
-                    "interaction_class is portal, container, none, or unknown. "
+            expected_node_type = str(
+                targeted_refresh.get("expected_node_type") or ""
+            ).strip().casefold()
+            container_refresh = expected_node_type == "container"
+            expected_type_instruction = (
+                "This is a targeted re-observation whose public expected_node_type is "
+                "container. It constrains class output only: interaction_class MUST be "
+                "container, portal_morphology and portal_aperture_evidence MUST be null, "
+                "and coarse_state MUST be open, closed, ajar, or unknown. Do not promote "
+                "this target to a portal. Still determine state, frontality, and reobserve "
+                "need from image pixels alone; do not assume a front view or hidden state. "
+                if container_refresh
+                else ""
+            )
+            class_instruction = (
+                "interaction_class is container for this targeted refresh. "
+                if container_refresh
+                else "interaction_class is portal, container, none, or unknown. "
+            )
+            portal_instruction = (
+                "For a non-portal, set portal_morphology and "
+                "portal_aperture_evidence to null. "
+                if container_refresh
+                else (
                     "For a portal only, portal_morphology is {door_leaf: absent|present|unknown, "
                     "confidence: 0..1}; report absent only when the image visibly shows a clear "
                     "opening with no door leaf. It is visual morphology only: never infer "
@@ -1730,6 +1743,23 @@ class InteractionAttributeInferenceNode:
                     "open or ajar from the class label, handle, or a guessed hidden state. "
                     "For a non-portal, set portal_morphology and "
                     "portal_aperture_evidence to null. "
+                )
+            )
+            instruction = "".join(
+                (
+                    expected_type_instruction,
+                    "Infer the outlined target's pre-interaction visual attributes using "
+                    "only pixels in the one supplied composite image. The composite shows "
+                    "the complete head-camera image, a target outline, and a padded target "
+                    "crop inset. Do not use object IDs, prior state, category names, map "
+                    "geometry, simulator knowledge, or hidden properties. Return exactly one "
+                    "compact, single-line JSON object with only object_id, interactable, "
+                    "interaction_class, coarse_state, portal_morphology, "
+                    "portal_aperture_evidence, view_state, view_state_confidence, "
+                    "front_surface_visible, front_surface_confidence, approach_ready, "
+                    "needs_reobserve, action_regions, interaction_parts, and confidence. ",
+                    class_instruction,
+                    portal_instruction,
                     "view_state is front, oblique, side_or_back, occluded, or unknown and "
                     "describes only the current camera view of the outlined target. Use front "
                     "only for a nearly head-on, broad usable face: both lateral boundaries and "
@@ -1749,16 +1779,28 @@ class InteractionAttributeInferenceNode:
                     "interaction_parts has at most one item with part_id, type, state, "
                     "handle_visible, and confidence. Use a short generic part_id such as "
                     "part_1; never copy simulator body or joint identifiers. Do not output "
-                    "markdown, explanations, geometry, axes, ranges, trajectories, or extra keys."
-                ),
+                    "markdown, explanations, geometry, axes, ranges, trajectories, or extra keys.",
+                )
+            )
+            model_call_started = True
+            response = self.client.request_json(
+                role="attribute_inference",
+                instruction=instruction,
                 context={
                     # Keep semantic identifiers and scene geometry outside the
                     # M1 prompt.  ``target`` is an opaque response-routing token
                     # which the caller replaces with the real object ID.
                     "object_id": "target",
+                    **(
+                        {"expected_node_type": "container"}
+                        if container_refresh
+                        else {}
+                    ),
                 },
                 images=[image_data],
-                response_schema=build_attribute_patch_response_schema("target"),
+                response_schema=build_attribute_patch_response_schema(
+                    "target", expected_node_type=expected_node_type or None
+                ),
                 timeout_s=remaining_timeout_s,
                 max_tokens=self.max_output_tokens,
                 metrics_context={
@@ -1776,6 +1818,19 @@ class InteractionAttributeInferenceNode:
                 outcome_error = str(response.error or "empty_model_response")
                 return
             patch = validate_attribute_patch(response.payload)
+            if container_refresh and patch.get("interaction_class") != "container":
+                # A compatible endpoint should enforce the strict schema.  Keep
+                # this response-side guard for older/command backends: preserve
+                # its image-derived state/frontality, but never let a targeted
+                # container refresh turn into a portal update.
+                patch["m1_reported_interaction_class"] = str(
+                    patch.get("interaction_class") or "unknown"
+                )
+                patch["interaction_class"] = "container"
+                if str(patch.get("coarse_state") or "").casefold() == "static_open":
+                    patch["coarse_state"] = "unknown"
+                patch.pop("portal_morphology", None)
+                patch.pop("portal_aperture_evidence", None)
             refresh_interval_s = self._attribute_refresh_interval(detection, patch)
             with self.lock:
                 if episode_id and episode_id != self.current_episode_id:

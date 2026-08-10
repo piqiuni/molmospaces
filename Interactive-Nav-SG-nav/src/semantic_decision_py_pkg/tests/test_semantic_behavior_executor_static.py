@@ -474,6 +474,8 @@ def test_container_requires_two_direct_front_m1_observations_before_opening(
     executor._publish_interaction_observation_request(commands[0])
     dispatched = []
 
+    assert published[-1]["expected_node_type"] == "container"
+
     def dispatch(next_commands):
         dispatched.extend(next_commands)
         for command in next_commands:
