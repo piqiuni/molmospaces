@@ -11,6 +11,8 @@ class MissionCompletionConfig:
     empty_candidate_confirmations: int = 3
     empty_candidate_min_steps: int = 50
     stagnation_failure_limit: int = 0
+    retryable_frontier_stall_min_steps: int = 50
+    retryable_frontier_stall_confirmations: int = 3
 
 
 @dataclass
@@ -316,7 +318,11 @@ class MissionCompletionTracker:
         self.reason = ""
         self.failure_streak = 0
         self.stalled = False
+        self.terminal_stalled = False
         self.empty_since_step: int | None = None
+        self.retryable_frontier_since_step: int | None = None
+        self.retryable_frontier_confirmations = 0
+        self.last_retryable_frontier_detail: dict[str, Any] = {}
 
     def note_feedback(self, feedback: dict[str, Any]) -> None:
         status = str(feedback.get("status") or "")
@@ -340,6 +346,8 @@ class MissionCompletionTracker:
     ) -> bool:
         if self.complete:
             return True
+        if self.terminal_stalled:
+            return False
         sequence = int(candidates_payload.get("sequence", 0) or 0)
         if sequence == self.last_sequence:
             return False
@@ -347,6 +355,9 @@ class MissionCompletionTracker:
         self.stalled = False
         exploration = candidates_payload.get("exploration_context") or {}
         initial_scan_complete = bool(exploration.get("initial_scan_complete", True))
+        retryable_filtered_frontier = bool(
+            exploration.get("filtered_frontier_retryable", False)
+        )
         candidates = list(candidates_payload.get("candidates") or [])
         # A producer counter can lag or reset while a candidate snapshot is
         # still live. Treat the raw snapshot as a conservative lower bound so
@@ -438,6 +449,70 @@ class MissionCompletionTracker:
             observation_step = int(observation_step)
         except (TypeError, ValueError):
             observation_step = None
+        if retryable_filtered_frontier:
+            if self.retryable_frontier_since_step is None:
+                self.retryable_frontier_since_step = observation_step
+            self.retryable_frontier_confirmations += 1
+            elapsed_steps = (
+                max(
+                    0,
+                    observation_step - self.retryable_frontier_since_step,
+                )
+                if observation_step is not None
+                and self.retryable_frontier_since_step is not None
+                else 0
+            )
+            self.last_retryable_frontier_detail = {
+                "reason": str(
+                    exploration.get("filtered_frontier_reason")
+                    or "material_frontier_without_safe_viewpoint"
+                ),
+                "raw_frontier_cluster_count": int(
+                    exploration.get("raw_frontier_cluster_count", 0) or 0
+                ),
+                "raw_frontier_material_cluster_count": int(
+                    exploration.get("raw_frontier_material_cluster_count", 0) or 0
+                ),
+                "filtered_no_viewpoint_frontier_cluster_count": int(
+                    exploration.get(
+                        "filtered_no_viewpoint_frontier_cluster_count", 0
+                    )
+                    or 0
+                ),
+                "retryable_frontier_since_observation_step": (
+                    self.retryable_frontier_since_step
+                ),
+                "retryable_frontier_elapsed_steps": elapsed_steps,
+                "retryable_frontier_has_observation_step": observation_step is not None,
+                "retryable_frontier_confirmations": (
+                    self.retryable_frontier_confirmations
+                ),
+                "retryable_frontier_stall_min_steps": max(
+                    0, int(self.config.retryable_frontier_stall_min_steps)
+                ),
+                "retryable_frontier_stall_confirmations_required": max(
+                    1, int(self.config.retryable_frontier_stall_confirmations)
+                ),
+            }
+            self.confirmations = 0
+            self.empty_since_step = None
+            self.stalled = False
+            enough_confirmations = self.retryable_frontier_confirmations >= max(
+                1, int(self.config.retryable_frontier_stall_confirmations)
+            )
+            enough_elapsed_steps = (
+                observation_step is None
+                or elapsed_steps
+                >= max(0, int(self.config.retryable_frontier_stall_min_steps))
+            )
+            if enough_confirmations and enough_elapsed_steps:
+                self.stalled = True
+                self.terminal_stalled = True
+                self.reason = str(self.last_retryable_frontier_detail["reason"])
+            return False
+        self.retryable_frontier_since_step = None
+        self.retryable_frontier_confirmations = 0
+        self.last_retryable_frontier_detail = {}
         stagnated = (
             not has_active_behavior
             and int(self.config.stagnation_failure_limit) > 0

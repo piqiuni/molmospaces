@@ -164,6 +164,11 @@ model:
 completion:
   empty_candidate_confirmations: 3
   stagnation_failure_limit: 8
+  # A material raw frontier that has no currently safe viewpoint is not map
+  # exhaustion.  Wait for a bounded number of fresh observations, then surface
+  # it as EXPLORATION_STALLED rather than falsely reporting exhausted.
+  retryable_frontier_stall_min_steps: 50
+  retryable_frontier_stall_confirmations: 3
   # Three terminal move-base approach failures make one concrete interaction
   # subgoal planner-unreachable for the rest of this episode.
   interaction_approach_failure_limit: 3

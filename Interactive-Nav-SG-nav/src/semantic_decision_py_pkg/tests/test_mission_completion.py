@@ -319,6 +319,81 @@ def test_raw_frontier_candidate_prevents_false_exhaustion_from_stale_counts() ->
     assert tracker.complete is False
 
 
+def test_material_filtered_frontier_blocks_exhaustion_then_reports_bounded_stall() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(
+            empty_candidate_confirmations=1,
+            empty_candidate_min_steps=0,
+            retryable_frontier_stall_min_steps=20,
+            retryable_frontier_stall_confirmations=3,
+        )
+    )
+
+    def snapshot(sequence: int, observation_step: int) -> dict:
+        return {
+            "sequence": sequence,
+            "candidate_count": 0,
+            "candidates": [],
+            "exploration_context": {
+                "initial_scan_complete": True,
+                "observation_step": observation_step,
+                # The candidate generator has no safe viewpoint yet, but the
+                # explorer still has a material frontier region to re-evaluate.
+                "frontier_exhausted": False,
+                "navigation_frontier_exhausted": False,
+                "interaction_frontier_exhausted": True,
+                "filtered_frontier_retryable": True,
+                "filtered_frontier_reason": "material_frontier_without_safe_viewpoint",
+                "raw_frontier_cluster_count": 2,
+                "raw_frontier_material_cluster_count": 1,
+                "filtered_no_viewpoint_frontier_cluster_count": 1,
+            },
+        }
+
+    assert not tracker.update(
+        snapshot(1, 100), has_active_behavior=False, target_enabled=False
+    )
+    assert not tracker.update(
+        snapshot(2, 110), has_active_behavior=False, target_enabled=False
+    )
+    assert not tracker.update(
+        snapshot(3, 120), has_active_behavior=False, target_enabled=False
+    )
+    assert tracker.complete is False
+    assert tracker.terminal_stalled is True
+    assert tracker.reason == "material_frontier_without_safe_viewpoint"
+    assert tracker.last_retryable_frontier_detail[
+        "retryable_frontier_elapsed_steps"
+    ] == 20
+
+
+def test_tiny_only_frontier_does_not_trigger_retryable_terminal_guard() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(empty_candidate_confirmations=1, empty_candidate_min_steps=0)
+    )
+    snapshot = {
+        "sequence": 1,
+        "candidate_count": 0,
+        "candidates": [],
+        "exploration_context": {
+            "initial_scan_complete": True,
+            "observation_step": 10,
+            "frontier_exhausted": True,
+            "navigation_frontier_exhausted": True,
+            "interaction_frontier_exhausted": True,
+            # A tiny-only filter result must remain a normal terminal state.
+            "filtered_frontier_retryable": False,
+            "raw_frontier_cluster_count": 1,
+            "raw_frontier_material_cluster_count": 0,
+            "filtered_tiny_frontier_cluster_count": 1,
+        },
+    }
+
+    assert tracker.update(snapshot, has_active_behavior=False, target_enabled=False)
+    assert tracker.complete is True
+    assert tracker.terminal_stalled is False
+
+
 def test_single_make_plan_failure_does_not_bypass_approach_failure_limit() -> None:
     tracker = TerminalInteractionNoPlanExitTracker(
         TerminalInteractionNoPlanExitConfig(enabled=True)

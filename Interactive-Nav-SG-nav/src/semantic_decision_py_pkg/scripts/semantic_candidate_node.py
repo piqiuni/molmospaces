@@ -11,6 +11,9 @@ from semantic_decision_py_pkg.behavior_candidates import (
     CandidateGeneratorConfig,
 )
 from semantic_decision_py_pkg.model_policy import compact_graph
+from semantic_decision_py_pkg.frontier_terminal_contract import (
+    summarize_frontier_filtering,
+)
 from semantic_decision_py_pkg.ros_compat import patch_roslogging_findcaller_for_py311
 from semantic_decision_py_pkg.startup_scan_lifecycle import StartupScanLifecycle
 
@@ -377,11 +380,20 @@ class SemanticCandidateNode:
             explorer_input.get("active_proposal_id")
             or explorer_state.get("active_goal")
         )
+        frontier_filtering = summarize_frontier_filtering(
+            explorer_input.get("frontier_debug")
+        )
+        retryable_filtered_frontier = bool(
+            frontier_filtering["filtered_frontier_retryable"]
+            and not active_navigation_frontier
+            and not navigation_frontiers
+        )
         navigation_frontier_exhausted = bool(
             ready
             and initial_scan_complete
             and not active_navigation_frontier
             and not navigation_frontiers
+            and not retryable_filtered_frontier
         )
         interaction_frontier_exhausted = not interaction_frontiers
         combined_frontier_exhausted = bool(
@@ -414,6 +426,7 @@ class SemanticCandidateNode:
                     explorer_input.get("frontier_exhausted", False)
                 ),
                 "proposal_count": int(explorer_input.get("proposal_count", 0) or 0),
+                **frontier_filtering,
                 "map_resolution": float(
                     explorer_input.get("map_resolution", 0.0) or 0.0
                 ),

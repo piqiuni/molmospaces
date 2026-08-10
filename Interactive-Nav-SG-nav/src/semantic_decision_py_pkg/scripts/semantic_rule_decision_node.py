@@ -445,6 +445,14 @@ class SemanticRuleDecisionNode:
                 stagnation_failure_limit=int(
                     completion_config.get("stagnation_failure_limit", 0)
                 ),
+                retryable_frontier_stall_min_steps=int(
+                    completion_config.get("retryable_frontier_stall_min_steps", 50)
+                ),
+                retryable_frontier_stall_confirmations=int(
+                    completion_config.get(
+                        "retryable_frontier_stall_confirmations", 3
+                    )
+                ),
             )
         )
         self.terminal_no_plan_exit_tracker = TerminalInteractionNoPlanExitTracker(
@@ -1312,11 +1320,12 @@ class SemanticRuleDecisionNode:
         if self.mission_mode == "semantic_interaction_object_goal" and self.target_goal_complete:
             self.goal_complete = True
             return
-        if self.completion_tracker.update(
+        mission_complete = self.completion_tracker.update(
             completion_snapshot,
             has_active_behavior=bool(self.active_candidate_id),
             target_enabled=bool(self.target_context.get("enabled")),
-        ):
+        )
+        if mission_complete:
             exploration_context = (
                 completion_snapshot.get("exploration_context") or {}
             )
@@ -1341,6 +1350,12 @@ class SemanticRuleDecisionNode:
                     ),
                 },
             )
+            return
+        if self.completion_tracker.terminal_stalled:
+            self.goal_complete = True
+            detail = dict(self.completion_tracker.last_retryable_frontier_detail)
+            detail["candidate_sequence"] = candidate_sequence
+            self._publish_goal_status("EXPLORATION_STALLED", detail=detail)
             return
         now = time.monotonic()
         decision_history, group_history = self._history_context(candidate_snapshot)
