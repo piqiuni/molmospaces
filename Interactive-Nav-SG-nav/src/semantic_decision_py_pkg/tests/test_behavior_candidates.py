@@ -1776,6 +1776,103 @@ def test_mllm_container_requires_fresh_front_observation_before_opening() -> Non
     assert candidate.metadata["observation_reason"] == "mllm_container_pre_action_visual"
 
 
+def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
+    """The finite fallback budget must cover four safe faces first.
+
+    This is intentionally a geometry-only assertion: no costmap cells are
+    cleared and no pose is accepted without the executor's normal planner and
+    bridge preconditions.  The outer ring simply prevents all four attempts
+    from being spent on a wall-side, high-inflation shoulder.
+    """
+
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_pre_action_mllm=True,
+            container_standoff_m=0.40,
+            interaction_safety_margin_m=0.10,
+            container_observation_standoff_m=0.70,
+            container_safe_staging_outer_offset_m=0.30,
+            container_safe_staging_arrival_tolerance_m=0.25,
+        )
+    )
+
+    candidate = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+    labels = candidate.metadata["interaction_approach_pose_labels"]
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+
+    assert labels[:4] == [
+        "current_view_safe_outer",
+        "quarter_turn_left_safe_outer",
+        "quarter_turn_right_safe_outer",
+        "opposite_view_safe_outer",
+    ]
+    assert labels[4:] == [
+        "current_view_safe_far",
+        "quarter_turn_left_safe_far",
+        "quarter_turn_right_safe_far",
+        "opposite_view_safe_far",
+    ]
+    assert len(goals) == 8
+    # The object AABB surface is at x=3.5 on the current side.  The fridge's
+    # 0.80 m observation standoff plus 0.30 m outer offset therefore places
+    # the primary point at x=2.4, not in the AABB shoulder.
+    assert math.isclose(goals[0][0], 2.4, abs_tol=1e-6)
+    assert math.isclose(goals[0][1], 2.0, abs_tol=1e-6)
+    # A failed outer ring must not fall back to a close shoulder pose.
+    assert math.isclose(goals[4][0], 2.1, abs_tol=1e-6)
+    assert math.isclose(goals[4][1], 2.0, abs_tol=1e-6)
+    assert candidate.interaction_command["interaction_ready_distance_m"] == 0.25
+    assert candidate.metadata["m1_safe_staging_outer_offset_m"] == 0.30
+    assert candidate.metadata["m1_safe_staging_arrival_tolerance_m"] == 0.25
+
+
+def test_non_model_container_keeps_original_four_pose_ring() -> None:
+    """Rule-only callers do not silently inherit model M1 staging geometry."""
+
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("container",))
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    assert candidate.metadata["interaction_approach_pose_labels"] == [
+        "current_view",
+        "quarter_turn_left",
+        "quarter_turn_right",
+        "opposite_view",
+    ]
+    assert len(candidate.metadata["goal_xyyaw_candidates"]) == 4
+
+
 def test_target_current_visibility_can_be_required() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(target_require_current_visibility=True)

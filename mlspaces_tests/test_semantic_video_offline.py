@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from scripts.InteractiveNav.build_semantic_video_offline import (
     load_episode_trajectory,
     offline_display_config,
     panel_names,
+    persist_final_completion_status_to_raw_steps,
     receipt_is_causal_at_boundary,
     resolve_episode_trajectory_path,
     route_event_at_stamp,
@@ -680,3 +682,77 @@ def test_terminal_status_uses_recorded_no_plan_countdown_only() -> None:
     assert "STEP 17/20" in str(summary["label"])
     assert "REM 3 STEP / 1 OBS" in str(summary["label"])
     assert terminal_status_summary({}) == {}
+
+
+def test_completion_status_uses_recorded_confirmation_and_hold_countdown() -> None:
+    pending = terminal_status_summary(
+        {
+            "completion_status": {
+                "requested": True,
+                "reason": "navigation_and_interaction_frontiers_exhausted",
+                "requested_at_step": 40,
+                "completed_steps": 43,
+                "config": {"post_completion_hold_steps": 10},
+                "detail": {"completion_confirmations": 3},
+            }
+        }
+    )
+    assert pending["remaining_steps"] == 7
+    assert "COMPLETION REQUESTED" in str(pending["label"])
+    assert "REM 7 STEP" in str(pending["label"])
+    assert "CONF 3" in str(pending["label"])
+
+    final = terminal_status_summary(
+        {
+            "completion_status": {
+                "requested": True,
+                "reason": "navigation_and_interaction_frontiers_exhausted",
+                "requested_at_step": 295,
+                "completed_steps": 295,
+                "config": {"post_completion_hold_steps": 0},
+            }
+        }
+    )
+    assert final["remaining_steps"] == 0
+    assert "COMPLETION CONFIRMED" in str(final["label"])
+    assert "NAV+INTERACT EXHAUSTED" in str(final["label"])
+
+
+def test_final_completion_status_is_persisted_to_last_raw_boundary(tmp_path: Path) -> None:
+    raw_manifest = tmp_path / "debug" / "raw" / "step_boundaries.jsonl"
+    raw_manifest.parent.mkdir(parents=True)
+    raw_manifest.write_text(
+        "\n".join(
+            json.dumps({"step_index": step, "stamp_sec": 10.0 + step})
+            for step in (0, 1, 2)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    completion_path = tmp_path / "completion_status.json"
+    completion_path.write_text(
+        json.dumps(
+            {
+                "requested": True,
+                "reason": "navigation_and_interaction_frontiers_exhausted",
+                "requested_at_step": 3,
+                "completed_steps": 3,
+                "requested_at_wall_time": 13.2,
+                "config": {"post_completion_hold_steps": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert persist_final_completion_status_to_raw_steps(raw_manifest, completion_path)
+    rows = [json.loads(line) for line in raw_manifest.read_text().splitlines() if line]
+    assert [row["step_index"] for row in rows] == [0, 1, 2]
+    assert rows[-1]["completion_status"]["requested"] is True
+    assert rows[-1]["completion_status_capture"] == {
+        "source": "completion_status_file",
+        "timing": "post_episode_finalization",
+        "status_wall_time": 13.2,
+        "final_raw_step_index": 2,
+    }
+    # A video rebuild is idempotent and does not rewrite the same raw boundary.
+    assert not persist_final_completion_status_to_raw_steps(raw_manifest, completion_path)

@@ -140,6 +140,76 @@ def _public_portal_aperture_evidence(patch):
     return {"open_aperture": aperture, "confidence": confidence}
 
 
+def _container_m1_hysteresis(
+    node,
+    interaction_class,
+    requested_state,
+    requested_interactable,
+    *,
+    is_visual_mllm_patch,
+):
+    """Keep a source-established container stable across one M1 response.
+
+    Module 1 classifies an image crop and is allowed to be uncertain about the
+    object ontology.  A one-frame ``portal``/``none`` answer must therefore not
+    rewrite a graph node that the observation lane already established as a
+    container.  The same applies to ``static_open``: that state is a topology
+    terminal for portals, but is not a valid one-frame terminal for a fridge or
+    drawer.  We deliberately do not infer simulator capability or an approach
+    direction here; an uncertain container remains an ordinary interaction
+    candidate and asks the caller for a fresh visual observation.
+
+    Returns ``(type_locked, state_rejected, reason)``.  The graph records the
+    rejection for diagnostics while retaining the previous interaction payload.
+    A future policy may add a multi-frame, public-evidence promotion lane, but
+    this conservative lane never promotes a container from one M1 frame.
+    """
+
+    if not is_visual_mllm_patch:
+        return False, False, "not_visual_mllm_patch"
+    attributes = node.attributes or {}
+    topology_type = str(
+        attributes.get("topology_type")
+        or attributes.get("observation_node_type")
+        or ""
+    ).strip().casefold()
+    established_container = node.type == "container" or topology_type == "container"
+    if not established_container:
+        return False, False, "not_established_container"
+
+    requested_class = str(interaction_class or "unknown").strip().casefold()
+    requested_state = str(requested_state or "unknown").strip().casefold()
+    type_locked = requested_class != "container"
+    # A negative image-only capability claim is not a terminal result for an
+    # otherwise openable source container.  Preserve its existing candidate
+    # and ask for another view; sealed executor feedback remains the only lane
+    # allowed to mark an openable container unavailable.
+    noninteractable_rejected = bool(
+        requested_class == "container"
+        and not bool(requested_interactable)
+        and bool(node.interaction.get("is_interactable"))
+    )
+    state_rejected = (
+        type_locked
+        or requested_state == "static_open"
+        or noninteractable_rejected
+    )
+    if not state_rejected:
+        return False, False, "container_evidence_accepted"
+    reasons = []
+    if type_locked:
+        reasons.append(f"class:{requested_class or 'unknown'}")
+    if requested_state == "static_open":
+        reasons.append("state:static_open")
+    if noninteractable_rejected:
+        reasons.append("interactable:false")
+    return (
+        type_locked,
+        state_rejected,
+        ";".join(reasons) or "uncertain_container_evidence",
+    )
+
+
 def _portal_has_observed_open_connectivity(node):
     """Whether mapping, not a synthetic post-open hypothesis, saw both sides."""
 
@@ -872,6 +942,11 @@ class InteractionGraphStore:
         )
         confidence = float(patch.get("confidence", 0.0) or 0.0)
         interaction_class = normalize_label(patch.get("interaction_class"))
+        patch_source = str(patch.get("source") or "mllm_attribute_inference")
+        is_visual_mllm_patch = "mllm" in patch_source.casefold()
+        requested_patch_state = str(
+            patch.get("coarse_state") or "unknown"
+        ).strip().casefold()
         observed_topology_type = str(
             node.attributes.get("topology_type")
             or node.attributes.get("observation_node_type")
@@ -887,11 +962,23 @@ class InteractionGraphStore:
             and observed_topology_type
             and observed_topology_type != "portal"
         )
+        (
+            container_type_locked,
+            container_state_rejected,
+            container_hysteresis_reason,
+        ) = _container_m1_hysteresis(
+            node,
+            interaction_class,
+            requested_patch_state,
+            bool(patch.get("interactable", False)),
+            is_visual_mllm_patch=is_visual_mllm_patch,
+        )
         if (
             not has_verified_interaction_state
             and confidence >= 0.5
             and interaction_class in {"portal", "container", "support", "object"}
             and not portal_promotion_rejected
+            and not container_type_locked
         ):
             node.type = interaction_class
         parts = list(patch.get("interaction_parts") or [])
@@ -915,6 +1002,26 @@ class InteractionGraphStore:
                 "mllm_interaction_parts": parts,
             }
         )
+        if is_visual_mllm_patch and (
+            node.type == "container"
+            or observed_topology_type == "container"
+        ):
+            # Keep this as public, bounded diagnostic metadata.  It makes a
+            # rejected one-frame answer visible to replay/inspection without
+            # allowing the answer to alter topology or interaction capability.
+            node.attributes["mllm_container_type_hysteresis"] = {
+                "locked_type": "container",
+                "requested_type": interaction_class or "unknown",
+                "requested_state": requested_patch_state or "unknown",
+                "accepted": not bool(container_type_locked),
+                "state_accepted": not bool(container_state_rejected),
+                "reason": container_hysteresis_reason,
+                "observation_capture_step": patch_frame_index,
+            }
+            node.attributes["mllm_container_type_locked"] = True
+            node.attributes["mllm_container_state_rejected"] = bool(
+                container_state_rejected
+            )
         # M1 owns the pre-interaction visual state. Persist its compact public
         # contract so candidate generation can derive an approach from the
         # observed view rather than from a simulator/oracle orientation.
@@ -944,6 +1051,13 @@ class InteractionGraphStore:
             )
             node.attributes["approach_source"] = node.attributes["view_state_source"]
             node.attributes["attribute_is_current"] = True
+        if container_state_rejected:
+            # The crop is still useful as a reason to re-observe, but its
+            # contradictory class/state must not make a fridge or drawer
+            # disappear from the interaction graph for this frame.
+            node.attributes["needs_reobserve"] = True
+            node.attributes["approach_ready"] = False
+            node.attributes["attribute_is_current"] = False
         for key in (
             "targeted_refresh",
             "targeted_refresh_request_id",
@@ -972,12 +1086,11 @@ class InteractionGraphStore:
             ],
             default=0.0,
         )
-        patch_source = str(patch.get("source") or "mllm_attribute_inference")
-        is_visual_mllm_patch = "mllm" in patch_source.casefold()
         state_was_updated = (
             not has_verified_interaction_state
             and latest_operation_stamp <= patch_stamp
             and is_visual_mllm_patch
+            and not container_state_rejected
         )
         if state_was_updated:
             patch_state = str(

@@ -142,6 +142,12 @@ class SemanticCandidateNode:
                 fridge_observation_standoff_m=float(
                     config.get("fridge_observation_standoff_m", 0.8)
                 ),
+                container_safe_staging_outer_offset_m=float(
+                    config.get("container_safe_staging_outer_offset_m", 0.30)
+                ),
+                container_safe_staging_arrival_tolerance_m=float(
+                    config.get("container_safe_staging_arrival_tolerance_m", 0.25)
+                ),
                 container_interaction_ready_distance_m=float(
                     config.get("container_interaction_ready_distance_m", 0.18)
                 ),

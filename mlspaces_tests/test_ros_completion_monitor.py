@@ -1,6 +1,9 @@
+import json
+
 from scripts.InteractiveNav.ros_completion_monitor import (
     CompletionMonitorConfig,
     CompletionState,
+    RosCompletionMonitor,
 )
 
 
@@ -77,3 +80,15 @@ def test_semantic_completion_stops_on_confirmed_terminal_no_plan_stagnation() ->
     ) is True
     assert state.reason == "no_executable_candidates_after_terminal_interaction_no_plan"
     assert state.should_stop(42) is True
+
+
+def test_completion_snapshot_has_atomic_transport_timestamp(tmp_path) -> None:
+    monitor = RosCompletionMonitor.__new__(RosCompletionMonitor)
+    monitor.state = CompletionState(CompletionMonitorConfig(mode="semantic"))
+    monitor.output_path = tmp_path / "completion_status.json"
+    monitor._write_snapshot(7)
+
+    payload = json.loads(monitor.output_path.read_text(encoding="utf-8"))
+    assert payload["completed_steps"] == 7
+    assert payload["snapshot_wall_time"] > 0.0
+    assert not (tmp_path / ".completion_status.json.tmp").exists()

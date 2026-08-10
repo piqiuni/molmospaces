@@ -1569,6 +1569,101 @@ class SemanticBehaviorExecutor:
             return "m1_needs_reobserve"
         return "ready"
 
+    def _container_m1_staging_pose_tolerance_m(self, candidate: dict) -> float:
+        """Return the pose envelope for a model-only outer staging observation.
+
+        The normal capture tolerance deliberately remains tight.  A candidate
+        may opt into a slightly wider envelope only when it explicitly records
+        an *outer* container staging ring.  That envelope is for the M1 image
+        barrier, never a generic contact relaxation: the bridge still receives
+        the selected staging pose and performs its own authoritative check.
+        """
+
+        base_tolerance_m = max(
+            0.05,
+            float(getattr(self, "container_m1_capture_pose_tolerance_m", 0.18)),
+        )
+        metadata = candidate.get("metadata") or {}
+        if not bool(metadata.get("m1_observation_staging_required", False)):
+            return base_tolerance_m
+        try:
+            outer_offset_m = float(
+                metadata.get("m1_safe_staging_outer_offset_m", 0.0) or 0.0
+            )
+            declared_tolerance_m = float(
+                metadata.get("m1_safe_staging_arrival_tolerance_m", 0.0) or 0.0
+            )
+            ready_tolerance_m = float(
+                (candidate.get("interaction_command") or {}).get(
+                    "interaction_ready_distance_m", 0.0
+                )
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            return base_tolerance_m
+        if (
+            outer_offset_m <= 1e-6
+            or declared_tolerance_m <= base_tolerance_m
+            or ready_tolerance_m <= 0.0
+            # The declared outer-ring envelope must already be accepted by the
+            # candidate's bridge-ready contract.  Do not use metadata to widen
+            # a physical action beyond its own stated tolerance.
+            or declared_tolerance_m > ready_tolerance_m + 1e-6
+        ):
+            return base_tolerance_m
+        return declared_tolerance_m
+
+    def _container_safe_staging_arrival_sample(
+        self,
+        candidate: dict,
+        expected_pose_xyyaw: tuple[float, float, float],
+        detail: dict,
+    ) -> dict | None:
+        """Revalidate a just-observed outer staging pose for the M1 barrier.
+
+        ``move_base`` can report success in the interval between two evaluator
+        steps.  Re-polling TF immediately after cancelling that goal can then
+        lose the same valid pose and consume every bounded retry before M1 is
+        requested.  Reuse only a pose that the navigation loop has *already*
+        validated against this exact selected outer staging goal.  This does
+        not bypass M1 or the bridge: it merely avoids discarding causal pose
+        evidence acquired in the same approach transition.
+        """
+
+        metadata = candidate.get("metadata") or {}
+        if not bool(metadata.get("m1_observation_staging_required", False)):
+            return None
+        try:
+            outer_offset_m = float(
+                metadata.get("m1_safe_staging_outer_offset_m", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            return None
+        if outer_offset_m <= 1e-6:
+            return None
+        arrival_validation = detail.get("interaction_pose_validation")
+        if not isinstance(arrival_validation, dict):
+            return None
+        actual_pose = arrival_validation.get("actual_pose_xyyaw")
+        interaction = candidate.get("interaction_command") or {}
+        validation = interaction_pose_validation(
+            list(expected_pose_xyyaw),
+            None if actual_pose is None else list(actual_pose),
+            distance_tolerance_m=float(
+                interaction.get("interaction_ready_distance_m", 0.45) or 0.45
+            ),
+            yaw_tolerance_rad=float(
+                interaction.get("interaction_ready_yaw_tolerance_rad", 0.55)
+                or 0.55
+            ),
+        )
+        if not bool(validation.get("valid")):
+            return None
+        validation["poll_index"] = 0
+        validation["step_index"] = detail.get("interaction_arrival_step_index")
+        validation["sample_source"] = "navigation_arrival_pose"
+        return validation
+
     def _container_m1_capture_evidence_locked(
         self,
         candidate: dict,
@@ -1611,8 +1706,8 @@ class SemanticBehaviorExecutor:
         validation = interaction_pose_validation(
             expected,
             None if actual is None else list(actual),
-            distance_tolerance_m=getattr(
-                self, "container_m1_capture_pose_tolerance_m", 0.18
+            distance_tolerance_m=self._container_m1_staging_pose_tolerance_m(
+                candidate
             ),
             yaw_tolerance_rad=getattr(
                 self, "container_m1_capture_yaw_tolerance_rad", 0.25
@@ -1658,8 +1753,8 @@ class SemanticBehaviorExecutor:
         validation = interaction_pose_validation(
             capture_pose,
             None if actual is None else list(actual),
-            distance_tolerance_m=getattr(
-                self, "container_m1_capture_pose_tolerance_m", 0.18
+            distance_tolerance_m=self._container_m1_staging_pose_tolerance_m(
+                candidate
             ),
             yaw_tolerance_rad=getattr(
                 self, "container_m1_capture_yaw_tolerance_rad", 0.25
@@ -5866,6 +5961,8 @@ class SemanticBehaviorExecutor:
         decision_id: str,
         candidate: dict,
         expected_pose_xyyaw: tuple[float, float, float],
+        *,
+        arrival_sample: dict | None = None,
     ) -> tuple[bool, dict]:
         """Poll fresh simulator-step poses, bounded by count rather than time."""
 
@@ -5881,6 +5978,22 @@ class SemanticBehaviorExecutor:
         with self.lock:
             observed_step_index = self._latest_step_sync_index
         samples = []
+        if isinstance(arrival_sample, dict) and bool(arrival_sample.get("valid")):
+            # This sample was produced by the navigation loop against the same
+            # selected outer staging pose.  It is intentionally accepted before
+            # a post-cancel TF lookup, which may otherwise transiently lose the
+            # just-reached pose while the evaluator advances to its next step.
+            accepted_sample = dict(arrival_sample)
+            samples.append(accepted_sample)
+            return True, {
+                "interaction_pose_validation": accepted_sample,
+                "interaction_pose_poll_count": 0,
+                "interaction_pose_poll_max_attempts": (
+                    self.interaction_approach_pose_poll_max_attempts
+                ),
+                "interaction_pose_poll_samples": samples,
+                "interaction_pose_poll_used_navigation_arrival": True,
+            }
         for poll_index in range(self.interaction_approach_pose_poll_max_attempts):
             actual_pose = self._current_pose(frame_id)
             validation = interaction_pose_validation(
@@ -5932,10 +6045,16 @@ class SemanticBehaviorExecutor:
     ) -> None:
         """Gate an INTERACT command on counted fresh-pose samples."""
 
+        arrival_sample = self._container_safe_staging_arrival_sample(
+            candidate,
+            selected_goal,
+            detail,
+        )
         pose_ready, poll_detail = self._poll_interaction_approach_pose(
             decision_id,
             candidate,
             selected_goal,
+            arrival_sample=arrival_sample,
         )
         detail = {
             **detail,
@@ -6056,6 +6175,21 @@ class SemanticBehaviorExecutor:
                         "yaw_error_rad": yaw_error,
                     }
                     if str(behavior_type).upper() == "INTERACT":
+                        with self.lock:
+                            arrival_step_index = getattr(
+                                self, "_latest_step_sync_index", None
+                            )
+                        direct_detail["interaction_pose_validation"] = (
+                            interaction_pose_validation(
+                                [primary_x, primary_y, primary_yaw],
+                                list(current_pose),
+                                distance_tolerance_m=direct_distance_tolerance,
+                                yaw_tolerance_rad=direct_yaw_tolerance,
+                            )
+                        )
+                        direct_detail["interaction_arrival_step_index"] = (
+                            arrival_step_index
+                        )
                         direct_attempts = list(interaction_approach_attempts)
                         direct_attempts.append(
                             {
@@ -6492,6 +6626,10 @@ class SemanticBehaviorExecutor:
                 )
                 if bool(interaction_pose_detail.get("valid")):
                     self.move_base.cancel_goal()
+                    with self.lock:
+                        arrival_step_index = getattr(
+                            self, "_latest_step_sync_index", None
+                        )
                     arrival_detail = {
                         "reason": "interaction_approach_pose_tolerance",
                         "goal_distance_m": goal_distance_m,
@@ -6500,6 +6638,7 @@ class SemanticBehaviorExecutor:
                             not local_plan_fresh
                         ),
                         "interaction_pose_validation": interaction_pose_detail,
+                        "interaction_arrival_step_index": arrival_step_index,
                     }
                     self._complete_interaction_approach_navigation(
                         decision_id,

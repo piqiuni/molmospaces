@@ -189,6 +189,86 @@ def load_jsonl(path: Path) -> list[dict]:
     return sorted(records, key=lambda record: int(record.get("step_index", 0)))
 
 
+def persist_final_completion_status_to_raw_steps(
+    raw_step_manifest: Path,
+    completion_status_path: Path,
+) -> bool:
+    """Attach a final monitor result to the final raw boundary, once drained.
+
+    Per-step recorder snapshots only accept a completion monitor state whose
+    timestamp is no later than the camera boundary.  A zero-hold completion can
+    be requested immediately after the final simulator action, so there is no
+    subsequent camera marker to carry that already-recorded result.  At offline
+    build time the recorder is stopped and the final monitor JSON is durable;
+    attach it to the last raw boundary with an explicit ``post_episode`` timing
+    annotation.  This preserves the raw step sequence and never fabricates a
+    semantic state or substitutes a later map receipt.
+    """
+
+    status = load_json(completion_status_path)
+    if not bool(status.get("requested", False)) or not raw_step_manifest.exists():
+        return False
+    try:
+        rows = [
+            json.loads(line)
+            for line in raw_step_manifest.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, ValueError):
+        return False
+    if not rows:
+        return False
+    final_row = rows[-1]
+    if not isinstance(final_row, dict):
+        return False
+    try:
+        status_time = float(status.get("snapshot_wall_time") or 0.0)
+    except (TypeError, ValueError):
+        status_time = 0.0
+    if not math.isfinite(status_time) or status_time <= 0.0:
+        try:
+            status_time = float(status.get("requested_at_wall_time") or 0.0)
+        except (TypeError, ValueError):
+            status_time = 0.0
+    if not math.isfinite(status_time) or status_time <= 0.0:
+        try:
+            status_time = float(completion_status_path.stat().st_mtime)
+        except OSError:
+            status_time = 0.0
+    merged_status = dict(status)
+    merged_status["snapshot_source"] = "completion_status_file"
+    merged_status["snapshot_wall_time"] = status_time
+    capture = {
+        "source": "completion_status_file",
+        "timing": "post_episode_finalization",
+        "status_wall_time": status_time,
+        "final_raw_step_index": int(final_row.get("step_index", len(rows) - 1)),
+    }
+    if (
+        final_row.get("completion_status") == merged_status
+        and final_row.get("completion_status_capture") == capture
+    ):
+        return False
+    final_row["completion_status"] = merged_status
+    final_row["completion_status_capture"] = capture
+    temporary_path = raw_step_manifest.with_name(
+        f".{raw_step_manifest.name}.completion.tmp"
+    )
+    try:
+        temporary_path.write_text(
+            "".join(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                for row in rows
+            ),
+            encoding="utf-8",
+        )
+        temporary_path.replace(raw_step_manifest)
+    except OSError:
+        temporary_path.unlink(missing_ok=True)
+        return False
+    return True
+
+
 def load_episode_trajectory(path: Path) -> list[tuple[int, float, float, float]]:
     """Load the recorder's lightweight, episode-level odom trajectory.
 
@@ -779,7 +859,12 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     """Reconstruct the established six-panel renderer from raw PNG+JSON data."""
 
     raw_dir = debug_dir / "raw"
-    steps = load_jsonl(raw_dir / "step_boundaries.jsonl")
+    raw_step_manifest = raw_dir / "step_boundaries.jsonl"
+    completion_status_reconciled = persist_final_completion_status_to_raw_steps(
+        raw_step_manifest,
+        scene_dir / "completion_status.json",
+    )
+    steps = load_jsonl(raw_step_manifest)
     maps = load_jsonl(raw_dir / "map_manifest.jsonl")
     if not steps or not maps:
         raise RuntimeError(f"Raw PNG+JSON recording is incomplete under {raw_dir}")
@@ -1097,6 +1182,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         "component_causal_fallback_count": component_causal_fallback_count,
         "requested_future_receipt_count": requested_future_receipt_count,
         "component_alignment": "causal_receipt_at_or_before_sim_stamp",
+        "completion_status_reconciled": completion_status_reconciled,
         "trajectory_source": trajectory_source,
         "trajectory_path": str(trajectory_path),
         "episode_trajectory_sample_count": len(episode_trajectory),

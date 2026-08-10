@@ -197,12 +197,14 @@ class RosCompletionMonitor:
         if self.output_path is None:
             return
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.output_path.write_text(
-            json.dumps(
-                self.state.to_dict(completed_steps),
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
+        snapshot = self.state.to_dict(completed_steps)
+        # This is transport provenance for the recorder, not another mission
+        # state.  A completion update may race a camera boundary, so publish
+        # exactly when this JSON became available and replace atomically.
+        snapshot["snapshot_wall_time"] = time.time()
+        temporary_path = self.output_path.with_name(f".{self.output_path.name}.tmp")
+        temporary_path.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        temporary_path.replace(self.output_path)

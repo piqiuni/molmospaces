@@ -855,3 +855,33 @@ def test_raw_writer_drop_policy_counts_an_explicit_queue_drop() -> None:
     assert writer._submit("raw_occ", ("grid",)) is False
     assert writer.queue_dropped == {"raw_occ": 1}
     assert writer.accepted == {}
+
+
+def test_completion_monitor_snapshot_is_causal_at_raw_boundary(tmp_path: Path) -> None:
+    status_path = tmp_path / "completion_status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "requested": True,
+                "reason": "navigation_and_interaction_frontiers_exhausted",
+                "snapshot_wall_time": 12.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    recorder = ExploreDebugRecorder.__new__(ExploreDebugRecorder)
+    recorder.completion_status_path = status_path
+    recorder._completion_status_cached_mtime_ns = -1
+    recorder._completion_status_cached = {}
+    recorder._completion_status_cached_source_time = 0.0
+    recorder.completion_status_captured_count = 0
+    recorder.completion_status_future_count = 0
+
+    # A terminal status published after the camera boundary cannot alter that
+    # earlier raw step, even if the recorder reads the file a little later.
+    assert recorder._completion_status_at_stamp_locked(11.5) == {}
+    captured = recorder._completion_status_at_stamp_locked(12.0)
+    assert captured["requested"] is True
+    assert captured["snapshot_source"] == "completion_status_file"
+    assert recorder.completion_status_future_count == 1
+    assert recorder.completion_status_captured_count == 1

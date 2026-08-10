@@ -570,6 +570,126 @@ def test_container_m1_capture_evidence_uses_staging_pose_without_tf(
     )
 
 
+def test_outer_container_staging_reuses_navigation_pose_before_m1_poll(
+    executor_module,
+) -> None:
+    """A same-transition safe staging validation must not be lost after cancel."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor._latest_step_sync_index = 91
+    executor.interaction_approach_pose_poll_max_attempts = 5
+    executor._current_pose = lambda _frame: pytest.fail(
+        "outer staging must reuse the navigation validation before a new TF poll"
+    )
+    candidate = {
+        "behavior_type": "INTERACT",
+        "metadata": {
+            "m1_observation_staging_required": True,
+            "m1_safe_staging_outer_offset_m": 0.30,
+            "m1_safe_staging_arrival_tolerance_m": 0.25,
+        },
+        "interaction_command": {
+            "interaction_ready_distance_m": 0.25,
+            "interaction_ready_yaw_tolerance_rad": 0.55,
+        },
+    }
+    selected_goal = (1.0, 2.0, 0.0)
+    detail = {
+        "interaction_arrival_step_index": 91,
+        "interaction_pose_validation": executor_module.interaction_pose_validation(
+            selected_goal,
+            [1.23, 2.0, 0.10],
+            distance_tolerance_m=0.25,
+            yaw_tolerance_rad=0.55,
+        ),
+    }
+
+    arrival_sample = executor._container_safe_staging_arrival_sample(
+        candidate, selected_goal, detail
+    )
+    ready, poll_detail = executor._poll_interaction_approach_pose(
+        "decision-safe-staging",
+        candidate,
+        selected_goal,
+        arrival_sample=arrival_sample,
+    )
+
+    assert ready is True
+    assert poll_detail["interaction_pose_poll_count"] == 0
+    assert poll_detail["interaction_pose_poll_used_navigation_arrival"] is True
+    assert poll_detail["interaction_pose_validation"]["sample_source"] == (
+        "navigation_arrival_pose"
+    )
+    assert poll_detail["interaction_pose_validation"]["step_index"] == 91
+
+    # A successful approach still enters the regular targeted-M1 barrier; the
+    # reused pose sample never turns into a physical interaction command.
+    candidate["metadata"].update(
+        {
+            "requires_approach": True,
+            "observation_required": True,
+            "container_pre_action_observation": True,
+        }
+    )
+    machine = executor_module.BehaviorExecutionStateMachine()
+    machine.start(candidate, now=0.0)
+    commands = machine.on_navigation_result(True, detail=detail, now=1.0)
+    assert machine.state == "WAITING_FOR_INTERACTION_OBSERVATION"
+    assert [command["kind"] for command in commands] == [
+        "request_interaction_observation"
+    ]
+
+
+def test_outer_container_staging_capture_uses_only_declared_safe_envelope(
+    executor_module,
+) -> None:
+    """The wider outer-ring tolerance cannot apply to an ordinary container pose."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.tf_listener = object()
+    executor.map_frame = "map"
+    executor.container_m1_capture_pose_tolerance_m = 0.18
+    executor.container_m1_capture_yaw_tolerance_rad = 0.25
+    executor._current_pose = lambda _frame: (0.23, 0.0, 0.10)
+    safe_candidate = {
+        "metadata": {
+            "frame_id": "map",
+            "m1_observation_staging_required": True,
+            "m1_safe_staging_outer_offset_m": 0.30,
+            "m1_safe_staging_arrival_tolerance_m": 0.25,
+            "effective_interaction_approach_pose_xyyaw": [0.0, 0.0, 0.0],
+        },
+        "interaction_command": {
+            "interaction_ready_distance_m": 0.25,
+            "interaction_approach_pose_xyyaw": [0.0, 0.0, 0.0],
+        },
+    }
+    update = {"observation_capture_step": 73}
+
+    evidence, reason = executor._container_m1_capture_evidence_locked(
+        safe_candidate, update, {}
+    )
+
+    assert reason == "ready"
+    assert evidence is not None
+    assert evidence["pose_validation"]["distance_tolerance_m"] == pytest.approx(0.25)
+
+    unsafe_candidate = {
+        **safe_candidate,
+        "metadata": {
+            **safe_candidate["metadata"],
+            "m1_safe_staging_outer_offset_m": 0.0,
+        },
+    }
+    evidence, reason = executor._container_m1_capture_evidence_locked(
+        unsafe_candidate, update, {}
+    )
+    assert evidence is None
+    assert reason == "m1_capture_pose_mismatch"
+
+
 def test_fresh_m1_drawer_plan_uses_sequential_scan_contract(executor_module) -> None:
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
     executor.container_pre_action_require_direct_front = True

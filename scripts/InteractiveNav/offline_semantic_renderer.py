@@ -545,6 +545,19 @@ def _nonnegative_int(value: object, default: int = 0) -> int:
         return max(0, int(default))
 
 
+def _completion_reason_label(value: object) -> str:
+    """Compact a recorded monitor reason without changing its meaning."""
+
+    reason = str(value or "").strip()
+    labels = {
+        "navigation_and_interaction_frontiers_exhausted": "NAV+INTERACT EXHAUSTED",
+        "exploration_exhausted": "EXPLORATION EXHAUSTED",
+        "target_goal_succeeded": "TARGET GOAL",
+        "no_executable_candidates_after_terminal_interaction_no_plan": "NO EXECUTABLE SUBGOAL",
+    }
+    return labels.get(reason, reason.replace("_", " ").upper()[:42] or "REQUESTED")
+
+
 def terminal_status_summary(step: dict) -> dict[str, object]:
     """Return a display-only summary of the recorded terminal progress.
 
@@ -636,7 +649,32 @@ def terminal_status_summary(step: dict) -> dict[str, object]:
         )
     )
     if bool(completion.get("requested", False)):
-        label = "COMPLETION REQUESTED"
+        detail = completion.get("detail") or {}
+        reason = _completion_reason_label(
+            completion.get("reason") or detail.get("reason")
+        )
+        hold_steps = _nonnegative_int(
+            completion_config.get("post_completion_hold_steps")
+        )
+        requested_at_step = completion.get("requested_at_step")
+        completed_steps = completion.get("completed_steps")
+        try:
+            elapsed_hold_steps = max(0, int(completed_steps) - int(requested_at_step))
+        except (TypeError, ValueError):
+            elapsed_hold_steps = 0
+        remaining_steps = max(0, hold_steps - elapsed_hold_steps)
+        recorded_confirmations = _nonnegative_int(
+            detail.get("completion_confirmations", confirmations)
+        )
+        if hold_steps > 0 and remaining_steps > 0:
+            label = (
+                f"COMPLETION REQUESTED · {reason} · HOLD "
+                f"{elapsed_hold_steps}/{hold_steps} · REM {remaining_steps} STEP"
+            )
+        else:
+            label = f"COMPLETION CONFIRMED · {reason}"
+        if recorded_confirmations:
+            label += f" · CONF {recorded_confirmations}"
     elif exhausted:
         label = (
             f"FRONTIERS EXHAUSTED: NAV {navigation_count} · INTERACT {interaction_count}"

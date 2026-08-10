@@ -181,6 +181,34 @@ def _interaction_display_selection(selection: dict, command: dict) -> dict:
     return merged
 
 
+def _load_completion_status(path: Path | None) -> tuple[dict, float]:
+    """Read one monitor snapshot and return the time it became available.
+
+    Completion is produced outside the recorder process.  The monitor's JSON
+    file is therefore a small, already-published runtime datum, not a renderer
+    inference.  ``mtime`` is the compatibility fallback for recordings made
+    before the monitor started adding an explicit snapshot timestamp.
+    """
+
+    if path is None:
+        return {}, 0.0
+    try:
+        stat = path.stat()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, 0.0
+    if not isinstance(payload, dict):
+        return {}, 0.0
+    source_time = payload.get("snapshot_wall_time")
+    try:
+        source_time = float(source_time)
+    except (TypeError, ValueError):
+        source_time = float(stat.st_mtime)
+    if not math.isfinite(source_time) or source_time <= 0.0:
+        source_time = float(stat.st_mtime)
+    return dict(payload), source_time
+
+
 def _yaw_from_quaternion(q) -> float:
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
@@ -1678,6 +1706,22 @@ class ExploreDebugRecorder:
 
         self.args = args
         self.projected_scan_topic = str(getattr(args, "projected_scan_topic", "") or "")
+        completion_status_path = str(
+            getattr(args, "completion_status_path", "") or ""
+        ).strip()
+        # The standard runner writes this next to ``debug/``.  Keep an explicit
+        # argument for standalone recorder use, while making ordinary semantic
+        # recordings self-describing without a second launch-only setting.
+        self.completion_status_path = (
+            Path(completion_status_path).expanduser().resolve()
+            if completion_status_path
+            else (output_dir.parent / "completion_status.json")
+        )
+        self._completion_status_cached_mtime_ns = -1
+        self._completion_status_cached: dict = {}
+        self._completion_status_cached_source_time = 0.0
+        self.completion_status_captured_count = 0
+        self.completion_status_future_count = 0
         self.step_capture_ack_topic = str(getattr(args, "step_capture_ack_topic", "") or "")
         self.step_capture_ack_pub = (
             rospy.Publisher(self.step_capture_ack_topic, String, queue_size=32)
@@ -3364,6 +3408,7 @@ class ExploreDebugRecorder:
                     "semantic_execution_state": snapshot.get("semantic_execution_state"),
                     "semantic_behavior_feedback": snapshot.get("semantic_behavior_feedback"),
                     "semantic_decision_trace": snapshot.get("semantic_decision_trace"),
+                    "completion_status": snapshot.get("completion_status"),
                     "route_phase": snapshot.get("route_phase"), "route_plan": snapshot.get("route_plan"),
                     "route_goal": snapshot.get("route_goal"),
                 }
@@ -3391,6 +3436,51 @@ class ExploreDebugRecorder:
             with self.lock:
                 self.last_recorded_image_stamp_ns = source_stamp_ns
                 self.last_recorded_image_key = source_key
+
+    def _completion_status_at_stamp_locked(self, image_stamp: float) -> dict:
+        """Return only a monitor state available no later than this boundary.
+
+        A completion monitor may publish while the simulator is advancing.  Do
+        not leak a later terminal result into an earlier camera/map snapshot;
+        the offline builder separately attaches the final post-episode status
+        to the last boundary with an explicit timing annotation.
+        """
+
+        path = getattr(self, "completion_status_path", None)
+        try:
+            mtime_ns = int(Path(path).stat().st_mtime_ns) if path is not None else -1
+        except OSError:
+            mtime_ns = -1
+        if mtime_ns != getattr(self, "_completion_status_cached_mtime_ns", -1):
+            status, source_time = _load_completion_status(path)
+            if status:
+                self._completion_status_cached_mtime_ns = mtime_ns
+                self._completion_status_cached = status
+                self._completion_status_cached_source_time = source_time
+            else:
+                # A monitor writes the small JSON file in place.  If a callback
+                # observes the brief truncated interval, retry on the next
+                # boundary instead of caching an empty parse at this mtime.
+                self._completion_status_cached_mtime_ns = -1
+                self._completion_status_cached = {}
+                self._completion_status_cached_source_time = 0.0
+        status = dict(getattr(self, "_completion_status_cached", {}) or {})
+        if not status:
+            return {}
+        source_time = float(
+            getattr(self, "_completion_status_cached_source_time", 0.0) or 0.0
+        )
+        if image_stamp > 0.0 and source_time > image_stamp + 1e-6:
+            self.completion_status_future_count = (
+                int(getattr(self, "completion_status_future_count", 0)) + 1
+            )
+            return {}
+        self.completion_status_captured_count = (
+            int(getattr(self, "completion_status_captured_count", 0)) + 1
+        )
+        status["snapshot_source"] = "completion_status_file"
+        status["snapshot_wall_time"] = source_time
+        return status
 
     def _capture_video_snapshot_locked(self, image_stamp: float) -> dict:
         capture_wall_time = time.time()
@@ -3532,6 +3622,7 @@ class ExploreDebugRecorder:
             "semantic_execution_state": dict(self.latest_semantic_execution_state),
             "semantic_behavior_feedback": dict(self.latest_semantic_behavior_feedback),
             "semantic_decision_trace": dict(self.latest_semantic_decision_trace),
+            "completion_status": self._completion_status_at_stamp_locked(image_stamp),
             "route_phase": dict(self.latest_route_phase),
             "route_plan": dict(self.latest_route_plan),
             "route_goal": dict(self.latest_route_goal),
@@ -8276,6 +8367,13 @@ class ExploreDebugRecorder:
                 "step_sync_image_wait_sec": self.step_sync_image_wait_sec,
                 "step_sync_image_max_stamp_delta_sec": self.step_sync_image_max_stamp_delta_ns / 1_000_000_000.0,
                 "step_sync_image_fallback_max_age_sec": self.step_sync_image_fallback_max_age_ns / 1_000_000_000.0,
+                "completion_status_path": str(self.completion_status_path),
+                "completion_status_captured_count": int(
+                    getattr(self, "completion_status_captured_count", 0)
+                ),
+                "completion_status_future_count": int(
+                    getattr(self, "completion_status_future_count", 0)
+                ),
                 "room_segment_callback_count": self.room_segment_callback_count,
                 "room_segment_valid_cell_count": self.latest_room_segment_valid_cell_count,
                 "room_segment_unique_ids": self.latest_room_segment_unique_ids,
@@ -8629,6 +8727,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--route-phase-topic",
         default="/semantic_decision/route_phase",
+    )
+    parser.add_argument(
+        "--completion-status-path",
+        default="",
+        help=(
+            "Published completion-monitor JSON snapshot. When omitted, use "
+            "<output-dir>/../completion_status.json."
+        ),
     )
     parser.add_argument("--global-plan-topic", default="/move_base/GlobalPlanner/plan")
     parser.add_argument("--local-global-plan-topic", default="/move_base/DWAPlannerROS/global_plan")

@@ -150,6 +150,16 @@ class CandidateGeneratorConfig:
     container_observation_standoff_m: float = 0.7
     drawer_observation_standoff_m: float = 0.65
     fridge_observation_standoff_m: float = 0.8
+    # A high local inflation radius can make an otherwise valid AABB-surface
+    # standoff land in the soft-cost shoulder beside a wall.  Model lanes first
+    # visit this *outer* staging ring for their M1 observation, then a second,
+    # farther safe ring if necessary.  This changes the requested goal geometry
+    # only; collision/footprint checks remain in move_base.
+    container_safe_staging_outer_offset_m: float = 0.30
+    # The bridge validates the robot against the selected staging pose.  The
+    # outer ring leaves enough object clearance that a modest arrival tolerance
+    # remains visually safe instead of forcing an unreliable close-range M1.
+    container_safe_staging_arrival_tolerance_m: float = 0.25
     container_interaction_ready_distance_m: float = 0.18
     interaction_safety_margin_m: float = 0.0
     interaction_ready_distance_m: float = 0.45
@@ -1311,6 +1321,12 @@ class CandidateGenerator:
                 observation_standoff,
                 node_type,
                 visual_container_axis=visual_container_axis,
+                safe_staging_outer_offset_m=(
+                    self.config.container_safe_staging_outer_offset_m
+                    if node_type == "container"
+                    and (container_pre_action or drawer_pre_action)
+                    else 0.0
+                ),
             )
             approach = goal_candidates[0]
             portal_aperture_observation = (
@@ -1392,7 +1408,10 @@ class CandidateGenerator:
                 "interaction_ready_distance_m": (
                     min(
                         self.config.interaction_ready_distance_m,
-                        self.config.container_interaction_ready_distance_m,
+                        max(
+                            self.config.container_interaction_ready_distance_m,
+                            self.config.container_safe_staging_arrival_tolerance_m,
+                        ),
                     )
                     if node_type == "container"
                     and (container_pre_action or drawer_pre_action)
@@ -1483,6 +1502,29 @@ class CandidateGenerator:
                         ),
                         "m1_observation_standoff_m": (
                             observation_standoff
+                            if node_type == "container"
+                            and (container_pre_action or drawer_pre_action)
+                            else 0.0
+                        ),
+                        "m1_safe_staging_outer_offset_m": (
+                            max(
+                                0.0,
+                                float(
+                                    self.config.container_safe_staging_outer_offset_m
+                                ),
+                            )
+                            if node_type == "container"
+                            and (container_pre_action or drawer_pre_action)
+                            else 0.0
+                        ),
+                        "m1_safe_staging_arrival_tolerance_m": (
+                            min(
+                                self.config.interaction_ready_distance_m,
+                                max(
+                                    self.config.container_interaction_ready_distance_m,
+                                    self.config.container_safe_staging_arrival_tolerance_m,
+                                ),
+                            )
                             if node_type == "container"
                             and (container_pre_action or drawer_pre_action)
                             else 0.0
@@ -1920,6 +1962,7 @@ class CandidateGenerator:
         node_type: str,
         *,
         visual_container_axis: tuple[float, float] | None = None,
+        safe_staging_outer_offset_m: float = 0.0,
     ) -> tuple[list[list[float]], list[str]]:
         candidates: list[list[float]] = []
         labels: list[str] = []
@@ -1966,25 +2009,45 @@ class CandidateGenerator:
                         )
             return candidates, labels
 
+        outer_offset = max(0.0, float(safe_staging_outer_offset_m))
+
         # M1 may explicitly say that the current RGB view contains the front
         # (or an adequate oblique face) of a container.  Derive the outward
         # approach axis from the actual robot--object geometry at that fresh
         # observation.  Do not read interaction_approach_axis_xy or an
         # interaction pose here: both can originate from GT/oracle geometry.
-        if visual_container_axis is not None:
+        if visual_container_axis is not None and outer_offset <= 1e-6:
+            # Preserve the rule/default behavior for callers that did not ask
+            # for a model-lane safe staging ring.
             for extra_standoff in (0.0, 0.25, 0.50):
                 candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
-                pose = self._approach_pose(
-                    robot_xy,
-                    target_xy,
-                    candidate_standoff,
-                    node=node,
-                    fixed_axis=visual_container_axis,
+                append_unique(
+                    self._approach_pose(
+                        robot_xy,
+                        target_xy,
+                        candidate_standoff,
+                        node=node,
+                        fixed_axis=visual_container_axis,
+                    ),
+                    "mllm_current_view",
                 )
-                append_unique(pose, "mllm_current_view")
             return candidates, labels
 
-        if not self.config.container_multiview_enabled:
+        if visual_container_axis is not None:
+            radial_axis = visual_container_axis
+            axes = (
+                radial_axis,
+                (-radial_axis[1], radial_axis[0]),
+                (radial_axis[1], -radial_axis[0]),
+                (-radial_axis[0], -radial_axis[1]),
+            )
+            face_labels = (
+                "mllm_current_view",
+                "mllm_quarter_turn_left",
+                "mllm_quarter_turn_right",
+                "mllm_opposite_view",
+            )
+        elif not self.config.container_multiview_enabled:
             append_unique(
                 self._approach_pose(
                     robot_xy,
@@ -1996,38 +2059,75 @@ class CandidateGenerator:
             )
             return candidates, labels
 
-        # No fresh M1 front observation was available.  The first pose retains
-        # the current radial side, then the executor may re-observe from three
-        # orthogonal faces.  These labels describe only the candidate-ring
-        # order; they do not assert a semantic front or reuse oracle geometry.
-        dx = float(robot_xy[0]) - float(target_xy[0])
-        dy = float(robot_xy[1]) - float(target_xy[1])
-        distance = math.hypot(dx, dy)
-        radial_axis = (-1.0, 0.0) if distance <= 1e-6 else (dx / distance, dy / distance)
-        axes = (
-            radial_axis,
-            (-radial_axis[1], radial_axis[0]),
-            (radial_axis[1], -radial_axis[0]),
-            (-radial_axis[0], -radial_axis[1]),
-        )
-        face_labels = (
-            "current_view",
-            "quarter_turn_left",
-            "quarter_turn_right",
-            "opposite_view",
-        )
-        face_count = max(1, min(len(axes), int(self.config.container_multiview_face_count)))
-        for axis, label in zip(axes[:face_count], face_labels[:face_count]):
-            append_unique(
-                self._approach_pose(
-                    robot_xy,
-                    target_xy,
-                    max(0.0, float(standoff_m)),
-                    node=node,
-                    fixed_axis=axis,
-                ),
-                label,
+        else:
+            # No fresh M1 front observation was available.  The first pose
+            # retains the current radial side, then the executor may re-observe
+            # from three orthogonal faces.  These labels describe only the
+            # candidate-ring order; they do not assert a semantic front or
+            # reuse oracle geometry.
+            dx = float(robot_xy[0]) - float(target_xy[0])
+            dy = float(robot_xy[1]) - float(target_xy[1])
+            distance = math.hypot(dx, dy)
+            radial_axis = (
+                (-1.0, 0.0)
+                if distance <= 1e-6
+                else (dx / distance, dy / distance)
             )
+            axes = (
+                radial_axis,
+                (-radial_axis[1], radial_axis[0]),
+                (radial_axis[1], -radial_axis[0]),
+                (-radial_axis[0], -radial_axis[1]),
+            )
+            face_labels = (
+                "current_view",
+                "quarter_turn_left",
+                "quarter_turn_right",
+                "opposite_view",
+            )
+        face_count = max(1, min(len(axes), int(self.config.container_multiview_face_count)))
+        if outer_offset > 1e-6:
+            # Make the four outer poses the primary finite ring.  The fallback
+            # ring is deliberately *farther* from the object, never the old
+            # inner shoulder: M1 must not be called from a close pose merely
+            # because the first ring was blocked by inflation.  We do not
+            # pre-clear cells or bypass the costmap: every pose is still
+            # subject to normal global/local planner preflight.
+            for axis, label in zip(axes[:face_count], face_labels[:face_count]):
+                append_unique(
+                    self._approach_pose(
+                        robot_xy,
+                        target_xy,
+                        max(0.0, float(standoff_m)) + outer_offset,
+                        node=node,
+                        fixed_axis=axis,
+                    ),
+                    f"{label}_safe_outer",
+                )
+            far_standoff = max(0.0, float(standoff_m)) + 2.0 * outer_offset
+            for axis, label in zip(axes[:face_count], face_labels[:face_count]):
+                append_unique(
+                    self._approach_pose(
+                        robot_xy,
+                        target_xy,
+                        far_standoff,
+                        node=node,
+                        fixed_axis=axis,
+                    ),
+                    f"{label}_safe_far",
+                )
+        else:
+            for axis, label in zip(axes[:face_count], face_labels[:face_count]):
+                append_unique(
+                    self._approach_pose(
+                        robot_xy,
+                        target_xy,
+                        max(0.0, float(standoff_m)),
+                        node=node,
+                        fixed_axis=axis,
+                    ),
+                    label,
+                )
         return candidates, labels
 
     @staticmethod

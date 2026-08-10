@@ -30,7 +30,15 @@ candidate:
   container_observation_standoff_m: 0.70
   drawer_observation_standoff_m: 0.65
   fridge_observation_standoff_m: 0.80
-  container_interaction_ready_distance_m: 0.18
+  # First try a four-sided outer staging ring.  It keeps M1 away from the
+  # container surface and outside the 0.50 m local-inflation shoulder; the
+  # normal local/global planners still validate every pose.
+  container_safe_staging_outer_offset_m: 0.30
+  # This is pose error around the outer staging target, not permission to
+  # collect M1 evidence beside the container.  The 0.30 m outer offset keeps
+  # the closest accepted camera clearance above the observation floor.
+  container_safe_staging_arrival_tolerance_m: 0.25
+  container_interaction_ready_distance_m: 0.25
   interaction_safety_margin_m: 0.10
   interaction_ready_distance_m: 0.30
   interaction_ready_yaw_tolerance_rad: 0.35

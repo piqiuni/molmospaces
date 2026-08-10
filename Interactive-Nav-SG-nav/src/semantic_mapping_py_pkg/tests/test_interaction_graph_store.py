@@ -1282,6 +1282,99 @@ def test_mllm_cannot_promote_source_container_to_topological_portal() -> None:
     assert node["attributes"]["topology_type"] == "container"
     assert node["attributes"]["mllm_interaction_class"] == "portal"
     assert node["attributes"]["mllm_portal_promotion_rejected"] is True
+    # A portal/open hallucination used to retain the container node type but
+    # overwrite its state, which removed the closed fridge from the interaction
+    # candidate set.  The graph now retains the ordinary container hypothesis
+    # and asks for a fresh visual observation instead.
+    assert node["interaction"]["state"] == "unknown"
+    assert node["interaction"]["is_interactable"] is True
+    assert node["interaction"]["requires_interaction"] is True
+    assert node["attributes"]["needs_reobserve"] is True
+    assert node["attributes"]["approach_ready"] is False
+    assert node["attributes"]["attribute_is_current"] is False
+    assert node["attributes"]["mllm_container_type_hysteresis"] == {
+        "locked_type": "container",
+        "requested_type": "portal",
+        "requested_state": "open",
+        "accepted": False,
+        "state_accepted": False,
+        "reason": "class:portal",
+        "observation_capture_step": 10,
+    }
+    container_hint = next(
+        hint
+        for hint in store.as_graph_dict(stamp=2.0)["views"]["navigation_view"]["hints"]
+        if hint["node_id"] == "container_fridge_1"
+    )
+    assert container_hint["type"] == "interactive_container"
+    assert container_hint["requires_interaction"] is True
+
+
+def test_mllm_static_open_or_none_cannot_disable_established_container() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    fridge = observation(
+        instance_id="fridge_1",
+        semantic_name="fridge",
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="hinge",
+        frame_index=10,
+        position=[1.0, 0.0, 1.0],
+        aabb_center=[1.0, 0.0, 1.0],
+        aabb_size=[1.0, 0.8, 2.0],
+    )
+    store.update_observations([fridge], source_mode="realtime_gt_observation", stamp=1.0)
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "fridge_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 10,
+            "interactable": True,
+            "interaction_class": "container",
+            "coarse_state": "closed",
+            "confidence": 0.95,
+            "interaction_parts": [],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+
+    for frame_index, interaction_class, coarse_state, reason in (
+        (11, "container", "static_open", "state:static_open"),
+        (12, "none", "unknown", "class:none"),
+        (13, "container", "unknown", "interactable:false"),
+    ):
+        assert store.apply_attribute_patch(
+            {
+                "object_id": "fridge_1",
+                "attribute_status": "ready",
+                "observation_frame_index": frame_index,
+                "interactable": False,
+                "interaction_class": interaction_class,
+                "coarse_state": coarse_state,
+                "confidence": 0.95,
+                "interaction_parts": [],
+                "source": "mllm_attribute_inference",
+            },
+            stamp=float(frame_index),
+        )
+        node = next(
+            item
+            for item in store.as_graph_dict(stamp=float(frame_index))["nodes"]
+            if item["id"] == "container_fridge_1"
+        )
+        assert node["type"] == "container"
+        assert node["interaction"]["state"] == "closed"
+        assert node["interaction"]["is_interactable"] is True
+        assert node["interaction"]["interaction_mode"] == "open_close"
+        assert node["interaction"]["requires_interaction"] is True
+        assert node["attributes"]["needs_reobserve"] is True
+        assert reason in node["attributes"]["mllm_container_type_hysteresis"][
+            "reason"
+        ].split(";")
+        assert node["attributes"]["mllm_container_type_hysteresis"][
+            "state_accepted"
+        ] is False
 
 
 def test_non_articulated_portal_feedback_persists_static_capability() -> None:
