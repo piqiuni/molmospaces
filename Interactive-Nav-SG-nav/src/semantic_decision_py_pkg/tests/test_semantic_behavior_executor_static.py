@@ -692,6 +692,188 @@ def test_outer_container_staging_capture_uses_only_declared_safe_envelope(
     assert reason == "m1_capture_pose_mismatch"
 
 
+def test_two_stage_outer_staging_tolerance_stays_separate_from_inner_bridge(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.container_m1_capture_pose_tolerance_m = 0.18
+    staging_candidate = {
+        "metadata": {
+            "m1_observation_staging_required": True,
+            "m1_safe_staging_outer_offset_m": 0.35,
+            "m1_safe_staging_arrival_tolerance_m": 0.30,
+            "container_two_stage_phase": "staging",
+        },
+        "interaction_command": {"interaction_ready_distance_m": 0.30},
+    }
+    inner_candidate = {
+        "metadata": {
+            "m1_observation_staging_required": False,
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "physical_action",
+        },
+        "interaction_command": {"interaction_ready_distance_m": 0.18},
+    }
+
+    assert executor._interaction_navigation_pose_tolerance_m(
+        staging_candidate
+    ) == pytest.approx(0.30)
+    assert executor._interaction_navigation_pose_tolerance_m(
+        inner_candidate
+    ) == pytest.approx(0.18)
+
+
+def test_two_stage_inner_drawer_bypasses_close_range_regrounding(executor_module) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.selection = {
+        "behavior_type": "INTERACT",
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "physical_action",
+        },
+        "interaction_command": {
+            "sequence_type": "drawer_scan",
+            "open_regions": [{"center": [0.5, 0.5], "confidence": 0.9}],
+        },
+    }
+
+    assert executor._needs_fresh_drawer_scan_locked() is False
+
+
+def test_executor_inner_navigation_failure_dispatches_next_outer_staging(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    executor.interaction_approach_fallback_max_attempts = 4
+    executor._navigation_is_current = lambda _decision_id: True
+    dispatched = []
+    executor._dispatch = lambda commands: dispatched.extend(commands)
+    executor.selection = None
+    executor._container_m1_last_accepted_evidence = {
+        "decision-inner": {"capture_step": 11}
+    }
+    candidate = {
+        "decision_id": "decision-inner",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [3.0, 2.0, 0.0],
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [3.0, 2.0, 0.0],
+            "interaction_ready_distance_m": 0.18,
+            "container_staging_ready_distance_m": 0.30,
+            "container_physical_action_ready_distance_m": 0.18,
+        },
+        "metadata": {
+            "requires_approach": True,
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "physical_action",
+            "container_two_stage_staging_goal_option_index": 0,
+            "container_staging_goal_xyyaw_candidates": [
+                [1.0, 2.0, 0.0],
+                [2.0, 2.0, 1.57],
+            ],
+            "container_staging_pose_labels": ["safe_outer", "safe_far"],
+            "container_action_goal_xyyaw_by_staging_index": [
+                [3.0, 2.0, 0.0],
+                [4.0, 2.0, 1.57],
+            ],
+            "container_two_stage_staging_observation_required": True,
+            "container_two_stage_staging_container_pre_action_observation": True,
+            "container_two_stage_staging_drawer_pre_action_observation": False,
+            "observation_required": False,
+            "container_pre_action_observation": False,
+            "drawer_pre_action_observation": False,
+            "m1_observation_staging_required": False,
+        },
+    }
+    executor.machine.start(candidate, now=0.0)
+    executor.selection = dict(executor.machine.candidate)
+
+    retried = executor._retry_interaction_approach(
+        "decision-inner",
+        candidate,
+        0,
+        [{"index": 0, "phase": "physical_action"}],
+        1,
+        {"reason": "navigation_stagnation"},
+    )
+
+    assert retried is True
+    assert [command["kind"] for command in dispatched] == ["navigate"]
+    assert dispatched[0]["start_goal_option_index"] == 1
+    assert executor.machine.candidate["metadata"]["container_two_stage_phase"] == (
+        "staging"
+    )
+    assert executor.machine.candidate["metadata"][
+        "container_pre_action_observation"
+    ] is True
+    assert executor._container_m1_last_accepted_evidence == {}
+
+
+def test_bridge_inner_pose_precondition_returns_next_outer_staging(executor_module) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    executor.interaction_approach_fallback_max_attempts = 4
+    executor._container_m1_last_accepted_evidence = {
+        "decision-bridge": {"capture_step": 11}
+    }
+    candidate = {
+        "decision_id": "decision-bridge",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [3.0, 2.0, 0.0],
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [3.0, 2.0, 0.0],
+            "interaction_ready_distance_m": 0.18,
+            "container_staging_ready_distance_m": 0.30,
+            "container_physical_action_ready_distance_m": 0.18,
+        },
+        "metadata": {
+            "requires_approach": True,
+            "node_type": "container",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "physical_action",
+            "container_two_stage_staging_goal_option_index": 0,
+            "interaction_approach_goal_option_index": 0,
+            "interaction_approach_attempts": [{"index": 0, "phase": "physical_action"}],
+            "container_staging_goal_xyyaw_candidates": [
+                [1.0, 2.0, 0.0],
+                [2.0, 2.0, 1.57],
+            ],
+            "container_staging_pose_labels": ["safe_outer", "safe_far"],
+            "container_action_goal_xyyaw_by_staging_index": [
+                [3.0, 2.0, 0.0],
+                [4.0, 2.0, 1.57],
+            ],
+            "container_two_stage_staging_observation_required": True,
+            "container_two_stage_staging_container_pre_action_observation": True,
+            "container_two_stage_staging_drawer_pre_action_observation": False,
+            "observation_required": False,
+            "container_pre_action_observation": False,
+            "drawer_pre_action_observation": False,
+            "m1_observation_staging_required": False,
+        },
+    }
+    executor.machine.start(candidate, now=0.0)
+    executor.machine.state = executor_module.STATE_INTERACTING
+    executor.selection = dict(executor.machine.candidate)
+
+    commands = executor._retry_interaction_approach_after_pose_failure_locked(
+        {"failure_reason": "unsafe_open_sweep", "recommended_retreat_m": 0.2}
+    )
+
+    assert [command["kind"] for command in commands] == ["navigate"]
+    assert commands[0]["start_goal_option_index"] == 1
+    assert executor.machine.candidate["metadata"]["container_two_stage_phase"] == (
+        "staging"
+    )
+    assert executor.machine.candidate["interaction_command"][
+        "interaction_ready_distance_m"
+    ] == pytest.approx(0.30)
+    assert executor._container_m1_last_accepted_evidence == {}
+
+
 def test_fresh_m1_drawer_plan_uses_sequential_scan_contract(executor_module) -> None:
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
     executor.container_pre_action_require_direct_front = True

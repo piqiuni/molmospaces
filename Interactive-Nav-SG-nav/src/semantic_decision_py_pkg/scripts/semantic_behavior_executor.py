@@ -31,6 +31,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     candidate_with_effective_interaction_approach,
     committed_turn_sign,
     interaction_pose_validation,
+    is_container_two_stage_physical_action,
     is_post_interaction_traversal_navigation,
     is_interaction_pose_precondition_failure,
     navigation_goal_options,
@@ -1575,8 +1576,8 @@ class SemanticBehaviorExecutor:
         The normal capture tolerance deliberately remains tight.  A candidate
         may opt into a slightly wider envelope only when it explicitly records
         an *outer* container staging ring.  That envelope is for the M1 image
-        barrier, never a generic contact relaxation: the bridge still receives
-        the selected staging pose and performs its own authoritative check.
+        barrier, never a generic contact relaxation: the bridge later receives
+        the paired inner action pose and performs its own authoritative check.
         """
 
         base_tolerance_m = max(
@@ -1593,25 +1594,31 @@ class SemanticBehaviorExecutor:
             declared_tolerance_m = float(
                 metadata.get("m1_safe_staging_arrival_tolerance_m", 0.0) or 0.0
             )
-            ready_tolerance_m = float(
-                (candidate.get("interaction_command") or {}).get(
-                    "interaction_ready_distance_m", 0.0
-                )
-                or 0.0
-            )
         except (TypeError, ValueError):
             return base_tolerance_m
         if (
             outer_offset_m <= 1e-6
             or declared_tolerance_m <= base_tolerance_m
-            or ready_tolerance_m <= 0.0
-            # The declared outer-ring envelope must already be accepted by the
-            # candidate's bridge-ready contract.  Do not use metadata to widen
-            # a physical action beyond its own stated tolerance.
-            or declared_tolerance_m > ready_tolerance_m + 1e-6
+            # Do not use metadata to create an outer visual envelope wider than
+            # the clearance deliberately added to that staging ring.  The
+            # two-stage candidate increases both by the same amount, while the
+            # inner bridge gate remains independently strict.
+            or declared_tolerance_m > outer_offset_m + 1e-6
         ):
             return base_tolerance_m
         return declared_tolerance_m
+
+    def _interaction_navigation_pose_tolerance_m(self, candidate: dict) -> float:
+        """Use the wider envelope only while moving to an outer M1 staging pose."""
+
+        metadata = candidate.get("metadata") or {}
+        if bool(metadata.get("m1_observation_staging_required", False)):
+            return self._container_m1_staging_pose_tolerance_m(candidate)
+        interaction = candidate.get("interaction_command") or {}
+        return max(
+            0.05,
+            float(interaction.get("interaction_ready_distance_m", 0.45) or 0.45),
+        )
 
     def _container_safe_staging_arrival_sample(
         self,
@@ -1649,8 +1656,8 @@ class SemanticBehaviorExecutor:
         validation = interaction_pose_validation(
             list(expected_pose_xyyaw),
             None if actual_pose is None else list(actual_pose),
-            distance_tolerance_m=float(
-                interaction.get("interaction_ready_distance_m", 0.45) or 0.45
+            distance_tolerance_m=self._container_m1_staging_pose_tolerance_m(
+                candidate
             ),
             yaw_tolerance_rad=float(
                 interaction.get("interaction_ready_yaw_tolerance_rad", 0.55)
@@ -1681,6 +1688,11 @@ class SemanticBehaviorExecutor:
 
         metadata = candidate.get("metadata") or {}
         interaction = candidate.get("interaction_command") or {}
+        if is_container_two_stage_physical_action(candidate):
+            # A two-stage candidate has already left its outer M1 stance.  Do
+            # not let a delayed targeted response become evidence for the
+            # nearer physical action pose.
+            return None, "m1_capture_not_outer_staging_phase"
         expected = list(
             request.get("observation_pose_xyyaw")
             or metadata.get("effective_interaction_approach_pose_xyyaw")
@@ -2347,6 +2359,47 @@ class SemanticBehaviorExecutor:
                 payload.get("interaction_pose_validation") or {}
             ),
         }
+        if is_container_two_stage_physical_action(candidate):
+            staging_goals = list(
+                metadata.get("container_staging_goal_xyyaw_candidates") or []
+            )
+            try:
+                completed_staging_index = max(
+                    0,
+                    int(
+                        metadata.get(
+                            "container_two_stage_staging_goal_option_index", 0
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                completed_staging_index = len(staging_goals)
+            next_staging_index = completed_staging_index + 1
+            if (
+                next_staging_index < len(staging_goals)
+                and len(attempts) < self.interaction_approach_fallback_max_attempts
+            ):
+                rospy.logwarn(
+                    "[semantic_behavior_executor] bridge rejected inner container "
+                    "pose; retrying outer M1 staging option %d/%d",
+                    next_staging_index + 1,
+                    len(staging_goals),
+                )
+                commands = self.machine.retry_container_two_stage_staging(
+                    next_staging_goal_option_index=next_staging_index,
+                    interaction_approach_attempts=attempts,
+                    detail=failure_detail,
+                )
+                if commands:
+                    self.selection = dict(self.machine.candidate or candidate)
+                    accepted_by_decision = getattr(
+                        self, "_container_m1_last_accepted_evidence", None
+                    )
+                    if isinstance(accepted_by_decision, dict):
+                        accepted_by_decision.pop(
+                            str(candidate.get("decision_id") or ""), None
+                        )
+                    return commands
         next_option_index = next_interaction_approach_option_index(
             behavior_type=str(candidate.get("behavior_type") or ""),
             failure_detail=failure_detail,
@@ -4274,6 +4327,13 @@ class SemanticBehaviorExecutor:
         if self.selection is None:
             return False
         if str(self.selection.get("behavior_type") or "").upper() != "INTERACT":
+            return False
+        if is_container_two_stage_physical_action(self.selection):
+            # This drawer already owns a request-ID-matched outer M1 frame and
+            # its visual action regions were carried into the inner pose.  The
+            # legacy post-arrival scan would discard them and issue a forbidden
+            # close-range re-grounding request, so only non-two-stage drawers
+            # use that wait path.
             return False
         node = self._selected_graph_node_locked(self.selection)
         return (
@@ -6227,8 +6287,8 @@ class SemanticBehaviorExecutor:
         interaction = candidate.get("interaction_command") or {}
         goal_labels = list(metadata.get("interaction_approach_pose_labels") or [])
         if behavior_type == "INTERACT":
-            direct_distance_tolerance = float(
-                interaction.get("interaction_ready_distance_m", 0.45) or 0.45
+            direct_distance_tolerance = self._interaction_navigation_pose_tolerance_m(
+                candidate
             )
             direct_yaw_tolerance = float(
                 interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
@@ -6553,6 +6613,36 @@ class SemanticBehaviorExecutor:
                 failure_detail["interaction_approach_preflight_debug_attempts"] = (
                     preflight_debug_attempts
                 )
+            if (
+                str(behavior_type).upper() == "INTERACT"
+                and is_container_two_stage_physical_action(candidate)
+            ):
+                # The inner physical point may be blocked even though its outer
+                # M1 staging stance was reachable.  Do not retry M1 at this
+                # close pose or turn it into a terminal object failure: record
+                # the failed inner preflight and return to the next outer ring.
+                action_attempts = list(interaction_approach_attempts)
+                action_attempts.append(
+                    {
+                        "index": 0,
+                        "goal_xyyaw": list(candidate.get("goal_xyyaw") or []),
+                        "approach_pose_label": (
+                            str(goal_labels[0]) if goal_labels else "physical_action"
+                        ),
+                        "reachable": False,
+                        "outcome": str(failure_detail.get("reason") or "failed"),
+                        "phase": "physical_action",
+                    }
+                )
+                if self._retry_interaction_approach(
+                    decision_id,
+                    candidate,
+                    0,
+                    action_attempts,
+                    len(goal_options),
+                    failure_detail,
+                ):
+                    return
             if is_post_interaction_traversal:
                 with self.lock:
                     latest_graph_revision = int(
@@ -7197,6 +7287,64 @@ class SemanticBehaviorExecutor:
         goal_option_count: int,
         failure_detail: dict,
     ) -> bool:
+        attempts = [dict(attempt) for attempt in interaction_approach_attempts]
+        if attempts:
+            attempts[-1]["outcome"] = str(failure_detail.get("reason") or "failed")
+            attempts[-1]["failure_detail"] = {
+                "goal_distance_m": failure_detail.get("goal_distance_m"),
+                "local_plan_fresh": failure_detail.get("local_plan_fresh"),
+            }
+        if is_container_two_stage_physical_action(candidate):
+            metadata = candidate.get("metadata") or {}
+            staging_goals = list(
+                metadata.get("container_staging_goal_xyyaw_candidates") or []
+            )
+            try:
+                completed_staging_index = max(
+                    0,
+                    int(
+                        metadata.get(
+                            "container_two_stage_staging_goal_option_index", 0
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                return False
+            next_staging_index = completed_staging_index + 1
+            if (
+                next_staging_index >= len(staging_goals)
+                or len(attempts) >= self.interaction_approach_fallback_max_attempts
+                or not self._navigation_is_current(decision_id)
+            ):
+                return False
+            rospy.logwarn(
+                "[semantic_behavior_executor] inner container action approach %s; "
+                "returning to outer M1 staging option %d/%d (attempt %d/%d)",
+                str(failure_detail.get("reason") or "failed"),
+                next_staging_index + 1,
+                len(staging_goals),
+                len(attempts) + 1,
+                self.interaction_approach_fallback_max_attempts,
+            )
+            with self.lock:
+                if not self._navigation_is_current(decision_id):
+                    return True
+                commands = self.machine.retry_container_two_stage_staging(
+                    next_staging_goal_option_index=next_staging_index,
+                    interaction_approach_attempts=attempts,
+                    detail=failure_detail,
+                )
+                if commands and self.machine.candidate is not None:
+                    self.selection = dict(self.machine.candidate)
+                accepted_by_decision = getattr(
+                    self, "_container_m1_last_accepted_evidence", None
+                )
+                if isinstance(accepted_by_decision, dict):
+                    accepted_by_decision.pop(decision_id, None)
+            if not commands:
+                return False
+            self._dispatch(commands)
+            return True
         if selected_option_index is None:
             return False
         next_option_index = next_interaction_approach_option_index(
@@ -7209,13 +7357,6 @@ class SemanticBehaviorExecutor:
         )
         if next_option_index is None:
             return False
-        attempts = [dict(attempt) for attempt in interaction_approach_attempts]
-        if attempts:
-            attempts[-1]["outcome"] = str(failure_detail.get("reason") or "failed")
-            attempts[-1]["failure_detail"] = {
-                "goal_distance_m": failure_detail.get("goal_distance_m"),
-                "local_plan_fresh": failure_detail.get("local_plan_fresh"),
-            }
         if not self._navigation_is_current(decision_id):
             return True
         pose_precondition_retry = is_interaction_pose_precondition_failure(

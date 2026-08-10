@@ -143,7 +143,7 @@ class SemanticCandidateNode:
                     config.get("fridge_observation_standoff_m", 0.8)
                 ),
                 container_safe_staging_outer_offset_m=float(
-                    config.get("container_safe_staging_outer_offset_m", 0.30)
+                    config.get("container_safe_staging_outer_offset_m", 0.35)
                 ),
                 container_safe_staging_ring_count=max(
                     1,
@@ -153,7 +153,7 @@ class SemanticCandidateNode:
                     ),
                 ),
                 container_safe_staging_arrival_tolerance_m=float(
-                    config.get("container_safe_staging_arrival_tolerance_m", 0.25)
+                    config.get("container_safe_staging_arrival_tolerance_m", 0.30)
                 ),
                 container_interaction_ready_distance_m=float(
                     config.get("container_interaction_ready_distance_m", 0.18)

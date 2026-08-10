@@ -366,6 +366,61 @@ def container_pre_action_candidate(requires_approach=True):
     return candidate
 
 
+def two_stage_container_pre_action_candidate():
+    candidate = container_pre_action_candidate()
+    candidate["interaction_command"].update(
+        {
+            "container_staging_ready_distance_m": 0.30,
+            "container_physical_action_ready_distance_m": 0.18,
+            "interaction_ready_distance_m": 0.30,
+        }
+    )
+    staging_goals = [
+        [1.0, 2.0, 0.0],
+        [2.0, 2.0, 1.57],
+        [2.0, 3.0, 3.14],
+        [1.0, 3.0, -1.57],
+    ]
+    action_goals = [
+        [1.30, 2.0, 0.0],
+        [2.30, 2.0, 1.57],
+        [2.30, 3.0, 3.14],
+        [1.30, 3.0, -1.57],
+    ]
+    candidate["metadata"].update(
+        {
+            "m1_observation_staging_required": True,
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "container_staging_goal_xyyaw_candidates": staging_goals,
+            "container_staging_pose_labels": [
+                "safe_outer",
+                "safe_far",
+                "safe_farthest",
+                "safe_max",
+            ],
+            "container_action_goal_xyyaw_by_staging_index": action_goals,
+            "container_action_pose_labels_by_staging_index": [
+                "safe_outer_physical_action",
+                "safe_far_physical_action",
+                "safe_farthest_physical_action",
+                "safe_max_physical_action",
+            ],
+            "container_two_stage_staging_observation_required": True,
+            "container_two_stage_staging_container_pre_action_observation": True,
+            "container_two_stage_staging_drawer_pre_action_observation": False,
+            # This is the executor's public, request-ID-matched evidence token;
+            # the state machine must not infer it from a ready-looking payload.
+            "accepted_container_m1_evidence": {
+                "staging_pose_xyyaw": list(staging_goals[0]),
+                "capture_pose_xyyaw": list(staging_goals[0]),
+                "capture_step": 11,
+            },
+        }
+    )
+    return candidate
+
+
 def test_committed_turn_sign_is_stable_at_pi_boundary() -> None:
     assert committed_turn_sign(math.pi - 0.05) == -1
     assert committed_turn_sign(-math.pi + 0.05) == -1
@@ -836,6 +891,136 @@ def test_container_pre_action_requires_fresh_front_and_moves_to_next_view() -> N
     )
     assert machine.state == STATE_INTERACTING
     assert execute[0]["kind"] == "interact"
+
+
+def test_container_two_stage_m1_staging_navigates_inner_before_bridge() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    commands = machine.start(candidate, now=0.0)
+    assert commands[0]["kind"] == "navigate"
+
+    first_request = machine.on_navigation_result(
+        True, {"capture_step": 10}, now=0.5
+    )
+    assert first_request[0]["kind"] == "request_interaction_observation"
+
+    inner_navigation = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "observed_bbox_2d": [10, 10, 80, 120],
+            "attribute_capture_step": 11,
+            "container_visual_precondition_reason": "ready",
+        },
+        now=1.0,
+    )
+
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert [command["kind"] for command in inner_navigation] == ["navigate"]
+    assert inner_navigation[0]["reason"] == (
+        "container_m1_ready_navigate_physical_action_pose"
+    )
+    assert machine.candidate["goal_xyyaw"] == [1.30, 2.0, 0.0]
+    assert machine.candidate["interaction_command"][
+        "interaction_approach_pose_xyyaw"
+    ] == [1.30, 2.0, 0.0]
+    assert machine.candidate["interaction_command"]["interaction_ready_distance_m"] == 0.18
+    assert machine.candidate["metadata"]["container_two_stage_phase"] == "physical_action"
+    assert machine.candidate["metadata"]["observation_required"] is False
+    assert machine.candidate["metadata"]["container_pre_action_observation"] is False
+
+    # The inner arrival emits the physical command directly.  A second M1
+    # request here would re-observe from the close action pose and violate the
+    # outer-evidence contract.
+    bridge = machine.on_navigation_result(True, {"capture_step": 12}, now=1.5)
+    assert machine.state == STATE_INTERACTING
+    assert [command["kind"] for command in bridge] == ["interact"]
+
+
+def test_container_two_stage_inner_failure_returns_next_outer_m1_staging() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    machine.start(candidate, now=0.0)
+    machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+    machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "observed_bbox_2d": [10, 10, 80, 120],
+            "attribute_capture_step": 11,
+            "container_visual_precondition_reason": "ready",
+        },
+        now=1.0,
+    )
+
+    retry = machine.retry_container_two_stage_staging(
+        next_staging_goal_option_index=1,
+        interaction_approach_attempts=[
+            {"index": 0, "phase": "staging"},
+            {"index": 0, "phase": "physical_action"},
+        ],
+        detail={"reason": "unsafe_open_sweep"},
+        now=1.5,
+    )
+
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert [command["kind"] for command in retry] == ["navigate"]
+    assert retry[0]["start_goal_option_index"] == 1
+    assert retry[0]["reason"] == "container_inner_action_failed_next_outer_staging"
+    assert machine.candidate["metadata"]["container_two_stage_phase"] == "staging"
+    assert machine.candidate["metadata"]["observation_required"] is True
+    assert machine.candidate["metadata"]["container_pre_action_observation"] is True
+    assert "accepted_container_m1_evidence" not in machine.candidate["metadata"]
+    assert machine.candidate["interaction_command"]["interaction_ready_distance_m"] == 0.30
+
+    # Only after reaching the next outer stance can M1 be requested again.
+    next_request = machine.on_navigation_result(
+        True, {"capture_step": 20}, now=2.0
+    )
+    assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    assert [command["kind"] for command in next_request] == [
+        "request_interaction_observation"
+    ]
+
+
+def test_container_two_stage_missing_inner_mapping_fails_closed_to_next_outer() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    candidate["metadata"]["container_two_stage_mapping_ready"] = False
+    candidate["metadata"]["container_action_goal_xyyaw_by_staging_index"] = []
+    machine.start(candidate, now=0.0)
+    machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+
+    retry = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "observed_bbox_2d": [10, 10, 80, 120],
+            "attribute_capture_step": 11,
+            "container_visual_precondition_reason": "ready",
+        },
+        now=1.0,
+    )
+
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert [command["kind"] for command in retry] == ["navigate"]
+    assert retry[0]["start_goal_option_index"] == 1
+    assert all(command["kind"] != "interact" for command in retry)
 
 
 def test_container_visual_open_without_fresh_bbox_is_reobserved() -> None:

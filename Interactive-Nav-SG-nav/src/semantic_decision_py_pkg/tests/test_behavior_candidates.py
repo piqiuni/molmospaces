@@ -1847,7 +1847,23 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
     # when the first two lie inside a wall-adjacent inflation shoulder.
     assert math.isclose(goals[8][0], 1.8, abs_tol=1e-6)
     assert math.isclose(goals[8][1], 2.0, abs_tol=1e-6)
+    assert candidate.metadata["container_two_stage_approach"] is True
+    assert candidate.metadata["container_two_stage_mapping_ready"] is True
+    action_goals = candidate.metadata[
+        "container_action_goal_xyyaw_by_staging_index"
+    ]
+    assert len(action_goals) == len(goals)
+    # The first physical action pose uses the same outer-ring side but restores
+    # the original .50 m type-safe contact standoff from the AABB surface.
+    assert math.isclose(action_goals[0][0], 3.0, abs_tol=1e-6)
+    assert math.isclose(action_goals[0][1], 2.0, abs_tol=1e-6)
     assert candidate.interaction_command["interaction_ready_distance_m"] == 0.25
+    assert candidate.interaction_command[
+        "container_staging_ready_distance_m"
+    ] == 0.25
+    assert candidate.interaction_command[
+        "container_physical_action_ready_distance_m"
+    ] == 0.18
     assert candidate.metadata["m1_safe_staging_outer_offset_m"] == 0.30
     assert candidate.metadata["m1_safe_staging_arrival_tolerance_m"] == 0.25
 

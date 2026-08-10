@@ -403,6 +403,68 @@ def navigation_goal_options(candidate: dict[str, Any]) -> list[tuple[float, floa
     return options
 
 
+def _goal_xyyaw_option(value: Any) -> tuple[float, float, float] | None:
+    values = list(value or [])
+    if len(values) < 2:
+        return None
+    try:
+        return (
+            float(values[0]),
+            float(values[1]),
+            float(values[2]) if len(values) > 2 else 0.0,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def container_two_stage_staging_goal_options(
+    candidate: dict[str, Any] | None,
+) -> list[tuple[float, float, float]]:
+    """Return the immutable outer M1 staging sequence for a container."""
+
+    metadata = (candidate or {}).get("metadata") or {}
+    if not bool(metadata.get("container_two_stage_approach", False)):
+        return []
+    options: list[tuple[float, float, float]] = []
+    for raw in list(metadata.get("container_staging_goal_xyyaw_candidates") or []):
+        option = _goal_xyyaw_option(raw)
+        if option is not None:
+            options.append(option)
+    return options
+
+
+def container_two_stage_action_goal_for_staging(
+    candidate: dict[str, Any] | None,
+    staging_goal_option_index: int,
+) -> tuple[float, float, float] | None:
+    """Look up the type-safe physical goal paired with one outer staging pose."""
+
+    metadata = (candidate or {}).get("metadata") or {}
+    if not bool(metadata.get("container_two_stage_approach", False)):
+        return None
+    try:
+        index = int(staging_goal_option_index)
+    except (TypeError, ValueError):
+        return None
+    action_goals = list(
+        metadata.get("container_action_goal_xyyaw_by_staging_index") or []
+    )
+    if index < 0 or index >= len(action_goals):
+        return None
+    return _goal_xyyaw_option(action_goals[index])
+
+
+def is_container_two_stage_physical_action(candidate: dict[str, Any] | None) -> bool:
+    """Whether the active candidate is between M1 acceptance and the bridge."""
+
+    metadata = (candidate or {}).get("metadata") or {}
+    return bool(
+        metadata.get("container_two_stage_approach", False)
+        and str(metadata.get("container_two_stage_phase") or "").casefold()
+        == "physical_action"
+    )
+
+
 def navigation_should_prerotate(behavior_type: str) -> bool:
     """Return whether a path-backed rear-goal pre-turn is permitted.
 
@@ -1150,19 +1212,36 @@ class BehaviorExecutionStateMachine:
             disposition = "retry"
 
         if disposition == "execute":
-            metadata["observation_required"] = False
-            metadata["reobserve"] = False
-            metadata["interaction_observation_resolved"] = True
-            self.candidate["metadata"] = metadata
-            return self._transition(
-                STATE_INTERACTING,
-                now,
-                {
-                    "kind": "interact",
-                    "candidate": self.candidate,
-                    "observation": observation,
-                },
-            )
+            if self._container_two_stage_staging_active(metadata):
+                action_navigation = self._begin_container_two_stage_action_approach(
+                    observation,
+                    now,
+                )
+                if action_navigation:
+                    return action_navigation
+                # A ready-looking M1 payload is not sufficient by itself for a
+                # two-stage container.  The executor must have bound it to the
+                # currently selected outer pose before a closer physical goal is
+                # allowed.  Treat a missing/mismatched binding as another outer
+                # observation failure, never as an inner action authorization.
+                observation.setdefault(
+                    "reason", "container_m1_evidence_not_bound_to_staging_pose"
+                )
+                disposition = "retry"
+            if disposition == "execute":
+                metadata["observation_required"] = False
+                metadata["reobserve"] = False
+                metadata["interaction_observation_resolved"] = True
+                self.candidate["metadata"] = metadata
+                return self._transition(
+                    STATE_INTERACTING,
+                    now,
+                    {
+                        "kind": "interact",
+                        "candidate": self.candidate,
+                        "observation": observation,
+                    },
+                )
         if disposition == "finish_without_action":
             return self._finish(
                 True,
@@ -1231,6 +1310,241 @@ class BehaviorExecutionStateMachine:
         return bool(
             self._behavior_type() == BEHAVIOR_INTERACT
             and metadata.get("observation_required", False)
+        )
+
+    @staticmethod
+    def _container_two_stage_staging_active(metadata: dict[str, Any]) -> bool:
+        return bool(
+            metadata.get("container_two_stage_approach", False)
+            and str(metadata.get("container_two_stage_phase") or "staging").casefold()
+            == "staging"
+        )
+
+    @staticmethod
+    def _container_two_stage_evidence_matches_staging(
+        evidence: dict[str, Any],
+        staging_goal: tuple[float, float, float],
+    ) -> bool:
+        """Check only the public pose token captured with the targeted M1 view."""
+
+        observed = _goal_xyyaw_option(evidence.get("staging_pose_xyyaw"))
+        if observed is None:
+            return False
+        return bool(
+            math.hypot(observed[0] - staging_goal[0], observed[1] - staging_goal[1])
+            <= 1e-6
+            and abs(normalize_angle(observed[2] - staging_goal[2])) <= 1e-6
+        )
+
+    def _begin_container_two_stage_action_approach(
+        self,
+        observation: dict[str, Any],
+        now: float,
+    ) -> list[dict[str, Any]]:
+        """Replace an accepted outer M1 barrier with its paired inner goal.
+
+        No visual request is emitted by this transition.  The fresh M1 result
+        remains attached to the outer staging pose and the next navigation
+        completion is the only path that can issue the physical bridge command.
+        """
+
+        if self.candidate is None:
+            return []
+        candidate = dict(self.candidate)
+        metadata = dict(candidate.get("metadata") or {})
+        if not self._container_two_stage_staging_active(metadata):
+            return []
+        try:
+            staging_index = max(
+                0, int(metadata.get("interaction_approach_goal_option_index", 0))
+            )
+        except (TypeError, ValueError):
+            return []
+        staging_goals = container_two_stage_staging_goal_options(candidate)
+        if staging_index >= len(staging_goals):
+            return []
+        action_goal = container_two_stage_action_goal_for_staging(
+            candidate, staging_index
+        )
+        evidence = metadata.get("accepted_container_m1_evidence")
+        if (
+            action_goal is None
+            or not isinstance(evidence, dict)
+            or not self._container_two_stage_evidence_matches_staging(
+                evidence, staging_goals[staging_index]
+            )
+        ):
+            return []
+        action_labels = list(
+            metadata.get("container_action_pose_labels_by_staging_index") or []
+        )
+        action_label = (
+            str(action_labels[staging_index])
+            if staging_index < len(action_labels)
+            else f"staging_{staging_index}_physical_action"
+        )
+        interaction = dict(candidate.get("interaction_command") or {})
+        interaction["interaction_approach_pose_xyyaw"] = list(action_goal)
+        try:
+            physical_ready_distance_m = float(
+                interaction.get("container_physical_action_ready_distance_m")
+            )
+        except (TypeError, ValueError):
+            return []
+        if physical_ready_distance_m <= 0.0:
+            return []
+        interaction["interaction_ready_distance_m"] = physical_ready_distance_m
+        metadata.update(
+            {
+                "container_two_stage_phase": "physical_action",
+                "container_two_stage_staging_goal_option_index": staging_index,
+                "container_two_stage_staging_pose_xyyaw": list(
+                    staging_goals[staging_index]
+                ),
+                "container_two_stage_action_goal_xyyaw": list(action_goal),
+                "container_two_stage_action_pose_label": action_label,
+                "container_m1_evidence_staging_goal_option_index": staging_index,
+                "container_m1_evidence_staging_pose_xyyaw": list(
+                    staging_goals[staging_index]
+                ),
+                # The inner phase must never request another M1 image.  It
+                # retains the drawer's visual action regions on the interaction
+                # command but clears only the observation-state flags.
+                "observation_required": False,
+                "reobserve": False,
+                "container_pre_action_observation": False,
+                "drawer_pre_action_observation": False,
+                "m1_observation_staging_required": False,
+                "interaction_observation_resolved": True,
+                "effective_interaction_approach_pose_xyyaw": list(action_goal),
+                "interaction_approach_goal_option_index": 0,
+                "goal_xyyaw_candidates": [],
+                "interaction_approach_pose_labels": [action_label],
+            }
+        )
+        candidate["goal_xyyaw"] = list(action_goal)
+        candidate["interaction_command"] = interaction
+        candidate["metadata"] = metadata
+        self.candidate = candidate
+        return self._transition(
+            STATE_APPROACH_INTERACTION,
+            now,
+            {
+                "kind": "navigate",
+                "candidate": self.candidate,
+                "start_goal_option_index": 0,
+                "interaction_approach_attempts": [
+                    dict(item)
+                    for item in metadata.get("interaction_approach_attempts") or []
+                    if isinstance(item, dict)
+                ],
+                "reason": "container_m1_ready_navigate_physical_action_pose",
+                "observation": observation,
+            },
+        )
+
+    def retry_container_two_stage_staging(
+        self,
+        *,
+        next_staging_goal_option_index: int,
+        interaction_approach_attempts: list[dict[str, Any]],
+        detail: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return from an inner failure to the next outer staging viewpoint.
+
+        A closer action pose cannot be re-observed: it has already consumed the
+        accepted outer M1 evidence.  Re-enter the original outer sequence with
+        the original flags restored so the next usable stance earns a new image.
+        """
+
+        if self.candidate is None or not is_container_two_stage_physical_action(
+            self.candidate
+        ):
+            return []
+        if self.state not in {STATE_APPROACH_INTERACTION, STATE_INTERACTING}:
+            return []
+        candidate = dict(self.candidate)
+        metadata = dict(candidate.get("metadata") or {})
+        staging_goals = container_two_stage_staging_goal_options(candidate)
+        try:
+            next_index = int(next_staging_goal_option_index)
+        except (TypeError, ValueError):
+            return []
+        if next_index < 0 or next_index >= len(staging_goals):
+            return []
+        staging_labels = list(metadata.get("container_staging_pose_labels") or [])
+        interaction = dict(candidate.get("interaction_command") or {})
+        interaction["interaction_approach_pose_xyyaw"] = list(staging_goals[next_index])
+        try:
+            staging_ready_distance_m = float(
+                interaction.get("container_staging_ready_distance_m")
+            )
+        except (TypeError, ValueError):
+            return []
+        if staging_ready_distance_m <= 0.0:
+            return []
+        interaction["interaction_ready_distance_m"] = staging_ready_distance_m
+        metadata.update(
+            {
+                "container_two_stage_phase": "staging",
+                "container_two_stage_last_inner_failure": dict(detail or {}),
+                "observation_required": bool(
+                    metadata.get(
+                        "container_two_stage_staging_observation_required", True
+                    )
+                ),
+                "reobserve": True,
+                "container_pre_action_observation": bool(
+                    metadata.get(
+                        "container_two_stage_staging_container_pre_action_observation",
+                        False,
+                    )
+                ),
+                "drawer_pre_action_observation": bool(
+                    metadata.get(
+                        "container_two_stage_staging_drawer_pre_action_observation",
+                        False,
+                    )
+                ),
+                "m1_observation_staging_required": True,
+                "interaction_observation_resolved": False,
+                "goal_xyyaw_candidates": [list(goal) for goal in staging_goals],
+                "interaction_approach_pose_labels": staging_labels,
+                "effective_interaction_approach_pose_xyyaw": list(
+                    staging_goals[next_index]
+                ),
+                "interaction_approach_goal_option_index": next_index,
+            }
+        )
+        for key in (
+            "accepted_container_m1_evidence",
+            "accepted_container_m1_capture_pose_xyyaw",
+            "accepted_container_m1_capture_step",
+            "container_m1_evidence_staging_goal_option_index",
+            "container_m1_evidence_staging_pose_xyyaw",
+        ):
+            metadata.pop(key, None)
+        candidate["interaction_command"] = interaction
+        candidate["metadata"] = metadata
+        # Preserve the canonical primary outer goal.  The executor receives the
+        # original index below, so its preflight/debug trace remains aligned
+        # with the immutable outer-to-inner mapping.
+        candidate["goal_xyyaw"] = list(staging_goals[0])
+        self.candidate = candidate
+        now = time.monotonic() if now is None else float(now)
+        return self._transition(
+            STATE_APPROACH_INTERACTION,
+            now,
+            {
+                "kind": "navigate",
+                "candidate": self.candidate,
+                "start_goal_option_index": next_index,
+                "interaction_approach_attempts": [
+                    dict(item) for item in interaction_approach_attempts
+                ],
+                "reason": "container_inner_action_failed_next_outer_staging",
+            },
         )
 
     def _interaction_observation_max_attempts(self) -> int:

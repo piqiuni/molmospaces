@@ -144,9 +144,8 @@ class CandidateGeneratorConfig:
     drawer_standoff_m: float | None = None
     # M1 is a visual front/action-region gate.  Do not collect that evidence
     # from an arbitrarily close final-tolerance pose, where perspective and
-    # detector boxes are unstable.  In model lanes the interaction pose itself
-    # becomes a safe staging pose; the force bridge can act from that pose, so
-    # no second close-range M1 call is needed.
+    # detector boxes are unstable.  Model lanes first use an outer staging
+    # pose for M1, then navigate to a separate type-safe physical action pose.
     container_observation_standoff_m: float = 0.7
     drawer_observation_standoff_m: float = 0.65
     fridge_observation_standoff_m: float = 0.8
@@ -157,17 +156,18 @@ class CandidateGeneratorConfig:
     # the executor's normal make-plan preflight selects the first reachable
     # one.  This changes requested goal geometry only; collision/footprint
     # checks remain in move_base.
-    container_safe_staging_outer_offset_m: float = 0.30
+    container_safe_staging_outer_offset_m: float = 0.35
     # Include one additional robot-side/four-view ring beyond ``safe_far`` by
     # default.  It gives a wall-adjacent container a costmap-reachable visual
     # staging option without falling back to an inner/close M1 pose.  Keep the
     # enumeration bounded because each option still participates in normal
     # preflight and visual re-observation accounting.
     container_safe_staging_ring_count: int = 3
-    # The bridge validates the robot against the selected staging pose.  The
-    # outer ring leaves enough object clearance that a modest arrival tolerance
-    # remains visually safe instead of forcing an unreliable close-range M1.
-    container_safe_staging_arrival_tolerance_m: float = 0.25
+    # M1-only staging accepts the ordinary move_base terminal error separately
+    # from the stricter physical bridge gate.  The default offset grows by the
+    # same 5 cm as this envelope, preserving the previous minimum clearance to
+    # the container surface.
+    container_safe_staging_arrival_tolerance_m: float = 0.30
     container_interaction_ready_distance_m: float = 0.18
     interaction_safety_margin_m: float = 0.0
     interaction_ready_distance_m: float = 0.45
@@ -1303,6 +1303,20 @@ class CandidateGenerator:
             )
             interaction_standoff = standoff + self.config.interaction_safety_margin_m
             observation_standoff = interaction_standoff
+            container_two_stage_requested = bool(
+                node_type == "container" and (container_pre_action or drawer_pre_action)
+            )
+            container_staging_ready_distance_m = min(
+                self.config.interaction_ready_distance_m,
+                max(
+                    0.05,
+                    self.config.container_safe_staging_arrival_tolerance_m,
+                ),
+            )
+            container_physical_action_ready_distance_m = min(
+                self.config.interaction_ready_distance_m,
+                max(0.05, self.config.container_interaction_ready_distance_m),
+            )
             if node_type == "container" and (
                 container_pre_action or drawer_pre_action
             ):
@@ -1336,6 +1350,30 @@ class CandidateGenerator:
                     else 0.0
                 ),
             )
+            # Keep the visual staging geometry and the physical action
+            # geometry as two explicit, index-aligned lists.  The outer pose is
+            # generated without a semantic front claim; its radial axis is
+            # merely carried inward to the type-specific action standoff.  M1
+            # later authorizes the action from the image captured at that exact
+            # outer pose, but it never supplies (or receives) this mapping.
+            container_two_stage_mapping_ready = False
+            container_action_goals_by_staging: list[list[float]] = []
+            container_action_labels_by_staging: list[str] = []
+            if container_two_stage_requested:
+                (
+                    container_action_goals_by_staging,
+                    container_action_labels_by_staging,
+                ) = self._container_action_goals_for_staging(
+                    target_xy=position,
+                    staging_goals=goal_candidates,
+                    staging_labels=approach_pose_labels,
+                    physical_standoff_m=interaction_standoff,
+                    node=node,
+                )
+                container_two_stage_mapping_ready = bool(
+                    container_action_goals_by_staging
+                    and len(container_action_goals_by_staging) == len(goal_candidates)
+                )
             approach = goal_candidates[0]
             portal_aperture_observation = (
                 self._portal_aperture_observation(node)
@@ -1414,16 +1452,19 @@ class CandidateGenerator:
                 "interaction_approach_axis_xy": list(visual_container_axis or []),
                 "interaction_approach_pose_labels": list(approach_pose_labels),
                 "interaction_ready_distance_m": (
-                    min(
-                        self.config.interaction_ready_distance_m,
-                        max(
-                            self.config.container_interaction_ready_distance_m,
-                            self.config.container_safe_staging_arrival_tolerance_m,
-                        ),
-                    )
-                    if node_type == "container"
-                    and (container_pre_action or drawer_pre_action)
+                    container_staging_ready_distance_m
+                    if container_two_stage_requested
                     else self.config.interaction_ready_distance_m
+                ),
+                "container_staging_ready_distance_m": (
+                    container_staging_ready_distance_m
+                    if container_two_stage_requested
+                    else 0.0
+                ),
+                "container_physical_action_ready_distance_m": (
+                    container_physical_action_ready_distance_m
+                    if container_two_stage_requested
+                    else 0.0
                 ),
                 "interaction_ready_yaw_tolerance_rad": 0.55,
                 "container_kind": (
@@ -1568,10 +1609,12 @@ class CandidateGenerator:
                         "observation_required": bool(
                             visual_unknown_portal_reobserve
                             or container_pre_action
+                            or drawer_pre_action
                         ),
                         "reobserve": bool(
                             visual_unknown_portal_reobserve
                             or container_pre_action
+                            or drawer_pre_action
                         ),
                         "observation_reason": (
                             "mllm_portal_state_unknown"
@@ -1597,11 +1640,49 @@ class CandidateGenerator:
                             if (
                                 visual_unknown_portal_reobserve
                                 or container_pre_action
+                                or drawer_pre_action
                             )
                             else ""
                         ),
                         "drawer_pre_action_observation": drawer_pre_action,
                         "container_pre_action_observation": container_pre_action,
+                        # A failed mapping is deliberately still marked as a
+                        # two-stage request.  The state machine will exhaust
+                        # outer observations fail-closed instead of reverting to
+                        # a legacy direct open from the staging pose.
+                        "container_two_stage_approach": container_two_stage_requested,
+                        "container_two_stage_mapping_ready": (
+                            container_two_stage_mapping_ready
+                        ),
+                        "container_two_stage_phase": (
+                            "staging" if container_two_stage_requested else ""
+                        ),
+                        "container_staging_goal_xyyaw_candidates": [
+                            list(goal) for goal in goal_candidates
+                        ]
+                        if container_two_stage_requested
+                        else [],
+                        "container_staging_pose_labels": list(approach_pose_labels)
+                        if container_two_stage_requested
+                        else [],
+                        "container_action_goal_xyyaw_by_staging_index": [
+                            list(goal) for goal in container_action_goals_by_staging
+                        ],
+                        "container_action_pose_labels_by_staging_index": list(
+                            container_action_labels_by_staging
+                        ),
+                        # These values restore exactly the pre-action flags when
+                        # an inner physical approach fails and the next outer
+                        # staging pose must earn a new M1 view.
+                        "container_two_stage_staging_observation_required": bool(
+                            container_pre_action or drawer_pre_action
+                        ),
+                        "container_two_stage_staging_container_pre_action_observation": (
+                            container_pre_action
+                        ),
+                        "container_two_stage_staging_drawer_pre_action_observation": (
+                            drawer_pre_action
+                        ),
                         # Preserve the geometry used to construct the two-sided
                         # approach options.  The post-open continuation uses it
                         # to select an AABB-clear goal on the far side instead
@@ -2138,6 +2219,56 @@ class CandidateGenerator:
                     label,
                 )
         return candidates, labels
+
+    @classmethod
+    def _container_action_goals_for_staging(
+        cls,
+        *,
+        target_xy: tuple[float, float],
+        staging_goals: list[list[float]],
+        staging_labels: list[str],
+        physical_standoff_m: float,
+        node: dict[str, Any],
+    ) -> tuple[list[list[float]], list[str]]:
+        """Map every safe M1 staging pose to one nearer physical action pose.
+
+        The mapping deliberately derives its axis from the already selected
+        outer goal, not from an object joint, a graph-provided front axis, or a
+        later M1 response.  This preserves the safe viewpoint's side while the
+        inner point restores the original type-specific interaction standoff.
+        """
+
+        action_goals: list[list[float]] = []
+        action_labels: list[str] = []
+        for index, staging_goal in enumerate(staging_goals):
+            values = list(staging_goal or [])
+            if len(values) < 2:
+                return [], []
+            try:
+                dx = float(values[0]) - float(target_xy[0])
+                dy = float(values[1]) - float(target_xy[1])
+            except (TypeError, ValueError):
+                return [], []
+            distance = math.hypot(dx, dy)
+            if distance <= 1e-6:
+                return [], []
+            axis = dx / distance, dy / distance
+            action_goals.append(
+                cls._approach_pose(
+                    target_xy,
+                    target_xy,
+                    physical_standoff_m,
+                    node=node,
+                    fixed_axis=axis,
+                )
+            )
+            label = (
+                str(staging_labels[index])
+                if index < len(staging_labels)
+                else f"staging_{index}"
+            )
+            action_labels.append(f"{label}_physical_action")
+        return action_goals, action_labels
 
     @staticmethod
     def _is_drawer_container(node: dict[str, Any]) -> bool:

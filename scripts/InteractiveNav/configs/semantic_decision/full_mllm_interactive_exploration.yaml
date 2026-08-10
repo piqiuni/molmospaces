@@ -24,21 +24,20 @@ candidate:
   container_standoff_m: 0.40
   drawer_standoff_m: 0.40
   fridge_standoff_m: 0.80
-  # M1 is sampled at the interaction staging pose, before the bridge command.
-  # These floors prevent a final pose tolerance from placing the camera at a
-  # too-close perspective; the drawer macro itself remains unchanged.
+  # M1 is sampled at an outer staging pose, then the executor navigates to its
+  # paired inner type-safe action pose before the bridge command.  The drawer
+  # macro retains the action regions from that outer visual observation.
   container_observation_standoff_m: 0.70
   drawer_observation_standoff_m: 0.65
   fridge_observation_standoff_m: 0.80
-  # Try three four-sided outer staging rings.  The farther robot-side ring is
-  # still a final physical-action staging pose, not a close M1-only fallback;
-  # normal local/global planners select the first reachable pose.
-  container_safe_staging_outer_offset_m: 0.30
+  # Try three four-sided outer staging rings.  Widening the M1-only arrival
+  # envelope by 5 cm is paired with 5 cm more outer clearance, while the inner
+  # bridge gate remains the separate container_interaction distance below.
+  container_safe_staging_outer_offset_m: 0.35
   container_safe_staging_ring_count: 3
-  # This is pose error around the outer staging target, not permission to
-  # collect M1 evidence beside the container.  The 0.30 m outer offset keeps
-  # the closest accepted camera clearance above the observation floor.
-  container_safe_staging_arrival_tolerance_m: 0.25
+  # This is pose error around the outer M1 staging target, never permission to
+  # execute there.  The paired .35 m offset preserves its closest clearance.
+  container_safe_staging_arrival_tolerance_m: 0.30
   container_interaction_ready_distance_m: 0.25
   interaction_safety_margin_m: 0.10
   interaction_ready_distance_m: 0.30
