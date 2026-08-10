@@ -155,6 +155,14 @@ class SemanticCandidateNode:
                         int(config.get("container_safe_staging_ring_count", 3)),
                     ),
                 ),
+                container_two_stage_observation_max_attempts=max(
+                    1,
+                    int(
+                        config.get(
+                            "container_two_stage_observation_max_attempts", 12
+                        )
+                    ),
+                ),
                 container_safe_staging_arrival_tolerance_m=float(
                     config.get("container_safe_staging_arrival_tolerance_m", 0.30)
                 ),

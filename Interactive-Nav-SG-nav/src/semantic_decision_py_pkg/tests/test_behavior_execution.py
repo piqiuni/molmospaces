@@ -945,8 +945,13 @@ def test_container_two_stage_m1_staging_navigates_inner_before_bridge() -> None:
 def test_container_two_stage_inner_failure_returns_next_outer_m1_staging() -> None:
     machine = BehaviorExecutionStateMachine()
     candidate = two_stage_container_pre_action_candidate()
+    # Model the live failure shape: the last rejected M1 response set an older
+    # baseline, then a later front frame authorized the inner physical pose.
+    # Returning to another outer stance must never reuse a frame between them.
+    candidate["metadata"]["interaction_observation_after_capture_step"] = 207
+    candidate["metadata"]["accepted_container_m1_evidence"]["capture_step"] = 306
     machine.start(candidate, now=0.0)
-    machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+    machine.on_navigation_result(True, {"capture_step": 207}, now=0.5)
     machine.on_interaction_observation_result(
         {
             "attribute_status": "ready",
@@ -957,7 +962,7 @@ def test_container_two_stage_inner_failure_returns_next_outer_m1_staging() -> No
             "front_surface_visible": True,
             "approach_ready": True,
             "observed_bbox_2d": [10, 10, 80, 120],
-            "attribute_capture_step": 11,
+            "attribute_capture_step": 306,
             "container_visual_precondition_reason": "ready",
         },
         now=1.0,
@@ -981,16 +986,21 @@ def test_container_two_stage_inner_failure_returns_next_outer_m1_staging() -> No
     assert machine.candidate["metadata"]["observation_required"] is True
     assert machine.candidate["metadata"]["container_pre_action_observation"] is True
     assert "accepted_container_m1_evidence" not in machine.candidate["metadata"]
+    assert (
+        machine.candidate["metadata"]["interaction_observation_after_capture_step"]
+        == 306
+    )
     assert machine.candidate["interaction_command"]["interaction_ready_distance_m"] == 0.30
 
     # Only after reaching the next outer stance can M1 be requested again.
     next_request = machine.on_navigation_result(
-        True, {"capture_step": 20}, now=2.0
+        True, {"interaction_arrival_step_index": 411}, now=2.0
     )
     assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
     assert [command["kind"] for command in next_request] == [
         "request_interaction_observation"
     ]
+    assert next_request[0]["min_capture_step"] == 307
 
 
 def test_container_two_stage_missing_inner_mapping_fails_closed_to_next_outer() -> None:

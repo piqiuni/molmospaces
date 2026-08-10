@@ -1485,6 +1485,30 @@ class BehaviorExecutionStateMachine:
         if staging_ready_distance_m <= 0.0:
             return []
         interaction["interaction_ready_distance_m"] = staging_ready_distance_m
+        # The next outer stance must request an image newer than the M1 frame
+        # that authorized the failed inner approach.  Keep that accepted
+        # capture as the monotonic observation baseline before clearing the
+        # one-use evidence token below; otherwise a delayed response captured
+        # before the inner attempt could satisfy the next outer M1 request.
+        accepted_capture_step = self._interaction_observation_capture_step(
+            metadata.get("accepted_container_m1_evidence")
+            if isinstance(metadata.get("accepted_container_m1_evidence"), dict)
+            else {}
+        )
+        previous_capture_step = self._interaction_observation_capture_step(
+            {
+                "capture_step": metadata.get(
+                    "interaction_observation_after_capture_step"
+                )
+            }
+        )
+        if accepted_capture_step is not None:
+            metadata["interaction_observation_after_capture_step"] = max(
+                int(accepted_capture_step),
+                int(previous_capture_step)
+                if previous_capture_step is not None
+                else int(accepted_capture_step),
+            )
         metadata.update(
             {
                 "container_two_stage_phase": "staging",

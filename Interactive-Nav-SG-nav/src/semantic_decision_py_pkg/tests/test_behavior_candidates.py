@@ -1772,7 +1772,8 @@ def test_mllm_container_requires_fresh_front_observation_before_opening() -> Non
 
     assert candidate.metadata["container_pre_action_observation"] is True
     assert candidate.metadata["observation_required"] is True
-    assert candidate.metadata["interaction_observation_max_attempts"] == 4
+    assert candidate.metadata["interaction_observation_max_attempts"] == 12
+    assert candidate.metadata["container_two_stage_observation_max_attempts"] == 12
     assert candidate.metadata["observation_reason"] == "mllm_container_pre_action_visual"
 
 
@@ -1849,6 +1850,7 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
     assert math.isclose(goals[8][1], 2.0, abs_tol=1e-6)
     assert candidate.metadata["container_two_stage_approach"] is True
     assert candidate.metadata["container_two_stage_mapping_ready"] is True
+    assert candidate.metadata["interaction_observation_max_attempts"] == 12
     action_goals = candidate.metadata[
         "container_action_goal_xyyaw_by_staging_index"
     ]
@@ -1866,6 +1868,38 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
     ] == 0.18
     assert candidate.metadata["m1_safe_staging_outer_offset_m"] == 0.30
     assert candidate.metadata["m1_safe_staging_arrival_tolerance_m"] == 0.25
+
+
+def test_two_stage_container_observation_budget_is_bounded_by_safe_ring() -> None:
+    """The visual retry budget must cover safe views, but remain finite."""
+
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_pre_action_mllm=True,
+            container_safe_staging_ring_count=3,
+            container_two_stage_observation_max_attempts=5,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    assert len(candidate.metadata["goal_xyyaw_candidates"]) == 12
+    assert candidate.metadata["interaction_observation_max_attempts"] == 5
+    assert candidate.metadata["container_two_stage_observation_max_attempts"] == 5
 
 
 def test_container_safe_outer_uses_visible_aabb_anchor_without_m1_axis() -> None:

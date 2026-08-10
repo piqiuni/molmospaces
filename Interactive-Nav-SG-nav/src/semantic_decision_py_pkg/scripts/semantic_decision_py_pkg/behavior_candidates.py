@@ -163,6 +163,12 @@ class CandidateGeneratorConfig:
     # enumeration bounded because each option still participates in normal
     # preflight and visual re-observation accounting.
     container_safe_staging_ring_count: int = 3
+    # The two-stage M1 gate may need to inspect more than the legacy four
+    # observations because a finite outer ring can contain several
+    # costmap-reachable sides.  Keep this explicit and bounded; it is not a
+    # retry-until-success policy.  The candidate also clamps it to the number
+    # of generated staging goals.
+    container_two_stage_observation_max_attempts: int = 12
     # M1-only staging accepts the ordinary move_base terminal error separately
     # from the stricter physical bridge gate.  The default offset grows by the
     # same 5 cm as this envelope, preserving the previous minimum clearance to
@@ -1636,15 +1642,40 @@ class CandidateGenerator:
                             if container_pre_action
                             else ""
                         ),
-                        "interaction_observation_max_attempts": max(
-                            1,
-                            int(
-                                self.config.drawer_pre_action_observation_max_attempts
-                                if drawer_pre_action
-                                else self.config.container_pre_action_observation_max_attempts
-                                if container_pre_action
-                                else self.config.portal_unknown_observation_max_attempts
-                            ),
+                        "interaction_observation_max_attempts": (
+                            min(
+                                len(goal_candidates),
+                                max(
+                                    1,
+                                    int(
+                                        self.config.container_two_stage_observation_max_attempts
+                                    ),
+                                ),
+                            )
+                            if container_two_stage_requested
+                            else max(
+                                1,
+                                int(
+                                    self.config.drawer_pre_action_observation_max_attempts
+                                    if drawer_pre_action
+                                    else self.config.container_pre_action_observation_max_attempts
+                                    if container_pre_action
+                                    else self.config.portal_unknown_observation_max_attempts
+                                ),
+                            )
+                        ),
+                        "container_two_stage_observation_max_attempts": (
+                            min(
+                                len(goal_candidates),
+                                max(
+                                    1,
+                                    int(
+                                        self.config.container_two_stage_observation_max_attempts
+                                    ),
+                                ),
+                            )
+                            if container_two_stage_requested
+                            else 0
                         ),
                         "interaction_observation_source": (
                             "mllm_attribute_inference"

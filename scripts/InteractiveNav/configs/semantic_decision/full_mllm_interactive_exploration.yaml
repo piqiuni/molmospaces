@@ -35,6 +35,9 @@ candidate:
   # bridge gate remains the separate container_interaction distance below.
   container_safe_staging_outer_offset_m: 0.35
   container_safe_staging_ring_count: 3
+  # Match the finite 3 x 4 outer staging ring: each fresh M1 rejection may
+  # advance to another safe view, but never creates an unbounded loop.
+  container_two_stage_observation_max_attempts: 12
   # This is pose error around the outer M1 staging target, never permission to
   # execute there.  The paired .35 m offset preserves its closest clearance.
   container_safe_staging_arrival_tolerance_m: 0.30

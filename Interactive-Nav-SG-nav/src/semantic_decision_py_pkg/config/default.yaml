@@ -86,6 +86,10 @@ candidate:
   # only for the dynamic-M1 lane.  A rule/oracle ablation remains explicit.
   # container_pre_action_mllm: true
   container_pre_action_observation_max_attempts: 4
+  # A two-stage container has a finite outer M1 staging ring.  Do not terminal
+  # it after the legacy four visual checks while unvisited safe outer poses
+  # remain; this value is clamped to the generated ring length.
+  container_two_stage_observation_max_attempts: 12
 
 policy:
   backend: "rule"
