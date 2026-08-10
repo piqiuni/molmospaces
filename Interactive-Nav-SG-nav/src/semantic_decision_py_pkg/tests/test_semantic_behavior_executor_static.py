@@ -1735,6 +1735,7 @@ def test_interaction_ready_standoff_runs_bounded_selected_yaw_alignment(
     executor.interaction_final_align_step_sync_enabled = True
     executor.interaction_final_align_control_dt_s = 0.2
     executor.interaction_final_align_max_control_steps = 56
+    executor.interaction_final_align_control_step_margin_steps = 4
     executor.interaction_final_align_step_sync_stall_timeout_s = 2.0
     executor.interaction_final_align_delivery_retry_steps = 2
     executor._interaction_final_align_gate = executor_module.StepCommandGate(
@@ -1782,7 +1783,7 @@ def test_interaction_ready_standoff_runs_bounded_selected_yaw_alignment(
     assert rotate_args[3] == pytest.approx(0.15)
     assert rotate_kwargs["step_command_gate"] is executor._interaction_final_align_gate
     assert rotate_kwargs["rotation_label"] == "interaction-final-align"
-    assert rotate_kwargs["max_prerotate_control_steps"] == 8
+    assert rotate_kwargs["max_prerotate_control_steps"] == 12
     assert rotate_kwargs["step_sync_budget_authoritative"] is True
     assert len(completed) == 1
     _args, kwargs = completed[0]
@@ -2083,6 +2084,7 @@ def test_full_mllm_interaction_final_align_is_opted_in_without_generic_align() -
     assert executor_override["interaction_final_align_step_sync_enabled"] is True
     assert executor_override["interaction_final_align_control_dt_s"] == 0.2
     assert executor_override["interaction_final_align_max_control_steps"] == 56
+    assert executor_override["interaction_final_align_control_step_margin_steps"] == 4
     assert executor_override["interaction_final_align_max_control_steps"] >= (
         math.ceil(math.pi / (0.30 * 0.20)) + 3
     )

@@ -724,6 +724,14 @@ class SemanticBehaviorExecutor:
             # a strict finite interaction-only cap.
             int(config.get("interaction_final_align_max_control_steps", 56)),
         )
+        # The bridge acknowledges a command window, not the exact base yaw
+        # displacement.  Preserve a few finite tracking windows beyond the
+        # ideal kinematic estimate so a near-interaction pose cannot fail only
+        # because MuJoCo under-rotated one or two fixed-dt actions.
+        self.interaction_final_align_control_step_margin_steps = max(
+            0,
+            int(config.get("interaction_final_align_control_step_margin_steps", 4)),
+        )
         self.interaction_final_align_post_budget_settle_steps = max(
             0,
             int(
@@ -6081,20 +6089,37 @@ class SemanticBehaviorExecutor:
         rotation_kwargs: dict = {}
         if self.interaction_final_align_step_sync_enabled:
             yaw_error = normalize_angle(goal_yaw - pose[2])
-            control_step_budget = prerotation_control_step_budget(
+            base_control_step_budget = prerotation_control_step_budget(
                 yaw_error,
                 self.interaction_final_align_yaw_tolerance_rad,
                 self.interaction_final_align_rotate_speed_rad_s,
                 self.interaction_final_align_control_dt_s,
                 self.interaction_final_align_max_control_steps,
             )
+            tracking_margin_steps = max(
+                0,
+                int(
+                    getattr(
+                        self,
+                        "interaction_final_align_control_step_margin_steps",
+                        0,
+                    )
+                ),
+            )
+            control_step_budget = min(
+                self.interaction_final_align_max_control_steps,
+                base_control_step_budget + tracking_margin_steps,
+            )
             if control_step_budget <= 0:
                 return True
             rospy.loginfo(
                 "[semantic_behavior_executor] interaction final-align "
-                "yaw_error=%.3f budget=%d cap=%d dt=%.3f speed=%.3f tol=%.3f",
+                "yaw_error=%.3f base_budget=%d budget=%d margin=%d cap=%d "
+                "dt=%.3f speed=%.3f tol=%.3f",
                 yaw_error,
+                base_control_step_budget,
                 control_step_budget,
+                tracking_margin_steps,
                 self.interaction_final_align_max_control_steps,
                 self.interaction_final_align_control_dt_s,
                 self.interaction_final_align_rotate_speed_rad_s,

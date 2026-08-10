@@ -301,6 +301,9 @@ executor:
   # 56 = ceil(pi / (0.30 * 0.20)) + 3 tracking-margin windows; the runtime
   # still budgets only the steps required by the current yaw error.
   interaction_final_align_max_control_steps: 56
+  # Bounded tracking allowance for applied yaw being slightly smaller than the
+  # nominal speed × fixed control dt estimate.
+  interaction_final_align_control_step_margin_steps: 4
   # Same causal pose-settle tail as rear pre-rotation; command count remains
   # strictly bounded by the derived interaction yaw budget.
   interaction_final_align_post_budget_settle_steps: 3

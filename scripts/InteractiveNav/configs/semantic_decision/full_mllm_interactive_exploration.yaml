@@ -117,6 +117,7 @@ executor:
   # Hard cap only; the actual count is derived from yaw error, .30 rad/s,
   # .20 s fixed simulator actions, and the .15 rad terminal tolerance.
   interaction_final_align_max_control_steps: 56
+  interaction_final_align_control_step_margin_steps: 4
   interaction_final_align_post_budget_settle_steps: 3
   interaction_final_align_step_sync_stall_timeout_s: 2.0
   interaction_final_align_delivery_retry_steps: 2
