@@ -92,6 +92,9 @@ def test_v3_dwa_biases_leave_room_for_local_obstacle_avoidance() -> None:
     assert float(config["goal_distance_bias"]) == 20.0
     assert float(config["occdist_scale"]) == 0.10
     assert float(config["max_scaling_factor"]) == 0.20
+    # The executor's paired inner container point has a 0.25 m public pose
+    # gate.  DWA must not declare success farther away than that contract.
+    assert float(config["xy_goal_tolerance"]) <= 0.25
 
 
 def test_v3_global_costmap_bounds_post_open_occ_propagation_at_10_hz() -> None:

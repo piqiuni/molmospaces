@@ -4,7 +4,10 @@ GlobalPlanner:
   orientation_window_size: 8
 
 DWAPlannerROS:
-  xy_goal_tolerance: 0.30
+  # Interaction approaches use a 0.25 m public physical-pose gate.  Keep DWA
+  # from declaring the goal reached outside that gate; otherwise an outer M1
+  # observation can be accepted but the paired inner action is never issued.
+  xy_goal_tolerance: 0.25
   yaw_goal_tolerance: 0.20
   latch_xy_goal_tolerance: true
   # Stock DWA parameters only.  Loosen the path/goal tether enough for a
