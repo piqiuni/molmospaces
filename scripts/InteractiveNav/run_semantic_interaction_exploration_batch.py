@@ -499,6 +499,21 @@ def write_summary(output_dir: Path, results: list[dict[str, Any]]) -> None:
             / len(selected_results)
             if selected_results else 0.0
         ),
+        "physical_container_interaction_count": sum(
+            int(row.get("physical_container_interaction_count", 0) or 0)
+            for row in results
+        ),
+        "physical_container_interaction_success_count": sum(
+            int(row.get("physical_container_interaction_success_count", 0) or 0)
+            for row in results
+        ),
+        "physical_container_interaction_failure_count": sum(
+            int(row.get("physical_container_interaction_failure_count", 0) or 0)
+            for row in results
+        ),
+        "drawer_scan_success_count": sum(
+            int(row.get("drawer_scan_success_count", 0) or 0) for row in results
+        ),
         "mean_coverage_ratio": mean_numeric("coverage_ratio"),
         "mean_mapped_free_coverage_ratio": mean_numeric("mapped_free_coverage_ratio"),
         "mean_elapsed_sec": mean_numeric("elapsed_sec"),
@@ -535,6 +550,13 @@ def write_summary(output_dir: Path, results: list[dict[str, Any]]) -> None:
         "decision_count",
         "successful_behavior_count",
         "interaction_count",
+        "physical_interaction_success_count",
+        "physical_interaction_failure_count",
+        "physical_container_interaction_count",
+        "physical_container_interaction_success_count",
+        "physical_container_interaction_failure_count",
+        "drawer_scan_interaction_count",
+        "drawer_scan_success_count",
         "contains_edge_count",
         "container_with_children_count",
         "target_goal_success",

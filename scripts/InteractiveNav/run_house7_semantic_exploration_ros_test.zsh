@@ -800,6 +800,44 @@ step_timing = {
     "simulated_dt_s": timing_windows[-1]["dt"] if timing_windows else None,
 }
 interaction_results = [event.get("result") or {} for event in force.get("events", [])]
+
+
+def is_physical_container_interaction(result):
+    candidate_id = str(result.get("candidate_id") or "")
+    sequence_type = str(result.get("sequence_type") or "").casefold()
+    interaction_mode = str(result.get("interaction_mode") or "").casefold()
+    return (
+        candidate_id.startswith("interaction:container_")
+        or sequence_type.startswith("drawer_")
+        or interaction_mode.startswith("drawer_")
+    )
+
+
+def public_interaction_outcome(result):
+    """Keep batch summaries explicit without copying force/private payloads."""
+
+    return {
+        "candidate_id": str(result.get("candidate_id") or ""),
+        "target_id": str(result.get("node_id") or result.get("object_id") or ""),
+        "interaction_mode": str(result.get("interaction_mode") or ""),
+        "sequence_type": str(result.get("sequence_type") or ""),
+        "status": str(result.get("status") or ""),
+        "success": bool(result.get("success", False)),
+        "pre_state": str(result.get("pre_state") or ""),
+        "post_state": str(result.get("post_state") or ""),
+        "task_steps_consumed": int(result.get("task_steps_consumed", 0) or 0),
+        "failure_reason": str(result.get("failure_reason") or ""),
+    }
+
+
+physical_container_results = [
+    result for result in interaction_results if is_physical_container_interaction(result)
+]
+drawer_scan_results = [
+    result
+    for result in physical_container_results
+    if str(result.get("sequence_type") or "").casefold() == "drawer_scan"
+]
 debug_events = []
 events_path = output_dir / "debug" / "events.jsonl"
 if events_path.exists():
@@ -881,6 +919,26 @@ result = {
     "coverage_ratio": coverage.get("exploration_coverage_ratio"),
     "mapped_free_coverage_ratio": coverage.get("mapped_free_coverage_ratio"),
     "interaction_count": len(interaction_results),
+    "physical_interaction_success_count": sum(
+        bool(result.get("success", False)) for result in interaction_results
+    ),
+    "physical_interaction_failure_count": sum(
+        not bool(result.get("success", False)) for result in interaction_results
+    ),
+    "physical_container_interaction_count": len(physical_container_results),
+    "physical_container_interaction_success_count": sum(
+        bool(result.get("success", False)) for result in physical_container_results
+    ),
+    "physical_container_interaction_failure_count": sum(
+        not bool(result.get("success", False)) for result in physical_container_results
+    ),
+    "drawer_scan_interaction_count": len(drawer_scan_results),
+    "drawer_scan_success_count": sum(
+        bool(result.get("success", False)) for result in drawer_scan_results
+    ),
+    "physical_container_interaction_outcomes": [
+        public_interaction_outcome(result) for result in physical_container_results
+    ],
     "interaction_roots": [event.get("object_id", "") for event in interaction_results],
     "interaction_steps": [event.get("step") for event in interaction_results],
     "contains_edge_count": semantic_summary.get("contains_edge_count", 0),
