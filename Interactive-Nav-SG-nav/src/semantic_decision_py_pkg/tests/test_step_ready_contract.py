@@ -15,7 +15,10 @@ if str(MLLM_SCRIPTS) not in sys.path:
 
 pytest.importorskip("rospy")
 
-from semantic_rule_decision_node import aggregate_step_ready_states
+from semantic_rule_decision_node import (
+    aggregate_step_ready_states,
+    is_completed_drawer_scan_candidate,
+)
 
 
 def _module(step: int, stamp: float, *, ready: bool = True, strict: bool = False):
@@ -81,3 +84,24 @@ def test_explicit_exact_source_falls_back_to_seq_when_stamp_unavailable():
     assert not payload["ready"]
     assert payload["source_alignment_required"]
     assert payload["source_match_mode"] == "seq"
+
+
+def test_completed_drawer_scan_rejects_rebuilt_candidate_for_same_target():
+    completed_candidate_ids = {"interaction:drawer_1:open"}
+    completed_target_ids = {"drawer_1"}
+    rebuilt = {
+        "candidate_id": "interaction:drawer_1:reobserve",
+        "target_id": "drawer_1",
+        "interaction_command": {"sequence_type": "drawer_scan"},
+    }
+    assert is_completed_drawer_scan_candidate(
+        rebuilt, completed_candidate_ids, completed_target_ids
+    )
+    assert not is_completed_drawer_scan_candidate(
+        {
+            **rebuilt,
+            "interaction_command": {"sequence_type": "drawer_open"},
+        },
+        completed_candidate_ids,
+        completed_target_ids,
+    )

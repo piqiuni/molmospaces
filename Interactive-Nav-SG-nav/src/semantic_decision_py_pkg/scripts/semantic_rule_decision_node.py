@@ -182,6 +182,21 @@ def aggregate_step_ready_states(
     }
 
 
+def is_completed_drawer_scan_candidate(
+    payload: dict,
+    completed_candidate_ids: set[str] | frozenset[str],
+    completed_target_ids: set[str] | frozenset[str],
+) -> bool:
+    """Whether a drawer-scan candidate was already completed this episode."""
+
+    interaction = payload.get("interaction_command") or {}
+    if str(interaction.get("sequence_type") or "").casefold() != "drawer_scan":
+        return False
+    candidate_id = str(payload.get("candidate_id") or "")
+    target_id = str(payload.get("target_id") or "")
+    return candidate_id in completed_candidate_ids or target_id in completed_target_ids
+
+
 class SemanticRuleDecisionNode:
     def __init__(self) -> None:
         env_path = os.environ.get("SEMANTIC_DECISION_ENV_FILE")
@@ -451,6 +466,11 @@ class SemanticRuleDecisionNode:
         self.pending_post_interaction_traversal: dict = {}
         self.terminal_post_interaction_traversal_ids: set[str] = set()
         self.completed_post_interaction_traversal_event_keys: set[str] = set()
+        # A successful sealed drawer_scan is a one-shot observation macro for
+        # this episode.  Keep both candidate and target keys because approach
+        # re-planning may rebuild the candidate ID while preserving the object.
+        self.completed_drawer_scan_candidate_ids: set[str] = set()
+        self.completed_drawer_scan_target_ids: set[str] = set()
         self.minimum_candidate_sequence = 0
         self.next_decision_time = 0.0
         self.goal_complete = False
@@ -554,6 +574,8 @@ class SemanticRuleDecisionNode:
                 self.post_interaction_refresh_gate.clear()
                 self.terminal_post_interaction_traversal_ids.clear()
                 self.completed_post_interaction_traversal_event_keys.clear()
+                self.completed_drawer_scan_candidate_ids.clear()
+                self.completed_drawer_scan_target_ids.clear()
                 self.minimum_candidate_sequence = 0
                 self.next_decision_time = 0.0
                 self.goal_complete = False
@@ -687,6 +709,24 @@ class SemanticRuleDecisionNode:
             and str(detail.get("reason") or "") == "preempted_by_target"
         )
         terminal_interaction_failure: dict = {}
+        active_interaction_command = dict(
+            self.active_interaction_candidate.get("interaction_command") or {}
+        )
+        successful_drawer_scan = bool(
+            status == "SUCCEEDED"
+            and self.active_behavior_type == "INTERACT"
+            and str(active_interaction_command.get("sequence_type") or "").casefold()
+            == "drawer_scan"
+        )
+        if successful_drawer_scan:
+            self.completed_drawer_scan_candidate_ids.add(candidate_id)
+            target_id = str(
+                self.active_interaction_candidate.get("target_id")
+                or self._interaction_target_id(candidate_id)
+                or ""
+            )
+            if target_id:
+                self.completed_drawer_scan_target_ids.add(target_id)
         if (
             self.active_behavior_type == "INTERACT"
             and not preempted_by_target
@@ -1905,6 +1945,12 @@ class SemanticRuleDecisionNode:
             terminal_interaction_candidate_ids = set(
                 self.interaction_failure_tracker.terminal_candidate_ids
             )
+            completed_drawer_scan_candidate_ids = set(
+                self.completed_drawer_scan_candidate_ids
+            )
+            completed_drawer_scan_target_ids = set(
+                self.completed_drawer_scan_target_ids
+            )
             target_goal_complete = bool(self.target_goal_complete)
             terminal_post_interaction_traversal_ids = set(
                 self.terminal_post_interaction_traversal_ids
@@ -1920,6 +1966,13 @@ class SemanticRuleDecisionNode:
                 rejected[candidate_id] = (
                     InteractionApproachFailureLimitTracker.REASON
                 )
+                continue
+            if is_completed_drawer_scan_candidate(
+                payload,
+                completed_drawer_scan_candidate_ids,
+                completed_drawer_scan_target_ids,
+            ):
+                rejected[candidate_id] = "drawer_scan_completed"
                 continue
             target_cooldown_key = self._interaction_target_id(candidate_id)
             if now < cooldown_until.get(candidate_id, 0.0) or (
