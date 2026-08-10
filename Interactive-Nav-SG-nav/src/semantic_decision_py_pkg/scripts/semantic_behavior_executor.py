@@ -6107,6 +6107,84 @@ class SemanticBehaviorExecutor:
             self.machine.candidate = bound_candidate
             self.selection = dict(bound_candidate)
 
+    @staticmethod
+    def _interaction_preflight_debug_attempts(
+        goal_options: list[tuple[float, float, float]],
+        goal_labels: list[str] | tuple[str, ...] | None,
+        *,
+        start_goal_option_index: int,
+        attempted_goals: list[dict] | tuple[dict, ...],
+        selected_goal_option_index: int | None = None,
+    ) -> list[dict]:
+        """Return a complete, non-control-flow preflight audit for an INTERACT.
+
+        ``interaction_approach_attempts`` intentionally contains only goals
+        which were actually sent to the navigation controller: its length is a
+        retry budget.  A retry starts at a later ring index, and a successful
+        preflight stops before evaluating the remaining options.  Previously
+        those options disappeared from debug traces, making a wall-side
+        container look as if it had fewer candidate poses than it really did.
+        Keep a separate audit list with explicit skipped reasons so diagnostics
+        are complete without consuming the physical retry budget.
+        """
+
+        options = list(goal_options or [])
+        labels = list(goal_labels or [])
+        checked_by_index: dict[int, dict] = {}
+        for raw in attempted_goals or []:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                index = int(raw.get("index"))
+            except (TypeError, ValueError):
+                continue
+            checked_by_index[index] = dict(raw)
+        start_index = max(0, int(start_goal_option_index))
+        selected_index = (
+            None
+            if selected_goal_option_index is None
+            else int(selected_goal_option_index)
+        )
+        result: list[dict] = []
+        for index, goal in enumerate(options):
+            if index in checked_by_index:
+                item = dict(checked_by_index[index])
+                item.setdefault("preflight_checked", True)
+            else:
+                if index < start_index:
+                    reason = "skipped_prior_retry"
+                elif selected_index is not None and index > selected_index:
+                    reason = "skipped_after_reachable_option"
+                else:
+                    reason = "skipped_preflight"
+                item = {
+                    "index": index,
+                    "goal_xyyaw": list(goal),
+                    "reachable": None,
+                    "preflight_reason": reason,
+                    "preflight_attempts": 0,
+                    "preflight_checked": False,
+                    "preflight_skipped": True,
+                }
+            if index < len(labels):
+                item.setdefault("approach_pose_label", str(labels[index]))
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _candidate_with_interaction_preflight_debug(
+        candidate: dict, debug_attempts: list[dict]
+    ) -> dict:
+        """Attach preflight diagnostics without changing retry accounting."""
+
+        result = dict(candidate or {})
+        metadata = dict(result.get("metadata") or {})
+        metadata["interaction_approach_preflight_debug_attempts"] = [
+            dict(item) for item in debug_attempts
+        ]
+        result["metadata"] = metadata
+        return result
+
     def _run_navigation(
         self,
         decision_id: str,
@@ -6142,6 +6220,7 @@ class SemanticBehaviorExecutor:
             return
         metadata = candidate.get("metadata") or {}
         interaction = candidate.get("interaction_command") or {}
+        goal_labels = list(metadata.get("interaction_approach_pose_labels") or [])
         if behavior_type == "INTERACT":
             direct_distance_tolerance = float(
                 interaction.get("interaction_ready_distance_m", 0.45) or 0.45
@@ -6195,10 +6274,50 @@ class SemanticBehaviorExecutor:
                             {
                                 "index": start_goal_option_index,
                                 "goal_xyyaw": [primary_x, primary_y, primary_yaw],
+                                "approach_pose_label": (
+                                    str(goal_labels[start_goal_option_index])
+                                    if start_goal_option_index < len(goal_labels)
+                                    else ""
+                                ),
                                 "reachable": True,
                                 "navigation_attempt": len(direct_attempts) + 1,
                                 "outcome": "already_at_verified_approach_pose",
                             }
+                        )
+                        direct_debug_attempts = (
+                            self._interaction_preflight_debug_attempts(
+                                goal_options,
+                                goal_labels,
+                                start_goal_option_index=start_goal_option_index,
+                                attempted_goals=[
+                                    {
+                                        "index": start_goal_option_index,
+                                        "goal_xyyaw": [
+                                            primary_x,
+                                            primary_y,
+                                            primary_yaw,
+                                        ],
+                                        "approach_pose_label": (
+                                            str(goal_labels[start_goal_option_index])
+                                            if start_goal_option_index < len(goal_labels)
+                                            else ""
+                                        ),
+                                        "reachable": True,
+                                        "preflight_reason": "already_at_verified_approach_pose",
+                                        "preflight_attempts": 0,
+                                    }
+                                ],
+                                selected_goal_option_index=start_goal_option_index,
+                            )
+                            if str(behavior_type).upper() == "INTERACT"
+                            else []
+                        )
+                        candidate = (
+                            self._candidate_with_interaction_preflight_debug(
+                                candidate, direct_debug_attempts
+                            )
+                            if direct_debug_attempts
+                            else candidate
                         )
                         self._complete_interaction_approach_navigation(
                             decision_id,
@@ -6352,6 +6471,11 @@ class SemanticBehaviorExecutor:
                 {
                     "index": option_index,
                     "goal_xyyaw": [option_x, option_y, option_yaw],
+                    "approach_pose_label": (
+                        str(goal_labels[option_index])
+                        if option_index < len(goal_labels)
+                        else ""
+                    ),
                     "reachable": bool(plan_reachable or fail_open_empty_plan),
                     "preflight_reason": preflight_reason,
                     "preflight_attempts": actual_attempts,
@@ -6366,6 +6490,17 @@ class SemanticBehaviorExecutor:
                 selected_goal_option_index = option_index
                 path_lookahead = option_lookahead
                 break
+        preflight_debug_attempts = (
+            self._interaction_preflight_debug_attempts(
+                goal_options,
+                goal_labels,
+                start_goal_option_index=start_goal_option_index,
+                attempted_goals=attempted_goals,
+                selected_goal_option_index=selected_goal_option_index,
+            )
+            if str(behavior_type).upper() == "INTERACT"
+            else []
+        )
         # An ExplorePy request is only acted on after this executor has made
         # its own preflight decision.  If the plan has become reachable, the
         # request is acknowledged as unnecessary; otherwise the sole executor
@@ -6409,6 +6544,10 @@ class SemanticBehaviorExecutor:
                 "attempted_goals": attempted_goals,
                 "interaction_approach_attempts": interaction_approach_attempts,
             }
+            if preflight_debug_attempts:
+                failure_detail["interaction_approach_preflight_debug_attempts"] = (
+                    preflight_debug_attempts
+                )
             if is_post_interaction_traversal:
                 with self.lock:
                     latest_graph_revision = int(
@@ -6484,6 +6623,9 @@ class SemanticBehaviorExecutor:
         x, y, yaw = selected_goal
         interaction_approach_attempt_history = list(interaction_approach_attempts)
         if str(behavior_type).upper() == "INTERACT":
+            candidate = self._candidate_with_interaction_preflight_debug(
+                candidate, preflight_debug_attempts
+            )
             selected_attempt = dict(attempted_goals[-1])
             selected_attempt["navigation_attempt"] = (
                 len(interaction_approach_attempt_history) + 1

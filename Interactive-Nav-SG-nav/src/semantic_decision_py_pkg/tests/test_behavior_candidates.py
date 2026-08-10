@@ -1822,13 +1822,19 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
         "quarter_turn_right_safe_outer",
         "opposite_view_safe_outer",
     ]
-    assert labels[4:] == [
+    assert labels[4:8] == [
         "current_view_safe_far",
         "quarter_turn_left_safe_far",
         "quarter_turn_right_safe_far",
         "opposite_view_safe_far",
     ]
-    assert len(goals) == 8
+    assert labels[8:] == [
+        "current_view_safe_farthest",
+        "quarter_turn_left_safe_farthest",
+        "quarter_turn_right_safe_farthest",
+        "opposite_view_safe_farthest",
+    ]
+    assert len(goals) == 12
     # The object AABB surface is at x=3.5 on the current side.  The fridge's
     # 0.80 m observation standoff plus 0.30 m outer offset therefore places
     # the primary point at x=2.4, not in the AABB shoulder.
@@ -1837,6 +1843,10 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
     # A failed outer ring must not fall back to a close shoulder pose.
     assert math.isclose(goals[4][0], 2.1, abs_tol=1e-6)
     assert math.isclose(goals[4][1], 2.0, abs_tol=1e-6)
+    # A third, still-safe robot-side ring gives preflight a reachable option
+    # when the first two lie inside a wall-adjacent inflation shoulder.
+    assert math.isclose(goals[8][0], 1.8, abs_tol=1e-6)
+    assert math.isclose(goals[8][1], 2.0, abs_tol=1e-6)
     assert candidate.interaction_command["interaction_ready_distance_m"] == 0.25
     assert candidate.metadata["m1_safe_staging_outer_offset_m"] == 0.30
     assert candidate.metadata["m1_safe_staging_arrival_tolerance_m"] == 0.25

@@ -152,10 +152,18 @@ class CandidateGeneratorConfig:
     fridge_observation_standoff_m: float = 0.8
     # A high local inflation radius can make an otherwise valid AABB-surface
     # standoff land in the soft-cost shoulder beside a wall.  Model lanes first
-    # visit this *outer* staging ring for their M1 observation, then a second,
-    # farther safe ring if necessary.  This changes the requested goal geometry
-    # only; collision/footprint checks remain in move_base.
+    # visit a finite set of *outer* staging rings for their M1 observation.
+    # Their robot-side axis comes only from the current robot--object geometry;
+    # the executor's normal make-plan preflight selects the first reachable
+    # one.  This changes requested goal geometry only; collision/footprint
+    # checks remain in move_base.
     container_safe_staging_outer_offset_m: float = 0.30
+    # Include one additional robot-side/four-view ring beyond ``safe_far`` by
+    # default.  It gives a wall-adjacent container a costmap-reachable visual
+    # staging option without falling back to an inner/close M1 pose.  Keep the
+    # enumeration bounded because each option still participates in normal
+    # preflight and visual re-observation accounting.
+    container_safe_staging_ring_count: int = 3
     # The bridge validates the robot against the selected staging pose.  The
     # outer ring leaves enough object clearance that a modest arrival tolerance
     # remains visually safe instead of forcing an unreliable close-range M1.
@@ -2087,35 +2095,36 @@ class CandidateGenerator:
             )
         face_count = max(1, min(len(axes), int(self.config.container_multiview_face_count)))
         if outer_offset > 1e-6:
-            # Make the four outer poses the primary finite ring.  The fallback
-            # ring is deliberately *farther* from the object, never the old
-            # inner shoulder: M1 must not be called from a close pose merely
-            # because the first ring was blocked by inflation.  We do not
-            # pre-clear cells or bypass the costmap: every pose is still
-            # subject to normal global/local planner preflight.
-            for axis, label in zip(axes[:face_count], face_labels[:face_count]):
-                append_unique(
-                    self._approach_pose(
-                        robot_xy,
-                        target_xy,
-                        max(0.0, float(standoff_m)) + outer_offset,
-                        node=node,
-                        fixed_axis=axis,
-                    ),
-                    f"{label}_safe_outer",
+            # Make every safe ring farther from the object than the requested
+            # observation standoff.  A wall-adjacent container can leave the
+            # first two rings inside a local-inflation shoulder even though a
+            # robot-side staging point another 30 cm away is fully reachable.
+            # Do not recover by reintroducing the old inner shoulder: that
+            # would call M1 from the exact close perspective this contract is
+            # meant to avoid.  The bounded rings remain ordinary move_base
+            # goals, so no costmap cells are cleared or treated as hard-free.
+            try:
+                ring_count = int(self.config.container_safe_staging_ring_count)
+            except (TypeError, ValueError):
+                ring_count = 3
+            ring_count = max(1, min(4, ring_count))
+            ring_labels = ("safe_outer", "safe_far", "safe_farthest", "safe_max")
+            for ring_index in range(1, ring_count + 1):
+                ring_standoff = (
+                    max(0.0, float(standoff_m)) + ring_index * outer_offset
                 )
-            far_standoff = max(0.0, float(standoff_m)) + 2.0 * outer_offset
-            for axis, label in zip(axes[:face_count], face_labels[:face_count]):
-                append_unique(
-                    self._approach_pose(
-                        robot_xy,
-                        target_xy,
-                        far_standoff,
-                        node=node,
-                        fixed_axis=axis,
-                    ),
-                    f"{label}_safe_far",
-                )
+                ring_label = ring_labels[ring_index - 1]
+                for axis, label in zip(axes[:face_count], face_labels[:face_count]):
+                    append_unique(
+                        self._approach_pose(
+                            robot_xy,
+                            target_xy,
+                            ring_standoff,
+                            node=node,
+                            fixed_axis=axis,
+                        ),
+                        f"{label}_{ring_label}",
+                    )
         else:
             for axis, label in zip(axes[:face_count], face_labels[:face_count]):
                 append_unique(

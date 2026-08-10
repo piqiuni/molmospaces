@@ -145,6 +145,13 @@ class SemanticCandidateNode:
                 container_safe_staging_outer_offset_m=float(
                     config.get("container_safe_staging_outer_offset_m", 0.30)
                 ),
+                container_safe_staging_ring_count=max(
+                    1,
+                    min(
+                        4,
+                        int(config.get("container_safe_staging_ring_count", 3)),
+                    ),
+                ),
                 container_safe_staging_arrival_tolerance_m=float(
                     config.get("container_safe_staging_arrival_tolerance_m", 0.25)
                 ),

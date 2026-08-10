@@ -1738,3 +1738,43 @@ def test_full_mllm_interaction_final_align_is_opted_in_without_generic_align() -
     assert executor_override["interaction_final_align_max_control_steps"] >= (
         math.ceil(math.pi / (0.30 * 0.20)) + 3
     )
+
+
+def test_interaction_preflight_debug_keeps_skipped_ring_options_separate_from_retry_budget(
+    executor_module,
+) -> None:
+    """Every ring is visible in diagnostics without counting as a navigation try."""
+
+    options = [
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (3.0, 0.0, 0.0),
+    ]
+    debug = executor_module.SemanticBehaviorExecutor._interaction_preflight_debug_attempts(
+        options,
+        ["safe_outer", "safe_far", "safe_farthest", "safe_max"],
+        start_goal_option_index=1,
+        attempted_goals=[
+            {
+                "index": 1,
+                "goal_xyyaw": list(options[1]),
+                "reachable": True,
+                "preflight_reason": "reachable",
+                "preflight_attempts": 1,
+            }
+        ],
+        selected_goal_option_index=1,
+    )
+
+    assert [item["approach_pose_label"] for item in debug] == [
+        "safe_outer",
+        "safe_far",
+        "safe_farthest",
+        "safe_max",
+    ]
+    assert debug[0]["preflight_reason"] == "skipped_prior_retry"
+    assert debug[0]["preflight_skipped"] is True
+    assert debug[1]["preflight_checked"] is True
+    assert debug[2]["preflight_reason"] == "skipped_after_reachable_option"
+    assert debug[3]["preflight_reason"] == "skipped_after_reachable_option"
