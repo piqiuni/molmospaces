@@ -6916,14 +6916,39 @@ class SemanticBehaviorExecutor:
                 # M1 staging stance was reachable.  Do not retry M1 at this
                 # close pose or turn it into a terminal object failure: record
                 # the failed inner preflight and return to the next outer ring.
+                # ``start_goal_option_index`` can be a tangent retry rather
+                # than zero.  Preserve the actual last attempted inner option
+                # so the retry helper advances monotonically through the
+                # same-face sequence instead of restarting at tangent #1.
+                failed_inner_index = max(0, int(start_goal_option_index))
+                failed_goal_values: list[float] = list(
+                    candidate.get("goal_xyyaw") or []
+                )
+                failed_label = "physical_action"
+                if attempted_goals:
+                    last_attempt = dict(attempted_goals[-1])
+                    try:
+                        failed_inner_index = max(
+                            0, int(last_attempt.get("index", failed_inner_index))
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    raw_goal = list(last_attempt.get("goal_xyyaw") or [])
+                    if raw_goal:
+                        failed_goal_values = raw_goal
+                    failed_label = str(
+                        last_attempt.get("approach_pose_label") or failed_label
+                    )
+                elif failed_inner_index < len(goal_options):
+                    failed_goal_values = list(goal_options[failed_inner_index])
+                    if failed_inner_index < len(goal_labels):
+                        failed_label = str(goal_labels[failed_inner_index])
                 action_attempts = list(interaction_approach_attempts)
                 action_attempts.append(
                     {
-                        "index": 0,
-                        "goal_xyyaw": list(candidate.get("goal_xyyaw") or []),
-                        "approach_pose_label": (
-                            str(goal_labels[0]) if goal_labels else "physical_action"
-                        ),
+                        "index": failed_inner_index,
+                        "goal_xyyaw": failed_goal_values,
+                        "approach_pose_label": failed_label,
                         "reachable": False,
                         "outcome": str(failure_detail.get("reason") or "failed"),
                         "phase": "physical_action",
@@ -6932,7 +6957,7 @@ class SemanticBehaviorExecutor:
                 if self._retry_interaction_approach(
                     decision_id,
                     candidate,
-                    0,
+                    failed_inner_index,
                     action_attempts,
                     len(goal_options),
                     failure_detail,

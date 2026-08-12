@@ -994,6 +994,89 @@ def test_executor_inner_navigation_failure_dispatches_next_outer_staging(
     assert executor._container_m1_last_accepted_evidence == {}
 
 
+def test_inner_preflight_exhaustion_uses_last_tangent_before_outer_retry(
+    executor_module, monkeypatch
+) -> None:
+    """A failed tangent preflight must not restart the inner sequence at zero."""
+
+    class _Goal:
+        def __init__(self) -> None:
+            self.target_pose = SimpleNamespace(
+                header=SimpleNamespace(frame_id="", stamp=None),
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=SimpleNamespace(z=0.0, w=1.0),
+                ),
+            )
+
+    class _MoveBase:
+        def wait_for_server(self, _timeout) -> bool:
+            return True
+
+    monkeypatch.setattr(executor_module, "MoveBaseGoal", _Goal)
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor.move_base = _MoveBase()
+    executor.post_interaction_traversal_make_plan_retry_window_s = 0.0
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._current_pose = lambda _frame_id: None
+    executor._preflight_navigation_plan = lambda *_args: (
+        False,
+        None,
+        "empty_plan",
+    )
+    retries = []
+    executor._retry_interaction_approach = (
+        lambda _decision_id, _candidate, selected_index, attempts, _count, detail: (
+            retries.append((selected_index, attempts, detail)) or True
+        )
+    )
+
+    candidate = {
+        "decision_id": "decision-inner-preflight",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 0.0, 0.0],
+        "interaction_command": {
+            "interaction_ready_distance_m": 0.25,
+            "interaction_ready_yaw_tolerance_rad": 0.35,
+        },
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "physical_action",
+            "interaction_approach_pose_labels": [
+                "physical_primary",
+                "physical_tangent_left",
+                "physical_tangent_right",
+            ],
+            "goal_xyyaw_candidates": [
+                [1.0, 0.22, 0.0],
+                [1.0, -0.22, 0.0],
+            ],
+        },
+    }
+
+    # Start at tangent-left.  The real preflight loop then also checks
+    # tangent-right; its failure must advance from index 2 to outer staging,
+    # not restart index 1 via the old hard-coded zero.
+    executor._run_navigation(
+        "decision-inner-preflight",
+        candidate,
+        start_goal_option_index=1,
+        interaction_approach_attempts=[{"index": 0, "phase": "physical_action"}],
+    )
+
+    assert len(retries) == 1
+    selected_index, attempts, detail = retries[0]
+    assert selected_index == 2
+    assert attempts[-1]["index"] == 2
+    assert attempts[-1]["goal_xyyaw"] == [1.0, -0.22, 0.0]
+    assert attempts[-1]["approach_pose_label"] == "physical_tangent_right"
+    assert detail["reason"] == "make_plan_unreachable"
+
+
 def test_bridge_inner_pose_precondition_returns_next_outer_staging(executor_module) -> None:
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
     executor.lock = threading.RLock()
