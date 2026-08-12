@@ -3057,8 +3057,8 @@ def test_outer_staging_terminal_abort_retries_same_pose_once_after_fresh_plan(
     assert retry_metadata["fresh_plan"]["attempts"] == 2
     assert retry_metadata["global_costmap_receipt"]["fresh_source"] == "global_costmap_update"
 
-    # The same decision/index cannot spawn a second same-pose worker or even
-    # consume another make_plan request after a repeated terminal callback.
+    # This decision cannot spawn a second same-pose worker or even consume
+    # another make_plan request after a repeated terminal callback.
     assert not executor._retry_outer_staging_after_terminal_abort(
         "decision-abort",
         candidate,
@@ -3067,6 +3067,21 @@ def test_outer_staging_terminal_abort_retries_same_pose_once_after_fresh_plan(
         selected_goal=selected_goal,
         selected_preflight_reachable=True,
         interaction_approach_attempts=[{"index": 2, "reachable": True}],
+        terminal_detail=detail,
+    )
+    assert fresh_calls == [("map", *selected_goal)]
+    assert len(started) == 1
+
+    # Bound the recovery at decision scope, rather than giving every one of a
+    # twenty-view container's staging points its own six-second retry window.
+    assert not executor._retry_outer_staging_after_terminal_abort(
+        "decision-abort",
+        candidate,
+        navigation_run_token=17,
+        selected_goal_option_index=3,
+        selected_goal=(9.0, 8.0, 0.0),
+        selected_preflight_reachable=True,
+        interaction_approach_attempts=[{"index": 3, "reachable": True}],
         terminal_detail=detail,
     )
     assert fresh_calls == [("map", *selected_goal)]

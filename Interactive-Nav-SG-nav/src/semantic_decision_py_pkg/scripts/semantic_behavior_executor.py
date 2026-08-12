@@ -995,9 +995,10 @@ class SemanticBehaviorExecutor:
         self._active_navigation_run_tokens: dict[str, int] = {}
         # A safe outer container viewpoint can occasionally pass make_plan and
         # then receive one immediate planner/costmap ABORT while its map refresh
-        # catches up.  Keep a decision/index ledger so the narrowly-scoped
-        # fresh-plan resend below can never become a same-pose retry loop.
-        self._container_outer_staging_terminal_retry_ledger: set[tuple[str, int]] = set()
+        # catches up.  Keep a decision ledger so the narrowly-scoped fresh-plan
+        # resend below can never become a same-pose retry loop or turn a
+        # twenty-view container candidate into twenty six-second waits.
+        self._container_outer_staging_terminal_retry_ledger: set[str] = set()
         self.interaction_approach_fallback_cancel_wait_s = max(
             0.0,
             float(config.get("interaction_approach_fallback_cancel_wait_s", 0.5)),
@@ -6856,9 +6857,7 @@ class SemanticBehaviorExecutor:
             self, "_container_outer_staging_terminal_retry_ledger", None
         )
         if isinstance(retry_ledger, set):
-            retry_ledger.difference_update(
-                key for key in retry_ledger if str(key[0]) == decision_key
-            )
+            retry_ledger.discard(decision_key)
 
     @classmethod
     def _requires_final_yaw_for_navigation(
@@ -8529,7 +8528,7 @@ class SemanticBehaviorExecutor:
         interaction_approach_attempts: list[dict],
         terminal_detail: dict,
     ) -> bool:
-        """Fresh-plan and resend exactly one aborted outer M1 staging goal.
+        """Fresh-plan and resend one aborted outer M1 staging goal per decision.
 
         A service response may become stale in the short gap between selection
         and DWA execution.  The retry remains safe because it does not move
@@ -8555,7 +8554,7 @@ class SemanticBehaviorExecutor:
             option_index = int(selected_goal_option_index)
         except (TypeError, ValueError):
             return False
-        retry_key = (str(decision_id), option_index)
+        retry_key = str(decision_id)
         with self.lock:
             retry_ledger = getattr(
                 self, "_container_outer_staging_terminal_retry_ledger", None)
@@ -8564,8 +8563,10 @@ class SemanticBehaviorExecutor:
                 self._container_outer_staging_terminal_retry_ledger = retry_ledger
             if retry_key in retry_ledger:
                 return False
-            # Consume before the synchronous service call so an overlapping
-            # terminal callback cannot create two same-pose workers.
+            # Consume before the bounded wait so an overlapping terminal
+            # callback cannot create a second worker.  This is decision-wide:
+            # H3's evidence calls for one recovery of the lone reachable
+            # staging stance, not up to twenty consecutive six-second waits.
             retry_ledger.add(retry_key)
         global_costmap_fresh, global_costmap_detail = (
             self._wait_for_outer_staging_abort_global_costmap_receipt(
