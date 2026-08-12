@@ -2996,12 +2996,13 @@ def test_outer_staging_terminal_abort_retries_same_pose_once_after_fresh_plan(
     executor.map_frame = "map"
     executor._container_outer_staging_terminal_retry_ledger = set()
     executor._navigation_is_current = lambda decision_id: decision_id == "decision-abort"
-    executor._wait_for_outer_staging_abort_global_costmap_receipt = lambda _decision_id: (
+    executor._navigation_run_is_active = lambda decision_id, _token: decision_id == "decision-abort"
+    executor._wait_for_outer_staging_abort_global_costmap_receipt = lambda _decision_id, _token: (
         True,
         {"fresh_source": "global_costmap_update"},
     )
     executor._wait_for_outer_staging_abort_reachable_plan = (
-        lambda decision_id, frame_id, x, y, yaw: (
+        lambda decision_id, _token, frame_id, x, y, yaw: (
             fresh_calls.append((frame_id, x, y, yaw)) or True,
             (x, y),
             "reachable",
@@ -3036,6 +3037,7 @@ def test_outer_staging_terminal_abort_retries_same_pose_once_after_fresh_plan(
     assert executor._retry_outer_staging_after_terminal_abort(
         "decision-abort",
         candidate,
+        navigation_run_token=17,
         selected_goal_option_index=2,
         selected_goal=selected_goal,
         selected_preflight_reachable=True,
@@ -3060,6 +3062,7 @@ def test_outer_staging_terminal_abort_retries_same_pose_once_after_fresh_plan(
     assert not executor._retry_outer_staging_after_terminal_abort(
         "decision-abort",
         candidate,
+        navigation_run_token=17,
         selected_goal_option_index=2,
         selected_goal=selected_goal,
         selected_preflight_reachable=True,
@@ -3080,7 +3083,8 @@ def test_outer_staging_terminal_abort_requires_new_costmap_before_replan(
     executor.map_frame = "map"
     executor._container_outer_staging_terminal_retry_ledger = set()
     executor._navigation_is_current = lambda _decision_id: True
-    executor._wait_for_outer_staging_abort_global_costmap_receipt = lambda _decision_id: (
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
+    executor._wait_for_outer_staging_abort_global_costmap_receipt = lambda _decision_id, _token: (
         False,
         {"reason": "container_outer_staging_abort_replan_global_costmap_timeout"},
     )
@@ -3106,6 +3110,7 @@ def test_outer_staging_terminal_abort_requires_new_costmap_before_replan(
     assert not executor._retry_outer_staging_after_terminal_abort(
         "decision-no-fresh-map",
         candidate,
+        navigation_run_token=1,
         selected_goal_option_index=0,
         selected_goal=(1.0, 0.0, 0.0),
         selected_preflight_reachable=True,
@@ -3136,6 +3141,7 @@ def test_outer_staging_abort_plan_wait_retries_exact_goal_until_reachable(
     executor.container_outer_staging_abort_replan_plan_retry_window_s = 1.0
     executor.container_outer_staging_abort_replan_plan_retry_interval_s = 0.20
     executor._navigation_is_current = lambda _decision_id: True
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
     calls = []
     outcomes = iter(
         [
@@ -3151,7 +3157,7 @@ def test_outer_staging_abort_plan_wait_retries_exact_goal_until_reachable(
     executor._preflight_navigation_plan = preflight
     reachable, lookahead, reason, detail = (
         executor._wait_for_outer_staging_abort_reachable_plan(
-            "decision-replan", "map", 1.0, 2.0, -0.5
+            "decision-replan", 1, "map", 1.0, 2.0, -0.5
         )
     )
 
@@ -3184,6 +3190,7 @@ def test_outer_staging_abort_plan_wait_times_out_without_reachable_plan(
     executor.container_outer_staging_abort_replan_plan_retry_window_s = 0.40
     executor.container_outer_staging_abort_replan_plan_retry_interval_s = 0.20
     executor._navigation_is_current = lambda _decision_id: True
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
     calls = []
     executor._preflight_navigation_plan = lambda frame_id, x, y, yaw: (
         calls.append((frame_id, x, y, yaw)) or False,
@@ -3193,7 +3200,7 @@ def test_outer_staging_abort_plan_wait_times_out_without_reachable_plan(
 
     reachable, lookahead, reason, detail = (
         executor._wait_for_outer_staging_abort_reachable_plan(
-            "decision-timeout", "map", 1.0, 2.0, -0.5
+            "decision-timeout", 1, "map", 1.0, 2.0, -0.5
         )
     )
 
@@ -3203,6 +3210,34 @@ def test_outer_staging_abort_plan_wait_times_out_without_reachable_plan(
     assert detail["reason"] == "container_outer_staging_abort_replan_plan_timeout"
     assert detail["attempts"] == len(calls)
     assert len(calls) == 3
+
+
+def test_outer_staging_abort_plan_wait_stops_when_navigation_token_is_replaced(
+    executor_module, monkeypatch
+) -> None:
+    """A stale ABORT worker cannot preflight or spawn after a newer run owns it."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.container_outer_staging_abort_replan_plan_retry_window_s = 1.0
+    executor.container_outer_staging_abort_replan_plan_retry_interval_s = 0.20
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._navigation_run_is_active = lambda _decision_id, _token: False
+    executor._preflight_navigation_plan = lambda *_args: pytest.fail(
+        "a superseded worker must not preflight"
+    )
+
+    reachable, lookahead, reason, detail = (
+        executor._wait_for_outer_staging_abort_reachable_plan(
+            "decision-stale", 4, "map", 1.0, 2.0, -0.5
+        )
+    )
+
+    assert reachable is False
+    assert lookahead is None
+    assert reason == "preempted"
+    assert detail["reason"] == "container_outer_staging_abort_replan_preempted"
+    assert detail["attempts"] == 0
 
 
 @pytest.mark.parametrize(
@@ -3222,6 +3257,7 @@ def test_terminal_abort_same_pose_retry_excludes_inner_and_unreachable_staging(
     executor.map_frame = "map"
     executor._container_outer_staging_terminal_retry_ledger = set()
     executor._navigation_is_current = lambda _decision_id: True
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
     fresh_calls = []
     executor._preflight_navigation_plan = lambda *_args: (
         fresh_calls.append(_args) or True,
@@ -3247,6 +3283,7 @@ def test_terminal_abort_same_pose_retry_excludes_inner_and_unreachable_staging(
     assert not executor._retry_outer_staging_after_terminal_abort(
         "decision-excluded",
         candidate,
+        navigation_run_token=1,
         selected_goal_option_index=0,
         selected_goal=(1.0, 0.0, 0.0),
         selected_preflight_reachable=initial_preflight_reachable,

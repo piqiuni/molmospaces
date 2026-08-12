@@ -8323,6 +8323,7 @@ class SemanticBehaviorExecutor:
             if self._retry_outer_staging_after_terminal_abort(
                 decision_id,
                 candidate,
+                navigation_run_token=navigation_run_token,
                 selected_goal_option_index=selected_goal_option_index,
                 selected_goal=selected_goal,
                 selected_preflight_reachable=selected_preflight_reachable,
@@ -8521,6 +8522,7 @@ class SemanticBehaviorExecutor:
         decision_id: str,
         candidate: dict,
         *,
+        navigation_run_token: int | None,
         selected_goal_option_index: int | None,
         selected_goal: tuple[float, float, float] | None,
         selected_preflight_reachable: bool,
@@ -8544,6 +8546,11 @@ class SemanticBehaviorExecutor:
             return False
         if selected_goal is None or selected_goal_option_index is None:
             return False
+        if not self._navigation_run_is_active(decision_id, navigation_run_token):
+            # An overlapping newer worker owns the same decision now.  Treat
+            # this old terminal callback as consumed so it cannot launch a
+            # second generic fallback after the newer worker has taken over.
+            return True
         try:
             option_index = int(selected_goal_option_index)
         except (TypeError, ValueError):
@@ -8561,9 +8568,13 @@ class SemanticBehaviorExecutor:
             # terminal callback cannot create two same-pose workers.
             retry_ledger.add(retry_key)
         global_costmap_fresh, global_costmap_detail = (
-            self._wait_for_outer_staging_abort_global_costmap_receipt(decision_id)
+            self._wait_for_outer_staging_abort_global_costmap_receipt(
+                decision_id, navigation_run_token
+            )
         )
         if not global_costmap_fresh:
+            if str(global_costmap_detail.get("reason") or "").endswith("preempted"):
+                return True
             return False
         metadata = candidate.get("metadata") or {}
         frame_id = str(metadata.get("frame_id") or self.map_frame)
@@ -8574,14 +8585,17 @@ class SemanticBehaviorExecutor:
             fresh_plan_detail,
         ) = self._wait_for_outer_staging_abort_reachable_plan(
             decision_id,
+            navigation_run_token,
             frame_id,
             float(selected_goal[0]),
             float(selected_goal[1]),
             float(selected_goal[2]),
         )
         if not fresh_reachable or fresh_reason != "reachable":
+            if str(fresh_plan_detail.get("reason") or "").endswith("preempted"):
+                return True
             return False
-        if not self._navigation_is_current(decision_id):
+        if not self._navigation_run_is_active(decision_id, navigation_run_token):
             return True
         retry_candidate = dict(candidate)
         retry_metadata = dict(retry_candidate.get("metadata") or {})
@@ -8621,6 +8635,7 @@ class SemanticBehaviorExecutor:
     def _wait_for_outer_staging_abort_reachable_plan(
         self,
         decision_id: str,
+        navigation_run_token: int | None,
         frame_id: str,
         goal_x: float,
         goal_y: float,
@@ -8663,7 +8678,7 @@ class SemanticBehaviorExecutor:
         attempts = 0
         last_reason = ""
         while True:
-            if not self._navigation_is_current(decision_id):
+            if not self._navigation_run_is_active(decision_id, navigation_run_token):
                 return False, None, "preempted", {
                     "attempts": attempts,
                     "last_preflight_reason": last_reason,
@@ -8675,6 +8690,14 @@ class SemanticBehaviorExecutor:
             reachable, lookahead, reason = self._preflight_navigation_plan(
                 frame_id, goal_x, goal_y, goal_yaw
             )
+            if not self._navigation_run_is_active(decision_id, navigation_run_token):
+                return False, None, "preempted", {
+                    "attempts": attempts,
+                    "last_preflight_reason": str(reason or ""),
+                    "retry_window_s": window_s,
+                    "elapsed_s": max(0.0, time.monotonic() - started_at),
+                    "reason": "container_outer_staging_abort_replan_preempted",
+                }
             last_reason = str(reason or "")
             detail = {
                 "attempts": attempts,
@@ -8694,7 +8717,7 @@ class SemanticBehaviorExecutor:
             time.sleep(retry_delay_s)
 
     def _wait_for_outer_staging_abort_global_costmap_receipt(
-        self, decision_id: str
+        self, decision_id: str, navigation_run_token: int | None
     ) -> tuple[bool, dict]:
         """Wait once for a global-costmap receipt after an outer ABORT.
 
@@ -8762,7 +8785,7 @@ class SemanticBehaviorExecutor:
                 }
                 if source:
                     return True, detail
-                if not self._navigation_is_current(decision_id):
+                if not self._navigation_run_is_active(decision_id, navigation_run_token):
                     detail["reason"] = "container_outer_staging_abort_replan_preempted"
                     return False, detail
                 remaining_s = deadline - time.monotonic()
