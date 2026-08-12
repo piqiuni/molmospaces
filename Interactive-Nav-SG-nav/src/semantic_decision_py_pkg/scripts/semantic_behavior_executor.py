@@ -7732,6 +7732,46 @@ class SemanticBehaviorExecutor:
                 "[semantic_behavior_executor] rear-goal safe recovery refused direct navigation: %s",
                 self._last_rear_goal_recovery_detail,
             )
+            # A normal pre-turn needs the initial direction of a verified
+            # global plan.  If move_base has just restarted or its make_plan
+            # service has disappeared, normal fail-open preflight can still
+            # select a later *outer M1 staging* option, but it cannot safely
+            # invent that direction.  Do not move blind and do not weaken the
+            # M1/bridge contracts.  Instead treat this one missing-heading case
+            # as an approach failure and advance through the already finite
+            # outer staging sequence.  Other rear-goal refusals (stale/local
+            # costmap, blocked turn sweep, control budget) remain terminal
+            # fail-closed safety gates.
+            rear_reason = str(
+                self._last_rear_goal_recovery_detail.get("reason") or ""
+            )
+            if (
+                str(behavior_type).upper() == "INTERACT"
+                and rear_reason == "rear_goal_heading_unavailable"
+                and bool(metadata.get("m1_observation_staging_required", False))
+            ):
+                retry_detail = dict(self._last_rear_goal_recovery_detail)
+                retry_detail.update(
+                    {
+                        "failure_reason": rear_reason,
+                        # Reuse the existing bounded approach-retry classifier
+                        # without broadening it for unsafe rear-goal failures.
+                        "reason": "navigation_terminal_failure",
+                        "interaction_approach_reposition": True,
+                        "interaction_approach_attempts": (
+                            interaction_approach_attempt_history
+                        ),
+                    }
+                )
+                if self._retry_interaction_approach(
+                    decision_id,
+                    candidate,
+                    selected_goal_option_index,
+                    interaction_approach_attempt_history,
+                    len(goal_options),
+                    retry_detail,
+                ):
+                    return
             report_result(
                 False,
                 dict(self._last_rear_goal_recovery_detail),

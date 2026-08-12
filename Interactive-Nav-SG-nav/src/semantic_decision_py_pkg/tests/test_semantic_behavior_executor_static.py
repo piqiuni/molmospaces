@@ -2125,6 +2125,95 @@ def test_interaction_arrival_tolerance_completes_selected_fallback_when_plan_is_
     assert kwargs["detail"]["interaction_pose_validation"]["valid"] is True
 
 
+def test_interaction_missing_path_heading_retries_next_safe_staging_pose(
+    executor_module, monkeypatch
+) -> None:
+    """A fail-open preflight must not terminalize M1 staging without a path yaw."""
+
+    class _Goal:
+        def __init__(self) -> None:
+            self.target_pose = SimpleNamespace(
+                header=SimpleNamespace(frame_id="", stamp=None),
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=SimpleNamespace(z=0.0, w=1.0),
+                ),
+            )
+
+    class _MoveBase:
+        def wait_for_server(self, _timeout) -> bool:
+            return True
+
+    monkeypatch.setattr(executor_module, "MoveBaseGoal", _Goal)
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    monkeypatch.setattr(
+        executor_module.rospy, "Time", SimpleNamespace(now=lambda: 0.0)
+    )
+
+    candidate = {
+        "candidate_id": "interaction:container:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 0.0, 0.0],
+        "metadata": {
+            "frame_id": "map",
+            "m1_observation_staging_required": True,
+            "goal_xyyaw_candidates": [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        },
+        "interaction_command": {
+            "interaction_ready_distance_m": 0.30,
+            "interaction_ready_yaw_tolerance_rad": 0.30,
+        },
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor.move_base = _MoveBase()
+    executor.machine = SimpleNamespace(
+        config=SimpleNamespace(
+            interaction_navigation_timeout_s=10.0,
+            navigation_timeout_s=10.0,
+        )
+    )
+    executor.post_interaction_traversal_make_plan_retry_window_s = 0.0
+    executor.final_align_enabled = True
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._navigation_run_is_active = lambda _decision_id, _run_token: True
+    executor._preflight_navigation_plan = lambda *_args: (
+        True,
+        None,
+        "service_unavailable",
+    )
+    executor._current_pose = lambda _frame_id: None
+    executor._prerotate_for_rear_goal = lambda *_args, **_kwargs: False
+    executor._set_effective_interaction_approach = lambda *_args, **_kwargs: None
+    executor._last_rear_goal_recovery_detail = {
+        "reason": "rear_goal_heading_unavailable",
+        "trigger_source": "initial_rear_goal",
+    }
+    retry_calls = []
+    executor._retry_interaction_approach = (
+        lambda _decision_id, _candidate, selected_index, attempts, count, detail: (
+            retry_calls.append((selected_index, attempts, count, detail)) or True
+        )
+    )
+    terminal_results = []
+    executor._handle_navigation_result = (
+        lambda *_args, **_kwargs: terminal_results.append((_args, _kwargs))
+    )
+
+    executor._run_navigation("decision-missing-heading", candidate)
+
+    assert len(retry_calls) == 1
+    selected_index, attempts, option_count, detail = retry_calls[0]
+    assert selected_index == 0
+    assert attempts[-1]["index"] == 0
+    assert option_count == 2
+    assert detail["reason"] == "navigation_terminal_failure"
+    assert detail["failure_reason"] == "rear_goal_heading_unavailable"
+    assert detail["interaction_approach_reposition"] is True
+    assert terminal_results == []
+
+
 def test_terminal_move_base_success_preserves_safe_staging_arrival_pose(
     executor_module, monkeypatch
 ) -> None:
