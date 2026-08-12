@@ -3647,6 +3647,7 @@ class SemanticBehaviorExecutor:
                     )
                 ),
                 "drawer_scan_execution_wait": self._drawer_scan_execution_wait_summary_locked(),
+                "container_inner_corridor": self._container_inner_corridor_summary_locked(),
                 "startup_scan": dict(self._startup_scan_progress),
                 "post_interaction_visual_audit_count": len(
                     getattr(self, "_post_interaction_visual_audits", ())
@@ -6681,6 +6682,48 @@ class SemanticBehaviorExecutor:
             0, int(getattr(self, "_container_inner_corridor_run_sequence", 0) or 0)
         ) + 1
         return int(self._container_inner_corridor_run_sequence)
+
+    def _container_inner_corridor_summary_locked(self) -> dict:
+        """Return a recorder-safe snapshot of the active private corridor.
+
+        This deliberately exposes only dispatch bookkeeping.  In particular it
+        does not publish the retained physical candidate or bridge metadata, so
+        recorder consumers can audit the intermediate waypoint without treating
+        it as a state-machine subgoal.
+        """
+
+        decision_id = str((self.selection or {}).get("decision_id") or "")
+        corridors = getattr(self, "_container_inner_corridors", None)
+        context = (
+            corridors.get(decision_id)
+            if decision_id and isinstance(corridors, dict)
+            else None
+        )
+        if not isinstance(context, dict):
+            return {"active": False}
+
+        def optional_int(key: str) -> int | None:
+            try:
+                return int(context.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        raw_waypoint = context.get("waypoint_xyyaw") or []
+        try:
+            waypoint_xyyaw = [float(value) for value in list(raw_waypoint)[:3]]
+        except (TypeError, ValueError):
+            waypoint_xyyaw = []
+        if len(waypoint_xyyaw) != 3 or not all(
+            math.isfinite(value) for value in waypoint_xyyaw
+        ):
+            waypoint_xyyaw = []
+        return {
+            "active": True,
+            "run_id": optional_int("corridor_run_id"),
+            "segment_index": optional_int("segments_completed"),
+            "waypoint_xyyaw": waypoint_xyyaw,
+            "final_goal_option_index": optional_int("final_goal_option_index"),
+        }
 
     def _register_navigation_run(self, decision_id: str, candidate: dict) -> int:
         """Bind one worker result to a unique dispatch generation."""

@@ -989,6 +989,37 @@ def test_start_inner_corridor_dispatches_one_private_navigation_waypoint(
     assert context["waypoint_xyyaw"] == [0.35, 0.0, 0.0]
 
 
+def test_inner_corridor_summary_is_recorder_safe_and_minimal(executor_module) -> None:
+    """Execution-state snapshots expose only private corridor bookkeeping."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.selection = {"decision_id": "decision-corridor-summary"}
+    executor._container_inner_corridors = {
+        "decision-corridor-summary": {
+            "corridor_run_id": 7,
+            "segments_completed": 2,
+            "waypoint_xyyaw": [0.35, 0.1, -0.2, 999.0],
+            "final_goal_option_index": 3,
+            # The retained candidate must never be copied into this payload.
+            "candidate": {"interaction_command": {"action": "open"}},
+        }
+    }
+
+    summary = executor._container_inner_corridor_summary_locked()
+
+    assert summary == {
+        "active": True,
+        "run_id": 7,
+        "segment_index": 2,
+        "waypoint_xyyaw": [0.35, 0.1, -0.2],
+        "final_goal_option_index": 3,
+    }
+    assert "candidate" not in summary
+
+    executor.selection = {"decision_id": "decision-without-corridor"}
+    assert executor._container_inner_corridor_summary_locked() == {"active": False}
+
+
 def test_inner_corridor_completion_relaunches_canonical_physical_goal_without_bridge(
     executor_module, monkeypatch
 ) -> None:
