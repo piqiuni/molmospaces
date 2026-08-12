@@ -7736,28 +7736,37 @@ class SemanticBehaviorExecutor:
             # global plan.  If move_base has just restarted or its make_plan
             # service has disappeared, normal fail-open preflight can still
             # select a later *outer M1 staging* option, but it cannot safely
-            # invent that direction.  Do not move blind and do not weaken the
-            # M1/bridge contracts.  Instead treat this one missing-heading case
-            # as an approach failure and advance through the already finite
-            # outer staging sequence.  Other rear-goal refusals (stale/local
-            # costmap, blocked turn sweep, control budget) remain terminal
-            # fail-closed safety gates.
+            # invent that direction.  Likewise, a bounded turn with confirmed
+            # commands but no yaw progress may be retried from another *outer*
+            # staging face.  Do not move blind and do not weaken the M1/bridge
+            # contracts: this exception is deliberately limited to a two-stage
+            # container before M1 has been accepted.  Other rear-goal refusals
+            # (stale/local costmap, blocked turn sweep, control budget) remain
+            # terminal fail-closed safety gates.
             rear_reason = str(
                 self._last_rear_goal_recovery_detail.get("reason") or ""
             )
             if (
                 str(behavior_type).upper() == "INTERACT"
-                and rear_reason == "rear_goal_heading_unavailable"
+                and rear_reason
+                in {"rear_goal_heading_unavailable", "rear_goal_turn_failed"}
+                and bool(metadata.get("container_two_stage_approach", False))
+                and str(metadata.get("container_two_stage_phase") or "staging").casefold()
+                == "staging"
                 and bool(metadata.get("m1_observation_staging_required", False))
             ):
                 retry_detail = dict(self._last_rear_goal_recovery_detail)
                 retry_detail.update(
-                    {
+                {
                         "failure_reason": rear_reason,
                         # Reuse the existing bounded approach-retry classifier
                         # without broadening it for unsafe rear-goal failures.
                         "reason": "navigation_terminal_failure",
                         "interaction_approach_reposition": True,
+                        # Audit this narrow safety exception separately from
+                        # normal approach retries.  A physical action point is
+                        # intentionally excluded by the phase predicate above.
+                        "rear_goal_turn_retry_to_next_outer_staging": True,
                         "interaction_approach_attempts": (
                             interaction_approach_attempt_history
                         ),
@@ -7772,6 +7781,22 @@ class SemanticBehaviorExecutor:
                     retry_detail,
                 ):
                     return
+                terminal_rear_detail = dict(self._last_rear_goal_recovery_detail)
+                terminal_rear_detail.update(
+                    {
+                        "failure_reason": rear_reason,
+                        "rear_goal_turn_retry_to_next_outer_staging": True,
+                        "interaction_approach_reposition": True,
+                    }
+                )
+                report_result(
+                    False,
+                    terminal_rear_detail,
+                )
+                return
+            # This candidate is not an outer container M1 staging pose (for
+            # example it may be the already-authorized physical action pose),
+            # so retain the original fail-closed terminal result.
             report_result(
                 False,
                 dict(self._last_rear_goal_recovery_detail),

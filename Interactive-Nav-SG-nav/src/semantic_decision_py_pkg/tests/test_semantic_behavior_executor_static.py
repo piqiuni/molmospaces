@@ -2156,7 +2156,13 @@ def test_interaction_missing_path_heading_retries_next_safe_staging_pose(
         "goal_xyyaw": [1.0, 0.0, 0.0],
         "metadata": {
             "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
             "m1_observation_staging_required": True,
+            "container_staging_goal_xyyaw_candidates": [
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
             "goal_xyyaw_candidates": [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
         },
         "interaction_command": {
@@ -2212,6 +2218,154 @@ def test_interaction_missing_path_heading_retries_next_safe_staging_pose(
     assert detail["failure_reason"] == "rear_goal_heading_unavailable"
     assert detail["interaction_approach_reposition"] is True
     assert terminal_results == []
+
+
+def _run_container_staging_rear_failure(
+    executor_module, monkeypatch, *, phase: str, retry_result: bool
+) -> tuple[list[tuple], list[tuple]]:
+    """Exercise the rear-turn exit before a move_base goal is sent."""
+
+    class _Goal:
+        def __init__(self) -> None:
+            self.target_pose = SimpleNamespace(
+                header=SimpleNamespace(frame_id="", stamp=None),
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=SimpleNamespace(z=0.0, w=1.0),
+                ),
+            )
+
+    class _MoveBase:
+        def wait_for_server(self, _timeout) -> bool:
+            return True
+
+        def send_goal(self, _goal) -> None:
+            return None
+
+        def get_state(self) -> int:
+            return executor_module.GoalStatus.ABORTED
+
+    monkeypatch.setattr(executor_module, "MoveBaseGoal", _Goal)
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    candidate = {
+        "candidate_id": "interaction:container:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 0.0, 0.0],
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": phase,
+            "m1_observation_staging_required": phase == "staging",
+            "container_staging_goal_xyyaw_candidates": [
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            "goal_xyyaw_candidates": [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        },
+        "interaction_command": {
+            "interaction_ready_distance_m": 0.25,
+            "interaction_ready_yaw_tolerance_rad": 0.30,
+        },
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor.move_base = _MoveBase()
+    executor.machine = SimpleNamespace(
+        config=SimpleNamespace(
+            interaction_navigation_timeout_s=10.0,
+            navigation_timeout_s=10.0,
+        )
+    )
+    executor.post_interaction_traversal_make_plan_retry_window_s = 0.0
+    executor.final_align_enabled = True
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._navigation_run_is_active = lambda _decision_id, _run_token: True
+    executor._preflight_navigation_plan = lambda *_args: (
+        True,
+        (1.0, 0.0),
+        "reachable",
+    )
+    # This test isolates the outer/physical rear-turn branch itself; a private
+    # inner corridor has separate ownership and result-routing coverage.
+    executor._start_container_inner_corridor = lambda *_args, **_kwargs: False
+    executor._current_pose = lambda _frame_id: None
+    executor._prerotate_for_rear_goal = lambda *_args, **_kwargs: False
+    executor._set_effective_interaction_approach = lambda *_args, **_kwargs: None
+    executor._last_rear_goal_recovery_detail = {
+        "reason": "rear_goal_turn_failed",
+        "turn_failure_detail": {
+            "reason": "rear_goal_step_budget_exhausted",
+            "delivered_step_count": 14,
+        },
+    }
+    retry_calls = []
+    executor._retry_interaction_approach = (
+        lambda _decision_id, _candidate, selected_index, attempts, count, detail: (
+            retry_calls.append((selected_index, attempts, count, detail)) or retry_result
+        )
+    )
+    terminal_results = []
+    executor._handle_navigation_result = (
+        lambda *_args, **_kwargs: terminal_results.append((_args, _kwargs))
+    )
+
+    executor._run_navigation_impl(
+        "decision-turn-failed", candidate, navigation_run_token=1
+    )
+    return retry_calls, terminal_results
+
+
+def test_two_stage_outer_staging_turn_failure_retries_next_safe_staging_pose(
+    executor_module, monkeypatch
+) -> None:
+    retry_calls, terminal_results = _run_container_staging_rear_failure(
+        executor_module, monkeypatch, phase="staging", retry_result=True
+    )
+
+    assert len(retry_calls) == 1
+    selected_index, attempts, option_count, detail = retry_calls[0]
+    assert selected_index == 0
+    assert attempts[-1]["index"] == 0
+    assert option_count == 2
+    assert detail["reason"] == "navigation_terminal_failure"
+    assert detail["failure_reason"] == "rear_goal_turn_failed"
+    assert detail["turn_failure_detail"]["reason"] == "rear_goal_step_budget_exhausted"
+    assert detail["rear_goal_turn_retry_to_next_outer_staging"] is True
+    assert terminal_results == []
+
+
+def test_two_stage_physical_rear_turn_failure_does_not_retry_outer_staging(
+    executor_module, monkeypatch
+) -> None:
+    retry_calls, terminal_results = _run_container_staging_rear_failure(
+        executor_module, monkeypatch, phase="physical_action", retry_result=False
+    )
+
+    # A physical-action candidate must not enter the new outer-staging retry
+    # policy.  It remains a direct fail-closed terminal result here.
+    assert retry_calls == []
+    assert len(terminal_results) == 1
+    args, _kwargs = terminal_results[0]
+    assert args[1] is False
+    assert args[2]["reason"] == "rear_goal_turn_failed"
+    assert "rear_goal_turn_retry_to_next_outer_staging" not in args[2]
+
+
+def test_two_stage_outer_staging_turn_failure_terminalizes_after_retry_exhaustion(
+    executor_module, monkeypatch
+) -> None:
+    retry_calls, terminal_results = _run_container_staging_rear_failure(
+        executor_module, monkeypatch, phase="staging", retry_result=False
+    )
+
+    assert len(retry_calls) == 1
+    assert len(terminal_results) == 1
+    args, _kwargs = terminal_results[0]
+    assert args[1] is False
+    assert args[2]["reason"] == "rear_goal_turn_failed"
+    assert args[2]["failure_reason"] == "rear_goal_turn_failed"
+    assert args[2]["rear_goal_turn_retry_to_next_outer_staging"] is True
 
 
 def test_terminal_move_base_success_preserves_safe_staging_arrival_pose(
