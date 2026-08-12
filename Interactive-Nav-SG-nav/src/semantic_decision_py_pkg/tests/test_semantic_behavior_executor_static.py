@@ -359,6 +359,15 @@ def test_unknown_portal_waits_for_its_matching_fresh_m1_update(
             "request_id": "decision_static:m1:001",
         }
     ]
+    # A duplicate dispatch while this targeted M1 request is unresolved must
+    # leave its token authoritative. Otherwise the valid first response becomes
+    # unmatchable and a later visual fallback can advance the interaction.
+    executor._publish_interaction_observation_request(commands[0])
+    assert len(published) == 1
+    assert executor.interaction_observation_sequence == 1
+    assert executor._interaction_observation_requests["decision_static"][
+        "request_id"
+    ] == "decision_static:m1:001"
     dispatched = []
     executor._dispatch = lambda next_commands: dispatched.extend(next_commands)
 

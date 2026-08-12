@@ -3678,6 +3678,26 @@ class SemanticBehaviorExecutor:
             node_id = str(command.get("node_id") or candidate.get("target_id") or "")
             if not object_id:
                 return
+            # Observation requests are a single-flight interface per decision.
+            # A navigation/result callback can race with the M1 worker and
+            # enqueue a second request while the first targeted response is
+            # still pending. Replacing the stored request would orphan the
+            # first request ID, causing its valid front evidence to be ignored
+            # and allowing a later non-ready frame to move the state machine to
+            # another outer pose. Keep the original request authoritative; its
+            # bounded timeout/retry path explicitly clears it when appropriate.
+            existing_request = dict(
+                (self._interaction_observation_requests or {}).get(decision_id)
+                or {}
+            )
+            if existing_request:
+                rospy.logwarn(
+                    "[semantic_behavior_executor] suppressing duplicate targeted "
+                    "M1 request decision=%s active_request=%s",
+                    decision_id,
+                    str(existing_request.get("request_id") or ""),
+                )
+                return
             minimum_capture_step = command.get("min_capture_step")
             try:
                 minimum_capture_step = int(minimum_capture_step)
