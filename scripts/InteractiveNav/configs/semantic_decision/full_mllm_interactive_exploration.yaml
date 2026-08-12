@@ -95,6 +95,13 @@ completion:
 executor:
   interaction_navigation_timeout_s: 180.0
   interaction_observation_timeout_s: 12.0
+  # If global make_plan passed but move_base aborts before outer M1 staging,
+  # wait for one newer global-costmap receipt before a single same-pose replan.
+  # This remains outside the M1/physical-action boundary.
+  container_outer_staging_abort_replan_global_costmap_wait_s: 1.0
+  container_outer_staging_abort_replan_global_costmap_poll_interval_s: 0.05
+  container_outer_staging_abort_replan_plan_retry_window_s: 6.0
+  container_outer_staging_abort_replan_plan_retry_interval_s: 0.25
   # A two-stage container has a finite twenty-pose M1 staging sequence; retain
   # that bounded coverage after an inner action-pose failure.
   container_two_stage_fallback_max_attempts: 20

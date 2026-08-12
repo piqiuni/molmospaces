@@ -2972,3 +2972,285 @@ def test_interaction_preflight_debug_keeps_skipped_ring_options_separate_from_re
     assert debug[1]["preflight_checked"] is True
     assert debug[2]["preflight_reason"] == "skipped_after_reachable_option"
     assert debug[3]["preflight_reason"] == "skipped_after_reachable_option"
+
+
+def test_outer_staging_terminal_abort_retries_same_pose_once_after_fresh_plan(
+    executor_module, monkeypatch
+) -> None:
+    """A reachable outer M1 stance gets one fresh-plan same-index resend only."""
+
+    started = []
+
+    class _Thread:
+        def __init__(self, *, target, args, daemon) -> None:
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self) -> None:
+            started.append((self.target, self.args, self.daemon))
+
+    monkeypatch.setattr(executor_module.threading, "Thread", _Thread)
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor._container_outer_staging_terminal_retry_ledger = set()
+    executor._navigation_is_current = lambda decision_id: decision_id == "decision-abort"
+    executor._wait_for_outer_staging_abort_global_costmap_receipt = lambda _decision_id: (
+        True,
+        {"fresh_source": "global_costmap_update"},
+    )
+    executor._wait_for_outer_staging_abort_reachable_plan = (
+        lambda decision_id, frame_id, x, y, yaw: (
+            fresh_calls.append((frame_id, x, y, yaw)) or True,
+            (x, y),
+            "reachable",
+            {"attempts": 2, "reason": "reachable"},
+        )
+    )
+    fresh_calls = []
+    executor._preflight_navigation_plan = (
+        lambda frame_id, x, y, yaw: (
+            fresh_calls.append((frame_id, x, y, yaw)) or True,
+            (x, y),
+            "reachable",
+        )
+    )
+    candidate = {
+        "candidate_id": "interaction:container:open",
+        "behavior_type": "INTERACT",
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "m1_observation_staging_required": True,
+        },
+    }
+    selected_goal = (1.2, 3.4, -0.5)
+    detail = {
+        "reason": "navigation_terminal_failure",
+        "status_code": executor_module.GoalStatus.ABORTED,
+        "status": "ABORTED",
+    }
+
+    assert executor._retry_outer_staging_after_terminal_abort(
+        "decision-abort",
+        candidate,
+        selected_goal_option_index=2,
+        selected_goal=selected_goal,
+        selected_preflight_reachable=True,
+        interaction_approach_attempts=[{"index": 2, "reachable": True}],
+        terminal_detail=detail,
+    )
+    assert fresh_calls == [("map", *selected_goal)]
+    assert len(started) == 1
+    _target, args, daemon = started[0]
+    assert daemon is True
+    assert args[0] == "decision-abort"
+    assert args[2] == 2
+    retry_metadata = args[1]["metadata"]["container_outer_staging_terminal_retry"]
+    assert retry_metadata["goal_option_index"] == 2
+    assert retry_metadata["goal_xyyaw"] == list(selected_goal)
+    assert retry_metadata["fresh_preflight_reason"] == "reachable"
+    assert retry_metadata["fresh_plan"]["attempts"] == 2
+    assert retry_metadata["global_costmap_receipt"]["fresh_source"] == "global_costmap_update"
+
+    # The same decision/index cannot spawn a second same-pose worker or even
+    # consume another make_plan request after a repeated terminal callback.
+    assert not executor._retry_outer_staging_after_terminal_abort(
+        "decision-abort",
+        candidate,
+        selected_goal_option_index=2,
+        selected_goal=selected_goal,
+        selected_preflight_reachable=True,
+        interaction_approach_attempts=[{"index": 2, "reachable": True}],
+        terminal_detail=detail,
+    )
+    assert fresh_calls == [("map", *selected_goal)]
+    assert len(started) == 1
+
+
+def test_outer_staging_terminal_abort_requires_new_costmap_before_replan(
+    executor_module
+) -> None:
+    """An old costmap cannot turn an outer ABORT into a blind same-pose resend."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor._container_outer_staging_terminal_retry_ledger = set()
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._wait_for_outer_staging_abort_global_costmap_receipt = lambda _decision_id: (
+        False,
+        {"reason": "container_outer_staging_abort_replan_global_costmap_timeout"},
+    )
+    executor._preflight_navigation_plan = lambda *_args: pytest.fail(
+        "make_plan must wait for a newer costmap receipt"
+    )
+    candidate = {
+        "candidate_id": "interaction:container:open",
+        "behavior_type": "INTERACT",
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "m1_observation_staging_required": True,
+        },
+    }
+    detail = {
+        "reason": "navigation_terminal_failure",
+        "status_code": executor_module.GoalStatus.ABORTED,
+        "status": "ABORTED",
+    }
+
+    assert not executor._retry_outer_staging_after_terminal_abort(
+        "decision-no-fresh-map",
+        candidate,
+        selected_goal_option_index=0,
+        selected_goal=(1.0, 0.0, 0.0),
+        selected_preflight_reachable=True,
+        interaction_approach_attempts=[],
+        terminal_detail=detail,
+    )
+
+
+def test_outer_staging_abort_plan_wait_retries_exact_goal_until_reachable(
+    executor_module, monkeypatch
+) -> None:
+    """A fresh receipt still needs a later real path before the same-pose resend."""
+
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, duration: float) -> None:
+            self.now += float(duration)
+
+    clock = _Clock()
+    monkeypatch.setattr(executor_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(executor_module.time, "sleep", clock.sleep)
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.container_outer_staging_abort_replan_plan_retry_window_s = 1.0
+    executor.container_outer_staging_abort_replan_plan_retry_interval_s = 0.20
+    executor._navigation_is_current = lambda _decision_id: True
+    calls = []
+    outcomes = iter(
+        [
+            (False, None, "empty_plan"),
+            (True, (1.1, 2.2), "reachable"),
+        ]
+    )
+
+    def preflight(frame_id, x, y, yaw):
+        calls.append((frame_id, x, y, yaw))
+        return next(outcomes)
+
+    executor._preflight_navigation_plan = preflight
+    reachable, lookahead, reason, detail = (
+        executor._wait_for_outer_staging_abort_reachable_plan(
+            "decision-replan", "map", 1.0, 2.0, -0.5
+        )
+    )
+
+    assert reachable is True
+    assert lookahead == (1.1, 2.2)
+    assert reason == "reachable"
+    assert detail["attempts"] == 2
+    assert calls == [("map", 1.0, 2.0, -0.5), ("map", 1.0, 2.0, -0.5)]
+
+
+def test_outer_staging_abort_plan_wait_times_out_without_reachable_plan(
+    executor_module, monkeypatch
+) -> None:
+    """The bounded same-pose recovery cannot wait forever on empty plans."""
+
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, duration: float) -> None:
+            self.now += float(duration)
+
+    clock = _Clock()
+    monkeypatch.setattr(executor_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(executor_module.time, "sleep", clock.sleep)
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.container_outer_staging_abort_replan_plan_retry_window_s = 0.40
+    executor.container_outer_staging_abort_replan_plan_retry_interval_s = 0.20
+    executor._navigation_is_current = lambda _decision_id: True
+    calls = []
+    executor._preflight_navigation_plan = lambda frame_id, x, y, yaw: (
+        calls.append((frame_id, x, y, yaw)) or False,
+        None,
+        "empty_plan",
+    )
+
+    reachable, lookahead, reason, detail = (
+        executor._wait_for_outer_staging_abort_reachable_plan(
+            "decision-timeout", "map", 1.0, 2.0, -0.5
+        )
+    )
+
+    assert reachable is False
+    assert lookahead is None
+    assert reason == "empty_plan"
+    assert detail["reason"] == "container_outer_staging_abort_replan_plan_timeout"
+    assert detail["attempts"] == len(calls)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("phase", "initial_preflight_reachable"),
+    [
+        ("physical_action", True),
+        ("staging", False),
+    ],
+)
+def test_terminal_abort_same_pose_retry_excludes_inner_and_unreachable_staging(
+    executor_module, phase, initial_preflight_reachable
+) -> None:
+    """No inner retry or fail-open resend may bypass outer M1/preflight gates."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor._container_outer_staging_terminal_retry_ledger = set()
+    executor._navigation_is_current = lambda _decision_id: True
+    fresh_calls = []
+    executor._preflight_navigation_plan = lambda *_args: (
+        fresh_calls.append(_args) or True,
+        (1.0, 0.0),
+        "reachable",
+    )
+    candidate = {
+        "candidate_id": "interaction:container:open",
+        "behavior_type": "INTERACT",
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": phase,
+            "m1_observation_staging_required": phase == "staging",
+        },
+    }
+    detail = {
+        "reason": "navigation_terminal_failure",
+        "status_code": executor_module.GoalStatus.ABORTED,
+        "status": "ABORTED",
+    }
+
+    assert not executor._retry_outer_staging_after_terminal_abort(
+        "decision-excluded",
+        candidate,
+        selected_goal_option_index=0,
+        selected_goal=(1.0, 0.0, 0.0),
+        selected_preflight_reachable=initial_preflight_reachable,
+        interaction_approach_attempts=[],
+        terminal_detail=detail,
+    )
+    assert fresh_calls == []

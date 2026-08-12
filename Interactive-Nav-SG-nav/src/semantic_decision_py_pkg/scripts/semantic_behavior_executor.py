@@ -788,6 +788,49 @@ class SemanticBehaviorExecutor:
         self.make_plan_empty_retry_delay_s = max(
             0.0, float(config.get("make_plan_empty_retry_delay_s", 0.15))
         )
+        # A container's outer M1 stance remains outside the physical-action
+        # envelope.  If move_base aborts immediately after a real make_plan
+        # result, wait briefly for a *new global* costmap receipt before one
+        # same-pose replan.  This is deliberately independent of the
+        # portal-open causal map gate below: no interaction has happened here.
+        self.container_outer_staging_abort_replan_global_costmap_wait_s = max(
+            0.0,
+            float(
+                config.get(
+                    "container_outer_staging_abort_replan_global_costmap_wait_s", 1.0
+                )
+            ),
+        )
+        self.container_outer_staging_abort_replan_global_costmap_poll_interval_s = max(
+            0.01,
+            float(
+                config.get(
+                    "container_outer_staging_abort_replan_global_costmap_poll_interval_s",
+                    0.05,
+                )
+            ),
+        )
+        # A receipt only proves that a costmap callback arrived; it does not
+        # promise the global planner has recovered from the ABORT yet.  Poll
+        # the same safe goal for a finite interval and resend only after a real
+        # reachable response.  This remains one retry per decision/index.
+        self.container_outer_staging_abort_replan_plan_retry_window_s = max(
+            0.0,
+            float(
+                config.get(
+                    "container_outer_staging_abort_replan_plan_retry_window_s", 6.0
+                )
+            ),
+        )
+        self.container_outer_staging_abort_replan_plan_retry_interval_s = max(
+            0.01,
+            float(
+                config.get(
+                    "container_outer_staging_abort_replan_plan_retry_interval_s",
+                    0.25,
+                )
+            ),
+        )
         self.post_interaction_traversal_make_plan_retry_window_s = max(
             0.0,
             float(
@@ -950,6 +993,11 @@ class SemanticBehaviorExecutor:
         self._navigation_run_sequence = 0
         self._navigation_result_sources: dict[tuple[str, int], dict] = {}
         self._active_navigation_run_tokens: dict[str, int] = {}
+        # A safe outer container viewpoint can occasionally pass make_plan and
+        # then receive one immediate planner/costmap ABORT while its map refresh
+        # catches up.  Keep a decision/index ledger so the narrowly-scoped
+        # fresh-plan resend below can never become a same-pose retry loop.
+        self._container_outer_staging_terminal_retry_ledger: set[tuple[str, int]] = set()
         self.interaction_approach_fallback_cancel_wait_s = max(
             0.0,
             float(config.get("interaction_approach_fallback_cancel_wait_s", 0.5)),
@@ -6804,6 +6852,13 @@ class SemanticBehaviorExecutor:
             for key in list(sources):
                 if isinstance(key, tuple) and key and str(key[0]) == decision_key:
                     sources.pop(key, None)
+        retry_ledger = getattr(
+            self, "_container_outer_staging_terminal_retry_ledger", None
+        )
+        if isinstance(retry_ledger, set):
+            retry_ledger.difference_update(
+                key for key in retry_ledger if str(key[0]) == decision_key
+            )
 
     @classmethod
     def _requires_final_yaw_for_navigation(
@@ -8244,6 +8299,37 @@ class SemanticBehaviorExecutor:
         }
         if not success:
             detail["reason"] = "navigation_terminal_failure"
+            # A short-lived planner ABORT can follow a successful global
+            # preflight while the costmap is being refreshed.  For an outer
+            # two-stage container stance, give that exact safe pose one fresh
+            # make_plan-confirmed resend before advancing to another M1 view.
+            # The helper is intentionally called before generic interaction
+            # fallback and cannot apply to the inner physical phase.
+            selected_preflight_reachable = False
+            if selected_goal_option_index is not None:
+                for attempted in reversed(attempted_goals):
+                    try:
+                        attempted_index = int(attempted.get("index"))
+                    except (TypeError, ValueError):
+                        continue
+                    if attempted_index != int(selected_goal_option_index):
+                        continue
+                    selected_preflight_reachable = bool(
+                        attempted.get("reachable")
+                        and str(attempted.get("preflight_reason") or "")
+                        == "reachable"
+                    )
+                    break
+            if self._retry_outer_staging_after_terminal_abort(
+                decision_id,
+                candidate,
+                selected_goal_option_index=selected_goal_option_index,
+                selected_goal=selected_goal,
+                selected_preflight_reachable=selected_preflight_reachable,
+                interaction_approach_attempts=interaction_approach_attempt_history,
+                terminal_detail=detail,
+            ):
+                return
         if is_post_interaction_traversal:
             detail["post_open_costmap"] = dict(post_open_costmap_detail)
             for trace_key in (
@@ -8384,6 +8470,310 @@ class SemanticBehaviorExecutor:
             metadata.get("container_staging_goal_xyyaw_candidates") or []
         )
         return max(0, min(len(staging_goals), max(0, int(limit))))
+
+    @staticmethod
+    def _container_outer_staging_terminal_abort_retry_eligible(
+        candidate: dict | None,
+        detail: dict | None,
+        *,
+        selected_goal_option_index: int | None,
+        selected_preflight_reachable: bool,
+    ) -> bool:
+        """Whether one aborted safe M1 stance may earn a fresh same-pose plan.
+
+        This is deliberately narrower than normal interaction fallback.  It
+        applies only before any M1 evidence has been accepted, while the
+        two-stage candidate is still at its *outer* visual stance.  The caller
+        consumes a decision/index one-shot token and must still confirm a fresh
+        ``make_plan`` result before resending the exact same goal.
+        """
+
+        metadata = (candidate or {}).get("metadata") or {}
+        if not bool(selected_preflight_reachable):
+            return False
+        if selected_goal_option_index is None or int(selected_goal_option_index) < 0:
+            return False
+        if not bool(metadata.get("container_two_stage_approach", False)):
+            return False
+        if str(metadata.get("container_two_stage_phase") or "").casefold() != "staging":
+            return False
+        if not bool(metadata.get("m1_observation_staging_required", False)):
+            return False
+        # A physical phase or accepted M1 token must never regain a same-index
+        # outer retry.  It would otherwise blur the one-way M1 -> inner action
+        # boundary and could incorrectly reuse visual evidence.
+        if isinstance(metadata.get("accepted_container_m1_evidence"), dict):
+            return False
+        detail = detail or {}
+        try:
+            status_code = int(detail.get("status_code"))
+        except (TypeError, ValueError):
+            status_code = None
+        status = str(detail.get("status") or "").strip().casefold()
+        return bool(
+            status_code == GoalStatus.ABORTED
+            or status == "aborted"
+            or "aborted" in status
+        )
+
+    def _retry_outer_staging_after_terminal_abort(
+        self,
+        decision_id: str,
+        candidate: dict,
+        *,
+        selected_goal_option_index: int | None,
+        selected_goal: tuple[float, float, float] | None,
+        selected_preflight_reachable: bool,
+        interaction_approach_attempts: list[dict],
+        terminal_detail: dict,
+    ) -> bool:
+        """Fresh-plan and resend exactly one aborted outer M1 staging goal.
+
+        A service response may become stale in the short gap between selection
+        and DWA execution.  The retry remains safe because it does not move
+        closer, cannot issue M1 or a bridge command itself, and is allowed only
+        after a new real ``make_plan`` result still reaches the same outer pose.
+        """
+
+        if not self._container_outer_staging_terminal_abort_retry_eligible(
+            candidate,
+            terminal_detail,
+            selected_goal_option_index=selected_goal_option_index,
+            selected_preflight_reachable=selected_preflight_reachable,
+        ):
+            return False
+        if selected_goal is None or selected_goal_option_index is None:
+            return False
+        try:
+            option_index = int(selected_goal_option_index)
+        except (TypeError, ValueError):
+            return False
+        retry_key = (str(decision_id), option_index)
+        with self.lock:
+            retry_ledger = getattr(
+                self, "_container_outer_staging_terminal_retry_ledger", None)
+            if not isinstance(retry_ledger, set):
+                retry_ledger = set()
+                self._container_outer_staging_terminal_retry_ledger = retry_ledger
+            if retry_key in retry_ledger:
+                return False
+            # Consume before the synchronous service call so an overlapping
+            # terminal callback cannot create two same-pose workers.
+            retry_ledger.add(retry_key)
+        global_costmap_fresh, global_costmap_detail = (
+            self._wait_for_outer_staging_abort_global_costmap_receipt(decision_id)
+        )
+        if not global_costmap_fresh:
+            return False
+        metadata = candidate.get("metadata") or {}
+        frame_id = str(metadata.get("frame_id") or self.map_frame)
+        (
+            fresh_reachable,
+            fresh_lookahead,
+            fresh_reason,
+            fresh_plan_detail,
+        ) = self._wait_for_outer_staging_abort_reachable_plan(
+            decision_id,
+            frame_id,
+            float(selected_goal[0]),
+            float(selected_goal[1]),
+            float(selected_goal[2]),
+        )
+        if not fresh_reachable or fresh_reason != "reachable":
+            return False
+        if not self._navigation_is_current(decision_id):
+            return True
+        retry_candidate = dict(candidate)
+        retry_metadata = dict(retry_candidate.get("metadata") or {})
+        retry_metadata["container_outer_staging_terminal_retry"] = {
+            "attempt": 1,
+            "goal_option_index": option_index,
+            "goal_xyyaw": list(selected_goal),
+            "initial_preflight_reachable": True,
+            "fresh_preflight_reason": fresh_reason,
+            "fresh_path_lookahead_xy": (
+                list(fresh_lookahead) if fresh_lookahead is not None else []
+            ),
+            "global_costmap_receipt": dict(global_costmap_detail),
+            "fresh_plan": dict(fresh_plan_detail),
+            "terminal_status_code": terminal_detail.get("status_code"),
+            "terminal_status": terminal_detail.get("status"),
+        }
+        retry_candidate["metadata"] = retry_metadata
+        rospy.logwarn(
+            "[semantic_behavior_executor] outer container M1 staging goal "
+            "ABORTED after reachable preflight; fresh plan confirmed, retrying "
+            "same safe option %d once",
+            option_index + 1,
+        )
+        threading.Thread(
+            target=self._run_navigation,
+            args=(
+                decision_id,
+                retry_candidate,
+                option_index,
+                [dict(item) for item in interaction_approach_attempts],
+            ),
+            daemon=True,
+        ).start()
+        return True
+
+    def _wait_for_outer_staging_abort_reachable_plan(
+        self,
+        decision_id: str,
+        frame_id: str,
+        goal_x: float,
+        goal_y: float,
+        goal_yaw: float,
+    ) -> tuple[bool, tuple[float, float] | None, str, dict]:
+        """Bound same-pose preflight until the planner has truly recovered.
+
+        The preceding fresh global-costmap receipt establishes that a planner
+        update occurred after the ABORT.  This loop deliberately makes no
+        motion and accepts only ``reason == 'reachable'``: a transient service
+        response, empty plan, or endpoint mismatch cannot revive the exact
+        outer M1 stance.  It is bounded per decision/index by the caller's
+        ledger and by this short wall-clock window.
+        """
+
+        window_s = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "container_outer_staging_abort_replan_plan_retry_window_s",
+                    6.0,
+                )
+                or 0.0
+            ),
+        )
+        interval_s = max(
+            0.01,
+            float(
+                getattr(
+                    self,
+                    "container_outer_staging_abort_replan_plan_retry_interval_s",
+                    0.25,
+                )
+                or 0.25
+            ),
+        )
+        started_at = time.monotonic()
+        deadline = started_at + window_s
+        attempts = 0
+        last_reason = ""
+        while True:
+            if not self._navigation_is_current(decision_id):
+                return False, None, "preempted", {
+                    "attempts": attempts,
+                    "last_preflight_reason": last_reason,
+                    "retry_window_s": window_s,
+                    "elapsed_s": max(0.0, time.monotonic() - started_at),
+                    "reason": "container_outer_staging_abort_replan_preempted",
+                }
+            attempts += 1
+            reachable, lookahead, reason = self._preflight_navigation_plan(
+                frame_id, goal_x, goal_y, goal_yaw
+            )
+            last_reason = str(reason or "")
+            detail = {
+                "attempts": attempts,
+                "last_preflight_reason": last_reason,
+                "retry_window_s": window_s,
+                "elapsed_s": max(0.0, time.monotonic() - started_at),
+            }
+            if bool(reachable) and last_reason == "reachable":
+                detail["reason"] = "reachable"
+                return True, lookahead, last_reason, detail
+            retry_delay_s = bounded_empty_plan_retry_delay(
+                time.monotonic(), deadline, interval_s
+            )
+            if retry_delay_s is None:
+                detail["reason"] = "container_outer_staging_abort_replan_plan_timeout"
+                return False, None, last_reason, detail
+            time.sleep(retry_delay_s)
+
+    def _wait_for_outer_staging_abort_global_costmap_receipt(
+        self, decision_id: str
+    ) -> tuple[bool, dict]:
+        """Wait once for a global-costmap receipt after an outer ABORT.
+
+        This is not an occupancy or interaction-state causal barrier.  The
+        container is still closed and the robot remains at a conservative M1
+        staging pose.  It merely prevents a same-pose retry from asking
+        ``make_plan`` again while the global planner's costmap cycle that
+        caused the ABORT is still in flight.  A newly received incremental
+        update is preferred; a newer full map is an accepted fallback.  The
+        receipt is then followed by a real ``make_plan`` confirmation before
+        any resend.
+        """
+
+        timeout_s = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "container_outer_staging_abort_replan_global_costmap_wait_s",
+                    1.0,
+                )
+                or 0.0
+            ),
+        )
+        poll_interval_s = max(
+            0.01,
+            float(
+                getattr(
+                    self,
+                    "container_outer_staging_abort_replan_global_costmap_poll_interval_s",
+                    0.05,
+                )
+                or 0.05
+            ),
+        )
+        started_at = time.monotonic()
+        deadline = started_at + timeout_s
+        with self._global_costmap_condition:
+            baseline_update_count = int(
+                getattr(self, "_global_costmap_update_received_count", 0) or 0
+            )
+            baseline_full_count = int(
+                getattr(self, "_global_costmap_received_count", 0) or 0
+            )
+            while True:
+                observed_update_count = int(
+                    getattr(self, "_global_costmap_update_received_count", 0) or 0
+                )
+                observed_full_count = int(
+                    getattr(self, "_global_costmap_received_count", 0) or 0
+                )
+                source = ""
+                if observed_update_count > baseline_update_count:
+                    source = "global_costmap_update"
+                elif observed_full_count > baseline_full_count:
+                    source = "global_costmap_full"
+                detail = {
+                    "baseline_update_receipt_count": baseline_update_count,
+                    "observed_update_receipt_count": observed_update_count,
+                    "baseline_full_receipt_count": baseline_full_count,
+                    "observed_full_receipt_count": observed_full_count,
+                    "wait_timeout_s": timeout_s,
+                    "wait_elapsed_s": max(0.0, time.monotonic() - started_at),
+                    "fresh_source": source,
+                }
+                if source:
+                    return True, detail
+                if not self._navigation_is_current(decision_id):
+                    detail["reason"] = "container_outer_staging_abort_replan_preempted"
+                    return False, detail
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0.0:
+                    detail["reason"] = (
+                        "container_outer_staging_abort_replan_global_costmap_timeout"
+                    )
+                    return False, detail
+                self._global_costmap_condition.wait(
+                    timeout=min(remaining_s, poll_interval_s)
+                )
 
     def _retry_interaction_approach(
         self,

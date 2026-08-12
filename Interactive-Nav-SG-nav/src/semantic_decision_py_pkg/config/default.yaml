@@ -332,6 +332,15 @@ executor:
   make_plan_fail_open: true
   make_plan_empty_retry_count: 2
   make_plan_empty_retry_delay_s: 0.15
+  # A move_base ABORT can briefly lag a just-successful outer container M1-staging
+  # preflight.  Wait for one newer global-costmap receipt before a single same-pose
+  # replan; no M1, physical action, or direct motion is permitted in this wait.
+  container_outer_staging_abort_replan_global_costmap_wait_s: 1.00
+  container_outer_staging_abort_replan_global_costmap_poll_interval_s: 0.05
+  # A receipt is not itself a valid global path.  Keep checking the exact same
+  # safe staging goal for a bounded window, and resend only on `reachable`.
+  container_outer_staging_abort_replan_plan_retry_window_s: 6.0
+  container_outer_staging_abort_replan_plan_retry_interval_s: 0.25
   # A successful portal open must causally propagate from raw SLAM occupancy
   # through planning_occ_map to the global costmap before make_plan runs.
   # This is one total bounded wait, rather than a per-stage retry loop.
