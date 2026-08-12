@@ -30,6 +30,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     bounded_empty_plan_retry_delay,
     candidate_with_effective_interaction_approach,
     committed_turn_sign,
+    container_two_stage_action_goal_options_for_staging,
     interaction_pose_validation,
     is_container_two_stage_physical_action,
     is_post_interaction_traversal_navigation,
@@ -2344,12 +2345,14 @@ class SemanticBehaviorExecutor:
 
         candidate = dict(self.machine.candidate or self.selection or {})
         metadata = candidate.get("metadata") or {}
+        two_stage_inner = is_container_two_stage_physical_action(candidate)
         failure_reason = str(
             payload.get("failure_reason") or payload.get("reason") or ""
         ).strip().casefold()
         if (
             failure_reason == "unsafe_open_sweep"
             and str(metadata.get("node_type") or "").casefold() == "container"
+            and not two_stage_inner
         ):
             # The bridge has not touched the joint.  Its public result says the
             # current refrigerator stance is unsafe, so the next ring option
@@ -2416,7 +2419,22 @@ class SemanticBehaviorExecutor:
                 payload.get("interaction_pose_validation") or {}
             ),
         }
-        if is_container_two_stage_physical_action(candidate):
+        if two_stage_inner:
+            # The accepted outer M1 image authorizes all bounded physical
+            # points for this one face.  Do not turn a bridge rejection at the
+            # primary point into a fresh M1 request until the tangent options
+            # have also failed.
+            inner_option_count = self._container_two_stage_inner_option_count(candidate)
+            next_inner_index = selected_option_index + 1
+            if next_inner_index < inner_option_count:
+                commands = self.machine.retry_interaction_approach(
+                    start_goal_option_index=next_inner_index,
+                    interaction_approach_attempts=attempts,
+                    detail=failure_detail,
+                )
+                if commands:
+                    self.selection = dict(self.machine.candidate or candidate)
+                    return commands
             staging_goals = list(
                 metadata.get("container_staging_goal_xyyaw_candidates") or []
             )
@@ -2432,9 +2450,11 @@ class SemanticBehaviorExecutor:
             except (TypeError, ValueError):
                 completed_staging_index = len(staging_goals)
             next_staging_index = completed_staging_index + 1
+            outer_retry_limit = self._container_two_stage_outer_retry_limit(
+                candidate, approach_attempt_limit
+            )
             if (
-                next_staging_index < len(staging_goals)
-                and len(attempts) < approach_attempt_limit
+                next_staging_index < outer_retry_limit
             ):
                 rospy.logwarn(
                     "[semantic_behavior_executor] bridge rejected inner container "
@@ -3729,6 +3749,17 @@ class SemanticBehaviorExecutor:
                 ),
                 "requested_at": time.monotonic(),
             }
+        # ``move_base.cancel_goal`` in the approach thread is asynchronous.  In
+        # particular, its final DWA command can still be applied for a few
+        # simulator steps after the state machine has entered the targeted-M1
+        # barrier.  For a two-stage container, that changes the view which M1
+        # is meant to judge and invalidates the outer-staging evidence.  Keep
+        # issuing a zero command at this already-validated safe pose until this
+        # exact request resolves; the normal response path is the only one that
+        # releases the hold into an inner action or another outer viewpoint.
+        self._begin_container_staging_observation_hold(
+            decision_id, request_id
+        )
         self.attribute_refresh_request_pub.publish(
             String(data=json.dumps(request, ensure_ascii=False, separators=(",", ":")))
         )
@@ -3739,6 +3770,102 @@ class SemanticBehaviorExecutor:
             minimum_capture_step,
             command.get("attempt", ""),
         )
+
+    @staticmethod
+    def _is_container_staging_observation_hold_candidate(candidate: dict | None) -> bool:
+        """Whether a targeted M1 request must freeze a safe outer container pose."""
+
+        metadata = (candidate or {}).get("metadata") or {}
+        return bool(
+            metadata.get("container_two_stage_approach", False)
+            and str(metadata.get("container_two_stage_phase") or "staging").casefold()
+            == "staging"
+            and metadata.get("m1_observation_staging_required", False)
+        )
+
+    def _container_staging_observation_hold_is_current_locked(
+        self, decision_id: str, request_id: str
+    ) -> bool:
+        """Check that this hold still owns the active targeted M1 barrier."""
+
+        if (
+            self.selection is None
+            or str(self.selection.get("decision_id") or "") != str(decision_id)
+            or self.machine.state != STATE_WAITING_FOR_INTERACTION_OBSERVATION
+        ):
+            return False
+        request = dict(
+            (getattr(self, "_interaction_observation_requests", {}) or {}).get(
+                str(decision_id)
+            )
+            or {}
+        )
+        if str(request.get("request_id") or "") != str(request_id):
+            return False
+        candidate = self.machine.candidate or self.selection
+        return self._is_container_staging_observation_hold_candidate(candidate)
+
+    def _publish_container_staging_hold_stop(self) -> None:
+        """Best-effort zero velocity while an outer M1 view is pending."""
+
+        publisher = getattr(self, "cmd_vel_pub", None)
+        if publisher is None:
+            return
+        try:
+            publisher.publish(Twist())
+        except Exception as exc:  # pragma: no cover - ROS transport failure
+            rospy.logwarn(
+                "[semantic_behavior_executor] failed to publish container M1 "
+                "staging hold stop: %s",
+                exc,
+            )
+
+    def _run_container_staging_observation_hold(
+        self, decision_id: str, request_id: str
+    ) -> None:
+        """Suppress residual DWA velocity until one exact targeted M1 reply ends it."""
+
+        interval_s = max(
+            0.01,
+            float(getattr(self, "interaction_observation_poll_interval_s", 0.05)),
+        )
+        while not rospy.is_shutdown():
+            with self.lock:
+                if not self._container_staging_observation_hold_is_current_locked(
+                    decision_id, request_id
+                ):
+                    return
+            # ``cancel_goal`` is sent once before this loop.  Repeating only the
+            # zero velocity avoids a cancellation storm while still overriding
+            # a DWA message already in flight when the request was armed.
+            self._publish_container_staging_hold_stop()
+            time.sleep(interval_s)
+
+    def _begin_container_staging_observation_hold(
+        self, decision_id: str, request_id: str
+    ) -> bool:
+        """Cancel residual navigation and start the bounded outer-staging hold."""
+
+        with self.lock:
+            if not self._container_staging_observation_hold_is_current_locked(
+                decision_id, request_id
+            ):
+                return False
+        try:
+            self.move_base.cancel_goal()
+        except Exception as exc:  # pragma: no cover - ROS transport failure
+            rospy.logwarn(
+                "[semantic_behavior_executor] failed to cancel residual "
+                "navigation for container M1 staging hold: %s",
+                exc,
+            )
+        self._publish_container_staging_hold_stop()
+        threading.Thread(
+            target=self._run_container_staging_observation_hold,
+            args=(str(decision_id), str(request_id)),
+            daemon=True,
+        ).start()
+        return True
 
     def _publish_explore_command(
         self,
@@ -7476,6 +7603,35 @@ class SemanticBehaviorExecutor:
                 )
         return max(1, int(self.interaction_approach_fallback_max_attempts))
 
+    def _container_two_stage_inner_option_count(self, candidate: dict | None) -> int:
+        """Return the finite same-face action sequence for the active staging face."""
+
+        metadata = (candidate or {}).get("metadata") or {}
+        if not is_container_two_stage_physical_action(candidate):
+            return 0
+        try:
+            staging_index = max(
+                0,
+                int(metadata.get("container_two_stage_staging_goal_option_index", 0)),
+            )
+        except (TypeError, ValueError):
+            return 0
+        return len(
+            container_two_stage_action_goal_options_for_staging(
+                candidate, staging_index
+            )
+        )
+
+    @staticmethod
+    def _container_two_stage_outer_retry_limit(candidate: dict | None, limit: int) -> int:
+        """Bound outer M1 faces independently from inner physical alternatives."""
+
+        metadata = (candidate or {}).get("metadata") or {}
+        staging_goals = list(
+            metadata.get("container_staging_goal_xyyaw_candidates") or []
+        )
+        return max(0, min(len(staging_goals), max(0, int(limit))))
+
     def _retry_interaction_approach(
         self,
         decision_id: str,
@@ -7509,10 +7665,36 @@ class SemanticBehaviorExecutor:
                 )
             except (TypeError, ValueError):
                 return False
-            next_staging_index = completed_staging_index + 1
+            # A fresh outer M1 acceptance owns a bounded sequence of physical
+            # points on that *same* face.  A navigation/pose failure at one
+            # point should try the remaining tangent points before forfeiting
+            # the M1 evidence and asking for another outer view.
+            inner_option_count = self._container_two_stage_inner_option_count(candidate)
+            current_inner_index = max(0, int(selected_option_index or 0))
+            next_inner_index = current_inner_index + 1
             if (
-                next_staging_index >= len(staging_goals)
-                or len(attempts) >= approach_attempt_limit
+                next_inner_index < inner_option_count
+                and self._navigation_is_current(decision_id)
+            ):
+                rospy.logwarn(
+                    "[semantic_behavior_executor] inner container action approach %s; "
+                    "retrying same-face physical option %d/%d without M1",
+                    str(failure_detail.get("reason") or "failed"),
+                    next_inner_index + 1,
+                    inner_option_count,
+                )
+                threading.Thread(
+                    target=self._run_navigation,
+                    args=(decision_id, candidate, next_inner_index, attempts),
+                    daemon=True,
+                ).start()
+                return True
+            next_staging_index = completed_staging_index + 1
+            outer_retry_limit = self._container_two_stage_outer_retry_limit(
+                candidate, approach_attempt_limit
+            )
+            if (
+                next_staging_index >= outer_retry_limit
                 or not self._navigation_is_current(decision_id)
             ):
                 return False

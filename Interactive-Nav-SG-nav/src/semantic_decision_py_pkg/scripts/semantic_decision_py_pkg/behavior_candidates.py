@@ -175,6 +175,12 @@ class CandidateGeneratorConfig:
     # the container surface.
     container_safe_staging_arrival_tolerance_m: float = 0.30
     container_interaction_ready_distance_m: float = 0.18
+    # A global plan can reach the nominal physical stance while the local
+    # controller cannot settle there beside an appliance corner.  Keep two
+    # bounded tangential alternatives at the same normal clearance; they are
+    # tried only after a fresh M1 acceptance for that exact outer staging face.
+    # This is not a smaller standoff or a costmap exception.
+    container_action_lateral_offset_m: float = 0.22
     interaction_safety_margin_m: float = 0.0
     interaction_ready_distance_m: float = 0.45
     # This is the public yaw gate shared by final approach validation and the
@@ -1384,17 +1390,26 @@ class CandidateGenerator:
                 (
                     container_action_goals_by_staging,
                     container_action_labels_by_staging,
+                    container_action_goal_options_by_staging,
+                    container_action_option_labels_by_staging,
                 ) = self._container_action_goals_for_staging(
                     target_xy=position,
                     staging_goals=goal_candidates,
                     staging_labels=approach_pose_labels,
                     physical_standoff_m=interaction_standoff,
+                    lateral_offset_m=self.config.container_action_lateral_offset_m,
                     node=node,
                 )
                 container_two_stage_mapping_ready = bool(
                     container_action_goals_by_staging
                     and len(container_action_goals_by_staging) == len(goal_candidates)
+                    and len(container_action_goal_options_by_staging)
+                    == len(goal_candidates)
+                    and all(container_action_goal_options_by_staging)
                 )
+            else:
+                container_action_goal_options_by_staging = []
+                container_action_option_labels_by_staging = []
             approach = goal_candidates[0]
             portal_aperture_observation = (
                 self._portal_aperture_observation(node)
@@ -1719,6 +1734,19 @@ class CandidateGenerator:
                         "container_action_pose_labels_by_staging_index": list(
                             container_action_labels_by_staging
                         ),
+                        # The primary inner pose is retained above for backward
+                        # compatible traces.  These are the only bounded
+                        # within-face alternatives: same normal standoff, then
+                        # a small left/right tangent.  They never authorize a
+                        # new M1 request or a different container face.
+                        "container_action_goal_xyyaw_options_by_staging_index": [
+                            [list(option) for option in options]
+                            for options in container_action_goal_options_by_staging
+                        ],
+                        "container_action_pose_option_labels_by_staging_index": [
+                            list(labels)
+                            for labels in container_action_option_labels_by_staging
+                        ],
                         # These values restore exactly the pre-action flags when
                         # an inner physical approach fails and the next outer
                         # staging pose must earn a new M1 view.
@@ -2285,9 +2313,15 @@ class CandidateGenerator:
         staging_goals: list[list[float]],
         staging_labels: list[str],
         physical_standoff_m: float,
+        lateral_offset_m: float,
         node: dict[str, Any],
-    ) -> tuple[list[list[float]], list[str]]:
-        """Map every safe M1 staging pose to one nearer physical action pose.
+    ) -> tuple[
+        list[list[float]],
+        list[str],
+        list[list[list[float]]],
+        list[list[str]],
+    ]:
+        """Map every outer M1 pose to bounded within-face physical poses.
 
         The mapping deliberately derives its axis from the already selected
         outer goal, not from an object joint, a graph-provided front axis, or a
@@ -2297,35 +2331,63 @@ class CandidateGenerator:
 
         action_goals: list[list[float]] = []
         action_labels: list[str] = []
+        action_goal_options: list[list[list[float]]] = []
+        action_option_labels: list[list[str]] = []
+        lateral_offset = max(0.0, float(lateral_offset_m))
         for index, staging_goal in enumerate(staging_goals):
             values = list(staging_goal or [])
             if len(values) < 2:
-                return [], []
+                return [], [], [], []
             try:
                 dx = float(values[0]) - float(target_xy[0])
                 dy = float(values[1]) - float(target_xy[1])
             except (TypeError, ValueError):
-                return [], []
+                return [], [], [], []
             distance = math.hypot(dx, dy)
             if distance <= 1e-6:
-                return [], []
+                return [], [], [], []
             axis = dx / distance, dy / distance
-            action_goals.append(
-                cls._approach_pose(
-                    target_xy,
-                    target_xy,
-                    physical_standoff_m,
-                    node=node,
-                    fixed_axis=axis,
-                )
+            primary = cls._approach_pose(
+                target_xy,
+                target_xy,
+                physical_standoff_m,
+                node=node,
+                fixed_axis=axis,
             )
+            options = [primary]
+            if lateral_offset > 1e-6:
+                tangent_x, tangent_y = -axis[1], axis[0]
+                for direction in (1.0, -1.0):
+                    x = primary[0] + direction * lateral_offset * tangent_x
+                    y = primary[1] + direction * lateral_offset * tangent_y
+                    options.append(
+                        [
+                            x,
+                            y,
+                            math.atan2(target_xy[1] - y, target_xy[0] - x),
+                        ]
+                    )
+            action_goals.append(primary)
+            action_goal_options.append(options)
             label = (
                 str(staging_labels[index])
                 if index < len(staging_labels)
                 else f"staging_{index}"
             )
             action_labels.append(f"{label}_physical_action")
-        return action_goals, action_labels
+            action_option_labels.append(
+                [
+                    f"{label}_physical_action",
+                    f"{label}_physical_action_tangent_left",
+                    f"{label}_physical_action_tangent_right",
+                ][: len(options)]
+            )
+        return (
+            action_goals,
+            action_labels,
+            action_goal_options,
+            action_option_labels,
+        )
 
     @staticmethod
     def _is_drawer_container(node: dict[str, Any]) -> bool:

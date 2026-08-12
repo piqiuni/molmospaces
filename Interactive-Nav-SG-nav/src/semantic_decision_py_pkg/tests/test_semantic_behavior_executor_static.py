@@ -429,6 +429,101 @@ def test_unknown_portal_waits_for_its_matching_fresh_m1_update(
     assert executor._interaction_observation_requests == {}
 
 
+def test_two_stage_container_staging_holds_until_its_matching_m1_request_resolves(
+    executor_module, monkeypatch
+) -> None:
+    """Residual DWA motion cannot move an outer M1 capture after it is armed."""
+
+    candidate = {
+        "decision_id": "decision-staging-hold",
+        "candidate_id": "interaction:container-staging-hold:open",
+        "behavior_type": "INTERACT",
+        "target_id": "container-staging-hold",
+        "metadata": {
+            "requires_approach": False,
+            "observation_required": True,
+            "container_pre_action_observation": True,
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "m1_observation_staging_required": True,
+        },
+        "interaction_command": {
+            "node_id": "container-staging-hold",
+            "object_id": "container-staging-hold",
+            "action": "open",
+            "expected_state": "open",
+        },
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = dict(candidate)
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    executor.machine.start(candidate, now=0.0)
+    assert executor.machine.state == executor_module.STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    executor._interaction_observation_requests = {
+        "decision-staging-hold": {"request_id": "decision-staging-hold:m1:001"}
+    }
+    executor.interaction_observation_poll_interval_s = 0.01
+    cancelled = []
+    executor.move_base = SimpleNamespace(cancel_goal=lambda: cancelled.append(True))
+    initial_stops = []
+    executor.cmd_vel_pub = SimpleNamespace(
+        publish=lambda message: initial_stops.append(message)
+    )
+    started = []
+
+    class _Thread:
+        def __init__(self, *, target, args, daemon):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            started.append((self.target, self.args, self.daemon))
+
+    monkeypatch.setattr(executor_module.threading, "Thread", _Thread)
+
+    assert executor._begin_container_staging_observation_hold(
+        "decision-staging-hold", "decision-staging-hold:m1:001"
+    )
+    assert cancelled == [True]
+    assert len(initial_stops) == 1
+    assert len(started) == 1
+
+    hold_target, hold_args, daemon = started[0]
+    assert daemon is True
+
+    # A superseding request must end the old worker immediately; it cannot
+    # keep publishing a stale zero/hold after the next M1 request is armed.
+    executor._interaction_observation_requests["decision-staging-hold"] = {
+        "request_id": "decision-staging-hold:m1:002"
+    }
+    stale_stops = []
+    executor._publish_container_staging_hold_stop = lambda: stale_stops.append(True)
+    hold_target(*hold_args)
+    assert stale_stops == []
+
+    # While this exact request remains pending, it repeatedly overrides any
+    # late DWA command. Removing the matching request models the response path
+    # consuming it, after which the worker terminates without another motion.
+    executor._interaction_observation_requests["decision-staging-hold"] = {
+        "request_id": "decision-staging-hold:m1:002"
+    }
+    active_stops = []
+
+    def hold_stop() -> None:
+        active_stops.append(True)
+        if len(active_stops) == 2:
+            executor._interaction_observation_requests.pop("decision-staging-hold")
+
+    executor._publish_container_staging_hold_stop = hold_stop
+    monkeypatch.setattr(executor_module.time, "sleep", lambda _seconds: None)
+    executor._run_container_staging_observation_hold(
+        "decision-staging-hold", "decision-staging-hold:m1:002"
+    )
+    assert active_stops == [True, True]
+
+
 @pytest.mark.parametrize("confirmation_count", [None, 2])
 def test_container_direct_front_confirmation_count_is_configurable(
     executor_module,

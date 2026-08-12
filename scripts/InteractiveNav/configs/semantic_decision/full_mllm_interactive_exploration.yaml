@@ -42,6 +42,10 @@ candidate:
   # execute there.  The paired .35 m offset preserves its closest clearance.
   container_safe_staging_arrival_tolerance_m: 0.30
   container_interaction_ready_distance_m: 0.25
+  # After a fresh outer M1 view has accepted one container face, retain the
+  # normal clearance and try these bounded tangent alternatives before asking
+  # M1 for a different outer view.  This is not a reduced standoff.
+  container_action_lateral_offset_m: 0.22
   interaction_safety_margin_m: 0.10
   interaction_ready_distance_m: 0.30
   interaction_ready_yaw_tolerance_rad: 0.35

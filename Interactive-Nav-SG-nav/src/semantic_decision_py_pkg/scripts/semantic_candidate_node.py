@@ -169,6 +169,10 @@ class SemanticCandidateNode:
                 container_interaction_ready_distance_m=float(
                     config.get("container_interaction_ready_distance_m", 0.18)
                 ),
+                container_action_lateral_offset_m=max(
+                    0.0,
+                    float(config.get("container_action_lateral_offset_m", 0.22)),
+                ),
                 interaction_safety_margin_m=float(
                     config.get("interaction_safety_margin_m", 0.0)
                 ),

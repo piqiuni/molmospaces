@@ -24,6 +24,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     STATE_VERIFYING,
     bounded_empty_plan_retry_delay,
     candidate_with_effective_interaction_approach,
+    container_two_stage_action_goal_options_for_staging,
     committed_turn_sign,
     interaction_pose_validation,
     interaction_observation_disposition,
@@ -405,6 +406,22 @@ def two_stage_container_pre_action_candidate():
                 "safe_far_physical_action",
                 "safe_farthest_physical_action",
                 "safe_max_physical_action",
+            ],
+            "container_action_goal_xyyaw_options_by_staging_index": [
+                [
+                    action_goals[index],
+                    [action_goals[index][0], action_goals[index][1] + 0.22, action_goals[index][2]],
+                    [action_goals[index][0], action_goals[index][1] - 0.22, action_goals[index][2]],
+                ]
+                for index in range(len(action_goals))
+            ],
+            "container_action_pose_option_labels_by_staging_index": [
+                [
+                    f"safe_{label}_physical_action" if not label.endswith("physical_action") else label,
+                    f"{label}_tangent_left",
+                    f"{label}_tangent_right",
+                ]
+                for label in ["outer", "far", "farthest", "max"]
             ],
             "container_two_stage_staging_observation_required": True,
             "container_two_stage_staging_container_pre_action_observation": True,
@@ -940,6 +957,41 @@ def test_container_two_stage_m1_staging_navigates_inner_before_bridge() -> None:
     bridge = machine.on_navigation_result(True, {"capture_step": 12}, now=1.5)
     assert machine.state == STATE_INTERACTING
     assert [command["kind"] for command in bridge] == ["interact"]
+
+
+def test_container_two_stage_accepted_m1_uses_same_face_inner_options_before_outer() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    machine.start(candidate, now=0.0)
+    machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+    inner_navigation = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "observed_bbox_2d": [10, 10, 80, 120],
+            "attribute_capture_step": 11,
+            "container_visual_precondition_reason": "ready",
+        },
+        now=1.0,
+    )
+
+    assert inner_navigation[0]["start_goal_option_index"] == 0
+    assert navigation_goal_options(machine.candidate) == [
+        (1.30, 2.0, 0.0),
+        (1.30, 2.22, 0.0),
+        (1.30, 1.78, 0.0),
+    ]
+    assert machine.candidate["metadata"]["container_two_stage_action_goal_option_index"] == 0
+    assert container_two_stage_action_goal_options_for_staging(machine.candidate, 0) == [
+        (1.30, 2.0, 0.0),
+        (1.30, 2.22, 0.0),
+        (1.30, 1.78, 0.0),
+    ]
 
 
 def test_container_two_stage_inner_failure_returns_next_outer_m1_staging() -> None:

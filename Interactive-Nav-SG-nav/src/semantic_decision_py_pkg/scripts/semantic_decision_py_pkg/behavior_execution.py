@@ -454,6 +454,109 @@ def container_two_stage_action_goal_for_staging(
     return _goal_xyyaw_option(action_goals[index])
 
 
+def container_two_stage_action_goal_options_for_staging(
+    candidate: dict[str, Any] | None,
+    staging_goal_option_index: int,
+) -> list[tuple[float, float, float]]:
+    """Return bounded same-face physical goals for one accepted outer M1 view.
+
+    New candidates carry a primary physical stance plus left/right tangent
+    alternatives.  Older recordings and externally produced candidates contain
+    only the primary mapping, so retain that as a fail-closed one-option
+    fallback instead of silently treating a missing new field as an error.
+    """
+
+    metadata = (candidate or {}).get("metadata") or {}
+    if not bool(metadata.get("container_two_stage_approach", False)):
+        return []
+    try:
+        index = int(staging_goal_option_index)
+    except (TypeError, ValueError):
+        return []
+    if index < 0:
+        return []
+    raw_by_staging = list(
+        metadata.get("container_action_goal_xyyaw_options_by_staging_index") or []
+    )
+    raw_options = (
+        list(raw_by_staging[index])
+        if index < len(raw_by_staging) and isinstance(raw_by_staging[index], list)
+        else []
+    )
+    options: list[tuple[float, float, float]] = []
+    for raw in raw_options:
+        option = _goal_xyyaw_option(raw)
+        if option is None or any(
+            math.hypot(option[0] - prior[0], option[1] - prior[1]) <= 1e-6
+            and abs(normalize_angle(option[2] - prior[2])) <= 1e-6
+            for prior in options
+        ):
+            continue
+        options.append(option)
+    primary = container_two_stage_action_goal_for_staging(candidate, index)
+    if primary is None:
+        return options
+    if not options:
+        return [primary]
+    # The geometry producer promises primary first.  Be defensive when an
+    # older or hand-authored candidate does not: physical traces and legacy
+    # fields must still retain the primary at index zero.
+    if not (
+        math.hypot(options[0][0] - primary[0], options[0][1] - primary[1]) <= 1e-6
+        and abs(normalize_angle(options[0][2] - primary[2])) <= 1e-6
+    ):
+        options = [primary] + [
+            option
+            for option in options
+            if math.hypot(option[0] - primary[0], option[1] - primary[1]) > 1e-6
+            or abs(normalize_angle(option[2] - primary[2])) > 1e-6
+        ]
+    return options
+
+
+def container_two_stage_action_pose_labels_for_staging(
+    candidate: dict[str, Any] | None,
+    staging_goal_option_index: int,
+    option_count: int,
+) -> list[str]:
+    """Return index-aligned labels without making trace schema mandatory."""
+
+    metadata = (candidate or {}).get("metadata") or {}
+    try:
+        staging_index = int(staging_goal_option_index)
+    except (TypeError, ValueError):
+        staging_index = 0
+    raw_by_staging = list(
+        metadata.get("container_action_pose_option_labels_by_staging_index") or []
+    )
+    raw_labels = (
+        list(raw_by_staging[staging_index])
+        if staging_index >= 0
+        and staging_index < len(raw_by_staging)
+        and isinstance(raw_by_staging[staging_index], list)
+        else []
+    )
+    legacy_labels = list(
+        metadata.get("container_action_pose_labels_by_staging_index") or []
+    )
+    primary_label = (
+        str(legacy_labels[staging_index])
+        if staging_index >= 0 and staging_index < len(legacy_labels)
+        else f"staging_{staging_index}_physical_action"
+    )
+    labels: list[str] = []
+    for option_index in range(max(0, int(option_count))):
+        raw = raw_labels[option_index] if option_index < len(raw_labels) else ""
+        labels.append(
+            str(raw)
+            if str(raw).strip()
+            else primary_label
+            if option_index == 0
+            else f"{primary_label}_tangent_{option_index}"
+        )
+    return labels
+
+
 def is_container_two_stage_physical_action(candidate: dict[str, Any] | None) -> bool:
     """Whether the active candidate is between M1 acceptance and the bridge."""
 
@@ -1363,26 +1466,30 @@ class BehaviorExecutionStateMachine:
         staging_goals = container_two_stage_staging_goal_options(candidate)
         if staging_index >= len(staging_goals):
             return []
-        action_goal = container_two_stage_action_goal_for_staging(
+        # Candidate generation marks an incomplete outer-to-inner mapping
+        # explicitly.  Even if an older trace still happens to retain a stale
+        # option list, never use it to authorize a close physical move.
+        if metadata.get("container_two_stage_mapping_ready") is False:
+            return []
+        action_goals = container_two_stage_action_goal_options_for_staging(
             candidate, staging_index
         )
         evidence = metadata.get("accepted_container_m1_evidence")
         if (
-            action_goal is None
+            not action_goals
             or not isinstance(evidence, dict)
             or not self._container_two_stage_evidence_matches_staging(
                 evidence, staging_goals[staging_index]
             )
         ):
             return []
-        action_labels = list(
-            metadata.get("container_action_pose_labels_by_staging_index") or []
+        action_labels = container_two_stage_action_pose_labels_for_staging(
+            candidate,
+            staging_index,
+            len(action_goals),
         )
-        action_label = (
-            str(action_labels[staging_index])
-            if staging_index < len(action_labels)
-            else f"staging_{staging_index}_physical_action"
-        )
+        action_goal = action_goals[0]
+        action_label = action_labels[0]
         interaction = dict(candidate.get("interaction_command") or {})
         interaction["interaction_approach_pose_xyyaw"] = list(action_goal)
         try:
@@ -1401,8 +1508,16 @@ class BehaviorExecutionStateMachine:
                 "container_two_stage_staging_pose_xyyaw": list(
                     staging_goals[staging_index]
                 ),
+                # Keep the original primary fields for old readers/traces, but
+                # expose the bounded same-face physical sequence separately.
+                # It is consumed before moving to another outer M1 stance.
                 "container_two_stage_action_goal_xyyaw": list(action_goal),
                 "container_two_stage_action_pose_label": action_label,
+                "container_two_stage_action_goal_xyyaw_options": [
+                    list(goal) for goal in action_goals
+                ],
+                "container_two_stage_action_pose_option_labels": list(action_labels),
+                "container_two_stage_action_goal_option_index": 0,
                 "container_m1_evidence_staging_goal_option_index": staging_index,
                 "container_m1_evidence_staging_pose_xyyaw": list(
                     staging_goals[staging_index]
@@ -1418,8 +1533,10 @@ class BehaviorExecutionStateMachine:
                 "interaction_observation_resolved": True,
                 "effective_interaction_approach_pose_xyyaw": list(action_goal),
                 "interaction_approach_goal_option_index": 0,
-                "goal_xyyaw_candidates": [],
-                "interaction_approach_pose_labels": [action_label],
+                "goal_xyyaw_candidates": [
+                    list(goal) for goal in action_goals[1:]
+                ],
+                "interaction_approach_pose_labels": list(action_labels),
             }
         )
         candidate["goal_xyyaw"] = list(action_goal)
