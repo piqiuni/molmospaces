@@ -102,6 +102,8 @@ executor:
   container_outer_staging_abort_replan_global_costmap_poll_interval_s: 0.05
   container_outer_staging_abort_replan_plan_retry_window_s: 6.0
   container_outer_staging_abort_replan_plan_retry_interval_s: 0.25
+  container_outer_staging_abort_replan_plan_health_confirmations: 2
+  container_outer_staging_abort_replan_plan_health_interval_s: 0.30
   # A two-stage container has a finite twenty-pose M1 staging sequence; retain
   # that bounded coverage after an inner action-pose failure.
   container_two_stage_fallback_max_attempts: 20

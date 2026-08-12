@@ -337,10 +337,13 @@ executor:
   # replan; no M1, physical action, or direct motion is permitted in this wait.
   container_outer_staging_abort_replan_global_costmap_wait_s: 1.00
   container_outer_staging_abort_replan_global_costmap_poll_interval_s: 0.05
-  # A receipt is not itself a valid global path.  Keep checking the exact same
-  # safe staging goal for a bounded window, and resend only on `reachable`.
+  # A receipt is not itself a healthy global planner.  Keep checking the exact
+  # same safe staging goal for a bounded window, and resend only after two
+  # endpoint-valid `reachable` replies separated by a quiet interval.
   container_outer_staging_abort_replan_plan_retry_window_s: 6.0
   container_outer_staging_abort_replan_plan_retry_interval_s: 0.25
+  container_outer_staging_abort_replan_plan_health_confirmations: 2
+  container_outer_staging_abort_replan_plan_health_interval_s: 0.30
   # A successful portal open must causally propagate from raw SLAM occupancy
   # through planning_occ_map to the global costmap before make_plan runs.
   # This is one total bounded wait, rather than a per-stage retry loop.

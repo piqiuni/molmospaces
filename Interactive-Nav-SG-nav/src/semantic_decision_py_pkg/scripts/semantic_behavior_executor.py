@@ -812,8 +812,9 @@ class SemanticBehaviorExecutor:
         )
         # A receipt only proves that a costmap callback arrived; it does not
         # promise the global planner has recovered from the ABORT yet.  Poll
-        # the same safe goal for a finite interval and resend only after a real
-        # reachable response.  This remains one retry per decision.
+        # the same safe goal for a finite interval and resend only after two
+        # endpoint-valid responses separated by a short quiet interval.  This
+        # remains one retry per decision.
         self.container_outer_staging_abort_replan_plan_retry_window_s = max(
             0.0,
             float(
@@ -828,6 +829,24 @@ class SemanticBehaviorExecutor:
                 config.get(
                     "container_outer_staging_abort_replan_plan_retry_interval_s",
                     0.25,
+                )
+            ),
+        )
+        self.container_outer_staging_abort_replan_plan_health_confirmations = max(
+            2,
+            int(
+                config.get(
+                    "container_outer_staging_abort_replan_plan_health_confirmations",
+                    2,
+                )
+            ),
+        )
+        self.container_outer_staging_abort_replan_plan_health_interval_s = max(
+            0.01,
+            float(
+                config.get(
+                    "container_outer_staging_abort_replan_plan_health_interval_s",
+                    0.30,
                 )
             ),
         )
@@ -8642,14 +8661,15 @@ class SemanticBehaviorExecutor:
         goal_y: float,
         goal_yaw: float,
     ) -> tuple[bool, tuple[float, float] | None, str, dict]:
-        """Bound same-pose preflight until the planner has truly recovered.
+        """Bound same-pose preflight until planner health is confirmed.
 
         The preceding fresh global-costmap receipt establishes that a planner
         update occurred after the ABORT.  This loop deliberately makes no
-        motion and accepts only ``reason == 'reachable'``: a transient service
-        response, empty plan, or endpoint mismatch cannot revive the exact
-        outer M1 stance.  It is bounded per decision by the caller's
-        ledger and by this short wall-clock window.
+        motion and requires consecutive ``reason == 'reachable'`` responses
+        for the exact same goal, separated by a short quiet interval.  A lone
+        transient response, empty plan, or endpoint mismatch therefore cannot
+        revive the exact outer M1 stance.  It is bounded per decision by the
+        caller's ledger and by this short wall-clock window.
         """
 
         window_s = max(
@@ -8674,48 +8694,84 @@ class SemanticBehaviorExecutor:
                 or 0.25
             ),
         )
+        required_confirmations = max(
+            2,
+            int(
+                getattr(
+                    self,
+                    "container_outer_staging_abort_replan_plan_health_confirmations",
+                    2,
+                )
+                or 2
+            ),
+        )
+        health_interval_s = max(
+            0.01,
+            float(
+                getattr(
+                    self,
+                    "container_outer_staging_abort_replan_plan_health_interval_s",
+                    0.30,
+                )
+                or 0.30
+            ),
+        )
         started_at = time.monotonic()
         deadline = started_at + window_s
         attempts = 0
         last_reason = ""
+        consecutive_reachable = 0
+        confirmed_lookahead: tuple[float, float] | None = None
+
+        def detail_snapshot() -> dict:
+            return {
+                "attempts": attempts,
+                "last_preflight_reason": last_reason,
+                "retry_window_s": window_s,
+                "elapsed_s": max(0.0, time.monotonic() - started_at),
+                "planner_health_required_confirmations": required_confirmations,
+                "planner_health_confirmations": consecutive_reachable,
+                "planner_health_interval_s": health_interval_s,
+            }
+
         while True:
             if not self._navigation_run_is_active(decision_id, navigation_run_token):
-                return False, None, "preempted", {
-                    "attempts": attempts,
-                    "last_preflight_reason": last_reason,
-                    "retry_window_s": window_s,
-                    "elapsed_s": max(0.0, time.monotonic() - started_at),
-                    "reason": "container_outer_staging_abort_replan_preempted",
-                }
+                detail = detail_snapshot()
+                detail["reason"] = "container_outer_staging_abort_replan_preempted"
+                return False, None, "preempted", detail
             attempts += 1
             reachable, lookahead, reason = self._preflight_navigation_plan(
                 frame_id, goal_x, goal_y, goal_yaw
             )
             if not self._navigation_run_is_active(decision_id, navigation_run_token):
-                return False, None, "preempted", {
-                    "attempts": attempts,
-                    "last_preflight_reason": str(reason or ""),
-                    "retry_window_s": window_s,
-                    "elapsed_s": max(0.0, time.monotonic() - started_at),
-                    "reason": "container_outer_staging_abort_replan_preempted",
-                }
+                last_reason = str(reason or "")
+                detail = detail_snapshot()
+                detail["reason"] = "container_outer_staging_abort_replan_preempted"
+                return False, None, "preempted", detail
             last_reason = str(reason or "")
-            detail = {
-                "attempts": attempts,
-                "last_preflight_reason": last_reason,
-                "retry_window_s": window_s,
-                "elapsed_s": max(0.0, time.monotonic() - started_at),
-            }
             if bool(reachable) and last_reason == "reachable":
-                detail["reason"] = "reachable"
-                return True, lookahead, last_reason, detail
-            retry_delay_s = bounded_empty_plan_retry_delay(
-                time.monotonic(), deadline, interval_s
-            )
-            if retry_delay_s is None:
+                consecutive_reachable += 1
+                confirmed_lookahead = lookahead
+                if consecutive_reachable >= required_confirmations:
+                    detail = detail_snapshot()
+                    detail["reason"] = "reachable"
+                    return True, confirmed_lookahead, last_reason, detail
+                next_delay_s = health_interval_s
+            else:
+                # Planner health must be consecutive.  An empty or mismatched
+                # response between two successes proves that the first one was
+                # not sufficient to safely resend this outer M1 stance.
+                consecutive_reachable = 0
+                confirmed_lookahead = None
+                next_delay_s = interval_s
+            detail = detail_snapshot()
+            # Unlike ordinary polling, a second health response must be
+            # separated by the full quiet interval; a shortened end-of-window
+            # sleep would make two near-simultaneous replies look stable.
+            if deadline - time.monotonic() < next_delay_s:
                 detail["reason"] = "container_outer_staging_abort_replan_plan_timeout"
                 return False, None, last_reason, detail
-            time.sleep(retry_delay_s)
+            time.sleep(next_delay_s)
 
     def _wait_for_outer_staging_abort_global_costmap_receipt(
         self, decision_id: str, navigation_run_token: int | None

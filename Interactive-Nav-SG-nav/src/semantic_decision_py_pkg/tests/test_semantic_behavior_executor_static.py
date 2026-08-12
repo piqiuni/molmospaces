@@ -3134,10 +3134,10 @@ def test_outer_staging_terminal_abort_requires_new_costmap_before_replan(
     )
 
 
-def test_outer_staging_abort_plan_wait_retries_exact_goal_until_reachable(
+def test_outer_staging_abort_plan_wait_requires_two_healthy_plans(
     executor_module, monkeypatch
 ) -> None:
-    """A fresh receipt still needs a later real path before the same-pose resend."""
+    """A fresh receipt needs two spaced real paths before the same-pose resend."""
 
     class _Clock:
         now = 0.0
@@ -3155,6 +3155,8 @@ def test_outer_staging_abort_plan_wait_retries_exact_goal_until_reachable(
     executor.lock = threading.RLock()
     executor.container_outer_staging_abort_replan_plan_retry_window_s = 1.0
     executor.container_outer_staging_abort_replan_plan_retry_interval_s = 0.20
+    executor.container_outer_staging_abort_replan_plan_health_confirmations = 2
+    executor.container_outer_staging_abort_replan_plan_health_interval_s = 0.30
     executor._navigation_is_current = lambda _decision_id: True
     executor._navigation_run_is_active = lambda _decision_id, _token: True
     calls = []
@@ -3162,6 +3164,7 @@ def test_outer_staging_abort_plan_wait_retries_exact_goal_until_reachable(
         [
             (False, None, "empty_plan"),
             (True, (1.1, 2.2), "reachable"),
+            (True, (1.3, 2.4), "reachable"),
         ]
     )
 
@@ -3177,10 +3180,62 @@ def test_outer_staging_abort_plan_wait_retries_exact_goal_until_reachable(
     )
 
     assert reachable is True
-    assert lookahead == (1.1, 2.2)
+    assert lookahead == (1.3, 2.4)
     assert reason == "reachable"
-    assert detail["attempts"] == 2
-    assert calls == [("map", 1.0, 2.0, -0.5), ("map", 1.0, 2.0, -0.5)]
+    assert detail["attempts"] == 3
+    assert detail["planner_health_required_confirmations"] == 2
+    assert detail["planner_health_confirmations"] == 2
+    assert clock.now == pytest.approx(0.50)
+    assert calls == [("map", 1.0, 2.0, -0.5)] * 3
+
+
+def test_outer_staging_abort_plan_wait_resets_health_after_transient_failure(
+    executor_module, monkeypatch
+) -> None:
+    """A solitary reachable reply cannot pair with one before an empty plan."""
+
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, duration: float) -> None:
+            self.now += float(duration)
+
+    clock = _Clock()
+    monkeypatch.setattr(executor_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(executor_module.time, "sleep", clock.sleep)
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.container_outer_staging_abort_replan_plan_retry_window_s = 1.5
+    executor.container_outer_staging_abort_replan_plan_retry_interval_s = 0.20
+    executor.container_outer_staging_abort_replan_plan_health_confirmations = 2
+    executor.container_outer_staging_abort_replan_plan_health_interval_s = 0.30
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
+    outcomes = iter(
+        [
+            (True, (1.0, 2.0), "reachable"),
+            (False, None, "empty_plan"),
+            (True, (1.2, 2.2), "reachable"),
+            (True, (1.4, 2.4), "reachable"),
+        ]
+    )
+    executor._preflight_navigation_plan = lambda *_args: next(outcomes)
+
+    reachable, lookahead, reason, detail = (
+        executor._wait_for_outer_staging_abort_reachable_plan(
+            "decision-reset", 1, "map", 1.0, 2.0, -0.5
+        )
+    )
+
+    assert reachable is True
+    assert lookahead == (1.4, 2.4)
+    assert reason == "reachable"
+    assert detail["attempts"] == 4
+    assert detail["planner_health_confirmations"] == 2
+    assert clock.now == pytest.approx(0.80)
 
 
 def test_outer_staging_abort_plan_wait_times_out_without_reachable_plan(
@@ -3204,6 +3259,8 @@ def test_outer_staging_abort_plan_wait_times_out_without_reachable_plan(
     executor.lock = threading.RLock()
     executor.container_outer_staging_abort_replan_plan_retry_window_s = 0.40
     executor.container_outer_staging_abort_replan_plan_retry_interval_s = 0.20
+    executor.container_outer_staging_abort_replan_plan_health_confirmations = 2
+    executor.container_outer_staging_abort_replan_plan_health_interval_s = 0.30
     executor._navigation_is_current = lambda _decision_id: True
     executor._navigation_run_is_active = lambda _decision_id, _token: True
     calls = []
