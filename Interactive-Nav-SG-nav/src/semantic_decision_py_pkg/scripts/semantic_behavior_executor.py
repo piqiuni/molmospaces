@@ -813,7 +813,7 @@ class SemanticBehaviorExecutor:
         # A receipt only proves that a costmap callback arrived; it does not
         # promise the global planner has recovered from the ABORT yet.  Poll
         # the same safe goal for a finite interval and resend only after a real
-        # reachable response.  This remains one retry per decision/index.
+        # reachable response.  This remains one retry per decision.
         self.container_outer_staging_abort_replan_plan_retry_window_s = max(
             0.0,
             float(
@@ -8484,7 +8484,7 @@ class SemanticBehaviorExecutor:
         This is deliberately narrower than normal interaction fallback.  It
         applies only before any M1 evidence has been accepted, while the
         two-stage candidate is still at its *outer* visual stance.  The caller
-        consumes a decision/index one-shot token and must still confirm a fresh
+        consumes a decision-wide one-shot token and must still confirm a fresh
         ``make_plan`` result before resending the exact same goal.
         """
 
@@ -8648,7 +8648,7 @@ class SemanticBehaviorExecutor:
         update occurred after the ABORT.  This loop deliberately makes no
         motion and accepts only ``reason == 'reachable'``: a transient service
         response, empty plan, or endpoint mismatch cannot revive the exact
-        outer M1 stance.  It is bounded per decision/index by the caller's
+        outer M1 stance.  It is bounded per decision by the caller's
         ledger and by this short wall-clock window.
         """
 
