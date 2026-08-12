@@ -1659,6 +1659,36 @@ class SemanticBehaviorExecutor:
             return base_tolerance_m
         return declared_tolerance_m
 
+    def _container_m1_staging_yaw_tolerance_rad(self, candidate: dict) -> float:
+        """Return the yaw envelope for a safe outer M1 staging observation.
+
+        The outer observation pose is deliberately farther from the appliance
+        than the later physical-action pose.  Its evidence contract therefore
+        has to agree with the yaw envelope that navigation used to accept that
+        same outer pose.  Otherwise a visually front-facing image can be
+        rejected solely because the evidence path is stricter than the arrival
+        path.  This never relaxes the inner bridge: the helper applies only
+        while the candidate still explicitly requires an outer M1 staging view.
+        """
+
+        base_tolerance_rad = max(
+            0.05,
+            float(getattr(self, "container_m1_capture_yaw_tolerance_rad", 0.25)),
+        )
+        metadata = candidate.get("metadata") or {}
+        if not bool(metadata.get("m1_observation_staging_required", False)):
+            return base_tolerance_rad
+        interaction = candidate.get("interaction_command") or {}
+        try:
+            declared_tolerance_rad = float(
+                interaction.get("interaction_ready_yaw_tolerance_rad", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            return base_tolerance_rad
+        if declared_tolerance_rad < base_tolerance_rad:
+            return base_tolerance_rad
+        return declared_tolerance_rad
+
     def _interaction_navigation_pose_tolerance_m(self, candidate: dict) -> float:
         """Use the wider envelope only while moving to an outer M1 staging pose."""
 
@@ -1772,8 +1802,8 @@ class SemanticBehaviorExecutor:
             distance_tolerance_m=self._container_m1_staging_pose_tolerance_m(
                 candidate
             ),
-            yaw_tolerance_rad=getattr(
-                self, "container_m1_capture_yaw_tolerance_rad", 0.25
+            yaw_tolerance_rad=self._container_m1_staging_yaw_tolerance_rad(
+                candidate
             ),
         )
         if not bool(validation.get("valid")):
@@ -1819,8 +1849,8 @@ class SemanticBehaviorExecutor:
             distance_tolerance_m=self._container_m1_staging_pose_tolerance_m(
                 candidate
             ),
-            yaw_tolerance_rad=getattr(
-                self, "container_m1_capture_yaw_tolerance_rad", 0.25
+            yaw_tolerance_rad=self._container_m1_staging_yaw_tolerance_rad(
+                candidate
             ),
         )
         return bool(validation.get("valid"))

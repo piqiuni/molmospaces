@@ -838,6 +838,61 @@ def test_two_stage_outer_staging_tolerance_stays_separate_from_inner_bridge(
     ) == pytest.approx(0.18)
 
 
+def test_outer_m1_capture_uses_declared_staging_yaw_contract(
+    executor_module,
+) -> None:
+    """Outer M1 may use its navigation yaw envelope, never the inner gate."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.tf_listener = object()
+    executor.map_frame = "map"
+    executor.container_m1_capture_pose_tolerance_m = 0.18
+    executor.container_m1_capture_yaw_tolerance_rad = 0.25
+    executor._current_pose = lambda _frame: (0.0, 0.0, 0.30)
+    candidate = {
+        "metadata": {
+            "frame_id": "map",
+            "m1_observation_staging_required": True,
+            "m1_safe_staging_outer_offset_m": 0.35,
+            "m1_safe_staging_arrival_tolerance_m": 0.30,
+            "effective_interaction_approach_pose_xyyaw": [0.0, 0.0, 0.0],
+        },
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [0.0, 0.0, 0.0],
+            "interaction_ready_yaw_tolerance_rad": 0.35,
+        },
+    }
+    update = {"observation_capture_step": 93}
+
+    evidence, reason = executor._container_m1_capture_evidence_locked(
+        candidate, update, {"observation_pose_xyyaw": [0.0, 0.0, 0.0]}
+    )
+    assert reason == "ready"
+    assert evidence is not None
+    assert evidence["pose_validation"]["yaw_tolerance_rad"] == pytest.approx(0.35)
+
+    executor._current_pose = lambda _frame: (0.0, 0.0, 0.36)
+    evidence, reason = executor._container_m1_capture_evidence_locked(
+        candidate, update, {"observation_pose_xyyaw": [0.0, 0.0, 0.0]}
+    )
+    assert evidence is None
+    assert reason == "m1_capture_pose_mismatch"
+
+    ordinary = {
+        **candidate,
+        "metadata": {
+            **candidate["metadata"],
+            "m1_observation_staging_required": False,
+        },
+    }
+    executor._current_pose = lambda _frame: (0.0, 0.0, 0.30)
+    evidence, reason = executor._container_m1_capture_evidence_locked(
+        ordinary, update, {"observation_pose_xyyaw": [0.0, 0.0, 0.0]}
+    )
+    assert evidence is None
+    assert reason == "m1_capture_pose_mismatch"
+
+
 def test_two_stage_inner_drawer_bypasses_close_range_regrounding(executor_module) -> None:
     executor = object.__new__(executor_module.SemanticBehaviorExecutor)
     executor.selection = {
