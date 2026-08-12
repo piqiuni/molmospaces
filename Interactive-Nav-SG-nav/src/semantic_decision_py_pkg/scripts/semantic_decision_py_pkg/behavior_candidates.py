@@ -2238,12 +2238,21 @@ class CandidateGenerator:
                 ring_count = 3
             ring_count = max(1, min(4, ring_count))
             ring_labels = ("safe_outer", "safe_far", "safe_farthest", "safe_max")
-            for ring_index in range(1, ring_count + 1):
-                ring_standoff = (
-                    max(0.0, float(standoff_m)) + ring_index * outer_offset
-                )
-                ring_label = ring_labels[ring_index - 1]
-                for axis, label in zip(axes[:face_count], face_labels[:face_count]):
+            # Keep each visual face contiguous across its bounded safe radii.
+            # A two-stage container retry advances linearly through this list.
+            # Ring-major ordering used to interleave faces (outer/current,
+            # outer/left, ... far/current), so a navigation failure on one face
+            # could repeatedly spend M1 attempts on an adjacent, non-front face
+            # at every radius.  Face-major ordering instead tests the same
+            # geometry from progressively safer/farther stances before moving
+            # to a different side.  It changes only retry scheduling: every
+            # pose still goes through ordinary make-plan and bridge checks.
+            for axis, label in zip(axes[:face_count], face_labels[:face_count]):
+                for ring_index in range(1, ring_count + 1):
+                    ring_standoff = (
+                        max(0.0, float(standoff_m)) + ring_index * outer_offset
+                    )
+                    ring_label = ring_labels[ring_index - 1]
                     append_unique(
                         self._approach_pose(
                             robot_xy,

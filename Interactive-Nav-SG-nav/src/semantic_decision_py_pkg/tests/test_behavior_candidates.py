@@ -1777,8 +1777,8 @@ def test_mllm_container_requires_fresh_front_observation_before_opening() -> Non
     assert candidate.metadata["observation_reason"] == "mllm_container_pre_action_visual"
 
 
-def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
-    """The finite fallback budget must cover four safe faces first.
+def test_mllm_container_preaction_prioritizes_safe_staging_face_before_radius() -> None:
+    """The finite fallback budget must finish one safe face before changing face.
 
     This is intentionally a geometry-only assertion: no costmap cells are
     cleared and no pose is accepted without the executor's normal planner and
@@ -1818,22 +1818,24 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
     labels = candidate.metadata["interaction_approach_pose_labels"]
     goals = candidate.metadata["goal_xyyaw_candidates"]
 
-    assert labels[:4] == [
+    assert labels[:3] == [
         "current_view_safe_outer",
-        "quarter_turn_left_safe_outer",
-        "quarter_turn_right_safe_outer",
-        "opposite_view_safe_outer",
-    ]
-    assert labels[4:8] == [
         "current_view_safe_far",
-        "quarter_turn_left_safe_far",
-        "quarter_turn_right_safe_far",
-        "opposite_view_safe_far",
-    ]
-    assert labels[8:] == [
         "current_view_safe_farthest",
+    ]
+    assert labels[3:6] == [
+        "quarter_turn_left_safe_outer",
+        "quarter_turn_left_safe_far",
         "quarter_turn_left_safe_farthest",
+    ]
+    assert labels[6:9] == [
+        "quarter_turn_right_safe_outer",
+        "quarter_turn_right_safe_far",
         "quarter_turn_right_safe_farthest",
+    ]
+    assert labels[9:] == [
+        "opposite_view_safe_outer",
+        "opposite_view_safe_far",
         "opposite_view_safe_farthest",
     ]
     assert len(goals) == 12
@@ -1843,12 +1845,12 @@ def test_mllm_container_preaction_prioritizes_outer_safe_staging_ring() -> None:
     assert math.isclose(goals[0][0], 2.4, abs_tol=1e-6)
     assert math.isclose(goals[0][1], 2.0, abs_tol=1e-6)
     # A failed outer ring must not fall back to a close shoulder pose.
-    assert math.isclose(goals[4][0], 2.1, abs_tol=1e-6)
-    assert math.isclose(goals[4][1], 2.0, abs_tol=1e-6)
+    assert math.isclose(goals[1][0], 2.1, abs_tol=1e-6)
+    assert math.isclose(goals[1][1], 2.0, abs_tol=1e-6)
     # A third, still-safe robot-side ring gives preflight a reachable option
     # when the first two lie inside a wall-adjacent inflation shoulder.
-    assert math.isclose(goals[8][0], 1.8, abs_tol=1e-6)
-    assert math.isclose(goals[8][1], 2.0, abs_tol=1e-6)
+    assert math.isclose(goals[2][0], 1.8, abs_tol=1e-6)
+    assert math.isclose(goals[2][1], 2.0, abs_tol=1e-6)
     assert candidate.metadata["container_two_stage_approach"] is True
     assert candidate.metadata["container_two_stage_mapping_ready"] is True
     assert candidate.metadata["interaction_observation_max_attempts"] == 12
@@ -1948,11 +1950,10 @@ def test_container_safe_outer_uses_visible_aabb_anchor_without_m1_axis() -> None
 
     labels = candidate.metadata["interaction_approach_pose_labels"]
     goals = candidate.metadata["goal_xyyaw_candidates"]
-    assert labels[:4] == [
+    assert labels[:3] == [
         "current_view_safe_outer",
-        "quarter_turn_left_safe_outer",
-        "quarter_turn_right_safe_outer",
-        "opposite_view_safe_outer",
+        "current_view_safe_far",
+        "current_view_safe_farthest",
     ]
     assert len(goals) == 12
     # AABB left surface x=3.5, then 0.80 m observation clearance and 0.30 m
