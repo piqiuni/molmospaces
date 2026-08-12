@@ -994,6 +994,103 @@ def test_container_two_stage_accepted_m1_uses_same_face_inner_options_before_out
     ]
 
 
+def test_container_two_stage_tangent_staging_acceptance_reuses_base_physical_face() -> None:
+    """A tangent M1 capture authorizes its base face, never a tangent contact."""
+
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    base_staging = [1.0, 2.0, 0.0]
+    tangent_staging = [1.0, 2.2, -0.20]
+    base_action = [1.30, 2.0, 0.0]
+    base_options = [
+        base_action,
+        [1.30, 2.22, 0.0],
+        [1.30, 1.78, 0.0],
+    ]
+    candidate["metadata"].update(
+        {
+            "container_staging_goal_xyyaw_candidates": [
+                base_staging,
+                tangent_staging,
+            ],
+            "container_staging_pose_labels": [
+                "safe_outer",
+                "safe_outer_tangent_left",
+            ],
+            "container_staging_source_index_by_index": [0, 0],
+            "container_action_goal_xyyaw_by_staging_index": [
+                base_action,
+                list(base_action),
+            ],
+            "container_action_pose_labels_by_staging_index": [
+                "safe_outer_physical_action",
+                "safe_outer_physical_action",
+            ],
+            "container_action_goal_xyyaw_options_by_staging_index": [
+                base_options,
+                [list(option) for option in base_options],
+            ],
+            "container_action_pose_option_labels_by_staging_index": [
+                [
+                    "safe_outer_physical_action",
+                    "safe_outer_physical_action_tangent_left",
+                    "safe_outer_physical_action_tangent_right",
+                ],
+                [
+                    "safe_outer_physical_action",
+                    "safe_outer_physical_action_tangent_left",
+                    "safe_outer_physical_action_tangent_right",
+                ],
+            ],
+            "accepted_container_m1_evidence": {
+                "staging_pose_xyyaw": list(tangent_staging),
+                "capture_pose_xyyaw": list(tangent_staging),
+                "capture_step": 11,
+            },
+        }
+    )
+    candidate["goal_xyyaw"] = list(base_staging)
+    machine.start(candidate, now=0.0)
+    request = machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+    assert request[0]["kind"] == "request_interaction_observation"
+    # The executor selects the tangent index after its ordinary make-plan
+    # preflight; the state machine must bind the fresh evidence to that exact
+    # outer pose before it can select the copied base action mapping.
+    machine.candidate["metadata"]["interaction_approach_goal_option_index"] = 1
+    machine.candidate["interaction_command"]["interaction_approach_pose_xyyaw"] = list(
+        tangent_staging
+    )
+    commands = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "observed_bbox_2d": [10, 10, 80, 120],
+            "attribute_capture_step": 11,
+            "container_visual_precondition_reason": "ready",
+        },
+        now=1.0,
+    )
+
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert [command["kind"] for command in commands] == ["navigate"]
+    assert commands[0]["reason"] == "container_m1_ready_navigate_physical_action_pose"
+    assert machine.candidate["metadata"]["container_two_stage_staging_goal_option_index"] == 1
+    assert machine.candidate["metadata"]["container_m1_evidence_staging_pose_xyyaw"] == tangent_staging
+    assert machine.candidate["goal_xyyaw"] == base_action
+    assert navigation_goal_options(machine.candidate) == [
+        tuple(base_options[0]),
+        tuple(base_options[1]),
+        tuple(base_options[2]),
+    ]
+    assert machine.candidate["metadata"]["m1_observation_staging_required"] is False
+    assert machine.candidate["metadata"]["observation_required"] is False
+
+
 def test_container_two_stage_inner_failure_returns_next_outer_m1_staging() -> None:
     machine = BehaviorExecutionStateMachine()
     candidate = two_stage_container_pre_action_candidate()

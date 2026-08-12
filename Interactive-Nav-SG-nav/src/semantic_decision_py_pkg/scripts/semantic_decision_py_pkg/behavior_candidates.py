@@ -163,6 +163,11 @@ class CandidateGeneratorConfig:
     # enumeration bounded because each option still participates in normal
     # preflight and visual re-observation accounting.
     container_safe_staging_ring_count: int = 3
+    # Keep the normal safe-outer standoff while adding at most one bounded
+    # left/right tangential view for each face.  A zero value preserves the
+    # original ring exactly; non-zero values are still ordinary move_base/M1
+    # staging candidates and never authorize a physical action by themselves.
+    container_safe_staging_tangent_offset_m: float = 0.0
     # The two-stage M1 gate may need to inspect more than the legacy four
     # observations because a finite outer ring can contain several
     # costmap-reachable sides.  Keep this explicit and bounded; it is not a
@@ -1386,7 +1391,13 @@ class CandidateGenerator:
             container_two_stage_mapping_ready = False
             container_action_goals_by_staging: list[list[float]] = []
             container_action_labels_by_staging: list[str] = []
+            container_staging_source_index_by_index: list[int] = list(
+                range(len(goal_candidates))
+            )
             if container_two_stage_requested:
+                container_staging_source_index_by_index = (
+                    self._container_staging_source_indices(approach_pose_labels)
+                )
                 (
                     container_action_goals_by_staging,
                     container_action_labels_by_staging,
@@ -1399,6 +1410,7 @@ class CandidateGenerator:
                     physical_standoff_m=interaction_standoff,
                     lateral_offset_m=self.config.container_action_lateral_offset_m,
                     node=node,
+                    staging_source_indices=container_staging_source_index_by_index,
                 )
                 container_two_stage_mapping_ready = bool(
                     container_action_goals_by_staging
@@ -1726,6 +1738,11 @@ class CandidateGenerator:
                         if container_two_stage_requested
                         else [],
                         "container_staging_pose_labels": list(approach_pose_labels)
+                        if container_two_stage_requested
+                        else [],
+                        "container_staging_source_index_by_index": list(
+                            container_staging_source_index_by_index
+                        )
                         if container_two_stage_requested
                         else [],
                         "container_action_goal_xyyaw_by_staging_index": [
@@ -2281,16 +2298,43 @@ class CandidateGenerator:
                         max(0.0, float(standoff_m)) + ring_index * outer_offset
                     )
                     ring_label = ring_labels[ring_index - 1]
-                    append_unique(
-                        self._approach_pose(
-                            robot_xy,
-                            target_xy,
-                            ring_standoff,
-                            node=node,
-                            fixed_axis=axis,
-                        ),
-                        f"{label}_{ring_label}",
+                    base_label = f"{label}_{ring_label}"
+                    base_pose = self._approach_pose(
+                        robot_xy,
+                        target_xy,
+                        ring_standoff,
+                        node=node,
+                        fixed_axis=axis,
                     )
+                    append_unique(base_pose, base_label)
+                    # A safe outer staging pose can still frame an appliance
+                    # behind a nearby counter edge.  Preserve its normal
+                    # clearance and add two bounded camera viewpoints along
+                    # the tangent only on the closest safe ring.  These labels
+                    # remain observation-only: their physical mapping below
+                    # explicitly reuses this base face rather than inferring a
+                    # contact normal from the tangent camera pose.
+                    tangent_offset_m = max(
+                        0.0,
+                        float(self.config.container_safe_staging_tangent_offset_m),
+                    )
+                    if ring_index != 1 or tangent_offset_m <= 1e-6:
+                        continue
+                    tangent_x, tangent_y = -axis[1], axis[0]
+                    for direction, tangent_label in (
+                        (1.0, "tangent_left"),
+                        (-1.0, "tangent_right"),
+                    ):
+                        x = float(base_pose[0]) + direction * tangent_offset_m * tangent_x
+                        y = float(base_pose[1]) + direction * tangent_offset_m * tangent_y
+                        append_unique(
+                            [
+                                x,
+                                y,
+                                math.atan2(target_xy[1] - y, target_xy[0] - x),
+                            ],
+                            f"{base_label}_{tangent_label}",
+                        )
         else:
             for axis, label in zip(axes[:face_count], face_labels[:face_count]):
                 append_unique(
@@ -2305,6 +2349,31 @@ class CandidateGenerator:
                 )
         return candidates, labels
 
+    @staticmethod
+    def _container_staging_source_indices(staging_labels: list[str]) -> list[int]:
+        """Map an outer tangent observation back to its base-face action pose.
+
+        The labels are internal candidate geometry labels, not semantic front
+        claims.  Tangential safe observations should earn their own fresh M1
+        evidence, but must never rotate the subsequent physical contact axis.
+        """
+
+        labels = [str(label) for label in staging_labels]
+        base_indices = {label: index for index, label in enumerate(labels)}
+        source_indices: list[int] = []
+        for index, label in enumerate(labels):
+            source_index = index
+            for suffix in ("_tangent_left", "_tangent_right"):
+                if not label.endswith(suffix):
+                    continue
+                base_label = label[: -len(suffix)]
+                candidate_index = base_indices.get(base_label)
+                if candidate_index is not None and candidate_index < index:
+                    source_index = candidate_index
+                break
+            source_indices.append(source_index)
+        return source_indices
+
     @classmethod
     def _container_action_goals_for_staging(
         cls,
@@ -2315,6 +2384,7 @@ class CandidateGenerator:
         physical_standoff_m: float,
         lateral_offset_m: float,
         node: dict[str, Any],
+        staging_source_indices: list[int] | None = None,
     ) -> tuple[
         list[list[float]],
         list[str],
@@ -2335,6 +2405,25 @@ class CandidateGenerator:
         action_option_labels: list[list[str]] = []
         lateral_offset = max(0.0, float(lateral_offset_m))
         for index, staging_goal in enumerate(staging_goals):
+            source_index = (
+                int(staging_source_indices[index])
+                if staging_source_indices is not None
+                and index < len(staging_source_indices)
+                else index
+            )
+            if 0 <= source_index < index:
+                # The outer tangent is a new M1 capture pose, not a new
+                # physical face.  Copy the already-built base face options so
+                # the eventual bridge target cannot drift with camera offset.
+                action_goals.append(list(action_goals[source_index]))
+                action_labels.append(str(action_labels[source_index]))
+                action_goal_options.append(
+                    [list(option) for option in action_goal_options[source_index]]
+                )
+                action_option_labels.append(
+                    list(action_option_labels[source_index])
+                )
+                continue
             values = list(staging_goal or [])
             if len(values) < 2:
                 return [], [], [], []

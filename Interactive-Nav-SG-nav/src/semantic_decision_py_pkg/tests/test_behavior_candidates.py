@@ -1906,6 +1906,103 @@ def test_two_stage_container_observation_budget_is_bounded_by_safe_ring() -> Non
     assert candidate.metadata["container_two_stage_observation_max_attempts"] == 5
 
 
+def test_two_stage_container_tangent_observation_reuses_base_action_mapping() -> None:
+    """Tangent M1 views keep standoff and cannot invent a physical face."""
+
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_pre_action_mllm=True,
+            container_safe_staging_ring_count=3,
+            container_safe_staging_tangent_offset_m=0.20,
+            container_two_stage_observation_max_attempts=20,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    labels = candidate.metadata["container_staging_pose_labels"]
+    goals = candidate.metadata["container_staging_goal_xyyaw_candidates"]
+    sources = candidate.metadata["container_staging_source_index_by_index"]
+    assert labels[:5] == [
+        "current_view_safe_outer",
+        "current_view_safe_outer_tangent_left",
+        "current_view_safe_outer_tangent_right",
+        "current_view_safe_far",
+        "current_view_safe_farthest",
+    ]
+    assert len(goals) == 20
+    assert sources[:5] == [0, 0, 0, 3, 4]
+    assert sources == [0, 0, 0, 3, 4, 5, 5, 5, 8, 9, 10, 10, 10, 13, 14, 15, 15, 15, 18, 19]
+    # The tangent keeps the same 1.15 m outer radial clearance while shifting
+    # only along the face tangent; it is not a closer M1 pose.
+    assert math.isclose(goals[0][0], 2.15, abs_tol=1e-6)
+    assert math.isclose(goals[0][1], 2.0, abs_tol=1e-6)
+    assert math.isclose(goals[1][0], 2.15, abs_tol=1e-6)
+    assert math.isclose(goals[1][1], 1.8, abs_tol=1e-6)
+    assert math.isclose(goals[2][0], 2.15, abs_tol=1e-6)
+    assert math.isclose(goals[2][1], 2.2, abs_tol=1e-6)
+    for tangent_index, base_index in ((1, 0), (2, 0), (6, 5), (7, 5), (11, 10), (12, 10), (16, 15), (17, 15)):
+        assert sources[tangent_index] == base_index
+        expected_yaw = math.atan2(2.0 - goals[tangent_index][1], 4.0 - goals[tangent_index][0])
+        assert math.isclose(goals[tangent_index][2], expected_yaw, abs_tol=1e-6)
+    action_goals = candidate.metadata[
+        "container_action_goal_xyyaw_by_staging_index"
+    ]
+    action_options = candidate.metadata[
+        "container_action_goal_xyyaw_options_by_staging_index"
+    ]
+    assert action_goals[1] == action_goals[0]
+    assert action_goals[2] == action_goals[0]
+    assert action_options[1] == action_options[0]
+    assert action_options[2] == action_options[0]
+    assert candidate.metadata["interaction_observation_max_attempts"] == 20
+    assert candidate.metadata["container_two_stage_observation_max_attempts"] == 20
+
+
+def test_two_stage_container_tangent_observation_budget_clamps_to_expanded_ring() -> None:
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_pre_action_mllm=True,
+            container_safe_staging_tangent_offset_m=0.20,
+            container_two_stage_observation_max_attempts=99,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    assert len(candidate.metadata["container_staging_goal_xyyaw_candidates"]) == 20
+    assert candidate.metadata["interaction_observation_max_attempts"] == 20
+    assert candidate.metadata["container_two_stage_observation_max_attempts"] == 20
+
+
 def test_container_safe_outer_uses_visible_aabb_anchor_without_m1_axis() -> None:
     """A current-view ring must aim at the observed box, not a stale centroid.
 

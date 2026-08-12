@@ -35,9 +35,14 @@ candidate:
   # bridge gate remains the separate container_interaction distance below.
   container_safe_staging_outer_offset_m: 0.35
   container_safe_staging_ring_count: 3
+  # Add two bounded tangent views beside each closest safe_outer pose.  The
+  # normal standoff is unchanged; each view still needs fresh M1 evidence and
+  # ordinary navigation preflight before the paired physical action is used.
+  container_safe_staging_tangent_offset_m: 0.20
   # Match the finite 3 x 4 outer staging ring: each fresh M1 rejection may
-  # advance to another safe view, but never creates an unbounded loop.
-  container_two_stage_observation_max_attempts: 12
+  # advance to another safe view, but never creates an unbounded loop.  The
+  # extra two tangent views per face make this a bounded 20-pose sequence.
+  container_two_stage_observation_max_attempts: 20
   # This is pose error around the outer M1 staging target, never permission to
   # execute there.  The paired .35 m offset preserves its closest clearance.
   container_safe_staging_arrival_tolerance_m: 0.30
@@ -90,9 +95,9 @@ completion:
 executor:
   interaction_navigation_timeout_s: 180.0
   interaction_observation_timeout_s: 12.0
-  # A two-stage container has a finite twelve-pose M1 staging sequence; retain
+  # A two-stage container has a finite twenty-pose M1 staging sequence; retain
   # that bounded coverage after an inner action-pose failure.
-  container_two_stage_fallback_max_attempts: 12
+  container_two_stage_fallback_max_attempts: 20
   # Keep close refrigerator/drawer action poses strict, but let DWA approach
   # them through a few short segments sampled from a verified global path.
   # The temporary points are executor-private: they never request M1 or issue
