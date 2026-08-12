@@ -910,6 +910,299 @@ def test_two_stage_inner_drawer_bypasses_close_range_regrounding(executor_module
     assert executor._needs_fresh_drawer_scan_locked() is False
 
 
+def test_start_inner_corridor_dispatches_one_private_navigation_waypoint(
+    executor_module, monkeypatch
+) -> None:
+    """A verified inner segment must not dispatch the physical bridge pose yet."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.container_inner_corridor_enabled = True
+    executor.container_inner_corridor_max_segments = 4
+    executor.container_inner_corridor_segment_m = 0.30
+    executor.container_inner_corridor_arrival_tolerance_m = 0.10
+    executor._preflight_navigation_path = lambda *_args: (
+        True,
+        [(0.0, 0.0), (0.15, 0.0), (0.35, 0.0), (1.0, 0.0)],
+        "reachable",
+    )
+    executor._current_pose = lambda _frame: (0.0, 0.0, 0.0)
+    physical_candidate = {
+        "decision_id": "decision-corridor-start",
+        "candidate_id": "interaction:fridge:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 0.0, 0.0],
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "physical_action",
+            "goal_xyyaw_candidates": [[1.1, 0.1, 0.0], [1.1, -0.1, 0.0]],
+        },
+        "interaction_command": {"action": "open", "node_type": "container"},
+    }
+    launched = []
+
+    class _Thread:
+        def __init__(self, *, target, args, daemon):
+            launched.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(executor_module.threading, "Thread", _Thread)
+
+    assert executor._start_container_inner_corridor(
+        "decision-corridor-start",
+        physical_candidate,
+        goal_frame="map",
+        final_goal=(1.0, 0.0, 0.0),
+        final_goal_option_index=0,
+        interaction_approach_attempts=[{"index": 0, "phase": "physical_action"}],
+    ) is True
+
+    assert len(launched) == 1
+    _target, args, daemon = launched[0]
+    assert daemon is True
+    assert args[0] == "decision-corridor-start"
+    corridor_candidate = args[1]
+    assert args[2:] == (0, [])
+    # The worker receives one short NAVIGATE target, not the physical action
+    # target or its tangent alternatives.
+    assert corridor_candidate["behavior_type"] == "NAVIGATE"
+    assert corridor_candidate["goal_xyyaw"] == [0.35, 0.0, 0.0]
+    assert executor_module.navigation_goal_options(corridor_candidate) == [
+        (0.35, 0.0, 0.0)
+    ]
+    assert corridor_candidate["metadata"]["goal_xyyaw_candidates"] == []
+    assert physical_candidate["behavior_type"] == "INTERACT"
+    assert physical_candidate["metadata"]["goal_xyyaw_candidates"] == [
+        [1.1, 0.1, 0.0],
+        [1.1, -0.1, 0.0],
+    ]
+
+    corridor_run_id = corridor_candidate["metadata"]["container_inner_corridor_run_id"]
+    assert corridor_run_id > 0
+    context = executor._container_inner_corridors["decision-corridor-start"]
+    assert context["corridor_run_id"] == corridor_run_id
+    assert context["candidate"]["behavior_type"] == "INTERACT"
+    assert context["candidate"]["goal_xyyaw"] == [1.0, 0.0, 0.0]
+    assert context["waypoint_xyyaw"] == [0.35, 0.0, 0.0]
+
+
+def test_inner_corridor_completion_relaunches_canonical_physical_goal_without_bridge(
+    executor_module, monkeypatch
+) -> None:
+    """A private corridor waypoint cannot become an interaction success."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "decision-corridor"}
+    executor._container_inner_corridors = {
+        "decision-corridor": {
+            "corridor_run_id": 1,
+            "candidate": {
+                "decision_id": "decision-corridor",
+                "behavior_type": "INTERACT",
+                "goal_xyyaw": [2.0, 0.0, 0.0],
+                "metadata": {
+                    "container_two_stage_approach": True,
+                    "container_two_stage_phase": "physical_action",
+                },
+            },
+            "final_goal_option_index": 1,
+            "interaction_approach_attempts": [{"index": 1}],
+            "waypoint_xyyaw": [1.0, 0.0, 0.0],
+        }
+    }
+    executor._navigation_is_current = lambda decision_id: decision_id == "decision-corridor"
+    launched = []
+
+    class _Thread:
+        def __init__(self, *, target, args, daemon):
+            launched.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(executor_module.threading, "Thread", _Thread)
+    executor._handle_navigation_result = lambda *_args, **_kwargs: pytest.fail(
+        "a corridor waypoint must not fall through to bridge/state-machine result"
+    )
+
+    assert executor._consume_container_inner_corridor_result(
+        "decision-corridor",
+        True,
+        {"status": "SUCCEEDED"},
+        candidate={
+            "metadata": {
+                "container_inner_corridor_navigation": True,
+                "container_inner_corridor_run_id": 1,
+            }
+        },
+    ) is True
+    assert executor._container_inner_corridors == {}
+    assert len(launched) == 1
+    _target, args, _daemon = launched[0]
+    assert args[0] == "decision-corridor"
+    assert args[2] == 1
+    assert args[1]["goal_xyyaw"] == [2.0, 0.0, 0.0]
+    assert args[1]["metadata"]["container_inner_corridor_segments_completed"] == 1
+
+
+def test_inner_corridor_failure_retries_original_physical_option(executor_module) -> None:
+    """A failed waypoint preserves the physical-option index for tangent retry."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.selection = {"decision_id": "decision-corridor-fail"}
+    candidate = {
+        "decision_id": "decision-corridor-fail",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [2.0, 0.0, 0.0],
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "physical_action",
+            "container_two_stage_staging_goal_option_index": 0,
+            "container_staging_goal_xyyaw_candidates": [[3.0, 0.0, 0.0]],
+            "container_action_goal_xyyaw_options_by_staging_index": [
+                [[2.0, 0.0, 0.0], [2.1, 0.1, 0.0], [2.1, -0.1, 0.0]]
+            ],
+        },
+    }
+    executor._container_inner_corridors = {
+        "decision-corridor-fail": {
+            "corridor_run_id": 2,
+            "candidate": candidate,
+            "final_goal_option_index": 1,
+            "interaction_approach_attempts": [{"index": 1}],
+            "waypoint_xyyaw": [1.0, 0.0, 0.0],
+        }
+    }
+    executor._navigation_is_current = lambda _decision_id: True
+    retry_calls = []
+    executor._retry_interaction_approach = lambda *args: retry_calls.append(args) or True
+    executor._handle_navigation_result = lambda *_args, **_kwargs: pytest.fail(
+        "successful bounded retry must not terminalize the physical candidate"
+    )
+
+    assert executor._consume_container_inner_corridor_result(
+        "decision-corridor-fail",
+        False,
+        {"reason": "navigation_stagnation"},
+        candidate={
+            "metadata": {
+                "container_inner_corridor_navigation": True,
+                "container_inner_corridor_run_id": 2,
+            }
+        },
+    ) is True
+    assert len(retry_calls) == 1
+    assert retry_calls[0][2] == 1
+    assert retry_calls[0][4] == 3
+    assert retry_calls[0][3][-1]["index"] == 1
+    assert retry_calls[0][3][-1]["outcome"] == "container_inner_corridor_failed"
+
+
+def test_non_corridor_result_cannot_consume_same_decision_corridor(executor_module) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor._container_inner_corridors = {
+        "decision-corridor-stale": {"candidate": {"behavior_type": "INTERACT"}}
+    }
+
+    assert executor._consume_container_inner_corridor_result(
+        "decision-corridor-stale",
+        True,
+        {},
+        candidate={"metadata": {}},
+    ) is False
+    assert "decision-corridor-stale" in executor._container_inner_corridors
+
+
+def test_stale_inner_corridor_run_id_cannot_consume_replacement_context(
+    executor_module,
+) -> None:
+    """An old private worker must not consume a newer waypoint's context."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    context = {
+        "corridor_run_id": 22,
+        "candidate": {"behavior_type": "INTERACT", "goal_xyyaw": [2.0, 0.0, 0.0]},
+        "final_goal_option_index": 0,
+        "interaction_approach_attempts": [],
+        "waypoint_xyyaw": [1.0, 0.0, 0.0],
+    }
+    executor._container_inner_corridors = {"decision-corridor-replaced": context}
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._retry_interaction_approach = lambda *_args: pytest.fail(
+        "a stale private worker must not retry the replacement context"
+    )
+    executor._handle_navigation_result = lambda *_args, **_kwargs: pytest.fail(
+        "a stale private worker must not terminalize the replacement context"
+    )
+
+    assert executor._consume_container_inner_corridor_result(
+        "decision-corridor-replaced",
+        True,
+        {"status": "SUCCEEDED"},
+        candidate={
+            "metadata": {
+                "container_inner_corridor_navigation": True,
+                "container_inner_corridor_run_id": 21,
+            }
+        },
+    ) is True
+    assert executor._container_inner_corridors["decision-corridor-replaced"] is context
+    assert context["corridor_run_id"] == 22
+
+
+def test_inner_corridor_never_consumes_physical_tangents_or_final_yaw(
+    executor_module,
+) -> None:
+    """Private waypoints have one goal and defer every retry to their context."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor._navigation_is_current = lambda _decision_id: True
+    corridor = {
+        "behavior_type": "NAVIGATE",
+        "goal_xyyaw": [1.0, 0.0, 0.2],
+        "metadata": {
+            "container_inner_corridor_navigation": True,
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "physical_action",
+            "goal_xyyaw_candidates": [],
+        },
+    }
+
+    assert executor._container_inner_corridor_marker(corridor) is True
+    assert executor._retry_interaction_approach(
+        "decision-corridor", corridor, 0, [], 1, {"reason": "navigation_stagnation"}
+    ) is False
+    assert executor_module.navigation_requires_final_yaw(
+        "NAVIGATE", True, [1.0, 0.0, 0.2]
+    ) is True
+    assert executor._requires_final_yaw_for_navigation(
+        corridor, "NAVIGATE", True, [1.0, 0.0, 0.2]
+    ) is False
+
+
+def test_inner_corridor_bypasses_rear_goal_direct_control(executor_module) -> None:
+    corridor = {
+        "metadata": {"container_inner_corridor_navigation": True},
+    }
+    ordinary = {"metadata": {}}
+    assert executor_module.SemanticBehaviorExecutor._container_inner_corridor_marker(
+        corridor
+    ) is True
+    assert executor_module.navigation_should_prerotate("NAVIGATE") is True
+    # The run loop combines the existing predicate with this marker.  Keep the
+    # marker itself explicit in a small regression, rather than calling direct
+    # control helpers in a static test fixture.
+    assert not executor_module.SemanticBehaviorExecutor._container_inner_corridor_marker(
+        ordinary
+    )
+
+
 def test_drawer_scan_wait_uses_finite_simulator_step_budget_not_wall_time(
     executor_module,
 ) -> None:

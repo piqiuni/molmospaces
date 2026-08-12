@@ -914,6 +914,42 @@ class SemanticBehaviorExecutor:
             1,
             int(config.get("container_two_stage_fallback_max_attempts", 12)),
         )
+        # A container M1 view is intentionally taken from a safe outer stance,
+        # while the bridge still needs a nearer physical action pose.  Let the
+        # local controller follow a few short segments of the already verified
+        # global plan between those two public poses instead of handing one long
+        # close-range move directly to DWA.  This remains an executor-private
+        # navigation aid: it neither asks for another M1 image nor changes the
+        # canonical bridge pose retained on the state-machine candidate.
+        self.container_inner_corridor_enabled = bool(
+            config.get("container_inner_corridor_enabled", True)
+        )
+        self.container_inner_corridor_segment_m = max(
+            0.10,
+            float(config.get("container_inner_corridor_segment_m", 0.30)),
+        )
+        self.container_inner_corridor_arrival_tolerance_m = max(
+            0.02,
+            float(
+                config.get(
+                    "container_inner_corridor_arrival_tolerance_m", 0.10
+                )
+            ),
+        )
+        self.container_inner_corridor_max_segments = max(
+            1,
+            int(config.get("container_inner_corridor_max_segments", 4)),
+        )
+        self._container_inner_corridors: dict[str, dict] = {}
+        self._container_inner_corridor_run_sequence = 0
+        # Navigation runs overlap briefly while an old actionlib callback is
+        # winding down and a bounded fallback has already been dispatched.
+        # Keep a monotonic dispatch token per process so an old run cannot be
+        # confused with a new run that happens to reuse the same candidate
+        # object or decision ID.
+        self._navigation_run_sequence = 0
+        self._navigation_result_sources: dict[tuple[str, int], dict] = {}
+        self._active_navigation_run_tokens: dict[str, int] = {}
         self.interaction_approach_fallback_cancel_wait_s = max(
             0.0,
             float(config.get("interaction_approach_fallback_cancel_wait_s", 0.5)),
@@ -1227,6 +1263,7 @@ class SemanticBehaviorExecutor:
             self.model_events = []
             decision_id = str(selection.get("decision_id") or "")
             if decision_id:
+                self._clear_navigation_tracking_locked(decision_id)
                 self._navigation_failure_recovery_attempts.pop(decision_id, None)
                 self._drawer_scan_wait_contexts.pop(decision_id, None)
                 self._drawer_scan_wait_records.pop(decision_id, None)
@@ -1267,6 +1304,7 @@ class SemanticBehaviorExecutor:
                 STATE_APPROACH_INTERACTION,
             }
             finalize_explore = True
+            self._clear_navigation_tracking_locked(active_decision_id)
             self.selection = None
             self.machine.reset()
         if cancel_navigation:
@@ -6452,6 +6490,7 @@ class SemanticBehaviorExecutor:
         interaction_approach_attempts: list[dict],
         goal_option_count: int,
         detail: dict,
+        navigation_run_token: int | None = None,
     ) -> None:
         """Gate an INTERACT command on counted fresh-pose samples."""
 
@@ -6478,7 +6517,13 @@ class SemanticBehaviorExecutor:
             ],
         }
         if pose_ready:
-            self._handle_navigation_result(decision_id, True, detail)
+            self._handle_navigation_result(
+                decision_id,
+                True,
+                detail,
+                source_candidate=candidate,
+                navigation_run_token=navigation_run_token,
+            )
             return
         if self._retry_interaction_approach(
             decision_id,
@@ -6489,7 +6534,13 @@ class SemanticBehaviorExecutor:
             detail,
         ):
             return
-        self._handle_navigation_result(decision_id, False, detail)
+        self._handle_navigation_result(
+            decision_id,
+            False,
+            detail,
+            source_candidate=candidate,
+            navigation_run_token=navigation_run_token,
+        )
 
     def _set_effective_interaction_approach(
         self,
@@ -6595,6 +6646,451 @@ class SemanticBehaviorExecutor:
         result["metadata"] = metadata
         return result
 
+    @staticmethod
+    def _container_inner_corridor_marker(candidate: dict | None) -> bool:
+        """Whether ``candidate`` is an executor-private corridor subgoal.
+
+        A corridor point deliberately is *not* an interaction approach pose.
+        It is a short, path-backed navigation subgoal between a fresh outer M1
+        stance and the already-authorized physical pose.  Keeping this marker
+        private to the executor prevents it from leaking into bridge metadata
+        or being mistaken for a new M1 observation pose.
+        """
+
+        metadata = (candidate or {}).get("metadata") or {}
+        return bool(metadata.get("container_inner_corridor_navigation", False))
+
+    @staticmethod
+    def _container_inner_corridor_run_id(candidate: dict | None) -> int | None:
+        """Return the private corridor ownership token carried by a waypoint."""
+
+        if not SemanticBehaviorExecutor._container_inner_corridor_marker(candidate):
+            return None
+        try:
+            run_id = int(
+                ((candidate or {}).get("metadata") or {}).get(
+                    "container_inner_corridor_run_id"
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+        return run_id if run_id > 0 else None
+
+    def _next_container_inner_corridor_run_id_locked(self) -> int:
+        self._container_inner_corridor_run_sequence = max(
+            0, int(getattr(self, "_container_inner_corridor_run_sequence", 0) or 0)
+        ) + 1
+        return int(self._container_inner_corridor_run_sequence)
+
+    def _register_navigation_run(self, decision_id: str, candidate: dict) -> int:
+        """Bind one worker result to a unique dispatch generation."""
+
+        decision_key = str(decision_id)
+        with self.lock:
+            self._navigation_run_sequence = max(
+                0, int(getattr(self, "_navigation_run_sequence", 0) or 0)
+            ) + 1
+            run_token = int(self._navigation_run_sequence)
+            sources = getattr(self, "_navigation_result_sources", None)
+            if not isinstance(sources, dict):
+                sources = {}
+                self._navigation_result_sources = sources
+            active_tokens = getattr(self, "_active_navigation_run_tokens", None)
+            if not isinstance(active_tokens, dict):
+                active_tokens = {}
+                self._active_navigation_run_tokens = active_tokens
+            sources[(decision_key, run_token)] = dict(candidate)
+            active_tokens[decision_key] = run_token
+            return run_token
+
+    def _navigation_run_is_active(
+        self, decision_id: str, run_token: int | None
+    ) -> bool:
+        if run_token is None:
+            return True
+        with self.lock:
+            active_tokens = getattr(self, "_active_navigation_run_tokens", None)
+            return bool(
+                isinstance(active_tokens, dict)
+                and active_tokens.get(str(decision_id)) == int(run_token)
+            )
+
+    def _clear_container_inner_corridor_if_owned_locked(
+        self, decision_id: str, candidate: dict | None
+    ) -> None:
+        run_id = self._container_inner_corridor_run_id(candidate)
+        if run_id is None:
+            return
+        corridors = getattr(self, "_container_inner_corridors", None)
+        if not isinstance(corridors, dict):
+            return
+        context = corridors.get(str(decision_id))
+        if isinstance(context, dict) and int(context.get("corridor_run_id", 0) or 0) == run_id:
+            corridors.pop(str(decision_id), None)
+
+    def _release_navigation_run(
+        self, decision_id: str, run_token: int, candidate: dict
+    ) -> None:
+        """Drop worker-local ownership on every result and early-return path."""
+
+        decision_key = str(decision_id)
+        with self.lock:
+            sources = getattr(self, "_navigation_result_sources", None)
+            if isinstance(sources, dict):
+                sources.pop((decision_key, int(run_token)), None)
+            active_tokens = getattr(self, "_active_navigation_run_tokens", None)
+            if (
+                isinstance(active_tokens, dict)
+                and active_tokens.get(decision_key) == int(run_token)
+            ):
+                active_tokens.pop(decision_key, None)
+            self._clear_container_inner_corridor_if_owned_locked(decision_key, candidate)
+
+    def _clear_navigation_tracking_locked(self, decision_id: str) -> None:
+        """Remove all private navigation state for a terminal/preempted decision."""
+
+        decision_key = str(decision_id)
+        corridors = getattr(self, "_container_inner_corridors", None)
+        if isinstance(corridors, dict):
+            corridors.pop(decision_key, None)
+        active_tokens = getattr(self, "_active_navigation_run_tokens", None)
+        if isinstance(active_tokens, dict):
+            active_tokens.pop(decision_key, None)
+        sources = getattr(self, "_navigation_result_sources", None)
+        if isinstance(sources, dict):
+            for key in list(sources):
+                if isinstance(key, tuple) and key and str(key[0]) == decision_key:
+                    sources.pop(key, None)
+
+    @classmethod
+    def _requires_final_yaw_for_navigation(
+        cls,
+        candidate: dict | None,
+        behavior_type: str,
+        final_align_enabled: bool,
+        primary_goal_values: list,
+    ) -> bool:
+        """Keep final interaction yaw alignment off private corridor points."""
+
+        return bool(
+            not cls._container_inner_corridor_marker(candidate)
+            and navigation_requires_final_yaw(
+                behavior_type, final_align_enabled, primary_goal_values
+            )
+        )
+
+    def _preflight_navigation_path(
+        self,
+        frame_id: str,
+        goal_x: float,
+        goal_y: float,
+        goal_yaw: float,
+    ) -> tuple[bool, list[tuple[float, float]], str]:
+        """Return a verified make-plan polyline without changing old callers.
+
+        ``_preflight_navigation_plan`` intentionally has a compact three-value
+        interface which many tests and regular navigation callers rely on.  The
+        inner-corridor module needs the full, already-public planner path, so it
+        crosses a separate seam rather than widening that interface.
+        """
+
+        if not self.make_plan_preflight_enabled:
+            return False, [], "disabled"
+        pose = self._current_pose(frame_id)
+        if pose is None:
+            return False, [], "pose_unavailable"
+        stamp = rospy.Time.now()
+        start = PoseStamped()
+        start.header.frame_id = frame_id
+        start.header.stamp = stamp
+        start.pose.position.x = pose[0]
+        start.pose.position.y = pose[1]
+        start.pose.orientation.z = math.sin(0.5 * pose[2])
+        start.pose.orientation.w = math.cos(0.5 * pose[2])
+        goal = PoseStamped()
+        goal.header.frame_id = frame_id
+        goal.header.stamp = stamp
+        goal.pose.position.x = float(goal_x)
+        goal.pose.position.y = float(goal_y)
+        goal.pose.orientation.z = math.sin(0.5 * float(goal_yaw))
+        goal.pose.orientation.w = math.cos(0.5 * float(goal_yaw))
+        try:
+            rospy.wait_for_service(
+                self.make_plan_service,
+                timeout=max(0.0, self.make_plan_service_wait_sec),
+            )
+            response = self.make_plan_client(
+                start=start,
+                goal=goal,
+                tolerance=max(0.0, self.make_plan_tolerance_m),
+            )
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            rospy.logwarn_throttle(
+                5.0,
+                "[semantic_behavior_executor] inner corridor make_plan unavailable: %s",
+                exc,
+            )
+            return False, [], "service_unavailable"
+        poses = list(response.plan.poses or [])
+        if not poses:
+            return False, [], "empty_plan"
+        endpoint = poses[-1].pose.position
+        reachable = math.hypot(
+            float(endpoint.x) - float(goal_x),
+            float(endpoint.y) - float(goal_y),
+        ) <= max(self.make_plan_endpoint_tolerance_m, self.make_plan_tolerance_m)
+        if not reachable:
+            return False, [], "endpoint_mismatch"
+        return True, [
+            (float(path_pose.pose.position.x), float(path_pose.pose.position.y))
+            for path_pose in poses
+        ], "reachable"
+
+    def _start_container_inner_corridor(
+        self,
+        decision_id: str,
+        candidate: dict,
+        *,
+        goal_frame: str,
+        final_goal: tuple[float, float, float],
+        final_goal_option_index: int,
+        interaction_approach_attempts: list[dict],
+    ) -> bool:
+        """Dispatch one verified intermediate segment before a close action pose.
+
+        The action endpoint stays canonical on the state-machine candidate.  A
+        corridor is used only once for a particular physical option; after its
+        single intermediate point completes, the normal physical navigation
+        flow re-plans to the original endpoint and retains the strict bridge
+        validation.  If a path cannot prove a useful intermediate point, this
+        returns ``False`` and the caller uses the existing direct path.
+        """
+
+        if (
+            not bool(getattr(self, "container_inner_corridor_enabled", False))
+            or not is_container_two_stage_physical_action(candidate)
+            or self._container_inner_corridor_marker(candidate)
+        ):
+            return False
+        metadata = dict(candidate.get("metadata") or {})
+        completed_segments = max(
+            0, int(metadata.get("container_inner_corridor_segments_completed", 0) or 0)
+        )
+        if completed_segments >= int(
+            getattr(self, "container_inner_corridor_max_segments", 1)
+        ):
+            return False
+        reachable, path_xy, reason = self._preflight_navigation_path(
+            goal_frame, final_goal[0], final_goal[1], final_goal[2]
+        )
+        if not reachable:
+            return False
+        current_pose = self._current_pose(goal_frame)
+        if current_pose is None:
+            return False
+        waypoint_xy = path_lookahead_point(
+            (current_pose[0], current_pose[1]),
+            path_xy,
+            float(getattr(self, "container_inner_corridor_segment_m", 0.30)),
+        )
+        if waypoint_xy is None:
+            return False
+        remaining_distance = math.hypot(
+            float(final_goal[0]) - float(waypoint_xy[0]),
+            float(final_goal[1]) - float(waypoint_xy[1]),
+        )
+        if remaining_distance <= float(
+            getattr(self, "container_inner_corridor_arrival_tolerance_m", 0.10)
+        ):
+            return False
+        # Do not impose a straight-line radial constraint here.  The point is
+        # intentionally sampled from the global planner path because a valid
+        # approach may bend around a costmap obstacle; a straight-line test
+        # would reject exactly the detours this corridor is meant to preserve.
+        # ``path_lookahead_point`` returns one of the planner's path points.
+        # Find the following non-coincident point, rather than scanning from
+        # the path origin (which would point the waypoint back toward the
+        # robot).  This yaw is only for the intermediate navigation segment;
+        # the final physical pose still uses its original object-facing yaw.
+        waypoint_index = min(
+            range(len(path_xy)),
+            key=lambda index: math.hypot(
+                path_xy[index][0] - waypoint_xy[0],
+                path_xy[index][1] - waypoint_xy[1],
+            ),
+        )
+        next_xy = final_goal[:2]
+        for point in path_xy[waypoint_index + 1 :]:
+            if math.hypot(point[0] - waypoint_xy[0], point[1] - waypoint_xy[1]) > 1e-4:
+                next_xy = point
+                break
+        waypoint_yaw = math.atan2(
+            float(next_xy[1]) - float(waypoint_xy[1]),
+            float(next_xy[0]) - float(waypoint_xy[0]),
+        )
+        corridor_candidate = dict(candidate)
+        corridor_metadata = dict(metadata)
+        with self.lock:
+            corridor_run_id = self._next_container_inner_corridor_run_id_locked()
+        corridor_metadata.update(
+            {
+                "container_inner_corridor_navigation": True,
+                "container_inner_corridor_run_id": corridor_run_id,
+                "container_inner_corridor_segment_index": completed_segments + 1,
+                "container_inner_corridor_final_goal_xyyaw": list(final_goal),
+                "container_inner_corridor_final_goal_option_index": int(
+                    final_goal_option_index
+                ),
+                "container_inner_corridor_preflight_reason": reason,
+                "container_inner_corridor_waypoint_xyyaw": [
+                    float(waypoint_xy[0]),
+                    float(waypoint_xy[1]),
+                    float(waypoint_yaw),
+                ],
+                # A corridor is one private navigation point, never the
+                # physical action candidate's tangent fallback list.  Keeping
+                # those alternatives here would let an ordinary NAVIGATE retry
+                # jump directly to a close bridge pose after the waypoint fails.
+                "goal_xyyaw_candidates": [],
+            }
+        )
+        corridor_candidate["behavior_type"] = "NAVIGATE"
+        corridor_candidate["goal_xyyaw"] = [
+            float(waypoint_xy[0]),
+            float(waypoint_xy[1]),
+            float(waypoint_yaw),
+        ]
+        corridor_candidate["metadata"] = corridor_metadata
+        with self.lock:
+            corridors = getattr(self, "_container_inner_corridors", None)
+            if not isinstance(corridors, dict):
+                corridors = {}
+                self._container_inner_corridors = corridors
+            # A newer dispatch explicitly supersedes any stale private waypoint
+            # for this decision.  Its old result carries a different run ID and
+            # will be ignored by the consumer below.
+            corridors[str(decision_id)] = {
+                "corridor_run_id": corridor_run_id,
+                "candidate": dict(candidate),
+                "final_goal_option_index": int(final_goal_option_index),
+                "interaction_approach_attempts": [
+                    dict(item) for item in interaction_approach_attempts
+                ],
+                "waypoint_xyyaw": list(corridor_candidate["goal_xyyaw"]),
+                "segments_completed": completed_segments + 1,
+            }
+        threading.Thread(
+            target=self._run_navigation,
+            args=(decision_id, corridor_candidate, 0, []),
+            daemon=True,
+        ).start()
+        return True
+
+    def _consume_container_inner_corridor_result(
+        self,
+        decision_id: str,
+        success: bool,
+        detail: dict,
+        *,
+        candidate: dict | None = None,
+    ) -> bool:
+        """Advance or fail a private corridor without exposing it as interaction.
+
+        ``True`` means the result was owned by a corridor and must not fall
+        through to the normal state machine.  This is the key seam that keeps a
+        waypoint from becoming a bridge approach pose.
+        """
+
+        # Results are asynchronous.  Decision IDs survive all of a container's
+        # outer/inner retries, so a stale direct-navigation callback must never
+        # be allowed to consume the current corridor just because it shares a
+        # decision ID.  Only the private marked candidate owns this context.
+        if not self._container_inner_corridor_marker(candidate):
+            return False
+        corridor_run_id = self._container_inner_corridor_run_id(candidate)
+        if corridor_run_id is None:
+            return True
+        with self.lock:
+            corridors = getattr(self, "_container_inner_corridors", None)
+            if not isinstance(corridors, dict):
+                return True
+            context = corridors.get(str(decision_id))
+            if (
+                not isinstance(context, dict)
+                or int(context.get("corridor_run_id", 0) or 0) != corridor_run_id
+            ):
+                # This is an old private worker whose decision was superseded.
+                # It must never fall through into a bridge/state-machine result.
+                return True
+            context = corridors.pop(str(decision_id))
+        candidate = dict(context.get("candidate") or {})
+        if not candidate or not self._navigation_is_current(decision_id):
+            return True
+        option_index = int(context.get("final_goal_option_index", 0) or 0)
+        attempts = [
+            dict(item)
+            for item in context.get("interaction_approach_attempts") or []
+            if isinstance(item, dict)
+        ]
+        if success:
+            final_candidate = dict(candidate)
+            final_metadata = dict(final_candidate.get("metadata") or {})
+            final_metadata["container_inner_corridor_segments_completed"] = int(
+                context.get("segments_completed", 1) or 1
+            )
+            final_metadata["container_inner_corridor_completed_waypoint_xyyaw"] = list(
+                context.get("waypoint_xyyaw") or []
+            )
+            final_candidate["metadata"] = final_metadata
+            threading.Thread(
+                target=self._run_navigation,
+                args=(decision_id, final_candidate, option_index, attempts),
+                daemon=True,
+            ).start()
+            return True
+        failure_detail = {
+            **dict(detail or {}),
+            "container_inner_corridor": True,
+            "container_inner_corridor_waypoint_xyyaw": list(
+                context.get("waypoint_xyyaw") or []
+            ),
+        }
+        physical_options = navigation_goal_options(candidate)
+        physical_goal = (
+            list(physical_options[option_index])
+            if 0 <= option_index < len(physical_options)
+            else list(candidate.get("goal_xyyaw") or [])
+        )
+        attempts.append(
+            {
+                "index": option_index,
+                "goal_xyyaw": physical_goal,
+                "reachable": False,
+                "outcome": "container_inner_corridor_failed",
+                "phase": "physical_action",
+                "container_inner_corridor_waypoint_xyyaw": list(
+                    context.get("waypoint_xyyaw") or []
+                ),
+            }
+        )
+        if self._retry_interaction_approach(
+            decision_id,
+            candidate,
+            option_index,
+            attempts,
+            max(
+                len(navigation_goal_options(candidate)),
+                self._container_two_stage_inner_option_count(candidate),
+            ),
+            failure_detail,
+        ):
+            return True
+        # Preserve the original physical candidate for terminal accounting.
+        self._handle_navigation_result(
+            decision_id, False, failure_detail, source_candidate=candidate
+        )
+        return True
+
     def _run_navigation(
         self,
         decision_id: str,
@@ -6602,23 +7098,75 @@ class SemanticBehaviorExecutor:
         start_goal_option_index: int = 0,
         interaction_approach_attempts: list[dict] | None = None,
     ) -> None:
+        """Run one navigation worker with a unique result-ownership token."""
+
+        run_token = self._register_navigation_run(decision_id, candidate)
+        try:
+            self._run_navigation_impl(
+                decision_id,
+                candidate,
+                start_goal_option_index=start_goal_option_index,
+                interaction_approach_attempts=interaction_approach_attempts,
+                navigation_run_token=run_token,
+            )
+        finally:
+            self._release_navigation_run(decision_id, run_token, candidate)
+
+    def _run_navigation_impl(
+        self,
+        decision_id: str,
+        candidate: dict,
+        start_goal_option_index: int = 0,
+        interaction_approach_attempts: list[dict] | None = None,
+        *,
+        navigation_run_token: int,
+    ) -> None:
+        """Execute a token-bound navigation worker; called only by the wrapper."""
+
+        def navigation_is_current() -> bool:
+            return bool(
+                self._navigation_run_is_active(decision_id, navigation_run_token)
+                and self._navigation_is_current(decision_id)
+            )
+
+        result_reported = False
+
+        def report_result(success: bool, detail: dict) -> None:
+            nonlocal result_reported
+            if result_reported:
+                return
+            result_reported = True
+            with self.lock:
+                sources = getattr(self, "_navigation_result_sources", None)
+                source = dict(
+                    sources.get((str(decision_id), navigation_run_token), candidate)
+                    if isinstance(sources, dict)
+                    else candidate
+                )
+            self._handle_navigation_result(
+                decision_id,
+                success,
+                detail,
+                source_candidate=source,
+                navigation_run_token=navigation_run_token,
+            )
+
         ready = self.move_base.wait_for_server(rospy.Duration(30.0))
         if not ready:
-            self._handle_navigation_result(decision_id, False, {"reason": "move_base_unavailable"})
+            report_result(False, {"reason": "move_base_unavailable"})
             return
-        if not self._navigation_is_current(decision_id):
+        if not navigation_is_current():
             return
         primary_goal_values = list(candidate.get("goal_xyyaw") or [])
         goal_options = navigation_goal_options(candidate)
         if not goal_options:
-            self._handle_navigation_result(decision_id, False, {"reason": "missing_goal"})
+            report_result(False, {"reason": "missing_goal"})
             return
         behavior_type = str(candidate.get("behavior_type") or "")
         start_goal_option_index = max(0, int(start_goal_option_index))
         interaction_approach_attempts = list(interaction_approach_attempts or [])
         if start_goal_option_index >= len(goal_options):
-            self._handle_navigation_result(
-                decision_id,
+            report_result(
                 False,
                 {
                     "reason": "interaction_approach_options_exhausted",
@@ -6631,6 +7179,25 @@ class SemanticBehaviorExecutor:
         metadata = candidate.get("metadata") or {}
         interaction = candidate.get("interaction_command") or {}
         goal_labels = list(metadata.get("interaction_approach_pose_labels") or [])
+        # A physical container action is reached from a farther M1-authorized
+        # stance.  Before giving DWA a long close-range endpoint, optionally
+        # dispatch one short point sampled from an already verified global
+        # path.  The private corridor returns here with a final-attempt marker,
+        # so it is finite and never replaces the canonical bridge pose.
+        if (
+            is_container_two_stage_physical_action(candidate)
+            and not self._container_inner_corridor_marker(candidate)
+            and start_goal_option_index < len(goal_options)
+            and self._start_container_inner_corridor(
+                decision_id,
+                candidate,
+                goal_frame=str(metadata.get("frame_id") or self.map_frame),
+                final_goal=goal_options[start_goal_option_index],
+                final_goal_option_index=start_goal_option_index,
+                interaction_approach_attempts=interaction_approach_attempts,
+            )
+        ):
+            return
         if behavior_type == "INTERACT":
             direct_distance_tolerance = self._interaction_navigation_pose_tolerance_m(
                 candidate
@@ -6645,6 +7212,7 @@ class SemanticBehaviorExecutor:
             direct_yaw_tolerance = float(
                 metadata.get("direct_goal_yaw_tolerance_rad", 0.0) or 0.0
             )
+        corridor_navigation = self._container_inner_corridor_marker(candidate)
         if direct_distance_tolerance > 0.0:
             current_pose = self._current_pose(
                 str(metadata.get("frame_id") or self.map_frame)
@@ -6737,10 +7305,10 @@ class SemanticBehaviorExecutor:
                             interaction_approach_attempts=direct_attempts,
                             goal_option_count=len(goal_options),
                             detail=direct_detail,
+                            navigation_run_token=navigation_run_token,
                         )
                     else:
-                        self._handle_navigation_result(
-                            decision_id,
+                        report_result(
                             True,
                             direct_detail,
                         )
@@ -6771,8 +7339,7 @@ class SemanticBehaviorExecutor:
                     == "post_open_costmap_wait_preempted"
                 ):
                     return
-                self._handle_navigation_result(
-                    decision_id,
+                report_result(
                     False,
                     {
                         **post_open_costmap_detail,
@@ -7079,8 +7646,7 @@ class SemanticBehaviorExecutor:
                             for item in attempted_goals
                         ),
                     )
-            self._handle_navigation_result(
-                decision_id,
+            report_result(
                 False,
                 failure_detail,
             )
@@ -7110,7 +7676,7 @@ class SemanticBehaviorExecutor:
                 len(goal_options),
             )
         prerotated = True
-        if navigation_should_prerotate(behavior_type):
+        if navigation_should_prerotate(behavior_type) and not corridor_navigation:
             prerotated = self._prerotate_for_rear_goal(
                 decision_id,
                 goal_frame,
@@ -7123,13 +7689,12 @@ class SemanticBehaviorExecutor:
                 "[semantic_behavior_executor] rear-goal safe recovery refused direct navigation: %s",
                 self._last_rear_goal_recovery_detail,
             )
-            self._handle_navigation_result(
-                decision_id,
+            report_result(
                 False,
                 dict(self._last_rear_goal_recovery_detail),
             )
             return
-        if not self._navigation_is_current(decision_id):
+        if not navigation_is_current():
             return
         goal.target_pose.header.stamp = rospy.Time.now()
         goal.target_pose.pose.position.x = x
@@ -7156,13 +7721,14 @@ class SemanticBehaviorExecutor:
             if start_pose is None
             else math.hypot(x - start_pose[0], y - start_pose[1])
         )
-        self._start_rear_dwa_monitor(
-            decision_id,
-            goal_frame,
-            path_lookahead,
-            start_pose,
-            start_goal_distance_m,
-        )
+        if not corridor_navigation:
+            self._start_rear_dwa_monitor(
+                decision_id,
+                goal_frame,
+                path_lookahead,
+                start_pose,
+                start_goal_distance_m,
+            )
         progress_watchdog = NavigationProgressWatchdog(
             timeout_s=self.navigation_stagnation_timeout_s,
             min_displacement_m=self.navigation_stagnation_distance_m,
@@ -7184,7 +7750,8 @@ class SemanticBehaviorExecutor:
         )
         deadline = time.monotonic() + navigation_timeout_s
         near_goal_since = None
-        require_final_yaw = navigation_requires_final_yaw(
+        require_final_yaw = self._requires_final_yaw_for_navigation(
+            candidate,
             behavior_type,
             self.final_align_enabled,
             primary_goal_values,
@@ -7192,7 +7759,7 @@ class SemanticBehaviorExecutor:
         state = int(self.move_base.get_state())
         while (
             not rospy.is_shutdown()
-            and self._navigation_is_current(decision_id)
+            and navigation_is_current()
             and state not in TERMINAL_STATES
             and time.monotonic() < deadline
         ):
@@ -7259,6 +7826,7 @@ class SemanticBehaviorExecutor:
                         ),
                         goal_option_count=len(goal_options),
                         detail=arrival_detail,
+                        navigation_run_token=navigation_run_token,
                     )
                     return
                 # ``final_align_max_distance_m`` is deliberately tight for
@@ -7316,6 +7884,7 @@ class SemanticBehaviorExecutor:
                             ),
                             goal_option_count=len(goal_options),
                             detail=alignment_detail,
+                            navigation_run_token=navigation_run_token,
                         )
                         return
                     if aligned is False:
@@ -7329,16 +7898,18 @@ class SemanticBehaviorExecutor:
                             alignment_detail,
                         ):
                             return
-                        self._handle_navigation_result(
-                            decision_id, False, alignment_detail
-                        )
+                        report_result(False, alignment_detail)
                         return
-            rear_oscillation = self._rear_dwa_oscillation_detail(
-                decision_id,
-                goal_frame,
-                path_lookahead,
-                pose,
-                goal_distance_m,
+            rear_oscillation = (
+                None
+                if corridor_navigation
+                else self._rear_dwa_oscillation_detail(
+                    decision_id,
+                    goal_frame,
+                    path_lookahead,
+                    pose,
+                    goal_distance_m,
+                )
             )
             if rear_oscillation is not None:
                 rospy.logwarn(
@@ -7355,8 +7926,7 @@ class SemanticBehaviorExecutor:
                 )
                 if not recovered:
                     self.move_base.cancel_goal()
-                    self._handle_navigation_result(
-                        decision_id,
+                    report_result(
                         False,
                         {
                             **rear_oscillation,
@@ -7365,7 +7935,7 @@ class SemanticBehaviorExecutor:
                         },
                     )
                     return
-                if not self._navigation_is_current(decision_id):
+                if not navigation_is_current():
                     return
                 goal.target_pose.header.stamp = rospy.Time.now()
                 self.move_base.send_goal(goal)
@@ -7451,8 +8021,7 @@ class SemanticBehaviorExecutor:
                     stagnation_detail,
                 ):
                     return
-                self._handle_navigation_result(
-                    decision_id,
+                report_result(
                     False,
                     stagnation_detail,
                 )
@@ -7498,10 +8067,10 @@ class SemanticBehaviorExecutor:
                                 ),
                                 goal_option_count=len(goal_options),
                                 detail=aligned_detail,
+                                navigation_run_token=navigation_run_token,
                             )
                         else:
-                            self._handle_navigation_result(
-                                decision_id,
+                            report_result(
                                 bool(aligned),
                                 aligned_detail,
                             )
@@ -7537,10 +8106,10 @@ class SemanticBehaviorExecutor:
                             ),
                             goal_option_count=len(goal_options),
                             detail=timeout_alignment_detail,
+                            navigation_run_token=navigation_run_token,
                         )
                     else:
-                        self._handle_navigation_result(
-                            decision_id,
+                        report_result(
                             bool(aligned),
                             timeout_alignment_detail,
                         )
@@ -7558,7 +8127,7 @@ class SemanticBehaviorExecutor:
                 timeout_detail,
             ):
                 return
-            self._handle_navigation_result(decision_id, False, timeout_detail)
+            report_result(False, timeout_detail)
             return
         success = state == GoalStatus.SUCCEEDED
         detail = {
@@ -7632,6 +8201,7 @@ class SemanticBehaviorExecutor:
                 interaction_approach_attempts=interaction_approach_attempt_history,
                 goal_option_count=len(goal_options),
                 detail=detail,
+                navigation_run_token=navigation_run_token,
             )
             return
         if (
@@ -7646,7 +8216,7 @@ class SemanticBehaviorExecutor:
             )
         ):
             return
-        self._handle_navigation_result(decision_id, success, detail)
+        report_result(success, detail)
 
     def _interaction_approach_attempt_limit(self, candidate: dict | None) -> int:
         """Return the finite retry budget appropriate to this approach shape.
@@ -7717,6 +8287,12 @@ class SemanticBehaviorExecutor:
         failure_detail: dict,
     ) -> bool:
         attempts = [dict(attempt) for attempt in interaction_approach_attempts]
+        # A private corridor owns its own completion/failure routing in
+        # ``_consume_container_inner_corridor_result``.  It must not consume a
+        # physical tangent or outer-M1 retry before that handler sees the
+        # outcome.
+        if self._container_inner_corridor_marker(candidate):
+            return False
         approach_attempt_limit = self._interaction_approach_attempt_limit(candidate)
         if attempts:
             attempts[-1]["outcome"] = str(failure_detail.get("reason") or "failed")
@@ -8077,10 +8653,22 @@ class SemanticBehaviorExecutor:
         }, recovery_detail
 
     def _handle_navigation_result(
-        self, decision_id: str, success: bool, detail: dict
+        self,
+        decision_id: str,
+        success: bool,
+        detail: dict,
+        *,
+        source_candidate: dict | None = None,
+        navigation_run_token: int | None = None,
     ) -> None:
         detail = dict(detail or {})
+        if not self._navigation_run_is_active(decision_id, navigation_run_token):
+            return
         self._clear_rear_dwa_monitor(decision_id)
+        if self._consume_container_inner_corridor_result(
+            decision_id, success, detail, candidate=source_candidate
+        ):
+            return
         with self.lock:
             locks = getattr(self, "_rear_goal_turn_locks", None)
             if isinstance(locks, dict):

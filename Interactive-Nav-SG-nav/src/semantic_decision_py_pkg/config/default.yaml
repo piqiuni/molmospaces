@@ -356,6 +356,13 @@ executor:
   # Keep the broader sequence bounded, but do not truncate it to the portal
   # fallback budget before a different M1 observation can be tried.
   container_two_stage_fallback_max_attempts: 12
+  # For a fresh M1-authorized container face, walk at most this many short
+  # make-plan-backed segments before the existing final physical bridge pose.
+  # These executor-private points never trigger M1 or an interaction command.
+  container_inner_corridor_enabled: true
+  container_inner_corridor_segment_m: 0.30
+  container_inner_corridor_arrival_tolerance_m: 0.10
+  container_inner_corridor_max_segments: 4
   interaction_approach_fallback_cancel_wait_s: 0.5
   # Once move_base reports arrival, validate the simulator pose on this many
   # fresh evaluator steps.  This is intentionally count-bounded, not
