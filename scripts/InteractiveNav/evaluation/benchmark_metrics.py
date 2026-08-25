@@ -736,6 +736,10 @@ def _group_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             None if interaction_attempts == 0 else correct_actions / interaction_attempts
         ),
         "mean_step_count": _mean(rows, "step_count"),
+        "mean_applied_action_step_count": _mean(
+            rows, "applied_action_step_count"
+        ),
+        "mean_no_fresh_action_count": _mean(rows, "no_fresh_action_count"),
         "mean_navigation_path_length_m": _mean(rows, "navigation_path_length_m"),
         "mean_reference_path_length_m": _mean(rows, "reference_path_length_m"),
         "mean_spl": paper_spl,

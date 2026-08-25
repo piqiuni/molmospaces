@@ -23,9 +23,11 @@ from scripts.InteractiveNav.build_semantic_video_offline import (
     offline_display_config,
     panel_names,
     persist_final_completion_status_to_raw_steps,
+    public_gt_payload_for_sim_frame,
     receipt_is_causal_at_boundary,
     resolve_episode_trajectory_path,
     route_event_at_stamp,
+    union_world_bounds,
     route_target_at_stamp,
     select_causal_receipt,
 )
@@ -141,6 +143,76 @@ def test_minimal_gt_schema_uses_payload_image_size_and_labels_name() -> None:
     )
     assert compact_spec is not None
     assert compact_spec["label"] == "INTERACT Door"
+
+
+def test_minimal_gt_schema_derives_render_size_from_mask_rle() -> None:
+    payload = {
+        "observations": [
+            {
+                "id": "obj_000001",
+                "name": "door",
+                "bbox_2d": [256, 144, 767, 431],
+                "mask_rle": {"size": [576, 1024], "counts": ""},
+            }
+        ],
+    }
+
+    spec = gt_draw_spec(
+        (360, 640, 3),
+        payload,
+        payload["observations"][0],
+    )
+
+    assert spec is not None
+    assert spec["start"] == (160, 90)
+    assert spec["end"] == (479, 269)
+
+
+def test_manifest_public_gt_precedes_legacy_raw_snapshot_and_preserves_causality() -> None:
+    sim_record = {
+        "step_index": 4,
+        "stamp_sec": 10.0,
+        "width": 640,
+        "height": 480,
+        "gt_observations": {
+            "episode_id": "episode-1",
+            "capture_step": 3,
+            "stamp_sec": 9.9,
+            "observations": [{"id": "manifest", "name": "door"}],
+        },
+    }
+    raw_step = {
+        "gt_observations": {
+            "episode_id": "episode-1",
+            "capture_step": 3,
+            "stamp_sec": 9.8,
+            "observations": [{"id": "legacy", "name": "drawer"}],
+        }
+    }
+
+    assert public_gt_payload_for_sim_frame(sim_record, raw_step)["observations"][0]["id"] == "manifest"
+
+    # A new manifest is causally bound by the bridge's next-RGB handoff rather
+    # than by numeric clock equality, so simulated ROS time cannot hide boxes.
+    sim_record["gt_observations"]["stamp_sec"] = 10.1
+    assert public_gt_payload_for_sim_frame(sim_record, raw_step)["observations"][0]["id"] == "manifest"
+
+    sim_record["gt_observations"] = None
+    assert public_gt_payload_for_sim_frame(sim_record, raw_step)["observations"][0]["id"] == "legacy"
+
+    raw_step["gt_observations"]["stamp_sec"] = 10.1
+    assert public_gt_payload_for_sim_frame(sim_record, raw_step) is None
+
+
+def test_episode_viewport_union_is_stable_when_known_map_expands() -> None:
+    early = (1.0, 2.0, 5.0, 6.0)
+    late = (-2.0, 1.0, 8.0, 9.0)
+
+    fixed = union_world_bounds(early, late)
+
+    assert fixed == (-2.0, 1.0, 8.0, 9.0)
+    assert union_world_bounds(None, fixed) == fixed
+    assert union_world_bounds(fixed, None) == fixed
 
 
 def test_route_target_is_carried_from_route_start_into_interaction() -> None:

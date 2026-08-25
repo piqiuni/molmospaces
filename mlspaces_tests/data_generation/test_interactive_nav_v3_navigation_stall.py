@@ -18,6 +18,17 @@ def _failed_feedback(index: int, *, behavior_type: str = "EXPLORE") -> dict[str,
     }
 
 
+def _preempted_feedback(index: int) -> dict[str, object]:
+    return {
+        "decision_id": f"decision-preempted-{index}",
+        "candidate_id": f"candidate-preempted-{index}",
+        "behavior_type": "NAVIGATE",
+        "status": "CANCELED",
+        "success": False,
+        "detail": {"reason": "preempted_by_target"},
+    }
+
+
 def test_cross_subgoal_failures_without_motion_trigger_early_stop() -> None:
     tracker = CrossSubgoalStallTracker(
         CrossSubgoalStallConfig(
@@ -87,3 +98,26 @@ def test_successful_navigation_resets_prior_failure_sequence() -> None:
     )
     assert not tracker.note_feedback(_failed_feedback(2), (0.0, 0.0), 3)
     assert tracker.snapshot()["failed_subgoal_count"] == 1
+
+
+def test_preempted_canceled_navigation_does_not_count_as_a_stall_failure() -> None:
+    tracker = CrossSubgoalStallTracker(
+        CrossSubgoalStallConfig(
+            min_failed_subgoals=2,
+            max_displacement_m=0.15,
+            min_no_progress_steps=0,
+        )
+    )
+    tracker.observe_pose((0.0, 0.0), 0)
+
+    assert not tracker.note_feedback(_preempted_feedback(1), (0.0, 0.0), 1)
+    assert not tracker.note_feedback(_preempted_feedback(2), (0.0, 0.0), 2)
+    assert not tracker.note_feedback(_failed_feedback(1), (0.0, 0.0), 3)
+
+    snapshot = tracker.snapshot()
+    assert snapshot["triggered"] is False
+    assert snapshot["failed_subgoal_count"] == 1
+    assert snapshot["observed_navigation_failure_count"] == 1
+    assert snapshot["failure_reason_counts"] == {"move_base_failed": 1}
+
+    assert tracker.note_feedback(_failed_feedback(2), (0.0, 0.0), 4)

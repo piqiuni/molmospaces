@@ -294,7 +294,16 @@ class RosBridgePolicyAdapter(ExternalPolicyAdapter):
             raise TypeError(f"ROS bridge {type(self.policy).__name__} has no get_action callable")
         raw_action = get_action(observation.observation)
         if raw_action is None:
-            return PolicyAction(kind="observe", metadata={"reason": "ros_bridge_returned_none"})
+            # ``None`` is another no-command bridge outcome, not an algorithm-
+            # requested observe action.  Canonicalising it keeps applied-step
+            # accounting and the wall-clock starvation guard honest.
+            return PolicyAction(
+                kind="observe",
+                metadata={
+                    "reason": "ros_bridge_no_fresh_action",
+                    "bridge_action_source": "returned_none",
+                },
+            )
         if isinstance(raw_action, dict):
             payload = raw_action.get("action", raw_action)
             # With ``task=None``, RosBridgePolicy represents an action timeout
@@ -304,9 +313,35 @@ class RosBridgePolicyAdapter(ExternalPolicyAdapter):
             if isinstance(payload, dict) and set(payload).issubset({"done"}) and not bool(payload.get("done", False)):
                 return PolicyAction(
                     kind="observe",
-                    metadata={"reason": "ros_bridge_no_fresh_action", "wrapped_action": _json_safe(payload)},
+                    metadata={
+                        "reason": "ros_bridge_no_fresh_action",
+                        "wrapped_action": _json_safe(payload),
+                        # Evaluator-visible diagnostics only.  They explain
+                        # whether the empty task-less payload came from the
+                        # configured action deadline without changing the
+                        # public action or simulator state.
+                        "bridge_action_timed_out": bool(
+                            getattr(self.policy, "last_action_timed_out", False)
+                        ),
+                        "bridge_action_source": str(
+                            getattr(self.policy, "last_action_source", "") or ""
+                        ),
+                    },
                 )
         return normalize_policy_action(raw_action)
+
+    def queue_step_frame_public_payload(self, payload: dict[str, Any]) -> bool:
+        """Forward evaluator-owned public perception to the bridge recorder.
+
+        This is intentionally not part of ``BenchmarkPolicy``: only the V3 ROS
+        bridge records per-RGB simulator frames, while all other policies remain
+        unaware of evaluator perception internals.
+        """
+
+        queue_payload = getattr(self.policy, "queue_step_frame_public_payload", None)
+        if not callable(queue_payload):
+            return False
+        return bool(queue_payload(payload))
 
 
 def _import_symbol(spec: str) -> Any:
@@ -370,6 +405,11 @@ def build_ros_bridge_policy(
     cmd_vel_linear_gain: float,
     require_move_base_active: bool,
     map_warmup_skip_frames: int,
+    step_ready_topic: str = "/semantic_decision/step_ready",
+    step_ready_barrier_enabled: bool = False,
+    step_ready_warmup_skip_frames: int = 0,
+    step_ready_timeout_s: float = 2.0,
+    step_ready_bootstrap_timeout_s: float = 10.0,
     step_frame_dir: str = "",
     step_frame_queue_size: int = 4,
     step_capture_ack_topic: str = "/molmo_spaces/step_capture_ack",
@@ -394,6 +434,11 @@ def build_ros_bridge_policy(
         require_fresh_cmd_vel=True,
         require_move_base_active_for_cmd_vel=bool(require_move_base_active),
         map_warmup_skip_frames=int(map_warmup_skip_frames),
+        step_ready_topic=str(step_ready_topic),
+        step_ready_barrier_enabled=bool(step_ready_barrier_enabled),
+        step_ready_warmup_skip_frames=int(step_ready_warmup_skip_frames),
+        step_ready_timeout_s=float(step_ready_timeout_s),
+        step_ready_bootstrap_timeout_s=float(step_ready_bootstrap_timeout_s),
         publish_realtime_gt=False,
         step_frame_dir=str(step_frame_dir),
         step_frame_queue_size=int(step_frame_queue_size),

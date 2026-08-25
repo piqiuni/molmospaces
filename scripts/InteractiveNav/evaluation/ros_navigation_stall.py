@@ -124,7 +124,10 @@ class CrossSubgoalStallTracker:
         if status in {"SUCCEEDED", "SUCCESS"} or success is True:
             self._reset_sequence(self._last_pose_xy, step_index)
             return False
-        if status not in {"FAILED", "ABORTED"} and success is not False:
+        # Only explicit terminal navigation failures advance the evaluator
+        # stall budget.  A CANCELED result can be a normal target preemption
+        # (for example ``preempted_by_target``), not an unsuccessful subgoal.
+        if status not in {"FAILED", "ABORTED"}:
             return False
         # A feedback message is terminal only once per executor-issued
         # subgoal/status pair.  Missing IDs cannot prove a cross-subgoal run.

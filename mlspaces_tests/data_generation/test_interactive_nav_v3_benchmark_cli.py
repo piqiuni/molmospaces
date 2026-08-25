@@ -30,6 +30,25 @@ def test_v3_runner_keeps_the_expanded_m1_budget_isolated() -> None:
     assert "object_goal_v3_full_mllm.yaml and room MLLM keeps its own mapping config cap" in source
 
 
+def test_v3_runner_bounds_observation_turns_and_gives_m1_worker_pool_headroom() -> None:
+    runner = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "InteractiveNav"
+        / "run_interactive_nav_v3_ros_eval_test.zsh"
+    )
+    source = runner.read_text(encoding="utf-8")
+
+    assert "SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-30.0}" in source
+    assert 'semantic_attribute_request_timeout_s:="${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S}"' in source
+    assert "ROS_ACTION_TIMEOUT_S=${ROS_ACTION_TIMEOUT_S:-0.2}" in source
+    assert "ROS_STEP_READY_BARRIER_ENABLED=${ROS_STEP_READY_BARRIER_ENABLED:-true}" in source
+    assert '--ros-step-ready-topic "${ROS_STEP_READY_TOPIC}"' in source
+    assert "EVAL_ARGS+=(--ros-step-ready-barrier-enabled)" in source
+    assert "ROS_OBSERVATION_TURN_MULTIPLIER=${ROS_OBSERVATION_TURN_MULTIPLIER:-1.5}" in source
+    assert '--ros-observation-turn-multiplier "${ROS_OBSERVATION_TURN_MULTIPLIER}"' in source
+
+
 def test_v3_runner_matches_zero_padded_episode_result_directory() -> None:
     """The evaluator writes ``0000_<case>`` directories, not ``0_<case>``."""
 

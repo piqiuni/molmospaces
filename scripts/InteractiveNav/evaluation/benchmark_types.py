@@ -143,6 +143,12 @@ class EpisodeResult:
     target_distance_m: float | None
     target_visibility_fraction: float | None
     interaction_attempts: list[dict[str, Any]]
+    # ``step_count`` remains the recordable ROS observation-turn count.  These
+    # fields make bridge waits and evaluator-applied actions explicit instead
+    # of forcing callers to infer them from a large JSON trace.
+    applied_action_step_count: int | None = None
+    no_fresh_action_count: int = 0
+    policy_termination: dict[str, Any] = field(default_factory=dict)
     episode_step_budget: int | None = None
     step_budget_mode: str = "fixed"
     step_budget_basis: dict[str, Any] = field(default_factory=dict)

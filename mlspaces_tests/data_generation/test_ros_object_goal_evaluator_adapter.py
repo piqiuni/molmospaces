@@ -11,6 +11,9 @@ import json
 
 import pytest
 
+from scripts.InteractiveNav.evaluation.benchmark_interaction_adapter import (
+    validate_public_interaction_pose,
+)
 from scripts.InteractiveNav.evaluation.ros_object_goal_adapter import (
     DIRECT_DRAWER_SCAN_BBOX_TTL_S,
     RestrictedGTContractError,
@@ -61,12 +64,20 @@ class _FakeRospy:
         return subscriber
 
 
-def _adapter(*, executor=None, clock=None) -> tuple[RosObjectGoalEvaluatorAdapter, _FakeRospy]:
+def _adapter(
+    *,
+    executor=None,
+    clock=None,
+    require_public_interaction_evidence: bool = False,
+    queue_rejected_interactions: bool = False,
+) -> tuple[RosObjectGoalEvaluatorAdapter, _FakeRospy]:
     rospy = _FakeRospy()
     adapter = RosObjectGoalEvaluatorAdapter(
         rospy_module=rospy,
         string_message_type=_FakeString,
         interaction_executor=executor,
+        require_public_interaction_evidence=require_public_interaction_evidence,
+        queue_rejected_interactions=queue_rejected_interactions,
         clock=clock or (lambda: 123.5),
     )
     return adapter, rospy
@@ -212,7 +223,11 @@ def test_object_level_command_uses_private_handle_but_redacts_force_result() -> 
     assert result["status"] == "SUCCEEDED"
     assert result["object_id"] == "obj_000017"
     assert result["instance_id"] == "obj_000017"
-    assert "state" not in result
+    assert result["state"] == "open"
+    assert result["post_state"] == "open"
+    assert result["interaction_capability"] == "articulated"
+    assert result["interactable"] is True
+    assert result["verification_source"] == "executor_state_verification"
     assert "source_object_name" not in result
     assert "joint_names" not in result
     assert "joint_infos" not in result
@@ -251,6 +266,199 @@ def test_public_portal_alias_resolves_to_the_canonical_opaque_id() -> None:
     assert request.instance_id == "obj_000017"
 
 
+def test_unpublished_opaque_ids_do_not_reveal_private_registration() -> None:
+    adapter, rospy = _adapter(
+        require_public_interaction_evidence=True,
+        queue_rejected_interactions=True,
+    )
+    adapter.reset(
+        episode_id="eval_000042",
+        target_context=build_public_target_context(
+            episode_id="eval_000042",
+            target_name="refrigerator",
+            object_labels=["fridge", "refrigerator"],
+            instruction="Find the refrigerator.",
+        ),
+        private_instances={"obj_000017": object()},
+        instance_aliases={"door_7031": "obj_000017"},
+    )
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "guessed-before-public-frame",
+            "object_id": "obj_000017",
+            "action": "open",
+        }
+    )
+
+    assert request is not None
+    assert request.instance_id == "obj_000017"
+    assert request.private_handle is None
+    assert request.public_observation == {}
+    assert request.rejection_reason == "interaction_not_visible"
+    assert adapter.pending_interaction_count == 1
+    assert rospy.publishers[adapter.interaction_result_topic].messages == []
+    assert adapter.pop_next_interaction_request() is request
+
+    unknown = adapter.receive_interaction_command(
+        {
+            "command_id": "guessed-unknown-before-public-frame",
+            "object_id": "obj_999999",
+            "action": "open",
+        }
+    )
+    assert unknown is not None
+    assert unknown.instance_id == "obj_999999"
+    assert unknown.private_handle is None
+    assert unknown.public_observation == {}
+    assert unknown.rejection_reason == request.rejection_reason
+
+    guessed_alias = adapter.receive_interaction_command(
+        {
+            "command_id": "guessed-alias-before-public-frame",
+            "object_id": "door_7031",
+            "node_type": "portal",
+            "action": "open",
+        }
+    )
+    assert guessed_alias is not None
+    assert guessed_alias.instance_id == "door_7031"
+    assert guessed_alias.private_handle is None
+    assert guessed_alias.rejection_reason == "interaction_not_visible"
+
+
+def test_recent_published_box_3d_is_attached_as_public_interaction_provenance() -> None:
+    now = [100.0]
+    private_handle = object()
+    adapter, _rospy = _adapter(
+        clock=lambda: now[0],
+        require_public_interaction_evidence=True,
+        queue_rejected_interactions=True,
+    )
+    _reset(adapter, {"obj_000017": private_handle})
+    adapter.publish_observations(
+        [
+            RestrictedGTObservation(
+                instance_id="obj_000017",
+                name="refrigerator",
+                bbox_2d_xyxy=[0, 0, 1, 1],
+                segmentation_rle={"size": [2, 2], "counts": [0, 4]},
+                box3d_center=[1.0, 2.0, 0.5],
+                box3d_size=[0.8, 0.6, 1.7],
+            )
+        ],
+        capture_step=12,
+    )
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "open-from-public-box",
+            "object_id": "obj_000017",
+            "action": "open",
+        }
+    )
+
+    assert request is not None
+    assert request.private_handle is private_handle
+    assert request.rejection_reason == ""
+    assert request.public_observation == {
+        "capture_step": 12,
+        "age_seconds": 0.0,
+        "box_3d": {
+            "center": [1.0, 2.0, 0.5],
+            "size": [0.8, 0.6, 1.7],
+            "frame_id": "world",
+        },
+    }
+
+
+def test_expired_public_box_3d_is_queued_as_not_visible() -> None:
+    now = [100.0]
+    adapter, _rospy = _adapter(
+        clock=lambda: now[0],
+        require_public_interaction_evidence=True,
+        queue_rejected_interactions=True,
+    )
+    _reset(adapter, {"obj_000017": object()})
+    adapter.publish_observations(
+        [
+            RestrictedGTObservation(
+                instance_id="obj_000017",
+                name="refrigerator",
+                bbox_2d_xyxy=[0, 0, 1, 1],
+                segmentation_rle={"size": [2, 2], "counts": [0, 4]},
+                box3d_center=[1.0, 2.0, 0.5],
+                box3d_size=[0.8, 0.6, 1.7],
+            )
+        ],
+        capture_step=12,
+    )
+    now[0] += DIRECT_DRAWER_SCAN_BBOX_TTL_S + 0.01
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "open-after-public-box-expired",
+            "object_id": "obj_000017",
+            "action": "open",
+        }
+    )
+
+    assert request is not None
+    assert request.rejection_reason == "interaction_not_visible"
+    assert request.public_observation == {}
+    assert adapter.pending_interaction_count == 1
+    assert adapter.pop_next_interaction_request() is request
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reason"),
+    [
+        (
+            {
+                "command_id": "unknown-nonportal",
+                "object_id": "obj_not_registered",
+                "node_type": "container",
+                "action": "open",
+            },
+            "unknown_instance_id",
+        ),
+        (
+            {
+                "command_id": "unsupported-close",
+                "object_id": "obj_000017",
+                "node_type": "container",
+                "action": "close",
+            },
+            "unsupported_action",
+        ),
+    ],
+)
+def test_unknown_nonportal_and_unsupported_commands_are_queued_for_accounting(
+    payload: dict,
+    expected_reason: str,
+) -> None:
+    adapter, rospy = _adapter(queue_rejected_interactions=True)
+    _reset(adapter, {"obj_000017": object()})
+
+    request = adapter.receive_interaction_command(payload)
+
+    assert request is not None
+    assert request.rejection_reason == expected_reason
+    assert adapter.pending_interaction_count == 1
+    assert rospy.publishers[adapter.interaction_result_topic].messages == []
+    assert adapter.pop_next_interaction_request() is request
+
+    result = adapter.complete_interaction(
+        request.command_id,
+        success=False,
+        status="INVALID",
+        reason=request.rejection_reason,
+    )
+    assert result["success"] is False
+    assert adapter.pending_interaction_count == 0
+    assert len(adapter.published_result_events) == 1
+
+
 def test_drawer_scan_visual_hint_is_sanitized_but_never_emitted_in_result() -> None:
     adapter, rospy = _adapter()
     _reset(adapter, {"obj_000017": object()})
@@ -259,7 +467,7 @@ def test_drawer_scan_visual_hint_is_sanitized_but_never_emitted_in_result() -> N
         {
             "command_id": "scan-dresser",
             "object_id": "obj_000017",
-            "action": "open",
+            "action": "scan",
             "sequence_type": "drawer_scan",
             "open_regions": [
                 {"center": [0.6, 0.8], "confidence": 0.9},
@@ -273,14 +481,53 @@ def test_drawer_scan_visual_hint_is_sanitized_but_never_emitted_in_result() -> N
     )
 
     assert request is not None
-    assert request.action == "open"
+    assert request.action == "scan"
     assert request.sequence_type == "drawer_scan"
     assert request.open_regions == ((0.4, 0.2), (0.6, 0.8))
+    assert request.public_command["open_regions"] == [
+        {"center": [0.6, 0.8]},
+        {"center": [0.4, 0.2]},
+    ]
+    assert "joint_names" not in request.public_command
+    assert "force_target_fraction" not in request.public_command
     result = adapter.complete_interaction(request.command_id, success=True)
+    assert result["action"] == "scan"
     serialized = json.dumps(result, sort_keys=True)
     assert "drawer_scan" not in serialized
     assert "guessed_private_drawer" not in serialized
     assert "force_target_fraction" not in serialized
+    assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
+
+
+def test_drawer_open_uses_open_action_and_retains_visual_grounding() -> None:
+    adapter, rospy = _adapter()
+    _reset(adapter, {"obj_000017": object()})
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "open-dresser-drawer",
+            "object_id": "obj_000017",
+            "action": "open",
+            "sequence_type": "drawer_open",
+            "open_regions": [{"center": [0.25, 0.75]}],
+        }
+    )
+
+    assert request is not None
+    assert request.action == "open"
+    assert request.sequence_type == "drawer_open"
+    assert request.open_regions == ((0.25, 0.75),)
+    result = adapter.complete_interaction(
+        request.command_id,
+        success=True,
+        outcome={
+            "state": "open",
+            "post_state": "open",
+            "verification_source": "executor_state_verification",
+        },
+    )
+    assert result["action"] == "open"
+    assert result["state"] == "open"
     assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
 
 
@@ -410,6 +657,11 @@ def test_direct_bbox_drawer_scan_rejects_noncurrent_or_ambiguous_public_boxes() 
     assert stale["status"] == "REJECTED"
     assert stale["reason"] == "unresolved_drawer_scan_target"
     assert stale["object_id"] == ""
+    assert stale["state"] == "unavailable"
+    assert stale["interaction_capability"] == "unavailable"
+    assert stale["interactable"] is False
+    assert stale["retryable"] is False
+    assert stale["verification_source"] == "executor_capability_check"
 
     # Matching must also be unique; a box cannot select among two public
     # instances that overlap equally.
@@ -559,7 +811,7 @@ def test_executor_receives_private_handle_and_unknown_raw_name_is_rejected() -> 
     assert len(received) == 1
 
 
-def test_unknown_semantic_portal_is_queued_for_invalid_evaluator_scoring() -> None:
+def test_unknown_semantic_portal_is_unavailable_without_public_aperture_evidence() -> None:
     adapter, rospy = _adapter()
     _reset(adapter, {"obj_000017": object()})
 
@@ -586,13 +838,177 @@ def test_unknown_semantic_portal_is_queued_for_invalid_evaluator_scoring() -> No
         status="INVALID",
         reason=request.rejection_reason,
     )
-    assert result["status"] == "INVALID"
+    assert result["status"] == "FAILED"
     assert result["success"] is False
-    assert result["reason"] == "unknown_instance_id"
-    assert result["state"] == "static"
+    assert result["reason"] == "capability_unavailable"
+    assert result["state"] == "unavailable"
     assert result["interactable"] is False
-    assert result["interaction_capability"] == "static"
+    assert result["retryable"] is False
+    assert result["interaction_capability"] == "unavailable"
     assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
+
+
+def test_unknown_semantic_portal_requires_two_factor_public_static_open_evidence() -> None:
+    adapter, rospy = _adapter()
+    _reset(adapter, {"obj_000017": object()})
+
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "open-fixed-aperture",
+            "node_id": "portal_obj_000021",
+            "candidate_id": "interaction:portal_obj_000021:open",
+            "node_type": "portal",
+            "object_id": "obj_000021",
+            "action": "open",
+            "portal_aperture_observation": {
+                "door_leaf": "absent",
+                "connectivity": "open",
+                "confidence": 0.9,
+                "private_body_name": "must_not_escape",
+            },
+        }
+    )
+
+    assert request is not None
+    result = adapter.complete_interaction(
+        request.command_id,
+        success=False,
+        status="INVALID",
+        reason=request.rejection_reason,
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert result["success"] is True
+    assert result["state"] == "static_open"
+    assert result["interaction_capability"] == "static"
+    assert result["portal_aperture_observation"] == {
+        "door_leaf": "absent",
+        "connectivity": "open",
+        "confidence": 0.9,
+    }
+    assert "must_not_escape" not in json.dumps(result)
+    assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
+
+
+def test_rich_backend_outcome_is_allowlisted_and_redacts_private_force_fields() -> None:
+    adapter, rospy = _adapter()
+    _reset(adapter, {"obj_000017": object()})
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "open-rich-result",
+            "node_id": "container_obj_000017",
+            "object_id": "obj_000017",
+            "node_type": "container",
+            "action": "open",
+            "interaction_approach_pose_xyyaw": [1.0, 2.0, 0.3],
+            "joint_names": ["guessed_private_joint"],
+        }
+    )
+    assert request is not None
+
+    result = adapter.complete_interaction(
+        request.command_id,
+        success=False,
+        outcome={
+            "state": "blocked",
+            "post_state": "blocked",
+            "interaction_capability": "blocked",
+            "interactable": False,
+            "retryable": False,
+            "failure_reason": "force_target_not_reached",
+            "verification_source": "executor_state_verification",
+            "physics_substeps": 123,
+            "task_steps_consumed": 4,
+            "recommended_retreat_m": 0.25,
+            "interaction_pose_validation": {
+                "checked": True,
+                "valid": True,
+                "expected_pose_xyyaw": [1.0, 2.0, 0.3],
+                "actual_pose_xyyaw": [1.02, 2.01, 0.31],
+                "private_joint_name": "hidden_joint",
+            },
+            "source_object_name": "hidden_container",
+            "joint_infos": [{"joint_name": "hidden_joint"}],
+            "final_joint_open_fractions": {"hidden_joint": 0.2},
+            "view_profile_result": {"joint_name": "robot_private_head_joint"},
+            "oracle_interaction_id": "private_recipe_step",
+        },
+    )
+
+    assert result["status"] == "FAILED"
+    assert result["state"] == "blocked"
+    assert result["interaction_capability"] == "blocked"
+    assert result["failure_reason"] == "force_target_not_reached"
+    assert result["physics_substeps"] == 123
+    assert result["task_steps_consumed"] == 4
+    assert result["recommended_retreat_m"] == 0.25
+    assert result["interaction_pose_validation"]["valid"] is True
+    serialized = json.dumps(result, sort_keys=True)
+    for forbidden in (
+        "hidden_container",
+        "hidden_joint",
+        "robot_private_head_joint",
+        "private_recipe_step",
+        "joint_infos",
+        "final_joint_open_fractions",
+        "oracle_interaction_id",
+    ):
+        assert forbidden not in serialized
+    assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
+
+
+def test_explicit_private_failure_reason_is_normalized_before_publication() -> None:
+    adapter, rospy = _adapter()
+    _reset(adapter, {"obj_000017": object()})
+    request = adapter.receive_interaction_command(
+        {
+            "command_id": "private-error-redaction",
+            "object_id": "obj_000017",
+            "action": "open",
+        }
+    )
+    assert request is not None
+
+    result = adapter.complete_interaction(
+        request.command_id,
+        success=False,
+        reason="private_joint_X failed at qpos 0.23",
+    )
+
+    assert result["reason"] == "executor_failed"
+    assert result["failure_reason"] == "executor_failed"
+    assert "private_joint" not in json.dumps(result, sort_keys=True).casefold()
+    assert _payload(rospy.publishers[adapter.interaction_result_topic].messages[-1]) == result
+
+
+def test_public_pose_validation_rejects_wrong_yaw_without_object_oracle() -> None:
+    validation = validate_public_interaction_pose(
+        {
+            "interaction_approach_pose_xyyaw": [1.0, 2.0, 0.0],
+            "interaction_ready_distance_m": 0.2,
+            "interaction_ready_yaw_tolerance_rad": 0.25,
+            "interaction_approach_axis_xy": [1.0, 0.0],
+            # Private selectors are irrelevant to this public-pose check.
+            "joint_names": ["must_not_be_read"],
+        },
+        actual_pose_xyyaw=[1.05, 2.0, 1.2],
+    )
+
+    assert validation["checked"] is True
+    assert validation["valid"] is False
+    assert validation["position_error_m"] == pytest.approx(0.05)
+    assert validation["yaw_error_rad"] == pytest.approx(1.2)
+    assert validation["approach_axis_xy"] == [1.0, 0.0]
+    assert "joint" not in json.dumps(validation, sort_keys=True)
+
+
+def test_public_pose_validation_without_expected_pose_preserves_legacy_access_gate() -> None:
+    assert validate_public_interaction_pose(
+        {},
+        actual_pose_xyyaw=[1.0, 2.0, 0.0],
+    ) == {
+        "checked": False,
+        "reason": "no_expected_approach_pose",
+    }
 
 
 def test_reset_clears_pending_command_and_publishes_empty_episode_marker() -> None:

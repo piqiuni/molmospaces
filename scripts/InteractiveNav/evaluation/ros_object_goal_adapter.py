@@ -20,9 +20,9 @@ Interaction execution is an evaluator-private capability.  A caller registers
 ``opaque_id -> private_handle`` at reset, consumes an
 :class:`EvaluatorInteractionRequest`, invokes its force skill internally, then
 calls :meth:`RosObjectGoalEvaluatorAdapter.complete_interaction`.  Published
-results expose only command routing, high-level action and success/failure;
-they never contain a joint name, joint value, articulation state, or private
-handle.
+results expose only command routing plus the ordinary bridge's allow-listed
+semantic state/capability/retry contract; they never contain a joint name,
+joint value/fraction, simulator articulation record, or private handle.
 
 ``rospy`` and ``std_msgs`` are imported lazily by :meth:`start`, so this module
 can be unit-tested without ROS installed.
@@ -43,6 +43,12 @@ from typing import Any
 from .restricted_gt_perception import (
     audit_restricted_gt_payload,
     binary_mask_rle_stats,
+)
+from .benchmark_interaction_adapter import (
+    portal_capability_from_public_evidence,
+    sanitize_public_failure_reason,
+    sanitize_public_interaction_command,
+    sanitize_public_interaction_outcome,
 )
 
 
@@ -652,6 +658,22 @@ class EvaluatorInteractionRequest:
     # rejection queued so the evaluator can record it as an invalid *attempt*
     # rather than silently losing it or reporting a physical skill failure.
     rejection_reason: str = ""
+    # Leak-safe method-produced command geometry.  This is suitable for the
+    # evaluator-owned execution adapter, unlike the original ROS dictionary,
+    # which may contain guessed joint/source selectors from legacy methods.
+    public_command: Mapping[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    # Recent geometry copied from a frame that already crossed the restricted
+    # public ROS boundary.  It proves interaction provenance without consulting
+    # a simulator-only visibility/AABB oracle.
+    public_observation: Mapping[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -661,6 +683,9 @@ class _PublicVisibleBoxFrame:
     capture_step: int
     published_at_sec: float
     boxes: tuple[tuple[str, tuple[float, float, float, float]], ...]
+    boxes_3d: tuple[
+        tuple[str, tuple[float, float, float], tuple[float, float, float]], ...
+    ] = ()
 
 
 InteractionExecutor = Callable[[EvaluatorInteractionRequest], bool | Mapping[str, Any]]
@@ -765,6 +790,8 @@ class RosObjectGoalEvaluatorAdapter:
         interaction_command_topic: str = DEFAULT_INTERACTION_COMMAND_TOPIC,
         interaction_result_topic: str = DEFAULT_INTERACTION_RESULT_TOPIC,
         interaction_executor: InteractionExecutor | None = None,
+        require_public_interaction_evidence: bool = False,
+        queue_rejected_interactions: bool = False,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.target_topic = str(target_topic)
@@ -774,6 +801,10 @@ class RosObjectGoalEvaluatorAdapter:
         self._rospy = rospy_module
         self._String = string_message_type
         self._interaction_executor = interaction_executor
+        self.require_public_interaction_evidence = bool(
+            require_public_interaction_evidence
+        )
+        self.queue_rejected_interactions = bool(queue_rejected_interactions)
         self._clock = clock
         self._lock = threading.RLock()
         self._started = False
@@ -1076,12 +1107,15 @@ class RosObjectGoalEvaluatorAdapter:
         success: bool,
         status: str | None = None,
         reason: str | None = None,
+        outcome: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Publish a minimal high-level completion result for one request.
+        """Publish a leak-safe high-level completion result for one request.
 
-        Force-policy outputs must be reduced to the boolean ``success`` before
-        this method is called.  In particular, do not pass joint diagnostics or
-        a post-action state through the ROS result topic.
+        ``outcome`` may be a full ordinary-interaction backend result.  It is
+        projected through an explicit public allow-list: object/joint names,
+        fractions, force traces, and evaluator recipe fields can never leave
+        this adapter.  ``success`` must describe the physical public action
+        postcondition; required-plan scoring remains evaluator-private.
         """
 
         with self._lock:
@@ -1093,6 +1127,7 @@ class RosObjectGoalEvaluatorAdapter:
             success=bool(success),
             status=status or ("SUCCEEDED" if success else "FAILED"),
             reason=reason,
+            outcome=outcome,
         )
 
     def reject_interaction(
@@ -1112,6 +1147,7 @@ class RosObjectGoalEvaluatorAdapter:
             success=False,
             status="REJECTED",
             reason=str(reason),
+            outcome=None,
         )
 
     def receive_interaction_command(
@@ -1151,7 +1187,8 @@ class RosObjectGoalEvaluatorAdapter:
             ) = self._drawer_scan_hint(payload)
             direct_bbox_drawer_scan = False
             unresolved_public_drawer_box = False
-            if sequence_type == "drawer_scan" and has_drawer_container_bbox:
+            public_command = sanitize_public_interaction_command(payload)
+            if sequence_type in {"drawer_scan", "drawer_open"} and has_drawer_container_bbox:
                 if (
                     drawer_container_bbox is None
                     or drawer_container_capture_step is None
@@ -1169,15 +1206,24 @@ class RosObjectGoalEvaluatorAdapter:
                         # determines the opaque object for this direct scan.
                         instance_id = matched_instance_id
                         direct_bbox_drawer_scan = True
+            response_instance_id = instance_id
             # Commands may contain a semantic graph's public compatibility
             # alias.  Resolve it here, before the private-registry lookup, so
             # downstream evaluator scoring and force execution use the one
             # canonical opaque object identity.
             instance_id = self._canonical_instance_ids.get(instance_id, instance_id)
             private_handle = self._private_instances.get(instance_id)
+            public_observation = self._latest_public_object_observation_locked(
+                instance_id
+            )
             episode_id = self._episode_id
             episode_generation = self._episode_generation
-        if action != "open":
+        # Match the ordinary force bridge's public action contract.  Generic
+        # interactions and ``drawer_open`` use ``open``; the sealed
+        # open-observe-close drawer macro may use the explicit ``scan`` action.
+        if action != "open" and not (
+            sequence_type == "drawer_scan" and action == "scan"
+        ):
             return self._reject_unresolved_command(
                 command_id=command_id,
                 episode_id=episode_id,
@@ -1187,6 +1233,7 @@ class RosObjectGoalEvaluatorAdapter:
                 candidate_id=candidate_id,
                 decision_id=decision_id,
                 reason="unsupported_action",
+                public_command=public_command,
             )
         if unresolved_public_drawer_box:
             return self._reject_unresolved_command(
@@ -1198,6 +1245,26 @@ class RosObjectGoalEvaluatorAdapter:
                 candidate_id=candidate_id,
                 decision_id=decision_id,
                 reason="unresolved_drawer_scan_target",
+                public_command=public_command,
+            )
+        # Provenance is checked before capability lookup.  Otherwise a method
+        # could enumerate opaque IDs and distinguish a hidden registered object
+        # ("not visible") from an unregistered ID ("unknown instance").  Both
+        # are deliberately indistinguishable until the evaluator has actually
+        # published this object's public box in the current episode.
+        if self.require_public_interaction_evidence and public_observation is None:
+            return self._reject_unresolved_command(
+                command_id=command_id,
+                episode_id=episode_id,
+                # Do not expose whether a guessed public alias canonicalized to
+                # a private registered object before it had public provenance.
+                instance_id=response_instance_id,
+                action=action,
+                node_id=node_id,
+                candidate_id=candidate_id,
+                decision_id=decision_id,
+                reason="interaction_not_visible",
+                public_command=public_command,
             )
         if private_handle is None:
             if instance_id and self._is_semantic_portal_command(
@@ -1220,6 +1287,7 @@ class RosObjectGoalEvaluatorAdapter:
                     candidate_id=candidate_id,
                     decision_id=decision_id,
                     rejection_reason="unknown_instance_id",
+                    public_command=public_command,
                 )
                 with self._lock:
                     if (
@@ -1247,6 +1315,7 @@ class RosObjectGoalEvaluatorAdapter:
                 candidate_id=candidate_id,
                 decision_id=decision_id,
                 reason="unknown_instance_id",
+                public_command=public_command,
             )
         request = EvaluatorInteractionRequest(
             command_id=command_id,
@@ -1260,6 +1329,8 @@ class RosObjectGoalEvaluatorAdapter:
             sequence_type=sequence_type,
             open_regions=open_regions,
             direct_bbox_drawer_scan=direct_bbox_drawer_scan,
+            public_command=public_command,
+            public_observation=public_observation or {},
         )
         with self._lock:
             if (
@@ -1280,7 +1351,12 @@ class RosObjectGoalEvaluatorAdapter:
                 # The external method gets only a generic failure signal.  Full
                 # exception details remain evaluator diagnostics.
                 success = False
-            self.complete_interaction(command_id, success=success)
+                outcome = None
+            self.complete_interaction(
+                command_id,
+                success=success,
+                outcome=outcome if isinstance(outcome, Mapping) else None,
+            )
             return None
         return request
 
@@ -1354,6 +1430,41 @@ class RosObjectGoalEvaluatorAdapter:
         }
         return next(iter(matches)) if len(matches) == 1 else None
 
+    def _latest_public_object_observation_locked(
+        self,
+        instance_id: str,
+    ) -> dict[str, Any] | None:
+        """Return recent geometry already exposed to the evaluated method."""
+
+        now = float(self._clock())
+        fresh_frames = deque(
+            (
+                frame
+                for frame in self._public_visible_box_frames
+                if 0.0
+                <= now - frame.published_at_sec
+                <= DIRECT_DRAWER_SCAN_BBOX_TTL_S
+            ),
+            maxlen=DIRECT_DRAWER_SCAN_BBOX_HISTORY_SIZE,
+        )
+        self._public_visible_box_frames = fresh_frames
+        for frame in reversed(fresh_frames):
+            for object_id, center, size in frame.boxes_3d:
+                if object_id == instance_id:
+                    return {
+                        "capture_step": int(frame.capture_step),
+                        "age_seconds": max(
+                            0.0,
+                            now - float(frame.published_at_sec),
+                        ),
+                        "box_3d": {
+                            "center": list(center),
+                            "size": list(size),
+                            "frame_id": "world",
+                        },
+                    }
+        return None
+
     @staticmethod
     def _drawer_scan_hint(
         payload: Mapping[str, Any],
@@ -1364,18 +1475,18 @@ class RosObjectGoalEvaluatorAdapter:
         int | None,
         bool,
     ]:
-        """Keep only public visual drawer-scan hints from a ROS command.
+        """Keep only public visual drawer-sequence hints from a ROS command.
 
-        A V3 method still requests ``open(opaque_object_id)``.  When its MLLM
-        has selected a drawer scan, the evaluator may use normalized image
-        centers to choose private slide joints.  Guessed joint names, force
-        settings, part IDs and other simulator metadata are intentionally not
-        accepted here.  A ``drawer_container_bbox_2d`` plus its public
-        ``drawer_container_capture_step`` binds a direct scan to an object
-        that was visible in one recent evaluator-published frame.
+        A V3 method may request ``drawer_scan/scan`` or ``drawer_open/open``.
+        The evaluator may use normalized image centers to choose private slide
+        joints.  Guessed joint names, force settings, part IDs and other
+        simulator metadata are intentionally not accepted here.  A
+        ``drawer_container_bbox_2d`` plus its public capture step binds a direct
+        drawer sequence to an object visible in a recent public frame.
         """
 
-        if str(payload.get("sequence_type") or "").strip().casefold() != "drawer_scan":
+        sequence_type = str(payload.get("sequence_type") or "").strip().casefold()
+        if sequence_type not in {"drawer_scan", "drawer_open"}:
             return "", (), None, None, False
         has_drawer_container_bbox = "drawer_container_bbox_2d" in payload
         drawer_container_bbox = _public_bbox_xyxy(
@@ -1387,7 +1498,7 @@ class RosObjectGoalEvaluatorAdapter:
         raw_regions = payload.get("open_regions")
         if not isinstance(raw_regions, list):
             return (
-                "drawer_scan",
+                sequence_type,
                 (),
                 drawer_container_bbox,
                 drawer_container_capture_step,
@@ -1411,7 +1522,7 @@ class RosObjectGoalEvaluatorAdapter:
                 regions.append(point)
         regions.sort(key=lambda point: (point[1], point[0]))
         return (
-            "drawer_scan",
+            sequence_type,
             tuple(regions),
             drawer_container_bbox,
             drawer_container_capture_step,
@@ -1429,7 +1540,20 @@ class RosObjectGoalEvaluatorAdapter:
         candidate_id: str,
         decision_id: str,
         reason: str,
-    ) -> None:
+        public_command: Mapping[str, Any] | None = None,
+    ) -> EvaluatorInteractionRequest | None:
+        safe_command = dict(public_command or {})
+        if not safe_command:
+            safe_command = sanitize_public_interaction_command(
+                {
+                    "command_id": command_id,
+                    "node_id": node_id,
+                    "candidate_id": candidate_id,
+                    "decision_id": decision_id,
+                    "object_id": instance_id,
+                    "action": action,
+                }
+            )
         request = EvaluatorInteractionRequest(
             command_id=command_id,
             episode_id=episode_id,
@@ -1439,12 +1563,33 @@ class RosObjectGoalEvaluatorAdapter:
             node_id=node_id,
             candidate_id=candidate_id,
             decision_id=decision_id,
+            rejection_reason=str(reason),
+            public_command=safe_command,
         )
+        if self.queue_rejected_interactions:
+            with self._lock:
+                if episode_id != self._episode_id:
+                    return None
+                self._pending_by_command_id[command_id] = request
+                self._pending_order.append(command_id)
+            return request
+        provenance_failure = str(reason) == "interaction_not_visible"
         self._emit_interaction_result(
             request,
             success=False,
             status="REJECTED",
             reason=reason,
+            outcome={
+                "state": "unknown" if provenance_failure else "unavailable",
+                "post_state": "unknown" if provenance_failure else "unavailable",
+                "interaction_capability": (
+                    "unknown" if provenance_failure else "unavailable"
+                ),
+                **({} if provenance_failure else {"interactable": False}),
+                "retryable": provenance_failure,
+                "failure_reason": reason,
+                "verification_source": "executor_capability_check",
+            },
         )
         return None
 
@@ -1455,14 +1600,15 @@ class RosObjectGoalEvaluatorAdapter:
         success: bool,
         status: str,
         reason: str | None = None,
+        outcome: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             self._event_sequence += 1
             event_id = f"object_skill_{self._event_sequence:06d}"
-        # The output has deliberately no state, joint, or force fields.  A
-        # method can observe the consequence only through the next public
-        # perception frame, while the evaluator separately retains full V3
-        # completion checks for final scoring.
+        # Rebuild a compact ordinary-bridge-style outcome from a public
+        # allow-list.  State/capability/retryability may cross this boundary;
+        # simulator object names, joint names/values, force traces and hidden
+        # oracle relevance never do.
         payload: dict[str, Any] = {
             "schema_version": 1,
             "event_id": event_id,
@@ -1482,28 +1628,44 @@ class RosObjectGoalEvaluatorAdapter:
             "source": "evaluator_object_skill",
             "stamp_sec": float(self._clock()),
         }
-        if reason:
-            payload["reason"] = str(reason)
+        public_outcome = sanitize_public_interaction_outcome(
+            outcome,
+            success=bool(success),
+        )
+        payload.update(public_outcome)
+        normalized_reason = sanitize_public_failure_reason(reason)
+        if normalized_reason:
+            payload["reason"] = normalized_reason
+            payload.setdefault("failure_reason", normalized_reason)
+        public_command = dict(request.public_command or {})
+        node_type = str(public_command.get("node_type") or "").strip().casefold()
+        if node_type:
+            payload["node_type"] = node_type
         if (
             str(status).strip().upper() == "INVALID"
-            and str(reason or "").strip().casefold() == "unknown_instance_id"
+            and normalized_reason == "unknown_instance_id"
             and self._is_semantic_portal_command(
-                node_type="",
+                node_type=node_type,
                 node_id=request.node_id,
                 candidate_id=request.candidate_id,
             )
         ):
-            # This is a public capability conclusion, not an articulation
-            # readback: a geometry-derived doorway has no evaluator-registered
-            # object skill.  Persist it in the semantic graph so later Module
-            # 1 updates cannot turn the same doorway into another open request.
-            payload.update(
-                {
-                    "state": "static",
-                    "interactable": False,
-                    "interaction_capability": "static",
-                }
+            # A missing articulation is ambiguous.  Reuse the ordinary bridge's
+            # public two-factor aperture contract; never promote an unknown
+            # semantic doorway to ``static`` from evaluator registration alone.
+            portal_outcome = portal_capability_from_public_evidence(
+                public_command.get("portal_aperture_observation")
             )
+            payload.update(portal_outcome)
+            if portal_outcome["state"] == "static_open":
+                payload["success"] = True
+                payload["status"] = "SUCCEEDED"
+                payload.pop("reason", None)
+                payload.pop("failure_reason", None)
+            else:
+                payload["success"] = False
+                payload["status"] = "FAILED"
+                payload["reason"] = str(portal_outcome["failure_reason"])
         self._publish(self._result_publisher, payload)
         with self._lock:
             self._published_result_events.append(deepcopy(payload))
@@ -1532,6 +1694,9 @@ class RosObjectGoalEvaluatorAdapter:
         is_reset = bool(payload.get("episode_reset", False))
         capture_step = _public_capture_step(payload.get("capture_step"))
         visible_boxes: list[tuple[str, tuple[float, float, float, float]]] = []
+        visible_boxes_3d: list[
+            tuple[str, tuple[float, float, float], tuple[float, float, float]]
+        ] = []
         if not is_reset and capture_step is not None:
             for observation in payload.get("observations") or []:
                 if not isinstance(observation, Mapping):
@@ -1540,6 +1705,27 @@ class RosObjectGoalEvaluatorAdapter:
                 bbox = _public_bbox_xyxy(observation.get("bbox_2d"))
                 if instance_id and bbox is not None:
                     visible_boxes.append((instance_id, bbox))
+                box_3d = observation.get("box_3d")
+                if instance_id and isinstance(box_3d, Mapping):
+                    try:
+                        center = tuple(
+                            float(value)
+                            for value in list(box_3d.get("center") or [])[:3]
+                        )
+                        size = tuple(
+                            float(value)
+                            for value in list(box_3d.get("size") or [])[:3]
+                        )
+                    except (TypeError, ValueError):
+                        center = ()
+                        size = ()
+                    if (
+                        len(center) == 3
+                        and len(size) == 3
+                        and all(math.isfinite(value) for value in (*center, *size))
+                        and all(value >= 0.0 for value in size)
+                    ):
+                        visible_boxes_3d.append((instance_id, center, size))
         with self._lock:
             if not self._episode_id:
                 raise RuntimeError("reset() must be called before publishing observations")
@@ -1575,6 +1761,7 @@ class RosObjectGoalEvaluatorAdapter:
                     capture_step=capture_step,
                     published_at_sec=float(self._clock()),
                     boxes=tuple(visible_boxes),
+                    boxes_3d=tuple(visible_boxes_3d),
                 )
             )
             self._public_visible_box_frames = deque(

@@ -31,6 +31,7 @@ class _FakeAdapter:
     def __init__(self, request: EvaluatorInteractionRequest) -> None:
         self._request: EvaluatorInteractionRequest | None = request
         self.completions: list[tuple[str, bool]] = []
+        self.outcomes: list[dict] = []
 
     def pop_next_interaction_request(self) -> EvaluatorInteractionRequest | None:
         request, self._request = self._request, None
@@ -43,11 +44,34 @@ class _FakeAdapter:
         success: bool,
         status: str | None = None,
         reason: str | None = None,
+        outcome: dict | None = None,
     ) -> dict[str, str]:
         self.completions.append((command_id, success))
+        self.outcomes.append(dict(outcome or {}))
         result = {"status": status or ("COMPLETED" if success else "FAILED")}
         if reason:
             result["reason"] = reason
+        if outcome:
+            result.update(
+                {
+                    key: value
+                    for key, value in outcome.items()
+                    if key
+                    in {
+                        "state",
+                        "pre_state",
+                        "post_state",
+                        "interaction_capability",
+                        "interactable",
+                        "retryable",
+                        "failure_reason",
+                        "verification_source",
+                        "interaction_pose_validation",
+                        "physics_substeps",
+                        "task_steps_consumed",
+                    }
+                }
+            )
         return result
 
 
@@ -69,6 +93,44 @@ def _runtime_joint(
         aabb_center=np.asarray([0.0, 0.0, 0.0]),
         aabb_size=np.asarray([1.0, 1.0, 1.0]),
     )
+
+
+def _public_pose_env(*, x: float = 0.0, y: float = 0.0, yaw: float = 0.0):
+    pose = np.eye(4, dtype=float)
+    pose[0, 0] = np.cos(yaw)
+    pose[0, 1] = -np.sin(yaw)
+    pose[1, 0] = np.sin(yaw)
+    pose[1, 1] = np.cos(yaw)
+    pose[0, 3] = x
+    pose[1, 3] = y
+    return SimpleNamespace(
+        current_robot=SimpleNamespace(
+            robot_view=SimpleNamespace(base=SimpleNamespace(pose=pose))
+        )
+    )
+
+
+def _valid_public_interaction_fields(
+    *, x: float = 0.0, y: float = 0.0, yaw: float = 0.0
+) -> dict:
+    """Return method/public-frame evidence for one local interaction."""
+
+    return {
+        "public_command": {
+            "interaction_approach_pose_xyyaw": [x, y, yaw],
+            "interaction_ready_distance_m": 0.45,
+            "interaction_ready_yaw_tolerance_rad": 0.55,
+        },
+        "public_observation": {
+            "capture_step": 7,
+            "age_seconds": 0.1,
+            "box_3d": {
+                "center": [x, y, 1.0],
+                "size": [1.0, 1.0, 2.0],
+                "frame_id": "world",
+            },
+        },
+    }
 
 
 def test_restricted_gt_root_body_alias_resolves_to_articulated_object_skill() -> None:
@@ -167,17 +229,31 @@ def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
 ) -> None:
     """A public frame's root-body ID must be accepted by the sealed adapter."""
 
+    startup_events: list[tuple[str, str]] = []
+
     class _FakeAdapter:
         def __init__(self, **_kwargs) -> None:
             self.private_instances: dict[str, str] = {}
             self.instance_aliases: dict[str, str] = {}
 
-        def reset(self, *, private_instances, instance_aliases=None, **_kwargs) -> None:
+        def reset(
+            self,
+            *,
+            episode_id,
+            private_instances,
+            instance_aliases=None,
+            **_kwargs,
+        ) -> None:
+            startup_events.append(("adapter_reset", str(episode_id)))
             self.private_instances = dict(private_instances)
             self.instance_aliases = dict(instance_aliases or {})
 
         def publish_restricted_gt_frame(self, *_args, **_kwargs) -> None:
             return None
+
+    class _FakeGoalStatusObserver:
+        def begin_episode(self, episode_id: str) -> None:
+            startup_events.append(("goal_begin", str(episode_id)))
 
     # Deliberately place the render/root body and the articulated leaf in
     # separate MuJoCo roots; this mirrors the ProcTHOR doorway asset seam.
@@ -198,6 +274,12 @@ def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
         joint_index=1,
         body_id=3,
     )
+    freezer = _runtime_joint(
+        object_name="private_fridge",
+        joint_name="private_freezer_hinge",
+        joint_index=2,
+        body_id=3,
+    )
     specs = [
         SimpleNamespace(source_name="doorway_hash_1_0_2", body_id=1),
         SimpleNamespace(source_name="doorway_hash_1_2_2", body_id=2),
@@ -215,20 +297,52 @@ def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
         lambda self, *_args, **_kwargs: None,
     )
 
+    task = SimpleNamespace(env=SimpleNamespace(current_model=model))
+    catalog = SimpleNamespace(joints=[leaf, fridge, freezer])
+    config = SimpleNamespace(
+        restricted_gt_min_visible_pixels=16,
+        restricted_gt_min_bbox_area_pixels=512,
+        restricted_gt_max_distance_m=4.0,
+        ros_target_topic="/target",
+        ros_restricted_gt_topic="/gt",
+        ros_interaction_command_topic="/command",
+        ros_interaction_result_topic="/result",
+    )
     runtime = benchmark_runner._build_restricted_ros_object_goal_runtime(
-        task=SimpleNamespace(env=SimpleNamespace(current_model=model)),
-        catalog=SimpleNamespace(joints=[leaf, fridge]),
-        episode={"interactive_nav": {"interactions": [], "oracle_plans": []}},
+        task=task,
+        catalog=catalog,
+        episode={
+            "interactive_nav": {
+                "target": {"selected_instance": "private_target"},
+                "interactions": [
+                    {"object_name": "private_fridge", "joint_index": 1}
+                ],
+                "oracle_plans": [
+                    {"required_interaction_ids": ["private_recipe_fridge"]}
+                ],
+            }
+        },
         public=SimpleNamespace(instruction="find the apple"),
-        config=SimpleNamespace(
-            restricted_gt_min_visible_pixels=16,
-            restricted_gt_min_bbox_area_pixels=512,
-            restricted_gt_max_distance_m=4.0,
-            ros_target_topic="/target",
-            ros_restricted_gt_topic="/gt",
-            ros_interaction_command_topic="/command",
-            ros_interaction_result_topic="/result",
-        ),
+        config=config,
+        episode_index=0,
+        goal_status_observer=_FakeGoalStatusObserver(),
+    )
+    alternate_runtime = benchmark_runner._build_restricted_ros_object_goal_runtime(
+        task=task,
+        catalog=catalog,
+        episode={
+            "interactive_nav": {
+                "target": {"selected_instance": "private_target"},
+                "interactions": [
+                    {"object_name": "private_fridge", "joint_index": 2}
+                ],
+                "oracle_plans": [
+                    {"required_interaction_ids": ["private_recipe_freezer"]}
+                ],
+            }
+        },
+        public=SimpleNamespace(instruction="find the apple"),
+        config=config,
         episode_index=0,
     )
 
@@ -242,10 +356,20 @@ def test_restricted_gt_door_root_opaque_id_is_registered_for_the_leaf_skill(
     assert runtime.adapter.instance_aliases[
         benchmark_runner.opaque_door_instance_id(root_opaque_id)
     ] == root_opaque_id
+    assert startup_events[0] == ("goal_begin", runtime.perception.episode_id)
+    assert startup_events[1] == ("adapter_reset", runtime.perception.episode_id)
     assert runtime.adapter.instance_aliases[
         benchmark_runner.opaque_door_instance_id(leaf_opaque_id)
     ] == leaf_opaque_id
     fridge_opaque_id = runtime.perception.registry.public_id_for("private_fridge")
+    alternate_fridge_id = alternate_runtime.perception.registry.public_id_for(
+        "private_fridge"
+    )
+    assert runtime.opaque_to_joints[fridge_opaque_id] == (fridge, freezer)
+    assert alternate_runtime.opaque_to_joints[alternate_fridge_id] == (
+        fridge,
+        freezer,
+    )
     assert benchmark_runner.opaque_door_instance_id(fridge_opaque_id) not in runtime.adapter.instance_aliases
 
 
@@ -288,6 +412,7 @@ def test_opaque_ros_object_command_keeps_private_resolution_out_of_public_attemp
             instance_id=opaque_id,
             action="open",
             private_handle=object(),
+            **_valid_public_interaction_fields(),
         )
     )
     runtime = SimpleNamespace(
@@ -296,11 +421,15 @@ def test_opaque_ros_object_command_keeps_private_resolution_out_of_public_attemp
         opaque_to_source_name={opaque_id: raw_object_name},
         opaque_to_joints={opaque_id: joints},
     )
-    task = SimpleNamespace(env=object(), get_observations=lambda: {"camera": "public-observation"})
+    task = SimpleNamespace(
+        env=_public_pose_env(),
+        get_observations=lambda: {"camera": "public-observation"},
+    )
     config = SimpleNamespace(
         interaction_max_distance_m=1.75,
         require_interaction_visible=True,
         record_video=False,
+        force_max_internal_steps=1500,
     )
     episode = {
         "interactive_nav": {
@@ -331,7 +460,33 @@ def test_opaque_ros_object_command_keeps_private_resolution_out_of_public_attemp
     monkeypatch.setattr(
         benchmark_runner,
         "_check_interaction_access",
-        lambda *_args, **_kwargs: (True, {"distance_m": 0.5, "visibility": 1.0}),
+        lambda *_args, **_kwargs: pytest.fail(
+            "restricted execution must not consult private access geometry"
+        ),
+    )
+    monkeypatch.setattr(benchmark_runner, "_robot_lock_snapshot", lambda _env: object())
+    monkeypatch.setattr(benchmark_runner, "_apply_robot_lock", lambda *_args: None)
+
+    def execute_group(_env, *, object_name, joints, **_kwargs):
+        assert object_name == raw_object_name
+        executed_joint_names.extend(joint.joint_name for joint in joints)
+        return SimpleNamespace(
+            success=True,
+            joint_results=(
+                JointOpenResult(True, 0.0, 0.90, simulated_seconds=1.0),
+                JointOpenResult(True, 0.0, 0.85, simulated_seconds=0.0),
+            ),
+            simulated_seconds=1.0,
+            physics_substeps=500,
+            pre_state="closed",
+            post_state="open",
+            private_metadata={"execution_mode": "ordinary_force_group_fast"},
+        )
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "execute_open_articulation_group",
+        execute_group,
     )
     monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -356,6 +511,8 @@ def test_opaque_ros_object_command_keeps_private_resolution_out_of_public_attemp
     public_attempt = consumed["public_attempt"]
     assert executed_joint_names == list(raw_joint_names)
     assert adapter.completions == [(command_id, True)]
+    assert adapter.outcomes[-1]["interaction_capability"] == "articulated"
+    assert adapter.outcomes[-1]["failure_reason"] == ""
     assert private_attempt["resolved_object_name"] == raw_object_name
     assert private_attempt["resolved_interaction_ids"] == list(scoring_ids)
     assert private_attempt["resolved_interaction_id"] == scoring_ids[0]
@@ -366,15 +523,16 @@ def test_opaque_ros_object_command_keeps_private_resolution_out_of_public_attemp
     # This is the policy-visible projection.  It carries only opaque routing,
     # high-level outcome and elapsed skill time; raw object/joint/V3 IDs remain
     # exclusively in ``private_attempt`` above.
-    assert public_attempt == {
-        "request_id": command_id,
-        "instance_id": opaque_id,
-        "operation": "open",
-        "status": "completed",
-        "decision_step": 8,
-        "simulated_seconds": pytest.approx(1.0),
-        "result_status": "COMPLETED",
-    }
+    assert public_attempt["request_id"] == command_id
+    assert public_attempt["instance_id"] == opaque_id
+    assert public_attempt["operation"] == "open"
+    assert public_attempt["status"] == "COMPLETED"
+    assert public_attempt["state"] == "open"
+    assert public_attempt["post_state"] == "open"
+    assert public_attempt["interaction_capability"] == "articulated"
+    assert public_attempt["decision_step"] == 8
+    assert public_attempt["simulated_seconds"] == pytest.approx(1.0)
+    assert public_attempt["result_status"] == "COMPLETED"
     public_json = json.dumps(public_attempt, sort_keys=True)
     for private_value in (raw_object_name, *raw_joint_names, *scoring_ids):
         assert private_value not in public_json
@@ -413,7 +571,10 @@ def test_unknown_semantic_portal_is_scored_as_invalid_not_failed_skill(
         opaque_to_source_name={},
         opaque_to_joints={},
     )
-    task = SimpleNamespace(env=object(), get_observations=lambda: {"camera": "public-observation"})
+    task = SimpleNamespace(
+        env=_public_pose_env(),
+        get_observations=lambda: {"camera": "public-observation"},
+    )
     config = SimpleNamespace(record_video=False)
     published_steps: list[int] = []
     monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
@@ -444,20 +605,87 @@ def test_unknown_semantic_portal_is_scored_as_invalid_not_failed_skill(
         "node_id": "portal_obj_000021",
         "candidate_id": "interaction:portal_obj_000021:open",
         "rejected_before_execution": True,
+        "action_skipped": False,
+        "public_state": "unavailable",
     }
-    assert consumed["public_attempt"] == {
-        "request_id": command_id,
-        "instance_id": opaque_id,
-        "operation": "open",
-        "status": "invalid",
-        "reason": "unknown_instance_id",
-        "decision_step": 12,
-        "simulated_seconds": 0.0,
-        "result_status": "INVALID",
-    }
+    public_attempt = consumed["public_attempt"]
+    assert public_attempt["request_id"] == command_id
+    assert public_attempt["instance_id"] == opaque_id
+    assert public_attempt["operation"] == "open"
+    assert public_attempt["status"] == "INVALID"
+    assert public_attempt["state"] == "unavailable"
+    assert public_attempt["interaction_capability"] == "unavailable"
+    assert public_attempt["reason"] == "unknown_instance_id"
+    assert public_attempt["decision_step"] == 12
+    assert public_attempt["simulated_seconds"] == 0.0
+    assert public_attempt["result_status"] == "INVALID"
 
 
-def test_drawer_scan_gate_and_scoring_ids_use_private_drawer_type_and_physical_order() -> None:
+def test_not_visible_rejection_is_neutral_and_does_not_reveal_private_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_id = "known-but-not-visible"
+    opaque_id = "obj_000077"
+    source_name = "private_fridge"
+    adapter = _FakeAdapter(
+        EvaluatorInteractionRequest(
+            command_id=command_id,
+            episode_id="episode_visibility_gate",
+            instance_id=opaque_id,
+            action="open",
+            private_handle=None,
+            rejection_reason="interaction_not_visible",
+        )
+    )
+    runtime = SimpleNamespace(
+        adapter=adapter,
+        opaque_to_source_name={opaque_id: source_name},
+        opaque_to_joints={},
+    )
+    task = SimpleNamespace(
+        env=_public_pose_env(),
+        get_observations=lambda: {"camera": "public-observation"},
+    )
+    monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(benchmark_runner, "_publish_restricted_ros_frame", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(benchmark_runner, "_discard_task_rollout_cache", lambda _task: None)
+
+    consumed = benchmark_runner._consume_pending_ros_object_goal_interaction(
+        task=task,
+        runtime=runtime,
+        episode={
+            "interactive_nav": {
+                "interactions": [
+                    {
+                        "interaction_id": "required_fridge_open",
+                        "object_name": source_name,
+                        "prerequisites": [],
+                    }
+                ],
+                "oracle_plans": [],
+            }
+        },
+        private_attempts=[],
+        config=SimpleNamespace(record_video=False),
+        decision_index=3,
+        frames=[],
+    )
+
+    assert consumed is not None
+    private_attempt = consumed["private_attempt"]
+    public_attempt = consumed["public_attempt"]
+    assert private_attempt["classification"] == "invalid"
+    assert private_attempt["success"] is False
+    assert private_attempt["resolved_object_name"] is None
+    assert private_attempt["resolved_interaction_ids"] == []
+    assert public_attempt["status"] == "FAILED"
+    assert public_attempt["failure_reason"] == "interaction_not_visible"
+    assert public_attempt["interaction_capability"] == "unknown"
+    assert "interactable" not in public_attempt
+    assert public_attempt["retryable"] is True
+
+
+def test_drawer_scan_scoring_ids_follow_physical_order_without_capability_gate() -> None:
     source_name = "private_dresser_body"
     top = _runtime_joint(object_name=source_name, joint_name="top_slide", joint_index=9)
     bottom = _runtime_joint(object_name=source_name, joint_name="bottom_slide", joint_index=4)
@@ -482,20 +710,81 @@ def test_drawer_scan_gate_and_scoring_ids_use_private_drawer_type_and_physical_o
         }
     }
 
-    assert benchmark_runner._is_trusted_drawer_scan_target(episode, source_name, (top, bottom))
-    assert benchmark_runner._trusted_drawer_scan_joint_indices(episode, source_name) == {4, 9}
     assert benchmark_runner._successful_drawer_scan_interaction_ids(
         episode=episode,
         source_name=source_name,
         opened_joints=(top, bottom),
     ) == ["drawer_top", "drawer_bottom"]
 
+    # Frozen V3 types affect only private scoring labels; they never decide
+    # whether the public drawer action is executable.
     episode["interactive_nav"]["interactions"][0]["type"] = "container_hinged_door"
     episode["interactive_nav"]["interactions"][1]["type"] = "container_hinged_door"
-    assert not benchmark_runner._is_trusted_drawer_scan_target(episode, source_name, (top, bottom))
+    assert benchmark_runner._successful_drawer_scan_interaction_ids(
+        episode=episode,
+        source_name=source_name,
+        opened_joints=(top, bottom),
+    ) == ["drawer_top", "drawer_bottom"]
 
 
-def test_object_skill_completion_requires_a_complete_object_local_oracle_plan() -> None:
+def test_static_open_portal_trace_matches_public_completion_without_force_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _StaticOpenAdapter(_FakeAdapter):
+        def complete_interaction(self, command_id: str, **_kwargs):
+            self.completions.append((command_id, False))
+            self.outcomes.append({})
+            return {
+                "status": "SUCCEEDED",
+                "success": True,
+                "state": "static_open",
+                "interaction_capability": "static",
+                "interactable": False,
+                "retryable": False,
+            }
+
+    command_id = "skip-static-aperture"
+    request = EvaluatorInteractionRequest(
+        command_id=command_id,
+        episode_id="episode_static_open",
+        instance_id="obj_000099",
+        action="open",
+        private_handle=None,
+        node_id="portal_obj_000099",
+        candidate_id="interaction:portal_obj_000099:open",
+        rejection_reason="unknown_instance_id",
+    )
+    runtime = SimpleNamespace(
+        adapter=_StaticOpenAdapter(request),
+        opaque_to_source_name={},
+        opaque_to_joints={},
+    )
+    monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(benchmark_runner, "_publish_restricted_ros_frame", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(benchmark_runner, "_discard_task_rollout_cache", lambda _task: None)
+
+    consumed = benchmark_runner._consume_pending_ros_object_goal_interaction(
+        task=SimpleNamespace(env=object(), get_observations=lambda: {}),
+        runtime=runtime,
+        episode={"interactive_nav": {"interactions": [], "oracle_plans": []}},
+        private_attempts=[],
+        config=SimpleNamespace(record_video=False),
+        decision_index=1,
+        frames=[],
+    )
+
+    assert consumed is not None
+    assert consumed["public_attempt"]["status"] == "SUCCEEDED"
+    assert consumed["public_attempt"]["success"] is True
+    rejection = consumed["private_attempt"]["metadata"]["rejection"]
+    assert rejection["action_skipped"] is True
+    assert rejection["public_state"] == "static_open"
+    # The evaluator did not apply force, so the private physical attempt stays
+    # false even though the public aperture postcondition is already satisfied.
+    assert consumed["private_attempt"]["success"] is False
+
+
+def test_private_scoring_orders_effect_ids_by_oracle_plan() -> None:
     source_name = "private_fridge_body"
     episode = {
         "interactive_nav": {
@@ -524,47 +813,10 @@ def test_object_skill_completion_requires_a_complete_object_local_oracle_plan() 
         }
     }
 
-    assert not benchmark_runner._object_skill_satisfies_an_oracle_plan(
-        episode=episode,
-        source_name=source_name,
-        successful_ids=["outer"],
-    )
-    assert benchmark_runner._object_skill_satisfies_an_oracle_plan(
-        episode=episode,
-        source_name=source_name,
-        successful_ids=["inner", "outer"],
-    )
-    assert benchmark_runner._object_skill_satisfies_an_oracle_plan(
-        episode=episode,
-        source_name=source_name,
-        successful_ids=["alternative"],
-    )
-    assert benchmark_runner._object_skill_satisfies_an_oracle_plan(
-        episode={"interactive_nav": {"interactions": [], "oracle_plans": []}},
-        source_name=source_name,
-        successful_ids=[],
-    )
     assert benchmark_runner._order_interaction_ids_by_oracle_plan(
         episode,
         ["inner", "outer"],
     ) == ["outer", "inner"]
-    inner_joint = _runtime_joint(
-        object_name=source_name,
-        joint_name="inner",
-        joint_index=1,
-    )
-    outer_joint = _runtime_joint(
-        object_name=source_name,
-        joint_name="outer",
-        joint_index=3,
-    )
-    ordered_joints = benchmark_runner._ordered_object_skill_joints(
-        source_name=source_name,
-        all_joints=(inner_joint, outer_joint),
-        interactions=episode["interactive_nav"]["interactions"],
-        plans=episode["interactive_nav"]["oracle_plans"],
-    )
-    assert [joint.joint_index for joint in ordered_joints] == [3, 1]
 
 
 def test_partial_object_skill_result_is_reported_failed_to_ros(
@@ -584,6 +836,7 @@ def test_partial_object_skill_result_is_reported_failed_to_ros(
             instance_id=opaque_id,
             action="open",
             private_handle=object(),
+            **_valid_public_interaction_fields(),
         )
     )
     public_result = ObjectInteractionResult(
@@ -629,16 +882,37 @@ def test_partial_object_skill_result_is_reported_failed_to_ros(
             ],
         }
     }
-    task = SimpleNamespace(env=object(), get_observations=lambda: {})
+    task = SimpleNamespace(env=_public_pose_env(), get_observations=lambda: {})
     config = SimpleNamespace(
         interaction_max_distance_m=1.75,
         require_interaction_visible=True,
         record_video=False,
+        force_max_internal_steps=1500,
     )
     monkeypatch.setattr(
         benchmark_runner,
         "_check_interaction_access",
-        lambda *_args, **_kwargs: (True, {}),
+        lambda *_args, **_kwargs: pytest.fail(
+            "restricted execution must not consult private access geometry"
+        ),
+    )
+    monkeypatch.setattr(benchmark_runner, "_robot_lock_snapshot", lambda _env: object())
+    monkeypatch.setattr(benchmark_runner, "_apply_robot_lock", lambda *_args: None)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "execute_open_articulation_group",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            success=False,
+            joint_results=(
+                JointOpenResult(True, 0.0, 0.9),
+                JointOpenResult(False, 0.0, 0.2),
+            ),
+            simulated_seconds=0.0,
+            physics_substeps=50,
+            pre_state="closed",
+            post_state="blocked",
+            private_metadata={"execution_mode": "ordinary_force_group_fast"},
+        ),
     )
     monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -660,11 +934,50 @@ def test_partial_object_skill_result_is_reported_failed_to_ros(
 
     assert consumed is not None
     assert adapter.completions == [(command_id, False)]
-    assert consumed["public_attempt"]["status"] == "failed"
+    assert adapter.outcomes[-1]["interaction_capability"] == "blocked"
+    assert adapter.outcomes[-1]["failure_reason"] == "force_target_not_reached"
+    assert adapter.outcomes[-1]["verification_source"] == "executor_state_verification"
+    assert consumed["public_attempt"]["status"] == "FAILED"
     assert consumed["public_attempt"]["result_status"] == "FAILED"
     assert consumed["private_attempt"]["classification"] == "required_valid"
     assert consumed["private_attempt"]["success"] is False
     assert consumed["private_attempt"]["resolved_interaction_ids"] == ["outer"]
+
+
+def test_unsafe_refrigerator_sweep_matches_ordinary_retry_contract() -> None:
+    outcome = benchmark_runner._public_force_execution_outcome(
+        execution=SimpleNamespace(
+            success=False,
+            physics_substeps=0,
+            pre_state="closed",
+        ),
+        executor_metadata={
+            "public_failure_reason": "unsafe_open_sweep",
+            "task_steps_consumed": 0,
+            "open_sweep_preflight": {
+                "checked": True,
+                "safe": False,
+                "recommended_retreat_m": 0.25,
+            },
+        },
+        pose_validation={"checked": True, "valid": True},
+    )
+
+    assert outcome == {
+        "state": "unknown",
+        "pre_state": "closed",
+        "post_state": "unknown",
+        "interaction_capability": "articulated",
+        "interactable": True,
+        "retryable": True,
+        "failure_reason": "unsafe_open_sweep",
+        "verification_source": "executor_open_sweep_preflight",
+        "interaction_pose_validation": {"checked": True, "valid": True},
+        "physics_substeps": 0,
+        "task_steps_consumed": 0,
+        "execution_cost": 0.0,
+        "recommended_retreat_m": 0.25,
+    }
 
 
 def test_failed_drawer_scan_cannot_return_transient_target_discovery(
@@ -679,10 +992,11 @@ def test_failed_drawer_scan_cannot_return_transient_target_discovery(
             command_id=command_id,
             episode_id="episode_public_2",
             instance_id=opaque_id,
-            action="open",
+            action="scan",
             private_handle=object(),
             sequence_type="drawer_scan",
             open_regions=((0.5, 0.2),),
+            **_valid_public_interaction_fields(),
         )
     )
     runtime = SimpleNamespace(
@@ -706,7 +1020,10 @@ def test_failed_drawer_scan_cannot_return_transient_target_discovery(
             "oracle_plans": [],
         }
     }
-    task = SimpleNamespace(env=object(), get_observations=lambda: {"camera": "public-observation"})
+    task = SimpleNamespace(
+        env=_public_pose_env(),
+        get_observations=lambda: {"camera": "public-observation"},
+    )
     config = SimpleNamespace(
         interaction_max_distance_m=1.75,
         require_interaction_visible=True,
@@ -715,7 +1032,9 @@ def test_failed_drawer_scan_cannot_return_transient_target_discovery(
     monkeypatch.setattr(
         benchmark_runner,
         "_check_interaction_access",
-        lambda *_args, **_kwargs: (True, {"distance_m": 0.5, "visibility": 1.0}),
+        lambda *_args, **_kwargs: pytest.fail(
+            "restricted execution must not consult private access geometry"
+        ),
     )
     monkeypatch.setattr(
         benchmark_runner,
@@ -757,11 +1076,290 @@ def test_failed_drawer_scan_cannot_return_transient_target_discovery(
     assert consumed["target_discovery"] is None
 
 
+def test_drawer_open_lifecycle_uses_grounded_groups_and_restores_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_name = "private_dresser"
+    joints = (
+        _runtime_joint(
+            object_name=source_name,
+            joint_name="private_slide_a",
+            joint_index=2,
+        ),
+        _runtime_joint(
+            object_name=source_name,
+            joint_name="private_slide_b",
+            joint_index=3,
+        ),
+    )
+    grouping_calls: list[dict] = []
+
+    def fake_groups(task, available, regions, **kwargs):
+        grouping_calls.append(dict(kwargs))
+        assert tuple(available) == joints
+        assert regions == ((0.25, 0.25), (0.75, 0.75))
+        return [
+            (joints[0], {"grounding_source": "m1_region"}),
+            (joints[1], {"grounding_source": "m1_region"}),
+        ]
+
+    monkeypatch.setattr(benchmark_runner, "_drawer_scan_runtime_groups", fake_groups)
+    monkeypatch.setattr(
+        benchmark_runner.probe,
+        "get_head_joint_position",
+        lambda _env: np.asarray([0.1, 0.2]),
+    )
+    monkeypatch.setattr(
+        benchmark_runner.probe,
+        "get_torso_joint_position",
+        lambda _env: np.asarray([0.3, 0.4]),
+    )
+    monkeypatch.setattr(
+        benchmark_runner.probe,
+        "lower_head_for_drawer_view",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        benchmark_runner.probe,
+        "lean_torso_for_drawer_view",
+        lambda *_args, **_kwargs: None,
+    )
+    restored: list[str] = []
+    monkeypatch.setattr(
+        benchmark_runner.probe,
+        "set_head_joint_position",
+        lambda *_args, **_kwargs: restored.append("head"),
+    )
+    monkeypatch.setattr(
+        benchmark_runner.probe,
+        "set_torso_joint_position",
+        lambda *_args, **_kwargs: restored.append("torso"),
+    )
+    monkeypatch.setattr(benchmark_runner.mujoco, "mj_forward", lambda *_args: None)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "joint_open_fraction",
+        lambda env, row: 0.95,
+    )
+    monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
+    published: list[int] = []
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_publish_restricted_ros_frame",
+        lambda runtime, task, *, decision_index: published.append(decision_index)
+        or True,
+    )
+    executed: list[str] = []
+
+    def execute_group(selected):
+        joint = selected[0]
+        executed.append(joint.joint_name)
+        return (
+            SimpleNamespace(
+                success=True,
+                joint_results=(JointOpenResult(True, 0.0, 0.95, 0.1),),
+                simulated_seconds=0.1,
+                physics_substeps=5,
+                pre_state="closed",
+            ),
+            {"execution_mode": "ordinary_force_group_fast"},
+        )
+
+    env = _public_pose_env()
+    env.current_model = object()
+    env.current_data = object()
+    env.camera_manager = SimpleNamespace(
+        registry=SimpleNamespace(update_all_cameras=lambda _env: None)
+    )
+    task = SimpleNamespace(
+        env=env,
+        get_observations=lambda: {"head_camera": "fresh"},
+    )
+
+    result = benchmark_runner._execute_private_drawer_open(
+        task=task,
+        runtime=object(),
+        joints=joints,
+        open_regions=((0.25, 0.25), (0.75, 0.75)),
+        allowed_joint_indices={2, 3},
+        execute_group=execute_group,
+        config=SimpleNamespace(record_video=False),
+        decision_index=17,
+        frames=[],
+    )
+
+    assert result["success"] is True
+    assert executed == ["private_slide_a", "private_slide_b"]
+    assert grouping_calls == [
+        {"allowed_joint_indices": {2, 3}, "fallback_to_all": False}
+    ]
+    assert published == [17, 17, 17]
+    assert restored == ["head", "torso"]
+    assert result["metadata"]["view_profile"] == "drawer_low_view"
+    assert result["metadata"]["final_state_satisfied"] is True
+
+
+def test_drawer_open_grounding_failure_returns_public_skill_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_grounding(*_args, **_kwargs):
+        raise RuntimeError("private drawer details must stay private")
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_drawer_scan_runtime_groups",
+        fail_grounding,
+    )
+    task = SimpleNamespace(
+        env=object(),
+        get_observations=lambda: {"head_camera": "fallback"},
+    )
+
+    result = benchmark_runner._execute_private_drawer_open(
+        task=task,
+        runtime=object(),
+        joints=(),
+        open_regions=((0.5, 0.5),),
+        allowed_joint_indices=set(),
+        execute_group=lambda _joints: pytest.fail("force must not run"),
+        config=SimpleNamespace(record_video=False),
+        decision_index=18,
+        frames=[],
+    )
+
+    assert result["success"] is False
+    assert result["metadata"] == {
+        "execution_mode": "ordinary_drawer_open_fast_sequence",
+        "reason": "drawer_open_execution_failed",
+        "error_type": "RuntimeError",
+        "group_count": 0,
+    }
+    assert result["observation"] == {"head_camera": "fallback"}
+    assert "private drawer details" not in json.dumps(result)
+
+
+def test_wrong_public_approach_yaw_is_retryable_and_skips_force(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque_id = "obj_000091"
+    source_name = "private_fridge"
+    command_id = "wrong-yaw"
+    joint = _runtime_joint(
+        object_name=source_name,
+        joint_name="private_hinge",
+        joint_index=2,
+    )
+    adapter = _FakeAdapter(
+        EvaluatorInteractionRequest(
+            command_id=command_id,
+            episode_id="episode_wrong_yaw",
+            instance_id=opaque_id,
+            action="open",
+            private_handle=object(),
+            public_command={
+                "interaction_approach_pose_xyyaw": [0.0, 0.0, 0.0],
+                "interaction_ready_distance_m": 0.2,
+                "interaction_ready_yaw_tolerance_rad": 0.2,
+            },
+            public_observation=_valid_public_interaction_fields()["public_observation"],
+        )
+    )
+    runtime = SimpleNamespace(
+        adapter=adapter,
+        opaque_to_source_name={opaque_id: source_name},
+        opaque_to_joints={opaque_id: (joint,)},
+    )
+    task = SimpleNamespace(
+        env=_public_pose_env(yaw=1.0),
+        get_observations=lambda: {},
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "execute_open_articulation_group",
+        lambda *_args, **_kwargs: pytest.fail("force must not run at the wrong yaw"),
+    )
+    monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(benchmark_runner, "_publish_restricted_ros_frame", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(benchmark_runner, "_discard_task_rollout_cache", lambda _task: None)
+
+    consumed = benchmark_runner._consume_pending_ros_object_goal_interaction(
+        task=task,
+        runtime=runtime,
+        episode={"interactive_nav": {"interactions": [], "oracle_plans": []}},
+        private_attempts=[],
+        config=SimpleNamespace(record_video=False, interaction_max_distance_m=1.75),
+        decision_index=2,
+        frames=[],
+    )
+
+    assert consumed is not None
+    outcome = adapter.outcomes[-1]
+    assert outcome["failure_reason"] == "interaction_pose_invalid"
+    assert outcome["verification_source"] == "executor_pose_precondition"
+    assert outcome["retryable"] is True
+    assert outcome["interaction_capability"] == "articulated"
+    assert outcome["interaction_pose_validation"]["valid"] is False
+
+
+def test_public_box_too_far_keeps_distinct_retryable_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque_id = "obj_000092"
+    source_name = "private_fridge"
+    joint = _runtime_joint(
+        object_name=source_name,
+        joint_name="private_hinge",
+        joint_index=2,
+    )
+    public_fields = _valid_public_interaction_fields()
+    public_fields["public_observation"]["box_3d"]["center"] = [5.0, 0.0, 1.0]
+    adapter = _FakeAdapter(
+        EvaluatorInteractionRequest(
+            command_id="too-far",
+            episode_id="episode_too_far",
+            instance_id=opaque_id,
+            action="open",
+            private_handle=object(),
+            **public_fields,
+        )
+    )
+    runtime = SimpleNamespace(
+        adapter=adapter,
+        opaque_to_source_name={opaque_id: source_name},
+        opaque_to_joints={opaque_id: (joint,)},
+    )
+    task = SimpleNamespace(env=_public_pose_env(), get_observations=lambda: {})
+    monkeypatch.setattr(
+        benchmark_runner,
+        "execute_open_articulation_group",
+        lambda *_args, **_kwargs: pytest.fail("force must not run when public box is too far"),
+    )
+    monkeypatch.setattr(benchmark_runner, "_capture_head_frame", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(benchmark_runner, "_publish_restricted_ros_frame", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(benchmark_runner, "_discard_task_rollout_cache", lambda _task: None)
+
+    consumed = benchmark_runner._consume_pending_ros_object_goal_interaction(
+        task=task,
+        runtime=runtime,
+        episode={"interactive_nav": {"interactions": [], "oracle_plans": []}},
+        private_attempts=[],
+        config=SimpleNamespace(record_video=False, interaction_max_distance_m=1.75),
+        decision_index=2,
+        frames=[],
+    )
+
+    assert consumed is not None
+    outcome = adapter.outcomes[-1]
+    assert outcome["failure_reason"] == "interaction_too_far"
+    assert outcome["verification_source"] == "executor_pose_precondition"
+    assert outcome["retryable"] is True
+
+
 @pytest.mark.parametrize(
     ("direct_bbox_drawer_scan", "expected_fallback"),
-    [(False, False), (True, True)],
+    [(False, False), (True, False)],
 )
-def test_empty_drawer_regions_fall_back_only_for_direct_public_bbox_scan(
+def test_empty_drawer_regions_never_enumerate_hidden_slide_joints(
     monkeypatch: pytest.MonkeyPatch,
     direct_bbox_drawer_scan: bool,
     expected_fallback: bool,
@@ -775,11 +1373,12 @@ def test_empty_drawer_regions_fall_back_only_for_direct_public_bbox_scan(
             command_id=command_id,
             episode_id="episode_public_3",
             instance_id=opaque_id,
-            action="open",
+            action="scan",
             private_handle=object(),
             sequence_type="drawer_scan",
             open_regions=(),
             direct_bbox_drawer_scan=direct_bbox_drawer_scan,
+            **_valid_public_interaction_fields(),
         )
     )
     runtime = SimpleNamespace(
@@ -803,7 +1402,10 @@ def test_empty_drawer_regions_fall_back_only_for_direct_public_bbox_scan(
             "oracle_plans": [],
         }
     }
-    task = SimpleNamespace(env=object(), get_observations=lambda: {"camera": "public-observation"})
+    task = SimpleNamespace(
+        env=_public_pose_env(),
+        get_observations=lambda: {"camera": "public-observation"},
+    )
     config = SimpleNamespace(
         interaction_max_distance_m=1.75,
         require_interaction_visible=True,
@@ -813,7 +1415,9 @@ def test_empty_drawer_regions_fall_back_only_for_direct_public_bbox_scan(
     monkeypatch.setattr(
         benchmark_runner,
         "_check_interaction_access",
-        lambda *_args, **_kwargs: (True, {"distance_m": 0.5, "visibility": 1.0}),
+        lambda *_args, **_kwargs: pytest.fail(
+            "restricted execution must not consult private access geometry"
+        ),
     )
 
     def execute_scan(**kwargs):

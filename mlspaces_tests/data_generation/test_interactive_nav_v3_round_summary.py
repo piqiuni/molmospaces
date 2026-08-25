@@ -405,3 +405,349 @@ def test_round_summary_refuses_incomplete_or_mixed_paper_metric_records(
     assert overall["total_cost_missing_count"] == 0
     assert overall["paper_metric_config_consistent"] is False
     assert any("Total Cost is unavailable" in warning for warning in summary["warnings"])
+
+
+def test_round_summary_merges_batch_manifest_latest_attempt_and_runtime_diagnostics(
+    tmp_path: Path,
+) -> None:
+    completed_task = tmp_path / "episode_0007"
+    incomplete_task = tmp_path / "episode_0008"
+    stale_attempt = completed_task / "attempt_001"
+    latest_attempt = completed_task / "attempt_002"
+    incomplete_attempt = incomplete_task / "attempt_001"
+    stale_result = stale_attempt / "eval" / "episodes" / "stale" / "episode_result.json"
+    latest_result = latest_attempt / "eval" / "episodes" / "latest" / "episode_result.json"
+    _write_json(
+        tmp_path / "batch_manifest.json",
+        {
+            "plans": [
+                {
+                    "episode_index": 7,
+                    "worker_id": 2,
+                    "output_dir": str(completed_task),
+                },
+                {
+                    "episode_index": 8,
+                    "worker_id": 3,
+                    "output_dir": str(incomplete_task),
+                },
+            ]
+        },
+    )
+    _write_json(
+        completed_task / "batch_task_summary.json",
+        {
+            "completed": True,
+            "worker_id": 2,
+            # Deliberately stale: the analyzer must use attempt_002 rather
+            # than double-counting or trusting the former retry result.
+            "attempt_dir": str(stale_attempt),
+            "episode_result_path": str(stale_result),
+        },
+    )
+    _write_json(
+        stale_result,
+        {
+            "status": "complete",
+            "result": {
+                "status": "complete",
+                "episode_index": 7,
+                "task_success": False,
+                "nav_success": False,
+                "interaction_requirement": "required",
+            },
+        },
+    )
+    _write_json(
+        latest_result,
+        {
+            "status": "complete",
+            "result": {
+                "status": "complete",
+                "episode_index": 7,
+                "house_index": 11,
+                "domains": ["channel", "container"],
+                "interaction_requirement": "required",
+                "success": True,
+                "task_success": True,
+                "nav_success": True,
+                "required_interaction_success": True,
+                "sequence_success": True,
+                "terminal_reason": "target_found",
+                "step_count": 21,
+                "episode_step_budget": 2000,
+                "applied_action_step_count": 13,
+                "no_fresh_action_count": 4,
+                "policy_termination": {
+                    "max_consecutive_no_fresh_action_count": 3,
+                    "max_no_fresh_wall_seconds": 1.25,
+                    "reason": "ros_bridge_command_starvation",
+                    "source": "command_starvation",
+                },
+                "invalid_interaction_action_count": 1,
+                "interaction_attempts": [
+                    {
+                        "status": "invalid",
+                        "result_status": "INVALID",
+                        "reason": "unknown_instance_id",
+                    }
+                ],
+                "elapsed_seconds": 12.0,
+            },
+        },
+    )
+    (stale_attempt / "mllm_metrics.jsonl").parent.mkdir(parents=True, exist_ok=True)
+    (stale_attempt / "mllm_metrics.jsonl").write_text(
+        json.dumps({"role": "attribute_inference", "error": "stale_error"}) + "\n",
+        encoding="utf-8",
+    )
+    (latest_attempt / "mllm_metrics.jsonl").parent.mkdir(parents=True, exist_ok=True)
+    (latest_attempt / "mllm_metrics.jsonl").write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in (
+                {"role": "attribute_inference", "error": "request_timeout"},
+                {"role": "attribute_inference", "error": ""},
+                {"role": "subgoal_selection", "candidate_ids": ["frontier:1"], "error": ""},
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_json(
+        incomplete_task / "batch_task_summary.json",
+        {
+            "completed": False,
+            "worker_id": 3,
+            "attempt_dir": str(incomplete_attempt),
+            "runner_exit_code": 124,
+            "timed_out": True,
+            "error": "scene timeout",
+        },
+    )
+    _write_json(
+        incomplete_attempt / "eval" / "episodes" / "partial" / "episode_result.json",
+        {
+            "status": "complete",
+            "result": {
+                "status": "complete",
+                "episode_index": 8,
+                # A runner-level failure must override these evaluator values
+                # for formal scoring while preserving them as diagnostics.
+                "scoring_eligible": True,
+                "success": True,
+                "task_success": True,
+                "nav_success": True,
+                "interaction_requirement": "required",
+                "required_interaction_success": True,
+                "sequence_success": True,
+                "terminal_reason": "target_found",
+            },
+        },
+    )
+    (incomplete_task / "mllm_metrics.jsonl").write_text(
+        json.dumps({"role": "attribute_inference", "error": "must_not_count"}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = v3_round_summary.summarise_round(tmp_path)
+    diagnostics = summary["round_diagnostics"]
+    completed_row, incomplete_row = summary["episodes"]
+
+    assert summary["episode_count"] == 2
+    assert diagnostics["completion"] == {
+        "planned_episode_count": 2,
+        "completed_episode_count": 1,
+        "incomplete_episode_count": 1,
+        "completed_result_episode_count": 1,
+        "missing_result_episode_count": 0,
+    }
+    assert completed_row["worker"] == "worker_2"
+    assert completed_row["artifacts"]["episode_result"] == str(latest_result)
+    assert completed_row["mllm"]["call_count"] == 3
+    assert completed_row["mllm"]["m1_call_count"] == 2
+    assert completed_row["mllm"]["m1_error_reason_counts"] == {"request_timeout": 1}
+    assert completed_row["outcomes"] == {
+        "task_success": True,
+        "nav_success": True,
+        "required_interaction_success": True,
+        "sequence_success": True,
+    }
+    assert completed_row["policy_termination"] == {
+        "no_fresh_action_count": 4,
+        "applied_action_step_count": 13,
+        "max_consecutive_no_fresh_action_count": 3,
+        "max_no_fresh_wall_seconds": 1.25,
+        "triggered": None,
+        "reason": "ros_bridge_command_starvation",
+        "source": "command_starvation",
+    }
+    assert diagnostics["interactions"] == {
+        "invalid_interaction_action_count": 1,
+        "unknown_interaction_attempt_count": 1,
+        "invalid_reason_counts": {"unknown_instance_id": 1},
+        "failed_interaction_attempt_count": 0,
+        "failed_reason_counts": {},
+        "unknown_reason_counts": {"unknown_instance_id": 1},
+    }
+    assert diagnostics["ros_policy"]["no_fresh_action_count"] == 4
+    assert diagnostics["ros_policy"]["applied_action_step_count"] == 13
+    assert diagnostics["m1"] == {
+        "metrics_available_episode_count": 1,
+        "call_count": 2,
+        "error_count": 1,
+        "error_reason_counts": {"request_timeout": 1},
+    }
+    assert incomplete_row["status"] == "incomplete"
+    assert incomplete_row["terminal_reason"] == "incomplete"
+    assert incomplete_row["scoring_eligible"] is False
+    assert incomplete_row["success"] is False
+    assert incomplete_row["completion"]["evaluator_success"] is True
+    assert incomplete_row["completion"]["evaluator_terminal_reason"] == "target_found"
+    assert incomplete_row["mllm"]["metrics_available"] is False
+    rendered = v3_round_summary.render_terminal_summary(summary)
+    assert "planned=2 completed=1 incomplete=1" in rendered
+    assert "M1 err/calls" in rendered
+
+
+def test_round_summary_attributes_failed_public_preconditions_to_invalid_metric(
+    tmp_path: Path,
+) -> None:
+    """Restricted V3 writes these evaluator-invalid requests as FAILED traces."""
+
+    result_path = tmp_path / "worker_0" / "episode_result.json"
+    _write_json(
+        result_path,
+        {
+            "episode_index": 4,
+            "success": False,
+            "terminal_reason": "policy_exploration_stalled",
+            "invalid_interaction_action_count": 2,
+            "interaction_attempts": [
+                {
+                    "status": "FAILED",
+                    "result_status": "FAILED",
+                    "failure_reason": "interaction_not_visible",
+                },
+                {
+                    "status": "FAILED",
+                    "failure_reason": "interaction_too_far",
+                },
+                {
+                    "status": "FAILED",
+                    "failure_reason": "force_target_not_reached",
+                },
+                {
+                    "status": "SUCCEEDED",
+                    "failure_reason": "interaction_not_visible",
+                },
+            ],
+        },
+    )
+
+    summary = v3_round_summary.summarise_round(tmp_path)
+    episode = summary["episodes"][0]
+    diagnostics = summary["round_diagnostics"]["interactions"]
+
+    assert episode["interaction_diagnostics"] == {
+        "invalid_reason_counts": {
+            "interaction_not_visible": 1,
+            "interaction_too_far": 1,
+        },
+        "failed_reason_counts": {"force_target_not_reached": 1},
+        "failed_interaction_attempt_count": 1,
+        "unknown_reason_counts": {},
+        "unknown_attempt_count": 0,
+    }
+    assert diagnostics == {
+        "invalid_interaction_action_count": 2,
+        "unknown_interaction_attempt_count": 0,
+        "invalid_reason_counts": {
+            "interaction_not_visible": 1,
+            "interaction_too_far": 1,
+        },
+        "failed_interaction_attempt_count": 1,
+        "failed_reason_counts": {"force_target_not_reached": 1},
+        "unknown_reason_counts": {},
+    }
+
+
+def test_round_summary_rejects_ambiguous_latest_attempt_results(tmp_path: Path) -> None:
+    task = tmp_path / "episode_0009"
+    attempt = task / "attempt_001"
+    _write_json(
+        tmp_path / "batch_manifest.json",
+        {"plans": [{"episode_index": 9, "worker_id": 0, "output_dir": str(task)}]},
+    )
+    _write_json(
+        task / "batch_task_summary.json",
+        {"completed": True, "worker_id": 0, "attempt_dir": str(attempt)},
+    )
+    for case in ("duplicate_a", "duplicate_b"):
+        _write_json(
+            attempt / "eval" / "episodes" / case / "episode_result.json",
+            {
+                "status": "complete",
+                "result": {
+                    "status": "complete",
+                    "episode_index": 9,
+                    "success": True,
+                    "task_success": True,
+                    "nav_success": True,
+                    "interaction_requirement": "required",
+                },
+            },
+        )
+
+    summary = v3_round_summary.summarise_round(tmp_path)
+    row = summary["episodes"][0]
+
+    assert row["artifacts"]["episode_result"] is None
+    assert row["status"] == "incomplete"
+    assert row["completion"]["completed"] is False
+    assert row["scoring_eligible"] is False
+    assert summary["round_diagnostics"]["completion"]["incomplete_episode_count"] == 1
+    assert summary["paper_metrics"]["scoring_eligible_episode_count"] == 0
+    assert any("Ambiguous results for planned episode 9" in warning for warning in summary["warnings"])
+
+
+def test_round_summary_requires_batch_wrapper_completion_record(tmp_path: Path) -> None:
+    """An evaluator result alone is not final evidence for a planned batch task."""
+
+    task = tmp_path / "episode_0010"
+    attempt = task / "attempt_001"
+    _write_json(
+        tmp_path / "batch_manifest.json",
+        {"plans": [{"episode_index": 10, "worker_id": 0, "output_dir": str(task)}]},
+    )
+    _write_json(
+        attempt / "eval" / "episodes" / "case" / "episode_result.json",
+        {
+            "status": "complete",
+            "result": {
+                "status": "complete",
+                "episode_index": 10,
+                "scoring_eligible": True,
+                "success": True,
+                "task_success": True,
+                "nav_success": True,
+                "interaction_requirement": "required",
+                "required_interaction_success": True,
+                "sequence_success": True,
+                "terminal_reason": "target_found",
+            },
+        },
+    )
+
+    summary = v3_round_summary.summarise_round(tmp_path)
+    row = summary["episodes"][0]
+
+    assert row["status"] == "incomplete"
+    assert row["terminal_reason"] == "incomplete"
+    assert row["completion"]["completed"] is False
+    assert row["completion"]["evaluator_terminal_reason"] == "target_found"
+    assert row["scoring_eligible"] is False
+    assert row["success"] is False
+    assert summary["success_count"] == 0
+    assert summary["round_diagnostics"]["completion"]["completed_result_episode_count"] == 0
+    assert summary["paper_metrics"]["scoring_eligible_episode_count"] == 0

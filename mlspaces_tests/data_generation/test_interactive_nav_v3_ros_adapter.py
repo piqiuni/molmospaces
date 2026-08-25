@@ -26,6 +26,8 @@ class _FakeRosBridge:
         self.reset_count = 0
         self.closed = False
         self.observation = None
+        self.last_action_timed_out = False
+        self.last_action_source = ""
 
     def reset(self) -> None:
         self.reset_count += 1
@@ -60,6 +62,15 @@ def test_v3_bridge_keeps_cmd_vel_fresh_for_control_step_budgets() -> None:
     assert "require_fresh_cmd_vel=True" in source
 
 
+def test_v3_bridge_exposes_the_ordinary_step_ready_contract() -> None:
+    signature = inspect.signature(build_ros_bridge_policy)
+    assert "step_ready_barrier_enabled" in signature.parameters
+    source = inspect.getsource(build_ros_bridge_policy)
+    assert "step_ready_topic=str(step_ready_topic)" in source
+    assert "step_ready_barrier_enabled=bool(step_ready_barrier_enabled)" in source
+    assert "step_ready_bootstrap_timeout_s=float(step_ready_bootstrap_timeout_s)" in source
+
+
 def test_ros_bridge_adapter_normalizes_navigation_and_timeout_without_task() -> None:
     live_observation = {"head_camera": object(), "robot_base_pose": [0.0] * 7}
     policy_observation = PolicyObservation(
@@ -82,6 +93,16 @@ def test_ros_bridge_adapter_normalizes_navigation_and_timeout_without_task() -> 
     assert action.base_action == {"base": [1.0, 2.0, 0.3]}
 
     bridge.response = {"done": False}
+    bridge.last_action_timed_out = True
+    bridge.last_action_source = "timeout_noop"
     timeout_action = adapter.act(policy_observation)
     assert timeout_action.kind == "observe"
     assert timeout_action.metadata["reason"] == "ros_bridge_no_fresh_action"
+    assert timeout_action.metadata["bridge_action_timed_out"] is True
+    assert timeout_action.metadata["bridge_action_source"] == "timeout_noop"
+
+    bridge.response = None
+    none_action = adapter.act(policy_observation)
+    assert none_action.kind == "observe"
+    assert none_action.metadata["reason"] == "ros_bridge_no_fresh_action"
+    assert none_action.metadata["bridge_action_source"] == "returned_none"

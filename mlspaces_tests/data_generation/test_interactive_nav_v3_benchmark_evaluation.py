@@ -26,10 +26,15 @@ from scripts.InteractiveNav.evaluation.benchmark_metrics import (
     target_metrics,
 )
 from scripts.InteractiveNav.evaluation.benchmark_policies import (
+    RosBridgePolicyAdapter,
     ScriptedOraclePolicy,
     normalize_policy_action,
 )
-from scripts.InteractiveNav.evaluation.benchmark_types import PolicyObservation, PublicEpisode
+from scripts.InteractiveNav.evaluation.benchmark_types import (
+    PolicyAction,
+    PolicyObservation,
+    PublicEpisode,
+)
 
 
 def _public_episode() -> PublicEpisode:
@@ -93,6 +98,8 @@ def _result_row(**overrides: object) -> dict[str, object]:
             "failure_penalty": 0.0,
         },
         "step_count": 5,
+        "applied_action_step_count": 4,
+        "no_fresh_action_count": 1,
         "navigation_path_length_m": 4.0,
         "reference_path_length_m": 3.0,
         "spl": 0.75,
@@ -388,6 +395,7 @@ def test_public_step_budget_basis_redacts_private_gt_inputs() -> None:
         "evaluator_private": True,
         "formula_version": "v1",
         "mode": "dynamic",
+        "budget_unit": "applied_action_step",
         "effective_max_steps": 900,
         "conservative_fallback": False,
     }
@@ -401,6 +409,174 @@ def test_dynamic_config_enforces_the_2000_step_hard_cap() -> None:
             max_steps=2001,
             step_budget_mode="dynamic",
         ).validate()
+
+
+def test_private_target_precheck_is_preserved_only_for_compatibility_policies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, object]] = []
+
+    def fake_target_metrics(task: object, episode: object):
+        calls.append((task, episode))
+        return True, 0.5, 0.25
+
+    monkeypatch.setattr(benchmark_runner, "target_metrics", fake_target_metrics)
+    task = object()
+    episode: dict[str, object] = {}
+
+    assert benchmark_runner._compatibility_target_precheck(
+        task,
+        episode,
+        restricted_public_mode=True,
+        transient_target_discovery=None,
+    ) is False
+    assert calls == []
+    assert benchmark_runner._compatibility_target_precheck(
+        task,
+        episode,
+        restricted_public_mode=False,
+        transient_target_discovery=None,
+    ) is True
+    assert calls == [(task, episode)]
+
+
+def test_final_goal_status_drain_accepts_delayed_status_without_applying_a_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    polls: list[float] = []
+    terminal = ("target_found", object(), {"status": "SUCCEEDED"})
+
+    def fake_poll(**_kwargs):
+        polls.append(now[0])
+        return terminal if now[0] >= 0.04 else None
+
+    def fake_sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_poll_restricted_goal_status",
+        fake_poll,
+    )
+    task = object()  # No task.step method: the drain must remain zero-step.
+    assert benchmark_runner._drain_restricted_goal_status(
+        observer=object(),
+        task=task,
+        runtime=object(),
+        episode={},
+        timeout_s=0.1,
+        poll_interval_s=0.02,
+        monotonic=lambda: now[0],
+        sleep=fake_sleep,
+    ) is terminal
+    assert polls == [0.0, 0.02, 0.04]
+
+
+def test_final_goal_status_drain_stops_at_its_wall_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [3.0]
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_poll_restricted_goal_status",
+        lambda **_kwargs: None,
+    )
+
+    assert benchmark_runner._drain_restricted_goal_status(
+        observer=object(),
+        task=object(),
+        runtime=object(),
+        episode={},
+        timeout_s=0.05,
+        poll_interval_s=0.02,
+        monotonic=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    ) is None
+    assert now[0] == pytest.approx(3.05)
+
+
+def test_oracle_waypoint_base_action_has_explicit_nonterminal_task_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = PolicyAction(
+        kind="base",
+        metadata={"oracle_waypoint": True},
+    )
+    notices: list[bool] = []
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_execute_oracle_waypoint",
+        lambda task, requested, config: (
+            {"frame": 1},
+            0.4,
+            True,
+            {"mode": "teleport", "reached": True},
+        ),
+    )
+
+    observation, increment, task_ended, details, event_key = (
+        benchmark_runner._execute_evaluator_base_action(
+            object(),
+            action,
+            object(),
+            SimpleNamespace(
+                notify_action_result=lambda requested, *, reached: notices.append(
+                    reached
+                )
+            ),
+        )
+    )
+
+    assert observation == {"frame": 1}
+    assert increment == 0.4
+    assert task_ended is False
+    assert details["reached"] is True
+    assert event_key == "oracle_navigation"
+    assert notices == [True]
+
+
+def test_oracle_waypoint_task_action_preserves_native_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_execute_oracle_waypoint",
+        lambda task, requested, config: (
+            {"frame": 1},
+            0.1,
+            False,
+            {"mode": "task_action", "terminated": False, "truncated": True},
+        ),
+    )
+
+    _observation, _increment, task_ended, details, event_key = (
+        benchmark_runner._execute_evaluator_base_action(
+            object(),
+            PolicyAction(kind="base", metadata={"oracle_waypoint": True}),
+            object(),
+            object(),
+        )
+    )
+
+    assert task_ended is True
+    assert details["truncated"] is True
+    assert event_key == "oracle_navigation"
+
+
+def test_native_horizon_truncation_at_budget_maps_to_max_steps_for_final_drain() -> None:
+    assert benchmark_runner._native_base_terminal_reason(
+        task_ended=True,
+        details={"terminated": False, "truncated": True},
+        applied_action_step_count=9,
+        effective_max_steps=10,
+    ) == "max_steps"
+    assert benchmark_runner._native_base_terminal_reason(
+        task_ended=True,
+        details={"terminated": False, "truncated": True},
+        applied_action_step_count=4,
+        effective_max_steps=10,
+    ) == "native_task_truncated"
 
 
 def test_summary_groups_and_interaction_precision() -> None:
@@ -433,6 +609,9 @@ def test_summary_groups_and_interaction_precision() -> None:
     assert summary["overall"]["episode_count"] == 2
     assert summary["overall"]["interaction_precision"] == pytest.approx(5 / 6)
     assert summary["overall"]["mean_spl"] == pytest.approx(0.5)
+    assert summary["overall"]["mean_step_count"] == 5.0
+    assert summary["overall"]["mean_applied_action_step_count"] == 4.0
+    assert summary["overall"]["mean_no_fresh_action_count"] == 1.0
     assert summary["domain/channel"]["success_rate"] == 1.0
     assert summary["requirement/unnecessary"]["non_interaction_success_rate"] == 0.0
     assert summary["interaction_type/container_hinged_door"]["episode_count"] == 1
@@ -814,6 +993,10 @@ def test_config_validation_and_index_selection_are_local() -> None:
             output_dir=Path("out"),
             ros_stall_min_failed_subgoals=1,
         ).validate()
+    with pytest.raises(ValueError, match="command_starvation_timeout_s"):
+        replace(config, ros_command_starvation_timeout_s=-1.0).validate()
+    with pytest.raises(ValueError, match="observation_turn_multiplier"):
+        replace(config, ros_observation_turn_multiplier=0.5).validate()
 
 
 def test_video_output_resolves_lazy_saver(
@@ -832,6 +1015,65 @@ def test_video_output_resolves_lazy_saver(
     benchmark_runner._save_video(frames, destination, 7.5)
 
     assert calls == [(frames, str(destination), 7.5)]
+
+
+def test_restricted_public_frame_is_forwarded_to_the_next_rgb_recorder_sink() -> None:
+    published = {
+        "schema_version": "semantic_minimal_gt_v1",
+        "episode_id": "episode-1",
+        "capture_step": 5,
+        "stamp_sec": 9.5,
+        "observations": [{"id": "obj_000001", "name": "door"}],
+    }
+    recorded: list[tuple[dict, int]] = []
+    queued: list[dict] = []
+
+    class Perception:
+        def build(self, task, *, step_index, force):
+            assert task == "task"
+            assert step_index == 5
+            assert force
+            return {"private_build": "not forwarded"}
+
+    class Adapter:
+        def publish_restricted_gt_frame(self, payload, *, capture_step):
+            assert payload == {"private_build": "not forwarded"}
+            assert capture_step == 5
+            return published
+
+    class Evidence:
+        def record_frame(self, payload, *, capture_step):
+            recorded.append((payload, capture_step))
+
+    runtime = SimpleNamespace(
+        perception=Perception(),
+        adapter=Adapter(),
+        goal_evidence=Evidence(),
+        published_frame_sink=lambda payload: queued.append(payload) or True,
+    )
+
+    assert benchmark_runner._publish_restricted_ros_frame(
+        runtime,
+        "task",
+        decision_index=5,
+    )
+    assert recorded == [(published, 5)]
+    assert queued == [published]
+
+
+def test_ros_bridge_adapter_forwards_public_step_frame_payload() -> None:
+    queued: list[dict] = []
+
+    class Bridge:
+        def queue_step_frame_public_payload(self, payload):
+            queued.append(payload)
+            return True
+
+    adapter = RosBridgePolicyAdapter(Bridge(), name="bridge")
+    payload = {"observations": []}
+
+    assert adapter.queue_step_frame_public_payload(payload)
+    assert queued == [payload]
 
 
 def test_empty_benchmark_resume_and_signature_guard(tmp_path: Path) -> None:

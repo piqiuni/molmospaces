@@ -353,6 +353,9 @@ def test_missing_portal_articulation_is_terminally_unavailable(monkeypatch) -> N
     )
     controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
     controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore_convergence = (
+        lambda _env: {"checked": True, "converged": True}
+    )
     assert controller.enqueue_command(
         {
             "command_id": "missing_door",
@@ -402,6 +405,9 @@ def test_missing_container_articulation_remains_a_recoverable_failure(monkeypatc
     )
     controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
     controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore_convergence = (
+        lambda _env: {"checked": True, "converged": True}
+    )
     assert controller.enqueue_command(
         {
             "command_id": "missing_container",
@@ -572,13 +578,16 @@ def test_smooth_door_or_fridge_interaction_uses_task_steps_without_low_view(
 
 
 def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch) -> None:
-    state = {"drawer_top": 0.0, "drawer_bottom": 0.0}
+    # The middle drawer was already open but was not M1-grounded. Every scan
+    # transition must still close it while observing the selected front.
+    state = {"drawer_top": 0.0, "drawer_bottom": 0.0, "drawer_hidden": 1.0}
     published = []
     prepared_targets = []
     lock_calls = []
     joints = [
         {"joint_name": "drawer_top", "joint_type": "slide", "joint_id": 0},
         {"joint_name": "drawer_bottom", "joint_type": "slide", "joint_id": 1},
+        {"joint_name": "drawer_hidden", "joint_type": "slide", "joint_id": 2},
     ]
 
     def prepare(_env, _root, open_joint_names=None, close_joint_names=None):
@@ -644,6 +653,9 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     )
     controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
     controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore_convergence = (
+        lambda _env: {"checked": True, "converged": True}
+    )
     monkeypatch.setattr(controller, "_publish", lambda _publisher, payload: published.append(payload))
     command = {
         "command_id": "drawer_scan_fast",
@@ -662,17 +674,21 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
         ],
     }
     assert controller.enqueue_command(command)
-    model = SimpleNamespace(jnt_bodyid=[0, 1])
-    data = SimpleNamespace(xpos=[[0.0, 0.0, 1.0], [0.0, 0.0, 0.2]])
+    model = SimpleNamespace(jnt_bodyid=[0, 1, 2])
+    data = SimpleNamespace(
+        xpos=[[0.0, 0.0, 1.0], [0.0, 0.0, 0.2], [0.0, 0.0, 0.6]]
+    )
     task = SimpleNamespace(env=SimpleNamespace(current_model=model, current_data=data))
 
-    for step in range(10):
+    for step in range(12):
         controller.before_step(task, step=step)
         result = controller.after_step(task, step=step)
+        if result is not None:
+            break
 
     assert result is not None
     assert result["success"] is True
-    assert result["task_steps_consumed"] == 10
+    assert result["task_steps_consumed"] == 11
     assert result["drawer_execution_mode"] == "fast"
     assert result["drawer_observation_steps"] == 3
     assert result["approach_goal_xyyaw"] == [1.0, 2.0, 0.5]
@@ -682,15 +698,21 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     assert "joint_infos" not in result
     assert result["source"] == "force_container_sequence"
     assert len(published) == 2
-    # A completed close phase now separates the two drawers.  In particular,
-    # the bottom drawer is never opened in the same transition that closes the
-    # top one, even in the low-latency ``fast`` mode.
+    # A completed close phase separates the selected drawers, and every open
+    # phase closes the pre-opened unselected sibling as well.
     assert prepared_targets == [
-        (("drawer_top",), ()),
+        (("drawer_top",), ("drawer_bottom", "drawer_hidden")),
         ((), ("drawer_top",)),
-        (("drawer_bottom",), ()),
+        (("drawer_bottom",), ("drawer_top", "drawer_hidden")),
         ((), ("drawer_bottom",)),
     ]
+    assert all(item["other_drawer_count"] == 2 for item in result["region_results"])
+    assert all(item["other_drawers_closed"] is True for item in result["region_results"])
+    assert result["final_joint_open_fractions"] == {
+        "drawer_top": 0.0,
+        "drawer_bottom": 0.0,
+        "drawer_hidden": 0.0,
+    }
     # The lock is applied before/after each phase and passed down to the force
     # routine so real MuJoCo substeps also reassert the robot pose.
     assert len(lock_calls) >= 12
@@ -752,6 +774,9 @@ def test_drawer_scan_reasserts_open_force_at_capture_after_passive_recoil(monkey
     )
     controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
     controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore_convergence = (
+        lambda _env: {"checked": True, "converged": True}
+    )
     controller._publish = lambda *_args, **_kwargs: None
     assert controller.enqueue_command(
         {
@@ -854,6 +879,9 @@ def test_drawer_open_fast_mode_leaves_visual_drawers_open(monkeypatch) -> None:
     )
     controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
     controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.restore_convergence = (
+        lambda _env: {"checked": True, "converged": True}
+    )
     controller._publish = lambda *_args, **_kwargs: None
     assert controller.enqueue_command(
         {
@@ -946,13 +974,23 @@ def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -
         "scripts.InteractiveNav.force_interaction_bridge.collect_articulation_groups",
         lambda _env: {"dresser_root": {"joints": joints}},
     )
+    view_commands = []
+    view_restores = []
     controller = AtomicForceInteractionController(
         close_all_doors_on_prepare=False,
         drawer_execution_mode="smooth",
         drawer_transition_steps=3,
     )
-    controller._head_view_controller.command = lambda *_args, **_kwargs: {"applied": True}
-    controller._head_view_controller.restore = lambda *_args, **_kwargs: {"applied": True}
+    controller._head_view_controller.command = (
+        lambda _env, profile, **kwargs: view_commands.append((profile, kwargs))
+        or {"applied": True}
+    )
+    controller._head_view_controller.restore = (
+        lambda *_args, **_kwargs: view_restores.append("restore") or {"applied": True}
+    )
+    controller._head_view_controller.restore_convergence = (
+        lambda _env: {"checked": True, "converged": True}
+    )
     controller._publish = lambda *_args, **_kwargs: None
     assert controller.enqueue_command(
         {
@@ -979,8 +1017,12 @@ def test_drawer_scan_smooth_mode_uses_configured_transition_steps(monkeypatch) -
     assert result is not None
     assert result["success"] is True
     assert result["drawer_transition_steps"] == 3
-    assert result["task_steps_consumed"] == 14
-    assert result["expected_task_steps"] == 14
+    assert result["task_steps_consumed"] == 15
+    assert result["expected_task_steps"] == 15
+    assert view_commands == [
+        ("drawer_low_view", {"tilt_rad": 0.30, "torso_pitch_rad": 0.35})
+    ]
+    assert view_restores == ["restore"]
 
 
 def test_drawer_scan_step_budget_matches_smooth_close_restore_macro() -> None:
@@ -992,7 +1034,7 @@ def test_drawer_scan_step_budget_matches_smooth_close_restore_macro() -> None:
     assert drawer_sequence_task_step_budget(8, 5, 3, 2) == 106
     assert drawer_sequence_task_step_budget(
         3, 5, 3, 2, preserve_open=True
-    ) == 24
+    ) == 26
 
 
 def test_drawer_scan_failure_best_effort_closes_and_restores_view(monkeypatch) -> None:
@@ -1282,6 +1324,9 @@ def test_drawer_scan_waits_for_view_restore_settle_without_new_semantic_state(
     controller._head_view_controller.restore = (
         lambda _env: view_events.append("restore") or {"restored": True}
     )
+    controller._head_view_controller.restore_convergence = (
+        lambda _env: {"checked": True, "converged": True}
+    )
     controller._publish = lambda *_args, **_kwargs: None
     assert controller.enqueue_command(
         {
@@ -1313,4 +1358,71 @@ def test_drawer_scan_waits_for_view_restore_settle_without_new_semantic_state(
     assert result["state"] == "closed"
     assert result["post_state"] == "closed"
     assert "restore_settle" not in {result["state"], result["post_state"]}
+    assert controller.should_pause_navigation() is False
+
+
+def test_drawer_view_restore_timeout_is_bounded_and_fail_closed(monkeypatch) -> None:
+    controller = AtomicForceInteractionController(
+        close_all_doors_on_prepare=False,
+        drawer_view_restore_max_steps=2,
+    )
+    controller._publish = lambda *_args, **_kwargs: None
+    controller._head_view_controller.restore_convergence = lambda _env: {
+        "checked": True,
+        "converged": False,
+        "head": [{"joint_name": "head_1", "position_error": 0.2}],
+    }
+    monkeypatch.setattr(
+        "scripts.InteractiveNav.force_interaction_bridge.articulation_joint_infos",
+        lambda _env, _root: [
+            {"joint_name": "drawer", "open_fraction": 0.0, "joint_value": 0.0}
+        ],
+    )
+    assert controller.enqueue_command(
+        {
+            "command_id": "drawer_restore_timeout",
+            "object_id": "dresser_root",
+            "action": "scan",
+            "sequence_type": "drawer_scan",
+        }
+    )
+    controller._pending = {
+        "kind": "drawer_sequence",
+        "command": {
+            "command_id": "drawer_restore_timeout",
+            "object_id": "dresser_root",
+            "action": "scan",
+            "sequence_type": "drawer_scan",
+        },
+        "step": 10,
+        "phase": "restore_settle",
+        "groups": [{"group_id": "drawer", "joint_names": ["drawer"]}],
+        "group_results": [{"success": True}],
+        "all_joint_names": ["drawer"],
+        "drawer_joint_names": ["drawer"],
+        "preserve_open": False,
+        "physics_substeps": 0,
+        "view_result": {"applied": True},
+        "view_restore_result": {"applied": True},
+        "view_restore_required": True,
+        "view_restore_failed": False,
+        "view_restore_settle_steps": 0,
+        "view_restore_max_steps": 2,
+        "view_restore_steps_elapsed": 0,
+        "view_restore_convergence": None,
+        "remaining_view_restore_settle_steps": 1,
+        "transition_steps": 1,
+        "observation_steps": 1,
+        "expected_task_steps": 4,
+        "transition_log": [],
+    }
+    task = SimpleNamespace(env=SimpleNamespace())
+
+    assert controller.after_step(task, step=10) is None
+    result = controller.after_step(task, step=11)
+    assert result is not None
+    assert result["status"] == "FAILED"
+    assert result["failure_reason"] == "drawer_view_restore_timeout"
+    assert result["view_restore_steps_elapsed"] == 2
+    assert result["view_restore_convergence"]["converged"] is False
     assert controller.should_pause_navigation() is False

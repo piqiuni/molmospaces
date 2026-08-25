@@ -1,5 +1,6 @@
 import inspect
 import math
+import queue
 import threading
 
 import numpy as np
@@ -83,6 +84,62 @@ def test_publish_realtime_gt_now_forces_current_snapshot() -> None:
     assert payload == {"frame_index": 11}
     assert policy._latest_gt_payload == payload
     assert calls == [(policy.task, "stamp", 11, True)]
+
+
+def test_external_public_payload_is_consumed_by_next_rgb_frame_only() -> None:
+    class Stamp:
+        def to_sec(self):
+            return 12.5
+
+    class Image:
+        width = 2
+        height = 1
+        data = bytes([0, 1, 2, 3, 4, 5])
+
+    policy = RosBridgePolicy.__new__(RosBridgePolicy)
+    policy._lock = threading.Lock()
+    policy._step_frame_thread = object()
+    policy._step_frame_queue = queue.Queue()
+    policy._latest_gt_payload = {"schema_version": "legacy"}
+    policy._pending_step_frame_public_payload = None
+    published = {
+        "schema_version": "semantic_minimal_gt_v1",
+        "episode_id": "episode-1",
+        "capture_step": 0,
+        "stamp_sec": 12.4,
+        "observations": [{"id": "obj_000001", "name": "door"}],
+    }
+
+    assert policy.queue_step_frame_public_payload(published)
+    # The bridge owns a snapshot, rather than a mutable reference to evaluator
+    # state that can be changed before the writer drains its queue.
+    published["observations"].append({"id": "obj_000002", "name": "drawer"})
+    policy._enqueue_step_frame(None, Stamp(), 0)
+    policy._enqueue_step_frame(Image(), Stamp(), 0)
+    policy._enqueue_step_frame(Image(), Stamp(), 1)
+    assert policy.queue_step_frame_public_payload(
+        {
+            "schema_version": "semantic_minimal_gt_v1",
+            "episode_id": "episode-1",
+            "capture_step": 1,
+            "stamp_sec": 12.5,
+            "observations": [],
+        }
+    )
+    policy._enqueue_step_frame(Image(), Stamp(), 2)
+
+    first = policy._step_frame_queue.get_nowait()
+    second = policy._step_frame_queue.get_nowait()
+    third = policy._step_frame_queue.get_nowait()
+    assert first[-1] == {
+        "schema_version": "semantic_minimal_gt_v1",
+        "episode_id": "episode-1",
+        "capture_step": 0,
+        "stamp_sec": 12.4,
+        "observations": [{"id": "obj_000001", "name": "door"}],
+    }
+    assert second[-1] == {"schema_version": "legacy"}
+    assert third[-1]["observations"] == []
 
 
 def test_missing_navigation_arm_actions_hold_the_current_reset_pose() -> None:
