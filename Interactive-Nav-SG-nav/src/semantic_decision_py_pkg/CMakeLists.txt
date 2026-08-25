@@ -4,6 +4,7 @@ project(semantic_decision_py_pkg)
 find_package(catkin REQUIRED COMPONENTS
   actionlib
   actionlib_msgs
+  dynamic_reconfigure
   geometry_msgs
   move_base_msgs
   nav_msgs

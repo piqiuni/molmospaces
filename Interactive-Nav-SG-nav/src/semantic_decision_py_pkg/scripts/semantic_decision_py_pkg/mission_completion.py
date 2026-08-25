@@ -337,6 +337,22 @@ class MissionCompletionTracker:
         elif status == "SUCCEEDED":
             self.failure_streak = 0
 
+    @staticmethod
+    def _unresolved_graph_interaction_count(payload: dict[str, Any]) -> int:
+        count = 0
+        graph = payload.get("graph_context") or {}
+        for node in list(graph.get("nodes") or []):
+            if not bool(node.get("requires_interaction")):
+                continue
+            state = str(node.get("interaction_state") or "unknown").casefold()
+            capability = str(node.get("interaction_capability") or "").casefold()
+            if state in {"open", "opened", "succeeded", "satisfied"}:
+                continue
+            if capability in {"blocked", "unavailable", "unsupported", "locked"}:
+                continue
+            count += 1
+        return count
+
     def update(
         self,
         candidates_payload: dict[str, Any],
@@ -357,6 +373,18 @@ class MissionCompletionTracker:
         initial_scan_complete = bool(exploration.get("initial_scan_complete", True))
         retryable_filtered_frontier = bool(
             exploration.get("filtered_frontier_retryable", False)
+        )
+        connected_unknown_area_present = bool(
+            exploration.get("connected_unknown_area_present", False)
+            or int(exploration.get("raw_frontier_material_cluster_count", 0) or 0)
+            > 0
+        )
+        unresolved_interaction_target_count = max(
+            int(exploration.get("unresolved_interaction_target_count", 0) or 0),
+            self._unresolved_graph_interaction_count(candidates_payload),
+        )
+        interaction_cooldown_target_count = max(
+            0, int(exploration.get("interaction_cooldown_target_count", 0) or 0)
         )
         candidates = list(candidates_payload.get("candidates") or [])
         # A producer counter can lag or reset while a candidate snapshot is
@@ -439,6 +467,9 @@ class MissionCompletionTracker:
         ready_to_complete = (
             not has_active_behavior
             and initial_scan_complete
+            and not connected_unknown_area_present
+            and unresolved_interaction_target_count == 0
+            and interaction_cooldown_target_count == 0
             and exhausted
             and navigation_frontier_exhausted
             and interaction_frontier_exhausted
@@ -450,6 +481,40 @@ class MissionCompletionTracker:
         except (TypeError, ValueError):
             observation_step = None
         if retryable_filtered_frontier:
+            # A filtered frontier is only retryable when there are no other
+            # unresolved obligations.  Do not let this stall shortcut bypass
+            # the unknown-area/interaction/cooldown guards above: after a
+            # successful drawer or door action the raw frontier view can be
+            # temporarily unavailable while the graph and costmap refresh.
+            # ``raw_frontier_material_cluster_count`` is retained as a
+            # conservative fallback for legacy producers, but old producers
+            # did not publish the live unknown/interaction counters.  Only the
+            # explicit live fields can veto this bounded frontier stall; this
+            # keeps the legacy retryable-frontier contract deterministic while
+            # protecting current runs such as H3.
+            live_unknown_guard = (
+                "connected_unknown_area_present" in exploration
+                and connected_unknown_area_present
+            )
+            live_unresolved_guard = (
+                "unresolved_interaction_target_count" in exploration
+                and unresolved_interaction_target_count > 0
+            )
+            live_cooldown_guard = (
+                "interaction_cooldown_target_count" in exploration
+                and interaction_cooldown_target_count > 0
+            )
+            if (
+                live_unknown_guard
+                or live_unresolved_guard
+                or live_cooldown_guard
+                or has_active_behavior
+            ):
+                self.retryable_frontier_since_step = None
+                self.retryable_frontier_confirmations = 0
+                self.last_retryable_frontier_detail = {}
+                self.terminal_stalled = False
+                return False
             if self.retryable_frontier_since_step is None:
                 self.retryable_frontier_since_step = observation_step
             self.retryable_frontier_confirmations += 1

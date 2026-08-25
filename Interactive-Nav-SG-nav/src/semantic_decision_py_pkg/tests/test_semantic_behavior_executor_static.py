@@ -6,6 +6,7 @@ import json
 import math
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,13 +71,19 @@ def _install_ros_import_stubs(monkeypatch) -> None:
                 "REJECTED": 4,
                 "RECALLED": 5,
                 "LOST": 6,
+                "PENDING": 10,
+                "ACTIVE": 11,
+                "PREEMPTING": 12,
+                "RECALLING": 13,
             },
         ),
+        GoalStatusArray=_Placeholder,
     )
     _stub_module(monkeypatch, "geometry_msgs")
     _stub_module(
         monkeypatch,
         "geometry_msgs.msg",
+        PointStamped=_Placeholder,
         PoseStamped=_Placeholder,
         Twist=_Placeholder,
         TwistStamped=_Placeholder,
@@ -319,6 +326,29 @@ def test_portal_aperture_observation_is_forwarded_without_private_metadata(
         "confidence": 0.8,
     }
     assert "private_joint_name" not in published[0]["portal_aperture_observation"]
+
+
+def test_physical_retries_publish_unique_command_ids(executor_module) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.evaluator_opaque_open_only = False
+    executor.interaction_command_sequence = 0
+    executor.latest_image_sequence = 0
+    executor._command_id = lambda _candidate: "decision:candidate"
+    published = []
+    executor.interaction_command_pub = SimpleNamespace(
+        publish=lambda message: published.append(json.loads(message.data))
+    )
+    candidate = _portal_selection()
+
+    executor._publish_interaction_command(candidate)
+    executor._publish_interaction_command(candidate)
+
+    assert [payload["command_id"] for payload in published] == [
+        "decision:candidate:interaction:001",
+        "decision:candidate:interaction:002",
+    ]
+    assert published[0]["candidate_id"] == published[1]["candidate_id"]
 
 
 def test_unknown_portal_waits_for_its_matching_fresh_m1_update(
@@ -659,6 +689,8 @@ def test_container_m1_capture_evidence_uses_staging_pose_without_tf(
         "metadata": {
             "frame_id": "map",
             "effective_interaction_approach_pose_xyyaw": [1.25, -0.5, 0.4],
+            "container_m1_front_axis_from_capture": True,
+            "container_geometry_anchor_xy": [0.25, -0.5],
         },
         "interaction_command": {
             "interaction_approach_pose_xyyaw": [1.25, -0.5, 0.4],
@@ -681,6 +713,8 @@ def test_container_m1_capture_evidence_uses_staging_pose_without_tf(
     assert evidence["capture_step"] == 73
     assert evidence["capture_pose_xyyaw"] == [1.25, -0.5, 0.4]
     assert evidence["staging_pose_xyyaw"] == [1.25, -0.5, 0.4]
+    assert evidence["m1_front_axis_xy"] == [1.0, 0.0]
+    assert evidence["m1_front_axis_source"] == "m1_confirmed_capture_pose"
     assert evidence["pose_validation"]["valid"] is True
     assert executor._container_m1_evidence_still_at_capture_pose_locked(
         candidate, evidence
@@ -838,6 +872,1069 @@ def test_two_stage_outer_staging_tolerance_stays_separate_from_inner_bridge(
     ) == pytest.approx(0.18)
 
 
+def test_mapped_m1_capture_rejects_generic_ready_pose_before_request(
+    executor_module,
+) -> None:
+    """A different scheduled M1 view must not reuse the last camera pose."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.tf_listener = object()
+    executor.map_frame = "map"
+    executor.container_m1_capture_pose_tolerance_m = 0.25
+    executor.container_m1_capture_yaw_tolerance_rad = 0.35
+    executor.container_m1_distinct_view_arrival_tolerance_m = 0.05
+    executor.container_m1_distinct_view_arrival_yaw_tolerance_rad = 0.08
+    # This pose was accepted by the former .25 m/.35 rad generic envelope, but
+    # is not the requested second capture target.
+    executor._current_pose = lambda _frame: (0.118, 0.0, 0.172)
+    candidate = {
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "m1_capture",
+            "container_two_stage_capture_pose_xyyaw": [0.0, 0.0, 0.0],
+            # The first direct M1 capture uses the same exact contract as a
+            # later viewpoint; this marker is audit-only.
+            "container_m1_capture_requires_distinct_view_arrival": False,
+            "m1_observation_staging_required": True,
+        },
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [0.0, 0.0, 0.0],
+            "container_m1_capture_ready_distance_m": 0.25,
+            "interaction_ready_yaw_tolerance_rad": 0.35,
+        },
+    }
+
+    assert executor._interaction_navigation_pose_tolerance_m(candidate) == pytest.approx(
+        0.05
+    )
+    assert executor._interaction_navigation_yaw_tolerance_rad(candidate) == pytest.approx(
+        0.35
+    )
+    evidence, reason = executor._container_m1_capture_evidence_locked(
+        candidate,
+        {"observation_capture_step": 101},
+        {"observation_pose_xyyaw": [0.0, 0.0, 0.0]},
+    )
+    assert evidence is None
+    assert reason == "m1_capture_pose_mismatch"
+
+    # The marker requires the direct-capture metadata produced by the new
+    # mapping. Old two-stage recordings therefore retain their legacy envelope.
+    legacy = {
+        **candidate,
+        "metadata": {
+            **candidate["metadata"],
+            "container_two_stage_capture_pose_xyyaw": [],
+        },
+    }
+    assert executor._interaction_navigation_pose_tolerance_m(legacy) == pytest.approx(
+        0.25
+    )
+    assert executor._interaction_navigation_yaw_tolerance_rad(legacy) == pytest.approx(
+        0.35
+    )
+
+
+def test_direct_m1_capture_dwa_profile_tightens_and_token_safely_restores(
+    executor_module,
+) -> None:
+    """Only the direct capture lease may change and later restore live DWA tolerances."""
+
+    class _DynamicClient:
+        def __init__(self) -> None:
+            self.cached_configuration = {
+                "xy_goal_tolerance": 0.25,
+                "yaw_goal_tolerance": 0.20,
+            }
+            self.configuration = dict(self.cached_configuration)
+            self.updates: list[dict] = []
+            self.read_count = 0
+
+        def get_configuration(self, timeout=None) -> dict:
+            del timeout
+            self.read_count += 1
+            # DynamicReconfigure Client can receive its subscriber update after
+            # the synchronous service reply.  Keep this cache deliberately
+            # stale to prove activation validates that reply directly.
+            return dict(self.cached_configuration)
+
+        def update_configuration(self, update: dict) -> dict:
+            self.updates.append(dict(update))
+            self.configuration.update(update)
+            return dict(self.configuration)
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor._container_m1_capture_dwa_profile_lock = threading.RLock()
+    executor._container_m1_capture_dwa_profile_active = None
+    executor._container_m1_capture_dwa_profile_sequence = 0
+    executor.container_m1_capture_dwa_profile_enabled = True
+    executor.container_m1_capture_dwa_reconfigure_timeout_s = 1.0
+    executor.container_m1_distinct_view_arrival_tolerance_m = 0.05
+    executor.container_m1_distinct_view_arrival_yaw_tolerance_rad = 0.08
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
+    client = _DynamicClient()
+    executor._container_m1_capture_dwa_reconfigure_client = client
+    candidate = {
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "m1_capture",
+            "container_two_stage_capture_pose_xyyaw": [1.0, 2.0, 0.0],
+        }
+    }
+
+    ready, detail = executor._activate_container_m1_capture_dwa_profile(
+        "decision-capture",
+        17,
+        candidate,
+        # XY tightens to the direct capture contract; the existing 0.20-rad DWA
+        # yaw is already stricter than this configured capture envelope.
+        direct_distance_tolerance_m=0.25,
+        direct_yaw_tolerance_rad=0.35,
+    )
+
+    assert ready is True
+    assert detail["default_xy_goal_tolerance"] == pytest.approx(0.25)
+    assert detail["default_yaw_goal_tolerance"] == pytest.approx(0.20)
+    assert client.read_count == 1
+    assert client.updates == [
+        {"xy_goal_tolerance": 0.05, "yaw_goal_tolerance": 0.20}
+    ]
+    assert client.configuration == {
+        "xy_goal_tolerance": 0.05,
+        "yaw_goal_tolerance": 0.20,
+    }
+
+    # A stale worker cannot restore a profile it no longer owns.
+    stale_release = executor._release_container_m1_capture_dwa_profile(
+        "decision-capture", 16
+    )
+    assert stale_release["released"] is False
+    assert stale_release["reason"] == "not_profile_owner"
+    assert len(client.updates) == 1
+
+    release = executor._release_container_m1_capture_dwa_profile(
+        "decision-capture", 17
+    )
+    assert release["released"] is True
+    assert release["restored"] is True
+    assert client.updates[-1] == {
+        "xy_goal_tolerance": 0.25,
+        "yaw_goal_tolerance": 0.20,
+    }
+    assert client.configuration == {
+        "xy_goal_tolerance": 0.25,
+        "yaw_goal_tolerance": 0.20,
+    }
+
+
+def test_interaction_dwa_profile_applies_explicit_pair_even_when_wider(
+    executor_module,
+) -> None:
+    """Generated INTERACT goals share one exact executor/DWA arrival contract."""
+
+    class _DynamicClient:
+        def __init__(self) -> None:
+            self.configuration = {
+                "xy_goal_tolerance": 0.25,
+                "yaw_goal_tolerance": 0.20,
+            }
+            self.updates: list[dict] = []
+
+        def get_configuration(self, timeout=None) -> dict:
+            del timeout
+            return dict(self.configuration)
+
+        def update_configuration(self, update: dict) -> dict:
+            self.updates.append(dict(update))
+            self.configuration.update(update)
+            return dict(self.configuration)
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor._container_m1_capture_dwa_profile_lock = threading.RLock()
+    executor._container_m1_capture_dwa_profile_active = None
+    executor._container_m1_capture_dwa_profile_sequence = 0
+    executor.container_m1_capture_dwa_profile_enabled = True
+    executor.container_m1_capture_dwa_reconfigure_timeout_s = 1.0
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
+    client = _DynamicClient()
+    executor._container_m1_capture_dwa_reconfigure_client = client
+
+    candidate = {
+        "behavior_type": "INTERACT",
+        "metadata": {
+            "interaction_command": {
+                "navigation_goal_position_tolerance_m": 0.30,
+                "navigation_goal_yaw_tolerance_rad": 0.40,
+            }
+        },
+    }
+    ready, detail = executor._activate_container_m1_capture_dwa_profile(
+        "decision-portal",
+        9,
+        candidate,
+        direct_distance_tolerance_m=0.30,
+        direct_yaw_tolerance_rad=0.40,
+    )
+
+    assert ready is True
+    assert detail["profile"] == "interaction_goal_tolerance_contract"
+    assert client.updates == [
+        {"xy_goal_tolerance": 0.30, "yaw_goal_tolerance": 0.40}
+    ]
+    assert detail["xy_goal_tolerance"] == pytest.approx(0.30)
+    assert detail["yaw_goal_tolerance"] == pytest.approx(0.40)
+
+    restored = executor._release_container_m1_capture_dwa_profile(
+        "decision-portal", 9
+    )
+    assert restored["released"] is True
+    assert client.updates[-1] == {
+        "xy_goal_tolerance": 0.25,
+        "yaw_goal_tolerance": 0.20,
+    }
+
+
+def test_non_capture_successor_cancels_and_confirms_capture_before_restoring_profile(
+    executor_module, monkeypatch
+) -> None:
+    """A successor restores defaults only after the old capture goal is quiescent."""
+
+    class _DynamicClient:
+        def __init__(self) -> None:
+            self.configuration = {
+                "xy_goal_tolerance": 0.05,
+                "yaw_goal_tolerance": 0.08,
+            }
+            self.updates: list[dict] = []
+
+        def update_configuration(self, update: dict) -> dict:
+            self.updates.append(dict(update))
+            self.configuration.update(update)
+            return dict(self.configuration)
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor._container_m1_capture_dwa_profile_lock = threading.RLock()
+    executor._navigation_run_is_active = lambda decision_id, token: (
+        (decision_id, token) == ("decision-successor", 22)
+    )
+    client = _DynamicClient()
+    executor._container_m1_capture_dwa_profile_active = {
+        "decision_id": "decision-successor",
+        "navigation_run_token": 21,
+        "client": client,
+        "restore_configuration": {
+            "xy_goal_tolerance": 0.25,
+            "yaw_goal_tolerance": 0.20,
+        },
+        "restore_required": True,
+        "detail": {},
+    }
+
+    class _MoveBase:
+        def __init__(self) -> None:
+            self.state = 1  # ACTIVE
+            self.cancel_count = 0
+            self.waits: list[float] = []
+
+        def get_state(self) -> int:
+            return self.state
+
+        def cancel_goal(self) -> None:
+            self.cancel_count += 1
+            self.state = 2  # terminal for this isolated action-client stub
+
+        def wait_for_result(self, timeout) -> None:
+            self.waits.append(timeout)
+
+    move_base = _MoveBase()
+    executor.move_base = move_base
+    executor.final_align_cancel_wait_s = 0.5
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+
+    restored, detail = (
+        executor._restore_container_m1_capture_dwa_profile_before_non_capture_dispatch(
+            "decision-successor", 22
+        )
+    )
+
+    assert restored is True
+    assert detail["restored_before_non_capture_dispatch"] is True
+    assert client.updates == [
+        {"xy_goal_tolerance": 0.25, "yaw_goal_tolerance": 0.20}
+    ]
+    assert executor._container_m1_capture_dwa_profile_active is None
+    assert move_base.cancel_count == 1
+    assert move_base.waits == [0.5]
+    assert detail["capture_goal_quiescence"] == {
+        "state_before": 1,
+        "state_after": 2,
+        "cancel_issued": True,
+        "server_status_confirmed": False,
+        "status_receipts_observed": 0,
+        "owned_goal_id": "",
+        "goal_generation": 0,
+    }
+
+
+def test_capture_successor_waits_for_server_preempted_after_client_done(
+    executor_module,
+) -> None:
+    """A local DONE state cannot outrun move_base's PREEMPTING status."""
+
+    class _MoveBase:
+        def get_state(self) -> int:
+            return 2  # locally terminal in this isolated stub
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.move_base = _MoveBase()
+    executor._move_base_status_condition = threading.Condition()
+    executor._move_base_status_received_count = 4
+    executor._move_base_active_goal_statuses = (("capture-goal", 6),)
+    executor._move_base_owned_goal_id = "capture-goal"
+    executor._move_base_goal_generation = 4
+    executor.container_m1_capture_successor_quiescence_timeout_s = 0.5
+
+    def _publish_server_terminal() -> None:
+        time.sleep(0.01)
+        with executor._move_base_status_condition:
+            executor._move_base_status_received_count += 1
+            executor._move_base_active_goal_statuses = (("capture-goal", 6),)
+            executor._move_base_status_condition.notify_all()
+        with executor._move_base_status_condition:
+            executor._move_base_status_received_count += 1
+            executor._move_base_active_goal_statuses = ()
+            executor._move_base_status_condition.notify_all()
+
+    publisher = threading.Thread(target=_publish_server_terminal)
+    publisher.start()
+    inactive, detail = (
+        executor._confirm_container_m1_capture_goal_inactive_before_profile_restore()
+    )
+    publisher.join(timeout=1.0)
+
+    assert inactive is True
+    assert detail["state_before"] == 2
+    assert detail["server_status_confirmed"] is True
+    assert detail["status_receipts_observed"] >= 1
+
+
+def test_terminal_client_with_empty_server_activity_is_immediately_quiescent(
+    executor_module,
+) -> None:
+    class _MoveBase:
+        def get_state(self) -> int:
+            return 2  # ROS GoalStatus.PREEMPTED
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.move_base = _MoveBase()
+    executor._move_base_status_condition = threading.Condition()
+    executor._move_base_status_received_count = 9
+    executor._move_base_active_goal_statuses = ()
+    executor._move_base_owned_goal_id = "latest-goal"
+    executor._move_base_goal_generation = 3
+    executor.move_base_successor_quiescence_timeout_s = 0.5
+
+    quiescent, detail = executor._confirm_move_base_goal_quiescent_before_successor()
+
+    assert quiescent is True
+    assert detail["status_receipts_observed"] == 0
+    assert detail["owned_goal_id"] == "latest-goal"
+    assert executor._move_base_owned_goal_id == ""
+
+
+def test_terminal_client_ignores_historical_recalling_from_other_goal(
+    executor_module,
+) -> None:
+    class _MoveBase:
+        def get_state(self) -> int:
+            return executor_module.GoalStatus.SUCCEEDED
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.move_base = _MoveBase()
+    executor._move_base_status_condition = threading.Condition()
+    executor._move_base_status_received_count = 12
+    executor._move_base_active_goal_statuses = (("historical-goal", 7),)
+    executor._move_base_owned_goal_id = "latest-goal"
+    executor._move_base_goal_generation = 5
+    executor.move_base_successor_quiescence_timeout_s = 0.5
+
+    quiescent, detail = executor._confirm_move_base_goal_quiescent_before_successor()
+
+    assert quiescent is True
+    assert detail["status_receipts_observed"] == 0
+    assert detail["owned_goal_id"] == "latest-goal"
+
+
+def test_direct_capture_profile_switch_confirms_old_goal_is_inactive(
+    executor_module, monkeypatch
+) -> None:
+    """A next M1 capture cannot replace global DWA tolerances under an old goal."""
+
+    class _DynamicClient:
+        def __init__(self) -> None:
+            self.configuration = {
+                "xy_goal_tolerance": 0.05,
+                "yaw_goal_tolerance": 0.08,
+            }
+            self.updates: list[dict] = []
+
+        def get_configuration(self, timeout=None) -> dict:
+            del timeout
+            return dict(self.configuration)
+
+        def update_configuration(self, update: dict) -> dict:
+            self.updates.append(dict(update))
+            self.configuration.update(update)
+            return dict(self.configuration)
+
+    class _MoveBase:
+        def __init__(self) -> None:
+            self.state = 1
+            self.cancel_count = 0
+            self.waits: list[float] = []
+
+        def get_state(self) -> int:
+            return self.state
+
+        def cancel_goal(self) -> None:
+            self.cancel_count += 1
+            self.state = 2
+
+        def wait_for_result(self, timeout) -> None:
+            self.waits.append(timeout)
+
+    client = _DynamicClient()
+    move_base = _MoveBase()
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor._container_m1_capture_dwa_profile_lock = threading.RLock()
+    executor._container_m1_capture_dwa_profile_active = {
+        "decision_id": "decision-capture",
+        "navigation_run_token": 10,
+        "client": client,
+        "restore_configuration": {
+            "xy_goal_tolerance": 0.25,
+            "yaw_goal_tolerance": 0.20,
+        },
+        "restore_required": True,
+        "detail": {},
+    }
+    executor._container_m1_capture_dwa_profile_sequence = 0
+    executor._container_m1_capture_dwa_reconfigure_client = client
+    executor.container_m1_capture_dwa_profile_enabled = True
+    executor.container_m1_capture_dwa_reconfigure_timeout_s = 1.0
+    executor.container_m1_distinct_view_arrival_tolerance_m = 0.05
+    executor.container_m1_distinct_view_arrival_yaw_tolerance_rad = 0.08
+    executor.final_align_cancel_wait_s = 0.5
+    executor.move_base = move_base
+    executor._navigation_run_is_active = lambda decision_id, token: (
+        (decision_id, token) == ("decision-capture", 11)
+    )
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    candidate = {
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "m1_capture",
+            "container_two_stage_capture_pose_xyyaw": [1.0, 0.0, 0.0],
+        }
+    }
+
+    ready, detail = executor._activate_container_m1_capture_dwa_profile(
+        "decision-capture",
+        11,
+        candidate,
+        direct_distance_tolerance_m=0.05,
+        direct_yaw_tolerance_rad=0.08,
+    )
+
+    assert ready is True
+    assert detail["active"] is True
+    assert move_base.cancel_count == 1
+    assert move_base.waits == [0.5]
+    assert client.updates == [
+        {"xy_goal_tolerance": 0.25, "yaw_goal_tolerance": 0.20},
+        {"xy_goal_tolerance": 0.05, "yaw_goal_tolerance": 0.08},
+    ]
+    assert executor._container_m1_capture_dwa_profile_active["navigation_run_token"] == 11
+
+
+def test_capture_profile_successor_fails_closed_when_old_goal_stays_active(
+    executor_module, monkeypatch
+) -> None:
+    """Never restore broad DWA tolerances if capture cancellation is unconfirmed."""
+
+    class _DynamicClient:
+        def __init__(self) -> None:
+            self.updates: list[dict] = []
+
+        def update_configuration(self, update: dict) -> dict:
+            self.updates.append(dict(update))
+            return dict(update)
+
+    class _MoveBase:
+        def __init__(self) -> None:
+            self.cancel_count = 0
+
+        def get_state(self) -> int:
+            return 1  # remains ACTIVE even after cancel
+
+        def cancel_goal(self) -> None:
+            self.cancel_count += 1
+
+        def wait_for_result(self, _timeout) -> None:
+            return None
+
+    client = _DynamicClient()
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor._container_m1_capture_dwa_profile_lock = threading.RLock()
+    executor._container_m1_capture_dwa_profile_active = {
+        "decision_id": "decision-successor",
+        "navigation_run_token": 30,
+        "client": client,
+        "restore_configuration": {
+            "xy_goal_tolerance": 0.25,
+            "yaw_goal_tolerance": 0.20,
+        },
+        "restore_required": True,
+        "detail": {},
+    }
+    executor._navigation_run_is_active = lambda decision_id, token: (
+        (decision_id, token) == ("decision-successor", 31)
+    )
+    executor.move_base = _MoveBase()
+    executor.final_align_cancel_wait_s = 0.5
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+
+    restored, detail = (
+        executor._restore_container_m1_capture_dwa_profile_before_non_capture_dispatch(
+            "decision-successor", 31
+        )
+    )
+
+    assert restored is False
+    assert detail["reason"] == (
+        "container_m1_capture_dwa_profile_goal_still_active_before_"
+        "successor_dispatch"
+    )
+    assert executor.move_base.cancel_count == 1
+    assert client.updates == []
+    assert executor._container_m1_capture_dwa_profile_active is not None
+
+
+@pytest.mark.parametrize("phase", ["staging", "physical_action"])
+def test_dwa_capture_profile_excludes_non_capture_container_phases(
+    executor_module, phase
+) -> None:
+    """Outer navigation and physical action must never mutate DWA tolerance."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor._container_m1_capture_dwa_profile_lock = threading.RLock()
+    executor._container_m1_capture_dwa_profile_active = None
+    executor.container_m1_capture_dwa_profile_enabled = True
+
+    class _UnexpectedClient:
+        def get_configuration(self, *args, **kwargs):
+            raise AssertionError("non-capture phase must not read DWA configuration")
+
+    executor._container_m1_capture_dwa_reconfigure_client = _UnexpectedClient()
+    candidate = {
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": phase,
+        }
+    }
+
+    ready, detail = executor._activate_container_m1_capture_dwa_profile(
+        "decision-non-capture",
+        3,
+        candidate,
+        direct_distance_tolerance_m=0.05,
+        direct_yaw_tolerance_rad=0.08,
+    )
+
+    assert ready is True
+    assert detail == {"active": False, "reason": "not_container_m1_capture"}
+    assert executor._container_m1_capture_dwa_profile_active is None
+
+
+def test_direct_m1_capture_strict_dwa_profile_owns_only_its_terminal_pose(
+    executor_module,
+) -> None:
+    """Only an active mapped capture profile may suppress generic final yaw."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    capture = {
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "m1_capture",
+            "container_two_stage_capture_pose_xyyaw": [1.0, 2.0, 0.0],
+        }
+    }
+    physical = {
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "physical_action",
+            "container_two_stage_capture_pose_xyyaw": [1.0, 2.0, 0.0],
+        }
+    }
+    strict_profile = {
+        "active": True,
+        "xy_goal_tolerance": 0.05,
+        "yaw_goal_tolerance": 0.08,
+    }
+
+    assert executor._container_m1_capture_dwa_owns_terminal_pose(
+        capture,
+        strict_profile,
+        distance_tolerance_m=0.05,
+        yaw_tolerance_rad=0.08,
+    )
+    assert not executor._container_m1_capture_dwa_owns_terminal_pose(
+        capture,
+        {**strict_profile, "active": False},
+        distance_tolerance_m=0.05,
+        yaw_tolerance_rad=0.08,
+    )
+    assert not executor._container_m1_capture_dwa_owns_terminal_pose(
+        capture,
+        {**strict_profile, "yaw_goal_tolerance": 0.09},
+        distance_tolerance_m=0.05,
+        yaw_tolerance_rad=0.08,
+    )
+    assert not executor._container_m1_capture_dwa_owns_terminal_pose(
+        physical,
+        strict_profile,
+        distance_tolerance_m=0.05,
+        yaw_tolerance_rad=0.08,
+    )
+
+
+def _direct_m1_capture_navigation_executor(
+    executor_module,
+    monkeypatch,
+    *,
+    profile_detail: dict,
+    state_sequence: list[int],
+    pose_reader,
+    on_state_read=None,
+):
+    """Build a small token-current direct-capture navigation worker harness."""
+
+    class _Goal:
+        def __init__(self) -> None:
+            self.target_pose = SimpleNamespace(
+                header=SimpleNamespace(frame_id="", stamp=None),
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=SimpleNamespace(z=0.0, w=1.0),
+                ),
+            )
+
+    class _MoveBase:
+        def __init__(self) -> None:
+            self.state_reads = 0
+            self.sent_goals = []
+            self.cancel_count = 0
+
+        def wait_for_server(self, _timeout) -> bool:
+            return True
+
+        def send_goal(self, goal) -> None:
+            self.sent_goals.append(goal)
+
+        def get_state(self) -> int:
+            self.state_reads += 1
+            if on_state_read is not None:
+                on_state_read(self.state_reads)
+            return int(state_sequence[min(self.state_reads - 1, len(state_sequence) - 1)])
+
+        def get_goal_status_text(self) -> str:
+            return "test-state"
+
+        def cancel_goal(self) -> None:
+            self.cancel_count += 1
+
+    class _Watchdog:
+        def __init__(self, **kwargs) -> None:
+            trace["watchdog_kwargs"].append(dict(kwargs))
+
+        def reset(self, *_args, **_kwargs) -> None:
+            return None
+
+        def observe(self, *_args, **_kwargs) -> bool:
+            trace["watchdog_observe_calls"] += 1
+            return False
+
+    monkeypatch.setattr(executor_module, "MoveBaseGoal", _Goal)
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    monkeypatch.setattr(
+        executor_module.rospy, "Time", SimpleNamespace(now=lambda: 0.0)
+    )
+    monkeypatch.setattr(executor_module.rospy, "is_shutdown", lambda: False)
+    monkeypatch.setattr(executor_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(executor_module, "NavigationProgressWatchdog", _Watchdog)
+
+    trace = {
+        "current": True,
+        "generic_interaction_align_calls": [],
+        "generic_terminal_align_calls": [],
+        "completed": [],
+        "watchdog_kwargs": [],
+        "watchdog_observe_calls": 0,
+        "rear_oscillation_calls": [],
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor._latest_step_sync_index = 0
+    executor.map_frame = "map"
+    executor.move_base = _MoveBase()
+    executor.machine = SimpleNamespace(
+        config=SimpleNamespace(
+            interaction_navigation_timeout_s=10.0,
+            navigation_timeout_s=10.0,
+        )
+    )
+    executor.post_interaction_traversal_make_plan_retry_window_s = 0.0
+    executor.container_m1_distinct_view_arrival_tolerance_m = 0.05
+    executor.container_m1_distinct_view_arrival_yaw_tolerance_rad = 0.08
+    # These focused tests exercise the strict 0.08-rad terminal-yaw controller;
+    # runtime full-M1 configuration separately verifies the new 30-degree gate.
+    executor.container_m1_capture_yaw_tolerance_rad = 0.08
+    executor.navigation_stagnation_timeout_s = 12.0
+    executor.navigation_stagnation_distance_m = 0.10
+    executor.navigation_stagnation_yaw_rad = 0.15
+    executor.navigation_stagnation_goal_distance_reduction_m = 0.02
+    executor.final_align_enabled = True
+    executor.final_align_max_distance_m = 0.12
+    executor.final_align_yaw_tolerance_rad = 0.15
+    executor.final_align_trigger_delay_s = 0.0
+    executor.interaction_final_align_enabled = True
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
+    executor._navigation_is_current = lambda _decision_id: trace["current"]
+    executor._current_pose = pose_reader
+    executor._preflight_navigation_plan = lambda *_args: (
+        True,
+        (1.0, 0.0),
+        "reachable",
+    )
+    executor._prerotate_for_rear_goal = lambda *_args, **_kwargs: True
+    executor._set_effective_interaction_approach = lambda *_args, **_kwargs: None
+    executor._activate_container_m1_capture_dwa_profile = (
+        lambda *_args, **_kwargs: (True, dict(profile_detail))
+    )
+    executor._start_rear_dwa_monitor = lambda *_args, **_kwargs: None
+    executor._has_fresh_local_plan = lambda *_args, **_kwargs: False
+    executor._rear_dwa_oscillation_detail = (
+        lambda *_args, **_kwargs: trace["rear_oscillation_calls"].append(True)
+        or None
+    )
+    executor._final_align_interaction_goal = (
+        lambda *_args, **_kwargs: trace["generic_interaction_align_calls"].append(
+            True
+        )
+        or True
+    )
+    executor._final_align_goal = (
+        lambda *_args, **_kwargs: trace["generic_terminal_align_calls"].append(True)
+        or True
+    )
+    executor._complete_interaction_approach_navigation = (
+        lambda *_args, **kwargs: trace["completed"].append(dict(kwargs))
+    )
+    candidate = {
+        "candidate_id": "interaction:container:direct-capture",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 0.0, 0.0],
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "m1_capture",
+            "container_two_stage_capture_pose_xyyaw": [1.0, 0.0, 0.0],
+        },
+        "interaction_command": {
+            "container_m1_capture_ready_distance_m": 0.05,
+            "interaction_ready_yaw_tolerance_rad": 0.08,
+        },
+    }
+    return executor, candidate, trace
+
+
+def test_strict_direct_m1_capture_leaves_position_ready_final_yaw_to_dwa(
+    executor_module, monkeypatch
+) -> None:
+    """A strict leased capture must not cancel DWA for generic final alignment."""
+
+    trace = {"current": True}
+
+    def stop_after_active_state(state_reads: int) -> None:
+        if state_reads >= 2:
+            trace["current"] = False
+
+    executor, candidate, worker_trace = _direct_m1_capture_navigation_executor(
+        executor_module,
+        monkeypatch,
+        profile_detail={
+            "active": True,
+            "xy_goal_tolerance": 0.05,
+            "yaw_goal_tolerance": 0.08,
+        },
+        # The import stub uses GoalStatus.PREEMPTED=1, so use its non-terminal
+        # pending state to keep this worker in the active-loop test path.
+        state_sequence=[0],
+        pose_reader=lambda _frame_id: (1.0, 0.0, 0.20),
+        on_state_read=stop_after_active_state,
+    )
+    # Share the worker's current token with the state callback only after its
+    # harness has been built.
+    trace = worker_trace
+
+    executor._run_navigation_impl(
+        "decision-strict-active",
+        candidate,
+        navigation_run_token=7,
+    )
+
+    assert executor.move_base.cancel_count == 0
+    assert worker_trace["generic_interaction_align_calls"] == []
+    assert worker_trace["generic_terminal_align_calls"] == []
+    assert worker_trace["watchdog_kwargs"][0]["allow_yaw_progress"] is False
+    assert worker_trace["watchdog_observe_calls"] == 0
+    assert worker_trace["rear_oscillation_calls"] == []
+
+
+def test_strict_direct_m1_capture_terminal_yaw_settle_timeout_retries(
+    executor_module, monkeypatch
+) -> None:
+    """The strict-capture settle budget advances only with simulator steps."""
+
+    holder = {}
+
+    def advance_public_step(_state_reads: int) -> None:
+        holder["executor"]._latest_step_sync_index += 1
+
+    executor, candidate, trace = _direct_m1_capture_navigation_executor(
+        executor_module,
+        monkeypatch,
+        profile_detail={
+            "active": True,
+            "xy_goal_tolerance": 0.05,
+            "yaw_goal_tolerance": 0.08,
+        },
+        state_sequence=[0],
+        pose_reader=lambda _frame_id: (1.0, 0.0, 0.20),
+        on_state_read=advance_public_step,
+    )
+    holder["executor"] = executor
+    executor.container_m1_capture_dwa_terminal_yaw_settle_max_task_steps = 5
+    retries = []
+    executor._retry_interaction_approach = (
+        lambda *_args: retries.append(dict(_args[-1])) or True
+    )
+
+    executor._run_navigation_impl(
+        "decision-strict-settle-timeout",
+        candidate,
+        navigation_run_token=71,
+    )
+
+    assert executor.move_base.cancel_count == 1
+    assert len(retries) == 1
+    yaw_detail = retries[0]["container_m1_capture_dwa_terminal_yaw"]
+    assert yaw_detail["timed_out"] is True
+    assert yaw_detail["elapsed_task_steps"] == 5
+    assert yaw_detail["settle_max_task_steps"] == 5
+    assert yaw_detail["best_yaw_error_rad"] == pytest.approx(0.20)
+    assert trace["generic_interaction_align_calls"] == []
+    assert trace["watchdog_observe_calls"] == 0
+
+
+def test_non_strict_direct_m1_capture_keeps_active_dwa_terminal_control(
+    executor_module, monkeypatch
+) -> None:
+    """A live move_base goal is not cancelled into a second cmd_vel turn."""
+
+    executor, candidate, trace = _direct_m1_capture_navigation_executor(
+        executor_module,
+        monkeypatch,
+        profile_detail={
+            "active": True,
+            "xy_goal_tolerance": 0.05,
+            "yaw_goal_tolerance": 0.09,
+        },
+        state_sequence=[0],
+        pose_reader=lambda _frame_id: (1.0, 0.0, 0.20),
+    )
+
+    executor._run_navigation_impl(
+        "decision-nonstrict-active",
+        candidate,
+        navigation_run_token=8,
+    )
+
+    assert trace["generic_interaction_align_calls"] == []
+
+
+def test_strict_direct_m1_capture_terminal_success_skips_generic_final_align(
+    executor_module, monkeypatch
+) -> None:
+    """SUCCEEDED still reaches M1 only through the strict terminal TF poll."""
+
+    poses = iter(
+        [
+            (1.0, 0.0, 0.20),  # direct precheck: distance-ready, yaw not ready
+            (1.0, 0.0, 0.20),  # navigation start sample
+            (1.0, 0.0, 0.00),  # move_base SUCCEEDED terminal TF sample
+        ]
+    )
+    executor, candidate, trace = _direct_m1_capture_navigation_executor(
+        executor_module,
+        monkeypatch,
+        profile_detail={
+            "active": True,
+            "xy_goal_tolerance": 0.05,
+            "yaw_goal_tolerance": 0.08,
+        },
+        state_sequence=[int(executor_module.GoalStatus.SUCCEEDED)],
+        pose_reader=lambda _frame_id: next(poses),
+    )
+
+    executor._run_navigation_impl(
+        "decision-strict-terminal",
+        candidate,
+        navigation_run_token=9,
+    )
+
+    assert trace["generic_interaction_align_calls"] == []
+    assert trace["generic_terminal_align_calls"] == []
+    assert len(trace["completed"]) == 1
+    detail = trace["completed"][0]["detail"]
+    assert detail["interaction_pose_validation_source"] == "move_base_terminal"
+    assert detail["interaction_pose_validation"]["valid"] is True
+    assert detail["interaction_pose_validation"]["yaw_tolerance_rad"] == pytest.approx(
+        0.08
+    )
+    assert detail["container_m1_capture_dwa_terminal_yaw"]["reason"] == (
+        "strict_dwa_move_base_terminal"
+    )
+
+
+def test_navigation_wrapper_releases_capture_profile_on_early_exit(
+    executor_module,
+) -> None:
+    """The worker-level finally covers cancellation, timeout, and every return path."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    released = []
+    executor._register_navigation_run = lambda _decision_id, _candidate: 29
+    executor._release_container_m1_capture_dwa_profile = (
+        lambda decision_id, token: released.append(("profile", decision_id, token))
+    )
+    executor._release_navigation_run = (
+        lambda decision_id, token, candidate: released.append(
+            ("navigation", decision_id, token, candidate)
+        )
+    )
+
+    def early_exit(*_args, **_kwargs) -> None:
+        return None
+
+    executor._run_navigation_impl = early_exit
+    candidate = {"candidate_id": "direct-capture"}
+    executor._run_navigation("decision-early-exit", candidate)
+
+    assert released == [
+        ("profile", "decision-early-exit", 29),
+        ("navigation", "decision-early-exit", 29, candidate),
+    ]
+
+
+def test_direct_capture_rechecks_navigation_token_after_profile_setup(
+    executor_module, monkeypatch
+) -> None:
+    """A profile RPC may race preemption, but the stale worker must not send its goal."""
+
+    class _Goal:
+        def __init__(self) -> None:
+            self.target_pose = SimpleNamespace(
+                header=SimpleNamespace(frame_id="", stamp=None),
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=SimpleNamespace(z=0.0, w=1.0),
+                ),
+            )
+
+    class _MoveBase:
+        def __init__(self) -> None:
+            self.sent_goals = []
+
+        def wait_for_server(self, _timeout) -> bool:
+            return True
+
+        def send_goal(self, goal) -> None:
+            self.sent_goals.append(goal)
+
+    monkeypatch.setattr(executor_module, "MoveBaseGoal", _Goal)
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    monkeypatch.setattr(
+        executor_module.rospy, "Time", SimpleNamespace(now=lambda: 0.0)
+    )
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor.move_base = _MoveBase()
+    executor.machine = SimpleNamespace(
+        config=SimpleNamespace(
+            interaction_navigation_timeout_s=10.0,
+            navigation_timeout_s=10.0,
+        )
+    )
+    executor.post_interaction_traversal_make_plan_retry_window_s = 0.0
+    executor.container_m1_distinct_view_arrival_tolerance_m = 0.05
+    executor.container_m1_distinct_view_arrival_yaw_tolerance_rad = 0.08
+    executor._register_navigation_run = lambda _decision_id, _candidate: 41
+    executor._release_container_m1_capture_dwa_profile = lambda *_args: None
+    executor._release_navigation_run = lambda *_args: None
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
+    current = [True]
+    executor._navigation_is_current = lambda _decision_id: current[0]
+    executor._current_pose = lambda _frame_id: (0.0, 0.0, 0.0)
+    executor._preflight_navigation_plan = lambda *_args: (
+        True,
+        (1.0, 0.0),
+        "reachable",
+    )
+    executor._prerotate_for_rear_goal = lambda *_args, **_kwargs: True
+    executor._set_effective_interaction_approach = lambda *_args, **_kwargs: None
+    activated = []
+
+    def activate(*_args, **_kwargs):
+        activated.append(True)
+        current[0] = False
+        return True, {"lease_token": 1, "active": True}
+
+    executor._activate_container_m1_capture_dwa_profile = activate
+    candidate = {
+        "candidate_id": "interaction:container:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 0.0, 0.0],
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "m1_capture",
+            "container_two_stage_capture_pose_xyyaw": [1.0, 0.0, 0.0],
+        },
+        "interaction_command": {
+            "container_m1_capture_ready_distance_m": 0.50,
+            "interaction_ready_yaw_tolerance_rad": 0.35,
+        },
+    }
+
+    executor._run_navigation("decision-profile-race", candidate)
+
+    assert activated == [True]
+    assert executor.move_base.sent_goals == []
+
+
 def test_outer_m1_capture_uses_declared_staging_yaw_contract(
     executor_module,
 ) -> None:
@@ -987,6 +2084,146 @@ def test_start_inner_corridor_dispatches_one_private_navigation_waypoint(
     assert context["candidate"]["behavior_type"] == "INTERACT"
     assert context["candidate"]["goal_xyyaw"] == [1.0, 0.0, 0.0]
     assert context["waypoint_xyyaw"] == [0.35, 0.0, 0.0]
+
+
+def test_container_successor_waits_for_predecessor_worker_release(
+    executor_module, monkeypatch
+) -> None:
+    """A callback successor must not race the predecessor actionlib worker."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor._active_navigation_run_tokens = {"decision-race": 7}
+    launched = []
+
+    class _Thread:
+        def __init__(self, *, target, args, daemon):
+            launched.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(executor_module.threading, "Thread", _Thread)
+    executor._schedule_navigation_successor(
+        "decision-race",
+        {"decision_id": "decision-race", "behavior_type": "NAVIGATE"},
+        2,
+        [{"index": 1}],
+    )
+
+    assert len(launched) == 1
+    target, args, daemon = launched[0]
+    assert daemon is True
+    assert target == executor._run_navigation_successor_after_release
+    assert args[0] == "decision-race"
+    assert args[2:] == (2, [{"index": 1}], 7)
+
+
+def test_container_successor_crosses_quiescence_before_final_dispatch(
+    executor_module
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.move_base_successor_quiescence_timeout_s = 0.1
+    active = iter([True, False])
+    executor._navigation_run_is_active = lambda *_args: next(active, False)
+    executor._navigation_is_current = lambda _decision_id: True
+    calls = []
+    executor._confirm_move_base_goal_quiescent_before_successor = lambda: (
+        calls.append("quiescence") or True,
+        {"state_after": 2},
+    )
+    executor._run_navigation = lambda *args: calls.append(("run", args))
+    executor._handle_navigation_result = lambda *_args, **_kwargs: pytest.fail(
+        "a quiescent successor must dispatch instead of terminalizing"
+    )
+
+    executor._run_navigation_successor_after_release(
+        "decision-serialized",
+        {"decision_id": "decision-serialized", "behavior_type": "INTERACT"},
+        3,
+        [{"index": 2}],
+        9,
+    )
+
+    assert calls[0] == "quiescence"
+    assert calls[1][0] == "run"
+    assert calls[1][1][2:] == (3, [{"index": 2}])
+
+
+def test_container_successor_quiescence_failure_returns_feedback(
+    executor_module
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.move_base_successor_quiescence_timeout_s = 0.1
+    executor._navigation_run_is_active = lambda *_args: False
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._confirm_move_base_goal_quiescent_before_successor = lambda: (
+        False,
+        {"state_after": 1},
+    )
+    feedback = []
+    executor._handle_navigation_result = lambda *args, **kwargs: feedback.append(
+        (args, kwargs)
+    )
+    executor._run_navigation = lambda *_args: pytest.fail(
+        "a non-quiescent move_base server must not receive the successor goal"
+    )
+    candidate = {
+        "decision_id": "decision-not-quiescent",
+        "behavior_type": "INTERACT",
+    }
+
+    executor._run_navigation_successor_after_release(
+        "decision-not-quiescent", candidate, 0, [], 4
+    )
+
+    assert len(feedback) == 1
+    detail = feedback[0][0][2]
+    assert detail["reason"] == "move_base_successor_not_quiescent"
+    assert detail["retryable"] is True
+    assert feedback[0][1]["source_candidate"] == candidate
+
+
+def test_shared_staging_corridor_is_one_shot_after_local_execution_failure(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.container_inner_corridor_enabled = True
+    executor.container_inner_corridor_max_segments = 4
+    calls = []
+    executor._preflight_navigation_path = lambda *_args: (
+        calls.append(_args) or (False, [], "empty_plan")
+    )
+    candidate = {
+        "behavior_type": "INTERACT",
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "m1_observation_staging_required": True,
+            "container_anchor_shared_pose": True,
+        },
+    }
+
+    assert executor._start_container_inner_corridor(
+        "decision-shared-staging",
+        candidate,
+        goal_frame="map",
+        final_goal=(1.0, 0.0, 0.0),
+        final_goal_option_index=0,
+        interaction_approach_attempts=[],
+    ) is False
+    assert len(calls) == 1
+
+    candidate["metadata"]["container_inner_corridor_segments_completed"] = 1
+    assert executor._start_container_inner_corridor(
+        "decision-shared-staging",
+        candidate,
+        goal_frame="map",
+        final_goal=(1.0, 0.0, 0.0),
+        final_goal_option_index=0,
+        interaction_approach_attempts=[],
+    ) is False
+    assert len(calls) == 1
 
 
 def test_inner_corridor_summary_is_recorder_safe_and_minimal(executor_module) -> None:
@@ -1287,6 +2524,36 @@ def test_drawer_scan_wait_uses_finite_simulator_step_budget_not_wall_time(
     )
 
 
+def test_drawer_scan_wait_ignores_stale_callback_timestamp_after_step_progress(
+    executor_module,
+) -> None:
+    candidate = {
+        "decision_id": "decision-drawer-stale-callback",
+        "candidate_id": "interaction:drawer-stale:scan",
+        "behavior_type": "INTERACT",
+        "metadata": {"requires_approach": False},
+        "interaction_command": {"sequence_type": "drawer_scan"},
+    }
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.selection = candidate
+    executor.machine = executor_module.BehaviorExecutionStateMachine(
+        executor_module.ExecutionConfig(interaction_timeout_s=30.0)
+    )
+    executor.machine.start(candidate, now=0.0)
+    executor.drawer_scan_execution_step_sync_stall_timeout_s = 5.0
+    executor.drawer_scan_execution_wall_cap_s = 180.0
+    executor._latest_step_sync_index = 141
+    executor._latest_step_sync_received_at = 1.0
+    executor._drawer_scan_execution_wait = {
+        "decision_id": "decision-drawer-stale-callback",
+        "started_step_index": 100,
+        "started_at_monotonic_s": 0.0,
+        "max_task_steps": 120,
+        "step_budget_margin": 8,
+    }
+    assert executor._drawer_scan_execution_timeout_reason_locked(now=55.0) == ""
+
+
 def test_executor_inner_navigation_failure_dispatches_next_outer_staging(
     executor_module,
 ) -> None:
@@ -1380,6 +2647,291 @@ def test_executor_inner_navigation_failure_dispatches_next_outer_staging(
         "container_pre_action_observation"
     ] is True
     assert executor._container_m1_last_accepted_evidence == {}
+
+
+def test_direct_m1_capture_failure_returns_to_next_outer_anchor(executor_module) -> None:
+    """A failed visual capture may not authorize M1 from an outer anchor."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    executor.interaction_approach_fallback_max_attempts = 8
+    executor.container_two_stage_fallback_max_attempts = 4
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._container_m1_last_accepted_evidence = {}
+    executor._confirm_container_m1_capture_goal_inactive_before_profile_restore = (
+        lambda: (True, {"server_status_confirmed": True})
+    )
+    dispatched = []
+    executor._dispatch = lambda commands: dispatched.extend(commands)
+    candidate = {
+        "decision_id": "decision-capture",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.10, 2.0, 0.0],
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [1.10, 2.0, 0.0],
+            "interaction_ready_distance_m": 0.30,
+            "container_staging_ready_distance_m": 0.30,
+            "container_physical_action_ready_distance_m": 0.18,
+        },
+        "metadata": {
+            "requires_approach": True,
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "m1_capture",
+            "container_two_stage_staging_goal_option_index": 0,
+            "container_staging_goal_xyyaw_candidates": [
+                [1.0, 2.0, 0.0],
+                [2.0, 2.0, 1.57],
+                [3.0, 2.0, 3.14],
+            ],
+            "container_m1_capture_goal_xyyaw_by_staging_index": [
+                [1.10, 2.0, 0.0],
+                [2.10, 2.0, 1.57],
+                [3.10, 2.0, 3.14],
+            ],
+            "container_staging_pose_labels": ["anchor_0", "anchor_1", "anchor_2"],
+            # Capture failures use the evidence scheduler, not legacy index +1.
+            "container_m1_viewpoint_order": [0, 2, 1],
+            "container_two_stage_staging_observation_required": True,
+            "container_two_stage_staging_container_pre_action_observation": True,
+            "container_two_stage_staging_drawer_pre_action_observation": False,
+            "m1_observation_staging_required": True,
+            "observation_required": True,
+            "container_pre_action_observation": True,
+        },
+    }
+    executor.machine.start(candidate, now=0.0)
+    executor.selection = dict(executor.machine.candidate)
+
+    assert executor._retry_interaction_approach(
+        "decision-capture",
+        candidate,
+        0,
+        [{"index": 0, "phase": "m1_capture"}],
+        1,
+        {"reason": "navigation_terminal_failure"},
+    )
+    assert [command["kind"] for command in dispatched] == ["navigate"]
+    assert dispatched[0]["start_goal_option_index"] == 2
+    assert executor.machine.candidate["metadata"]["container_two_stage_phase"] == "staging"
+    assert executor.machine.candidate["goal_xyyaw"] == [1.0, 2.0, 0.0]
+    assert executor.machine.candidate["metadata"]["m1_observation_staging_required"] is True
+
+
+def test_outer_staging_failure_uses_m1_viewpoint_order(executor_module) -> None:
+    """A failed anchor must not fall through to the old linear ring order."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    executor.interaction_approach_fallback_max_attempts = 8
+    executor.container_two_stage_fallback_max_attempts = 4
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._confirm_move_base_goal_quiescent_before_successor = lambda: (
+        True,
+        {"server_status_confirmed": True},
+    )
+    dispatched = []
+    executor._dispatch = lambda commands: dispatched.extend(commands)
+    candidate = {
+        "decision_id": "decision-staging-order",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [2.0, 0.0, 0.0],
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [2.0, 0.0, 0.0],
+            "interaction_ready_distance_m": 0.30,
+            "container_staging_ready_distance_m": 0.30,
+        },
+        "metadata": {
+            "requires_approach": True,
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "container_two_stage_staging_goal_option_index": 2,
+            "interaction_approach_goal_option_index": 2,
+            "container_staging_goal_xyyaw_candidates": [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+            ],
+            "container_m1_viewpoint_order": [0, 2, 1, 3],
+            "container_staging_pose_labels": ["face_0", "face_1", "face_2", "face_3"],
+            "container_two_stage_staging_observation_required": True,
+            "container_two_stage_staging_container_pre_action_observation": True,
+            "container_two_stage_staging_drawer_pre_action_observation": False,
+            "m1_observation_staging_required": True,
+            "observation_required": True,
+            "container_pre_action_observation": True,
+            "interaction_observation_attempts": 2,
+            "interaction_observation_viewpoint_staging_indices": [0],
+        },
+    }
+    executor.machine.start(candidate, now=0.0)
+    executor.selection = dict(executor.machine.candidate)
+
+    assert executor._retry_interaction_approach(
+        "decision-staging-order",
+        candidate,
+        2,
+        [{"index": 2, "phase": "staging"}],
+        4,
+        {"reason": "navigation_terminal_failure"},
+    )
+    assert [command["kind"] for command in dispatched] == ["navigate"]
+    # Evidence order is 0 -> 2 -> 1 -> 3, so index 1—not legacy index 3—is
+    # the next usable capture anchor after index 2 fails.
+    assert dispatched[0]["start_goal_option_index"] == 1
+    assert executor.machine.candidate["metadata"][
+        "container_m1_unavailable_staging_indices"
+    ] == [2]
+
+
+def test_outer_m1_staging_batches_all_remaining_anchor_preflights(
+    executor_module, monkeypatch
+) -> None:
+    """Empty plans are scanned in one worker without per-anchor redispatch."""
+
+    class _Goal:
+        def __init__(self) -> None:
+            self.target_pose = SimpleNamespace(
+                header=SimpleNamespace(frame_id="", stamp=None),
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0),
+                    orientation=SimpleNamespace(z=0.0, w=1.0),
+                ),
+            )
+
+    class _MoveBase:
+        def wait_for_server(self, _timeout) -> bool:
+            return True
+
+    monkeypatch.setattr(executor_module, "MoveBaseGoal", _Goal)
+    monkeypatch.setattr(executor_module.rospy, "Duration", lambda seconds: seconds)
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor.move_base = _MoveBase()
+    executor.post_interaction_traversal_make_plan_retry_window_s = 0.0
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
+    executor._current_pose = lambda _frame_id: None
+    preflight_goals = []
+
+    def preflight(_frame_id, x, y, _yaw):
+        preflight_goals.append((x, y))
+        return False, None, "empty_plan"
+
+    executor._preflight_navigation_plan = preflight
+    retry_calls = []
+    executor._retry_interaction_approach = (
+        lambda _decision_id, _candidate, selected_index, attempts, count, detail: (
+            retry_calls.append((selected_index, attempts, count, detail)) or True
+        )
+    )
+    candidate = {
+        "candidate_id": "interaction:drawer:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 0.0, 0.0],
+        "interaction_command": {
+            "interaction_ready_distance_m": 0.30,
+            "container_staging_ready_distance_m": 0.30,
+        },
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "m1_observation_staging_required": True,
+            "container_staging_goal_xyyaw_candidates": [
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+            ],
+            "goal_xyyaw_candidates": [
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+            ],
+        },
+    }
+
+    executor._run_navigation_impl(
+        "decision-m1-anchor-only",
+        candidate,
+        start_goal_option_index=0,
+        interaction_approach_attempts=[],
+        navigation_run_token=1,
+    )
+
+    assert preflight_goals == [(1.0, 0.0), (2.0, 0.0), (3.0, 0.0)]
+    assert len(retry_calls) == 1
+    assert retry_calls[0][0] == 2
+    assert retry_calls[0][1][-1]["index"] == 2
+    assert [item["index"] for item in retry_calls[0][3]["attempted_goals"]] == [
+        0,
+        1,
+        2,
+    ]
+
+
+def test_outer_staging_exhaustion_defers_inconclusive_m1_evidence(executor_module) -> None:
+    """No reachable follow-up view may permanently exclude an M1-inconclusive drawer."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.machine = executor_module.BehaviorExecutionStateMachine()
+    executor.interaction_approach_fallback_max_attempts = 8
+    executor.container_two_stage_fallback_max_attempts = 2
+    executor._navigation_is_current = lambda _decision_id: True
+    dispatched = []
+    executor._dispatch = lambda commands: dispatched.extend(commands)
+    candidate = {
+        "decision_id": "decision-staging-defer",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 0.0, 0.0],
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [1.0, 0.0, 0.0],
+            "interaction_ready_distance_m": 0.30,
+            "container_staging_ready_distance_m": 0.30,
+        },
+        "metadata": {
+            "requires_approach": True,
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "container_two_stage_staging_goal_option_index": 1,
+            "interaction_approach_goal_option_index": 1,
+            "container_staging_goal_xyyaw_candidates": [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
+            "container_m1_viewpoint_order": [0, 1],
+            "container_staging_pose_labels": ["face_0", "face_1"],
+            "container_two_stage_staging_observation_required": True,
+            "container_two_stage_staging_container_pre_action_observation": False,
+            "container_two_stage_staging_drawer_pre_action_observation": True,
+            "m1_observation_staging_required": True,
+            "observation_required": True,
+            "drawer_pre_action_observation": True,
+            "interaction_observation_attempts": 2,
+            "interaction_observation_viewpoint_staging_indices": [0],
+        },
+    }
+    executor.machine.start(candidate, now=0.0)
+    executor.selection = dict(executor.machine.candidate)
+
+    assert executor._retry_interaction_approach(
+        "decision-staging-defer",
+        candidate,
+        1,
+        [{"index": 1, "phase": "staging"}],
+        2,
+        {"reason": "navigation_terminal_failure"},
+    )
+    assert [command["kind"] for command in dispatched] == ["terminal"]
+    detail = dispatched[0]["detail"]
+    assert detail["m1_evidence_inconclusive"] is True
+    assert detail["retryable"] is True
+    assert detail["terminal_candidate_exclusion"] is False
+    assert detail["m1_viewpoint_navigation_inconclusive"] is True
 
 
 def test_inner_preflight_exhaustion_uses_last_tangent_before_outer_retry(
@@ -1518,14 +3070,20 @@ def test_bridge_inner_pose_precondition_returns_next_outer_staging(executor_modu
     )
 
     assert [command["kind"] for command in commands] == ["navigate"]
-    assert commands[0]["start_goal_option_index"] == 1
+    assert commands[0]["start_goal_option_index"] == 0
     assert executor.machine.candidate["metadata"]["container_two_stage_phase"] == (
-        "staging"
+        "physical_action"
+    )
+    assert executor.machine.candidate["metadata"][
+        "unsafe_open_sweep_retreat_attempted"
+    ] is True
+    assert executor.machine.candidate["goal_xyyaw"] == pytest.approx(
+        [2.8, 2.0, 0.0]
     )
     assert executor.machine.candidate["interaction_command"][
         "interaction_ready_distance_m"
-    ] == pytest.approx(0.30)
-    assert executor._container_m1_last_accepted_evidence == {}
+    ] == pytest.approx(0.18)
+    assert "decision-bridge" in executor._container_m1_last_accepted_evidence
 
 
 def test_fresh_m1_drawer_plan_uses_sequential_scan_contract(executor_module) -> None:
@@ -1784,8 +3342,7 @@ def test_rear_turn_choice_locks_deterministic_side_on_fresh_costmap(
     assert choice is not None
     assert choice["direction"] == "cw"
     assert detail["selected_turn"] == "cw"
-    # A later re-evaluation retains the selected side even though both arcs
-    # remain geometrically equivalent.
+    assert detail["shortest_angle_enforced"] is True
     choice_again, _detail_again = executor._rear_goal_rotation_choice(
         "decision-rear", "map", (-1.0, 1.0)
     )
@@ -1793,10 +3350,10 @@ def test_rear_turn_choice_locks_deterministic_side_on_fresh_costmap(
     assert choice_again["turn_sign"] == choice["turn_sign"]
 
 
-def test_rear_turn_uses_finite_wrapped_side_when_short_turn_is_blocked(
+def test_rear_turn_fails_closed_when_shortest_side_is_blocked(
     monkeypatch, executor_module
 ) -> None:
-    """A costmap-safe full alternate turn must not be rejected at the pi cap."""
+    """A blocked shortest turn must not trigger a long collision-free spin."""
 
     class _Orientation:
         x = y = z = 0.0
@@ -1824,7 +3381,7 @@ def test_rear_turn_uses_finite_wrapped_side_when_short_turn_is_blocked(
     executor.rear_goal_exit_angle_rad = 0.20
     executor.rear_goal_rotate_speed_rad_s = 1.25
     executor.rear_goal_prerotate_control_dt_s = 0.2
-    # Enough for a wrapped 2*pi fallback, while still a strict finite budget.
+    # Enough for a wrapped fallback, which must no longer be selected.
     executor.rear_goal_prerotate_max_control_steps = 28
     executor.rear_goal_robot_radius_m = 0.20
     executor.rear_goal_safety_margin_m = 0.05
@@ -1848,11 +3405,9 @@ def test_rear_turn_uses_finite_wrapped_side_when_short_turn_is_blocked(
         "decision-wrapped", "map", target
     )
 
-    assert choice is not None
-    assert choice["direction"] == "ccw"
-    assert choice["required_control_steps"] > 14
-    assert choice["required_control_steps"] <= 28
-    assert detail["selected_turn"] == "ccw"
+    assert choice is None
+    assert detail["reason"] == "rear_goal_shortest_turn_sweep_blocked"
+    assert detail["shortest_angle_enforced"] is True
 
 
 def test_rear_dwa_detector_requires_flips_and_no_progress(executor_module) -> None:
@@ -2604,7 +4159,7 @@ def test_interaction_ready_standoff_runs_bounded_selected_yaw_alignment(
             (0.0, 0.0, 0.0),
             ready_but_misaligned,
             ready_but_misaligned,
-            ready_but_misaligned,
+            (0.814, 0.0, math.pi),
         ]
     )
     executor._current_pose = lambda _frame_id: next(poses)
@@ -2620,23 +4175,13 @@ def test_interaction_ready_standoff_runs_bounded_selected_yaw_alignment(
     executor._run_navigation("decision-2", candidate, start_goal_option_index=1)
 
     assert executor.move_base.cancel_count == 1
-    assert executor.move_base.cancel_waits == [0.0]
-    assert len(rotate_calls) == 1
-    rotate_args, rotate_kwargs = rotate_calls[0]
-    assert rotate_args[2] == pytest.approx(math.pi)
-    assert rotate_args[3] == pytest.approx(0.15)
-    assert rotate_kwargs["step_command_gate"] is executor._interaction_final_align_gate
-    assert rotate_kwargs["rotation_label"] == "interaction-final-align"
-    assert rotate_kwargs["max_prerotate_control_steps"] == 12
-    assert rotate_kwargs["step_sync_budget_authoritative"] is True
+    assert executor.move_base.cancel_waits == []
+    assert rotate_calls == []
     assert len(completed) == 1
     _args, kwargs = completed[0]
     assert kwargs["selected_goal"] == tuple(selected_fallback)
-    assert kwargs["detail"]["reason"] == "interaction_approach_final_yaw_alignment"
-    before = kwargs["detail"]["interaction_pose_validation_before_final_align"]
-    assert before["position_error_m"] < before["distance_tolerance_m"]
-    assert before["yaw_error_rad"] > before["yaw_tolerance_rad"]
-    assert before["valid"] is False
+    assert kwargs["detail"]["reason"] == "interaction_approach_pose_tolerance"
+    assert kwargs["detail"]["interaction_pose_validation"]["valid"] is True
 
 
 def test_interaction_final_align_rotation_waits_for_its_own_fresh_step_gate(
@@ -2932,6 +4477,30 @@ def test_full_mllm_interaction_final_align_is_opted_in_without_generic_align() -
     assert executor_override["interaction_final_align_max_control_steps"] >= (
         math.ceil(math.pi / (0.30 * 0.20)) + 3
     )
+    assert executor_override["container_m1_capture_dwa_profile_enabled"] is True
+    assert executor_override["container_m1_capture_dwa_reconfigure_server"] == (
+        "/move_base/DWAPlannerROS"
+    )
+    assert executor_override["container_m1_capture_dwa_reconfigure_timeout_s"] == 1.0
+    assert (
+        executor_override[
+            "container_m1_capture_dwa_terminal_yaw_settle_max_task_steps"
+        ]
+        == 75
+    )
+    assert executor_override["container_m1_capture_yaw_tolerance_rad"] == pytest.approx(
+        math.radians(30.0)
+    )
+    assert (
+        executor_override[
+            "container_m1_capture_successor_quiescence_timeout_s"
+        ]
+        == 1.0
+    )
+    assert executor_override["move_base_successor_quiescence_timeout_s"] == 1.0
+    assert executor_override["navigation_failure_recovery_enabled"] is False
+    assert executor_override["navigation_failure_recovery_max_attempts"] == 0
+    assert executor_override["navigation_stagnation_post_rotation_grace_s"] == 15.0
 
 
 def test_interaction_preflight_debug_keeps_skipped_ring_options_separate_from_retry_budget(
@@ -2997,6 +4566,10 @@ def test_outer_staging_terminal_abort_retries_same_pose_once_after_fresh_plan(
     executor._container_outer_staging_terminal_retry_ledger = set()
     executor._navigation_is_current = lambda decision_id: decision_id == "decision-abort"
     executor._navigation_run_is_active = lambda decision_id, _token: decision_id == "decision-abort"
+    executor._confirm_move_base_goal_quiescent_before_successor = lambda: (
+        True,
+        {"server_status_confirmed": True},
+    )
     executor._wait_for_outer_staging_abort_global_costmap_receipt = lambda _decision_id, _token: (
         True,
         {"fresh_source": "global_costmap_update"},
@@ -3086,6 +4659,54 @@ def test_outer_staging_terminal_abort_retries_same_pose_once_after_fresh_plan(
     )
     assert fresh_calls == [("map", *selected_goal)]
     assert len(started) == 1
+
+
+def test_outer_staging_abort_waits_for_goal_quiescence_before_make_plan(
+    executor_module,
+) -> None:
+    """PREEMPTING is a transport fence, not an unreachable next viewpoint."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor.map_frame = "map"
+    executor._container_outer_staging_terminal_retry_ledger = set()
+    executor._navigation_is_current = lambda _decision_id: True
+    executor._navigation_run_is_active = lambda _decision_id, _token: True
+    executor._wait_for_outer_staging_abort_global_costmap_receipt = lambda *_args: (
+        True,
+        {"fresh_source": "global_costmap_update"},
+    )
+    executor._confirm_move_base_goal_quiescent_before_successor = lambda: (
+        False,
+        {"reason": "move_base_successor_server_still_active"},
+    )
+    executor._wait_for_outer_staging_abort_reachable_plan = lambda *_args: pytest.fail(
+        "make_plan must not run while move_base is PREEMPTING"
+    )
+    candidate = {
+        "behavior_type": "INTERACT",
+        "metadata": {
+            "frame_id": "map",
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "m1_observation_staging_required": True,
+        },
+    }
+
+    assert not executor._retry_outer_staging_after_terminal_abort(
+        "decision-preempting",
+        candidate,
+        navigation_run_token=3,
+        selected_goal_option_index=0,
+        selected_goal=(1.0, 2.0, 0.0),
+        selected_preflight_reachable=True,
+        interaction_approach_attempts=[],
+        terminal_detail={
+            "reason": "navigation_terminal_failure",
+            "status_code": executor_module.GoalStatus.ABORTED,
+            "status": "ABORTED",
+        },
+    )
 
 
 def test_outer_staging_terminal_abort_requires_new_costmap_before_replan(

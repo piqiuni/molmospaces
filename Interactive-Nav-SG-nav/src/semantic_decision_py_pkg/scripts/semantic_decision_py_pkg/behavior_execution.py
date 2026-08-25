@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
 import time
 from typing import Any
 
@@ -159,7 +160,11 @@ def interaction_observation_disposition(
         if state in {"open", "opened", "static_open", "static"}:
             return "finish_without_action"
         if state in {"blocked", "unavailable", "static_closed", "locked"}:
-            return "terminal"
+            # M1 is visual evidence, not an authoritative capability oracle.
+            # A single "locked"/"unavailable" judgement is therefore only an
+            # inconclusive view and has to consume the bounded evidence policy
+            # below before the candidate can be deferred.
+            return "retry"
         if state not in {"closed", "ajar"}:
             return "retry"
         view_state = str(merged.get("view_state") or "unknown").strip().casefold()
@@ -184,7 +189,9 @@ def interaction_observation_disposition(
     if state in {"open", "opened", "static_open", "static"}:
         return "finish_without_action"
     if state in {"blocked", "unavailable", "static_closed", "locked"}:
-        return "terminal"
+        # See the container branch above: M1 must not one-shot terminalize a
+        # portal or container merely from a semantic label in one image.
+        return "retry"
     return "retry"
 
 
@@ -433,6 +440,203 @@ def container_two_stage_staging_goal_options(
     return options
 
 
+def container_two_stage_m1_viewpoint_order(
+    candidate: dict[str, Any] | None,
+) -> list[int]:
+    """Return valid anchor indices in the candidate's M1 evidence order.
+
+    New geometry publishes a face-diverse order separately from ordinary
+    navigation fallback order.  Legacy candidates remain deterministic by
+    falling back to their immutable staging sequence.
+    """
+
+    staging_goals = container_two_stage_staging_goal_options(candidate)
+    metadata = (candidate or {}).get("metadata") or {}
+    raw_order = list(metadata.get("container_m1_viewpoint_order") or [])
+    order: list[int] = []
+    for raw_index in raw_order:
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < len(staging_goals) and index not in order:
+            order.append(index)
+    order.extend(index for index in range(len(staging_goals)) if index not in order)
+    return order
+
+
+def container_two_stage_m1_preflight_batch_indices(
+    candidate: dict[str, Any] | None,
+    requested_index: int,
+) -> list[int]:
+    """Return all still-usable outer anchors for one make-plan batch.
+
+    The requested canonical index remains first, but a negative make-plan result
+    does not require another state-machine dispatch.  Remaining anchors follow
+    the immutable, face-diverse M1 order.  Already sampled or already known
+    unavailable indices are excluded without changing the canonical index used
+    by capture/action mappings.
+    """
+
+    staging_goals = container_two_stage_staging_goal_options(candidate)
+    if not staging_goals:
+        return []
+    metadata = (candidate or {}).get("metadata") or {}
+    excluded: set[int] = set()
+    for key in (
+        "container_m1_unavailable_staging_indices",
+        "interaction_observation_viewpoint_staging_indices",
+        "container_m1_rejected_face_staging_indices",
+    ):
+        for raw_index in list(metadata.get(key) or []):
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(staging_goals):
+                excluded.add(index)
+    try:
+        requested = int(requested_index)
+    except (TypeError, ValueError):
+        requested = -1
+    batch: list[int] = []
+    if 0 <= requested < len(staging_goals) and requested not in excluded:
+        batch.append(requested)
+    for index in container_two_stage_m1_viewpoint_order(candidate):
+        if index not in excluded and index not in batch:
+            batch.append(index)
+    return batch
+
+
+_AABB_FAN_LABEL_RE = re.compile(
+    r"aabb_fan_[^_]+_[^_]+_angle_(?P<angle>[+-]?[0-9.]+)_clearance_(?P<clearance>[0-9.]+)"
+)
+
+
+def container_two_stage_m1_anchor_priority(
+    candidate: dict[str, Any] | None,
+    staging_index: int,
+) -> tuple[float, float, float, int]:
+    """Rank reachable container anchors without changing canonical indices.
+
+    Drawer AABB-fan anchors prefer the smallest surface clearance and then the
+    smallest absolute angular offset.  The canonical index remains the final
+    tie-breaker so capture/action mappings stay immutable.  Legacy container
+    layouts retain their published order.
+    """
+
+    metadata = (candidate or {}).get("metadata") or {}
+    labels = list(metadata.get("container_staging_pose_labels") or [])
+    try:
+        index = int(staging_index)
+    except (TypeError, ValueError):
+        index = 0
+    label = str(labels[index]) if 0 <= index < len(labels) else ""
+    robot_distances = list(
+        metadata.get("container_anchor_robot_distance_m_by_staging_index") or []
+    )
+    try:
+        robot_distance_m = (
+            float(robot_distances[index])
+            if 0 <= index < len(robot_distances)
+            else float(index)
+        )
+    except (TypeError, ValueError):
+        robot_distance_m = float(index)
+    match = _AABB_FAN_LABEL_RE.fullmatch(label)
+    if match is None:
+        if label.startswith("aabb_face_"):
+            return 0.0, 0.0, robot_distance_m, index
+        return float(index), 0.0, robot_distance_m, index
+    try:
+        angle_deg = float(match.group("angle"))
+        clearance_m = float(match.group("clearance"))
+    except (TypeError, ValueError):
+        return float(index), 0.0, robot_distance_m, index
+    return clearance_m, abs(angle_deg), robot_distance_m, index
+
+
+def container_two_stage_next_m1_viewpoint_index(
+    candidate: dict[str, Any] | None,
+    *,
+    excluded_indices: set[int] | list[int] | tuple[int, ...] = (),
+) -> int | None:
+    """Return the next usable outer anchor in the explicit M1 view order.
+
+    ``excluded_indices`` combines views that already produced a targeted M1
+    response with anchors that navigation could not reach.  Keeping this small
+    policy helper independent from the state machine lets executor-side
+    navigation failures advance the same evidence plan instead of falling back
+    to the legacy linear ring order.
+    """
+
+    excluded: set[int] = set()
+    for raw_index in excluded_indices:
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if index >= 0:
+            excluded.add(index)
+    for index in container_two_stage_m1_viewpoint_order(candidate):
+        if index not in excluded:
+            return index
+    return None
+
+
+def container_two_stage_face_indices(
+    candidate: dict[str, Any] | None,
+    staging_index: int,
+) -> list[int]:
+    """Return all immutable anchors on the selected AABB cardinal face."""
+
+    metadata = (candidate or {}).get("metadata") or {}
+    labels = [str(value) for value in metadata.get("container_staging_pose_labels") or []]
+    try:
+        selected = labels[int(staging_index)]
+    except (IndexError, TypeError, ValueError):
+        return []
+    match = re.match(r"aabb_(?:fan|face)_(pos_x|pos_y|neg_x|neg_y)(?:_|$)", selected)
+    if match is None:
+        return []
+    face = match.group(1)
+    pattern = re.compile(rf"aabb_(?:fan|face)_{re.escape(face)}(?:_|$)")
+    return [index for index, label in enumerate(labels) if pattern.match(label)]
+
+
+def container_two_stage_capture_goal_for_staging(
+    candidate: dict[str, Any] | None,
+    staging_goal_option_index: int,
+) -> tuple[float, float, float] | None:
+    """Return the M1 capture goal paired with one navigation anchor.
+
+    New candidates can keep navigation-only outer anchors separate from the
+    closer visual capture stance through
+    ``container_m1_capture_goal_xyyaw_by_staging_index``.  Old recordings do
+    not have that mapping, in which case their staging goal remains the capture
+    goal for backward compatibility.
+    """
+
+    metadata = (candidate or {}).get("metadata") or {}
+    if not bool(metadata.get("container_two_stage_approach", False)):
+        return None
+    try:
+        index = int(staging_goal_option_index)
+    except (TypeError, ValueError):
+        return None
+    if index < 0:
+        return None
+    raw_capture_goals = metadata.get(
+        "container_m1_capture_goal_xyyaw_by_staging_index"
+    )
+    if isinstance(raw_capture_goals, (list, tuple)) and raw_capture_goals:
+        if index >= len(raw_capture_goals):
+            return None
+        return _goal_xyyaw_option(raw_capture_goals[index])
+    staging_goals = container_two_stage_staging_goal_options(candidate)
+    return staging_goals[index] if index < len(staging_goals) else None
+
+
 def container_two_stage_action_goal_for_staging(
     candidate: dict[str, Any] | None,
     staging_goal_option_index: int,
@@ -514,6 +718,98 @@ def container_two_stage_action_goal_options_for_staging(
     return options
 
 
+def container_two_stage_action_goal_options_from_m1_front_evidence(
+    candidate: dict[str, Any] | None,
+    evidence: dict[str, Any] | None,
+) -> tuple[list[tuple[float, float, float]], list[str], dict[str, Any]] | None:
+    """Project safe physical poses from one accepted M1-confirmed front ray.
+
+    M1's interface deliberately has no world-space normal: one RGB image
+    cannot author map geometry.  Instead it confirms that the calibrated
+    object-to-camera ray at its *actual capture pose* is a usable front.  This
+    helper hides the surface-clearance projection behind that small contract so
+    the active decision need not wait for a later graph regeneration to use the
+    newly established face.
+
+    ``None`` preserves legacy candidates that never published this contract.
+    A new candidate that explicitly opts in but lacks valid frozen evidence is
+    handled fail-closed by its caller rather than falling back to a graph/oracle
+    front axis.
+    """
+
+    metadata = (candidate or {}).get("metadata") or {}
+    if not bool(metadata.get("container_m1_front_axis_from_capture", False)):
+        return None
+    if not isinstance(evidence, dict):
+        return None
+    axis_values = list(evidence.get("m1_front_axis_xy") or [])
+    anchor_values = list(metadata.get("container_geometry_anchor_xy") or [])
+    size_values = list(metadata.get("container_geometry_aabb_size_xy") or [])
+    if len(axis_values) < 2 or len(anchor_values) < 2 or len(size_values) < 2:
+        return None
+    try:
+        axis_x = float(axis_values[0])
+        axis_y = float(axis_values[1])
+        anchor_x = float(anchor_values[0])
+        anchor_y = float(anchor_values[1])
+        half_x = 0.5 * abs(float(size_values[0]))
+        half_y = 0.5 * abs(float(size_values[1]))
+        physical_standoff_m = float(
+            metadata.get("container_physical_action_standoff_m")
+        )
+        lateral_offset_m = max(
+            0.0, float(metadata.get("container_action_lateral_offset_m", 0.0))
+        )
+    except (TypeError, ValueError):
+        return None
+    norm = math.hypot(axis_x, axis_y)
+    if (
+        norm <= 1e-6
+        or half_x <= 1e-6
+        or half_y <= 1e-6
+        or not math.isfinite(physical_standoff_m)
+        or physical_standoff_m < 0.0
+    ):
+        return None
+    axis_x /= norm
+    axis_y /= norm
+    ray_denominator = abs(axis_x) / half_x + abs(axis_y) / half_y
+    if ray_denominator <= 1e-6:
+        return None
+    boundary_distance = 1.0 / ray_denominator
+    offset = boundary_distance + physical_standoff_m
+    primary_x = anchor_x + axis_x * offset
+    primary_y = anchor_y + axis_y * offset
+    primary_yaw = math.atan2(anchor_y - primary_y, anchor_x - primary_x)
+    options: list[tuple[float, float, float]] = [
+        (primary_x, primary_y, primary_yaw)
+    ]
+    labels = ["m1_confirmed_front_physical_action"]
+    if lateral_offset_m > 1e-6:
+        tangent_x, tangent_y = -axis_y, axis_x
+        for direction, label in (
+            (1.0, "m1_confirmed_front_physical_action_tangent_left"),
+            (-1.0, "m1_confirmed_front_physical_action_tangent_right"),
+        ):
+            x = primary_x + direction * lateral_offset_m * tangent_x
+            y = primary_y + direction * lateral_offset_m * tangent_y
+            options.append((x, y, math.atan2(anchor_y - y, anchor_x - x)))
+            labels.append(label)
+    front = {
+        "m1_front_axis_xy": [axis_x, axis_y],
+        "m1_front_yaw": primary_yaw,
+        "m1_front_axis_source": str(
+            evidence.get("m1_front_axis_source")
+            or "m1_confirmed_capture_pose"
+        ),
+        "m1_front_capture_pose_xyyaw": list(
+            evidence.get("capture_pose_xyyaw") or []
+        ),
+        "m1_front_capture_step": evidence.get("capture_step"),
+    }
+    return options, labels, front
+
+
 def container_two_stage_action_pose_labels_for_staging(
     candidate: dict[str, Any] | None,
     staging_goal_option_index: int,
@@ -565,6 +861,17 @@ def is_container_two_stage_physical_action(candidate: dict[str, Any] | None) -> 
         metadata.get("container_two_stage_approach", False)
         and str(metadata.get("container_two_stage_phase") or "").casefold()
         == "physical_action"
+    )
+
+
+def is_container_two_stage_m1_capture(candidate: dict[str, Any] | None) -> bool:
+    """Whether a container is travelling to its direct M1 capture pose."""
+
+    metadata = (candidate or {}).get("metadata") or {}
+    return bool(
+        metadata.get("container_two_stage_approach", False)
+        and str(metadata.get("container_two_stage_phase") or "").casefold()
+        == "m1_capture"
     )
 
 
@@ -929,6 +1236,7 @@ def next_interaction_approach_option_index(
         "unsafe_open_sweep",
         "visual_reposition_required",
         "navigation_timeout",
+        "navigation_step_sync_stall",
         "navigation_terminal_failure",
         "final_yaw_alignment_failed",
     }:
@@ -1012,16 +1320,22 @@ class NavigationProgressWatchdog:
     # watchdog forever while the robot stays in place.  Keep the legacy
     # default for callers that explicitly use a rotation-only phase.
     allow_yaw_progress: bool = True
+    # When supplied, the evaluator's public step clock is authoritative.  A
+    # wall-clock timeout is unreliable while VLM calls or several simulators
+    # share a host, and used to abort valid in-place turns prematurely.
+    timeout_task_steps: int | None = None
     reference_xy: tuple[float, float] | None = None
     reference_yaw: float | None = None
     reference_goal_distance_m: float | None = None
     last_progress_at: float | None = None
+    reference_step_index: int | None = None
 
     def reset(
         self,
         pose: tuple[float, ...] | None,
         now: float,
         goal_distance_m: float | None = None,
+        task_step_index: int | None = None,
     ) -> None:
         self.reference_xy = None if pose is None else (float(pose[0]), float(pose[1]))
         self.reference_yaw = (
@@ -1033,6 +1347,9 @@ class NavigationProgressWatchdog:
             else None
         )
         self.last_progress_at = float(now) if pose is not None else None
+        self.reference_step_index = (
+            int(task_step_index) if task_step_index is not None else None
+        )
 
     def observe(
         self,
@@ -1041,11 +1358,12 @@ class NavigationProgressWatchdog:
         *,
         goal_distance_m: float | None = None,
         local_plan_fresh: bool = False,
+        task_step_index: int | None = None,
     ) -> bool:
         if self.timeout_s <= 0.0 or pose is None:
             return False
         if self.reference_xy is None or self.last_progress_at is None:
-            self.reset(pose, now, goal_distance_m)
+            self.reset(pose, now, goal_distance_m, task_step_index)
             return False
         displacement = math.hypot(
             float(pose[0]) - float(self.reference_xy[0]),
@@ -1057,7 +1375,7 @@ class NavigationProgressWatchdog:
         if displacement >= self.min_displacement_m or (
             self.allow_yaw_progress and yaw_change >= self.min_yaw_change_rad
         ):
-            self.reset(pose, now, goal_distance_m)
+            self.reset(pose, now, goal_distance_m, task_step_index)
             return False
         if (
             local_plan_fresh
@@ -1074,8 +1392,17 @@ class NavigationProgressWatchdog:
                 # A fresh local trajectory plus a material reduction in
                 # distance-to-goal is real progress even when DWA deliberately
                 # drives below the coarse pose-displacement threshold.
-                self.reset(pose, now, current_goal_distance_m)
+                self.reset(pose, now, current_goal_distance_m, task_step_index)
                 return False
+        if (
+            self.timeout_task_steps is not None
+            and task_step_index is not None
+            and self.reference_step_index is not None
+        ):
+            return (
+                int(task_step_index) - int(self.reference_step_index)
+                >= max(1, int(self.timeout_task_steps))
+            )
         return float(now) - self.last_progress_at >= self.timeout_s
 
     def goal_distance_reduction_m(self, goal_distance_m: float | None) -> float:
@@ -1095,6 +1422,21 @@ class ExecutionConfig:
     interaction_timeout_s: float = 30.0
     drawer_scan_wait_timeout_s: float = 8.0
     interaction_observation_timeout_s: float = 8.0
+    # A negative M1 result is treated as an inconclusive image.  By default
+    # collect one fresh confirmation at the held pose before changing view.
+    interaction_observation_same_pose_samples_per_view: int = 2
+    # Zero retains each candidate's legacy ``interaction_observation_max_attempts``
+    # as its viewpoint budget.  A positive value is an explicit cap on distinct
+    # capture viewpoints, separate from the total request budget.
+    interaction_observation_max_viewpoints: int = 0
+    # Zero derives a finite total budget from viewpoints x samples-per-view.
+    interaction_observation_max_total_requests: int = 0
+    # A second planned M1 capture pose is a distinct visual experiment only
+    # when navigation actually reaches it.  This is deliberately tighter than
+    # the ordinary capture/physical-ready envelope, which remains useful for
+    # the first capture and the physical bridge contract.
+    container_m1_distinct_view_arrival_tolerance_m: float = 0.05
+    container_m1_distinct_view_arrival_yaw_tolerance_rad: float = 0.08
     verification_timeout_s: float = 30.0
     explore_prepare_timeout_s: float = 10.0
     explore_finalize_timeout_s: float = 10.0
@@ -1234,6 +1576,18 @@ class BehaviorExecutionStateMachine:
             return []
         if not success:
             return self._finish(False, detail or {}, now)
+        metadata = (self.candidate or {}).get("metadata") or {}
+        if self._container_two_stage_staging_active(metadata):
+            # A recovery anchor is intentionally farther than the visual
+            # capture point.  Reaching that anchor never authorizes M1: move
+            # to the paired direct capture pose first.  Legacy candidates have
+            # no distinct mapping, so the helper returns no transition and the
+            # old same-pose M1 behaviour remains intact.
+            capture_navigation = self._begin_container_two_stage_m1_capture(
+                detail or {}, now
+            )
+            if capture_navigation:
+                return capture_navigation
         if self._interaction_requires_observation():
             return self._request_interaction_observation(detail or {}, now)
         if wait_for_drawer_scan:
@@ -1269,6 +1623,7 @@ class BehaviorExecutionStateMachine:
         observation = self._normalized_interaction_observation(detail)
         metadata = dict(self.candidate.get("metadata") or {})
         metadata["last_interaction_observation"] = dict(observation)
+        metadata["interaction_observation_viewpoint_pending"] = False
         self.candidate["metadata"] = metadata
 
         drawer_pre_action = bool(metadata.get("drawer_pre_action_observation"))
@@ -1315,7 +1670,10 @@ class BehaviorExecutionStateMachine:
             disposition = "retry"
 
         if disposition == "execute":
-            if self._container_two_stage_staging_active(metadata):
+            if (
+                self._container_two_stage_staging_active(metadata)
+                or self._container_two_stage_m1_capture_active(metadata)
+            ):
                 action_navigation = self._begin_container_two_stage_action_approach(
                     observation,
                     now,
@@ -1372,30 +1730,40 @@ class BehaviorExecutionStateMachine:
             )
 
         attempts = int(metadata.get("interaction_observation_attempts", 0) or 0)
-        max_attempts = self._interaction_observation_max_attempts()
-        if attempts < max_attempts:
-            if drawer_pre_action or container_pre_action:
+        samples_at_viewpoint = int(
+            metadata.get("interaction_observation_samples_at_viewpoint", 0) or 0
+        )
+        viewpoints = int(
+            metadata.get("interaction_observation_viewpoint_count", 0) or 0
+        )
+        max_samples_per_view = self._interaction_observation_same_pose_samples_per_view()
+        max_viewpoints = self._interaction_observation_max_viewpoints()
+        max_total_requests = self._interaction_observation_max_total_requests()
+        if drawer_pre_action or container_pre_action:
+            # A single M1 negative is only an inconclusive image, not evidence
+            # that the container is impossible to interact with.  First obtain
+            # one independently fresh frame while holding the exact capture
+            # pose.  Only then spend a distinct navigation anchor/viewpoint.
+            if (
+                attempts < max_total_requests
+                and samples_at_viewpoint < max_samples_per_view
+            ):
+                return self._request_interaction_observation(observation, now)
+            if attempts < max_total_requests and viewpoints < max_viewpoints:
                 return self._advance_interaction_reobservation_approach(
                     observation,
                     now,
                     drawer_pre_action=drawer_pre_action,
                 )
-            return self._request_interaction_observation(observation, now)
-        if drawer_pre_action or container_pre_action:
             precondition_kind = "drawer" if drawer_pre_action else "container"
-            return self._finish(
-                False,
-                {
-                    **observation,
-                    "action_executed": False,
-                    "observation_outcome": "terminal_visual_precondition",
-                    "observation_attempts": attempts,
-                    "failure_stage": "interaction_visual_precondition",
-                    "terminal_candidate_exclusion": True,
-                    "reason": f"{precondition_kind}_visual_precondition_unresolved",
-                },
+            return self._defer_container_m1_evidence(
+                observation,
                 now,
+                drawer_pre_action=drawer_pre_action,
+                reason=f"{precondition_kind}_m1_evidence_inconclusive",
             )
+        if attempts < self._interaction_observation_max_attempts():
+            return self._request_interaction_observation(observation, now)
         return self._finish(
             False,
             {
@@ -1424,6 +1792,56 @@ class BehaviorExecutionStateMachine:
         )
 
     @staticmethod
+    def _container_two_stage_m1_capture_active(metadata: dict[str, Any]) -> bool:
+        return bool(
+            metadata.get("container_two_stage_approach", False)
+            and str(metadata.get("container_two_stage_phase") or "").casefold()
+            == "m1_capture"
+        )
+
+    def _container_m1_capture_requires_distinct_view_arrival(
+        self,
+        metadata: dict[str, Any],
+        capture_goal: tuple[float, float, float],
+    ) -> tuple[bool, tuple[float, float, float] | None]:
+        """Return whether a mapped capture must reach a genuinely new view.
+
+        The outer-anchor-to-capture contract can deliberately accept a broad
+        first arrival.  Once M1 has sampled one mapped capture pose, however,
+        a later capture target that is materially different must not reuse that
+        broad envelope: doing so would count the same camera pose twice.  The
+        previous value is the pose that owned an actual M1 request, not merely
+        a navigation anchor that happened to be visited.
+        """
+
+        previous_goal = _goal_xyyaw_option(
+            metadata.get("container_m1_last_sampled_capture_goal_xyyaw")
+        )
+        if previous_goal is None:
+            return False, None
+        try:
+            distance_tolerance_m = float(
+                self.config.container_m1_distinct_view_arrival_tolerance_m
+            )
+            yaw_tolerance_rad = float(
+                self.config.container_m1_distinct_view_arrival_yaw_tolerance_rad
+            )
+        except (TypeError, ValueError):
+            return False, previous_goal
+        if distance_tolerance_m <= 0.0 or yaw_tolerance_rad <= 0.0:
+            return False, previous_goal
+        is_distinct = bool(
+            math.hypot(
+                capture_goal[0] - previous_goal[0],
+                capture_goal[1] - previous_goal[1],
+            )
+            > distance_tolerance_m
+            or abs(normalize_angle(capture_goal[2] - previous_goal[2]))
+            > yaw_tolerance_rad
+        )
+        return is_distinct, previous_goal
+
+    @staticmethod
     def _container_two_stage_evidence_matches_staging(
         evidence: dict[str, Any],
         staging_goal: tuple[float, float, float],
@@ -1437,6 +1855,118 @@ class BehaviorExecutionStateMachine:
             math.hypot(observed[0] - staging_goal[0], observed[1] - staging_goal[1])
             <= 1e-6
             and abs(normalize_angle(observed[2] - staging_goal[2])) <= 1e-6
+        )
+
+    def _begin_container_two_stage_m1_capture(
+        self,
+        arrival_detail: dict[str, Any],
+        now: float,
+    ) -> list[dict[str, Any]]:
+        """Move from a navigation-only anchor to its direct M1 capture pose.
+
+        The anchor exists solely to obtain a costmap-reachable route around an
+        inflated obstacle shoulder.  It is not a camera-distance adjustment and
+        must never be used as M1 evidence.  Old candidates do not carry a
+        separate capture mapping, in which case this method deliberately
+        returns no command and preserves their legacy staging observation.
+        """
+
+        if self.candidate is None:
+            return []
+        candidate = dict(self.candidate)
+        metadata = dict(candidate.get("metadata") or {})
+        if not self._container_two_stage_staging_active(metadata):
+            return []
+        if metadata.get("container_two_stage_mapping_ready") is False:
+            return []
+        try:
+            staging_index = max(
+                0, int(metadata.get("interaction_approach_goal_option_index", 0))
+            )
+        except (TypeError, ValueError):
+            return []
+        staging_goals = container_two_stage_staging_goal_options(candidate)
+        capture_goal = container_two_stage_capture_goal_for_staging(
+            candidate, staging_index
+        )
+        if staging_index >= len(staging_goals) or capture_goal is None:
+            return []
+        anchor_goal = staging_goals[staging_index]
+        if (
+            math.hypot(capture_goal[0] - anchor_goal[0], capture_goal[1] - anchor_goal[1])
+            <= 1e-6
+            and abs(normalize_angle(capture_goal[2] - anchor_goal[2])) <= 1e-6
+        ):
+            return []
+        interaction = dict(candidate.get("interaction_command") or {})
+        try:
+            capture_ready_distance_m = float(
+                interaction.get(
+                    "container_m1_capture_ready_distance_m",
+                    interaction.get("container_physical_action_ready_distance_m"),
+                )
+            )
+        except (TypeError, ValueError):
+            return []
+        if capture_ready_distance_m <= 0.0:
+            return []
+        interaction["interaction_approach_pose_xyyaw"] = list(capture_goal)
+        interaction["interaction_ready_distance_m"] = capture_ready_distance_m
+        interaction["navigation_goal_position_tolerance_m"] = capture_ready_distance_m
+        interaction["navigation_goal_yaw_tolerance_rad"] = float(
+            interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+        )
+        distinct_view_arrival_required, prior_sampled_capture_goal = (
+            self._container_m1_capture_requires_distinct_view_arrival(
+                metadata, capture_goal
+            )
+        )
+        metadata.update(
+            {
+                "container_two_stage_phase": "m1_capture",
+                "container_two_stage_staging_goal_option_index": staging_index,
+                "container_two_stage_navigation_anchor_pose_xyyaw": list(anchor_goal),
+                "container_two_stage_capture_pose_xyyaw": list(capture_goal),
+                "effective_interaction_approach_pose_xyyaw": list(capture_goal),
+                # The immutable anchor index remains the mapping key.  The
+                # private one-goal capture navigation always dispatches option
+                # zero, so its retries cannot be mistaken for another anchor.
+                "interaction_approach_goal_option_index": staging_index,
+                "goal_xyyaw_candidates": [],
+                "interaction_observation_samples_at_viewpoint": 0,
+                "interaction_observation_viewpoint_pending": False,
+                # This applies only after M1 has actually sampled a different
+                # mapped capture pose.  It is intentionally absent from legacy
+                # candidates which have no direct-capture mapping.
+                "container_m1_capture_requires_distinct_view_arrival": (
+                    distinct_view_arrival_required
+                ),
+                "container_m1_capture_prior_sampled_goal_xyyaw": (
+                    list(prior_sampled_capture_goal)
+                    if prior_sampled_capture_goal is not None
+                    else []
+                ),
+            }
+        )
+        candidate["goal_xyyaw"] = list(capture_goal)
+        candidate["interaction_command"] = interaction
+        candidate["metadata"] = metadata
+        self.candidate = candidate
+        return self._transition(
+            STATE_APPROACH_INTERACTION,
+            now,
+            {
+                "kind": "navigate",
+                "candidate": self.candidate,
+                "start_goal_option_index": 0,
+                "interaction_approach_attempts": [
+                    dict(item)
+                    for item in metadata.get("interaction_approach_attempts") or []
+                    if isinstance(item, dict)
+                ],
+                "reason": "container_navigation_anchor_to_m1_capture",
+                "navigation_anchor_arrival": dict(arrival_detail),
+            },
         )
 
     def _begin_container_two_stage_action_approach(
@@ -1455,43 +1985,110 @@ class BehaviorExecutionStateMachine:
             return []
         candidate = dict(self.candidate)
         metadata = dict(candidate.get("metadata") or {})
-        if not self._container_two_stage_staging_active(metadata):
+        if not (
+            self._container_two_stage_staging_active(metadata)
+            or self._container_two_stage_m1_capture_active(metadata)
+        ):
             return []
         try:
             staging_index = max(
-                0, int(metadata.get("interaction_approach_goal_option_index", 0))
+                0,
+                int(
+                    metadata.get(
+                        "container_two_stage_staging_goal_option_index",
+                        metadata.get("interaction_approach_goal_option_index", 0),
+                    )
+                ),
             )
         except (TypeError, ValueError):
             return []
         staging_goals = container_two_stage_staging_goal_options(candidate)
         if staging_index >= len(staging_goals):
             return []
+        capture_goal = container_two_stage_capture_goal_for_staging(
+            candidate, staging_index
+        )
+        if capture_goal is None:
+            return []
         # Candidate generation marks an incomplete outer-to-inner mapping
         # explicitly.  Even if an older trace still happens to retain a stale
         # option list, never use it to authorize a close physical move.
         if metadata.get("container_two_stage_mapping_ready") is False:
             return []
-        action_goals = container_two_stage_action_goal_options_for_staging(
-            candidate, staging_index
-        )
         evidence = metadata.get("accepted_container_m1_evidence")
         if (
-            not action_goals
-            or not isinstance(evidence, dict)
+            not isinstance(evidence, dict)
             or not self._container_two_stage_evidence_matches_staging(
-                evidence, staging_goals[staging_index]
+                evidence, capture_goal
             )
         ):
             return []
-        action_labels = container_two_stage_action_pose_labels_for_staging(
-            candidate,
-            staging_index,
-            len(action_goals),
+        shared_anchor_pose = bool(metadata.get("container_anchor_shared_pose", False))
+        front_evidence_action = (
+            None
+            if shared_anchor_pose
+            else container_two_stage_action_goal_options_from_m1_front_evidence(
+                candidate, evidence
+            )
         )
+        front_axis_required = bool(
+            metadata.get("container_m1_front_axis_from_capture", False)
+        )
+        if shared_anchor_pose:
+            action_goals = [staging_goals[staging_index]]
+            action_labels = ["shared_anchor_physical_action"]
+            front_evidence = {
+                key: evidence[key]
+                for key in (
+                    "m1_front_axis_xy",
+                    "m1_front_yaw",
+                    "m1_front_axis_source",
+                    "capture_pose_xyyaw",
+                    "capture_step",
+                )
+                if key in evidence
+            }
+            action_geometry_source = "shared_selected_anchor"
+        elif front_evidence_action is not None:
+            action_goals, action_labels, front_evidence = front_evidence_action
+            action_geometry_source = "m1_confirmed_capture_front_axis"
+        elif front_axis_required and metadata.get("container_geometry_anchor_xy"):
+            # The candidate explicitly requested this contract, but the
+            # executor did not bind an M1-confirmed capture ray.  Do not quietly
+            # fall back to a possibly stale staging face or a graph/oracle axis.
+            return []
+        else:
+            action_goals = container_two_stage_action_goal_options_for_staging(
+                candidate, staging_index
+            )
+            action_labels = container_two_stage_action_pose_labels_for_staging(
+                candidate,
+                staging_index,
+                len(action_goals),
+            )
+            front_evidence = {}
+            action_geometry_source = "legacy_staging_face"
+        if not action_goals:
+            return []
         action_goal = action_goals[0]
         action_label = action_labels[0]
         interaction = dict(candidate.get("interaction_command") or {})
         interaction["interaction_approach_pose_xyyaw"] = list(action_goal)
+        if front_evidence.get("m1_front_axis_xy"):
+            interaction["interaction_approach_axis_xy"] = list(
+                front_evidence["m1_front_axis_xy"]
+            )
+            # Carry the face contract all the way to the simulator bridge.  A
+            # categorical M1 ``front`` flag is not an authorization by itself:
+            # the bridge must independently check that the arrived base yaw
+            # faces the frozen, M1-confirmed world-space face normal.
+            interaction["interaction_front_axis_source"] = str(
+                front_evidence.get("m1_front_axis_source") or "m1_capture"
+            )
+            interaction["interaction_front_axis_validation_required"] = True
+            interaction["interaction_target_center_xy"] = list(
+                metadata.get("container_geometry_anchor_xy") or []
+            )
         try:
             physical_ready_distance_m = float(
                 interaction.get("container_physical_action_ready_distance_m")
@@ -1501,6 +2098,10 @@ class BehaviorExecutionStateMachine:
         if physical_ready_distance_m <= 0.0:
             return []
         interaction["interaction_ready_distance_m"] = physical_ready_distance_m
+        interaction["navigation_goal_position_tolerance_m"] = physical_ready_distance_m
+        interaction["navigation_goal_yaw_tolerance_rad"] = float(
+            interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+        )
         metadata.update(
             {
                 "container_two_stage_phase": "physical_action",
@@ -1508,11 +2109,14 @@ class BehaviorExecutionStateMachine:
                 "container_two_stage_staging_pose_xyyaw": list(
                     staging_goals[staging_index]
                 ),
+                "container_two_stage_capture_pose_xyyaw": list(capture_goal),
                 # Keep the original primary fields for old readers/traces, but
                 # expose the bounded same-face physical sequence separately.
                 # It is consumed before moving to another outer M1 stance.
                 "container_two_stage_action_goal_xyyaw": list(action_goal),
                 "container_two_stage_action_pose_label": action_label,
+                "container_two_stage_action_geometry_source": action_geometry_source,
+                **front_evidence,
                 "container_two_stage_action_goal_xyyaw_options": [
                     list(goal) for goal in action_goals
                 ],
@@ -1522,6 +2126,7 @@ class BehaviorExecutionStateMachine:
                 "container_m1_evidence_staging_pose_xyyaw": list(
                     staging_goals[staging_index]
                 ),
+                "container_m1_evidence_capture_pose_xyyaw": list(capture_goal),
                 # The inner phase must never request another M1 image.  It
                 # retains the drawer's visual action regions on the interaction
                 # command but clears only the observation-state flags.
@@ -1543,6 +2148,22 @@ class BehaviorExecutionStateMachine:
         candidate["interaction_command"] = interaction
         candidate["metadata"] = metadata
         self.candidate = candidate
+        if shared_anchor_pose:
+            # The selected anchor has already passed navigation arrival and the
+            # accepted M1 evidence is bound to this exact pose.  There is no
+            # second physical navigation target in the shared-anchor contract;
+            # proceed directly to the bridge, which performs its normal final
+            # pose/state validation before applying force.
+            return self._transition(
+                STATE_INTERACTING,
+                now,
+                {
+                    "kind": "interact",
+                    "candidate": self.candidate,
+                    "observation": observation,
+                    "reason": "container_m1_ready_at_shared_action_anchor",
+                },
+            )
         return self._transition(
             STATE_APPROACH_INTERACTION,
             now,
@@ -1575,11 +2196,20 @@ class BehaviorExecutionStateMachine:
         the original flags restored so the next usable stance earns a new image.
         """
 
-        if self.candidate is None or not is_container_two_stage_physical_action(
-            self.candidate
+        if self.candidate is None or not bool(
+            ((self.candidate.get("metadata") or {}).get("container_two_stage_approach", False))
         ):
             return []
-        if self.state not in {STATE_APPROACH_INTERACTION, STATE_INTERACTING}:
+        phase = str(
+            ((self.candidate.get("metadata") or {}).get("container_two_stage_phase") or "")
+        ).casefold()
+        if phase not in {"physical_action", "m1_capture", "staging"}:
+            return []
+        if self.state not in {
+            STATE_APPROACH_INTERACTION,
+            STATE_INTERACTING,
+            STATE_WAITING_FOR_INTERACTION_OBSERVATION,
+        }:
             return []
         candidate = dict(self.candidate)
         metadata = dict(candidate.get("metadata") or {})
@@ -1602,6 +2232,10 @@ class BehaviorExecutionStateMachine:
         if staging_ready_distance_m <= 0.0:
             return []
         interaction["interaction_ready_distance_m"] = staging_ready_distance_m
+        interaction["navigation_goal_position_tolerance_m"] = staging_ready_distance_m
+        interaction["navigation_goal_yaw_tolerance_rad"] = float(
+            interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+        )
         # The next outer stance must request an image newer than the M1 frame
         # that authorized the failed inner approach.  Keep that accepted
         # capture as the monotonic observation baseline before clearing the
@@ -1656,6 +2290,8 @@ class BehaviorExecutionStateMachine:
                     staging_goals[next_index]
                 ),
                 "interaction_approach_goal_option_index": next_index,
+                "interaction_observation_samples_at_viewpoint": 0,
+                "interaction_observation_viewpoint_pending": True,
             }
         )
         for key in (
@@ -1664,6 +2300,11 @@ class BehaviorExecutionStateMachine:
             "accepted_container_m1_capture_step",
             "container_m1_evidence_staging_goal_option_index",
             "container_m1_evidence_staging_pose_xyyaw",
+            "container_m1_evidence_capture_pose_xyyaw",
+            "container_two_stage_capture_pose_xyyaw",
+            "container_two_stage_navigation_anchor_pose_xyyaw",
+            "container_m1_capture_requires_distinct_view_arrival",
+            "container_m1_capture_prior_sampled_goal_xyyaw",
         ):
             metadata.pop(key, None)
         candidate["interaction_command"] = interaction
@@ -1684,7 +2325,15 @@ class BehaviorExecutionStateMachine:
                 "interaction_approach_attempts": [
                     dict(item) for item in interaction_approach_attempts
                 ],
-                "reason": "container_inner_action_failed_next_outer_staging",
+                "reason": (
+                "container_m1_capture_failed_next_outer_staging"
+                if phase == "m1_capture"
+                else (
+                    "container_staging_navigation_failed_next_m1_viewpoint"
+                    if phase == "staging"
+                    else "container_inner_action_failed_next_outer_staging"
+                )
+                ),
             },
         )
 
@@ -1695,6 +2344,163 @@ class BehaviorExecutionStateMachine:
         except (TypeError, ValueError):
             return 2
 
+    def _interaction_observation_same_pose_samples_per_view(self) -> int:
+        metadata = (self.candidate or {}).get("metadata") or {}
+        configured = metadata.get(
+            "interaction_observation_same_pose_samples_per_view",
+            getattr(self.config, "interaction_observation_same_pose_samples_per_view", 2),
+        )
+        try:
+            return max(1, int(configured))
+        except (TypeError, ValueError):
+            return 2
+
+    def _interaction_observation_max_viewpoints(self) -> int:
+        metadata = (self.candidate or {}).get("metadata") or {}
+        configured = metadata.get(
+            "interaction_observation_max_viewpoints",
+            getattr(self.config, "interaction_observation_max_viewpoints", 0),
+        )
+        try:
+            configured_value = int(configured or 0)
+        except (TypeError, ValueError):
+            configured_value = 0
+        if configured_value > 0:
+            return configured_value
+        return self._interaction_observation_max_attempts()
+
+    def _interaction_observation_max_total_requests(self) -> int:
+        metadata = (self.candidate or {}).get("metadata") or {}
+        configured = metadata.get(
+            "interaction_observation_max_total_requests",
+            getattr(self.config, "interaction_observation_max_total_requests", 0),
+        )
+        try:
+            configured_value = int(configured or 0)
+        except (TypeError, ValueError):
+            configured_value = 0
+        if configured_value > 0:
+            return configured_value
+        return min(
+            self._interaction_observation_max_attempts(),
+            self._interaction_observation_max_viewpoints()
+            * self._interaction_observation_same_pose_samples_per_view(),
+        )
+
+    def _defer_container_m1_evidence(
+        self,
+        observation: dict[str, Any],
+        now: float,
+        *,
+        drawer_pre_action: bool,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        """Finish this attempt without declaring the container impossible.
+
+        M1 is a visual authorizer.  When its bounded evidence plan is exhausted
+        it can defer the candidate for a later exploration/cooldown cycle, but
+        it cannot write a permanent candidate exclusion from image evidence.
+        """
+
+        metadata = dict((self.candidate or {}).get("metadata") or {})
+        precondition_kind = "drawer" if drawer_pre_action else "container"
+        return self._finish(
+            False,
+            {
+                **observation,
+                "action_executed": False,
+                "observation_outcome": "m1_evidence_inconclusive",
+                "m1_evidence_inconclusive": True,
+                "retryable": True,
+                "terminal_candidate_exclusion": False,
+                "failure_stage": "interaction_visual_precondition",
+                "reason": reason,
+                "observation_attempts": int(
+                    metadata.get("interaction_observation_attempts", 0) or 0
+                ),
+                "observation_samples_per_view": (
+                    self._interaction_observation_same_pose_samples_per_view()
+                ),
+                "observation_viewpoints": int(
+                    metadata.get("interaction_observation_viewpoint_count", 0) or 0
+                ),
+                "observation_max_viewpoints": (
+                    self._interaction_observation_max_viewpoints()
+                ),
+                "observation_max_total_requests": (
+                    self._interaction_observation_max_total_requests()
+                ),
+                "precondition_kind": precondition_kind,
+            },
+            now,
+        )
+
+    def defer_container_m1_viewpoint_navigation(
+        self,
+        detail: dict[str, Any] | None = None,
+        *,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Defer a container after reachable M1 views cannot be completed.
+
+        Navigation failures before a new camera capture do not prove that the
+        object is impossible to interact with.  This is especially important
+        immediately after the startup scan, when every anchor can temporarily
+        return ``empty_plan`` against an incomplete map.  Preserve the same
+        retryable, non-exclusion outcome used after inconclusive visual evidence
+        instead of turning that one map generation into a permanent object fact.
+        """
+
+        if self.candidate is None:
+            return []
+        metadata = dict(self.candidate.get("metadata") or {})
+        try:
+            observation_attempts = int(
+                metadata.get("interaction_observation_attempts", 0) or 0
+            )
+        except (TypeError, ValueError):
+            observation_attempts = 0
+        if not (
+            (
+                self._container_two_stage_staging_active(metadata)
+                or self._container_two_stage_m1_capture_active(metadata)
+            )
+            and bool(metadata.get("m1_observation_staging_required", False))
+        ):
+            return []
+        drawer_pre_action = bool(metadata.get("drawer_pre_action_observation"))
+        kind = "drawer" if drawer_pre_action else "container"
+        staging_goal_count = len(container_two_stage_staging_goal_options(self.candidate))
+        unavailable_indices: set[int] = set()
+        for raw_index in list(
+            (detail or {}).get("container_m1_unavailable_staging_indices")
+            or metadata.get("container_m1_unavailable_staging_indices")
+            or []
+        ):
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < staging_goal_count:
+                unavailable_indices.add(index)
+        all_anchors_unreachable = bool(
+            staging_goal_count > 0
+            and len(unavailable_indices) >= staging_goal_count
+        )
+        return self._defer_container_m1_evidence(
+            {
+                **dict(detail or {}),
+                "m1_viewpoint_navigation_inconclusive": True,
+                "m1_capture_not_reached": observation_attempts <= 0,
+                "all_container_anchors_unreachable": all_anchors_unreachable,
+                "container_anchor_count": staging_goal_count,
+                "container_unreachable_anchor_count": len(unavailable_indices),
+            },
+            time.monotonic() if now is None else float(now),
+            drawer_pre_action=drawer_pre_action,
+            reason=f"{kind}_m1_evidence_inconclusive_viewpoint_navigation",
+        )
+
     def _advance_interaction_reobservation_approach(
         self,
         observation: dict[str, Any],
@@ -1702,45 +2508,97 @@ class BehaviorExecutionStateMachine:
         *,
         drawer_pre_action: bool,
     ) -> list[dict[str, Any]]:
-        """Move to the next preserved container viewpoint before another M1 call.
+        """Move to one bounded new capture viewpoint after same-pose sampling.
 
-        Repeating M1 at the same side/occluded pose cannot make a usable
-        container front appear.  A retry consumes the next navigation-ring
-        option; exhausting it is a terminal visual precondition rather than an
-        unbounded same-pose polling loop.
+        The caller has already collected the configured fresh samples at the
+        held M1 capture pose.  For the three-phase container contract this
+        method returns to the next *navigation anchor* and lets normal arrival
+        logic move inward to its paired direct capture pose; it never treats a
+        navigation-only anchor image as M1 evidence.
         """
 
         if self.candidate is None:
             return []
         metadata = dict(self.candidate.get("metadata") or {})
-        goal_options = navigation_goal_options(self.candidate)
+        is_direct_capture = self._container_two_stage_m1_capture_active(metadata)
+        goal_options = (
+            container_two_stage_staging_goal_options(self.candidate)
+            if is_direct_capture
+            else navigation_goal_options(self.candidate)
+        )
         try:
             selected_index = max(
                 0,
-                int(metadata.get("interaction_approach_goal_option_index", 0)),
+                int(
+                    metadata.get(
+                        "container_two_stage_staging_goal_option_index",
+                        metadata.get("interaction_approach_goal_option_index", 0),
+                    )
+                    if is_direct_capture
+                    else metadata.get("interaction_approach_goal_option_index", 0)
+                ),
             )
         except (TypeError, ValueError):
             selected_index = 0
-        next_index = selected_index + 1
+        if is_direct_capture:
+            viewed_indices: set[int] = set()
+            for raw_index in list(
+                metadata.get("interaction_observation_viewpoint_staging_indices")
+                or []
+            ):
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= index < len(goal_options):
+                    viewed_indices.add(index)
+            # The current direct capture has just returned a result even if an
+            # older trace did not record its first request bookkeeping.
+            viewed_indices.add(selected_index)
+            view_state = str(observation.get("view_state") or "").strip().casefold()
+            if view_state in {"side", "side_or_back", "back", "rear"}:
+                rejected_face_indices = container_two_stage_face_indices(
+                    self.candidate, selected_index
+                )
+                viewed_indices.update(rejected_face_indices)
+                previously_rejected: set[int] = set()
+                for raw_index in metadata.get(
+                    "container_m1_rejected_face_staging_indices", []
+                ):
+                    try:
+                        index = int(raw_index)
+                    except (TypeError, ValueError):
+                        continue
+                    if index >= 0:
+                        previously_rejected.add(index)
+                metadata["container_m1_rejected_face_staging_indices"] = sorted(
+                    previously_rejected | set(rejected_face_indices)
+                )
+            unavailable_indices: set[int] = set()
+            for key in (
+                "container_m1_unavailable_staging_indices",
+                "container_m1_rejected_face_staging_indices",
+            ):
+                for raw_index in list(metadata.get(key) or []):
+                    try:
+                        index = int(raw_index)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= index < len(goal_options):
+                        unavailable_indices.add(index)
+            next_index = container_two_stage_next_m1_viewpoint_index(
+                self.candidate,
+                excluded_indices=viewed_indices | unavailable_indices,
+            )
+        else:
+            next_index = selected_index + 1
         precondition_kind = "drawer" if drawer_pre_action else "container"
-        if next_index >= len(goal_options):
-            return self._finish(
-                False,
-                {
-                    **observation,
-                    "action_executed": False,
-                    "observation_outcome": "terminal_visual_precondition",
-                    "observation_attempts": int(
-                        metadata.get("interaction_observation_attempts", 0)
-                        or 0
-                    ),
-                    "failure_stage": "interaction_visual_precondition",
-                    "terminal_candidate_exclusion": True,
-                    "reason": f"{precondition_kind}_visual_precondition_no_alternate_viewpoint",
-                    "interaction_approach_goal_option_index": selected_index,
-                    "interaction_approach_goal_option_count": len(goal_options),
-                },
+        if next_index is None or next_index >= len(goal_options):
+            return self._defer_container_m1_evidence(
+                observation,
                 now,
+                drawer_pre_action=drawer_pre_action,
+                reason=f"{precondition_kind}_m1_evidence_inconclusive_no_alternate_viewpoint",
             )
         capture_step = self._interaction_observation_capture_step(observation)
         previous_baseline = self._interaction_observation_capture_step(
@@ -1765,6 +2623,26 @@ class BehaviorExecutionStateMachine:
             metadata["drawer_visual_reobserve_next_goal_option_index"] = next_index
             metadata["last_drawer_visual_precondition"] = dict(observation)
         self.candidate["metadata"] = metadata
+        if is_direct_capture:
+            # Restore the next immutable anchor and reset the per-view sample
+            # counter.  ``retry_container_two_stage_staging`` also clears the
+            # prior request's evidence/baseline so a delayed response cannot
+            # authorize this new view.
+            return self.retry_container_two_stage_staging(
+                next_staging_goal_option_index=next_index,
+                interaction_approach_attempts=[
+                    dict(item)
+                    for item in metadata.get("interaction_approach_attempts") or []
+                    if isinstance(item, dict)
+                ],
+                detail={
+                    **observation,
+                    "reason": f"{precondition_kind}_m1_next_capture_viewpoint",
+                    "interaction_visual_reobserve_from_goal_option_index": selected_index,
+                    "interaction_visual_reobserve_next_goal_option_index": next_index,
+                },
+                now=now,
+            )
         return self._transition(
             STATE_APPROACH_INTERACTION,
             now,
@@ -1831,6 +2709,59 @@ class BehaviorExecutionStateMachine:
         ):
             baseline_capture_step = previous_capture_step
             metadata["interaction_observation_after_capture_step"] = baseline_capture_step
+        viewpoints = int(metadata.get("interaction_observation_viewpoint_count", 0) or 0)
+        if self._container_two_stage_m1_capture_active(metadata):
+            try:
+                staging_index = int(
+                    metadata.get("container_two_stage_staging_goal_option_index", 0)
+                )
+            except (TypeError, ValueError):
+                staging_index = 0
+            viewed_indices: list[int] = []
+            for raw_index in list(
+                metadata.get("interaction_observation_viewpoint_staging_indices")
+                or []
+            ):
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if index >= 0 and index not in viewed_indices:
+                    viewed_indices.append(index)
+            if staging_index not in viewed_indices:
+                viewed_indices.append(staging_index)
+            viewpoints = len(viewed_indices)
+            metadata["interaction_observation_viewpoint_staging_indices"] = viewed_indices
+            metadata["interaction_observation_viewpoint_count"] = viewpoints
+            # Record only a capture pose which is about to issue M1.  Reaching
+            # an outer anchor or failing to reach a later direct capture must
+            # not become a sampled viewpoint or consume the evidence budget.
+            capture_goal = _goal_xyyaw_option(
+                metadata.get("container_two_stage_capture_pose_xyyaw")
+            )
+            if capture_goal is None:
+                capture_goal = container_two_stage_capture_goal_for_staging(
+                    self.candidate, staging_index
+                )
+            if capture_goal is not None:
+                metadata["container_m1_last_sampled_capture_goal_xyyaw"] = list(
+                    capture_goal
+                )
+                metadata["container_m1_last_sampled_capture_staging_index"] = (
+                    staging_index
+                )
+        elif viewpoints <= 0:
+            # Legacy candidates do not transition through a distinct capture
+            # pose.  Their first request still owns one explicit viewpoint.
+            viewpoints = 1
+            metadata["interaction_observation_viewpoint_count"] = viewpoints
+            metadata["interaction_observation_samples_at_viewpoint"] = 0
+        samples_at_viewpoint = (
+            int(metadata.get("interaction_observation_samples_at_viewpoint", 0) or 0)
+            + 1
+        )
+        metadata["interaction_observation_samples_at_viewpoint"] = samples_at_viewpoint
+        metadata["interaction_observation_viewpoint_pending"] = True
         attempts = int(metadata.get("interaction_observation_attempts", 0) or 0) + 1
         metadata["interaction_observation_attempts"] = attempts
         minimum_capture_step = (
@@ -1851,6 +2782,13 @@ class BehaviorExecutionStateMachine:
                 "object_id": interaction.get("object_id") or self.candidate.get("target_name"),
                 "attempt": attempts,
                 "max_attempts": self._interaction_observation_max_attempts(),
+                "same_pose_sample": samples_at_viewpoint,
+                "same_pose_samples_per_view": (
+                    self._interaction_observation_same_pose_samples_per_view()
+                ),
+                "viewpoint": viewpoints,
+                "max_viewpoints": self._interaction_observation_max_viewpoints(),
+                "max_total_requests": self._interaction_observation_max_total_requests(),
                 "min_capture_step": minimum_capture_step,
                 "require_current_visibility": True,
                 "require_attribute_status": "ready",
@@ -2205,6 +3143,26 @@ class BehaviorExecutionStateMachine:
                     "success": False,
                     "detail": {"reason": reason},
                 },
+            )
+        metadata = (self.candidate or {}).get("metadata") or {}
+        if (
+            self.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+            and str(reason or "") == "interaction_observation_timeout"
+            and (
+                bool(metadata.get("drawer_pre_action_observation"))
+                or bool(metadata.get("container_pre_action_observation"))
+            )
+        ):
+            # A missing M1 reply is visual uncertainty just like an oblique
+            # reply.  Spend the bounded same-pose/viewpoint evidence plan; do
+            # not let one endpoint timeout permanently exclude the container.
+            return self.on_interaction_observation_result(
+                {
+                    "reason": "interaction_observation_timeout",
+                    "attribute_status": "timeout",
+                    "is_currently_visible": False,
+                },
+                now,
             )
         return self._finish(False, {"reason": reason}, now)
 

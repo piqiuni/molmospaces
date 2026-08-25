@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import math
+import re
 from typing import Any
 
 
@@ -128,6 +129,14 @@ class CandidateGeneratorConfig:
     # a radial guess.
     container_multiview_enabled: bool = True
     container_multiview_face_count: int = 4
+    # When enabled, AABB geometry contributes only the four cardinal face
+    # candidates.  A current robot-side ray or remembered graph axis must not
+    # select the face; the targeted M1 result is the face authorization token.
+    container_m1_face_selection_enabled: bool = False
+    # Refrigerator leaves can hide the interior from widely separated side
+    # poses. Scale only the fridge multiview angular offsets; 0.5 maps the
+    # former 0/+90/-90/180 degree set to 0/+45/-45/90 degrees.
+    fridge_multiview_angular_scale: float = 1.0
     # Full-MLLM drawer scans require one targeted, causally later M1 view at
     # the arrived approach pose.  That view supplies frontality plus visible
     # drawer action regions; it is never replaced with a scene/joint fallback.
@@ -138,24 +147,73 @@ class CandidateGeneratorConfig:
     # itself authorization to pull/open a fridge, cabinet, or drawer.
     container_pre_action_mllm: bool = False
     container_pre_action_observation_max_attempts: int = 4
-    # ``None`` means drawers inherit ``container_standoff_m``.  The shipped
-    # YAML may opt into a type-specific drawer/fridge policy while the default
-    # remains backwards compatible for rule-only callers.
+    # ``None`` means drawers inherit ``container_standoff_m``.  These legacy
+    # fields describe the requested physical standoff *before* the legacy
+    # safety margin is applied.  New model-lane configs should instead use the
+    # explicit action/capture clearances below, so a visual observation never
+    # silently inherits a physical-distance calculation.
     drawer_standoff_m: float | None = None
-    # M1 is a visual front/action-region gate.  Do not collect that evidence
-    # from an arbitrarily close final-tolerance pose, where perspective and
-    # detector boxes are unstable.  Model lanes first use an outer staging
-    # pose for M1, then navigate to a separate type-safe physical action pose.
+    # Explicit AABB-surface clearances for the three distinct container phases.
+    # ``*_action_standoff_m`` includes any desired safety allowance and is the
+    # final physical bridge target.  ``*_m1_capture_standoff_m`` is the actual
+    # visual evidence pose.  ``None`` preserves legacy configs: action falls
+    # back to the old standoff + margin and capture falls back to the old
+    # observation field.  A capture nearer than its action pose is rejected by
+    # the resolver and explicitly falls back to the action clearance; this is
+    # a compatibility validation path, not the former runtime ``max(a, b)``
+    # policy.
+    container_action_standoff_m: float | None = None
+    drawer_action_standoff_m: float | None = None
+    fridge_action_standoff_m: float | None = None
+    container_m1_capture_standoff_m: float | None = None
+    drawer_m1_capture_standoff_m: float | None = None
+    fridge_m1_capture_standoff_m: float | None = None
+    # Deprecated names retained as a legacy capture-clearance fallback.  New
+    # configs should use the explicit ``*_m1_capture_standoff_m`` fields.
     container_observation_standoff_m: float = 0.7
     drawer_observation_standoff_m: float = 0.65
     fridge_observation_standoff_m: float = 0.8
-    # A high local inflation radius can make an otherwise valid AABB-surface
-    # standoff land in the soft-cost shoulder beside a wall.  Model lanes first
-    # visit a finite set of *outer* staging rings for their M1 observation.
-    # Their robot-side axis comes only from the current robot--object geometry;
-    # the executor's normal make-plan preflight selects the first reachable
-    # one.  This changes requested goal geometry only; collision/footprint
-    # checks remain in move_base.
+    # Navigation anchors are recovery / costmap escape points only.  M1 must
+    # not be queried from these offsets: the executor first maps an anchor to
+    # the direct capture point above.  The old safe-staging names remain as
+    # fallbacks so external policy YAMLs do not break during this migration.
+    container_navigation_anchor_outer_offset_m: float | None = None
+    container_navigation_anchor_ring_count: int | None = None
+    container_navigation_anchor_tangent_offset_m: float | None = None
+    # In the simplified model lane, one selected anchor is the complete
+    # interaction contract: move_base arrival, targeted M1 capture, and the
+    # physical bridge all bind to exactly the same x/y/yaw.  Keep this opt-in so
+    # legacy traces with a separate outer/capture/action mapping remain readable.
+    container_anchor_shared_pose_enabled: bool = False
+    # Type-specific navigation anchors can be sampled from the actual AABB
+    # surface in a bounded fan around each cardinal face normal.  M1 still
+    # authorizes which geometric face is the semantic front.
+    # Clearances are measured from the ray/box intersection, never the centre.
+    drawer_navigation_anchor_aabb_fan_enabled: bool = False
+    drawer_navigation_anchor_fan_clearances_m: tuple[float, ...] = (
+        0.50,
+        0.85,
+        1.20,
+    )
+    drawer_navigation_anchor_fan_angles_deg: tuple[float, ...] = (
+        -30.0,
+        -15.0,
+        0.0,
+        15.0,
+        30.0,
+    )
+    fridge_navigation_anchor_aabb_fan_enabled: bool = False
+    fridge_navigation_anchor_fan_clearances_m: tuple[float, ...] = (
+        1.15,
+        1.35,
+        1.55,
+    )
+    fridge_navigation_anchor_fan_angles_deg: tuple[float, ...] = (
+        -15.0,
+        0.0,
+        15.0,
+    )
+    # Deprecated navigation-anchor aliases.
     container_safe_staging_outer_offset_m: float = 0.35
     # Include one additional robot-side/four-view ring beyond ``safe_far`` by
     # default.  It gives a wall-adjacent container a costmap-reachable visual
@@ -174,6 +232,13 @@ class CandidateGeneratorConfig:
     # retry-until-success policy.  The candidate also clamps it to the number
     # of generated staging goals.
     container_two_stage_observation_max_attempts: int = 12
+    # M1 is a stochastic visual authorizer.  A negative result first receives
+    # a fresh same-pose confirmation, then consumes a distinct capture
+    # viewpoint.  These caps are deliberately separate from the navigation
+    # anchor count so one image flip cannot exhaust a container candidate.
+    container_m1_same_pose_samples_per_view: int = 2
+    container_m1_max_viewpoints: int = 4
+    container_m1_max_total_requests: int = 8
     # M1-only staging accepts the ordinary move_base terminal error separately
     # from the stricter physical bridge gate.  The default offset grows by the
     # same 5 cm as this envelope, preserving the previous minimum clearance to
@@ -186,6 +251,10 @@ class CandidateGeneratorConfig:
     # tried only after a fresh M1 acceptance for that exact outer staging face.
     # This is not a smaller standoff or a costmap exception.
     container_action_lateral_offset_m: float = 0.22
+    # M1 does not estimate a map-space normal from one image.  Once it confirms
+    # that a direct capture is frontal, the executor freezes that calibrated
+    # capture ray as the physical-action face for this decision.
+    container_m1_front_axis_from_capture: bool = True
     interaction_safety_margin_m: float = 0.0
     interaction_ready_distance_m: float = 0.45
     # This is the public yaw gate shared by final approach validation and the
@@ -193,6 +262,16 @@ class CandidateGeneratorConfig:
     # policy YAML to require a more front-facing interaction pose.
     interaction_ready_yaw_tolerance_rad: float = 0.55
     require_current_visibility: bool = False
+    # A remembered portal may remain in the graph after leaving the camera
+    # view.  Physical portal interaction is stricter than ordinary graph
+    # retention: the current RGB observation must contain enough of the leaf
+    # to make the approach decision meaningful.  A confirmed successful open
+    # is stored as an interaction postcondition and is not regenerated by this
+    # candidate path, so this gate does not erase confirmed state.
+    portal_require_current_visibility: bool = False
+    portal_min_visible_pixels: int = 128
+    portal_min_visible_fraction: float = 0.2
+    remembered_portal_reobservation_enabled: bool = False
     target_standoff_m: float = 1.0
     target_max_state_age_sec: float = 300.0
     target_require_current_visibility: bool = False
@@ -231,11 +310,111 @@ class CandidateGenerator:
             candidates.extend(
                 self._target_candidates(graph or {}, robot_xy, target_context or {})
             )
+            if not candidates and self.config.remembered_portal_reobservation_enabled:
+                candidates.extend(
+                    self._remembered_portal_reobservation_candidates(
+                        graph or {}, robot_xy
+                    )
+                )
         self._attach_portal_child_room_context(candidates, graph or {})
         self._attach_frontier_room_context(candidates, graph or {}, robot_xy)
         self._attach_spatial_context(candidates, graph or {})
         candidates = self._limit_frontier_candidates(candidates)
         return sorted(candidates, key=lambda candidate: candidate.candidate_id)
+
+    def _remembered_portal_reobservation_candidates(
+        self,
+        graph: dict[str, Any],
+        robot_xy: tuple[float, float],
+    ) -> list[BehaviorCandidate]:
+        """Keep a concrete subgoal while unresolved doors are out of view.
+
+        Full-MLLM physical door candidates deliberately require current pixels.
+        That visibility gate must not turn remembered unresolved doors into a
+        permanently empty candidate stream.  Navigate to the ordinary safe
+        portal approach first; the next graph revision can then emit the real
+        visually-authorized INTERACT candidate.
+        """
+
+        candidates: list[BehaviorCandidate] = []
+        for node in graph.get("nodes") or []:
+            if str(node.get("type") or "").strip().casefold() != "portal":
+                continue
+            interaction = node.get("interaction") or {}
+            if not bool(
+                interaction.get(
+                    "requires_interaction", node.get("requires_interaction", False)
+                )
+            ):
+                continue
+            state = str(
+                interaction.get("state", node.get("interaction_state")) or "unknown"
+            ).strip().casefold()
+            capability = str(
+                interaction.get("capability", node.get("interaction_capability")) or ""
+            ).strip().casefold()
+            if state in {"open", "opened", "succeeded", "satisfied"} or capability in {
+                "blocked",
+                "unavailable",
+                "unsupported",
+                "locked",
+            }:
+                continue
+            attributes = node.get("attributes") or {}
+            visible_now = bool(node.get("is_currently_visible")) and int(
+                attributes.get("visible_pixels", 0) or 0
+            ) >= int(self.config.portal_min_visible_pixels) and float(
+                attributes.get("visible_fraction", 0.0) or 0.0
+            ) >= float(self.config.portal_min_visible_fraction)
+            if visible_now:
+                continue
+            position = list(
+                node.get("aabb_center")
+                or node.get("centroid")
+                or node.get("position")
+                or []
+            )
+            if len(position) < 2:
+                continue
+            target_xy = (float(position[0]), float(position[1]))
+            goals, labels = self._approach_candidates(
+                robot_xy,
+                target_xy,
+                node,
+                self.config.portal_standoff_m,
+                "portal",
+            )
+            if not goals:
+                continue
+            node_id = str(node.get("id") or "")
+            candidates.append(
+                BehaviorCandidate(
+                    candidate_id=f"reobserve_portal:{node_id}",
+                    behavior_type=BEHAVIOR_NAVIGATE,
+                    source="remembered_interaction_reobserve",
+                    target_id=node_id,
+                    target_name=str(node.get("label") or node.get("name") or "door"),
+                    goal_xyyaw=list(goals[0]),
+                    features={
+                        "exploration_gain": 0.8,
+                        "visibility_gain": 1.0,
+                        "semantic_gain": 0.8,
+                        "distance_m": math.hypot(
+                            float(goals[0][0]) - robot_xy[0],
+                            float(goals[0][1]) - robot_xy[1],
+                        ),
+                        "priority": 0.9,
+                    },
+                    metadata={
+                        "reobserve_interaction_target": True,
+                        "requires_approach": True,
+                        "goal_xyyaw_candidates": [list(goal) for goal in goals],
+                        "interaction_approach_pose_labels": list(labels),
+                        "is_currently_visible": False,
+                    },
+                )
+            )
+        return candidates
 
     def _target_candidates(
         self,
@@ -1223,6 +1402,21 @@ class CandidateGenerator:
                     and not visual_unknown_portal_reobserve
                 ):
                     continue
+                if self.config.portal_require_current_visibility:
+                    portal_visible_pixels = int(
+                        attributes.get("visible_pixels", 0) or 0
+                    )
+                    portal_visible_fraction = float(
+                        attributes.get("visible_fraction", 0.0) or 0.0
+                    )
+                    if (
+                        not bool(node.get("is_currently_visible"))
+                        or portal_visible_pixels
+                        < int(self.config.portal_min_visible_pixels)
+                        or portal_visible_fraction
+                        < float(self.config.portal_min_visible_fraction)
+                    ):
+                        continue
                 if (
                     node_state == "unknown"
                     and not unknown_portal_rule_fallback
@@ -1264,9 +1458,10 @@ class CandidateGenerator:
             # point and may drift from that box; mixing the two made a
             # ``current_view_safe_outer`` pose face the centroid while its
             # clearance was computed from the AABB.  Use one geometry anchor
-            # for both the robot-side radial axis and the AABB surface offset.
-            # This remains only a visual re-observation pose when M1 lacks a
-            # front axis; it does not consume an oracle/front-direction field.
+            # for both the AABB-normal approach axis and the AABB surface
+            # offset.  This remains only a visual re-observation pose when M1
+            # lacks a front axis; it does not consume an oracle/front-direction
+            # field.
             position = self._node_xy(
                 node,
                 prefer_aabb=(node_type == "container"),
@@ -1333,8 +1528,21 @@ class CandidateGenerator:
             object_id = str(
                 attributes.get("instance_id") or source_object_name or node_id
             )
-            interaction_standoff = standoff + self.config.interaction_safety_margin_m
-            observation_standoff = interaction_standoff
+            legacy_interaction_standoff = self._nonnegative_clearance(
+                standoff + self.config.interaction_safety_margin_m
+            )
+            container_kind = (
+                "drawer"
+                if is_drawer_container
+                else "refrigerator"
+                if is_refrigerator_container
+                else "container"
+            )
+            physical_action_standoff = legacy_interaction_standoff
+            physical_action_standoff_source = "legacy_type_standoff_plus_safety_margin"
+            m1_capture_standoff = physical_action_standoff
+            m1_capture_standoff_source = "not_applicable"
+            m1_capture_standoff_validation = "not_applicable"
             container_two_stage_requested = bool(
                 node_type == "container" and (container_pre_action or drawer_pre_action)
             )
@@ -1349,46 +1557,148 @@ class CandidateGenerator:
                 self.config.interaction_ready_distance_m,
                 max(0.05, self.config.container_interaction_ready_distance_m),
             )
-            if node_type == "container" and (
-                container_pre_action or drawer_pre_action
-            ):
-                if is_drawer_container:
-                    minimum_observation_standoff = (
-                        self.config.drawer_observation_standoff_m
-                    )
-                elif is_refrigerator_container:
-                    minimum_observation_standoff = (
-                        self.config.fridge_observation_standoff_m
-                    )
-                else:
-                    minimum_observation_standoff = (
-                        self.config.container_observation_standoff_m
-                    )
-                observation_standoff = max(
-                    interaction_standoff,
-                    max(0.0, float(minimum_observation_standoff)),
+            navigation_anchor_outer_offset_m = 0.0
+            navigation_anchor_ring_count = 1
+            navigation_anchor_tangent_offset_m = 0.0
+            navigation_anchor_source = "not_applicable"
+            if node_type == "container":
+                (
+                    physical_action_standoff,
+                    physical_action_standoff_source,
+                    m1_capture_standoff,
+                    m1_capture_standoff_source,
+                    m1_capture_standoff_validation,
+                ) = self._container_phase_standoffs(
+                    container_kind=container_kind,
+                    legacy_action_standoff_m=legacy_interaction_standoff,
                 )
+                if container_two_stage_requested:
+                    (
+                        navigation_anchor_outer_offset_m,
+                        navigation_anchor_ring_count,
+                        navigation_anchor_tangent_offset_m,
+                        navigation_anchor_source,
+                    ) = self._navigation_anchor_settings()
+            shared_container_anchor_pose = bool(
+                container_two_stage_requested
+                and self.config.container_anchor_shared_pose_enabled
+            )
+            container_m1_face_selection = bool(
+                container_two_stage_requested
+                and self.config.container_m1_face_selection_enabled
+            )
+            if container_m1_face_selection:
+                # A graph-level attribute refresh may already have classified
+                # the current image.  It must not preselect the active
+                # decision's face: targeted M1 at one of the four explicit
+                # AABB faces owns that decision.
+                visual_container_axis = None
+            if shared_container_anchor_pose:
+                # There is one arrival contract for navigation, observation and
+                # action.  The physical-ready envelope is the conservative one;
+                # no wider outer-staging tolerance may authorize this pose.
+                container_staging_ready_distance_m = (
+                    container_physical_action_ready_distance_m
+                )
+                navigation_anchor_outer_offset_m = 0.0
+                navigation_anchor_ring_count = 1
+                navigation_anchor_tangent_offset_m = 0.0
+                navigation_anchor_source = "shared_navigation_m1_action_anchor"
+            # Store only the object reference geometry that was already used to
+            # generate the candidate ring.  A later M1-positive capture can use
+            # this to project its confirmed camera-side ray back to a safe
+            # AABB-surface action pose; it must not read a graph/oracle front
+            # axis for that purpose.
+            container_geometry_anchor_xy: list[float] = []
+            container_geometry_aabb_size_xy: list[float] = []
+            if node_type == "container":
+                try:
+                    container_geometry_anchor_xy = [
+                        float(position[0]),
+                        float(position[1]),
+                    ]
+                except (TypeError, ValueError, IndexError):
+                    container_geometry_anchor_xy = []
+                raw_container_size = list(node.get("aabb_size") or [])
+                if len(raw_container_size) >= 2:
+                    try:
+                        container_geometry_aabb_size_xy = [
+                            abs(float(raw_container_size[0])),
+                            abs(float(raw_container_size[1])),
+                        ]
+                    except (TypeError, ValueError):
+                        container_geometry_aabb_size_xy = []
             goal_candidates, approach_pose_labels = self._approach_candidates(
                 robot_xy,
                 position,
                 node,
-                observation_standoff,
+                (
+                    physical_action_standoff
+                    if shared_container_anchor_pose
+                    else m1_capture_standoff
+                    if container_two_stage_requested
+                    else physical_action_standoff
+                ),
                 node_type,
                 visual_container_axis=visual_container_axis,
-                safe_staging_outer_offset_m=(
-                    self.config.container_safe_staging_outer_offset_m
-                    if node_type == "container"
-                    and (container_pre_action or drawer_pre_action)
+                navigation_anchor_outer_offset_m=(
+                    0.0
+                    if shared_container_anchor_pose
+                    else navigation_anchor_outer_offset_m
+                    if container_two_stage_requested
                     else 0.0
                 ),
+                navigation_anchor_ring_count=navigation_anchor_ring_count,
+                navigation_anchor_tangent_offset_m=navigation_anchor_tangent_offset_m,
+                navigation_anchor_aabb_fan_clearances_m=(
+                    self.config.drawer_navigation_anchor_fan_clearances_m
+                    if is_drawer_container
+                    and self.config.drawer_navigation_anchor_aabb_fan_enabled
+                    else self.config.fridge_navigation_anchor_fan_clearances_m
+                    if is_refrigerator_container
+                    and self.config.fridge_navigation_anchor_aabb_fan_enabled
+                    else ()
+                ),
+                navigation_anchor_aabb_fan_angles_deg=(
+                    self.config.drawer_navigation_anchor_fan_angles_deg
+                    if is_drawer_container
+                    and self.config.drawer_navigation_anchor_aabb_fan_enabled
+                    else self.config.fridge_navigation_anchor_fan_angles_deg
+                    if is_refrigerator_container
+                    and self.config.fridge_navigation_anchor_aabb_fan_enabled
+                    else ()
+                ),
+                container_multiview_angular_scale=(
+                    self.config.fridge_multiview_angular_scale
+                    if is_refrigerator_container
+                    else 1.0
+                ),
+                container_m1_face_selection_enabled=(
+                    container_m1_face_selection
+                ),
             )
+            container_face_axes_by_staging = [
+                list(axis) if axis is not None else []
+                for axis in (
+                    self._container_face_axis_from_label(label)
+                    for label in approach_pose_labels
+                )
+            ]
+            container_anchor_robot_distances_m = [
+                math.hypot(float(goal[0]) - robot_xy[0], float(goal[1]) - robot_xy[1])
+                for goal in goal_candidates
+            ]
             # Keep the visual staging geometry and the physical action
             # geometry as two explicit, index-aligned lists.  The outer pose is
             # generated without a semantic front claim; its radial axis is
             # merely carried inward to the type-specific action standoff.  M1
             # later authorizes the action from the image captured at that exact
-            # outer pose, but it never supplies (or receives) this mapping.
+            # direct capture pose, but it never supplies (or receives) this
+            # mapping.  The outer goal is a navigation anchor only: M1 is
+            # deliberately never queried until the paired capture pose arrives.
             container_two_stage_mapping_ready = False
+            container_m1_capture_goals_by_staging: list[list[float]] = []
+            container_m1_capture_labels_by_staging: list[str] = []
             container_action_goals_by_staging: list[list[float]] = []
             container_action_labels_by_staging: list[str] = []
             container_staging_source_index_by_index: list[int] = list(
@@ -1398,21 +1708,59 @@ class CandidateGenerator:
                 container_staging_source_index_by_index = (
                     self._container_staging_source_indices(approach_pose_labels)
                 )
-                (
-                    container_action_goals_by_staging,
-                    container_action_labels_by_staging,
-                    container_action_goal_options_by_staging,
-                    container_action_option_labels_by_staging,
-                ) = self._container_action_goals_for_staging(
-                    target_xy=position,
-                    staging_goals=goal_candidates,
-                    staging_labels=approach_pose_labels,
-                    physical_standoff_m=interaction_standoff,
-                    lateral_offset_m=self.config.container_action_lateral_offset_m,
-                    node=node,
-                    staging_source_indices=container_staging_source_index_by_index,
-                )
+                if shared_container_anchor_pose:
+                    container_m1_capture_goals_by_staging = [
+                        list(goal) for goal in goal_candidates
+                    ]
+                    container_m1_capture_labels_by_staging = [
+                        f"{label}_shared_m1_capture"
+                        for label in approach_pose_labels
+                    ]
+                    container_action_goals_by_staging = [
+                        list(goal) for goal in goal_candidates
+                    ]
+                    container_action_labels_by_staging = [
+                        f"{label}_shared_physical_action"
+                        for label in approach_pose_labels
+                    ]
+                    container_action_goal_options_by_staging = [
+                        [list(goal)] for goal in goal_candidates
+                    ]
+                    container_action_option_labels_by_staging = [
+                        [container_action_labels_by_staging[index]]
+                        for index in range(len(goal_candidates))
+                    ]
+                else:
+                    (
+                        container_m1_capture_goals_by_staging,
+                        container_m1_capture_labels_by_staging,
+                    ) = self._container_m1_capture_goals_for_staging(
+                        target_xy=position,
+                        staging_goals=goal_candidates,
+                        staging_labels=approach_pose_labels,
+                        capture_standoff_m=m1_capture_standoff,
+                        node=node,
+                        staging_source_indices=container_staging_source_index_by_index,
+                    )
+                    (
+                        container_action_goals_by_staging,
+                        container_action_labels_by_staging,
+                        container_action_goal_options_by_staging,
+                        container_action_option_labels_by_staging,
+                    ) = self._container_action_goals_for_staging(
+                        target_xy=position,
+                        staging_goals=goal_candidates,
+                        staging_labels=approach_pose_labels,
+                        physical_standoff_m=physical_action_standoff,
+                        lateral_offset_m=self.config.container_action_lateral_offset_m,
+                        node=node,
+                        staging_source_indices=container_staging_source_index_by_index,
+                    )
                 container_two_stage_mapping_ready = bool(
+                    container_m1_capture_goals_by_staging
+                    and len(container_m1_capture_goals_by_staging)
+                    == len(goal_candidates)
+                    and
                     container_action_goals_by_staging
                     and len(container_action_goals_by_staging) == len(goal_candidates)
                     and len(container_action_goal_options_by_staging)
@@ -1504,29 +1852,46 @@ class CandidateGenerator:
                     if container_two_stage_requested
                     else self.config.interaction_ready_distance_m
                 ),
-                "container_staging_ready_distance_m": (
-                    container_staging_ready_distance_m
-                    if container_two_stage_requested
-                    else 0.0
-                ),
-                "container_physical_action_ready_distance_m": (
-                    container_physical_action_ready_distance_m
-                    if container_two_stage_requested
-                    else 0.0
-                ),
                 "interaction_ready_yaw_tolerance_rad": max(
                     0.05, float(self.config.interaction_ready_yaw_tolerance_rad)
                 ),
-                "container_kind": (
-                    "drawer"
-                    if is_drawer_container
-                    else "refrigerator"
-                    if is_refrigerator_container
-                    else "container"
-                    if node_type == "container"
-                    else ""
+                # Move-base has no per-goal tolerance fields in MoveBaseGoal.
+                # The executor consumes this explicit pair, applies it to DWA
+                # before dispatch, and uses the same pair for arrival checks.
+                "navigation_goal_position_tolerance_m": (
+                    container_staging_ready_distance_m
+                    if container_two_stage_requested
+                    else self.config.interaction_ready_distance_m
                 ),
+                "navigation_goal_yaw_tolerance_rad": max(
+                    0.05, float(self.config.interaction_ready_yaw_tolerance_rad)
+                ),
+                "navigation_goal_tolerance_contract_explicit": True,
             }
+            if node_type == "container":
+                interaction_command.update(
+                    {
+                        "container_staging_ready_distance_m": (
+                            container_staging_ready_distance_m
+                            if container_two_stage_requested
+                            else 0.0
+                        ),
+                        "container_physical_action_ready_distance_m": (
+                            container_physical_action_ready_distance_m
+                            if container_two_stage_requested
+                            else 0.0
+                        ),
+                        # M1 capture is a direct, action-clearance observation
+                        # pose; only the preceding navigation anchor uses the
+                        # wider outer staging tolerance.
+                        "container_m1_capture_ready_distance_m": (
+                            container_physical_action_ready_distance_m
+                            if container_two_stage_requested
+                            else 0.0
+                        ),
+                        "container_kind": container_kind,
+                    }
+                )
             if portal_aperture_observation is not None:
                 interaction_command["portal_aperture_observation"] = dict(
                     portal_aperture_observation
@@ -1582,10 +1947,75 @@ class CandidateGenerator:
                         "room_transition_required": room_hops not in {None, 0},
                         "room_hops": room_hops,
                         "room_reachable": room_hops is not None,
-                        "interaction_standoff_m": observation_standoff,
-                        "configured_interaction_standoff_m": interaction_standoff,
+                        # Keep the legacy names pointed at the physical action
+                        # clearance.  Previously ``interaction_standoff_m``
+                        # meant the implicit M1 observation base for two-stage
+                        # containers, which made traces report a distance that
+                        # neither described the outer navigation anchor nor the
+                        # bridge target.
+                        "interaction_standoff_m": physical_action_standoff,
+                        "configured_interaction_standoff_m": physical_action_standoff,
                         "interaction_standoff_source": standoff_source,
                         "interaction_safety_margin_m": self.config.interaction_safety_margin_m,
+                        "container_physical_action_standoff_m": (
+                            physical_action_standoff
+                            if node_type == "container"
+                            else 0.0
+                        ),
+                        "container_physical_action_standoff_source": (
+                            physical_action_standoff_source
+                            if node_type == "container"
+                            else ""
+                        ),
+                        "container_action_lateral_offset_m": (
+                            0.0
+                            if shared_container_anchor_pose
+                            else max(0.0, float(self.config.container_action_lateral_offset_m))
+                            if container_two_stage_requested
+                            else 0.0
+                        ),
+                        # Immutable object-reference geometry for the active
+                        # decision.  It carries no semantic/front-axis claim;
+                        # only an accepted M1 image at a calibrated capture
+                        # pose may turn its object-to-camera ray into an action
+                        # face.
+                        "container_geometry_anchor_xy": (
+                            list(container_geometry_anchor_xy)
+                            if container_two_stage_requested
+                            else []
+                        ),
+                        "container_geometry_aabb_size_xy": (
+                            list(container_geometry_aabb_size_xy)
+                            if container_two_stage_requested
+                            else []
+                        ),
+                        "container_m1_front_axis_from_capture": bool(
+                            container_two_stage_requested
+                            and (
+                                not shared_container_anchor_pose
+                                or container_m1_face_selection
+                            )
+                            and self.config.container_m1_front_axis_from_capture
+                        ),
+                        "container_anchor_shared_pose": shared_container_anchor_pose,
+                        "container_m1_face_selection_enabled": bool(
+                            container_m1_face_selection
+                        ),
+                        "container_m1_face_selection_contract": (
+                            "aabb_four_faces_m1_authorized"
+                            if container_m1_face_selection
+                            else "legacy_robot_side_or_mllm_view"
+                        ),
+                        "container_face_axis_xy_by_staging_index": (
+                            container_face_axes_by_staging
+                            if container_two_stage_requested
+                            else []
+                        ),
+                        "container_anchor_robot_distance_m_by_staging_index": (
+                            container_anchor_robot_distances_m
+                            if container_two_stage_requested
+                            else []
+                        ),
                         "container_kind": (
                             "drawer"
                             if is_drawer_container
@@ -1599,25 +2029,63 @@ class CandidateGenerator:
                             node_type == "container"
                             and (container_pre_action or drawer_pre_action)
                         ),
+                        # ``m1_observation_standoff_m`` remains a readable
+                        # compatibility alias.  The canonical fields below
+                        # make it explicit that it is a direct capture point,
+                        # not an outer navigation ring.
                         "m1_observation_standoff_m": (
-                            observation_standoff
+                            m1_capture_standoff
                             if node_type == "container"
                             and (container_pre_action or drawer_pre_action)
                             else 0.0
                         ),
+                        "container_m1_capture_standoff_m": (
+                            m1_capture_standoff
+                            if container_two_stage_requested
+                            else 0.0
+                        ),
+                        "container_m1_capture_standoff_source": (
+                            m1_capture_standoff_source
+                            if container_two_stage_requested
+                            else ""
+                        ),
+                        "container_m1_capture_standoff_validation": (
+                            m1_capture_standoff_validation
+                            if container_two_stage_requested
+                            else "not_applicable"
+                        ),
+                        "container_navigation_anchor_outer_offset_m": (
+                            navigation_anchor_outer_offset_m
+                            if container_two_stage_requested
+                            else 0.0
+                        ),
+                        "container_navigation_anchor_ring_count": (
+                            navigation_anchor_ring_count
+                            if container_two_stage_requested
+                            else 0
+                        ),
+                        "container_navigation_anchor_tangent_offset_m": (
+                            navigation_anchor_tangent_offset_m
+                            if container_two_stage_requested
+                            else 0.0
+                        ),
+                        "container_navigation_anchor_source": (
+                            navigation_anchor_source
+                            if container_two_stage_requested
+                            else ""
+                        ),
+                        # Deprecated alias used by existing executor versions
+                        # while they migrate from staging observations to
+                        # navigation anchors.
                         "m1_safe_staging_outer_offset_m": (
-                            max(
-                                0.0,
-                                float(
-                                    self.config.container_safe_staging_outer_offset_m
-                                ),
-                            )
-                            if node_type == "container"
-                            and (container_pre_action or drawer_pre_action)
+                            navigation_anchor_outer_offset_m
+                            if container_two_stage_requested
                             else 0.0
                         ),
                         "m1_safe_staging_arrival_tolerance_m": (
-                            min(
+                            container_physical_action_ready_distance_m
+                            if shared_container_anchor_pose
+                            else min(
                                 self.config.interaction_ready_distance_m,
                                 max(
                                     self.config.container_interaction_ready_distance_m,
@@ -1710,6 +2178,50 @@ class CandidateGenerator:
                             if container_two_stage_requested
                             else 0
                         ),
+                        # Evidence budgets are intentionally not the outer
+                        # anchor count.  Every viewpoint earns up to the given
+                        # number of independently fresh M1 frames before a
+                        # negative image advances to another capture pose.
+                        "interaction_observation_same_pose_samples_per_view": (
+                            max(
+                                1,
+                                int(
+                                    self.config.container_m1_same_pose_samples_per_view
+                                ),
+                            )
+                            if container_two_stage_requested
+                            else 1
+                        ),
+                        "interaction_observation_max_viewpoints": (
+                            min(
+                                len(goal_candidates),
+                                max(
+                                    1,
+                                    int(self.config.container_m1_max_viewpoints),
+                                ),
+                            )
+                            if container_two_stage_requested
+                            else 0
+                        ),
+                        "interaction_observation_max_total_requests": (
+                            min(
+                                max(
+                                    1,
+                                    int(
+                                        self.config.container_m1_max_total_requests
+                                    ),
+                                ),
+                                len(goal_candidates)
+                                * max(
+                                    1,
+                                    int(
+                                        self.config.container_m1_same_pose_samples_per_view
+                                    ),
+                                ),
+                            )
+                            if container_two_stage_requested
+                            else 0
+                        ),
                         "interaction_observation_source": (
                             "mllm_attribute_inference"
                             if (
@@ -1740,11 +2252,47 @@ class CandidateGenerator:
                         "container_staging_pose_labels": list(approach_pose_labels)
                         if container_two_stage_requested
                         else [],
+                        # Canonical names for the same legacy staging fields:
+                        # these positions are navigation recovery anchors, not
+                        # M1 observation locations.
+                        "container_navigation_anchor_goal_xyyaw_candidates": [
+                            list(goal) for goal in goal_candidates
+                        ]
+                        if container_two_stage_requested
+                        else [],
+                        "container_navigation_anchor_pose_labels": list(
+                            approach_pose_labels
+                        )
+                        if container_two_stage_requested
+                        else [],
                         "container_staging_source_index_by_index": list(
                             container_staging_source_index_by_index
                         )
                         if container_two_stage_requested
                         else [],
+                        # M1 visual retries use a separate, face-diverse order
+                        # from navigation's face-major recovery list.  This
+                        # keeps the planner-friendly anchor ordering while a
+                        # single oblique M1 image can promptly sample another
+                        # face rather than spend its entire evidence budget at
+                        # farther radii of the same face.
+                        "container_m1_viewpoint_order": (
+                            self._container_m1_viewpoint_order(approach_pose_labels)
+                            if container_two_stage_requested
+                            else []
+                        ),
+                        # Index i is a complete three-phase contract:
+                        # navigation_anchor[i] -> m1_capture[i] ->
+                        # physical_action[i].  Capture positions are direct
+                        # configured clearances; the navigation-only outer
+                        # offset is not part of their geometry.
+                        "container_m1_capture_goal_xyyaw_by_staging_index": [
+                            list(goal)
+                            for goal in container_m1_capture_goals_by_staging
+                        ],
+                        "container_m1_capture_pose_labels_by_staging_index": list(
+                            container_m1_capture_labels_by_staging
+                        ),
                         "container_action_goal_xyyaw_by_staging_index": [
                             list(goal) for goal in container_action_goals_by_staging
                         ],
@@ -2082,7 +2630,8 @@ class CandidateGenerator:
         ``interaction_approach_pose_xyyaw`` are intentionally excluded here:
         they may be supplied by scene geometry or an oracle.  M1 instead says
         whether the *current* camera view is front/oblique enough to approach;
-        the actual axis is then the normalized object-to-robot direction.
+        the actual axis is then snapped to the visible AABB face direction
+        nearest that view, not the arbitrary robot-to-centre angle.
         """
 
         attributes = node.get("attributes") or {}
@@ -2120,6 +2669,9 @@ class CandidateGenerator:
             attributes.get("approach_ready")
         ):
             return None
+        aabb_axis = CandidateGenerator._aabb_surface_axis(node, robot_xy, target_xy)
+        if aabb_axis is not None:
+            return aabb_axis
         axis_x = float(robot_xy[0]) - float(target_xy[0])
         axis_y = float(robot_xy[1]) - float(target_xy[1])
         norm = math.hypot(axis_x, axis_y)
@@ -2128,12 +2680,167 @@ class CandidateGenerator:
         return axis_x / norm, axis_y / norm
 
     @staticmethod
+    def _aabb_surface_axis(
+        node: dict[str, Any],
+        robot_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+    ) -> tuple[float, float] | None:
+        """Return the AABB face normal on the side currently seen by the robot."""
+
+        size = list(node.get("aabb_size") or [])
+        if len(size) < 2:
+            return None
+        try:
+            half_x = 0.5 * abs(float(size[0]))
+            half_y = 0.5 * abs(float(size[1]))
+        except (TypeError, ValueError):
+            return None
+        if half_x <= 1e-6 or half_y <= 1e-6:
+            return None
+        dx = float(robot_xy[0]) - float(target_xy[0])
+        dy = float(robot_xy[1]) - float(target_xy[1])
+        scaled_x = abs(dx) / half_x
+        scaled_y = abs(dy) / half_y
+        if scaled_x >= scaled_y:
+            return (1.0, 0.0) if dx >= 0.0 else (-1.0, 0.0)
+        return (0.0, 1.0) if dy >= 0.0 else (0.0, -1.0)
+
+    @staticmethod
     def _truthy_mllm_attribute(value: Any) -> bool:
         return value is True or str(value or "").strip().casefold() in {
             "1",
             "true",
             "yes",
         }
+
+    @staticmethod
+    def _nonnegative_clearance(value: Any, fallback: float = 0.0) -> float:
+        """Parse a public surface-clearance setting without propagating NaNs."""
+
+        try:
+            clearance = float(value)
+        except (TypeError, ValueError):
+            return float(fallback)
+        if not math.isfinite(clearance) or clearance < 0.0:
+            return float(fallback)
+        return clearance
+
+    def _explicit_container_clearance(
+        self,
+        *,
+        container_kind: str,
+        phase: str,
+    ) -> tuple[float | None, str]:
+        """Return the direct type/generic phase setting, if one was supplied.
+
+        The generic direct setting is intentionally lower precedence than a
+        type-specific direct setting, but higher precedence than every legacy
+        standoff field.  This lets a policy declare one contract for all
+        containers while overriding, for example, refrigerator clearance.
+        """
+
+        if phase not in {"action", "m1_capture"}:
+            return None, ""
+        type_prefix = {
+            "drawer": "drawer",
+            "refrigerator": "fridge",
+            "container": "container",
+        }.get(container_kind, "container")
+        field_suffix = f"_{phase}_standoff_m"
+        field_names = [f"{type_prefix}{field_suffix}"]
+        if type_prefix != "container":
+            field_names.append(f"container{field_suffix}")
+        for field_name in field_names:
+            value = getattr(self.config, field_name, None)
+            if value is None:
+                continue
+            clearance = self._nonnegative_clearance(value, fallback=-1.0)
+            if clearance < 0.0:
+                continue
+            return clearance, f"explicit_{field_name}"
+        return None, ""
+
+    def _container_phase_standoffs(
+        self,
+        *,
+        container_kind: str,
+        legacy_action_standoff_m: float,
+    ) -> tuple[float, str, float, str, str]:
+        """Resolve direct action/capture clearances for a container candidate.
+
+        Legacy policy files still provide a physical standoff plus a safety
+        margin and a separate observation setting.  They are migrated here
+        once into explicit values.  In new configs no action/capture ``max`` is
+        taken at candidate generation: each phase has its declared clearance.
+        If a legacy or explicit capture setting violates the safety invariant,
+        the resolver records that validation and falls back to the action
+        clearance rather than producing an unsafe capture pose.
+        """
+
+        legacy_action = self._nonnegative_clearance(legacy_action_standoff_m)
+        explicit_action, action_source = self._explicit_container_clearance(
+            container_kind=container_kind,
+            phase="action",
+        )
+        if explicit_action is None:
+            action_standoff = legacy_action
+            action_source = "legacy_type_standoff_plus_safety_margin"
+        else:
+            action_standoff = explicit_action
+
+        explicit_capture, capture_source = self._explicit_container_clearance(
+            container_kind=container_kind,
+            phase="m1_capture",
+        )
+        if explicit_capture is None:
+            legacy_capture_field = {
+                "drawer": "drawer_observation_standoff_m",
+                "refrigerator": "fridge_observation_standoff_m",
+                "container": "container_observation_standoff_m",
+            }.get(container_kind, "container_observation_standoff_m")
+            capture_standoff = self._nonnegative_clearance(
+                getattr(self.config, legacy_capture_field, 0.0)
+            )
+            capture_source = f"legacy_{legacy_capture_field}"
+        else:
+            capture_standoff = explicit_capture
+
+        validation = "valid"
+        if capture_standoff + 1e-6 < action_standoff:
+            # Do not repeat the old max(action, observation) rule here.  This
+            # is an explicit invalid-config fallback, exposed in candidate
+            # metadata so the applied capture clearance is never mysterious.
+            capture_standoff = action_standoff
+            validation = "capture_below_action_fallback_to_action"
+        return (
+            action_standoff,
+            action_source,
+            capture_standoff,
+            capture_source,
+            validation,
+        )
+
+    def _navigation_anchor_settings(self) -> tuple[float, int, float, str]:
+        """Resolve outer recovery anchors without turning them into M1 poses."""
+
+        explicit_offset = self.config.container_navigation_anchor_outer_offset_m
+        explicit_count = self.config.container_navigation_anchor_ring_count
+        explicit_tangent = self.config.container_navigation_anchor_tangent_offset_m
+        offset_source = "explicit_navigation_anchor"
+        if explicit_offset is None:
+            explicit_offset = self.config.container_safe_staging_outer_offset_m
+            offset_source = "legacy_safe_staging"
+        if explicit_count is None:
+            explicit_count = self.config.container_safe_staging_ring_count
+        if explicit_tangent is None:
+            explicit_tangent = self.config.container_safe_staging_tangent_offset_m
+        offset = self._nonnegative_clearance(explicit_offset)
+        tangent = self._nonnegative_clearance(explicit_tangent)
+        try:
+            ring_count = int(explicit_count)
+        except (TypeError, ValueError):
+            ring_count = 1
+        return offset, max(1, min(4, ring_count)), tangent, offset_source
 
     def _approach_candidates(
         self,
@@ -2144,7 +2851,13 @@ class CandidateGenerator:
         node_type: str,
         *,
         visual_container_axis: tuple[float, float] | None = None,
-        safe_staging_outer_offset_m: float = 0.0,
+        navigation_anchor_outer_offset_m: float = 0.0,
+        navigation_anchor_ring_count: int = 1,
+        navigation_anchor_tangent_offset_m: float = 0.0,
+        navigation_anchor_aabb_fan_clearances_m: tuple[float, ...] = (),
+        navigation_anchor_aabb_fan_angles_deg: tuple[float, ...] = (),
+        container_multiview_angular_scale: float = 1.0,
+        container_m1_face_selection_enabled: bool = False,
     ) -> tuple[list[list[float]], list[str]]:
         candidates: list[list[float]] = []
         labels: list[str] = []
@@ -2191,14 +2904,96 @@ class CandidateGenerator:
                         )
             return candidates, labels
 
-        outer_offset = max(0.0, float(safe_staging_outer_offset_m))
+        outer_offset = self._nonnegative_clearance(
+            navigation_anchor_outer_offset_m
+        )
+
+        fan_clearances = sorted(
+            {
+                self._nonnegative_clearance(value)
+                for value in navigation_anchor_aabb_fan_clearances_m
+                if self._nonnegative_clearance(value) > 1e-6
+            }
+        )
+        fan_angles_deg = []
+        for raw_angle in navigation_anchor_aabb_fan_angles_deg:
+            try:
+                angle_deg = max(-89.0, min(89.0, float(raw_angle)))
+            except (TypeError, ValueError):
+                continue
+            if angle_deg not in fan_angles_deg:
+                fan_angles_deg.append(angle_deg)
+        # A fan is a geometric set, not an execution queue.  Publish its stable
+        # canonical order in the same near/straight-first preference used by
+        # the batch planner: 0, -small, +small, -large, +large.
+        fan_angles_deg.sort(
+            key=lambda value: (abs(value), 0 if value <= 0.0 else 1)
+        )
+        if fan_clearances and fan_angles_deg:
+            # Treat the public AABB as the real object bounds. Select the face
+            # intersected by the centre-to-robot ray, then sample a surface fan
+            # around that exact cardinal face normal. This removes the former
+            # arbitrary robot-ray tilt while keeping the anchors on the visible
+            # half of the box.
+            size = list(node.get("aabb_size") or [])
+            if len(size) >= 2:
+                half_x = 0.5 * abs(float(size[0]))
+                half_y = 0.5 * abs(float(size[1]))
+            else:
+                half_x = half_y = 0.0
+            if half_x > 1e-6 and half_y > 1e-6:
+                dx = float(robot_xy[0]) - float(target_xy[0])
+                dy = float(robot_xy[1]) - float(target_xy[1])
+                scaled_x = abs(dx) / half_x
+                scaled_y = abs(dy) / half_y
+                if container_m1_face_selection_enabled:
+                    face_axes = (
+                        (0.0, "pos_x"),
+                        (math.pi / 2.0, "pos_y"),
+                        (math.pi, "neg_x"),
+                        (-math.pi / 2.0, "neg_y"),
+                    )
+                elif scaled_x >= scaled_y:
+                    face_axes = ((0.0 if dx >= 0.0 else math.pi,
+                                  "pos_x" if dx >= 0.0 else "neg_x"),)
+                else:
+                    face_axes = ((math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0,
+                                  "pos_y" if dy >= 0.0 else "neg_y"),)
+                for normal_angle, face_name in face_axes:
+                    for clearance in fan_clearances:
+                        for angle_deg in fan_angles_deg:
+                            angle = normal_angle + math.radians(angle_deg)
+                            axis = (math.cos(angle), math.sin(angle))
+                            ray_scale = max(
+                                abs(axis[0]) / half_x,
+                                abs(axis[1]) / half_y,
+                            )
+                            boundary_distance = 1.0 / ray_scale
+                            x = target_xy[0] + axis[0] * (
+                                boundary_distance + clearance
+                            )
+                            y = target_xy[1] + axis[1] * (
+                                boundary_distance + clearance
+                            )
+                            append_unique(
+                                [
+                                    x,
+                                    y,
+                                    math.atan2(target_xy[1] - y, target_xy[0] - x),
+                                ],
+                                (
+                                    f"aabb_fan_{face_name}_angle_{angle_deg:+g}_"
+                                    f"clearance_{clearance:.2f}"
+                                ),
+                            )
+                return candidates, labels
 
         # M1 may explicitly say that the current RGB view contains the front
-        # (or an adequate oblique face) of a container.  Derive the outward
-        # approach axis from the actual robot--object geometry at that fresh
-        # observation.  Do not read interaction_approach_axis_xy or an
+        # (or an adequate oblique face) of a container.  Snap that outward
+        # approach axis to the current AABB face normal, not the arbitrary
+        # robot-to-centre angle.  Do not read interaction_approach_axis_xy or an
         # interaction pose here: both can originate from GT/oracle geometry.
-        if visual_container_axis is not None and outer_offset <= 1e-6:
+        if visual_container_axis is not None and not container_m1_face_selection_enabled and outer_offset <= 1e-6:
             # Preserve the rule/default behavior for callers that did not ask
             # for a model-lane safe staging ring.
             for extra_standoff in (0.0, 0.25, 0.50):
@@ -2215,13 +3010,26 @@ class CandidateGenerator:
                 )
             return candidates, labels
 
-        if visual_container_axis is not None:
+        try:
+            angular_scale = max(0.0, min(1.0, float(container_multiview_angular_scale)))
+        except (TypeError, ValueError):
+            angular_scale = 1.0
+
+        def rotate_axis(axis: tuple[float, float], angle: float) -> tuple[float, float]:
+            cosine = math.cos(angle)
+            sine = math.sin(angle)
+            return (
+                axis[0] * cosine - axis[1] * sine,
+                axis[0] * sine + axis[1] * cosine,
+            )
+
+        if visual_container_axis is not None and not container_m1_face_selection_enabled:
             radial_axis = visual_container_axis
             axes = (
                 radial_axis,
-                (-radial_axis[1], radial_axis[0]),
-                (radial_axis[1], -radial_axis[0]),
-                (-radial_axis[0], -radial_axis[1]),
+                rotate_axis(radial_axis, 0.5 * math.pi * angular_scale),
+                rotate_axis(radial_axis, -0.5 * math.pi * angular_scale),
+                rotate_axis(radial_axis, math.pi * angular_scale),
             )
             face_labels = (
                 "mllm_current_view",
@@ -2243,44 +3051,61 @@ class CandidateGenerator:
 
         else:
             # No fresh M1 front observation was available.  The first pose
-            # retains the current radial side, then the executor may re-observe
+            # retains the current AABB face, then the executor may re-observe
             # from three orthogonal faces.  These labels describe only the
             # candidate-ring order; they do not assert a semantic front or
             # reuse oracle geometry.
             dx = float(robot_xy[0]) - float(target_xy[0])
             dy = float(robot_xy[1]) - float(target_xy[1])
             distance = math.hypot(dx, dy)
-            radial_axis = (
+            aabb_axis = self._aabb_surface_axis(node, robot_xy, target_xy)
+            radial_axis = aabb_axis or (
                 (-1.0, 0.0)
                 if distance <= 1e-6
                 else (dx / distance, dy / distance)
             )
-            axes = (
-                radial_axis,
-                (-radial_axis[1], radial_axis[0]),
-                (radial_axis[1], -radial_axis[0]),
-                (-radial_axis[0], -radial_axis[1]),
-            )
-            face_labels = (
-                "current_view",
-                "quarter_turn_left",
-                "quarter_turn_right",
-                "opposite_view",
-            )
+            if container_m1_face_selection_enabled:
+                # The AABB supplies only geometry.  Enumerate all four
+                # cardinal faces in a stable order; M1, not the robot's
+                # current side, decides which one is the usable front.
+                axes = (
+                    (1.0, 0.0),
+                    (0.0, 1.0),
+                    (-1.0, 0.0),
+                    (0.0, -1.0),
+                )
+                face_labels = (
+                    "aabb_face_pos_x",
+                    "aabb_face_pos_y",
+                    "aabb_face_neg_x",
+                    "aabb_face_neg_y",
+                )
+            else:
+                axes = (
+                    radial_axis,
+                    rotate_axis(radial_axis, 0.5 * math.pi * angular_scale),
+                    rotate_axis(radial_axis, -0.5 * math.pi * angular_scale),
+                    rotate_axis(radial_axis, math.pi * angular_scale),
+                )
+                face_labels = (
+                    "current_view",
+                    "quarter_turn_left",
+                    "quarter_turn_right",
+                    "opposite_view",
+                )
         face_count = max(1, min(len(axes), int(self.config.container_multiview_face_count)))
         if outer_offset > 1e-6:
-            # Make every safe ring farther from the object than the requested
-            # observation standoff.  A wall-adjacent container can leave the
-            # first two rings inside a local-inflation shoulder even though a
-            # robot-side staging point another 30 cm away is fully reachable.
-            # Do not recover by reintroducing the old inner shoulder: that
-            # would call M1 from the exact close perspective this contract is
-            # meant to avoid.  The bounded rings remain ordinary move_base
-            # goals, so no costmap cells are cleared or treated as hard-free.
+            # Make every navigation anchor farther from the direct capture
+            # point.  A wall-adjacent container can leave the closest route in
+            # a local-inflation shoulder even though an anchor another 30 cm
+            # away is reachable.  The executor later moves from this anchor to
+            # the index-aligned direct M1 capture pose; M1 is not called here.
+            # The bounded anchors remain ordinary move_base goals, so no
+            # costmap cells are cleared or treated as hard-free.
             try:
-                ring_count = int(self.config.container_safe_staging_ring_count)
+                ring_count = int(navigation_anchor_ring_count)
             except (TypeError, ValueError):
-                ring_count = 3
+                ring_count = 1
             ring_count = max(1, min(4, ring_count))
             ring_labels = ("safe_outer", "safe_far", "safe_farthest", "safe_max")
             # Keep each visual face contiguous across its bounded safe radii.
@@ -2307,16 +3132,12 @@ class CandidateGenerator:
                         fixed_axis=axis,
                     )
                     append_unique(base_pose, base_label)
-                    # A safe outer staging pose can still frame an appliance
-                    # behind a nearby counter edge.  Preserve its normal
-                    # clearance and add two bounded camera viewpoints along
-                    # the tangent only on the closest safe ring.  These labels
-                    # remain observation-only: their physical mapping below
-                    # explicitly reuses this base face rather than inferring a
-                    # contact normal from the tangent camera pose.
-                    tangent_offset_m = max(
-                        0.0,
-                        float(self.config.container_safe_staging_tangent_offset_m),
+                    # Preserve optional tangential recovery anchors on the
+                    # closest ring.  Their capture mapping retains the same
+                    # tangent shift at the direct capture clearance, while the
+                    # physical action mapping continues to reuse the base face.
+                    tangent_offset_m = self._nonnegative_clearance(
+                        navigation_anchor_tangent_offset_m
                     )
                     if ring_index != 1 or tangent_offset_m <= 1e-6:
                         continue
@@ -2350,12 +3171,31 @@ class CandidateGenerator:
         return candidates, labels
 
     @staticmethod
+    def _container_face_axis_from_label(
+        label: str,
+    ) -> tuple[float, float] | None:
+        """Return the cardinal AABB face carried by an internal anchor label."""
+
+        text = str(label)
+        for face_name, axis in (
+            ("pos_x", (1.0, 0.0)),
+            ("pos_y", (0.0, 1.0)),
+            ("neg_x", (-1.0, 0.0)),
+            ("neg_y", (0.0, -1.0)),
+        ):
+            if text.startswith(f"aabb_face_{face_name}") or text.startswith(
+                f"aabb_fan_{face_name}_"
+            ):
+                return axis
+        return None
+
+    @staticmethod
     def _container_staging_source_indices(staging_labels: list[str]) -> list[int]:
-        """Map an outer tangent observation back to its base-face action pose.
+        """Map an outer tangent anchor back to its base-face action pose.
 
         The labels are internal candidate geometry labels, not semantic front
-        claims.  Tangential safe observations should earn their own fresh M1
-        evidence, but must never rotate the subsequent physical contact axis.
+        claims.  Tangential anchors retain their camera shift at M1 capture,
+        but must never rotate the subsequent physical contact axis.
         """
 
         labels = [str(label) for label in staging_labels]
@@ -2373,6 +3213,153 @@ class CandidateGenerator:
                 break
             source_indices.append(source_index)
         return source_indices
+
+    @staticmethod
+    def _container_m1_viewpoint_order(staging_labels: list[str]) -> list[int]:
+        """Return a bounded, face-diverse M1 order over immutable anchors.
+
+        Navigation remains face-major because it has to keep nearby recovery
+        routes coherent.  Visual evidence has a different job: after a
+        same-pose confirmation, it should expose one direct outer view from
+        each available face before spending budget on tangents and farther
+        rings.  Labels are generator-private bookkeeping only; no semantic
+        front axis or oracle geometry is introduced by this scheduling.
+        """
+
+        labels = [str(label) for label in staging_labels]
+        face_names = ("pos_x", "pos_y", "neg_x", "neg_y")
+        face_fans: dict[str, list[tuple[float, float, int, int]]] = {
+            face: [] for face in face_names
+        }
+        for index, label in enumerate(labels):
+            match = re.fullmatch(
+                r"aabb_fan_(pos_x|pos_y|neg_x|neg_y)_angle_"
+                r"(?P<angle>[+-]?[0-9.]+)_clearance_(?P<clearance>[0-9.]+)",
+                label,
+            )
+            if match is None:
+                continue
+            angle = float(match.group("angle"))
+            clearance = float(match.group("clearance"))
+            face_fans[match.group(1)].append(
+                (clearance, abs(angle), 0 if angle <= 0.0 else 1, index)
+            )
+        if any(face_fans.values()):
+            for values in face_fans.values():
+                values.sort()
+            ordered: list[int] = []
+            max_per_face = max(len(values) for values in face_fans.values())
+            # Round-robin across AABB faces.  One negative M1 view therefore
+            # advances to a different physical face before spending evidence
+            # budget on a wider angle/radius of the same face.
+            for rank in range(max_per_face):
+                for face in face_names:
+                    values = face_fans[face]
+                    if rank < len(values):
+                        ordered.append(values[rank][3])
+            ordered.extend(
+                index for index in range(len(labels)) if index not in ordered
+            )
+            return ordered
+        buckets: list[list[int]] = [[], [], [], [], []]
+        for index, label in enumerate(labels):
+            if "_safe_outer_tangent_" in label:
+                buckets[1].append(index)
+            elif label.endswith("_safe_outer"):
+                buckets[0].append(index)
+            elif label.endswith("_safe_far"):
+                buckets[2].append(index)
+            elif label.endswith("_safe_farthest"):
+                buckets[3].append(index)
+            elif label.endswith("_safe_max"):
+                buckets[4].append(index)
+        ordered = [index for bucket in buckets for index in bucket]
+        # Hand-authored/legacy labels may not follow the generator naming
+        # scheme.  Retain every valid anchor deterministically instead of
+        # silently losing a safe fallback.
+        ordered.extend(index for index in range(len(labels)) if index not in ordered)
+        return ordered
+
+    @classmethod
+    def _container_m1_capture_goals_for_staging(
+        cls,
+        *,
+        target_xy: tuple[float, float],
+        staging_goals: list[list[float]],
+        staging_labels: list[str],
+        capture_standoff_m: float,
+        node: dict[str, Any],
+        staging_source_indices: list[int] | None = None,
+    ) -> tuple[list[list[float]], list[str]]:
+        """Map navigation anchors to direct, index-aligned M1 capture poses.
+
+        An anchor may sit farther from the object solely to escape an inflated
+        costmap.  It must not decide the visual evidence range.  Each mapped
+        pose restores the configured direct capture clearance on the same
+        radial face.  Tangent anchors retain their tangent displacement at the
+        capture clearance so they remain genuinely different camera views;
+        the separate physical-action mapping still reuses the base face.
+        """
+
+        capture_goals: list[list[float]] = []
+        capture_labels: list[str] = []
+        direct_capture_standoff = cls._nonnegative_clearance(capture_standoff_m)
+        for index, staging_goal in enumerate(staging_goals):
+            source_index = (
+                int(staging_source_indices[index])
+                if staging_source_indices is not None
+                and index < len(staging_source_indices)
+                else index
+            )
+            if source_index < 0 or source_index >= len(staging_goals):
+                return [], []
+            source_goal = list(staging_goals[source_index] or [])
+            values = list(staging_goal or [])
+            if len(source_goal) < 2 or len(values) < 2:
+                return [], []
+            try:
+                axis_x = float(source_goal[0]) - float(target_xy[0])
+                axis_y = float(source_goal[1]) - float(target_xy[1])
+            except (TypeError, ValueError):
+                return [], []
+            axis_norm = math.hypot(axis_x, axis_y)
+            if axis_norm <= 1e-6:
+                return [], []
+            axis = axis_x / axis_norm, axis_y / axis_norm
+            capture = cls._approach_pose(
+                target_xy,
+                target_xy,
+                direct_capture_standoff,
+                node=node,
+                fixed_axis=axis,
+            )
+            # Preserve a recovery anchor's tangent offset at the direct capture
+            # radius.  Project rather than copying XY deltas so a different
+            # outer radial ring cannot leak into the visual clearance.
+            try:
+                staging_delta_x = float(values[0]) - float(source_goal[0])
+                staging_delta_y = float(values[1]) - float(source_goal[1])
+            except (TypeError, ValueError):
+                return [], []
+            tangent_x, tangent_y = -axis[1], axis[0]
+            tangent_offset = (
+                staging_delta_x * tangent_x + staging_delta_y * tangent_y
+            )
+            if abs(tangent_offset) > 1e-9:
+                capture[0] += tangent_offset * tangent_x
+                capture[1] += tangent_offset * tangent_y
+                capture[2] = math.atan2(
+                    float(target_xy[1]) - capture[1],
+                    float(target_xy[0]) - capture[0],
+                )
+            capture_goals.append(capture)
+            label = (
+                str(staging_labels[index])
+                if index < len(staging_labels)
+                else f"navigation_anchor_{index}"
+            )
+            capture_labels.append(f"{label}_m1_capture")
+        return capture_goals, capture_labels
 
     @classmethod
     def _container_action_goals_for_staging(

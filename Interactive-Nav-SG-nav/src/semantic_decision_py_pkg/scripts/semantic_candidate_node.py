@@ -24,6 +24,36 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 
 
+def _unresolved_interaction_target_count(graph: dict) -> int:
+    """Count public graph targets that still require interaction.
+
+    An empty candidate list may only mean that a remembered target is out of
+    view or temporarily on cooldown.  Keep that distinct from true mission
+    exhaustion, while excluding executor-confirmed unavailable targets.
+    """
+
+    count = 0
+    for node in list((graph or {}).get("nodes") or []):
+        interaction = node.get("interaction") or {}
+        requires_interaction = interaction.get(
+            "requires_interaction", node.get("requires_interaction")
+        )
+        if not bool(requires_interaction):
+            continue
+        state = str(
+            interaction.get("state", node.get("interaction_state")) or "unknown"
+        ).casefold()
+        capability = str(
+            interaction.get("capability", node.get("interaction_capability")) or ""
+        ).casefold()
+        if state in {"open", "opened", "succeeded", "satisfied"}:
+            continue
+        if capability in {"blocked", "unavailable", "unsupported", "locked"}:
+            continue
+        count += 1
+    return count
+
+
 class SemanticCandidateNode:
     def __init__(self) -> None:
         rospy.init_node("semantic_candidate_node")
@@ -97,6 +127,9 @@ class SemanticCandidateNode:
                     config.get("portal_allow_unknown_state", True)
                 ),
                 portal_unknown_default_interact=bool(unknown_portal_default),
+                remembered_portal_reobservation_enabled=bool(
+                    config.get("remembered_portal_reobservation_enabled", False)
+                ),
                 portal_standoff_m=float(config.get("portal_standoff_m", 1.0)),
                 portal_traversal_distance_m=float(
                     config.get("portal_traversal_distance_m", 0.9)
@@ -112,6 +145,13 @@ class SemanticCandidateNode:
                     float(config["fridge_standoff_m"])
                     if config.get("fridge_standoff_m") is not None
                     else None
+                ),
+                fridge_multiview_angular_scale=max(
+                    0.0,
+                    min(1.0, float(config.get("fridge_multiview_angular_scale", 1.0))),
+                ),
+                container_m1_face_selection_enabled=bool(
+                    config.get("container_m1_face_selection_enabled", False)
                 ),
                 drawer_pre_action_mllm=bool(drawer_pre_action_mllm),
                 drawer_pre_action_observation_max_attempts=max(
@@ -136,6 +176,36 @@ class SemanticCandidateNode:
                     if config.get("drawer_standoff_m") is not None
                     else None
                 ),
+                container_action_standoff_m=(
+                    float(config["container_action_standoff_m"])
+                    if config.get("container_action_standoff_m") is not None
+                    else None
+                ),
+                drawer_action_standoff_m=(
+                    float(config["drawer_action_standoff_m"])
+                    if config.get("drawer_action_standoff_m") is not None
+                    else None
+                ),
+                fridge_action_standoff_m=(
+                    float(config["fridge_action_standoff_m"])
+                    if config.get("fridge_action_standoff_m") is not None
+                    else None
+                ),
+                container_m1_capture_standoff_m=(
+                    float(config["container_m1_capture_standoff_m"])
+                    if config.get("container_m1_capture_standoff_m") is not None
+                    else None
+                ),
+                drawer_m1_capture_standoff_m=(
+                    float(config["drawer_m1_capture_standoff_m"])
+                    if config.get("drawer_m1_capture_standoff_m") is not None
+                    else None
+                ),
+                fridge_m1_capture_standoff_m=(
+                    float(config["fridge_m1_capture_standoff_m"])
+                    if config.get("fridge_m1_capture_standoff_m") is not None
+                    else None
+                ),
                 container_observation_standoff_m=float(
                     config.get("container_observation_standoff_m", 0.7)
                 ),
@@ -144,6 +214,61 @@ class SemanticCandidateNode:
                 ),
                 fridge_observation_standoff_m=float(
                     config.get("fridge_observation_standoff_m", 0.8)
+                ),
+                container_navigation_anchor_outer_offset_m=(
+                    float(config["container_navigation_anchor_outer_offset_m"])
+                    if config.get("container_navigation_anchor_outer_offset_m")
+                    is not None
+                    else None
+                ),
+                container_navigation_anchor_ring_count=(
+                    int(config["container_navigation_anchor_ring_count"])
+                    if config.get("container_navigation_anchor_ring_count")
+                    is not None
+                    else None
+                ),
+                container_navigation_anchor_tangent_offset_m=(
+                    float(config["container_navigation_anchor_tangent_offset_m"])
+                    if config.get("container_navigation_anchor_tangent_offset_m")
+                    is not None
+                    else None
+                ),
+                container_anchor_shared_pose_enabled=bool(
+                    config.get("container_anchor_shared_pose_enabled", False)
+                ),
+                drawer_navigation_anchor_aabb_fan_enabled=bool(
+                    config.get("drawer_navigation_anchor_aabb_fan_enabled", False)
+                ),
+                drawer_navigation_anchor_fan_clearances_m=tuple(
+                    float(value)
+                    for value in config.get(
+                        "drawer_navigation_anchor_fan_clearances_m",
+                        [0.50, 0.85, 1.20],
+                    )
+                ),
+                drawer_navigation_anchor_fan_angles_deg=tuple(
+                    float(value)
+                    for value in config.get(
+                        "drawer_navigation_anchor_fan_angles_deg",
+                        [-30.0, -15.0, 0.0, 15.0, 30.0],
+                    )
+                ),
+                fridge_navigation_anchor_aabb_fan_enabled=bool(
+                    config.get("fridge_navigation_anchor_aabb_fan_enabled", False)
+                ),
+                fridge_navigation_anchor_fan_clearances_m=tuple(
+                    float(value)
+                    for value in config.get(
+                        "fridge_navigation_anchor_fan_clearances_m",
+                        [1.15, 1.35, 1.55],
+                    )
+                ),
+                fridge_navigation_anchor_fan_angles_deg=tuple(
+                    float(value)
+                    for value in config.get(
+                        "fridge_navigation_anchor_fan_angles_deg",
+                        [-15.0, 0.0, 15.0],
+                    )
                 ),
                 container_safe_staging_outer_offset_m=float(
                     config.get("container_safe_staging_outer_offset_m", 0.35)
@@ -169,6 +294,20 @@ class SemanticCandidateNode:
                         )
                     ),
                 ),
+                container_m1_same_pose_samples_per_view=max(
+                    1,
+                    int(
+                        config.get(
+                            "container_m1_same_pose_samples_per_view", 2
+                        )
+                    ),
+                ),
+                container_m1_max_viewpoints=max(
+                    1, int(config.get("container_m1_max_viewpoints", 4))
+                ),
+                container_m1_max_total_requests=max(
+                    1, int(config.get("container_m1_max_total_requests", 8))
+                ),
                 container_safe_staging_arrival_tolerance_m=float(
                     config.get("container_safe_staging_arrival_tolerance_m", 0.30)
                 ),
@@ -178,6 +317,9 @@ class SemanticCandidateNode:
                 container_action_lateral_offset_m=max(
                     0.0,
                     float(config.get("container_action_lateral_offset_m", 0.22)),
+                ),
+                container_m1_front_axis_from_capture=bool(
+                    config.get("container_m1_front_axis_from_capture", True)
                 ),
                 interaction_safety_margin_m=float(
                     config.get("interaction_safety_margin_m", 0.0)
@@ -191,6 +333,15 @@ class SemanticCandidateNode:
                 ),
                 require_current_visibility=bool(
                     config.get("require_current_visibility", False)
+                ),
+                portal_require_current_visibility=bool(
+                    config.get("portal_require_current_visibility", False)
+                ),
+                portal_min_visible_pixels=int(
+                    config.get("portal_min_visible_pixels", 128)
+                ),
+                portal_min_visible_fraction=float(
+                    config.get("portal_min_visible_fraction", 0.2)
                 ),
                 target_standoff_m=float(config.get("target_standoff_m", 1.0)),
                 target_max_state_age_sec=float(
@@ -410,14 +561,24 @@ class SemanticCandidateNode:
             and not active_navigation_frontier
             and not navigation_frontiers
         )
+        unresolved_interaction_target_count = _unresolved_interaction_target_count(
+            self.graph
+        )
+        connected_unknown_area_present = bool(
+            int(frontier_filtering.get("raw_frontier_material_cluster_count", 0) or 0)
+            > 0
+        )
         navigation_frontier_exhausted = bool(
             ready
             and initial_scan_complete
             and not active_navigation_frontier
             and not navigation_frontiers
             and not retryable_filtered_frontier
+            and not connected_unknown_area_present
         )
-        interaction_frontier_exhausted = not interaction_frontiers
+        interaction_frontier_exhausted = bool(
+            not interaction_frontiers and unresolved_interaction_target_count == 0
+        )
         combined_frontier_exhausted = bool(
             navigation_frontier_exhausted and interaction_frontier_exhausted
         )
@@ -442,6 +603,10 @@ class SemanticCandidateNode:
                 "navigation_frontier_count": len(navigation_frontiers),
                 "interaction_frontier_exhausted": interaction_frontier_exhausted,
                 "interaction_frontier_count": len(interaction_frontiers),
+                "unresolved_interaction_target_count": (
+                    unresolved_interaction_target_count
+                ),
+                "connected_unknown_area_present": connected_unknown_area_present,
                 "combined_frontier_count": len(navigation_frontiers)
                 + len(interaction_frontiers),
                 "source_frontier_exhausted": bool(

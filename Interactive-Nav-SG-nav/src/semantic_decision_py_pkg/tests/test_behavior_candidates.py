@@ -1,11 +1,144 @@
 from __future__ import annotations
 
 import math
+import pytest
 
 from semantic_decision_py_pkg.behavior_candidates import (
     CandidateGenerator,
     CandidateGeneratorConfig,
 )
+
+
+def test_drawer_aabb_fan_anchors_use_true_surface_clearance() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig())
+    center = (8.7270050032, 8.2093864962)
+    size = (0.6197699904, 0.3079470059)
+    anchors, labels = generator._approach_candidates(
+        (11.5, 8.5),
+        center,
+        {"aabb_size": list(size)},
+        0.70,
+        "container",
+        navigation_anchor_outer_offset_m=0.35,
+        navigation_anchor_ring_count=3,
+        navigation_anchor_tangent_offset_m=0.20,
+        navigation_anchor_aabb_fan_clearances_m=(0.60, 0.95, 1.30),
+        navigation_anchor_aabb_fan_angles_deg=(-30.0, -15.0, 0.0, 15.0, 30.0),
+    )
+
+    assert len(anchors) == 15
+    assert len(labels) == 15
+    # Clearance-major, straight-first order: the first ray of each five-point
+    # band is exactly perpendicular to the nearest +X AABB face.
+    for band, clearance in enumerate((0.60, 0.95, 1.30)):
+        x, y, yaw = anchors[band * 5]
+        assert x == pytest.approx(center[0] + size[0] / 2.0 + clearance)
+        assert y == pytest.approx(center[1])
+        assert abs(math.atan2(math.sin(yaw - math.pi), math.cos(yaw - math.pi))) < 1e-9
+    assert labels[:5] == [
+        "aabb_fan_pos_x_angle_+0_clearance_0.60",
+        "aabb_fan_pos_x_angle_-15_clearance_0.60",
+        "aabb_fan_pos_x_angle_+15_clearance_0.60",
+        "aabb_fan_pos_x_angle_-30_clearance_0.60",
+        "aabb_fan_pos_x_angle_+30_clearance_0.60",
+    ]
+
+
+def test_drawer_m1_face_selection_covers_all_four_aabb_faces() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig())
+    anchors, labels = generator._approach_candidates(
+        (11.5, 8.5),
+        (8.7, 8.2),
+        {"aabb_size": [0.62, 0.31, 1.0]},
+        0.70,
+        "container",
+        navigation_anchor_aabb_fan_clearances_m=(0.60, 0.95, 1.30),
+        navigation_anchor_aabb_fan_angles_deg=(-30.0, -15.0, 0.0, 15.0, 30.0),
+        container_m1_face_selection_enabled=True,
+    )
+    assert len(anchors) == 60
+    assert {label.split("_")[2] + "_" + label.split("_")[3] for label in labels} == {
+        "pos_x",
+        "pos_y",
+        "neg_x",
+        "neg_y",
+    }
+    order = generator._container_m1_viewpoint_order(labels)
+    assert [labels[index] for index in order[:4]] == [
+        "aabb_fan_pos_x_angle_+0_clearance_0.60",
+        "aabb_fan_pos_y_angle_+0_clearance_0.60",
+        "aabb_fan_neg_x_angle_+0_clearance_0.60",
+        "aabb_fan_neg_y_angle_+0_clearance_0.60",
+    ]
+
+
+def test_fridge_fan_uses_four_faces_three_distances_and_narrow_angles() -> None:
+    generator = CandidateGenerator(CandidateGeneratorConfig())
+    anchors, labels = generator._approach_candidates(
+        (8.0, 8.0),
+        (4.0, 4.0),
+        {"aabb_size": [1.0, 0.8, 2.0]},
+        1.15,
+        "container",
+        navigation_anchor_aabb_fan_clearances_m=(1.15, 1.35, 1.55),
+        navigation_anchor_aabb_fan_angles_deg=(-15.0, 0.0, 15.0),
+        container_m1_face_selection_enabled=True,
+    )
+
+    assert len(anchors) == 36
+    assert {label.split("_")[2] + "_" + label.split("_")[3] for label in labels} == {
+        "pos_x",
+        "pos_y",
+        "neg_x",
+        "neg_y",
+    }
+    assert all(
+        any(token in label for token in ("angle_-15_", "angle_+0_", "angle_+15_"))
+        for label in labels
+    )
+
+
+def test_empty_candidate_stream_reobserves_remembered_invisible_portal() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_require_current_visibility=True,
+            portal_min_visible_pixels=128,
+            portal_min_visible_fraction=0.2,
+            remembered_portal_reobservation_enabled=True,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_hidden",
+                "type": "portal",
+                "name": "door",
+                "centroid": [2.0, 0.0, 1.0],
+                "aabb_size": [0.1, 1.0, 2.0],
+                "is_currently_visible": False,
+                "attributes": {"visible_pixels": 0, "visible_fraction": 0.0},
+                "interaction": {
+                    "requires_interaction": True,
+                    "is_interactable": True,
+                    "state": "closed",
+                    "state_confidence": 0.9,
+                    "capability": "confirmed",
+                },
+            }
+        ]
+    }
+
+    candidates = generator.generate(
+        {"initial_scan_complete": True, "frontier_clusters": []},
+        graph,
+        (0.0, 0.0),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].behavior_type == "NAVIGATE"
+    assert candidates[0].candidate_id == "reobserve_portal:portal_hidden"
+    assert candidates[0].metadata["reobserve_interaction_target"] is True
 
 
 def test_generator_combines_frontiers_and_closed_portals() -> None:
@@ -499,6 +632,41 @@ def test_mllm_unknown_portal_requires_current_ready_visual_observation() -> None
     node["attributes"]["attribute_source"] = "restricted_gt"
     node["interaction"]["state_source"] = "restricted_gt"
     assert generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0)) == []
+
+
+def test_remembered_portal_requires_current_visibility_threshold() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_require_current_visibility=True,
+            portal_min_visible_pixels=128,
+            portal_min_visible_fraction=0.2,
+        )
+    )
+    node = {
+        "id": "portal_wall_leak",
+        "type": "portal",
+        "centroid": [2.0, 0.0, 1.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": False,
+        "attributes": {
+            "visible_pixels": 64,
+            "visible_fraction": 0.08,
+            "attribute_status": "ready",
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 1.0,
+        },
+    }
+    assert generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0)) == []
+
+    node["is_currently_visible"] = True
+    node["attributes"].update({"visible_pixels": 128, "visible_fraction": 0.2})
+    candidates = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0))
+    assert [candidate.target_id for candidate in candidates] == ["portal_wall_leak"]
 
 
 def test_portal_open_waits_for_ready_module1_state_in_full_mllm_mode() -> None:
@@ -1672,6 +1840,83 @@ def test_container_oracle_pose_is_ignored_without_fresh_mllm_front_view() -> Non
     assert candidate.goal_xyyaw != [8.25, 1.05, math.pi]
 
 
+def test_fridge_multiview_angular_scale_halves_only_fridge_spread() -> None:
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [2.0, 2.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            fridge_multiview_angular_scale=0.5,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+    labels = candidate.metadata["interaction_approach_pose_labels"]
+    assert labels == [
+        "current_view",
+        "quarter_turn_left",
+        "quarter_turn_right",
+        "opposite_view",
+    ]
+    # Robot is on the negative X side, so the old quarter-turns were +/-90°.
+    # The fridge-specific scale changes them to +/-45° and opposite to 90°.
+    angles = [math.atan2(2.0 - y, 4.0 - x) for x, y, _ in goals]
+    assert math.isclose(abs(angles[1] - angles[0]), math.pi / 4.0, abs_tol=1e-6)
+    assert math.isclose(abs(angles[2] - angles[0]), math.pi / 4.0, abs_tol=1e-6)
+    assert math.isclose(abs(angles[3] - angles[0]), math.pi / 2.0, abs_tol=1e-6)
+
+
+def test_m1_face_selection_enumerates_aabb_cardinal_faces() -> None:
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [2.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_pre_action_mllm=True,
+            container_m1_face_selection_enabled=True,
+            container_anchor_shared_pose_enabled=True,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+    assert candidate.metadata["container_m1_face_selection_contract"] == (
+        "aabb_four_faces_m1_authorized"
+    )
+    assert candidate.metadata["interaction_approach_pose_labels"] == [
+        "aabb_face_pos_x",
+        "aabb_face_pos_y",
+        "aabb_face_neg_x",
+        "aabb_face_neg_y",
+    ]
+    assert candidate.metadata["container_m1_front_axis_from_capture"] is True
+    assert candidate.metadata["container_anchor_shared_pose"] is True
+    axes = candidate.metadata["container_face_axis_xy_by_staging_index"]
+    assert axes == [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
+
+
 def test_oblique_mllm_container_view_uses_reobservation_ring_not_contact_axis() -> None:
     node = {
         "id": "container_fridge",
@@ -1744,6 +1989,40 @@ def test_container_without_front_axis_keeps_bounded_reobservation_ring() -> None
             0.0,
             abs_tol=1e-6,
         )
+
+
+def test_container_multiview_uses_aabb_surface_axis_not_robot_bearing() -> None:
+    node = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [2.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 1.0,
+        },
+    }
+
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_multiview_enabled=True,
+            container_multiview_face_count=4,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0))[0]
+
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+    assert candidate.metadata["interaction_approach_pose_labels"][0] == "current_view"
+    assert math.isclose(goals[0][0], 2.0, abs_tol=1e-6)
+    assert math.isclose(goals[0][1], 2.0, abs_tol=1e-6)
+    assert math.isclose(goals[0][2], 0.0, abs_tol=1e-6)
+    # The old robot-bearing fallback would have produced a diagonal stance.
+    assert not math.isclose(goals[0][1], 1.0527864045000421, abs_tol=1e-3)
 
 
 def test_mllm_container_requires_fresh_front_observation_before_opening() -> None:
@@ -2001,6 +2280,153 @@ def test_two_stage_container_tangent_observation_budget_clamps_to_expanded_ring(
     assert len(candidate.metadata["container_staging_goal_xyyaw_candidates"]) == 20
     assert candidate.metadata["interaction_observation_max_attempts"] == 20
     assert candidate.metadata["container_two_stage_observation_max_attempts"] == 20
+    # Navigation stays face-major, while M1 gets one direct outer view from
+    # each face before it spends evidence budget on tangents/farther rings.
+    assert candidate.metadata["container_m1_viewpoint_order"][:4] == [0, 5, 10, 15]
+
+
+def test_two_stage_container_maps_navigation_anchor_to_direct_m1_capture_then_action() -> None:
+    """Outer recovery geometry must never become the M1 evidence distance."""
+
+    node = {
+        "id": "container_drawers",
+        "type": "container",
+        "label": "dresser",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            drawer_pre_action_mllm=True,
+            drawer_action_standoff_m=0.50,
+            drawer_m1_capture_standoff_m=0.65,
+            container_navigation_anchor_outer_offset_m=0.35,
+            container_navigation_anchor_ring_count=1,
+            container_navigation_anchor_tangent_offset_m=0.0,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    anchors = candidate.metadata["container_navigation_anchor_goal_xyyaw_candidates"]
+    captures = candidate.metadata["container_m1_capture_goal_xyyaw_by_staging_index"]
+    actions = candidate.metadata["container_action_goal_xyyaw_by_staging_index"]
+    assert anchors == candidate.metadata["container_staging_goal_xyyaw_candidates"]
+    assert len(anchors) == len(captures) == len(actions) == 4
+    # The AABB's left surface is x=3.5.  The outer anchor is only a recovery
+    # point at .65 + .35; M1 must instead be requested from its direct .65 m
+    # capture point, then the bridge goes to the .50 m action point.
+    assert math.isclose(anchors[0][0], 2.50, abs_tol=1e-6)
+    assert math.isclose(captures[0][0], 2.85, abs_tol=1e-6)
+    assert math.isclose(actions[0][0], 3.00, abs_tol=1e-6)
+    assert candidate.metadata["container_m1_capture_standoff_m"] == 0.65
+    assert candidate.metadata["container_physical_action_standoff_m"] == 0.50
+    assert candidate.metadata["container_m1_capture_standoff_validation"] == "valid"
+    assert candidate.metadata["container_geometry_anchor_xy"] == [4.0, 2.0]
+    assert candidate.metadata["container_geometry_aabb_size_xy"] == [1.0, 1.0]
+    assert candidate.metadata["container_m1_front_axis_from_capture"] is True
+    assert candidate.metadata["interaction_observation_same_pose_samples_per_view"] == 2
+    assert candidate.metadata["interaction_observation_max_viewpoints"] == 4
+    assert candidate.metadata["interaction_observation_max_total_requests"] == 8
+    assert candidate.metadata["container_m1_capture_pose_labels_by_staging_index"][
+        0
+    ] == "current_view_safe_outer_m1_capture"
+    assert candidate.interaction_command["container_m1_capture_ready_distance_m"] == (
+        candidate.interaction_command["container_physical_action_ready_distance_m"]
+    )
+
+
+def test_shared_container_anchor_is_navigation_capture_and_action_pose() -> None:
+    node = {
+        "id": "container_drawers_shared",
+        "type": "container",
+        "label": "dresser",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            drawer_pre_action_mllm=True,
+            drawer_action_standoff_m=0.70,
+            drawer_m1_capture_standoff_m=0.90,
+            container_navigation_anchor_outer_offset_m=0.35,
+            container_navigation_anchor_ring_count=3,
+            container_anchor_shared_pose_enabled=True,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    anchors = candidate.metadata["container_staging_goal_xyyaw_candidates"]
+    captures = candidate.metadata["container_m1_capture_goal_xyyaw_by_staging_index"]
+    actions = candidate.metadata["container_action_goal_xyyaw_by_staging_index"]
+    action_options = candidate.metadata[
+        "container_action_goal_xyyaw_options_by_staging_index"
+    ]
+    assert candidate.metadata["container_anchor_shared_pose"] is True
+    assert anchors == captures == actions
+    assert action_options == [[goal] for goal in anchors]
+    assert candidate.metadata["container_navigation_anchor_outer_offset_m"] == 0.0
+    assert candidate.metadata["container_navigation_anchor_ring_count"] == 1
+    assert candidate.metadata["container_m1_front_axis_from_capture"] is False
+    assert candidate.interaction_command["interaction_ready_distance_m"] == (
+        candidate.interaction_command["container_physical_action_ready_distance_m"]
+    )
+    assert candidate.interaction_command[
+        "navigation_goal_position_tolerance_m"
+    ] == candidate.interaction_command["interaction_ready_distance_m"]
+
+
+def test_invalid_direct_capture_clearance_falls_back_with_visible_validation() -> None:
+    """A bad explicit capture setting cannot silently become an unsafe pose."""
+
+    node = {
+        "id": "container_drawers",
+        "type": "container",
+        "label": "dresser",
+        "aabb_center": [4.0, 2.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "confidence": 1.0,
+        },
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            drawer_pre_action_mllm=True,
+            drawer_action_standoff_m=0.80,
+            drawer_m1_capture_standoff_m=0.60,
+            container_navigation_anchor_outer_offset_m=0.35,
+            container_navigation_anchor_ring_count=1,
+        )
+    ).generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+
+    assert candidate.metadata["container_m1_capture_standoff_m"] == 0.80
+    assert candidate.metadata["container_m1_capture_standoff_validation"] == (
+        "capture_below_action_fallback_to_action"
+    )
+    capture = candidate.metadata["container_m1_capture_goal_xyyaw_by_staging_index"][0]
+    action = candidate.metadata["container_action_goal_xyyaw_by_staging_index"][0]
+    assert capture == action
 
 
 def test_container_safe_outer_uses_visible_aabb_anchor_without_m1_axis() -> None:

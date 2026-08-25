@@ -394,6 +394,74 @@ def test_tiny_only_frontier_does_not_trigger_retryable_terminal_guard() -> None:
     assert tracker.terminal_stalled is False
 
 
+def test_completion_is_blocked_by_connected_unknown_area_without_candidate() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(empty_candidate_confirmations=1, empty_candidate_min_steps=0)
+    )
+    snapshot = payload(1, exhausted=True, candidate_count=0)
+    snapshot["exploration_context"].update(
+        {
+            "initial_scan_complete": True,
+            "observation_step": 10,
+            "connected_unknown_area_present": True,
+            "navigation_frontier_exhausted": True,
+            "interaction_frontier_exhausted": True,
+            "combined_frontier_count": 0,
+        }
+    )
+    assert not tracker.update(snapshot, has_active_behavior=False, target_enabled=False)
+    assert tracker.complete is False
+
+
+def test_completion_is_blocked_by_remembered_unresolved_interaction() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(empty_candidate_confirmations=1, empty_candidate_min_steps=0)
+    )
+    snapshot = payload(1, exhausted=True, candidate_count=0)
+    snapshot["exploration_context"].update(
+        {
+            "initial_scan_complete": True,
+            "observation_step": 10,
+            "navigation_frontier_exhausted": True,
+            "interaction_frontier_exhausted": True,
+            "combined_frontier_count": 0,
+        }
+    )
+    snapshot["graph_context"] = {
+        "nodes": [
+            {
+                "id": "door_0003",
+                "type": "portal",
+                "requires_interaction": True,
+                "interaction_state": "closed",
+                "interaction_capability": "unknown",
+                "is_currently_visible": False,
+            }
+        ]
+    }
+    assert not tracker.update(snapshot, has_active_behavior=False, target_enabled=False)
+    assert tracker.complete is False
+
+
+def test_completion_is_blocked_while_interaction_target_is_on_cooldown() -> None:
+    tracker = MissionCompletionTracker(
+        MissionCompletionConfig(empty_candidate_confirmations=1, empty_candidate_min_steps=0)
+    )
+    snapshot = payload(1, exhausted=True, candidate_count=0)
+    snapshot["exploration_context"].update(
+        {
+            "initial_scan_complete": True,
+            "observation_step": 10,
+            "navigation_frontier_exhausted": True,
+            "interaction_frontier_exhausted": True,
+            "combined_frontier_count": 0,
+            "interaction_cooldown_target_count": 1,
+        }
+    )
+    assert not tracker.update(snapshot, has_active_behavior=False, target_enabled=False)
+    assert tracker.complete is False
+
+
 def test_single_make_plan_failure_does_not_bypass_approach_failure_limit() -> None:
     tracker = TerminalInteractionNoPlanExitTracker(
         TerminalInteractionNoPlanExitConfig(enabled=True)

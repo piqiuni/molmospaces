@@ -289,6 +289,22 @@ class SemanticRuleDecisionNode:
         self.interaction_target_failure_cooldown_s = float(
             config.get("interaction_target_failure_cooldown_s", self.failure_cooldown_s)
         )
+        self.container_anchor_unreachable_cooldown_s = max(
+            0.0,
+            float(
+                config.get(
+                    "container_anchor_unreachable_cooldown_s",
+                    self.interaction_target_failure_cooldown_s,
+                )
+            ),
+        )
+        configured_m1_cooldown_schedule = config.get(
+            "container_m1_inconclusive_cooldown_schedule_s",
+            [15.0, 60.0, 180.0],
+        )
+        self.container_m1_inconclusive_cooldown_schedule_s = tuple(
+            max(0.0, float(value)) for value in configured_m1_cooldown_schedule
+        ) or (15.0,)
         self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
         self.failure_retry_delay_s = float(config.get("failure_retry_delay_s", 2.0))
         self.portal_traversal_distance_m = max(
@@ -523,6 +539,7 @@ class SemanticRuleDecisionNode:
         self.preempt_requested_for_decision_id = ""
         self.cooldown_until: dict[str, float] = {}
         self.failure_counts: dict[str, int] = {}
+        self.container_m1_inconclusive_counts: dict[str, int] = {}
         # Count-bounded executor approach attempts are not object failures.
         # Suppress only the identical candidate fingerprint so another
         # interaction subgoal can be selected immediately, without a timer.
@@ -628,6 +645,7 @@ class SemanticRuleDecisionNode:
                 self.interaction_outcome_beliefs.clear()
                 self.cooldown_until.clear()
                 self.failure_counts.clear()
+                self.container_m1_inconclusive_counts.clear()
                 self.approach_exhausted_fingerprints.clear()
                 self.interaction_failure_tracker.reset()
                 self.decision_history.clear()
@@ -722,6 +740,42 @@ class SemanticRuleDecisionNode:
                 self.active_interaction_candidate
             )
         detail = dict(payload.get("detail") or {})
+        if status == "SUCCEEDED" and self.active_behavior_type == "INTERACT":
+            successful_target_id = self._interaction_target_id(candidate_id)
+            if successful_target_id:
+                self.container_m1_inconclusive_counts.pop(
+                    successful_target_id, None
+                )
+        # A bounded M1 evidence plan may run out of clean views without any
+        # physical action or reachability proof.  That is retryable visual
+        # uncertainty, not an object/candidate exclusion or target-wide
+        # failure.  Preserve a short normal cooldown so the explorer can gather
+        # new context before selecting the same container again.
+        m1_evidence_inconclusive = bool(
+            detail.get("m1_evidence_inconclusive", False)
+            and detail.get("retryable", False)
+        )
+        all_container_anchors_unreachable = bool(
+            m1_evidence_inconclusive
+            and detail.get("all_container_anchors_unreachable", False)
+        )
+        failure_reason = str(
+            detail.get("failure_reason") or detail.get("reason") or ""
+        ).strip().casefold()
+        # Actionlib lifecycle and transport failures do not describe candidate
+        # geometry.  Defer them without consuming the candidate, target, or
+        # terminal-no-plan budget; otherwise one stale PREEMPTING/RECALLING
+        # receipt can place every real subgoal on cooldown.
+        executor_transport_defer = bool(
+            status != "SUCCEEDED"
+            and detail.get("retryable", False)
+            and (
+                "successor_not_quiescent" in failure_reason
+                or "successor_quiescence" in failure_reason
+                or "service_unavailable" in failure_reason
+                or "transport" in failure_reason
+            )
+        )
         # The executor has a finite set of preserved approach poses. Once that
         # set is exhausted, the outcome is a terminal *candidate-local*
         # reachability fact even though no force reached the object. Keep it
@@ -770,6 +824,8 @@ class SemanticRuleDecisionNode:
         if (
             self.active_behavior_type == "INTERACT"
             and not preempted_by_target
+            and not m1_evidence_inconclusive
+            and not executor_transport_defer
             and (
                 status == "SUCCEEDED"
                 or not approach_precondition_failed
@@ -789,7 +845,7 @@ class SemanticRuleDecisionNode:
             detail.update(terminal_interaction_failure)
             payload = {**payload, "detail": detail}
         self._record_decision_result(payload)
-        if not preempted_by_target:
+        if not preempted_by_target and not executor_transport_defer:
             self.completion_tracker.note_feedback(payload)
             self.terminal_no_plan_exit_tracker.note_feedback(
                 payload,
@@ -797,9 +853,33 @@ class SemanticRuleDecisionNode:
                     self.latest_candidates_payload
                 ),
             )
-        if (
+        if candidate_id and m1_evidence_inconclusive and not preempted_by_target:
+            target_id = self._interaction_target_id(candidate_id)
+            count_key = target_id or candidate_id
+            inconclusive_count = (
+                self.container_m1_inconclusive_counts.get(count_key, 0) + 1
+            )
+            self.container_m1_inconclusive_counts[count_key] = inconclusive_count
+            cooldown_s = progressive_failure_cooldown(
+                self.container_m1_inconclusive_cooldown_schedule_s,
+                inconclusive_count,
+            )
+            if all_container_anchors_unreachable:
+                cooldown_s = max(
+                    cooldown_s,
+                    self.container_anchor_unreachable_cooldown_s,
+                )
+            cooldown_deadline = time.monotonic() + max(0.0, cooldown_s)
+            self.cooldown_until[candidate_id] = cooldown_deadline
+            # Evidence plans are rebuilt with new candidate fingerprints as the
+            # graph changes.  Preserve the bounded retry memory at object scope
+            # so a failed drawer cannot immediately restart at anchor zero.
+            if target_id:
+                self.cooldown_until[target_id] = cooldown_deadline
+        elif (
             candidate_id
             and not preempted_by_target
+            and not executor_transport_defer
             and not approach_precondition_failed
             and not terminal_interaction_failure
         ):
@@ -828,6 +908,8 @@ class SemanticRuleDecisionNode:
             and self.active_behavior_type == "INTERACT"
             and not approach_precondition_failed
             and not terminal_interaction_failure
+            and not m1_evidence_inconclusive
+            and not executor_transport_defer
         ):
             target_id = self._interaction_target_id(candidate_id)
             if target_id:
@@ -843,7 +925,39 @@ class SemanticRuleDecisionNode:
             target_id = self._interaction_target_id(candidate_id)
             if target_id:
                 self.cooldown_until.pop(target_id, None)
-        if approach_precondition_failed or terminal_interaction_failure:
+        # A container approach failure is often a transient local-planner or
+        # lifecycle problem, not a change in the object's eligibility.  Keep a
+        # stable target-level cooldown even when the candidate fingerprint is
+        # rebuilt from a newer AABB/graph revision; otherwise the same drawer
+        # can be selected again immediately and burn the whole horizon.
+        container_approach_retryable = bool(
+            approach_precondition_failed
+            and self.active_behavior_type == "INTERACT"
+            and isinstance(self.active_interaction_candidate, dict)
+            and str(
+                (self.active_interaction_candidate.get("interaction_command") or {}).get(
+                    "container_kind", ""
+                )
+                or ""
+            ).strip().casefold()
+            in {"drawer", "fridge", "refrigerator", "container"}
+        )
+        if container_approach_retryable and not preempted_by_target:
+            target_id = self._interaction_target_id(candidate_id)
+            if target_id:
+                self.cooldown_until[target_id] = time.monotonic() + max(
+                    0.0, self.container_anchor_unreachable_cooldown_s
+                )
+        if executor_transport_defer:
+            self.next_decision_time = 0.0
+        elif all_container_anchors_unreachable:
+            # Skip immediately to another candidate while this target cools
+            # down.  The cooldown is retryable map-generation memory, not a
+            # terminal exclusion and not a blank period with no subgoal.
+            self.next_decision_time = 0.0
+        elif m1_evidence_inconclusive:
+            self.next_decision_time = time.monotonic() + self.failure_retry_delay_s
+        elif approach_precondition_failed or terminal_interaction_failure:
             # No wall-clock cooldown: the executor already consumed its finite
             # pose-poll budget, or this candidate has exhausted its configured
             # execution-failure budget. Move directly to another eligible
@@ -1291,6 +1405,35 @@ class SemanticRuleDecisionNode:
         ) = self._completion_snapshot_without_terminal_interactions(
             candidate_snapshot
         )
+        # A zero eligible-candidate list can be a transient target cooldown,
+        # not mission exhaustion.  Publish the live interaction cooldown count
+        # into the completion contract so the tracker waits for it to expire.
+        now_monotonic = time.monotonic()
+        candidate_ids = {
+            str(item.get("candidate_id") or "")
+            for item in candidate_snapshot.get("candidates") or []
+        }
+        with self.state_lock:
+            live_interaction_cooldowns = sum(
+                1
+                for key, until in self.cooldown_until.items()
+                if float(until or 0.0) > now_monotonic
+                and (
+                    key in candidate_ids
+                    or str(key).casefold().startswith("interaction")
+                    or "container" in str(key).casefold()
+                    or "drawer" in str(key).casefold()
+                    or "fridge" in str(key).casefold()
+                    or "door" in str(key).casefold()
+                )
+            )
+        completion_context = dict(
+            completion_snapshot.get("exploration_context") or {}
+        )
+        completion_context["interaction_cooldown_target_count"] = (
+            live_interaction_cooldowns
+        )
+        completion_snapshot["exploration_context"] = completion_context
         candidate_sequence = int(candidate_snapshot.get("sequence", 0) or 0)
         if candidate_sequence < self.minimum_candidate_sequence:
             return

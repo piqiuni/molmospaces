@@ -31,7 +31,11 @@ from semantic_decision_py_pkg.behavior_execution import (
     candidate_with_effective_interaction_approach,
     committed_turn_sign,
     container_two_stage_action_goal_options_for_staging,
+    container_two_stage_m1_anchor_priority,
+    container_two_stage_m1_preflight_batch_indices,
+    container_two_stage_next_m1_viewpoint_index,
     interaction_pose_validation,
+    is_container_two_stage_m1_capture,
     is_container_two_stage_physical_action,
     is_post_interaction_traversal_navigation,
     is_interaction_pose_precondition_failure,
@@ -91,8 +95,8 @@ patch_roslogging_findcaller_for_py311()
 import actionlib
 import rospy
 import tf
-from actionlib_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
+from actionlib_msgs.msg import GoalStatus, GoalStatusArray
+from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
 from map_msgs.msg import OccupancyGridUpdate
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from nav_msgs.msg import OccupancyGrid, Path
@@ -472,7 +476,95 @@ class SemanticBehaviorExecutor:
         )
         self.container_m1_capture_yaw_tolerance_rad = max(
             0.05,
-            float(config.get("container_m1_capture_yaw_tolerance_rad", 0.25)),
+            float(
+                config.get(
+                    "container_m1_capture_yaw_tolerance_rad",
+                    math.radians(30.0),
+                )
+            ),
+        )
+        # A later, materially different mapped capture target must not count the
+        # same camera pose twice.  These thresholds detect a distinct requested
+        # view and provide its strict XY envelope; direct-capture yaw acceptance
+        # is configured independently by ``container_m1_capture_yaw_tolerance``.
+        try:
+            distinct_view_tolerance_m = float(
+                config.get("container_m1_distinct_view_arrival_tolerance_m", 0.05)
+            )
+        except (TypeError, ValueError):
+            distinct_view_tolerance_m = 0.05
+        if not math.isfinite(distinct_view_tolerance_m) or distinct_view_tolerance_m <= 0.0:
+            distinct_view_tolerance_m = 0.05
+        self.container_m1_distinct_view_arrival_tolerance_m = min(
+            distinct_view_tolerance_m,
+            0.5 * self.container_m1_capture_pose_tolerance_m,
+        )
+        try:
+            distinct_view_yaw_tolerance_rad = float(
+                config.get(
+                    "container_m1_distinct_view_arrival_yaw_tolerance_rad", 0.08
+                )
+            )
+        except (TypeError, ValueError):
+            distinct_view_yaw_tolerance_rad = 0.08
+        if (
+            not math.isfinite(distinct_view_yaw_tolerance_rad)
+            or distinct_view_yaw_tolerance_rad <= 0.0
+        ):
+            distinct_view_yaw_tolerance_rad = 0.08
+        self.container_m1_distinct_view_arrival_yaw_tolerance_rad = min(
+            distinct_view_yaw_tolerance_rad,
+            0.5 * self.container_m1_capture_yaw_tolerance_rad,
+        )
+        # One interaction goal must not be declared complete under a different
+        # DWA tolerance than the executor later validates.  The token-bound
+        # lease applies the candidate's explicit x/y/yaw pair immediately before
+        # send_goal and restores the previous controller configuration on every
+        # exit.  The legacy option name remains for configuration compatibility.
+        self.container_m1_capture_dwa_profile_enabled = bool(
+            config.get("container_m1_capture_dwa_profile_enabled", False)
+        )
+        self.container_m1_capture_dwa_reconfigure_server = str(
+            config.get(
+                "container_m1_capture_dwa_reconfigure_server",
+                "/move_base/DWAPlannerROS",
+            )
+            or "/move_base/DWAPlannerROS"
+        ).strip()
+        self.container_m1_capture_dwa_reconfigure_timeout_s = max(
+            0.05,
+            float(
+                config.get(
+                    "container_m1_capture_dwa_reconfigure_timeout_s", 1.0
+                )
+            ),
+        )
+        # Once an interaction is position-ready, DWA gets a finite terminal-yaw
+        # settle window measured in public simulator steps.  Wall time is not a
+        # stable task-time clock when several simulators or VLM calls share the
+        # host, so it must not decide whether a still-turning robot timed out.
+        try:
+            capture_terminal_yaw_settle_max_task_steps = int(
+                config.get(
+                    "container_m1_capture_dwa_terminal_yaw_settle_max_task_steps",
+                    75,
+                )
+            )
+        except (TypeError, ValueError):
+            capture_terminal_yaw_settle_max_task_steps = 75
+        self.container_m1_capture_dwa_terminal_yaw_settle_max_task_steps = max(
+            1, capture_terminal_yaw_settle_max_task_steps
+        )
+        try:
+            interaction_terminal_yaw_settle_max_task_steps = int(
+                config.get(
+                    "interaction_dwa_terminal_yaw_settle_max_task_steps", 75
+                )
+            )
+        except (TypeError, ValueError):
+            interaction_terminal_yaw_settle_max_task_steps = 75
+        self.interaction_dwa_terminal_yaw_settle_max_task_steps = max(
+            1, interaction_terminal_yaw_settle_max_task_steps
         )
         # A transient M1 flip at one fixed staging pose should consume another
         # observation, not discard the recently valid front/action-region
@@ -518,6 +610,28 @@ class SemanticBehaviorExecutor:
                 interaction_timeout_s=float(config.get("interaction_timeout_s", 30.0)),
                 drawer_scan_wait_timeout_s=self.drawer_scan_wait_timeout_s,
                 interaction_observation_timeout_s=self.interaction_observation_timeout_s,
+                interaction_observation_same_pose_samples_per_view=max(
+                    1,
+                    int(
+                        config.get(
+                            "interaction_observation_same_pose_samples_per_view", 2
+                        )
+                    ),
+                ),
+                interaction_observation_max_viewpoints=max(
+                    0,
+                    int(config.get("interaction_observation_max_viewpoints", 0)),
+                ),
+                interaction_observation_max_total_requests=max(
+                    0,
+                    int(config.get("interaction_observation_max_total_requests", 0)),
+                ),
+                container_m1_distinct_view_arrival_tolerance_m=(
+                    self.container_m1_distinct_view_arrival_tolerance_m
+                ),
+                container_m1_distinct_view_arrival_yaw_tolerance_rad=(
+                    self.container_m1_distinct_view_arrival_yaw_tolerance_rad
+                ),
                 verification_timeout_s=float(config.get("verification_timeout_s", 30.0)),
                 explore_prepare_timeout_s=float(
                     config.get("explore_prepare_timeout_s", 10.0)
@@ -914,6 +1028,24 @@ class SemanticBehaviorExecutor:
         self.final_align_cancel_wait_s = float(
             config.get("final_align_cancel_wait_s", 1.0)
         )
+        self.move_base_successor_quiescence_timeout_s = max(
+            0.1,
+            float(
+                config.get(
+                    "move_base_successor_quiescence_timeout_s",
+                    config.get(
+                        "container_m1_capture_successor_quiescence_timeout_s",
+                        1.0,
+                    ),
+                )
+            ),
+        )
+        # Backward-compatible attribute for diagnostics/tests and older launch
+        # overlays.  The fence now protects every container staging/capture
+        # successor, not only a direct-capture DWA-profile handoff.
+        self.container_m1_capture_successor_quiescence_timeout_s = (
+            self.move_base_successor_quiescence_timeout_s
+        )
         self.stuck_recovery_enabled = bool(config.get("stuck_recovery_enabled", True))
         self.stuck_recovery_subgoal_failures = max(
             1, int(config.get("stuck_recovery_subgoal_failures", 3))
@@ -955,6 +1087,14 @@ class SemanticBehaviorExecutor:
             0.0,
             float(config.get("navigation_stagnation_goal_distance_reduction_m", 0.02)),
         )
+        # A rear-safe preturn deliberately spends simulator steps on rotation.
+        # Give the replanned DWA goal a bounded yaw-settle phase, continuously
+        # rebasing the translation watchdog during that phase.  Once it ends,
+        # the full ordinary stagnation window starts from the current pose.
+        self.navigation_stagnation_post_rotation_grace_s = max(
+            0.0,
+            float(config.get("navigation_stagnation_post_rotation_grace_s", 15.0)),
+        )
         self.navigation_stagnation_local_plan_max_age_s = max(
             0.0,
             float(config.get("navigation_stagnation_local_plan_max_age_s", 1.0)),
@@ -962,6 +1102,26 @@ class SemanticBehaviorExecutor:
         self.navigation_stagnation_local_plan_min_poses = max(
             1,
             int(config.get("navigation_stagnation_local_plan_min_poses", 2)),
+        )
+        # Navigation watchdogs use the evaluator step clock whenever it is
+        # available.  The previous wall-clock-only guard treated a slow host
+        # and a real simulator stall identically, and could abort a valid
+        # yaw-only turn while the robot was still converging.
+        self.navigation_stagnation_timeout_task_steps = max(
+            1,
+            int(config.get("navigation_stagnation_timeout_task_steps", 60)),
+        )
+        self.navigation_max_task_steps = max(
+            1,
+            int(config.get("navigation_max_task_steps", 360)),
+        )
+        self.interaction_navigation_max_task_steps = max(
+            1,
+            int(config.get("interaction_navigation_max_task_steps", 240)),
+        )
+        self.navigation_step_sync_stall_timeout_s = max(
+            0.1,
+            float(config.get("navigation_step_sync_stall_timeout_s", 5.0)),
         )
         self.interaction_approach_fallback_max_attempts = max(
             1,
@@ -1012,6 +1172,13 @@ class SemanticBehaviorExecutor:
         self._navigation_run_sequence = 0
         self._navigation_result_sources: dict[tuple[str, int], dict] = {}
         self._active_navigation_run_tokens: dict[str, int] = {}
+        # A dynamic-reconfigure tolerance change belongs to exactly one direct
+        # M1 capture worker.  Keep this lock separate from ``self.lock`` so a
+        # bounded ROS service call cannot block selection/state callbacks.
+        self._container_m1_capture_dwa_profile_lock = threading.RLock()
+        self._container_m1_capture_dwa_profile_active: dict | None = None
+        self._container_m1_capture_dwa_profile_sequence = 0
+        self._container_m1_capture_dwa_reconfigure_client = None
         # A safe outer container viewpoint can occasionally pass make_plan and
         # then receive one immediate planner/costmap ABORT while its map refresh
         # catches up.  Keep a decision ledger so the narrowly-scoped fresh-plan
@@ -1030,6 +1197,14 @@ class SemanticBehaviorExecutor:
             int(config.get("interaction_approach_pose_poll_max_attempts", 5)),
         )
         self.lock = threading.RLock()
+        # SimpleActionClient can enter its local DONE state one callback before
+        # move_base publishes PREEMPTED.  Track the server status stream so a
+        # capture retry cannot call make_plan during that PREEMPTING window.
+        self._move_base_status_condition = threading.Condition()
+        self._move_base_status_received_count = 0
+        self._move_base_active_goal_statuses: tuple[tuple[str, int], ...] = ()
+        self._move_base_owned_goal_id = ""
+        self._move_base_goal_generation = 0
         self.selection: dict | None = None
         self.latest_graph: dict = {}
         self._interaction_observation_requests: dict[str, dict] = {}
@@ -1157,6 +1332,15 @@ class SemanticBehaviorExecutor:
             queue_size=4,
             latch=True,
         )
+        # ExplorePy and the semantic executor share one display seam.  Publishing
+        # every actually dispatched fallback goal keeps the video overlay bound
+        # to actionlib state instead of to the higher-level selection cadence.
+        self.subgoal_pub = rospy.Publisher(
+            topics.get("current_subgoal", "/explore_py/current_subgoal"),
+            PointStamped,
+            queue_size=1,
+            latch=True,
+        )
         self.attribute_refresh_request_pub = rospy.Publisher(
             topics.get(
                 "attribute_refresh_requests",
@@ -1173,6 +1357,12 @@ class SemanticBehaviorExecutor:
             topics.get("move_base", "/move_base"), MoveBaseAction
         )
         self.make_plan_client = rospy.ServiceProxy(self.make_plan_service, GetPlan)
+        rospy.Subscriber(
+            topics.get("move_base_status", "/move_base/status"),
+            GoalStatusArray,
+            self._move_base_status_callback,
+            queue_size=4,
+        )
         rospy.Subscriber(
             topics.get("selected_behavior", "/semantic_decision/selected_behavior"),
             String,
@@ -1741,7 +1931,26 @@ class SemanticBehaviorExecutor:
             0.05,
             float(getattr(self, "container_m1_capture_pose_tolerance_m", 0.18)),
         )
-        metadata = candidate.get("metadata") or {}
+        metadata = dict(candidate.get("metadata") or {})
+        interaction = candidate.get("interaction_command") or {}
+        if bool(metadata.get("container_anchor_shared_pose", False)):
+            explicit = self._finite_positive_tolerance(
+                interaction.get("navigation_goal_position_tolerance_m")
+            )
+            if explicit is not None:
+                return explicit
+        if str(metadata.get("container_two_stage_phase") or "").casefold() == "m1_capture":
+            try:
+                capture_tolerance_m = float(
+                    interaction.get(
+                        "container_m1_capture_ready_distance_m",
+                        interaction.get("container_physical_action_ready_distance_m"),
+                    )
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                capture_tolerance_m = 0.0
+            return capture_tolerance_m if capture_tolerance_m > 0.0 else base_tolerance_m
         if not bool(metadata.get("m1_observation_staging_required", False)):
             return base_tolerance_m
         try:
@@ -1765,6 +1974,72 @@ class SemanticBehaviorExecutor:
             return base_tolerance_m
         return declared_tolerance_m
 
+    @staticmethod
+    def _container_m1_capture_requires_exact_arrival(candidate: dict) -> bool:
+        """Whether a mapped direct capture must prove its planned camera pose.
+
+        Every direct-capture mapping is an M1 evidence pose, including the
+        first one.  The normal capture-ready envelope is intentionally wider
+        for navigation, but cannot authorize M1 here: it would let a close or
+        oblique pose masquerade as the requested object-facing view.  Older
+        candidates without direct-capture metadata retain their legacy path.
+        """
+
+        metadata = candidate.get("metadata") or {}
+        capture_pose = metadata.get("container_two_stage_capture_pose_xyyaw")
+        return bool(
+            is_container_two_stage_m1_capture(candidate)
+            and isinstance(capture_pose, (list, tuple))
+            and len(capture_pose) >= 3
+        )
+
+    def _interaction_navigation_yaw_tolerance_rad(self, candidate: dict) -> float:
+        """Return the yaw contract for the active interaction navigation phase."""
+
+        interaction = candidate.get("interaction_command") or {}
+        if bool(interaction.get("navigation_goal_tolerance_contract_explicit", False)):
+            explicit = self._finite_positive_tolerance(
+                interaction.get("navigation_goal_yaw_tolerance_rad")
+            )
+            if explicit is not None:
+                return explicit
+        if self._container_m1_capture_requires_exact_arrival(candidate):
+            return float(
+                getattr(
+                    self,
+                    "container_m1_capture_yaw_tolerance_rad",
+                    math.radians(30.0),
+                )
+            )
+        return float(interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55)
+
+    def _container_m1_capture_evidence_tolerances(
+        self, candidate: dict
+    ) -> tuple[float, float]:
+        """Return the pose envelope that must bind a targeted M1 response."""
+
+        metadata = candidate.get("metadata") or {}
+        if bool(metadata.get("container_anchor_shared_pose", False)):
+            return (
+                self._interaction_navigation_pose_tolerance_m(candidate),
+                self._interaction_navigation_yaw_tolerance_rad(candidate),
+            )
+        if self._container_m1_capture_requires_exact_arrival(candidate):
+            return (
+                float(
+                    getattr(
+                        self,
+                        "container_m1_distinct_view_arrival_tolerance_m",
+                        0.05,
+                    )
+                ),
+                self._interaction_navigation_yaw_tolerance_rad(candidate),
+            )
+        return (
+            self._container_m1_staging_pose_tolerance_m(candidate),
+            self._container_m1_staging_yaw_tolerance_rad(candidate),
+        )
+
     def _container_m1_staging_yaw_tolerance_rad(self, candidate: dict) -> float:
         """Return the yaw envelope for a safe outer M1 staging observation.
 
@@ -1782,9 +2057,15 @@ class SemanticBehaviorExecutor:
             float(getattr(self, "container_m1_capture_yaw_tolerance_rad", 0.25)),
         )
         metadata = candidate.get("metadata") or {}
+        interaction = candidate.get("interaction_command") or {}
+        if bool(metadata.get("container_anchor_shared_pose", False)):
+            explicit = self._finite_positive_tolerance(
+                interaction.get("navigation_goal_yaw_tolerance_rad")
+            )
+            if explicit is not None:
+                return explicit
         if not bool(metadata.get("m1_observation_staging_required", False)):
             return base_tolerance_rad
-        interaction = candidate.get("interaction_command") or {}
         try:
             declared_tolerance_rad = float(
                 interaction.get("interaction_ready_yaw_tolerance_rad", 0.0) or 0.0
@@ -1799,9 +2080,34 @@ class SemanticBehaviorExecutor:
         """Use the wider envelope only while moving to an outer M1 staging pose."""
 
         metadata = candidate.get("metadata") or {}
+        interaction = candidate.get("interaction_command") or {}
+        if bool(interaction.get("navigation_goal_tolerance_contract_explicit", False)):
+            explicit = self._finite_positive_tolerance(
+                interaction.get("navigation_goal_position_tolerance_m")
+            )
+            if explicit is not None:
+                return explicit
+        if str(metadata.get("container_two_stage_phase") or "").casefold() == "m1_capture":
+            if self._container_m1_capture_requires_exact_arrival(candidate):
+                return float(
+                    getattr(
+                        self,
+                        "container_m1_distinct_view_arrival_tolerance_m",
+                        0.05,
+                    )
+                )
+            return max(
+                0.05,
+                float(
+                    interaction.get(
+                        "container_m1_capture_ready_distance_m",
+                        interaction.get("container_physical_action_ready_distance_m", 0.45),
+                    )
+                    or 0.45
+                ),
+            )
         if bool(metadata.get("m1_observation_staging_required", False)):
             return self._container_m1_staging_pose_tolerance_m(candidate)
-        interaction = candidate.get("interaction_command") or {}
         return max(
             0.05,
             float(interaction.get("interaction_ready_distance_m", 0.45) or 0.45),
@@ -1825,6 +2131,9 @@ class SemanticBehaviorExecutor:
         """
 
         metadata = candidate.get("metadata") or {}
+        phase = str(metadata.get("container_two_stage_phase") or "").casefold()
+        if phase and phase != "staging":
+            return None
         if not bool(metadata.get("m1_observation_staging_required", False)):
             return None
         try:
@@ -1902,15 +2211,14 @@ class SemanticBehaviorExecutor:
         # test doubles deterministic by treating their selected staging pose
         # as the capture pose rather than failing solely because they omit TF.
         actual = pose_reader(frame_id) if callable(pose_reader) else list(expected)
+        distance_tolerance_m, yaw_tolerance_rad = (
+            self._container_m1_capture_evidence_tolerances(candidate)
+        )
         validation = interaction_pose_validation(
             expected,
             None if actual is None else list(actual),
-            distance_tolerance_m=self._container_m1_staging_pose_tolerance_m(
-                candidate
-            ),
-            yaw_tolerance_rad=self._container_m1_staging_yaw_tolerance_rad(
-                candidate
-            ),
+            distance_tolerance_m=distance_tolerance_m,
+            yaw_tolerance_rad=yaw_tolerance_rad,
         )
         if not bool(validation.get("valid")):
             return None, "m1_capture_pose_mismatch"
@@ -1920,6 +2228,12 @@ class SemanticBehaviorExecutor:
         )
         if capture_step is None:
             return None, "m1_capture_step_unavailable"
+        front_axis = self._container_m1_front_axis_from_capture_pose(
+            candidate,
+            list(validation.get("actual_pose_xyyaw") or []),
+        )
+        if front_axis is None:
+            return None, "m1_front_axis_unavailable"
         return {
             "capture_step": int(capture_step),
             "capture_pose_xyyaw": list(validation.get("actual_pose_xyyaw") or []),
@@ -1928,7 +2242,78 @@ class SemanticBehaviorExecutor:
             "view_state": str(update.get("view_state") or ""),
             "front_surface_visible": bool(update.get("front_surface_visible")),
             "approach_ready": bool(update.get("approach_ready")),
+            **front_axis,
         }, "ready"
+
+    @staticmethod
+    def _container_m1_front_axis_from_capture_pose(
+        candidate: dict,
+        capture_pose_xyyaw: list | tuple,
+    ) -> dict | None:
+        """Freeze a world-space face only after M1 confirms the current image.
+
+        M1 intentionally supplies a categorical visual claim, not a map-space
+        normal.  The calibrated capture pose supplies the metric half: the
+        target-to-camera ray is meaningful only because the accepted M1 image
+        established that it sees the target's usable front.  Never substitute a
+        graph ``interaction_approach_axis_xy`` here: it may be oracle geometry.
+        """
+
+        metadata = candidate.get("metadata") or {}
+        if not bool(metadata.get("container_m1_front_axis_from_capture", False)):
+            return {}
+        if bool(metadata.get("container_m1_face_selection_enabled", False)):
+            try:
+                staging_index = int(
+                    metadata.get(
+                        "container_two_stage_staging_goal_option_index",
+                        metadata.get("interaction_approach_goal_option_index", 0),
+                    )
+                )
+            except (TypeError, ValueError):
+                return None
+            axes = list(metadata.get("container_face_axis_xy_by_staging_index") or [])
+            axis_values = (
+                list(axes[staging_index] or [])
+                if 0 <= staging_index < len(axes)
+                else []
+            )
+            if len(axis_values) < 2:
+                return None
+            try:
+                axis_x = float(axis_values[0])
+                axis_y = float(axis_values[1])
+            except (TypeError, ValueError):
+                return None
+            norm = math.hypot(axis_x, axis_y)
+            if not math.isfinite(norm) or norm <= 1e-6:
+                return None
+            axis_x /= norm
+            axis_y /= norm
+            return {
+                "m1_front_axis_xy": [axis_x, axis_y],
+                "m1_front_yaw": math.atan2(-axis_y, -axis_x),
+                "m1_front_axis_source": "m1_confirmed_aabb_cardinal_face",
+                "m1_front_staging_index": staging_index,
+            }
+        anchor = list(metadata.get("container_geometry_anchor_xy") or [])
+        if len(anchor) < 2 or len(capture_pose_xyyaw) < 2:
+            return None
+        try:
+            axis_x = float(capture_pose_xyyaw[0]) - float(anchor[0])
+            axis_y = float(capture_pose_xyyaw[1]) - float(anchor[1])
+        except (TypeError, ValueError):
+            return None
+        norm = math.hypot(axis_x, axis_y)
+        if not math.isfinite(norm) or norm <= 1e-6:
+            return None
+        axis_x /= norm
+        axis_y /= norm
+        return {
+            "m1_front_axis_xy": [axis_x, axis_y],
+            "m1_front_yaw": math.atan2(-axis_y, -axis_x),
+            "m1_front_axis_source": "m1_confirmed_capture_pose",
+        }
 
     def _container_m1_evidence_still_at_capture_pose_locked(
         self, candidate: dict, evidence: dict
@@ -1949,15 +2334,14 @@ class SemanticBehaviorExecutor:
             if callable(pose_reader)
             else list(capture_pose)
         )
+        distance_tolerance_m, yaw_tolerance_rad = (
+            self._container_m1_capture_evidence_tolerances(candidate)
+        )
         validation = interaction_pose_validation(
             capture_pose,
             None if actual is None else list(actual),
-            distance_tolerance_m=self._container_m1_staging_pose_tolerance_m(
-                candidate
-            ),
-            yaw_tolerance_rad=self._container_m1_staging_yaw_tolerance_rad(
-                candidate
-            ),
+            distance_tolerance_m=distance_tolerance_m,
+            yaw_tolerance_rad=yaw_tolerance_rad,
         )
         return bool(validation.get("valid"))
 
@@ -2543,6 +2927,83 @@ class SemanticBehaviorExecutor:
                     ),
                 }
             )
+        if (
+            failure_reason == "unsafe_open_sweep"
+            and two_stage_inner
+            and not bool(metadata.get("unsafe_open_sweep_retreat_attempted", False))
+        ):
+            try:
+                retreat_m = float(payload.get("recommended_retreat_m", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                retreat_m = 0.0
+            effective_pose = list(
+                metadata.get("effective_interaction_approach_pose_xyyaw")
+                or (candidate.get("interaction_command") or {}).get(
+                    "interaction_approach_pose_xyyaw"
+                )
+                or []
+            )
+            front_axis = list(metadata.get("m1_front_axis_xy") or [])
+            if retreat_m > 0.0 and len(effective_pose) >= 3:
+                if len(front_axis) >= 2:
+                    axis_norm = math.hypot(
+                        float(front_axis[0]), float(front_axis[1])
+                    )
+                    axis_x = float(front_axis[0]) / max(axis_norm, 1e-9)
+                    axis_y = float(front_axis[1]) / max(axis_norm, 1e-9)
+                else:
+                    # The action yaw points from robot toward the object; its
+                    # opposite ray is the public retreat direction.  This is a
+                    # pose-frame fallback, not simulator geometry.
+                    axis_x = -math.cos(float(effective_pose[2]))
+                    axis_y = -math.sin(float(effective_pose[2]))
+                retreat_goal = [
+                    float(effective_pose[0]) + retreat_m * axis_x,
+                    float(effective_pose[1]) + retreat_m * axis_y,
+                    float(effective_pose[2]),
+                ]
+                interaction = dict(candidate.get("interaction_command") or {})
+                interaction["interaction_approach_pose_xyyaw"] = list(retreat_goal)
+                metadata.update(
+                    {
+                        "unsafe_open_sweep_retreat_attempted": True,
+                        "unsafe_open_sweep_recommended_retreat_m": retreat_m,
+                        "unsafe_open_sweep_retreat_goal_xyyaw": list(retreat_goal),
+                        "effective_interaction_approach_pose_xyyaw": list(
+                            retreat_goal
+                        ),
+                        "interaction_approach_goal_option_index": 0,
+                        "container_two_stage_action_goal_option_index": 0,
+                        "container_two_stage_action_goal_xyyaw": list(retreat_goal),
+                        "container_two_stage_action_goal_xyyaw_options": [
+                            list(retreat_goal)
+                        ],
+                        "container_two_stage_action_pose_option_labels": [
+                            "unsafe_open_sweep_retreat"
+                        ],
+                        "interaction_approach_pose_labels": [
+                            "unsafe_open_sweep_retreat"
+                        ],
+                    }
+                )
+                candidate["goal_xyyaw"] = list(retreat_goal)
+                candidate["goal_xyyaw_candidates"] = []
+                candidate["interaction_command"] = interaction
+                candidate["metadata"] = metadata
+                self.machine.candidate = candidate
+                self.selection = dict(candidate)
+                commands = self.machine.retry_interaction_approach(
+                    start_goal_option_index=0,
+                    interaction_approach_attempts=attempts,
+                    detail={
+                        "reason": "unsafe_open_sweep_retreat",
+                        "recommended_retreat_m": retreat_m,
+                        "retreat_goal_xyyaw": list(retreat_goal),
+                    },
+                )
+                if commands:
+                    self.selection = dict(self.machine.candidate or candidate)
+                    return commands
         goal_option_count = len(navigation_goal_options(candidate))
         approach_attempt_limit = self._interaction_approach_attempt_limit(candidate)
         failure_detail = {
@@ -2849,11 +3310,13 @@ class SemanticBehaviorExecutor:
             if now - started_at >= self.drawer_scan_execution_step_sync_stall_timeout_s:
                 return "drawer_scan_execution_step_sync_stall"
             return ""
-        if (
-            now - float(self._latest_step_sync_received_at or started_at)
-            >= self.drawer_scan_execution_step_sync_stall_timeout_s
-        ):
-            return "drawer_scan_execution_step_sync_stall"
+        # Once the public evaluator step has advanced, wall-clock delay of the
+        # callback is not evidence that the macro stalled.  Under concurrent
+        # MLLM/ROS load the callback can be delivered in bursts; using its host
+        # timestamp here falsely aborted successful drawer scans and allowed
+        # the same drawer to be selected a second time.  The authoritative
+        # simulator-step budget below handles real overrun; the short stall
+        # timeout remains only for a stream that never advances at all.
         elapsed_steps = int(latest_step) - int(started_step)
         allowed_steps = int(context.get("max_task_steps", 0) or 0) + int(
             context.get("step_budget_margin", 0) or 0
@@ -2959,6 +3422,87 @@ class SemanticBehaviorExecutor:
                 else []
             )
         self._dispatch(commands)
+
+    def _move_base_status_callback(self, message: GoalStatusArray) -> None:
+        """Record authoritative server-side activity for capture handoff."""
+
+        active_states = {
+            GoalStatus.PENDING,
+            GoalStatus.ACTIVE,
+            GoalStatus.PREEMPTING,
+            GoalStatus.RECALLING,
+        }
+        active_statuses = tuple(
+            (
+                str(getattr(getattr(item, "goal_id", None), "id", "") or ""),
+                int(getattr(item, "status", GoalStatus.LOST)),
+            )
+            for item in list(getattr(message, "status_list", ()) or ())
+            if int(getattr(item, "status", GoalStatus.LOST)) in active_states
+        )
+        condition = getattr(self, "_move_base_status_condition", None)
+        if condition is None:
+            return
+        with condition:
+            self._move_base_status_received_count = (
+                int(getattr(self, "_move_base_status_received_count", 0) or 0) + 1
+            )
+            self._move_base_active_goal_statuses = active_statuses
+            if (
+                not str(getattr(self, "_move_base_owned_goal_id", "") or "")
+                and int(getattr(self, "_move_base_goal_generation", 0) or 0) > 0
+                and len(active_statuses) == 1
+            ):
+                # Fallback for actionlib adapters that do not expose ``gh``:
+                # after an executor dispatch, the sole newly active server goal
+                # is the owned generation.  Never infer ownership before the
+                # first executor send.
+                self._move_base_owned_goal_id = active_statuses[0][0]
+            condition.notify_all()
+
+    def _current_move_base_goal_id(self) -> str:
+        """Return SimpleActionClient's current goal id without exposing it.
+
+        actionlib does not offer a public goal-id accessor.  Keep the internal
+        lookup concentrated at this seam and fail closed to an empty id for
+        test adapters or alternative clients.
+        """
+
+        try:
+            return str(
+                self.move_base.gh.comm_state_machine.action_goal.goal_id.id or ""
+            )
+        except (AttributeError, TypeError, ValueError):
+            return ""
+
+    def _record_move_base_goal_dispatch(self) -> str:
+        goal_id = self._current_move_base_goal_id()
+        condition = getattr(self, "_move_base_status_condition", None)
+        if condition is None:
+            self._move_base_owned_goal_id = goal_id
+            self._move_base_goal_generation = int(
+                getattr(self, "_move_base_goal_generation", 0) or 0
+            ) + 1
+            return goal_id
+        with condition:
+            self._move_base_owned_goal_id = goal_id
+            self._move_base_goal_generation = int(
+                getattr(self, "_move_base_goal_generation", 0) or 0
+            ) + 1
+            condition.notify_all()
+        return goal_id
+
+    def _publish_dispatched_subgoal(self, frame_id: str, x: float, y: float) -> None:
+        publisher = getattr(self, "subgoal_pub", None)
+        if publisher is None:
+            return
+        message = PointStamped()
+        message.header.frame_id = str(frame_id or self.map_frame)
+        message.header.stamp = rospy.Time.now()
+        message.point.x = float(x)
+        message.point.y = float(y)
+        message.point.z = 0.0
+        publisher.publish(message)
 
     def _occupancy_callback(self, message: OccupancyGrid) -> None:
         with self.lock:
@@ -3930,13 +4474,14 @@ class SemanticBehaviorExecutor:
 
     @staticmethod
     def _is_container_staging_observation_hold_candidate(candidate: dict | None) -> bool:
-        """Whether a targeted M1 request must freeze a safe outer container pose."""
+        """Whether a targeted M1 request must freeze its direct capture pose."""
 
         metadata = (candidate or {}).get("metadata") or {}
         return bool(
-            metadata.get("container_two_stage_approach", False)
+            str((candidate or {}).get("behavior_type") or "").upper() == "INTERACT"
+            and metadata.get("container_two_stage_approach", False)
             and str(metadata.get("container_two_stage_phase") or "staging").casefold()
-            == "staging"
+            in {"staging", "m1_capture"}
             and metadata.get("m1_observation_staging_required", False)
         )
 
@@ -4112,8 +4657,8 @@ class SemanticBehaviorExecutor:
         self._dispatch(commands)
 
     def _publish_interaction_command(self, candidate: dict) -> None:
-        interaction = candidate.get("interaction_command") or {}
         metadata = candidate.get("metadata") or {}
+        interaction = candidate.get("interaction_command") or {}
         drawer_sequence_type = str(
             interaction.get("sequence_type") or ""
         ).casefold()
@@ -4132,7 +4677,13 @@ class SemanticBehaviorExecutor:
             self.interaction_command_sequence += 1
             interaction_sequence = self.interaction_command_sequence
         payload = {
-            "command_id": self._command_id(candidate),
+            # The bridge deduplicates physical requests by command_id.  One
+            # semantic decision may legitimately issue a second physical
+            # attempt from a different bounded recovery anchor, so the
+            # per-decision base id is not a sufficient physical request id.
+            "command_id": (
+                f"{self._command_id(candidate)}:interaction:{interaction_sequence:03d}"
+            ),
             "decision_id": candidate.get("decision_id", ""),
             "candidate_id": candidate.get("candidate_id", ""),
             "event_id": f"{candidate.get('decision_id', 'decision')}_interaction_{interaction_sequence:03d}",
@@ -4167,6 +4718,15 @@ class SemanticBehaviorExecutor:
             ),
             "interaction_approach_axis_xy": list(
                 interaction.get("interaction_approach_axis_xy") or []
+            ),
+            "interaction_target_center_xy": list(
+                interaction.get("interaction_target_center_xy") or []
+            ),
+            "interaction_front_axis_source": str(
+                interaction.get("interaction_front_axis_source") or ""
+            ),
+            "interaction_front_axis_validation_required": bool(
+                interaction.get("interaction_front_axis_validation_required", False)
             ),
             "interaction_ready_distance_m": float(
                 interaction.get("interaction_ready_distance_m", 0.45) or 0.45
@@ -5395,7 +5955,16 @@ class SemanticBehaviorExecutor:
             float(self.rear_goal_rotate_speed_rad_s)
             * float(self.rear_goal_prerotate_control_dt_s)
         )
-        for sign in (-1, 1):
+        shortest_sign = 1 if angular_error > 0.0 else -1
+        if abs(abs(angular_error) - math.pi) <= float(
+            getattr(self, "rear_goal_pi_tie_tolerance_rad", 0.20)
+        ):
+            shortest_sign = 1 if int(self.rear_goal_pi_turn_sign) > 0 else -1
+        # Never take the collision-free long arc as a substitute for a blocked
+        # shortest turn.  It causes the conspicuous full spin seen before an
+        # otherwise nearby interaction goal.  A blocked shortest sweep is a
+        # fail-closed navigation outcome and can select another anchor instead.
+        for sign in (shortest_sign,):
             arc = _rotation_arc_for_sign(float(pose[2]), target_yaw, sign)
             required_steps = (
                 0
@@ -5440,33 +6009,20 @@ class SemanticBehaviorExecutor:
                 rejected.append({**candidate_detail, "reason": "footprint_collision"})
         if not choices:
             reason = (
-                "rear_goal_both_turn_sweeps_blocked"
+                "rear_goal_shortest_turn_sweep_blocked"
                 if any(item.get("reason") == "footprint_collision" for item in rejected)
                 else "rear_goal_rotation_control_budget"
             )
             return None, {
+                **costmap_detail,
                 "reason": reason,
                 "angular_error_rad": angular_error,
                 "target_yaw": target_yaw,
+                "shortest_turn_sign": shortest_sign,
+                "shortest_angle_enforced": True,
                 "rejected_turns": rejected,
-                **costmap_detail,
             }
-        with self.lock:
-            previous_lock = dict(self._rear_goal_turn_locks.get(decision_id) or {})
-        locked_sign = previous_lock.get("turn_sign")
-        selected = next(
-            (choice for choice in choices if choice["turn_sign"] == locked_sign),
-            None,
-        )
-        if selected is None:
-            tie_sign = int(self.rear_goal_pi_turn_sign)
-            selected = sorted(
-                choices,
-                key=lambda choice: (
-                    float(choice["arc_rad"]),
-                    0 if int(choice["turn_sign"]) == tie_sign else 1,
-                ),
-            )[0]
+        selected = choices[0]
         selected = {
             **selected,
             "status": "selected",
@@ -5479,6 +6035,7 @@ class SemanticBehaviorExecutor:
                 "target_yaw": float(target_yaw),
             }
         return selected, {
+            **costmap_detail,
             "reason": "rear_goal_turn_selected",
             "angular_error_rad": angular_error,
             "target_yaw": target_yaw,
@@ -5486,8 +6043,8 @@ class SemanticBehaviorExecutor:
             "selected_turn_sign": int(selected["turn_sign"]),
             "selected_arc_rad": float(selected["arc_rad"]),
             "selected_control_steps": int(selected["required_control_steps"]),
+            "shortest_angle_enforced": True,
             "rejected_turns": rejected,
-            **costmap_detail,
         }
 
     def _drive_rear_goal_reverse_step_gated(
@@ -6483,15 +7040,12 @@ class SemanticBehaviorExecutor:
     ) -> tuple[bool, dict]:
         """Poll fresh simulator-step poses, bounded by count rather than time."""
 
-        interaction = candidate.get("interaction_command") or {}
         metadata = candidate.get("metadata") or {}
         frame_id = str(metadata.get("frame_id") or self.map_frame)
-        distance_tolerance_m = float(
-            interaction.get("interaction_ready_distance_m", 0.45) or 0.45
+        distance_tolerance_m = self._interaction_navigation_pose_tolerance_m(
+            candidate
         )
-        yaw_tolerance_rad = float(
-            interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
-        )
+        yaw_tolerance_rad = self._interaction_navigation_yaw_tolerance_rad(candidate)
         with self.lock:
             observed_step_index = self._latest_step_sync_index
         samples = []
@@ -6563,6 +7117,14 @@ class SemanticBehaviorExecutor:
     ) -> None:
         """Gate an INTERACT command on counted fresh-pose samples."""
 
+        profile_detail = (candidate.get("metadata") or {}).get(
+            "container_m1_capture_dwa_profile"
+        )
+        if isinstance(profile_detail, dict):
+            detail = {
+                **detail,
+                "container_m1_capture_dwa_profile": dict(profile_detail),
+            }
         arrival_sample = self._container_safe_staging_arrival_sample(
             candidate,
             selected_goal,
@@ -6793,6 +7355,725 @@ class SemanticBehaviorExecutor:
             "final_goal_option_index": optional_int("final_goal_option_index"),
         }
 
+    @staticmethod
+    def _finite_positive_tolerance(value: object) -> float | None:
+        """Return one finite positive tolerance without silently widening it."""
+
+        try:
+            tolerance = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(tolerance) or tolerance <= 0.0:
+            return None
+        return tolerance
+
+    def _container_m1_capture_dwa_profile_lock_for_use(self) -> threading.RLock:
+        """Get the private DWA-profile mutex for normal and test-only instances."""
+
+        profile_lock = getattr(self, "_container_m1_capture_dwa_profile_lock", None)
+        if profile_lock is None:
+            profile_lock = threading.RLock()
+            self._container_m1_capture_dwa_profile_lock = profile_lock
+        return profile_lock
+
+    def _container_m1_capture_dwa_reconfigure_timeout(self) -> float:
+        value = self._finite_positive_tolerance(
+            getattr(self, "container_m1_capture_dwa_reconfigure_timeout_s", 1.0)
+        )
+        return max(0.05, value if value is not None else 1.0)
+
+    def _container_m1_capture_dwa_reconfigure_client_locked(
+        self,
+    ) -> tuple[object | None, dict]:
+        """Return a lazily-created DWA dynamic-reconfigure client.
+
+        The executor can start before the local planner's dynamic server.  Do
+        not make construction a process-start dependency; this bounded request
+        happens only after a capture goal has passed normal path preflight.
+        """
+
+        client = getattr(
+            self, "_container_m1_capture_dwa_reconfigure_client", None
+        )
+        if client is not None:
+            return client, {}
+        try:
+            from dynamic_reconfigure.client import Client as DynamicReconfigureClient
+        except ImportError as exc:
+            return None, {
+                "reason": "container_m1_capture_dwa_reconfigure_unavailable",
+                "error": str(exc),
+            }
+        server = str(
+            getattr(
+                self,
+                "container_m1_capture_dwa_reconfigure_server",
+                "/move_base/DWAPlannerROS",
+            )
+            or "/move_base/DWAPlannerROS"
+        ).strip()
+        if not server:
+            return None, {"reason": "container_m1_capture_dwa_reconfigure_server_missing"}
+        try:
+            client = DynamicReconfigureClient(
+                server,
+                timeout=self._container_m1_capture_dwa_reconfigure_timeout(),
+            )
+        except Exception as exc:  # ROS service availability is runtime-only.
+            return None, {
+                "reason": "container_m1_capture_dwa_reconfigure_connect_failed",
+                "server": server,
+                "error": str(exc),
+            }
+        self._container_m1_capture_dwa_reconfigure_client = client
+        return client, {"server": server}
+
+    def _invalidate_container_m1_capture_dwa_reconfigure_client_locked(
+        self, client: object | None = None
+    ) -> None:
+        """Forget a failed dynamic client so a move_base respawn gets a fresh one."""
+
+        cached_client = getattr(
+            self, "_container_m1_capture_dwa_reconfigure_client", None
+        )
+        if client is None or cached_client is client:
+            self._container_m1_capture_dwa_reconfigure_client = None
+
+    def _container_m1_capture_dwa_read_configuration_locked(
+        self, client: object
+    ) -> tuple[dict | None, dict]:
+        """Read one bounded DWA configuration snapshot from the active client."""
+
+        try:
+            configuration = client.get_configuration(
+                timeout=self._container_m1_capture_dwa_reconfigure_timeout()
+            )
+        except TypeError:
+            # Small test doubles and older client shims may not take ``timeout``.
+            try:
+                configuration = client.get_configuration()
+            except Exception as exc:
+                self._invalidate_container_m1_capture_dwa_reconfigure_client_locked(
+                    client
+                )
+                return None, {
+                    "reason": "container_m1_capture_dwa_reconfigure_read_failed",
+                    "error": str(exc),
+                }
+        except Exception as exc:  # Dynamic reconfigure can disappear on respawn.
+            self._invalidate_container_m1_capture_dwa_reconfigure_client_locked(client)
+            return None, {
+                "reason": "container_m1_capture_dwa_reconfigure_read_failed",
+                "error": str(exc),
+            }
+        if not isinstance(configuration, dict):
+            self._invalidate_container_m1_capture_dwa_reconfigure_client_locked(client)
+            return None, {
+                "reason": "container_m1_capture_dwa_reconfigure_invalid_snapshot"
+            }
+        return dict(configuration), {}
+
+    def _restore_container_m1_capture_dwa_profile_locked(
+        self, active_profile: dict
+    ) -> tuple[bool, dict]:
+        """Restore the exact pre-capture DWA tolerance pair while holding its lease."""
+
+        if not bool(active_profile.get("restore_required", False)):
+            return True, {"restored": False, "reason": "already_strict_or_lower"}
+        client = active_profile.get("client")
+        restore_configuration = active_profile.get("restore_configuration")
+        if client is None or not isinstance(restore_configuration, dict):
+            return False, {"reason": "container_m1_capture_dwa_restore_missing_snapshot"}
+        try:
+            client.update_configuration(dict(restore_configuration))
+        except Exception as exc:  # Keep the failure visible; never issue a blind retry.
+            self._invalidate_container_m1_capture_dwa_reconfigure_client_locked(client)
+            return False, {
+                "reason": "container_m1_capture_dwa_restore_failed",
+                "error": str(exc),
+            }
+        return True, {
+            "restored": True,
+            "xy_goal_tolerance": restore_configuration.get("xy_goal_tolerance"),
+            "yaw_goal_tolerance": restore_configuration.get("yaw_goal_tolerance"),
+        }
+
+    def _activate_container_m1_capture_dwa_profile(
+        self,
+        decision_id: str,
+        navigation_run_token: int,
+        candidate: dict,
+        *,
+        direct_distance_tolerance_m: float,
+        direct_yaw_tolerance_rad: float,
+    ) -> tuple[bool, dict]:
+        """Apply one explicit executor/DWA tolerance pair for an interaction goal.
+
+        Live interaction candidates use the requested pair exactly, including
+        a portal whose valid position envelope is wider than the current DWA
+        default.  Legacy direct-capture test fixtures retain tighten-only
+        behavior.  Setup is fail-closed so no goal runs under a split contract.
+        """
+
+        is_interaction_goal = str(candidate.get("behavior_type") or "").upper() == "INTERACT"
+        legacy_capture_goal = is_container_two_stage_m1_capture(candidate)
+        if not (is_interaction_goal or legacy_capture_goal):
+            return True, {"active": False, "reason": "not_container_m1_capture"}
+        if not bool(
+            getattr(self, "container_m1_capture_dwa_profile_enabled", False)
+        ):
+            if is_interaction_goal and not legacy_capture_goal:
+                return True, {
+                    "active": False,
+                    "reason": "interaction_dwa_profile_disabled",
+                }
+            return False, {"reason": "container_m1_capture_dwa_profile_disabled"}
+        requested_distance = self._finite_positive_tolerance(
+            direct_distance_tolerance_m
+        )
+        requested_yaw = self._finite_positive_tolerance(direct_yaw_tolerance_rad)
+        if requested_distance is None or requested_yaw is None:
+            return False, {"reason": "interaction_dwa_profile_invalid_tolerance"}
+        if legacy_capture_goal and not is_interaction_goal:
+            # Preserve hand-authored/legacy static candidates; live generated
+            # interaction candidates always carry the explicit contract.
+            requested_distance = min(
+                requested_distance,
+                self._finite_positive_tolerance(
+                    getattr(self, "container_m1_distinct_view_arrival_tolerance_m", 0.05)
+                )
+                or 0.05,
+            )
+            requested_yaw = min(
+                requested_yaw,
+                self._finite_positive_tolerance(
+                    getattr(
+                        self,
+                        "container_m1_capture_yaw_tolerance_rad",
+                        math.radians(30.0),
+                    )
+                )
+                or 0.08,
+            )
+        owner = (str(decision_id), int(navigation_run_token))
+        profile_lock = self._container_m1_capture_dwa_profile_lock_for_use()
+        with profile_lock:
+            active_profile = getattr(
+                self, "_container_m1_capture_dwa_profile_active", None
+            )
+            if isinstance(active_profile, dict):
+                active_owner = (
+                    str(active_profile.get("decision_id") or ""),
+                    int(active_profile.get("navigation_run_token", -1) or -1),
+                )
+                if active_owner == owner:
+                    return True, {
+                        **dict(active_profile.get("detail") or {}),
+                        "active": True,
+                        "reused_by_owner": True,
+                    }
+                # A newer worker has already replaced the old navigation token
+                # by the time it can reach this point.  Restore that stale
+                # owner's saved defaults before taking the same global DWA
+                # server; an actually active owner remains a hard, safe reject.
+                owner_is_active = True
+                checker = getattr(self, "_navigation_run_is_active", None)
+                if callable(checker):
+                    owner_is_active = bool(checker(*active_owner))
+                if owner_is_active:
+                    return False, {
+                        "reason": "container_m1_capture_dwa_profile_owned_by_active_run",
+                        "active_decision_id": active_owner[0],
+                        "active_navigation_run_token": active_owner[1],
+                    }
+                capture_goal_inactive, capture_goal_detail = (
+                    self._confirm_container_m1_capture_goal_inactive_before_profile_restore()
+                )
+                if not capture_goal_inactive:
+                    return False, {
+                        "reason": (
+                            "container_m1_capture_dwa_profile_goal_still_active_before_"
+                            "profile_switch"
+                        ),
+                        "capture_goal_detail": capture_goal_detail,
+                        "active_decision_id": active_owner[0],
+                        "active_navigation_run_token": active_owner[1],
+                    }
+                restored, stale_restore_detail = (
+                    self._restore_container_m1_capture_dwa_profile_locked(active_profile)
+                )
+                if not restored:
+                    return False, {
+                        "reason": "container_m1_capture_dwa_profile_stale_restore_failed",
+                        "restore_detail": stale_restore_detail,
+                        "active_decision_id": active_owner[0],
+                        "active_navigation_run_token": active_owner[1],
+                    }
+                self._container_m1_capture_dwa_profile_active = None
+
+            client, client_detail = (
+                self._container_m1_capture_dwa_reconfigure_client_locked()
+            )
+            if client is None:
+                return False, client_detail
+            configuration, read_detail = (
+                self._container_m1_capture_dwa_read_configuration_locked(client)
+            )
+            if configuration is None:
+                return False, {**client_detail, **read_detail}
+            default_distance = self._finite_positive_tolerance(
+                configuration.get("xy_goal_tolerance")
+            )
+            default_yaw = self._finite_positive_tolerance(
+                configuration.get("yaw_goal_tolerance")
+            )
+            if default_distance is None or default_yaw is None:
+                return False, {
+                    **client_detail,
+                    "reason": "container_m1_capture_dwa_reconfigure_missing_goal_tolerance",
+                }
+            # This per-goal pair is the single arrival contract used by both
+            # executor validation and DWA.  Apply it exactly—even when a portal
+            # deliberately requests a wider tolerance than the planner default.
+            strict_distance = (
+                requested_distance
+                if is_interaction_goal
+                else min(default_distance, requested_distance)
+            )
+            strict_yaw = (
+                requested_yaw
+                if is_interaction_goal
+                else min(default_yaw, requested_yaw)
+            )
+            restore_configuration = {
+                "xy_goal_tolerance": default_distance,
+                "yaw_goal_tolerance": default_yaw,
+            }
+            restore_required = bool(
+                abs(strict_distance - default_distance) > 1e-6
+                or abs(strict_yaw - default_yaw) > 1e-6
+            )
+            detail = {
+                **client_detail,
+                "profile": "interaction_goal_tolerance_contract",
+                "default_xy_goal_tolerance": default_distance,
+                "default_yaw_goal_tolerance": default_yaw,
+                "xy_goal_tolerance": strict_distance,
+                "yaw_goal_tolerance": strict_yaw,
+                "restore_required": restore_required,
+            }
+            if restore_required:
+                try:
+                    applied = client.update_configuration(
+                        {
+                            "xy_goal_tolerance": strict_distance,
+                            "yaw_goal_tolerance": strict_yaw,
+                        }
+                    )
+                except Exception as exc:
+                    self._invalidate_container_m1_capture_dwa_reconfigure_client_locked(
+                        client
+                    )
+                    return False, {
+                        **detail,
+                        "reason": "container_m1_capture_dwa_reconfigure_update_failed",
+                        "error": str(exc),
+                    }
+                applied_distance = (
+                    None
+                    if not isinstance(applied, dict)
+                    else self._finite_positive_tolerance(
+                        applied.get("xy_goal_tolerance")
+                    )
+                )
+                applied_yaw = (
+                    None
+                    if not isinstance(applied, dict)
+                    else self._finite_positive_tolerance(
+                        applied.get("yaw_goal_tolerance")
+                    )
+                )
+                if (
+                    applied_distance is None
+                    or applied_yaw is None
+                    or abs(applied_distance - strict_distance) > 1e-6
+                    or abs(applied_yaw - strict_yaw) > 1e-6
+                ):
+                    try:
+                        client.update_configuration(dict(restore_configuration))
+                    except Exception:
+                        pass
+                    self._invalidate_container_m1_capture_dwa_reconfigure_client_locked(
+                        client
+                    )
+                    return False, {
+                        **detail,
+                        "reason": "container_m1_capture_dwa_reconfigure_not_strict",
+                        "applied_xy_goal_tolerance": applied_distance,
+                        "applied_yaw_goal_tolerance": applied_yaw,
+                    }
+            sequence = max(
+                0,
+                int(
+                    getattr(self, "_container_m1_capture_dwa_profile_sequence", 0)
+                    or 0
+                ),
+            ) + 1
+            self._container_m1_capture_dwa_profile_sequence = sequence
+            detail["lease_token"] = sequence
+            self._container_m1_capture_dwa_profile_active = {
+                "decision_id": owner[0],
+                "navigation_run_token": owner[1],
+                "client": client,
+                "restore_configuration": restore_configuration,
+                "restore_required": restore_required,
+                "detail": dict(detail),
+            }
+            rospy.loginfo(
+                "[semantic_behavior_executor] interaction DWA tolerance profile "
+                "lease=%d owner=%s/%d xy %.3f->%.3f yaw %.3f->%.3f",
+                sequence,
+                owner[0],
+                owner[1],
+                default_distance,
+                strict_distance,
+                default_yaw,
+                strict_yaw,
+            )
+            return True, {**detail, "active": True}
+
+    def _release_container_m1_capture_dwa_profile(
+        self, decision_id: str, navigation_run_token: int
+    ) -> dict:
+        """Restore an interaction tolerance profile iff this worker still owns it."""
+
+        owner = (str(decision_id), int(navigation_run_token))
+        profile_lock = self._container_m1_capture_dwa_profile_lock_for_use()
+        with profile_lock:
+            active_profile = getattr(
+                self, "_container_m1_capture_dwa_profile_active", None
+            )
+            if not isinstance(active_profile, dict):
+                return {"released": False, "reason": "not_active"}
+            active_owner = (
+                str(active_profile.get("decision_id") or ""),
+                int(active_profile.get("navigation_run_token", -1) or -1),
+            )
+            if active_owner != owner:
+                return {
+                    "released": False,
+                    "reason": "not_profile_owner",
+                    "active_decision_id": active_owner[0],
+                    "active_navigation_run_token": active_owner[1],
+                }
+            restored, detail = self._restore_container_m1_capture_dwa_profile_locked(
+                active_profile
+            )
+            # Clear even when a ROS respawn makes restoration unavailable.  The
+            # lease must not let an old, terminated worker block future
+            # navigation; the failure is surfaced in the log and the next
+            # capture will take a fresh dynamic snapshot.
+            self._container_m1_capture_dwa_profile_active = None
+            if not restored:
+                rospy.logwarn(
+                    "[semantic_behavior_executor] failed to restore interaction "
+                    "DWA tolerance profile: %s",
+                    detail,
+                )
+            else:
+                rospy.loginfo(
+                    "[semantic_behavior_executor] restored interaction DWA "
+                    "profile owner=%s/%d: %s",
+                    owner[0],
+                    owner[1],
+                    detail,
+                )
+            return {"released": True, "restored": restored, **detail}
+
+    def _container_m1_capture_dwa_owns_terminal_pose(
+        self,
+        candidate: dict,
+        profile_detail: dict | None,
+        *,
+        distance_tolerance_m: float,
+        yaw_tolerance_rad: float,
+    ) -> bool:
+        """Whether this direct capture's live DWA lease owns its final pose.
+
+        A mapped M1 capture installs a token-bound DWA profile with the same
+        strict tolerances that bind later visual evidence.  While that profile
+        is active, a generic executor-side final turn would cancel DWA before
+        its stricter terminal yaw settles.  Only bypass that generic path after
+        confirming the live profile is at least as strict as the selected
+        capture contract; staging, physical action, and ordinary navigation
+        retain their existing final-align behaviour.
+        """
+
+        if not (
+            is_container_two_stage_m1_capture(candidate)
+            and isinstance(profile_detail, dict)
+            and bool(profile_detail.get("active", False))
+        ):
+            return False
+        configured_distance = self._finite_positive_tolerance(
+            profile_detail.get("xy_goal_tolerance")
+        )
+        configured_yaw = self._finite_positive_tolerance(
+            profile_detail.get("yaw_goal_tolerance")
+        )
+        required_distance = self._finite_positive_tolerance(distance_tolerance_m)
+        required_yaw = self._finite_positive_tolerance(yaw_tolerance_rad)
+        return bool(
+            configured_distance is not None
+            and configured_yaw is not None
+            and required_distance is not None
+            and required_yaw is not None
+            and configured_distance <= required_distance + 1e-9
+            and configured_yaw <= required_yaw + 1e-9
+        )
+
+    def _confirm_move_base_goal_quiescent_before_successor(
+        self,
+    ) -> tuple[bool, dict]:
+        """Cancel and prove the prior move_base goal is no longer commanding.
+
+        SimpleActionClient can report a local terminal result one callback before
+        the server stops publishing ACTIVE/PREEMPTING.  Both a direct-capture
+        profile handoff and an outer-staging retry must cross this bounded fence
+        before restoring DWA, calling make_plan, or dispatching a successor.
+        """
+
+        move_base = getattr(self, "move_base", None)
+        if move_base is None:
+            return False, {"reason": "move_base_successor_move_base_unavailable"}
+        active_states = {0, 1, 6, 7}  # PENDING, ACTIVE, PREEMPTING, RECALLING.
+        status_condition = getattr(self, "_move_base_status_condition", None)
+        status_baseline = int(
+            getattr(self, "_move_base_status_received_count", 0) or 0
+        )
+        owned_goal_id = str(
+            getattr(self, "_move_base_owned_goal_id", "")
+            or self._current_move_base_goal_id()
+            or ""
+        )
+        goal_generation = int(
+            getattr(self, "_move_base_goal_generation", 0) or 0
+        )
+        try:
+            state_before = int(move_base.get_state())
+        except Exception as exc:
+            return False, {
+                "reason": "move_base_successor_goal_state_unavailable",
+                "error": str(exc),
+            }
+        cancel_issued = False
+        state_after = state_before
+        if state_before in active_states:
+            try:
+                move_base.cancel_goal()
+                move_base.wait_for_result(
+                    rospy.Duration(
+                        max(
+                            0.0,
+                            float(getattr(self, "final_align_cancel_wait_s", 1.0)),
+                        )
+                    )
+                )
+                state_after = int(move_base.get_state())
+                cancel_issued = True
+            except Exception as exc:
+                return False, {
+                    "reason": "move_base_successor_goal_cancel_unconfirmed",
+                    "state_before": state_before,
+                    "error": str(exc),
+                }
+        server_status_confirmed = False
+        status_receipts_observed = 0
+        if status_condition is not None:
+            timeout_s = max(
+                0.1,
+                float(
+                    getattr(
+                        self,
+                        "move_base_successor_quiescence_timeout_s",
+                        getattr(
+                            self,
+                            "container_m1_capture_successor_quiescence_timeout_s",
+                            1.0,
+                        ),
+                    )
+                ),
+            )
+            deadline = time.monotonic() + timeout_s
+            with status_condition:
+                while True:
+                    receipt_count = int(
+                        getattr(self, "_move_base_status_received_count", 0) or 0
+                    )
+                    active_statuses = tuple(
+                        getattr(self, "_move_base_active_goal_statuses", ()) or ()
+                    )
+                    owned_active_statuses = tuple(
+                        (goal_id, status)
+                        for goal_id, status in active_statuses
+                        if owned_goal_id and goal_id == owned_goal_id
+                    )
+                    status_receipts_observed = max(0, receipt_count - status_baseline)
+                    # Server activity is goal-id scoped.  Historical
+                    # PREEMPTING/RECALLING entries from an older action must not
+                    # block a terminal current client, and an empty active set
+                    # already proves quiescence without waiting for an arbitrary
+                    # newer status receipt.  When actionlib's internal goal id is
+                    # unavailable, the terminal client state is the best bounded
+                    # authority and avoids turning status-history retention into
+                    # a global navigation outage.
+                    if not owned_active_statuses and (
+                        bool(owned_goal_id) or state_after not in active_states
+                    ):
+                        server_status_confirmed = True
+                        break
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0.0 or rospy.is_shutdown():
+                        break
+                    status_condition.wait(timeout=min(0.05, remaining_s))
+            if not server_status_confirmed:
+                return False, {
+                    "reason": "move_base_successor_server_still_active",
+                    "state_before": state_before,
+                    "state_after": state_after,
+                    "cancel_issued": cancel_issued,
+                    "status_baseline": status_baseline,
+                    "status_receipts_observed": status_receipts_observed,
+                    "active_goal_statuses": [
+                        [goal_id, status]
+                        for goal_id, status in tuple(
+                            getattr(self, "_move_base_active_goal_statuses", ()) or ()
+                        )
+                    ],
+                    "owned_goal_id": owned_goal_id,
+                    "goal_generation": goal_generation,
+                    "timeout_s": timeout_s,
+                }
+        if state_after in active_states:
+            return False, {
+                "reason": "move_base_successor_goal_still_active",
+                "state_before": state_before,
+                "state_after": state_after,
+                "cancel_issued": cancel_issued,
+            }
+        if owned_goal_id:
+            condition = getattr(self, "_move_base_status_condition", None)
+            if condition is None:
+                if str(getattr(self, "_move_base_owned_goal_id", "")) == owned_goal_id:
+                    self._move_base_owned_goal_id = ""
+            else:
+                with condition:
+                    if str(getattr(self, "_move_base_owned_goal_id", "")) == owned_goal_id:
+                        self._move_base_owned_goal_id = ""
+        return True, {
+            "state_before": state_before,
+            "state_after": state_after,
+            "cancel_issued": cancel_issued,
+            "server_status_confirmed": server_status_confirmed,
+            "status_receipts_observed": status_receipts_observed,
+            "owned_goal_id": owned_goal_id,
+            "goal_generation": goal_generation,
+        }
+
+    def _confirm_container_m1_capture_goal_inactive_before_profile_restore(
+        self,
+    ) -> tuple[bool, dict]:
+        """Compatibility wrapper for the now-general successor fence."""
+
+        return self._confirm_move_base_goal_quiescent_before_successor()
+
+    def _restore_container_m1_capture_dwa_profile_before_non_capture_dispatch(
+        self, decision_id: str, navigation_run_token: int
+    ) -> tuple[bool, dict]:
+        """Synchronously clear a preceding capture lease before another goal.
+
+        A result callback can schedule a successor worker before the prior
+        worker reaches its ``finally`` block.  DWA is global to move_base, so a
+        staging, physical-action, or ordinary navigation successor must not
+        inherit the previous direct-capture tolerance merely because of that
+        brief overlap.  The current token is checked first; a different still-
+        active decision remains a safe reject rather than a cross-decision
+        restore.
+        """
+
+        owner = (str(decision_id), int(navigation_run_token))
+        profile_lock = self._container_m1_capture_dwa_profile_lock_for_use()
+        with profile_lock:
+            active_profile = getattr(
+                self, "_container_m1_capture_dwa_profile_active", None
+            )
+            if not isinstance(active_profile, dict):
+                return True, {"restored": False, "reason": "not_active"}
+            active_owner = (
+                str(active_profile.get("decision_id") or ""),
+                int(active_profile.get("navigation_run_token", -1) or -1),
+            )
+            checker = getattr(self, "_navigation_run_is_active", None)
+            if callable(checker) and not bool(checker(*owner)):
+                return False, {
+                    "reason": "container_m1_capture_dwa_profile_successor_token_stale",
+                    "active_decision_id": active_owner[0],
+                    "active_navigation_run_token": active_owner[1],
+                }
+            if callable(checker) and bool(checker(*active_owner)):
+                return False, {
+                    "reason": "container_m1_capture_dwa_profile_owned_by_active_run",
+                    "active_decision_id": active_owner[0],
+                    "active_navigation_run_token": active_owner[1],
+                }
+            if not callable(checker) and active_owner[0] != owner[0]:
+                return False, {
+                    "reason": "container_m1_capture_dwa_profile_owner_unverified",
+                    "active_decision_id": active_owner[0],
+                    "active_navigation_run_token": active_owner[1],
+                }
+            capture_goal_inactive, capture_goal_detail = (
+                self._confirm_container_m1_capture_goal_inactive_before_profile_restore()
+            )
+            if not capture_goal_inactive:
+                return False, {
+                    "reason": (
+                        "container_m1_capture_dwa_profile_goal_still_active_before_"
+                        "successor_dispatch"
+                    ),
+                    "capture_goal_detail": capture_goal_detail,
+                    "active_decision_id": active_owner[0],
+                    "active_navigation_run_token": active_owner[1],
+                }
+            restored, detail = self._restore_container_m1_capture_dwa_profile_locked(
+                active_profile
+            )
+            if not restored:
+                return False, {
+                    "reason": (
+                        "container_m1_capture_dwa_profile_restore_before_"
+                        "non_capture_dispatch_failed"
+                    ),
+                    "restore_detail": detail,
+                    "active_decision_id": active_owner[0],
+                    "active_navigation_run_token": active_owner[1],
+                }
+            self._container_m1_capture_dwa_profile_active = None
+            rospy.loginfo(
+                "[semantic_behavior_executor] restored direct M1 capture DWA "
+                "profile owner=%s/%d before successor=%s/%d dispatch",
+                active_owner[0],
+                active_owner[1],
+                owner[0],
+                owner[1],
+            )
+            return True, {
+                "restored": True,
+                "restored_before_non_capture_dispatch": True,
+                "capture_goal_quiescence": capture_goal_detail,
+                **detail,
+            }
+
     def _register_navigation_run(self, decision_id: str, candidate: dict) -> int:
         """Bind one worker result to a unique dispatch generation."""
 
@@ -6825,6 +8106,134 @@ class SemanticBehaviorExecutor:
                 isinstance(active_tokens, dict)
                 and active_tokens.get(str(decision_id)) == int(run_token)
             )
+
+    def _schedule_navigation_successor(
+        self,
+        decision_id: str,
+        candidate: dict,
+        start_goal_option_index: int = 0,
+        interaction_approach_attempts: list[dict] | None = None,
+    ) -> None:
+        """Start a successor only after the current action worker has released.
+
+        Starting a private corridor or final container goal directly from an
+        actionlib result callback overlaps ``SimpleActionClient.send_goal`` with
+        the predecessor's transition/finally path.  In live H3/H10 runs that
+        produced an untracked goal handle and a decision which never emitted a
+        terminal result.  Capture the current token, wait for its wrapper to run
+        ``finally``, then cross the normal move_base quiescence fence before the
+        successor is allowed to register or send a goal.
+        """
+
+        decision_key = str(decision_id)
+        with self.lock:
+            active_tokens = getattr(self, "_active_navigation_run_tokens", None)
+            predecessor_token = (
+                active_tokens.get(decision_key)
+                if isinstance(active_tokens, dict)
+                else None
+            )
+        if predecessor_token is None:
+            # Initial dispatches and test/legacy adapters have no predecessor
+            # worker to serialize. Preserve the original lightweight launch.
+            threading.Thread(
+                target=self._run_navigation,
+                args=(
+                    decision_key,
+                    dict(candidate),
+                    int(start_goal_option_index),
+                    [dict(item) for item in (interaction_approach_attempts or [])],
+                ),
+                daemon=True,
+            ).start()
+            return
+        threading.Thread(
+            target=self._run_navigation_successor_after_release,
+            args=(
+                decision_key,
+                dict(candidate),
+                int(start_goal_option_index),
+                [dict(item) for item in (interaction_approach_attempts or [])],
+                predecessor_token,
+            ),
+            daemon=True,
+        ).start()
+
+    def _run_navigation_successor_after_release(
+        self,
+        decision_id: str,
+        candidate: dict,
+        start_goal_option_index: int,
+        interaction_approach_attempts: list[dict],
+        predecessor_token: int | None,
+    ) -> None:
+        """Serialize cancel -> predecessor release -> quiescence -> successor."""
+
+        release_deadline = time.monotonic() + max(
+            0.1,
+            float(
+                getattr(
+                    self,
+                    "move_base_successor_quiescence_timeout_s",
+                    1.0,
+                )
+            ),
+        )
+        while (
+            predecessor_token is not None
+            and self._navigation_run_is_active(decision_id, predecessor_token)
+            and self._navigation_is_current(decision_id)
+            and not rospy.is_shutdown()
+            and time.monotonic() < release_deadline
+        ):
+            time.sleep(0.01)
+        if not self._navigation_is_current(decision_id) or rospy.is_shutdown():
+            return
+        predecessor_released = bool(
+            predecessor_token is None
+            or not self._navigation_run_is_active(decision_id, predecessor_token)
+        )
+        if not predecessor_released:
+            self._handle_navigation_result(
+                decision_id,
+                False,
+                {
+                    "reason": "move_base_successor_not_quiescent",
+                    "failure_reason": "move_base_successor_not_quiescent",
+                    "retryable": True,
+                    "successor_stage": "predecessor_worker_release",
+                    "predecessor_navigation_run_token": predecessor_token,
+                    "interaction_approach_attempts": interaction_approach_attempts,
+                },
+                source_candidate=candidate,
+            )
+            return
+        goal_quiescent, quiescence_detail = (
+            self._confirm_move_base_goal_quiescent_before_successor()
+        )
+        if not goal_quiescent:
+            self._handle_navigation_result(
+                decision_id,
+                False,
+                {
+                    **quiescence_detail,
+                    "reason": "move_base_successor_not_quiescent",
+                    "failure_reason": "move_base_successor_not_quiescent",
+                    "retryable": True,
+                    "successor_stage": "move_base_quiescence",
+                    "interaction_approach_attempts": interaction_approach_attempts,
+                },
+                source_candidate=candidate,
+            )
+            return
+        if not self._navigation_is_current(decision_id):
+            return
+        self._run_navigation(
+            decision_id,
+            candidate,
+            start_goal_option_index,
+            interaction_approach_attempts,
+        )
 
     def _clear_container_inner_corridor_if_owned_locked(
         self, decision_id: str, candidate: dict | None
@@ -6972,28 +8381,37 @@ class SemanticBehaviorExecutor:
         final_goal_option_index: int,
         interaction_approach_attempts: list[dict],
     ) -> bool:
-        """Dispatch one verified intermediate segment before a close action pose.
+        """Dispatch one verified path segment before a container endpoint.
 
-        The action endpoint stays canonical on the state-machine candidate.  A
-        corridor is used only once for a particular physical option; after its
-        single intermediate point completes, the normal physical navigation
-        flow re-plans to the original endpoint and retains the strict bridge
-        validation.  If a path cannot prove a useful intermediate point, this
-        returns ``False`` and the caller uses the existing direct path.
+        The endpoint stays canonical on the state-machine candidate.  The
+        waypoint is executor-private: after it completes, normal navigation
+        re-plans to the original shared staging or physical endpoint.  It can
+        neither request M1 nor authorize the bridge.  If the verified planner
+        path has no useful intermediate point, the caller keeps its existing
+        retry path.
         """
 
+        metadata = dict(candidate.get("metadata") or {})
+        shared_staging_corridor = bool(
+            metadata.get("container_anchor_shared_pose", False)
+            and self._is_container_two_stage_m1_staging(candidate)
+        )
         if (
             not bool(getattr(self, "container_inner_corridor_enabled", False))
-            or not is_container_two_stage_physical_action(candidate)
+            or not (is_container_two_stage_physical_action(candidate) or shared_staging_corridor)
             or self._container_inner_corridor_marker(candidate)
         ):
             return False
-        metadata = dict(candidate.get("metadata") or {})
         completed_segments = max(
             0, int(metadata.get("container_inner_corridor_segments_completed", 0) or 0)
         )
-        if completed_segments >= int(
+        # A shared staging/M1/action pose gets at most one path waypoint.  It is
+        # a navigation escape hatch, not a multi-segment approach policy.
+        max_segments = 1 if shared_staging_corridor else int(
             getattr(self, "container_inner_corridor_max_segments", 1)
+        )
+        if completed_segments >= int(
+            max_segments
         ):
             return False
         reachable, path_xy, reason = self._preflight_navigation_path(
@@ -7051,6 +8469,7 @@ class SemanticBehaviorExecutor:
         corridor_metadata.update(
             {
                 "container_inner_corridor_navigation": True,
+                "container_inner_corridor_shared_staging": shared_staging_corridor,
                 "container_inner_corridor_run_id": corridor_run_id,
                 "container_inner_corridor_segment_index": completed_segments + 1,
                 "container_inner_corridor_final_goal_xyyaw": list(final_goal),
@@ -7088,6 +8507,7 @@ class SemanticBehaviorExecutor:
             corridors[str(decision_id)] = {
                 "corridor_run_id": corridor_run_id,
                 "candidate": dict(candidate),
+                "shared_staging_corridor": shared_staging_corridor,
                 "final_goal_option_index": int(final_goal_option_index),
                 "interaction_approach_attempts": [
                     dict(item) for item in interaction_approach_attempts
@@ -7095,11 +8515,9 @@ class SemanticBehaviorExecutor:
                 "waypoint_xyyaw": list(corridor_candidate["goal_xyyaw"]),
                 "segments_completed": completed_segments + 1,
             }
-        threading.Thread(
-            target=self._run_navigation,
-            args=(decision_id, corridor_candidate, 0, []),
-            daemon=True,
-        ).start()
+        self._schedule_navigation_successor(
+            decision_id, corridor_candidate, 0, []
+        )
         return True
 
     def _consume_container_inner_corridor_result(
@@ -7158,11 +8576,9 @@ class SemanticBehaviorExecutor:
                 context.get("waypoint_xyyaw") or []
             )
             final_candidate["metadata"] = final_metadata
-            threading.Thread(
-                target=self._run_navigation,
-                args=(decision_id, final_candidate, option_index, attempts),
-                daemon=True,
-            ).start()
+            self._schedule_navigation_successor(
+                decision_id, final_candidate, option_index, attempts
+            )
             return True
         failure_detail = {
             **dict(detail or {}),
@@ -7183,7 +8599,11 @@ class SemanticBehaviorExecutor:
                 "goal_xyyaw": physical_goal,
                 "reachable": False,
                 "outcome": "container_inner_corridor_failed",
-                "phase": "physical_action",
+                "phase": (
+                    "staging"
+                    if bool(context.get("shared_staging_corridor", False))
+                    else "physical_action"
+                ),
                 "container_inner_corridor_waypoint_xyyaw": list(
                     context.get("waypoint_xyyaw") or []
                 ),
@@ -7226,7 +8646,16 @@ class SemanticBehaviorExecutor:
                 navigation_run_token=run_token,
             )
         finally:
-            self._release_navigation_run(decision_id, run_token, candidate)
+            # A direct M1 capture owns a temporary global DWA profile.  Release
+            # it before the navigation token so success, failure, cancellation,
+            # timeout, and every early return restore the normal controller
+            # tolerances through the same token-safe path.
+            try:
+                self._release_container_m1_capture_dwa_profile(
+                    decision_id, run_token
+                )
+            finally:
+                self._release_navigation_run(decision_id, run_token, candidate)
 
     def _run_navigation_impl(
         self,
@@ -7246,6 +8675,7 @@ class SemanticBehaviorExecutor:
             )
 
         result_reported = False
+        capture_dwa_profile_detail: dict | None = None
 
         def report_result(success: bool, detail: dict) -> None:
             nonlocal result_reported
@@ -7259,10 +8689,16 @@ class SemanticBehaviorExecutor:
                     if isinstance(sources, dict)
                     else candidate
                 )
+            result_detail = dict(detail or {})
+            if isinstance(capture_dwa_profile_detail, dict):
+                result_detail.setdefault(
+                    "interaction_goal_tolerance_profile",
+                    dict(capture_dwa_profile_detail),
+                )
             self._handle_navigation_result(
                 decision_id,
                 success,
-                detail,
+                result_detail,
                 source_candidate=source,
                 navigation_run_token=navigation_run_token,
             )
@@ -7318,8 +8754,8 @@ class SemanticBehaviorExecutor:
             direct_distance_tolerance = self._interaction_navigation_pose_tolerance_m(
                 candidate
             )
-            direct_yaw_tolerance = float(
-                interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
+            direct_yaw_tolerance = self._interaction_navigation_yaw_tolerance_rad(
+                candidate
             )
         else:
             direct_distance_tolerance = float(
@@ -7436,6 +8872,7 @@ class SemanticBehaviorExecutor:
         goal_frame = goal.target_pose.header.frame_id
         selected_goal = None
         selected_goal_option_index = None
+        selected_goal_priority = None
         path_lookahead = None
         attempted_goals = []
         is_explore = str(candidate.get("behavior_type") or "").upper() == "EXPLORE"
@@ -7472,21 +8909,75 @@ class SemanticBehaviorExecutor:
             post_interaction_retry_started_at
             + self.post_interaction_traversal_make_plan_retry_window_s
         )
-        for option_index, (option_x, option_y, option_yaw) in enumerate(
-            goal_options[start_goal_option_index:], start=start_goal_option_index
-        ):
+        # Preflight every still-usable outer M1 anchor in one worker. make_plan
+        # is read-only and does not justify a state-machine transition per empty
+        # path. The selected canonical index is carried into capture/action
+        # mapping, so batching does not confuse which visual face was reached.
+        if self._is_container_two_stage_m1_staging(candidate):
+            option_indices = container_two_stage_m1_preflight_batch_indices(
+                candidate, start_goal_option_index
+            )
+        else:
+            option_indices = range(start_goal_option_index, len(goal_options))
+        if getattr(self, "_move_base_status_condition", None) is None:
+            # Test/legacy adapters have no server status stream.  Their existing
+            # capture-profile handoff still uses the client-state fence, while
+            # this new global preflight fence is production-only.
+            goal_quiescent, quiescence_detail = True, {
+                "status_stream_unavailable": True
+            }
+        else:
+            goal_quiescent, quiescence_detail = (
+                self._confirm_move_base_goal_quiescent_before_successor()
+            )
+        if not goal_quiescent:
+            # A make_plan request issued while the previous action is still
+            # ACTIVE/PREEMPTING is rejected by move_base and used to consume an
+            # entire interaction ring in a few milliseconds.  Treat the server
+            # lifecycle as one bounded transport failure, not twenty geometric
+            # failures.
+            report_result(
+                False,
+                {
+                    **quiescence_detail,
+                    "reason": "move_base_successor_not_quiescent",
+                    "failure_reason": "move_base_successor_not_quiescent",
+                    "retryable": True,
+                    "attempted_goal_count": 0,
+                    "attempted_goals": [],
+                    "interaction_approach_attempts": interaction_approach_attempts,
+                },
+            )
+            return
+        if not navigation_is_current():
+            return
+        preflight_batch_started_at = time.monotonic()
+        with self.lock:
+            preflight_batch_started_step_index = self._public_step_or_none(
+                getattr(self, "_latest_step_sync_index", None)
+            )
+        for option_index in option_indices:
+            if option_index < 0 or option_index >= len(goal_options):
+                # Private waypoint candidates retain canonical container
+                # metadata but intentionally expose one navigation goal.
+                continue
+            option_x, option_y, option_yaw = goal_options[option_index]
             plan_reachable = False
             option_lookahead = None
             preflight_reason = ""
             actual_attempts = 0
             while True:
                 actual_attempts += 1
+                preflight_call_started_at = time.monotonic()
                 (
                     plan_reachable,
                     option_lookahead,
                     preflight_reason,
                 ) = self._preflight_navigation_plan(
                     goal_frame, option_x, option_y, option_yaw
+                )
+                preflight_call_elapsed_s = max(
+                    0.0, time.monotonic() - preflight_call_started_at
                 )
                 if is_post_interaction_traversal:
                     # Do not inherit normal-navigation's configurable
@@ -7572,6 +9063,7 @@ class SemanticBehaviorExecutor:
                     "reachable": bool(plan_reachable or fail_open_empty_plan),
                     "preflight_reason": preflight_reason,
                     "preflight_attempts": actual_attempts,
+                    "preflight_elapsed_s": preflight_call_elapsed_s,
                     "fail_open_after_empty_plan": fail_open_empty_plan,
                     "post_interaction_traversal_retry": (
                         is_post_interaction_traversal
@@ -7579,10 +9071,75 @@ class SemanticBehaviorExecutor:
                 }
             )
             if plan_reachable or fail_open_empty_plan:
-                selected_goal = option_x, option_y, option_yaw
-                selected_goal_option_index = option_index
-                path_lookahead = option_lookahead
-                break
+                if self._is_container_two_stage_m1_staging(candidate):
+                    option_priority = container_two_stage_m1_anchor_priority(
+                        candidate, option_index
+                    )
+                    if (
+                        selected_goal is None
+                        or selected_goal_priority is None
+                        or option_priority < selected_goal_priority
+                    ):
+                        selected_goal = option_x, option_y, option_yaw
+                        selected_goal_option_index = option_index
+                        selected_goal_priority = option_priority
+                        path_lookahead = option_lookahead
+                elif selected_goal is None:
+                    selected_goal = option_x, option_y, option_yaw
+                    selected_goal_option_index = option_index
+                    path_lookahead = option_lookahead
+                    break
+        preflight_batch_elapsed_s = max(
+            0.0, time.monotonic() - preflight_batch_started_at
+        )
+        with self.lock:
+            preflight_batch_finished_step_index = self._public_step_or_none(
+                getattr(self, "_latest_step_sync_index", None)
+            )
+        for batch_position, attempted in enumerate(attempted_goals):
+            attempted["preflight_batch_position"] = batch_position
+            attempted["preflight_batch_goal_count"] = len(attempted_goals)
+            attempted["preflight_batch_elapsed_s"] = preflight_batch_elapsed_s
+            attempted["preflight_batch_started_step_index"] = (
+                preflight_batch_started_step_index
+            )
+            attempted["preflight_batch_finished_step_index"] = (
+                preflight_batch_finished_step_index
+            )
+        if self._is_container_two_stage_m1_staging(candidate):
+            rospy.loginfo(
+                "[semantic_behavior_executor] container anchor preflight batch: "
+                "goals=%d selected=%s wall=%.3fs sim_steps=%s->%s",
+                len(attempted_goals),
+                str(selected_goal_option_index),
+                preflight_batch_elapsed_s,
+                str(preflight_batch_started_step_index),
+                str(preflight_batch_finished_step_index),
+            )
+            # Retain the complete same-generation reachability scan so a later
+            # navigation failure does not redispatch and recheck anchors that
+            # were already empty in this batch.
+            failed_batch_indices = {
+                int(item["index"])
+                for item in attempted_goals
+                if not bool(item.get("reachable"))
+            }
+            if failed_batch_indices:
+                candidate = dict(candidate)
+                batch_metadata = dict(candidate.get("metadata") or {})
+                prior_unavailable = {
+                    int(index)
+                    for index in list(
+                        batch_metadata.get(
+                            "container_m1_unavailable_staging_indices"
+                        )
+                        or []
+                    )
+                }
+                batch_metadata["container_m1_unavailable_staging_indices"] = sorted(
+                    prior_unavailable | failed_batch_indices
+                )
+                candidate["metadata"] = batch_metadata
         preflight_debug_attempts = (
             self._interaction_preflight_debug_attempts(
                 goal_options,
@@ -7598,11 +9155,20 @@ class SemanticBehaviorExecutor:
         # its own preflight decision.  If the plan has become reachable, the
         # request is acknowledged as unnecessary; otherwise the sole executor
         # runs one existing costmap-gated reverse/replan attempt.
+        selected_preflight_attempt = next(
+            (
+                item
+                for item in attempted_goals
+                if int(item.get("index", -1))
+                == int(selected_goal_option_index if selected_goal_option_index is not None else -1)
+            ),
+            None,
+        )
         preflight_failed = bool(
             selected_goal is None
             or (
-                attempted_goals
-                and bool(attempted_goals[-1].get("fail_open_after_empty_plan"))
+                selected_preflight_attempt
+                and bool(selected_preflight_attempt.get("fail_open_after_empty_plan"))
             )
         )
         if is_explore and self._consume_external_recovery_if_needed(
@@ -7641,6 +9207,44 @@ class SemanticBehaviorExecutor:
                 failure_detail["interaction_approach_preflight_debug_attempts"] = (
                     preflight_debug_attempts
                 )
+            if (
+                str(behavior_type).upper() == "INTERACT"
+                and self._is_container_two_stage_m1_staging(candidate)
+            ):
+                failed_staging_index = max(0, int(start_goal_option_index))
+                staging_attempts = list(interaction_approach_attempts)
+                if attempted_goals:
+                    last_attempt = dict(attempted_goals[-1])
+                    try:
+                        failed_staging_index = max(
+                            0,
+                            int(last_attempt.get("index", failed_staging_index)),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    staging_attempts.append(
+                        {
+                            "index": failed_staging_index,
+                            "goal_xyyaw": list(last_attempt.get("goal_xyyaw") or []),
+                            "approach_pose_label": str(
+                                last_attempt.get("approach_pose_label") or "staging"
+                            ),
+                            "reachable": False,
+                            "outcome": str(
+                                failure_detail.get("reason") or "failed"
+                            ),
+                            "phase": "staging",
+                        }
+                    )
+                if self._retry_interaction_approach(
+                    decision_id,
+                    candidate,
+                    failed_staging_index,
+                    staging_attempts,
+                    len(goal_options),
+                    failure_detail,
+                ):
+                    return
             if (
                 str(behavior_type).upper() == "INTERACT"
                 and is_container_two_stage_physical_action(candidate)
@@ -7773,7 +9377,7 @@ class SemanticBehaviorExecutor:
             candidate = self._candidate_with_interaction_preflight_debug(
                 candidate, preflight_debug_attempts
             )
-            selected_attempt = dict(attempted_goals[-1])
+            selected_attempt = dict(selected_preflight_attempt or attempted_goals[-1])
             selected_attempt["navigation_attempt"] = (
                 len(interaction_approach_attempt_history) + 1
             )
@@ -7785,13 +9389,14 @@ class SemanticBehaviorExecutor:
                 int(selected_goal_option_index or 0),
                 interaction_approach_attempt_history,
             )
-        if attempted_goals[-1]["index"] > 0:
+        if int(selected_goal_option_index or 0) > 0:
             rospy.loginfo(
                 "[semantic_behavior_executor] selected interaction fallback goal %d/%d",
-                attempted_goals[-1]["index"] + 1,
+                int(selected_goal_option_index or 0) + 1,
                 len(goal_options),
             )
         prerotated = True
+        rear_preturn_completed = False
         if navigation_should_prerotate(behavior_type) and not corridor_navigation:
             prerotated = self._prerotate_for_rear_goal(
                 decision_id,
@@ -7799,6 +9404,16 @@ class SemanticBehaviorExecutor:
                 x,
                 y,
                 heading_target_xy=path_lookahead,
+            )
+            rear_preturn_completed = bool(
+                prerotated
+                and str(
+                    (
+                        getattr(self, "_last_rear_goal_recovery_detail", {}) or {}
+                    ).get("reason")
+                    or ""
+                )
+                == "rear_goal_turn_complete"
             )
         if not prerotated:
             rospy.logwarn(
@@ -7877,12 +9492,88 @@ class SemanticBehaviorExecutor:
             return
         if not navigation_is_current():
             return
+        if str(behavior_type).upper() == "INTERACT":
+            profile_ready, profile_detail = (
+                self._activate_container_m1_capture_dwa_profile(
+                    decision_id,
+                    navigation_run_token,
+                    candidate,
+                    direct_distance_tolerance_m=direct_distance_tolerance,
+                    direct_yaw_tolerance_rad=direct_yaw_tolerance,
+                )
+            )
+            if not profile_ready:
+                # Do not hand direct M1 capture to a controller that can still
+                # terminate at the broad normal-navigation tolerance.  This is
+                # an executor-local transport failure, not M1 evidence and not
+                # a physical-action failure, so do not spend a new viewpoint.
+                report_result(
+                    False,
+                    {
+                        **profile_detail,
+                        "selected_goal_xyyaw": list(selected_goal),
+                        "interaction_approach_attempts": (
+                            interaction_approach_attempt_history
+                        ),
+                    },
+                )
+                return
+            capture_dwa_profile_detail = dict(profile_detail)
+            candidate = dict(candidate)
+            capture_metadata = dict(candidate.get("metadata") or {})
+            capture_metadata["interaction_goal_tolerance_profile"] = dict(
+                profile_detail
+            )
+            candidate["metadata"] = capture_metadata
+        else:
+            profile_restored, restore_detail = (
+                self._restore_container_m1_capture_dwa_profile_before_non_capture_dispatch(
+                    decision_id, navigation_run_token
+                )
+            )
+            if not profile_restored:
+                # Do not let a physical action, outer staging goal, or ordinary
+                # successor inherit a previous direct-capture profile during a
+                # callback/thread overlap.  Its owner will either restore in
+                # finally or the next current worker will retry from a fresh
+                # dynamic snapshot.
+                report_result(
+                    False,
+                    {
+                        **restore_detail,
+                        "selected_goal_xyyaw": list(selected_goal),
+                        "interaction_approach_attempts": (
+                            interaction_approach_attempt_history
+                        ),
+                    },
+                )
+                return
+        # The temporary direct-capture DWA profile owns final yaw only while it
+        # remains demonstrably at least as strict as the M1 evidence contract.
+        # Do not let the broader generic final-align path preempt that controller
+        # in its terminal rotation window.
+        capture_dwa_owns_terminal_pose = (
+            self._container_m1_capture_dwa_owns_terminal_pose(
+                candidate,
+                capture_dwa_profile_detail,
+                distance_tolerance_m=direct_distance_tolerance,
+                yaw_tolerance_rad=direct_yaw_tolerance,
+            )
+        )
+        # Dynamic reconfigure is bounded but may still take one scheduling turn.
+        # Recheck ownership after the profile branch so a preempted worker never
+        # sends an old move_base goal over its successor; ``_run_navigation``'s
+        # finally will release any lease acquired immediately above.
+        if not navigation_is_current():
+            return
         goal.target_pose.header.stamp = rospy.Time.now()
         goal.target_pose.pose.position.x = x
         goal.target_pose.pose.position.y = y
         goal.target_pose.pose.orientation.z = math.sin(0.5 * yaw)
         goal.target_pose.pose.orientation.w = math.cos(0.5 * yaw)
         self.move_base.send_goal(goal)
+        self._record_move_base_goal_dispatch()
+        self._publish_dispatched_subgoal(goal_frame, x, y)
         # The two ROS callbacks may race by one scheduling turn: if ExplorePy
         # published its request just after the preflight branch above, claim it
         # immediately after this executor-owned goal is active, then cancel it
@@ -7896,6 +9587,10 @@ class SemanticBehaviorExecutor:
         ):
             return
         navigation_started_at = time.monotonic()
+        with self.lock:
+            navigation_started_step_index = self._public_step_or_none(
+                getattr(self, "_latest_step_sync_index", None)
+            )
         start_pose = self._current_pose(goal_frame)
         start_goal_distance_m = (
             None
@@ -7912,17 +9607,32 @@ class SemanticBehaviorExecutor:
             )
         progress_watchdog = NavigationProgressWatchdog(
             timeout_s=self.navigation_stagnation_timeout_s,
+            timeout_task_steps=getattr(
+                self, "navigation_stagnation_timeout_task_steps", 60
+            ),
             min_displacement_m=self.navigation_stagnation_distance_m,
             min_yaw_change_rad=self.navigation_stagnation_yaw_rad,
             min_goal_distance_reduction_m=(
                 self.navigation_stagnation_goal_distance_reduction_m
             ),
+            # Never reset generic navigation progress on arbitrary yaw motion:
+            # DWA oscillation is not progress.  The active loop below suppresses
+            # this watchdog only for one strict, position-ready M1 capture while
+            # its leased DWA controller is converging to the target yaw.
             allow_yaw_progress=False,
         )
         progress_watchdog.reset(
             start_pose,
             time.monotonic(),
             start_goal_distance_m,
+            navigation_started_step_index,
+        )
+        stagnation_not_before = navigation_started_at + (
+            float(
+                getattr(self, "navigation_stagnation_post_rotation_grace_s", 15.0)
+            )
+            if rear_preturn_completed
+            else 0.0
         )
         navigation_timeout_s = (
             self.machine.config.interaction_navigation_timeout_s
@@ -7931,18 +9641,69 @@ class SemanticBehaviorExecutor:
         )
         deadline = time.monotonic() + navigation_timeout_s
         near_goal_since = None
+        capture_dwa_terminal_yaw_started_step_index: int | None = None
+        capture_dwa_terminal_yaw_last_progress_step_index: int | None = None
+        capture_dwa_terminal_yaw_best_error_rad: float | None = None
+        capture_dwa_terminal_yaw_progress_delta_rad = 0.02
+        capture_dwa_terminal_yaw_settle_max_task_steps = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "container_m1_capture_dwa_terminal_yaw_settle_max_task_steps",
+                    75,
+                )
+            ),
+        )
+        interaction_dwa_terminal_yaw_started_step_index: int | None = None
+        interaction_dwa_terminal_yaw_best_error_rad: float | None = None
+        interaction_dwa_terminal_yaw_settle_max_task_steps = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "interaction_dwa_terminal_yaw_settle_max_task_steps",
+                    75,
+                )
+            ),
+        )
         require_final_yaw = self._requires_final_yaw_for_navigation(
             candidate,
             behavior_type,
             self.final_align_enabled,
             primary_goal_values,
         )
+        # Track only shortest-angle progress toward the current path heading.
+        # This cannot be extended by left/right oscillation: only a material
+        # decrease in absolute yaw error rebases the task-step watchdog.
+        yaw_progress_target_rad: float | None = None
+        yaw_progress_best_error_rad: float | None = None
+        yaw_progress_min_delta_rad = 0.02
+        container_approach_navigation = bool(
+            str(behavior_type).upper() == "INTERACT" or corridor_navigation
+        )
+        interaction_task_step_budget = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "interaction_navigation_max_task_steps"
+                    if container_approach_navigation
+                    else "navigation_max_task_steps",
+                    240 if container_approach_navigation else 360,
+                )
+            ),
+        )
+        navigation_task_step_timeout = False
         state = int(self.move_base.get_state())
         while (
             not rospy.is_shutdown()
             and navigation_is_current()
             and state not in TERMINAL_STATES
-            and time.monotonic() < deadline
+            and (
+                navigation_started_step_index is not None
+                or time.monotonic() < deadline
+            )
         ):
             time.sleep(0.10)
             if is_explore and self._consume_external_recovery_if_needed(
@@ -7956,6 +9717,49 @@ class SemanticBehaviorExecutor:
             state = int(self.move_base.get_state())
             pose = self._current_pose(goal_frame)
             now = time.monotonic()
+            with self.lock:
+                latest_task_step_index = self._public_step_or_none(
+                    getattr(self, "_latest_step_sync_index", None)
+                )
+                latest_step_sync_received_at = float(
+                    getattr(self, "_latest_step_sync_received_at", 0.0) or 0.0
+                )
+            if (
+                state not in TERMINAL_STATES
+                and
+                navigation_started_step_index is not None
+                and latest_step_sync_received_at > 0.0
+                and now - latest_step_sync_received_at
+                >= self.navigation_step_sync_stall_timeout_s
+            ):
+                self.move_base.cancel_goal()
+                report_result(
+                    False,
+                    {
+                        "reason": "navigation_step_sync_stall",
+                        "failure_reason": "navigation_step_sync_stall",
+                        "started_step_index": navigation_started_step_index,
+                        "latest_step_index": latest_task_step_index,
+                        "step_sync_stall_timeout_s": (
+                            self.navigation_step_sync_stall_timeout_s
+                        ),
+                        "retryable": True,
+                    },
+                )
+                return
+            if (
+                state not in TERMINAL_STATES
+                and
+                navigation_started_step_index is not None
+                and latest_task_step_index is not None
+                and latest_task_step_index - navigation_started_step_index
+                >= interaction_task_step_budget
+            ):
+                # A lost actionlib transition must not leave an interaction
+                # worker active while a fast simulator advances indefinitely.
+                navigation_task_step_timeout = True
+                self.move_base.cancel_goal()
+                break
             goal_distance_m = (
                 None
                 if pose is None
@@ -7964,6 +9768,58 @@ class SemanticBehaviorExecutor:
             local_plan_fresh = self._has_fresh_local_plan(
                 navigation_started_at, now
             )
+            beneficial_yaw_progress = False
+            if pose is not None and latest_task_step_index is not None:
+                desired_heading = None
+                if (
+                    path_lookahead is not None
+                    and math.hypot(
+                        float(path_lookahead[0]) - float(pose[0]),
+                        float(path_lookahead[1]) - float(pose[1]),
+                    )
+                    > 0.05
+                    and (
+                        goal_distance_m is None
+                        or goal_distance_m > self.final_align_max_distance_m
+                    )
+                ):
+                    desired_heading = math.atan2(
+                        float(path_lookahead[1]) - float(pose[1]),
+                        float(path_lookahead[0]) - float(pose[0]),
+                    )
+                elif require_final_yaw:
+                    desired_heading = float(yaw)
+                if desired_heading is not None:
+                    yaw_error = abs(
+                        normalize_angle(desired_heading - float(pose[2]))
+                    )
+                    target_changed = bool(
+                        yaw_progress_target_rad is None
+                        or abs(
+                            normalize_angle(
+                                desired_heading - yaw_progress_target_rad
+                            )
+                        )
+                        > 0.20
+                    )
+                    if target_changed:
+                        yaw_progress_target_rad = desired_heading
+                        yaw_progress_best_error_rad = yaw_error
+                    elif (
+                        yaw_progress_best_error_rad is not None
+                        and yaw_error
+                        <= yaw_progress_best_error_rad - yaw_progress_min_delta_rad
+                    ):
+                        yaw_progress_best_error_rad = yaw_error
+                        beneficial_yaw_progress = True
+                        progress_watchdog.reset(
+                            pose,
+                            now,
+                            goal_distance_m,
+                            latest_task_step_index,
+                        )
+            capture_dwa_final_yaw_in_progress = False
+            interaction_dwa_final_yaw_in_progress = False
             # move_base can stop publishing a fresh local plan after it has
             # already brought the base to a valid interaction approach pose.
             # Do not let the semantic watchdog turn that safe, ready pose into
@@ -7995,6 +9851,34 @@ class SemanticBehaviorExecutor:
                         "interaction_pose_validation": interaction_pose_detail,
                         "interaction_arrival_step_index": arrival_step_index,
                     }
+                    if capture_dwa_owns_terminal_pose:
+                        current_yaw_error_rad = float(
+                            interaction_pose_detail.get("yaw_error_rad", 0.0)
+                        )
+                        arrival_detail["container_m1_capture_dwa_terminal_yaw"] = {
+                            "reason": "strict_dwa_terminal_pose_ready",
+                            "best_yaw_error_rad": min(
+                                current_yaw_error_rad,
+                                capture_dwa_terminal_yaw_best_error_rad
+                                if capture_dwa_terminal_yaw_best_error_rad
+                                is not None
+                                else current_yaw_error_rad,
+                            ),
+                            "elapsed_task_steps": (
+                                0
+                                if capture_dwa_terminal_yaw_started_step_index is None
+                                or latest_task_step_index is None
+                                else max(
+                                    0,
+                                    latest_task_step_index
+                                    - capture_dwa_terminal_yaw_started_step_index,
+                                )
+                            ),
+                            "settle_max_task_steps": (
+                                capture_dwa_terminal_yaw_settle_max_task_steps
+                            ),
+                            "timed_out": False,
+                        }
                     self._complete_interaction_approach_navigation(
                         decision_id,
                         candidate,
@@ -8031,7 +9915,205 @@ class SemanticBehaviorExecutor:
                     and float(interaction_pose_detail.get("yaw_error_rad", 0.0))
                     > float(interaction_pose_detail.get("yaw_tolerance_rad", math.inf))
                 )
-                if yaw_needs_alignment and self.interaction_final_align_enabled:
+                # This is deliberately stricter than generic yaw progress:
+                # only the mapped M1 camera pose, already inside its .05 m
+                # capture distance, may wait for its leased DWA terminal yaw.
+                # DWA's own terminal criteria and navigation timeout remain
+                # finite bounds; no generic yaw delta resets the watchdog.
+                capture_dwa_final_yaw_in_progress = bool(
+                    capture_dwa_owns_terminal_pose
+                    and position_ready
+                    and yaw_needs_alignment
+                )
+                if capture_dwa_final_yaw_in_progress:
+                    current_yaw_error_rad = float(
+                        interaction_pose_detail.get("yaw_error_rad", math.inf)
+                    )
+                    if (
+                        capture_dwa_terminal_yaw_started_step_index is None
+                        and latest_task_step_index is not None
+                    ):
+                        capture_dwa_terminal_yaw_started_step_index = (
+                            latest_task_step_index
+                        )
+                        capture_dwa_terminal_yaw_last_progress_step_index = (
+                            latest_task_step_index
+                        )
+                        capture_dwa_terminal_yaw_best_error_rad = current_yaw_error_rad
+                    elif (
+                        capture_dwa_terminal_yaw_best_error_rad is None
+                        or current_yaw_error_rad
+                        <= capture_dwa_terminal_yaw_best_error_rad
+                        - capture_dwa_terminal_yaw_progress_delta_rad
+                    ):
+                        # Only a material decrease in error toward the selected
+                        # target yaw earns another watchdog reference point;
+                        # oscillation or a turn away from target cannot extend
+                        # this capture-only settle budget.
+                        capture_dwa_terminal_yaw_best_error_rad = (
+                            current_yaw_error_rad
+                        )
+                        capture_dwa_terminal_yaw_last_progress_step_index = (
+                            latest_task_step_index
+                        )
+                        progress_watchdog.reset(
+                            pose,
+                            now,
+                            goal_distance_m,
+                            latest_task_step_index,
+                        )
+                    elapsed_task_steps = (
+                        0
+                        if capture_dwa_terminal_yaw_started_step_index is None
+                        or latest_task_step_index is None
+                        else max(
+                            0,
+                            latest_task_step_index
+                            - capture_dwa_terminal_yaw_started_step_index,
+                        )
+                    )
+                    if (
+                        capture_dwa_terminal_yaw_started_step_index is not None
+                        and elapsed_task_steps
+                        >= capture_dwa_terminal_yaw_settle_max_task_steps
+                    ):
+                        capture_yaw_detail = {
+                            "reason": (
+                                "container_m1_capture_dwa_terminal_yaw_"
+                                "settle_timeout"
+                            ),
+                            "failure_reason": (
+                                "container_m1_capture_dwa_terminal_yaw_"
+                                "settle_timeout"
+                            ),
+                            "goal_distance_m": goal_distance_m,
+                            "interaction_pose_validation": interaction_pose_detail,
+                            "container_m1_capture_dwa_terminal_yaw": {
+                                "best_yaw_error_rad": (
+                                    capture_dwa_terminal_yaw_best_error_rad
+                                ),
+                                "current_yaw_error_rad": current_yaw_error_rad,
+                                "started_step_index": (
+                                    capture_dwa_terminal_yaw_started_step_index
+                                ),
+                                "latest_step_index": latest_task_step_index,
+                                "elapsed_task_steps": elapsed_task_steps,
+                                "last_progress_elapsed_task_steps": (
+                                    0
+                                    if latest_task_step_index is None
+                                    or capture_dwa_terminal_yaw_last_progress_step_index
+                                    is None
+                                    else max(
+                                        0,
+                                        latest_task_step_index
+                                        - capture_dwa_terminal_yaw_last_progress_step_index,
+                                    )
+                                ),
+                                "settle_max_task_steps": (
+                                    capture_dwa_terminal_yaw_settle_max_task_steps
+                                ),
+                                "progress_delta_rad": (
+                                    capture_dwa_terminal_yaw_progress_delta_rad
+                                ),
+                                "timed_out": True,
+                            },
+                        }
+                        self.move_base.cancel_goal()
+                        if self._retry_interaction_approach(
+                            decision_id,
+                            candidate,
+                            selected_goal_option_index,
+                            interaction_approach_attempt_history,
+                            len(goal_options),
+                            capture_yaw_detail,
+                        ):
+                            return
+                        report_result(False, capture_yaw_detail)
+                        return
+                elif yaw_needs_alignment and state in {0, 1}:
+                    # Keep one controller responsible for the terminal pose.
+                    # Previously the executor cancelled a still-active DWA goal
+                    # as soon as XY entered the interaction tolerance, then ran
+                    # an independent cmd_vel turn.  The handoff produced large
+                    # yaw errors, contact-induced translation, and another DWA
+                    # goal immediately afterwards.  Normal DWA already forbids
+                    # reverse trajectories and owns its configured terminal yaw,
+                    # so let it finish in place under a finite semantic bound.
+                    interaction_dwa_final_yaw_in_progress = True
+                    current_yaw_error_rad = float(
+                        interaction_pose_detail.get("yaw_error_rad", math.inf)
+                    )
+                    if (
+                        interaction_dwa_terminal_yaw_started_step_index is None
+                        and latest_task_step_index is not None
+                    ):
+                        interaction_dwa_terminal_yaw_started_step_index = (
+                            latest_task_step_index
+                        )
+                        interaction_dwa_terminal_yaw_best_error_rad = (
+                            current_yaw_error_rad
+                        )
+                    elif (
+                        interaction_dwa_terminal_yaw_best_error_rad is None
+                        or current_yaw_error_rad
+                        <= interaction_dwa_terminal_yaw_best_error_rad - 0.02
+                    ):
+                        interaction_dwa_terminal_yaw_best_error_rad = (
+                            current_yaw_error_rad
+                        )
+                    elapsed_task_steps = (
+                        0
+                        if interaction_dwa_terminal_yaw_started_step_index is None
+                        or latest_task_step_index is None
+                        else max(
+                            0,
+                            latest_task_step_index
+                            - interaction_dwa_terminal_yaw_started_step_index,
+                        )
+                    )
+                    if (
+                        interaction_dwa_terminal_yaw_started_step_index is not None
+                        and elapsed_task_steps
+                        >= interaction_dwa_terminal_yaw_settle_max_task_steps
+                    ):
+                        terminal_yaw_detail = {
+                            "reason": "interaction_dwa_terminal_yaw_settle_timeout",
+                            "failure_reason": (
+                                "interaction_dwa_terminal_yaw_settle_timeout"
+                            ),
+                            "goal_distance_m": goal_distance_m,
+                            "interaction_pose_validation": interaction_pose_detail,
+                            "best_yaw_error_rad": (
+                                interaction_dwa_terminal_yaw_best_error_rad
+                            ),
+                            "current_yaw_error_rad": current_yaw_error_rad,
+                            "started_step_index": (
+                                interaction_dwa_terminal_yaw_started_step_index
+                            ),
+                            "latest_step_index": latest_task_step_index,
+                            "elapsed_task_steps": elapsed_task_steps,
+                            "settle_max_task_steps": (
+                                interaction_dwa_terminal_yaw_settle_max_task_steps
+                            ),
+                        }
+                        self.move_base.cancel_goal()
+                        if self._retry_interaction_approach(
+                            decision_id,
+                            candidate,
+                            selected_goal_option_index,
+                            interaction_approach_attempt_history,
+                            len(goal_options),
+                            terminal_yaw_detail,
+                        ):
+                            return
+                        report_result(False, terminal_yaw_detail)
+                        return
+                if (
+                    yaw_needs_alignment
+                    and self.interaction_final_align_enabled
+                    and not capture_dwa_owns_terminal_pose
+                    and not interaction_dwa_final_yaw_in_progress
+                ):
                     aligned = self._final_align_interaction_goal(
                         decision_id,
                         goal_frame,
@@ -8083,7 +10165,11 @@ class SemanticBehaviorExecutor:
                         return
             rear_oscillation = (
                 None
-                if corridor_navigation
+                if (
+                    corridor_navigation
+                    or capture_dwa_final_yaw_in_progress
+                    or interaction_dwa_final_yaw_in_progress
+                )
                 else self._rear_dwa_oscillation_detail(
                     decision_id,
                     goal_frame,
@@ -8118,8 +10204,32 @@ class SemanticBehaviorExecutor:
                     return
                 if not navigation_is_current():
                     return
+                if getattr(self, "_move_base_status_condition", None) is None:
+                    goal_quiescent, quiescence_detail = True, {
+                        "status_stream_unavailable": True
+                    }
+                else:
+                    goal_quiescent, quiescence_detail = (
+                        self._confirm_move_base_goal_quiescent_before_successor()
+                    )
+                if not goal_quiescent:
+                    report_result(
+                        False,
+                        {
+                            **rear_oscillation,
+                            **quiescence_detail,
+                            "reason": "move_base_successor_not_quiescent",
+                            "failure_reason": "move_base_successor_not_quiescent",
+                            "retryable": True,
+                        },
+                    )
+                    return
+                if not navigation_is_current():
+                    return
                 goal.target_pose.header.stamp = rospy.Time.now()
                 self.move_base.send_goal(goal)
+                self._record_move_base_goal_dispatch()
+                self._publish_dispatched_subgoal(goal_frame, x, y)
                 navigation_started_at = time.monotonic()
                 start_pose = self._current_pose(goal_frame)
                 start_goal_distance_m = (
@@ -8131,6 +10241,16 @@ class SemanticBehaviorExecutor:
                     start_pose,
                     navigation_started_at,
                     start_goal_distance_m,
+                    latest_task_step_index,
+                )
+                stagnation_not_before = navigation_started_at + (
+                    float(
+                        getattr(
+                            self,
+                            "navigation_stagnation_post_rotation_grace_s",
+                            15.0,
+                        )
+                    )
                 )
                 self._start_rear_dwa_monitor(
                     decision_id,
@@ -8143,21 +10263,39 @@ class SemanticBehaviorExecutor:
                 state = int(self.move_base.get_state())
                 continue
             near_final_yaw_alignment = bool(
-                pose is not None
+                not capture_dwa_owns_terminal_pose
+                and pose is not None
                 and require_final_yaw
                 and goal_distance_m is not None
                 and goal_distance_m <= self.final_align_max_distance_m
             )
-            if not near_final_yaw_alignment and progress_watchdog.observe(
+            if now < stagnation_not_before:
+                # The executor's rear-safe turn has completed, but DWA may need
+                # several more yaw-only actions before it begins translation.
+                # Rebase rather than merely skip: at the end of this bounded
+                # phase the full translation progress window starts now.
+                progress_watchdog.reset(
+                    pose, now, goal_distance_m, latest_task_step_index
+                )
+            elif not (
+                near_final_yaw_alignment
+                or capture_dwa_final_yaw_in_progress
+                or interaction_dwa_final_yaw_in_progress
+                or beneficial_yaw_progress
+            ) and progress_watchdog.observe(
                 pose,
                 now,
                 goal_distance_m=goal_distance_m,
                 local_plan_fresh=local_plan_fresh,
+                task_step_index=latest_task_step_index,
             ):
                 self.move_base.cancel_goal()
                 stagnation_detail = {
                     "reason": "navigation_stagnation",
                     "stagnation_timeout_s": self.navigation_stagnation_timeout_s,
+                    "stagnation_timeout_task_steps": getattr(
+                        self, "navigation_stagnation_timeout_task_steps", 60
+                    ),
                     "stagnation_distance_m": self.navigation_stagnation_distance_m,
                     "stagnation_yaw_rad": self.navigation_stagnation_yaw_rad,
                     "stagnation_goal_distance_reduction_m": (
@@ -8207,7 +10345,7 @@ class SemanticBehaviorExecutor:
                     stagnation_detail,
                 )
                 return
-            if require_final_yaw:
+            if require_final_yaw and not capture_dwa_owns_terminal_pose:
                 if pose is None:
                     near_goal_since = None
                     continue
@@ -8258,11 +10396,47 @@ class SemanticBehaviorExecutor:
                         return
                 else:
                     near_goal_since = None
+        if navigation_task_step_timeout:
+            if not self._navigation_is_current(decision_id):
+                return
+            timeout_detail = {
+                "reason": "navigation_timeout",
+                "failure_reason": "navigation_timeout",
+                "navigation_timeout_kind": "task_step_budget",
+                "navigation_max_task_steps": interaction_task_step_budget,
+                "navigation_started_step_index": (
+                    navigation_started_step_index
+                ),
+                "navigation_latest_step_index": latest_task_step_index,
+                "navigation_elapsed_task_steps": (
+                    None
+                    if navigation_started_step_index is None
+                    or latest_task_step_index is None
+                    else max(
+                        0,
+                        latest_task_step_index - navigation_started_step_index,
+                    )
+                ),
+                "interaction_approach_attempts": (
+                    interaction_approach_attempt_history
+                ),
+            }
+            if self._retry_interaction_approach(
+                decision_id,
+                candidate,
+                selected_goal_option_index,
+                interaction_approach_attempt_history,
+                len(goal_options),
+                timeout_detail,
+            ):
+                return
+            report_result(False, timeout_detail)
+            return
         if not self._navigation_is_current(decision_id):
             return
         if state not in TERMINAL_STATES:
             self.move_base.cancel_goal()
-            if require_final_yaw:
+            if require_final_yaw and not capture_dwa_owns_terminal_pose:
                 aligned = self._final_align_goal(
                     decision_id,
                     goal_frame,
@@ -8392,7 +10566,16 @@ class SemanticBehaviorExecutor:
                     "interaction_pose_validation_source": "move_base_terminal",
                 }
             )
-        if success and require_final_yaw:
+            if capture_dwa_owns_terminal_pose:
+                detail["container_m1_capture_dwa_terminal_yaw"] = {
+                    "reason": "strict_dwa_move_base_terminal",
+                    "best_yaw_error_rad": terminal_validation.get("yaw_error_rad"),
+                    "settle_max_task_steps": (
+                        capture_dwa_terminal_yaw_settle_max_task_steps
+                    ),
+                    "timed_out": False,
+                }
+        if success and require_final_yaw and not capture_dwa_owns_terminal_pose:
             aligned = self._final_align_goal(
                 decision_id,
                 goal_frame,
@@ -8596,6 +10779,16 @@ class SemanticBehaviorExecutor:
             if str(global_costmap_detail.get("reason") or "").endswith("preempted"):
                 return True
             return False
+        goal_quiescent, quiescence_detail = (
+            self._confirm_move_base_goal_quiescent_before_successor()
+        )
+        if not goal_quiescent:
+            rospy.logwarn(
+                "[semantic_behavior_executor] outer staging ABORT retry held "
+                "behind move_base successor fence: %s",
+                quiescence_detail,
+            )
+            return False
         metadata = candidate.get("metadata") or {}
         frame_id = str(metadata.get("frame_id") or self.map_frame)
         (
@@ -8629,6 +10822,7 @@ class SemanticBehaviorExecutor:
                 list(fresh_lookahead) if fresh_lookahead is not None else []
             ),
             "global_costmap_receipt": dict(global_costmap_detail),
+            "move_base_successor_quiescence": dict(quiescence_detail),
             "fresh_plan": dict(fresh_plan_detail),
             "terminal_status_code": terminal_detail.get("status_code"),
             "terminal_status": terminal_detail.get("status"),
@@ -8640,16 +10834,12 @@ class SemanticBehaviorExecutor:
             "same safe option %d once",
             option_index + 1,
         )
-        threading.Thread(
-            target=self._run_navigation,
-            args=(
-                decision_id,
-                retry_candidate,
-                option_index,
-                [dict(item) for item in interaction_approach_attempts],
-            ),
-            daemon=True,
-        ).start()
+        self._schedule_navigation_successor(
+            decision_id,
+            retry_candidate,
+            option_index,
+            [dict(item) for item in interaction_approach_attempts],
+        )
         return True
 
     def _wait_for_outer_staging_abort_reachable_plan(
@@ -8855,6 +11045,237 @@ class SemanticBehaviorExecutor:
                     timeout=min(remaining_s, poll_interval_s)
                 )
 
+    @staticmethod
+    def _is_container_two_stage_m1_staging(candidate: dict | None) -> bool:
+        """Return whether ``candidate`` is an outer anchor before M1 capture."""
+
+        metadata = (candidate or {}).get("metadata") or {}
+        return bool(
+            metadata.get("container_two_stage_approach", False)
+            and str(metadata.get("container_two_stage_phase") or "").casefold()
+            == "staging"
+            and metadata.get("m1_observation_staging_required", False)
+        )
+
+    @staticmethod
+    def _container_m1_unavailable_staging_indices(
+        metadata: dict,
+        failure_detail: dict,
+        selected_option_index: int | None,
+    ) -> set[int]:
+        """Collect anchors known to be unreachable for this evidence attempt."""
+
+        indices: set[int] = set()
+        for raw_index in list(
+            metadata.get("container_m1_unavailable_staging_indices") or []
+        ):
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if index >= 0:
+                indices.add(index)
+        if selected_option_index is not None:
+            try:
+                index = int(selected_option_index)
+            except (TypeError, ValueError):
+                index = -1
+            if index >= 0:
+                indices.add(index)
+        for attempted in list((failure_detail or {}).get("attempted_goals") or []):
+            if not isinstance(attempted, dict) or bool(attempted.get("reachable")):
+                continue
+            try:
+                index = int(attempted.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if index >= 0:
+                indices.add(index)
+        return indices
+
+    @staticmethod
+    def _container_m1_viewed_staging_indices(metadata: dict) -> set[int]:
+        indices: set[int] = set()
+        for raw_index in list(
+            metadata.get("interaction_observation_viewpoint_staging_indices") or []
+        ):
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if index >= 0:
+                indices.add(index)
+        return indices
+
+    def _retry_container_two_stage_staging_m1_viewpoint(
+        self,
+        decision_id: str,
+        candidate: dict,
+        selected_option_index: int | None,
+        interaction_approach_attempts: list[dict],
+        approach_attempt_limit: int,
+        failure_detail: dict,
+    ) -> bool:
+        """Advance an unavailable outer anchor in the M1 evidence order.
+
+        Outer navigation is only a means of reaching a direct capture pose.  It
+        must therefore use the same face-diverse scheduler as an M1 negative,
+        rather than falling through to the legacy linear navigation ring.  If
+        the earlier M1 samples are inconclusive and no reachable capture anchor
+        remains, defer the object instead of permanently excluding it.
+        """
+
+        if not self._is_container_two_stage_m1_staging(candidate):
+            return False
+        metadata = dict(candidate.get("metadata") or {})
+        staging_goals = list(
+            metadata.get("container_staging_goal_xyyaw_candidates") or []
+        )
+        if not staging_goals or not self._navigation_is_current(decision_id):
+            return False
+        failure_reason = str((failure_detail or {}).get("reason") or "").casefold()
+        # Refrigerator faces are independent M1 hypotheses.  A globally
+        # reachable face whose local DWA execution fails must not spend another
+        # recovery cycle on the same face before testing the other faces; the
+        # next face can have a completely different clearance corridor.
+        is_refrigerator = str(
+            metadata.get("container_kind") or metadata.get("object_kind") or ""
+        ).casefold() in {"refrigerator", "fridge"}
+        try:
+            failed_index = int(selected_option_index)
+        except (TypeError, ValueError):
+            failed_index = -1
+        # A global path can be valid while DWA cannot synthesize a trajectory
+        # to the full endpoint from its current local window.  For a shared
+        # navigation/M1/action anchor, try one private waypoint sampled from the
+        # same verified path before discarding that face.  The waypoint never
+        # requests M1 and never authorizes the bridge.
+        if (
+            not is_refrigerator
+            and
+            bool(metadata.get("container_anchor_shared_pose", False))
+            and failure_reason
+            in {
+                "navigation_stagnation",
+                "navigation_terminal_failure",
+                "navigation_step_sync_stall",
+                "navigation_timeout",
+            }
+            and 0 <= failed_index < len(staging_goals)
+            and int(metadata.get("container_inner_corridor_segments_completed", 0) or 0) < 1
+        ):
+            goal_quiescent, _ = self._confirm_move_base_goal_quiescent_before_successor()
+            if goal_quiescent and self._start_container_inner_corridor(
+                decision_id,
+                candidate,
+                goal_frame=str(metadata.get("frame_id") or self.map_frame),
+                final_goal=tuple(float(value) for value in staging_goals[failed_index]),
+                final_goal_option_index=failed_index,
+                interaction_approach_attempts=interaction_approach_attempts,
+            ):
+                rospy.logwarn(
+                    "[semantic_behavior_executor] shared container anchor %d local "
+                    "execution failed; retrying through one verified path waypoint",
+                    failed_index,
+                )
+                return True
+        unavailable = self._container_m1_unavailable_staging_indices(
+            metadata,
+            failure_detail,
+            selected_option_index,
+        )
+        viewed = self._container_m1_viewed_staging_indices(metadata)
+        outer_retry_limit = self._container_two_stage_outer_retry_limit(
+            candidate, approach_attempt_limit
+        )
+        next_staging_index = container_two_stage_next_m1_viewpoint_index(
+            candidate,
+            excluded_indices=unavailable | viewed,
+        )
+        if (
+            next_staging_index is not None
+            and next_staging_index >= outer_retry_limit
+        ):
+            next_staging_index = None
+        if next_staging_index is None:
+            with self.lock:
+                if not self._navigation_is_current(decision_id):
+                    return True
+                commands = self.machine.defer_container_m1_viewpoint_navigation(
+                    {
+                        **failure_detail,
+                        "container_m1_unavailable_staging_indices": sorted(unavailable),
+                        "container_m1_viewed_staging_indices": sorted(viewed),
+                    }
+                )
+            if not commands:
+                return False
+            rospy.logwarn(
+                "[semantic_behavior_executor] no remaining reachable M1 capture "
+                "anchor after %d targeted samples; deferring container evidence",
+                len(viewed),
+            )
+            self._dispatch(commands)
+            return True
+        goal_quiescent, quiescence_detail = (
+            self._confirm_move_base_goal_quiescent_before_successor()
+        )
+        if not goal_quiescent:
+            # Do not advance the evidence-order cursor while the previous goal
+            # can still be ACTIVE/PREEMPTING. In that interval a make_plan
+            # transport error says nothing about the next anchor's geometry.
+            with self.lock:
+                if not self._navigation_is_current(decision_id):
+                    return True
+                commands = self.machine.defer_container_m1_viewpoint_navigation(
+                    {
+                        **failure_detail,
+                        "reason": "container_successor_quiescence_timeout",
+                        "move_base_successor_quiescence": quiescence_detail,
+                        "container_m1_unavailable_staging_indices": sorted(unavailable),
+                        "container_m1_viewed_staging_indices": sorted(viewed),
+                    }
+                )
+            if commands:
+                self._dispatch(commands)
+                return True
+            return False
+        with self.lock:
+            if not self._navigation_is_current(decision_id):
+                return True
+            current_candidate = dict(self.machine.candidate or candidate)
+            current_metadata = dict(current_candidate.get("metadata") or {})
+            current_metadata["container_m1_unavailable_staging_indices"] = sorted(
+                unavailable
+            )
+            current_candidate["metadata"] = current_metadata
+            self.machine.candidate = current_candidate
+            self.selection = dict(current_candidate)
+            commands = self.machine.retry_container_two_stage_staging(
+                next_staging_goal_option_index=next_staging_index,
+                interaction_approach_attempts=interaction_approach_attempts,
+                detail={
+                    **failure_detail,
+                    "container_m1_staging_navigation_failed": True,
+                    "container_m1_unavailable_staging_indices": sorted(unavailable),
+                    "container_m1_viewed_staging_indices": sorted(viewed),
+                    "failed_staging_goal_option_index": selected_option_index,
+                },
+            )
+            if commands and self.machine.candidate is not None:
+                self.selection = dict(self.machine.candidate)
+        if not commands:
+            return False
+        rospy.logwarn(
+            "[semantic_behavior_executor] outer M1 staging navigation %s; "
+            "retrying capture anchor %d/%d in evidence order",
+            str(failure_detail.get("reason") or "failed"),
+            next_staging_index + 1,
+            len(staging_goals),
+        )
+        self._dispatch(commands)
+        return True
+
     def _retry_interaction_approach(
         self,
         decision_id: str,
@@ -8878,6 +11299,139 @@ class SemanticBehaviorExecutor:
                 "goal_distance_m": failure_detail.get("goal_distance_m"),
                 "local_plan_fresh": failure_detail.get("local_plan_fresh"),
             }
+        if self._is_container_two_stage_m1_staging(candidate):
+            return self._retry_container_two_stage_staging_m1_viewpoint(
+                decision_id,
+                candidate,
+                selected_option_index,
+                attempts,
+                approach_attempt_limit,
+                failure_detail,
+            )
+        if is_container_two_stage_m1_capture(candidate):
+            # A capture pose is visual-only.  If it cannot be navigated to,
+            # return to the next outer recovery anchor and earn a new M1 frame;
+            # never reinterpret an anchor arrival as evidence or enter bridge.
+            metadata = candidate.get("metadata") or {}
+            staging_goals = list(
+                metadata.get("container_staging_goal_xyyaw_candidates") or []
+            )
+            try:
+                completed_staging_index = max(
+                    0,
+                    int(
+                        metadata.get(
+                            "container_two_stage_staging_goal_option_index", 0
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                return False
+            unavailable = self._container_m1_unavailable_staging_indices(
+                metadata,
+                failure_detail,
+                completed_staging_index,
+            )
+            viewed = self._container_m1_viewed_staging_indices(metadata)
+            next_staging_index = container_two_stage_next_m1_viewpoint_index(
+                candidate,
+                excluded_indices=unavailable | viewed,
+            )
+            outer_retry_limit = self._container_two_stage_outer_retry_limit(
+                candidate, approach_attempt_limit
+            )
+            if (
+                next_staging_index is None
+                or next_staging_index >= outer_retry_limit
+                or not self._navigation_is_current(decision_id)
+            ):
+                with self.lock:
+                    if not self._navigation_is_current(decision_id):
+                        return True
+                    current_candidate = dict(self.machine.candidate or candidate)
+                    current_metadata = dict(current_candidate.get("metadata") or {})
+                    current_metadata["container_m1_unavailable_staging_indices"] = sorted(
+                        unavailable
+                    )
+                    current_candidate["metadata"] = current_metadata
+                    self.machine.candidate = current_candidate
+                    self.selection = dict(current_candidate)
+                    commands = self.machine.defer_container_m1_viewpoint_navigation(
+                        {
+                            **failure_detail,
+                            "container_m1_capture_navigation_failed": True,
+                            "container_m1_unavailable_staging_indices": sorted(
+                                unavailable
+                            ),
+                            "container_m1_viewed_staging_indices": sorted(viewed),
+                        }
+                    )
+                if commands:
+                    self._dispatch(commands)
+                    return True
+                return False
+            capture_goal_inactive, capture_goal_detail = (
+                self._confirm_container_m1_capture_goal_inactive_before_profile_restore()
+            )
+            if not capture_goal_inactive:
+                # Do not dispatch the next outer anchor while move_base still
+                # reports the direct-capture goal as ACTIVE/PREEMPTING.  In that
+                # state make_plan rejects external callers, which previously
+                # consumed every remaining viewpoint in a few milliseconds.
+                with self.lock:
+                    if not self._navigation_is_current(decision_id):
+                        return True
+                    commands = self.machine.defer_container_m1_viewpoint_navigation(
+                        {
+                            **failure_detail,
+                            "reason": "container_m1_capture_successor_quiescence_timeout",
+                            "container_m1_capture_navigation_failed": True,
+                            "container_m1_capture_successor_quiescence": (
+                                capture_goal_detail
+                            ),
+                            "container_m1_unavailable_staging_indices": sorted(
+                                unavailable
+                            ),
+                            "container_m1_viewed_staging_indices": sorted(viewed),
+                        }
+                    )
+                if commands:
+                    self._dispatch(commands)
+                    return True
+                return False
+            with self.lock:
+                if not self._navigation_is_current(decision_id):
+                    return True
+                current_candidate = dict(self.machine.candidate or candidate)
+                current_metadata = dict(current_candidate.get("metadata") or {})
+                current_metadata["container_m1_unavailable_staging_indices"] = sorted(
+                    unavailable
+                )
+                current_candidate["metadata"] = current_metadata
+                self.machine.candidate = current_candidate
+                self.selection = dict(current_candidate)
+                commands = self.machine.retry_container_two_stage_staging(
+                    next_staging_goal_option_index=next_staging_index,
+                    interaction_approach_attempts=attempts,
+                    detail={
+                        **failure_detail,
+                        "container_m1_capture_navigation_failed": True,
+                        "failed_staging_goal_option_index": completed_staging_index,
+                    },
+                )
+                if commands and self.machine.candidate is not None:
+                    self.selection = dict(self.machine.candidate)
+            if not commands:
+                return False
+            rospy.logwarn(
+                "[semantic_behavior_executor] direct M1 capture navigation %s; "
+                "retrying outer anchor %d/%d without issuing M1 at the anchor",
+                str(failure_detail.get("reason") or "failed"),
+                next_staging_index + 1,
+                len(staging_goals),
+            )
+            self._dispatch(commands)
+            return True
         if is_container_two_stage_physical_action(candidate):
             metadata = candidate.get("metadata") or {}
             staging_goals = list(
@@ -8912,11 +11466,9 @@ class SemanticBehaviorExecutor:
                     next_inner_index + 1,
                     inner_option_count,
                 )
-                threading.Thread(
-                    target=self._run_navigation,
-                    args=(decision_id, candidate, next_inner_index, attempts),
-                    daemon=True,
-                ).start()
+                self._schedule_navigation_successor(
+                    decision_id, candidate, next_inner_index, attempts
+                )
                 return True
             next_staging_index = completed_staging_index + 1
             outer_retry_limit = self._container_two_stage_outer_retry_limit(
@@ -8990,11 +11542,9 @@ class SemanticBehaviorExecutor:
             len(attempts) + 1,
             approach_attempt_limit,
         )
-        threading.Thread(
-            target=self._run_navigation,
-            args=(decision_id, candidate, next_option_index, attempts),
-            daemon=True,
-        ).start()
+        self._schedule_navigation_successor(
+            decision_id, candidate, next_option_index, attempts
+        )
         return True
 
     def _preflight_navigation_plan(
@@ -9262,16 +11812,12 @@ class SemanticBehaviorExecutor:
                 "replanning once: %s",
                 active_goal_recovery_detail,
             )
-            threading.Thread(
-                target=self._run_navigation,
-                args=(
-                    decision_id,
-                    dict(restart["candidate"]),
-                    int(restart["start_goal_option_index"]),
-                    list(restart["interaction_approach_attempts"]),
-                ),
-                daemon=True,
-            ).start()
+            self._schedule_navigation_successor(
+                decision_id,
+                dict(restart["candidate"]),
+                int(restart["start_goal_option_index"]),
+                list(restart["interaction_approach_attempts"]),
+            )
             return
         if active_goal_recovery_detail:
             detail = {**detail, "active_goal_recovery": active_goal_recovery_detail}
@@ -9308,6 +11854,7 @@ class SemanticBehaviorExecutor:
                 if approach_reason in {
                     "make_plan_unreachable",
                     "navigation_stagnation",
+                    "navigation_step_sync_stall",
                     "navigation_timeout",
                     "navigation_terminal_failure",
                     "final_yaw_alignment_failed",

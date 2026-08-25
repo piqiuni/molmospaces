@@ -25,6 +25,9 @@ from semantic_decision_py_pkg.behavior_execution import (
     bounded_empty_plan_retry_delay,
     candidate_with_effective_interaction_approach,
     container_two_stage_action_goal_options_for_staging,
+    container_two_stage_m1_anchor_priority,
+    container_two_stage_face_indices,
+    container_two_stage_m1_preflight_batch_indices,
     committed_turn_sign,
     interaction_pose_validation,
     interaction_observation_disposition,
@@ -52,6 +55,99 @@ from semantic_decision_py_pkg.behavior_execution import (
     is_stuck_recovery_failure,
     safe_grid_motion_distance,
 )
+
+
+def test_container_m1_preflight_batch_scans_remaining_face_diverse_anchors() -> None:
+    candidate = {
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_staging_goal_xyyaw_candidates": [
+                [float(index), 0.0, 0.0] for index in range(6)
+            ],
+            "container_m1_viewpoint_order": [0, 3, 1, 4, 2, 5],
+            "container_m1_unavailable_staging_indices": [0],
+            "interaction_observation_viewpoint_staging_indices": [3],
+        }
+    }
+
+    assert container_two_stage_m1_preflight_batch_indices(candidate, 1) == [
+        1,
+        4,
+        2,
+        5,
+    ]
+
+
+def test_rejected_container_face_excludes_all_anchors_from_preflight() -> None:
+    labels = [
+        "aabb_fan_pos_x_angle_+0_clearance_0.50",
+        "aabb_fan_pos_x_angle_+15_clearance_0.50",
+        "aabb_fan_pos_y_angle_+0_clearance_0.50",
+        "aabb_fan_neg_x_angle_+0_clearance_0.50",
+    ]
+    candidate = {
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_staging_goal_xyyaw_candidates": [
+                [float(index), 0.0, 0.0] for index in range(len(labels))
+            ],
+            "container_staging_pose_labels": labels,
+            "container_m1_viewpoint_order": [0, 2, 3, 1],
+            "container_m1_rejected_face_staging_indices": [0, 1],
+        }
+    }
+
+    assert container_two_stage_face_indices(candidate, 0) == [0, 1]
+    assert container_two_stage_m1_preflight_batch_indices(candidate, 0) == [2, 3]
+
+
+def test_drawer_anchor_priority_prefers_near_then_straight() -> None:
+    labels = [
+        "aabb_fan_pos_x_angle_-30_clearance_0.60",
+        "aabb_fan_pos_x_angle_+15_clearance_0.60",
+        "aabb_fan_pos_x_angle_+0_clearance_0.60",
+        "aabb_fan_pos_x_angle_-15_clearance_0.95",
+    ]
+    candidate = {"metadata": {"container_staging_pose_labels": labels}}
+
+    ranked = sorted(
+        range(len(labels)),
+        key=lambda index: container_two_stage_m1_anchor_priority(candidate, index),
+    )
+
+    assert ranked == [2, 1, 0, 3]
+
+
+def test_pre_m1_empty_anchor_batch_defers_without_candidate_exclusion() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = {
+        "decision_id": "decision-pre-m1-empty",
+        "candidate_id": "interaction:drawer:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 0.0, 0.0],
+        "interaction_command": {"action": "open"},
+        "metadata": {
+            "requires_approach": True,
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "m1_observation_staging_required": True,
+            "drawer_pre_action_observation": True,
+            "interaction_observation_attempts": 0,
+        },
+    }
+    machine.start(candidate, now=0.0)
+
+    commands = machine.defer_container_m1_viewpoint_navigation(
+        {"reason": "make_plan_unreachable"}, now=1.0
+    )
+
+    assert [command["kind"] for command in commands] == ["terminal"]
+    detail = commands[0]["detail"]
+    assert detail["m1_evidence_inconclusive"] is True
+    assert detail["retryable"] is True
+    assert detail["terminal_candidate_exclusion"] is False
+    assert detail["m1_capture_not_reached"] is True
+
 
 
 def test_navigation_progress_watchdog_resets_on_translation_or_rotation() -> None:
@@ -105,6 +201,33 @@ def test_navigation_progress_watchdog_keeps_a_fresh_local_plan_making_goal_progr
         now=24.0,
         goal_distance_m=1.97,
         local_plan_fresh=False,
+    )
+
+
+def test_navigation_progress_watchdog_uses_public_task_steps_when_available() -> None:
+    watchdog = NavigationProgressWatchdog(
+        timeout_s=1.0,
+        timeout_task_steps=6,
+        min_displacement_m=0.10,
+        allow_yaw_progress=False,
+    )
+    watchdog.reset((0.0, 0.0, 0.0), now=0.0, task_step_index=10)
+
+    # Host time can advance arbitrarily while VLM/simulator workers contend;
+    # only evaluator actions consume the authoritative navigation budget.
+    assert not watchdog.observe(
+        (0.0, 0.0, 0.0), now=100.0, task_step_index=15
+    )
+    assert watchdog.observe(
+        (0.0, 0.0, 0.0), now=100.1, task_step_index=16
+    )
+
+    watchdog.reset((0.0, 0.0, 0.0), now=0.0, task_step_index=20)
+    assert not watchdog.observe(
+        (0.11, 0.0, 0.0), now=50.0, task_step_index=25
+    )
+    assert not watchdog.observe(
+        (0.11, 0.0, 0.0), now=100.0, task_step_index=30
     )
 
 
@@ -435,6 +558,35 @@ def two_stage_container_pre_action_candidate():
             },
         }
     )
+    return candidate
+
+
+def direct_capture_two_stage_container_candidate():
+    """Return an anchor -> capture -> action candidate for M1 contract tests."""
+
+    candidate = two_stage_container_pre_action_candidate()
+    staging = candidate["metadata"]["container_staging_goal_xyyaw_candidates"]
+    captures = [
+        [1.10, 2.0, 0.0],
+        [2.10, 2.0, 1.57],
+        [2.10, 3.0, 3.14],
+        [1.10, 3.0, -1.57],
+    ]
+    candidate["metadata"].update(
+        {
+            "container_two_stage_mapping_ready": True,
+            "container_m1_capture_goal_xyyaw_by_staging_index": captures,
+            "container_m1_capture_pose_labels_by_staging_index": [
+                f"capture_{index}" for index in range(len(captures))
+            ],
+            "interaction_observation_same_pose_samples_per_view": 2,
+            "interaction_observation_max_viewpoints": 2,
+            "interaction_observation_max_total_requests": 4,
+        }
+    )
+    candidate["metadata"].pop("accepted_container_m1_evidence", None)
+    # The primary public goal remains the navigation anchor, not the M1 pose.
+    candidate["goal_xyyaw"] = list(staging[0])
     return candidate
 
 
@@ -860,7 +1012,7 @@ def test_unknown_portal_observation_retries_then_terminates_unresolved() -> None
     assert terminal[0]["detail"]["reason"] == "interaction_observation_unresolved"
 
 
-def test_container_pre_action_requires_fresh_front_and_moves_to_next_view() -> None:
+def test_container_pre_action_confirms_one_negative_before_moving_to_next_view() -> None:
     machine = BehaviorExecutionStateMachine()
     commands = machine.start(container_pre_action_candidate(), now=0.0)
     assert commands[0]["kind"] == "navigate"
@@ -868,7 +1020,7 @@ def test_container_pre_action_requires_fresh_front_and_moves_to_next_view() -> N
     assert request[0]["kind"] == "request_interaction_observation"
     assert request[0]["min_capture_step"] == 11
 
-    retry = machine.on_interaction_observation_result(
+    same_pose = machine.on_interaction_observation_result(
         {
             "attribute_status": "ready",
             "attribute_source": "mllm_attribute_inference",
@@ -881,6 +1033,24 @@ def test_container_pre_action_requires_fresh_front_and_moves_to_next_view() -> N
             "container_visual_precondition_reason": "m1_view_state_side_or_back",
         },
         now=1.0,
+    )
+    assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
+    assert same_pose[0]["kind"] == "request_interaction_observation"
+    assert same_pose[0]["same_pose_sample"] == 2
+
+    retry = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "view_state": "side_or_back",
+            "front_surface_visible": False,
+            "approach_ready": False,
+            "attribute_capture_step": 12,
+            "container_visual_precondition_reason": "m1_view_state_side_or_back",
+        },
+        now=1.1,
     )
     assert machine.state == STATE_APPROACH_INTERACTION
     assert retry[0]["kind"] == "navigate"
@@ -959,6 +1129,244 @@ def test_container_two_stage_m1_staging_navigates_inner_before_bridge() -> None:
     assert [command["kind"] for command in bridge] == ["interact"]
 
 
+def test_shared_container_anchor_executes_without_second_navigation() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = two_stage_container_pre_action_candidate()
+    anchors = candidate["metadata"]["container_staging_goal_xyyaw_candidates"]
+    candidate["metadata"].update(
+        {
+            "container_anchor_shared_pose": True,
+            "container_m1_front_axis_from_capture": False,
+            "container_m1_capture_goal_xyyaw_by_staging_index": [
+                list(goal) for goal in anchors
+            ],
+            "container_action_goal_xyyaw_by_staging_index": [
+                list(goal) for goal in anchors
+            ],
+            "container_action_goal_xyyaw_options_by_staging_index": [
+                [list(goal)] for goal in anchors
+            ],
+        }
+    )
+    candidate["interaction_command"].update(
+        {
+            "container_staging_ready_distance_m": 0.10,
+            "container_physical_action_ready_distance_m": 0.10,
+            "interaction_ready_distance_m": 0.10,
+        }
+    )
+    machine.start(candidate, now=0.0)
+    request = machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+    assert request[0]["kind"] == "request_interaction_observation"
+
+    command = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "closed",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "observed_bbox_2d": [10, 10, 80, 120],
+            "attribute_capture_step": 11,
+            "container_visual_precondition_reason": "ready",
+        },
+        now=1.0,
+    )
+
+    assert machine.state == STATE_INTERACTING
+    assert [item["kind"] for item in command] == ["interact"]
+    assert command[0]["reason"] == "container_m1_ready_at_shared_action_anchor"
+    assert machine.candidate["goal_xyyaw"] == anchors[0]
+    assert machine.candidate["metadata"]["container_two_stage_action_geometry_source"] == (
+        "shared_selected_anchor"
+    )
+
+
+def test_container_m1_repeats_fresh_same_capture_then_moves_to_next_anchor() -> None:
+    """One rejected M1 image is not an exclusion or an inner-action shortcut."""
+
+    machine = BehaviorExecutionStateMachine()
+    candidate = direct_capture_two_stage_container_candidate()
+    anchor0 = candidate["metadata"]["container_staging_goal_xyyaw_candidates"][0]
+    capture0 = candidate["metadata"]["container_m1_capture_goal_xyyaw_by_staging_index"][0]
+    capture1 = candidate["metadata"]["container_m1_capture_goal_xyyaw_by_staging_index"][1]
+    commands = machine.start(candidate, now=0.0)
+    assert commands[0]["kind"] == "navigate"
+    assert commands[0]["candidate"]["goal_xyyaw"] == anchor0
+
+    # Anchor arrival cannot issue M1; it first moves to the direct capture pose.
+    capture_navigation = machine.on_navigation_result(True, {}, now=0.1)
+    assert capture_navigation[0]["kind"] == "navigate"
+    assert capture_navigation[0]["reason"] == "container_navigation_anchor_to_m1_capture"
+    assert capture_navigation[0]["candidate"]["goal_xyyaw"] == capture0
+    assert machine.candidate["metadata"]["container_two_stage_phase"] == "m1_capture"
+    # The direct visual pose uses the physical/capture tolerance, not the
+    # wider navigation-anchor tolerance retained for the outer recovery point.
+    assert machine.candidate["interaction_command"]["interaction_ready_distance_m"] == (
+        machine.candidate["interaction_command"]["container_physical_action_ready_distance_m"]
+    )
+
+    request1 = machine.on_navigation_result(True, {}, now=0.2)
+    assert request1[0]["kind"] == "request_interaction_observation"
+    assert request1[0]["same_pose_sample"] == 1
+    assert request1[0]["viewpoint"] == 1
+
+    rejected = {
+        "attribute_source": "mllm_attribute_inference",
+        "attribute_status": "ready",
+        "is_currently_visible": True,
+        "state": "closed",
+        "view_state": "oblique",
+        "front_surface_visible": False,
+        "approach_ready": False,
+        "capture_step": 12,
+    }
+    request2 = machine.on_interaction_observation_result(rejected, now=0.3)
+    assert request2[0]["kind"] == "request_interaction_observation"
+    assert request2[0]["same_pose_sample"] == 2
+    assert request2[0]["viewpoint"] == 1
+    assert machine.candidate["goal_xyyaw"] == capture0
+
+    # Only the second negative consumes a new viewpoint.  It returns to the
+    # next navigation anchor, never calls M1 from that offset, and never emits
+    # a terminal candidate exclusion.
+    next_anchor = machine.on_interaction_observation_result(
+        {**rejected, "capture_step": 13}, now=0.4
+    )
+    assert next_anchor[0]["kind"] == "navigate"
+    assert next_anchor[0]["start_goal_option_index"] == 1
+    assert next_anchor[0]["reason"] == "container_m1_capture_failed_next_outer_staging"
+    assert machine.candidate["metadata"]["container_two_stage_phase"] == "staging"
+
+    capture_navigation_1 = machine.on_navigation_result(True, {}, now=0.5)
+    assert capture_navigation_1[0]["candidate"]["goal_xyyaw"] == capture1
+    request3 = machine.on_navigation_result(True, {}, now=0.6)
+    assert request3[0]["kind"] == "request_interaction_observation"
+    assert request3[0]["viewpoint"] == 2
+    assert request3[0]["same_pose_sample"] == 1
+
+    # The executor normally supplies this request-ID/pose-bound record.  The
+    # state machine must use the direct capture pose, not the outer anchor.
+    machine.candidate["metadata"]["accepted_container_m1_evidence"] = {
+        "staging_pose_xyyaw": list(capture1),
+        "capture_pose_xyyaw": list(capture1),
+        "capture_step": 14,
+    }
+    action_navigation = machine.on_interaction_observation_result(
+        {
+            **rejected,
+            "capture_step": 14,
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+        },
+        now=0.7,
+    )
+    assert action_navigation[0]["kind"] == "navigate"
+    assert action_navigation[0]["reason"] == "container_m1_ready_navigate_physical_action_pose"
+    assert machine.candidate["metadata"]["container_two_stage_phase"] == "physical_action"
+    assert machine.candidate["metadata"]["container_m1_evidence_capture_pose_xyyaw"] == capture1
+
+
+def test_distinct_m1_capture_requires_real_arrival_without_spending_view_budget() -> None:
+    """A failed direct capture cannot masquerade as a second sampled camera view."""
+
+    machine = BehaviorExecutionStateMachine(
+        ExecutionConfig(
+            container_m1_distinct_view_arrival_tolerance_m=0.05,
+            container_m1_distinct_view_arrival_yaw_tolerance_rad=0.08,
+        )
+    )
+    candidate = direct_capture_two_stage_container_candidate()
+    capture0 = candidate["metadata"]["container_m1_capture_goal_xyyaw_by_staging_index"][0]
+    capture1 = candidate["metadata"]["container_m1_capture_goal_xyyaw_by_staging_index"][1]
+    machine.start(candidate, now=0.0)
+
+    # Anchor 0 -> direct capture 0 -> two fresh negative M1 samples.
+    machine.on_navigation_result(True, {}, now=0.1)
+    request1 = machine.on_navigation_result(True, {}, now=0.2)
+    assert request1[0]["kind"] == "request_interaction_observation"
+    assert machine.candidate["metadata"]["container_m1_last_sampled_capture_goal_xyyaw"] == capture0
+    assert machine.candidate["metadata"]["container_m1_capture_requires_distinct_view_arrival"] is False
+    rejected = {
+        "attribute_source": "mllm_attribute_inference",
+        "attribute_status": "ready",
+        "is_currently_visible": True,
+        "state": "closed",
+        "view_state": "oblique",
+        "front_surface_visible": False,
+        "approach_ready": False,
+        "capture_step": 12,
+    }
+    machine.on_interaction_observation_result(rejected, now=0.3)
+    next_anchor = machine.on_interaction_observation_result(
+        {**rejected, "capture_step": 13}, now=0.4
+    )
+    assert next_anchor[0]["start_goal_option_index"] == 1
+
+    # Anchor 1 is not itself an M1 viewpoint. Its paired capture is different
+    # from the pose which actually issued the first M1 request, so navigation
+    # must prove stricter direct-capture arrival before M1 can be requested.
+    capture_navigation = machine.on_navigation_result(True, {}, now=0.5)
+    assert capture_navigation[0]["candidate"]["goal_xyyaw"] == capture1
+    metadata = machine.candidate["metadata"]
+    assert metadata["container_m1_capture_requires_distinct_view_arrival"] is True
+    assert metadata["container_m1_capture_prior_sampled_goal_xyyaw"] == capture0
+    assert metadata["interaction_observation_attempts"] == 2
+    assert metadata["interaction_observation_viewpoint_count"] == 1
+    assert metadata["interaction_observation_viewpoint_staging_indices"] == [0]
+
+    # If direct capture 1 cannot reach its exact pose, no third M1 request is
+    # issued and therefore neither samples nor viewpoints are consumed.
+    retry = machine.retry_container_two_stage_staging(
+        next_staging_goal_option_index=2,
+        interaction_approach_attempts=[{"index": 1, "phase": "m1_capture"}],
+        detail={"reason": "interaction_pose_poll_exhausted"},
+        now=0.6,
+    )
+    assert retry[0]["kind"] == "navigate"
+    metadata = machine.candidate["metadata"]
+    assert metadata["container_two_stage_phase"] == "staging"
+    assert metadata["interaction_observation_attempts"] == 2
+    assert metadata["interaction_observation_viewpoint_count"] == 1
+    assert metadata["interaction_observation_viewpoint_staging_indices"] == [0]
+
+
+def test_container_m1_budget_defers_without_terminal_candidate_exclusion() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = direct_capture_two_stage_container_candidate()
+    candidate["metadata"].update(
+        {
+            "interaction_observation_max_viewpoints": 1,
+            "interaction_observation_max_total_requests": 2,
+        }
+    )
+    machine.start(candidate, now=0.0)
+    machine.on_navigation_result(True, {}, now=0.1)
+    machine.on_navigation_result(True, {}, now=0.2)
+    rejected = {
+        "attribute_source": "mllm_attribute_inference",
+        "attribute_status": "ready",
+        "is_currently_visible": True,
+        "view_state": "oblique",
+        "front_surface_visible": False,
+        "approach_ready": False,
+        "capture_step": 12,
+    }
+    same_pose = machine.on_interaction_observation_result(rejected, now=0.3)
+    assert same_pose[0]["kind"] == "request_interaction_observation"
+    terminal = machine.on_interaction_observation_result(
+        {**rejected, "capture_step": 13}, now=0.4
+    )
+    assert terminal[0]["kind"] == "terminal"
+    assert terminal[0]["success"] is False
+    assert terminal[0]["detail"]["m1_evidence_inconclusive"] is True
+    assert terminal[0]["detail"]["retryable"] is True
+    assert terminal[0]["detail"]["terminal_candidate_exclusion"] is False
+
+
 def test_container_two_stage_accepted_m1_uses_same_face_inner_options_before_outer() -> None:
     machine = BehaviorExecutionStateMachine()
     candidate = two_stage_container_pre_action_candidate()
@@ -994,8 +1402,8 @@ def test_container_two_stage_accepted_m1_uses_same_face_inner_options_before_out
     ]
 
 
-def test_container_two_stage_tangent_staging_acceptance_reuses_base_physical_face() -> None:
-    """A tangent M1 capture authorizes its base face, never a tangent contact."""
+def test_container_two_stage_m1_front_capture_selects_physical_face() -> None:
+    """A ready M1 image freezes its actual capture ray as the action face."""
 
     machine = BehaviorExecutionStateMachine()
     candidate = two_stage_container_pre_action_candidate()
@@ -1042,10 +1450,18 @@ def test_container_two_stage_tangent_staging_acceptance_reuses_base_physical_fac
                     "safe_outer_physical_action_tangent_right",
                 ],
             ],
+            "container_m1_front_axis_from_capture": True,
+            "container_geometry_anchor_xy": [0.0, 0.0],
+            "container_geometry_aabb_size_xy": [2.0, 2.0],
+            "container_physical_action_standoff_m": 0.30,
+            "container_action_lateral_offset_m": 0.22,
             "accepted_container_m1_evidence": {
                 "staging_pose_xyyaw": list(tangent_staging),
                 "capture_pose_xyyaw": list(tangent_staging),
                 "capture_step": 11,
+                "m1_front_axis_xy": [0.0, 1.0],
+                "m1_front_yaw": -math.pi / 2.0,
+                "m1_front_axis_source": "m1_confirmed_capture_pose",
             },
         }
     )
@@ -1081,11 +1497,22 @@ def test_container_two_stage_tangent_staging_acceptance_reuses_base_physical_fac
     assert commands[0]["reason"] == "container_m1_ready_navigate_physical_action_pose"
     assert machine.candidate["metadata"]["container_two_stage_staging_goal_option_index"] == 1
     assert machine.candidate["metadata"]["container_m1_evidence_staging_pose_xyyaw"] == tangent_staging
-    assert machine.candidate["goal_xyyaw"] == base_action
+    # The old index mapping pointed at base_action.  The accepted M1 front
+    # image instead makes the calibrated +Y capture ray authoritative for this
+    # active decision: surface boundary 1.0 + physical clearance .30.
+    assert machine.candidate["goal_xyyaw"] == [0.0, 1.3, -math.pi / 2.0]
     assert navigation_goal_options(machine.candidate) == [
-        tuple(base_options[0]),
-        tuple(base_options[1]),
-        tuple(base_options[2]),
+        (0.0, 1.3, -math.pi / 2.0),
+        (-0.22, 1.3, math.atan2(-1.3, 0.22)),
+        (0.22, 1.3, math.atan2(-1.3, -0.22)),
+    ]
+    assert (
+        machine.candidate["metadata"]["container_two_stage_action_geometry_source"]
+        == "m1_confirmed_capture_front_axis"
+    )
+    assert machine.candidate["interaction_command"]["interaction_approach_axis_xy"] == [
+        0.0,
+        1.0,
     ]
     assert machine.candidate["metadata"]["m1_observation_staging_required"] is False
     assert machine.candidate["metadata"]["observation_required"] is False
@@ -1157,6 +1584,9 @@ def test_container_two_stage_missing_inner_mapping_fails_closed_to_next_outer() 
     candidate = two_stage_container_pre_action_candidate()
     candidate["metadata"]["container_two_stage_mapping_ready"] = False
     candidate["metadata"]["container_action_goal_xyyaw_by_staging_index"] = []
+    # This test isolates the mapping fail-closed branch rather than the normal
+    # default same-pose evidence confirmation.
+    candidate["metadata"]["interaction_observation_same_pose_samples_per_view"] = 1
     machine.start(candidate, now=0.0)
     machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
 
@@ -1184,7 +1614,9 @@ def test_container_two_stage_missing_inner_mapping_fails_closed_to_next_outer() 
 
 def test_container_visual_open_without_fresh_bbox_is_reobserved() -> None:
     machine = BehaviorExecutionStateMachine()
-    machine.start(container_pre_action_candidate(), now=0.0)
+    candidate = container_pre_action_candidate()
+    candidate["metadata"]["interaction_observation_same_pose_samples_per_view"] = 1
+    machine.start(candidate, now=0.0)
     machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
     retry = machine.on_interaction_observation_result(
         {
@@ -1205,7 +1637,7 @@ def test_container_visual_open_without_fresh_bbox_is_reobserved() -> None:
     assert retry[0]["start_goal_option_index"] == 1
 
 
-def test_drawer_pre_action_reobserves_then_emits_terminal_visual_failure() -> None:
+def test_drawer_pre_action_reobserves_then_defers_inconclusive_m1_evidence() -> None:
     machine = BehaviorExecutionStateMachine()
     commands = machine.start(drawer_pre_action_candidate(requires_approach=True), now=0.0)
     assert commands[0]["kind"] == "navigate"
@@ -1229,21 +1661,14 @@ def test_drawer_pre_action_reobserves_then_emits_terminal_visual_failure() -> No
         },
         now=1.0,
     )
-    assert machine.state == STATE_APPROACH_INTERACTION
-    assert retry[0]["kind"] == "navigate"
-    assert retry[0]["start_goal_option_index"] == 1
-    assert retry[0]["reason"] == "drawer_visual_reobserve_next_approach"
-
-    # The second M1 request is emitted only after navigation reaches the next
-    # preserved ring pose, and it must be newer than both views seen so far.
-    second_observation = machine.on_navigation_result(
-        True, {"capture_step": 20}, now=1.5
-    )
     assert machine.state == STATE_WAITING_FOR_INTERACTION_OBSERVATION
-    assert second_observation[0]["kind"] == "request_interaction_observation"
-    assert second_observation[0]["attempt"] == 2
-    assert second_observation[0]["min_capture_step"] == 21
+    assert retry[0]["kind"] == "request_interaction_observation"
+    assert retry[0]["attempt"] == 2
+    assert retry[0]["same_pose_sample"] == 2
 
+    # A second independent negative at the held capture pose exhausts the
+    # explicit two-request budget.  It must defer, not permanently exclude the
+    # drawer or manufacture a different physical action.
     terminal = machine.on_interaction_observation_result(
         {
             "attribute_status": "ready",
@@ -1253,15 +1678,16 @@ def test_drawer_pre_action_reobserves_then_emits_terminal_visual_failure() -> No
             "front_surface_visible": True,
             "approach_ready": True,
             "drawer_action_regions_ready": False,
-            "attribute_capture_step": 21,
+            "attribute_capture_step": 12,
         },
-        now=2.0,
+        now=1.5,
     )
     assert machine.state != STATE_VERIFYING
     assert terminal[0]["kind"] == "terminal"
     assert terminal[0]["success"] is False
-    assert terminal[0]["detail"]["failure_stage"] == "interaction_visual_precondition"
-    assert terminal[0]["detail"]["terminal_candidate_exclusion"] is True
+    assert terminal[0]["detail"]["m1_evidence_inconclusive"] is True
+    assert terminal[0]["detail"]["retryable"] is True
+    assert terminal[0]["detail"]["terminal_candidate_exclusion"] is False
 
 
 def test_drawer_execution_terminal_failure_skips_post_action_verification() -> None:
