@@ -31,6 +31,7 @@ import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -40,12 +41,142 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNNER = REPO_ROOT / "scripts" / "InteractiveNav" / "run_interactive_nav_v3_ros_eval_test.zsh"
 SUMMARY_SCHEMA_VERSION = "interactive_nav_v3_ros_batch_v2"
+PLANNED_INVOCATION_SCHEMA_VERSION = "interactive_nav_v3_ros_planned_invocation_v1"
+PLANNED_INVOCATION_FILENAME = "planned_invocation.json"
+
+# The single-episode runner is intentionally configured through environment
+# variables.  Keep the defaults mirrored here so a resumed batch can prove it
+# is reusing the same launch contract without serialising output-local paths.
+_RUNNER_ENV_DEFAULTS: dict[str, str] = {
+    "METHOD": "full_mllm_object_goal",
+    "POLICY": "ros_object_goal_rule",
+    "MIN_STEPS": "300",
+    "DYNAMIC_PATH_FREE_M": "3.0",
+    "DYNAMIC_STEPS_PER_PATH_M": "25.0",
+    "DYNAMIC_CHANNEL_INTERACTION_STEPS": "150",
+    "DYNAMIC_CONTAINER_INTERACTION_STEPS": "200",
+    "DYNAMIC_CONTAINER_JOINT_STEPS": "40",
+    "DYNAMIC_STEP_QUANTUM": "50",
+    "VIDEO_FPS": "5",
+    "RECORD_HEAD_CAMERA": "false",
+    "SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS": "384",
+    "ROS_ACTION_TIMEOUT_S": "0.2",
+    "ROS_STEP_READY_BARRIER_ENABLED": "true",
+    "ROS_STEP_READY_TOPIC": "/semantic_decision/step_ready",
+    "ROS_STEP_READY_WARMUP_SKIP_FRAMES": "0",
+    "ROS_STEP_READY_TIMEOUT_S": "2.0",
+    "ROS_STEP_READY_BOOTSTRAP_TIMEOUT_S": "10.0",
+    "SEMANTIC_DECISION_OVERRIDE": str(
+        REPO_ROOT / "scripts" / "InteractiveNav" / "configs" / "semantic_decision" / "object_goal_v3_full_mllm.yaml"
+    ),
+    "SEMANTIC_MAPPING_OVERRIDE": str(
+        REPO_ROOT / "scripts" / "InteractiveNav" / "configs" / "semantic_decision" / "full_mllm_mapping.yaml"
+    ),
+    "EXPLORE_PY_CONFIG_OVERRIDE": str(
+        REPO_ROOT / "scripts" / "InteractiveNav" / "configs" / "semantic_decision" / "semantic_controlled_explore.yaml"
+    ),
+    "NAV_CONFIG_OVERRIDE": str(
+        REPO_ROOT / "scripts" / "InteractiveNav" / "configs" / "semantic_decision" / "semantic_interaction_nav.yaml"
+    ),
+    "ROS_SETUP": str(REPO_ROOT / "Interactive-Nav-SG-nav" / "devel" / "setup.bash"),
+}
+_RUNNER_FILE_ENV_KEYS = (
+    "SEMANTIC_DECISION_OVERRIDE",
+    "SEMANTIC_MAPPING_OVERRIDE",
+    "EXPLORE_PY_CONFIG_OVERRIDE",
+    "NAV_CONFIG_OVERRIDE",
+    "ROS_SETUP",
+)
+
+# ``benchmark_runner`` records an equivalent evaluator implementation digest in
+# its own manifest.  The batch wrapper cannot import it cheaply or safely before
+# ROS/conda setup, so retain the same file-level evidence here.  This prevents a
+# --resume from silently carrying an old evaluator protocol across code changes.
+_V3_EVALUATOR_PROTOCOL_FILES = (
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluate_interactive_nav_v3.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "benchmark_runner.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "benchmark_metrics.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "benchmark_policies.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "benchmark_interaction_adapter.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "benchmark_interaction_executor.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "benchmark_types.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "public_goal.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "restricted_gt_perception.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "ros_object_goal_adapter.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "ros_navigation_stall.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "goal_status.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "ros_policy_termination.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "evaluation" / "trusted_interaction_skill.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "force_interaction_runtime.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "force_interaction_bridge.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "container_scene_probe.py",
+    REPO_ROOT / "scripts" / "InteractiveNav" / "interactive_nav_v3.py",
+)
+
+# The evaluator launches a real ROS navigation stack.  Its public interaction
+# and completion contract therefore also depends on these runtime seams.  Keep
+# this list explicit (rather than hashing the whole nested repository) so a
+# resume is invalidated by a relevant ROS change without making every batch
+# startup scan unrelated assets/tests.
+_ROS_RUNTIME_PROTOCOL_FILES = (
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "launch" / "molmospaces_nav_system.launch",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "launch" / "nav.launch",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "nav_pkg" / "scripts" / "run_nav_ros_sim.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_decision_py_pkg" / "launch" / "semantic_decision.launch",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_decision_py_pkg" / "scripts" / "semantic_behavior_executor.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_decision_py_pkg" / "scripts" / "semantic_rule_decision_node.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_decision_py_pkg" / "scripts" / "semantic_decision_py_pkg" / "behavior_execution.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_decision_py_pkg" / "scripts" / "semantic_decision_py_pkg" / "post_interaction_traversal.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_decision_py_pkg" / "scripts" / "semantic_decision_py_pkg" / "rule_policy.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_decision_py_pkg" / "scripts" / "semantic_decision_py_pkg" / "model_policy.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "launch" / "semantic_mapping_py.launch",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts" / "interaction_attribute_inference_node.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts" / "semantic_mapping_py_pkg" / "interaction_result_contract.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "semantic_mapping_py_pkg" / "scripts" / "semantic_mapping_py_pkg" / "interaction_graph_store.py",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "launch" / "explore_py.launch",
+    REPO_ROOT / "Interactive-Nav-SG-nav" / "src" / "explore_py_pkg" / "scripts" / "explore_py_pkg" / "frontier_core.py",
+)
+
+# These fields are evaluator-owned facts.  Keep the batch wrapper's normal and
+# recovery summaries aligned so an artifact recovered after an interrupted
+# wrapper is indistinguishable from a normally collected evaluator outcome
+# except for the explicit recovery provenance below.
+EPISODE_RESULT_SUMMARY_FIELDS = (
+    "case_id",
+    "house_index",
+    "domains",
+    "recipe",
+    "interaction_types",
+    "interaction_requirement",
+    "success",
+    "task_success",
+    "interaction_conditioned_success",
+    "nav_success",
+    "required_interaction_success",
+    "sequence_success",
+    "terminal_reason",
+    "step_count",
+    "navigation_step_count",
+    "view_action_count",
+    "interaction_action_count",
+    "correct_interaction_action_count",
+    "invalid_interaction_action_count",
+    "navigation_path_length_m",
+    "reference_path_length_m",
+    "spl",
+    "elapsed_seconds",
+    "target_distance_m",
+    "target_visibility_fraction",
+    "scoring_eligible",
+    "early_stop",
+    "timing_summary",
+)
 
 
 @dataclass(frozen=True)
@@ -78,6 +209,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--base-master-port", type=int, default=12600)
     parser.add_argument("--max-steps", type=int, default=1500)
+    parser.add_argument(
+        "--step-budget-mode",
+        choices=("dynamic", "fixed"),
+        default="dynamic",
+        help=(
+            "Forward the V3 evaluator budget mode to every isolated runner. "
+            "Use fixed when --max-steps is a required per-episode applied-step budget."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-attribute-request-timeout-s",
+        type=float,
+        default=30.0,
+        help="M1 request timeout forwarded to each V3 runner; independent of M2/M3.",
+    )
+    parser.add_argument(
+        "--ros-command-starvation-timeout-s",
+        type=float,
+        default=60.0,
+        help="Continuous no-fresh-command wall time before the V3 evaluator stops.",
+    )
+    parser.add_argument(
+        "--ros-observation-turn-multiplier",
+        type=float,
+        default=1.5,
+        help="Maximum policy-observation turns relative to each applied-step budget.",
+    )
     parser.add_argument(
         "--scene-timeout-s",
         type=float,
@@ -162,6 +320,239 @@ def read_json(path: Path) -> dict[str, Any]:
     except (OSError, ValueError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def sha256_file(path: Path) -> str | None:
+    """Return a file digest, or ``None`` when the file is not readable."""
+
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _stable_json_hash(payload: Any) -> str:
+    """Return a deterministic digest for one JSON-serialisable protocol record."""
+
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _resolved_runner_setting(key: str) -> str:
+    """Return one output-independent V3 runner setting after environment defaults."""
+
+    return str(os.environ.get(key, _RUNNER_ENV_DEFAULTS[key]))
+
+
+def _file_digest_record(path: Path) -> dict[str, str] | None:
+    digest = sha256_file(path)
+    if digest is None:
+        return None
+    try:
+        relative = path.resolve().relative_to(REPO_ROOT)
+    except ValueError:
+        relative = path.resolve()
+    return {"path": str(relative), "sha256": digest}
+
+
+def _effective_runtime_contract(args: argparse.Namespace) -> tuple[str, str | None]:
+    """Resolve the interpreter values the shell runner will actually use.
+
+    The wrapper activates ``CONDA_ENV`` before choosing ``PYTHON_BIN``.  A
+    resume signature must therefore include inherited values and the wrapper's
+    absolute default, rather than only explicit CLI flags.
+    """
+
+    requested_conda = getattr(args, "conda_env", None)
+    conda_value = (
+        requested_conda
+        or infer_conda_prefix()
+        or os.environ.get("CONDA_ENV")
+        or "/home/ldl/conda_envs/mlspaces"
+    )
+    conda_path = Path(str(conda_value)).expanduser()
+    runtime_conda = str(conda_path.resolve()) if conda_path.is_absolute() else str(conda_path)
+
+    requested_python = getattr(args, "python_bin", None)
+    python_value = requested_python or os.environ.get("PYTHON_BIN")
+    if python_value is None and conda_path.is_absolute():
+        candidate = conda_path / "bin" / "python"
+        if candidate.is_file():
+            python_value = str(candidate)
+    runtime_python = None
+    if python_value:
+        python_path = Path(str(python_value)).expanduser()
+        runtime_python = str(python_path.resolve()) if python_path.is_absolute() else str(python_path)
+    return runtime_conda, runtime_python
+
+
+def _protocol_files_sha256(files: tuple[Path, ...]) -> str | None:
+    """Digest one explicit implementation contract without importing ROS."""
+
+    records: list[dict[str, str]] = []
+    for path in files:
+        record = _file_digest_record(path)
+        if record is None:
+            return None
+        records.append(record)
+    return _stable_json_hash(records)
+
+
+def _v3_evaluator_protocol_sha256() -> str | None:
+    """Digest evaluator-only implementation files for the invocation contract."""
+
+    return _protocol_files_sha256(_V3_EVALUATOR_PROTOCOL_FILES)
+
+
+def _ros_runtime_protocol_sha256() -> str | None:
+    """Digest the explicit ROS runtime seam launched by the V3 runner."""
+
+    return _protocol_files_sha256(_ROS_RUNTIME_PROTOCOL_FILES)
+
+
+def planned_invocation_payload(
+    plan: EpisodePlan,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Build the complete output-independent identity for one planned episode.
+
+    This is the single seam for batch resume and artifact recovery.  It contains
+    every evaluator or launch input that can change formal V3 semantics or the
+    outer batch completion contract, but deliberately excludes output paths,
+    worker/port assignment, timestamps, telemetry, and other scheduling-only
+    details.
+    """
+
+    benchmark_hash = sha256_file(Path(args.benchmark))
+    runner_record = _file_digest_record(Path(args.runner))
+    evaluator_digest = _v3_evaluator_protocol_sha256()
+    ros_runtime_digest = _ros_runtime_protocol_sha256()
+    if (
+        not benchmark_hash
+        or runner_record is None
+        or not evaluator_digest
+        or not ros_runtime_digest
+    ):
+        return None
+    runner_settings = {
+        key: _resolved_runner_setting(key)
+        for key in sorted(_RUNNER_ENV_DEFAULTS)
+    }
+    file_settings: dict[str, dict[str, str]] = {}
+    for key in _RUNNER_FILE_ENV_KEYS:
+        record = _file_digest_record(Path(runner_settings[key]))
+        if record is None:
+            return None
+        file_settings[key] = record
+    semantic_model_env: dict[str, str] | None = None
+    semantic_model_env_file = getattr(args, "semantic_model_env_file", None)
+    if semantic_model_env_file is None:
+        inherited_model_env = os.environ.get("SEMANTIC_MODEL_ENV_FILE")
+        semantic_model_env_file = (
+            Path(inherited_model_env)
+            if inherited_model_env
+            else REPO_ROOT / ".env"
+        )
+    if semantic_model_env_file is not None:
+        record = _file_digest_record(Path(semantic_model_env_file))
+        if record is None:
+            return None
+        semantic_model_env = record
+    runtime_conda, runtime_python = _effective_runtime_contract(args)
+    return {
+        "schema_version": PLANNED_INVOCATION_SCHEMA_VERSION,
+        "episode_index": int(plan.episode_index),
+        "benchmark_sha256": benchmark_hash,
+        "runner": runner_record,
+        "evaluator_protocol_sha256": evaluator_digest,
+        "ros_runtime_protocol_sha256": ros_runtime_digest,
+        "runner_shell": str(args.runner_shell),
+        "fast_eval": bool(args.fast_eval),
+        "scene_timeout_s": float(args.scene_timeout_s),
+        "max_steps": int(args.max_steps),
+        "step_budget_mode": str(args.step_budget_mode),
+        "semantic_attribute_request_timeout_s": float(
+            args.semantic_attribute_request_timeout_s
+        ),
+        "ros_command_starvation_timeout_s": float(
+            args.ros_command_starvation_timeout_s
+        ),
+        "ros_observation_turn_multiplier": float(
+            args.ros_observation_turn_multiplier
+        ),
+        "model_endpoint": assigned_model_endpoint(plan.worker_id, args),
+        "semantic_model_env": semantic_model_env,
+        "runtime_python": runtime_python,
+        "runtime_conda": runtime_conda,
+        "runner_settings": runner_settings,
+        "runner_file_settings": file_settings,
+    }
+
+
+def planned_invocation_signature(
+    plan: EpisodePlan,
+    args: argparse.Namespace,
+) -> tuple[str, dict[str, Any]] | None:
+    """Return one exact planned-invocation signature and its audit payload."""
+
+    payload = planned_invocation_payload(plan, args)
+    if payload is None:
+        return None
+    return _stable_json_hash(payload), payload
+
+
+def planned_invocation_record(
+    plan: EpisodePlan,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    signed = planned_invocation_signature(plan, args)
+    if signed is None:
+        return None
+    signature, payload = signed
+    return {
+        "planned_invocation_signature": signature,
+        "planned_invocation": payload,
+    }
+
+
+def _has_matching_planned_invocation(
+    record: Mapping[str, Any],
+    plan: EpisodePlan,
+    args: argparse.Namespace,
+) -> bool:
+    """Validate a persisted summary/attempt against today's exact plan."""
+
+    expected = planned_invocation_record(plan, args)
+    if expected is None:
+        return False
+    return (
+        record.get("planned_invocation_signature")
+        == expected["planned_invocation_signature"]
+        and record.get("planned_invocation") == expected["planned_invocation"]
+    )
+
+
+def _write_planned_invocation(
+    attempt_dir: Path,
+    plan: EpisodePlan,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Persist the planned signature before the subprocess can create artifacts."""
+
+    record = planned_invocation_record(plan, args)
+    if record is None:
+        raise RuntimeError("unable to hash planned V3 invocation inputs")
+    atomic_json(attempt_dir / PLANNED_INVOCATION_FILENAME, record)
+    return record
 
 
 def atomic_json(path: Path, payload: Any) -> None:
@@ -531,9 +922,17 @@ def episode_result_is_complete(path: Path | None) -> bool:
     return document_status == "complete" and result.get("status") == "complete"
 
 
-def existing_completed_summary(task_dir: Path, args: argparse.Namespace) -> dict[str, Any] | None:
+def existing_completed_summary(
+    plan: EpisodePlan,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Return a completed summary only when it matches this exact V3 plan."""
+
+    task_dir = plan.task_dir
     summary = read_json(task_dir / "batch_task_summary.json")
     if not summary.get("completed"):
+        return None
+    if not _has_matching_planned_invocation(summary, plan, args):
         return None
     # Do not let a recording-mode resume silently satisfy a fast-eval request,
     # or vice versa: their evidence contracts are intentionally different.
@@ -586,31 +985,62 @@ def encode_csv_value(value: Any) -> Any:
 def make_environment(args: argparse.Namespace, plan: EpisodePlan, attempt_dir: Path) -> dict[str, str]:
     environment = os.environ.copy()
     cache_root = args.output_dir / "_runtime_cache"
-    temporary_root = args.output_dir / "_tmp"
-    for path in (cache_root, temporary_root, attempt_dir / "mplconfig"):
+    temporary_root = attempt_dir / "tmp"
+    ros_home = attempt_dir / "ros_home"
+    ros_log_dir = ros_home / "log"
+    scene_mirror = attempt_dir / "scene_mirror"
+    hf_cache = cache_root / "hf"
+    torch_cache = cache_root / "torch"
+    cuda_cache = cache_root / "cuda"
+    for path in (
+        cache_root,
+        temporary_root,
+        attempt_dir / "mplconfig",
+        ros_home,
+        ros_log_dir,
+        scene_mirror,
+        hf_cache,
+        torch_cache,
+        cuda_cache,
+    ):
         path.mkdir(parents=True, exist_ok=True)
     environment.update(
         {
             "MAX_STEPS": str(args.max_steps),
+            "STEP_BUDGET_MODE": str(args.step_budget_mode),
+            "SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S": str(
+                args.semantic_attribute_request_timeout_s
+            ),
+            "ROS_COMMAND_STARVATION_TIMEOUT_S": str(
+                args.ros_command_starvation_timeout_s
+            ),
+            "ROS_OBSERVATION_TURN_MULTIPLIER": str(
+                args.ros_observation_turn_multiplier
+            ),
             "BENCHMARK": str(args.benchmark),
             "ROS_MASTER_URI": plan.ros_master_uri,
             "MPLCONFIGDIR": str(attempt_dir / "mplconfig"),
             "TMPDIR": str(temporary_root),
             "XDG_CACHE_HOME": str(cache_root),
+            # Keep all per-episode ROS logs and transient compiler/model caches
+            # off the nearly full root volume and prevent concurrent workers
+            # from sharing one ROS_HOME.
+            "ROS_HOME": str(ros_home),
+            "ROS_LOG_DIR": str(ros_log_dir),
+            "INTERACTIVE_NAV_SCENE_MIRROR": str(scene_mirror),
+            "HF_HOME": str(hf_cache),
+            "TORCH_HOME": str(torch_cache),
+            "CUDA_CACHE_PATH": str(cuda_cache),
             "PYTHONUNBUFFERED": "1",
             "FAST_EVAL": "true" if args.fast_eval else "false",
             "RECORD_HEAD_CAMERA": "false" if args.fast_eval else environment.get("RECORD_HEAD_CAMERA", "false"),
         }
     )
-    conda_env = args.conda_env or infer_conda_prefix()
+    conda_env, python_bin = _effective_runtime_contract(args)
     if conda_env:
         environment["CONDA_ENV"] = conda_env
-    if args.python_bin is not None:
-        environment["PYTHON_BIN"] = str(args.python_bin)
-    elif conda_env and Path(conda_env).is_absolute():
-        candidate = Path(conda_env) / "bin" / "python"
-        if candidate.is_file():
-            environment["PYTHON_BIN"] = str(candidate)
+    if python_bin:
+        environment["PYTHON_BIN"] = python_bin
     model_endpoint = assigned_model_endpoint(plan.worker_id, args)
     if model_endpoint is not None:
         assert args.semantic_model_env_file is not None
@@ -625,8 +1055,13 @@ def make_environment(args: argparse.Namespace, plan: EpisodePlan, attempt_dir: P
     return environment
 
 
-def base_summary(plan: EpisodePlan, args: argparse.Namespace) -> dict[str, Any]:
-    return {
+def base_summary(
+    plan: EpisodePlan,
+    args: argparse.Namespace,
+    *,
+    planned_record: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = {
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "episode_index": plan.episode_index,
         "worker_id": plan.worker_id,
@@ -634,12 +1069,235 @@ def base_summary(plan: EpisodePlan, args: argparse.Namespace) -> dict[str, Any]:
         "output_dir": str(plan.task_dir),
         "runner": str(args.runner),
         "benchmark": str(args.benchmark),
+        "scene_timeout_s": float(args.scene_timeout_s),
         "max_steps": args.max_steps,
+        "step_budget_mode": str(args.step_budget_mode),
+        "semantic_attribute_request_timeout_s": float(
+            args.semantic_attribute_request_timeout_s
+        ),
+        "ros_command_starvation_timeout_s": float(
+            args.ros_command_starvation_timeout_s
+        ),
+        "ros_observation_turn_multiplier": float(
+            args.ros_observation_turn_multiplier
+        ),
         "fast_eval": bool(args.fast_eval),
         "recording_enabled": not bool(args.fast_eval),
         "model_endpoint": assigned_model_endpoint(plan.worker_id, args),
         "mujoco_egl_device": assigned_mujoco_egl_device(plan.worker_id, args),
     }
+    # A normal run writes this record before it launches the subprocess.  Keep
+    # that original launch identity in its summary instead of recomputing after
+    # a potentially long evaluation window.
+    record = dict(planned_record) if planned_record is not None else planned_invocation_record(plan, args)
+    if record is not None:
+        result.update(record)
+    return result
+
+
+def copy_episode_result_fields(summary: dict[str, Any], episode_result: dict[str, Any]) -> None:
+    for key in EPISODE_RESULT_SUMMARY_FIELDS:
+        if key in episode_result:
+            summary[key] = episode_result[key]
+
+
+def latest_attempt_dir(task_dir: Path) -> Path | None:
+    """Return the only attempt eligible for recovery: the highest numeric one."""
+
+    attempts: list[tuple[int, Path]] = []
+    for candidate in task_dir.glob("attempt_*"):
+        if not candidate.is_dir():
+            continue
+        suffix = candidate.name.removeprefix("attempt_")
+        if not suffix.isdigit():
+            # A hand-made/unknown attempt name makes recovery provenance
+            # ambiguous.  Leave it for an explicit rerun instead.
+            return None
+        attempts.append((int(suffix), candidate))
+    if not attempts:
+        return None
+    return max(attempts, key=lambda item: item[0])[1]
+
+
+def matching_current_attempt_artifact(
+    plan: EpisodePlan,
+    args: argparse.Namespace,
+) -> tuple[Path, Path, dict[str, Any], str, str] | None:
+    """Validate a sole current-attempt result before reconstructing a summary.
+
+    A batch summary is a wrapper-side artifact.  If a process dies in the tiny
+    interval after the single-episode runner wrote its evaluator result, that
+    result is still usable only when it can be tied to the *latest* attempt,
+    exact planned index, frozen benchmark and evaluator run signature.  Older
+    attempts are intentionally ignored; a newer empty attempt is never allowed
+    to fall back to stale evidence.
+    """
+
+    attempt_dir = latest_attempt_dir(plan.task_dir)
+    if attempt_dir is None:
+        return None
+    attempt_invocation = read_json(attempt_dir / PLANNED_INVOCATION_FILENAME)
+    if not _has_matching_planned_invocation(attempt_invocation, plan, args):
+        return None
+    task_log = plan.task_dir / "batch_task.log"
+    try:
+        task_log_text = task_log.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if (
+        f"attempt={attempt_dir.name}" not in task_log_text
+        or "start command=" not in task_log_text
+        or str(attempt_dir) not in task_log_text
+    ):
+        return None
+
+    # One isolated wrapper invocation must produce exactly one evaluator trace.
+    # Do not guess when a stale or partially copied attempt has multiple files.
+    result_paths = sorted((attempt_dir / "eval" / "episodes").glob("*/episode_result.json"))
+    if len(result_paths) != 1:
+        return None
+    result_path = result_paths[0]
+    if not result_path.parent.name.startswith(f"{plan.episode_index:04d}_"):
+        return None
+
+    document = read_json(result_path)
+    episode_result, document_status = load_episode_result(result_path)
+    if document_status != "complete" or episode_result.get("status") != "complete":
+        return None
+    if episode_result.get("episode_index") != plan.episode_index:
+        return None
+    run_signature = document.get("run_signature")
+    if not isinstance(run_signature, str) or not run_signature:
+        return None
+
+    run_manifest = read_json(attempt_dir / "eval" / "run_manifest.json")
+    if run_manifest.get("run_signature") != run_signature:
+        return None
+    if run_manifest.get("episode_indices") != [plan.episode_index]:
+        return None
+    evaluation_config = run_manifest.get("evaluation_config")
+    if not isinstance(evaluation_config, dict):
+        return None
+    if evaluation_config.get("episode_indices") != [plan.episode_index]:
+        return None
+    if evaluation_config.get("max_steps") != args.max_steps:
+        return None
+    if evaluation_config.get("step_budget_mode") != args.step_budget_mode:
+        return None
+    if evaluation_config.get("ros_command_starvation_timeout_s") != float(
+        args.ros_command_starvation_timeout_s
+    ):
+        return None
+    if evaluation_config.get("ros_observation_turn_multiplier") != float(
+        args.ros_observation_turn_multiplier
+    ):
+        return None
+    benchmark_hash = sha256_file(args.benchmark)
+    if not benchmark_hash or run_manifest.get("benchmark_sha256") != benchmark_hash:
+        return None
+
+    paths = artifact_paths(attempt_dir, plan.episode_index)
+    if paths["episode_result"] != result_path:
+        return None
+    if not args.fast_eval and not video_is_valid(paths["six_panel_video"]):
+        return None
+    return attempt_dir, result_path, episode_result, document_status, run_signature
+
+
+def recover_missing_task_summary(plan: EpisodePlan, args: argparse.Namespace) -> dict[str, Any] | None:
+    """Atomically reconstruct a missing wrapper summary from validated evidence.
+
+    This is deliberately narrower than evaluator resume: it never reuses an
+    old attempt, guesses between multiple traces, or trusts a result whose run
+    signature/configuration is not exactly the planned V3 invocation.
+    """
+
+    task_summary = plan.task_dir / "batch_task_summary.json"
+    if task_summary.exists():
+        return None
+    evidence = matching_current_attempt_artifact(plan, args)
+    if evidence is None:
+        return None
+    attempt_dir, result_path, episode_result, document_status, run_signature = evidence
+    paths = artifact_paths(attempt_dir, plan.episode_index)
+    six_panel = paths["six_panel_video"]
+    topdown = paths["topdown"]
+    recovered_at = utc_now()
+    result = base_summary(
+        plan,
+        args,
+        planned_record=read_json(attempt_dir / PLANNED_INVOCATION_FILENAME),
+    )
+    result.update(
+        {
+            "attempt_dir": str(attempt_dir),
+            "attempt": attempt_dir.name,
+            "runner_log": str(attempt_dir / "runner.log"),
+            "started_at": None,
+            "finished_at": recovered_at,
+            "elapsed_sec": None,
+            "timed_out": False,
+            # The shell's exit status was lost with the wrapper process.  Do
+            # not fabricate it; completion rests on the signed evaluator
+            # artifact validated above.
+            "runner_exit_code": None,
+            "exit_code": None,
+            "completed": True,
+            "resumed": False,
+            "episode_result_path": str(result_path),
+            "episode_document_status": document_status,
+            "episode_status": episode_result.get("status"),
+            "run_signature": run_signature,
+            "artifact_validation_mode": (
+                "episode_result_only_fast_eval" if args.fast_eval else "episode_result_and_six_panel_video"
+            ),
+            "six_panel_video": None if args.fast_eval else str(six_panel),
+            "six_panel_video_bytes": (
+                0 if args.fast_eval or not video_is_valid(six_panel) else six_panel.stat().st_size
+            ),
+            "topdown": None if args.fast_eval or topdown is None else str(topdown),
+            "topdown_exists": (
+                False
+                if args.fast_eval
+                else topdown is not None and topdown.is_file() and topdown.stat().st_size > 0
+            ),
+            "error": episode_result.get("error"),
+            "recovered_batch_task_summary": True,
+            "recovery_source": "complete_current_attempt_episode_result",
+            "recovery_reason": "missing_batch_task_summary",
+            "recovered_at": recovered_at,
+        }
+    )
+    copy_episode_result_fields(result, episode_result)
+    atomic_json(attempt_dir / "wrapper_summary.json", result)
+    atomic_json(task_summary, result)
+    append_task_log(
+        plan.task_dir / "batch_task.log",
+        f"[{recovered_at}] attempt={attempt_dir.name} recovered_missing_batch_task_summary "
+        f"run_signature={run_signature}",
+    )
+    return result
+
+
+def recover_unreported_task_summaries(
+    plans: list[EpisodePlan],
+    args: argparse.Namespace,
+    results: list[dict[str, Any]],
+) -> None:
+    """Add only formally validated wrapper recoveries to the live result list."""
+
+    reported_indices = {
+        row.get("episode_index")
+        for row in results
+        if isinstance(row.get("episode_index"), int)
+    }
+    for plan in plans:
+        if plan.episode_index in reported_indices:
+            continue
+        recovered = recover_missing_task_summary(plan, args)
+        if recovered is not None:
+            results.append(recovered)
+            reported_indices.add(plan.episode_index)
 
 
 def run_episode(
@@ -665,7 +1323,11 @@ def run_episode(
         )
         return result
 
-    previous = existing_completed_summary(task_dir, args) if args.resume else None
+    recovered = recover_missing_task_summary(plan, args) if args.resume else None
+    if recovered is not None:
+        return recovered
+
+    previous = existing_completed_summary(plan, args) if args.resume else None
     if previous is not None:
         result = dict(previous)
         result.update({"worker_id": plan.worker_id, "resumed": True, "resume_skipped": True})
@@ -687,6 +1349,7 @@ def run_episode(
     task_dir.mkdir(parents=True, exist_ok=True)
     attempt_dir = next_attempt_dir(task_dir)
     attempt_dir.mkdir(parents=True, exist_ok=False)
+    planned_record = _write_planned_invocation(attempt_dir, plan, args)
     environment = make_environment(args, plan, attempt_dir)
     command = [args.runner_shell, str(args.runner), str(attempt_dir), str(plan.episode_index)]
     task_log = task_dir / "batch_task.log"
@@ -695,7 +1358,9 @@ def run_episode(
     started = time.monotonic()
     append_task_log(
         task_log,
-        f"[{started_wall_time}] attempt={attempt_dir.name} start command={shlex.join(command)}",
+        f"[{started_wall_time}] attempt={attempt_dir.name} "
+        f"planned_invocation_signature={planned_record['planned_invocation_signature']} "
+        f"start command={shlex.join(command)}",
     )
 
     timed_out = False
@@ -727,6 +1392,7 @@ def run_episode(
 
     elapsed_sec = time.monotonic() - started
     paths = artifact_paths(attempt_dir, plan.episode_index)
+    episode_document = read_json(paths["episode_result"]) if paths["episode_result"] else {}
     episode_result, document_status = load_episode_result(paths["episode_result"])
     six_panel = paths["six_panel_video"]
     topdown = paths["topdown"]
@@ -738,7 +1404,7 @@ def run_episode(
         and episode_result_complete
         and (args.fast_eval or video_is_valid(six_panel))
     )
-    result = base_summary(plan, args)
+    result = base_summary(plan, args, planned_record=planned_record)
     result.update(
         {
             "attempt_dir": str(attempt_dir),
@@ -756,6 +1422,7 @@ def run_episode(
             "episode_result_path": None if paths["episode_result"] is None else str(paths["episode_result"]),
             "episode_document_status": document_status,
             "episode_status": episode_result.get("status"),
+            "run_signature": episode_document.get("run_signature"),
             "artifact_validation_mode": (
                 "episode_result_only_fast_eval" if args.fast_eval else "episode_result_and_six_panel_video"
             ),
@@ -773,38 +1440,7 @@ def run_episode(
             "error": exception_text or episode_result.get("error"),
         }
     )
-    for key in (
-        "case_id",
-        "house_index",
-        "domains",
-        "recipe",
-        "interaction_types",
-        "interaction_requirement",
-        "success",
-        "task_success",
-        "interaction_conditioned_success",
-        "nav_success",
-        "required_interaction_success",
-        "sequence_success",
-        "terminal_reason",
-        "step_count",
-        "navigation_step_count",
-        "view_action_count",
-        "interaction_action_count",
-        "correct_interaction_action_count",
-        "invalid_interaction_action_count",
-        "navigation_path_length_m",
-        "reference_path_length_m",
-        "spl",
-        "elapsed_seconds",
-        "target_distance_m",
-        "target_visibility_fraction",
-        "scoring_eligible",
-        "early_stop",
-        "timing_summary",
-    ):
-        if key in episode_result:
-            result[key] = episode_result[key]
+    copy_episode_result_fields(result, episode_result)
     atomic_json(attempt_dir / "wrapper_summary.json", result)
     atomic_json(task_dir / "batch_task_summary.json", result)
     append_task_log(
@@ -820,20 +1456,83 @@ def numeric_mean(rows: list[dict[str, Any]], key: str) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def missing_plan_summary(plan: EpisodePlan, args: argparse.Namespace) -> dict[str, Any]:
+    """Represent a planned episode whose worker never reported a wrapper result."""
+
+    result = base_summary(plan, args)
+    result.update(
+        {
+            "completed": False,
+            "report_status": "missing",
+            "worker_result_reported": False,
+            "failure_kind": "missing_episode_report",
+            "incomplete_reason": "planned_episode_not_reported",
+            "episode_status": "not_reported",
+            "terminal_reason": "missing_episode_report",
+            "scoring_eligible": False,
+            # Keep every score-like outcome explicitly false: no evaluator
+            # result is evidence of neither task success nor navigation success.
+            "success": False,
+            "task_success": False,
+            "nav_success": False,
+            "required_interaction_success": False,
+            "sequence_success": False,
+            "error": "no worker result was reported for this planned episode",
+        }
+    )
+    return result
+
+
 def write_summary(
     args: argparse.Namespace,
     plans: list[EpisodePlan],
     results: list[dict[str, Any]],
     resource_summary: dict[str, Any] | None = None,
-) -> None:
+    *,
+    recover_missing_task_summaries: bool = False,
+) -> dict[str, Any]:
+    if recover_missing_task_summaries:
+        # A worker can be interrupted after the evaluator atomically commits
+        # its result but before this wrapper writes batch_task_summary.json.
+        # Do this only after the worker pool has joined: during an intermediate
+        # progress write another shell may still be validating/tearing down.
+        recover_unreported_task_summaries(plans, args, results)
     ordered_results = sorted(results, key=lambda row: int(row.get("episode_index", -1)))
+    planned_indices = {plan.episode_index for plan in plans}
+    reported_planned_indices = {
+        int(row["episode_index"])
+        for row in ordered_results
+        if isinstance(row.get("episode_index"), int)
+        and int(row["episode_index"]) in planned_indices
+    }
+    missing_rows = [
+        missing_plan_summary(plan, args)
+        for plan in plans
+        if plan.episode_index not in reported_planned_indices
+    ]
+    episode_rows = sorted(
+        [
+            {
+                **row,
+                "report_status": row.get("report_status", "reported"),
+                "worker_result_reported": True,
+            }
+            for row in ordered_results
+        ]
+        + missing_rows,
+        key=lambda row: int(row.get("episode_index", -1)),
+    )
     completed = [row for row in ordered_results if bool(row.get("completed"))]
     failures = [row for row in ordered_results if not bool(row.get("completed"))]
     aggregate = {
         "planned_episode_count": len(plans),
         "reported_episode_count": len(ordered_results),
+        "reported_planned_episode_count": len(reported_planned_indices),
+        "missing_episode_count": len(missing_rows),
+        "planned_minus_reported_episode_count": len(missing_rows),
         "completed_episode_count": len(completed),
-        "failed_or_incomplete_episode_count": len(failures),
+        "reported_failed_or_incomplete_episode_count": len(failures),
+        "failed_or_incomplete_episode_count": len(failures) + len(missing_rows),
         "six_panel_video_count": sum(video_is_valid(Path(str(row["six_panel_video"]))) for row in ordered_results if row.get("six_panel_video")),
         "formal_success_count": sum(bool(row.get("success")) for row in completed),
         "task_success_count": sum(bool(row.get("task_success")) for row in completed),
@@ -856,6 +1555,16 @@ def write_summary(
             "workers": args.workers,
             "base_master_port": args.base_master_port,
             "max_steps": args.max_steps,
+            "step_budget_mode": str(args.step_budget_mode),
+            "semantic_attribute_request_timeout_s": float(
+                args.semantic_attribute_request_timeout_s
+            ),
+            "ros_command_starvation_timeout_s": float(
+                args.ros_command_starvation_timeout_s
+            ),
+            "ros_observation_turn_multiplier": float(
+                args.ros_observation_turn_multiplier
+            ),
             "scene_timeout_s": args.scene_timeout_s,
             "fast_eval": bool(args.fast_eval),
             "recording_enabled": not bool(args.fast_eval),
@@ -870,7 +1579,8 @@ def write_summary(
         },
         "plans": [plan_to_dict(plan, args) for plan in plans],
         "aggregate": aggregate,
-        "episodes": ordered_results,
+        "episodes": episode_rows,
+        "missing_episode_reports": missing_rows,
     }
     atomic_json(args.output_dir / "summary.json", summary)
     atomic_json(args.output_dir / "aggregate_metrics.json", aggregate)
@@ -883,6 +1593,10 @@ def write_summary(
         "fast_eval",
         "artifact_validation_mode",
         "completed",
+        "report_status",
+        "worker_result_reported",
+        "failure_kind",
+        "incomplete_reason",
         "runner_exit_code",
         "elapsed_sec",
         "episode_status",
@@ -909,9 +1623,10 @@ def write_summary(
     with temporary.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        for row in ordered_results:
+        for row in episode_rows:
             writer.writerow({key: encode_csv_value(row.get(key)) for key in fields})
     temporary.replace(args.output_dir / "summary.csv")
+    return aggregate
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -928,6 +1643,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-steps must be positive")
     if args.scene_timeout_s <= 0:
         raise ValueError("--scene-timeout-s must be positive")
+    if args.semantic_attribute_request_timeout_s <= 0.0:
+        raise ValueError("--semantic-attribute-request-timeout-s must be positive")
+    if args.ros_command_starvation_timeout_s < 0.0:
+        raise ValueError("--ros-command-starvation-timeout-s must be non-negative")
+    if args.ros_observation_turn_multiplier < 1.0:
+        raise ValueError("--ros-observation-turn-multiplier must be at least 1")
     if args.resource_sample_interval_s <= 0.0:
         raise ValueError("--resource-sample-interval-s must be positive")
     if not 1 <= args.base_master_port <= 65535:
@@ -1033,6 +1754,16 @@ def main() -> int:
                 "workers": args.workers,
                 "base_master_port": args.base_master_port,
                 "max_steps": args.max_steps,
+                "step_budget_mode": str(args.step_budget_mode),
+                "semantic_attribute_request_timeout_s": float(
+                    args.semantic_attribute_request_timeout_s
+                ),
+                "ros_command_starvation_timeout_s": float(
+                    args.ros_command_starvation_timeout_s
+                ),
+                "ros_observation_turn_multiplier": float(
+                    args.ros_observation_turn_multiplier
+                ),
                 "scene_timeout_s": args.scene_timeout_s,
                 "fast_eval": bool(args.fast_eval),
                 "recording_enabled": not bool(args.fast_eval),
@@ -1074,8 +1805,14 @@ def main() -> int:
     finally:
         resource_summary = telemetry.stop() if telemetry is not None else None
 
-    write_summary(args, plans, results, resource_summary)
-    failure_count = sum(not bool(result.get("completed")) for result in results)
+    aggregate = write_summary(
+        args,
+        plans,
+        results,
+        resource_summary,
+        recover_missing_task_summaries=True,
+    )
+    failure_count = int(aggregate["failed_or_incomplete_episode_count"])
     print(
         json.dumps(
             {

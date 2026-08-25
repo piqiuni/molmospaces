@@ -1,0 +1,75 @@
+# Habitat Challenge 2023 ObjectNav-v2 profile.
+#
+# This profile is intentionally not an original ROS ablation YAML: the original
+# Module-3 enum has no "disabled" state and its full launch starts an executor.
+# The external bridge therefore owns the hard navigation-only boundary.
+schema_version: 1
+profile: habitat-objectnav-v2-m1-detector-m2-navigation-only
+
+official_task_assertions:
+  habitat_config: benchmark/nav/objectnav/objectnav_v2_hm3d_stretch.yaml
+  distance_to: VIEW_POINTS
+  success_distance_m: 0.1
+  requires_explicit_stop: true
+
+modules:
+  module1:
+    enabled: true
+    mode: detector_only_sidecar
+    sidecar:
+      # The host currently has no ROS runtime.  This sidecar invokes the
+      # original Module-1 ExternalHttpProvider/ExternalHttpDetector seam and
+      # exposes its detector-only RGB-D request/response contract over HTTP.
+      transport: http_sidecar
+      endpoint: http://127.0.0.1:12186
+      timeout_s: 5.0
+      interval_steps: 5
+      min_confidence: 0.35
+      include_depth: true
+      original_module1_scripts: /home/ldl/molmospaces-exp-setting/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts
+      require_healthy: true
+
+  module2:
+    enabled: true
+    mode: original_model_policy
+    endpoint: http://127.0.0.1:8000/v1
+    model: qwen3.6-35b-a3b-fp8
+    timeout_s: 30.0
+    # Module-1 is the visual discovery lane in this profile.  Module-2 still
+    # ranks frontier and public detector-standoff candidates; no second MLLM
+    # image controller may pre-empt it.
+    vision_localization_enabled: false
+
+  module3:
+    enabled: false
+    mode: disabled
+    fail_closed: true
+    allowed_behavior_types: [EXPLORE, NAVIGATE]
+    forbidden_behavior_types: [INTERACT]
+    forbidden_habitat_actions: [INTERACT, OPEN, CLOSE]
+
+approach:
+  min_depth_m: 0.20
+  max_target_depth_m: 4.0
+  # These are public detector-surface/standoff controls, not the benchmark's
+  # success radius.  A route waypoint is reached at 0.1 m to match the v2
+  # precision scale, while a detected object keeps a 1.0 m standoff candidate.
+  waypoint_standoff_m: 0.60
+  waypoint_reached_distance_m: 0.08
+  max_contiguous_steps: 120
+  target_track_standoff_m: 1.00
+  route_goal_reached_distance_m: 0.10
+
+stop_proxy:
+  # Object surface depth cannot certify the official 0.1 m distance to a valid
+  # VIEW_POINT.  Keep autonomous STOP disabled for this detector-only bridge
+  # until it has a separately calibrated public stopping policy.  The official
+  # task still requires explicit velocity_stop for success.
+  enabled: false
+  habitat_action: velocity_stop
+  depth_m: 0.60
+  center_tolerance: 0.18
+  confirmations: 2
+
+logging:
+  public_trace: true

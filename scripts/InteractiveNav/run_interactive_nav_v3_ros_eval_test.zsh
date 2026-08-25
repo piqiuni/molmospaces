@@ -86,6 +86,23 @@ SEMANTIC_MODEL_ENV_FILE=${SEMANTIC_MODEL_ENV_FILE:-${REPO_ROOT}/.env}
 # This launch argument reaches only the object-attribute (M1) lane; M2/M3 use
 # object_goal_v3_full_mllm.yaml and room MLLM keeps its own mapping config cap.
 SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS:-384}
+# Match the ordinary full-MLLM interaction profile.  A caller may still lower
+# this explicitly for a dedicated throughput experiment.
+SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S:-30.0}
+# Keep the bridge freshness/synchronisation contract aligned with the ordinary
+# interaction runner.  These values control public observation delivery only;
+# restricted perception and evaluator scoring remain separate V3 concerns.
+ROS_ACTION_TIMEOUT_S=${ROS_ACTION_TIMEOUT_S:-0.2}
+ROS_STEP_READY_BARRIER_ENABLED=${ROS_STEP_READY_BARRIER_ENABLED:-true}
+ROS_STEP_READY_TOPIC=${ROS_STEP_READY_TOPIC:-/semantic_decision/step_ready}
+ROS_STEP_READY_WARMUP_SKIP_FRAMES=${ROS_STEP_READY_WARMUP_SKIP_FRAMES:-0}
+ROS_STEP_READY_TIMEOUT_S=${ROS_STEP_READY_TIMEOUT_S:-2.0}
+ROS_STEP_READY_BOOTSTRAP_TIMEOUT_S=${ROS_STEP_READY_BOOTSTRAP_TIMEOUT_S:-10.0}
+# Non-applied bridge refreshes must not make a fixed applied-step evaluation
+# unbounded.  1.5x admits the observed normal async slack while bounding an
+# intermittent-command/no-progress loop before the outer scene timeout.
+ROS_COMMAND_STARVATION_TIMEOUT_S=${ROS_COMMAND_STARVATION_TIMEOUT_S:-60.0}
+ROS_OBSERVATION_TURN_MULTIPLIER=${ROS_OBSERVATION_TURN_MULTIPLIER:-1.5}
 SEMANTIC_DECISION_OVERRIDE=${SEMANTIC_DECISION_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/object_goal_v3_full_mllm.yaml}
 SEMANTIC_MAPPING_OVERRIDE=${SEMANTIC_MAPPING_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/full_mllm_mapping.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-${SCRIPT_DIR}/configs/semantic_decision/semantic_controlled_explore.yaml}
@@ -146,7 +163,7 @@ for required_mllm_setting in \
 done
 printf '%s\n' "[v3-eval] method=${METHOD} policy_adapter=${POLICY}"
 printf '%s\n' "[v3-eval] step_budget_mode=${STEP_BUDGET_MODE} min_steps=${MIN_STEPS} max_steps=${MAX_STEPS}"
-printf '%s\n' "[v3-eval] m1_attribute_max_output_tokens=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS}"
+printf '%s\n' "[v3-eval] m1_attribute_max_output_tokens=${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS} request_timeout_s=${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S} ros_action_timeout_s=${ROS_ACTION_TIMEOUT_S} step_ready=${ROS_STEP_READY_BARRIER_ENABLED} ros_command_starvation_timeout_s=${ROS_COMMAND_STARVATION_TIMEOUT_S} ros_observation_turn_multiplier=${ROS_OBSERVATION_TURN_MULTIPLIER}"
 if [[ "${FAST_EVAL}" == true ]]; then
   printf '%s\n' "[v3-eval] fast_eval=true recorder_enabled=false step_capture_ack_barrier=false"
 else
@@ -293,6 +310,7 @@ roslaunch "${ROS_SOURCE_DIR}/nav_pkg/launch/molmospaces_nav_system.launch" \
   semantic_attribute_inference:=true \
   semantic_attribute_model_name:= \
   semantic_attribute_max_output_tokens:="${SEMANTIC_ATTRIBUTE_MAX_OUTPUT_TOKENS}" \
+  semantic_attribute_request_timeout_s:="${SEMANTIC_ATTRIBUTE_REQUEST_TIMEOUT_S}" \
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
   semantic_config_override_file:="${SEMANTIC_MAPPING_OVERRIDE}" \
   explore_py_config_override_file:="${EXPLORE_PY_CONFIG_OVERRIDE}" \
@@ -359,12 +377,23 @@ EVAL_ARGS=(
   --dynamic-container-interaction-steps "${DYNAMIC_CONTAINER_INTERACTION_STEPS}"
   --dynamic-container-joint-steps "${DYNAMIC_CONTAINER_JOINT_STEPS}"
   --dynamic-step-quantum "${DYNAMIC_STEP_QUANTUM}"
-  --ros-action-timeout-s 1.0
+  --ros-action-timeout-s "${ROS_ACTION_TIMEOUT_S}"
+  --ros-step-ready-topic "${ROS_STEP_READY_TOPIC}"
+  --ros-step-ready-warmup-skip-frames "${ROS_STEP_READY_WARMUP_SKIP_FRAMES}"
+  --ros-step-ready-timeout-s "${ROS_STEP_READY_TIMEOUT_S}"
+  --ros-step-ready-bootstrap-timeout-s "${ROS_STEP_READY_BOOTSTRAP_TIMEOUT_S}"
+  --ros-command-starvation-timeout-s "${ROS_COMMAND_STARVATION_TIMEOUT_S}"
+  --ros-observation-turn-multiplier "${ROS_OBSERVATION_TURN_MULTIPLIER}"
   --no-ros-require-move-base-active
   --ros-map-warmup-skip-frames 0
   --video-fps "${VIDEO_FPS}"
   --progress-every 1
 )
+if [[ "${ROS_STEP_READY_BARRIER_ENABLED}" == true ]]; then
+  EVAL_ARGS+=(--ros-step-ready-barrier-enabled)
+else
+  EVAL_ARGS+=(--no-ros-step-ready-barrier-enabled)
+fi
 if [[ "${FAST_EVAL}" != true ]]; then
   # Frame persistence and the acknowledgement barrier are inseparable in the
   # recordable protocol.  Do not pass either in FAST_EVAL: no recorder exists

@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="config_file"/>
+  <arg name="override_config_file"/>
+  <!-- Navigation-only launch: the original candidate generator is retained,
+       while semantic_behavior_executor (Module-3) is intentionally absent. -->
+  <node name="semantic_candidate_node"
+        pkg="semantic_decision_py_pkg"
+        type="semantic_candidate_node.py"
+        output="screen">
+    <rosparam file="$(arg config_file)" command="load"/>
+    <rosparam file="$(arg override_config_file)" command="load"/>
+  </node>
+</launch>

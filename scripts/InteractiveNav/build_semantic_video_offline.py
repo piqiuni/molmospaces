@@ -526,14 +526,19 @@ def gt_draw_spec(
     payload: dict,
     observation: dict,
     target_object_id: str | set[str] = "",
+    source_image_size: tuple[int, int] | None = None,
 ) -> dict | None:
     bbox = observation.get("bbox_2d") or []
-    image_size = observation.get("image_size") or payload.get("image_size") or []
-    if len(bbox) != 4 or len(image_size) != 2:
+    image_size = _gt_image_size(
+        payload,
+        observation,
+        source_image_size=source_image_size,
+    )
+    if len(bbox) != 4 or image_size is None:
         return None
     frame_height, frame_width = frame_shape[:2]
-    scale_x = float(frame_width) / max(1, int(image_size[0]))
-    scale_y = float(frame_height) / max(1, int(image_size[1]))
+    scale_x = float(frame_width) / max(1, image_size[0])
+    scale_y = float(frame_height) / max(1, image_size[1])
     x0, y0, x1, y1 = [int(value) for value in bbox]
     start = (
         max(0, min(frame_width - 1, int(x0 * scale_x))),
@@ -588,17 +593,101 @@ def gt_draw_spec(
     }
 
 
+def _normalise_image_size(value: object) -> tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        width, height = int(value[0]), int(value[1])
+    except (TypeError, ValueError):
+        return None
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _gt_image_size(
+    payload: dict,
+    observation: dict,
+    *,
+    source_image_size: tuple[int, int] | None = None,
+) -> tuple[int, int] | None:
+    """Resolve render dimensions without changing the strict ROS payload."""
+
+    for candidate in (
+        observation.get("image_size"),
+        payload.get("image_size"),
+        source_image_size,
+    ):
+        image_size = _normalise_image_size(candidate)
+        if image_size is not None:
+            return image_size
+    for key in ("mask_rle", "segmentation_rle"):
+        rle = observation.get(key)
+        if not isinstance(rle, dict):
+            continue
+        size = rle.get("size")
+        if not isinstance(size, (list, tuple)) or len(size) != 2:
+            continue
+        try:
+            height, width = int(size[0]), int(size[1])
+        except (TypeError, ValueError):
+            continue
+        if width > 0 and height > 0:
+            return width, height
+    return None
+
+
+def _sim_record_image_size(sim_record: dict) -> tuple[int, int] | None:
+    return _normalise_image_size((sim_record.get("width"), sim_record.get("height")))
+
+
+def public_gt_payload_for_sim_frame(
+    sim_record: dict,
+    raw_step: dict | None = None,
+) -> dict | None:
+    """Return the causal public payload for one simulator RGB frame.
+
+    New V3 manifests own this association.  ``raw_step`` is only a legacy
+    fallback for recordings made before the bridge received the evaluator's
+    public-perception handoff; it is already exact-step aligned by the caller.
+    """
+
+    manifest_payload = sim_record.get("gt_observations")
+    if isinstance(manifest_payload, dict):
+        # The bridge consumes an evaluator payload only while enqueueing this
+        # exact RGB job.  It is causal by construction, and must not be
+        # discarded merely because ROS simulated time and the adapter's clock
+        # use different numeric domains.
+        return manifest_payload
+    if raw_step is None or not isinstance(raw_step.get("gt_observations"), dict):
+        return None
+    candidate = raw_step["gt_observations"]
+    try:
+        sim_stamp = float(sim_record.get("stamp_sec") or 0.0)
+        gt_stamp = float(candidate.get("stamp_sec") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if sim_stamp > 0.0 and gt_stamp > sim_stamp + _CAUSAL_RECEIPT_EPSILON_SEC:
+        return None
+    return candidate
+
+
 def draw_gt(
     frame,
     payload: dict | None,
     target_object_id: str | set[str] = "",
+    source_image_size: tuple[int, int] | None = None,
 ) -> None:
     if not payload:
         return
     observations = list(payload.get("observations") or [])
     source_height, source_width = frame.shape[:2]
     for observation in observations:
-        spec = gt_draw_spec(frame.shape, payload, observation, target_object_id)
+        spec = gt_draw_spec(
+            frame.shape,
+            payload,
+            observation,
+            target_object_id,
+            source_image_size=source_image_size,
+        )
         if spec is None:
             continue
         start = spec["start"]
@@ -615,7 +704,7 @@ def draw_gt(
             cv2.LINE_AA,
         )
     gt_frame = payload.get("frame_index", "-")
-    status_text = f"GT visible={len(observations)} frame={gt_frame} source=realtime_gt"
+    status_text = f"GT visible={len(observations)} frame={gt_frame} source=public_gt"
     cv2.putText(
         frame,
         status_text,
@@ -855,6 +944,46 @@ def _title_panel(panel, title: str, step_index: int) -> None:
     cv2.putText(panel, f"{title}  STEP={step_index + 1:04d}", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (20, 20, 20), 1, cv2.LINE_AA)
 
 
+def union_world_bounds(
+    first: tuple[float, float, float, float] | None,
+    second: tuple[float, float, float, float] | None,
+) -> tuple[float, float, float, float] | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return (
+        min(first[0], second[0]),
+        min(first[1], second[1]),
+        max(first[2], second[2]),
+        max(first[3], second[3]),
+    )
+
+
+def episode_planning_world_bounds(
+    planning_records: list[dict],
+    *,
+    margin_m: float,
+) -> tuple[float, float, float, float] | None:
+    """Compute one immutable viewport from all causally recorded planning maps."""
+
+    bounds = None
+    for record in planning_records:
+        grid = load_raw_grid(record)
+        if grid is None:
+            continue
+        bounds = union_world_bounds(bounds, known_world_bounds(grid, margin_m=0.0))
+    if bounds is None:
+        return None
+    margin = max(0.0, float(margin_m))
+    return (
+        bounds[0] - margin,
+        bounds[1] - margin,
+        bounds[2] + margin,
+        bounds[3] + margin,
+    )
+
+
 def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list[dict]) -> dict:
     """Reconstruct the established six-panel renderer from raw PNG+JSON data."""
 
@@ -904,6 +1033,25 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
     )
     renderer = OfflineSixPanelRenderer(transforms=transforms)
     global_replay = GlobalCostmapReplay(maps_by_id)
+
+    # Per-frame known bounds made Panel 5 visibly pan/zoom whenever one new map
+    # row arrived.  Lock all map-frame panels to the episode envelope instead.
+    episode_occ_crop_margin_m = max(
+        [
+            float(
+                (step.get("visualization_config") or {}).get(
+                    "video_occ_crop_margin_m", 2.5
+                )
+                or 2.5
+            )
+            for step in steps
+        ]
+        or [2.5]
+    )
+    fixed_world_bounds = episode_planning_world_bounds(
+        maps_by_stage.get("planning_occ", []),
+        margin_m=episode_occ_crop_margin_m,
+    )
 
     panel_size = (480, 270)
     videos_dir = scene_dir / "videos"
@@ -1014,11 +1162,11 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 semantic_xy_overview_inset = bool(
                     getattr(args, "semantic_xy_overview_inset", False)
                 )
-                world_bounds = (
-                    known_world_bounds(planning, margin_m=occ_crop_margin_m)
-                    if planning is not None
-                    else None
-                )
+                world_bounds = fixed_world_bounds
+                if world_bounds is None and planning is not None:
+                    world_bounds = known_world_bounds(
+                        planning, margin_m=occ_crop_margin_m
+                    )
                 occ_world_bounds = extend_world_bounds_lower(
                     world_bounds, occ_lower_margin_m
                 )
@@ -1032,8 +1180,9 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                 selection = active_semantic_selection(step)
                 draw_gt(
                     camera,
-                    sim_record.get("gt_observations"),
+                    public_gt_payload_for_sim_frame(sim_record, step),
                     selection_target_ids(selection),
+                    _sim_record_image_size(sim_record),
                 )
                 draw_camera_title(camera, step, step_index)
                 occ = renderer.render_map_panel(
@@ -1351,8 +1500,9 @@ def main() -> None:
             camera_frame = cv2.resize(camera_frame, (panel_width, panel_height), interpolation=cv2.INTER_AREA)
             draw_gt(
                 camera_frame,
-                sim_record.get("gt_observations"),
+                public_gt_payload_for_sim_frame(sim_record),
                 route_target_at_stamp(route_events, stamp_sec),
+                _sim_record_image_size(sim_record),
             )
             draw_route_event(camera_frame, route_event_at_stamp(route_events, stamp_sec))
             sim_step = sim_step_index + 1

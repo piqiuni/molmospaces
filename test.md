@@ -921,7 +921,7 @@ METHOD=full_mllm_exploration \
 HOUSE_IND=0 SCENE_SEED=0 ROUTE_ID=house_0000 \
 USE_FIXED_ROUTE=false ROUTE_NAV_CONFIG='' RUNTIME_TARGET_MODE=none \
 TASK_HORIZON=500 SIM_TIMEOUT_S=3600 \
-MAPPING_SCAN_SOURCE=pointcloud POINTCLOUD_STRIDE=1 \
+MAPPING_SCAN_SOURCE=organized_depth POINTCLOUD_STRIDE=1 \
 INITIAL_DOOR_STATE=closed FORCE_CLOSE_CONTAINERS=true \
 ENABLE_RECORDING=true \
 bash scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh "$RUN" house_0000
@@ -1091,6 +1091,7 @@ COMMON=(
   --base-master-port 12600
   --episode-indices $(seq 0 49)
   --max-steps 2000
+  --step-budget-mode fixed
   # 先保守设置；完成小批 p95 后再按实际时长收紧。
   --scene-timeout-s 7200
   --model-endpoints http://127.0.0.1:8000/v1 http://127.0.0.1:8001/v1
@@ -1120,6 +1121,21 @@ COMMON=(
 （12610）、mixed=3（12620）；mixed 的 endpoint 顺序写成 `8001 8000`，其余两个使用
 `8000 8001`，可得到约 5:5 的模型请求分配。三批输出目录各自保留
 `resource_telemetry.csv` 和 `aggregate_metrics.json`。
+
+`--step-budget-mode fixed` 才表示每个 episode 使用 2,000 个 applied-action step；
+`dynamic` 会按路径和交互复杂度缩短上限。`--resume` 只复用带有当前
+planned-invocation 签名的完整结果；benchmark、评测器/ROS launch、预算、超时、模型
+环境或运行时解释器发生变化时会安全地重新执行旧 episode。历史目录若没有该签名也
+不会被静默当作当前协议结果。
+
+每轮结束后可生成包含 incomplete、no-fresh/applied、M1 错误和交互失败原因的诊断：
+
+```bash
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/evaluation/v3_round_summary.py \
+  /home/ldl/outputs/<v3-round> --format table \
+  --json-output /home/ldl/outputs/<v3-round>/round_diagnostic.json
+```
 
 若已有运行中的任意批次 PID，需要额外记录整批 CPU/RAM/每卡显存和 GPU 利用率，可
 并行启动：
@@ -2016,3 +2032,42 @@ conda run -n mlspaces python scripts/InteractiveNav/evaluate_module3_visual_plan
 ```
 
 无可用视觉模型时可用 `--mode mock --model mock-module3` 检查裁图、协议、schema 和评分链路；mock 结果不能作为视觉能力结论。
+
+---
+
+## 12. Habitat ObjectNav-v2 外部 Module-2 评测
+
+适用场景：在不修改 `Interactive-Nav-SG-nav`、不生成交互动作的前提下，
+将原始 Module-2 `ModelPolicyClient` 接入官方 Habitat Challenge 2023
+ObjectNav-v2 / HM3D-Sem v0.2 验证环境。运行时 policy 只使用公开的
+RGB-D、GPS、Compass 和 ObjectGoal；只向 Module-2 提供 `EXPLORE` / `NAVIGATE`
+候选，并且只输出连续 `velocity_control` / `velocity_stop`。
+
+先确认共享 HM3D-Sem 资产已获本项目授权，再运行固定的 10 场景、每场 1
+episode 验证切片：
+
+```bash
+env EGL_PLATFORM=surfaceless \
+  TMPDIR=/home/ldl/tmp/habitat-objectnav-eval \
+  XDG_CACHE_HOME=/home/ldl/.cache/habitat-objectnav-eval \
+  PYTHONPYCACHEPREFIX=/home/ldl/.cache/habitat-objectnav-eval/pycache \
+  PYTHONPATH=/home/ldl/molmospaces-exp-setting/scripts/InteractiveNav:/home/ldl/habitat-objectnav/src/habitat-lab/habitat-lab \
+  /home/ldl/conda_envs/habitat-challenge-2023/bin/python \
+  /home/ldl/molmospaces-exp-setting/scripts/InteractiveNav/habitat_v2_adapter/evaluate.py \
+  --output-dir /home/ldl/outputs/habitat_objectnav_v2_m2/current_m2_public_ten \
+  --scene-count 10 --episodes-per-scene 1 --max-steps 1000 \
+  --max-episode-seconds 500 --gpu-id 0
+```
+
+结果查看：
+
+```text
+/home/ldl/outputs/habitat_objectnav_v2_m2/current_m2_public_ten/<run>/summary.json
+/home/ldl/outputs/habitat_objectnav_v2_m2/current_m2_public_ten/<run>/episodes.jsonl
+```
+
+2026-08-17 的可复现实测位于
+`current_m2_public_ten/run-20260817T085119Z`：10/10 episode 完成、159 次
+模型实际选中、1,104/1,104 次 MLLM 请求成功，但 SR=0、SPL=0。该数值证明
+外部接口和官方 v2 评测链路可运行，不可表述为导航性能提升；后续模型改动应
+先在相同 manifest 上重新报告官方 `success` / `spl`。
