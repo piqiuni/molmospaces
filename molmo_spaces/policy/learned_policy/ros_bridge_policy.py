@@ -2,8 +2,9 @@ import json
 import queue
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -209,6 +210,13 @@ class RosBridgePolicy(BasePolicy):
         )
         self._step_frame_thread = None
         self._latest_gt_payload = None
+        # V3 publishes its restricted public perception through an evaluator
+        # adapter rather than this policy's task-backed realtime-GT publisher.
+        # Keep one adapter payload for the next successfully published RGB so
+        # the media manifest has the exact public evidence available to the
+        # policy for that image.  ``None`` means no external payload was
+        # provided; an empty observations list remains a real payload.
+        self._pending_step_frame_public_payload: dict[str, Any] | None = None
         self.publish_realtime_gt = bool(publish_realtime_gt)
         if cmd_vel_control_dt_s is None:
             cfg_dt_ms = getattr(config, "policy_dt_ms", None)
@@ -283,6 +291,10 @@ class RosBridgePolicy(BasePolicy):
         }
         self.last_timing_ms: dict[str, float] = {}
         self._latest_depth_scan_diagnostics: dict[str, int | float] = {}
+        # Per-frame organized-depth provenance.  The ROS LaserScan message has
+        # no field for why a beam is NaN, so retain the projector counters for
+        # the recorder/timing JSONL without changing scan semantics.
+        self.last_depth_scan_diagnostics: dict[str, int | float] = {}
         self.last_action_source: str = ""
         self._step_frame_queue_peak: int = 0
         self._lock = threading.Lock()
@@ -759,6 +771,8 @@ class RosBridgePolicy(BasePolicy):
         for key in self._timing_acc_ms:
             self._timing_acc_ms[key] = 0.0
         with self._lock:
+            self._latest_gt_payload = None
+            self._pending_step_frame_public_payload = None
             self._latest_action = None
             self._latest_action_step = -1
             self._latest_action_mono_s = 0.0
@@ -794,6 +808,32 @@ class RosBridgePolicy(BasePolicy):
         if payload is not None:
             self._latest_gt_payload = payload
         return payload
+
+    def queue_step_frame_public_payload(self, payload: Mapping[str, Any]) -> bool:
+        """Attach an already-published public perception frame to next RGB.
+
+        The standalone V3 evaluator owns restricted-GT publication because this
+        bridge intentionally has no simulator task.  Recording must nevertheless
+        preserve the same public payload that preceded the next policy RGB.  A
+        deep copy makes this a self-contained snapshot and
+        prevents later evaluator-side mutations from changing queued media.
+
+        This is deliberately a next-frame one-shot: a newer post-action public
+        state replaces an older pending state until an RGB is actually emitted.
+        Normal task-backed realtime-GT continues to use ``_latest_gt_payload``.
+        """
+
+        if not isinstance(payload, Mapping):
+            return False
+        try:
+            snapshot = deepcopy(dict(payload))
+        except (TypeError, ValueError, RecursionError):
+            return False
+        if not isinstance(snapshot, dict):
+            return False
+        with self._lock:
+            self._pending_step_frame_public_payload = snapshot
+        return True
 
     def prepare_realtime_gt_snapshot_for_next_step(self, next_step_index: int) -> None:
         """Request a private task snapshot only when the next GT frame is due.
@@ -1877,6 +1917,16 @@ class RosBridgePolicy(BasePolicy):
     def _enqueue_step_frame(self, image_msg, stamp, step_index: int) -> None:
         if self._step_frame_thread is None or image_msg is None:
             return
+        with self._lock:
+            # An externally published V3 payload is consumed exactly once by
+            # the next RGB.  Do not clear it on a skipped/failed RGB encode:
+            # the following successful image is still the first policy frame
+            # that can causally observe that state.
+            gt_payload = self._pending_step_frame_public_payload
+            if gt_payload is not None:
+                self._pending_step_frame_public_payload = None
+            else:
+                gt_payload = self._latest_gt_payload
         self._step_frame_queue.put(
             (
                 int(step_index),
@@ -1884,7 +1934,7 @@ class RosBridgePolicy(BasePolicy):
                 int(image_msg.width),
                 int(image_msg.height),
                 bytes(image_msg.data),
-                self._latest_gt_payload,
+                gt_payload,
             )
         )
 
@@ -1954,6 +2004,10 @@ class RosBridgePolicy(BasePolicy):
         t0 = time.perf_counter()
         common_stamp = self._next_common_stamp()
         self._current_step_stamp_sec = float(common_stamp.to_sec())
+        # Do not carry provenance from a previous frame when this step has no
+        # organized-depth input or projection failure.
+        self._latest_depth_scan_diagnostics = {}
+        self.last_depth_scan_diagnostics = {}
         self.last_step_ready_diagnostics = {
             "enabled": bool(self.step_ready_barrier_enabled),
             "phase": "not_attempted",
@@ -2119,6 +2173,7 @@ class RosBridgePolicy(BasePolicy):
                                 time.perf_counter() - t0_depth_scan_publish
                             ) * 1000.0
                             self._latest_depth_scan_diagnostics = depth_scan_diagnostics
+                            self.last_depth_scan_diagnostics = dict(depth_scan_diagnostics)
                         except (TypeError, ValueError, FloatingPointError) as exc:
                             self._rospy.logwarn_throttle(
                                 2.0,

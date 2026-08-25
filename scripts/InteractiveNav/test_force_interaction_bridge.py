@@ -3,6 +3,7 @@ import math
 import numpy as np
 import pytest
 
+import force_interaction_bridge as bridge
 from force_interaction_bridge import AtomicForceInteractionController
 
 
@@ -64,3 +65,143 @@ def test_interaction_pose_validation_rejects_side_pose_with_feedback_detail() ->
         AtomicForceInteractionController._validate_interaction_pose(_Task(), command)
     assert command["interaction_pose_validation"]["valid"] is False
     assert command["interaction_pose_validation"]["position_error_m"] > 1.0
+
+
+def test_interaction_pose_validation_rejects_m1_face_normal_mismatch() -> None:
+    # The expected pose is deliberately close enough for the legacy distance
+    # and yaw checks.  The independent face contract must still reject a
+    # robot that arrived on the side of the selected AABB face.
+    _set_pose(1.0, 1.35, 0.0)
+    command = {
+        "interaction_approach_pose_xyyaw": [1.0, 1.35, 0.0],
+        "interaction_ready_distance_m": 0.45,
+        "interaction_ready_yaw_tolerance_rad": 0.55,
+        "interaction_approach_axis_xy": [0.0, 1.0],
+        "interaction_target_center_xy": [1.0, 1.0],
+        "interaction_front_axis_validation_required": True,
+    }
+    with pytest.raises(ValueError, match="face_checked=True"):
+        AtomicForceInteractionController._validate_interaction_pose(_Task(), command)
+    validation = command["interaction_pose_validation"]
+    assert validation["face_checked"] is True
+    assert validation["face_valid"] is False
+    assert validation["face_yaw_error_rad"] > 0.35
+
+
+def test_interaction_pose_validation_accepts_m1_confirmed_face() -> None:
+    _set_pose(1.0, 1.35, -math.pi / 2.0)
+    result = AtomicForceInteractionController._validate_interaction_pose(
+        _Task(),
+        {
+            "interaction_approach_pose_xyyaw": [1.0, 1.35, -math.pi / 2.0],
+            "interaction_ready_distance_m": 0.45,
+            "interaction_ready_yaw_tolerance_rad": 0.55,
+            "interaction_approach_axis_xy": [0.0, 1.0],
+            "interaction_target_center_xy": [1.0, 1.0],
+            "interaction_front_axis_validation_required": True,
+        },
+    )
+    assert result["face_checked"] is True
+    assert result["face_valid"] is True
+
+
+def _enqueue_fridge_open(controller: AtomicForceInteractionController) -> None:
+    controller.enqueue_command(
+        {
+            "command_id": "fridge-open-1",
+            "object_id": "public-fridge-1",
+            "node_id": "container-1",
+            "node_type": "container",
+            "container_kind": "fridge",
+            "action": "open",
+        }
+    )
+
+
+def _stub_interaction_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    controller: AtomicForceInteractionController,
+) -> None:
+    monkeypatch.setattr(
+        controller,
+        "_validate_interaction_pose",
+        lambda _task, _command: {"valid": True},
+    )
+    monkeypatch.setattr(
+        controller._head_view_controller,
+        "command",
+        lambda *_args, **_kwargs: {"applied": False},
+    )
+    monkeypatch.setattr(
+        bridge,
+        "prepare_articulation_force",
+        lambda *_args, **_kwargs: {"supported": True},
+    )
+
+
+def test_unsafe_open_sweep_bypass_runs_real_backend_and_audits_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = AtomicForceInteractionController(bypass_unsafe_open_sweep=True)
+    _stub_interaction_setup(monkeypatch, controller)
+    monkeypatch.setattr(
+        bridge,
+        "_refrigerator_open_sweep_preflight",
+        lambda *_args, **_kwargs: pytest.fail("bypassed sweep must not run"),
+    )
+    backend_calls = []
+
+    def _complete(*_args, **_kwargs):
+        backend_calls.append(True)
+        # A bypass must not turn a real backend failure into success.
+        return {
+            "success": False,
+            "pre_state": "closed",
+            "post_state": "closed",
+            "physics_substeps": 7,
+            "task_steps_consumed": 1,
+        }
+
+    monkeypatch.setattr(bridge, "complete_articulation_force", _complete)
+    _enqueue_fridge_open(controller)
+
+    assert controller.before_step(_Task(), step=10) is None
+    assert controller._pending is not None
+    result = controller.after_step(_Task(), step=10)
+
+    assert backend_calls == [True]
+    assert result is not None
+    assert result["success"] is False
+    assert result["failure_reason"] == "force_target_not_reached"
+    assert result["open_sweep_preflight_bypassed"] is True
+
+
+def test_unsafe_open_sweep_still_rejects_when_bypass_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = AtomicForceInteractionController(bypass_unsafe_open_sweep=False)
+    _stub_interaction_setup(monkeypatch, controller)
+    monkeypatch.setattr(
+        bridge,
+        "_refrigerator_open_sweep_preflight",
+        lambda *_args, **_kwargs: {
+            "checked": True,
+            "safe": False,
+            "reason": "unsafe_open_sweep",
+            "recommended_retreat_m": 0.25,
+        },
+    )
+    monkeypatch.setattr(
+        bridge,
+        "complete_articulation_force",
+        lambda *_args, **_kwargs: pytest.fail("unsafe sweep must reject before force"),
+    )
+    _enqueue_fridge_open(controller)
+
+    result = controller.before_step(_Task(), step=11)
+
+    assert result is not None
+    assert result["success"] is False
+    assert result["failure_reason"] == "unsafe_open_sweep"
+    assert result["physics_substeps"] == 0
+    assert controller._pending is None

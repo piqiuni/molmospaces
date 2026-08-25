@@ -265,6 +265,9 @@ class RBY1Config(BaseRobotConfig):
 
     default_world_pose: list[float] = [0.0, 0.0, 0.0]
     use_holo_base: bool = True  # Whether to use virtual holonomic base joints or not
+    # The legacy robot XML limits planar x/y to +/-25 m, which is smaller than
+    # some ProcTHOR scenes and creates an invisible navigation boundary.
+    holo_base_position_limit_m: float = 100.0
     command_mode: dict[str, str | None] = {
         "arm": "joint_position",  # e.g., "joint_position", "joint_velocity", "ee_position", "ee_velocity"
         "gripper": "joint_position",

@@ -1086,12 +1086,14 @@ def apply_view_profile(
 class HeadViewController:
     def __init__(self) -> None:
         self._restore_state: dict[str, Any] | None = None
+        self._restore_head_targets: dict[str, float] = {}
         self._torso_target: np.ndarray | None = None
         self._torso_restore_target: np.ndarray | None = None
         self._torso_home_target: np.ndarray | None = None
 
     def reset(self) -> None:
         self._restore_state = None
+        self._restore_head_targets = {}
         self._torso_target = None
         self._torso_restore_target = None
         self._torso_home_target = None
@@ -1149,9 +1151,92 @@ class HeadViewController:
             "default",
             restore_state=self._restore_state,
         )
+        self._restore_head_targets = {
+            str(row.get("joint_name")): float(
+                row.get("ctrl") if row.get("ctrl") is not None else row.get("qpos", 0.0)
+            )
+            for row in result.get("after", [])
+            if row.get("joint_name")
+        }
         self._torso_target = self._torso_restore_target
         self._restore_state = None
+        result["restore_head_targets"] = dict(self._restore_head_targets)
+        result["restore_torso_target"] = (
+            None if self._torso_target is None else self._torso_target.tolist()
+        )
         return result
+
+    def restore_convergence(
+        self,
+        env,
+        *,
+        head_tolerance_rad: float = 0.03,
+        torso_tolerance: float = 0.03,
+        velocity_tolerance: float = 0.08,
+    ) -> dict[str, Any]:
+        """Check that the commanded home view has physically settled.
+
+        The drawer macro must not release navigation merely because actuator
+        targets were changed.  This check is deliberately fail-closed when a
+        real simulator exposes no measurable head/torso state; tests and
+        lightweight adapters may explicitly return a verified result instead.
+        """
+        model = getattr(env, "current_model", None)
+        data = getattr(env, "current_data", None)
+        head_rows: list[dict[str, Any]] = []
+        if model is not None and data is not None:
+            for joint_id in range(int(getattr(model, "njnt", 0))):
+                name = str(model.joint(joint_id).name or "")
+                if name not in self._restore_head_targets:
+                    continue
+                qpos_addr = int(model.jnt_qposadr[joint_id])
+                dof_addr = int(model.jnt_dofadr[joint_id])
+                qpos = float(data.qpos[qpos_addr])
+                qvel = float(data.qvel[dof_addr])
+                target = float(self._restore_head_targets[name])
+                head_rows.append(
+                    {
+                        "joint_name": name,
+                        "qpos": qpos,
+                        "target": target,
+                        "qvel": qvel,
+                        "position_error": abs(qpos - target),
+                        "converged": abs(qpos - target) <= float(head_tolerance_rad)
+                        and abs(qvel) <= float(velocity_tolerance),
+                    }
+                )
+
+        torso_row: dict[str, Any] | None = None
+        torso_target = self._torso_target
+        try:
+            torso_group = env.current_robot.robot_view.get_move_group("torso")
+            torso_qpos = np.asarray(torso_group.joint_pos, dtype=float).reshape(-1)
+            if torso_target is not None:
+                target = np.asarray(torso_target, dtype=float).reshape(-1)
+                if torso_qpos.shape == target.shape:
+                    error = float(np.max(np.abs(torso_qpos - target))) if target.size else 0.0
+                    torso_row = {
+                        "qpos": torso_qpos.tolist(),
+                        "target": target.tolist(),
+                        "max_position_error": error,
+                        "converged": error <= float(torso_tolerance),
+                    }
+        except (AttributeError, KeyError, TypeError, ValueError):
+            torso_row = None
+
+        checked = bool(head_rows or torso_row is not None)
+        converged = checked and bool(head_rows) and all(
+            bool(row["converged"]) for row in head_rows
+        ) and (torso_row is None or bool(torso_row["converged"]))
+        return {
+            "checked": checked,
+            "converged": converged,
+            "head": head_rows,
+            "torso": torso_row,
+            "head_tolerance_rad": float(head_tolerance_rad),
+            "torso_tolerance": float(torso_tolerance),
+            "velocity_tolerance": float(velocity_tolerance),
+        }
 
     def torso_target(self) -> list[float] | None:
         return None if self._torso_target is None else self._torso_target.tolist()

@@ -1841,6 +1841,7 @@ class ExploreDebugRecorder:
             self.step_sync_placeholder_width * self.step_sync_placeholder_height * 3
         )
         self.latest_external_image: tuple[float, int, int, bytearray] | None = None
+        self.latest_semantic_panel6_image: tuple[float, int, int, bytearray] | None = None
         self.latest_external_image_step = 0
         self.last_image_wall_time = 0.0
         self.final_first_person_path = ""
@@ -1853,6 +1854,10 @@ class ExploreDebugRecorder:
         self.latest_local_global_plan: dict | None = None
         self.latest_local_plan: dict | None = None
         self.latest_gt_observations: dict = {}
+        self.latest_external_detections: dict = {}
+        self.external_detection_history = deque(maxlen=history_size)
+        self.latest_task_target: dict = {}
+        self.external_detection_callback_count = 0
         self.recording_episode_id = ""
         self.observed_instance_ids: set[str] = set()
         self.latest_unified_graph: dict = {}
@@ -2202,12 +2207,39 @@ class ExploreDebugRecorder:
                     queue_size=max(1, int(args.image_queue_size)),
                 )
             )
+        if args.semantic_panel6_image_topic:
+            self.subscribers.append(
+                rospy.Subscriber(
+                    args.semantic_panel6_image_topic,
+                    Image,
+                    self.semantic_panel6_image_callback,
+                    queue_size=1,
+                )
+            )
         self.subscribers.append(rospy.Subscriber(args.odom_topic, Odometry, self.odom_callback, queue_size=50))
         self.subscribers.append(rospy.Subscriber(args.goal_topic, PoseStamped, self.goal_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.current_subgoal_topic, PointStamped, self.current_subgoal_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.move_base_status_topic, GoalStatusArray, self.move_base_status_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.explore_status_topic, String, self.explore_status_callback, queue_size=20))
         self.subscribers.append(rospy.Subscriber(args.gt_observations_topic, String, self.gt_observations_callback, queue_size=2))
+        if args.external_perception_overlay:
+            self.subscribers.append(
+                rospy.Subscriber(
+                    args.external_detections_topic,
+                    String,
+                    self.external_detections_callback,
+                    queue_size=8,
+                )
+            )
+        if args.semantic_focus_mode == "object_goal":
+            self.subscribers.append(
+                rospy.Subscriber(
+                    args.task_target_topic,
+                    String,
+                    self.task_target_callback,
+                    queue_size=4,
+                )
+            )
         self.subscribers.append(rospy.Subscriber(args.unified_graph_topic, String, self.unified_graph_callback, queue_size=2))
         self.subscribers.append(
             rospy.Subscriber(
@@ -2769,6 +2801,35 @@ class ExploreDebugRecorder:
                 self.gt_observation_history.append(
                     (float(payload.get("stamp_sec", 0.0) or 0.0), payload, set(self.observed_instance_ids))
                 )
+
+    def external_detections_callback(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        stamp = float(payload.get("stamp_sec", 0.0) or 0.0) + 1e-9 * float(
+            payload.get("stamp_nsec", 0.0) or 0.0
+        )
+        with self.lock:
+            if self.shutting_down:
+                return
+            self.external_detection_callback_count += 1
+            self.latest_external_detections = payload
+            if self._retain_video_state_history:
+                self.external_detection_history.append((stamp, payload))
+
+    def task_target_callback(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        with self.lock:
+            if not self.shutting_down:
+                self.latest_task_target = payload
 
     def unified_graph_callback(self, msg: String) -> None:
         try:
@@ -3537,6 +3598,10 @@ class ExploreDebugRecorder:
             self.gt_observation_history,
             (0.0, self.latest_gt_observations, set(self.observed_instance_ids)),
         )
+        external_detection_record = causal(
+            self.external_detection_history,
+            (0.0, self.latest_external_detections),
+        )
         graph_record = causal(
             self.unified_graph_history,
             (
@@ -3608,6 +3673,9 @@ class ExploreDebugRecorder:
             "stuck": stuck,
             "unified_graph": graph_record[1],
             "gt_observations": gt_record[1],
+            "external_detections": external_detection_record[1],
+            "task_target": dict(self.latest_task_target),
+            "semantic_panel6_image": self.latest_semantic_panel6_image,
             "semantic_events": graph_record[2],
             "observed_instance_ids": gt_record[2],
             "pending_semantic_keyframe_revision": int(graph_record[3]),
@@ -3664,6 +3732,17 @@ class ExploreDebugRecorder:
             if self.shutting_down:
                 return
             self._record_external_video_frame_locked(width, height, rgb, stamp)
+
+    def semantic_panel6_image_callback(self, msg: Image) -> None:
+        """Cache an opt-in external panel without changing default GT rendering."""
+
+        converted = _image_msg_to_rgb(msg)
+        if converted is None:
+            return
+        width, height, rgb = converted
+        stamp = msg.header.stamp.to_sec() if msg.header.stamp else 0.0
+        with self.lock:
+            self.latest_semantic_panel6_image = (stamp, width, height, rgb)
 
     def _write_optional_dependency_warning(self) -> None:
         sys.stderr.write(
@@ -3750,6 +3829,107 @@ class ExploreDebugRecorder:
         )
 
     @staticmethod
+    def _normalized_semantic_label(value) -> str:
+        return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+
+    @classmethod
+    def _task_target_labels(cls, task_target: dict | None) -> set[str]:
+        task_target = task_target or {}
+        values = [task_target.get("target_name"), task_target.get("object_category")]
+        values.extend(list(task_target.get("object_labels") or []))
+        labels = {cls._normalized_semantic_label(value) for value in values if value}
+        aliases = {
+            "couch": {"sofa"},
+            "sofa": {"couch"},
+            "television": {"tv", "tv_monitor"},
+            "tv": {"television", "tv_monitor"},
+            "tv_monitor": {"television", "tv"},
+            "potted_plant": {"plant"},
+            "plant": {"potted_plant"},
+        }
+        for label in list(labels):
+            labels.update(aliases.get(label, set()))
+        return labels
+
+    def _draw_external_detections_locked(
+        self,
+        frame,
+        source_width: int,
+        source_height: int,
+        detections_payload: dict | None,
+        task_target: dict | None,
+    ) -> None:
+        payload = detections_payload or {}
+        detections = list(payload.get("detections") or [])
+        target_labels = self._task_target_labels(task_target)
+        target_hits = 0
+        for detection in detections:
+            bbox = list(detection.get("bbox") or detection.get("bbox_xyxy") or [])
+            if len(bbox) != 4:
+                continue
+            values = [float(value) for value in bbox]
+            if max(abs(value) for value in values) <= 1.5:
+                x0, y0, x1, y1 = (
+                    values[0] * source_width,
+                    values[1] * source_height,
+                    values[2] * source_width,
+                    values[3] * source_height,
+                )
+            else:
+                x0, y0, x1, y1 = values
+            scale_x = float(frame.shape[1]) / max(1, source_width)
+            scale_y = float(frame.shape[0]) / max(1, source_height)
+            start = (
+                max(0, min(frame.shape[1] - 1, int(round(x0 * scale_x)))),
+                max(0, min(frame.shape[0] - 1, int(round(y0 * scale_y)))),
+            )
+            end = (
+                max(0, min(frame.shape[1] - 1, int(round(x1 * scale_x)))),
+                max(0, min(frame.shape[0] - 1, int(round(y1 * scale_y)))),
+            )
+            if end[0] <= start[0] or end[1] <= start[1]:
+                continue
+            label = str(
+                detection.get("semantic_class")
+                or detection.get("label")
+                or detection.get("semantic_class_raw")
+                or "object"
+            )
+            raw_label = str(detection.get("semantic_class_raw") or label)
+            is_target = bool(
+                target_labels
+                and {
+                    self._normalized_semantic_label(label),
+                    self._normalized_semantic_label(raw_label),
+                }
+                & target_labels
+            )
+            target_hits += int(is_target)
+            color = (235, 35, 210) if is_target else (20, 210, 210)
+            confidence = float(detection.get("confidence", 0.0) or 0.0)
+            cv2.rectangle(frame, start, end, color, 4 if is_target else 2, cv2.LINE_AA)
+            prefix = "OBJGOAL " if is_target else ""
+            cv2.putText(
+                frame,
+                f"{prefix}{label} {confidence:.2f}"[:48],
+                (start[0], max(18, start[1] - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        first_detection = detections[0] if detections else {}
+        source = str(
+            payload.get("source_model")
+            or payload.get("backend")
+            or first_detection.get("source_model")
+            or "external"
+        )
+        status = f"MODEL visible={len(detections)} target_hits={target_hits} source={source}"
+        cv2.putText(frame, status, (9, frame.shape[0] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (245, 245, 245), 3, cv2.LINE_AA)
+        cv2.putText(frame, status, (8, frame.shape[0] - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (20, 20, 20), 1, cv2.LINE_AA)
+    @staticmethod
     def _node_xy(node: dict) -> tuple[float, float] | None:
         center = node.get("aabb_center") or node.get("centroid") or []
         if len(center) < 2:
@@ -3759,6 +3939,14 @@ class ExploreDebugRecorder:
     def _node_observed_in_recording(self, node: dict, observed_instance_ids: set[str] | None = None) -> bool:
         if node.get("type") == "room":
             return bool((node.get("attributes") or {}).get("active", True))
+        if self.args.semantic_focus_mode == "object_goal" and self.args.external_perception_overlay:
+            attributes = node.get("attributes") or {}
+            return bool(
+                node.get("is_currently_visible")
+                or int(node.get("observation_count", 0) or 0) > 0
+                or attributes.get("source_model")
+                or attributes.get("detector_backend")
+            )
         observed_instance_ids = self.observed_instance_ids if observed_instance_ids is None else observed_instance_ids
         return any(
             identifier in observed_instance_ids
@@ -3782,6 +3970,28 @@ class ExploreDebugRecorder:
     @classmethod
     def _node_matches_target(cls, node: dict, target_id: str) -> bool:
         return bool(target_id and target_id in cls._node_object_ids(node))
+
+    def _node_matches_focus(
+        self,
+        node: dict,
+        target_id: str,
+        task_target: dict | None,
+    ) -> bool:
+        if self._node_matches_target(node, target_id):
+            return True
+        if self.args.semantic_focus_mode != "object_goal":
+            return False
+        labels = self._task_target_labels(task_target)
+        attributes = node.get("attributes") or {}
+        node_labels = {
+            self._normalized_semantic_label(node.get("label")),
+            self._normalized_semantic_label(node.get("semantic_class")),
+            self._normalized_semantic_label(attributes.get("semantic_class")),
+            self._normalized_semantic_label(attributes.get("semantic_class_raw")),
+            self._normalized_semantic_label(attributes.get("label")),
+        }
+        node_labels.discard("")
+        return bool(labels & node_labels)
 
     @staticmethod
     def _short_node_id(node: dict) -> str:
@@ -3866,6 +4076,7 @@ class ExploreDebugRecorder:
         graph: dict,
         observed_instance_ids: set[str] | None,
         target_id: str,
+        task_target: dict | None = None,
     ) -> list[dict]:
         """Keep video panels legible and bounded as the persistent graph grows."""
         observed_nodes = [
@@ -3888,7 +4099,7 @@ class ExploreDebugRecorder:
             return room_nodes + interaction_nodes
         interaction_nodes.sort(
             key=lambda node: (
-                0 if self._node_matches_target(node, target_id) else 1,
+                0 if self._node_matches_focus(node, target_id, task_target) else 1,
                 0 if bool(node.get("is_currently_visible")) else 1,
                 0 if str(node.get("type") or "") == "portal" else 1,
                 0 if str(node.get("type") or "") == "container" else 1,
@@ -3909,6 +4120,7 @@ class ExploreDebugRecorder:
         semantic_selection: dict | None = None,
         image_step: int | None = None,
         world_bounds: tuple[float, float, float, float] | None = None,
+        task_target: dict | None = None,
     ) -> object:
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
@@ -3917,6 +4129,7 @@ class ExploreDebugRecorder:
             graph,
             observed_instance_ids,
             target_id,
+            task_target,
         )
         positions = [self._node_xy(node) for node in nodes]
         positions = [position for position in positions if position is not None]
@@ -4027,7 +4240,7 @@ class ExploreDebugRecorder:
             half_h = max(3, int(max(0.08, float(size[1]) * 0.5) * scale))
             center = to_px(*position)
             color = self._semantic_node_color(node)
-            is_target = self._node_matches_target(node, target_id)
+            is_target = self._node_matches_focus(node, target_id, task_target)
             if is_target:
                 color = (235, 35, 210)
             thickness = 4 if is_target else 2 if node.get("is_currently_visible") else 1
@@ -4043,7 +4256,7 @@ class ExploreDebugRecorder:
             label = (
                 display_label
                 if node.get("type") == "room"
-                else f"{'INTERACT ' if is_target else ''}{short_id} {display_label}"
+                else f"{('OBJGOAL ' if self.args.semantic_focus_mode == 'object_goal' else 'INTERACT ') if is_target else ''}{short_id} {display_label}"
             )[:30]
             cv2.putText(panel, label, (center[0] + 3, center[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.28, color if is_target else (35, 35, 35), 1, cv2.LINE_AA)
         if pose is not None:
@@ -4067,6 +4280,7 @@ class ExploreDebugRecorder:
         image_step: int | None = None,
         world_bounds: tuple[float, float, float, float] | None = None,
         draw_title: bool = True,
+        task_target: dict | None = None,
     ):
         panel = np.full((panel_height, panel_width, 3), 246, dtype=np.uint8)
         graph = self.latest_unified_graph if graph is None else graph
@@ -4181,14 +4395,103 @@ class ExploreDebugRecorder:
         if segment_layer is not None:
             panel = cv2.addWeighted(segment_layer, 0.38, panel, 0.62, 0.0)
 
+        # Keep the room label on the same causal room-segmentation frame.  The
+        # old panel showed only numeric colours, which made a stable room ID
+        # look like a different room whenever the raw fringe changed.  Names
+        # come from the unified graph but are placed using the current label
+        # mask; they are annotation only and do not alter segmentation.
+        if scene_grid is not None and cv2 is not None and np is not None:
+            room_names = {}
+            for room_node in (graph or {}).get("nodes") or []:
+                if str(room_node.get("type") or "") != "room":
+                    continue
+                raw_id = room_node.get("room_id")
+                if raw_id is None:
+                    raw_id = str(room_node.get("id") or "").removeprefix("room_")
+                try:
+                    raw_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                attrs = room_node.get("attributes") or {}
+                name = (
+                    attrs.get("room_attribute")
+                    or attrs.get("room_attribute_rule")
+                    or room_node.get("name")
+                    or room_node.get("label")
+                    or f"room_{raw_id}"
+                )
+                room_names[raw_id] = str(name).replace("_", " ")
+            raw_scene = getattr(scene_grid, "data", None)
+            if room_names and raw_scene is not None:
+                scene_values = np.asarray(raw_scene, dtype=np.int32).reshape(
+                    (int(scene_grid.info.height), int(scene_grid.info.width))
+                )
+                scene_origin = scene_grid.info.origin
+                scene_yaw = math.atan2(
+                    2.0
+                    * (
+                        scene_origin.orientation.w * scene_origin.orientation.z
+                        + scene_origin.orientation.x * scene_origin.orientation.y
+                    ),
+                    1.0
+                    - 2.0
+                    * (
+                        scene_origin.orientation.y * scene_origin.orientation.y
+                        + scene_origin.orientation.z * scene_origin.orientation.z
+                    ),
+                )
+                scene_cos = math.cos(scene_yaw)
+                scene_sin = math.sin(scene_yaw)
+                scene_resolution = float(scene_grid.info.resolution)
+
+                def scene_world(cell_x: float, cell_y: float) -> tuple[float, float]:
+                    return (
+                        float(scene_origin.position.x)
+                        + scene_cos * cell_x * scene_resolution
+                        - scene_sin * cell_y * scene_resolution,
+                        float(scene_origin.position.y)
+                        + scene_sin * cell_x * scene_resolution
+                        + scene_cos * cell_y * scene_resolution,
+                    )
+
+                for room_id, room_name in room_names.items():
+                    rows, cols = np.where(scene_values == int(room_id))
+                    if rows.size == 0:
+                        continue
+                    cell_x = float(np.mean(cols)) + 0.5
+                    cell_y = float(np.mean(rows)) + 0.5
+                    label_px = to_px(*scene_world(cell_x, cell_y))
+                    cv2.putText(
+                        panel,
+                        room_name,
+                        (label_px[0] + 2, label_px[1] + 2),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.34,
+                        (255, 255, 255),
+                        3,
+                        cv2.LINE_AA,
+                    )
+                    cv2.putText(
+                        panel,
+                        room_name,
+                        label_px,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.34,
+                        (35, 35, 35),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
         nodes = [
             node
             for node in self._bounded_observed_video_nodes(
                 graph,
                 observed_instance_ids,
                 target_id,
+                task_target,
             )
             if node.get("type") in {"portal", "container"}
+            or self._node_matches_focus(node, target_id, task_target)
         ]
         for node in nodes:
             center = self._node_xy(node)
@@ -4199,7 +4502,7 @@ class ExploreDebugRecorder:
             half_w = max(3, int(abs(float(size[0])) * scale * 0.5))
             half_h = max(3, int(abs(float(size[1])) * scale * 0.5))
             color = self._semantic_node_color(node)
-            is_target = self._node_matches_target(node, target_id)
+            is_target = self._node_matches_focus(node, target_id, task_target)
             if is_target:
                 color = (235, 35, 210)
             cv2.rectangle(
@@ -4212,7 +4515,7 @@ class ExploreDebugRecorder:
             )
             cv2.putText(
                 panel,
-                f"{'INTERACT ' if is_target else ''}{self._short_node_id(node)} {node.get('label', node.get('type', ''))}",
+                f"{('OBJGOAL ' if self.args.semantic_focus_mode == 'object_goal' else 'INTERACT ') if is_target else ''}{self._short_node_id(node)} {node.get('label', node.get('type', ''))}",
                 (center_px[0] + 3, center_px[1] - half_h - 3),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.30,
@@ -4230,7 +4533,7 @@ class ExploreDebugRecorder:
         if draw_title:
             self._draw_panel_title(
                 panel,
-                "ROOM SEGMENTS + INTERACTION",
+                "ROOM SEGMENTS + OBJECT GOAL" if self.args.semantic_focus_mode == "object_goal" else "ROOM SEGMENTS + INTERACTION",
                 image_step,
             )
         return panel
@@ -4248,6 +4551,7 @@ class ExploreDebugRecorder:
         semantic_decision_trace: dict | None = None,
         image_step: int | None = None,
         draw_title: bool = True,
+        task_target: dict | None = None,
     ) -> object:
         panel = np.full(
             (panel_height, panel_width, 3),
@@ -4281,6 +4585,7 @@ class ExploreDebugRecorder:
             graph,
             observed_instance_ids,
             selected_target_id,
+            task_target,
         )
         node_lookup = {
             str(node.get("id") or ""): node
@@ -5143,6 +5448,9 @@ class ExploreDebugRecorder:
                 )
                 graph = snapshot["unified_graph"]
                 gt_observations = snapshot["gt_observations"]
+                external_detections = snapshot["external_detections"]
+                task_target = snapshot["task_target"]
+                semantic_panel6_image = snapshot.get("semantic_panel6_image")
                 semantic_events = snapshot["semantic_events"]
                 observed_instance_ids = snapshot["observed_instance_ids"]
                 scene_id_grid = snapshot["scene_id_grid"]
@@ -5198,13 +5506,21 @@ class ExploreDebugRecorder:
             else:
                 camera_frame = np.frombuffer(bytes(rgb), dtype=np.uint8).reshape((height, width, 3))
                 camera_frame = cv2.resize(camera_frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
-            if self.args.semantic_video:
+            if self.args.semantic_video and self.args.gt_perception_overlay:
                 self._draw_gt_observations_locked(
                     camera_frame,
                     width,
                     height,
                     gt_observations,
                     semantic_selection,
+                )
+            if self.args.semantic_video and self.args.external_perception_overlay:
+                self._draw_external_detections_locked(
+                    camera_frame,
+                    width,
+                    height,
+                    external_detections,
+                    task_target,
                 )
             occ_panel = None
             global_costmap_panel = None
@@ -5326,6 +5642,7 @@ class ExploreDebugRecorder:
                     image_step=image_step,
                     world_bounds=occupancy_world_bounds,
                     draw_title=not self.args.paper_frame_exports,
+                    task_target=task_target,
                 )
                 if self.args.paper_frame_exports:
                     room_segment_clean_panel = room_segment_panel.copy()
@@ -5345,6 +5662,7 @@ class ExploreDebugRecorder:
                     semantic_selection=semantic_selection,
                     image_step=image_step,
                     world_bounds=occupancy_world_bounds,
+                    task_target=task_target,
                 )
                 semantic_topology_panel = self._render_semantic_topology_panel_locked(
                     frame_width,
@@ -5358,7 +5676,23 @@ class ExploreDebugRecorder:
                     semantic_decision_trace=semantic_decision_trace,
                     image_step=image_step,
                     draw_title=not self.args.paper_frame_exports,
+                    task_target=task_target,
                 )
+                if self.args.semantic_panel6_mode == "external" and semantic_panel6_image is not None:
+                    _, panel6_width, panel6_height, panel6_rgb = semantic_panel6_image
+                    external_panel = np.frombuffer(panel6_rgb, dtype=np.uint8).reshape(
+                        (panel6_height, panel6_width, 3)
+                    )
+                    semantic_topology_panel = cv2.resize(
+                        external_panel[:, :, ::-1],
+                        (frame_width, frame_height),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    self._draw_panel_title(
+                        semantic_topology_panel,
+                        "HABITAT TOPDOWN + GOAL OBJECT + OCC",
+                        image_step,
+                    )
                 if self.args.paper_frame_exports:
                     semantic_topology_clean_panel = semantic_topology_panel.copy()
                     self._draw_panel_title(
@@ -6534,8 +6868,14 @@ class ExploreDebugRecorder:
                 subgoal_px = to_panel(world_to_px(route_goal[0], route_goal[1]))
                 if subgoal_px is None:
                     continue
-                cv2.circle(panel, subgoal_px, 5, (210, 105, 35), -1, cv2.LINE_AA)
-                cv2.circle(panel, subgoal_px, 7, (255, 255, 255), 1, cv2.LINE_AA)
+                self._draw_cv_goal_arrow(
+                    panel,
+                    subgoal_px,
+                    route_goal[2],
+                    max(6, int(6 * scale)),
+                    color=(210, 105, 35),
+                    thickness=2,
+                )
                 cv2.putText(
                     panel,
                     str(index),
@@ -6593,23 +6933,15 @@ class ExploreDebugRecorder:
                     continue
                 behavior_type = str(candidate.get("behavior_type") or "EXPLORE")
                 color = candidate_color(behavior_type)
-                if str(candidate.get("candidate_id") or "") == selected_candidate_id:
-                    self._draw_cv_goal_arrow(
-                        panel,
-                        candidate_px,
-                        transformed[2],
-                        max(9, int(9 * scale)),
-                        color=color,
-                    )
-                else:
-                    cv2.circle(
-                        panel,
-                        candidate_px,
-                        max(2, int(round(max(scale, 1.0) * 0.8))),
-                        color,
-                        -1,
-                        cv2.LINE_AA,
-                    )
+                selected = str(candidate.get("candidate_id") or "") == selected_candidate_id
+                self._draw_cv_goal_arrow(
+                    panel,
+                    candidate_px,
+                    transformed[2],
+                    max(9, int(9 * scale)) if selected else max(5, int(5 * scale)),
+                    color=color,
+                    thickness=4 if selected else 2,
+                )
         if goal_in_grid is not None:
             goal_px = to_panel(world_to_px(goal_in_grid[0], goal_in_grid[1]))
             if goal_px is not None:
@@ -6708,6 +7040,7 @@ class ExploreDebugRecorder:
         yaw: float,
         length: int,
         color: tuple[int, int, int] = (230, 30, 45),
+        thickness: int = 4,
     ) -> None:
         if cv2 is None or np is None:
             return
@@ -6725,11 +7058,11 @@ class ExploreDebugRecorder:
             tuple(start.astype(np.int32)),
             tuple(end.astype(np.int32)),
             color,
-            4,
+            max(1, int(thickness)),
             cv2.LINE_AA,
             tipLength=0.45,
         )
-        cv2.circle(image, (cx, cy), max(4, length // 4), color, -1, cv2.LINE_AA)
+        cv2.circle(image, (cx, cy), max(2, length // 4), color, -1, cv2.LINE_AA)
 
     def odom_callback(self, msg: Odometry) -> None:
         if self.shutting_down:
@@ -8694,6 +9027,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--move-base-status-topic", default="/move_base/status")
     parser.add_argument("--explore-status-topic", default="/explore_py/status")
     parser.add_argument("--gt-observations-topic", default="/semantic_mapping/gt_observations")
+    parser.add_argument(
+        "--gt-perception-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw the existing GT perception overlay; enabled by default for backward compatibility.",
+    )
+    parser.add_argument(
+        "--external-perception-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draw detector-only perception results without changing the GT recording path.",
+    )
+    parser.add_argument(
+        "--external-detections-topic",
+        default="/semantic_mapping/object_detections",
+    )
+    parser.add_argument(
+        "--semantic-focus-mode",
+        choices=("interaction", "object_goal"),
+        default="interaction",
+    )
+    parser.add_argument(
+        "--task-target-topic",
+        default="/semantic_decision/target",
+    )
     parser.add_argument("--unified-graph-topic", default="/semantic_mapping/unified_graph")
     parser.add_argument("--scene-id-grid-topic", default="/semantic_mapping/room_segment_grid")
     parser.add_argument(
@@ -8739,6 +9097,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--global-plan-topic", default="/move_base/GlobalPlanner/plan")
     parser.add_argument("--local-global-plan-topic", default="/move_base/DWAPlannerROS/global_plan")
     parser.add_argument("--local-plan-topic", default="/move_base/DWAPlannerROS/local_plan")
+    parser.add_argument(
+        "--semantic-panel6-mode",
+        choices=("topology", "external"),
+        default="topology",
+        help="Keep the original topology panel, or replace panel 6 with an external diagnostic image.",
+    )
+    parser.add_argument(
+        "--semantic-panel6-image-topic",
+        default="",
+        help="sensor_msgs/Image used only when --semantic-panel6-mode=external.",
+    )
     parser.add_argument("--global-costmap-topic", default="/move_base/global_costmap/costmap")
     parser.add_argument("--local-costmap-topic", default="/move_base/local_costmap/costmap")
     parser.add_argument("--global-costmap-updates-topic", default="/move_base/global_costmap/costmap_updates")

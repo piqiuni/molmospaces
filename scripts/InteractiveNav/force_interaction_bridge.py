@@ -53,21 +53,29 @@ def drawer_sequence_task_step_budget(
     groups = max(0, int(group_count))
     transition = max(1, int(transition_steps))
     observation = max(1, int(observation_steps))
-    settle = max(0, int(restore_settle_steps))
+    # Even a zero configured visual settle still needs one simulator step to
+    # measure the restored head/torso state.
+    settle = max(1, int(restore_settle_steps))
     per_group = transition + observation
     if not preserve_open:
         per_group += transition
-    return groups * per_group + (0 if preserve_open else settle)
+    return groups * per_group + settle
 
 
 def _capture_robot_lock(task_env) -> dict[str, Any] | None:
-    """Snapshot base and upper body after the drawer low-view posture is set."""
+    """Snapshot the base and non-camera upper body during a drawer macro.
+
+    Head and torso controls intentionally stay outside this lock. They own the
+    drawer low-view target and must keep driving it while force substeps run;
+    replaying their pre-view no-op controls would otherwise undo the requested
+    camera posture.
+    """
 
     try:
         robot_view = task_env.current_robot.robot_view
         base = robot_view.base
         groups: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-        for name in ("left_arm", "right_arm", "left_gripper", "right_gripper", "torso", "head"):
+        for name in ("left_arm", "right_arm", "left_gripper", "right_gripper"):
             try:
                 group = robot_view.get_move_group(name)
             except (AttributeError, KeyError, ValueError):
@@ -346,6 +354,8 @@ class AtomicForceInteractionController:
         drawer_transition_steps: int | None = None,
         drawer_observation_steps: int = 1,
         drawer_view_restore_settle_steps: int = 0,
+        drawer_view_restore_max_steps: int = 24,
+        bypass_unsafe_open_sweep: bool = False,
         object_id_resolver: Callable[[str], str] | None = None,
     ) -> None:
         self.command_topic = str(command_topic)
@@ -370,6 +380,13 @@ class AtomicForceInteractionController:
         self.drawer_view_restore_settle_steps = max(
             0, int(drawer_view_restore_settle_steps)
         )
+        # A restore is complete only after measured head/torso convergence. The
+        # bound prevents a stalled actuator from holding navigation forever.
+        self.drawer_view_restore_max_steps = max(1, int(drawer_view_restore_max_steps))
+        # Temporary experiment switch.  This bypasses only the predictive
+        # refrigerator-door sweep; the real articulation force and its
+        # postcondition verification still run normally.
+        self.bypass_unsafe_open_sweep = bool(bypass_unsafe_open_sweep)
         # The public semantic graph may use an opaque portal ID.  Only this
         # simulator-side controller resolves it to a MuJoCo body name; results
         # deliberately retain the public ID so private names never flow back
@@ -550,8 +567,22 @@ class AtomicForceInteractionController:
                     view_result=view_result,
                 )
             if _requires_refrigerator_open_sweep(command):
-                preflight = _refrigerator_open_sweep_preflight(task.env, plan)
-                if bool(preflight.get("checked")) and not bool(preflight.get("safe", True)):
+                if self.bypass_unsafe_open_sweep:
+                    command["_open_sweep_preflight"] = {
+                        "checked": False,
+                        "safe": True,
+                        "bypassed": True,
+                        "reason": "configured_bypass",
+                    }
+                    command["_open_sweep_preflight_bypassed"] = True
+                else:
+                    preflight = _refrigerator_open_sweep_preflight(task.env, plan)
+                    command["_open_sweep_preflight"] = preflight
+                if (
+                    not self.bypass_unsafe_open_sweep
+                    and bool(preflight.get("checked"))
+                    and not bool(preflight.get("safe", True))
+                ):
                     # No force has been applied.  Keep the simulator-only
                     # sweep private and publish only the public retry contract.
                     command["_open_sweep_preflight"] = preflight
@@ -874,6 +905,9 @@ class AtomicForceInteractionController:
                     else "force_atomic_interaction"
                 ),
                 "verification_source": "executor_state_verification",
+                "open_sweep_preflight_bypassed": bool(
+                    command.get("_open_sweep_preflight_bypassed", False)
+                ),
                 "interaction_pose_validation": dict(
                     command.get("interaction_pose_validation") or {}
                 ),
@@ -981,6 +1015,19 @@ class AtomicForceInteractionController:
         )
         if not groups:
             raise ValueError("drawer interaction requires at least one valid visible drawer region")
+        drawer_joint_names = list(
+            dict.fromkeys(
+                str(joint.get("joint_name") or "")
+                for joint in articulation.get("joints") or []
+                if str(joint.get("joint_type") or "").casefold() == "slide"
+                and str(joint.get("joint_name") or "")
+            )
+        )
+        if not drawer_joint_names:
+            raise ValueError("drawer interaction target has no slide joints")
+        selected_joint_names = [
+            name for group in groups for name in group["joint_names"]
+        ]
         sequence_type = str(command.get("sequence_type") or "drawer_scan").casefold()
         if sequence_type not in {"drawer_scan", "drawer_open"}:
             raise ValueError(f"Unsupported drawer interaction sequence: {sequence_type}")
@@ -1016,9 +1063,11 @@ class AtomicForceInteractionController:
             # normal interactive exploration: selected, M1-grounded drawers
             # remain open so subsequent RGB/map updates can expose contents.
             "preserve_open": preserve_open,
-            "all_joint_names": [
-                name for group in groups for name in group["joint_names"]
-            ],
+            # ``all_joint_names`` remains the M1-grounded set used by the
+            # exploration-open postcondition. A sealed scan additionally
+            # closes and verifies every physical slide joint on the container.
+            "all_joint_names": selected_joint_names,
+            "drawer_joint_names": drawer_joint_names,
             "transition_steps": transition_steps,
             "observation_steps": observation_steps,
             "remaining_observation_steps": 0,
@@ -1038,6 +1087,13 @@ class AtomicForceInteractionController:
                 preserve_open=preserve_open,
             ),
             "remaining_view_restore_settle_steps": 0,
+            "view_restore_max_steps": max(
+                self.drawer_view_restore_max_steps, restore_settle_steps
+            ),
+            "view_restore_steps_elapsed": 0,
+            "view_restore_convergence": None,
+            "view_restore_required": False,
+            "view_restore_failed": False,
             # Filled after the low view is applied, then reasserted around
             # every internal force substep for the whole drawer macro.
             "robot_lock_snapshot": None,
@@ -1050,8 +1106,8 @@ class AtomicForceInteractionController:
             return
         phase = str(pending["phase"])
         if phase == "restore_settle":
-            # The restore command has already moved head/torso to the normal
-            # view.  Reserve these task steps for a visible camera settle.
+            # The restore command has already set home targets. Reserve these
+            # task steps for a visible camera settle and convergence check.
             self._force_observation_requested = True
             return
         if phase == "observe":
@@ -1067,15 +1123,23 @@ class AtomicForceInteractionController:
         transition_steps = int(pending["transition_steps"]) if mode == "smooth" else 1
         if pending.get("phase_plan") is None:
             if phase == "open":
+                close_joint_names = (
+                    [
+                        name
+                        for name in pending["drawer_joint_names"]
+                        if name not in current_group["joint_names"]
+                    ]
+                    if not bool(pending.get("preserve_open"))
+                    else []
+                )
                 pending["phase_plan"] = prepare_articulation_state_force(
                     task.env,
                     self._execution_object_id(pending["command"]),
                     open_joint_names=current_group["joint_names"],
-                    # A scan has already closed every processed drawer.  An
-                    # exploration open intentionally preserves them, but each
-                    # new force transition still targets only the next M1-
-                    # grounded drawer front.
-                    close_joint_names=[],
+                    # A sealed scan never has more than one physical drawer
+                    # open: close all sibling slide joints in the same force
+                    # transition, including unseen/pre-opened drawers.
+                    close_joint_names=close_joint_names,
                 )
             else:
                 pending["phase_plan"] = prepare_articulation_state_force(
@@ -1096,25 +1160,17 @@ class AtomicForceInteractionController:
         next_step = int(pending["phase_step"]) + 1
         progress = min(1.0, float(next_step) / float(transition_steps))
         command = pending["command"]
-        if phase == "open" and group_index == 0:
-            view_progress = progress if mode == "smooth" else 1.0
+        if phase == "open" and group_index == 0 and pending["view_result"] is None:
+            # Apply the full low view once before any drawer force is applied.
+            # The camera then holds one stable pose for the whole macro rather
+            # than ramping with the smooth drawer transition progress.
             view_result = self._head_view_controller.command(
                 task.env,
                 "drawer_low_view",
-                tilt_rad=float(command.get("view_tilt_rad", 0.30) or 0.30)
-                * view_progress,
-                torso_pitch_rad=float(
-                    command.get("view_torso_pitch_rad", 0.35) or 0.35
-                )
-                * view_progress,
+                tilt_rad=float(command.get("view_tilt_rad", 0.30) or 0.30),
+                torso_pitch_rad=float(command.get("view_torso_pitch_rad", 0.35) or 0.35),
             )
-            if pending["view_result"] is None:
-                pending["view_result"] = view_result
-            # In smooth mode the low-view pose itself ramps over the first
-            # drawer-open transition.  Refresh the lock after each view update
-            # so it holds the current ramp pose instead of resetting to the
-            # first partial tilt on every force substep.
-            pending["robot_lock_snapshot"] = _capture_robot_lock(task.env)
+            pending["view_result"] = view_result
         if pending.get("robot_lock_snapshot") is None:
             pending["robot_lock_snapshot"] = _capture_robot_lock(task.env)
         robot_lock = pending.get("robot_lock_snapshot")
@@ -1156,11 +1212,36 @@ class AtomicForceInteractionController:
         mode = self.interaction_execution_mode
         transition_steps = int(pending["transition_steps"]) if mode == "smooth" else 1
         if phase == "restore_settle":
-            pending["remaining_view_restore_settle_steps"] -= 1
+            pending["remaining_view_restore_settle_steps"] = max(
+                0, int(pending.get("remaining_view_restore_settle_steps", 0)) - 1
+            )
+            pending["view_restore_steps_elapsed"] = int(
+                pending.get("view_restore_steps_elapsed", 0)
+            ) + 1
             self._force_observation_requested = True
-            if int(pending["remaining_view_restore_settle_steps"]) > 0:
-                return None
-            return self._finish_drawer_sequence(task, step)
+            try:
+                convergence = self._head_view_controller.restore_convergence(task.env)
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                convergence = {
+                    "checked": False,
+                    "converged": False,
+                    "reason": f"restore_convergence_check_failed:{type(exc).__name__}",
+                }
+            pending["view_restore_convergence"] = convergence
+            if bool(convergence.get("converged")) and int(
+                pending["remaining_view_restore_settle_steps"]
+            ) <= 0:
+                return self._finish_drawer_sequence(task, step)
+            if int(pending["view_restore_steps_elapsed"]) >= int(
+                pending.get("view_restore_max_steps", self.drawer_view_restore_max_steps)
+            ):
+                pending["view_restore_failed"] = True
+                return self._finish_drawer_sequence(task, step)
+            # Keep stepping even after the fixed visual-settle budget expires;
+            # physical convergence, not elapsed time, authorizes completion.
+            if int(pending["remaining_view_restore_settle_steps"]) <= 0:
+                pending["remaining_view_restore_settle_steps"] = 1
+            return None
         if phase in {"open", "close"} and int(pending["phase_step"]) < transition_steps:
             return None
         if phase == "open":
@@ -1193,7 +1274,13 @@ class AtomicForceInteractionController:
                 # that every selected public region is still open.
                 pending["robot_lock_snapshot"] = None
                 pending["view_restore_result"] = self._head_view_controller.restore(task.env)
-                return self._finish_drawer_sequence(task, step)
+                pending["view_restore_required"] = True
+                pending["phase"] = "restore_settle"
+                pending["phase_step"] = 0
+                pending["remaining_view_restore_settle_steps"] = 1
+                pending["view_restore_steps_elapsed"] = 0
+                self._force_observation_requested = True
+                return None
             pending["phase"] = "close"
             pending["phase_step"] = 0
             pending["phase_plan"] = None
@@ -1209,13 +1296,13 @@ class AtomicForceInteractionController:
             # restoring the head/torso is a separate final action.
             pending["robot_lock_snapshot"] = None
             pending["view_restore_result"] = self._head_view_controller.restore(task.env)
+            pending["view_restore_required"] = True
             settle_steps = int(pending.get("view_restore_settle_steps", 0) or 0)
-            if settle_steps > 0:
-                pending["phase"] = "restore_settle"
-                pending["remaining_view_restore_settle_steps"] = settle_steps
-                self._force_observation_requested = True
-                return None
-            return self._finish_drawer_sequence(task, step)
+            pending["phase"] = "restore_settle"
+            pending["remaining_view_restore_settle_steps"] = max(1, settle_steps)
+            pending["view_restore_steps_elapsed"] = 0
+            self._force_observation_requested = True
+            return None
         return None
 
     def _hold_drawer_observation(
@@ -1282,7 +1369,11 @@ class AtomicForceInteractionController:
             recovery_plan = prepare_articulation_state_force(
                 task.env,
                 self._execution_object_id(command),
-                close_joint_names=list(pending.get("all_joint_names") or []),
+                close_joint_names=list(
+                    pending.get("drawer_joint_names")
+                    or pending.get("all_joint_names")
+                    or []
+                ),
             )
             robot_lock = pending.get("robot_lock_snapshot") or _capture_robot_lock(task.env)
             if robot_lock is not None:
@@ -1326,11 +1417,33 @@ class AtomicForceInteractionController:
         selected_infos = [
             info for info in joint_infos if info["joint_name"] in group["joint_names"]
         ]
-        success = bool(selected_infos) and all(
+        selected_open = bool(selected_infos) and all(
             float(info.get("open_fraction", 0.0))
             >= float(self.force_config.open_fraction_threshold)
             for info in selected_infos
         )
+        if bool(pending.get("preserve_open")):
+            # ``drawer_open`` deliberately leaves previously selected drawers
+            # open for exploration, so sibling closure is a scan-only invariant.
+            other_drawer_joint_names = []
+            other_drawers_closed = True
+        else:
+            other_drawer_joint_names = [
+                name
+                for name in pending.get("drawer_joint_names") or []
+                if name not in group["joint_names"]
+            ]
+            other_infos_by_name = {
+                str(info.get("joint_name") or ""): info
+                for info in joint_infos
+                if str(info.get("joint_name") or "") in other_drawer_joint_names
+            }
+            other_drawers_closed = len(other_infos_by_name) == len(other_drawer_joint_names) and all(
+                float(other_infos_by_name[name].get("open_fraction", 1.0))
+                <= 1.0 - float(self.force_config.open_fraction_threshold)
+                for name in other_drawer_joint_names
+            )
+        success = selected_open and other_drawers_closed
         pending["group_results"].append(
             {
                 "region_id": group["group_id"],
@@ -1339,6 +1452,9 @@ class AtomicForceInteractionController:
                     "grounding_source", "simulator_articulation_mapping"
                 ),
                 "success": success,
+                "selected_drawer_open": selected_open,
+                "other_drawer_count": len(other_drawer_joint_names),
+                "other_drawers_closed": other_drawers_closed,
                 "observed_open_fractions": {
                     str(info["joint_name"]): float(info.get("open_fraction", 0.0))
                     for info in selected_infos
@@ -1356,22 +1472,34 @@ class AtomicForceInteractionController:
         success = bool(pending["group_results"]) and all(
             bool(group.get("success")) for group in pending["group_results"]
         )
+        if bool(pending.get("view_restore_required")):
+            success = success and not bool(pending.get("view_restore_failed")) and bool(
+                (pending.get("view_restore_convergence") or {}).get("converged")
+            )
         sequence_type = str(command.get("sequence_type") or "drawer_scan").casefold()
         preserve_open = bool(pending.get("preserve_open"))
         final_state_settle: dict[str, Any] = {"attempted": False}
+        final_state_joint_names = list(
+            pending["all_joint_names"]
+            if preserve_open
+            else pending.get("drawer_joint_names") or pending["all_joint_names"]
+        )
+        final_infos_by_name = {
+            str(info.get("joint_name") or ""): info
+            for info in final_joint_infos
+            if str(info.get("joint_name") or "") in final_state_joint_names
+        }
         if preserve_open:
-            final_state_success = bool(final_joint_infos) and all(
-                float(info.get("open_fraction", 0.0))
+            final_state_success = len(final_infos_by_name) == len(final_state_joint_names) and all(
+                float(final_infos_by_name[name].get("open_fraction", 0.0))
                 >= float(self.force_config.open_fraction_threshold)
-                for info in final_joint_infos
-                if info.get("joint_name") in pending["all_joint_names"]
+                for name in final_state_joint_names
             )
         else:
-            final_state_success = bool(final_joint_infos) and all(
-                float(info.get("open_fraction", 1.0))
+            final_state_success = len(final_infos_by_name) == len(final_state_joint_names) and all(
+                float(final_infos_by_name[name].get("open_fraction", 1.0))
                 <= 1.0 - float(self.force_config.open_fraction_threshold)
-                for info in final_joint_infos
-                if info.get("joint_name") in pending["all_joint_names"]
+                for name in final_state_joint_names
             )
             if not final_state_success:
                 # The final task step is intentionally a passive camera/nav
@@ -1384,7 +1512,7 @@ class AtomicForceInteractionController:
                     settle_plan = prepare_articulation_state_force(
                         task.env,
                         self._execution_object_id(command),
-                        close_joint_names=list(pending["all_joint_names"]),
+                        close_joint_names=final_state_joint_names,
                     )
                     settle = complete_articulation_force(
                         task.env,
@@ -1401,11 +1529,17 @@ class AtomicForceInteractionController:
                     final_joint_infos = articulation_joint_infos(
                         task.env, self._execution_object_id(command)
                     )
-                    final_state_success = bool(final_joint_infos) and all(
-                        float(info.get("open_fraction", 1.0))
-                        <= 1.0 - float(self.force_config.open_fraction_threshold)
+                    final_infos_by_name = {
+                        str(info.get("joint_name") or ""): info
                         for info in final_joint_infos
-                        if info.get("joint_name") in pending["all_joint_names"]
+                        if str(info.get("joint_name") or "") in final_state_joint_names
+                    }
+                    final_state_success = len(final_infos_by_name) == len(
+                        final_state_joint_names
+                    ) and all(
+                        float(final_infos_by_name[name].get("open_fraction", 1.0))
+                        <= 1.0 - float(self.force_config.open_fraction_threshold)
+                        for name in final_state_joint_names
                     )
                 except Exception as exc:
                     final_state_settle["error"] = type(exc).__name__
@@ -1444,7 +1578,7 @@ class AtomicForceInteractionController:
             "final_joint_open_fractions": {
                 str(info["joint_name"]): float(info.get("open_fraction", 0.0))
                 for info in final_joint_infos
-                if info.get("joint_name") in pending["all_joint_names"]
+                if info.get("joint_name") in final_state_joint_names
             },
             "final_close_success": final_state_success if not preserve_open else None,
             "final_open_success": final_state_success if preserve_open else None,
@@ -1452,6 +1586,13 @@ class AtomicForceInteractionController:
             "view_profile": "drawer_low_view",
             "view_profile_result": pending["view_result"],
             "view_restore_result": pending["view_restore_result"],
+            "view_restore_convergence": pending.get("view_restore_convergence"),
+            "view_restore_max_steps": int(
+                pending.get("view_restore_max_steps", self.drawer_view_restore_max_steps)
+            ),
+            "view_restore_steps_elapsed": int(
+                pending.get("view_restore_steps_elapsed", 0)
+            ),
             "interaction_execution_mode": self.interaction_execution_mode,
             "interaction_transition_steps": int(pending["transition_steps"]),
             "drawer_execution_mode": self.interaction_execution_mode,
@@ -1467,6 +1608,11 @@ class AtomicForceInteractionController:
             "post_state": "open" if preserve_open else "closed",
             "success": success,
             "status": "SUCCEEDED" if success else "FAILED",
+            "failure_reason": (
+                "drawer_view_restore_timeout"
+                if bool(pending.get("view_restore_failed"))
+                else None
+            ),
             "confidence": 1.0,
             "execution_cost": 1.0,
             "sim_steps_consumed": int(step) - int(pending["step"]) + 1,
@@ -1543,10 +1689,67 @@ class AtomicForceInteractionController:
                 command.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
             ),
         )
-        valid = (
+        pose_valid = (
             position_error_m <= distance_tolerance_m
             and yaw_error_rad <= yaw_tolerance_rad
         )
+        face_required = bool(
+            command.get("interaction_front_axis_validation_required", False)
+        )
+        axis_values = list(command.get("interaction_approach_axis_xy") or [])
+        center_values = list(command.get("interaction_target_center_xy") or [])
+        face_checked = False
+        face_valid = not face_required
+        face_position_error_rad: float | None = None
+        face_yaw_error_rad: float | None = None
+        face_position_tolerance_rad = max(
+            0.05,
+            float(command.get("interaction_front_position_tolerance_rad", 0.55) or 0.55),
+        )
+        face_yaw_tolerance_rad = max(
+            0.05,
+            float(command.get("interaction_front_yaw_tolerance_rad", 0.55) or 0.55),
+        )
+        normalized_axis: list[float] = []
+        if len(axis_values) >= 2 and len(center_values) >= 2:
+            try:
+                axis_x = float(axis_values[0])
+                axis_y = float(axis_values[1])
+                center_x = float(center_values[0])
+                center_y = float(center_values[1])
+            except (TypeError, ValueError):
+                axis_x = axis_y = center_x = center_y = float("nan")
+            axis_norm = math.hypot(axis_x, axis_y)
+            offset_x = actual[0] - center_x
+            offset_y = actual[1] - center_y
+            offset_norm = math.hypot(offset_x, offset_y)
+            if (
+                math.isfinite(axis_norm)
+                and math.isfinite(offset_norm)
+                and axis_norm > 1e-6
+                and offset_norm > 1e-6
+            ):
+                axis_x /= axis_norm
+                axis_y /= axis_norm
+                normalized_axis = [axis_x, axis_y]
+                dot = max(
+                    -1.0,
+                    min(1.0, (offset_x * axis_x + offset_y * axis_y) / offset_norm),
+                )
+                face_position_error_rad = math.acos(dot)
+                expected_front_yaw = math.atan2(-axis_y, -axis_x)
+                face_yaw_error_rad = abs(
+                    math.atan2(
+                        math.sin(actual[2] - expected_front_yaw),
+                        math.cos(actual[2] - expected_front_yaw),
+                    )
+                )
+                face_checked = True
+                face_valid = (
+                    face_position_error_rad <= face_position_tolerance_rad
+                    and face_yaw_error_rad <= face_yaw_tolerance_rad
+                )
+        valid = pose_valid and face_valid
         result = {
             "checked": True,
             "valid": valid,
@@ -1556,16 +1759,28 @@ class AtomicForceInteractionController:
             "yaw_error_rad": yaw_error_rad,
             "distance_tolerance_m": distance_tolerance_m,
             "yaw_tolerance_rad": yaw_tolerance_rad,
-            "approach_axis_xy": list(
-                command.get("interaction_approach_axis_xy") or []
+            "approach_axis_xy": normalized_axis or axis_values,
+            "face_validation_required": face_required,
+            "face_checked": face_checked,
+            "face_valid": face_valid,
+            "target_center_xy": center_values,
+            "front_axis_source": str(
+                command.get("interaction_front_axis_source") or ""
             ),
+            "face_position_error_rad": face_position_error_rad,
+            "face_yaw_error_rad": face_yaw_error_rad,
+            "face_position_tolerance_rad": face_position_tolerance_rad,
+            "face_yaw_tolerance_rad": face_yaw_tolerance_rad,
         }
         if not valid:
             command["interaction_pose_validation"] = result
             raise ValueError(
                 "Interaction pose invalid: "
                 f"position_error_m={position_error_m:.3f} "
-                f"yaw_error_rad={yaw_error_rad:.3f}"
+                f"yaw_error_rad={yaw_error_rad:.3f} "
+                f"face_checked={face_checked} "
+                f"face_position_error_rad={face_position_error_rad} "
+                f"face_yaw_error_rad={face_yaw_error_rad}"
             )
         return result
 

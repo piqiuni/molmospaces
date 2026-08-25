@@ -688,6 +688,9 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
                         "step_ready": dict(
                             getattr(policy, "last_step_ready_diagnostics", {}) or {}
                         ),
+                        "organized_depth_scan": dict(
+                            getattr(policy, "last_depth_scan_diagnostics", {}) or {}
+                        ),
                         "step_frame_queue_size": 0 if step_frame_queue is None else step_frame_queue.qsize(),
                         "step_frame_queue_capacity": 0 if step_frame_queue is None else step_frame_queue.maxsize,
                     },
@@ -1056,6 +1059,17 @@ def parse_args():
     parser.add_argument("--force_interaction_max_physics_substeps", type=int, default=3000)
     parser.add_argument("--force_interaction_open_fraction_threshold", type=float, default=0.95)
     parser.add_argument(
+        "--force_interaction_bypass_unsafe_open_sweep",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "Temporarily bypass the predictive refrigerator open-sweep collision "
+            "rejection; physical execution and postcondition checks still run."
+        ),
+    )
+    parser.add_argument(
         "--force_interaction_execution_mode",
         choices=["fast", "smooth"],
         default=None,
@@ -1070,6 +1084,9 @@ def parse_args():
     parser.add_argument("--force_interaction_drawer_observation_steps", type=int, default=1)
     parser.add_argument(
         "--force_interaction_drawer_view_restore_settle_steps", type=int, default=2
+    )
+    parser.add_argument(
+        "--force_interaction_drawer_view_restore_max_steps", type=int, default=24
     )
     parser.add_argument(
         "--completion_mode",
@@ -1453,6 +1470,12 @@ def main():
             drawer_observation_steps=args.force_interaction_drawer_observation_steps,
             drawer_view_restore_settle_steps=(
                 args.force_interaction_drawer_view_restore_settle_steps
+            ),
+            drawer_view_restore_max_steps=(
+                args.force_interaction_drawer_view_restore_max_steps
+            ),
+            bypass_unsafe_open_sweep=(
+                args.force_interaction_bypass_unsafe_open_sweep
             ),
             object_id_resolver=(
                 getattr(policy._realtime_gt_publisher, "resolve_public_object_id", None)

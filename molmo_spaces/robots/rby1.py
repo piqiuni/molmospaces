@@ -585,6 +585,30 @@ class RBY1(Robot):
         return "base"
 
     @classmethod
+    def apply_control_overrides(cls, spec: MjSpec, robot_config) -> None:
+        super().apply_control_overrides(spec, robot_config)
+        if not bool(getattr(robot_config, "use_holo_base", False)):
+            return
+
+        limit_m = float(getattr(robot_config, "holo_base_position_limit_m", 100.0))
+        if not np.isfinite(limit_m) or limit_m <= 0.0:
+            raise ValueError("holo_base_position_limit_m must be finite and positive")
+
+        namespace = str(robot_config.robot_namespace)
+        planar_range = np.array([-limit_m, limit_m], dtype=np.float64)
+        for axis in ("x", "y"):
+            joint_name = f"{namespace}base_{axis}"
+            actuator_name = f"{namespace}base_{axis}_act"
+            joint = spec.joint(joint_name)
+            actuator = spec.actuator(actuator_name)
+            if joint is None or actuator is None:
+                raise ValueError(
+                    f"holonomic base requires {joint_name!r} and {actuator_name!r}"
+                )
+            joint.range = planar_range
+            actuator.ctrlrange = planar_range
+
+    @classmethod
     def add_robot_to_scene(
         cls,
         robot_config: "MlSpacesExpConfig.RobotConfig",
