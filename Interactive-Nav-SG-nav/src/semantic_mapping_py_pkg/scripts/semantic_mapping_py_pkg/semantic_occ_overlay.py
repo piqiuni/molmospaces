@@ -126,6 +126,7 @@ class SemanticOccupancyOverlay:
         clear_padding_m=-0.05,
         open_states=None,
         max_aperture_thickness_m=0.25,
+        raw_free_confirmations=3,
     ):
         self.enabled = bool(enabled)
         # This is a *signed* inset/outset applied to the immutable closed-door
@@ -137,6 +138,7 @@ class SemanticOccupancyOverlay:
             0.0, float(max_aperture_thickness_m)
         )
         self.open_states = set(open_states or ["open"])
+        self.raw_free_confirmations = max(1, int(raw_free_confirmations))
         self.reference_aabbs: dict[str, tuple[list[float], list[float]]] = {}
         # A pending interaction command can arrive before its result, but it
         # must never be enough to turn an arbitrary openable object into a map
@@ -145,12 +147,24 @@ class SemanticOccupancyOverlay:
         self.known_portal_ids: set[str] = set()
         self.active_portal_ids: set[str] = set()
         self.pending_portal_ids: set[str] = set()
+        # A successful open is a map-state transition, not a traversal lease.
+        # Keep its aperture alive even if the graph/traversal snapshot briefly
+        # disappears.  Retire it only after the underlying occupancy has
+        # independently reported the whole aperture free for several builds.
+        self.confirmed_portal_ids: set[str] = set()
+        self.raw_free_portal_ids: set[str] = set()
+        self.raw_free_streaks: dict[str, int] = {}
+        self.graph_portal_states: dict[str, str] = {}
 
     def reset(self) -> None:
         self.reference_aabbs.clear()
         self.known_portal_ids.clear()
         self.active_portal_ids.clear()
         self.pending_portal_ids.clear()
+        self.confirmed_portal_ids.clear()
+        self.raw_free_portal_ids.clear()
+        self.raw_free_streaks.clear()
+        self.graph_portal_states.clear()
 
     def set_interaction_pending(
         self, node_id: str, pending: bool, *, node_type: str | None = None
@@ -179,12 +193,14 @@ class SemanticOccupancyOverlay:
         return before != self.pending_portal_ids
 
     def update_graph(self, graph_payload: dict[str, Any]) -> None:
-        active = set()
         known = set()
+        present = set()
         for node in graph_payload.get("nodes") or []:
+            node_id = str(node.get("id") or "")
+            if node_id:
+                present.add(node_id)
             if not self._is_topology_portal(node):
                 continue
-            node_id = str(node.get("id") or "")
             if node_id:
                 known.add(node_id)
             attributes = node.get("attributes") or {}
@@ -204,8 +220,26 @@ class SemanticOccupancyOverlay:
             state = str((node.get("interaction") or {}).get("state") or "unknown")
             if node_id not in self.reference_aabbs or state == "closed":
                 self.reference_aabbs[node_id] = (center, size)
-            if state in self.open_states and node_id in self.reference_aabbs:
-                active.add(node_id)
+            previous_state = self.graph_portal_states.get(node_id)
+            if state == "closed":
+                self.confirmed_portal_ids.discard(node_id)
+                self.raw_free_portal_ids.discard(node_id)
+                self.raw_free_streaks.pop(node_id, None)
+            elif (
+                state in self.open_states
+                and previous_state not in self.open_states
+                and node_id not in self.raw_free_portal_ids
+                and node_id in self.reference_aabbs
+            ):
+                self.confirmed_portal_ids.add(node_id)
+                self.raw_free_streaks[node_id] = 0
+            self.graph_portal_states[node_id] = state
+        reclassified = self.known_portal_ids.intersection(present).difference(known)
+        for node_id in reclassified:
+            self.confirmed_portal_ids.discard(node_id)
+            self.raw_free_portal_ids.discard(node_id)
+            self.raw_free_streaks.pop(node_id, None)
+            self.graph_portal_states.pop(node_id, None)
         self.known_portal_ids = known
         # A node that was reclassified from a transient MLLM portal proposal
         # to a source-observed container must immediately lose both its cached
@@ -213,10 +247,10 @@ class SemanticOccupancyOverlay:
         self.reference_aabbs = {
             node_id: reference
             for node_id, reference in self.reference_aabbs.items()
-            if node_id in known
+            if node_id in known or node_id in self.confirmed_portal_ids
         }
         self.pending_portal_ids.intersection_update(known)
-        self.active_portal_ids = active | self.pending_portal_ids
+        self.active_portal_ids = self.confirmed_portal_ids | self.pending_portal_ids
 
     @staticmethod
     def _is_topology_portal(node: dict[str, Any]) -> bool:
@@ -342,6 +376,7 @@ class SemanticOccupancyOverlay:
                 continue
             selected_cols = []
             selected_rows = []
+            selected_indices = []
             for row in range(row_min, row_max + 1):
                 offset = row * width
                 for col in range(col_min, col_max + 1):
@@ -360,14 +395,26 @@ class SemanticOccupancyOverlay:
                     ):
                         continue
                     index = offset + col
-                    if result[index] != 0:
-                        cleared_cells += 1
-                    result[index] = 0
-                    mask[index] = 100
+                    selected_indices.append(index)
                     selected_cols.append(col)
                     selected_rows.append(row)
             if not selected_cols:
                 continue
+            if node_id in self.confirmed_portal_ids:
+                raw_is_free = all(result[index] == 0 for index in selected_indices)
+                streak = self.raw_free_streaks.get(node_id, 0) + 1 if raw_is_free else 0
+                self.raw_free_streaks[node_id] = streak
+                if streak >= self.raw_free_confirmations:
+                    self.confirmed_portal_ids.discard(node_id)
+                    self.active_portal_ids.discard(node_id)
+                    self.raw_free_portal_ids.add(node_id)
+                    self.raw_free_streaks.pop(node_id, None)
+                    continue
+            for index in selected_indices:
+                if result[index] != 0:
+                    cleared_cells += 1
+                result[index] = 0
+                mask[index] = 100
             applied_ids.append(node_id)
             portal_bounds = {
                 "x": min(selected_cols),
@@ -414,13 +461,16 @@ class SemanticOccupancyOverlay:
         if extent_x <= 0.0 or extent_y <= 0.0:
             return 0.0, 0.0
 
-        # Use the smaller source axis as the normal/thickness direction.  This
-        # preserves the doorway's long-axis opening even when a positive legacy
-        # padding value is still present in an old launch configuration.
+        # Use the smaller source axis as the normal/thickness direction.  Keep
+        # the lateral inset on the long opening axis, but do not contract the
+        # normal axis below the closed-door reference thickness.  At least two
+        # raster cells are needed here: a one-cell slab can select only one row
+        # when the reference centre is not grid-aligned, leaving the adjacent
+        # occupied door row as a complete barrier in the planning map.
         if size_x >= size_y:
-            extent_y = min(extent_y, self._thickness_limit(resolution))
+            extent_y = self._normal_aperture_extent(size_y, resolution)
         else:
-            extent_x = min(extent_x, self._thickness_limit(resolution))
+            extent_x = self._normal_aperture_extent(size_x, resolution)
         return 0.5 * extent_x, 0.5 * extent_y
 
     def _inset_extent(self, source_extent: float, resolution: float) -> float:
@@ -434,7 +484,22 @@ class SemanticOccupancyOverlay:
         return max(float(resolution), inset_extent)
 
     def _thickness_limit(self, resolution: float) -> float:
-        return max(float(resolution), self.max_aperture_thickness_m)
+        return max(2.0 * float(resolution), self.max_aperture_thickness_m)
+
+    def _normal_aperture_extent(
+        self,
+        source_extent: float,
+        resolution: float,
+    ) -> float:
+        """Raster-safe doorway thickness without widening the lateral opening."""
+
+        source_extent = max(0.0, float(source_extent))
+        if source_extent <= 0.0:
+            return 0.0
+        return min(
+            max(source_extent, 2.0 * float(resolution)),
+            self._thickness_limit(resolution),
+        )
 
     @staticmethod
     def _quaternion_yaw(quaternion: Any) -> float:

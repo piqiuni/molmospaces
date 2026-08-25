@@ -426,6 +426,30 @@ def test_object_store_can_expose_tentative_tracks_for_graph():
     assert tentative[0]["observation_count"] == 1
 
 
+def test_object_store_preserves_public_visibility_evidence_for_target_candidates():
+    store = ObjectMapStore(match_distance=0.5, min_confirmations=1)
+    detection = {
+        "semantic_class": "sofa",
+        "confidence": 0.9,
+        "world_position": {"x": 1.0, "y": 2.0, "z": 0.4},
+        "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.4},
+        "world_box3d_size": {"x": 1.5, "y": 0.7, "z": 0.8},
+        "bbox": [10, 20, 110, 120],
+        "mask": {"rows": list(range(64)), "cols": list(range(64))},
+    }
+    store.update([detection], 1.0)
+    store.update([detection], 2.0)
+
+    tracked = store.as_tracked_detections()
+    assert len(tracked) == 1
+    assert tracked[0]["bbox_2d"] == [10, 20, 110, 120]
+    assert tracked[0]["visible_pixels"] == 64
+    assert tracked[0]["max_visible_pixels"] == 64
+    assert tracked[0]["consecutive_observations"] == 2
+    assert tracked[0]["max_consecutive_observations"] == 2
+    assert tracked[0]["visible_fraction"] > 0.0
+
+
 def test_object_store_merges_overlapping_different_labels():
     store = ObjectMapStore(match_distance=0.5, min_confirmations=2, size_match_ratio=0.7)
     store.update(
@@ -568,7 +592,9 @@ def test_identical_room_grid_reuses_cached_statistics_and_advances_graph():
 
     room = store.nodes["room_1"]
     assert store.graph_revision == first_revision + 1
-    assert store.room_geometry_candidates[1]["count"] == 2
+    # Identical geometry is already contained by the locked public box; it is
+    # not a pending expansion and therefore does not accumulate a relock streak.
+    assert store.room_geometry_candidates[1]["count"] == 0
     assert room.attributes["cell_count"] == len(scene_data)
     assert room.confidence == 0.8
 
@@ -1310,6 +1336,59 @@ def test_mllm_cannot_promote_source_container_to_topological_portal() -> None:
     assert container_hint["requires_interaction"] is True
 
 
+def test_single_mllm_container_frame_cannot_demote_established_portal() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="door_2",
+        semantic_name="door",
+        is_door=True,
+        is_articulable=True,
+        joint_type="hinge",
+        frame_index=10,
+        position=[1.0, 0.0, 1.0],
+        aabb_center=[1.0, 0.0, 1.0],
+        aabb_size=[0.9, 0.2, 2.0],
+    )
+    store.update_observations([door], source_mode="realtime_gt_observation", stamp=1.0)
+    portal_id = next(
+        item["id"]
+        for item in store.as_graph_dict(stamp=1.0)["nodes"]
+        if item["type"] == "portal"
+    )
+
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_2",
+            "attribute_status": "ready",
+            "observation_frame_index": 10,
+            "interactable": True,
+            "interaction_class": "container",
+            "coarse_state": "closed",
+            "confidence": 0.95,
+            "interaction_parts": [{"part_id": "visual_drawer_00"}],
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+
+    node = next(
+        item
+        for item in store.as_graph_dict(stamp=2.0)["nodes"]
+        if item["id"] == portal_id
+    )
+    assert node["type"] == "portal"
+    assert node["attributes"]["mllm_interaction_class"] == "container"
+    assert node["attributes"]["mllm_portal_type_hysteresis"] == {
+        "locked_type": "portal",
+        "requested_type": "container",
+        "accepted": False,
+        "reason": "class:container",
+        "observation_capture_step": 10,
+    }
+    assert node["attributes"]["needs_reobserve"] is True
+    assert node["attributes"]["attribute_is_current"] is False
+
+
 def test_mllm_static_open_or_none_cannot_disable_established_container() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     fridge = observation(
@@ -2026,6 +2105,114 @@ def test_room_geometry_does_not_shrink_after_confirmed_observation() -> None:
     assert updated["aabb_center"] == initial_center
     assert updated["aabb_size"] == initial_size
 
+
+def test_room_geometry_box_relocks_only_after_a_stable_expansion() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    accepted_center, accepted_size = store._accept_room_geometry(
+        1, [0.5, 0.5, 0.05], [1.0, 1.0, 0.1], 3
+    )
+
+    # A moving exploration fringe is accumulated into a monotonic pending
+    # union.  The public box stays stable between checkpoints, but changing
+    # proposals no longer reset the streak forever.
+    for width in (1.4, 1.6):
+        center, size = store._accept_room_geometry(
+            1, [width * 0.5, 0.5, 0.05], [width, 1.0, 0.1], 3
+        )
+        assert center == accepted_center
+        assert size == accepted_size
+    center, size = store._accept_room_geometry(
+        1, [0.9, 0.5, 0.05], [1.8, 1.0, 0.1], 3
+    )
+    assert center == [0.9, 0.5, 0.05]
+    assert size == [1.8, 1.0, 0.1]
+
+
+def test_room_geometry_commit_resets_confirmation_streak() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store._accept_room_geometry(1, [0.5, 0.5, 0.05], [1.0, 1.0, 0.1], 2)
+    for _ in range(2):
+        center, size = store._accept_room_geometry(
+            1, [0.75, 0.5, 0.05], [1.5, 1.0, 0.1], 2
+        )
+    assert size[:2] == [1.5, 1.0]
+
+    # A single next-frame expansion is pending, not an immediate public jump.
+    center, size = store._accept_room_geometry(
+        1, [1.0, 0.5, 0.05], [2.0, 1.0, 0.1], 2
+    )
+    assert center[:2] == [0.75, 0.5]
+    assert size[:2] == [1.5, 1.0]
+
+
+def test_failed_portal_open_result_cannot_promote_open_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        instance_id="door_failed_open",
+        semantic_name="door",
+        is_door=True,
+        is_articulable=True,
+        joint_type="hinge",
+        frame_index=1,
+    )
+    store.update_observations([door], source_mode="realtime_gt_observation")
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_failed_open",
+            "action": "open",
+            "post_state": "open",
+            "success": False,
+            "event_id": "failed-open",
+        }
+    )
+    node = next(
+        item
+        for item in store.as_graph_dict()["nodes"]
+        if item["id"] == "portal_door_failed_open"
+    )
+    assert node["interaction"]["state"] != "open"
+    assert node["attributes"]["portal_result_state_gate"]["accepted"] is False
+
+
+def test_room_merge_preserves_surviving_id_and_unions_public_box() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store._accept_room_geometry(1, [0.5, 0.5, 0.1], [1.0, 1.0, 0.2], 1)
+    store._accept_room_geometry(2, [2.5, 0.5, 0.1], [1.0, 1.0, 0.2], 1)
+    store._ensure_room_node(1)
+    store._ensure_room_node(2)
+    store._apply_room_merges({2: 1})
+    assert 2 not in store.room_geometry_candidates
+    candidate = store.room_geometry_candidates[1]
+    assert candidate["accepted_size"][:2] == [3.0, 1.0]
+    assert candidate["accepted_center"][:2] == [1.5, 0.5]
+
+
+def test_room_summary_refresh_cannot_shrink_or_relock_public_box() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.set_room_geometries(
+        [
+            {
+                "room_id": 1,
+                "aabb_center": [1.0, 1.0, 0.1],
+                "aabb_size": [2.0, 2.0, 0.2],
+            }
+        ]
+    )
+    initial = store.nodes["room_1"]
+    initial_center = list(initial.aabb_center)
+    initial_size = list(initial.aabb_size)
+
+    store.set_room_geometries(
+        [
+            {
+                "room_id": 1,
+                "aabb_center": [1.1, 1.0, 0.1],
+                "aabb_size": [1.4, 1.4, 0.2],
+            }
+        ]
+    )
+    assert store.nodes["room_1"].aabb_center == initial_center
+    assert store.nodes["room_1"].aabb_size == initial_size
 
 def test_attribute_patch_sets_semantic_state_and_preserves_last_seen():
     store = InteractionGraphStore(scene_id="test_scene")

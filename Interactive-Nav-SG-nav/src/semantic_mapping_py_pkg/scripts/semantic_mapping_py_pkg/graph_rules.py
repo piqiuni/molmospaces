@@ -610,6 +610,15 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
             "asset_id": detection.get("asset_id"),
             "object_id": detection.get("object_id"),
             "source": source,
+            # Preserve public 2-D detector evidence through the tracked-object
+            # seam.  CandidateGenerator uses these fields to distinguish a
+            # reliably observed ObjectGoal from a position-only graph node.
+            "bbox_2d": list(detection.get("bbox_2d") or detection.get("bbox") or []),
+            "visible_pixels": int(detection.get("visible_pixels", 0) or 0),
+            "visible_fraction": float(detection.get("visible_fraction", 0.0) or 0.0),
+            "consecutive_observations": int(
+                detection.get("consecutive_observations", 0) or 0
+            ),
             "viz_aabb_center": viz_aabb_center,
             "viz_aabb_size": viz_aabb_size,
         }

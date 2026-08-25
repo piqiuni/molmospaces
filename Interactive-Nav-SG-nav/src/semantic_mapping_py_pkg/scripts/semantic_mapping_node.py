@@ -126,7 +126,7 @@ class SemanticMappingNode:
         self.room_small_obstacle_max_cells = max(0, int(config.get("room_small_obstacle_max_cells", 0)))
         self.room_remove_enclosed_occupied = bool(config.get("room_remove_enclosed_occupied", True))
         self.room_enclosed_occupied_max_cells = max(0, int(config.get("room_enclosed_occupied_max_cells", 700)))
-        self.room_enclosed_occupied_max_aspect = float(config.get("room_enclosed_occupied_max_aspect", 2.5))
+        self.room_enclosed_occupied_max_aspect = float(config.get("room_enclosed_occupied_max_aspect", 1.8))
         self.room_enclosed_occupied_known_ring_ratio = float(
             config.get("room_enclosed_occupied_known_ring_ratio", 0.95)
         )
@@ -240,6 +240,9 @@ class SemanticMappingNode:
             max_aperture_thickness_m=overlay_config.get(
                 "max_aperture_thickness_m", 0.25
             ),
+            raw_free_confirmations=overlay_config.get(
+                "raw_free_confirmations", 3
+            ),
         )
         # Room segmentation consumes the same graph snapshot as the planning
         # overlay, but it must not share the mutable planning-overlay instance:
@@ -251,6 +254,9 @@ class SemanticMappingNode:
             open_states=overlay_config.get("open_states", ["open"]),
             max_aperture_thickness_m=overlay_config.get(
                 "max_aperture_thickness_m", 0.25
+            ),
+            raw_free_confirmations=overlay_config.get(
+                "raw_free_confirmations", 3
             ),
         )
         self.semantic_occ_update_tracker = OverlayUpdateRegionTracker()

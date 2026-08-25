@@ -122,6 +122,47 @@ def test_room_grid_signature_changes_when_only_origin_yaw_changes():
     )
 
 
+def test_room_cores_do_not_connect_across_a_diagonal_free_space_pinhole():
+    cv2 = pytest.importorskip("cv2")
+    mask = np.zeros((3, 3), dtype=np.uint8)
+    mask[0, 0] = 1
+    mask[1, 1] = 1
+
+    count, labels, _stats, _centroids = (
+        RoomSegmenter._connected_components_with_stats(mask, cv2)
+    )
+
+    assert count == 3
+    assert labels[0, 0] != labels[1, 1]
+
+
+def test_enclosed_obstacle_filter_removes_compact_furniture_but_keeps_wall_like_island():
+    width, height = 16, 12
+    values = np.zeros((height, width), dtype=np.int8)
+    values[0, :] = values[-1, :] = 100
+    values[:, 0] = values[:, -1] = 100
+    values[3:5, 3:5] = 100  # compact furniture-like island
+    values[3:5, 8:13] = 100  # detached but wall-like 2x5 divider
+    grid = _grid(width=width, height=height)
+    grid.data = values.reshape(-1).tolist()
+    segmenter = RoomSegmenter(
+        room_min_component_cells=1,
+        room_core_min_component_cells=1,
+        room_core_clearance_cells=1,
+        room_remove_enclosed_occupied=True,
+        room_enclosed_occupied_max_cells=100,
+        room_enclosed_occupied_max_aspect=1.8,
+        room_enclosed_occupied_known_ring_ratio=0.95,
+        room_enclosed_occupied_free_ring_ratio=0.8,
+        room_portal_cut_enabled=False,
+    )
+
+    room_ids, _room_conf = segmenter.segment(grid, force_stable=True)
+
+    assert room_ids[3 * width + 3] >= 0
+    assert room_ids[3 * width + 9] == segmenter.room_unknown_id
+
+
 def _small_portal_pocket_grid():
     width, height = 20, 12
     values = np.full((height, width), 100, dtype=np.int8)

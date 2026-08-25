@@ -177,7 +177,9 @@ semantic_map:
   room_small_obstacle_max_cells: 0
   room_remove_enclosed_occupied: true
   room_enclosed_occupied_max_cells: 700
-  room_enclosed_occupied_max_aspect: 2.5
+  # Only compact, furniture-like islands may be ignored for room topology.
+  # Preserve elongated occupied components as possible wall dividers.
+  room_enclosed_occupied_max_aspect: 1.8
   room_enclosed_occupied_known_ring_ratio: 0.95
   room_enclosed_occupied_free_ring_ratio: 0.45
   room_portal_cut_enabled: true
@@ -227,6 +229,7 @@ semantic_occ_overlay:
   # rotating door leaf cannot clear adjacent wall cells in the planning map.
   clear_padding_m: -0.05
   max_aperture_thickness_m: 0.25
+  raw_free_confirmations: 3
   open_states: ["ajar", "open"]
 
 scene_types:

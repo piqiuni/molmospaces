@@ -76,6 +76,12 @@ class ObjectMapStore:
                     "is_confirmed": False,
                     "instance_id": instance_id,
                     "last_seen": now,
+                    "bbox_2d": [],
+                    "visible_pixels": 0,
+                    "max_visible_pixels": 0,
+                    "visible_fraction": 0.0,
+                    "max_visible_fraction": 0.0,
+                    "max_consecutive_observations": 0,
                 }
                 self.next_id += 1
                 self.objects.append(match)
@@ -109,6 +115,42 @@ class ObjectMapStore:
             match["observation_count"] += 1
             match["hit_streak"] = int(match.get("hit_streak", 0)) + 1
             match["miss_streak"] = 0
+            bbox_2d = list(det.get("bbox_2d") or det.get("bbox") or [])
+            mask = det.get("mask")
+            mask_pixels = 0
+            if isinstance(mask, dict):
+                rows = mask.get("rows") or []
+                cols = mask.get("cols") or []
+                if len(rows) == len(cols):
+                    mask_pixels = len(rows)
+            visible_pixels = int(
+                det.get("visible_pixels", mask_pixels or det.get("mask_area", 0)) or 0
+            )
+            bbox_area = 0.0
+            if len(bbox_2d) >= 4:
+                bbox_area = max(0.0, float(bbox_2d[2]) - float(bbox_2d[0])) * max(
+                    0.0, float(bbox_2d[3]) - float(bbox_2d[1])
+                )
+            visible_fraction = float(
+                det.get(
+                    "visible_fraction",
+                    min(1.0, visible_pixels / bbox_area) if bbox_area > 0.0 else 0.0,
+                )
+                or 0.0
+            )
+            match["bbox_2d"] = bbox_2d
+            match["visible_pixels"] = visible_pixels
+            match["max_visible_pixels"] = max(
+                int(match.get("max_visible_pixels", 0) or 0), visible_pixels
+            )
+            match["visible_fraction"] = visible_fraction
+            match["max_visible_fraction"] = max(
+                float(match.get("max_visible_fraction", 0.0) or 0.0), visible_fraction
+            )
+            match["max_consecutive_observations"] = max(
+                int(match.get("max_consecutive_observations", 0) or 0),
+                int(match["hit_streak"]),
+            )
             match["is_confirmed"] = bool(match["observation_count"] >= self.min_confirmations)
             match["last_seen"] = now
             matched_ids.add(int(match["object_id"]))
@@ -166,6 +208,15 @@ class ObjectMapStore:
                         obj["aabb_size"][0], obj["aabb_size"][1], obj["aabb_size"][2]
                     ),
                     "observation_count": int(obj["observation_count"]),
+                    "bbox_2d": list(obj.get("bbox_2d") or []),
+                    "visible_pixels": int(obj.get("visible_pixels", 0) or 0),
+                    "max_visible_pixels": int(obj.get("max_visible_pixels", 0) or 0),
+                    "visible_fraction": float(obj.get("visible_fraction", 0.0) or 0.0),
+                    "max_visible_fraction": float(obj.get("max_visible_fraction", 0.0) or 0.0),
+                    "consecutive_observations": int(obj.get("hit_streak", 0) or 0),
+                    "max_consecutive_observations": int(
+                        obj.get("max_consecutive_observations", 0) or 0
+                    ),
                     "source": "tracked_object_store",
                     "viz_aabb_center": point_dict(
                         obj["aabb_center"][0], obj["aabb_center"][1], obj["aabb_center"][2]

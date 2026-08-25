@@ -97,6 +97,44 @@ def test_reset_clears_cross_episode_portal_state():
     assert overlay.pending_portal_ids == set()
 
 
+def test_confirmed_open_survives_graph_gap_until_raw_aperture_is_stably_free():
+    overlay = SemanticOccupancyOverlay(
+        clear_padding_m=0.0,
+        raw_free_confirmations=3,
+    )
+    blocked = [100] * (GridInfo.width * GridInfo.height)
+    overlay.update_graph(graph(portal("closed")))
+    overlay.update_graph(graph(portal("open")))
+
+    # A post-open traversal timeout can temporarily publish a graph without the
+    # portal.  That must not restore the stale closed-door cells.
+    overlay.update_graph({"nodes": []})
+    planning, _mask, stats = overlay.apply(GridInfo(), blocked)
+    assert stats["active_portal_ids"] == ["portal_door"]
+    assert planning[10 * GridInfo.width + 10] == 0
+
+    raw_free = list(blocked)
+    for index, value in enumerate(planning):
+        if value == 0:
+            raw_free[index] = 0
+    for _ in range(2):
+        _planning, _mask, stats = overlay.apply(GridInfo(), raw_free)
+        assert stats["active_portal_ids"] == ["portal_door"]
+
+    planning, mask, stats = overlay.apply(GridInfo(), raw_free)
+    assert stats["active_portal_ids"] == []
+    assert planning == raw_free
+    assert max(mask) == 0
+
+    # Repeated open snapshots do not re-arm a portal that the raw map already
+    # confirmed free.  A real close -> open transition does.
+    overlay.update_graph(graph(portal("open")))
+    assert not overlay.has_active_portals()
+    overlay.update_graph(graph(portal("closed")))
+    overlay.update_graph(graph(portal("open")))
+    assert overlay.has_active_portals()
+
+
 def test_pending_open_interaction_clears_before_result_and_rolls_back():
     overlay = SemanticOccupancyOverlay(clear_padding_m=0.0)
     raw = [100] * (GridInfo.width * GridInfo.height)
@@ -233,6 +271,40 @@ def test_open_portal_insets_reference_and_preserves_adjacent_wall_cells():
     assert planning[10 * GridInfo.width + 14] == 100
     assert planning[10 * GridInfo.width + 10] == 0
     assert sum(value > 0 for value in mask) == 16
+
+
+def test_non_grid_aligned_thin_portal_clears_both_occupied_rows():
+    overlay = SemanticOccupancyOverlay(
+        clear_padding_m=-0.05,
+        max_aperture_thickness_m=0.25,
+    )
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    opened = portal(
+        "closed",
+        center=(1.0, 1.067, 1.0),
+        size=(0.8, 0.1697, 2.0),
+    )
+    overlay.update_graph(graph(opened))
+    opened["interaction"] = {"state": "open"}
+    overlay.update_graph(graph(opened))
+
+    planning, mask, stats = overlay.apply(GridInfo(), raw)
+
+    assert stats["active_portal_ids"] == ["portal_door"]
+    cleared_rows = {
+        index // GridInfo.width
+        for index, value in enumerate(mask)
+        if value > 0
+    }
+    assert cleared_rows == {10, 11}
+    for row in cleared_rows:
+        assert all(
+            planning[row * GridInfo.width + col] == 0
+            for col in range(6, 14)
+        )
+    # The lateral inset still protects cells immediately outside the opening.
+    assert planning[10 * GridInfo.width + 5] == 100
+    assert planning[10 * GridInfo.width + 14] == 100
 
 
 def test_wide_portal_reference_is_limited_to_a_narrow_doorway_slab():

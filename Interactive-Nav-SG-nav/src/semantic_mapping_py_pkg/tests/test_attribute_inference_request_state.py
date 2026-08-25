@@ -488,6 +488,12 @@ def test_targeted_container_refresh_constrains_class_without_supplying_view() ->
         "object_id": "target",
         "expected_node_type": "container",
     }
+    instruction = request["instruction"]
+    assert "Judge frontality primarily from the target's horizontal perspective" in instruction
+    assert "lower boundary may leave the frame" in instruction
+    assert "vertical framing/height cues alone are not evidence of an oblique view" in instruction
+    assert "do not require the top or bottom boundary to be fully visible" in instruction
+    assert "include only action regions that are actually visible" in instruction
     properties = request["response_schema"]["schema"]["properties"]
     assert properties["interaction_class"]["enum"] == ["container"]
     assert properties["portal_morphology"] == {"type": "null"}

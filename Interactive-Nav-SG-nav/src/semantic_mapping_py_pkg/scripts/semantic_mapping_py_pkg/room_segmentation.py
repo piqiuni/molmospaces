@@ -35,7 +35,7 @@ class RoomSegmenter:
         room_small_obstacle_max_cells=0,
         room_remove_enclosed_occupied=True,
         room_enclosed_occupied_max_cells=700,
-        room_enclosed_occupied_max_aspect=2.5,
+        room_enclosed_occupied_max_aspect=1.8,
         room_enclosed_occupied_known_ring_ratio=0.95,
         room_enclosed_occupied_free_ring_ratio=0.45,
         room_fill_enclosed_obstacles=False,
@@ -102,18 +102,20 @@ class RoomSegmenter:
         self.state = state if state is not None else RoomSegmentationState()
 
     @staticmethod
-    def _connected_components_with_stats(mask, cv2):
-        """Use OpenCV's BBDT labeller when this build exposes it.
+    def _connected_components_with_stats(mask, cv2, *, connectivity=4):
+        """Label components without connecting rooms through diagonal pinholes.
 
-        BBDT preserves the 8-connectivity labels/stats contract used below,
-        while avoiding the slower default dispatch on large room grids.  The
-        ordinary OpenCV call remains the compatibility fallback.
+        Free-space/core components use four-connectivity by default: two rooms
+        touching only at one diagonal pixel are not traversably connected.
+        Occupied-object callers explicitly request eight-connectivity so a
+        diagonally sampled wall remains one conservative obstacle component.
         """
+        connectivity = 8 if int(connectivity) == 8 else 4
         algorithm = getattr(cv2, "CCL_BBDT", None)
         accelerated = getattr(cv2, "connectedComponentsWithStatsWithAlgorithm", None)
         if algorithm is not None and accelerated is not None:
-            return accelerated(mask, 8, cv2.CV_32S, algorithm)
-        return cv2.connectedComponentsWithStats(mask, 8)
+            return accelerated(mask, connectivity, cv2.CV_32S, algorithm)
+        return cv2.connectedComponentsWithStats(mask, connectivity)
 
     def update_portal_hints(
         self,
@@ -232,7 +234,9 @@ class RoomSegmenter:
                 row_max = int(np.max(known_ys)) + 1
                 col_min = int(np.min(known_xs))
                 col_max = int(np.max(known_xs)) + 1
-                component_count, labels, stats, _centroids = self._connected_components_with_stats(occupied_mask, cv2)
+                component_count, labels, stats, _centroids = self._connected_components_with_stats(
+                    occupied_mask, cv2, connectivity=8
+                )
                 for component_id in range(1, component_count):
                     area = int(stats[component_id, cv2.CC_STAT_AREA])
                     if area <= 0 or area > self.room_enclosed_occupied_max_cells:
@@ -275,7 +279,9 @@ class RoomSegmenter:
                     segmentation_free[labels == component_id] = 1
 
         if cv2 is not None and self.room_small_obstacle_max_cells > 0 and np.any(occupied_mask):
-            component_count, labels, stats, _centroids = self._connected_components_with_stats(occupied_mask, cv2)
+            component_count, labels, stats, _centroids = self._connected_components_with_stats(
+                occupied_mask, cv2, connectivity=8
+            )
             for component_id in range(1, component_count):
                 area = int(stats[component_id, cv2.CC_STAT_AREA])
                 if area > self.room_small_obstacle_max_cells:
@@ -706,7 +712,9 @@ class RoomSegmenter:
         ys, xs = np.where(known_mask > 0)
         row_min, row_max = int(np.min(ys)), int(np.max(ys)) + 1
         col_min, col_max = int(np.min(xs)), int(np.max(xs)) + 1
-        component_count, labels, stats, _centroids = self._connected_components_with_stats(occupied_mask, cv2)
+        component_count, labels, stats, _centroids = self._connected_components_with_stats(
+            occupied_mask, cv2, connectivity=8
+        )
         for component_id in range(1, component_count):
             area = int(stats[component_id, cv2.CC_STAT_AREA])
             if area < self.room_enclosed_obstacle_min_cells or area > self.room_enclosed_obstacle_max_cells:

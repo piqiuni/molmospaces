@@ -210,6 +210,26 @@ def _container_m1_hysteresis(
     )
 
 
+def _portal_m1_type_hysteresis(node, interaction_class, *, is_visual_mllm_patch):
+    """Keep a topology-established portal stable across one visual response."""
+
+    if not is_visual_mllm_patch:
+        return False, "not_visual_mllm_patch"
+    attributes = node.attributes or {}
+    topology_type = str(
+        attributes.get("topology_type")
+        or attributes.get("observation_node_type")
+        or ""
+    ).strip().casefold()
+    established_portal = node.type == "portal" or topology_type == "portal"
+    if not established_portal:
+        return False, "not_established_portal"
+    requested_class = str(interaction_class or "unknown").strip().casefold()
+    if requested_class == "portal":
+        return False, "portal_evidence_accepted"
+    return True, f"class:{requested_class or 'unknown'}"
+
+
 def _portal_has_observed_open_connectivity(node):
     """Whether mapping, not a synthetic post-open hypothesis, saw both sides."""
 
@@ -318,6 +338,54 @@ def _is_confirmed_portal_open_result(result, resolved_state):
     if source == "executor_static_portal":
         return False
     return state in {"open", "opened"}
+
+
+def _portal_result_state_gate(node, result, resolved_state):
+    """Allow result-lane portal opening only after a real successful action."""
+
+    requested = str(resolved_state or "").strip().casefold()
+    if node.type != "portal" or requested not in {
+        "open",
+        "opened",
+        "ajar",
+        "static_open",
+    }:
+        return True, "not_applicable"
+    action = str(result.get("action") or "").strip().casefold()
+    capability = _interaction_result_capability(result)
+    source = str(result.get("source") or "").strip().casefold()
+    trusted_verified_state = source in {
+        "oracle_interaction",
+        "direct_joint_readback",
+        "executor_state_verification",
+        "successful_action_postcondition",
+    }
+    static_terminal = (
+        requested == "static_open"
+        and capability == "static"
+        and result.get("success") is True
+    )
+    accepted = bool(
+        static_terminal
+        or trusted_verified_state
+        or (
+            result.get("success") is True
+            and action == "open"
+            and requested in {"open", "opened", "ajar"}
+            and capability not in {"static", "blocked", "unavailable"}
+            and source != "executor_static_portal"
+        )
+    )
+    return (
+        accepted,
+        "trusted_verified_state"
+        if trusted_verified_state
+        else "successful_force_open"
+        if accepted and not static_terminal
+        else "static_terminal"
+        if static_terminal
+        else "missing_successful_force_open",
+    )
 
 
 class InteractionGraphStore:
@@ -500,10 +568,19 @@ class InteractionGraphStore:
             self.room_id_to_name.setdefault(room_id, self.room_geometries[room_id]["name"])
             node = self._ensure_room_node(room_id)
             geom = self.room_geometries[room_id]
+            stable_center, stable_size = self._accept_room_geometry(
+                room_id,
+                geom["aabb_center"],
+                geom["aabb_size"],
+                self.room_geometry_stability_frames,
+            )
             node.name = geom["name"]
-            node.centroid = list(geom["center"])
-            node.aabb_center = list(geom["aabb_center"])
-            node.aabb_size = list(geom["aabb_size"])
+            # Room summaries are refreshed alongside graph revisions.  They may
+            # describe a smaller or slightly shifted frontier envelope, but the
+            # public box is the stable, monotonic geometry owned by the room ID.
+            node.centroid = list(stable_center)
+            node.aabb_center = list(stable_center)
+            node.aabb_size = list(stable_size)
             node.attributes["cell_count"] = geom["cell_count"]
 
     def update_observations(
@@ -581,6 +658,24 @@ class InteractionGraphStore:
         now = float(stamp if stamp is not None else time.time())
         pre_state = str(node.interaction.get("state", "unknown"))
         resolved_state, inferred_from_action = _resolved_interaction_state(result)
+        result_state_allowed, result_state_gate_reason = _portal_result_state_gate(
+            node, result, resolved_state
+        )
+        if node.type == "portal" and str(resolved_state or "").casefold() in {
+            "open",
+            "opened",
+            "ajar",
+            "static_open",
+        }:
+            node.attributes["portal_result_state_gate"] = {
+                "accepted": bool(result_state_allowed),
+                "requested_state": str(resolved_state or "").casefold(),
+                "reason": result_state_gate_reason,
+                "event_id": str(result.get("event_id") or ""),
+            }
+        if not result_state_allowed:
+            resolved_state = None
+            inferred_from_action = False
         observed_step = result.get(
             "capture_step",
             result.get("step", result.get("result_published_step")),
@@ -831,11 +926,6 @@ class InteractionGraphStore:
 
     @staticmethod
     def _expanded_room_geometry(accepted_center, accepted_size, center, size):
-        if (
-            float(size[0]) <= float(accepted_size[0]) + 1e-6
-            and float(size[1]) <= float(accepted_size[1]) + 1e-6
-        ):
-            return list(accepted_center), list(accepted_size)
         old_min_x = float(accepted_center[0]) - 0.5 * float(accepted_size[0])
         old_max_x = float(accepted_center[0]) + 0.5 * float(accepted_size[0])
         old_min_y = float(accepted_center[1]) - 0.5 * float(accepted_size[1])
@@ -844,6 +934,13 @@ class InteractionGraphStore:
         new_max_x = float(center[0]) + 0.5 * float(size[0])
         new_min_y = float(center[1]) - 0.5 * float(size[1])
         new_max_y = float(center[1]) + 0.5 * float(size[1])
+        if (
+            new_min_x >= old_min_x - 1e-6
+            and new_max_x <= old_max_x + 1e-6
+            and new_min_y >= old_min_y - 1e-6
+            and new_max_y <= old_max_y + 1e-6
+        ):
+            return list(accepted_center), list(accepted_size)
         min_x, max_x = min(old_min_x, new_min_x), max(old_max_x, new_max_x)
         min_y, max_y = min(old_min_y, new_min_y), max(old_max_y, new_max_y)
         return (
@@ -973,12 +1070,18 @@ class InteractionGraphStore:
             bool(patch.get("interactable", False)),
             is_visual_mllm_patch=is_visual_mllm_patch,
         )
+        portal_type_locked, portal_hysteresis_reason = _portal_m1_type_hysteresis(
+            node,
+            interaction_class,
+            is_visual_mllm_patch=is_visual_mllm_patch,
+        )
         if (
             not has_verified_interaction_state
             and confidence >= 0.5
             and interaction_class in {"portal", "container", "support", "object"}
             and not portal_promotion_rejected
             and not container_type_locked
+            and not portal_type_locked
         ):
             node.type = interaction_class
         parts = list(patch.get("interaction_parts") or [])
@@ -1022,6 +1125,17 @@ class InteractionGraphStore:
             node.attributes["mllm_container_state_rejected"] = bool(
                 container_state_rejected
             )
+        if is_visual_mllm_patch and (
+            node.type == "portal" or observed_topology_type == "portal"
+        ):
+            node.attributes["mllm_portal_type_hysteresis"] = {
+                "locked_type": "portal",
+                "requested_type": interaction_class or "unknown",
+                "accepted": not bool(portal_type_locked),
+                "reason": portal_hysteresis_reason,
+                "observation_capture_step": patch_frame_index,
+            }
+            node.attributes["mllm_portal_type_locked"] = True
         # M1 owns the pre-interaction visual state. Persist its compact public
         # contract so candidate generation can derive an approach from the
         # observed view rather than from a simulator/oracle orientation.
@@ -1051,7 +1165,7 @@ class InteractionGraphStore:
             )
             node.attributes["approach_source"] = node.attributes["view_state_source"]
             node.attributes["attribute_is_current"] = True
-        if container_state_rejected:
+        if container_state_rejected or portal_type_locked:
             # The crop is still useful as a reason to re-observe, but its
             # contradictory class/state must not make a fridge or drawer
             # disappear from the interaction graph for this frame.
@@ -1091,6 +1205,7 @@ class InteractionGraphStore:
             and latest_operation_stamp <= patch_stamp
             and is_visual_mllm_patch
             and not container_state_rejected
+            and not portal_type_locked
         )
         if state_was_updated:
             patch_state = str(
@@ -1826,8 +1941,8 @@ class InteractionGraphStore:
                 0.5 * self.room_box_height,
             ]
             size = [
-                max(resolution, float(xs.max() - xs.min())),
-                max(resolution, float(ys.max() - ys.min())),
+                max(resolution, float(xs.max() - xs.min()) + resolution),
+                max(resolution, float(ys.max() - ys.min()) + resolution),
                 self.room_box_height,
             ]
             room_confidence_mask = member_mask & confidence_available
@@ -2024,33 +2139,84 @@ class InteractionGraphStore:
         candidate = self.room_geometry_candidates.get(room_id)
         if candidate is None:
             candidate = {
+                # ``center``/``size`` are a pending relock proposal.  The
+                # public room box is intentionally not driven by every room
+                # grid publication: exploration grows a room one fringe cell
+                # at a time and that made the box visibly walk every frame.
                 "center": list(center),
                 "size": list(size),
-                "count": 1,
+                "count": 0,
                 "accepted_center": list(center),
                 "accepted_size": list(size),
             }
             self.room_geometry_candidates[room_id] = candidate
             return list(center), list(size)
+
+        proposed_center, proposed_size = self._expanded_room_geometry(
+            candidate["accepted_center"],
+            candidate["accepted_size"],
+            center,
+            size,
+        )
         if self._room_geometry_close(
-            candidate["center"], candidate["size"], center, size
+            candidate["accepted_center"],
+            candidate["accepted_size"],
+            proposed_center,
+            proposed_size,
+        ) and all(
+            abs(float(proposed_size[index]) - float(candidate["accepted_size"][index]))
+            <= 1e-6
+            for index in (0, 1)
         ):
-            candidate["count"] += 1
-        else:
-            candidate["count"] = 1
-        candidate["center"] = list(center)
-        candidate["size"] = list(size)
+            # A shrink or an observation already contained by the accepted box
+            # is not a new proposal.  Clear any transient expansion streak.
+            candidate["center"] = list(candidate["accepted_center"])
+            candidate["size"] = list(candidate["accepted_size"])
+            candidate["count"] = 0
+            self.room_geometry_candidates[room_id] = candidate
+            return list(candidate["accepted_center"]), list(candidate["accepted_size"])
+
+        # Exploration normally grows a room by a different fringe on every
+        # frame.  Requiring those evolving boxes to be mutually close resets
+        # the confirmation streak forever, so the public box can remain stale
+        # while the segmentation visibly expands.  Accumulate consecutive
+        # expansion observations into one monotonic pending union instead.
+        # This still batches public updates and never admits a shrink/jump.
+        pending_center, pending_size = self._expanded_room_geometry(
+            candidate["center"],
+            candidate["size"],
+            proposed_center,
+            proposed_size,
+        )
+        candidate["count"] += 1
+        candidate["center"] = list(pending_center)
+        candidate["size"] = list(pending_size)
         if candidate["count"] >= max(1, int(stability_frames)):
-            candidate["accepted_center"], candidate["accepted_size"] = (
-                self._expanded_room_geometry(
-                    candidate["accepted_center"],
-                    candidate["accepted_size"],
-                    center,
-                    size,
-                )
-            )
+            candidate["accepted_center"] = list(pending_center)
+            candidate["accepted_size"] = list(pending_size)
+            # A committed checkpoint starts a new streak.  Without this reset,
+            # count remains above the threshold and every later frame mutates
+            # the public box again.
+            candidate["count"] = 0
         self.room_geometry_candidates[room_id] = candidate
         return list(candidate["accepted_center"]), list(candidate["accepted_size"])
+
+    @staticmethod
+    def _room_geometry_relock_close(old_center, old_size, center, size):
+        """Whether two pending room boxes represent the same stable proposal."""
+
+        center_delta = math.hypot(
+            float(old_center[0]) - float(center[0]),
+            float(old_center[1]) - float(center[1]),
+        )
+        size_delta = max(
+            abs(float(old_size[0]) - float(size[0])),
+            abs(float(old_size[1]) - float(size[1])),
+        )
+        # Half-cell scale jitter must settle before it changes graph geometry.
+        # These limits are deliberately much tighter than identity matching in
+        # ``_room_geometry_close``.
+        return center_delta <= 0.05 and size_delta <= 0.10
 
     @staticmethod
     def _room_geometry_close(old_center, old_size, center, size):
@@ -2078,6 +2244,7 @@ class InteractionGraphStore:
             primary = self._resolve_room_id(primary)
             if secondary == primary:
                 continue
+            self._merge_room_geometry_memory(secondary, primary)
             self.room_redirects[secondary] = primary
             old_node = self.nodes.get(f"room_{secondary}")
             if old_node is not None:
@@ -2091,6 +2258,50 @@ class InteractionGraphStore:
                     node.attributes["connected_room_ids"] = sorted(
                         {self._resolve_room_id(room_id) for room_id in room_ids}
                     )
+
+    def _merge_room_geometry_memory(self, secondary, primary):
+        """Move both public room extents behind the surviving stable room ID."""
+
+        def accepted_geometry(room_id):
+            candidate = self.room_geometry_candidates.get(room_id)
+            if candidate is not None:
+                return (
+                    list(candidate["accepted_center"]),
+                    list(candidate["accepted_size"]),
+                )
+            node = self.nodes.get(f"room_{room_id}")
+            if node is not None:
+                return list(node.aabb_center), list(node.aabb_size)
+            return None
+
+        primary_geometry = accepted_geometry(primary)
+        secondary_geometry = accepted_geometry(secondary)
+        if primary_geometry is None and secondary_geometry is None:
+            return
+        if primary_geometry is None:
+            merged_center, merged_size = secondary_geometry
+        elif secondary_geometry is None:
+            merged_center, merged_size = primary_geometry
+        else:
+            merged_center, merged_size = self._expanded_room_geometry(
+                primary_geometry[0],
+                primary_geometry[1],
+                secondary_geometry[0],
+                secondary_geometry[1],
+            )
+        self.room_geometry_candidates[primary] = {
+            "center": list(merged_center),
+            "size": list(merged_size),
+            "count": 0,
+            "accepted_center": list(merged_center),
+            "accepted_size": list(merged_size),
+        }
+        self.room_geometry_candidates.pop(secondary, None)
+        primary_node = self.nodes.get(f"room_{primary}")
+        if primary_node is not None:
+            primary_node.centroid = list(merged_center)
+            primary_node.aabb_center = list(merged_center)
+            primary_node.aabb_size = list(merged_size)
 
     def _refresh_missing_room_nodes_from_observations(self):
         room_to_nodes = defaultdict(list)
@@ -2117,9 +2328,15 @@ class InteractionGraphStore:
             center[2] = 0.5 * self.room_box_height
             size = [max(max_corner[i] - min_corner[i], 0.1) for i in range(3)]
             size[2] = self.room_box_height
-            room_node.centroid = center
-            room_node.aabb_center = center
-            room_node.aabb_size = size
+            stable_center, stable_size = self._accept_room_geometry(
+                room_id,
+                center,
+                size,
+                self.room_geometry_stability_frames,
+            )
+            room_node.centroid = stable_center
+            room_node.aabb_center = stable_center
+            room_node.aabb_size = stable_size
             room_node.attributes["estimated_from_observations"] = True
             room_node.attributes["cell_count"] = len(child_nodes)
 
