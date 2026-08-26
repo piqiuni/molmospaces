@@ -1,0 +1,8 @@
+# unitree_sdk2py and cyclonedds are supplied by the Go2 image/SDK checkout.
+websocket-client==1.8.0
+
+# Voice intercom dependencies are deployed under /home/unitree/uni_control/vendor.
+# Keep them isolated from the Unitree system Python packages.
+aiortc==1.9.0
+edge-tts==7.2.8
+sherpa-onnx==1.13.2

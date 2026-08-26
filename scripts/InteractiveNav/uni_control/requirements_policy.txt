@@ -1,0 +1,3 @@
+websockets>=14,<17
+# ROS continuous mode additionally needs the system ROS 1 packages:
+# rospy and geometry_msgs (not installed with pip).
