@@ -115,6 +115,20 @@ class PhysicalRosGateway:
         return {"x": float(point[0]), "y": float(point[1]), "z": float(point[2])}
 
     @staticmethod
+    def _point3(value: Any) -> tuple[float, float, float] | None:
+        if isinstance(value, dict):
+            try:
+                return tuple(float(value.get(axis, 0.0)) for axis in ("x", "y", "z"))
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, (list, tuple)) and len(value) >= 3:
+            try:
+                return tuple(float(item) for item in value[:3])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @staticmethod
     def _rotate_point(quaternion: Any, point: tuple[float, float, float]) -> tuple[float, float, float]:
         x, y, z, w = (float(quaternion.x), float(quaternion.y), float(quaternion.z), float(quaternion.w))
         px, py, pz = point
@@ -152,6 +166,25 @@ class PhysicalRosGateway:
         mapped["world_box3d_center"] = self._point_dict(translated)
         mapped["aabb_center"] = [translated[0], translated[1], translated[2]]
         mapped["box3d_center"] = [translated[0], translated[1], translated[2]]
+        source_size = self._point3(detection.get("camera_box3d_size"))
+        if source_size is not None:
+            transformed_corners = []
+            for sx in (-0.5, 0.5):
+                for sy in (-0.5, 0.5):
+                    for sz in (-0.5, 0.5):
+                        corner = (point[0] + sx * abs(source_size[0]), point[1] + sy * abs(source_size[1]), point[2] + sz * abs(source_size[2]))
+                        rotated = self._rotate_point(transform.transform.rotation, corner)
+                        transformed_corners.append((rotated[0] + float(transform.transform.translation.x), rotated[1] + float(transform.transform.translation.y), rotated[2] + float(transform.transform.translation.z)))
+            mins = tuple(min(corner[index] for corner in transformed_corners) for index in range(3))
+            maxs = tuple(max(corner[index] for corner in transformed_corners) for index in range(3))
+            map_center = tuple((mins[index] + maxs[index]) / 2.0 for index in range(3))
+            map_size = tuple(max(maxs[index] - mins[index], 0.01) for index in range(3))
+            mapped["world_box3d_center"] = self._point_dict(map_center)
+            mapped["aabb_center"] = list(map_center)
+            mapped["box3d_center"] = list(map_center)
+            mapped["world_box3d_size"] = self._point_dict(map_size)
+            mapped["aabb_size"] = list(map_size)
+            mapped["box3d_size"] = list(map_size)
         mapped["map_frame"] = self.world_frame
         mapped["map_transform_status"] = "tf"
         mapped["map_transform_source_frame"] = source_frame
