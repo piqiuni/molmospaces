@@ -132,7 +132,7 @@ class SemanticCandidateNode:
                 ),
                 portal_standoff_m=float(config.get("portal_standoff_m", 1.0)),
                 portal_traversal_distance_m=float(
-                    config.get("portal_traversal_distance_m", 0.9)
+                    config.get("portal_traversal_distance_m", 0.8)
                 ),
                 portal_traversal_max_start_distance_m=float(
                     config.get("portal_traversal_max_start_distance_m", 2.0)

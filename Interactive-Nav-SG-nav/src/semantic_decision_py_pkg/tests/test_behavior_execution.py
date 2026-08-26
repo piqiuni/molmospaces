@@ -10,6 +10,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
     NavigationProgressWatchdog,
+    SemanticNavigationProgressSupervisor,
     PostInteractionCostmapBaseline,
     PostInteractionRawMapBarrier,
     STATE_APPROACH_INTERACTION,
@@ -229,6 +230,81 @@ def test_navigation_progress_watchdog_uses_public_task_steps_when_available() ->
     assert not watchdog.observe(
         (0.11, 0.0, 0.0), now=100.0, task_step_index=30
     )
+
+
+def test_semantic_progress_supervisor_survives_worker_and_anchor_changes() -> None:
+    supervisor = SemanticNavigationProgressSupervisor(
+        subgoal_timeout_task_steps=6,
+        mission_timeout_task_steps=18,
+        min_displacement_m=0.10,
+    )
+
+    first = supervisor.observe(
+        subgoal_key="drawer|staging|0",
+        pose=(0.0, 0.0, 0.0),
+        task_step_index=10,
+        goal_distance_m=2.0,
+    )
+    assert not first["subgoal_stalled"]
+    # A private waypoint worker retains the same semantic key, so it does not
+    # restart the k-step timer.
+    stalled = supervisor.observe(
+        subgoal_key="drawer|staging|0",
+        pose=(0.01, 0.0, 0.0),
+        task_step_index=16,
+        goal_distance_m=1.995,
+    )
+    assert stalled["subgoal_stalled"]
+    assert not stalled["mission_stalled"]
+
+    # Changing anchor resets only the local timer.  The 3*k mission timer is
+    # intentionally continuous while the base remains in the same place.
+    assert not supervisor.observe(
+        subgoal_key="drawer|staging|15",
+        pose=(0.01, 0.0, 0.0),
+        task_step_index=17,
+        goal_distance_m=1.5,
+    )["subgoal_stalled"]
+    mission_stall = supervisor.observe(
+        subgoal_key="fridge|staging|3",
+        pose=(0.02, 0.0, 0.0),
+        task_step_index=28,
+        goal_distance_m=3.0,
+    )
+    assert mission_stall["mission_stalled"]
+
+
+def test_semantic_progress_supervisor_accepts_shortest_yaw_and_translation_progress() -> None:
+    supervisor = SemanticNavigationProgressSupervisor(
+        subgoal_timeout_task_steps=6,
+        mission_timeout_task_steps=18,
+        min_displacement_m=0.10,
+        min_yaw_error_reduction_rad=0.02,
+    )
+    supervisor.observe(
+        subgoal_key="door|navigation|0",
+        pose=(0.0, 0.0, 0.0),
+        task_step_index=0,
+        goal_distance_m=1.0,
+        yaw_error_rad=1.0,
+        allow_yaw_progress=True,
+    )
+    assert not supervisor.observe(
+        subgoal_key="door|navigation|0",
+        pose=(0.0, 0.0, 0.2),
+        task_step_index=5,
+        goal_distance_m=1.0,
+        yaw_error_rad=0.95,
+        allow_yaw_progress=True,
+    )["subgoal_stalled"]
+    assert not supervisor.observe(
+        subgoal_key="door|navigation|0",
+        pose=(0.11, 0.0, 0.2),
+        task_step_index=11,
+        goal_distance_m=0.9,
+        yaw_error_rad=0.95,
+        allow_yaw_progress=True,
+    )["mission_stalled"]
 
 
 def test_stuck_recovery_accepts_repeated_no_progress_plan_failures() -> None:

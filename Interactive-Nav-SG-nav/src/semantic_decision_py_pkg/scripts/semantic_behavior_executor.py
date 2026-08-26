@@ -15,6 +15,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     BehaviorExecutionStateMachine,
     ExecutionConfig,
     NavigationProgressWatchdog,
+    SemanticNavigationProgressSupervisor,
     PostInteractionCostmapBaseline,
     PostInteractionPlanningMapBarrier,
     PostInteractionRawMapBarrier,
@@ -31,6 +32,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     candidate_with_effective_interaction_approach,
     committed_turn_sign,
     container_two_stage_action_goal_options_for_staging,
+    container_two_stage_face_indices,
     container_two_stage_m1_anchor_priority,
     container_two_stage_m1_preflight_batch_indices,
     container_two_stage_next_m1_viewpoint_index,
@@ -572,7 +574,7 @@ class SemanticBehaviorExecutor:
         # wall-clock timeout.
         self.container_m1_same_pose_flip_retry_count = max(
             0,
-            int(config.get("container_m1_same_pose_flip_retry_count", 1)),
+            int(config.get("container_m1_same_pose_flip_retry_count", 0)),
         )
         startup_scan_config = rospy.get_param("~startup_scan", {}) or {}
         self.startup_scan_enabled = bool(startup_scan_config.get("enabled", False))
@@ -1123,6 +1125,27 @@ class SemanticBehaviorExecutor:
             0.1,
             float(config.get("navigation_step_sync_stall_timeout_s", 5.0)),
         )
+        self.semantic_progress_supervisor_enabled = bool(
+            config.get("semantic_progress_supervisor_enabled", True)
+        )
+        self.semantic_subgoal_no_progress_task_steps = max(
+            1,
+            int(
+                config.get(
+                    "semantic_subgoal_no_progress_task_steps",
+                    self.navigation_stagnation_timeout_task_steps,
+                )
+            ),
+        )
+        self.semantic_mission_no_progress_task_steps = max(
+            self.semantic_subgoal_no_progress_task_steps,
+            int(
+                config.get(
+                    "semantic_mission_no_progress_task_steps",
+                    3 * self.semantic_subgoal_no_progress_task_steps,
+                )
+            ),
+        )
         self.interaction_approach_fallback_max_attempts = max(
             1,
             int(config.get("interaction_approach_fallback_max_attempts", 4)),
@@ -1172,6 +1195,15 @@ class SemanticBehaviorExecutor:
         self._navigation_run_sequence = 0
         self._navigation_result_sources: dict[tuple[str, int], dict] = {}
         self._active_navigation_run_tokens: dict[str, int] = {}
+        self._semantic_navigation_progress = SemanticNavigationProgressSupervisor(
+            subgoal_timeout_task_steps=self.semantic_subgoal_no_progress_task_steps,
+            mission_timeout_task_steps=self.semantic_mission_no_progress_task_steps,
+            min_displacement_m=self.navigation_stagnation_distance_m,
+            min_goal_distance_reduction_m=(
+                self.navigation_stagnation_goal_distance_reduction_m
+            ),
+            min_yaw_error_reduction_rad=0.02,
+        )
         # A dynamic-reconfigure tolerance change belongs to exactly one direct
         # M1 capture worker.  Keep this lock separate from ``self.lock`` so a
         # bounded ROS service call cannot block selection/state callbacks.
@@ -2588,7 +2620,7 @@ class SemanticBehaviorExecutor:
                             getattr(
                                 self,
                                 "container_pre_action_confirmation_count",
-                                1,
+                                0,
                             )
                             or 1
                         ),
@@ -2897,10 +2929,85 @@ class SemanticBehaviorExecutor:
         selected_option_index = max(
             0, int(metadata.get("interaction_approach_goal_option_index", 0) or 0)
         )
+        if failure_reason == "interaction_wrong_face" and two_stage_inner:
+            try:
+                completed_staging_index = max(
+                    0,
+                    int(
+                        metadata.get(
+                            "container_two_stage_staging_goal_option_index", 0
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                completed_staging_index = 0
+            rejected = {
+                int(value)
+                for value in list(
+                    metadata.get("container_m1_rejected_face_staging_indices") or []
+                )
+                if str(value).lstrip("-").isdigit()
+            }
+            rejected.update(
+                container_two_stage_face_indices(candidate, completed_staging_index)
+            )
+            metadata = dict(metadata)
+            metadata["container_m1_rejected_face_staging_indices"] = sorted(rejected)
+            metadata["interaction_observation_resolved"] = False
+            metadata["interaction_observation_attempts"] = 0
+            metadata.pop("m1_front_axis_xy", None)
+            metadata.pop("m1_front_yaw", None)
+            candidate["metadata"] = metadata
+            self.machine.candidate = candidate
+            self.selection = dict(candidate)
+            excluded = set(rejected)
+            for key in (
+                "container_m1_unavailable_staging_indices",
+                "interaction_observation_viewpoint_staging_indices",
+            ):
+                for value in list(metadata.get(key) or []):
+                    try:
+                        excluded.add(int(value))
+                    except (TypeError, ValueError):
+                        continue
+            next_staging_index = container_two_stage_next_m1_viewpoint_index(
+                candidate, excluded_indices=excluded
+            )
+            if next_staging_index is not None:
+                commands = self.machine.retry_container_two_stage_staging(
+                    next_staging_goal_option_index=next_staging_index,
+                    interaction_approach_attempts=[],
+                    detail={
+                        "reason": "interaction_wrong_face",
+                        "rejected_face_staging_indices": sorted(rejected),
+                    },
+                )
+                if commands:
+                    accepted_by_decision = getattr(
+                        self, "_container_m1_last_accepted_evidence", None
+                    )
+                    if isinstance(accepted_by_decision, dict):
+                        accepted_by_decision.pop(
+                            str(candidate.get("decision_id") or ""), None
+                        )
+                    self.selection = dict(self.machine.candidate or candidate)
+                    return commands
+            return self.machine.on_interaction_result(
+                False,
+                detail={
+                    **payload,
+                    "reason": "interaction_wrong_face_options_exhausted",
+                    "failure_reason": "interaction_wrong_face_options_exhausted",
+                    "failure_stage": "interaction_approach_exhausted",
+                    "container_m1_rejected_face_staging_indices": sorted(rejected),
+                },
+            )
         if attempts:
             attempts[-1]["outcome"] = (
                 "unsafe_open_sweep"
                 if failure_reason == "unsafe_open_sweep"
+                else "interaction_wrong_face"
+                if failure_reason == "interaction_wrong_face"
                 else "interaction_pose_invalid"
             )
             attempts[-1]["bridge_pose_validation"] = dict(
@@ -2920,6 +3027,8 @@ class SemanticBehaviorExecutor:
                     "outcome": (
                         "unsafe_open_sweep"
                         if failure_reason == "unsafe_open_sweep"
+                        else "interaction_wrong_face"
+                        if failure_reason == "interaction_wrong_face"
                         else "interaction_pose_invalid"
                     ),
                     "bridge_pose_validation": dict(
@@ -3010,6 +3119,8 @@ class SemanticBehaviorExecutor:
             "reason": (
                 "unsafe_open_sweep"
                 if failure_reason == "unsafe_open_sweep"
+                else "interaction_wrong_face"
+                if failure_reason == "interaction_wrong_face"
                 else "interaction_pose_invalid"
             ),
             "interaction_pose_validation": dict(
@@ -4414,6 +4525,18 @@ class SemanticBehaviorExecutor:
                 )[:160],
                 "request_id": request_id,
             }
+            actual_observation_pose = None
+            if getattr(self, "tf_listener", None) is not None:
+                actual_observation_pose = self._current_pose(
+                    str(getattr(self, "map_frame", "map") or "map")
+                )
+            if actual_observation_pose is not None:
+                # Public pose is consumed only by Module 1's local evidence
+                # selector to reject duplicate viewpoints. It is deliberately
+                # omitted from the model prompt and attribute response.
+                request["observation_pose_xyyaw"] = [
+                    float(value) for value in actual_observation_pose
+                ]
             if self._is_container_pre_action_candidate(self.machine.candidate):
                 # Public graph/candidate semantics constrain only the M1 class
                 # contract for this targeted re-observation.  M1 still decides
@@ -8627,6 +8750,39 @@ class SemanticBehaviorExecutor:
         )
         return True
 
+    @staticmethod
+    def _semantic_navigation_subgoal_key(
+        candidate: dict, selected_goal_option_index: int | None
+    ) -> str:
+        """Return a stable semantic key across private waypoint workers."""
+
+        metadata = dict(candidate.get("metadata") or {})
+        target_key = str(
+            candidate.get("target_id")
+            or metadata.get("interaction_target_id")
+            or candidate.get("candidate_id")
+            or "navigation"
+        )
+        phase = str(metadata.get("container_two_stage_phase") or "navigation")
+        raw_index = metadata.get(
+            "container_two_stage_staging_goal_option_index",
+            metadata.get(
+                "interaction_approach_goal_option_index",
+                selected_goal_option_index if selected_goal_option_index is not None else 0,
+            ),
+        )
+        try:
+            option_index = int(raw_index)
+        except (TypeError, ValueError):
+            option_index = int(selected_goal_option_index or 0)
+        # A private inner-corridor waypoint belongs to the same selected anchor;
+        # do not let its worker/run token restart the semantic timer.
+        if bool(metadata.get("container_inner_corridor_navigation", False)):
+            phase = "staging" if bool(
+                metadata.get("container_inner_corridor_shared_staging", False)
+            ) else phase
+        return f"{target_key}|{phase}|{option_index}"
+
     def _run_navigation(
         self,
         decision_id: str,
@@ -9372,6 +9528,9 @@ class SemanticBehaviorExecutor:
             )
             return
         x, y, yaw = selected_goal
+        semantic_subgoal_key = self._semantic_navigation_subgoal_key(
+            candidate, selected_goal_option_index
+        )
         interaction_approach_attempt_history = list(interaction_approach_attempts)
         if str(behavior_type).upper() == "INTERACT":
             candidate = self._candidate_with_interaction_preflight_debug(
@@ -9769,6 +9928,7 @@ class SemanticBehaviorExecutor:
                 navigation_started_at, now
             )
             beneficial_yaw_progress = False
+            semantic_yaw_error_rad = None
             if pose is not None and latest_task_step_index is not None:
                 desired_heading = None
                 if (
@@ -9793,6 +9953,7 @@ class SemanticBehaviorExecutor:
                     yaw_error = abs(
                         normalize_angle(desired_heading - float(pose[2]))
                     )
+                    semantic_yaw_error_rad = yaw_error
                     target_changed = bool(
                         yaw_progress_target_rad is None
                         or abs(
@@ -10269,6 +10430,56 @@ class SemanticBehaviorExecutor:
                 and goal_distance_m is not None
                 and goal_distance_m <= self.final_align_max_distance_m
             )
+            semantic_progress_detail = {"subgoal_stalled": False, "mission_stalled": False}
+            if bool(getattr(self, "semantic_progress_supervisor_enabled", False)):
+                with self.lock:
+                    supervisor = getattr(self, "_semantic_navigation_progress", None)
+                    if supervisor is not None:
+                        semantic_progress_detail = supervisor.observe(
+                        subgoal_key=semantic_subgoal_key,
+                        pose=pose,
+                        task_step_index=latest_task_step_index,
+                        goal_distance_m=goal_distance_m,
+                        yaw_error_rad=semantic_yaw_error_rad,
+                        allow_yaw_progress=semantic_yaw_error_rad is not None,
+                    )
+            if bool(
+                semantic_progress_detail.get("subgoal_stalled")
+                or semantic_progress_detail.get("mission_stalled")
+            ):
+                self.move_base.cancel_goal()
+                semantic_stall_detail = {
+                    "reason": "semantic_subgoal_no_progress",
+                    "failure_reason": "semantic_subgoal_no_progress",
+                    "retryable": not bool(
+                        semantic_progress_detail.get("mission_stalled")
+                    ),
+                    "semantic_mission_no_progress": bool(
+                        semantic_progress_detail.get("mission_stalled")
+                    ),
+                    "goal_distance_m": goal_distance_m,
+                    "local_plan_fresh": local_plan_fresh,
+                    "interaction_approach_attempts": (
+                        interaction_approach_attempt_history
+                    ),
+                    **semantic_progress_detail,
+                }
+                # A mission-level stall is terminal by construction.  For a
+                # single stalled anchor, keep the existing bounded container
+                # scheduler but never re-enter the same private waypoint.
+                if not semantic_stall_detail["semantic_mission_no_progress"] and (
+                    self._retry_interaction_approach(
+                        decision_id,
+                        candidate,
+                        selected_goal_option_index,
+                        interaction_approach_attempt_history,
+                        len(goal_options),
+                        semantic_stall_detail,
+                    )
+                ):
+                    return
+                report_result(False, semantic_stall_detail)
+                return
             if now < stagnation_not_before:
                 # The executor's rear-safe turn has completed, but DWA may need
                 # several more yaw-only actions before it begins translation.
@@ -11792,6 +12003,17 @@ class SemanticBehaviorExecutor:
         detail = dict(detail or {})
         if not self._navigation_run_is_active(decision_id, navigation_run_token):
             return
+        if success and bool(
+            getattr(self, "semantic_progress_supervisor_enabled", False)
+        ):
+            progress_pose = self._current_pose(self.map_frame)
+            with self.lock:
+                progress_step = self._public_step_or_none(
+                    getattr(self, "_latest_step_sync_index", None)
+                )
+                supervisor = getattr(self, "_semantic_navigation_progress", None)
+                if supervisor is not None:
+                    supervisor.note_success(progress_pose, progress_step)
         self._clear_rear_dwa_monitor(decision_id)
         if self._consume_container_inner_corridor_result(
             decision_id, success, detail, candidate=source_candidate
@@ -11854,6 +12076,7 @@ class SemanticBehaviorExecutor:
                 if approach_reason in {
                     "make_plan_unreachable",
                     "navigation_stagnation",
+                    "semantic_subgoal_no_progress",
                     "navigation_step_sync_stall",
                     "navigation_timeout",
                     "navigation_terminal_failure",

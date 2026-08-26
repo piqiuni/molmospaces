@@ -141,6 +141,43 @@ def test_empty_candidate_stream_reobserves_remembered_invisible_portal() -> None
     assert candidates[0].metadata["reobserve_interaction_target"] is True
 
 
+def test_remembered_invisible_portal_remains_interaction_candidate_when_enabled() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_require_current_visibility=False,
+            remembered_portal_reobservation_enabled=False,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_hidden",
+                "type": "portal",
+                "name": "door",
+                "centroid": [2.0, 0.0, 1.0],
+                "aabb_size": [0.1, 1.0, 2.0],
+                "state_age_sec": 1.0,
+                "is_currently_visible": False,
+                "attributes": {},
+                "interaction": {
+                    "requires_interaction": True,
+                    "is_interactable": True,
+                    "state": "closed",
+                    "state_confidence": 0.9,
+                    "capability": "confirmed",
+                },
+            }
+        ]
+    }
+
+    candidates = generator.generate({}, graph, (0.0, 0.0))
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "interaction:portal_hidden:open"
+    ]
+
+
 def test_generator_combines_frontiers_and_closed_portals() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(interaction_types=("portal",), portal_standoff_m=1.15)
@@ -1236,6 +1273,37 @@ def test_multi_drawer_metadata_emits_id_only_open_candidate() -> None:
     assert "sequence_type" not in command
     assert math.isclose(candidates[0].goal_xyyaw[0], 0.0, abs_tol=1e-6)
     assert candidates[0].metadata["interaction_standoff_m"] == 1.0
+
+
+def test_completed_drawer_scan_is_not_regenerated_from_closed_state() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("container",))
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "container_drawers",
+                "type": "container",
+                "name": "dresser",
+                "centroid": [1.0, 0.0, 0.5],
+                "aabb_center": [1.0, 0.0, 0.5],
+                "aabb_size": [0.6, 0.4, 1.0],
+                "state_age_sec": 0.0,
+                "is_currently_visible": False,
+                "attributes": {"source_object_name": "dresser_1"},
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                    "drawer_scan_completed": True,
+                    "drawer_scan_covered_region_count": 3,
+                },
+            }
+        ]
+    }
+
+    assert generator.generate({}, graph, robot_xy=(0.0, 0.0)) == []
 
 
 def test_legacy_completed_drawer_groups_do_not_shape_planner_command() -> None:
@@ -2807,8 +2875,8 @@ def test_container_same_room_filter_rejects_closed_room_transition() -> None:
     assert generator.generate({}, graph, robot_xy=(1.0, 0.0)) == []
 
 
-def test_invisible_unreachable_container_is_not_an_interaction_candidate() -> None:
-    """A stale container in a disconnected room cannot create INTERACT."""
+def test_invisible_unreachable_container_remains_graph_interaction_candidate() -> None:
+    """Reachability is execution metadata and must not erase a graph target."""
 
     generator = CandidateGenerator(
         CandidateGeneratorConfig(interaction_types=("container",))
@@ -2858,7 +2926,11 @@ def test_invisible_unreachable_container_is_not_an_interaction_candidate() -> No
         ],
     }
 
-    assert generator.generate({}, graph, robot_xy=(1.0, 0.0)) == []
+    candidates = generator.generate({}, graph, robot_xy=(1.0, 0.0))
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "interaction:container_dresser:open"
+    ]
+    assert candidates[0].metadata["room_reachable"] is False
 
 
 def test_target_same_room_filter_allows_traversable_room_transition() -> None:

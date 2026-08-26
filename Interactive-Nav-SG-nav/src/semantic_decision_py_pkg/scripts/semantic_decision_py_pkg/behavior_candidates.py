@@ -114,7 +114,7 @@ class CandidateGeneratorConfig:
     # or more fresh observations before an action can be dispatched.
     portal_unknown_observation_max_attempts: int = 2
     portal_standoff_m: float = 1.0
-    portal_traversal_distance_m: float = 0.9
+    portal_traversal_distance_m: float = 0.8
     portal_traversal_max_start_distance_m: float = 2.0
     portal_traversal_completion_margin_m: float = 0.35
     container_standoff_m: float = 1.0
@@ -1432,17 +1432,17 @@ class CandidateGenerator:
             node_room_id = node.get("room_id")
             allow_connected_room = bool(self.config.container_allow_connected_room)
             room_hops = self._room_hops(graph, robot_room_id, node_room_id)
-            # A remembered container can remain in the graph after it leaves
-            # the current camera view.  Do not turn that stale observation
-            # into a physical INTERACT request when the observed room graph
-            # also has no reachable route to it.  This is deliberately a
-            # conjunction: a visible container or a reachable remembered one
-            # may still be useful for planning.
+            # Graph interaction targets are remembered planning facts. Current
+            # visibility and room reachability affect execution/preflight, not
+            # candidate existence; otherwise a transient camera/room revision
+            # makes pending subgoals disappear from the global candidate set.
             if (
                 node_type == "container"
-                and node.get("is_currently_visible") is False
-                and room_hops is None
+                and bool(interaction.get("drawer_scan_completed", False))
             ):
+                # A scan deliberately restores physical state to closed. Its
+                # completion therefore has a separate persistent flag and must
+                # not be regenerated merely because ``state == closed``.
                 continue
             if (
                 node_type == "container"

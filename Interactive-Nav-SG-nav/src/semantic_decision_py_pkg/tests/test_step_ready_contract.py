@@ -19,9 +19,25 @@ pytest.importorskip("rospy")
 from semantic_rule_decision_node import (
     SemanticRuleDecisionNode,
     aggregate_step_ready_states,
+    container_anchor_step_cooldown_active,
     is_completed_drawer_scan_candidate,
     successful_drawer_scan_feedback,
 )
+
+
+def test_container_anchor_step_cooldown_is_deterministic() -> None:
+    deadlines = {"interaction_target:fridge": 420}
+
+    assert container_anchor_step_cooldown_active(
+        "interaction_target:fridge", 119, deadlines
+    )
+    assert container_anchor_step_cooldown_active(
+        "interaction_target:fridge", 419, deadlines
+    )
+    assert not container_anchor_step_cooldown_active(
+        "interaction_target:fridge", 420, deadlines
+    )
+    assert not container_anchor_step_cooldown_active("", 119, deadlines)
 
 
 def _module(step: int, stamp: float, *, ready: bool = True, strict: bool = False):

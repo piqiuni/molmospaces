@@ -69,6 +69,19 @@ import rospy
 from std_msgs.msg import String
 
 
+def container_anchor_step_cooldown_active(
+    target_key: str,
+    observation_step: int,
+    unreachable_until_step: dict[str, int],
+) -> bool:
+    """Whether an unchanged container anchor set is still step-cooled."""
+
+    return bool(
+        target_key
+        and int(observation_step) < int(unreachable_until_step.get(target_key, 0) or 0)
+    )
+
+
 def aggregate_step_ready_states(
     required_modules, states, *, require_exact_source: bool = False
 ):
@@ -298,6 +311,14 @@ class SemanticRuleDecisionNode:
                 )
             ),
         )
+        # Wall time is load-dependent: the same 60 seconds can contain a very
+        # different number of simulator observations under parallel runs.
+        # Keep an additional evaluator-step cooldown so an unchanged container
+        # cannot immediately replay the same exhausted anchor set.
+        self.container_anchor_unreachable_cooldown_steps = max(
+            0,
+            int(config.get("container_anchor_unreachable_cooldown_steps", 300)),
+        )
         configured_m1_cooldown_schedule = config.get(
             "container_m1_inconclusive_cooldown_schedule_s",
             [15.0, 60.0, 180.0],
@@ -308,7 +329,7 @@ class SemanticRuleDecisionNode:
         self.success_cooldown_s = float(config.get("success_cooldown_s", 5.0))
         self.failure_retry_delay_s = float(config.get("failure_retry_delay_s", 2.0))
         self.portal_traversal_distance_m = max(
-            0.0, float(candidate_config.get("portal_traversal_distance_m", 0.9))
+            0.0, float(candidate_config.get("portal_traversal_distance_m", 0.8))
         )
         self.post_interaction_refresh_gate = PostInteractionRefreshGate(
             PostInteractionRefreshConfig(
@@ -540,6 +561,7 @@ class SemanticRuleDecisionNode:
         self.cooldown_until: dict[str, float] = {}
         self.failure_counts: dict[str, int] = {}
         self.container_m1_inconclusive_counts: dict[str, int] = {}
+        self.container_anchor_unreachable_until_step: dict[str, int] = {}
         # Count-bounded executor approach attempts are not object failures.
         # Suppress only the identical candidate fingerprint so another
         # interaction subgoal can be selected immediately, without a timer.
@@ -646,6 +668,7 @@ class SemanticRuleDecisionNode:
                 self.cooldown_until.clear()
                 self.failure_counts.clear()
                 self.container_m1_inconclusive_counts.clear()
+                self.container_anchor_unreachable_until_step.clear()
                 self.approach_exhausted_fingerprints.clear()
                 self.interaction_failure_tracker.reset()
                 self.decision_history.clear()
@@ -740,6 +763,9 @@ class SemanticRuleDecisionNode:
                 self.active_interaction_candidate
             )
         detail = dict(payload.get("detail") or {})
+        semantic_mission_no_progress = bool(
+            detail.get("semantic_mission_no_progress", False)
+        )
         if status == "SUCCEEDED" and self.active_behavior_type == "INTERACT":
             successful_target_id = self._interaction_target_id(candidate_id)
             if successful_target_id:
@@ -876,6 +902,25 @@ class SemanticRuleDecisionNode:
             # so a failed drawer cannot immediately restart at anchor zero.
             if target_id:
                 self.cooldown_until[target_id] = cooldown_deadline
+                if all_container_anchors_unreachable:
+                    current_step = self._observation_step(
+                        self.latest_candidates_payload
+                    )
+                    if not hasattr(
+                        self, "container_anchor_unreachable_until_step"
+                    ):
+                        self.container_anchor_unreachable_until_step = {}
+                    self.container_anchor_unreachable_until_step[target_id] = (
+                        current_step
+                        + int(
+                            getattr(
+                                self,
+                                "container_anchor_unreachable_cooldown_steps",
+                                300,
+                            )
+                            or 0
+                        )
+                    )
         elif (
             candidate_id
             and not preempted_by_target
@@ -1110,6 +1155,21 @@ class SemanticRuleDecisionNode:
         self.active_target_goal = False
         self.preempt_requested_for_decision_id = ""
         self._publish_inactive_selection(payload)
+        if semantic_mission_no_progress:
+            # This signal is produced only after one persistent supervisor has
+            # observed 3*k evaluator steps without material base translation,
+            # across anchor/candidate worker replacements.  Finish cleanly
+            # instead of consuming the remaining horizon in an IDLE/retry loop.
+            self.goal_complete = True
+            self._publish_goal_status(
+                "EXPLORATION_STALLED",
+                detail={
+                    **detail,
+                    "reason": "semantic_mission_no_progress",
+                    "candidate_id": candidate_id,
+                    "decision_id": decision_id,
+                },
+            )
 
     def _candidate_fingerprint_for_id(self, candidate_id: str) -> str:
         """Return the current pose-sensitive fingerprint for an active candidate."""
@@ -2129,6 +2189,9 @@ class SemanticRuleDecisionNode:
     ) -> tuple[list[BehaviorCandidate], dict[str, str]]:
         with self.state_lock:
             cooldown_until = dict(self.cooldown_until)
+            container_anchor_unreachable_until_step = dict(
+                getattr(self, "container_anchor_unreachable_until_step", {})
+            )
             approach_exhausted_fingerprints = set(
                 self.approach_exhausted_fingerprints
             )
@@ -2150,6 +2213,7 @@ class SemanticRuleDecisionNode:
             )
         candidates = []
         rejected: dict[str, str] = {}
+        observation_step = self._observation_step(candidate_snapshot)
         for payload in candidate_snapshot.get("candidates") or []:
             candidate_id = str(payload.get("candidate_id") or "")
             if candidate_id in terminal_interaction_candidate_ids:
@@ -2165,6 +2229,13 @@ class SemanticRuleDecisionNode:
                 rejected[candidate_id] = "drawer_scan_completed"
                 continue
             target_cooldown_key = self._interaction_target_id(candidate_id)
+            if container_anchor_step_cooldown_active(
+                target_cooldown_key,
+                observation_step,
+                container_anchor_unreachable_until_step,
+            ):
+                rejected[candidate_id] = "container_anchor_step_cooldown"
+                continue
             if now < cooldown_until.get(candidate_id, 0.0) or (
                 target_cooldown_key
                 and now < cooldown_until.get(target_cooldown_key, 0.0)
@@ -2211,7 +2282,7 @@ class SemanticRuleDecisionNode:
             candidates,
             graph=candidate_snapshot.get("graph_context") or {},
             history_by_key=region_history,
-            observation_step=self._observation_step(candidate_snapshot),
+            observation_step=observation_step,
         )
         rejected.update(curator_rejections)
         mission_filtered = self.target_mission.filter_candidates(candidates)

@@ -91,6 +91,7 @@ def is_interaction_pose_precondition_failure(detail: dict[str, Any] | None) -> b
             "interaction_pose_invalid",
             "interaction_pose_poll_exhausted",
             "interaction_approach_options_exhausted",
+            "interaction_wrong_face",
             # A refrigerator sweep is checked privately by the simulator before
             # force is applied.  Treat it like an approach precondition: retry
             # another safe public ring pose rather than mark the appliance
@@ -1413,6 +1414,159 @@ class NavigationProgressWatchdog:
         ):
             return 0.0
         return float(self.reference_goal_distance_m) - float(goal_distance_m)
+
+
+@dataclass
+class SemanticNavigationProgressSupervisor:
+    """Keep no-progress memory across private move_base worker replacements.
+
+    A corridor waypoint or actionlib retry is an implementation detail, not a
+    new semantic subgoal.  This supervisor deliberately lives above those
+    workers: the current anchor gets one finite evaluator-step budget, while a
+    second mission-level budget survives anchor/candidate changes until the
+    robot makes material translational progress.
+    """
+
+    subgoal_timeout_task_steps: int = 60
+    mission_timeout_task_steps: int = 180
+    min_displacement_m: float = 0.10
+    min_goal_distance_reduction_m: float = 0.02
+    min_yaw_error_reduction_rad: float = 0.02
+    subgoal_key: str = ""
+    subgoal_reference_xy: tuple[float, float] | None = None
+    subgoal_reference_goal_distance_m: float | None = None
+    subgoal_reference_yaw_error_rad: float | None = None
+    subgoal_reference_step_index: int | None = None
+    mission_reference_xy: tuple[float, float] | None = None
+    mission_reference_step_index: int | None = None
+
+    @staticmethod
+    def _finite(value: float | None) -> float | None:
+        if value is None:
+            return None
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+
+    def reset(self) -> None:
+        self.subgoal_key = ""
+        self.subgoal_reference_xy = None
+        self.subgoal_reference_goal_distance_m = None
+        self.subgoal_reference_yaw_error_rad = None
+        self.subgoal_reference_step_index = None
+        self.mission_reference_xy = None
+        self.mission_reference_step_index = None
+
+    def note_success(
+        self, pose: tuple[float, ...] | None, task_step_index: int | None
+    ) -> None:
+        if pose is None or task_step_index is None:
+            self.reset()
+            return
+        xy = (float(pose[0]), float(pose[1]))
+        step = int(task_step_index)
+        self.subgoal_key = ""
+        self.subgoal_reference_xy = None
+        self.subgoal_reference_goal_distance_m = None
+        self.subgoal_reference_yaw_error_rad = None
+        self.subgoal_reference_step_index = None
+        self.mission_reference_xy = xy
+        self.mission_reference_step_index = step
+
+    def observe(
+        self,
+        *,
+        subgoal_key: str,
+        pose: tuple[float, ...] | None,
+        task_step_index: int | None,
+        goal_distance_m: float | None = None,
+        yaw_error_rad: float | None = None,
+        allow_yaw_progress: bool = False,
+    ) -> dict:
+        if pose is None or task_step_index is None or not str(subgoal_key):
+            return {"subgoal_stalled": False, "mission_stalled": False}
+        xy = (float(pose[0]), float(pose[1]))
+        step = int(task_step_index)
+        goal_distance = self._finite(goal_distance_m)
+        yaw_error = self._finite(yaw_error_rad)
+
+        if self.mission_reference_xy is None or self.mission_reference_step_index is None:
+            self.mission_reference_xy = xy
+            self.mission_reference_step_index = step
+        mission_displacement = math.hypot(
+            xy[0] - self.mission_reference_xy[0],
+            xy[1] - self.mission_reference_xy[1],
+        )
+        if mission_displacement >= max(0.0, float(self.min_displacement_m)):
+            self.mission_reference_xy = xy
+            self.mission_reference_step_index = step
+
+        if str(subgoal_key) != self.subgoal_key:
+            self.subgoal_key = str(subgoal_key)
+            self.subgoal_reference_xy = xy
+            self.subgoal_reference_goal_distance_m = goal_distance
+            self.subgoal_reference_yaw_error_rad = yaw_error
+            self.subgoal_reference_step_index = step
+        else:
+            displacement = math.hypot(
+                xy[0] - float(self.subgoal_reference_xy[0]),
+                xy[1] - float(self.subgoal_reference_xy[1]),
+            ) if self.subgoal_reference_xy is not None else 0.0
+            distance_progress = bool(
+                goal_distance is not None
+                and self.subgoal_reference_goal_distance_m is not None
+                and self.subgoal_reference_goal_distance_m - goal_distance
+                >= max(0.0, float(self.min_goal_distance_reduction_m))
+            )
+            yaw_progress = bool(
+                allow_yaw_progress
+                and yaw_error is not None
+                and self.subgoal_reference_yaw_error_rad is not None
+                and self.subgoal_reference_yaw_error_rad - yaw_error
+                >= max(0.0, float(self.min_yaw_error_reduction_rad))
+            )
+            if (
+                displacement >= max(0.0, float(self.min_displacement_m))
+                or distance_progress
+                or yaw_progress
+            ):
+                self.subgoal_reference_xy = xy
+                self.subgoal_reference_goal_distance_m = goal_distance
+                self.subgoal_reference_yaw_error_rad = yaw_error
+                self.subgoal_reference_step_index = step
+
+        subgoal_elapsed = max(
+            0,
+            step
+            - int(
+                self.subgoal_reference_step_index
+                if self.subgoal_reference_step_index is not None
+                else step
+            ),
+        )
+        mission_elapsed = max(
+            0,
+            step
+            - int(
+                self.mission_reference_step_index
+                if self.mission_reference_step_index is not None
+                else step
+            ),
+        )
+        return {
+            "subgoal_stalled": subgoal_elapsed
+            >= max(1, int(self.subgoal_timeout_task_steps)),
+            "mission_stalled": mission_elapsed
+            >= max(1, int(self.mission_timeout_task_steps)),
+            "subgoal_key": self.subgoal_key,
+            "subgoal_elapsed_task_steps": subgoal_elapsed,
+            "mission_elapsed_task_steps": mission_elapsed,
+            "subgoal_timeout_task_steps": max(
+                1, int(self.subgoal_timeout_task_steps)
+            ),
+            "mission_timeout_task_steps": max(
+                1, int(self.mission_timeout_task_steps)
+            ),
+        }
 
 
 @dataclass

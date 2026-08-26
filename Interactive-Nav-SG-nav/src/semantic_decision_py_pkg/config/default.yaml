@@ -133,6 +133,9 @@ policy:
   # A container whose complete anchor batch is unreachable is deferred as a
   # whole; do not spend the next decision cycle immediately replaying it.
   container_anchor_unreachable_cooldown_s: 60.0
+  # Also suppress the unchanged target for a deterministic number of simulator
+  # observations; wall time alone is unstable under parallel evaluation load.
+  container_anchor_unreachable_cooldown_steps: 300
   # After a portal open, retain the crossing candidate until the *same* portal
   # is publicly open/traversable and a fresh capture has reached the graph.
   # The evaluator continues advancing RGB-D/scan steps while decision making
@@ -386,6 +389,11 @@ executor:
   # Public evaluator-step budgets.  At the nominal 0.2 s action cadence,
   # 60 steps correspond to the legacy 12 s translation watchdog.
   navigation_stagnation_timeout_task_steps: 60
+  # Persist across private move_base/corridor workers.  One semantic anchor is
+  # abandoned after k steps without progress; the mission exits after 3*k.
+  semantic_progress_supervisor_enabled: true
+  semantic_subgoal_no_progress_task_steps: 60
+  semantic_mission_no_progress_task_steps: 180
   navigation_max_task_steps: 360
   interaction_navigation_max_task_steps: 240
   navigation_step_sync_stall_timeout_s: 5.0

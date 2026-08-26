@@ -112,6 +112,9 @@ def test_minimal_gt_unknown_portal_defaults_to_rule_interaction_only() -> None:
         "interaction_approach_pose_labels",
         "interaction_ready_distance_m",
         "interaction_ready_yaw_tolerance_rad",
+        "navigation_goal_position_tolerance_m",
+        "navigation_goal_yaw_tolerance_rad",
+        "navigation_goal_tolerance_contract_explicit",
     }
 
     assert "joint_names" not in command
