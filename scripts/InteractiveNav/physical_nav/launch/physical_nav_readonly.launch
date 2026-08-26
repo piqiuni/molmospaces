@@ -33,7 +33,11 @@
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
   </node>
 
-  <node name="physical_nav_consistency" pkg="physical_nav" type="physical_consistency_node.py" launch-prefix="$(arg ros_python)" output="screen"/>
+  <node name="physical_nav_consistency" pkg="physical_nav" type="physical_consistency_node.py" launch-prefix="$(arg ros_python)" output="screen">
+    <param name="camera_frame" value="d435i_color_optical_frame"/>
+    <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
+    <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
+  </node>
   <!-- The gateway is started separately so it can run before roslaunch and
        accept the Go2 WebSocket connection. -->
 </launch>

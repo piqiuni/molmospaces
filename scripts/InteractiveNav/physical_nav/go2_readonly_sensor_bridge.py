@@ -63,11 +63,14 @@ def _unitree_state_reader(state: ReadOnlyState, interface: str) -> None:
                 yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
                 value = {
                     "received_at": time.time(),
+                    "error_code": int(getattr(msg, "error_code", 0)),
                     "position": [float(v) for v in msg.position],
                     "velocity": [float(v) for v in msg.velocity],
                     "yaw_speed": float(msg.yaw_speed),
                     "mode": int(msg.mode),
+                    "progress": float(getattr(msg, "progress", 0.0)),
                     "gait_type": int(msg.gait_type),
+                    "foot_raise_height": float(getattr(msg, "foot_raise_height", 0.0)),
                     "body_height": float(msg.body_height),
                     "range_obstacle": [float(v) for v in msg.range_obstacle],
                     "foot_force": [int(v) for v in msg.foot_force],
@@ -92,11 +95,17 @@ def _unitree_state_reader(state: ReadOnlyState, interface: str) -> None:
                 value = {
                     "received_at": time.time(),
                     "soc": int(bms.soc),
+                    "bms_current": int(getattr(bms, "current", 0)),
+                    "cycle": int(getattr(bms, "cycle", 0)),
+                    "cell_vol": [int(v) for v in getattr(bms, "cell_vol", [])],
+                    "bq_ntc": [int(v) for v in getattr(bms, "bq_ntc", [])],
+                    "mcu_ntc": [int(v) for v in getattr(bms, "mcu_ntc", [])],
                     "voltage": float(msg.power_v),
                     "current": float(msg.power_a),
                     "power": float(msg.power_v) * float(msg.power_a),
                     "temperature_ntc1": int(msg.temperature_ntc1),
                     "temperature_ntc2": int(msg.temperature_ntc2),
+                    "fan_frequency": [int(v) for v in getattr(msg, "fan_frequency", [])],
                 }
                 with pose_lock:
                     latest["battery"] = value

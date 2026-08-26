@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -23,6 +23,128 @@ def _point3(value: Any) -> tuple[float, float, float] | None:
     return None
 
 
+def _vector3(value: Any, default: tuple[float, float, float]) -> tuple[float, float, float]:
+    point = _point3(value)
+    if point is None:
+        return default
+    return point
+
+
+def _size3(value: Any, default: tuple[float, float, float] = (0.2, 0.2, 0.2)) -> tuple[float, float, float]:
+    point = _point3(value)
+    if point is None:
+        return default
+    # A mapper can briefly publish a position-only node.  A small finite box
+    # lets us still test its projected center without inventing a zero-area
+    # image rectangle.
+    return tuple(max(abs(component), 0.02) for component in point)
+
+
+def _rotation_matrix(roll: float, pitch: float, yaw: float) -> tuple[tuple[float, float, float], ...]:
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return (
+        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+        (-sp, cp * sr, cp * cr),
+    )
+
+
+def _world_to_camera(
+    point: tuple[float, float, float],
+    telemetry: Mapping[str, Any],
+    camera_translation: Sequence[float],
+    camera_rpy: Sequence[float],
+) -> tuple[float, float, float]:
+    """Transform a map-frame point into the D435i optical frame.
+
+    The YOLOE worker uses ``p_base = R_camera_to_base p_camera + t`` and a
+    planar Go2 pose.  This is the exact inverse, kept dependency-free so the
+    ROS Noetic consistency node can run with system Python.
+    """
+    position = _vector3(telemetry.get("position"), (0.0, 0.0, 0.0))
+    yaw = _num(telemetry.get("yaw"), _num((telemetry.get("imu") or {}).get("rpy", [0.0, 0.0, 0.0])[2] if isinstance(telemetry.get("imu"), Mapping) else 0.0))
+    dx, dy, dz = point[0] - position[0], point[1] - position[1], point[2] - position[2]
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    # world -> base, inverse of the worker's planar base -> world transform.
+    base = (cy * dx + sy * dy, -sy * dx + cy * dy, point[2] - position[2])
+    translation = _vector3(camera_translation, (0.0, 0.0, 0.0))
+    shifted = (base[0] - translation[0], base[1] - translation[1], base[2] - translation[2])
+    rpy = list(camera_rpy or (0.0, 0.0, 0.0))
+    while len(rpy) < 3:
+        rpy.append(0.0)
+    rotation = _rotation_matrix(_num(rpy[0]), _num(rpy[1]), _num(rpy[2]))
+    # R.T @ shifted.
+    return tuple(sum(rotation[row][axis] * shifted[row] for row in range(3)) for axis in range(3))
+
+
+def project_map_node(
+    map_node: Mapping[str, Any],
+    *,
+    intrinsics: Mapping[str, Any],
+    telemetry: Mapping[str, Any],
+    camera_translation: Sequence[float] = (0.0, 0.0, 0.0),
+    camera_rpy: Sequence[float] = (0.0, 0.0, 0.0),
+    image_size: Sequence[int] | None = None,
+) -> dict[str, Any] | None:
+    """Project a global graph node's 3-D box into the current RGB image.
+
+    Returns ``None`` when the node has no usable position or is entirely behind
+    the camera.  The returned depth is camera-Z (the same quantity used by
+    D435i/YOLOE), not world-Z.
+    """
+    center = _point3(
+        map_node.get("world_box3d_center")
+        or map_node.get("aabb_center")
+        or map_node.get("box3d_center")
+        or map_node.get("world_position")
+        or map_node.get("position")
+        or map_node.get("centroid")
+    )
+    if center is None:
+        return None
+    size = _size3(
+        map_node.get("world_box3d_size")
+        or map_node.get("aabb_size")
+        or map_node.get("box3d_size")
+        or map_node.get("size")
+    )
+    corners = []
+    for sx in (-0.5, 0.5):
+        for sy in (-0.5, 0.5):
+            for sz in (-0.5, 0.5):
+                corners.append(
+                    _world_to_camera(
+                        (center[0] + sx * size[0], center[1] + sy * size[1], center[2] + sz * size[2]),
+                        telemetry,
+                        camera_translation,
+                        camera_rpy,
+                    )
+                )
+    visible = [point for point in corners if point[2] > 1e-3]
+    if not visible:
+        return None
+    fx, fy = _num(intrinsics.get("fx")), _num(intrinsics.get("fy"))
+    cx, cy = _num(intrinsics.get("cx")), _num(intrinsics.get("cy"))
+    if fx <= 0.0 or fy <= 0.0:
+        return None
+    projected = [(fx * point[0] / point[2] + cx, fy * point[1] / point[2] + cy) for point in visible]
+    bbox = [min(point[0] for point in projected), min(point[1] for point in projected), max(point[0] for point in projected), max(point[1] for point in projected)]
+    if image_size is not None and len(image_size) >= 2:
+        width, height = max(1, int(image_size[0])), max(1, int(image_size[1]))
+        bbox = [max(0.0, min(float(width - 1), bbox[0])), max(0.0, min(float(height - 1), bbox[1])), max(0.0, min(float(width - 1), bbox[2])), max(0.0, min(float(height - 1), bbox[3]))]
+    depth_values = sorted(point[2] for point in visible)
+    middle = len(depth_values) // 2
+    depth_m = 0.5 * (depth_values[(len(depth_values) - 1) // 2] + depth_values[middle])
+    return {
+        "bbox": bbox,
+        "depth_m": float(depth_m),
+        "camera_center": _world_to_camera(center, telemetry, camera_translation, camera_rpy),
+        "visible_corners": len(visible),
+    }
+
+
 def bbox_iou(a: Iterable[float], b: Iterable[float]) -> float:
     ax1, ay1, ax2, ay2 = [float(v) for v in a]; bx1, by1, bx2, by2 = [float(v) for v in b]
     ix1, iy1, ix2, iy2 = max(ax1, bx1), max(ay1, by1), min(ax2, bx2), min(ay2, by2)
@@ -33,7 +155,8 @@ def bbox_iou(a: Iterable[float], b: Iterable[float]) -> float:
 
 def evaluate_detection(detection: Mapping[str, Any], *, projected_bbox: Iterable[float] | None = None,
                        observed_depth_m: Iterable[float] | None = None, map_node: Mapping[str, Any] | None = None,
-                       previous: Mapping[str, Any] | None = None, thresholds: Mapping[str, float] | None = None) -> dict[str, Any]:
+                       previous: Mapping[str, Any] | None = None, thresholds: Mapping[str, float] | None = None,
+                       projected_depth_m: float | None = None) -> dict[str, Any]:
     t = {"bbox_iou": .45, "bbox_center_px": 35., "depth_abs_m": .25, "map_distance_m": .5, "temporal_jump_m": .6}
     t.update({str(k): _num(v) for k, v in (thresholds or {}).items()}); metrics: dict[str, float] = {}; reasons: list[str] = []
     bbox = detection.get("bbox") or detection.get("bbox_2d")
@@ -44,6 +167,10 @@ def evaluate_detection(detection: Mapping[str, Any], *, projected_bbox: Iterable
         metrics["bbox_center_px"] = math.hypot(ax - bx, ay - by)
         if metrics["bbox_iou"] < t["bbox_iou"]: reasons.append("reprojection_bbox_iou_low")
         if metrics["bbox_center_px"] > t["bbox_center_px"]: reasons.append("reprojection_center_offset")
+    if projected_depth_m is not None and _num(detection.get("depth_median_m"), -1.0) > 0.0:
+        metrics["map_projected_depth_abs_m"] = abs(_num(detection.get("depth_median_m")) - _num(projected_depth_m))
+        if metrics["map_projected_depth_abs_m"] > t["depth_abs_m"]:
+            reasons.append("map_reprojection_depth_offset")
     if observed_depth_m is not None:
         depths = sorted(float(v) for v in observed_depth_m if _num(v) > 0)
         if depths:
@@ -81,7 +208,13 @@ def evaluate_detection(detection: Mapping[str, Any], *, projected_bbox: Iterable
     return {"object_id": detection.get("instance_id", detection.get("id", "")), "status": status, "metrics": metrics, "reasons": reasons, "confidence": confidence}
 
 
-def evaluate_frame(detections: list[Mapping[str, Any]], *, graph: Mapping[str, Any] | None = None, thresholds: Mapping[str, float] | None = None) -> dict[str, Any]:
+def evaluate_frame(
+    detections: list[Mapping[str, Any]],
+    *,
+    graph: Mapping[str, Any] | None = None,
+    thresholds: Mapping[str, float] | None = None,
+    projection_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     nodes = (graph or {}).get("nodes", []) if isinstance(graph, Mapping) else []; reports = []
     for det in detections:
         label = det.get("semantic_class", det.get("class", "")); candidates = [node for node in nodes if node.get("label") == label or node.get("semantic_class") == label]
@@ -90,7 +223,25 @@ def evaluate_frame(detections: list[Mapping[str, Any]], *, graph: Mapping[str, A
             candidate = min(candidates, key=lambda node: math.dist(det_point, _point3(node.get("world_position") or node.get("position") or node.get("centroid") or node.get("aabb_center")) or (float("inf"),) * 3))
         else:
             candidate = candidates[0] if candidates else None
-        report = evaluate_detection(det, map_node=candidate, thresholds=thresholds)
+        projected = None
+        if candidate is not None and projection_context:
+            projected = project_map_node(
+                candidate,
+                intrinsics=projection_context.get("intrinsics", {}),
+                telemetry=projection_context.get("telemetry", {}),
+                camera_translation=projection_context.get("camera_translation", (0.0, 0.0, 0.0)),
+                camera_rpy=projection_context.get("camera_rpy", (0.0, 0.0, 0.0)),
+                image_size=projection_context.get("image_size"),
+            )
+        report = evaluate_detection(
+            det,
+            projected_bbox=projected.get("bbox") if projected else None,
+            projected_depth_m=projected.get("depth_m") if projected else None,
+            map_node=candidate,
+            thresholds=thresholds,
+        )
+        if projected is not None:
+            report["projection"] = projected
         if candidate is None:
             report["status"] = "warn" if report["status"] == "pass" else report["status"]
             report["reasons"].append("missing_map_node")

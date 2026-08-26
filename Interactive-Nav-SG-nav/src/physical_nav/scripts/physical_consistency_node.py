@@ -1,33 +1,124 @@
 #!/usr/bin/env python3
-"""Installed ROS entry point for read-only perception/map diagnostics."""
+"""ROS1 adapter for image-to-semantic-map consistency diagnostics."""
+
 from __future__ import annotations
-import json, threading
+
+import json
+import math
+import threading
 from typing import Any
+
 import rospy
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import String
+
 from physical_consistency import evaluate_frame
 
+
 class ConsistencyNode:
-    def __init__(self) -> None:
-        self._lock = threading.Lock(); self._detections: list[dict[str, Any]] = []; self._graph: dict[str, Any] = {}
+    def __init__(self, args: Any) -> None:
+        self._lock = threading.Lock()
+        self._detections: list[dict[str, Any]] = []
+        self._graph: dict[str, Any] = {}
+        self._intrinsics: dict[str, Any] = {}
+        self._telemetry: dict[str, Any] = {}
+        self._camera_translation = (args.camera_x, args.camera_y, args.camera_z)
+        self._camera_rpy = (args.camera_roll, args.camera_pitch, args.camera_yaw)
+        self._camera_frame = args.camera_frame
         self._pub = rospy.Publisher("/physical_nav/consistency", String, queue_size=1)
-        rospy.Subscriber("/physical_nav/detections", String, self._detections_cb, queue_size=1); rospy.Subscriber("/physical_nav/unified_graph", String, self._graph_cb, queue_size=1)
-        rospy.Timer(rospy.Duration(.2), self._publish)
+        rospy.Subscriber("/physical_nav/detections", String, self._detections_cb, queue_size=1)
+        rospy.Subscriber("/physical_nav/unified_graph", String, self._graph_cb, queue_size=1)
+        rospy.Subscriber("/physical_nav/camera_info", CameraInfo, self._camera_info_cb, queue_size=1)
+        rospy.Subscriber("/physical_nav/odom", Odometry, self._odom_cb, queue_size=1)
+        self._timer = rospy.Timer(rospy.Duration(0.2), self._publish)
+
     def _detections_cb(self, msg: Any) -> None:
         try:
-            value = json.loads(msg.data); value = value.get("detections", value.get("objects", [])) if isinstance(value, dict) else value
-            with self._lock: self._detections = list(value or [])
-        except Exception as exc: rospy.logwarn_throttle(5.0, "invalid detections JSON: %s", exc)
+            value = json.loads(msg.data)
+            if isinstance(value, dict):
+                value = value.get("detections", value.get("objects", []))
+            with self._lock:
+                self._detections = list(value or [])
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "invalid detections JSON: %s", exc)
+
     def _graph_cb(self, msg: Any) -> None:
         try:
-            with self._lock: self._graph = json.loads(msg.data)
-        except Exception as exc: rospy.logwarn_throttle(5.0, "invalid graph JSON: %s", exc)
+            with self._lock:
+                self._graph = json.loads(msg.data)
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "invalid graph JSON: %s", exc)
+
+    def _camera_info_cb(self, msg: CameraInfo) -> None:
+        with self._lock:
+            self._intrinsics = {
+                "fx": float(msg.K[0]),
+                "fy": float(msg.K[4]),
+                "cx": float(msg.K[2]),
+                "cy": float(msg.K[5]),
+                "width": int(msg.width),
+                "height": int(msg.height),
+            }
+
+    def _odom_cb(self, msg: Odometry) -> None:
+        q = msg.pose.pose.orientation
+        yaw = 2.0 * math.atan2(float(q.z), float(q.w))
+        with self._lock:
+            self._telemetry = {
+                "position": [
+                    float(msg.pose.pose.position.x),
+                    float(msg.pose.pose.position.y),
+                    float(msg.pose.pose.position.z),
+                ],
+                "velocity": [
+                    float(msg.twist.twist.linear.x),
+                    float(msg.twist.twist.linear.y),
+                    float(msg.twist.twist.linear.z),
+                ],
+                "yaw": yaw,
+            }
+
     def _publish(self, _event: Any) -> None:
-        with self._lock: detections, graph = list(self._detections), dict(self._graph)
-        result = evaluate_frame(detections, graph=graph); result["graph_revision"] = graph.get("revision", graph.get("timestamp"))
-        self._pub.publish(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        with self._lock:
+            detections = list(self._detections)
+            graph = dict(self._graph)
+            intrinsics = dict(self._intrinsics)
+            telemetry = dict(self._telemetry)
+        context = None
+        if intrinsics and telemetry:
+            context = {
+                "intrinsics": intrinsics,
+                "telemetry": telemetry,
+                "camera_translation": self._camera_translation,
+                "camera_rpy": self._camera_rpy,
+                "image_size": (intrinsics.get("width", 0), intrinsics.get("height", 0)),
+            }
+        report = evaluate_frame(detections, graph=graph, projection_context=context)
+        report["detection_count"] = len(detections)
+        report["graph_revision"] = graph.get("revision", graph.get("timestamp"))
+        report["projection"] = {
+            "enabled": bool(context),
+            "source": "d435i_camera_info+physical_nav_odom" if context else "waiting_for_camera_info_and_odom",
+            "camera_frame": self._camera_frame,
+        }
+        self._pub.publish(String(data=json.dumps(report, ensure_ascii=False, separators=(",", ":"))))
+
 
 def main() -> None:
-    rospy.init_node("physical_nav_consistency", anonymous=False); ConsistencyNode(); rospy.spin()
+    rospy.init_node("physical_nav_consistency", anonymous=False)
+    args = type("ConsistencyArgs", (), {
+        "camera_frame": str(rospy.get_param("~camera_frame", "d435i_color_optical_frame")),
+        "camera_x": float(rospy.get_param("~camera_x", 0.0)),
+        "camera_y": float(rospy.get_param("~camera_y", 0.0)),
+        "camera_z": float(rospy.get_param("~camera_z", 0.0)),
+        "camera_roll": float(rospy.get_param("~camera_roll", 0.0)),
+        "camera_pitch": float(rospy.get_param("~camera_pitch", 0.0)),
+        "camera_yaw": float(rospy.get_param("~camera_yaw", 0.0)),
+    })()
+    ConsistencyNode(args)
+    rospy.spin()
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()

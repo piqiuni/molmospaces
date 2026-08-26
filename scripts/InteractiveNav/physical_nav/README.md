@@ -116,7 +116,9 @@ bash scripts/InteractiveNav/physical_nav/start_physical_nav.sh
 3. D435i RGB/Depth/CameraInfo and Unitree state share sequence/timestamp data.
 4. YOLOE output is lifted to map-frame 3-D boxes and fed to the existing global
    semantic graph implementation through `/physical_nav/*` topics.
-5. The consistency report checks image reprojection, depth, map association and
-   temporal/spatial relations; it is displayed in panel 6.
+5. The consistency report projects each matched global 3-D graph box back into
+   the current RGB frame using the live D435i `CameraInfo` and Go2 odometry,
+   then checks image IoU/pixel offset, camera-Z depth, RGB-D lift, map
+   association and temporal/spatial relations; it is displayed in panel 6.
 6. `curl http://<policy-lan-ip>:8765/api/health` returns JSON and a browser can
    render `/stream.mjpg` while the dog remains stationary.

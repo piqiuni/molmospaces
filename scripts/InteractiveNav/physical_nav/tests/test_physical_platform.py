@@ -7,7 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from physical_protocol import command_blocked_packet, hello_packet, image_packet, validate_packet
-from physical_consistency import bbox_iou, evaluate_detection, evaluate_frame
+from physical_consistency import bbox_iou, evaluate_detection, evaluate_frame, project_map_node
 from safety_gate import ReadOnlySafetyGate
 from physical_yoloe_bridge import _label, _rotation, _world_points
 
@@ -50,6 +50,17 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert lifted["metrics"]["rgbd_depth_lift_abs_m"] == 0.0
     frame = evaluate_frame([{"instance_id": "chair_1", "semantic_class": "chair", "confidence": .9}], graph={"nodes": []})
     assert frame["counts"]["warn"] == 1
+
+  def test_consistency_reprojects_graph_node_into_rgbd_frame(self):
+    node = {"label": "chair", "aabb_center": [0., 0., 2.], "aabb_size": [.4, .4, .4]}
+    camera = {"fx": 100., "fy": 100., "cx": 50., "cy": 50., "width": 100, "height": 100}
+    projection = project_map_node(node, intrinsics=camera, telemetry={"position": [0., 0., 0.], "yaw": 0.})
+    assert projection is not None
+    detection = {"instance_id": "chair_1", "semantic_class": "chair", "bbox": projection["bbox"], "world_position": [0., 0., 2.], "camera_position": [0., 0., 2.], "depth_median_m": projection["depth_m"], "confidence": .9}
+    frame = evaluate_frame([detection], graph={"nodes": [node]}, projection_context={"intrinsics": camera, "telemetry": {"position": [0., 0., 0.], "yaw": 0.}, "image_size": (100, 100)})
+    assert frame["counts"]["pass"] == 1
+    assert frame["detections"][0]["metrics"]["bbox_iou"] > .99
+    assert frame["detections"][0]["metrics"]["map_projected_depth_abs_m"] == 0.0
 
   def test_yoloe_label_and_pose_lift(self):
     assert _label("refrigerator_door") == "fridge"
