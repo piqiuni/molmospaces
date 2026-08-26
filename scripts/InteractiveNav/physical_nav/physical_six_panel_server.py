@@ -219,6 +219,86 @@ _HTML = """<!doctype html><meta charset='utf-8'><title>Go2 Physical Interactive 
 <script>async function refresh(){try{let r=await fetch('/api/state');document.querySelector('#state').textContent=JSON.stringify(await r.json(),null,2)}catch(e){document.querySelector('#state').textContent=e}} async function intent(a){await fetch('/api/teleop-intent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a,source:'web'})});refresh()} async function askQwen(){await fetch('/api/qwen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:document.querySelector('#prompt').value})});refresh()} setInterval(refresh,1000);refresh()</script>"""
 
 
+def _compact_qwen_context(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Keep sparse masks out of the text prompt sent to the remote Qwen."""
+    compact_detections: list[dict[str, Any]] = []
+    for detection in snapshot.get("detections", []):
+        if not isinstance(detection, dict):
+            continue
+        item = {
+            key: detection.get(key)
+            for key in (
+                "semantic_class", "raw_class", "confidence", "bbox", "mask_area",
+                "depth_median_m", "depth_valid_points", "world_position", "aabb_center",
+                "aabb_size", "map_transform_status", "source_frame", "capture_seq", "stamp",
+            )
+            if key in detection
+        }
+        mask = detection.get("mask")
+        if isinstance(mask, dict):
+            item["mask_summary"] = {
+                "area": mask.get("area", mask.get("mask_area", 0)),
+                "rows": len(mask.get("rows", [])),
+                "cols": len(mask.get("cols", [])),
+            }
+        compact_detections.append(item)
+
+    graph = snapshot.get("graph")
+    compact_graph: dict[str, Any] = {}
+    if isinstance(graph, dict):
+        compact_graph = {
+            key: graph.get(key)
+            for key in ("scene_id", "episode_id", "source_mode", "graph_revision", "timestamp", "module1_mode")
+            if key in graph
+        }
+        compact_graph["nodes"] = []
+        for node in graph.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            item = {
+                key: node.get(key)
+                for key in ("id", "type", "label", "centroid", "aabb_center", "aabb_size", "parent_id", "room_id", "confidence", "observation_count")
+                if key in node
+            }
+            interaction = node.get("interaction")
+            if isinstance(interaction, dict):
+                item["interaction"] = {
+                    key: interaction.get(key)
+                    for key in ("is_interactable", "interaction_mode", "capability", "state", "cost", "requires_interaction", "traversable", "expected_effect")
+                    if key in interaction
+                }
+            compact_graph["nodes"].append(item)
+        compact_graph["edges"] = graph.get("edges", [])
+
+    return {
+        "frame_seq": snapshot.get("frame_seq", -1),
+        "telemetry": snapshot.get("telemetry", {}),
+        "detections": compact_detections,
+        "graph": compact_graph,
+        "consistency": _compact_consistency(snapshot.get("consistency", {})),
+    }
+
+
+def _compact_consistency(consistency: Any) -> dict[str, Any]:
+    if not isinstance(consistency, dict):
+        return {}
+    result = {
+        key: consistency.get(key)
+        for key in ("status", "counts", "detection_count", "graph_revision", "projection")
+        if key in consistency
+    }
+    result["detections"] = []
+    for item in consistency.get("detections", []):
+        if not isinstance(item, dict):
+            continue
+        result["detections"].append({
+            key: item.get(key)
+            for key in ("object_id", "status", "metrics", "reasons", "confidence")
+            if key in item
+        })
+    return result
+
+
 class PhysicalGateway:
     def __init__(self, host: str, port: int, qwen_url: str = "", qwen_model: str = "qwen3.6-35b-a3b-fp8", camera_parent: str = "tf_frame_base_link", camera_x: float = 0.0, camera_y: float = 0.0, camera_z: float = 0.0, camera_roll: float = 0.0, camera_pitch: float = 0.0, camera_yaw: float = 0.0, qwen_auto_interval: float = 0.0) -> None:
         self.host, self.port = host, port
@@ -263,13 +343,7 @@ class PhysicalGateway:
             if self.qwen is None: return {"accepted": False, "error": "Qwen client is disabled"}
             user_prompt = str(payload.get("prompt", "请分析当前全局语义图与感知一致性"))
             snapshot = self.state.snapshot()
-            context = {
-                "frame_seq": snapshot["frame_seq"],
-                "telemetry": snapshot["telemetry"],
-                "detections": snapshot["detections"],
-                "graph": snapshot["graph"],
-                "consistency": snapshot["consistency"],
-            }
+            context = _compact_qwen_context(snapshot)
             prompt = user_prompt + "\n\n当前实物平台状态(JSON)：\n" + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
             request = {"prompt": user_prompt, "context": context, "requested_at": time.time(), "model": self.qwen.model}
             self.state.add_qwen(request)
@@ -296,7 +370,8 @@ class PhysicalGateway:
                 while True:
                     time.sleep(self.qwen_auto_interval)
                     snapshot = self.state.snapshot()
-                    prompt = "请根据当前全局语义图、检测结果和一致性诊断，简要报告空间关系异常和需要人工确认的对象。\n" + json.dumps({"graph": snapshot["graph"], "detections": snapshot["detections"], "consistency": snapshot["consistency"]}, ensure_ascii=False)
+                    compact = _compact_qwen_context(snapshot)
+                    prompt = "请根据当前全局语义图、检测结果和一致性诊断，简要报告空间关系异常和需要人工确认的对象。\n" + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
                     request = {"prompt": prompt, "requested_at": time.time(), "model": self.qwen.model, "source": "auto_graph_review"}
                     self.state.add_qwen(request)
                     result = self.qwen.chat(prompt, max_tokens=256)

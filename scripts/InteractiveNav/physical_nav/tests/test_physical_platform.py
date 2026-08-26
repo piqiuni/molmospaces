@@ -11,6 +11,7 @@ from physical_consistency import bbox_iou, evaluate_detection, evaluate_frame, p
 from safety_gate import ReadOnlySafetyGate
 from physical_yoloe_bridge import _label, _rotation, _world_points
 from runtime_state import RuntimeState
+from physical_six_panel_server import _compact_qwen_context
 
 
 class PhysicalPlatformTests(unittest.TestCase):
@@ -89,3 +90,17 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert snapshot["detections"][0]["mask"]
     assert snapshot["mapped_detections"][0]["map_transform_status"] == "tf"
     assert snapshot["mapped_detection_meta"]["map_frame"] == "tf_frame_map"
+
+  def test_qwen_context_compacts_sparse_masks_and_graph_interaction(self):
+    snapshot = {
+      "frame_seq": 7,
+      "telemetry": {"position": [0., 0., 0.]},
+      "detections": [{"semantic_class": "chair", "mask": {"rows": list(range(1000)), "cols": list(range(1000))}, "bbox": [1, 2, 3, 4]}],
+      "graph": {"nodes": [{"id": "chair_1", "interaction": {"state": "unknown", "operation_history": list(range(1000))}}], "edges": []},
+      "consistency": {"status": "warn", "detections": []},
+    }
+    compact = _compact_qwen_context(snapshot)
+    assert "mask" not in compact["detections"][0]
+    assert compact["detections"][0]["mask_summary"]["rows"] == 1000
+    assert "operation_history" not in compact["graph"]["nodes"][0]["interaction"]
+    assert len(__import__("json").dumps(compact)) < 2000

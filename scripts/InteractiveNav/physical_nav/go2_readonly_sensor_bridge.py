@@ -210,7 +210,6 @@ async def publish(args: argparse.Namespace) -> None:
         try:
             ws = websocket.create_connection(args.url, timeout=args.connect_timeout, enable_multithread=True)
             ws.send(json.dumps(hello_packet(host=socket.gethostname(), streams={"camera": "d435i", "fps": args.fps})))
-            ws.settimeout(0.0)
             last_telemetry = 0.0
             print(f"connected to policy WebSocket {args.url}", flush=True)
             while True:
@@ -218,10 +217,17 @@ async def publish(args: argparse.Namespace) -> None:
                 # messages so a long-running sensor stream cannot fill the TCP
                 # receive window; no command is ever read or acted upon here.
                 try:
+                    # Keep sends blocking so a transiently full TCP buffer is
+                    # retried by the socket instead of surfacing EAGAIN from
+                    # a non-blocking websocket-client socket.  A tiny receive
+                    # timeout is sufficient to drain any queued ACKs.
+                    ws.settimeout(0.001)
                     while ws.recv():
                         pass
                 except (websocket.WebSocketTimeoutException, websocket.WebSocketConnectionClosedException, OSError):
                     pass
+                finally:
+                    ws.settimeout(args.connect_timeout)
                 started = time.monotonic()
                 if source is None:
                     rgb, depth, sync_ms, intr = _synthetic_frame(args.width, args.height)
