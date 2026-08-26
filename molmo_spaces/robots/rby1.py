@@ -432,6 +432,9 @@ class RBY1(Robot):
 
         if robot_config.use_holo_base:
             spec.worldbody.add_site(name=f"{prefix}world", pos=[0, 0, 0.005], quat=[1, 0, 0, 0])
-            add_slider_act("base_x_act", 25, 25000, [0, -25000, 0.5], 0)
-            add_slider_act("base_y_act", 25, 25000, [0, -25000, 0.5], 1)
+            planar_limit_m = float(robot_config.holo_base_position_limit_m)
+            if not np.isfinite(planar_limit_m) or planar_limit_m <= 0.0:
+                raise ValueError("holo_base_position_limit_m must be finite and positive")
+            add_slider_act("base_x_act", planar_limit_m, 25000, [0, -25000, 0.5], 0)
+            add_slider_act("base_y_act", planar_limit_m, 25000, [0, -25000, 0.5], 1)
             add_slider_act("base_theta_act", np.pi, 5000, [0, -5000, 0.5], 5)

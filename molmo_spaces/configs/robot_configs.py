@@ -284,6 +284,8 @@ class RBY1Config(BaseRobotConfig):
     }
 
     use_holo_base: bool = True  # Whether to use virtual holonomic base joints or not
+    # Some ProcTHOR layouts extend beyond the legacy +/-25 m actuator range.
+    holo_base_position_limit_m: float = 100.0
     command_mode: dict[str, str | None] = {
         "arm": "joint_position",  # e.g., "joint_position", "joint_velocity", "ee_position", "ee_velocity"
         "gripper": "joint_position",
