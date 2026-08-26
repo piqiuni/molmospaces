@@ -267,9 +267,19 @@ def candidate_with_effective_interaction_approach(
     interaction["interaction_approach_pose_xyyaw"] = list(approach)
     metadata.setdefault("planned_goal_xyyaw", list(result.get("goal_xyyaw") or []))
     metadata["effective_interaction_approach_pose_xyyaw"] = list(approach)
-    metadata["interaction_approach_goal_option_index"] = max(
-        0, int(goal_option_index)
-    )
+    effective_option_index = max(0, int(goal_option_index))
+    metadata["interaction_approach_goal_option_index"] = effective_option_index
+    if bool(metadata.get("container_two_stage_approach", False)) and str(
+        metadata.get("container_two_stage_phase") or "staging"
+    ).strip().casefold() in {"staging", "m1_capture"}:
+        # Batch preflight may choose a non-primary container anchor.  M1
+        # rejection/viewpoint bookkeeping is keyed by the canonical staging
+        # index, so bind that index to the goal actually sent to move_base.
+        # Leaving the generated primary index here caused a negative M1 result
+        # to exclude the wrong face and select the same physical anchor again.
+        metadata["container_two_stage_staging_goal_option_index"] = (
+            effective_option_index
+        )
     if attempts is not None:
         metadata["interaction_approach_attempts"] = [dict(item) for item in attempts]
     result["interaction_command"] = interaction

@@ -422,6 +422,31 @@ def test_effective_interaction_approach_replaces_bridge_pose_not_primary_goal() 
     )["valid"]
 
 
+def test_effective_container_anchor_binds_actual_staging_index() -> None:
+    candidate = {
+        "candidate_id": "interaction:container_fridge:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 1.0, 0.0],
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [1.0, 1.0, 0.0],
+        },
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "container_two_stage_staging_goal_option_index": 27,
+        },
+    }
+
+    bound = candidate_with_effective_interaction_approach(
+        candidate,
+        [0.8, 4.3, 1.83],
+        goal_option_index=29,
+    )
+
+    assert bound["metadata"]["interaction_approach_goal_option_index"] == 29
+    assert bound["metadata"]["container_two_stage_staging_goal_option_index"] == 29
+
+
 def test_pose_precondition_failure_is_not_an_object_failure() -> None:
     assert is_interaction_pose_precondition_failure(
         {"failure_reason": "interaction_pose_invalid"}
