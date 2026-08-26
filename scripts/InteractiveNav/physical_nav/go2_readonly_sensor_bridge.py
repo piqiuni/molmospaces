@@ -42,6 +42,15 @@ class ReadOnlyState:
             return dict(self.telemetry)
 
 
+def _field_sequence(message: Any, name: str, *, cast: Any = float) -> list[Any]:
+    """Read optional SDK sequences without dropping the whole pose packet."""
+    try:
+        values = getattr(message, name, None)
+        return [] if values is None else [cast(value) for value in values]
+    except (TypeError, ValueError):
+        return []
+
+
 def _unitree_state_reader(state: ReadOnlyState, interface: str) -> None:
     """Subscribe to state topics without loading any command client."""
     try:
@@ -58,28 +67,33 @@ def _unitree_state_reader(state: ReadOnlyState, interface: str) -> None:
 
         def on_sport(msg: Any) -> None:
             try:
-                q = [float(v) for v in msg.imu_state.quaternion]
+                imu = getattr(msg, "imu_state")
+                q = _field_sequence(imu, "quaternion")
+                if len(q) != 4:
+                    raise ValueError("IMU quaternion is missing or does not contain four values")
                 w, x, y, z = q
                 yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+                position = (_field_sequence(msg, "position") + [0.0, 0.0, 0.0])[:3]
+                velocity = (_field_sequence(msg, "velocity") + [0.0, 0.0, 0.0])[:3]
                 value = {
                     "received_at": time.time(),
                     "error_code": int(getattr(msg, "error_code", 0)),
-                    "position": [float(v) for v in msg.position],
-                    "velocity": [float(v) for v in msg.velocity],
-                    "yaw_speed": float(msg.yaw_speed),
-                    "mode": int(msg.mode),
+                    "position": position,
+                    "velocity": velocity,
+                    "yaw_speed": float(getattr(msg, "yaw_speed", 0.0)),
+                    "mode": int(getattr(msg, "mode", 0)),
                     "progress": float(getattr(msg, "progress", 0.0)),
-                    "gait_type": int(msg.gait_type),
+                    "gait_type": int(getattr(msg, "gait_type", 0)),
                     "foot_raise_height": float(getattr(msg, "foot_raise_height", 0.0)),
-                    "body_height": float(msg.body_height),
-                    "range_obstacle": [float(v) for v in msg.range_obstacle],
-                    "foot_force": [int(v) for v in msg.foot_force],
+                    "body_height": float(getattr(msg, "body_height", 0.0)),
+                    "range_obstacle": _field_sequence(msg, "range_obstacle"),
+                    "foot_force": _field_sequence(msg, "foot_force", cast=int),
                     "imu": {
                         "quaternion": q,
-                        "gyroscope": [float(v) for v in msg.imu_state.gyroscope],
-                        "accelerometer": [float(v) for v in msg.imu_state.accelerometer],
-                        "rpy": [float(v) for v in msg.imu_state.rpy],
-                        "temperature": int(msg.imu_state.temperature),
+                        "gyroscope": _field_sequence(imu, "gyroscope"),
+                        "accelerometer": _field_sequence(imu, "accelerometer"),
+                        "rpy": _field_sequence(imu, "rpy"),
+                        "temperature": int(getattr(imu, "temperature", 0)),
                     },
                     "yaw": yaw,
                 }
@@ -94,17 +108,17 @@ def _unitree_state_reader(state: ReadOnlyState, interface: str) -> None:
                 bms = msg.bms_state
                 value = {
                     "received_at": time.time(),
-                    "soc": int(bms.soc),
+                    "soc": int(getattr(bms, "soc", 0)),
                     "bms_current": int(getattr(bms, "current", 0)),
                     "cycle": int(getattr(bms, "cycle", 0)),
                     "cell_vol": [int(v) for v in getattr(bms, "cell_vol", [])],
                     "bq_ntc": [int(v) for v in getattr(bms, "bq_ntc", [])],
                     "mcu_ntc": [int(v) for v in getattr(bms, "mcu_ntc", [])],
-                    "voltage": float(msg.power_v),
-                    "current": float(msg.power_a),
-                    "power": float(msg.power_v) * float(msg.power_a),
-                    "temperature_ntc1": int(msg.temperature_ntc1),
-                    "temperature_ntc2": int(msg.temperature_ntc2),
+                    "voltage": float(getattr(msg, "power_v", 0.0)),
+                    "current": float(getattr(msg, "power_a", 0.0)),
+                    "power": float(getattr(msg, "power_v", 0.0)) * float(getattr(msg, "power_a", 0.0)),
+                    "temperature_ntc1": int(getattr(msg, "temperature_ntc1", 0)),
+                    "temperature_ntc2": int(getattr(msg, "temperature_ntc2", 0)),
                     "fan_frequency": [int(v) for v in getattr(msg, "fan_frequency", [])],
                 }
                 with pose_lock:
@@ -138,7 +152,16 @@ class D435iSource:
         color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
         self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
         c = color_profile.get_intrinsics()
-        self.intrinsics = {"fx": c.fx, "fy": c.fy, "cx": c.ppx, "cy": c.ppy, "width": c.width, "height": c.height}
+        self.intrinsics = {
+            "fx": c.fx,
+            "fy": c.fy,
+            "cx": c.ppx,
+            "cy": c.ppy,
+            "width": c.width,
+            "height": c.height,
+            "distortion_model": str(getattr(c, "model", "")),
+            "distortion": [float(v) for v in getattr(c, "coeffs", [])],
+        }
         self.camera_frame = f"{color_profile.stream_name()}_frame"
         print(f"D435i started {c.width}x{c.height}@{fps}, depth_scale={self.depth_scale}", flush=True)
 

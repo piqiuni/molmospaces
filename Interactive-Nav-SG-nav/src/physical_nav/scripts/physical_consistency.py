@@ -62,6 +62,25 @@ def _world_to_camera(point: tuple[float, float, float], telemetry: Mapping[str, 
     return tuple(sum(rotation[row][axis] * shifted[row] for row in range(3)) for axis in range(3))
 
 
+def _project_camera_point(point: tuple[float, float, float], intrinsics: Mapping[str, Any]) -> tuple[float, float] | None:
+    if point[2] <= 1e-3:
+        return None
+    fx, fy = _num(intrinsics.get("fx")), _num(intrinsics.get("fy"))
+    cx, cy = _num(intrinsics.get("cx")), _num(intrinsics.get("cy"))
+    if fx <= 0.0 or fy <= 0.0:
+        return None
+    x, y = point[0] / point[2], point[1] / point[2]
+    distortion = list(intrinsics.get("distortion") or [])
+    distortion_model = str(intrinsics.get("distortion_model", "")).lower()
+    if len(distortion) >= 4 and "inverse" not in distortion_model:
+        k1, k2, p1, p2 = [_num(value) for value in distortion[:4]]
+        k3 = _num(distortion[4]) if len(distortion) >= 5 else 0.0
+        radius2 = x * x + y * y
+        radial = 1.0 + k1 * radius2 + k2 * radius2 * radius2 + k3 * radius2 * radius2 * radius2
+        x, y = x * radial + 2.0 * p1 * x * y + p2 * (radius2 + 2.0 * x * x), y * radial + p1 * (radius2 + 2.0 * y * y) + 2.0 * p2 * x * y
+    return fx * x + cx, fy * y + cy
+
+
 def project_map_node(map_node: Mapping[str, Any], *, intrinsics: Mapping[str, Any], telemetry: Mapping[str, Any], camera_translation: Sequence[float] = (0.0, 0.0, 0.0), camera_rpy: Sequence[float] = (0.0, 0.0, 0.0), image_size: Sequence[int] | None = None) -> dict[str, Any] | None:
     """Project a global graph node's 3-D box into the current RGB image."""
     center = _point3(map_node.get("world_box3d_center") or map_node.get("aabb_center") or map_node.get("box3d_center") or map_node.get("world_position") or map_node.get("position") or map_node.get("centroid"))
@@ -72,10 +91,11 @@ def project_map_node(map_node: Mapping[str, Any], *, intrinsics: Mapping[str, An
     visible = [point for point in corners if point[2] > 1e-3]
     if not visible:
         return None
-    fx, fy, cx, cy = (_num(intrinsics.get(key)) for key in ("fx", "fy", "cx", "cy"))
-    if fx <= 0.0 or fy <= 0.0:
+    if _num(intrinsics.get("fx")) <= 0.0 or _num(intrinsics.get("fy")) <= 0.0:
         return None
-    projected = [(fx * point[0] / point[2] + cx, fy * point[1] / point[2] + cy) for point in visible]
+    projected = [pixel for point in visible if (pixel := _project_camera_point(point, intrinsics)) is not None]
+    if not projected:
+        return None
     bbox = [min(point[0] for point in projected), min(point[1] for point in projected), max(point[0] for point in projected), max(point[1] for point in projected)]
     if image_size is not None and len(image_size) >= 2:
         width, height = max(1, int(image_size[0])), max(1, int(image_size[1]))

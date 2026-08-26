@@ -26,6 +26,18 @@ sent to the robot.
 
 ## Start on the policy machine
 
+Install the side-specific transport dependencies first. The Go2 image uses
+Python 3.8, while the policy machine uses Python 3.10+:
+
+```bash
+python3 -m pip install -r /home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/requirements_go2.txt  # on Go2
+python3 -m pip install -r /home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/requirements_policy.txt  # on policy machine
+```
+
+`unitree_sdk2py`, `librealsense/pyrealsense2`, ROS Noetic and Ultralytics are
+not vendored. They must already be provided by the corresponding platform
+environment; YOLOE is loaded only on the policy machine.
+
 Start the WebSocket/web gateway before the Go2 client. It binds to all interfaces so a LAN
 browser can connect:
 

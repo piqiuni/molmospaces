@@ -1,0 +1,6 @@
+# Policy-machine Python 3.10+ side. ROS Noetic dependencies are system/apt
+# packages; Ultralytics is installed in the algorithm environment separately.
+websockets>=12,<17
+websocket-client>=1.8,<2
+numpy>=1.23
+opencv-python>=4.8

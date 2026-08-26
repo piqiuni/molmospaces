@@ -1,0 +1,8 @@
+# Go2/Jetson Python 3.8 side. Unitree SDK2 and librealsense/pyrealsense2 are
+# supplied by the robot image or installed from their vendor packages.
+websocket-client==1.8.0
+numpy>=1.23,<2.0
+
+# OpenCV (cv2) and pyrealsense2 are intentionally not pip-pinned here: ARM64
+# builds depend on the librealsense/OpenCV packages shipped by the target Go2
+# image.

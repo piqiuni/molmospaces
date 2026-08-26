@@ -104,6 +104,9 @@ class PhysicalRosGateway:
         if depth.dtype != np.uint16: depth = depth.astype(np.uint16)
         stamp = rospy.Time.from_sec(float(raw.get("stamp", time.time()))); frame = str(raw.get("camera_frame", self.args.camera_frame)); rgb_msg = _image_msg(rgb, "bgr8", stamp, frame); depth_msg = _image_msg(depth, "16UC1", stamp, frame)
         info = CameraInfo(); info.header.stamp = stamp; info.header.frame_id = frame; info.width = int(raw.get("width", rgb.shape[1])); info.height = int(raw.get("height", rgb.shape[0])); intr = raw.get("intrinsics", {}); info.K = [float(intr.get("fx", 0)), 0, float(intr.get("cx", 0)), 0, float(intr.get("fy", 0)), float(intr.get("cy", 0)), 0, 0, 1]
+        distortion = [float(value) for value in (intr.get("distortion") or [])[:5]]
+        info.D = distortion
+        info.distortion_model = str(intr.get("distortion_model", "plumb_bob") or "plumb_bob")
         self.rgb_pub.publish(rgb_msg); self.depth_pub.publish(depth_msg); self.info_pub.publish(info)
         self._publish_cloud(depth, intr, stamp, frame); self._publish_pose(raw.get("telemetry", {}), stamp)
 
