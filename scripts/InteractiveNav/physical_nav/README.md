@@ -95,7 +95,8 @@ python3 qwen_ssh_tunnel.py --ssh-port 41051 --user root \
 
 The remote vLLM service currently listens on `127.0.0.1:8000`; the remote
 service port remains configurable because the SSH port (`41051`) and the Qwen
-HTTP port are independent. The web page exposes `/api/qwen` and shows all
+HTTP port are independent. Its advertised model id is
+`qwen3.6-35b-a3b-fp8`. The web page exposes `/api/qwen` and shows all
 requests/results and latency in the status area.
 
 `start_physical_nav.sh` can manage this tunnel too:
