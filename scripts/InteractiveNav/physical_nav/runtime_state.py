@@ -26,6 +26,8 @@ class RuntimeState:
         self.telemetry: dict[str, Any] = {}
         self.detections: list[dict[str, Any]] = []
         self.detection_meta: dict[str, Any] = {}
+        self.mapped_detections: list[dict[str, Any]] = []
+        self.mapped_detection_meta: dict[str, Any] = {}
         self.graph: dict[str, Any] = {}
         self.occupancy = None
         self.consistency: dict[str, Any] = {}
@@ -52,8 +54,9 @@ class RuntimeState:
 
     def update_topic(self, name: str, value: Any) -> None:
         with self._lock:
-            if name == "detections" and isinstance(value, dict):
-                self.detection_meta = {k: v for k, v in value.items() if k not in {"detections", "objects"}}
+            if name in {"detections", "mapped_detections"} and isinstance(value, dict):
+                meta_attr = "detection_meta" if name == "detections" else "mapped_detection_meta"
+                setattr(self, meta_attr, {k: v for k, v in value.items() if k not in {"detections", "objects"}})
                 value = value.get("detections", value.get("objects", []))
             setattr(self, name, value)
             if name == "detections":
@@ -103,6 +106,8 @@ class RuntimeState:
                 "telemetry": copy.deepcopy(self.telemetry),
                 "detections": copy.deepcopy(self.detections),
                 "detection_meta": copy.deepcopy(self.detection_meta),
+                "mapped_detections": copy.deepcopy(self.mapped_detections),
+                "mapped_detection_meta": copy.deepcopy(self.mapped_detection_meta),
                 "graph": copy.deepcopy(self.graph),
                 "occupancy": ({k: self.occupancy.get(k) for k in ("width", "height", "resolution", "origin")} if isinstance(self.occupancy, dict) else None),
                 "consistency": copy.deepcopy(self.consistency),

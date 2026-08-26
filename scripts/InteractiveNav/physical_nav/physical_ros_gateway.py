@@ -107,6 +107,10 @@ class PhysicalRosGateway:
                         transform_cache[source_frame] = None
             detections = [self._map_detection(item, transform_cache.get(str(item.get("source_frame", "") or ""))) for item in state.get("detections", []) if isinstance(item, dict)]
             self.detection_pub.publish(json.dumps({"seq": state.get("frame_seq", -1), "stamp": state.get("frame_stamp", 0), "detections": detections}, ensure_ascii=False, separators=(",", ":")))
+            # Keep a compact, map-aligned evidence view for the LAN page while
+            # preserving the raw YOLOE masks in ``detections``.
+            compact = [{key: value for key, value in item.items() if key != "mask"} for item in detections]
+            self._post_state("mapped_detections", {"seq": state.get("frame_seq", -1), "stamp": state.get("frame_stamp", 0), "map_frame": self.world_frame, "detections": compact})
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "physical state polling: %s", exc)
 

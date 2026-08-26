@@ -200,7 +200,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         if self.path == "/api/ros-state":
             length = int(self.headers.get("Content-Length", "0")); payload = json.loads(self.rfile.read(length) or b"{}")
             name, value = str(payload.get("name", "")), payload.get("value")
-            if name not in {"detections", "graph", "consistency", "occupancy", "telemetry"}:
+            if name not in {"detections", "mapped_detections", "graph", "consistency", "occupancy", "telemetry"}:
                 self._json({"accepted": False, "error": "unsupported ROS state"}, 400); return
             self.state.update_topic(name, value); self._json({"accepted": True}); return
         if self.path == "/api/qwen":

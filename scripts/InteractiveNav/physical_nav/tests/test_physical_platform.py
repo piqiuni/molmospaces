@@ -80,3 +80,12 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert snapshot["link"]["last_packet_type"] == "sensor_frame"
     state.link_disconnected()
     assert state.snapshot()["link"]["connected"] is False
+
+  def test_raw_and_map_aligned_detection_views_are_separate(self):
+    state = RuntimeState()
+    state.update_topic("detections", {"seq": 4, "detections": [{"semantic_class": "chair", "mask": {"rows": [1]}}]})
+    state.update_topic("mapped_detections", {"seq": 4, "map_frame": "tf_frame_map", "detections": [{"semantic_class": "chair", "map_transform_status": "tf"}]})
+    snapshot = state.snapshot()
+    assert snapshot["detections"][0]["mask"]
+    assert snapshot["mapped_detections"][0]["map_transform_status"] == "tf"
+    assert snapshot["mapped_detection_meta"]["map_frame"] == "tf_frame_map"
