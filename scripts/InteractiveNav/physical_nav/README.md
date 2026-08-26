@@ -31,7 +31,9 @@ browser can connect:
 
 ```bash
 cd /home/user/ldl/molmospaces
-source /opt/ros/noetic/setup.bash
+# In zsh use the zsh setup files; in bash use the corresponding setup.bash files.
+source /opt/ros/noetic/setup.zsh
+source /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/devel/setup.zsh
 export PYTHONPATH="$PWD/scripts/InteractiveNav/physical_nav/ros_compat:$PWD/scripts/InteractiveNav/physical_nav:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PYTHONPATH"
 python3 scripts/InteractiveNav/physical_nav/physical_six_panel_server.py \
   --ws-host 0.0.0.0 --ws-port 12334 --http-host 0.0.0.0 --http-port 8765 \
@@ -56,7 +58,9 @@ In another local terminal, after sourcing the catkin workspace, start the
 physical mapping nodes:
 
 ```bash
-export PYTHONPATH="/home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/ros_compat:$PYTHONPATH"
+source /opt/ros/noetic/setup.zsh
+source /home/user/ldl/molmospaces/Interactive-Nav-SG-nav/devel/setup.zsh
+export PYTHONPATH="/home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/ros_compat:/home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav:$PYTHONPATH"
 roslaunch physical_nav physical_nav_readonly.launch \
   model_path:=/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt
 ```
@@ -64,7 +68,7 @@ roslaunch physical_nav physical_nav_readonly.launch \
 On the Go2:
 
 ```bash
-python3 start_go2_readonly_sensor.py --policy-host <policy-lan-ip>
+python3 /home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/start_go2_readonly_sensor.py --policy-host <policy-lan-ip>
 ```
 
 For a development-only protocol test without a Go2 or camera:
@@ -89,7 +93,7 @@ The Qwen service is not run on the Go2. Forward its remote HTTP port to the
 policy machine (the remote SSH endpoint is the one supplied for this project):
 
 ```bash
-python3 qwen_ssh_tunnel.py --ssh-port 41051 --user root \
+python3 /home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/qwen_ssh_tunnel.py --ssh-port 41051 --user root \
   --host 115.190.90.101 --local-port 18080 --remote-port 8000
 ```
 
