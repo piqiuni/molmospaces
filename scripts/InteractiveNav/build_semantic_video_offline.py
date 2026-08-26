@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import shutil
 import subprocess
 from bisect import bisect_right
@@ -33,6 +34,63 @@ from offline_semantic_renderer import (
 
 
 _CAUSAL_RECEIPT_EPSILON_SEC = 1e-6
+
+
+def scene_display_id(scene_dir: Path) -> str:
+    """Return a compact stable house/benchmark label for every video frame."""
+
+    result_path = scene_dir / "semantic_exploration_result.json"
+    payload: dict = {}
+    if result_path.is_file():
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    house_value = (
+        payload.get("house_id")
+        or payload.get("house_ind")
+        or payload.get("house_index")
+        or ""
+    )
+    if house_value == "":
+        match = re.search(r"(?:^|[_-])h(?:ouse)?[_-]?(\d+)(?:[_-]|$)", scene_dir.name, re.I)
+        house_value = match.group(1) if match else ""
+    benchmark_value = str(
+        payload.get("benchmark_id") or payload.get("bench_id") or ""
+    ).strip()
+    parts = []
+    if str(house_value).strip():
+        parts.append(f"H{str(house_value).strip()}")
+    if benchmark_value:
+        parts.append(f"B:{benchmark_value}")
+    return " · ".join(parts) or scene_dir.name[:22]
+
+
+def draw_scene_id_badge(frame: np.ndarray, label: str) -> None:
+    text = str(label or "").strip()
+    if not text:
+        return
+    font_scale = 0.34
+    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0]
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (3, 3),
+        (min(frame.shape[1] - 3, text_size[0] + 13), text_size[1] + 12),
+        (15, 15, 15),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0.0, frame)
+    cv2.putText(
+        frame,
+        text,
+        (8, text_size[1] + 7),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (250, 250, 250),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def _receipt_stamp_sec(record: dict | None) -> float:
@@ -1032,6 +1090,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
         fallback_csv=debug_dir / "map_to_odom.csv",
     )
     renderer = OfflineSixPanelRenderer(transforms=transforms)
+    display_id = scene_display_id(scene_dir)
     global_replay = GlobalCostmapReplay(maps_by_id)
 
     # Per-frame known bounds made Panel 5 visibly pan/zoom whenever one new map
@@ -1268,6 +1327,7 @@ def build_raw_overview(scene_dir: Path, debug_dir: Path, args, sim_records: list
                     np.concatenate([camera, occ, room_panel], axis=1),
                     np.concatenate([costmaps, spatial, topology], axis=1),
                 ])
+                draw_scene_id_badge(frame, display_id)
                 output_path = frames_dir / f"frame_{written + 1:06d}_composite.png"
                 # Every offline panel is rendered with OpenCV's native BGR
                 # convention, just like the camera PNG.  Converting the whole

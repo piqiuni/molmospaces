@@ -532,8 +532,20 @@ def _draw_occupancy_candidate_legend(
     cv2.rectangle(overlay, (x0 - 2, y0 - 3), (box_width, height - 3), (255, 255, 255), -1)
     cv2.addWeighted(overlay, 0.82, panel, 0.18, 0.0, panel)
     x = x0 + 4
-    for label, color in legend:
-        cv2.circle(panel, (x + 6, y0 + 8), 5, color, -1, cv2.LINE_AA)
+    for legend_index, (label, color) in enumerate(legend):
+        center = (x + 6, y0 + 8)
+        cv2.circle(panel, center, 4, (18, 18, 18), -1, cv2.LINE_AA)
+        cv2.circle(panel, center, 2, color, -1, cv2.LINE_AA)
+        if legend_index == 2:
+            cv2.arrowedLine(
+                panel,
+                (center[0] - 2, center[1]),
+                (center[0] + 6, center[1]),
+                (18, 18, 18),
+                1,
+                cv2.LINE_AA,
+                tipLength=0.4,
+            )
         cv2.putText(panel, label, (x + 15, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.29, (20, 20, 20), 1, cv2.LINE_AA)
         x += 104
 
@@ -914,6 +926,102 @@ def _draw_goal_arrow(panel: np.ndarray, center: tuple[int, int], yaw: float, len
     cv2.circle(panel, (cx, cy), max(4, length // 4), color, -1, cv2.LINE_AA)
 
 
+def _draw_subgoal_marker(
+    panel: np.ndarray,
+    center: tuple[int, int],
+    color: tuple[int, int, int],
+    *,
+    radius: int,
+    selected: bool = False,
+    yaw: float | None = None,
+) -> None:
+    """Draw one behavior-independent subgoal marker above every map overlay."""
+
+    radius = max(3, int(radius))
+    # Selection is communicated by the heading arrow.  Keep the same one-pixel
+    # black ring and full interior colour as the original behavior marker;
+    # thickening the ring made the live goal look black/different.
+    border = 1
+    cv2.circle(panel, center, radius, (18, 18, 18), -1, cv2.LINE_AA)
+    cv2.circle(
+        panel,
+        center,
+        max(2, radius - border),
+        tuple(int(value) for value in color),
+        -1,
+        cv2.LINE_AA,
+    )
+    if selected and yaw is not None and math.isfinite(float(yaw)):
+        _draw_subgoal_direction(panel, center, float(yaw), radius)
+
+
+def _draw_subgoal_direction(
+    panel: np.ndarray,
+    center: tuple[int, int],
+    yaw: float,
+    length: int,
+    color: tuple[int, int, int] = (230, 30, 45),
+) -> None:
+    """Add the original behavior colour and a readable heading to a live goal."""
+
+    if math.isfinite(float(yaw)):
+        heading = np.asarray(
+            [math.cos(float(yaw)), -math.sin(float(yaw))], dtype=np.float32
+        )
+        length = max(10, int(length))
+        start = np.asarray(center, dtype=np.float32) - heading * float(length * 0.18)
+        end = np.asarray(center, dtype=np.float32) + heading * float(length)
+        cv2.arrowedLine(
+            panel,
+            tuple(start.astype(np.int32)),
+            tuple(end.astype(np.int32)),
+            (18, 18, 18),
+            4,
+            cv2.LINE_AA,
+            tipLength=0.42,
+        )
+        cv2.arrowedLine(
+            panel,
+            tuple(start.astype(np.int32)),
+            tuple(end.astype(np.int32)),
+            tuple(int(value) for value in color),
+            2,
+            cv2.LINE_AA,
+            tipLength=0.42,
+        )
+
+
+def _outlined_text(
+    panel: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    *,
+    font_scale: float,
+    color: tuple[int, int, int] = (25, 25, 25),
+    thickness: int = 1,
+) -> None:
+    cv2.putText(
+        panel,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (250, 250, 250),
+        thickness + 2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
 def _selection_target_id(selection: dict | None) -> str:
     selection = selection or {}
     if selection.get("active") is False:
@@ -1187,6 +1295,27 @@ def _node_color(node: dict) -> tuple[int, int, int]:
     return (30, 190, 195) if node.get("is_currently_visible") else (145, 145, 145)
 
 
+def _interaction_display_state(node: dict) -> str:
+    interaction = node.get("interaction") or {}
+    state = str(interaction.get("state") or "unknown").strip().casefold()
+    capability = str(interaction.get("capability") or "").strip().casefold()
+    if capability == "unavailable":
+        if state in {"", "unknown", "unavailable"}:
+            # Older raw recordings retained the real aperture in operation
+            # history even when the public state used the capability token.
+            history = list(interaction.get("operation_history") or [])
+            if history:
+                state = str(
+                    history[-1].get("pre_state") or state
+                ).strip().casefold()
+        if state in {"open", "ajar", "static_open"}:
+            return "unavail/open"
+        if state in {"closed", "static_closed", "blocked"}:
+            return "unavail/closed"
+        return "unavail/?"
+    return state
+
+
 def _bounded_nodes(
     graph: dict, observed_ids: set[str], target_ids: set[str], limit: int = 96
 ) -> list[dict]:
@@ -1435,18 +1564,23 @@ class OfflineSixPanelRenderer:
             (20, 118, 230),
             3,
         )
+        ego_arrow_length = max(9, int(round(9 * scale)))
         if pose is not None and (robot_px := to_panel(pose)) is not None:
-            _draw_robot_arrow(panel, robot_px, pose[2], max(9, int(9 * scale)))
+            _draw_robot_arrow(panel, robot_px, pose[2], ego_arrow_length)
         if draw_global_plan:
             _draw_polyline(panel, [point for item in global_plan if (point := to_panel(item)) is not None], (40, 190, 60), 3)
         if draw_local_global_plan:
             _draw_polyline(panel, [point for item in local_global_plan if (point := to_panel(item)) is not None], (40, 190, 60), 3)
         if draw_local_plan:
             _draw_polyline(panel, [point for item in local_plan if (point := to_panel(item)) is not None], (240, 150, 20), 3)
-        # Candidate lists are diagnostic dots. The live semantic selection gets
-        # the only goal arrow, so every map panel has one canonical command.
+        # Candidate snapshots remain diagnostic-only.  Accumulate their marker
+        # geometry now, then draw every behavior with the same large black-ring
+        # shape at the very end so paths, labels, and the robot cannot obscure
+        # the goals.  The canonical live selection is always drawn last.
         selected_id = str(selection.get("candidate_id") or "")
-        selected_candidate_stale = False
+        candidate_markers: list[
+            tuple[tuple[int, int], tuple[int, int, int]]
+        ] = []
         if draw_semantic_candidates:
             for candidate in (step.get("semantic_candidates") or {}).get("candidates") or []:
                 values = list(candidate.get("goal_xyyaw") or [])
@@ -1455,40 +1589,24 @@ class OfflineSixPanelRenderer:
                 behavior_type = str(candidate.get("behavior_type") or "EXPLORE").upper()
                 color = candidate_color(behavior_type)
                 if str(candidate.get("candidate_id") or "") == selected_id:
-                    if candidate_matches_canonical_selection(selection, candidate):
-                        if candidate_px is not None:
-                            cv2.circle(panel, candidate_px, max(5, int(round(3.0 * max(scale, 1.0)))), color, 2, cv2.LINE_AA)
-                    else:
-                        selected_candidate_stale = True
+                    # Never render same-ID stale geometry. The live selection
+                    # below is authoritative even when the snapshot revision is
+                    # old; this validation intentionally remains silent.
+                    candidate_matches_canonical_selection(selection, candidate)
+                    continue
                 if candidate_point is not None and candidate_px is not None and str(candidate.get("candidate_id") or "") != selected_id:
-                    if behavior_type == "EXPLORE":
-                        radius = max(3, int(round(1.3 * max(scale, 1.0))))
-                        cv2.circle(panel, candidate_px, radius, UNSELECTED_EXPLORE_COLOR, -1, cv2.LINE_AA)
-                        cv2.circle(panel, candidate_px, radius, UNSELECTED_EXPLORE_BORDER_COLOR, 1, cv2.LINE_AA)
-                    else:
-                        cv2.circle(panel, candidate_px, max(2, int(round(max(scale, 1.0) * 0.8))), color, -1, cv2.LINE_AA)
+                    candidate_markers.append((candidate_px, color))
 
-        # The live semantic selection (including an executor fallback) is the
-        # only authority for the goal arrow. Candidate lists are merely a
-        # diagnostic snapshot and must never substitute same-ID stale geometry.
+        live_goal_marker = None
         if (
             goal is not None
             and (goal_px := to_panel(goal)) is not None
         ):
             behavior = str(selection.get("behavior_type") or "NAVIGATE").upper()
-            transformed_goal_yaw = goal[2] if math.isfinite(goal[2]) else goal_yaw
-            _draw_goal_arrow(panel, goal_px, transformed_goal_yaw, max(9, int(9 * scale)), candidate_color(behavior))
-        if selected_candidate_stale:
-            cv2.rectangle(panel, (6, 101), (min(panel.shape[1] - 6, 302), 120), (255, 255, 255), -1)
-            cv2.putText(
-                panel,
-                "CANDIDATE SNAPSHOT OUTDATED (LIVE GOAL SHOWN)",
-                (10, 115),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.30,
-                (55, 55, 170),
-                1,
-                cv2.LINE_AA,
+            live_goal_marker = (
+                goal_px,
+                candidate_color(behavior),
+                float(goal[2]) if len(goal) >= 3 else None,
             )
         _draw_panel_title(panel, title, step_index)
         draw_map_snapshot_note(
@@ -1505,6 +1623,33 @@ class OfflineSixPanelRenderer:
             _draw_occupancy_candidate_legend(
                 panel,
                 str(selection.get("behavior_type") or ""),
+            )
+        marker_radius = max(4, min(6, int(round(1.5 * max(scale, 1.0)))))
+        for marker_px, marker_color in candidate_markers:
+            _draw_subgoal_marker(
+                panel,
+                marker_px,
+                marker_color,
+                radius=marker_radius,
+            )
+        if live_goal_marker is not None:
+            _draw_subgoal_marker(
+                panel,
+                live_goal_marker[0],
+                live_goal_marker[1],
+                radius=marker_radius,
+                selected=True,
+            )
+            _draw_subgoal_direction(
+                panel,
+                live_goal_marker[0],
+                live_goal_marker[2],
+                # ``_draw_robot_arrow`` spans 1.55 * its nominal length from
+                # tail to tip.  Make the selected-goal arrow exactly half of
+                # that visible ego-pose span, rather than half of only its
+                # forward half (which was too short in Fig. 2/Fig. 4).
+                max(10, int(round(0.5 * 1.55 * ego_arrow_length))),
+                live_goal_marker[1],
             )
         return panel
 
@@ -1637,7 +1782,23 @@ class OfflineSixPanelRenderer:
         selection = active_semantic_selection(step)
         target_ids = selection_target_ids(selection)
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
-        for node in _bounded_nodes(graph, observed, target_ids):
+        bounded_nodes = _bounded_nodes(graph, observed, target_ids)
+        room_labels: list[tuple[tuple[int, int], str]] = []
+        for node in bounded_nodes:
+            if str(node.get("type") or "") != "room":
+                continue
+            center = _node_xy(node)
+            if center is None:
+                continue
+            room_id = (
+                node.get("room_id")
+                if node.get("room_id") is not None
+                else str(node.get("id") or "").removeprefix("room_")
+            )
+            room_labels.append(
+                (to_px(*center), f"Room {room_id}: {_node_label(node)}")
+            )
+        for node in bounded_nodes:
             if str(node.get("type") or "") not in {"portal", "container"}:
                 continue
             center = _node_xy(node)
@@ -1650,6 +1811,25 @@ class OfflineSixPanelRenderer:
             color = (235, 35, 210) if is_target else _node_color(node)
             cv2.rectangle(panel, (center_px[0] - half_w, center_px[1] - half_h), (center_px[0] + half_w, center_px[1] + half_h), color, 4 if is_target else 2, cv2.LINE_AA)
             cv2.putText(panel, f"{'INTERACT ' if is_target else ''}{_short_node_id(node)} {node.get('label', node.get('type', ''))}", (center_px[0] + 3, center_px[1] - half_h - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.30, color, 1, cv2.LINE_AA)
+        for center_px, label in room_labels:
+            text = label[:36]
+            text_size = cv2.getTextSize(
+                text, cv2.FONT_HERSHEY_SIMPLEX, 0.28, 1
+            )[0]
+            origin = (
+                int(center_px[0] - text_size[0] * 0.5),
+                int(center_px[1] + text_size[1] * 0.5),
+            )
+            cv2.putText(
+                panel,
+                text,
+                origin,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.28,
+                (25, 25, 25),
+                1,
+                cv2.LINE_AA,
+            )
         pose = self._transform(step.get("pose"), self.transforms.odom_frame, self.transforms.map_frame, step_index)
         if pose is not None:
             _draw_robot_arrow(panel, to_px(pose[0], pose[1]), pose[2], 14)
@@ -1681,7 +1861,9 @@ class OfflineSixPanelRenderer:
         snapshot_selection_reason: str = "",
     ) -> np.ndarray:
         width, height = panel_size
-        panel = np.full((height, width, 3), 246, dtype=np.uint8)
+        map_width = max(180, int(round(width * 0.66)))
+        map_size = (map_width, height)
+        panel = np.full((height, map_width, 3), 246, dtype=np.uint8)
         graph = step.get("unified_graph") or {}
         selection = active_semantic_selection(step)
         target_ids = selection_target_ids(selection)
@@ -1694,14 +1876,17 @@ class OfflineSixPanelRenderer:
         if not positions:
             cv2.putText(panel, "WAITING FOR UNIFIED GRAPH", (40, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 90, 90), 2, cv2.LINE_AA)
             _draw_panel_title(panel, "SEMANTIC XY", step_index)
-            return panel
+            return np.concatenate(
+                [panel, self._render_candidate_sidebar((width - map_width, height), step, step_index)],
+                axis=1,
+            )
         if world_bounds is None:
             min_x, max_x = min(value[0] for value in positions), max(value[0] for value in positions)
             min_y, max_y = min(value[1] for value in positions), max(value[1] for value in positions)
             world_bounds = (min_x, min_y, max_x, max_y)
         view_bounds = zoom_world_bounds(world_bounds, view_scale)
-        scale, to_px = self._world_view(view_bounds, panel_size, margin=38, vertical_center=0.53)
-        occ_layer = self._warp_grid(panel_size, occupancy, _occupancy_base(occupancy) if occupancy else None, to_px, (246, 246, 246))
+        scale, to_px = self._world_view(view_bounds, map_size, margin=28, vertical_center=0.53)
+        occ_layer = self._warp_grid(map_size, occupancy, _occupancy_base(occupancy) if occupancy else None, to_px, (246, 246, 246))
         if occ_layer is not None:
             panel = cv2.addWeighted(occ_layer, 0.35, panel, 0.65, 0.0)
         min_x, min_y, max_x, max_y = view_bounds
@@ -1773,6 +1958,98 @@ class OfflineSixPanelRenderer:
             selection_reason=snapshot_selection_reason,
             y=42,
         )
+        sidebar = self._render_candidate_sidebar(
+            (width - map_width, height), step, step_index
+        )
+        return np.concatenate([panel, sidebar], axis=1)
+
+    def _render_candidate_sidebar(
+        self,
+        panel_size: tuple[int, int],
+        step: dict,
+        step_index: int,
+    ) -> np.ndarray:
+        """Render the complete current candidate set in deterministic order."""
+
+        width, height = panel_size
+        panel = np.full((height, width, 3), (238, 242, 248), dtype=np.uint8)
+        selection = active_semantic_selection(step)
+        selected_id = str(selection.get("candidate_id") or "")
+        by_id: dict[str, dict] = {}
+        for raw in (step.get("semantic_candidates") or {}).get("candidates") or []:
+            candidate = dict(raw)
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if candidate_id:
+                by_id[candidate_id] = candidate
+        if selected_id:
+            merged = dict(by_id.get(selected_id) or {})
+            merged.update(selection)
+            merged["candidate_id"] = selected_id
+            by_id[selected_id] = merged
+        priority = {"INTERACT": 0, "NAVIGATE": 1, "EXPLORE": 2}
+
+        def score(candidate: dict) -> float:
+            features = candidate.get("features") or {}
+            for value in (
+                candidate.get("score"),
+                candidate.get("policy_score"),
+                features.get("score"),
+                features.get("pre_score"),
+            ):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    pass
+            return 0.0
+
+        rows = sorted(
+            by_id.values(),
+            key=lambda candidate: (
+                priority.get(str(candidate.get("behavior_type") or "").upper(), 3),
+                -score(candidate),
+                str(candidate.get("candidate_id") or ""),
+            ),
+        )
+        cv2.rectangle(panel, (0, 0), (max(0, width - 1), max(0, height - 1)), (80, 80, 80), 1)
+        cv2.putText(panel, "ALL SUBGOALS", (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.31, (35, 35, 35), 1, cv2.LINE_AA)
+        if not rows:
+            cv2.putText(panel, "-- none --", (8, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (95, 95, 95), 1, cv2.LINE_AA)
+            return panel
+        available_h = max(1, height - 27)
+        row_h = max(8, min(22, available_h // max(1, len(rows))))
+        font_scale = 0.25 if row_h >= 14 else 0.21
+        for index, candidate in enumerate(rows):
+            y1 = 24 + index * row_h
+            y2 = min(height - 2, y1 + row_h - 2)
+            if y1 >= height - 1:
+                break
+            candidate_id = str(candidate.get("candidate_id") or "")
+            behavior = str(candidate.get("behavior_type") or "EXPLORE").upper()
+            color = candidate_color(behavior)
+            selected = bool(selected_id and candidate_id == selected_id)
+            fill = (255, 255, 255) if not selected else (232, 246, 255)
+            cv2.rectangle(panel, (3, y1), (width - 4, y2), fill, -1)
+            cv2.rectangle(panel, (3, y1), (width - 4, y2), (15, 15, 15), 2 if selected else 1)
+            cv2.rectangle(panel, (4, y1 + 1), (10, max(y1 + 1, y2 - 1)), color, -1)
+            target = str(
+                candidate.get("target_name")
+                or candidate.get("target_id")
+                or candidate_id
+                or "-"
+            )
+            prefix = ">" if selected else " "
+            label = f"{prefix}{behavior[:3]} {target}"
+            max_chars = max(5, int((width - 17) / max(3.5, 7.0 * font_scale)))
+            cv2.putText(
+                panel,
+                label[:max_chars],
+                (13, min(y2 - 2, y1 + max(7, row_h - 5))),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (25, 25, 25),
+                1,
+                cv2.LINE_AA,
+            )
         return panel
 
     def render_topology(self, panel_size: tuple[int, int], step: dict, step_index: int) -> np.ndarray:
@@ -1843,13 +2120,18 @@ class OfflineSixPanelRenderer:
             if is_target:
                 cv2.rectangle(panel, (max(1, x1 - 2), max(1, y1 - 2)), (min(width - 2, x2 + 2), min(height - 2, y2 + 2)), (235, 35, 210), 2, cv2.LINE_AA)
             node_type = str(node.get("type") or "object")
-            state = str((node.get("interaction") or {}).get("state") or "unknown")
+            state = _interaction_display_state(node)
             if node_type == "room":
                 room_id = node.get("room_id") if node.get("room_id") is not None else node_id.removeprefix("room_")
                 cv2.putText(panel, f"Room {room_id}"[:22], (x1 + 4, y1 + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.29, (25, 25, 25), 1, cv2.LINE_AA)
                 cv2.putText(panel, _node_label(node)[:22], (x1 + 4, y2 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (25, 25, 25), 1, cv2.LINE_AA)
             else:
-                label = _node_label(node) if node_type == "object" else f"{_short_node_id(node)} {_node_label(node)} [{state}]"
+                if node_type == "portal" and state.startswith("unavail/"):
+                    # Keep the two unavailable portal states readable inside the
+                    # compact topology node instead of truncating the qualifier.
+                    label = f"{_short_node_id(node)} [{state.replace('/', '-')}]"
+                else:
+                    label = _node_label(node) if node_type == "object" else f"{_short_node_id(node)} {_node_label(node)} [{state}]"
                 text_width, text_height = cv2.getTextSize(label[:26], cv2.FONT_HERSHEY_SIMPLEX, 0.25, 1)[0]
                 cv2.putText(panel, label[:26], (x1 + max(3, (x2 - x1 - text_width) // 2), (y1 + y2 + text_height) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (25, 25, 25), 1, cv2.LINE_AA)
         dashed_line((4, 29), (13, 29), (35, 35, 210)); dashed_line((13, 29), (13, 37), (35, 35, 210)); dashed_line((13, 37), (4, 37), (35, 35, 210)); dashed_line((4, 37), (4, 29), (35, 35, 210))

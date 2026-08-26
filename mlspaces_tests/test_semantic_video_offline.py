@@ -411,12 +411,13 @@ def test_stale_same_id_candidate_never_replaces_canonical_goal(monkeypatch) -> N
     }
     assert not candidate_matches_canonical_selection(canonical, stale_candidate)
 
-    arrows: list[tuple[tuple[int, int], float]] = []
+    markers: list[tuple[tuple[int, int], bool]] = []
 
-    def capture_arrow(_panel, center, yaw, _length, _color):
-        arrows.append((center, yaw))
+    def capture_marker(_panel, center, _color, *, radius, selected=False):
+        assert 4 <= radius <= 6
+        markers.append((center, bool(selected)))
 
-    monkeypatch.setattr(offline_renderer, "_draw_goal_arrow", capture_arrow)
+    monkeypatch.setattr(offline_renderer, "_draw_subgoal_marker", capture_marker)
     grid = RawGrid(
         values=np.zeros((120, 120), dtype=np.int32),
         width=120,
@@ -450,10 +451,10 @@ def test_stale_same_id_candidate_never_replaces_canonical_goal(monkeypatch) -> N
         world_bounds=(-5.0, -5.0, 5.0, 5.0),
         draw_semantic_candidates=True,
     )
-    # There is one arrow, from the canonical map goal transformed into odom.
-    # Its yaw proves that local panels use the transformed, not map-frame yaw.
-    assert len(arrows) == 1
-    assert math.isclose(arrows[0][1], -math.pi / 2.0, abs_tol=1e-6)
+    # There is one marker and it is the canonical live goal.  The stale same-ID
+    # snapshot is silently rejected and cannot add or replace map geometry.
+    assert len(markers) == 1
+    assert markers[0][1] is True
 
 
 def test_renderer_uses_episode_trajectory_instead_of_boundary_history(monkeypatch) -> None:
@@ -619,7 +620,7 @@ def test_unselected_explore_candidates_use_pale_purple(monkeypatch) -> None:
     assert offline_renderer.UNSELECTED_EXPLORE_COLOR in colors
 
 
-def test_stale_candidate_text_explains_live_goal_is_authoritative(monkeypatch) -> None:
+def test_stale_candidate_warning_is_hidden_while_live_goal_remains_authoritative(monkeypatch) -> None:
     import cv2
 
     labels: list[str] = []
@@ -672,7 +673,107 @@ def test_stale_candidate_text_explains_live_goal_is_authoritative(monkeypatch) -
         world_bounds=(0.0, 0.0, 10.0, 10.0),
         draw_semantic_candidates=True,
     )
-    assert "CANDIDATE SNAPSHOT OUTDATED (LIVE GOAL SHOWN)" in labels
+    assert "CANDIDATE SNAPSHOT OUTDATED (LIVE GOAL SHOWN)" not in labels
+    assert "LIVE EXPLORE" in labels
+
+
+def test_room_panel_draws_room_name_at_room_center(monkeypatch) -> None:
+    import cv2
+
+    labels: list[str] = []
+    original_put_text = cv2.putText
+
+    def capture_put_text(image, text, *args, **kwargs):
+        labels.append(str(text))
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "putText", capture_put_text)
+    renderer = OfflineSixPanelRenderer(
+        transforms=TransformResolver([], map_frame="map", odom_frame="map")
+    )
+    grid = RawGrid(
+        values=np.zeros((100, 100), dtype=np.int32),
+        width=100,
+        height=100,
+        resolution=0.1,
+        frame_id="map",
+        origin_x=0.0,
+        origin_y=0.0,
+        origin_yaw=0.0,
+    )
+    renderer.render_room_panel(
+        grid,
+        grid,
+        (480, 270),
+        {
+            "pose": [5.0, 5.0, 0.0],
+            "unified_graph": {
+                "nodes": [
+                    {
+                        "id": "room_7",
+                        "type": "room",
+                        "room_id": 7,
+                        "centroid": [5.0, 5.0],
+                        "aabb_size": [5.0, 4.0, 0.0],
+                        "attributes": {"room_attribute": "kitchen"},
+                    }
+                ],
+                "edges": [],
+            },
+        },
+        0,
+        (0.0, 0.0, 10.0, 10.0),
+    )
+    assert "Room 7: kitchen room" in labels
+
+
+def test_semantic_sidebar_orders_interact_navigate_explore(monkeypatch) -> None:
+    import cv2
+
+    labels: list[str] = []
+    original_put_text = cv2.putText
+
+    def capture_put_text(image, text, *args, **kwargs):
+        labels.append(str(text))
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "putText", capture_put_text)
+    renderer = OfflineSixPanelRenderer(
+        transforms=TransformResolver([], map_frame="map", odom_frame="map")
+    )
+    renderer._render_candidate_sidebar(
+        (180, 270),
+        {
+            "semantic_candidates": {
+                "candidates": [
+                    {"candidate_id": "e", "behavior_type": "EXPLORE", "target_name": "E"},
+                    {"candidate_id": "n", "behavior_type": "NAVIGATE", "target_name": "N"},
+                    {"candidate_id": "i", "behavior_type": "INTERACT", "target_name": "I"},
+                ]
+            }
+        },
+        0,
+    )
+    row_labels = [label for label in labels if label.startswith(" ")]
+    assert row_labels == [" INT I", " NAV N", " EXP E"]
+
+
+def test_unavailable_portal_display_distinguishes_open_and_closed() -> None:
+    assert offline_renderer._interaction_display_state(
+        {"interaction": {"capability": "unavailable", "state": "static_open"}}
+    ) == "unavail/open"
+    assert offline_renderer._interaction_display_state(
+        {"interaction": {"capability": "unavailable", "state": "static_closed"}}
+    ) == "unavail/closed"
+    assert offline_renderer._interaction_display_state(
+        {
+            "interaction": {
+                "capability": "unavailable",
+                "state": "unavailable",
+                "operation_history": [{"pre_state": "closed"}],
+            }
+        }
+    ) == "unavail/closed"
 
 
 def test_interaction_subgoal_is_true_orange_and_legend_uses_live_behavior(monkeypatch) -> None:
