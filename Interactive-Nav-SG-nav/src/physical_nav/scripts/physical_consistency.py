@@ -72,5 +72,9 @@ def evaluate_frame(detections: list[Mapping[str, Any]], *, graph: Mapping[str, A
             node = min(candidates, key=lambda item: math.dist(det_point, _point3(item.get("world_position") or item.get("position") or item.get("centroid") or item.get("aabb_center")) or (float("inf"),) * 3))
         else:
             node = candidates[0] if candidates else None
-        reports.append(evaluate_detection(det, map_node=node, thresholds=thresholds))
+        report = evaluate_detection(det, map_node=node, thresholds=thresholds)
+        if node is None:
+            report["status"] = "warn" if report["status"] == "pass" else report["status"]
+            report["reasons"].append("missing_map_node")
+        reports.append(report)
     counts = {s: sum(r["status"] == s for r in reports) for s in ("pass", "warn", "fail")}; return {"status": "fail" if counts["fail"] else ("warn" if counts["warn"] else "pass"), "counts": counts, "detections": reports}

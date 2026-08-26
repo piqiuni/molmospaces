@@ -49,7 +49,7 @@ class PhysicalPlatformTests(unittest.TestCase):
     lifted = evaluate_detection({"world_position": {"x": 0., "y": 0., "z": 1.}, "camera_position": {"x": 0., "y": 0., "z": 1.}, "depth_median_m": 1., "depth_valid_points": 20, "confidence": .9})
     assert lifted["metrics"]["rgbd_depth_lift_abs_m"] == 0.0
     frame = evaluate_frame([{"instance_id": "chair_1", "semantic_class": "chair", "confidence": .9}], graph={"nodes": []})
-    assert frame["counts"]["pass"] == 1
+    assert frame["counts"]["warn"] == 1
 
   def test_yoloe_label_and_pose_lift(self):
     assert _label("refrigerator_door") == "fridge"
