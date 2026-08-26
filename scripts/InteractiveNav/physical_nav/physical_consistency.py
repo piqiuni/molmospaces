@@ -53,6 +53,15 @@ def evaluate_detection(detection: Mapping[str, Any], *, projected_bbox: Iterable
                 metrics["depth_median_abs_m"] = abs(_num(z) - median)
                 if metrics["depth_median_abs_m"] > t["depth_abs_m"]: reasons.append("depth_projection_mismatch")
             metrics["depth_valid_ratio"] = min(1.0, float(len(depths)) / max(1.0, _num(detection.get("mask_area"), len(depths))))
+    sensor_depth = _num(detection.get("depth_median_m"), -1.0)
+    camera_point = _point3(detection.get("camera_position"))
+    if sensor_depth > 0.0:
+        metrics["sensor_depth_m"] = sensor_depth
+        metrics["depth_valid_points"] = _num(detection.get("depth_valid_points"))
+        if camera_point is not None:
+            metrics["rgbd_depth_lift_abs_m"] = abs(camera_point[2] - sensor_depth)
+            if metrics["rgbd_depth_lift_abs_m"] > t["depth_abs_m"]:
+                reasons.append("rgbd_depth_lift_mismatch")
     if map_node:
         p = detection.get("world_position") or detection.get("position") or {}; q = map_node.get("world_position") or map_node.get("position") or map_node.get("centroid") or map_node.get("aabb_center") or {}
         p3, q3 = _point3(p), _point3(q)
