@@ -27,6 +27,7 @@
   </group>
   <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" launch-prefix="$(arg ros_python)" output="screen" respawn="true">
     <param name="web_url" value="http://127.0.0.1:8765"/>
+    <param name="world_frame" value="tf_frame_map"/>
     <param name="camera_frame" value="d435i_color_optical_frame"/>
     <param name="camera_parent" value="tf_frame_base_link"/>
     <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
@@ -35,6 +36,7 @@
 
   <node name="physical_nav_consistency" pkg="physical_nav" type="physical_consistency_node.py" launch-prefix="$(arg ros_python)" output="screen">
     <param name="camera_frame" value="d435i_color_optical_frame"/>
+    <param name="world_frame" value="tf_frame_map"/>
     <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
   </node>

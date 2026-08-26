@@ -81,13 +81,28 @@ def _project_camera_point(point: tuple[float, float, float], intrinsics: Mapping
     return fx * x + cx, fy * y + cy
 
 
-def project_map_node(map_node: Mapping[str, Any], *, intrinsics: Mapping[str, Any], telemetry: Mapping[str, Any], camera_translation: Sequence[float] = (0.0, 0.0, 0.0), camera_rpy: Sequence[float] = (0.0, 0.0, 0.0), image_size: Sequence[int] | None = None) -> dict[str, Any] | None:
+def _transform_world_to_camera(point: tuple[float, float, float], transform: Mapping[str, Any]) -> tuple[float, float, float]:
+    translation = _vector3(transform.get("translation"), (0.0, 0.0, 0.0))
+    quaternion = list(transform.get("quaternion") or [])
+    if len(quaternion) < 4:
+        return point
+    x, y, z, w = [_num(value) for value in quaternion[:4]]
+    px, py, pz = point
+    tx = 2.0 * (y * pz - z * py)
+    ty = 2.0 * (z * px - x * pz)
+    tz = 2.0 * (x * py - y * px)
+    return (px + w * tx + y * tz - z * ty + translation[0], py + w * ty + z * tx - x * tz + translation[1], pz + w * tz + x * ty - y * tx + translation[2])
+
+
+def project_map_node(map_node: Mapping[str, Any], *, intrinsics: Mapping[str, Any], telemetry: Mapping[str, Any], camera_translation: Sequence[float] = (0.0, 0.0, 0.0), camera_rpy: Sequence[float] = (0.0, 0.0, 0.0), image_size: Sequence[int] | None = None, world_to_camera: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
     """Project a global graph node's 3-D box into the current RGB image."""
     center = _point3(map_node.get("world_box3d_center") or map_node.get("aabb_center") or map_node.get("box3d_center") or map_node.get("world_position") or map_node.get("position") or map_node.get("centroid"))
     if center is None:
         return None
     size = _size3(map_node.get("world_box3d_size") or map_node.get("aabb_size") or map_node.get("box3d_size") or map_node.get("size"))
-    corners = [_world_to_camera((center[0] + sx * size[0], center[1] + sy * size[1], center[2] + sz * size[2]), telemetry, camera_translation, camera_rpy) for sx in (-0.5, 0.5) for sy in (-0.5, 0.5) for sz in (-0.5, 0.5)]
+    def transform_corner(corner: tuple[float, float, float]) -> tuple[float, float, float]:
+        return _transform_world_to_camera(corner, world_to_camera) if world_to_camera else _world_to_camera(corner, telemetry, camera_translation, camera_rpy)
+    corners = [transform_corner((center[0] + sx * size[0], center[1] + sy * size[1], center[2] + sz * size[2])) for sx in (-0.5, 0.5) for sy in (-0.5, 0.5) for sz in (-0.5, 0.5)]
     visible = [point for point in corners if point[2] > 1e-3]
     if not visible:
         return None
@@ -103,7 +118,7 @@ def project_map_node(map_node: Mapping[str, Any], *, intrinsics: Mapping[str, An
     depth_values = sorted(point[2] for point in visible)
     middle = len(depth_values) // 2
     depth_m = 0.5 * (depth_values[(len(depth_values) - 1) // 2] + depth_values[middle])
-    return {"bbox": bbox, "depth_m": float(depth_m), "camera_center": _world_to_camera(center, telemetry, camera_translation, camera_rpy), "visible_corners": len(visible)}
+    return {"bbox": bbox, "depth_m": float(depth_m), "camera_center": _transform_world_to_camera(center, world_to_camera) if world_to_camera else _world_to_camera(center, telemetry, camera_translation, camera_rpy), "visible_corners": len(visible)}
 
 
 def bbox_iou(a: Iterable[float], b: Iterable[float]) -> float:
@@ -177,7 +192,7 @@ def evaluate_frame(detections: list[Mapping[str, Any]], *, graph: Mapping[str, A
         candidate = min(candidates, key=lambda node: math.dist(det_point, _point3(node.get("world_position") or node.get("position") or node.get("centroid") or node.get("aabb_center")) or (float("inf"),) * 3)) if det_point is not None and candidates else (candidates[0] if candidates else None)
         projected = None
         if candidate is not None and projection_context:
-            projected = project_map_node(candidate, intrinsics=projection_context.get("intrinsics", {}), telemetry=projection_context.get("telemetry", {}), camera_translation=projection_context.get("camera_translation", (0.0, 0.0, 0.0)), camera_rpy=projection_context.get("camera_rpy", (0.0, 0.0, 0.0)), image_size=projection_context.get("image_size"))
+            projected = project_map_node(candidate, intrinsics=projection_context.get("intrinsics", {}), telemetry=projection_context.get("telemetry", {}), camera_translation=projection_context.get("camera_translation", (0.0, 0.0, 0.0)), camera_rpy=projection_context.get("camera_rpy", (0.0, 0.0, 0.0)), image_size=projection_context.get("image_size"), world_to_camera=projection_context.get("world_to_camera"))
         report = evaluate_detection(detection, projected_bbox=projected.get("bbox") if projected else None, projected_depth_m=projected.get("depth_m") if projected else None, map_node=candidate, thresholds=thresholds)
         if projected is not None: report["projection"] = projected
         if candidate is None:

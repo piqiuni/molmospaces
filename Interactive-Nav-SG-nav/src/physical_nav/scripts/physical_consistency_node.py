@@ -9,6 +9,7 @@ import threading
 from typing import Any
 
 import rospy
+import tf2_ros
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import String
@@ -26,6 +27,9 @@ class ConsistencyNode:
         self._camera_translation = (args.camera_x, args.camera_y, args.camera_z)
         self._camera_rpy = (args.camera_roll, args.camera_pitch, args.camera_yaw)
         self._camera_frame = args.camera_frame
+        self._world_frame = args.world_frame
+        self._tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
         self._pub = rospy.Publisher("/physical_nav/consistency", String, queue_size=1)
         rospy.Subscriber("/physical_nav/detections", String, self._detections_cb, queue_size=1)
         rospy.Subscriber("/physical_nav/unified_graph", String, self._graph_cb, queue_size=1)
@@ -94,12 +98,24 @@ class ConsistencyNode:
                 "camera_rpy": self._camera_rpy,
                 "image_size": (intrinsics.get("width", 0), intrinsics.get("height", 0)),
             }
+        projection_source = "odom+camera_extrinsic_fallback"
+        if intrinsics:
+            try:
+                transform = self._tf_buffer.lookup_transform(self._camera_frame, self._world_frame, rospy.Time(0), rospy.Duration(0.05))
+                context = context or {"intrinsics": intrinsics, "telemetry": telemetry}
+                context["world_to_camera"] = {
+                    "translation": [float(transform.transform.translation.x), float(transform.transform.translation.y), float(transform.transform.translation.z)],
+                    "quaternion": [float(transform.transform.rotation.x), float(transform.transform.rotation.y), float(transform.transform.rotation.z), float(transform.transform.rotation.w)],
+                }
+                projection_source = "tf_camera_from_map"
+            except Exception:
+                pass
         report = evaluate_frame(detections, graph=graph, projection_context=context)
         report["detection_count"] = len(detections)
         report["graph_revision"] = graph.get("revision", graph.get("timestamp"))
         report["projection"] = {
             "enabled": bool(context),
-            "source": "d435i_camera_info+physical_nav_odom" if context else "waiting_for_camera_info_and_odom",
+            "source": projection_source if context else "waiting_for_camera_info_and_odom",
             "camera_frame": self._camera_frame,
         }
         self._pub.publish(String(data=json.dumps(report, ensure_ascii=False, separators=(",", ":"))))
@@ -109,6 +125,7 @@ def main() -> None:
     rospy.init_node("physical_nav_consistency", anonymous=False)
     args = type("ConsistencyArgs", (), {
         "camera_frame": str(rospy.get_param("~camera_frame", "d435i_color_optical_frame")),
+        "world_frame": str(rospy.get_param("~world_frame", "tf_frame_map")),
         "camera_x": float(rospy.get_param("~camera_x", 0.0)),
         "camera_y": float(rospy.get_param("~camera_y", 0.0)),
         "camera_z": float(rospy.get_param("~camera_z", 0.0)),

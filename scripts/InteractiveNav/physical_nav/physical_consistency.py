@@ -102,6 +102,23 @@ def _project_camera_point(point: tuple[float, float, float], intrinsics: Mapping
     return fx * x + cx, fy * y + cy
 
 
+def _transform_world_to_camera(point: tuple[float, float, float], transform: Mapping[str, Any]) -> tuple[float, float, float]:
+    translation = _vector3(transform.get("translation"), (0.0, 0.0, 0.0))
+    quaternion = list(transform.get("quaternion") or [])
+    if len(quaternion) < 4:
+        return point
+    x, y, z, w = [_num(value) for value in quaternion[:4]]
+    px, py, pz = point
+    tx = 2.0 * (y * pz - z * py)
+    ty = 2.0 * (z * px - x * pz)
+    tz = 2.0 * (x * py - y * px)
+    return (
+        px + w * tx + y * tz - z * ty + translation[0],
+        py + w * ty + z * tx - x * tz + translation[1],
+        pz + w * tz + x * ty - y * tx + translation[2],
+    )
+
+
 def project_map_node(
     map_node: Mapping[str, Any],
     *,
@@ -110,6 +127,7 @@ def project_map_node(
     camera_translation: Sequence[float] = (0.0, 0.0, 0.0),
     camera_rpy: Sequence[float] = (0.0, 0.0, 0.0),
     image_size: Sequence[int] | None = None,
+    world_to_camera: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Project a global graph node's 3-D box into the current RGB image.
 
@@ -133,18 +151,16 @@ def project_map_node(
         or map_node.get("box3d_size")
         or map_node.get("size")
     )
+    def transform_corner(corner: tuple[float, float, float]) -> tuple[float, float, float]:
+        if world_to_camera:
+            return _transform_world_to_camera(corner, world_to_camera)
+        return _world_to_camera(corner, telemetry, camera_translation, camera_rpy)
+
     corners = []
     for sx in (-0.5, 0.5):
         for sy in (-0.5, 0.5):
             for sz in (-0.5, 0.5):
-                corners.append(
-                    _world_to_camera(
-                        (center[0] + sx * size[0], center[1] + sy * size[1], center[2] + sz * size[2]),
-                        telemetry,
-                        camera_translation,
-                        camera_rpy,
-                    )
-                )
+                corners.append(transform_corner((center[0] + sx * size[0], center[1] + sy * size[1], center[2] + sz * size[2])))
     visible = [point for point in corners if point[2] > 1e-3]
     if not visible:
         return None
@@ -163,7 +179,7 @@ def project_map_node(
     return {
         "bbox": bbox,
         "depth_m": float(depth_m),
-        "camera_center": _world_to_camera(center, telemetry, camera_translation, camera_rpy),
+        "camera_center": _transform_world_to_camera(center, world_to_camera) if world_to_camera else _world_to_camera(center, telemetry, camera_translation, camera_rpy),
         "visible_corners": len(visible),
     }
 
@@ -255,6 +271,7 @@ def evaluate_frame(
                 camera_translation=projection_context.get("camera_translation", (0.0, 0.0, 0.0)),
                 camera_rpy=projection_context.get("camera_rpy", (0.0, 0.0, 0.0)),
                 image_size=projection_context.get("image_size"),
+                world_to_camera=projection_context.get("world_to_camera"),
             )
         report = evaluate_detection(
             det,

@@ -40,6 +40,7 @@ class PhysicalRosGateway:
         self.args = args
         self.args.occupancy_period = max(0.0, float(self.args.occupancy_period))
         self.last_seq = -1; self.last_raw: dict[str, Any] | None = None
+        self.world_frame = str(getattr(self.args, "world_frame", "tf_frame_map"))
         self.rgb_pub = rospy.Publisher("/physical_nav/rgb/image_raw", Image, queue_size=1)
         self.depth_pub = rospy.Publisher("/physical_nav/depth/image_raw", Image, queue_size=1)
         self.info_pub = rospy.Publisher("/physical_nav/camera_info", CameraInfo, queue_size=1)
@@ -47,6 +48,7 @@ class PhysicalRosGateway:
         self.odom_pub = rospy.Publisher("/physical_nav/odom", Odometry, queue_size=1)
         self.detection_pub = rospy.Publisher("/physical_nav/detections", String, queue_size=1)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(); self.static_broadcaster = tf2_ros.StaticTransformBroadcaster()
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0)); self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_state_poll = 0.0; self._last_occupancy_post = 0.0
         # Detections originate in the non-ROS YOLOE worker and are republished
         # below for the existing mapper.  Do not subscribe to the same topic
@@ -93,10 +95,67 @@ class PhysicalRosGateway:
     def _publish_state(self) -> None:
         try:
             with urllib.request.urlopen(self.args.web_url.rstrip("/") + "/api/state", timeout=.6) as response: state = json.loads(response.read().decode())
-            detections = state.get("detections", [])
+            transform_cache: dict[str, Any] = {}
+            for item in state.get("detections", []):
+                if not isinstance(item, dict):
+                    continue
+                source_frame = str(item.get("source_frame", "") or "")
+                if source_frame not in transform_cache:
+                    try:
+                        transform_cache[source_frame] = self.tf_buffer.lookup_transform(self.world_frame, source_frame, rospy.Time(0), rospy.Duration(0.05)) if source_frame else None
+                    except Exception:
+                        transform_cache[source_frame] = None
+            detections = [self._map_detection(item, transform_cache.get(str(item.get("source_frame", "") or ""))) for item in state.get("detections", []) if isinstance(item, dict)]
             self.detection_pub.publish(json.dumps({"seq": state.get("frame_seq", -1), "stamp": state.get("frame_stamp", 0), "detections": detections}, ensure_ascii=False, separators=(",", ":")))
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "physical state polling: %s", exc)
+
+    @staticmethod
+    def _point_dict(point: tuple[float, float, float]) -> dict[str, float]:
+        return {"x": float(point[0]), "y": float(point[1]), "z": float(point[2])}
+
+    @staticmethod
+    def _rotate_point(quaternion: Any, point: tuple[float, float, float]) -> tuple[float, float, float]:
+        x, y, z, w = (float(quaternion.x), float(quaternion.y), float(quaternion.z), float(quaternion.w))
+        px, py, pz = point
+        # q * p * q^-1, expanded to avoid tf2_geometry_msgs/cv_bridge deps.
+        tx = 2.0 * (y * pz - z * py); ty = 2.0 * (z * px - x * pz); tz = 2.0 * (x * py - y * px)
+        return (px + w * tx + y * tz - z * ty, py + w * ty + z * tx - x * tz, pz + w * tz + x * ty - y * tx)
+
+    def _map_detection(self, detection: dict[str, Any], transform: Any = None) -> dict[str, Any]:
+        mapped = dict(detection)
+        source_frame = str(detection.get("source_frame", "") or "")
+        source_point = detection.get("camera_box3d_center") or detection.get("camera_position")
+        if not source_frame or not isinstance(source_point, (dict, list, tuple)):
+            mapped.setdefault("map_transform_status", "telemetry_fallback")
+            return mapped
+        if isinstance(source_point, dict):
+            try: point = (float(source_point.get("x", 0.0)), float(source_point.get("y", 0.0)), float(source_point.get("z", 0.0)))
+            except (TypeError, ValueError):
+                mapped["map_transform_status"] = "telemetry_fallback"; return mapped
+        elif len(source_point) >= 3:
+            try: point = (float(source_point[0]), float(source_point[1]), float(source_point[2]))
+            except (TypeError, ValueError):
+                mapped["map_transform_status"] = "telemetry_fallback"; return mapped
+        else:
+            mapped["map_transform_status"] = "telemetry_fallback"; return mapped
+        try:
+            if transform is None:
+                raise RuntimeError("sensor-to-map transform unavailable")
+            translated = self._rotate_point(transform.transform.rotation, point)
+            translated = (translated[0] + float(transform.transform.translation.x), translated[1] + float(transform.transform.translation.y), translated[2] + float(transform.transform.translation.z))
+        except Exception:
+            mapped["map_transform_status"] = "telemetry_fallback"
+            return mapped
+        mapped["world_position"] = self._point_dict(translated)
+        mapped["position"] = self._point_dict(translated)
+        mapped["world_box3d_center"] = self._point_dict(translated)
+        mapped["aabb_center"] = [translated[0], translated[1], translated[2]]
+        mapped["box3d_center"] = [translated[0], translated[1], translated[2]]
+        mapped["map_frame"] = self.world_frame
+        mapped["map_transform_status"] = "tf"
+        mapped["map_transform_source_frame"] = source_frame
+        return mapped
 
     def _publish(self, raw: dict[str, Any]) -> None:
         rgb = _decode(raw["rgb"]); depth = _decode(raw["depth"])
@@ -137,11 +196,11 @@ def _image_msg(array: np.ndarray, encoding: str, stamp: Any, frame: str) -> Imag
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--rate", type=float, default=10.); p.add_argument("--state-period", type=float, default=.2); p.add_argument("--occupancy-period", type=float, default=.5); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--camera-frame", default="d435i_color_optical_frame"); p.add_argument("--camera-parent", default="tf_frame_base_link"); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args, _unknown = p.parse_known_args()
+    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--rate", type=float, default=10.); p.add_argument("--state-period", type=float, default=.2); p.add_argument("--occupancy-period", type=float, default=.5); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--world-frame", default="tf_frame_map"); p.add_argument("--camera-frame", default="d435i_color_optical_frame"); p.add_argument("--camera-parent", default="tf_frame_base_link"); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args, _unknown = p.parse_known_args()
     # ROS launch appends __name/__log remappings; ignore those in the local
     # CLI parser so the gateway can also be run directly.
     rospy.init_node("physical_ros_gateway", anonymous=False)
-    for name in ("web_url", "rate", "state_period", "occupancy_period", "point_stride", "max_depth_m", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw"):
+    for name in ("web_url", "rate", "state_period", "occupancy_period", "point_stride", "max_depth_m", "world_frame", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw"):
         setattr(args, name, rospy.get_param("~" + name, getattr(args, name)))
     PhysicalRosGateway(args); rospy.spin()
 

@@ -60,6 +60,10 @@ by YOLOE. It posts graph, consistency and occupancy snapshots back to
 `/api/ros-state` for the detailed web area. The ROS bridge republishes
 the detector JSON from the web gateway to `/physical_nav/detections`; graph,
 consistency and occupancy messages flow in the opposite direction.
+Before republishing detections, it resolves each RGB-D 3-D center from the
+D435i frame into `tf_frame_map` through the live GMapping TF. If that TF is not
+available during startup, the detector's Unitree-odometry estimate is retained
+with `map_transform_status: telemetry_fallback` until TF becomes available.
 
 `start_physical_nav.sh` also starts `physical_yoloe_bridge.py` in the local
 algorithm Python environment. Set `PHYSICAL_NAV_ALGORITHM_PYTHON` to the
