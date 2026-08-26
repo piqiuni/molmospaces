@@ -95,8 +95,9 @@ python3 go2_readonly_sensor_bridge.py --dry-run --url ws://127.0.0.1:12334
 ```
 
 Open `http://<policy-lan-ip>:8765/`. `/stream.mjpg` is the six-panel live
-image, `/api/state` includes graph, detections, telemetry, consistency and
-Qwen request/result history, and `/api/health` is suitable for a smoke test.
+image, `/api/state` includes raw detections, `mapped_detections` after TF
+alignment, graph, telemetry, consistency and Qwen request/result history, and
+`/api/health` is suitable for a smoke test.
 
 Before trusting map-frame 3-D geometry, set the measured D435i-to-base
 extrinsic through `PHYSICAL_NAV_CAMERA_X/Y/Z/ROLL/PITCH/YAW` (metres/radians). The
