@@ -1,0 +1,47 @@
+# Installed copy of the physical platform configuration. Keep this file in
+# sync with scripts/InteractiveNav/physical_nav/config/physical_nav.yaml.
+frames: {world_frame: tf_frame_map, base_frame: tf_frame_base_link, camera_frame: d435i_color_optical_frame}
+topics:
+  rgb_image: /physical_nav/rgb/image_raw
+  depth_image: /physical_nav/depth/image_raw
+  camera_info: /physical_nav/camera_info
+  pointcloud: /physical_nav/points
+  occupancy_grid: /physical_nav/occupancy
+  object_detections: /physical_nav/detections
+  object_map: /physical_nav/object_map
+  object_markers: /physical_nav/object_markers
+  scene_id_grid: /physical_nav/scene_id_grid
+  scene_confidence_grid: /physical_nav/scene_confidence_grid
+  room_segment_grid: /physical_nav/room_segment_grid
+  unified_graph: /physical_nav/unified_graph
+  unified_graph_markers: /physical_nav/unified_graph_markers
+  unified_graph_markers_lifted: /physical_nav/unified_graph_markers_lifted
+  navigation_hints: /physical_nav/navigation_hints
+object_detection:
+  backend: yoloe_pf_box3d
+  provider: yoloe_local
+  model_path: /home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt
+  device: cuda:0
+  imgsz: 640
+  confidence_threshold: 0.35
+  iou_threshold: 0.7
+  max_detections: 50
+  publish_rate: 10.0
+  max_sync_slop_sec: 0.08
+  process_each_stamp_once: true
+  point_stride: 4
+  max_depth_m: 8.0
+  min_valid_points: 12
+  projection_frame_id: tf_frame_map
+  publish_debug_markers: true
+  publish_debug_segmented_cloud: true
+  publish_debug_detection_image: true
+  publish_debug_world_markers: true
+  publish_debug_world_segmented_cloud: true
+  debug_marker_topic: /physical_nav/boxes_3d
+  debug_segmented_cloud_topic: /physical_nav/segmented_cloud
+  debug_detection_image_topic: /physical_nav/detections_overlay
+  debug_world_marker_topic: /physical_nav/boxes_3d_world
+  debug_world_segmented_cloud_topic: /physical_nav/segmented_cloud_world
+semantic_map: {enable_object_mapping: true, enable_scene_mapping: true, subscribe_pointcloud: true, publish_rate: 5.0, object_min_confirmations: 1, graph_min_observations: 1}
+physical_nav: {read_only: true, web_host: 0.0.0.0, web_port: 8765, sensor_ws_host: 0.0.0.0, sensor_ws_port: 12334}
