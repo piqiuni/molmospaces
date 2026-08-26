@@ -16,7 +16,7 @@ def main() -> None:
     p.add_argument("--user", default="root")
     p.add_argument("--host", default="115.190.90.101")
     p.add_argument("--local-port", type=int, default=18080)
-    p.add_argument("--remote-port", type=int, default=18080, help="Qwen HTTP port on the remote host")
+    p.add_argument("--remote-port", type=int, default=8000, help="Qwen HTTP port on the remote host")
     p.add_argument("--remote-bind", default="127.0.0.1")
     args = p.parse_args()
     target = f"{args.user}@{args.host}"

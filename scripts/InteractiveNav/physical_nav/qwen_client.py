@@ -11,7 +11,7 @@ from typing import Any
 
 
 class QwenClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:18080/v1", model: str = "qwen3.6-35b-a3b", timeout_s: float = 30.0, api_key: str = "") -> None:
+    def __init__(self, base_url: str = "http://127.0.0.1:18080/v1", model: str = "qwen3.6-35b-a3b-fp8", timeout_s: float = 30.0, api_key: str = "") -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_s = timeout_s

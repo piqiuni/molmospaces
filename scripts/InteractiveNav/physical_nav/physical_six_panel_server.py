@@ -220,7 +220,7 @@ _HTML = """<!doctype html><meta charset='utf-8'><title>Go2 Physical Interactive 
 
 
 class PhysicalGateway:
-    def __init__(self, host: str, port: int, qwen_url: str = "", qwen_model: str = "qwen3.6-35b-a3b", camera_parent: str = "tf_frame_base_link", camera_x: float = 0.0, camera_y: float = 0.0, camera_z: float = 0.0, camera_roll: float = 0.0, camera_pitch: float = 0.0, camera_yaw: float = 0.0, qwen_auto_interval: float = 0.0) -> None:
+    def __init__(self, host: str, port: int, qwen_url: str = "", qwen_model: str = "qwen3.6-35b-a3b-fp8", camera_parent: str = "tf_frame_base_link", camera_x: float = 0.0, camera_y: float = 0.0, camera_z: float = 0.0, camera_roll: float = 0.0, camera_pitch: float = 0.0, camera_yaw: float = 0.0, qwen_auto_interval: float = 0.0) -> None:
         self.host, self.port = host, port
         self.state, self.gate = RuntimeState(), ReadOnlySafetyGate()
         self.renderer = SixPanelRenderer(self.state)
@@ -322,7 +322,7 @@ def main() -> None:
     p.add_argument("--http-host", default="0.0.0.0"); p.add_argument("--http-port", type=int, default=8765)
     p.add_argument("--max-message-mb", type=int, default=16)
     p.add_argument("--qwen-url", default="", help="e.g. http://127.0.0.1:18080/v1 after SSH forwarding")
-    p.add_argument("--qwen-model", default="qwen3.6-35b-a3b")
+    p.add_argument("--qwen-model", default="qwen3.6-35b-a3b-fp8")
     p.add_argument("--qwen-auto-interval", type=float, default=0.0, help="seconds; 0 disables periodic graph review")
     p.add_argument("--camera-parent", default="tf_frame_base_link")
     p.add_argument("--camera-x", type=float, default=0.0); p.add_argument("--camera-y", type=float, default=0.0); p.add_argument("--camera-z", type=float, default=0.0); p.add_argument("--camera-roll", type=float, default=0.0); p.add_argument("--camera-pitch", type=float, default=0.0); p.add_argument("--camera-yaw", type=float, default=0.0)

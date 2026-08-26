@@ -89,18 +89,19 @@ policy machine (the remote SSH endpoint is the one supplied for this project):
 
 ```bash
 python3 qwen_ssh_tunnel.py --ssh-port 41051 --user root \
-  --host 115.190.90.101 --local-port 18080 --remote-port 18080
+  --host 115.190.90.101 --local-port 18080 --remote-port 8000
 ```
 
-The remote service port is configurable because the SSH port (`41051`) and the
-Qwen HTTP port are independent. The web page exposes `/api/qwen` and shows all
+The remote vLLM service currently listens on `127.0.0.1:8000`; the remote
+service port remains configurable because the SSH port (`41051`) and the Qwen
+HTTP port are independent. The web page exposes `/api/qwen` and shows all
 requests/results and latency in the status area.
 
 `start_physical_nav.sh` can manage this tunnel too:
 
 ```bash
 PHYSICAL_NAV_START_QWEN_TUNNEL=1 \
-PHYSICAL_NAV_QWEN_REMOTE_PORT=18080 \
+PHYSICAL_NAV_QWEN_REMOTE_PORT=8000 \
 bash scripts/InteractiveNav/physical_nav/start_physical_nav.sh
 ```
 

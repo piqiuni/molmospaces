@@ -77,6 +77,6 @@ physical_nav:
   sensor_ws_host: "0.0.0.0"
   sensor_ws_port: 12334
   qwen_url: "http://127.0.0.1:18080/v1"
-  qwen_model: "qwen3.6-35b-a3b"
+  qwen_model: "qwen3.6-35b-a3b-fp8"
   qwen_auto_interval: 0.0
   consistency_topic: "/physical_nav/consistency"
