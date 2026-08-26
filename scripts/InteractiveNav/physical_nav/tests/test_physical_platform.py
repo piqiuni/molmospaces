@@ -10,6 +10,7 @@ from physical_protocol import command_blocked_packet, hello_packet, image_packet
 from physical_consistency import bbox_iou, evaluate_detection, evaluate_frame, project_map_node
 from safety_gate import ReadOnlySafetyGate
 from physical_yoloe_bridge import _label, _rotation, _world_points
+from runtime_state import RuntimeState
 
 
 class PhysicalPlatformTests(unittest.TestCase):
@@ -67,3 +68,15 @@ class PhysicalPlatformTests(unittest.TestCase):
     points = _world_points(__import__("numpy").array([[0., 0., 1.]], dtype="float32"), {"position": [2., 3., 0.], "yaw": 0.0}, __import__("numpy").zeros(3), (0., 0., 0.))
     assert points[0].tolist() == [2.0, 3.0, 1.0]
     assert _rotation(0., 0., 0.).shape == (3, 3)
+
+  def test_websocket_link_state_is_observable(self):
+    state = RuntimeState()
+    hello = hello_packet(host="go2", streams={"camera": "d435i"})
+    state.link_connected(hello)
+    state.link_packet("sensor_frame")
+    snapshot = state.snapshot()
+    assert snapshot["link"]["connected"] is True
+    assert snapshot["link"]["last_hello"]["role"] == "go2_readonly_sensor"
+    assert snapshot["link"]["last_packet_type"] == "sensor_frame"
+    state.link_disconnected()
+    assert state.snapshot()["link"]["connected"] is False

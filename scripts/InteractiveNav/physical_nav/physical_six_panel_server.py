@@ -231,6 +231,10 @@ class PhysicalGateway:
 
     def receive(self, packet: dict[str, Any]) -> dict[str, Any]:
         validate_packet(packet)
+        self.state.link_packet(str(packet.get("type", "")))
+        if packet.get("type") == "hello":
+            self.state.link_connected(packet)
+            return {"type": "ack", "v": 1, "accepted": True, "read_only": True, "capabilities": ["rgb", "depth", "camera_info", "pose", "telemetry"]}
         if packet.get("type") in {"control", "cmd", "lidar", "posture", "speak", "teleop_intent"}:
             # Defensive boundary: even if an old policy client connects to this
             # port, no command is forwarded to Go2 or any local actuator.
@@ -311,6 +315,8 @@ async def run_gateway(args: argparse.Namespace) -> None:
             # A browser/Go2 reconnect or a normal process shutdown can close
             # without a WebSocket close frame; it is not a sensor error.
             return
+        finally:
+            gateway.state.link_disconnected()
     async with websockets.serve(handler, args.ws_host, args.ws_port, max_size=args.max_message_mb * 1024 * 1024):
         print(f"physical sensor WebSocket: ws://{args.ws_host}:{args.ws_port}", flush=True)
         await __import__("asyncio").Future()

@@ -29,6 +29,13 @@ class RuntimeState:
         self.occupancy = None
         self.consistency: dict[str, Any] = {}
         self.qwen: dict[str, Any] = {"requests": [], "results": []}
+        self.link: dict[str, Any] = {
+            "connected": False,
+            "connections": 0,
+            "last_hello": {},
+            "last_packet_at": 0.0,
+            "last_disconnect_at": 0.0,
+        }
         self.counters = {"frames": 0, "detections": 0, "graph_updates": 0, "dropped": 0}
         self.last_error = ""
 
@@ -48,6 +55,25 @@ class RuntimeState:
                 self.counters["detections"] = len(value) if isinstance(value, list) else 0
             elif name == "graph":
                 self.counters["graph_updates"] += 1
+
+    def link_connected(self, hello: dict[str, Any] | None = None) -> None:
+        with self._lock:
+            self.link["connections"] = int(self.link.get("connections", 0)) + 1
+            self.link["connected"] = True
+            if hello:
+                self.link["last_hello"] = copy.deepcopy(hello)
+            self.link["last_packet_at"] = time.time()
+
+    def link_packet(self, packet_type: str) -> None:
+        with self._lock:
+            self.link["last_packet_at"] = time.time()
+            self.link["last_packet_type"] = str(packet_type)
+
+    def link_disconnected(self) -> None:
+        with self._lock:
+            self.link["connections"] = max(0, int(self.link.get("connections", 1)) - 1)
+            self.link["connected"] = bool(self.link["connections"])
+            self.link["last_disconnect_at"] = time.time()
 
     def add_qwen(self, request: dict[str, Any], result: dict[str, Any] | None = None) -> None:
         with self._lock:
@@ -75,6 +101,7 @@ class RuntimeState:
                 "occupancy": ({k: self.occupancy.get(k) for k in ("width", "height", "resolution", "origin")} if isinstance(self.occupancy, dict) else None),
                 "consistency": copy.deepcopy(self.consistency),
                 "qwen": copy.deepcopy(self.qwen),
+                "link": copy.deepcopy(self.link),
                 "counters": dict(self.counters),
                 "last_error": self.last_error,
                 "read_only": True,
