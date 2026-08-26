@@ -38,6 +38,7 @@ def _decode(encoded: str) -> np.ndarray:
 class PhysicalRosGateway:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.args.occupancy_period = max(0.0, float(self.args.occupancy_period))
         self.last_seq = -1; self.last_raw: dict[str, Any] | None = None
         self.rgb_pub = rospy.Publisher("/physical_nav/rgb/image_raw", Image, queue_size=1)
         self.depth_pub = rospy.Publisher("/physical_nav/depth/image_raw", Image, queue_size=1)
@@ -46,7 +47,7 @@ class PhysicalRosGateway:
         self.odom_pub = rospy.Publisher("/physical_nav/odom", Odometry, queue_size=1)
         self.detection_pub = rospy.Publisher("/physical_nav/detections", String, queue_size=1)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(); self.static_broadcaster = tf2_ros.StaticTransformBroadcaster()
-        self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_state_poll = 0.0
+        self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_state_poll = 0.0; self._last_occupancy_post = 0.0
         # Detections originate in the non-ROS YOLOE worker and are republished
         # below for the existing mapper.  Do not subscribe to the same topic
         # here: that would feed our own message back into the HTTP state loop.
@@ -72,6 +73,10 @@ class PhysicalRosGateway:
 
     def _occupancy_callback(self, msg: Any) -> None:
         # Keep the map visible in the browser without serializing ROS metadata.
+        now = time.monotonic()
+        if now - self._last_occupancy_post < self.args.occupancy_period:
+            return
+        self._last_occupancy_post = now
         self._post_state("occupancy", {"width": msg.info.width, "height": msg.info.height, "resolution": msg.info.resolution, "origin": {"x": msg.info.origin.position.x, "y": msg.info.origin.position.y}, "data": list(msg.data)})
 
     def _poll(self, _event: Any) -> None:
@@ -129,11 +134,11 @@ def _image_msg(array: np.ndarray, encoding: str, stamp: Any, frame: str) -> Imag
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--rate", type=float, default=10.); p.add_argument("--state-period", type=float, default=.2); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--camera-frame", default="d435i_color_optical_frame"); p.add_argument("--camera-parent", default="tf_frame_base_link"); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args, _unknown = p.parse_known_args()
+    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--rate", type=float, default=10.); p.add_argument("--state-period", type=float, default=.2); p.add_argument("--occupancy-period", type=float, default=.5); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--camera-frame", default="d435i_color_optical_frame"); p.add_argument("--camera-parent", default="tf_frame_base_link"); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args, _unknown = p.parse_known_args()
     # ROS launch appends __name/__log remappings; ignore those in the local
     # CLI parser so the gateway can also be run directly.
     rospy.init_node("physical_ros_gateway", anonymous=False)
-    for name in ("web_url", "rate", "state_period", "point_stride", "max_depth_m", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw"):
+    for name in ("web_url", "rate", "state_period", "occupancy_period", "point_stride", "max_depth_m", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw"):
         setattr(args, name, rospy.get_param("~" + name, getattr(args, name)))
     PhysicalRosGateway(args); rospy.spin()
 
