@@ -56,6 +56,7 @@ In another local terminal, after sourcing the catkin workspace, start the
 physical mapping nodes:
 
 ```bash
+export PYTHONPATH="/home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/ros_compat:$PYTHONPATH"
 roslaunch physical_nav physical_nav_readonly.launch \
   model_path:=/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt
 ```
