@@ -20,7 +20,8 @@ def main() -> None:
     p.add_argument("--remote-bind", default="127.0.0.1")
     args = p.parse_args()
     target = f"{args.user}@{args.host}"
-    command = ["ssh", "-N", "-T", "-p", str(args.ssh_port), "-o", "ExitOnForwardFailure=yes",
+    command = ["ssh", "-N", "-T", "-p", str(args.ssh_port), "-o", "BatchMode=yes",
+               "-o", "ConnectTimeout=5", "-o", "ExitOnForwardFailure=yes",
                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
                "-L", f"127.0.0.1:{args.local_port}:{args.remote_bind}:{args.remote_port}", target]
     print("starting Qwen SSH tunnel:", " ".join(command[:-1] + [target]), flush=True)
