@@ -1644,11 +1644,12 @@ class SemanticMappingNode:
                 planning_grid,
                 graph_payload,
             )
+        self.planning_occupancy_grid_pub.publish(effective_grid)
+        if graph_store is not None and overlay is not None:
             if door_clear_mask is not None:
                 self.door_clear_mask_pub.publish(door_clear_mask)
             if planning_update is not None:
                 self.planning_occupancy_grid_updates_pub.publish(planning_update)
-        self.planning_occupancy_grid_pub.publish(effective_grid)
         raw_stamp = self._occupancy_header_stamp_sec(planning_grid)
         rospy.loginfo(
             "[semantic_mapping_node.py] published post-open effective planning OCC: "
