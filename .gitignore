@@ -53,3 +53,9 @@ mlspaces_tests/**/test_data
 # pytest
 .pytest_cache/
 __pycache__/
+
+# This branch contains simulator interfaces only. Keep full navigation stacks
+# and experiment scripts untracked so simulator changes can flow one-way into
+# codex/exp-setting without accidentally importing its algorithms here.
+/Interactive-Nav-SG-nav/
+/scripts/InteractiveNav/
