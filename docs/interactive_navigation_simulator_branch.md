@@ -19,6 +19,29 @@ The simulator seam is `SimulatorInteractionInterface`:
 - `set_joint_open_fraction(name, joint_index, fraction)` moves exactly one
   hinge or slider, including one drawer in a multi-drawer cabinet.
 
+## Real-scene smoke test
+
+`scripts/smoke_test_interaction_interface.py` attaches RBY1 to a local MuJoCo
+scene, scans its articulations, and searches around each target for a robot pose
+that is collision-free with the target both closed and open. It then checks one
+door through `open_door` and every joint of the largest detected container
+through `set_joint_open_fraction`. Each target runs through open fractions
+`0, 0.5, 1, 0`, and container sibling joints must remain unchanged.
+
+The scene XML must be in a layout where its relative mesh and texture paths
+resolve. Run from an environment where this checkout is installed, or set
+`PYTHONPATH` to the checkout:
+
+```bash
+python scripts/smoke_test_interaction_interface.py \
+  --scene-xml <SCENE_XML> \
+  --metadata <OPTIONAL_SCENE_METADATA_JSON> \
+  --output <RESULT_JSON>
+```
+
+The command exits nonzero on a missing interface category, an invalid state
+transition, sibling-joint movement, or failure to find a collision-free pose.
+
 ## Synchronization rule
 
 Changes flow in one direction:
