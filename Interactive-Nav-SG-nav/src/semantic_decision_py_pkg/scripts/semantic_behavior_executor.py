@@ -568,10 +568,10 @@ class SemanticBehaviorExecutor:
         self.interaction_dwa_terminal_yaw_settle_max_task_steps = max(
             1, interaction_terminal_yaw_settle_max_task_steps
         )
-        # A transient M1 flip at one fixed staging pose should consume another
-        # observation, not discard the recently valid front/action-region
-        # evidence and jump to a different side.  This is a count bound, not a
-        # wall-clock timeout.
+        # Optional compatibility budget for a transient M1 flip at one fixed
+        # pose.  The current contract disables it: negative evidence must move
+        # to a materially different anchor instead of spending another request
+        # on an effectively identical image.
         self.container_m1_same_pose_flip_retry_count = max(
             0,
             int(config.get("container_m1_same_pose_flip_retry_count", 0)),
@@ -2678,7 +2678,7 @@ class SemanticBehaviorExecutor:
                             getattr(
                                 self,
                                 "container_m1_same_pose_flip_retry_count",
-                                1,
+                                0,
                             )
                             or 0
                         )
