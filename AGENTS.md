@@ -162,6 +162,113 @@ python molmo_spaces/evaluation/eval_main.py <POLICY_CONFIG> --benchmark_dir <BEN
 
 如果只修改某个模块，应优先运行相关测试文件或更小范围的测试。若因为依赖、资产、GPU、模拟器或网络限制无法运行测试，需要在最终说明中明确写出。
 
+## `interactive-nav/full` 集成与 ROS 端到端回归
+
+当任务要求从 `codex/exp-setting` 创建或更新 `interactive-nav/full`、合入最新 `main` 并证明交互导航性能没有下降时，按以下流程执行。不要因为 `/opt/ros/noetic/setup.bash` 不存在就判定本机没有 ROS：本机使用 Conda ROS Noetic，前缀为 `/home/ldl/conda_envs/ros-noetic`；MolmoSpaces 仿真 Python 环境则是独立的 `/home/ldl/conda_envs/mlspaces`。
+
+### 分支与提交纪律
+
+1. 开始前记录基线 SHA，并执行 `git fetch origin main`。确认目标分支包含最新 `origin/main`，不能只依据可能过期的本地 `main`。
+2. 工作树已有用户改动时，不切换或覆盖该工作树；为 `interactive-nav/full` 使用独立 worktree。
+3. 合并提交、每一项兼容性修复、测试调整和文档更新分别提交。不要把多个不相关修复压进一个提交，也不要提交 `build/`、`devel/`、缓存、日志、视频或 benchmark 输出。
+4. 每个小提交后先运行与该修改直接相关的最小测试；全部修改完成后再运行静态回归和 ROS 端到端回归。
+
+可参考以下分支检查命令：
+
+```bash
+git fetch origin main
+git status --short --branch
+git log --oneline --decorate --graph -12
+git merge-base --is-ancestor origin/main HEAD
+```
+
+最后一条命令退出码必须为 `0`。提交建议保持单一意图，例如：
+
+```text
+merge: preserve interactive navigation history on latest main
+feat(interactive-nav): restore simulator and navigation integration
+fix(interactive-nav): <one concrete compatibility fix>
+test(interactive-nav): cover <the repaired behavior>
+docs: document ROS regression workflow
+```
+
+### 准备 Conda ROS 和当前 worktree 的 catkin 产物
+
+每个新 worktree 都必须生成自己的 `Interactive-Nav-SG-nav/build` 和 `devel`；不能复用另一个绝对路径下生成的 `devel/setup.bash`。首次准备命令如下：
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+export TMPDIR=/home/ldl/tmp/interactive-nav-full-build
+export XDG_CACHE_HOME=/home/ldl/.cache/interactive-nav-full-build
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+
+source /home/ldl/conda_envs/ros-noetic/setup.bash
+cd Interactive-Nav-SG-nav
+catkin_make \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPYTHON_EXECUTABLE=/home/ldl/conda_envs/ros-noetic/bin/python
+source devel/setup.bash
+
+command -v roscore
+command -v roslaunch
+rospack find nav_pkg
+rospack find semantic_decision_py_pkg
+```
+
+预期 `roscore`、`roslaunch` 位于 `/home/ldl/conda_envs/ros-noetic/bin/`，两个 `rospack find` 指向当前 worktree。若 `/home/ldl/conda_envs/ros-noetic/setup.bash` 本身不存在，才属于 ROS 环境缺失；安装或下载 ROS 需要用户另行授权。若 Conda ROS 存在但 catkin 构建失败，应报告首个真实编译/依赖错误，不能笼统写成“缺少 `/opt/ros/noetic`”。
+
+### 单场景 ROS smoke
+
+从仓库根目录运行。脚本会先激活 MolmoSpaces Python 环境，再加载当前 worktree 的 `ROS_SETUP`；临时目录、缓存和输出必须放在 `/home/ldl`：
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+RUN=/home/ldl/outputs/interactive-nav/full_smoke_h1_$(date +%Y%m%d_%H%M%S)
+TMPDIR=/home/ldl/tmp/interactive-nav-full-smoke \
+XDG_CACHE_HOME=/home/ldl/.cache/interactive-nav-full-smoke \
+HF_HOME=/home/ldl/.cache/interactive-nav-full-smoke/hf \
+TORCH_HOME=/home/ldl/.cache/interactive-nav-full-smoke/torch \
+CONDA_SH=/home/ldl/miniconda3/etc/profile.d/conda.sh \
+CONDA_ENV=/home/ldl/conda_envs/mlspaces \
+PYTHON_BIN=/home/ldl/conda_envs/mlspaces/bin/python \
+ROS_SETUP="$PWD/Interactive-Nav-SG-nav/devel/setup.bash" \
+ROS_MASTER_URI=http://127.0.0.1:15101 \
+METHOD=full_mllm_exploration \
+HOUSE_IND=1 SCENE_SEED=1 ROUTE_ID=full_smoke_h1 \
+USE_FIXED_ROUTE=false RUNTIME_TARGET_MODE=none \
+TASK_HORIZON=100 SIM_TIMEOUT_S=1800 \
+MAPPING_SCAN_SOURCE=organized_depth POINTCLOUD_STRIDE=1 \
+INITIAL_DOOR_STATE=closed FORCE_CLOSE_CONTAINERS=true \
+ENABLE_RECORDING=true CLEAN_INTERMEDIATE=false \
+bash scripts/InteractiveNav/run_house7_semantic_exploration_ros_test.zsh \
+  "$RUN" full_smoke_h1
+```
+
+运行前必须确认所选 `ROS_MASTER_URI` 端口没有其他 master。清理时只终止本次启动的进程组，不使用全局 `pkill roscore`。成功后至少检查：
+
+- `$RUN/semantic_exploration_result.json`
+- `$RUN/force_interaction_events.json`
+- `$RUN/debug/events.jsonl`
+- `$RUN/offline_video_summary.json`
+- `$RUN/videos/overview_6panel.mp4`
+
+### “无性能下降”回归门槛
+
+不能用“脚本退出 0”代替算法性能验收。应在合并前基线 SHA 和 `interactive-nav/full` 上使用相同模型服务、配置、house、seed、horizon、录制开关与机器资源，至少运行 H1/H3/H4/H7/H8/H10 六场各 1000 step。每场使用不同 ROS master 端口和独立输出目录；资源不足时分批并行，但基线与候选必须采用相同并发度。
+
+回归报告至少比较：
+
+- 完成 step、是否异常早停、崩溃、TF 卡死、长期无 subgoal 或 actionlib 竞态；
+- coverage / mapped-free；
+- 物理交互成功数与失败数、container 成功数、drawer scan 成功数；
+- interaction approach/M1/anchor exhausted、navigation stagnation 与 timeout 次数；
+- recorder 的 exact-step 对齐、missing/drop/write failure；
+- 每 step 墙钟耗时以及关键 mapping/navigation p50、p95。
+
+候选分支必须满足：没有新增崩溃或永久卡死；视频/状态 exact-step 对齐且无丢帧；交互总成功数和容器成功数不低于基线；失败数不高于基线；平均 coverage 不出现可复现下降。单场 coverage 绝对下降超过 `0.02`、交互结果变差或耗时显著上升时，不得宣称“无性能下降”，必须归因、修复并按相同条件重跑。MLLM 存在随机性时，至少重复异常场景，不能用一次有利波动覆盖退化。
+
+如果完整 ROS 回归受阻，允许先提交已经通过最小测试的独立修复，但最终状态必须明确写成 `blocked`，列出已经通过的测试、缺失的具体环境文件或首个构建错误，以及环境恢复后的完整命令；在端到端结果产生前不能声称性能门槛通过。
+
 ## 文档与注释
 
 - 面向用户的安装、使用和功能说明放在 `README.md` 或 `docs/`。
