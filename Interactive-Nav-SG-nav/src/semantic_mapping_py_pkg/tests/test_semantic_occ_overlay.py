@@ -97,7 +97,7 @@ def test_reset_clears_cross_episode_portal_state():
     assert overlay.pending_portal_ids == set()
 
 
-def test_confirmed_open_survives_graph_gap_until_raw_aperture_is_stably_free():
+def test_confirmed_open_survives_graph_gap_and_later_raw_door_reappearance():
     overlay = SemanticOccupancyOverlay(
         clear_padding_m=0.0,
         raw_free_confirmations=3,
@@ -122,15 +122,21 @@ def test_confirmed_open_survives_graph_gap_until_raw_aperture_is_stably_free():
         assert stats["active_portal_ids"] == ["portal_door"]
 
     planning, mask, stats = overlay.apply(GridInfo(), raw_free)
-    assert stats["active_portal_ids"] == []
+    assert stats["active_portal_ids"] == ["portal_door"]
     assert planning == raw_free
-    assert max(mask) == 0
+    assert max(mask) == 100
 
-    # Repeated open snapshots do not re-arm a portal that the raw map already
-    # confirmed free.  A real close -> open transition does.
+    # A later depth frame may project the moved leaf back into its old aperture.
+    # Public open state remains authoritative until an explicit close, so the
+    # stale occupied cells are still cleared.
+    planning, _mask, stats = overlay.apply(GridInfo(), blocked)
+    assert stats["active_portal_ids"] == ["portal_door"]
+    assert planning[10 * GridInfo.width + 10] == 0
+
     overlay.update_graph(graph(portal("open")))
-    assert not overlay.has_active_portals()
+    assert overlay.has_active_portals()
     overlay.update_graph(graph(portal("closed")))
+    assert not overlay.has_active_portals()
     overlay.update_graph(graph(portal("open")))
     assert overlay.has_active_portals()
 

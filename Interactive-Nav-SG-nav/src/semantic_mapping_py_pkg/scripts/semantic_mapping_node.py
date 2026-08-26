@@ -1541,10 +1541,11 @@ class SemanticMappingNode:
             post_open_t0 = time.perf_counter()
             if self._raw_occupancy_is_after_post_open_refresh_locked(msg):
                 result_stamp = self._post_open_planning_refresh_after_stamp_sec
-                # Publish the first source-new raw map before room
-                # segmentation.  The room refresh itself is now queued after
-                # this short critical section, so incoming raw OCC never waits
-                # for the full room pipeline.
+                # Publish the first source-new map before room segmentation,
+                # but apply the already-confirmed portal overlay first.  A raw
+                # sensor frame may still contain the old door leaf immediately
+                # after force success; publishing it verbatim briefly recloses
+                # the planning map and can strand the post-open traversal.
                 self._publish_post_open_raw_planning_grid_locked(
                     msg,
                     result_stamp=result_stamp,
@@ -1624,16 +1625,39 @@ class SemanticMappingNode:
         )
 
     def _publish_post_open_raw_planning_grid_locked(self, planning_grid, *, result_stamp):
-        """Directly hand the first post-open raw OCC to the planning map."""
+        """Publish the first post-open OCC with the confirmed portal cleared."""
 
-        self.planning_occupancy_grid_pub.publish(planning_grid)
+        effective_grid = planning_grid
+        overlay_stats = {"active_portal_ids": [], "cleared_cells": 0}
+        graph_store = getattr(self, "graph_store", None)
+        overlay = getattr(self, "semantic_occ_overlay", None)
+        if graph_store is not None and overlay is not None:
+            graph_payload = apply_module1_ablation(
+                graph_store.as_graph_dict(), self.ablation.module1
+            )
+            (
+                effective_grid,
+                planning_update,
+                door_clear_mask,
+                overlay_stats,
+            ) = self._build_planning_products_from_snapshot(
+                planning_grid,
+                graph_payload,
+            )
+            if door_clear_mask is not None:
+                self.door_clear_mask_pub.publish(door_clear_mask)
+            if planning_update is not None:
+                self.planning_occupancy_grid_updates_pub.publish(planning_update)
+        self.planning_occupancy_grid_pub.publish(effective_grid)
         raw_stamp = self._occupancy_header_stamp_sec(planning_grid)
         rospy.loginfo(
-            "[semantic_mapping_node.py] published post-open raw planning OCC: "
-            "raw_stamp=%s result_stamp=%s raw_seq=%s",
+            "[semantic_mapping_node.py] published post-open effective planning OCC: "
+            "raw_stamp=%s result_stamp=%s raw_seq=%s active_portals=%s cleared=%s",
             "%.6f" % raw_stamp if raw_stamp is not None else "missing",
             "%.6f" % result_stamp if result_stamp is not None else "missing",
             int(getattr(planning_grid.header, "seq", 0) or 0),
+            list(overlay_stats.get("active_portal_ids") or []),
+            int(overlay_stats.get("cleared_cells", 0) or 0),
         )
 
     def _raw_occupancy_is_after_post_open_refresh_locked(self, msg):

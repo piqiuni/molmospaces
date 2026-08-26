@@ -149,8 +149,9 @@ class SemanticOccupancyOverlay:
         self.pending_portal_ids: set[str] = set()
         # A successful open is a map-state transition, not a traversal lease.
         # Keep its aperture alive even if the graph/traversal snapshot briefly
-        # disappears.  Retire it only after the underlying occupancy has
-        # independently reported the whole aperture free for several builds.
+        # disappears.  Raw-free streaks are diagnostic only: retiring the
+        # overlay after a few free frames allowed a later noisy/depth return to
+        # write the opened leaf back into planning OCC permanently.
         self.confirmed_portal_ids: set[str] = set()
         self.raw_free_portal_ids: set[str] = set()
         self.raw_free_streaks: dict[str, int] = {}
@@ -405,11 +406,10 @@ class SemanticOccupancyOverlay:
                 streak = self.raw_free_streaks.get(node_id, 0) + 1 if raw_is_free else 0
                 self.raw_free_streaks[node_id] = streak
                 if streak >= self.raw_free_confirmations:
-                    self.confirmed_portal_ids.discard(node_id)
-                    self.active_portal_ids.discard(node_id)
                     self.raw_free_portal_ids.add(node_id)
-                    self.raw_free_streaks.pop(node_id, None)
-                    continue
+                    # Do not retire ``confirmed_portal_ids``.  The graph's open
+                    # state is the authority until an explicit closed update;
+                    # raw OCC can flicker back to occupied after this point.
             for index in selected_indices:
                 if result[index] != 0:
                     cleared_cells += 1

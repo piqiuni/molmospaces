@@ -294,7 +294,7 @@ def test_room_segment_grid_compacts_stable_ids_for_int8_ros_message() -> None:
     assert all(-128 <= int(value) <= 127 for value in grid.data)
 
 
-def test_post_open_raw_occupancy_directly_publishes_before_room_segmentation(
+def test_post_open_occupancy_applies_portal_overlay_before_room_segmentation(
     monkeypatch,
 ):
     monkeypatch.setattr(semantic_mapping_module.rospy, "loginfo", lambda *_args: None)
@@ -303,6 +303,14 @@ def test_post_open_raw_occupancy_directly_publishes_before_room_segmentation(
     node.scene_store = _SceneStore()
     node._post_open_planning_refresh_after_stamp_sec = 12.0
     node.world_frame = "world"
+    node.graph_store = SimpleNamespace(as_graph_dict=lambda: {"nodes": []})
+    node.semantic_occ_overlay = object()
+    node.ablation = SimpleNamespace(module1="full")
+    monkeypatch.setattr(
+        semantic_mapping_module,
+        "apply_module1_ablation",
+        lambda graph, _mode: graph,
+    )
     publisher = _Publisher()
     node.planning_occupancy_grid_pub = publisher
     refresh_publish_counts = []
@@ -317,14 +325,22 @@ def test_post_open_raw_occupancy_directly_publishes_before_room_segmentation(
 
     # The first source-new raw map publishes directly, before segmentation.
     fresh_raw = _raw_occupancy(12.1)
+    effective = _raw_occupancy(12.1)
+    effective.data = [0 for _ in fresh_raw.data]
+    node._build_planning_products_from_snapshot = lambda raw, graph: (
+        effective,
+        None,
+        None,
+        {"active_portal_ids": ["door_1"], "cleared_cells": len(raw.data)},
+    )
     SemanticMappingNode.occupancy_callback(node, fresh_raw)
     assert len(publisher.messages) == 1
     planning_grid = publisher.messages[0]
-    assert planning_grid is fresh_raw
+    assert planning_grid is effective
     assert planning_grid.header.seq == fresh_raw.header.seq
     assert planning_grid.header.stamp.to_sec() == fresh_raw.header.stamp.to_sec()
     assert planning_grid.header.frame_id == fresh_raw.header.frame_id
-    assert list(planning_grid.data) == list(fresh_raw.data)
+    assert list(planning_grid.data) == [0 for _ in fresh_raw.data]
     assert refresh_publish_counts[-1] == 1
     assert node._post_open_planning_refresh_after_stamp_sec is None
 

@@ -359,7 +359,10 @@ def test_visible_instances_uses_dominant_connected_component_bbox():
 
     visible = publisher._visible_instances(segmentation)
 
-    assert visible == [(0, 16, [1, 1, 4, 4])]
+    assert len(visible) == 1
+    assert visible[0][:3] == (0, 16, [1, 1, 4, 4])
+    assert visible[0][3]["size"] == [16, 16]
+    assert sum(visible[0][3]["counts"][1::2]) == 16
 
 
 def test_visible_instances_does_not_sum_disconnected_fragments_to_pass_threshold():
@@ -395,7 +398,10 @@ def test_realtime_gt_keeps_visually_resolved_portal_component():
     pixels = [(y, x) for y in range(4, 16) for x in range(3, 11)]
     segmentation = _segmentation_for_geom_pixels((24, 16), pixels)
 
-    assert publisher._visible_instances(segmentation) == [(0, 96, [3, 4, 10, 15])]
+    visible = publisher._visible_instances(segmentation)
+    assert len(visible) == 1
+    assert visible[0][:3] == (0, 96, [3, 4, 10, 15])
+    assert sum(visible[0][3]["counts"][1::2]) == 96
 
 
 def test_publisher_applies_min_visible_fraction_to_projected_object_extent():
@@ -464,6 +470,7 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
             "bbox_2d",
             "visible_pixels",
             "visible_fraction",
+            "mask_rle",
             "box_3d",
         }
         assert observation["id"] == "chair_body"
@@ -471,6 +478,7 @@ def test_one_pass_visibility_step_interval_stable_ids_and_episode_reset():
         assert observation["bbox_2d"] == [0, 0, 4, 1]
         assert observation["visible_pixels"] == 6
         assert "segmentation" not in observation
+        assert sum(observation["mask_rle"]["counts"][1::2]) == 6
         assert observation["visible_fraction"] == 0.6
         assert observation["box_3d"] == {
             "center": [2.0, 0.0, 0.5],

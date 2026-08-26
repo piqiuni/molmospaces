@@ -684,6 +684,22 @@ class InteractionGraphStore:
             observed_step = int(observed_step) if observed_step is not None else None
         except (TypeError, ValueError):
             observed_step = None
+        sequence_type = str(result.get("sequence_type") or "").strip().casefold()
+        if bool(result.get("success")) and sequence_type == "drawer_scan":
+            grounded_regions = [
+                str(item.get("region_id") or "")
+                for item in list(result.get("grounded_regions") or [])
+                if isinstance(item, dict) and str(item.get("region_id") or "")
+            ]
+            node.interaction.update(
+                {
+                    "drawer_scan_completed": True,
+                    "drawer_scan_completed_step": observed_step,
+                    "drawer_scan_completed_event_id": str(result.get("event_id") or ""),
+                    "drawer_scan_covered_region_ids": grounded_regions,
+                    "drawer_scan_covered_region_count": len(grounded_regions),
+                }
+            )
         result_source = str(
             result.get("source")
             or result.get("verification_source")
@@ -756,9 +772,32 @@ class InteractionGraphStore:
                 }
             )
         elif blocked_capability or unavailable_capability:
-            terminal_state = (
-                "unavailable" if unavailable_capability else "blocked"
-            )
+            terminal_state = "blocked"
+            if unavailable_capability:
+                # Capability and aperture state are orthogonal.  A fixed
+                # doorway may be permanently open or permanently closed; do
+                # not erase that physical distinction by storing the generic
+                # capability token as its state.  Only trusted pre-action or
+                # already-gated graph state is used here, so a failed action
+                # still cannot manufacture an open passage.
+                graph_pre_state = str(pre_state or "unknown").strip().casefold()
+                result_pre_state = str(
+                    result.get("pre_state") or "unknown"
+                ).strip().casefold()
+                # The graph state was observed before this command and is more
+                # trustworthy than a capability payload that may use
+                # ``unavailable`` as both capability and placeholder state.
+                observed_pre_state = (
+                    graph_pre_state
+                    if graph_pre_state not in {"", "unknown", "unavailable"}
+                    else result_pre_state
+                )
+                if observed_pre_state in {"open", "opened", "ajar", "static_open"}:
+                    terminal_state = "static_open"
+                elif observed_pre_state in {"closed", "static_closed"}:
+                    terminal_state = "static_closed"
+                else:
+                    terminal_state = "unavailable"
             node.interaction.update(
                 {
                     "is_interactable": False,
@@ -1179,6 +1218,11 @@ class InteractionGraphStore:
             "targeted_refresh_reason",
             "targeted_refresh_minimum_capture_step",
             "targeted_refresh_image_sequence",
+            "evidence_frame_ids",
+            "evidence_capture_steps",
+            "evidence_observation_pose_xyyaw",
+            "m1_evidence_image_count",
+            "target_bbox_containment",
         ):
             if key in patch:
                 node.attributes[key] = patch.get(key)
@@ -1832,6 +1876,11 @@ class InteractionGraphStore:
                 "operation_history",
                 "completed_interaction_groups",
                 "failed_interaction_groups",
+                "drawer_scan_completed",
+                "drawer_scan_completed_step",
+                "drawer_scan_completed_event_id",
+                "drawer_scan_covered_region_ids",
+                "drawer_scan_covered_region_count",
             )
             if key in node.interaction
         }

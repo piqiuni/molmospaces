@@ -143,6 +143,13 @@ room_mllm:
 attribute_inference:
   visual_evidence_max_side_px: 1024
   targeted_refresh_priority: 1000.0
+  # One M1 call may use earlier target views, but only when they are separated
+  # in evaluator steps and robot pose. The latest image remains authoritative.
+  targeted_multiview_max_images: 3
+  targeted_multiview_min_step_gap: 8
+  targeted_multiview_min_position_gap_m: 0.25
+  targeted_multiview_min_yaw_gap_rad: 0.25
+  target_bbox_mask_containment_required: true
 
 semantic_map:
   enable_object_mapping: true

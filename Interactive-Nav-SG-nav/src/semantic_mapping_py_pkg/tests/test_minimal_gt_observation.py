@@ -445,7 +445,7 @@ def test_executor_semantic_result_updates_graph_by_object_id() -> None:
             "object_id": "double_door_root",
             "state": "open",
             "success": True,
-            "verification_source": "executor_state_verification",
+            "source": "executor_state_verification",
         }
     )
 

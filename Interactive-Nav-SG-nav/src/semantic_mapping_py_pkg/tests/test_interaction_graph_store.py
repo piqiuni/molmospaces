@@ -2092,6 +2092,49 @@ def test_container_semantic_interaction_state_survives_later_observations() -> N
     assert node["interaction"]["state"] == "open"
 
 
+def test_successful_drawer_scan_completion_survives_closed_observation() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    dresser = observation(
+        instance_id="dresser_scan_1",
+        semantic_name="dresser",
+        is_receptacle=True,
+        is_articulable=True,
+        joint_type="slide",
+        joint_range=[0.0, 0.4],
+        joint_value=0.0,
+    )
+    store.update_observations([dresser], source_mode="realtime_gt_observation")
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_dresser_scan_1",
+            "event_id": "drawer_scan_1",
+            "sequence_type": "drawer_scan",
+            "action": "scan",
+            "success": True,
+            "post_state": "closed",
+            "step": 42,
+            "grounded_regions": [
+                {"region_id": "region_1"},
+                {"region_id": "region_2"},
+            ],
+        }
+    )
+    store.update_observations([dresser], source_mode="realtime_gt_observation")
+
+    node = next(
+        item
+        for item in store.as_graph_dict()["nodes"]
+        if item["id"] == "container_dresser_scan_1"
+    )
+    assert node["interaction"]["state"] == "closed"
+    assert node["interaction"]["drawer_scan_completed"] is True
+    assert node["interaction"]["drawer_scan_completed_step"] == 42
+    assert node["interaction"]["drawer_scan_covered_region_ids"] == [
+        "region_1",
+        "region_2",
+    ]
+
+
 def test_room_geometry_does_not_shrink_after_confirmed_observation() -> None:
     store = InteractionGraphStore(scene_id="test_scene")
     info = type("Info", (), {"width": 3, "resolution": 1.0})()

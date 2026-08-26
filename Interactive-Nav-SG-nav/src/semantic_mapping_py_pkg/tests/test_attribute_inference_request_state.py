@@ -350,6 +350,137 @@ def test_attribute_visual_evidence_is_full_image_with_target_outline_and_inset()
     assert np.any(np.all(evidence == np.array([0, 255, 255]), axis=2))
 
 
+def test_portal_visual_evidence_keeps_full_frame_without_crop_inset() -> None:
+    image = np.full((100, 160, 3), 17, dtype=np.uint8)
+    image[25:85, 60:110] = (30, 100, 200)
+    detection = {
+        "semantic_name": "door",
+        "bbox_2d": [60, 25, 110, 85],
+    }
+
+    evidence = InteractionAttributeInferenceNode._compose_attribute_visual_evidence(
+        image,
+        detection,
+        margin_ratio=0.10,
+        include_crop_inset=False,
+    )
+
+    assert InteractionAttributeInferenceNode._is_portal_detection(detection) is True
+    assert evidence is not None
+    assert evidence.shape == image.shape
+    # Every corner stays from the original full frame; only the target outline
+    # is added, so wall/leaf/aperture context is never replaced by an inset.
+    for row, col in ((0, 0), (0, 159), (99, 0), (99, 159)):
+        assert np.array_equal(evidence[row, col], image[row, col])
+    assert np.any(np.all(evidence == np.array([0, 255, 255]), axis=2))
+
+
+def test_target_bbox_containment_requires_visible_target_mask_inside_box() -> None:
+    image = np.zeros((20, 30, 3), dtype=np.uint8)
+    contained = InteractionAttributeInferenceNode._target_bbox_containment(
+        image,
+        {
+            "bbox_2d": [8, 4, 20, 16],
+            # Geometry/restricted-GT boxes use inclusive maxima; pixels on the
+            # right/bottom edges are therefore still contained.
+            "segmentation": {"rows": [5, 8, 16], "cols": [9, 12, 20]},
+        },
+    )
+    outside = InteractionAttributeInferenceNode._target_bbox_containment(
+        image,
+        {
+            "bbox_2d": [8, 4, 20, 16],
+            "segmentation": {"rows": [5, 8], "cols": [9, 22]},
+        },
+    )
+
+    assert contained["valid"] is True
+    assert contained["target_mask_pixels"] == 3
+    assert outside["valid"] is False
+    assert outside["reason"] == "target_mask_outside_bbox"
+
+
+def test_invalid_target_bbox_releases_armed_refresh_with_terminal_failure() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.filter_counts = {"targeted_refresh_bbox_rejected": 0, "failed": 0}
+    refresh = {
+        "request_key": "fridge_1",
+        "refresh_sequence": 3,
+        "request_id": "decision:m1:003",
+        "minimum_capture_step": 40,
+        "reason": "container_front",
+    }
+    node.targeted_refresh_requests = {"fridge_1": dict(refresh)}
+    published = []
+    node._publish_updates = lambda episode, stamp, updates: published.append(
+        (episode, stamp, updates)
+    )
+
+    node._reject_targeted_refresh_bbox(
+        object_id="fridge_1",
+        episode_id="episode_1",
+        observation_stamp=12.0,
+        frame_id="44",
+        image_sequence=45,
+        signature="view-44",
+        targeted_refresh=refresh,
+        bbox_containment={"valid": False, "reason": "target_mask_unavailable"},
+    )
+
+    assert node.targeted_refresh_requests == {}
+    patch = published[0][2][0]
+    assert patch["attribute_status"] == "failed"
+    assert patch["targeted_refresh_request_id"] == "decision:m1:003"
+    assert patch["observation_capture_step"] == 44
+    assert patch["error"].endswith("target_mask_unavailable")
+
+
+def test_target_multiview_history_requires_step_and_pose_separation() -> None:
+    evidence = np.zeros((8, 8, 3), dtype=np.uint8)
+    history = [
+        {
+            "capture_step": 10,
+            "frame_id": "10",
+            "observation_pose_xyyaw": [0.0, 0.0, 0.0],
+            "bbox_containment": {"valid": True},
+            "visual_evidence": evidence,
+        },
+        {
+            # Enough steps, but effectively the same viewpoint: reject.
+            "capture_step": 20,
+            "frame_id": "20",
+            "observation_pose_xyyaw": [0.04, 0.01, 0.05],
+            "bbox_containment": {"valid": True},
+            "visual_evidence": evidence,
+        },
+        {
+            "capture_step": 34,
+            "frame_id": "34",
+            "observation_pose_xyyaw": [0.35, 0.0, 0.0],
+            "bbox_containment": {"valid": True},
+            "visual_evidence": evidence,
+        },
+        {
+            "capture_step": 50,
+            "frame_id": "50",
+            "observation_pose_xyyaw": [0.35, 0.30, 0.4],
+            "bbox_containment": {"valid": True},
+            "visual_evidence": evidence,
+        },
+    ]
+
+    selected = InteractionAttributeInferenceNode._select_diverse_target_visual_history(
+        history,
+        max_images=3,
+        min_step_gap=8,
+        min_position_gap_m=0.25,
+        min_yaw_gap_rad=0.25,
+    )
+
+    assert [item["capture_step"] for item in selected] == [10, 34, 50]
+
+
 def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> None:
     node = object.__new__(InteractionAttributeInferenceNode)
     node.lock = threading.Lock()

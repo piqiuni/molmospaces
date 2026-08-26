@@ -168,6 +168,23 @@ class InteractionAttributeInferenceNode:
                 )
             ),
         )
+        self.targeted_multiview_max_images = max(
+            1, int(attribute_config.get("targeted_multiview_max_images", 3))
+        )
+        self.targeted_multiview_min_step_gap = max(
+            1, int(attribute_config.get("targeted_multiview_min_step_gap", 8))
+        )
+        self.targeted_multiview_min_position_gap_m = max(
+            0.0,
+            float(attribute_config.get("targeted_multiview_min_position_gap_m", 0.25)),
+        )
+        self.targeted_multiview_min_yaw_gap_rad = max(
+            0.0,
+            float(attribute_config.get("targeted_multiview_min_yaw_gap_rad", 0.25)),
+        )
+        self.target_bbox_mask_containment_required = bool(
+            attribute_config.get("target_bbox_mask_containment_required", True)
+        )
         self.room_enabled = bool(room_mllm_config.get("enabled", True))
         self.room_worker_count = max(
             1, int(room_mllm_config.get("worker_count", 1))
@@ -228,6 +245,8 @@ class InteractionAttributeInferenceNode:
             "targeted_refresh_matched": 0,
             "targeted_refresh_enqueued": 0,
             "targeted_refresh_rejected": 0,
+            "targeted_refresh_bbox_rejected": 0,
+            "targeted_refresh_multiview": 0,
         }
         self.room_counts = {
             "messages_received": 0,
@@ -251,6 +270,7 @@ class InteractionAttributeInferenceNode:
         self.aliases: dict[str, str] = {}
         self.targeted_refresh_sequence = 0
         self.targeted_refresh_requests: dict[str, dict] = {}
+        self.target_visual_history: dict[str, list[dict]] = {}
         self.request_queue = LatestPriorityRequestQueue(self.max_queue_size)
         self.room_request_sequence = 0
         self.room_last_request: dict[str, float] = {}
@@ -456,9 +476,69 @@ class InteractionAttributeInferenceNode:
                 image,
                 detection,
                 margin_ratio=self.crop_margin_ratio,
+                include_crop_inset=not self._is_portal_detection(detection),
             )
             if visual_evidence is None:
                 continue
+            visual_evidence_history: list[np.ndarray] = []
+            evidence_frame_ids = [frame_id] if frame_id else []
+            evidence_capture_steps = (
+                [int(capture_step)] if capture_step is not None else []
+            )
+            evidence_observation_poses: list[list[float]] = []
+            bbox_containment = self._target_bbox_containment(
+                image, detection
+            )
+            if targeted_refresh is not None:
+                if (
+                    self.target_bbox_mask_containment_required
+                    and not bool(bbox_containment.get("valid"))
+                ):
+                    self._reject_targeted_refresh_bbox(
+                        object_id=object_id,
+                        episode_id=episode_id,
+                        observation_stamp=observation_stamp,
+                        frame_id=frame_id,
+                        image_sequence=image_sequence,
+                        signature=signature,
+                        targeted_refresh=targeted_refresh,
+                        bbox_containment=bbox_containment,
+                    )
+                    continue
+                selected_evidence = self._record_and_select_target_visual_history(
+                    object_id,
+                    visual_evidence,
+                    capture_step=capture_step,
+                    frame_id=frame_id,
+                    observation_pose_xyyaw=targeted_refresh.get(
+                        "observation_pose_xyyaw"
+                    ),
+                    bbox_containment=bbox_containment,
+                )
+                if selected_evidence:
+                    visual_evidence_history = [
+                        item["visual_evidence"]
+                        for item in selected_evidence[:-1]
+                    ]
+                    evidence_frame_ids = [
+                        str(item.get("frame_id") or "")
+                        for item in selected_evidence
+                        if str(item.get("frame_id") or "")
+                    ]
+                    evidence_capture_steps = [
+                        int(item["capture_step"])
+                        for item in selected_evidence
+                        if item.get("capture_step") is not None
+                    ]
+                    evidence_observation_poses = [
+                        [float(value) for value in item["observation_pose_xyyaw"]]
+                        for item in selected_evidence
+                        if isinstance(item.get("observation_pose_xyyaw"), list)
+                        and len(item["observation_pose_xyyaw"]) >= 3
+                    ]
+                    if len(selected_evidence) > 1:
+                        with self.lock:
+                            self.filter_counts["targeted_refresh_multiview"] += 1
             if targeted_refresh is None:
                 self._invalidate_if_state_changed(object_id, signature, episode_id)
                 reservation = self._try_reserve(object_id, signature)
@@ -482,6 +562,11 @@ class InteractionAttributeInferenceNode:
                     "object_id": object_id,
                     "detection": dict(detection),
                     "visual_evidence": visual_evidence,
+                    "visual_evidence_history": visual_evidence_history,
+                    "evidence_frame_ids": evidence_frame_ids,
+                    "evidence_capture_steps": evidence_capture_steps,
+                    "evidence_observation_pose_xyyaw": evidence_observation_poses,
+                    "target_bbox_containment": bbox_containment,
                     "episode_id": episode_id,
                     "frame_id": frame_id,
                     "image_sequence": image_sequence,
@@ -897,6 +982,7 @@ class InteractionAttributeInferenceNode:
             self.room_completed.clear()
             self.room_generations.clear()
             self.targeted_refresh_requests.clear()
+            self.target_visual_history.clear()
         for object_id, request_sequence in stale_request_ids:
             self.request_queue.discard(object_id, request_sequence)
         for room_key, request_sequence in stale_room_request_ids:
@@ -946,10 +1032,9 @@ class InteractionAttributeInferenceNode:
     def _parse_targeted_refresh_payload(payload: object) -> dict | None:
         """Validate the compact public request for a fresh Module-1 view.
 
-        The request intentionally carries no image, pose, category, or private
-        simulator data.  It only identifies the object and the earliest
-        acceptable public capture step; the node waits for a later local RGB +
-        detection pair before creating an inference request.
+        The request carries no image, category, or private simulator data.  A
+        public base pose may be included only to choose spatially distinct
+        historical RGB evidence; it is never included in the model prompt.
         """
 
         if not isinstance(payload, dict):
@@ -966,6 +1051,16 @@ class InteractionAttributeInferenceNode:
         expected_node_type = str(payload.get("expected_node_type") or "").strip().casefold()
         if expected_node_type not in {"", "container", "portal"}:
             return None
+        observation_pose = payload.get("observation_pose_xyyaw")
+        if not isinstance(observation_pose, (list, tuple)) or len(observation_pose) < 3:
+            observation_pose = []
+        else:
+            try:
+                observation_pose = [float(value) for value in observation_pose[:3]]
+            except (TypeError, ValueError):
+                observation_pose = []
+            if not all(math.isfinite(value) for value in observation_pose):
+                observation_pose = []
         return {
             "object_id": object_id,
             "episode_id": str(payload.get("episode_id") or "").strip(),
@@ -974,6 +1069,7 @@ class InteractionAttributeInferenceNode:
             or "targeted_refresh",
             "request_id": str(payload.get("request_id") or "").strip()[:96],
             "expected_node_type": expected_node_type,
+            "observation_pose_xyyaw": observation_pose,
         }
 
     def _targeted_refresh_callback(self, message: String) -> None:
@@ -1089,6 +1185,210 @@ class InteractionAttributeInferenceNode:
                 return dict(request)
         return None
 
+    @staticmethod
+    def _target_bbox_containment(image: np.ndarray, detection: dict) -> dict:
+        """Verify that the public target mask is contained by its visual box."""
+
+        bbox = InteractionAttributeInferenceNode._bbox_pixels(image, detection)
+        if bbox is None:
+            return {"valid": False, "reason": "invalid_bbox"}
+        left, top, right, bottom = bbox
+        mask_rle = detection.get("mask_rle") or detection.get("segmentation_rle")
+        if not isinstance(mask_rle, dict):
+            segmentation = detection.get("segmentation") or detection.get("mask")
+            if isinstance(segmentation, dict):
+                rows = list(segmentation.get("rows") or [])
+                cols = list(segmentation.get("cols") or [])
+                if rows and cols and len(rows) == len(cols):
+                    try:
+                        min_x, max_x = min(int(value) for value in cols), max(
+                            int(value) for value in cols
+                        )
+                        min_y, max_y = min(int(value) for value in rows), max(
+                            int(value) for value in rows
+                        )
+                    except (TypeError, ValueError):
+                        min_x = min_y = 0
+                        max_x = max_y = -1
+                    contained = bool(
+                        max_x >= min_x
+                        and max_y >= min_y
+                        and min_x >= left
+                        and min_y >= top
+                        and max_x <= right
+                        and max_y <= bottom
+                    )
+                    return {
+                        "valid": contained,
+                        "reason": (
+                            "target_mask_contained"
+                            if contained
+                            else "target_mask_outside_bbox"
+                        ),
+                        "bbox_xyxy": list(bbox),
+                        "target_mask_bbox_xyxy": [
+                            min_x,
+                            min_y,
+                            max_x + 1,
+                            max_y + 1,
+                        ],
+                        "target_mask_pixels": len(rows),
+                    }
+            return {
+                "valid": False,
+                "reason": "target_mask_unavailable",
+                "bbox_xyxy": list(bbox),
+            }
+        size = mask_rle.get("size")
+        counts = mask_rle.get("counts")
+        if (
+            not isinstance(size, (list, tuple))
+            or len(size) != 2
+            or not isinstance(counts, (list, tuple))
+        ):
+            return {"valid": False, "reason": "invalid_target_mask_rle"}
+        try:
+            height, width = int(size[0]), int(size[1])
+            run_counts = [int(value) for value in counts]
+        except (TypeError, ValueError):
+            return {"valid": False, "reason": "invalid_target_mask_rle"}
+        if (
+            height <= 0
+            or width <= 0
+            or sum(run_counts) != height * width
+            or height != int(image.shape[0])
+            or width != int(image.shape[1])
+        ):
+            return {"valid": False, "reason": "target_mask_shape_mismatch"}
+        cursor = 0
+        foreground = 0
+        min_x, min_y = width, height
+        max_x = max_y = -1
+        for run_index, run_count in enumerate(run_counts):
+            if run_count < 0:
+                return {"valid": False, "reason": "invalid_target_mask_rle"}
+            if run_index % 2 == 1 and run_count:
+                start = cursor
+                end = cursor + run_count - 1
+                start_x, start_y = divmod(start, height)
+                end_x, end_y = divmod(end, height)
+                min_x = min(min_x, start_x)
+                max_x = max(max_x, end_x)
+                if start_x == end_x:
+                    min_y = min(min_y, start_y)
+                    max_y = max(max_y, end_y)
+                else:
+                    min_y = 0
+                    max_y = height - 1
+                foreground += run_count
+            cursor += run_count
+        if foreground <= 0:
+            return {"valid": False, "reason": "empty_target_mask"}
+        # Restricted-GT and geometry-observation boxes use inclusive maxima.
+        mask_bbox = [min_x, min_y, max_x + 1, max_y + 1]
+        contained = bool(
+            min_x >= left
+            and min_y >= top
+            and max_x <= right
+            and max_y <= bottom
+        )
+        return {
+            "valid": contained,
+            "reason": "target_mask_contained" if contained else "target_mask_outside_bbox",
+            "bbox_xyxy": list(bbox),
+            "target_mask_bbox_xyxy": mask_bbox,
+            "target_mask_pixels": int(foreground),
+        }
+
+    @staticmethod
+    def _select_diverse_target_visual_history(
+        history: list[dict],
+        *,
+        max_images: int,
+        min_step_gap: int,
+        min_position_gap_m: float,
+        min_yaw_gap_rad: float,
+    ) -> list[dict]:
+        """Choose newest-first distinct observations, returned chronologically."""
+
+        valid = [
+            item
+            for item in history
+            if isinstance(item, dict)
+            and item.get("capture_step") is not None
+            and len(list(item.get("observation_pose_xyyaw") or [])) >= 3
+            and bool((item.get("bbox_containment") or {}).get("valid"))
+        ]
+        if not valid:
+            return []
+        selected = [valid[-1]]
+        for candidate in reversed(valid[:-1]):
+            if len(selected) >= max(1, int(max_images)):
+                break
+            candidate_pose = [float(value) for value in candidate["observation_pose_xyyaw"][:3]]
+            candidate_step = int(candidate["capture_step"])
+            sufficiently_distinct = True
+            for chosen in selected:
+                chosen_pose = [float(value) for value in chosen["observation_pose_xyyaw"][:3]]
+                step_gap = abs(candidate_step - int(chosen["capture_step"]))
+                position_gap = math.hypot(
+                    candidate_pose[0] - chosen_pose[0],
+                    candidate_pose[1] - chosen_pose[1],
+                )
+                yaw_gap = abs(
+                    math.atan2(
+                        math.sin(candidate_pose[2] - chosen_pose[2]),
+                        math.cos(candidate_pose[2] - chosen_pose[2]),
+                    )
+                )
+                if step_gap < int(min_step_gap) or (
+                    position_gap < float(min_position_gap_m)
+                    and yaw_gap < float(min_yaw_gap_rad)
+                ):
+                    sufficiently_distinct = False
+                    break
+            if sufficiently_distinct:
+                selected.append(candidate)
+        return list(reversed(selected))
+
+    def _record_and_select_target_visual_history(
+        self,
+        object_id: str,
+        visual_evidence: np.ndarray,
+        *,
+        capture_step: int | None,
+        frame_id: str,
+        observation_pose_xyyaw: object,
+        bbox_containment: dict,
+    ) -> list[dict]:
+        pose = list(observation_pose_xyyaw or [])
+        if capture_step is None or len(pose) < 3:
+            return []
+        record = {
+            "capture_step": int(capture_step),
+            "frame_id": str(frame_id or ""),
+            "observation_pose_xyyaw": [float(value) for value in pose[:3]],
+            "bbox_containment": dict(bbox_containment),
+            "visual_evidence": visual_evidence.copy(),
+        }
+        with self.lock:
+            history = list(self.target_visual_history.get(str(object_id)) or [])
+            history = [
+                item
+                for item in history
+                if int(item.get("capture_step", -1)) != int(capture_step)
+            ]
+            history.append(record)
+            history = history[-12:]
+            self.target_visual_history[str(object_id)] = history
+        return self._select_diverse_target_visual_history(
+            history,
+            max_images=self.targeted_multiview_max_images,
+            min_step_gap=self.targeted_multiview_min_step_gap,
+            min_position_gap_m=self.targeted_multiview_min_position_gap_m,
+            min_yaw_gap_rad=self.targeted_multiview_min_yaw_gap_rad,
+        )
+
     def _force_reserve_targeted_refresh(
         self,
         object_id: str,
@@ -1159,6 +1459,45 @@ class InteractionAttributeInferenceNode:
             current = self.targeted_refresh_requests.get(request_key) or {}
             if int(current.get("refresh_sequence", 0) or 0) == refresh_sequence:
                 self.targeted_refresh_requests.pop(request_key, None)
+
+    def _reject_targeted_refresh_bbox(
+        self,
+        *,
+        object_id: str,
+        episode_id: str,
+        observation_stamp: float,
+        frame_id: str,
+        image_sequence: int,
+        signature: str,
+        targeted_refresh: dict,
+        bbox_containment: dict,
+    ) -> None:
+        """Fail and release an armed refresh whose target box is not grounded."""
+
+        with self.lock:
+            self.filter_counts["targeted_refresh_bbox_rejected"] += 1
+            self.filter_counts["failed"] += 1
+        self._consume_targeted_refresh(targeted_refresh)
+        self._publish_updates(
+            episode_id,
+            observation_stamp,
+            [
+                self._attribute_status_patch(
+                    {
+                        "object_id": object_id,
+                        "frame_id": frame_id,
+                        "image_sequence": image_sequence,
+                        "signature": signature,
+                        "targeted_refresh": targeted_refresh,
+                    },
+                    "failed",
+                    error=(
+                        "target_bbox_validation_failed:"
+                        + str(bbox_containment.get("reason") or "unknown")
+                    ),
+                )
+            ],
+        )
 
     @classmethod
     def _attribute_status_patch(
@@ -1427,6 +1766,19 @@ class InteractionAttributeInferenceNode:
             else self.success_refresh_interval_s
         )
 
+    @staticmethod
+    def _is_portal_detection(detection: dict) -> bool:
+        """Classify only the public detector label for visual layout choice."""
+
+        semantic_text = " ".join(
+            str(detection.get(key) or "").strip().casefold()
+            for key in ("semantic_name", "category", "name")
+        )
+        return any(
+            token in semantic_text
+            for token in ("door", "gate", "barrier", "portal")
+        )
+
     def _priority(self, detection: dict) -> float:
         distance_m = max(0.0, float(detection.get("distance_m", 0.0) or 0.0))
         visible_fraction = max(
@@ -1677,6 +2029,11 @@ class InteractionAttributeInferenceNode:
         enqueued_at: float,
         targeted_refresh: dict,
         deadline_monotonic: float | None = None,
+        visual_evidence_history: list[np.ndarray] | None = None,
+        evidence_frame_ids: list[str] | None = None,
+        evidence_capture_steps: list[int] | None = None,
+        evidence_observation_pose_xyyaw: list[list[float]] | None = None,
+        target_bbox_containment: dict | None = None,
     ) -> None:
         request_started = time.monotonic()
         queue_lag_sec = max(0.0, request_started - float(enqueued_at))
@@ -1694,14 +2051,19 @@ class InteractionAttributeInferenceNode:
             ):
                 outcome_status = "stale"
                 return
-            encoded = self._encode_jpeg(
-                self._resize_visual_evidence(
-                    visual_evidence, self.visual_evidence_max_side_px
+            image_data_sequence: list[str] = []
+            for evidence_image in [*list(visual_evidence_history or []), visual_evidence]:
+                encoded = self._encode_jpeg(
+                    self._resize_visual_evidence(
+                        evidence_image, self.visual_evidence_max_side_px
+                    )
                 )
-            )
-            if not encoded:
-                return
-            image_data = "data:image/jpeg;base64," + __import__("base64").b64encode(encoded).decode("ascii")
+                if not encoded:
+                    return
+                image_data_sequence.append(
+                    "data:image/jpeg;base64,"
+                    + __import__("base64").b64encode(encoded).decode("ascii")
+                )
             remaining_timeout_s = self._remaining_request_timeout(
                 deadline_monotonic, self.request_timeout_s
             )
@@ -1745,13 +2107,28 @@ class InteractionAttributeInferenceNode:
                     "portal_aperture_evidence to null. "
                 )
             )
+            portal_full_frame = self._is_portal_detection(detection)
+            visual_layout_instruction = (
+                "Each image is the complete head-camera image with only a target outline; "
+                "there is no crop inset. Judge the whole door leaf, frame, aperture, and "
+                "surrounding wall context together. "
+                if portal_full_frame
+                else (
+                    "Each composite shows the complete head-camera image, a target outline, "
+                    "and a padded target crop inset. "
+                )
+            )
             instruction = "".join(
                 (
                     expected_type_instruction,
                     "Infer the outlined target's pre-interaction visual attributes using "
-                    "only pixels in the one supplied composite image. The composite shows "
-                    "the complete head-camera image, a target outline, and a padded target "
-                    "crop inset. Do not use object IDs, prior state, category names, map "
+                    "only pixels in the supplied composite image sequence. Images are ordered "
+                    "from older to newest and come only from materially separated robot views; "
+                    "the newest image is authoritative for approach_ready and action_regions, "
+                    "while older images only corroborate which physical surface is the front. "
+                    "Every image passed a target-mask-inside-outline check. ",
+                    visual_layout_instruction,
+                    "Do not use object IDs, prior state, category names, map "
                     "geometry, simulator knowledge, or hidden properties. Return exactly one "
                     "compact, single-line JSON object with only object_id, interactable, "
                     "interaction_class, coarse_state, portal_morphology, "
@@ -1761,7 +2138,8 @@ class InteractionAttributeInferenceNode:
                     class_instruction,
                     portal_instruction,
                     "view_state is front, oblique, side_or_back, occluded, or unknown and "
-                    "describes only the current camera view of the outlined target. Judge "
+                    "describes only the newest camera view of the outlined target. A historical "
+                    "front view must never make a side/oblique newest view approach_ready. Judge "
                     "frontality primarily from the target's horizontal perspective: use front "
                     "for a nearly head-on, broad usable face whose left/right extent and visible "
                     "drawer or door fronts/handles face the camera without a dominant receding "
@@ -1807,7 +2185,7 @@ class InteractionAttributeInferenceNode:
                         else {}
                     ),
                 },
-                images=[image_data],
+                images=image_data_sequence,
                 response_schema=build_attribute_patch_response_schema(
                     "target", expected_node_type=expected_node_type or None
                 ),
@@ -1822,6 +2200,12 @@ class InteractionAttributeInferenceNode:
                     "request_sequence": request_sequence,
                     "queue_lag_sec": queue_lag_sec,
                     "targeted_refresh": bool(targeted_refresh),
+                    "m1_evidence_image_count": len(image_data_sequence),
+                    "m1_evidence_capture_steps": list(evidence_capture_steps or []),
+                    "m1_evidence_observation_pose_xyyaw": list(
+                        evidence_observation_pose_xyyaw or []
+                    ),
+                    "target_bbox_containment": dict(target_bbox_containment or {}),
                 },
             )
             if response.error or response.payload is None:
@@ -1861,7 +2245,13 @@ class InteractionAttributeInferenceNode:
                     "observation_signature": signature,
                     "source": "mllm_attribute_inference",
                     "model_name": self.client.config.model,
-                    "evidence_frame_ids": [frame_id] if frame_id else [],
+                    "evidence_frame_ids": list(evidence_frame_ids or ([frame_id] if frame_id else [])),
+                    "evidence_capture_steps": list(evidence_capture_steps or []),
+                    "evidence_observation_pose_xyyaw": list(
+                        evidence_observation_pose_xyyaw or []
+                    ),
+                    "m1_evidence_image_count": len(image_data_sequence),
+                    "target_bbox_containment": dict(target_bbox_containment or {}),
                     "request_sequence": request_sequence,
                     "attribute_status": "ready",
                     "queue_lag_sec": queue_lag_sec,
@@ -2332,7 +2722,12 @@ class InteractionAttributeInferenceNode:
 
     @classmethod
     def _compose_attribute_visual_evidence(
-        cls, image: np.ndarray, detection: dict, *, margin_ratio: float
+        cls,
+        image: np.ndarray,
+        detection: dict,
+        *,
+        margin_ratio: float,
+        include_crop_inset: bool = True,
     ) -> np.ndarray | None:
         """Build M1's one-image visual observation without textual/GT context.
 
@@ -2346,7 +2741,7 @@ class InteractionAttributeInferenceNode:
             return None
         bbox = cls._bbox_pixels(image, detection)
         crop = cls._crop(image, detection, margin_ratio=margin_ratio)
-        if bbox is None or crop is None or crop.size == 0:
+        if bbox is None or (include_crop_inset and (crop is None or crop.size == 0)):
             return None
         composite = image.copy()
         height, width = composite.shape[:2]
@@ -2361,6 +2756,8 @@ class InteractionAttributeInferenceNode:
             outline_color,
             thickness=max(2, min(width, height) // 240),
         )
+        if not include_crop_inset:
+            return composite
 
         max_panel_width = max(1, min(width, max(32, int(round(width * 0.38)))))
         max_panel_height = max(1, min(height, max(32, int(round(height * 0.46)))))
