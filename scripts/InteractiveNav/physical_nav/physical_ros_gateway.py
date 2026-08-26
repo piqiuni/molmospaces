@@ -49,7 +49,7 @@ class PhysicalRosGateway:
         self.detection_pub = rospy.Publisher("/physical_nav/detections", String, queue_size=1)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(); self.static_broadcaster = tf2_ros.StaticTransformBroadcaster()
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0)); self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
-        self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_state_poll = 0.0; self._last_occupancy_post = 0.0
+        self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_state_poll = 0.0; self._last_occupancy_post = 0.0; self._mapped_post_lock = threading.Lock(); self._mapped_post_busy = False
         # Detections originate in the non-ROS YOLOE worker and are republished
         # below for the existing mapper.  Do not subscribe to the same topic
         # here: that would feed our own message back into the HTTP state loop.
@@ -110,9 +110,27 @@ class PhysicalRosGateway:
             # Keep a compact, map-aligned evidence view for the LAN page while
             # preserving the raw YOLOE masks in ``detections``.
             compact = [{key: value for key, value in item.items() if key != "mask"} for item in detections]
-            self._post_state("mapped_detections", {"seq": state.get("frame_seq", -1), "stamp": state.get("frame_stamp", 0), "map_frame": self.world_frame, "detections": compact})
+            self._post_mapped_state({"seq": state.get("frame_seq", -1), "stamp": state.get("frame_stamp", 0), "map_frame": self.world_frame, "detections": compact})
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "physical state polling: %s", exc)
+
+    def _post_mapped_state(self, value: dict[str, Any]) -> None:
+        # A slow local HTTP client must not stall the 10 Hz image/point-cloud
+        # timer. Keep at most one in-flight compact evidence post; the next
+        # polling cycle will carry a fresher frame if this one is delayed.
+        with self._mapped_post_lock:
+            if self._mapped_post_busy:
+                return
+            self._mapped_post_busy = True
+
+        def worker() -> None:
+            try:
+                self._post_state("mapped_detections", value)
+            finally:
+                with self._mapped_post_lock:
+                    self._mapped_post_busy = False
+
+        threading.Thread(target=worker, name="physical-mapped-state", daemon=True).start()
 
     @staticmethod
     def _point_dict(point: tuple[float, float, float]) -> dict[str, float]:
