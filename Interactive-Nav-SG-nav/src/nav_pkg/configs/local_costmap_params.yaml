@@ -1,0 +1,48 @@
+local_costmap:
+   global_frame: tf_frame_odom
+   robot_base_frame: tf_frame_base_link
+   static_map: false
+   rolling_window: true
+   width: 4.0
+   height: 4.0
+   update_frequency: 5.0
+   publish_frequency: 5.0
+   always_send_full_costmap: true
+   transform_tolerance: 2.0
+   resolution: 0.05
+
+   plugins:
+     - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
+     - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+
+   obstacle_layer:
+     observation_sources: local_obstacles
+     obstacle_range: 4.0
+     raytrace_range: 4.0
+     track_unknown_space: false
+     local_obstacles:
+       data_type: PointCloud2
+       topic: /filtered_pointcloud
+       sensor_frame: tf_frame_base_link
+       marking: true
+       clearing: true
+       observation_queue_size: 10
+       tf_filter_tolerance: 0.10
+       max_observation_age: 0.0
+       expected_update_rate: 0.0
+       # The head-camera cloud is refreshed every simulator step.  Retaining
+       # three seconds of old base-frame observations builds a ghost obstacle
+       # field while the robot turns or translates, which can seal an otherwise
+       # valid local continuation.  Keep one short clearing window instead:
+       # consistently observed physical obstacles remain marked, while stale
+       # depth surfaces age out before they become a planning wall.
+       observation_persistence: 0.5
+       max_obstacle_height: 1.85
+       min_obstacle_height: 0.05
+
+   inflation_layer:
+     # Keep a modest safety margin over the 0.40 m global layer without
+     # rejecting corridors that the global planner can actually traverse.
+     inflation_radius: 0.45
+     cost_scaling_factor: 10.0
+   

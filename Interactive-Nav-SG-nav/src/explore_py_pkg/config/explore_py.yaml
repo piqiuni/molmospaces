@@ -1,0 +1,170 @@
+frames:
+  map_frame: "tf_frame_map"
+
+topics:
+  occupancy_grid: "/struct_mapping/occ_map"
+  odom: "/odom"
+  move_base_status: "/move_base/status"
+  goal: "/move_base_simple/goal"
+  move_base_cancel: "/move_base/cancel"
+  cmd_vel: "/cmd_vel"
+  global_plan: "/move_base/GlobalPlanner/plan"
+  local_plan: "/move_base/DWAPlannerROS/local_plan"
+  status: "/explore_py/status"
+  frontiers: "/explore_py/frontiers"
+  current_subgoal: "/explore_py/current_subgoal"
+  behavior_command: "/explore_py/command"
+  behavior_feedback: "/explore_py/behavior_feedback"
+  recovery_request: "/semantic_decision/recovery_request"
+  recovery_feedback: "/semantic_decision/recovery_feedback"
+  reset: "/explore_py/reset"
+  fresh_command_gate: "/molmo_spaces/fresh_cmd_gate"
+  llm_value_grid: "/explore_py/llm_value_grid"
+  strategy_bias: "/explore_py/strategy_bias"
+  object_map: "/semantic_mapping/obj_map"
+  scene_id_grid: "/semantic_mapping/scene_id_grid"
+  scene_confidence_grid: "/semantic_mapping/scene_confidence_grid"
+  unified_graph: "/semantic_mapping/unified_graph"
+  navigation_hints: "/semantic_mapping/navigation_hints"
+
+exploration:
+  external_behavior_control: false
+  # In external-control mode only: report a failed frontier preflight to the
+  # executor. ExplorePy never publishes a recovery cmd_vel or cancels its goal.
+  external_recovery_request_enabled: true
+  external_recovery_preflight_enabled: true
+  external_recovery_plan_grace_sec: 16.0
+  external_recovery_request_cooldown_sec: 2.0
+  # A request can arrive before the executor observes the matching reservation.
+  # Resend once for that explicit transient rejection; ExplorePy never drives cmd_vel.
+  external_recovery_request_retry_limit: 1
+  external_recovery_request_retry_delay_sec: 0.5
+  tick_rate_hz: 1.0
+  goal_republish_interval_sec: 0.0
+  goal_reach_tolerance_m: 0.35
+  goal_timeout_sec: 90.0
+  stall_timeout_sec: 30.0
+  stall_distance_m: 0.15
+  min_goal_lifetime_sec: 8.0
+  stall_yaw_progress_rad: 0.20
+  rotation_stall_timeout_sec: 45.0
+  # Event-only global replan fallback for left/right rotation oscillation.
+  rotation_replan_enabled: true
+  rotation_replan_window_sec: 10.0
+  rotation_replan_min_duration_sec: 8.0
+  rotation_replan_max_translation_m: 0.05
+  rotation_replan_min_yaw_sum_rad: 0.80
+  rotation_replan_max_net_yaw_rad: 0.30
+  rotation_replan_min_direction_changes: 3
+  rotation_replan_min_yaw_step_rad: 0.03
+  rotation_replan_max_per_goal: 1
+  rotation_replan_cooldown_sec: 20.0
+  blacklist_duration_sec: 25.0
+  failed_cluster_retry_sec: 120.0
+  failed_cluster_max_failures: 3
+  frontier_match_distance_m: 1.0
+  frontier_gone_confirm_ticks: 3
+  frontier_gone_min_goal_age_sec: 8.0
+  failed_point_soft_blacklist_sec: 10.0
+  failed_point_blacklist_sec: 180.0
+  failed_point_blacklist_radius_m: 1.25
+  reached_point_blacklist_sec: 5.0
+  reached_point_blacklist_radius_m: 0.50
+  visit_viewpoint_once: true
+  visited_viewpoint_radius_m: 0.50
+  # Reaching a viewpoint without clearing its frontier means that frontier is
+  # not observable from the navigable free space. Suppress nearby re-clusters.
+  unreachable_frontier_radius_m: 0.50
+  active_goal_frontier_min_cells: 3
+  initial_spin_enabled: false
+  initial_spin_angle_rad: 6.283185307179586
+  # The V3 startup scan is action-gated; at the 200 ms evaluator period this
+  # completes 2π in 26 commands and remains below the 28-command hard cap.
+  initial_spin_angular_speed: 1.25
+  initial_spin_timeout_sec: 95.0
+  initial_spin_settle_sec: 1.0
+  initial_spin_cmd_rate_hz: 10.0
+  initial_spin_fresh_step_gate_enabled: true
+  initial_spin_fresh_command_gate_enabled: true
+  initial_spin_fresh_step_min_delay_sec: 0.0
+  initial_spin_max_control_steps: 28
+  local_plan_watchdog_enabled: false
+  local_plan_watchdog_sec: 12.0
+  local_plan_min_poses: 3
+  local_plan_min_length_m: 0.20
+  global_plan_min_poses: 3
+  plan_freshness_sec: 4.0
+  global_plan_current_goal_check_enabled: true
+  global_plan_current_goal_grace_sec: 4.0
+  external_navigation_plan_grace_sec: 16.0
+  global_plan_goal_tolerance_m: 0.6
+  make_plan_preflight_enabled: true
+  make_plan_service: "/move_base/make_plan"
+  make_plan_service_wait_sec: 2.0
+  make_plan_tolerance_m: 0.20
+  make_plan_endpoint_tolerance_m: 0.60
+  make_plan_fail_open: true
+  initial_local_goal_count: 3
+
+frontier:
+  free_max: 20
+  occupied_min: 50
+  hard_min_cluster_cells: 3
+  # This is the actual extraction gate (not only score normalization).
+  min_cluster_cells: 12
+  connect_8: true
+  candidate_top_k: 12
+  sensor_range_m: 5.0
+  unknown_component_radius_m: 5.0
+  subgoal_search_radius_cells: 18
+  min_subgoal_distance_m: 1.00
+  hard_min_subgoal_distance_m: 0.50
+  target_frontier_offset_m: 1.0
+  use_voronoi_viewpoints: true
+  min_viewpoint_frontier_distance_m: 0.8
+  max_viewpoint_frontier_distance_m: 3.0
+  clearance_weight: 1.0
+  frontier_offset_weight: 0.55
+  local_horizon_m: 3.0
+  local_horizon_penalty: 0.45
+  far_cluster_penalty: 0.45
+  far_cluster_penalty_saturation_m: 4.0
+  min_obstacle_clearance_m: 0.35
+  max_clearance_check_m: 1.2
+  robot_radius_m: 0.25
+  footprint_safety_margin_m: 0.15
+  require_footprint_free: true
+  footprint_unknown_is_free: false
+  turning_safety_margin_m: 0.0
+  require_turning_clearance: true
+  near_frontier_relax_distance_m: 1.5
+  relaxed_min_viewpoint_frontier_distance_m: 0.35
+  initial_local_radius_m: 2.2
+  initial_backward_weight: 0.35
+  # Bounded LOS checks reject a stand-off pose whose view is occluded by a
+  # wall, while preserving a small fixed ray budget per frontier update.
+  los_enabled: true
+  los_max_viewpoint_candidates: 12
+  los_frontier_samples: 12
+  los_unknown_samples: 48
+  los_min_visible_frontier_samples: 1
+  # Adjacent re-clusters of the same unknown component share a persistent
+  # region memory.  A covered region reopens only after material new unknown.
+  frontier_region_match_distance_m: 3.0
+  frontier_region_overlap_threshold: 0.20
+  frontier_region_reactivate_unknown_growth_ratio: 0.25
+  frontier_region_reactivate_unknown_growth_m2: 0.25
+  region_signature_max_cells: 96
+  region_signature_quantization_m: 0.50
+
+scoring:
+  information_weight: 1.0
+  distance_weight: 0.80
+  semantic_weight: 0.35
+  llm_weight: 0.8
+  revisit_penalty: 0.6
+  failure_penalty: 1.0
+  receding_distance_weight: 0.15
+  previous_subgoal_weight: 0.35
+  continuity_cost_weight: 0.25
+  continuity_cost_saturation_m: 4.0

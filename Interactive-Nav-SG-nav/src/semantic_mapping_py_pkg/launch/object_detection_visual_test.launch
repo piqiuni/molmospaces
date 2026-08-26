@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="config_file" default="$(find semantic_mapping_py_pkg)/config/default.yaml"/>
+  <arg name="rgb_path" default=""/>
+  <arg name="depth_path" default=""/>
+  <arg name="backend" default="no_detection"/>
+  <arg name="provider" default="external_http"/>
+  <arg name="external_url" default="http://127.0.0.1:8000/detect"/>
+  <arg name="model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt"/>
+  <arg name="include_depth" default="false"/>
+  <arg name="confidence_threshold" default="0.35"/>
+
+  <node name="object_detection_visual_test"
+        pkg="semantic_mapping_py_pkg"
+        type="object_detection_visual_test.py"
+        output="screen">
+    <rosparam file="$(arg config_file)" command="load"/>
+    <param name="visual_test/rgb_path" value="$(arg rgb_path)"/>
+    <param name="visual_test/depth_path" value="$(arg depth_path)"/>
+    <param name="object_detection/backend" value="$(arg backend)"/>
+    <param name="object_detection/provider" value="$(arg provider)"/>
+    <param name="object_detection/external_url" value="$(arg external_url)"/>
+    <param name="object_detection/model_path" value="$(arg model_path)"/>
+    <param name="object_detection/include_depth" value="$(arg include_depth)"/>
+    <param name="object_detection/confidence_threshold" value="$(arg confidence_threshold)"/>
+  </node>
+</launch>

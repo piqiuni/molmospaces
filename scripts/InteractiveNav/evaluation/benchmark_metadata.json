@@ -1,0 +1,30 @@
+{
+  "schema_version": "interactive_nav_v3_eval_metadata_v2",
+  "release_id": "interactive-nav-v3-procthor10k-val-release-v1.1",
+  "benchmark_relative_path": "scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json",
+  "candidate_episode_count": 3000,
+  "episode_count": 2968,
+  "excluded_episode_count": 32,
+  "domain_counts": {
+    "channel": 1000,
+    "container": 976,
+    "mixed": 992
+  },
+  "excluded_domain_counts": {
+    "container": 24,
+    "mixed": 8
+  },
+  "exclusion_reason_counts": {
+    "initial_target_visibility_mismatch": 32
+  },
+  "candidate_benchmark_sha256": "4021ca2bebd9c875ccc4df70c746d9ed7f2376d13247fa1b7e98f2e9690b219f",
+  "formal_benchmark_sha256": "91106ca03a73665b1344251cdc276cfdc931bc7066a877c938a4ca1e370efc9e",
+  "quality_gate_protocol_version": "interactive_nav_v3_benchmark_eval_v4",
+  "quality_gate_run_signature": "3d9ec0fa060abad348b36502c404c2c6965f05617bb83de7244292ab4b79cd46",
+  "robot": "rby1",
+  "scene_dataset": "procthor-10k",
+  "data_split": "val",
+  "default_policy_dt_ms": 200.0,
+  "force_success_fraction": 0.8,
+  "policy_gt_boundary": "interactive_nav is evaluator-only except scripted_oracle"
+}

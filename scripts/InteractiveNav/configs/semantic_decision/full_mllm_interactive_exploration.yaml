@@ -1,0 +1,255 @@
+ablation:
+  module1: "dynamic_mllm"
+  module2: "mllm_score"
+  module3: "mllm_skill_verified"
+
+target:
+  enabled: false
+
+candidate:
+  interaction_types: ["portal", "container"]
+  # Do not let the label-derived Door prior issue an interaction before the
+  # visual attribute module has returned a ready result.
+  require_current_visibility: false
+  # A closed/unknown remembered door is actionable only from a sufficiently
+  # large current observation.  This prevents wall-occluded graph memory from
+  # leaking into Module 2 while preserving confirmed post-open graph state.
+  # Keep remembered graph interactions in the candidate sequence even while
+  # out of view. Execution may re-observe them before acting.
+  portal_require_current_visibility: false
+  portal_traversal_distance_m: 0.8
+  portal_min_visible_pixels: 128
+  portal_min_visible_fraction: 0.20
+  remembered_portal_reobservation_enabled: true
+  max_state_age_sec: 3600.0
+  # Preserve remembered containers as global planning candidates. A fresh M1
+  # view is required only immediately before execution, never to erase the
+  # global candidate from Module 2.
+  container_require_same_room: false
+  container_allow_connected_room: true
+  portal_standoff_m: 0.85
+  # Direct AABB-surface clearances for the shared container anchor.  The
+  # selected point is used for navigation, M1, and the physical bridge in this
+  # model lane; the bridge still performs its independent collision/sweep gate.
+  container_action_standoff_m: 0.50
+  drawer_action_standoff_m: 0.50
+  # The closed-AABB clearance alone did not cover the hinged leaf sweep in H4
+  # and H10.  Keep M1 at its useful 0.90 m image distance, then retreat to a
+  # 1.15 m physical stance before force.
+  fridge_action_standoff_m: 1.15
+  # AABB supplies four cardinal candidate faces only.  Targeted M1 decides
+  # which face is the real usable front before the shared anchor may act.
+  container_m1_face_selection_enabled: true
+  fridge_multiview_angular_scale: 1.0
+  # Legacy capture aliases remain documented for old traces.  They are not
+  # used to create a second pose while the shared contract is enabled.
+  container_m1_capture_standoff_m: 0.50
+  drawer_m1_capture_standoff_m: 0.50
+  fridge_m1_capture_standoff_m: 1.15
+  # These legacy navigation-ring values are retained for compatibility; the
+  # shared contract below deliberately sets their effective offset to zero.
+  container_navigation_anchor_outer_offset_m: 0.35
+  container_navigation_anchor_ring_count: 3
+  container_navigation_anchor_tangent_offset_m: 0.20
+  # Simplified container contract for this model lane: the selected anchor is
+  # simultaneously the M1 image pose and the physical action pose.
+  container_anchor_shared_pose_enabled: true
+  # Drawer outer navigation uses the real AABB surface, centred on the
+  # robot-visible face normal.  This replaces the four tilted radial rings.
+  drawer_navigation_anchor_aabb_fan_enabled: true
+  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.20]
+  drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
+  # Refrigerators use the same four-face M1 authorization, but their physical
+  # fan is narrower and remains farther away to preserve leaf/interior space.
+  fridge_navigation_anchor_aabb_fan_enabled: true
+  fridge_navigation_anchor_fan_clearances_m: [1.15, 1.35, 1.55]
+  fridge_navigation_anchor_fan_angles_deg: [-15.0, 0.0, 15.0]
+  # The finite anchor list bounds navigation recovery.  M1 sample/view budgets
+  # are tracked separately by the executor, so a single negative M1 result
+  # cannot consume an anchor merely by being a model flip.
+  container_two_stage_observation_max_attempts: 20
+  # M1 contributes one thing here: a current-image confirmation that the
+  # calibrated object-to-camera ray is the usable front.  A negative image is
+  # inconclusive, so move to a genuinely different capture view rather than
+  # re-querying the same frame/pose.  Exhaustion defers the candidate instead
+  # of permanently excluding it.
+  container_m1_same_pose_samples_per_view: 1
+  container_m1_max_viewpoints: 4
+  container_m1_max_total_requests: 4
+  container_m1_front_axis_from_capture: true
+  # This is pose error around a navigation recovery anchor, never permission to
+  # query M1 or execute there.  M1 and bridge readiness use their own paired
+  # capture/action targets below.
+  container_safe_staging_arrival_tolerance_m: 0.15
+  container_interaction_ready_distance_m: 0.15
+  # After a fresh direct M1 capture accepts one face, retain the normal action
+  # clearance and try these bounded tangent alternatives before asking M1 for a
+  # different face.  This is not a reduced standoff.
+  container_action_lateral_offset_m: 0.22
+  interaction_safety_margin_m: 0.10
+  # Keep the public portal position contract aligned with DWA's 0.25 m
+  # xy_goal_tolerance.  Tightening only this evaluator value makes move_base
+  # legitimately finish in the 0.15--0.25 m band and then causes the executor
+  # to reject the same pose.  The stricter 0.20 rad heading contract addresses
+  # visibly oblique arrivals without creating that split-brain distance gate.
+  # Container phases keep their dedicated tolerances above.
+  interaction_ready_distance_m: 0.25
+  interaction_ready_yaw_tolerance_rad: 0.20
+
+policy:
+  backend: "model"
+  portal_bonus: 0.55
+  container_bonus: 1.0
+  interaction_cost_weight: 0.30
+  nearby_interaction_radius_m: 1.5
+  nearby_interaction_bonus: 1.5
+  interaction_priority_bonus: 2.0
+  failure_cooldown_s: 5.0
+  interaction_target_failure_cooldown_s: 60.0
+  container_anchor_unreachable_cooldown_s: 60.0
+  container_anchor_unreachable_cooldown_steps: 300
+  container_m1_inconclusive_cooldown_schedule_s: [15.0, 60.0, 180.0]
+  failure_retry_delay_s: 1.0
+  repeat_guard_enabled: true
+  repeat_guard_low_gain_limit: 2
+  repeat_guard_min_frontier_shrink_m: 0.15
+
+model:
+  # The local Qwen service may data-parallel across both GPUs; 12 s keeps a
+  # large real-navigation margin
+  # while preventing a stalled endpoint from freezing a scene for 30 seconds.
+  timeout_s: 12.0
+  # Module 2 normally returns a tiny ranking.  Keep enough headroom to recover
+  # from a local Qwen response that starts to serialize long candidate context
+  # instead of silently truncating its JSON and falling back to rules.
+  max_tokens: 384
+  consecutive_timeout_limit: 2
+  timeout_cooldown_s: 60.0
+  skill_timeout_s: 12.0
+  skill_max_output_tokens: 256
+  verification_timeout_s: 12.0
+  # Visual verification has a strict, compact JSON schema, but reserve enough
+  # completion headroom so a local MLLM cannot cut off the enclosing object.
+  verification_max_output_tokens: 256
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+
+executor:
+  interaction_navigation_timeout_s: 180.0
+  # A negative M1 view must advance to a materially different anchor.  Never
+  # spend another request at the same pose after a transient/front flip.
+  container_m1_same_pose_flip_retry_count: 0
+  interaction_observation_timeout_s: 12.0
+  interaction_observation_same_pose_samples_per_view: 1
+  interaction_observation_max_viewpoints: 3
+  interaction_observation_max_total_requests: 3
+  # M1 is sampled at the same selected anchor.  Navigation/executor/bridge
+  # tolerance is the explicit per-command contract carried in metadata.
+  container_m1_capture_yaw_tolerance_rad: 0.5235987756
+  # Legacy distinct-view tolerances remain for old staged candidates.  Shared
+  # anchors carry their explicit arrival pair on every interaction command.
+  container_m1_distinct_view_arrival_tolerance_m: 0.05
+  container_m1_distinct_view_arrival_yaw_tolerance_rad: 0.08
+  # Before every INTERACT send_goal, snapshot DWA and apply the exact tolerance
+  # pair carried by that goal; restore it when the token-bound worker exits.
+  # The option name remains capture-specific only for backwards compatibility.
+  container_m1_capture_dwa_profile_enabled: true
+  container_m1_capture_dwa_reconfigure_server: "/move_base/DWAPlannerROS"
+  container_m1_capture_dwa_reconfigure_timeout_s: 1.0
+  # Any remaining terminal-yaw settlement is bounded by public simulator steps,
+  # independent of host load and VLM wall latency.
+  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 75
+  # A capture timeout cancels move_base before the next outer viewpoint.  Wait
+  # for a newer server status with no ACTIVE/PREEMPTING goal so make_plan cannot
+  # observe the action client's brief local-DONE/server-PREEMPTING mismatch.
+  container_m1_capture_successor_quiescence_timeout_s: 1.0
+  # Apply the same server-side ACTIVE/PREEMPTING fence to outer staging and
+  # direct-capture successors before any new make_plan request or dispatch.
+  move_base_successor_quiescence_timeout_s: 1.0
+  # If global make_plan passed but move_base aborts before outer M1 staging,
+  # wait for one newer global-costmap receipt before a single same-pose replan.
+  # This remains outside the M1/physical-action boundary.
+  container_outer_staging_abort_replan_global_costmap_wait_s: 1.0
+  container_outer_staging_abort_replan_global_costmap_poll_interval_s: 0.05
+  container_outer_staging_abort_replan_plan_retry_window_s: 6.0
+  container_outer_staging_abort_replan_plan_retry_interval_s: 0.25
+  container_outer_staging_abort_replan_plan_health_confirmations: 2
+  container_outer_staging_abort_replan_plan_health_interval_s: 0.30
+  # A two-stage container has a finite twenty-pose M1 staging sequence; retain
+  # that bounded coverage after an inner action-pose failure.
+  container_two_stage_fallback_max_attempts: 20
+  # Keep close refrigerator/drawer action poses strict, but let DWA approach
+  # them through a few short segments sampled from a verified global path.
+  # The temporary points are executor-private: they never request M1 or issue
+  # a bridge command; only the original inner pose can do that.
+  container_inner_corridor_enabled: true
+  container_inner_corridor_segment_m: 0.30
+  container_inner_corridor_arrival_tolerance_m: 0.10
+  container_inner_corridor_max_segments: 4
+  # M1 is sampled only after its paired direct capture pose.  One accepted
+  # direct-front image freezes that capture ray as the action face; the
+  # simulator still checks the public pose contract and refrigerator sweep
+  # before force.
+  container_pre_action_confirmation_count: 1
+  # Full-MLLM runs use the same safe rear-navigation controller as the rule
+  # lane: a fresh local-grid sweep chooses and locks a turn side before DWA.
+  rear_goal_enter_angle_rad: 1.5707963267948966
+  # Leave room for a costmap-safe wrapped opposite turn when the shortest
+  # direction is blocked; the action count remains finite and step-synced.
+  rear_goal_prerotate_max_control_steps: 28
+  rear_goal_prerotate_post_budget_settle_steps: 3
+  rear_goal_local_costmap_max_age_s: 0.75
+  rear_goal_robot_radius_m: 0.25
+  rear_goal_safety_margin_m: 0.05
+  # Do not turn ordinary inflation costs into hard obstacles in the executor;
+  # only costmap inscribed/lethal cells block the radius-aware safety sweep.
+  rear_goal_costmap_occupied_threshold: 253
+  rear_goal_unknown_is_blocked: true
+  rear_goal_rotation_sweep_step_rad: 0.10
+  rear_goal_oscillation_window_steps: 4
+  rear_goal_oscillation_min_sign_flips: 2
+  rear_goal_oscillation_max_displacement_m: 0.05
+  rear_goal_reverse_distance_m: 0.15
+  rear_goal_reverse_min_distance_m: 0.05
+  rear_goal_reverse_speed_mps: 0.10
+  rear_goal_reverse_max_control_steps: 10
+  # H3 showed that a per-decision allowance becomes effectively unbounded when
+  # exploration emits many short decisions in one area. Disable this generic
+  # stagnation/ABORT backoff in the full-M1 lane. The separate rear-turn safety
+  # path may still perform one bounded backoff only when both fresh sweeps are
+  # explicitly blocked.
+  navigation_failure_recovery_enabled: false
+  navigation_failure_recovery_max_attempts: 0
+  navigation_stagnation_timeout_task_steps: 60
+  semantic_progress_supervisor_enabled: true
+  semantic_subgoal_no_progress_task_steps: 60
+  semantic_mission_no_progress_task_steps: 180
+  navigation_max_task_steps: 360
+  interaction_navigation_max_task_steps: 240
+  navigation_step_sync_stall_timeout_s: 5.0
+  # A completed rear-safe turn is followed by a bounded DWA yaw-settle phase.
+  # Rebase the translation watchdog during it, then grant a fresh normal
+  # stagnation window instead of counting the turn against forward progress.
+  navigation_stagnation_post_rotation_grace_s: 15.0
+  # Keep generic final-align disabled in the base config: only an INTERACT
+  # approach may rotate in place at its public bridge-ready standoff.
+  interaction_final_align_enabled: true
+  interaction_final_align_max_distance_m: 0.35
+  interaction_final_align_yaw_tolerance_rad: 0.15
+  interaction_final_align_rotate_speed_rad_s: 0.30
+  interaction_final_align_timeout_s: 15.0
+  # While move_base is still ACTIVE at a position-ready interaction pose, DWA
+  # owns terminal rotation. Bound the wait in public simulator steps so a busy
+  # host cannot make the same trajectory time out earlier.
+  interaction_dwa_terminal_yaw_settle_max_task_steps: 75
+  interaction_final_align_step_sync_enabled: true
+  interaction_final_align_control_dt_s: 0.2
+  # Hard cap only; the actual count is derived from yaw error, .30 rad/s,
+  # .20 s fixed simulator actions, and the .15 rad terminal tolerance.
+  interaction_final_align_max_control_steps: 56
+  interaction_final_align_control_step_margin_steps: 4
+  interaction_final_align_post_budget_settle_steps: 3
+  interaction_final_align_step_sync_stall_timeout_s: 2.0
+  interaction_final_align_delivery_retry_steps: 2

@@ -1,0 +1,44 @@
+# Test-scoped configuration for validating the restricted-GT door contract.
+#
+# This file is intentionally not the default interactive exploration policy:
+# it removes ordinary frontier/container candidates so a visible generic
+# portal is selected as soon as the rule lane receives it.  The portal state
+# remains unknown until the force executor returns action feedback.
+
+mission:
+  mode: "semantic_interaction_exploration"
+
+target:
+  enabled: false
+
+candidate:
+  max_frontier_candidates: 0
+  interaction_types: ["portal"]
+  require_current_visibility: false
+  max_state_age_sec: 3600.0
+  min_state_confidence: 0.5
+  portal_require_attribute_ready: false
+  portal_allow_unknown_state: true
+  portal_unknown_default_interact: true
+  portal_standoff_m: 0.85
+  interaction_safety_margin_m: 0.25
+  interaction_ready_distance_m: 0.45
+
+policy:
+  backend: "rule"
+  # Keep portal scoring deterministic and above any accidental non-portal
+  # fallback if a caller changes the frontier cap in an experiment.
+  portal_bonus: 2.0
+  interaction_priority_bonus: 5.0
+  nearby_interaction_radius_m: 2.0
+  nearby_interaction_bonus: 2.0
+  failure_cooldown_s: 30.0
+  failure_cooldown_schedule_s: [30.0, 60.0, 180.0]
+  failure_retry_delay_s: 1.0
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+
+executor:
+  interaction_navigation_timeout_s: 45.0

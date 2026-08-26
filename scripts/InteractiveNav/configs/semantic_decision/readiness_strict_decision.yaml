@@ -1,0 +1,4 @@
+# Companion override for readiness_strict_room_graph.yaml.  The decision node
+# also auto-detects the strict mapper token, but this makes the smoke contract
+# explicit in the loaded per-node ROS parameters.
+step_ready_require_exact_source: true

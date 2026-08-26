@@ -1,0 +1,21 @@
+target:
+  enabled: false
+
+candidate:
+  interaction_types: ["portal", "container"]
+  require_current_visibility: false
+  max_container_interaction_distance_m: 3.0
+  max_state_age_sec: 300.0
+  container_require_same_room: true
+  container_allow_connected_room: true
+  max_interaction_distance_m: 6.0
+  target_require_visibility_verification: true
+
+policy:
+  backend: "rule"
+  portal_bonus: 0.55
+  container_bonus: 1.0
+  interaction_cost_weight: 0.30
+
+completion:
+  stagnation_failure_limit: 8

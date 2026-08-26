@@ -1,0 +1,78 @@
+<launch>
+    <!-- AI2-THOR仿真器启动文件（支持ProcTHOR-10K） -->
+    
+    <!-- 场景类型: procthor 或 floorplan -->
+    <arg name="scene_type" default="procthor" />
+    
+    <!-- ProcTHOR参数 -->
+    <arg name="procthor_dataset" default="procthor-10k" />
+    <arg name="procthor_split" default="train" />
+    <arg name="procthor_index" default="120" />
+    <arg name="dataset_cache_dir" default="/home/lsl/Experiment/Interactive-nav/datasets/procthor_cache" />
+    
+    <!-- FloorPlan参数 -->
+    <arg name="floorplan_scene" default="FloorPlan1" />
+    
+    <!-- 语义目标 -->
+    <arg name="semantic_target_type" default="Microwave" />
+    
+    <!-- 相机参数 -->
+    <arg name="camera_width" default="720" />
+    <arg name="camera_height" default="720" />
+    <arg name="fov" default="90" />
+    
+    <!-- 机器人参数 -->
+    <arg name="rotation_step" default="1" />  
+    <arg name="move_step" default="0.25" />
+    
+    <!-- 初始化选项 -->
+    <arg name="random_spawn" default="true" />
+    <arg name="enable_top_view" default="true" />
+    
+    <!-- 相机偏移参数 -->
+    <arg name="camera_offset_x" default="0.0" />
+    <arg name="camera_offset_y" default="0.9" />
+    <arg name="camera_offset_z" default="0.0" />
+    
+    <!-- 启动AI2-THOR ROS桥接节点 -->
+    <node name="ai2thor_ros" pkg="ai2thor_pkg" type="ai2thor_ros.py" output="screen">
+        <!-- 场景配置 -->
+        <param name="scene_type" value="$(arg scene_type)" />
+        <param name="procthor_dataset" value="$(arg procthor_dataset)" />
+        <param name="procthor_split" value="$(arg procthor_split)" />
+        <param name="procthor_index" value="$(arg procthor_index)" />
+        <param name="dataset_cache_dir" value="$(arg dataset_cache_dir)" />
+        <param name="floorplan_scene" value="$(arg floorplan_scene)" />
+        
+        <!-- 相机参数 -->
+        <param name="camera_width" value="$(arg camera_width)" />
+        <param name="camera_height" value="$(arg camera_height)" />
+        <param name="fov" value="$(arg fov)" />
+        
+        <!-- 机器人参数 -->
+        <param name="rotation_step" value="$(arg rotation_step)" />
+        <param name="move_step" value="$(arg move_step)" />
+        
+        <!-- 初始化选项 -->
+        <param name="random_spawn" value="$(arg random_spawn)" />
+        <param name="enable_top_view" value="$(arg enable_top_view)" />
+        
+        <!-- 相机偏移参数 -->
+        <param name="camera_offset_x" value="$(arg camera_offset_x)" />
+        <param name="camera_offset_y" value="$(arg camera_offset_y)" />
+        <param name="camera_offset_z" value="$(arg camera_offset_z)" />
+    </node>
+    
+    <!-- 启动Riz-->
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find ai2thor_pkg)/rviz/rviz.rviz" />
+    
+    <!--启动键盘控制运动-->
+    <!--node name="keyboard_control" pkg="ai2thor_pkg" type="keyboard_control.py" output="screen" /-->
+    <!-- 设置全局参数 -->
+    <param name="semantic_target_type" value="$(arg semantic_target_type)"/>
+    <!--加载地图-->
+    <!--node pkg="map_server" type="map_server" name="map_server" args="$(find ai2thor_pkg)/map/map.yaml" >
+        <param name="frame_id" value="tf_frame_map"/>
+    </node-->
+
+</launch>

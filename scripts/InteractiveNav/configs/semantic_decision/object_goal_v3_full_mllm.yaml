@@ -1,0 +1,232 @@
+# Compose with semantic_decision_py_pkg/config/default.yaml.  This keeps the
+# V3 evaluator's public object-goal contract while replacing its rule decision
+# modules with the full MLLM variants.  Endpoint and credentials are loaded
+# exclusively through SEMANTIC_DECISION_ENV_FILE, never from this repository.
+
+mission:
+  mode: "semantic_interaction_object_goal"
+
+target:
+  enabled: false
+  object_labels: []
+  require_interaction: true
+  completion_requires_visibility: true
+
+candidate:
+  # V3 object-goal constraints.
+  target_require_current_visibility: false
+  target_require_same_room: false
+  target_allow_connected_room: true
+  target_min_visible_pixels: 128
+  target_min_visible_fraction: 0.2
+  target_min_consecutive_observations: 2
+
+  # Full-MLLM interaction candidate settings.
+  interaction_types: ["portal", "container"]
+  require_current_visibility: false
+  portal_require_current_visibility: false
+  portal_traversal_distance_m: 0.8
+  max_state_age_sec: 3600.0
+  # The interaction planner must see the same remembered-container candidate
+  # set and use the same three-stage capture/action geometry as the ordinary
+  # full-MLLM profile.  The evaluator still controls which public observations
+  # exist; these values do not expose private container identity.
+  container_require_same_room: false
+  container_allow_connected_room: true
+  container_action_standoff_m: 0.50
+  drawer_action_standoff_m: 0.50
+  fridge_action_standoff_m: 1.15
+  container_m1_face_selection_enabled: true
+  fridge_multiview_angular_scale: 1.0
+  container_m1_capture_standoff_m: 0.50
+  drawer_m1_capture_standoff_m: 0.50
+  fridge_m1_capture_standoff_m: 1.15
+  container_navigation_anchor_outer_offset_m: 0.35
+  container_navigation_anchor_ring_count: 3
+  container_navigation_anchor_tangent_offset_m: 0.20
+  container_anchor_shared_pose_enabled: true
+  drawer_navigation_anchor_aabb_fan_enabled: true
+  drawer_navigation_anchor_fan_clearances_m: [0.50, 0.85, 1.20]
+  drawer_navigation_anchor_fan_angles_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]
+  fridge_navigation_anchor_aabb_fan_enabled: true
+  fridge_navigation_anchor_fan_clearances_m: [1.15, 1.35, 1.55]
+  fridge_navigation_anchor_fan_angles_deg: [-15.0, 0.0, 15.0]
+  container_two_stage_observation_max_attempts: 20
+  container_m1_same_pose_samples_per_view: 1
+  container_m1_max_viewpoints: 4
+  container_m1_max_total_requests: 4
+  container_m1_front_axis_from_capture: true
+  container_safe_staging_arrival_tolerance_m: 0.15
+  container_interaction_ready_distance_m: 0.15
+  container_action_lateral_offset_m: 0.22
+  # Do not turn the graph's initial unknown/default portal state into an
+  # OPEN action.  The asynchronous Module 1 object lane must first classify
+  # the visible door; a ready-but-unknown classification is also non-actionable.
+  portal_require_attribute_ready: true
+  portal_allow_unknown_state: false
+  remembered_portal_reobservation_enabled: true
+  # Keep the channel interaction pose contract identical to the ordinary
+  # full-MLLM navigation profile.  ``portal_standoff_m`` is measured from the
+  # observed AABB surface; the safety margin is part of the desired stance,
+  # while ``interaction_ready_distance_m`` is only arrival error around that
+  # stance.
+  portal_standoff_m: 0.85
+  interaction_safety_margin_m: 0.10
+  interaction_ready_distance_m: 0.25
+  interaction_ready_yaw_tolerance_rad: 0.20
+
+policy:
+  backend: "model"
+  target_relevance_weight: 3.0
+  portal_bonus: 0.55
+  container_bonus: 1.0
+  interaction_cost_weight: 0.30
+  nearby_interaction_radius_m: 1.5
+  nearby_interaction_bonus: 1.5
+  interaction_priority_bonus: 2.0
+  failure_cooldown_s: 5.0
+  interaction_target_failure_cooldown_s: 60.0
+  container_m1_inconclusive_cooldown_schedule_s: [15.0, 60.0, 180.0]
+  failure_retry_delay_s: 1.0
+  # Do not hold the traverse decision on asynchronous Module-1/graph state.
+  # The executor owns the only hard post-open barrier: it records the open
+  # result and waits for one newer *global costmap* publication before calling
+  # make_plan.  That is the map actually consumed by the planner.
+  post_interaction_refresh_enabled: false
+  repeat_guard_enabled: true
+  repeat_guard_low_gain_limit: 2
+  repeat_guard_min_frontier_shrink_m: 0.15
+  direct_atomic_outcome_belief_enabled: false
+
+ablation:
+  module1: "dynamic_mllm"
+  module2: "mllm_score"
+  module3: "mllm_skill_verified"
+
+model:
+  # Empty makes the executor use SEMANTIC_MODEL_NAME from the secure env file
+  # instead of overriding it with the default config's local model name.
+  model: ""
+  timeout_s: 12.0
+  max_tokens: 384
+  consecutive_timeout_limit: 2
+  timeout_cooldown_s: 60.0
+  # Curate with observation-derived semantic/topological priors before asking
+  # the MLLM.  The guard applies only to explicit target/next-route hints.
+  suppress_semantic_container_mismatch: true
+  pre_score_guard_margin: 0.75
+  skill_timeout_s: 12.0
+  skill_max_output_tokens: 256
+  verification_timeout_s: 12.0
+  verification_max_output_tokens: 256
+
+completion:
+  empty_candidate_confirmations: 3
+  stagnation_failure_limit: 8
+
+topics:
+  # RosBridge's evaluator-step heartbeat, used only to cap V3 pre-rotation.
+  step_sync: "/molmo_spaces/step_sync"
+  # The post-open executor gate follows the actual StaticLayer input before
+  # accepting a later global-costmap update.
+  raw_occupancy_grid: "/struct_mapping/occ_map"
+  planning_occupancy_grid: "/semantic_mapping/planning_occ_map"
+  global_costmap: "/move_base/global_costmap/costmap"
+  global_costmap_updates: "/move_base/global_costmap/costmap_updates"
+
+executor:
+  container_m1_same_pose_flip_retry_count: 0
+  # V3 exposes only open(opaque_object_id); a drawer_scan visual hint remains
+  # opaque and is expanded privately into low-view open-observe-close steps.
+  evaluator_opaque_open_only: true
+  # A force interaction may legitimately spend more than the native 30 s
+  # default waiting for the bridge's physical result under a loaded V3 batch.
+  # Keep this evaluator-only override long enough to receive that result and
+  # capture the post-open causal costmap baseline before clearing selection.
+  interaction_timeout_s: 90.0
+  # Container observation/navigation remains the ordinary implementation.  V3
+  # changes only the opaque force boundary and its result wait below.
+  interaction_observation_timeout_s: 12.0
+  interaction_observation_same_pose_samples_per_view: 1
+  interaction_observation_max_viewpoints: 3
+  interaction_observation_max_total_requests: 3
+  container_m1_capture_yaw_tolerance_rad: 0.5235987756
+  container_m1_distinct_view_arrival_tolerance_m: 0.05
+  container_m1_distinct_view_arrival_yaw_tolerance_rad: 0.08
+  container_m1_capture_dwa_profile_enabled: true
+  container_m1_capture_dwa_reconfigure_server: "/move_base/DWAPlannerROS"
+  container_m1_capture_dwa_reconfigure_timeout_s: 1.0
+  container_m1_capture_dwa_terminal_yaw_settle_max_task_steps: 75
+  container_m1_capture_successor_quiescence_timeout_s: 1.0
+  move_base_successor_quiescence_timeout_s: 1.0
+  container_outer_staging_abort_replan_global_costmap_wait_s: 1.0
+  container_outer_staging_abort_replan_global_costmap_poll_interval_s: 0.05
+  container_outer_staging_abort_replan_plan_retry_window_s: 6.0
+  container_outer_staging_abort_replan_plan_retry_interval_s: 0.25
+  container_outer_staging_abort_replan_plan_health_confirmations: 2
+  container_outer_staging_abort_replan_plan_health_interval_s: 0.30
+  container_two_stage_fallback_max_attempts: 20
+  container_inner_corridor_enabled: true
+  container_inner_corridor_segment_m: 0.30
+  container_inner_corridor_arrival_tolerance_m: 0.10
+  container_inner_corridor_max_segments: 4
+  container_pre_action_confirmation_count: 1
+  # Match the ordinary full-MLLM rear-goal and interaction-arrival controller.
+  # Evaluator-only execution remains behind the opaque interaction seam below;
+  # navigation geometry and recovery must not drift between the two profiles.
+  rear_goal_enter_angle_rad: 1.5707963267948966
+  rear_goal_exit_angle_rad: 0.20
+  # Match the existing DWA max_vel_theta cap (rad/s); the executor never
+  # requests a faster pre-rotation than normal navigation permits.
+  rear_goal_rotate_speed_rad_s: 1.25
+  # Leave room for a costmap-safe wrapped opposite turn when the shortest
+  # direction is blocked; the action count remains finite and step-synced.
+  rear_goal_prerotate_step_sync_enabled: true
+  rear_goal_prerotate_control_dt_s: 0.2
+  rear_goal_prerotate_max_control_steps: 28
+  rear_goal_prerotate_post_budget_settle_steps: 3
+  rear_goal_prerotate_step_sync_stall_timeout_s: 2.0
+  rear_goal_local_costmap_max_age_s: 0.75
+  rear_goal_robot_radius_m: 0.25
+  rear_goal_safety_margin_m: 0.05
+  rear_goal_costmap_occupied_threshold: 253
+  rear_goal_unknown_is_blocked: true
+  rear_goal_rotation_sweep_step_rad: 0.10
+  rear_goal_oscillation_window_steps: 4
+  rear_goal_oscillation_min_sign_flips: 2
+  rear_goal_oscillation_max_displacement_m: 0.05
+  rear_goal_reverse_distance_m: 0.15
+  rear_goal_reverse_min_distance_m: 0.05
+  rear_goal_reverse_speed_mps: 0.10
+  rear_goal_reverse_max_control_steps: 10
+  navigation_failure_recovery_enabled: false
+  navigation_failure_recovery_max_attempts: 0
+  navigation_stagnation_timeout_task_steps: 60
+  semantic_progress_supervisor_enabled: true
+  semantic_subgoal_no_progress_task_steps: 60
+  semantic_mission_no_progress_task_steps: 180
+  navigation_max_task_steps: 360
+  interaction_navigation_max_task_steps: 240
+  navigation_step_sync_stall_timeout_s: 5.0
+  navigation_stagnation_post_rotation_grace_s: 15.0
+  interaction_final_align_enabled: true
+  interaction_final_align_max_distance_m: 0.35
+  interaction_final_align_yaw_tolerance_rad: 0.15
+  interaction_final_align_rotate_speed_rad_s: 0.30
+  interaction_final_align_timeout_s: 15.0
+  interaction_dwa_terminal_yaw_settle_max_task_steps: 75
+  interaction_final_align_step_sync_enabled: true
+  interaction_final_align_control_dt_s: 0.2
+  interaction_final_align_max_control_steps: 56
+  interaction_final_align_control_step_margin_steps: 4
+  interaction_final_align_post_budget_settle_steps: 3
+  interaction_final_align_step_sync_stall_timeout_s: 2.0
+  interaction_final_align_delivery_retry_steps: 2
+  interaction_navigation_timeout_s: 180.0
+  # Require a bounded causal refresh: post-result raw OCC -> planning OCC ->
+  # global costmap update/full, then allow only a short same-goal retry.
+  # The 2 s budget is total across the three stages, not a polling loop.
+  post_interaction_costmap_fresh_timeout_s: 2.0
+  post_interaction_costmap_fresh_poll_interval_s: 0.05
+  post_interaction_traversal_make_plan_retry_window_s: 0.35
+  post_interaction_traversal_make_plan_retry_interval_s: 0.10

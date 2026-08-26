@@ -1,0 +1,7 @@
+# Smoke-only causal readiness override.  The semantic mapping readiness token
+# becomes true only after the raw OCC source for the current observation has
+# produced a matching room-segmentation grid and the matching unified graph has
+# been published.  This intentionally exposes room-worker latency to the
+# simulator step barrier; keep the normal default on the fast OCC-only path.
+semantic_map:
+  step_ready_require_room_graph: true
