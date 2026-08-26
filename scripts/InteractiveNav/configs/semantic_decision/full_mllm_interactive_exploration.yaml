@@ -14,7 +14,10 @@ candidate:
   # A closed/unknown remembered door is actionable only from a sufficiently
   # large current observation.  This prevents wall-occluded graph memory from
   # leaking into Module 2 while preserving confirmed post-open graph state.
-  portal_require_current_visibility: true
+  # Keep remembered graph interactions in the candidate sequence even while
+  # out of view. Execution may re-observe them before acting.
+  portal_require_current_visibility: false
+  portal_traversal_distance_m: 0.8
   portal_min_visible_pixels: 128
   portal_min_visible_fraction: 0.20
   remembered_portal_reobservation_enabled: true
@@ -104,6 +107,7 @@ policy:
   failure_cooldown_s: 5.0
   interaction_target_failure_cooldown_s: 60.0
   container_anchor_unreachable_cooldown_s: 60.0
+  container_anchor_unreachable_cooldown_steps: 300
   container_m1_inconclusive_cooldown_schedule_s: [15.0, 60.0, 180.0]
   failure_retry_delay_s: 1.0
   repeat_guard_enabled: true
@@ -134,6 +138,9 @@ completion:
 
 executor:
   interaction_navigation_timeout_s: 180.0
+  # A negative M1 view must advance to a materially different anchor.  Never
+  # spend another request at the same pose after a transient/front flip.
+  container_m1_same_pose_flip_retry_count: 0
   interaction_observation_timeout_s: 12.0
   interaction_observation_same_pose_samples_per_view: 1
   interaction_observation_max_viewpoints: 3
@@ -216,6 +223,9 @@ executor:
   navigation_failure_recovery_enabled: false
   navigation_failure_recovery_max_attempts: 0
   navigation_stagnation_timeout_task_steps: 60
+  semantic_progress_supervisor_enabled: true
+  semantic_subgoal_no_progress_task_steps: 60
+  semantic_mission_no_progress_task_steps: 180
   navigation_max_task_steps: 360
   interaction_navigation_max_task_steps: 240
   navigation_step_sync_stall_timeout_s: 5.0

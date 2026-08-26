@@ -26,6 +26,7 @@ from scripts.InteractiveNav.force_interaction_runtime import (
     collect_articulation_groups,
     finalize_articulation_force_transition,
     ground_drawer_open_regions,
+    infer_articulation_front_axis_xy,
     prepare_articulation_force,
     prepare_articulation_state_force,
     open_door_root_with_force,
@@ -1749,7 +1750,55 @@ class AtomicForceInteractionController:
                     face_position_error_rad <= face_position_tolerance_rad
                     and face_yaw_error_rad <= face_yaw_tolerance_rad
                 )
-        valid = pose_valid and face_valid
+        physical_front_required = bool(
+            face_required
+            and str(command.get("node_type") or "").strip().casefold() == "container"
+        )
+        physical_front_checked = False
+        physical_front_valid = not physical_front_required
+        physical_front_position_error_rad: float | None = None
+        physical_front_yaw_error_rad: float | None = None
+        physical_front_source = ""
+        if physical_front_required:
+            physical_front = infer_articulation_front_axis_xy(
+                task.env, str(command.get("_execution_object_id") or command.get("object_id") or "")
+            )
+            physical_front_checked = bool(physical_front.get("checked"))
+            physical_front_source = str(
+                physical_front.get("source") or physical_front.get("reason") or ""
+            )
+            physical_axis = list(physical_front.get("axis_xy") or [])
+            if physical_front_checked and len(physical_axis) >= 2 and len(center_values) >= 2:
+                offset_x = actual[0] - float(center_values[0])
+                offset_y = actual[1] - float(center_values[1])
+                offset_norm = math.hypot(offset_x, offset_y)
+                if offset_norm > 1e-6:
+                    physical_axis_x = float(physical_axis[0])
+                    physical_axis_y = float(physical_axis[1])
+                    dot = max(
+                        -1.0,
+                        min(
+                            1.0,
+                            (offset_x * physical_axis_x + offset_y * physical_axis_y)
+                            / offset_norm,
+                        ),
+                    )
+                    physical_front_position_error_rad = math.acos(dot)
+                    physical_front_yaw = math.atan2(
+                        -physical_axis_y, -physical_axis_x
+                    )
+                    physical_front_yaw_error_rad = abs(
+                        math.atan2(
+                            math.sin(actual[2] - physical_front_yaw),
+                            math.cos(actual[2] - physical_front_yaw),
+                        )
+                    )
+                    physical_front_valid = bool(
+                        physical_front_position_error_rad
+                        <= face_position_tolerance_rad
+                        and physical_front_yaw_error_rad <= face_yaw_tolerance_rad
+                    )
+        valid = pose_valid and face_valid and physical_front_valid
         result = {
             "checked": True,
             "valid": valid,
@@ -1771,12 +1820,22 @@ class AtomicForceInteractionController:
             "face_yaw_error_rad": face_yaw_error_rad,
             "face_position_tolerance_rad": face_position_tolerance_rad,
             "face_yaw_tolerance_rad": face_yaw_tolerance_rad,
+            "physical_front_required": physical_front_required,
+            "physical_front_checked": physical_front_checked,
+            "physical_front_valid": physical_front_valid,
+            "physical_front_source": physical_front_source,
+            "physical_front_position_error_rad": physical_front_position_error_rad,
+            "physical_front_yaw_error_rad": physical_front_yaw_error_rad,
         }
         if not valid:
             command["interaction_pose_validation"] = result
+            prefix = (
+                "Interaction physical front invalid: "
+                if physical_front_required and not physical_front_valid
+                else "Interaction pose invalid: "
+            )
             raise ValueError(
-                "Interaction pose invalid: "
-                f"position_error_m={position_error_m:.3f} "
+                prefix + f"position_error_m={position_error_m:.3f} "
                 f"yaw_error_rad={yaw_error_rad:.3f} "
                 f"face_checked={face_checked} "
                 f"face_position_error_rad={face_position_error_rad} "
@@ -1800,6 +1859,9 @@ class AtomicForceInteractionController:
         node_type = str(command.get("node_type") or "").casefold()
         missing_articulation = str(exc).startswith("Articulated object not found:")
         invalid_interaction_pose = str(exc).startswith("Interaction pose invalid:")
+        invalid_physical_front = str(exc).startswith(
+            "Interaction physical front invalid:"
+        )
         unsafe_open_sweep = str(exc).strip() == "unsafe_open_sweep"
         drawer_sequence_type = str(command.get("sequence_type") or "").casefold()
         drawer_sequence_execution_failed = str(exc).startswith(
@@ -1860,6 +1922,10 @@ class AtomicForceInteractionController:
         elif drawer_sequence_execution_failed:
             verification_source = "executor_drawer_sequence_failure"
             failure_reason = f"{drawer_sequence_type or 'drawer'}_execution_failed"
+        elif invalid_physical_front:
+            verification_source = "executor_pose_precondition"
+            failure_reason = "interaction_wrong_face"
+            resolved_capability = "articulated"
         elif invalid_interaction_pose:
             verification_source = "executor_pose_precondition"
             failure_reason = "interaction_pose_invalid"
@@ -1887,14 +1953,14 @@ class AtomicForceInteractionController:
                 False
                 if portal_missing_articulation
                 else True
-                if unsafe_open_sweep
+                if unsafe_open_sweep or invalid_physical_front
                 else None
             ),
             "retryable": (
                 False
                 if portal_missing_articulation
                 else True
-                if unsafe_open_sweep
+                if unsafe_open_sweep or invalid_physical_front
                 else None
             ),
             "state": semantic_state,

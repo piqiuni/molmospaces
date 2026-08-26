@@ -189,9 +189,9 @@ def _bbox_short_side_pixels(bbox: list[float] | list[int]) -> int:
     return min(width, height)
 
 
-def _largest_connected_component_bbox(
+def _largest_connected_component(
     xs: np.ndarray, ys: np.ndarray
-) -> tuple[int, list[int]] | None:
+) -> tuple[int, list[int], np.ndarray, np.ndarray] | None:
     """Return the dominant 8-connected visible component for one object.
 
     MuJoCo's segmentation image is exact at the geom level, but an object can
@@ -209,7 +209,7 @@ def _largest_connected_component_bbox(
     max_y = int(np.max(ys))
     mask = np.zeros((max_y - min_y + 1, max_x - min_x + 1), dtype=np.uint8)
     mask[ys - min_y, xs - min_x] = 1
-    component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
         mask, connectivity=8
     )
     if component_count <= 1:
@@ -222,10 +222,45 @@ def _largest_connected_component_bbox(
     top = int(stats[component_index, cv2.CC_STAT_TOP])
     width = int(stats[component_index, cv2.CC_STAT_WIDTH])
     height = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+    component_ys, component_xs = np.nonzero(labels == component_index)
     return (
         int(stats[component_index, cv2.CC_STAT_AREA]),
         [min_x + left, min_y + top, min_x + left + width - 1, min_y + top + height - 1],
+        component_xs.astype(np.int32, copy=False) + min_x,
+        component_ys.astype(np.int32, copy=False) + min_y,
     )
+
+
+def _largest_connected_component_bbox(
+    xs: np.ndarray, ys: np.ndarray
+) -> tuple[int, list[int]] | None:
+    component = _largest_connected_component(xs, ys)
+    if component is None:
+        return None
+    return component[0], component[1]
+
+
+def _encode_component_mask_rle(
+    height: int,
+    width: int,
+    xs: np.ndarray,
+    ys: np.ndarray,
+) -> dict[str, list[int]]:
+    """Encode public target pixels in compact COCO/Fortran run order."""
+
+    mask = np.zeros((int(height), int(width)), dtype=np.uint8)
+    mask[ys, xs] = 1
+    flat = mask.reshape(-1, order="F")
+    if flat.size == 0:
+        counts = [0]
+    else:
+        transitions = np.flatnonzero(flat[1:] != flat[:-1]) + 1
+        starts = np.concatenate((np.asarray([0]), transitions))
+        ends = np.concatenate((transitions, np.asarray([flat.size])))
+        counts = [int(end - start) for start, end in zip(starts, ends, strict=True)]
+        if int(flat[0]) == 1:
+            counts.insert(0, 0)
+    return {"size": [int(height), int(width)], "counts": counts}
 
 
 def _project_aabb_bbox(
@@ -475,7 +510,7 @@ class RealtimeGTObservationPublisher:
         camera_position = np.asarray(camera.pos, dtype=np.float64).copy()
         image_size = [int(segmentation.shape[1]), int(segmentation.shape[0])]
         observations = []
-        for spec_index, visible_pixels, bbox_2d in visible:
+        for spec_index, visible_pixels, bbox_2d, mask_rle in visible:
             spec = self._specs[spec_index]
             position = np.asarray(data.xpos[spec.body_id], dtype=np.float64).copy()
             distance_m = float(np.linalg.norm(position - camera_position))
@@ -525,6 +560,7 @@ class RealtimeGTObservationPublisher:
                     visible_pixels,
                     center,
                     size,
+                    mask_rle=mask_rle,
                     interaction_approach_axis_xy=interaction_approach_axis_xy,
                 )
             )
@@ -692,7 +728,7 @@ class RealtimeGTObservationPublisher:
 
     def _visible_instances(
         self, segmentation: np.ndarray
-    ) -> list[tuple[int, int, list[int]]]:
+    ) -> list[tuple[int, int, list[int], dict[str, list[int]]]]:
         if not self._specs or self._geom_to_spec.size == 0:
             return []
         geom_mask = segmentation[..., 1] == int(mujoco.mjtObj.mjOBJ_GEOM)
@@ -713,13 +749,13 @@ class RealtimeGTObservationPublisher:
         counts = np.bincount(spec_indices, minlength=len(self._specs))
         result = []
         for spec_index in np.flatnonzero(counts >= self.min_visible_pixels):
-            component = _largest_connected_component_bbox(
+            component = _largest_connected_component(
                 xs[spec_indices == spec_index],
                 ys[spec_indices == spec_index],
             )
             if component is None:
                 continue
-            component_pixels, bbox_2d = component
+            component_pixels, bbox_2d, component_xs, component_ys = component
             # Do not combine two individually invisible islands merely because
             # they share a GT object ID.  This prevents a tiny pair of door
             # fragments from becoming a large box over unrelated objects.
@@ -738,6 +774,12 @@ class RealtimeGTObservationPublisher:
                     int(spec_index),
                     int(component_pixels),
                     bbox_2d,
+                    _encode_component_mask_rle(
+                        int(segmentation.shape[0]),
+                        int(segmentation.shape[1]),
+                        component_xs,
+                        component_ys,
+                    ),
                 )
             )
         return result
@@ -749,6 +791,7 @@ class RealtimeGTObservationPublisher:
         visible_pixels: int,
         center: np.ndarray,
         size: np.ndarray,
+        mask_rle: dict[str, list[int]] | None = None,
         interaction_approach_axis_xy: list[float] | None = None,
     ) -> dict[str, Any]:
         metadata = spec.metadata
@@ -786,6 +829,11 @@ class RealtimeGTObservationPublisher:
                 "frame_id": "world",
             },
         }
+        if mask_rle is not None:
+            observation["mask_rle"] = {
+                "size": [int(value) for value in mask_rle.get("size", [])],
+                "counts": [int(value) for value in mask_rle.get("counts", [])],
+            }
         if interaction_approach_axis_xy is not None:
             observation["interaction_approach_axis_xy"] = [
                 float(value) for value in interaction_approach_axis_xy[:2]

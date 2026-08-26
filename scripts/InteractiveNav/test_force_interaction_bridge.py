@@ -105,6 +105,40 @@ def test_interaction_pose_validation_accepts_m1_confirmed_face() -> None:
     assert result["face_valid"] is True
 
 
+def test_interaction_pose_validation_rejects_m1_face_that_is_not_physical_front(
+    monkeypatch,
+) -> None:
+    _set_pose(1.0, 1.35, -math.pi / 2.0)
+    monkeypatch.setattr(
+        bridge,
+        "infer_articulation_front_axis_xy",
+        lambda _env, _object_id: {
+            "checked": True,
+            "axis_xy": [1.0, 0.0],
+            "source": "slide_open_travel",
+        },
+    )
+    command = {
+        "node_type": "container",
+        "object_id": "drawer_1",
+        "_execution_object_id": "private_drawer_1",
+        "interaction_approach_pose_xyyaw": [1.0, 1.35, -math.pi / 2.0],
+        "interaction_ready_distance_m": 0.45,
+        "interaction_ready_yaw_tolerance_rad": 0.55,
+        "interaction_approach_axis_xy": [0.0, 1.0],
+        "interaction_target_center_xy": [1.0, 1.0],
+        "interaction_front_axis_validation_required": True,
+    }
+
+    with pytest.raises(ValueError, match="Interaction physical front invalid"):
+        AtomicForceInteractionController._validate_interaction_pose(_Task(), command)
+
+    validation = command["interaction_pose_validation"]
+    assert validation["face_valid"] is True
+    assert validation["physical_front_checked"] is True
+    assert validation["physical_front_valid"] is False
+
+
 def _enqueue_fridge_open(controller: AtomicForceInteractionController) -> None:
     controller.enqueue_command(
         {

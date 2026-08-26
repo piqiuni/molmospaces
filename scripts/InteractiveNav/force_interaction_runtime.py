@@ -597,6 +597,66 @@ def articulation_joint_infos(env, object_name: str) -> list[dict[str, Any]]:
     return _joint_infos_for_group(env.current_model, env.current_data, list(group["joints"]))
 
 
+def infer_articulation_front_axis_xy(env, object_name: str) -> dict[str, Any]:
+    """Infer a private physical front normal from live articulation geometry.
+
+    Slide travel directly defines the outward normal. For a hinge, the initial
+    opening velocity of the articulated body (axis cross hinge-to-body radius)
+    defines the side from which an outward-opening leaf is operated. No joint
+    names or axis values leave the force bridge; callers receive only a compact
+    validation source and the normalized axis for an immediate private check.
+    """
+
+    groups = collect_articulation_groups(env)
+    group = groups.get(str(object_name))
+    if group is None:
+        return {"checked": False, "reason": "articulation_group_unavailable"}
+    model = env.current_model
+    data = env.current_data
+    axes: list[np.ndarray] = []
+    sources: list[str] = []
+    for joint in list(group.get("joints") or []):
+        joint_id = int(joint.get("joint_id", -1))
+        if joint_id < 0:
+            continue
+        body_id = int(model.jnt_bodyid[joint_id])
+        local_axis = np.asarray(model.jnt_axis[joint_id], dtype=float)
+        body_rotation = np.asarray(data.xmat[body_id], dtype=float).reshape(3, 3)
+        world_axis = body_rotation @ local_axis
+        closed_value, open_value = joint_closed_open_values(joint.get("joint_range") or [])
+        direction_sign = 1.0 if open_value >= closed_value else -1.0
+        joint_type = str(joint.get("joint_type") or "").casefold()
+        if joint_type == "slide":
+            axis_xy = direction_sign * world_axis[:2]
+            source = "slide_open_travel"
+        elif joint_type == "hinge":
+            anchor = np.asarray(data.xanchor[joint_id], dtype=float)
+            radial = np.asarray(data.xpos[body_id], dtype=float) - anchor
+            axis_xy = direction_sign * np.cross(world_axis, radial)[:2]
+            source = "hinge_initial_open_motion"
+        else:
+            continue
+        norm = float(np.linalg.norm(axis_xy))
+        if math.isfinite(norm) and norm > 1e-6:
+            axes.append(np.asarray(axis_xy, dtype=float) / norm)
+            sources.append(source)
+    if not axes:
+        return {"checked": False, "reason": "front_axis_geometry_unavailable"}
+    reference = axes[0]
+    aligned = [axis if float(np.dot(axis, reference)) >= 0.0 else -axis for axis in axes]
+    mean_axis = np.mean(aligned, axis=0)
+    norm = float(np.linalg.norm(mean_axis))
+    if not math.isfinite(norm) or norm <= 1e-6:
+        mean_axis = reference
+        norm = float(np.linalg.norm(mean_axis))
+    return {
+        "checked": True,
+        "axis_xy": [float(value) for value in mean_axis / norm],
+        "source": "+".join(sorted(set(sources))),
+        "joint_count": len(axes),
+    }
+
+
 def _build_force_specs(model, joint_targets: Mapping[str, float]) -> list[dict[str, Any]]:
     specs = []
     for joint_name, target_value in joint_targets.items():
