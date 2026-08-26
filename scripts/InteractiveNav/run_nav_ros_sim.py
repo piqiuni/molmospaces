@@ -428,7 +428,13 @@ class NavRosRolloutRunner(ParallelRolloutRunner):
         end_on_success: bool = False,
     ):
         log.info("Starting task.reset() ...")
-        task.set_history_retention(bool(getattr(policy, "retain_task_history", False)))
+        # ``set_history_retention`` exists only on the interactive task
+        # implementation.  Latest MolmoSpaces navigation tasks do not expose
+        # that optional history hook, so keep the rollout compatible with both
+        # task APIs instead of failing before the first observation.
+        set_history_retention = getattr(task, "set_history_retention", None)
+        if callable(set_history_retention):
+            set_history_retention(bool(getattr(policy, "retain_task_history", False)))
         if hasattr(policy, "prepare_episode_reset"):
             policy.prepare_episode_reset()
         observation, _info = task.reset()
