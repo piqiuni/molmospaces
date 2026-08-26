@@ -44,9 +44,13 @@ class PhysicalRosGateway:
         self.info_pub = rospy.Publisher("/physical_nav/camera_info", CameraInfo, queue_size=1)
         self.cloud_pub = rospy.Publisher("/physical_nav/points", PointCloud2, queue_size=1)
         self.odom_pub = rospy.Publisher("/physical_nav/odom", Odometry, queue_size=1)
+        self.detection_pub = rospy.Publisher("/physical_nav/detections", String, queue_size=1)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(); self.static_broadcaster = tf2_ros.StaticTransformBroadcaster()
-        self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}
-        for topic, name in (("/physical_nav/detections", "detections"), ("/physical_nav/unified_graph", "graph"), ("/physical_nav/consistency", "consistency"),):
+        self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_state_poll = 0.0
+        # Detections originate in the non-ROS YOLOE worker and are republished
+        # below for the existing mapper.  Do not subscribe to the same topic
+        # here: that would feed our own message back into the HTTP state loop.
+        for topic, name in (("/physical_nav/unified_graph", "graph"), ("/physical_nav/consistency", "consistency"),):
             rospy.Subscriber(topic, String, self._json_callback(name), queue_size=1)
         rospy.Subscriber("/physical_nav/occupancy", __import__("nav_msgs.msg", fromlist=["OccupancyGrid"]).OccupancyGrid, self._occupancy_callback, queue_size=1)
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(args.rate, 1e-3)), self._poll)
@@ -76,8 +80,18 @@ class PhysicalRosGateway:
                 raw = json.loads(response.read().decode())
             if int(raw.get("seq", -1)) <= self.last_seq or not raw.get("rgb") or not raw.get("depth"): return
             self.last_seq = int(raw["seq"]); self.last_raw = raw; self._publish(raw)
+            if time.monotonic() - self._last_state_poll >= self.args.state_period:
+                self._publish_state(); self._last_state_poll = time.monotonic()
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "physical raw-frame polling: %s", exc)
+
+    def _publish_state(self) -> None:
+        try:
+            with urllib.request.urlopen(self.args.web_url.rstrip("/") + "/api/state", timeout=.6) as response: state = json.loads(response.read().decode())
+            detections = state.get("detections", [])
+            self.detection_pub.publish(json.dumps({"seq": state.get("frame_seq", -1), "stamp": state.get("frame_stamp", 0), "detections": detections}, ensure_ascii=False, separators=(",", ":")))
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "physical state polling: %s", exc)
 
     def _publish(self, raw: dict[str, Any]) -> None:
         rgb = _decode(raw["rgb"]); depth = _decode(raw["depth"])
@@ -115,11 +129,11 @@ def _image_msg(array: np.ndarray, encoding: str, stamp: Any, frame: str) -> Imag
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--rate", type=float, default=10.); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--camera-frame", default="d435i_color_optical_frame"); p.add_argument("--camera-parent", default="tf_frame_base_link"); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args, _unknown = p.parse_known_args()
+    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--rate", type=float, default=10.); p.add_argument("--state-period", type=float, default=.2); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--camera-frame", default="d435i_color_optical_frame"); p.add_argument("--camera-parent", default="tf_frame_base_link"); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args, _unknown = p.parse_known_args()
     # ROS launch appends __name/__log remappings; ignore those in the local
     # CLI parser so the gateway can also be run directly.
     rospy.init_node("physical_ros_gateway", anonymous=False)
-    for name in ("web_url", "rate", "point_stride", "max_depth_m", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw"):
+    for name in ("web_url", "rate", "state_period", "point_stride", "max_depth_m", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw"):
         setattr(args, name, rospy.get_param("~" + name, getattr(args, name)))
     PhysicalRosGateway(args); rospy.spin()
 

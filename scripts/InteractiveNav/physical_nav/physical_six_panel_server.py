@@ -11,7 +11,6 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-import urllib.error
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -37,18 +36,13 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _ros_master_available(timeout_s: float = 0.25) -> bool:
-    """Probe ROS master without making the web server wait indefinitely."""
-    uri = __import__("os").environ.get("ROS_MASTER_URI", "http://127.0.0.1:11311").rstrip("/")
-    try:
-        with urllib.request.urlopen(uri, timeout=timeout_s):
-            return True
-    except urllib.error.HTTPError:
-        # ROS master deliberately rejects GET with 501, which still proves
-        # that the XML-RPC endpoint is alive.
-        return True
-    except Exception:
-        return False
+def _point_xy(value: Any) -> tuple[float, float] | None:
+    """Read either graph point dictionaries or the mapper's XYZ arrays."""
+    if isinstance(value, dict):
+        return _safe_float(value.get("x")), _safe_float(value.get("y"))
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return _safe_float(value[0]), _safe_float(value[1])
+    return None
 
 
 def _decode(value: str, encoding: str) -> Any:
@@ -131,7 +125,8 @@ class SixPanelRenderer:
         positions = {}
         for index, node in enumerate(nodes):
             value = node.get("world_position") or node.get("position") or node.get("centroid") or node.get("aabb_center") or node.get("center") or {}
-            x, y = _safe_float(value.get("x"), float(index % 5)) if isinstance(value, dict) else float(index % 5), _safe_float(value.get("y"), float(index // 5)) if isinstance(value, dict) else float(index // 5)
+            point = _point_xy(value)
+            x, y = point if point is not None else (float(index % 5), float(index // 5))
             positions[str(node.get("id", node.get("node_id", index)))] = (x, y)
         if positions:
             xs, ys = [p[0] for p in positions.values()], [p[1] for p in positions.values()]; minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
@@ -234,98 +229,6 @@ class PhysicalGateway:
         self.qwen_auto_interval = qwen_auto_interval
         self.http: ThreadingHTTPServer | None = None
 
-    def _publish_ros(self, packet: dict[str, Any]) -> None:
-        """Decode and publish to local ROS if rospy is installed."""
-        try:
-            import rospy
-            from sensor_msgs.msg import CameraInfo, Image, PointCloud2
-            from nav_msgs.msg import Odometry
-            from geometry_msgs.msg import TransformStamped
-            import sensor_msgs.point_cloud2 as pc2
-            import tf2_ros
-            from std_msgs.msg import Header
-            from cv_bridge import CvBridge
-        except ImportError:
-            return
-        if not getattr(rospy, "core", None) or not rospy.core.is_initialized():
-            return
-        if not hasattr(self, "_ros_ready"):
-            self._bridge = CvBridge(); self._ros_ready = True
-            self._rgb_pub = rospy.Publisher("/physical_nav/rgb/image_raw", Image, queue_size=1)
-            self._depth_pub = rospy.Publisher("/physical_nav/depth/image_raw", Image, queue_size=1)
-            self._info_pub = rospy.Publisher("/physical_nav/camera_info", CameraInfo, queue_size=1)
-            self._cloud_pub = rospy.Publisher("/physical_nav/points", PointCloud2, queue_size=1)
-            self._odom_pub = rospy.Publisher("/physical_nav/odom", Odometry, queue_size=1)
-            self._tf_broadcaster = tf2_ros.TransformBroadcaster()
-            self._static_tf_broadcaster = tf2_ros.StaticTransformBroadcaster()
-        rgb = self.state.rgb; depth = self.state.depth
-        if rgb is None or depth is None: return
-        stamp = rospy.Time.from_sec(float(packet["stamp"]))
-        rgb_msg = self._bridge.cv2_to_imgmsg(rgb, encoding="bgr8"); rgb_msg.header.stamp = stamp; rgb_msg.header.frame_id = packet["camera_frame"]
-        depth_msg = self._bridge.cv2_to_imgmsg(depth, encoding="16UC1"); depth_msg.header.stamp = stamp; depth_msg.header.frame_id = packet["camera_frame"]
-        info = CameraInfo(); info.header.stamp = stamp; info.header.frame_id = packet["camera_frame"]; info.width = int(packet["width"]); info.height = int(packet["height"])
-        intr = packet.get("intrinsics", {}); info.K = [float(intr.get("fx", 0)), 0, float(intr.get("cx", 0)), 0, float(intr.get("fy", 0)), float(intr.get("cy", 0)), 0, 0, 1]
-        self._rgb_pub.publish(rgb_msg); self._depth_pub.publish(depth_msg); self._info_pub.publish(info)
-        # Organized depth -> sparse XYZ cloud.  The mapping node can consume
-        # this directly; invalid/too-distant pixels are omitted.
-        try:
-            points = []
-            fx, fy = float(intr.get("fx", 0)), float(intr.get("fy", 0)); cx, cy = float(intr.get("cx", 0)), float(intr.get("cy", 0))
-            stride = 4; scale = float(packet.get("depth_scale", .001)); max_depth = 8.0
-            for v in range(0, depth.shape[0], stride):
-                for u in range(0, depth.shape[1], stride):
-                    z = float(depth[v, u]) * scale
-                    if z <= 0 or z > max_depth or fx <= 0 or fy <= 0: continue
-                    points.append(((u - cx) * z / fx, (v - cy) * z / fy, z))
-            header = Header(); header.stamp = stamp; header.frame_id = packet["camera_frame"]
-            self._cloud_pub.publish(pc2.create_cloud_xyz32(header, points))
-        except Exception as exc:
-            self.state.last_error = f"pointcloud: {exc}"
-        telemetry = self.state.telemetry
-        position = telemetry.get("position", [0, 0, 0]); rpy = telemetry.get("imu", {}).get("rpy", [0, 0, 0])
-        try:
-            odom = Odometry(); odom.header.stamp = stamp; odom.header.frame_id = "tf_frame_odom"; odom.child_frame_id = "tf_frame_base_link"
-            odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z = [float(v) for v in position[:3]]
-            odom.twist.twist.linear.x, odom.twist.twist.linear.y = [float(v) for v in (telemetry.get("velocity", [0, 0])[:2])]
-            self._odom_pub.publish(odom)
-            transform = TransformStamped(); transform.header.stamp = stamp; transform.header.frame_id = "tf_frame_odom"; transform.child_frame_id = "tf_frame_base_link"
-            transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z = [float(v) for v in position[:3]]
-            yaw = float(telemetry.get("yaw", rpy[2] if len(rpy) > 2 else 0.0)); transform.transform.rotation.z = __import__("math").sin(yaw / 2); transform.transform.rotation.w = __import__("math").cos(yaw / 2)
-            self._tf_broadcaster.sendTransform(transform)
-            if not getattr(self, "_camera_tf_sent", False):
-                static = TransformStamped(); static.header.stamp = stamp; static.header.frame_id = self.camera_parent; static.child_frame_id = packet["camera_frame"]
-                static.transform.translation.x, static.transform.translation.y, static.transform.translation.z = self.camera_translation
-                import math
-                roll, pitch, yaw = self.camera_rpy; cr, sr = math.cos(roll / 2), math.sin(roll / 2); cp, sp = math.cos(pitch / 2), math.sin(pitch / 2); cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
-                static.transform.rotation.w = cr * cp * cy + sr * sp * sy; static.transform.rotation.x = sr * cp * cy - cr * sp * sy; static.transform.rotation.y = cr * sp * cy + sr * cp * sy; static.transform.rotation.z = cr * cp * sy - sr * sp * cy
-                self._static_tf_broadcaster.sendTransform(static); self._camera_tf_sent = True
-        except Exception as exc:
-            self.state.last_error = f"odom/tf: {exc}"
-
-    def start_ros_subscribers(self) -> None:
-        """Mirror mapping/detector diagnostics into the web state when ROS1 is available."""
-        try:
-            import rospy
-            from std_msgs.msg import String
-            from nav_msgs.msg import OccupancyGrid
-        except ImportError:
-            return
-        if not getattr(rospy, "core", None) or not rospy.core.is_initialized():
-            if not _ros_master_available():
-                return
-            rospy.init_node("physical_nav_web_gateway", anonymous=True, disable_signals=True)
-        def json_callback(attr: str):
-            def callback(msg: Any) -> None:
-                try: self.state.update_topic(attr, json.loads(msg.data))
-                except Exception as exc: self.state.last_error = f"ROS {attr}: {exc}"
-            return callback
-        rospy.Subscriber("/physical_nav/detections", String, json_callback("detections"), queue_size=1)
-        rospy.Subscriber("/physical_nav/unified_graph", String, json_callback("graph"), queue_size=1)
-        rospy.Subscriber("/physical_nav/consistency", String, json_callback("consistency"), queue_size=1)
-        def occupancy_callback(msg: Any) -> None:
-            self.state.update_topic("occupancy", {"width": msg.info.width, "height": msg.info.height, "resolution": msg.info.resolution, "origin": {"x": msg.info.origin.position.x, "y": msg.info.origin.position.y}, "data": list(msg.data)})
-        rospy.Subscriber("/physical_nav/occupancy", OccupancyGrid, occupancy_callback, queue_size=1)
-
     def receive(self, packet: dict[str, Any]) -> dict[str, Any]:
         validate_packet(packet)
         if packet.get("type") in {"control", "cmd", "lidar", "posture", "speak", "teleop_intent"}:
@@ -347,12 +250,21 @@ class PhysicalGateway:
         handler.state, handler.renderer, handler.gate = self.state, self.renderer, self.gate
         def submit_qwen(payload: dict[str, Any]) -> dict[str, Any]:
             if self.qwen is None: return {"accepted": False, "error": "Qwen client is disabled"}
-            prompt = str(payload.get("prompt", "请分析当前全局语义图与感知一致性"))
-            request = {"prompt": prompt, "requested_at": time.time(), "model": self.qwen.model}
+            user_prompt = str(payload.get("prompt", "请分析当前全局语义图与感知一致性"))
+            snapshot = self.state.snapshot()
+            context = {
+                "frame_seq": snapshot["frame_seq"],
+                "telemetry": snapshot["telemetry"],
+                "detections": snapshot["detections"],
+                "graph": snapshot["graph"],
+                "consistency": snapshot["consistency"],
+            }
+            prompt = user_prompt + "\n\n当前实物平台状态(JSON)：\n" + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+            request = {"prompt": user_prompt, "context": context, "requested_at": time.time(), "model": self.qwen.model}
             self.state.add_qwen(request)
             def worker() -> None:
                 result = self.qwen.chat(prompt, max_tokens=int(payload.get("max_tokens", 256)))
-                self.state.add_qwen({}, {"completed_at": time.time(), "prompt": prompt, "result": result})
+                self.state.add_qwen({}, {"completed_at": time.time(), "prompt": user_prompt, "result": result})
             threading.Thread(target=worker, daemon=True).start()
             return {"accepted": True, "queued_at": request["requested_at"]}
         # Store as a static callback; otherwise BaseHTTPRequestHandler binds
@@ -388,12 +300,17 @@ async def run_gateway(args: argparse.Namespace) -> None:
     gateway = PhysicalGateway(args.http_host, args.http_port, args.qwen_url, args.qwen_model, args.camera_parent, args.camera_x, args.camera_y, args.camera_z, args.camera_roll, args.camera_pitch, args.camera_yaw, args.qwen_auto_interval)
     gateway.start_http()
     async def handler(websocket: Any) -> None:
-        async for raw in websocket:
-            try:
-                packet = json.loads(raw); reply = gateway.receive(packet)
-            except Exception as exc:
-                reply = {"type": "error", "accepted": False, "error": str(exc)}
-            await websocket.send(json.dumps(reply, separators=(",", ":")))
+        try:
+            async for raw in websocket:
+                try:
+                    packet = json.loads(raw); reply = gateway.receive(packet)
+                except Exception as exc:
+                    reply = {"type": "error", "accepted": False, "error": str(exc)}
+                await websocket.send(json.dumps(reply, separators=(",", ":")))
+        except websockets.exceptions.ConnectionClosed:
+            # A browser/Go2 reconnect or a normal process shutdown can close
+            # without a WebSocket close frame; it is not a sensor error.
+            return
     async with websockets.serve(handler, args.ws_host, args.ws_port, max_size=args.max_message_mb * 1024 * 1024):
         print(f"physical sensor WebSocket: ws://{args.ws_host}:{args.ws_port}", flush=True)
         await __import__("asyncio").Future()

@@ -15,6 +15,14 @@ def _num(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _point3(value: Any) -> tuple[float, float, float] | None:
+    if isinstance(value, Mapping):
+        return tuple(_num(value.get(axis)) for axis in ("x", "y", "z"))
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        return tuple(_num(item) for item in value[:3])
+    return None
+
+
 def bbox_iou(a: Iterable[float], b: Iterable[float]) -> float:
     ax1, ay1, ax2, ay2 = [float(v) for v in a]; bx1, by1, bx2, by2 = [float(v) for v in b]
     ix1, iy1, ix2, iy2 = max(ax1, bx1), max(ay1, by1), min(ax2, bx2), min(ay2, by2)
@@ -47,13 +55,18 @@ def evaluate_detection(detection: Mapping[str, Any], *, projected_bbox: Iterable
             metrics["depth_valid_ratio"] = min(1.0, float(len(depths)) / max(1.0, _num(detection.get("mask_area"), len(depths))))
     if map_node:
         p = detection.get("world_position") or detection.get("position") or {}; q = map_node.get("world_position") or map_node.get("position") or map_node.get("centroid") or map_node.get("aabb_center") or {}
-        if isinstance(p, Mapping) and isinstance(q, Mapping):
-            metrics["map_distance_m"] = math.sqrt(sum((_num(p.get(k)) - _num(q.get(k))) ** 2 for k in ("x", "y", "z")))
+        p3, q3 = _point3(p), _point3(q)
+        if p3 is not None and q3 is not None:
+            metrics["map_distance_m"] = math.sqrt(sum((a - b) ** 2 for a, b in zip(p3, q3)))
+            metrics["map_xy_distance_m"] = math.hypot(p3[0] - q3[0], p3[1] - q3[1])
+            metrics["map_z_abs_m"] = abs(p3[2] - q3[2])
             if metrics["map_distance_m"] > t["map_distance_m"]: reasons.append("map_node_offset")
+            if metrics["map_z_abs_m"] > t["depth_abs_m"]: reasons.append("map_depth_offset")
     if previous:
         p = detection.get("world_position") or detection.get("position") or {}; q = previous.get("world_position") or previous.get("position") or {}
-        if isinstance(p, Mapping) and isinstance(q, Mapping):
-            metrics["temporal_jump_m"] = math.hypot(_num(p.get("x")) - _num(q.get("x")), _num(p.get("y")) - _num(q.get("y")))
+        p3, q3 = _point3(p), _point3(q)
+        if p3 is not None and q3 is not None:
+            metrics["temporal_jump_m"] = math.hypot(p3[0] - q3[0], p3[1] - q3[1])
             if metrics["temporal_jump_m"] > t["temporal_jump_m"]: reasons.append("temporal_position_jump")
     confidence = _num(detection.get("confidence")); status = "fail" if len(reasons) >= 2 else ("warn" if reasons or confidence < .35 else "pass")
     return {"object_id": detection.get("instance_id", detection.get("id", "")), "status": status, "metrics": metrics, "reasons": reasons, "confidence": confidence}
@@ -62,7 +75,12 @@ def evaluate_detection(detection: Mapping[str, Any], *, projected_bbox: Iterable
 def evaluate_frame(detections: list[Mapping[str, Any]], *, graph: Mapping[str, Any] | None = None, thresholds: Mapping[str, float] | None = None) -> dict[str, Any]:
     nodes = (graph or {}).get("nodes", []) if isinstance(graph, Mapping) else []; reports = []
     for det in detections:
-        label = det.get("semantic_class", det.get("class", "")); candidate = next((node for node in nodes if node.get("label") == label or node.get("semantic_class") == label), None)
+        label = det.get("semantic_class", det.get("class", "")); candidates = [node for node in nodes if node.get("label") == label or node.get("semantic_class") == label]
+        det_point = _point3(det.get("world_position") or det.get("position"))
+        if det_point is not None and candidates:
+            candidate = min(candidates, key=lambda node: math.dist(det_point, _point3(node.get("world_position") or node.get("position") or node.get("centroid") or node.get("aabb_center")) or (float("inf"),) * 3))
+        else:
+            candidate = candidates[0] if candidates else None
         reports.append(evaluate_detection(det, map_node=candidate, thresholds=thresholds))
     counts = {status: sum(report["status"] == status for report in reports) for status in ("pass", "warn", "fail")}
     return {"status": "fail" if counts["fail"] else ("warn" if counts["warn"] else "pass"), "counts": counts, "detections": reports}

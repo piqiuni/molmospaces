@@ -5,26 +5,15 @@
   <arg name="device" default="cuda:0"/>
   <arg name="camera_x" default="0.0"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.0"/>
   <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.0"/><arg name="camera_yaw" default="0.0"/>
+  <arg name="ros_python" default="/usr/bin/python3"/>
   <arg name="start_mapping" default="true"/>
 
   <!-- Existing nodes are reused through physical topic parameters.  No
        simulator launch or default semantic_mapping config is modified. -->
-  <include file="$(find semantic_mapping_py_pkg)/launch/semantic_mapping_py.launch">
-    <arg name="config_file" value="$(arg config_file)"/>
-    <arg name="start_object_detection" value="true"/>
-    <arg name="start_room_attribute" value="false"/>
-    <arg name="start_semantic_mapping" value="true"/>
-    <arg name="start_attribute_inference" value="false"/>
-    <arg name="object_detection_backend" value="yoloe_pf_box3d"/>
-    <arg name="object_detection_provider" value="yoloe_local"/>
-    <arg name="object_detection_model_path" value="$(arg model_path)"/>
-    <arg name="object_detection_device" value="$(arg device)"/>
-    <arg name="publish_debug_markers" value="true"/>
-    <arg name="publish_debug_segmented_cloud" value="true"/>
-    <arg name="publish_debug_detection_image" value="true"/>
-    <arg name="publish_debug_world_markers" value="true"/>
-    <arg name="publish_debug_world_segmented_cloud" value="true"/>
-  </include>
+  <node name="semantic_mapping_py" pkg="semantic_mapping_py_pkg" type="semantic_mapping_node.py" launch-prefix="$(arg ros_python)" output="screen" respawn="true">
+    <rosparam file="$(arg config_file)" command="load"/>
+    <param name="semantic_map/subscribe_pointcloud" value="true" type="bool"/>
+  </node>
   <group>
     <remap from="/registered_scan" to="/physical_nav/points"/>
     <remap from="/struct_mapping/occ_map" to="/physical_nav/occupancy"/>
@@ -36,7 +25,7 @@
       <arg name="mapping_scan_topic" value="/physical_nav/points"/>
     </include>
   </group>
-  <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" output="screen" respawn="true">
+  <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" launch-prefix="$(arg ros_python)" output="screen" respawn="true">
     <param name="web_url" value="http://127.0.0.1:8765"/>
     <param name="camera_frame" value="d435i_color_optical_frame"/>
     <param name="camera_parent" value="tf_frame_base_link"/>
@@ -44,7 +33,7 @@
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
   </node>
 
-  <node name="physical_nav_consistency" pkg="physical_nav" type="physical_consistency_node.py" output="screen"/>
+  <node name="physical_nav_consistency" pkg="physical_nav" type="physical_consistency_node.py" launch-prefix="$(arg ros_python)" output="screen"/>
   <!-- The gateway is started separately so it can run before roslaunch and
        accept the Go2 WebSocket connection. -->
 </launch>

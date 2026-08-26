@@ -13,8 +13,10 @@ D435i + Unitree state subscribers (Go2)
   -> JSON WebSocket (RGB JPEG, depth PNG16, intrinsics, timestamps, pose)
   -> physical_six_panel_server.py (WebSocket gateway + LAN web page)
   -> physical_ros_gateway.py (system-Python ROS bridge via /api/raw-frame)
-  -> semantic_mapping_py_pkg/object_detection_node.py
-       YOLOE-26l PF Seg -> 3-D boxes/pointcloud -> object map/interaction graph
+  -> physical_yoloe_bridge.py (algorithm Python, no ROS dependency)
+       YOLOE-26l PF Seg -> RGB-D 3-D boxes/pointcloud -> ROS detections
+  -> semantic_mapping_py_pkg/semantic_mapping_node.py
+       object map/room segmentation/interaction graph
   -> physical_consistency_node.py -> /physical_nav/consistency
 ```
 
@@ -30,7 +32,7 @@ browser can connect:
 ```bash
 cd /home/user/ldl/molmospaces
 source /opt/ros/noetic/setup.bash
-export PYTHONPATH="$PWD/scripts/InteractiveNav/physical_nav:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PYTHONPATH"
+export PYTHONPATH="$PWD/scripts/InteractiveNav/physical_nav/ros_compat:$PWD/scripts/InteractiveNav/physical_nav:$PWD/Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:$PYTHONPATH"
 python3 scripts/InteractiveNav/physical_nav/physical_six_panel_server.py \
   --ws-host 0.0.0.0 --ws-port 12334 --http-host 0.0.0.0 --http-port 8765 \
   --qwen-url http://127.0.0.1:18080/v1
@@ -40,8 +42,15 @@ The ROS bridge (`physical_ros_gateway.py`) is started by
 `physical_nav_readonly.launch`; it uses the system ROS Python and polls the
 gateway's encoded frame endpoint. This process separation is required on ROS
 Noetic hosts whose `rospy` is not compatible with the Python environment used
-by YOLOE. It also posts detector, graph, consistency and occupancy snapshots
-back to `/api/ros-state` for the detailed web area.
+by YOLOE. It posts graph, consistency and occupancy snapshots back to
+`/api/ros-state` for the detailed web area. The ROS bridge republishes
+the detector JSON from the web gateway to `/physical_nav/detections`; graph,
+consistency and occupancy messages flow in the opposite direction.
+
+`start_physical_nav.sh` also starts `physical_yoloe_bridge.py` in the local
+algorithm Python environment. Set `PHYSICAL_NAV_ALGORITHM_PYTHON` to the
+environment containing Ultralytics; set `PHYSICAL_NAV_START_YOLO_WORKER=0`
+only when using a separately managed detector.
 
 In another local terminal, after sourcing the catkin workspace, start the
 physical mapping nodes:
