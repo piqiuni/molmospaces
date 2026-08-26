@@ -226,6 +226,13 @@ class PhysicalGateway:
         self.renderer = SixPanelRenderer(self.state)
         self.qwen = QwenClient(qwen_url, qwen_model) if qwen_url else None
         self.camera_parent, self.camera_translation, self.camera_rpy = camera_parent, (camera_x, camera_y, camera_z), (camera_roll, camera_pitch, camera_yaw)
+        self.state.set_calibration(
+            parent_frame=camera_parent,
+            translation_m=[camera_x, camera_y, camera_z],
+            rpy_rad=[camera_roll, camera_pitch, camera_yaw],
+            source="PHYSICAL_NAV_CAMERA_X/Y/Z/ROLL/PITCH/YAW",
+            calibrated=any(abs(value) > 1e-12 for value in (camera_x, camera_y, camera_z, camera_roll, camera_pitch, camera_yaw)),
+        )
         self.qwen_auto_interval = qwen_auto_interval
         self.http: ThreadingHTTPServer | None = None
 

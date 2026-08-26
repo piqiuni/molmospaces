@@ -19,6 +19,7 @@ class RuntimeState:
         self.depth_scale = 0.001
         self.intrinsics: dict[str, Any] = {}
         self.camera_frame = ""
+        self.calibration: dict[str, Any] = {}
         self.frame_seq = -1
         self.frame_stamp = 0.0
         self.sync_ms = None
@@ -44,6 +45,10 @@ class RuntimeState:
             for key, value in kwargs.items():
                 setattr(self, key, value)
             self.counters["frames"] += 1
+
+    def set_calibration(self, **value: Any) -> None:
+        with self._lock:
+            self.calibration = copy.deepcopy(value)
 
     def update_topic(self, name: str, value: Any) -> None:
         with self._lock:
@@ -90,6 +95,7 @@ class RuntimeState:
                 "frame_seq": self.frame_seq,
                 "frame_stamp": self.frame_stamp,
                 "camera_frame": self.camera_frame,
+                "calibration": copy.deepcopy(self.calibration),
                 "sync_ms": self.sync_ms,
                 "depth_scale": self.depth_scale,
                 "intrinsics": copy.deepcopy(self.intrinsics),
