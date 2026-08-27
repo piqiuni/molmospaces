@@ -117,6 +117,36 @@ class SixPanelRenderer:
             return None
 
     @staticmethod
+    def _draw_live_detections(panel: Any, detections: list[dict[str, Any]], source_shape: tuple[int, int] | None) -> None:
+        """Overlay the live YOLOE boxes on canonical panel 1.
+
+        The shared offline renderer intentionally draws only recorder/GT
+        overlays.  Physical detections arrive asynchronously, so they are
+        added by this adapter after the canonical camera title is rendered.
+        """
+        if source_shape is None:
+            return
+        src_h, src_w = source_shape
+        if src_w <= 0 or src_h <= 0:
+            return
+        sx, sy = panel.shape[1] / float(src_w), panel.shape[0] / float(src_h)
+        for det in detections:
+            box = det.get("bbox") or det.get("bbox_2d")
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+            try:
+                x1, y1, x2, y2 = [float(value) for value in box]
+            except (TypeError, ValueError):
+                continue
+            x1, x2 = sorted((max(0.0, min(src_w - 1.0, x1)), max(0.0, min(src_w - 1.0, x2))))
+            y1, y2 = sorted((max(0.0, min(src_h - 1.0, y1)), max(0.0, min(src_h - 1.0, y2))))
+            confidence = _safe_float(det.get("confidence"), 0.0)
+            color = (0, 220, 0) if confidence >= 0.5 else (0, 165, 255)
+            p1, p2 = (int(round(x1 * sx)), int(round(y1 * sy))), (int(round(x2 * sx)), int(round(y2 * sy)))
+            cv2.rectangle(panel, p1, p2, color, 2, cv2.LINE_AA)
+            label = f"{det.get('semantic_class', det.get('class', '?'))} {confidence:.2f}"
+            cv2.putText(panel, label[:34], (p1[0], max(48, p1[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, .42, color, 1, cv2.LINE_AA)
+    @staticmethod
     def _physical_step(snapshot: dict[str, Any]) -> dict[str, Any]:
         telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
         position = telemetry.get("map_position") or telemetry.get("position") or [0.0, 0.0, 0.0]
@@ -311,6 +341,7 @@ class SixPanelRenderer:
                 "telemetry": dict(self.state.telemetry),
                 "graph": dict(self.state.graph),
                 "consistency": dict(self.state.consistency),
+                "detections": [dict(item) for item in self.state.detections if isinstance(item, dict)],
             }
             rgb = None if self.state.rgb is None else self.state.rgb.copy()
             planning = self._raw_grid(self.state.occupancy)
@@ -332,6 +363,7 @@ class SixPanelRenderer:
         else:
             camera = cv2.resize(rgb, self.panel_size, interpolation=cv2.INTER_AREA)
         draw_camera_title(camera, step, int(step["step_index"]))
+        self._draw_live_detections(camera, snapshot["detections"], None if rgb is None else (rgb.shape[0], rgb.shape[1]))
         occ = self._canonical.render_map_panel(
             planning, self.panel_size, step, int(step["step_index"]),
             title="OCC", kind="occupancy", world_bounds=world_bounds,
@@ -426,8 +458,8 @@ class _WebHandler(BaseHTTPRequestHandler):
 _HTML = """<!doctype html><meta charset='utf-8'><title>Go2 Physical Interactive Navigation</title>
 <style>body{font-family:monospace;background:#111;color:#eee;margin:12px}img{max-width:100%;border:1px solid #555}pre{white-space:pre-wrap;max-height:420px;overflow:auto;background:#1b1b1b;padding:10px}.grid{display:grid;grid-template-columns:2fr 1fr;gap:12px}.ok{color:#5f5}.warn{color:#fc3}</style>
 <h2>Go2 Physical Interactive Navigation <span class='warn'>READ_ONLY_BLOCKED</span></h2>
-<div class='grid'><div><img src='/stream.mjpg'></div><div><h3>状态 / Qwen / Graph</h3><pre id='state'>loading...</pre><input id='prompt' size='40' value='请分析当前全局语义图和感知一致性'><button onclick="askQwen()">请求 Qwen</button><br><button onclick="intent('STOP')">STOP（仅记录）</button><button onclick="intent('MOVE_FORWARD')">前进意图（阻断）</button></div></div>
-<script>async function refresh(){try{let r=await fetch('/api/state');document.querySelector('#state').textContent=JSON.stringify(await r.json(),null,2)}catch(e){document.querySelector('#state').textContent=e}} async function intent(a){await fetch('/api/teleop-intent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a,source:'web'})});refresh()} async function askQwen(){await fetch('/api/qwen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:document.querySelector('#prompt').value})});refresh()} setInterval(refresh,1000);refresh()</script>"""
+<div class='grid'><div><img id='stream' src='/stream.mjpg'></div><div><h3>状态 / Qwen / Graph</h3><pre id='state'>loading...</pre><input id='prompt' size='40' value='请分析当前全局语义图和感知一致性'><button onclick="askQwen()">请求 Qwen</button><br><button onclick="intent('STOP')">STOP（仅记录）</button><button onclick="intent('MOVE_FORWARD')">前进意图（阻断）</button></div></div>
+<script>const stream=document.querySelector('#stream');let lastSeq=-1,lastSeqAt=Date.now();function reconnectStream(){stream.src='/stream.mjpg?ts='+Date.now()}stream.onerror=()=>setTimeout(reconnectStream,500);async function refresh(){try{let r=await fetch('/api/state?ts='+Date.now(),{cache:'no-store'});let s=await r.json();document.querySelector('#state').textContent=JSON.stringify(s,null,2);if(s.frame_seq!==lastSeq){lastSeq=s.frame_seq;lastSeqAt=Date.now()}else if(Date.now()-lastSeqAt>5000){reconnectStream();lastSeqAt=Date.now()}}catch(e){document.querySelector('#state').textContent=e;reconnectStream()}}async function intent(a){await fetch('/api/teleop-intent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a,source:'web'})});refresh()}async function askQwen(){await fetch('/api/qwen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:document.querySelector('#prompt').value})});refresh()}setInterval(refresh,1000);refresh()</script>"""
 
 
 def _compact_qwen_context(snapshot: dict[str, Any]) -> dict[str, Any]:

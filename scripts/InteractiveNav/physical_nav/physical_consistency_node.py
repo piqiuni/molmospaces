@@ -75,6 +75,7 @@ class ConsistencyNode:
                 "telemetry": telemetry,
                 "camera_translation": self._camera_translation,
                 "camera_rpy": self._camera_rpy,
+                "camera_optical": True,
                 "image_size": (intrinsics.get("width", 0), intrinsics.get("height", 0)),
             }
         projection_source = "odom+camera_extrinsic_fallback"

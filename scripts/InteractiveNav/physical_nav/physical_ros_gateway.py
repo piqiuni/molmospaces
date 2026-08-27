@@ -277,12 +277,33 @@ class PhysicalRosGateway:
         odom = Odometry(); odom.header.stamp = stamp; odom.header.frame_id = "tf_frame_odom"; odom.child_frame_id = "tf_frame_base_link"; odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z = [_to_float(v) for v in position[:3]]; odom.twist.twist.linear.x, odom.twist.twist.linear.y = [_to_float(v) for v in velocity[:2]]; self.odom_pub.publish(odom)
         transform = TransformStamped(); transform.header.stamp = stamp; transform.header.frame_id = "tf_frame_odom"; transform.child_frame_id = "tf_frame_base_link"; transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z = [_to_float(v) for v in position[:3]]; transform.transform.rotation.z = math.sin(yaw/2); transform.transform.rotation.w = math.cos(yaw/2); self.tf_broadcaster.sendTransform(transform)
         if not self._static_sent:
-            static = TransformStamped(); static.header.stamp = stamp; static.header.frame_id = self.args.camera_parent; static.child_frame_id = self.args.camera_frame; static.transform.translation.x, static.transform.translation.y, static.transform.translation.z = self.args.camera_x, self.args.camera_y, self.args.camera_z; cr, sr = math.cos(self.args.camera_roll/2), math.sin(self.args.camera_roll/2); cp, sp = math.cos(self.args.camera_pitch/2), math.sin(self.args.camera_pitch/2); cy, sy = math.cos(self.args.camera_yaw/2), math.sin(self.args.camera_yaw/2); static.transform.rotation.w = cr*cp*cy + sr*sp*sy; static.transform.rotation.x = sr*cp*cy - cr*sp*sy; static.transform.rotation.y = cr*sp*cy + sr*cp*sy; static.transform.rotation.z = cr*cp*sy - sr*sp*cy; self.static_broadcaster.sendTransform(static); self._static_sent = True
+            static = TransformStamped(); static.header.stamp = stamp; static.header.frame_id = self.args.camera_parent; static.child_frame_id = self.args.camera_frame; static.transform.translation.x, static.transform.translation.y, static.transform.translation.z = self.args.camera_x, self.args.camera_y, self.args.camera_z
+            # REP-103 optical frame -> Go2 base: optical x=right, y=down,
+            # z=forward maps to base x=forward, y=left, z=up.  This is a
+            # coordinate convention, not an additional physical mounting tilt.
+            mount = _quat_from_rpy(self.args.camera_roll, self.args.camera_pitch, self.args.camera_yaw)
+            optical = (0.5, -0.5, 0.5, -0.5)  # base <- d435i_color_optical
+            qx, qy, qz, qw = _quat_multiply(mount, optical)
+            static.transform.rotation.x, static.transform.rotation.y = qx, qy
+            static.transform.rotation.z, static.transform.rotation.w = qz, qw
+            self.static_broadcaster.sendTransform(static); self._static_sent = True
 
 
 def _to_float(value: Any) -> float:
     try: return float(value)
     except (TypeError, ValueError): return 0.0
+
+
+def _quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    return (sr*cp*cy - cr*sp*sy, cr*sp*cy + sr*cp*sy, cr*cp*sy - sr*sp*cy, cr*cp*cy + sr*sp*sy)
+
+
+def _quat_multiply(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    ax, ay, az, aw = a; bx, by, bz, bw = b
+    return (aw*bx + ax*bw + ay*bz - az*by, aw*by - ax*bz + ay*bw + az*bx, aw*bz + ax*by - ay*bx + az*bw, aw*bw - ax*bx - ay*by - az*bz)
 
 
 def _image_msg(array: np.ndarray, encoding: str, stamp: Any, frame: str) -> Image:

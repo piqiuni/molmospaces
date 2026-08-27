@@ -56,6 +56,8 @@ def _world_to_camera(
     telemetry: Mapping[str, Any],
     camera_translation: Sequence[float],
     camera_rpy: Sequence[float],
+    *,
+    optical_frame: bool = False,
 ) -> tuple[float, float, float]:
     """Transform a map-frame point into the D435i optical frame.
 
@@ -75,8 +77,13 @@ def _world_to_camera(
     while len(rpy) < 3:
         rpy.append(0.0)
     rotation = _rotation_matrix(_num(rpy[0]), _num(rpy[1]), _num(rpy[2]))
-    # R.T @ shifted.
-    return tuple(sum(rotation[row][axis] * shifted[row] for row in range(3)) for axis in range(3))
+    # R.T @ shifted gives the nominal camera frame.  Convert base axes to the
+    # D435i REP-103 optical axes when requested (x right, y down, z forward).
+    mounted = tuple(sum(rotation[row][axis] * shifted[row] for row in range(3)) for axis in range(3))
+    if optical_frame:
+        # inverse of optical->base: optical = [ -base_y, -base_z, base_x ]
+        return (-mounted[1], -mounted[2], mounted[0])
+    return mounted
 
 
 def _project_camera_point(point: tuple[float, float, float], intrinsics: Mapping[str, Any]) -> tuple[float, float] | None:
@@ -128,6 +135,7 @@ def project_map_node(
     camera_rpy: Sequence[float] = (0.0, 0.0, 0.0),
     image_size: Sequence[int] | None = None,
     world_to_camera: Mapping[str, Any] | None = None,
+    camera_optical: bool = False,
 ) -> dict[str, Any] | None:
     """Project a global graph node's 3-D box into the current RGB image.
 
@@ -154,7 +162,7 @@ def project_map_node(
     def transform_corner(corner: tuple[float, float, float]) -> tuple[float, float, float]:
         if world_to_camera:
             return _transform_world_to_camera(corner, world_to_camera)
-        return _world_to_camera(corner, telemetry, camera_translation, camera_rpy)
+        return _world_to_camera(corner, telemetry, camera_translation, camera_rpy, optical_frame=camera_optical)
 
     corners = []
     for sx in (-0.5, 0.5):
@@ -179,7 +187,7 @@ def project_map_node(
     return {
         "bbox": bbox,
         "depth_m": float(depth_m),
-        "camera_center": _transform_world_to_camera(center, world_to_camera) if world_to_camera else _world_to_camera(center, telemetry, camera_translation, camera_rpy),
+        "camera_center": _transform_world_to_camera(center, world_to_camera) if world_to_camera else _world_to_camera(center, telemetry, camera_translation, camera_rpy, optical_frame=camera_optical),
         "visible_corners": len(visible),
     }
 
@@ -272,6 +280,7 @@ def evaluate_frame(
                 camera_rpy=projection_context.get("camera_rpy", (0.0, 0.0, 0.0)),
                 image_size=projection_context.get("image_size"),
                 world_to_camera=projection_context.get("world_to_camera"),
+                camera_optical=bool(projection_context.get("camera_optical", False)),
             )
         report = evaluate_detection(
             det,

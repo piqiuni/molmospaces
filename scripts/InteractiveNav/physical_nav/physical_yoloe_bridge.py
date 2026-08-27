@@ -40,8 +40,28 @@ def _rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
     return np.asarray([[cy*cp, cy*sp*sr-sy*cr, cy*sp*cr+sy*sr], [sy*cp, sy*sp*sr+cy*cr, sy*sp*cr-cy*sr], [-sp, cp*sr, cp*cr]], dtype=np.float32)
 
 
-def _world_points(points: np.ndarray, telemetry: dict[str, Any], translation: np.ndarray, rpy: tuple[float, float, float]) -> np.ndarray:
-    base = points @ _rotation(*rpy).T + translation
+_OPTICAL_TO_BASE = np.asarray(
+    [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
+    dtype=np.float32,
+)
+
+
+def _world_points(
+    points: np.ndarray,
+    telemetry: dict[str, Any],
+    translation: np.ndarray,
+    rpy: tuple[float, float, float],
+    *,
+    optical_frame: bool = False,
+) -> np.ndarray:
+    """Lift camera points into the odom/map frame.
+
+    D435i points use REP-103 optical axes (x right, y down, z forward), while
+    Go2 base/odom uses x forward, y left, z up.  ``optical_frame`` is opt-in to
+    preserve the historical helper contract used by simulator-side tests.
+    """
+    camera = points @ _OPTICAL_TO_BASE.T if optical_frame else points
+    base = camera @ _rotation(*rpy).T + translation
     position = np.asarray(telemetry.get("position", [0, 0, 0])[:3], dtype=np.float32)
     yaw = float(telemetry.get("yaw", telemetry.get("imu", {}).get("rpy", [0, 0, 0])[2] if telemetry.get("imu") else 0.0))
     c, s = math.cos(yaw), math.sin(yaw); rot = np.asarray([[c, -s], [s, c]], dtype=np.float32)
@@ -89,7 +109,7 @@ class YoloeWorker:
             camera_center = np.percentile(points, 50, axis=0)
             camera_mins, camera_maxs = np.percentile(points, 10, axis=0), np.percentile(points, 90, axis=0)
             camera_size = np.maximum(camera_maxs - camera_mins, .01)
-            world = _world_points(points, raw.get("telemetry", {}), self.translation, (self.args.camera_roll, self.args.camera_pitch, self.args.camera_yaw)); mins, maxs = np.percentile(world, 10, axis=0), np.percentile(world, 90, axis=0); center = (mins + maxs) / 2; size = np.maximum(maxs - mins, .01)
+            world = _world_points(points, raw.get("telemetry", {}), self.translation, (self.args.camera_roll, self.args.camera_pitch, self.args.camera_yaw), optical_frame=True); mins, maxs = np.percentile(world, 10, axis=0), np.percentile(world, 90, axis=0); center = (mins + maxs) / 2; size = np.maximum(maxs - mins, .01)
             sparse_rows, sparse_cols = np.where(mask)
             if sparse_rows.size > 3000: sparse_rows, sparse_cols = sparse_rows[::max(1, sparse_rows.size // 3000)], sparse_cols[::max(1, sparse_cols.size // 3000)]
             detections.append({"semantic_class": _label(raw_name), "raw_class": str(raw_name), "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "box3d_center": center.astype(float).tolist(), "box3d_size": size.astype(float).tolist(), "source_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")), "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
