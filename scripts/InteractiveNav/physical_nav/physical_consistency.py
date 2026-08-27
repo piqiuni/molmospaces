@@ -51,6 +51,21 @@ def _rotation_matrix(roll: float, pitch: float, yaw: float) -> tuple[tuple[float
     )
 
 
+def _quaternion_matrix(quaternion: Sequence[float]) -> tuple[tuple[float, float, float], ...] | None:
+    if len(quaternion) < 4:
+        return None
+    x, y, z, w = [_num(value) for value in quaternion[:4]]
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 1e-6:
+        return None
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return (
+        (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
+        (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
+        (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
+    )
+
+
 def _world_to_camera(
     point: tuple[float, float, float],
     telemetry: Mapping[str, Any],
@@ -68,9 +83,18 @@ def _world_to_camera(
     position = _vector3(telemetry.get("position"), (0.0, 0.0, 0.0))
     yaw = _num(telemetry.get("yaw"), _num((telemetry.get("imu") or {}).get("rpy", [0.0, 0.0, 0.0])[2] if isinstance(telemetry.get("imu"), Mapping) else 0.0))
     dx, dy, dz = point[0] - position[0], point[1] - position[1], point[2] - position[2]
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    # world -> base, inverse of the worker's planar base -> world transform.
-    base = (cy * dx + sy * dy, -sy * dx + cy * dy, point[2] - position[2])
+    body_rotation = _quaternion_matrix(telemetry.get("quaternion") or [])
+    if body_rotation is not None:
+        # Full live orientation (including pitch/roll) from Go2/D435i pose.
+        relative = (dx, dy, dz)
+        base = tuple(
+            sum(body_rotation[column][row] * relative[row] for row in range(3))
+            for column in range(3)
+        )
+    else:
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        # world -> base, inverse of the worker's planar base -> world transform.
+        base = (cy * dx + sy * dy, -sy * dx + cy * dy, dz)
     translation = _vector3(camera_translation, (0.0, 0.0, 0.0))
     shifted = (base[0] - translation[0], base[1] - translation[1], base[2] - translation[2])
     rpy = list(camera_rpy or (0.0, 0.0, 0.0))

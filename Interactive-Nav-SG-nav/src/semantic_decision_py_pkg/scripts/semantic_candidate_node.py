@@ -112,6 +112,9 @@ class SemanticCandidateNode:
                 interaction_types=tuple(
                     config.get("interaction_types", ["portal", "container"])
                 ),
+                interaction_semantic_types=tuple(
+                    config.get("interaction_semantic_types", [])
+                ),
                 container_require_same_room=bool(
                     config.get("container_require_same_room", False)
                 ),

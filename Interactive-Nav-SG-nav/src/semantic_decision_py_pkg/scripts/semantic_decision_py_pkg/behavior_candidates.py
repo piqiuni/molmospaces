@@ -94,6 +94,10 @@ class BehaviorCandidate:
 class CandidateGeneratorConfig:
     max_frontier_candidates: int = 12
     interaction_types: tuple[str, ...] = ("portal", "container")
+    # Optional semantic allow-list for physical interaction targets.  Empty
+    # keeps the historical type-only behaviour; the Go2 shadow lane narrows
+    # this to door/portal, fridge and drawer/cabinet.
+    interaction_semantic_types: tuple[str, ...] = ()
     container_require_same_room: bool = False
     container_allow_connected_room: bool = False
     max_state_age_sec: float = 300.0
@@ -1333,6 +1337,13 @@ class CandidateGenerator:
         for node in graph.get("nodes") or []:
             node_type = str(node.get("type") or "")
             if node_type not in allowed_types:
+                continue
+            allowed_semantics = {
+                str(value).strip().casefold()
+                for value in self.config.interaction_semantic_types
+                if str(value).strip()
+            }
+            if allowed_semantics and self._interaction_semantic_label(node) not in allowed_semantics:
                 continue
             interaction = node.get("interaction") or {}
             node_state = str(interaction.get("state") or "unknown")
@@ -3508,6 +3519,26 @@ class CandidateGenerator:
             for label in labels
             for marker in ("drawer", "dresser", "chest_of_drawers", "chestofdrawers")
         )
+
+    @staticmethod
+    def _interaction_semantic_label(node: dict[str, Any]) -> str:
+        """Normalize graph labels for the physical interaction allow-list."""
+        interaction = node.get("interaction") or {}
+        attributes = node.get("attributes") or {}
+        values = (
+            node.get("label"), node.get("name"), node.get("type"),
+            attributes.get("semantic_name"), attributes.get("category"),
+            attributes.get("source_object_name"),
+            interaction.get("interaction_mode"), interaction.get("capability"),
+        )
+        text = " ".join(str(value or "").casefold() for value in values)
+        if any(marker in text for marker in ("door", "portal", "gate")):
+            return "door"
+        if any(marker in text for marker in ("fridge", "refrigerator")):
+            return "fridge"
+        if any(marker in text for marker in ("drawer", "cabinet", "dresser", "chest_of_drawers", "chestofdrawers")):
+            return "drawer_cabinet"
+        return str(node.get("type") or "").strip().casefold()
 
     @staticmethod
     def _is_refrigerator_container(node: dict[str, Any]) -> bool:

@@ -36,6 +36,7 @@ class MLLMClientConfig:
     reasoning_effort: str = "off"
     image_detail: str = "low"
     metrics_path: str = ""
+    trace_url: str = ""
 
 
 @dataclass
@@ -139,7 +140,7 @@ class MLLMClient:
             )
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
             response = MLLMResponse(payload=None, latency_s=time.perf_counter() - started, error=str(exc))
-        self._record_metrics(role, response, config, metrics_context)
+        self._record_metrics(role, response, config, metrics_context, instruction=instruction, context=context, images=images)
         return response
 
     def _request_http(
@@ -558,13 +559,28 @@ class MLLMClient:
         response: MLLMResponse,
         config: MLLMClientConfig,
         metrics_context: dict[str, Any] | None,
+        *,
+        instruction: str = "",
+        context: dict[str, Any] | None = None,
+        images: Iterable[str] | None = None,
     ) -> None:
-        if not config.metrics_path:
-            return
+        stage = {"attribute_inference": "M1", "room_attribute_inference": "M1", "subgoal_selection": "M2"}.get(str(role), "M1")
+        image_refs = []
+        for image in list(images or [])[:4]:
+            value = str(image or "")
+            if value.startswith("data:"):
+                image_refs.append({"kind": "data_url", "bytes": len(value), "value": value[:256] + ("…" if len(value) > 256 else "")})
+            else:
+                image_refs.append({"kind": "path", "value": value})
         record = {
+            "event_type": "mllm_call",
+            "stage": stage,
             "timestamp": time.time(),
             "role": role,
             "model": config.model,
+            "instruction": str(instruction)[:4000],
+            "context": context or {},
+            "image_refs": image_refs,
             "timeout_s": config.timeout_s,
             "max_output_tokens": config.max_tokens,
             "protocol": config.protocol,
@@ -572,12 +588,24 @@ class MLLMClient:
             **(metrics_context or {}),
             **response.metrics(),
         }
-        path = Path(config.metrics_path).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with self._metrics_lock, path.open("a", encoding="utf-8") as stream:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-            try:
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-                stream.flush()
-            finally:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        if config.metrics_path:
+            path = Path(config.metrics_path).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._metrics_lock, path.open("a", encoding="utf-8") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                    stream.flush()
+                finally:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        if config.trace_url:
+            threading.Thread(target=self._post_trace, args=(config.trace_url, record), daemon=True).start()
+
+    @staticmethod
+    def _post_trace(url: str, record: dict[str, Any]) -> None:
+        try:
+            target = url.rstrip("/") + "/api/mllm-event" if "/api/" not in url else url
+            request_obj = request.Request(target, data=json.dumps(record, ensure_ascii=False, default=str).encode(), headers={"Content-Type": "application/json"})
+            request.urlopen(request_obj, timeout=0.4).read()
+        except Exception:
+            pass

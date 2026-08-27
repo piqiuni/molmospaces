@@ -49,6 +49,7 @@ ablation:
 candidate:
   max_frontier_candidates: 12
   interaction_types: ["portal", "container"]
+  interaction_semantic_types: []
   container_require_same_room: false
   container_allow_connected_room: false
   max_state_age_sec: 300.0

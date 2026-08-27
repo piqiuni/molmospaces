@@ -40,6 +40,49 @@ def _rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
     return np.asarray([[cy*cp, cy*sp*sr-sy*cr, cy*sp*cr+sy*sr], [sy*cp, sy*sp*sr+cy*cr, sy*sp*cr-cy*sr], [-sp, cp*sr, cp*cr]], dtype=np.float32)
 
 
+def _telemetry_quaternion(telemetry: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """Return the live body/camera quaternion as (x, y, z, w).
+
+    Unitree publishes ``imu.quaternion`` as (w, x, y, z).  A future D435i
+    tracking source may publish an explicit ``camera_pose.quaternion`` in
+    either common mapping/list form; prefer that when present.
+    """
+    candidates = [telemetry.get("camera_pose"), telemetry.get("d435i_pose"), telemetry.get("pose"), telemetry.get("camera_imu")]
+    candidates.append(telemetry.get("imu"))
+    for source in candidates:
+        if not isinstance(source, dict):
+            continue
+        raw = source.get("quaternion") or source.get("orientation")
+        if isinstance(raw, dict):
+            try:
+                values = [float(raw[k]) for k in ("x", "y", "z", "w")]
+            except (KeyError, TypeError, ValueError):
+                continue
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 4:
+            try:
+                values = [float(v) for v in raw[:4]]
+            except (TypeError, ValueError):
+                continue
+            if source is telemetry.get("imu"):
+                values = [values[1], values[2], values[3], values[0]]
+        else:
+            continue
+        norm = float(np.linalg.norm(values))
+        if norm > 1e-6 and np.isfinite(norm):
+            return tuple(float(v / norm) for v in values)
+    return None
+
+
+def _quaternion_matrix(quaternion: tuple[float, float, float, float]) -> np.ndarray:
+    x, y, z, w = quaternion
+    return np.asarray(
+        [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]],
+        dtype=np.float32,
+    )
+
+
 _OPTICAL_TO_BASE = np.asarray(
     [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
     dtype=np.float32,
@@ -63,10 +106,16 @@ def _world_points(
     camera = points @ _OPTICAL_TO_BASE.T if optical_frame else points
     base = camera @ _rotation(*rpy).T + translation
     position = np.asarray(telemetry.get("position", [0, 0, 0])[:3], dtype=np.float32)
-    yaw = float(telemetry.get("yaw", telemetry.get("imu", {}).get("rpy", [0, 0, 0])[2] if telemetry.get("imu") else 0.0))
-    c, s = math.cos(yaw), math.sin(yaw); rot = np.asarray([[c, -s], [s, c]], dtype=np.float32)
-    base[:, :2] = base[:, :2] @ rot.T + position[:2]
-    base[:, 2] += position[2]
+    quaternion = _telemetry_quaternion(telemetry)
+    if quaternion is not None:
+        # Dynamic roll/pitch/yaw from the live IMU correct the camera rod tilt;
+        # the fixed extrinsic is only the rigid base-to-camera offset.
+        base = base @ _quaternion_matrix(quaternion).T
+    else:
+        yaw = float(telemetry.get("yaw", telemetry.get("imu", {}).get("rpy", [0, 0, 0])[2] if telemetry.get("imu") else 0.0))
+        c, s = math.cos(yaw), math.sin(yaw)
+        base[:, :2] = base[:, :2] @ np.asarray([[c, -s], [s, c]], dtype=np.float32).T
+    base += position
     return base
 
 
@@ -89,10 +138,11 @@ class YoloeWorker:
         print(f"YOLOE loaded: {args.model_path} device={args.device}", flush=True)
 
     def infer(self, raw: dict[str, Any]) -> dict[str, Any]:
+        infer_started = time.perf_counter()
         rgb = _decode(raw["rgb"]); depth = _decode(raw["depth"]).astype(np.float32); intr = raw.get("intrinsics", {}); fx, fy, cx, cy = [float(intr.get(k, 0)) for k in ("fx", "fy", "cx", "cy")]
         result = self.model.predict(source=rgb, device=self.args.device, imgsz=self.args.imgsz, conf=self.args.conf, iou=self.args.iou, max_det=self.args.max_det, verbose=False, save=False)[0]
         boxes = getattr(result, "boxes", None); masks = getattr(result, "masks", None); detections = []
-        if boxes is None: return {"seq": raw["seq"], "stamp": raw["stamp"], "model": self.args.model_path, "detections": []}
+        if boxes is None: return {"seq": raw["seq"], "stamp": raw["stamp"], "model": self.args.model_path, "inference_ms": (time.perf_counter() - infer_started) * 1000.0, "detections": []}
         xyxy = boxes.xyxy.detach().cpu().numpy() if hasattr(boxes.xyxy, "detach") else np.asarray(boxes.xyxy); confs = boxes.conf.detach().cpu().numpy() if hasattr(boxes.conf, "detach") else np.asarray(boxes.conf); classes = boxes.cls.detach().cpu().numpy().astype(int) if hasattr(boxes.cls, "detach") else np.asarray(boxes.cls, dtype=int); names = getattr(result, "names", {})
         mask_data = None
         if masks is not None and getattr(masks, "data", None) is not None:
@@ -113,7 +163,7 @@ class YoloeWorker:
             sparse_rows, sparse_cols = np.where(mask)
             if sparse_rows.size > 3000: sparse_rows, sparse_cols = sparse_rows[::max(1, sparse_rows.size // 3000)], sparse_cols[::max(1, sparse_cols.size // 3000)]
             detections.append({"semantic_class": _label(raw_name), "raw_class": str(raw_name), "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "box3d_center": center.astype(float).tolist(), "box3d_size": size.astype(float).tolist(), "source_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")), "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
-        return {"seq": raw["seq"], "stamp": raw["stamp"], "model": self.args.model_path, "detections": detections}
+        return {"seq": raw["seq"], "stamp": raw["stamp"], "model": self.args.model_path, "inference_ms": (time.perf_counter() - infer_started) * 1000.0, "detections": detections}
 
     def run(self) -> None:
         while True:

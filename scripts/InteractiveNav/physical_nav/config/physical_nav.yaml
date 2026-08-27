@@ -57,7 +57,9 @@ semantic_map:
   enable_object_mapping: true
   enable_scene_mapping: true
   subscribe_pointcloud: true
-  publish_rate: 5.0
+  # Fuse/publish the latest RGB-D/YOLO result at 10 Hz. Navigation consumes
+  # these receipts at its independent 5 Hz logical step.
+  publish_rate: 10.0
   object_min_confirmations: 1
   graph_min_observations: 1
   room_segment_use_semantic_overlay: true

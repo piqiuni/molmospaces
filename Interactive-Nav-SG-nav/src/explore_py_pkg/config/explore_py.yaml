@@ -39,7 +39,8 @@ exploration:
   # Resend once for that explicit transient rejection; ExplorePy never drives cmd_vel.
   external_recovery_request_retry_limit: 1
   external_recovery_request_retry_delay_sec: 0.5
-  tick_rate_hz: 1.0
+  # Simulator-compatible 0.2 s logical step for physical read-only testing.
+  tick_rate_hz: 5.0
   goal_republish_interval_sec: 0.0
   goal_reach_tolerance_m: 0.35
   goal_timeout_sec: 90.0

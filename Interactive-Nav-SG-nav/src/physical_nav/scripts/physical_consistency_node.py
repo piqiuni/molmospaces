@@ -81,6 +81,8 @@ class ConsistencyNode:
                     float(msg.twist.twist.linear.z),
                 ],
                 "yaw": yaw,
+                "quaternion": [float(q.x), float(q.y), float(q.z), float(q.w)],
+                "pose_source": "go2_imu_or_camera_pose",
             }
 
     def _publish(self, _event: Any) -> None:

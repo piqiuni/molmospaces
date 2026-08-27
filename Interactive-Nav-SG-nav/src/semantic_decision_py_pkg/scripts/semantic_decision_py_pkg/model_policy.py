@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -196,6 +197,10 @@ class ModelPolicyConfig:
     # only applies to deterministic high-priority hints and leaves ordinary
     # semantic/exploration ranking to the MLLM.
     pre_score_guard_margin: float = 0.75
+    # Restrict only INTERACT options sent to Module 2.  Navigation/frontier
+    # candidates remain available.  Empty preserves the general simulator
+    # policy; the physical Go2 lane uses door/fridge.
+    subgoal_interaction_semantic_types: tuple[str, ...] = ()
 
 
 @dataclass
@@ -1200,6 +1205,7 @@ class ModelPolicyClient:
                 reasoning_effort=self.config.reasoning_effort,
                 image_detail=self.config.image_detail,
                 metrics_path=self.config.metrics_path,
+                trace_url=os.environ.get("SEMANTIC_MODEL_TRACE_URL", ""),
             )
         )
 
@@ -1212,6 +1218,18 @@ class ModelPolicyClient:
         metrics_context: dict[str, Any] | None = None,
     ) -> BehaviorCandidate | None:
         candidates = list(candidates)
+        allowed_interactions = {
+            str(value).strip().casefold()
+            for value in self.config.subgoal_interaction_semantic_types
+            if str(value).strip()
+        }
+        if allowed_interactions:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.behavior_type != "INTERACT"
+                or self._interaction_candidate_family(candidate) in allowed_interactions
+            ]
         self.last_ranking_ids = []
         self.last_selected_group_id = ""
         self.last_selected_candidate_id = ""
@@ -1306,6 +1324,26 @@ class ModelPolicyClient:
             else "model"
         )
         return candidate_groups[selected_id][0]
+
+    @staticmethod
+    def _interaction_candidate_family(candidate: BehaviorCandidate) -> str:
+        metadata = candidate.metadata or {}
+        text = " ".join(
+            str(value or "").casefold()
+            for value in (
+                candidate.target_name,
+                metadata.get("semantic_name"),
+                metadata.get("node_type"),
+                (candidate.interaction_command or {}).get("container_kind"),
+            )
+        )
+        if any(marker in text for marker in ("door", "portal", "gate")):
+            return "door"
+        if any(marker in text for marker in ("fridge", "refrigerator")):
+            return "fridge"
+        if any(marker in text for marker in ("drawer", "cabinet", "dresser")):
+            return "drawer_cabinet"
+        return str(metadata.get("node_type") or "").strip().casefold()
 
     @staticmethod
     def _sanitize_model_selection(

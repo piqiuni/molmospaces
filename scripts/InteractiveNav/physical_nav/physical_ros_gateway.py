@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import faulthandler
 import io
 import json
 import math
@@ -21,7 +22,7 @@ from typing import Any
 
 import numpy as np
 import rospy
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, PointStamped
 from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
@@ -29,6 +30,11 @@ import sensor_msgs.point_cloud2 as pc2
 from std_msgs.msg import Header, String
 import tf2_ros
 from PIL import Image as PILImage
+
+try:
+    faulthandler.register(__import__('signal').SIGUSR1, file=open('/tmp/physical_ros_gateway.trace', 'w'))
+except Exception:
+    pass
 
 
 def _decode(encoded: str) -> np.ndarray:
@@ -56,6 +62,19 @@ class PhysicalRosGateway:
         # here: that would feed our own message back into the HTTP state loop.
         for topic, name in (("/physical_nav/unified_graph", "graph"), ("/physical_nav/consistency", "consistency"),):
             rospy.Subscriber(topic, String, self._json_callback(name), queue_size=1)
+        # Shadow navigation/decision outputs are observed for rendering and
+        # evaluation only. They are never forwarded to a robot controller.
+        for topic, name in (
+            ("/explore_py/status", "explore_status"),
+            ("/semantic_decision/candidates", "candidates"),
+            ("/semantic_decision/selected_behavior", "selection"),
+            ("/semantic_decision/execution_state", "execution_state"),
+            ("/semantic_decision/behavior_feedback", "behavior_feedback"),
+            ("/semantic_decision/decision_trace", "decision_trace"),
+            ("/semantic_mapping/interaction_result", "interaction_result"),
+        ):
+            rospy.Subscriber(topic, String, self._json_callback(name), queue_size=2)
+        rospy.Subscriber("/explore_py/current_subgoal", PointStamped, self._subgoal_callback, queue_size=2)
         for topic, name in (
             (self.args.occupancy_grid_topic, "occupancy"),
             (self.args.room_grid_topic, "room_grid"),
@@ -80,6 +99,9 @@ class PhysicalRosGateway:
                 value = json.loads(msg.data); self._post_state(name, value)
             except Exception as exc: rospy.logwarn_throttle(5.0, "physical ROS state %s: %s", name, exc)
         return callback
+
+    def _subgoal_callback(self, msg: PointStamped) -> None:
+        self._post_state("current_subgoal", {"point": [float(msg.point.x), float(msg.point.y), float(msg.point.z)], "frame_id": str(msg.header.frame_id or "")})
 
     @staticmethod
     def _grid_payload(msg: OccupancyGrid) -> dict[str, Any]:
@@ -274,8 +296,13 @@ class PhysicalRosGateway:
 
     def _publish_pose(self, telemetry: dict[str, Any], stamp: Any) -> None:
         position = telemetry.get("position", [0, 0, 0]); velocity = telemetry.get("velocity", [0, 0, 0]); yaw = _to_float(telemetry.get("yaw", telemetry.get("imu", {}).get("rpy", [0, 0, 0])[2] if telemetry.get("imu") else 0))
-        odom = Odometry(); odom.header.stamp = stamp; odom.header.frame_id = "tf_frame_odom"; odom.child_frame_id = "tf_frame_base_link"; odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z = [_to_float(v) for v in position[:3]]; odom.twist.twist.linear.x, odom.twist.twist.linear.y = [_to_float(v) for v in velocity[:2]]; self.odom_pub.publish(odom)
-        transform = TransformStamped(); transform.header.stamp = stamp; transform.header.frame_id = "tf_frame_odom"; transform.child_frame_id = "tf_frame_base_link"; transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z = [_to_float(v) for v in position[:3]]; transform.transform.rotation.z = math.sin(yaw/2); transform.transform.rotation.w = math.cos(yaw/2); self.tf_broadcaster.sendTransform(transform)
+        quaternion = _telemetry_quaternion(telemetry)
+        odom = Odometry(); odom.header.stamp = stamp; odom.header.frame_id = "tf_frame_odom"; odom.child_frame_id = "tf_frame_base_link"; odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z = [_to_float(v) for v in position[:3]]; odom.twist.twist.linear.x, odom.twist.twist.linear.y = [_to_float(v) for v in velocity[:2]]
+        if quaternion is None:
+            quaternion = (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+        odom.pose.pose.orientation.x, odom.pose.pose.orientation.y, odom.pose.pose.orientation.z, odom.pose.pose.orientation.w = quaternion
+        self.odom_pub.publish(odom)
+        transform = TransformStamped(); transform.header.stamp = stamp; transform.header.frame_id = "tf_frame_odom"; transform.child_frame_id = "tf_frame_base_link"; transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z = [_to_float(v) for v in position[:3]]; transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z, transform.transform.rotation.w = quaternion; self.tf_broadcaster.sendTransform(transform)
         if not self._static_sent:
             static = TransformStamped(); static.header.stamp = stamp; static.header.frame_id = self.args.camera_parent; static.child_frame_id = self.args.camera_frame; static.transform.translation.x, static.transform.translation.y, static.transform.translation.z = self.args.camera_x, self.args.camera_y, self.args.camera_z
             # REP-103 optical frame -> Go2 base: optical x=right, y=down,
@@ -292,6 +319,30 @@ class PhysicalRosGateway:
 def _to_float(value: Any) -> float:
     try: return float(value)
     except (TypeError, ValueError): return 0.0
+
+
+def _telemetry_quaternion(telemetry: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """Read live orientation as (x, y, z, w), preferring camera pose/IMU."""
+    candidates = [telemetry.get("camera_pose"), telemetry.get("d435i_pose"), telemetry.get("pose"), telemetry.get("camera_imu"), telemetry.get("imu")]
+    for source in candidates:
+        if not isinstance(source, dict):
+            continue
+        raw = source.get("quaternion") or source.get("orientation")
+        if isinstance(raw, dict):
+            try:
+                values = [_to_float(raw[key]) for key in ("x", "y", "z", "w")]
+            except KeyError:
+                continue
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 4:
+            values = [_to_float(value) for value in raw[:4]]
+            if source is telemetry.get("imu"):
+                values = [values[1], values[2], values[3], values[0]]
+        else:
+            continue
+        norm = math.sqrt(sum(value * value for value in values))
+        if norm > 1e-6 and math.isfinite(norm):
+            return tuple(value / norm for value in values)
+    return None
 
 
 def _quat_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:

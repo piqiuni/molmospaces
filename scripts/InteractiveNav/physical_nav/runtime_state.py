@@ -37,6 +37,14 @@ class RuntimeState:
         self.local_costmap = None
         self.consistency: dict[str, Any] = {}
         self.qwen: dict[str, Any] = {"requests": [], "results": []}
+        # Native M1/M2 model traces and M3 interaction-result evaluations are
+        # retained as a small bounded history for the live dashboard.
+        self.mllm_events: list[dict[str, Any]] = []
+        self.navigation: dict[str, Any] = {
+            "explore_status": {}, "current_subgoal": {}, "candidates": {},
+            "selection": {}, "execution_state": {}, "behavior_feedback": {},
+            "interaction_result": {}, "decision_trace": {},
+        }
         self.link: dict[str, Any] = {
             "connected": False,
             "connections": 0,
@@ -97,6 +105,13 @@ class RuntimeState:
                 self.qwen.setdefault("results", []).append(result)
                 self.qwen["results"] = self.qwen["results"][-100:]
 
+    def add_mllm_event(self, event: dict[str, Any]) -> None:
+        with self._lock:
+            if not isinstance(event, dict):
+                return
+            self.mllm_events.append(copy.deepcopy(event))
+            self.mllm_events = self.mllm_events[-100:]
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -120,6 +135,8 @@ class RuntimeState:
                 "local_costmap": ({k: self.local_costmap.get(k) for k in ("width", "height", "resolution", "origin", "frame_id")} if isinstance(self.local_costmap, dict) else None),
                 "consistency": copy.deepcopy(self.consistency),
                 "qwen": copy.deepcopy(self.qwen),
+                "mllm_events": copy.deepcopy(self.mllm_events),
+                "navigation": copy.deepcopy(self.navigation),
                 "link": copy.deepcopy(self.link),
                 "counters": dict(self.counters),
                 "last_error": self.last_error,

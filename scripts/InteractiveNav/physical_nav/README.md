@@ -39,6 +39,16 @@ centre; the separately reported 1.18 m camera-to-ground height implies an
 approximately 0.43 m base-to-ground offset. Override the six
 `PHYSICAL_NAV_CAMERA_*` variables if the mounting reference is different.
 
+The extrinsic is only the rigid rod offset; live orientation is no longer
+forced to zero. The Go2 read-only state subscriber forwards the Unitree IMU
+quaternion, and the ROS bridge publishes that full quaternion (roll/pitch/yaw)
+on `/physical_nav/odom` and `tf_frame_odom -> tf_frame_base_link`. YOLOE RGB-D
+lifting and consistency projection use the same dynamic transform. The D435i
+source also forwards gyro/accelerometer samples as `telemetry.camera_imu` when
+the librealsense driver exposes them. D435i itself has no absolute pose/VO
+stream, so an explicit `camera_pose`/`d435i_pose` quaternion, if supplied by a
+tracking wrapper, takes precedence over the body IMU automatically.
+
 ## Start on the policy machine
 
 Install the side-specific transport dependencies first. The Go2 image uses

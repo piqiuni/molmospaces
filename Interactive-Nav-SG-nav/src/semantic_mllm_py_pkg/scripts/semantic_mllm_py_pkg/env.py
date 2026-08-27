@@ -54,4 +54,5 @@ def client_config_from_env(
         metrics_path=metrics_path
         if metrics_path is not None
         else os.environ.get("SEMANTIC_MODEL_METRICS_PATH", ""),
+        trace_url=os.environ.get("SEMANTIC_MODEL_TRACE_URL", ""),
     )

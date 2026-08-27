@@ -14,7 +14,7 @@ if [[ -f "${CATKIN_SETUP}" ]]; then
   # checkout without a catkin build.
   source "${CATKIN_SETUP}"
 fi
-export PYTHONPATH="${ROOT_DIR}/ros_compat:${ROOT_DIR}:${ROOT_DIR}/../../../Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${PYTHONPATH:-}"
+export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/../../../Interactive-Nav-SG-nav/src/semantic_mllm_py_pkg/scripts:${ROOT_DIR}/../../../Interactive-Nav-SG-nav/src/semantic_decision_py_pkg/scripts:${ROOT_DIR}/../../../Interactive-Nav-SG-nav/src/explore_py_pkg/scripts:${ROOT_DIR}/../../../Interactive-Nav-SG-nav/src/semantic_mapping_py_pkg/scripts:${ROOT_DIR}/ros_compat:${PYTHONPATH:-}"
 export ROS_PACKAGE_PATH="${ROOT_DIR}/../../../Interactive-Nav-SG-nav/src:${ROS_PACKAGE_PATH:-}"
 
 WEB_HOST="${PHYSICAL_NAV_WEB_HOST:-0.0.0.0}"
@@ -24,6 +24,12 @@ WS_PORT="${PHYSICAL_NAV_WS_PORT:-12334}"
 QWEN_URL="${PHYSICAL_NAV_QWEN_URL:-http://127.0.0.1:18080/v1}"
 QWEN_MODEL="${PHYSICAL_NAV_QWEN_MODEL:-qwen3.6-35b-a3b-fp8}"
 QWEN_AUTO_INTERVAL="${PHYSICAL_NAV_QWEN_AUTO_INTERVAL:-0}"
+export SEMANTIC_MODEL_MODE="${SEMANTIC_MODEL_MODE:-http}"
+export SEMANTIC_MODEL_ENDPOINT="${SEMANTIC_MODEL_ENDPOINT:-http://127.0.0.1:18080/v1}"
+export SEMANTIC_MODEL_NAME="${SEMANTIC_MODEL_NAME:-${QWEN_MODEL}}"
+export SEMANTIC_MODEL_PROTOCOL="${SEMANTIC_MODEL_PROTOCOL:-openai_chat}"
+export SEMANTIC_MODEL_METRICS_PATH="${SEMANTIC_MODEL_METRICS_PATH:-/tmp/physical_nav_mllm.jsonl}"
+export SEMANTIC_MODEL_TRACE_URL="${SEMANTIC_MODEL_TRACE_URL:-http://127.0.0.1:${WEB_PORT}/api/mllm-event}"
 # Measured Go2 standing-pose calibration: camera is about 3 cm forward of
 # the base centre (38 cm from a 70 cm rear-to-front body) and 0.75 m above
 # the base. The base-to-ground offset is therefore about 0.43 m (1.18 m
@@ -79,7 +85,7 @@ elif command -v roscore >/dev/null 2>&1 && command -v roslaunch >/dev/null 2>&1;
     model_path:="${PHYSICAL_NAV_MODEL_PATH:-/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt}" \
     camera_x:="${CAMERA_X}" camera_y:="${CAMERA_Y}" camera_z:="${CAMERA_Z}" \
     camera_roll:="${CAMERA_ROLL}" camera_pitch:="${CAMERA_PITCH}" camera_yaw:="${CAMERA_YAW}" \
-    ros_python:="${PHYSICAL_NAV_ROS_PYTHON:-/usr/bin/python3}"
+    ros_python:="${PHYSICAL_NAV_ROS_PYTHON:-/home/user/miniconda3/envs/mlspaces/bin/python3}"
 else
   echo "ROS1 tools not found; gateway remains available for protocol/web tests."
   wait "${GATEWAY_PID}"

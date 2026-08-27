@@ -1,0 +1,20 @@
+ablation:
+  module1: "dynamic_mllm"
+  module2: "mllm_score"
+candidate:
+  # Panel 6 and the physical candidate lane expose only these interaction
+  # target families.  Drawer/cabinet remains visible as a graph target, but
+  # Module 2 subgoal selection is narrowed to door/fridge below.
+  interaction_semantic_types: ["door", "fridge", "drawer_cabinet"]
+  subgoal_interaction_semantic_types: ["door", "fridge"]
+startup_scan:
+  enabled: false
+model:
+  mode: "http"
+  endpoint: "http://127.0.0.1:18080/v1"
+  model: "qwen3.6-35b-a3b-fp8"
+  protocol: "openai_chat"
+  timeout_s: 20.0
+  max_tokens: 256
+  metrics_path: "/tmp/physical_nav_mllm.jsonl"
+  subgoal_interaction_semantic_types: ["door", "fridge"]

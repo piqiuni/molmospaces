@@ -138,7 +138,7 @@ def _unitree_state_reader(state: ReadOnlyState, interface: str) -> None:
 
 
 class D435iSource:
-    def __init__(self, width: int, height: int, fps: int) -> None:
+    def __init__(self, width: int, height: int, fps: int, enable_motion: bool = False) -> None:
         import pyrealsense2 as rs
 
         self.rs = rs
@@ -146,6 +146,17 @@ class D435iSource:
         self.config = rs.config()
         self.config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
         self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        self.motion_enabled = False
+        try:
+            # D435i exposes gyro/accelerometer streams, but not a standalone
+            # visual-odometry pose stream.  Keep these measurements alongside
+            # the Go2 body quaternion so the policy host can use dynamic tilt.
+            if enable_motion:
+                self.config.enable_stream(rs.stream.gyro)
+                self.config.enable_stream(rs.stream.accel)
+                self.motion_enabled = True
+        except Exception as exc:
+            print(f"D435i motion streams unavailable: {exc}", flush=True)
         self.profile = self.pipeline.start(self.config)
         self.align = rs.align(rs.stream.color)
         depth_profile = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
@@ -163,6 +174,7 @@ class D435iSource:
             "distortion": [float(v) for v in getattr(c, "coeffs", [])],
         }
         self.camera_frame = f"{color_profile.stream_name()}_frame"
+        self.latest_motion: dict[str, Any] = {}
         print(f"D435i started {c.width}x{c.height}@{fps}, depth_scale={self.depth_scale}", flush=True)
 
     def read(self) -> tuple[Any, Any, float]:
@@ -171,6 +183,26 @@ class D435iSource:
         depth = frames.get_depth_frame()
         if not color or not depth:
             raise RuntimeError("D435i returned an incomplete RGB-D frame")
+        if self.motion_enabled:
+            motion: dict[str, Any] = {"source": "d435i_imu", "received_at": time.time()}
+            try:
+                gyro = frames.first_or_default(self.rs.stream.gyro)
+                if gyro:
+                    value = gyro.as_motion_frame().get_motion_data()
+                    motion["gyroscope"] = [float(value.x), float(value.y), float(value.z)]
+                    motion["gyro_timestamp_ms"] = float(gyro.get_timestamp())
+            except Exception:
+                pass
+            try:
+                accel = frames.first_or_default(self.rs.stream.accel)
+                if accel:
+                    value = accel.as_motion_frame().get_motion_data()
+                    motion["accelerometer"] = [float(value.x), float(value.y), float(value.z)]
+                    motion["accel_timestamp_ms"] = float(accel.get_timestamp())
+            except Exception:
+                pass
+            if "gyroscope" in motion or "accelerometer" in motion:
+                self.latest_motion = motion
         stamp = time.time()
         sync_ms = abs(float(color.get_timestamp()) - float(depth.get_timestamp()))
         import numpy as np
@@ -203,7 +235,9 @@ def _synthetic_frame(width: int, height: int) -> tuple[Any, Any, float, dict[str
 async def publish(args: argparse.Namespace) -> None:
     state = ReadOnlyState()
     threading.Thread(target=_unitree_state_reader, args=(state, args.interface), daemon=True).start()
-    source = None if args.dry_run else D435iSource(args.width, args.height, args.fps)
+    source = None if args.dry_run else D435iSource(
+        args.width, args.height, args.fps, enable_motion=args.enable_camera_imu
+    )
     seq = 0
     telemetry_seq = 0
     while True:
@@ -243,7 +277,10 @@ async def publish(args: argparse.Namespace) -> None:
                 now = time.monotonic()
                 if now - last_telemetry >= args.telemetry_period:
                     telemetry_seq += 1
-                    ws.send(json.dumps(telemetry_packet(seq=telemetry_seq, telemetry=state.snapshot()), separators=(",", ":")))
+                    telemetry = state.snapshot()
+                    if source is not None and source.latest_motion:
+                        telemetry["camera_imu"] = dict(source.latest_motion)
+                    ws.send(json.dumps(telemetry_packet(seq=telemetry_seq, telemetry=telemetry), separators=(",", ":")))
                     last_telemetry = now
                 elapsed = time.monotonic() - started
                 await asyncio.sleep(max(0.0, 1.0 / args.fps - elapsed))
@@ -264,6 +301,11 @@ def main() -> None:
     parser.add_argument("--reconnect-s", type=float, default=2.0)
     parser.add_argument("--camera-frame", default="d435i_color_optical_frame")
     parser.add_argument("--depth-scale", type=float, default=0.001)
+    parser.add_argument(
+        "--enable-camera-imu",
+        action="store_true",
+        help="also stream the D435i gyro/accelerometer (disabled by default for RGB-D stability)",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:

@@ -7,6 +7,7 @@
   <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.0"/><arg name="camera_yaw" default="0.0"/>
   <arg name="ros_python" default="/usr/bin/python3"/>
   <arg name="start_mapping" default="true"/>
+  <arg name="semantic_override_config" default="$(find physical_nav)/config/semantic_shadow_override.yaml"/>
 
   <!-- Existing nodes are reused through physical topic parameters.  No
        simulator launch or default semantic_mapping config is modified. -->
@@ -25,7 +26,7 @@
       <arg name="mapping_scan_topic" value="/physical_nav/points"/>
     </include>
   </group>
-  <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" launch-prefix="$(arg ros_python)" output="screen" respawn="true">
+  <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" launch-prefix="/usr/bin/python3" output="screen" respawn="true">
     <param name="web_url" value="http://127.0.0.1:8765"/>
     <param name="world_frame" value="tf_frame_map"/>
     <param name="camera_frame" value="d435i_color_optical_frame"/>
@@ -44,6 +45,39 @@
     <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
   </node>
+  <!-- Full navigation/interaction decision chain in shadow mode. Every
+       motion/action topic is remapped to an unconsumed physical_nav sink;
+       this keeps planning, M1/M2 decisions and M3 feedback live while the
+       Go2 remains exclusively under manual teleoperation. -->
+  <group>
+    <remap from="/odom" to="/physical_nav/odom"/>
+    <remap from="/struct_mapping/occ_map" to="/physical_nav/occupancy"/>
+    <remap from="/semantic_mapping/unified_graph" to="/physical_nav/unified_graph"/>
+    <remap from="/semantic_mapping/interaction_result" to="/physical_nav/interaction_result"/>
+    <remap from="/semantic_mapping/attribute_updates" to="/physical_nav/attribute_updates"/>
+    <remap from="/semantic_mapping/interaction_result" to="/physical_nav/interaction_result"/>
+    <remap from="/semantic_mapping/attribute_updates" to="/physical_nav/attribute_updates"/>
+    <remap from="/move_base" to="/physical_nav/shadow_move_base"/>
+    <remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>
+    <remap from="/cmd_vel_stamped" to="/physical_nav/shadow_cmd_vel_stamped"/>
+    <remap from="/move_base/cancel" to="/physical_nav/shadow_move_base_cancel"/>
+    <remap from="/move_base_simple/goal" to="/physical_nav/shadow_goal"/>
+    <include file="$(find explore_py_pkg)/launch/explore_py.launch">
+      <arg name="external_control_enabled" value="true"/>
+    </include>
+  </group>
+  <group>
+    <remap from="/odom" to="/physical_nav/odom"/>
+    <remap from="/struct_mapping/occ_map" to="/physical_nav/occupancy"/>
+    <remap from="/semantic_mapping/unified_graph" to="/physical_nav/unified_graph"/>
+    <remap from="/move_base" to="/physical_nav/shadow_move_base"/>
+    <remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>
+    <remap from="/cmd_vel_stamped" to="/physical_nav/shadow_cmd_vel_stamped"/>
+    <remap from="/move_base/cancel" to="/physical_nav/shadow_move_base_cancel"/>
+    <include file="$(find semantic_decision_py_pkg)/launch/semantic_decision.launch">
+      <arg name="override_config_file" value="$(arg semantic_override_config)"/>
+    </include>
+  </group>
   <!-- The gateway is started separately so it can run before roslaunch and
        accept the Go2 WebSocket connection. -->
 </launch>

@@ -164,6 +164,24 @@ class SixPanelRenderer:
         except (IndexError, TypeError, ValueError):
             pose = [0.0, 0.0, 0.0]
         graph = snapshot.get("graph") if isinstance(snapshot.get("graph"), dict) else {}
+        navigation = snapshot.get("navigation") if isinstance(snapshot.get("navigation"), dict) else {}
+        current = navigation.get("current_subgoal") if isinstance(navigation.get("current_subgoal"), dict) else {}
+        selected = navigation.get("selection") if isinstance(navigation.get("selection"), dict) else {}
+        candidates = navigation.get("candidates") if isinstance(navigation.get("candidates"), dict) else {}
+        goal = current.get("point") or current.get("position") or current.get("goal") or []
+        if not isinstance(goal, (list, tuple)) or len(goal) < 2:
+            goal = []
+        if goal:
+            selected = dict(selected)
+            selected.setdefault(
+                "goal_xyyaw",
+                [
+                    float(goal[0]),
+                    float(goal[1]),
+                    _safe_float(current.get("yaw", current.get("theta", 0.0))),
+                ],
+            )
+            selected.setdefault("active", True)
         observed = []
         for node in graph.get("nodes", []):
             if not isinstance(node, dict):
@@ -181,18 +199,18 @@ class SixPanelRenderer:
             "stamp_sec": float(snapshot.get("frame_stamp", 0.0) or 0.0),
             "pose": pose,
             "pose_frame_id": "tf_frame_map",
-            "active_goal": [],
-            "active_goal_yaw": 0.0,
+            "active_goal": list(goal[:2]) if goal else [],
+            "active_goal_yaw": _safe_float(current.get("yaw", current.get("theta", 0.0))),
             "distance_m": 0.0,
             "trajectory": [pose + [float(snapshot.get("frame_stamp", 0.0) or 0.0)]],
             "global_plan": {}, "local_global_plan": {}, "local_plan": {},
             "unified_graph": graph,
             "observed_instance_ids": sorted(set(observed)),
-            "semantic_candidates": {},
-            "semantic_selection": {"active": False},
-            "semantic_execution_state": {},
-            "semantic_behavior_feedback": {},
-            "semantic_decision_trace": {},
+            "semantic_candidates": candidates,
+            "semantic_selection": selected or {"active": False},
+            "semantic_execution_state": navigation.get("execution_state") or {},
+            "semantic_behavior_feedback": navigation.get("behavior_feedback") or {},
+            "semantic_decision_trace": navigation.get("decision_trace") or {},
         }
 
     def _placeholder(self, title: str) -> Any:
@@ -350,6 +368,7 @@ class SixPanelRenderer:
                 "telemetry": dict(self.state.telemetry),
                 "graph": dict(self.state.graph),
                 "consistency": dict(self.state.consistency),
+                "navigation": dict(self.state.navigation),
                 "detections": [dict(item) for item in self.state.detections if isinstance(item, dict)],
             }
             rgb = None if self.state.rgb is None else self.state.rgb.copy()
@@ -376,8 +395,8 @@ class SixPanelRenderer:
         occ = self._canonical.render_map_panel(
             planning, self.panel_size, step, int(step["step_index"]),
             title="OCC", kind="occupancy", world_bounds=world_bounds,
-            draw_global_plan=False, draw_local_plan=False, draw_frontiers=False,
-            draw_semantic_candidates=False, draw_route_plan=False,
+            draw_global_plan=False, draw_local_plan=False, draw_frontiers=True,
+            draw_semantic_candidates=True, draw_route_plan=False,
         )
         draw_task_subgoal_header(occ, step, box_width_px=width // 2 - 10, background_alpha=.55)
         room_panel = self._canonical.render_room_panel(
@@ -388,19 +407,68 @@ class SixPanelRenderer:
         global_panel = self._canonical.render_map_panel(
             global_grid, (global_width, height), step, int(step["step_index"]),
             title="GLOBAL COSTMAP", kind="costmap", world_bounds=world_bounds,
-            draw_global_plan=False, draw_local_plan=False, draw_frontiers=False,
+            draw_global_plan=False, draw_local_plan=False, draw_frontiers=True,
+            draw_semantic_candidates=True,
         )
         local_panel = self._canonical.render_map_panel(
             local_grid, (width - global_width, height), step, int(step["step_index"]),
             title="LOCAL COSTMAP", kind="costmap", draw_global_plan=False,
-            draw_local_global_plan=False, draw_local_plan=False, draw_frontiers=False,
+            draw_local_global_plan=False, draw_local_plan=False, draw_frontiers=True,
+            draw_semantic_candidates=True,
         )
         costmaps = np.concatenate([global_panel, local_panel], axis=1)
         spatial = self._canonical.render_semantic_xy(
             planning, self.panel_size, step, int(step["step_index"]), world_bounds,
             view_scale=1.8, label_mode="all", draw_overview_inset=False,
         )
-        topology = self._canonical.render_topology(self.panel_size, step, int(step["step_index"]))
+        topology_step = dict(step)
+        topology_candidates = dict(step.get("semantic_candidates") or {})
+        raw_topology_candidates = list(topology_candidates.get("candidates") or [])
+        allowed_topology_families = ("door", "portal", "gate", "fridge", "refrigerator", "drawer", "cabinet", "dresser")
+        topology_candidates["candidates"] = [
+            candidate
+            for candidate in raw_topology_candidates
+            if str(candidate.get("behavior_type") or candidate.get("type") or "").upper() != "INTERACT"
+            or any(
+                marker in " ".join(
+                    str(value or "").casefold()
+                    for value in (
+                        candidate.get("target_name"),
+                        (candidate.get("metadata") or {}).get("semantic_name"),
+                        (candidate.get("metadata") or {}).get("node_type"),
+                    )
+                )
+                for marker in allowed_topology_families
+            )
+        ]
+        topology_step["semantic_candidates"] = topology_candidates
+        # Keep panel 6's interaction layer aligned with the physical policy:
+        # generic detector boxes are useful evidence in panels 1/5, but they
+        # are not interaction targets.  Preserve rooms/ordinary objects and
+        # retain only door/portal, fridge and drawer/cabinet containers in the
+        # topology's interaction container layer.
+        topology_graph = dict(step.get("unified_graph") or {})
+        if isinstance(topology_graph, dict):
+            filtered_nodes = []
+            for node in list(topology_graph.get("nodes") or []):
+                if not isinstance(node, dict):
+                    continue
+                if str(node.get("type") or node.get("node_type") or "").casefold() != "container":
+                    filtered_nodes.append(node)
+                    continue
+                node_text = " ".join(
+                    str(value or "").casefold()
+                    for value in (
+                        node.get("label"), node.get("name"),
+                        (node.get("attributes") or {}).get("semantic_name"),
+                        (node.get("attributes") or {}).get("category"),
+                    )
+                )
+                if any(marker in node_text for marker in ("fridge", "refrigerator", "drawer", "cabinet", "dresser")):
+                    filtered_nodes.append(node)
+            topology_graph["nodes"] = filtered_nodes
+            topology_step["unified_graph"] = topology_graph
+        topology = self._canonical.render_topology(self.panel_size, topology_step, int(step["step_index"]))
         canvas = np.vstack([
             np.concatenate([camera, occ, room_panel], axis=1),
             np.concatenate([costmaps, spatial, topology], axis=1),
@@ -427,10 +495,66 @@ class _WebHandler(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
 
+    @staticmethod
+    def _state_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Return a browser-sized view of state (full masks stay on /api/state)."""
+        def detection_view(item: Any) -> dict[str, Any]:
+            if not isinstance(item, dict):
+                return {"value": item}
+            return {
+                "semantic_class": item.get("semantic_class", item.get("raw_class", "")),
+                "confidence": item.get("confidence"),
+                "depth_median_m": item.get("depth_median_m"),
+                "position": item.get("world_position", item.get("position")),
+                "capture_seq": item.get("capture_seq"),
+            }
+
+        graph = snapshot.get("graph")
+        graph_summary = graph
+        if isinstance(graph, dict):
+            graph_summary = {
+                "scene_id": graph.get("scene_id"),
+                "graph_revision": graph.get("graph_revision"),
+                "capture_step": graph.get("capture_step"),
+                "node_count": len(graph.get("nodes") or []),
+                "edge_count": len(graph.get("edges") or []),
+            }
+        mllm = [item for item in (snapshot.get("mllm_events") or []) if isinstance(item, dict)]
+        stages = {stage: [item for item in mllm if item.get("stage") == stage][-20:] for stage in ("M1", "M2")}
+        navigation = snapshot.get("navigation") or {}
+        return {
+            "frame_seq": snapshot.get("frame_seq"),
+            "frame_stamp": snapshot.get("frame_stamp"),
+            "generated_at": snapshot.get("generated_at"),
+            "read_only": snapshot.get("read_only", True),
+            "status": snapshot.get("status"),
+            "link": snapshot.get("link"),
+            "counters": snapshot.get("counters"),
+            "telemetry": snapshot.get("telemetry"),
+            "detections": [detection_view(item) for item in (snapshot.get("detections") or [])],
+            "mapped_detections": [detection_view(item) for item in (snapshot.get("mapped_detections") or [])],
+            "graph": graph_summary,
+            "consistency": snapshot.get("consistency"),
+            "safety": snapshot.get("safety"),
+            "qwen": snapshot.get("qwen"),
+            "mllm": stages,
+            "m3": {
+                "stage": "M3",
+                "model_call": False,
+                "interaction_result": navigation.get("interaction_result", {}),
+                "behavior_feedback": navigation.get("behavior_feedback", {}),
+                "execution_state": navigation.get("execution_state", {}),
+            },
+            "navigation": navigation,
+            "last_error": snapshot.get("last_error", ""),
+        }
+
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/state":
             self._json({**self.state.snapshot(), "safety": self.gate.snapshot()}); return
+        if path == "/api/state-summary":
+            self._json(self._state_summary({**self.state.snapshot(), "safety": self.gate.snapshot()})); return
         if path == "/api/raw-frame":
             self._json(self.state.raw_frame()); return
         if path == "/api/health":
@@ -458,18 +582,43 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # A physical audit view does not need camera-rate streaming;
                 # limiting this to 5 Hz reduces network pressure for remote
                 # browsers while still showing continuous state changes.
-                time.sleep(.5)
+                time.sleep(.2)
+        elif path in {"/panel1.mjpg", "/panel5.mjpg"}:
+            panel_index = 0 if path.startswith("/panel1") else 4
+            self.connection.settimeout(2.0)
+            self.send_response(200); self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame"); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Connection", "close"); self.end_headers()
+            while True:
+                with self.frame_lock: frame = self.latest_jpeg
+                if frame and cv2 is not None:
+                    try:
+                        image = cv2.imdecode(np.frombuffer(frame, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        if image is not None:
+                            x = (panel_index % 3) * 480; y = (panel_index // 3) * 270
+                            crop = image[y:y + 270, x:x + 480]
+                            ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                            if ok:
+                                data = bytes(encoded)
+                                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n"); self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError): return
+                time.sleep(.2)
         else:
             html = _HTML.encode()
-            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html)
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(html))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(html)
 
     def do_POST(self) -> None:
         if self.path == "/api/ros-state":
             length = int(self.headers.get("Content-Length", "0")); payload = json.loads(self.rfile.read(length) or b"{}")
             name, value = str(payload.get("name", "")), payload.get("value")
-            if name not in {"detections", "mapped_detections", "graph", "consistency", "occupancy", "room_grid", "global_costmap", "local_costmap", "telemetry"}:
+            if name not in {"detections", "mapped_detections", "graph", "consistency", "occupancy", "room_grid", "global_costmap", "local_costmap", "telemetry", "explore_status", "current_subgoal", "candidates", "selection", "execution_state", "behavior_feedback", "interaction_result", "decision_trace"}:
                 self._json({"accepted": False, "error": "unsupported ROS state"}, 400); return
-            self.state.update_topic(name, value); self._json({"accepted": True}); return
+            if name in {"explore_status", "current_subgoal", "candidates", "selection", "execution_state", "behavior_feedback", "interaction_result", "decision_trace"}:
+                self.state.navigation[name] = value
+            else:
+                self.state.update_topic(name, value)
+            self._json({"accepted": True}); return
+        if self.path == "/api/mllm-event":
+            length = int(self.headers.get("Content-Length", "0")); payload = json.loads(self.rfile.read(length) or b"{}")
+            self.state.add_mllm_event(payload); self._json({"accepted": True}); return
         if self.path == "/api/qwen":
             length = int(self.headers.get("Content-Length", "0")); payload = json.loads(self.rfile.read(length) or b"{}")
             if self.qwen_submit is None: self._json({"error": "Qwen client is disabled"}, 503); return
@@ -479,11 +628,27 @@ class _WebHandler(BaseHTTPRequestHandler):
         self._json(self.gate.handle_intent(payload), 202)
 
 
-_HTML = """<!doctype html><meta charset='utf-8'><title>Go2 Physical Interactive Navigation</title>
-<style>body{font-family:monospace;background:#111;color:#eee;margin:12px}canvas{display:block;max-width:100%;height:auto;border:1px solid #555;background:#222}pre{white-space:pre-wrap;max-height:420px;overflow:auto;background:#1b1b1b;padding:10px}.grid{display:grid;grid-template-columns:2fr 1fr;gap:12px}.ok{color:#5f5}.warn{color:#fc3}</style>
-<h2>Go2 Physical Interactive Navigation <span class='warn'>READ_ONLY_BLOCKED</span></h2>
-<div class='grid'><div><canvas id='stream' width='1440' height='540'></canvas><div id='streamStatus' class='warn'>loading video...</div></div><div><h3>状态 / Qwen / Graph</h3><pre id='state'>loading...</pre><input id='prompt' size='40' value='请分析当前全局语义图和感知一致性'><button onclick="askQwen()">请求 Qwen</button><br><button onclick="intent('STOP')">STOP（仅记录）</button><button onclick="intent('MOVE_FORWARD')">前进意图（阻断）</button></div></div>
-<script>const canvas=document.querySelector('#stream'),ctx=canvas.getContext('2d'),statusEl=document.querySelector('#streamStatus');let lastSeq=-1,lastSeqAt=Date.now(),polling=false;async function refreshImage(){if(polling)return;polling=true;try{let r=await fetch('/snapshot.jpg?ts='+Date.now(),{cache:'no-store'});if(!r.ok)throw Error('snapshot HTTP '+r.status);let bmp=await createImageBitmap(await r.blob());ctx.drawImage(bmp,0,0,canvas.width,canvas.height);bmp.close();statusEl.textContent='video polling: '+new Date().toLocaleTimeString();statusEl.className='ok'}catch(e){statusEl.textContent='video retry: '+e;statusEl.className='warn'}finally{polling=false}}async function refresh(){try{let r=await fetch('/api/state?ts='+Date.now(),{cache:'no-store'});let s=await r.json();document.querySelector('#state').textContent=JSON.stringify(s,null,2);if(s.frame_seq!==lastSeq){lastSeq=s.frame_seq;lastSeqAt=Date.now()}else if(Date.now()-lastSeqAt>5000){refreshImage();lastSeqAt=Date.now()}}catch(e){document.querySelector('#state').textContent=e}}async function intent(a){await fetch('/api/teleop-intent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a,source:'web'})});refresh()}async function askQwen(){await fetch('/api/qwen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:document.querySelector('#prompt').value})});refresh()}setInterval(refresh,1000);setInterval(refreshImage,500);refresh();refreshImage()</script>"""
+_HTML = """<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Go2 Physical Interactive Navigation</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d11;--card:#141821;--line:#2e3748;--blue:#67a7ff;--green:#54d68b;--amber:#ffca58;--red:#ff6c67;--muted:#9ba8ba}*{box-sizing:border-box}body{font-family:Inter,"Noto Sans SC",system-ui,sans-serif;background:var(--bg);color:#edf2fa;margin:0;padding:14px}.title{display:flex;align-items:center;gap:12px;margin:0 0 10px;font-size:23px}.readonly{font-size:13px;color:#101418;background:var(--amber);padding:4px 9px;border-radius:99px}.dashboard{display:grid;grid-template-columns:minmax(640px,1fr) 430px;gap:12px;align-items:start}.left{min-width:0}.overview{display:block;width:100%;border:1px solid var(--line);border-radius:8px;background:#111}.ratebar{display:flex;gap:14px;flex-wrap:wrap;color:var(--green);font-size:13px;padding:7px 2px}.mllm-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.right{display:grid;gap:10px}.card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:10px;min-width:0;box-shadow:0 4px 14px #0004}.card h3{display:flex;align-items:center;justify-content:space-between;margin:0 0 8px;color:var(--blue);font-size:15px}.hint{color:var(--muted);font-size:11px;font-weight:400}.visual{width:100%;display:block;border-radius:6px;border:1px solid #343c49;background:#0d0f13}.events{max-height:390px;overflow:auto;display:grid;gap:8px}.event{display:grid;grid-template-columns:minmax(76px,.8fr) minmax(105px,1.25fr) minmax(90px,1fr);gap:7px;padding:7px;border:1px solid #313947;border-radius:8px;background:#0e1218;font-size:11px}.event-col{min-width:0;overflow:hidden}.label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}.thumb{width:100%;height:70px;object-fit:cover;border-radius:4px;border:1px solid #354053}.chips{display:flex;gap:4px;flex-wrap:wrap}.chip{display:inline-block;max-width:100%;padding:2px 5px;border-radius:5px;background:#263248;color:#cfe1ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.prompt,.result{line-height:1.35;word-break:break-word}.result{color:#d9f7e6}.meta{grid-column:1/-1;color:#7f8da1;font-size:10px}.empty{height:110px;display:grid;place-items:center;color:#768397;border:1px dashed #354052;border-radius:8px}.state-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.metric{padding:9px 7px;border:1px solid #303a4a;border-radius:8px;background:#0e1218;text-align:center}.metric .icon{font-size:19px}.metric .value{font-size:16px;font-weight:700;margin-top:2px}.metric .name{font-size:10px;color:var(--muted)}.statusline{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.badge{padding:3px 7px;border-radius:99px;font-size:11px;background:#263248;color:#cfe1ff}.badge.good{background:#173b2b;color:#7ff0ae}.badge.warn{background:#493b14;color:#ffd46c}.badge.bad{background:#4b2021;color:#ff9692}.m3box{display:grid;gap:8px}.m3head{display:flex;align-items:center;gap:8px}.m3status{font-size:22px;font-weight:800}.m3details{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.mini{background:#0e1218;border:1px solid #303a4a;border-radius:7px;padding:7px}.mini b{display:block;color:#eaf1fc;font-size:12px}.mini span{font-size:10px;color:var(--muted)}@media(max-width:1150px){.dashboard{grid-template-columns:1fr}.right{grid-template-columns:repeat(3,minmax(0,1fr));grid-row:2}.mllm-grid{grid-row:3}}@media(max-width:800px){body{padding:8px}.dashboard{display:block}.right,.mllm-grid{grid-template-columns:1fr;margin-top:10px}.event{grid-template-columns:1fr 1fr}.meta{grid-column:1/-1}}
+</style>
+<h1 class='title'>Go2 Physical Interactive Navigation <span class='readonly'>READ ONLY · 动作阻断</span></h1>
+<main class='dashboard'><div class='left'><img class='overview' src='/stream.mjpg' alt='实时六面板'><div class='ratebar'><span>● 导航 5 Hz</span><span>● YOLOE / 建图输入 10 Hz</span><span>● 网页 5 Hz</span><span>● Go2 人工遥控</span></div><div class='mllm-grid'><section class='card'><h3>1 · M1 VLM 感知 <span class='hint'>图片 → 简化问题 → 结果</span></h3><div id='m1' class='events'></div></section><section class='card'><h3>2 · M2 LLM 子目标 <span class='hint'>历史 + 候选 + 目标</span></h3><div id='m2' class='events'></div></section><section class='card'><h3>3 · M3 交互评价 <span class='hint'>规则验证，无模型调用</span></h3><div id='m3' class='m3box'></div></section></div></div><aside class='right'><section class='card'><h3>4 · Go2 当前状态 <span id='stamp' class='hint'>连接中</span></h3><div id='go2'></div></section><section class='card'><h3>5 · 图 1 放大 <span class='hint'>RGB + YOLOE box / seg</span></h3><img class='visual' src='/panel1.mjpg' alt='图1放大'></section><section class='card'><h3>6 · 图 5 放大 <span class='hint'>语义地图 + 3D box</span></h3><img class='visual' src='/panel5.mjpg' alt='图5放大'></section></aside></main>
+<script>
+const q=s=>document.querySelector(s), text=v=>String(v??'').replace(/\\s+/g,' ').trim(), clip=(v,n=150)=>{v=text(v);return v.length>n?v.slice(0,n)+'…':v};
+function make(tag,cls,value){const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=value;return e}
+function contextCandidates(e){const c=e?.context?.candidates||e?.payload?.candidates||[];return Array.isArray(c)?c:[]}
+function outputSummary(e){if(e?.error)return '调用失败：'+clip(e.error,120);let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??'';if(typeof raw==='object')raw=JSON.stringify(raw);try{const o=JSON.parse(raw);const ids=o.ranked_ids||o.candidate_id||o.label||o.state||'';return clip([Array.isArray(ids)?ids.join(' → '):ids,o.reason,o.confidence].filter(Boolean).join(' · '),150)}catch(_){return clip(raw||'已完成（无文本结果）',150)}}
+function addChips(parent,items,max=5){const wrap=make('div','chips');items.slice(0,max).forEach(v=>wrap.append(make('span','chip',clip(v,28))));if(items.length>max)wrap.append(make('span','chip','+'+(items.length-max)));parent.append(wrap)}
+function renderEvents(id,events,stage){const box=q(id);box.replaceChildren();if(!events?.length){box.append(make('div','empty','等待 '+stage+' 调用'));return}events.slice(-8).reverse().forEach((e,index)=>{const row=make('article','event'),left=make('div','event-col'),mid=make('div','event-col'),right=make('div','event-col');left.append(make('div','label',stage==='M1'?'输入图像':'候选 subgoal'));if(stage==='M1'){const im=make('img','thumb');im.src='/panel1.mjpg?event='+index;im.alt='M1图像输入';left.append(im)}else{const cs=contextCandidates(e);addChips(left,cs.map(c=>c.id||c.candidate_id||c.target_name||'candidate'))}mid.append(make('div','label',stage==='M2'?'历史 / 目标 / 简化请求':'简化问题'));if(stage==='M2'){const hist=e?.context?.recent_decisions||e?.payload?.recent_decisions||[];const mission=e?.context?.mission||e?.payload?.mission||{};addChips(mid,['历史 '+(Array.isArray(hist)?hist.length:0),'候选 '+contextCandidates(e).length,'目标 '+(mission.target_name||mission.target||mission.mode||'探索')]);mid.append(make('div','prompt','从当前候选中选择下一语义子目标'))}else mid.append(make('div','prompt',clip(e.instruction||'判断当前交互对象属性与状态')));right.append(make('div','label','MLLM 输出'));right.append(make('div','result',outputSummary(e)));const meta=make('div','meta',`${e.timestamp?new Date(e.timestamp*1000).toLocaleTimeString():'--:--:--'} · ${e.latency_s!=null?Number(e.latency_s).toFixed(2)+' s':'等待耗时'} · ${e.model||e.role||''}`);row.append(left,mid,right,meta);box.append(row)})}
+function firstObj(...values){return values.find(v=>v&&typeof v==='object')||{}}
+function renderM3(m3){const box=q('#m3');box.replaceChildren();const fb=firstObj(m3?.behavior_feedback,m3?.interaction_result),detail=firstObj(fb.detail,fb.result,fb);let status=text(fb.status||detail.status||'WAITING').toUpperCase(),success=fb.success??detail.success;let kind=success===true||/PASS|SUCCESS|COMPLETE/.test(status)?'good':success===false||/FAIL|ERROR|BLOCK/.test(status)?'bad':'warn';const head=make('div','m3head');head.append(make('div','m3status',status),make('span','badge '+kind,success===true?'验证通过':success===false?'验证未通过':'等待结果'));box.append(head);const grid=make('div','m3details');[['评价对象',fb.target_name||fb.target_id||fb.candidate_id||detail.target||'暂无'],['结果原因',detail.reason||fb.reason||detail.failure_stage||'等待交互反馈'],['状态变化',detail.pre_state&&detail.post_state?detail.pre_state+' → '+detail.post_state:'未产生'],['验证方式','状态/图更新一致性']].forEach(([n,v])=>{const d=make('div','mini');d.append(make('span','',n),make('b','',clip(v,60)));grid.append(d)});box.append(grid)}
+function num(v,d=1){const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--'}
+function speed(t){const v=t?.velocity||t?.linear_velocity||[];if(Array.isArray(v))return Math.hypot(...v.slice(0,3).map(Number));if(v&&typeof v==='object')return Math.hypot(Number(v.x||0),Number(v.y||0),Number(v.z||0));return Number(t?.speed||0)}
+function renderGo2(s){const t=s.telemetry||{},b=t.battery||{},link=s.link||{},grid=make('div','state-grid');const metrics=[['🔋',num(b.soc??t.battery_soc,0)+' %','电量'],['↗',num(speed(t),2)+' m/s','速度'],['⟳',num((Number(t.yaw||0)*180/Math.PI),1)+'°','航向'],['◉',text(t.mode||'站立'),'动作模式'],['↕',num(t.body_height,2)+' m','机身高度'],['⚠',String(t.error_code??0),'错误码']];metrics.forEach(([i,v,n])=>{const d=make('div','metric');d.append(make('div','icon',i),make('div','value',v),make('div','name',n));grid.append(d)});const line=make('div','statusline');line.append(make('span','badge '+(link.connected===false?'bad':'good'),link.connected===false?'相机断开':'相机在线'),make('span','badge good','控制输出阻断'),make('span','badge','图节点 '+(s.graph?.node_count??0)),make('span','badge','候选 '+((s.navigation?.candidates?.candidates||[]).length)));const box=q('#go2');box.replaceChildren(grid,line);q('#stamp').textContent='帧 '+(s.frame_seq??'--')+' · '+new Date().toLocaleTimeString()}
+async function refresh(){try{const r=await fetch('/api/state-summary?ts='+Date.now(),{cache:'no-store'}),s=await r.json();renderEvents('#m1',s.mllm?.M1,'M1');renderEvents('#m2',s.mllm?.M2,'M2');renderM3(s.m3||{});renderGo2(s)}catch(e){q('#stamp').textContent='刷新失败';q('#go2').replaceChildren(make('div','empty',clip(e,100)))}}
+setInterval(refresh,1000);refresh();
+</script></html>"""
 
 
 def _compact_qwen_context(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -649,7 +814,7 @@ class PhysicalGateway:
                     with handler.frame_lock: handler.latest_jpeg = frame
                 except Exception as exc:
                     self.state.last_error = str(exc)
-                time.sleep(.5)
+                time.sleep(.2)
         threading.Thread(target=render_loop, daemon=True).start()
         if self.qwen is not None and self.qwen_auto_interval > 0:
             def qwen_loop() -> None:

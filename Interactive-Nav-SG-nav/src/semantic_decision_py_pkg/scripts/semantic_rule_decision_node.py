@@ -412,6 +412,9 @@ class SemanticRuleDecisionNode:
                 pre_score_guard_margin=float(
                     model_config.get("pre_score_guard_margin", 0.75)
                 ),
+                subgoal_interaction_semantic_types=tuple(
+                    model_config.get("subgoal_interaction_semantic_types", [])
+                ),
             )
         )
         self.candidate_curator = CandidateCurator(
