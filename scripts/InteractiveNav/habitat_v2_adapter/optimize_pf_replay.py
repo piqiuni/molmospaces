@@ -6,9 +6,32 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SEMANTIC_MAPPING_SCRIPTS = (
+    REPO_ROOT
+    / "Interactive-Nav-SG-nav"
+    / "src"
+    / "semantic_mapping_py_pkg"
+    / "scripts"
+)
+if str(SEMANTIC_MAPPING_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SEMANTIC_MAPPING_SCRIPTS))
+
+from semantic_mapping_py_pkg.detection_filter import DetectionFilter, load_detection_filter_config
+
+DEFAULT_DETECTOR_CONFIG = (
+    REPO_ROOT
+    / "Interactive-Nav-SG-nav"
+    / "src"
+    / "semantic_mapping_py_pkg"
+    / "config"
+    / "default.yaml"
+)
 
 
 REGION_LABELS = {
@@ -37,16 +60,6 @@ TASK_OBJECT_LABELS = {
     "shelf", "locker", "sink", "toilet", "stove", "microwave", "storage box", "box", "person",
     "table", "workbench", "whiteboard", "mirror", "bathroom mirror", "air conditioning", "dish washer",
     "window screen",
-}
-# Conservative replay exclusions: these labels are frequent PF false positives
-# in the mobile sequence (mirrors and ceiling-mounted lighting), not navigation
-# targets.  Keep light_switch available as a potential interaction object.
-EXCLUDED_NON_TARGET_LABELS = {
-    "mirror", "bathroom mirror", "vanity mirror", "wall mirror",
-    "lamp", "lamp shade", "ceiling light", "ceiling lamp", "chandelier",
-    "pendant light", "light fixture", "downlight", "spotlight",
-    "ceiling fixture",
-    "extrude", "extruded", "extrusion",
 }
 ALIAS_GROUPS = {
     "television": {"television", "tv", "tv monitor", "tv_monitor", "monitor", "screen"},
@@ -85,17 +98,31 @@ def is_region_label(raw: str, canonical: str) -> bool:
     return bool(words & REGION_TOKENS) and not bool(words & OBJECT_TOKENS)
 
 
-def optimize_detections(detections: list[dict], width: int, height: int, threshold: float, profile: str = "scene") -> list[dict]:
+def optimize_detections(
+    detections: list[dict],
+    width: int,
+    height: int,
+    threshold: float,
+    profile: str = "scene",
+    detection_filter: DetectionFilter | None = None,
+) -> list[dict]:
+    if detection_filter is not None:
+        normalized = []
+        for detection in detection_filter.apply(detections):
+            item = dict(detection)
+            item["label"] = item.get("semantic_class", item.get("label", ""))
+            item["raw_label"] = item.get("semantic_class_raw", item.get("raw_label", item["label"]))
+            normalized.append(item)
+        detections = normalized
     candidates = []
     image_area = float(width * height)
     for original in detections:
         confidence = float(original.get("confidence", 0.0))
         if confidence < threshold:
             continue
-        raw = str(original.get("label", "")).casefold().replace("_", " ").strip()
-        canonical = canonical_label(raw)
-        if raw in EXCLUDED_NON_TARGET_LABELS or canonical in EXCLUDED_NON_TARGET_LABELS:
-            continue
+        raw = str(original.get("raw_label", original.get("label", ""))).casefold().replace("_", " ").strip()
+        semantic = str(original.get("label", raw)).casefold().replace("_", " ").strip()
+        canonical = canonical_label(semantic)
         if profile == "interaction" and raw not in TASK_OBJECT_LABELS and canonical not in TASK_OBJECT_LABELS:
             continue
         box = [float(value) for value in original["bbox_xyxy"]]
@@ -139,8 +166,10 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.35)
     parser.add_argument("--source-name", default="YOLOE-26l PF")
     parser.add_argument("--profile", choices=("scene", "interaction"), default="interaction")
+    parser.add_argument("--detector-config", type=Path, default=DEFAULT_DETECTOR_CONFIG)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    detection_filter = DetectionFilter(load_detection_filter_config(args.detector_config))
     rows = [json.loads(line) for line in args.input_jsonl.read_text().splitlines() if line.strip()]
     optim_rows = []
     stats = {str(value): {"frames_with_boxes": 0, "boxes": 0} for value in (0.25, 0.35, 0.45, 0.55)}
@@ -152,10 +181,10 @@ def main() -> None:
             raise RuntimeError(row["source"])
         height, width = image.shape[:2]
         for key in stats:
-            detections = optimize_detections(row["detections"], width, height, float(key), args.profile)
+            detections = optimize_detections(row["detections"], width, height, float(key), args.profile, detection_filter)
             stats[key]["frames_with_boxes"] += int(bool(detections))
             stats[key]["boxes"] += len(detections)
-        detections = optimize_detections(row["detections"], width, height, args.threshold, args.profile)
+        detections = optimize_detections(row["detections"], width, height, args.threshold, args.profile, detection_filter)
         optim_rows.append({"index": row["index"], "source": row["source"], "latency_ms": row.get("latency_ms", 0.0), "detections": detections})
         cv2.imwrite(str(box_dir / f"frame_{int(row['index']):04d}.jpg"), draw(image, detections, f"{args.source_name} OPT conf>={args.threshold:.2f}"), [cv2.IMWRITE_JPEG_QUALITY, 96])
     labels = {}
@@ -169,7 +198,7 @@ def main() -> None:
         "frames_with_boxes": sum(bool(row["detections"]) for row in optim_rows),
         "label_counts": dict(sorted(labels.items(), key=lambda item: (-item[1], item[0]))),
         "threshold_sweep": stats,
-        "rules": {"region_labels_removed": sorted(REGION_LABELS), "excluded_non_target_labels": sorted(EXCLUDED_NON_TARGET_LABELS), "class_aware_iou": 0.45, "large_box_area_ratio_removed": 0.68},
+        "rules": {"detector_config": str(args.detector_config), "region_labels_removed": sorted(REGION_LABELS), "class_aware_iou": 0.45, "large_box_area_ratio_removed": 0.68},
     }
     with (args.output_dir / "detections.jsonl").open("w", encoding="utf-8") as handle:
         for row in optim_rows:

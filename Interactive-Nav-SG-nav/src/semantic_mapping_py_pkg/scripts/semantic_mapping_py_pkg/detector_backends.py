@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from .geometry_utils import point_dict, transform_point_with_snapshot, transform_points_with_snapshot
+from .detection_filter import DetectionFilter
 
 
 def _normalize_label(value):
@@ -702,6 +703,19 @@ class RawDetectionProvider:
         raise NotImplementedError
 
 
+class FilteredRawDetectionProvider(RawDetectionProvider):
+    """Apply the model-perception filter before any 3D projection backend."""
+
+    def __init__(self, provider, filter_config=None):
+        self.provider = provider
+        self.detection_filter = DetectionFilter(filter_config)
+
+    def detect_2d(self, rgb_image, depth_image, camera_info, stamp):
+        return self.detection_filter.apply(
+            self.provider.detect_2d(rgb_image, depth_image, camera_info, stamp)
+        )
+
+
 class NoDetectionDetector(ObjectDetectorBackend):
     def detect(self, rgb_image, depth_image, camera_info, stamp, frame_id, tf_snapshot=None):
         return []
@@ -776,6 +790,7 @@ class YoloeLocalProvider(RawDetectionProvider):
         max_detections=50,
         keep_unknown_open_set=False,
         class_mapping=None,
+        class_aliases=None,
     ):
         self.model_path = str(model_path)
         self.confidence_threshold = float(confidence_threshold)
@@ -785,6 +800,13 @@ class YoloeLocalProvider(RawDetectionProvider):
         self.max_detections = max(1, int(max_detections))
         self.keep_unknown_open_set = bool(keep_unknown_open_set)
         self.class_mapping = _load_mapping_config(class_mapping)
+        self.class_mapping.update(
+            {
+                _normalize_label(source): _normalize_label(target)
+                for source, target in (class_aliases or {}).items()
+                if source and target
+            }
+        )
         self._model = None
         self.mask_component_min_area = 48
         self.mask_component_max_area_ratio = 0.85
@@ -1210,8 +1232,9 @@ class SamBox3DDetector(ObjectDetectorBackend):
 
 def make_raw_detection_provider(kind, config):
     kind = str(kind or "external_http").strip().lower()
+    filter_config = config.get("detection_filter", {}) or {}
     if kind == "yoloe_local":
-        return YoloeLocalProvider(
+        provider = YoloeLocalProvider(
             model_path=config.get(
                 "model_path",
                 "/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26x-seg-pf.pt",
@@ -1223,14 +1246,17 @@ def make_raw_detection_provider(kind, config):
             max_detections=config.get("max_detections", 50),
             keep_unknown_open_set=config.get("keep_unknown_open_set", False),
             class_mapping=config.get("class_mapping", {}),
+            class_aliases=filter_config.get("aliases", {}),
         )
-    if kind == "external_http":
-        return ExternalHttpProvider(
+    elif kind == "external_http":
+        provider = ExternalHttpProvider(
             config.get("external_url", "http://127.0.0.1:8000/detect"),
             timeout=config.get("timeout", 5.0),
             include_depth=config.get("include_depth", False),
         )
-    return MockEmptyProvider()
+    else:
+        provider = MockEmptyProvider()
+    return FilteredRawDetectionProvider(provider, filter_config)
 
 
 def make_detector_backend(kind, config, frames=None):

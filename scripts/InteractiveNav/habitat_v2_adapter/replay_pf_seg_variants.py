@@ -5,7 +5,8 @@ import argparse, hashlib, json, time
 from pathlib import Path
 import cv2, numpy as np
 
-from optimize_pf_replay import optimize_detections
+from optimize_pf_replay import DEFAULT_DETECTOR_CONFIG, optimize_detections
+from semantic_mapping_py_pkg.detection_filter import DetectionFilter, load_detection_filter_config
 
 def draw(image, detections, masks, title):
     canvas=image.copy(); overlay=canvas.copy(); h,w=image.shape[:2]
@@ -26,10 +27,11 @@ def draw(image, detections, masks, title):
     return canvas
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--frames-dir',type=Path,required=True); ap.add_argument('--weight',type=Path,required=True); ap.add_argument('--output-dir',type=Path,required=True); ap.add_argument('--device',default='cuda:0'); ap.add_argument('--imgsz',type=int,default=640); ap.add_argument('--infer-conf',type=float,default=.25); ap.add_argument('--max-det',type=int,default=60); ap.add_argument('--profile',choices=('raw','interaction'),default='interaction'); ap.add_argument('--thresholds',default='.25,.35,.45,.55'); ap.add_argument('--name',default='YOLOE PF')
+    ap=argparse.ArgumentParser(); ap.add_argument('--frames-dir',type=Path,required=True); ap.add_argument('--weight',type=Path,required=True); ap.add_argument('--output-dir',type=Path,required=True); ap.add_argument('--device',default='cuda:0'); ap.add_argument('--imgsz',type=int,default=640); ap.add_argument('--infer-conf',type=float,default=.25); ap.add_argument('--max-det',type=int,default=60); ap.add_argument('--profile',choices=('raw','interaction'),default='interaction'); ap.add_argument('--thresholds',default='.25,.35,.45,.55'); ap.add_argument('--name',default='YOLOE PF'); ap.add_argument('--detector-config',type=Path,default=DEFAULT_DETECTOR_CONFIG)
     a=ap.parse_args(); a.output_dir.mkdir(parents=True,exist_ok=True)
     paths=sorted([p for p in a.frames_dir.iterdir() if p.suffix.lower() in {'.jpg','.jpeg','.png','.webp'}])
     if not paths: raise SystemExit('no frames')
+    detection_filter=DetectionFilter(load_detection_filter_config(a.detector_config))
     import torch
     from ultralytics import YOLOE
     model=YOLOE(str(a.weight)); warm=cv2.imread(str(paths[0]));
@@ -54,7 +56,7 @@ def main():
             selected=[d for d in all_d if d['confidence']>=threshold]
             if a.profile=='interaction':
                 # optimize_detections performs canonicalization, filtering and class-aware NMS.
-                selected=optimize_detections(selected,image.shape[1],image.shape[0],threshold,'interaction')
+                selected=optimize_detections(selected,image.shape[1],image.shape[0],threshold,'interaction',detection_filter)
             stat=threshold_stats[str(threshold)]
             stat['frames_with_boxes'] += int(bool(selected))
             stat['boxes'] += len(selected)
@@ -71,6 +73,6 @@ def main():
         rows.append({'index':index,'source':str(path),'latency_ms':ms,'raw_detections':len(all_d)})
     for stat in threshold_stats.values():
         stat['label_counts']=dict(sorted(stat['label_counts'].items(), key=lambda kv:(-kv[1],kv[0])))
-    summary={'model':a.name,'weight':str(a.weight),'weight_sha256':hashlib.sha256(a.weight.read_bytes()).hexdigest(),'frames':len(rows),'profile':a.profile,'thresholds':thresholds,'threshold_summary':threshold_stats,'latency_p50_ms':float(np.median(lat)),'latency_p95_ms':float(np.percentile(lat,95)),'latency_mean_ms':float(np.mean(lat)),'peak_vram_allocated_mib':torch.cuda.max_memory_allocated()/2**20 if torch.cuda.is_available() else 0.0,'peak_vram_reserved_mib':torch.cuda.max_memory_reserved()/2**20 if torch.cuda.is_available() else 0.0}
+    summary={'model':a.name,'weight':str(a.weight),'weight_sha256':hashlib.sha256(a.weight.read_bytes()).hexdigest(),'frames':len(rows),'profile':a.profile,'detector_config':str(a.detector_config),'thresholds':thresholds,'threshold_summary':threshold_stats,'latency_p50_ms':float(np.median(lat)),'latency_p95_ms':float(np.percentile(lat,95)),'latency_mean_ms':float(np.mean(lat)),'peak_vram_allocated_mib':torch.cuda.max_memory_allocated()/2**20 if torch.cuda.is_available() else 0.0,'peak_vram_reserved_mib':torch.cuda.max_memory_reserved()/2**20 if torch.cuda.is_available() else 0.0}
     (a.output_dir/'summary.json').write_text(json.dumps(summary,indent=2)); (a.output_dir/'timing.jsonl').write_text('\n'.join(json.dumps(r) for r in rows)+'\n'); print(json.dumps(summary,indent=2))
 if __name__=='__main__': main()
