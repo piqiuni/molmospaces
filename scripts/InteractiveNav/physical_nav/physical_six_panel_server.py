@@ -435,6 +435,14 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._json(self.state.raw_frame()); return
         if path == "/api/health":
             snapshot = self.state.snapshot(); self._json({"ok": bool(snapshot["frame_seq"] >= 0), "read_only": True, "frame_seq": snapshot["frame_seq"], "generated_at": snapshot["generated_at"]}); return
+        if path == "/snapshot.jpg":
+            # Short-lived JPEG requests are more reliable than a long-lived
+            # multipart stream through some LAN proxies/browser setups.
+            with self.frame_lock:
+                frame = self.latest_jpeg
+            if not frame:
+                self._json({"ok": False, "error": "frame not ready"}, 503); return
+            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(frame))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(frame); return
         if path == "/stream.mjpg":
             # Browser refreshes can leave an old multipart request half-open.
             # A write timeout ensures those abandoned stream threads are
@@ -474,8 +482,8 @@ class _WebHandler(BaseHTTPRequestHandler):
 _HTML = """<!doctype html><meta charset='utf-8'><title>Go2 Physical Interactive Navigation</title>
 <style>body{font-family:monospace;background:#111;color:#eee;margin:12px}img{max-width:100%;border:1px solid #555}pre{white-space:pre-wrap;max-height:420px;overflow:auto;background:#1b1b1b;padding:10px}.grid{display:grid;grid-template-columns:2fr 1fr;gap:12px}.ok{color:#5f5}.warn{color:#fc3}</style>
 <h2>Go2 Physical Interactive Navigation <span class='warn'>READ_ONLY_BLOCKED</span></h2>
-<div class='grid'><div><img id='stream' src='/stream.mjpg'></div><div><h3>状态 / Qwen / Graph</h3><pre id='state'>loading...</pre><input id='prompt' size='40' value='请分析当前全局语义图和感知一致性'><button onclick="askQwen()">请求 Qwen</button><br><button onclick="intent('STOP')">STOP（仅记录）</button><button onclick="intent('MOVE_FORWARD')">前进意图（阻断）</button></div></div>
-<script>const stream=document.querySelector('#stream');let lastSeq=-1,lastSeqAt=Date.now();function reconnectStream(){stream.src='/stream.mjpg?ts='+Date.now()}stream.onerror=()=>setTimeout(reconnectStream,500);async function refresh(){try{let r=await fetch('/api/state?ts='+Date.now(),{cache:'no-store'});let s=await r.json();document.querySelector('#state').textContent=JSON.stringify(s,null,2);if(s.frame_seq!==lastSeq){lastSeq=s.frame_seq;lastSeqAt=Date.now()}else if(Date.now()-lastSeqAt>5000){reconnectStream();lastSeqAt=Date.now()}}catch(e){document.querySelector('#state').textContent=e;reconnectStream()}}async function intent(a){await fetch('/api/teleop-intent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a,source:'web'})});refresh()}async function askQwen(){await fetch('/api/qwen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:document.querySelector('#prompt').value})});refresh()}setInterval(refresh,1000);refresh()</script>"""
+<div class='grid'><div><img id='stream' src='/snapshot.jpg'></div><div><h3>状态 / Qwen / Graph</h3><pre id='state'>loading...</pre><input id='prompt' size='40' value='请分析当前全局语义图和感知一致性'><button onclick="askQwen()">请求 Qwen</button><br><button onclick="intent('STOP')">STOP（仅记录）</button><button onclick="intent('MOVE_FORWARD')">前进意图（阻断）</button></div></div>
+<script>const stream=document.querySelector('#stream');let lastSeq=-1,lastSeqAt=Date.now();function refreshImage(){stream.src='/snapshot.jpg?ts='+Date.now()}stream.onerror=()=>setTimeout(refreshImage,300);async function refresh(){try{let r=await fetch('/api/state?ts='+Date.now(),{cache:'no-store'});let s=await r.json();document.querySelector('#state').textContent=JSON.stringify(s,null,2);if(s.frame_seq!==lastSeq){lastSeq=s.frame_seq;lastSeqAt=Date.now()}else if(Date.now()-lastSeqAt>5000){refreshImage();lastSeqAt=Date.now()}}catch(e){document.querySelector('#state').textContent=e;refreshImage()}}async function intent(a){await fetch('/api/teleop-intent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a,source:'web'})});refresh()}async function askQwen(){await fetch('/api/qwen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:document.querySelector('#prompt').value})});refresh()}setInterval(refresh,1000);setInterval(refreshImage,500);refresh();refreshImage()</script>"""
 
 
 def _compact_qwen_context(snapshot: dict[str, Any]) -> dict[str, Any]:
