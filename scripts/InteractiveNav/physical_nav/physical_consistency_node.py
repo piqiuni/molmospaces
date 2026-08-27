@@ -106,9 +106,9 @@ def main() -> None:
     args = type("ConsistencyArgs", (), {
         "camera_frame": str(rospy.get_param("~camera_frame", "d435i_color_optical_frame")),
         "world_frame": str(rospy.get_param("~world_frame", "tf_frame_map")),
-        "camera_x": float(rospy.get_param("~camera_x", 0.0)),
+        "camera_x": float(rospy.get_param("~camera_x", 0.03)),
         "camera_y": float(rospy.get_param("~camera_y", 0.0)),
-        "camera_z": float(rospy.get_param("~camera_z", 0.0)),
+        "camera_z": float(rospy.get_param("~camera_z", 0.75)),
         "camera_roll": float(rospy.get_param("~camera_roll", 0.0)),
         "camera_pitch": float(rospy.get_param("~camera_pitch", 0.0)),
         "camera_yaw": float(rospy.get_param("~camera_yaw", 0.0)),

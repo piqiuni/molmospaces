@@ -24,6 +24,13 @@ The Go2 client has no motion publisher or control client. Keyboard/web commands
 are handled by `ReadOnlySafetyGate`, recorded as `READ_ONLY_BLOCKED`, and never
 sent to the robot.
 
+The current measured standing-pose camera extrinsic is used by default:
+`base -> camera = (x=+0.03 m, y=0 m, z=+0.75 m)` with zero roll/pitch/yaw.
+This interprets the 38 cm camera location as 3 cm forward of the 70 cm body
+centre; the separately reported 1.18 m camera-to-ground height implies an
+approximately 0.43 m base-to-ground offset. Override the six
+`PHYSICAL_NAV_CAMERA_*` variables if the mounting reference is different.
+
 ## Start on the policy machine
 
 Install the side-specific transport dependencies first. The Go2 image uses
@@ -99,10 +106,10 @@ image, `/api/state` includes raw detections, `mapped_detections` after TF
 alignment, graph, telemetry, consistency and Qwen request/result history, and
 `/api/health` is suitable for a smoke test.
 
-Before trusting map-frame 3-D geometry, set the measured D435i-to-base
-extrinsic through `PHYSICAL_NAV_CAMERA_X/Y/Z/ROLL/PITCH/YAW` (metres/radians). The
-defaults are identity solely for protocol smoke tests; they are not a camera
-calibration.
+Before trusting map-frame 3-D geometry, verify the measured D435i-to-base
+extrinsic through `PHYSICAL_NAV_CAMERA_X/Y/Z/ROLL/PITCH/YAW` (metres/radians).
+The defaults are the current Go2 standing-pose measurement above; override them
+when the camera mount or base-frame convention changes.
 
 ## Qwen over SSH
 

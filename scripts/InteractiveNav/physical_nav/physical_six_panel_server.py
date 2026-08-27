@@ -7,6 +7,7 @@ import argparse
 import base64
 import io
 import json
+import math
 import threading
 import time
 import urllib.parse
@@ -85,7 +86,7 @@ class SixPanelRenderer:
         return panel
 
     def _detection_panel(self, rgb: Any, detections: list[dict[str, Any]]) -> Any:
-        panel = self._image_panel(rgb, "YOLOE-26l PF Seg")
+        panel = self._image_panel(rgb, f"3 Original M1 / YOLOE detections | n={len(detections)}")
         if rgb is None:
             return panel
         sx, sy = self.width / rgb.shape[1], self.height / rgb.shape[0]
@@ -100,6 +101,18 @@ class SixPanelRenderer:
             cv2.putText(panel, text, (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, .48, color, 1)
         return panel
 
+    def _depth_panel(self, depth: Any, depth_scale: float) -> Any:
+        if depth is None:
+            return self._placeholder("2 Public depth | clearance=N/A")
+        valid = np.asarray(depth) > 0
+        clearance = 0.0
+        if np.any(valid):
+            center = np.asarray(depth)[..., max(0, np.asarray(depth).shape[1] // 2 - 8): np.asarray(depth).shape[1] // 2 + 8]
+            center_valid = center > 0
+            if np.any(center_valid):
+                clearance = float(np.median(center[center_valid])) * float(depth_scale)
+        return self._image_panel(depth, f"2 Public depth | clearance={clearance:.2f}m")
+
     def _json_panel(self, title: str, value: Any) -> Any:
         panel = self._placeholder(title)
         lines = json.dumps(value, ensure_ascii=False, indent=2, default=str).splitlines()[:16]
@@ -109,14 +122,14 @@ class SixPanelRenderer:
 
     def _map_panel(self, occupancy: Any, telemetry: dict[str, Any]) -> Any:
         if not isinstance(occupancy, dict) or not occupancy.get("data"):
-            return self._json_panel("Occupancy / pose", telemetry)
+            return self._json_panel("4 Public RGB-D occupancy / route", telemetry)
         panel = np.full((self.height, self.width, 3), 127, dtype=np.uint8)
         width, height = int(occupancy.get("width", 0)), int(occupancy.get("height", 0)); values = np.asarray(occupancy.get("data", []), dtype=np.int16)
         if width > 0 and height > 0 and values.size >= width * height:
             grid = values[:width * height].reshape(height, width); image = np.full((height, width, 3), 127, dtype=np.uint8)
             image[grid == 0] = (235, 235, 235); image[grid > 50] = (30, 30, 30)
             panel = cv2.resize(image, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
-        cv2.putText(panel, "Occupancy / pose", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, .8, (0, 255, 255), 2)
+        cv2.putText(panel, "4 Public RGB-D occupancy / route | no-control", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 255, 255), 2)
         pose = telemetry.get("position", [0, 0, 0]); cv2.putText(panel, f"pose={pose[:2]} yaw={telemetry.get('yaw', '?')}", (12, self.height - 15), cv2.FONT_HERSHEY_PLAIN, 1.1, (0, 100, 255), 1)
         return panel
 
@@ -138,7 +151,59 @@ class SixPanelRenderer:
                 key = str(node.get("id", node.get("node_id", nodes.index(node)))); xy = positions.get(key); 
                 if not xy: continue
                 kind = str(node.get("type", node.get("node_type", "object"))); color = {"room": (255, 160, 30), "portal": (30, 220, 255), "container": (180, 80, 220), "support": (200, 200, 60)}.get(kind, (60, 220, 80)); px = point(*xy); cv2.circle(panel, px, 7, color, -1); cv2.putText(panel, str(node.get("label", key))[:18], (px[0] + 8, px[1]), cv2.FONT_HERSHEY_PLAIN, .9, color, 1)
-        cv2.putText(panel, f"Global semantic graph  nodes={len(nodes)} edges={len(edges)}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 255, 255), 2)
+        cv2.putText(panel, f"5 Original semantic graph / room context | nodes={len(nodes)} edges={len(edges)}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, .52, (0, 255, 255), 2)
+        return panel
+
+    def _topdown_panel(self, occupancy: Any, graph: dict[str, Any], telemetry: dict[str, Any], consistency: dict[str, Any]) -> Any:
+        """Physical replacement for the canonical six-panel topdown/GT view.
+
+        The simulator's panel 6 is explicitly posthoc GT.  A real Go2 has no
+        GT target stream, so this panel keeps the same slot and layout while
+        showing the public map-frame audit: occupancy, robot pose and mapped
+        semantic nodes. Detailed consistency metrics remain in the side panel.
+        """
+        if not isinstance(occupancy, dict) or not occupancy.get("data"):
+            return self._json_panel("6 Physical topdown / map audit", consistency)
+        width, height = int(occupancy.get("width", 0)), int(occupancy.get("height", 0))
+        values = np.asarray(occupancy.get("data", []), dtype=np.int16)
+        if width <= 0 or height <= 0 or values.size < width * height:
+            return self._json_panel("6 Physical topdown / map audit", consistency)
+        grid = values[: width * height].reshape(height, width)
+        canvas = np.full((height, width, 3), 127, dtype=np.uint8)
+        canvas[grid == 0] = (235, 235, 235)
+        canvas[grid > 50] = (25, 25, 25)
+        origin = occupancy.get("origin") if isinstance(occupancy.get("origin"), dict) else {}
+        resolution = float(occupancy.get("resolution", 0.05) or 0.05)
+        ox, oy = float(origin.get("x", 0.0) or 0.0), float(origin.get("y", 0.0) or 0.0)
+
+        def world_pixel(value: Any) -> tuple[int, int] | None:
+            point = _point_xy(value)
+            if point is None or resolution <= 0:
+                return None
+            px = int(round((point[0] - ox) / resolution))
+            py = int(round(height - 1 - (point[1] - oy) / resolution))
+            return (px, py) if 0 <= px < width and 0 <= py < height else None
+
+        robot = world_pixel(telemetry.get("position"))
+        if robot is not None:
+            cv2.circle(canvas, robot, max(3, min(width, height) // 90), (0, 0, 255), -1)
+            yaw = _safe_float(telemetry.get("yaw"))
+            tip = (int(robot[0] + 18 * math.cos(yaw)), int(robot[1] - 18 * math.sin(yaw)))
+            cv2.arrowedLine(canvas, robot, tip, (255, 80, 0), 2, tipLength=0.3)
+        for node in graph.get("nodes", []) if isinstance(graph, dict) else []:
+            if not isinstance(node, dict):
+                continue
+            point = world_pixel(node.get("centroid") or node.get("aabb_center") or node.get("world_position") or node.get("position"))
+            if point is None:
+                continue
+            kind = str(node.get("type", node.get("node_type", "object")))
+            color = {"room": (255, 160, 30), "portal": (30, 220, 255), "container": (180, 80, 220)}.get(kind, (60, 190, 80))
+            cv2.circle(canvas, point, max(2, min(width, height) // 140), color, -1)
+        panel = cv2.resize(canvas, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+        status = str(consistency.get("status", "waiting")) if isinstance(consistency, dict) else "waiting"
+        counts = consistency.get("counts", {}) if isinstance(consistency, dict) else {}
+        cv2.putText(panel, f"6 Physical topdown / map audit | consistency={status}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, .58, (0, 255, 255), 2)
+        cv2.putText(panel, f"pass={counts.get('pass', 0)} warn={counts.get('warn', 0)} fail={counts.get('fail', 0)}", (12, self.height - 15), cv2.FONT_HERSHEY_PLAIN, 1.1, (0, 180, 255), 1)
         return panel
 
     def render(self) -> bytes:
@@ -148,10 +213,10 @@ class SixPanelRenderer:
             rgb, depth = self.state.rgb, self.state.depth
             detections, graph, consistency, occupancy = list(self.state.detections), dict(self.state.graph), dict(self.state.consistency), self.state.occupancy
             telemetry = dict(self.state.telemetry)
-        panels = [self._image_panel(rgb, "Go2 / D435i RGB"), self._image_panel(depth, "D435i Depth"),
+            frame_seq, depth_scale = self.state.frame_seq, self.state.depth_scale
+        panels = [self._image_panel(rgb, f"1 RGB | target=physical-readonly | step={frame_seq}"), self._depth_panel(depth, depth_scale),
                   self._detection_panel(rgb, detections), self._map_panel(occupancy, telemetry),
-                  self._graph_panel(graph),
-                  self._json_panel("Perception-map consistency", consistency)]
+                  self._graph_panel(graph), self._topdown_panel(occupancy, graph, telemetry, consistency)]
         canvas = np.vstack([np.hstack(panels[:3]), np.hstack(panels[3:])])
         ok, encoded = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 82])
         if not ok:
@@ -319,7 +384,7 @@ def _compact_telemetry(telemetry: Any) -> dict[str, Any]:
 
 
 class PhysicalGateway:
-    def __init__(self, host: str, port: int, qwen_url: str = "", qwen_model: str = "qwen3.6-35b-a3b-fp8", camera_parent: str = "tf_frame_base_link", camera_x: float = 0.0, camera_y: float = 0.0, camera_z: float = 0.0, camera_roll: float = 0.0, camera_pitch: float = 0.0, camera_yaw: float = 0.0, qwen_auto_interval: float = 0.0) -> None:
+    def __init__(self, host: str, port: int, qwen_url: str = "", qwen_model: str = "qwen3.6-35b-a3b-fp8", camera_parent: str = "tf_frame_base_link", camera_x: float = 0.03, camera_y: float = 0.0, camera_z: float = 0.75, camera_roll: float = 0.0, camera_pitch: float = 0.0, camera_yaw: float = 0.0, qwen_auto_interval: float = 0.0) -> None:
         self.host, self.port = host, port
         self.state, self.gate = RuntimeState(), ReadOnlySafetyGate()
         self.renderer = SixPanelRenderer(self.state)
@@ -432,7 +497,7 @@ def main() -> None:
     p.add_argument("--qwen-model", default="qwen3.6-35b-a3b-fp8")
     p.add_argument("--qwen-auto-interval", type=float, default=0.0, help="seconds; 0 disables periodic graph review")
     p.add_argument("--camera-parent", default="tf_frame_base_link")
-    p.add_argument("--camera-x", type=float, default=0.0); p.add_argument("--camera-y", type=float, default=0.0); p.add_argument("--camera-z", type=float, default=0.0); p.add_argument("--camera-roll", type=float, default=0.0); p.add_argument("--camera-pitch", type=float, default=0.0); p.add_argument("--camera-yaw", type=float, default=0.0)
+    p.add_argument("--camera-x", type=float, default=0.03); p.add_argument("--camera-y", type=float, default=0.0); p.add_argument("--camera-z", type=float, default=0.75); p.add_argument("--camera-roll", type=float, default=0.0); p.add_argument("--camera-pitch", type=float, default=0.0); p.add_argument("--camera-yaw", type=float, default=0.0)
     args = p.parse_args()
     try:
         import asyncio; asyncio.run(run_gateway(args))

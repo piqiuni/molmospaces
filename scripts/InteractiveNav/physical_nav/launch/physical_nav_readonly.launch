@@ -3,7 +3,7 @@
   <arg name="config_file" default="$(find physical_nav)/config/physical_nav.yaml"/>
   <arg name="model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"/>
   <arg name="device" default="cuda:0"/>
-  <arg name="camera_x" default="0.0"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.0"/>
+  <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.75"/>
   <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.0"/><arg name="camera_yaw" default="0.0"/>
   <arg name="ros_python" default="/usr/bin/python3"/>
   <arg name="start_mapping" default="true"/>

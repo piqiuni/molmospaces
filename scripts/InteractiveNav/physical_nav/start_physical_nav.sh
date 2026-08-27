@@ -24,7 +24,11 @@ WS_PORT="${PHYSICAL_NAV_WS_PORT:-12334}"
 QWEN_URL="${PHYSICAL_NAV_QWEN_URL:-http://127.0.0.1:18080/v1}"
 QWEN_MODEL="${PHYSICAL_NAV_QWEN_MODEL:-qwen3.6-35b-a3b-fp8}"
 QWEN_AUTO_INTERVAL="${PHYSICAL_NAV_QWEN_AUTO_INTERVAL:-0}"
-CAMERA_X="${PHYSICAL_NAV_CAMERA_X:-0}"; CAMERA_Y="${PHYSICAL_NAV_CAMERA_Y:-0}"; CAMERA_Z="${PHYSICAL_NAV_CAMERA_Z:-0}"; CAMERA_ROLL="${PHYSICAL_NAV_CAMERA_ROLL:-0}"; CAMERA_PITCH="${PHYSICAL_NAV_CAMERA_PITCH:-0}"; CAMERA_YAW="${PHYSICAL_NAV_CAMERA_YAW:-0}"
+# Measured Go2 standing-pose calibration: camera is about 3 cm forward of
+# the base centre (38 cm from a 70 cm rear-to-front body) and 0.75 m above
+# the base. The base-to-ground offset is therefore about 0.43 m (1.18 m
+# camera height), which is not part of this base-frame extrinsic.
+CAMERA_X="${PHYSICAL_NAV_CAMERA_X:-0.03}"; CAMERA_Y="${PHYSICAL_NAV_CAMERA_Y:-0}"; CAMERA_Z="${PHYSICAL_NAV_CAMERA_Z:-0.75}"; CAMERA_ROLL="${PHYSICAL_NAV_CAMERA_ROLL:-0}"; CAMERA_PITCH="${PHYSICAL_NAV_CAMERA_PITCH:-0}"; CAMERA_YAW="${PHYSICAL_NAV_CAMERA_YAW:-0}"
 QWEN_TUNNEL_PID=""
 ROSCORE_PID=""
 YOLO_PID=""
