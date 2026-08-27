@@ -27,6 +27,15 @@ class _Task:
     env = _Env()
 
 
+class _DrawerEnv(_Env):
+    current_model = object()
+    current_data = object()
+
+
+class _DrawerTask:
+    env = _DrawerEnv()
+
+
 def _set_pose(x: float, y: float, yaw: float) -> None:
     cosine = math.cos(yaw)
     sine = math.sin(yaw)
@@ -38,6 +47,38 @@ def _set_pose(x: float, y: float, yaw: float) -> None:
             [0.0, 0.0, 0.0, 1.0],
         ],
         dtype=float,
+    )
+
+
+def test_drawer_scan_defaults_to_every_slide_joint(monkeypatch) -> None:
+    controller = AtomicForceInteractionController()
+    joints = [
+        {"joint_name": f"drawer_{index}", "joint_type": "slide"}
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        bridge,
+        "collect_articulation_groups",
+        lambda _env: {"dresser": {"joints": joints}},
+    )
+
+    controller._start_drawer_sequence(
+        _DrawerTask(),
+        {
+            "object_id": "dresser",
+            "sequence_type": "drawer_scan",
+            "open_regions": [
+                {"center": [0.5, 0.35]},
+                {"center": [0.5, 0.65]},
+            ],
+        },
+        step=10,
+    )
+
+    assert len(controller._pending["groups"]) == 4
+    assert all(
+        group["grounding_source"] == "simulator_all_slide_joints"
+        for group in controller._pending["groups"]
     )
 
 

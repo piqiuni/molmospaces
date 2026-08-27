@@ -1985,6 +1985,112 @@ def test_m1_face_selection_enumerates_aabb_cardinal_faces() -> None:
     assert axes == [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
 
 
+def test_container_anchors_are_filtered_to_the_target_room() -> None:
+    room_1 = {
+        "id": "room_1",
+        "type": "room",
+        "room_id": 1,
+        "aabb_center": [0.0, 0.0, 0.1],
+        "aabb_size": [10.0, 10.0, 0.2],
+    }
+    room_2 = {
+        "id": "room_2",
+        "type": "room",
+        "room_id": 2,
+        "aabb_center": [10.0, 0.0, 0.1],
+        "aabb_size": [10.0, 10.0, 0.2],
+    }
+    container = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "room_id": 1,
+        "aabb_center": [4.5, 0.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "state": "closed",
+            "state_confidence": 1.0,
+            "requires_interaction": True,
+            "is_interactable": True,
+        },
+        "attributes": {"category": "refrigerator"},
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_pre_action_mllm=True,
+            container_m1_face_selection_enabled=True,
+            container_anchor_shared_pose_enabled=True,
+        )
+    ).generate({}, {"nodes": [room_1, room_2, container]}, robot_xy=(0.0, 0.0))[0]
+
+    goals = candidate.metadata["container_staging_goal_xyyaw_candidates"]
+    assert goals
+    assert all(
+        CandidateGenerator._room_id_for_xy(
+            {"nodes": [room_1, room_2]}, (goal[0], goal[1])
+        )
+        == 1
+        for goal in goals
+    )
+    assert not any(
+        label.startswith("aabb_face_pos_x")
+        for label in candidate.metadata["interaction_approach_pose_labels"]
+    )
+
+
+def test_container_room_is_inferred_from_its_aabb_center_before_anchor_filtering() -> None:
+    room_1 = {
+        "id": "room_1",
+        "type": "room",
+        "room_id": 1,
+        "aabb_center": [0.0, 0.0, 0.1],
+        "aabb_size": [10.0, 10.0, 0.2],
+    }
+    room_2 = {
+        "id": "room_2",
+        "type": "room",
+        "room_id": 2,
+        "aabb_center": [10.0, 0.0, 0.1],
+        "aabb_size": [10.0, 10.0, 0.2],
+    }
+    container = {
+        "id": "container_fridge",
+        "type": "container",
+        "label": "fridge",
+        "aabb_center": [4.5, 0.0, 1.0],
+        "aabb_size": [1.0, 1.0, 2.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "interaction": {
+            "state": "closed",
+            "state_confidence": 1.0,
+            "requires_interaction": True,
+            "is_interactable": True,
+        },
+        "attributes": {"category": "refrigerator"},
+    }
+    candidate = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            container_pre_action_mllm=True,
+            container_m1_face_selection_enabled=True,
+            container_anchor_shared_pose_enabled=True,
+        )
+    ).generate({}, {"nodes": [room_1, room_2, container]}, robot_xy=(0.0, 0.0))[0]
+
+    assert candidate.metadata["target_room_id"] == 1
+    assert all(
+        CandidateGenerator._room_id_for_xy(
+            {"nodes": [room_1, room_2]}, (goal[0], goal[1])
+        )
+        == 1
+        for goal in candidate.metadata["container_staging_goal_xyyaw_candidates"]
+    )
+
+
 def test_oblique_mllm_container_view_uses_reobservation_ring_not_contact_axis() -> None:
     node = {
         "id": "container_fridge",

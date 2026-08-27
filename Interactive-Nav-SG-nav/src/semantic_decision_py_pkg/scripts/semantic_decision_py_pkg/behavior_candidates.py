@@ -1468,6 +1468,17 @@ class CandidateGenerator:
             )
             if position is None:
                 continue
+            if node_type == "container" and node_room_id is None:
+                node_room_id = self._room_id_for_xy(graph, position)
+                graph_has_rooms = any(
+                    str(graph_node.get("type") or "").casefold() == "room"
+                    for graph_node in (graph.get("nodes") or [])
+                )
+                if node_room_id is None and graph_has_rooms:
+                    # Without a target room there is no safe way to reject an
+                    # anchor across a wall.  Keep the graph target remembered,
+                    # but do not turn it into an executable interaction yet.
+                    continue
             object_distance = math.hypot(position[0] - robot_xy[0], position[1] - robot_xy[1])
             is_drawer_container = bool(
                 node_type == "container" and self._is_drawer_container(node)
@@ -1677,6 +1688,24 @@ class CandidateGenerator:
                     container_m1_face_selection
                 ),
             )
+            if node_type == "container" and node_room_id is not None:
+                same_room_goals: list[list[float]] = []
+                same_room_labels: list[str] = []
+                for goal, label in zip(goal_candidates, approach_pose_labels):
+                    anchor_room_id = self._room_id_for_xy(
+                        graph, (float(goal[0]), float(goal[1]))
+                    )
+                    if (
+                        anchor_room_id is not None
+                        and str(anchor_room_id).removeprefix("room_")
+                        == str(node_room_id).removeprefix("room_")
+                    ):
+                        same_room_goals.append(list(goal))
+                        same_room_labels.append(str(label))
+                goal_candidates = same_room_goals
+                approach_pose_labels = same_room_labels
+                if not goal_candidates:
+                    continue
             container_face_axes_by_staging = [
                 list(axis) if axis is not None else []
                 for axis in (

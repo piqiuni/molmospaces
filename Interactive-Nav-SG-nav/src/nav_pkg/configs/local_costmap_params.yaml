@@ -30,12 +30,10 @@ local_costmap:
        tf_filter_tolerance: 0.10
        max_observation_age: 0.0
        expected_update_rate: 0.0
-       # The head-camera cloud is refreshed every simulator step.  Retaining
-       # three seconds of old base-frame observations builds a ghost obstacle
-       # field while the robot turns or translates, which can seal an otherwise
-       # valid local continuation.  Keep one short clearing window instead:
-       # consistently observed physical obstacles remain marked, while stale
-       # depth surfaces age out before they become a planning wall.
+       # Retain the latest simulator-step cloud across the local costmap update
+       # cycles between sensor frames.  Door-specific clearing must not shorten
+       # this below the actual point-cloud interval, otherwise the obstacle
+       # layer repeatedly runs without an observation.
        observation_persistence: 0.5
        max_obstacle_height: 1.85
        min_obstacle_height: 0.05

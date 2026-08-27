@@ -1005,14 +1005,18 @@ class AtomicForceInteractionController:
                 body_id = int(model.jnt_bodyid[int(joint["joint_id"])])
             if body_id is not None:
                 body_heights[joint_name] = float(data.xpos[body_id][2])
+        sequence_type = str(command.get("sequence_type") or "drawer_scan").casefold()
+        if sequence_type not in {"drawer_scan", "drawer_open"}:
+            raise ValueError(f"Unsupported drawer interaction sequence: {sequence_type}")
+        # A scan is a complete container audit: enumerate every physical slide
+        # joint even when M1 returns an incomplete visible-region list.  A normal
+        # drawer_open remains limited to the explicitly grounded visual regions.
+        scan_all_drawers = sequence_type == "drawer_scan"
         groups = ground_drawer_open_regions(
             list(articulation.get("joints") or []),
-            list(command.get("open_regions") or []),
+            [] if scan_all_drawers else list(command.get("open_regions") or []),
             body_heights,
-            # An MLLM drawer_scan may operate only on front/handle regions it
-            # actually identified.  Do not silently convert an empty visual
-            # plan into a simulator-wide sweep of hidden drawers.
-            fallback_to_all=False,
+            fallback_to_all=scan_all_drawers,
         )
         if not groups:
             raise ValueError("drawer interaction requires at least one valid visible drawer region")
@@ -1029,9 +1033,6 @@ class AtomicForceInteractionController:
         selected_joint_names = [
             name for group in groups for name in group["joint_names"]
         ]
-        sequence_type = str(command.get("sequence_type") or "drawer_scan").casefold()
-        if sequence_type not in {"drawer_scan", "drawer_open"}:
-            raise ValueError(f"Unsupported drawer interaction sequence: {sequence_type}")
         preserve_open = sequence_type == "drawer_open"
         transition_steps = max(
             1,
