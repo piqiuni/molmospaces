@@ -51,6 +51,11 @@ except ImportError:  # pragma: no cover - useful for protocol-only testing
     np = None
 
 
+class _ReusableHTTPServer(ThreadingHTTPServer):
+    # Allow an immediate service restart after a browser/MJPEG disconnect.
+    allow_reuse_address = True
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         result = float(value)
@@ -617,7 +622,7 @@ class PhysicalGateway:
         # Store as a static callback; otherwise BaseHTTPRequestHandler binds
         # this closure as an instance method and adds an unwanted ``self``.
         handler.qwen_submit = staticmethod(submit_qwen)
-        self.http = ThreadingHTTPServer((self.host, self.port), handler)
+        self.http = _ReusableHTTPServer((self.host, self.port), handler)
         def render_loop() -> None:
             while True:
                 try:
