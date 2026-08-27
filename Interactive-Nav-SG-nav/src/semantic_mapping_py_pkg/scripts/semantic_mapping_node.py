@@ -208,6 +208,8 @@ class SemanticMappingNode:
             min_confirmations=config.get("object_min_confirmations", 2),
             size_match_ratio=config.get("object_size_match_ratio", 0.7),
             stable_history_size=config.get("object_stable_history_size", 5),
+            duplicate_bbox_iou_threshold=config.get("object_duplicate_bbox_iou_threshold", 0.0),
+            duplicate_3d_overlap_threshold=config.get("object_duplicate_3d_overlap_threshold", 0.15),
         )
         self.scene_store = SceneGridStore(
             unknown_id=scene_types.get("unknown_id", -1),

@@ -83,6 +83,8 @@ if [[ "${PHYSICAL_NAV_SKIP_ROS:-0}" == "1" ]]; then
 elif command -v roscore >/dev/null 2>&1 && command -v roslaunch >/dev/null 2>&1; then
   roslaunch "${ROOT_DIR}/launch/physical_nav_readonly.launch" \
     config_file:="${ROOT_DIR}/config/physical_nav.yaml" \
+    semantic_override_config:="${ROOT_DIR}/config/semantic_shadow_override.yaml" \
+    move_base_override_config:="${ROOT_DIR}/config/physical_move_base_override.yaml" \
     model_path:="${PHYSICAL_NAV_MODEL_PATH:-/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt}" \
     camera_x:="${CAMERA_X}" camera_y:="${CAMERA_Y}" camera_z:="${CAMERA_Z}" \
     camera_roll:="${CAMERA_ROLL}" camera_pitch:="${CAMERA_PITCH}" camera_yaw:="${CAMERA_YAW}" \

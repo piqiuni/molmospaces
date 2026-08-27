@@ -21,6 +21,9 @@ class RuntimeState:
         self.camera_frame = ""
         self.calibration: dict[str, Any] = {}
         self.frame_seq = -1
+        # Local 5 Hz navigation/viewer step. Unlike the Go2 sensor sequence,
+        # this starts from zero whenever the policy-side navigation restarts.
+        self.navigation_step = -1
         self.frame_stamp = 0.0
         self.sync_ms = None
         self.telemetry: dict[str, Any] = {}
@@ -60,6 +63,11 @@ class RuntimeState:
             for key, value in kwargs.items():
                 setattr(self, key, value)
             self.counters["frames"] += 1
+
+    def advance_navigation_step(self) -> int:
+        with self._lock:
+            self.navigation_step += 1
+            return self.navigation_step
 
     def set_calibration(self, **value: Any) -> None:
         with self._lock:
@@ -116,6 +124,7 @@ class RuntimeState:
         with self._lock:
             return {
                 "frame_seq": self.frame_seq,
+                "navigation_step": self.navigation_step,
                 "frame_stamp": self.frame_stamp,
                 "camera_frame": self.camera_frame,
                 "calibration": copy.deepcopy(self.calibration),

@@ -71,7 +71,7 @@ class PhysicalRosGateway:
             ("/semantic_decision/execution_state", "execution_state"),
             ("/semantic_decision/behavior_feedback", "behavior_feedback"),
             ("/semantic_decision/decision_trace", "decision_trace"),
-            ("/semantic_mapping/interaction_result", "interaction_result"),
+            ("/physical_nav/interaction_result", "interaction_result"),
         ):
             rospy.Subscriber(topic, String, self._json_callback(name), queue_size=2)
         rospy.Subscriber("/explore_py/current_subgoal", PointStamped, self._subgoal_callback, queue_size=2)

@@ -8,12 +8,26 @@
   <arg name="ros_python" default="/usr/bin/python3"/>
   <arg name="start_mapping" default="true"/>
   <arg name="semantic_override_config" default="$(find physical_nav)/config/semantic_shadow_override.yaml"/>
+  <arg name="move_base_override_config" default="$(find physical_nav)/config/physical_move_base_override.yaml"/>
 
   <!-- Existing nodes are reused through physical topic parameters.  No
        simulator launch or default semantic_mapping config is modified. -->
   <node name="semantic_mapping_py" pkg="semantic_mapping_py_pkg" type="semantic_mapping_node.py" launch-prefix="$(arg ros_python)" output="screen" respawn="true">
     <rosparam file="$(arg config_file)" command="load"/>
+    <rosparam file="$(arg semantic_override_config)" command="load"/>
     <param name="semantic_map/subscribe_pointcloud" value="true" type="bool"/>
+  </node>
+  <!-- Module 1 was previously absent from the physical launch, so detected
+       portals entered the graph but never received a visual state patch. -->
+  <node name="interaction_attribute_inference" pkg="semantic_mapping_py_pkg" type="interaction_attribute_inference_node.py" launch-prefix="$(arg ros_python)" output="screen" respawn="true">
+    <rosparam file="$(arg config_file)" command="load"/>
+    <rosparam file="$(arg semantic_override_config)" command="load"/>
+    <param name="model_name" value="qwen3.6-35b-a3b-fp8"/>
+    <param name="max_output_tokens" value="256"/>
+    <param name="request_timeout_s" value="20.0"/>
+    <param name="min_interval_s" value="2.0"/>
+    <param name="worker_count" value="1"/>
+    <param name="max_queue_size" value="8"/>
   </node>
   <group>
     <remap from="/registered_scan" to="/physical_nav/points"/>
@@ -21,10 +35,32 @@
     <remap from="/struct_mapping/occ_map_updates" to="/physical_nav/occupancy_updates"/>
     <remap from="/filtered_pointcloud" to="/physical_nav/filtered_pointcloud"/>
     <remap from="/odom" to="/physical_nav/odom"/>
-  <include file="$(find struct_mapping_pkg)/launch/slam_gmapping.launch">
-      <arg name="mapping_scan_source" value="pointcloud"/>
-      <arg name="mapping_scan_topic" value="/physical_nav/points"/>
-    </include>
+    <!-- Instantiate the stock mapping nodes here so physical-only timing
+         overrides do not change the simulator launch/configuration. -->
+    <node pkg="struct_mapping_pkg" type="slam_gmapping" name="slam_gmapping" output="screen">
+      <rosparam command="load" file="$(find struct_mapping_pkg)/config/slam_gmapping_params.yaml"/>
+      <param name="use_odom_pose_for_mapping" value="true"/>
+      <param name="mapping_scan_source" value="pointcloud"/>
+      <param name="mapping_scan_topic" value="/physical_nav/points"/>
+      <param name="scan_filter_tolerance_sec" value="0.15"/>
+      <!-- D435i and Go2 telemetry arrive over independent WebSocket packets.
+           Their measured nearest-stamp delta is commonly 70-150 ms, so the
+           simulation-tuned 30 ms guard discarded most physical scans. -->
+      <param name="max_odom_cloud_time_diff" value="0.15"/>
+      <!-- Conservative D435i planar projection for the physical OCC map:
+           reject floor/ceiling returns and isolated angular hits while
+           retaining supported door/furniture surfaces. -->
+      <param name="maxUrange" value="5.9"/>
+      <param name="pointcloud_scan_range_max" value="6.0"/>
+      <param name="pointcloud_scan_height_min" value="0.12"/>
+      <param name="pointcloud_scan_height_max" value="1.60"/>
+      <param name="pointcloud_scan_min_points_per_beam" value="4"/>
+      <param name="pointcloud_scan_cluster_min_points" value="8"/>
+      <param name="pointcloud_scan_min_support_neighbors" value="2"/>
+    </node>
+    <node pkg="struct_mapping_pkg" type="voronoi_mapping_node" name="voronoi_mapping" respawn="true">
+      <rosparam command="load" file="$(find struct_mapping_pkg)/config/voronoi_params.yaml"/>
+    </node>
   </group>
   <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" launch-prefix="/usr/bin/python3" output="screen" respawn="true">
     <param name="web_url" value="http://127.0.0.1:8765"/>
@@ -45,22 +81,29 @@
     <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
   </node>
-  <!-- Full navigation/interaction decision chain in shadow mode. Every
-       motion/action topic is remapped to an unconsumed physical_nav sink;
-       this keeps planning, M1/M2 decisions and M3 feedback live while the
-       Go2 remains exclusively under manual teleoperation. -->
+  <!-- Publish real global/local costmaps while keeping every navigation output
+       in an unconsumed shadow namespace. The local obstacle layer consumes
+       the latest filtered D435i cloud rather than a copy of the SLAM map. -->
+  <group>
+    <remap from="/registered_scan" to="/physical_nav/points"/>
+    <remap from="/filtered_pointcloud" to="/physical_nav/filtered_pointcloud"/>
+    <remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>
+    <remap from="/cmd_vel_stamped" to="/physical_nav/shadow_cmd_vel_stamped"/>
+    <include file="$(find nav_pkg)/launch/nav.launch">
+      <arg name="global_map_topic" value="/physical_nav/occupancy"/>
+      <arg name="move_base_respawn" value="true"/>
+      <arg name="override_config_file" value="$(arg move_base_override_config)"/>
+    </include>
+  </group>
+  <!-- Full navigation/interaction decision chain in shadow mode. The local
+       move_base action server remains connected to planners, but every final
+       velocity output is remapped to an unconsumed physical_nav sink. -->
   <group>
     <remap from="/odom" to="/physical_nav/odom"/>
     <remap from="/struct_mapping/occ_map" to="/physical_nav/occupancy"/>
     <remap from="/semantic_mapping/unified_graph" to="/physical_nav/unified_graph"/>
-    <remap from="/semantic_mapping/interaction_result" to="/physical_nav/interaction_result"/>
-    <remap from="/semantic_mapping/attribute_updates" to="/physical_nav/attribute_updates"/>
-    <remap from="/semantic_mapping/interaction_result" to="/physical_nav/interaction_result"/>
-    <remap from="/semantic_mapping/attribute_updates" to="/physical_nav/attribute_updates"/>
-    <remap from="/move_base" to="/physical_nav/shadow_move_base"/>
     <remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>
     <remap from="/cmd_vel_stamped" to="/physical_nav/shadow_cmd_vel_stamped"/>
-    <remap from="/move_base/cancel" to="/physical_nav/shadow_move_base_cancel"/>
     <remap from="/move_base_simple/goal" to="/physical_nav/shadow_goal"/>
     <include file="$(find explore_py_pkg)/launch/explore_py.launch">
       <arg name="external_control_enabled" value="true"/>
@@ -70,10 +113,12 @@
     <remap from="/odom" to="/physical_nav/odom"/>
     <remap from="/struct_mapping/occ_map" to="/physical_nav/occupancy"/>
     <remap from="/semantic_mapping/unified_graph" to="/physical_nav/unified_graph"/>
-    <remap from="/move_base" to="/physical_nav/shadow_move_base"/>
+    <remap from="/semantic_mapping/interaction_result" to="/physical_nav/interaction_result"/>
+    <remap from="/semantic_mapping/attribute_updates" to="/physical_nav/attribute_updates"/>
+    <remap from="/semantic_mapping/attribute_refresh_requests" to="/physical_nav/attribute_refresh_requests"/>
+    <remap from="/semantic_decision/interaction_command" to="/physical_nav/interaction_command"/>
     <remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>
     <remap from="/cmd_vel_stamped" to="/physical_nav/shadow_cmd_vel_stamped"/>
-    <remap from="/move_base/cancel" to="/physical_nav/shadow_move_base_cancel"/>
     <include file="$(find semantic_decision_py_pkg)/launch/semantic_decision.launch">
       <arg name="override_config_file" value="$(arg semantic_override_config)"/>
     </include>

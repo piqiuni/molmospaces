@@ -19,12 +19,16 @@ class ObjectMapStore:
         min_confirmations=2,
         size_match_ratio=0.7,
         stable_history_size=5,
+        duplicate_bbox_iou_threshold=0.0,
+        duplicate_3d_overlap_threshold=0.15,
     ):
         self.match_distance = float(match_distance)
         self.stale_after_sec = float(stale_after_sec)
         self.min_confirmations = max(1, int(min_confirmations))
         self.size_match_ratio = max(0.05, float(size_match_ratio))
         self.stable_history_size = max(1, int(stable_history_size))
+        self.duplicate_bbox_iou_threshold = max(0.0, float(duplicate_bbox_iou_threshold))
+        self.duplicate_3d_overlap_threshold = max(0.0, float(duplicate_3d_overlap_threshold))
         self.objects = []
         self.next_id = 1
 
@@ -161,7 +165,78 @@ class ObjectMapStore:
             obj["hit_streak"] = 0
             obj["miss_streak"] = int(obj.get("miss_streak", 0)) + 1
 
+        self._merge_duplicate_tracks()
         self._purge_stale(now)
+
+    @staticmethod
+    def _bbox_iou_2d(a, b):
+        if len(a or []) < 4 or len(b or []) < 4:
+            return 0.0
+        ax1, ay1, ax2, ay2 = [float(value) for value in a[:4]]
+        bx1, by1, bx2, by2 = [float(value) for value in b[:4]]
+        intersection = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(
+            0.0, min(ay2, by2) - max(ay1, by1)
+        )
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        return intersection / max(area_a + area_b - intersection, 1e-6)
+
+    def _merge_duplicate_tracks(self):
+        """Collapse split tracks only when current 2D and stable 3D boxes agree."""
+        if self.duplicate_bbox_iou_threshold <= 0.0 or len(self.objects) < 2:
+            return
+        removed = set()
+        ordered = sorted(
+            self.objects,
+            key=lambda obj: (-int(obj.get("observation_count", 0)), int(obj.get("object_id", 0))),
+        )
+        for index, keeper in enumerate(ordered):
+            if int(keeper.get("object_id", -1)) in removed:
+                continue
+            for duplicate in ordered[index + 1 :]:
+                duplicate_id = int(duplicate.get("object_id", -1))
+                if duplicate_id in removed or keeper.get("semantic_name") != duplicate.get("semantic_name"):
+                    continue
+                if self._bbox_iou_2d(keeper.get("bbox_2d"), duplicate.get("bbox_2d")) < self.duplicate_bbox_iou_threshold:
+                    continue
+                center_a = keeper.get("aabb_center", keeper.get("coord", [0.0, 0.0, 0.0]))
+                center_b = duplicate.get("aabb_center", duplicate.get("coord", [0.0, 0.0, 0.0]))
+                if math.dist([float(v) for v in center_a], [float(v) for v in center_b]) >= self.match_distance:
+                    continue
+                overlap = self._aabb_overlap_ratio(
+                    center_a,
+                    keeper.get("aabb_size", [0.0, 0.0, 0.0]),
+                    center_b,
+                    duplicate.get("aabb_size", [0.0, 0.0, 0.0]),
+                )
+                if overlap < self.duplicate_3d_overlap_threshold:
+                    continue
+                keeper["conf"] = max(float(keeper.get("conf", 0.0)), float(duplicate.get("conf", 0.0)))
+                keeper["observation_count"] = max(
+                    int(keeper.get("observation_count", 0)),
+                    int(duplicate.get("observation_count", 0)),
+                )
+                keeper["max_visible_pixels"] = max(
+                    int(keeper.get("max_visible_pixels", 0)),
+                    int(duplicate.get("max_visible_pixels", 0)),
+                )
+                keeper["max_visible_fraction"] = max(
+                    float(keeper.get("max_visible_fraction", 0.0)),
+                    float(duplicate.get("max_visible_fraction", 0.0)),
+                )
+                keeper["max_consecutive_observations"] = max(
+                    int(keeper.get("max_consecutive_observations", 0)),
+                    int(duplicate.get("max_consecutive_observations", 0)),
+                )
+                keeper["last_seen"] = max(float(keeper.get("last_seen", 0.0)), float(duplicate.get("last_seen", 0.0)))
+                keeper["is_confirmed"] = bool(keeper.get("is_confirmed") or duplicate.get("is_confirmed"))
+                votes = dict(keeper.get("label_votes") or {})
+                for label, score in (duplicate.get("label_votes") or {}).items():
+                    votes[label] = max(float(votes.get(label, 0.0)), float(score))
+                keeper["label_votes"] = votes
+                removed.add(duplicate_id)
+        if removed:
+            self.objects = [obj for obj in self.objects if int(obj.get("object_id", -1)) not in removed]
 
     def as_obj_map(self):
         return [

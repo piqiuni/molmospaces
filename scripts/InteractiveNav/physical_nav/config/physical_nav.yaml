@@ -24,6 +24,11 @@ topics:
   navigation_hints: "/physical_nav/navigation_hints"
   interaction_command: "/physical_nav/interaction_command"
   interaction_result: "/physical_nav/interaction_result"
+  attribute_updates: "/physical_nav/attribute_updates"
+  attribute_refresh_requests: "/physical_nav/attribute_refresh_requests"
+  attribute_inference_status: "/physical_nav/attribute_inference_status"
+  room_attribute_requests: "/physical_nav/room_attribute_requests"
+  room_attribute_updates: "/physical_nav/room_attribute_updates"
 
 object_detection:
   backend: "yoloe_pf_box3d"
@@ -52,10 +57,57 @@ object_detection:
       - downlight
       - spotlight
       - ceiling_fixture
+      - lighting
+      # Place/structure masks are scene evidence, not object instances. If
+      # fused as tracks, their floor/wall masks grow into multi-metre boxes.
+      - floor
+      - ground
+      - wall
+      - ceiling
+      - beam
+      - atrium
+      - courtyard
+      - basement
+      - hall
+      - gallery
+      - server_room
+      - wine_cellar
+      - hotel_lobby
+      - hospital_room
+      - bank_vault
+      - ktv
       - extrude
       - extruded
       - extrusion
     excluded_semantic_labels: []
+    # YOLOE PF can return open-vocabulary compound place/structure labels
+    # such as wood_wall, airport_terminal or train_interior. Exact matching
+    # above cannot catch those variants, so the physical worker also rejects
+    # these normalized label tokens before any 3D lifting/tracking occurs.
+    excluded_label_tokens:
+      - lighting
+      - wall
+      - floor
+      - ground
+      - ceiling
+      - beam
+      - hallway
+      - corridor
+      - lobby
+      - interior
+      - room
+      - kitchen
+      - restaurant
+      - airport
+      - terminal
+      - elevator
+      - shaft
+      - winery
+      - gallery
+      - atrium
+      - basement
+      - courtyard
+      - building
     aliases:
       exit: door
       exit_door: door
@@ -66,6 +118,22 @@ object_detection:
   point_stride: 4
   max_depth_m: 8.0
   min_valid_points: 12
+  mask_component_min_area: 48
+  drop_bottom_ratio: 0.12
+  depth_band_lower_quantile: 0.05
+  depth_band_upper_quantile: 0.70
+  cluster_eps: 0.18
+  cluster_min_points: 12
+  bbox_quantile_lower: 0.10
+  bbox_quantile_upper: 0.90
+  enable_euclidean_cluster: true
+  reject_low_mean_height: true
+  min_mean_height_m: 0.08
+  ground_reject_min_xy_span: 1.20
+  ground_reject_max_height: 0.40
+  ground_reject_max_center_z: 0.25
+  max_noninteraction_box_span_m: 2.50
+  max_noninteraction_box_volume_m3: 4.00
   projection_frame_id: "tf_frame_map"
   publish_debug_markers: true
   publish_debug_segmented_cloud: true
@@ -86,6 +154,11 @@ semantic_map:
   # these receipts at its independent 5 Hz logical step.
   publish_rate: 10.0
   object_min_confirmations: 1
+  # Merge split historical tracks only when their latest image boxes are
+  # nearly identical and their stable 3D boxes overlap. Distinct adjacent
+  # objects remain separate even when their 3D centers are close.
+  object_duplicate_bbox_iou_threshold: 0.85
+  object_duplicate_3d_overlap_threshold: 0.15
   graph_min_observations: 1
   room_segment_use_semantic_overlay: true
   room_portal_cut_enabled: true
@@ -93,6 +166,20 @@ semantic_map:
 
 room_inference:
   backend: "object_rules"
+
+# Module 1 uses image evidence only for physical interaction objects. Room
+# semantics stay on deterministic object rules to avoid unrelated VLM calls.
+attribute_inference:
+  visual_evidence_max_side_px: 1024
+  targeted_refresh_priority: 1000.0
+  targeted_multiview_max_images: 2
+  targeted_multiview_min_step_gap: 8
+  targeted_multiview_min_position_gap_m: 0.25
+  targeted_multiview_min_yaw_gap_rad: 0.25
+  target_bbox_mask_containment_required: true
+
+room_mllm:
+  enabled: false
 
 semantic_occ_overlay:
   enabled: true

@@ -9,9 +9,16 @@ sys.path.insert(0, str(ROOT))
 from physical_protocol import command_blocked_packet, hello_packet, image_packet, validate_packet
 from physical_consistency import bbox_iou, evaluate_detection, evaluate_frame, project_map_node
 from safety_gate import ReadOnlySafetyGate
-from physical_yoloe_bridge import _label, _rotation, _world_points
+from physical_yoloe_bridge import (
+  _is_excluded_scene_label,
+  _is_ground_like_box,
+  _is_implausibly_large_object,
+  _label,
+  _rotation,
+  _world_points,
+)
 from runtime_state import RuntimeState
-from physical_six_panel_server import SixPanelRenderer, _compact_qwen_context
+from physical_six_panel_server import SixPanelRenderer, _HTML, _compact_qwen_context
 
 
 class PhysicalPlatformTests(unittest.TestCase):
@@ -70,6 +77,29 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert points[0].tolist() == [2.0, 3.0, 1.0]
     assert _rotation(0., 0., 0.).shape == (3, 3)
 
+  def test_physical_filter_excludes_lighting_and_scene_regions(self):
+    import yaml
+    from semantic_mapping_py_pkg.detection_filter import DetectionFilter
+
+    config = yaml.safe_load((ROOT / "config" / "physical_nav.yaml").read_text())
+    detection_filter = DetectionFilter(config["object_detection"]["detection_filter"])
+    for label in ("lighting", "atrium", "floor", "server room"):
+      assert detection_filter.apply_one({"semantic_class_raw": label, "semantic_class": label}) is None
+    assert detection_filter.apply_one({"semantic_class_raw": "door", "semantic_class": "door"}) is not None
+    object_config = config["object_detection"]
+    for label in ("wood_wall", "airport_terminal", "train interior", "elevator_lobby"):
+      assert _is_excluded_scene_label(label, object_config)
+    assert not _is_excluded_scene_label("door", object_config)
+
+  def test_ground_like_box_gate_preserves_compact_floor_level_objects(self):
+    import numpy as np
+
+    config = {"ground_reject_min_xy_span": 1.2, "ground_reject_max_height": .4, "ground_reject_max_center_z": .25}
+    assert _is_ground_like_box(np.array([2., 0., -.1]), np.array([2.3, 2.1, .3]), config)
+    assert not _is_ground_like_box(np.array([2., 0., .05]), np.array([.3, .2, .2]), config)
+    assert _is_implausibly_large_object("wall_art", np.array([3., 2., 1.]), config)
+    assert not _is_implausibly_large_object("door", np.array([3., 2., 1.]), config)
+
   def test_websocket_link_state_is_observable(self):
     state = RuntimeState()
     hello = hello_packet(host="go2", streams={"camera": "d435i"})
@@ -81,6 +111,22 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert snapshot["link"]["last_packet_type"] == "sensor_frame"
     state.link_disconnected()
     assert state.snapshot()["link"]["connected"] is False
+
+  def test_navigation_step_is_local_to_policy_session(self):
+    state = RuntimeState()
+    state.update_frame(frame_seq=90001)
+    assert state.advance_navigation_step() == 0
+    assert state.advance_navigation_step() == 1
+    snapshot = state.snapshot()
+    assert snapshot["frame_seq"] == 90001
+    assert snapshot["navigation_step"] == 1
+    assert SixPanelRenderer._physical_step(snapshot)["step_index"] == 1
+
+  def test_dashboard_polls_snapshots_instead_of_opening_mjpeg_streams(self):
+    assert "fetch('/snapshot.jpg?ts='" in _HTML
+    assert "src='/stream.mjpg'" not in _HTML
+    assert "src='/panel1.mjpg'" not in _HTML
+    assert "src='/panel5.mjpg'" not in _HTML
 
   def test_raw_and_map_aligned_detection_views_are_separate(self):
     state = RuntimeState()
@@ -118,6 +164,97 @@ class PhysicalPlatformTests(unittest.TestCase):
     image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
     assert image is not None
     assert image.shape[:2] == (540, 1440)
+
+  def test_live_panel_one_draws_segmentation_and_readable_track_label(self):
+    import numpy as np
+
+    panel = np.zeros((270, 480, 3), dtype=np.uint8)
+    SixPanelRenderer._draw_live_detections(
+      panel,
+      [{"semantic_class": "door", "confidence": .9, "bbox": [10, 10, 40, 40],
+        "mask": {"rows": [20, 20, 21, 21], "cols": [20, 21, 20, 21]}, "mask_area": 4}],
+      (100, 100),
+    )
+    assert np.any(panel[50:65, 95:110] != 0)
+    display = SixPanelRenderer._display_candidate({
+      "target_id": "portal_track_0048", "target_name": "track_0048",
+      "metadata": {"semantic_name": "portal"},
+    })
+    assert display["target_name"] == "door #0048"
+
+  def test_six_panel_camera_is_box_only_and_enlargement_is_source_resolution(self):
+    import cv2
+    import numpy as np
+
+    detection = {"semantic_class": "door", "confidence": .9, "bbox": [5, 5, 45, 45],
+                 "mask": {"rows": [25], "cols": [25]}, "mask_area": 1}
+    panel = np.zeros((50, 50, 3), dtype=np.uint8)
+    SixPanelRenderer._draw_live_detections(panel, [detection], (50, 50), include_masks=False)
+    assert np.all(panel[25, 25] == 0)
+    assert np.any(panel[5, 5] != 0)
+
+    state = RuntimeState()
+    state.rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+    state.detections = [detection]
+    renderer = SixPanelRenderer(state)
+    encoded = renderer.render_camera_overlay()
+    image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert image.shape[:2] == (480, 640)
+    assert renderer._canonical.transforms.odom_frame == "tf_frame_odom"
+    assert "/camera-overlay.jpg?ts=" in _HTML
+
+  def test_stale_global_costmap_display_falls_back_to_aligned_occ(self):
+    import numpy as np
+    from offline_semantic_renderer import RawGrid
+
+    values = np.zeros((10, 10), dtype=np.int32)
+    values[4, 6] = 100
+    planning = RawGrid(values, 10, 10, .1, "tf_frame_map", -1., -1., 0.)
+    stale = RawGrid(np.zeros((10, 10), dtype=np.int32), 10, 10, .1, "tf_frame_map", -1., -1., 0.)
+    display = SixPanelRenderer._global_costmap_for_display(planning, stale)
+    assert display.values[4, 6] == 100
+    assert np.count_nonzero(display.values >= 100) == 1
+
+  def test_physical_tracker_merges_only_strict_2d_3d_duplicates(self):
+    from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore
+
+    store = ObjectMapStore(
+      match_distance=.5,
+      duplicate_bbox_iou_threshold=.85,
+      duplicate_3d_overlap_threshold=.15,
+    )
+    base = {
+      "semantic_name": "chair", "aabb_center": [1., 2., .5],
+      "aabb_size": [.4, .4, .4], "bbox_2d": [100, 100, 200, 240],
+      "observation_count": 20, "conf": .9, "object_id": 1,
+      "label_votes": {"chair": 10.}, "last_seen": 2., "is_confirmed": True,
+    }
+    duplicate = dict(base, object_id=2, aabb_center=[1.12, 2.02, .5],
+                     bbox_2d=[102, 101, 201, 239], observation_count=10)
+    distinct = dict(base, object_id=3, aabb_center=[1.2, 2.1, .5],
+                    bbox_2d=[210, 100, 310, 240], observation_count=12)
+    store.objects = [base, duplicate, distinct]
+    store._merge_duplicate_tracks()
+    assert {item["object_id"] for item in store.objects} == {1, 3}
+
+  def test_physical_launch_contains_m1_and_shadow_costmaps(self):
+    launch = (ROOT / "launch" / "physical_nav_readonly.launch").read_text()
+    start = (ROOT / "start_physical_nav.sh").read_text()
+    assert 'name="interaction_attribute_inference"' in launch
+    assert 'file="$(find nav_pkg)/launch/nav.launch"' in launch
+    assert '<param name="scan_filter_tolerance_sec" value="0.15"/>' in launch
+    assert '<param name="max_odom_cloud_time_diff" value="0.15"/>' in launch
+    assert '<param name="pointcloud_scan_min_support_neighbors" value="2"/>' in launch
+    assert '<arg name="override_config_file" value="$(arg move_base_override_config)"/>' in launch
+    assert '<remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>' in launch
+    assert '<remap from="/semantic_mapping/attribute_refresh_requests" to="/physical_nav/attribute_refresh_requests"/>' in launch
+    assert 'semantic_override_config:="${ROOT_DIR}/config/semantic_shadow_override.yaml"' in start
+    assert 'move_base_override_config:="${ROOT_DIR}/config/physical_move_base_override.yaml"' in start
+    import yaml
+    local_override = yaml.safe_load((ROOT / "config" / "physical_move_base_override.yaml").read_text())
+    assert local_override["local_costmap"]["width"] == 8.0
+    assert local_override["local_costmap"]["height"] == 8.0
+    assert local_override["local_costmap"]["obstacle_range"] == 8.0
 
   def test_qwen_context_compacts_sparse_masks_and_graph_interaction(self):
     snapshot = {

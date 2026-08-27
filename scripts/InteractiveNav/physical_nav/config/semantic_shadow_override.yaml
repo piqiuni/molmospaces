@@ -5,6 +5,13 @@ ablation:
   module2: "mllm_score"
 startup_scan:
   enabled: false
+candidate:
+  # The candidate node normalizes portal -> door and cabinet/drawer variants
+  # -> drawer_cabinet. Keep all three classes in the graph/candidate display.
+  interaction_semantic_types: ["door", "fridge", "drawer_cabinet"]
+  # Only doors and refrigerators may be selected as physical interaction
+  # subgoals in phase 1.
+  subgoal_interaction_semantic_types: ["door", "fridge"]
 model:
   mode: "http"
   endpoint: "http://127.0.0.1:18080/v1"
@@ -13,3 +20,4 @@ model:
   timeout_s: 20.0
   max_tokens: 256
   metrics_path: "/tmp/physical_nav_mllm.jsonl"
+  subgoal_interaction_semantic_types: ["door", "fridge"]

@@ -1,0 +1,16 @@
+# Physical-only move_base overrides. Loaded inside the /move_base private
+# namespace after the shared navigation defaults, leaving simulator settings
+# unchanged.
+local_costmap:
+  rolling_window: true
+  width: 8.0
+  height: 8.0
+  resolution: 0.05
+  # Costmap2DROS mirrors these top-level values into the obstacle plugin at
+  # runtime, so override both levels to prevent the shared 15 m default from
+  # replacing the physical window-specific range.
+  obstacle_range: 8.0
+  raytrace_range: 8.0
+  obstacle_layer:
+    obstacle_range: 8.0
+    raytrace_range: 8.0

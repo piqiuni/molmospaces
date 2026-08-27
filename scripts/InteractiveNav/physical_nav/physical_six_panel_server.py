@@ -96,7 +96,10 @@ class SixPanelRenderer:
         # the same shape as record_explore_debug.py's offline artifacts.
         self.panel_size = (480, 270)
         self._canonical = OfflineSixPanelRenderer(
-            transforms=TransformResolver([], map_frame="tf_frame_map", odom_frame="tf_frame_map")
+            # Physical telemetry is odometry-frame pose. Mapping is currently
+            # odom-locked, so the empty resolver supplies the correct identity
+            # map<->odom transform while retaining both frame names.
+            transforms=TransformResolver([], map_frame="tf_frame_map", odom_frame="tf_frame_odom")
         )
 
     @staticmethod
@@ -126,8 +129,59 @@ class SixPanelRenderer:
             return None
 
     @staticmethod
-    def _draw_live_detections(panel: Any, detections: list[dict[str, Any]], source_shape: tuple[int, int] | None) -> None:
-        """Overlay the live YOLOE boxes on canonical panel 1.
+    def _global_costmap_for_display(planning: RawGrid | None, costmap: RawGrid | None) -> RawGrid | None:
+        """Use a causally aligned global costmap, synthesizing stale frames."""
+        if planning is None:
+            return costmap
+        geometry_matches = bool(
+            costmap is not None
+            and costmap.width == planning.width
+            and costmap.height == planning.height
+            and abs(costmap.resolution - planning.resolution) <= 1e-6
+            and abs(costmap.origin_x - planning.origin_x) <= 1e-4
+            and abs(costmap.origin_y - planning.origin_y) <= 1e-4
+        )
+        occupied = planning.values >= 50
+        if geometry_matches and costmap is not None:
+            lethal = costmap.values >= 100
+            occupied_count = int(np.count_nonzero(occupied))
+            overlap = int(np.count_nonzero(occupied & lethal))
+            if occupied_count == 0 or overlap / occupied_count >= 0.90:
+                return costmap
+
+        # The ROS maps are delivered on independent callbacks. When the
+        # costmap receipt is older than the OCC receipt, derive only the
+        # display frame from that exact OCC so panel 4 never compares two
+        # different map epochs. Navigation continues using the ROS costmap.
+        values = np.full(planning.values.shape, -1, dtype=np.int32)
+        known = planning.values >= 0
+        values[known] = 0
+        values[occupied] = 100
+        if np.any(occupied) and planning.resolution > 0.0:
+            distances = cv2.distanceTransform((~occupied).astype(np.uint8), cv2.DIST_L2, 5)
+            distances *= float(planning.resolution)
+            inscribed = known & ~occupied & (distances <= 0.25)
+            soft = known & ~occupied & ~inscribed & (distances <= 0.40)
+            values[inscribed] = 99
+            values[soft] = np.clip(
+                np.rint(1.0 + 97.0 * (0.40 - distances[soft]) / 0.15),
+                1,
+                98,
+            ).astype(np.int32)
+        return RawGrid(
+            values=values,
+            width=planning.width,
+            height=planning.height,
+            resolution=planning.resolution,
+            frame_id=planning.frame_id,
+            origin_x=planning.origin_x,
+            origin_y=planning.origin_y,
+            origin_yaw=planning.origin_yaw,
+        )
+
+    @staticmethod
+    def _draw_live_detections(panel: Any, detections: list[dict[str, Any]], source_shape: tuple[int, int] | None, *, include_masks: bool = True) -> None:
+        """Overlay live YOLOE boxes and optionally segmentation masks.
 
         The shared offline renderer intentionally draws only recorder/GT
         overlays.  Physical detections arrive asynchronously, so they are
@@ -139,6 +193,49 @@ class SixPanelRenderer:
         if src_w <= 0 or src_h <= 0:
             return
         sx, sy = panel.shape[1] / float(src_w), panel.shape[0] / float(src_h)
+        palette = (
+            (70, 210, 70), (235, 165, 45), (210, 80, 210), (60, 190, 235),
+            (235, 95, 70), (185, 210, 55), (220, 125, 45), (100, 130, 245),
+        )
+
+        def detection_color(det: dict[str, Any]) -> tuple[int, int, int]:
+            label = str(det.get("semantic_class", det.get("class", "?")))
+            return palette[sum(ord(char) for char in label) % len(palette)]
+
+        # Sparse masks are capped by the detector worker. Reconstruct a small
+        # display mask and close sampling gaps before alpha blending it.
+        for det in detections if include_masks else ():
+            mask = det.get("mask")
+            if not isinstance(mask, dict):
+                continue
+            rows = np.asarray(mask.get("rows") or [], dtype=np.int32)
+            cols = np.asarray(mask.get("cols") or [], dtype=np.int32)
+            if rows.size == 0 or rows.size != cols.size:
+                continue
+            valid = (rows >= 0) & (rows < src_h) & (cols >= 0) & (cols < src_w)
+            rows, cols = rows[valid], cols[valid]
+            if rows.size == 0:
+                continue
+            ys = np.clip(np.rint(rows * sy).astype(np.int32), 0, panel.shape[0] - 1)
+            xs = np.clip(np.rint(cols * sx).astype(np.int32), 0, panel.shape[1] - 1)
+            display_mask = np.zeros(panel.shape[:2], dtype=np.uint8)
+            display_mask[ys, xs] = 255
+            sampling_ratio = max(1.0, _safe_float(det.get("mask_area"), rows.size) / rows.size)
+            kernel_size = min(7, max(1, int(round(math.sqrt(sampling_ratio)))))
+            if kernel_size > 1:
+                display_mask = cv2.dilate(
+                    display_mask,
+                    np.ones((kernel_size, kernel_size), dtype=np.uint8),
+                    iterations=1,
+                )
+            active = display_mask > 0
+            color = np.asarray(detection_color(det), dtype=np.float32)
+            panel[active] = np.clip(
+                panel[active].astype(np.float32) * 0.70 + color * 0.30,
+                0,
+                255,
+            ).astype(np.uint8)
+
         for det in detections:
             box = det.get("bbox") or det.get("bbox_2d")
             if not isinstance(box, (list, tuple)) or len(box) != 4:
@@ -150,11 +247,43 @@ class SixPanelRenderer:
             x1, x2 = sorted((max(0.0, min(src_w - 1.0, x1)), max(0.0, min(src_w - 1.0, x2))))
             y1, y2 = sorted((max(0.0, min(src_h - 1.0, y1)), max(0.0, min(src_h - 1.0, y2))))
             confidence = _safe_float(det.get("confidence"), 0.0)
-            color = (0, 220, 0) if confidence >= 0.5 else (0, 165, 255)
+            color = detection_color(det)
             p1, p2 = (int(round(x1 * sx)), int(round(y1 * sy))), (int(round(x2 * sx)), int(round(y2 * sy)))
             cv2.rectangle(panel, p1, p2, color, 2, cv2.LINE_AA)
             label = f"{det.get('semantic_class', det.get('class', '?'))} {confidence:.2f}"
             cv2.putText(panel, label[:34], (p1[0], max(48, p1[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, .42, color, 1, cv2.LINE_AA)
+
+    def render_camera_overlay(self) -> bytes:
+        """Render box+seg directly at the D435i source resolution."""
+        if cv2 is None:
+            raise RuntimeError("physical viewer requires opencv-python and numpy")
+        with self.state._lock:
+            rgb = None if self.state.rgb is None else self.state.rgb.copy()
+            detections = [dict(item) for item in self.state.detections if isinstance(item, dict)]
+        if rgb is None:
+            rgb = np.full((480, 640, 3), 25, dtype=np.uint8)
+            cv2.putText(rgb, "NO RGB YET", (24, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2, cv2.LINE_AA)
+        self._draw_live_detections(rgb, detections, (rgb.shape[0], rgb.shape[1]), include_masks=True)
+        ok, encoded = cv2.imencode(".jpg", rgb, [cv2.IMWRITE_JPEG_QUALITY, 94])
+        if not ok:
+            raise RuntimeError("camera overlay JPEG encoding failed")
+        return bytes(encoded)
+
+    @staticmethod
+    def _display_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+        """Give physical subgoals a readable label without changing identity."""
+        display = dict(candidate)
+        metadata = display.get("metadata") if isinstance(display.get("metadata"), dict) else {}
+        family = str(metadata.get("semantic_name") or metadata.get("node_type") or "").casefold()
+        if family in {"portal", "doorway", "entrance", "gate"}:
+            family = "door"
+        raw_name = str(display.get("target_name") or "")
+        if family and (not raw_name or "track_" in raw_name.casefold()):
+            stable_id = str(display.get("target_id") or raw_name)
+            suffix = stable_id.rsplit("_", 1)[-1]
+            display["target_name"] = f"{family} #{suffix}" if suffix.isdigit() else family
+        return display
+
     @staticmethod
     def _physical_step(snapshot: dict[str, Any]) -> dict[str, Any]:
         telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
@@ -167,7 +296,13 @@ class SixPanelRenderer:
         navigation = snapshot.get("navigation") if isinstance(snapshot.get("navigation"), dict) else {}
         current = navigation.get("current_subgoal") if isinstance(navigation.get("current_subgoal"), dict) else {}
         selected = navigation.get("selection") if isinstance(navigation.get("selection"), dict) else {}
-        candidates = navigation.get("candidates") if isinstance(navigation.get("candidates"), dict) else {}
+        selected = SixPanelRenderer._display_candidate(selected)
+        candidates = dict(navigation.get("candidates")) if isinstance(navigation.get("candidates"), dict) else {}
+        candidates["candidates"] = [
+            SixPanelRenderer._display_candidate(item)
+            for item in candidates.get("candidates", [])
+            if isinstance(item, dict)
+        ]
         goal = current.get("point") or current.get("position") or current.get("goal") or []
         if not isinstance(goal, (list, tuple)) or len(goal) < 2:
             goal = []
@@ -195,7 +330,7 @@ class SixPanelRenderer:
                 if value not in {None, ""}
             )
         return {
-            "step_index": int(snapshot.get("frame_seq", 0) or 0),
+            "step_index": int(snapshot.get("navigation_step", 0) or 0),
             "stamp_sec": float(snapshot.get("frame_stamp", 0.0) or 0.0),
             "pose": pose,
             "pose_frame_id": "tf_frame_map",
@@ -361,9 +496,11 @@ class SixPanelRenderer:
     def render(self) -> bytes:
         if cv2 is None:
             raise RuntimeError("physical viewer requires opencv-python and numpy")
+        navigation_step = self.state.advance_navigation_step()
         with self.state._lock:
             snapshot = {
                 "frame_seq": self.state.frame_seq,
+                "navigation_step": navigation_step,
                 "frame_stamp": self.state.frame_stamp,
                 "telemetry": dict(self.state.telemetry),
                 "graph": dict(self.state.graph),
@@ -391,7 +528,9 @@ class SixPanelRenderer:
         else:
             camera = cv2.resize(rgb, self.panel_size, interpolation=cv2.INTER_AREA)
         draw_camera_title(camera, step, int(step["step_index"]))
-        self._draw_live_detections(camera, snapshot["detections"], None if rgb is None else (rgb.shape[0], rgb.shape[1]))
+        # The canonical six-panel camera stays box-only. The separate right
+        # side enlargement uses the source-resolution box+seg endpoint.
+        self._draw_live_detections(camera, snapshot["detections"], None if rgb is None else (rgb.shape[0], rgb.shape[1]), include_masks=False)
         occ = self._canonical.render_map_panel(
             planning, self.panel_size, step, int(step["step_index"]),
             title="OCC", kind="occupancy", world_bounds=world_bounds,
@@ -403,6 +542,7 @@ class SixPanelRenderer:
             planning, room, self.panel_size, step, int(step["step_index"]), world_bounds,
             view_scale=1.5,
         )
+        global_grid = self._global_costmap_for_display(planning, global_grid)
         global_width = width // 2
         global_panel = self._canonical.render_map_panel(
             global_grid, (global_width, height), step, int(step["step_index"]),
@@ -413,9 +553,21 @@ class SixPanelRenderer:
         local_panel = self._canonical.render_map_panel(
             local_grid, (width - global_width, height), step, int(step["step_index"]),
             title="LOCAL COSTMAP", kind="costmap", draw_global_plan=False,
-            draw_local_global_plan=False, draw_local_plan=False, draw_frontiers=True,
-            draw_semantic_candidates=True,
+            draw_local_global_plan=False, draw_local_plan=False, draw_frontiers=False,
+            draw_semantic_candidates=False,
         )
+        if local_grid is not None:
+            # Full local grid is square and letterboxed into this half-panel.
+            # Keep the scale bar on the right, away from the cost legend.
+            rendered_side = min(width - global_width, height)
+            extent_m = max(local_grid.width * local_grid.resolution, 1e-6)
+            metre_px = max(8, int(round(rendered_side / extent_m)))
+            bar_right, bar_y = local_panel.shape[1] - 10, local_panel.shape[0] - 14
+            bar_left = max(local_panel.shape[1] // 2, bar_right - metre_px)
+            cv2.line(local_panel, (bar_left, bar_y), (bar_right, bar_y), (20, 20, 20), 2, cv2.LINE_AA)
+            cv2.line(local_panel, (bar_left, bar_y - 4), (bar_left, bar_y + 4), (20, 20, 20), 2, cv2.LINE_AA)
+            cv2.line(local_panel, (bar_right, bar_y - 4), (bar_right, bar_y + 4), (20, 20, 20), 2, cv2.LINE_AA)
+            cv2.putText(local_panel, "1 m", (bar_left, bar_y - 7), cv2.FONT_HERSHEY_PLAIN, .8, (20, 20, 20), 1, cv2.LINE_AA)
         costmaps = np.concatenate([global_panel, local_panel], axis=1)
         spatial = self._canonical.render_semantic_xy(
             planning, self.panel_size, step, int(step["step_index"]), world_bounds,
@@ -486,6 +638,7 @@ class _WebHandler(BaseHTTPRequestHandler):
     qwen_submit = None
     frame_lock = threading.Lock()
     latest_jpeg: bytes = b""
+    latest_camera_jpeg: bytes = b""
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
@@ -524,6 +677,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         navigation = snapshot.get("navigation") or {}
         return {
             "frame_seq": snapshot.get("frame_seq"),
+            "navigation_step": snapshot.get("navigation_step"),
             "frame_stamp": snapshot.get("frame_stamp"),
             "generated_at": snapshot.get("generated_at"),
             "read_only": snapshot.get("read_only", True),
@@ -558,7 +712,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         if path == "/api/raw-frame":
             self._json(self.state.raw_frame()); return
         if path == "/api/health":
-            snapshot = self.state.snapshot(); self._json({"ok": bool(snapshot["frame_seq"] >= 0), "read_only": True, "frame_seq": snapshot["frame_seq"], "generated_at": snapshot["generated_at"]}); return
+            snapshot = self.state.snapshot(); self._json({"ok": bool(snapshot["frame_seq"] >= 0), "read_only": True, "frame_seq": snapshot["frame_seq"], "navigation_step": snapshot["navigation_step"], "generated_at": snapshot["generated_at"]}); return
         if path == "/snapshot.jpg":
             # Short-lived JPEG requests are more reliable than a long-lived
             # multipart stream through some LAN proxies/browser setups.
@@ -567,6 +721,27 @@ class _WebHandler(BaseHTTPRequestHandler):
             if not frame:
                 self._json({"ok": False, "error": "frame not ready"}, 503); return
             self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(frame))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(frame); return
+        if path == "/camera-overlay.jpg":
+            with self.frame_lock:
+                frame = self.latest_camera_jpeg
+            if not frame:
+                self._json({"ok": False, "error": "camera overlay not ready"}, 503); return
+            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(frame))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(frame); return
+        if path in {"/panel1.jpg", "/panel5.jpg"}:
+            panel_index = 0 if path.startswith("/panel1") else 4
+            with self.frame_lock:
+                frame = self.latest_jpeg
+            if not frame or cv2 is None:
+                self._json({"ok": False, "error": "frame not ready"}, 503); return
+            image = cv2.imdecode(np.frombuffer(frame, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                self._json({"ok": False, "error": "frame decode failed"}, 503); return
+            x = (panel_index % 3) * 480; y = (panel_index // 3) * 270
+            ok, encoded = cv2.imencode(".jpg", image[y:y + 270, x:x + 480], [cv2.IMWRITE_JPEG_QUALITY, 88])
+            if not ok:
+                self._json({"ok": False, "error": "panel encode failed"}, 500); return
+            data = bytes(encoded)
+            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(data); return
         if path == "/stream.mjpg":
             # Browser refreshes can leave an old multipart request half-open.
             # A write timeout ensures those abandoned stream threads are
@@ -633,21 +808,23 @@ _HTML = """<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='v
 :root{color-scheme:dark;--bg:#0b0d11;--card:#141821;--line:#2e3748;--blue:#67a7ff;--green:#54d68b;--amber:#ffca58;--red:#ff6c67;--muted:#9ba8ba}*{box-sizing:border-box}body{font-family:Inter,"Noto Sans SC",system-ui,sans-serif;background:var(--bg);color:#edf2fa;margin:0;padding:14px}.title{display:flex;align-items:center;gap:12px;margin:0 0 10px;font-size:23px}.readonly{font-size:13px;color:#101418;background:var(--amber);padding:4px 9px;border-radius:99px}.dashboard{display:grid;grid-template-columns:minmax(640px,1fr) 430px;gap:12px;align-items:start}.left{min-width:0}.overview{display:block;width:100%;border:1px solid var(--line);border-radius:8px;background:#111}.ratebar{display:flex;gap:14px;flex-wrap:wrap;color:var(--green);font-size:13px;padding:7px 2px}.mllm-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.right{display:grid;gap:10px}.card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:10px;min-width:0;box-shadow:0 4px 14px #0004}.card h3{display:flex;align-items:center;justify-content:space-between;margin:0 0 8px;color:var(--blue);font-size:15px}.hint{color:var(--muted);font-size:11px;font-weight:400}.visual{width:100%;display:block;border-radius:6px;border:1px solid #343c49;background:#0d0f13}.events{max-height:390px;overflow:auto;display:grid;gap:8px}.event{display:grid;grid-template-columns:minmax(76px,.8fr) minmax(105px,1.25fr) minmax(90px,1fr);gap:7px;padding:7px;border:1px solid #313947;border-radius:8px;background:#0e1218;font-size:11px}.event-col{min-width:0;overflow:hidden}.label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}.thumb{width:100%;height:70px;object-fit:cover;border-radius:4px;border:1px solid #354053}.chips{display:flex;gap:4px;flex-wrap:wrap}.chip{display:inline-block;max-width:100%;padding:2px 5px;border-radius:5px;background:#263248;color:#cfe1ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.prompt,.result{line-height:1.35;word-break:break-word}.result{color:#d9f7e6}.meta{grid-column:1/-1;color:#7f8da1;font-size:10px}.empty{height:110px;display:grid;place-items:center;color:#768397;border:1px dashed #354052;border-radius:8px}.state-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.metric{padding:9px 7px;border:1px solid #303a4a;border-radius:8px;background:#0e1218;text-align:center}.metric .icon{font-size:19px}.metric .value{font-size:16px;font-weight:700;margin-top:2px}.metric .name{font-size:10px;color:var(--muted)}.statusline{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.badge{padding:3px 7px;border-radius:99px;font-size:11px;background:#263248;color:#cfe1ff}.badge.good{background:#173b2b;color:#7ff0ae}.badge.warn{background:#493b14;color:#ffd46c}.badge.bad{background:#4b2021;color:#ff9692}.m3box{display:grid;gap:8px}.m3head{display:flex;align-items:center;gap:8px}.m3status{font-size:22px;font-weight:800}.m3details{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.mini{background:#0e1218;border:1px solid #303a4a;border-radius:7px;padding:7px}.mini b{display:block;color:#eaf1fc;font-size:12px}.mini span{font-size:10px;color:var(--muted)}@media(max-width:1150px){.dashboard{grid-template-columns:1fr}.right{grid-template-columns:repeat(3,minmax(0,1fr));grid-row:2}.mllm-grid{grid-row:3}}@media(max-width:800px){body{padding:8px}.dashboard{display:block}.right,.mllm-grid{grid-template-columns:1fr;margin-top:10px}.event{grid-template-columns:1fr 1fr}.meta{grid-column:1/-1}}
 </style>
 <h1 class='title'>Go2 Physical Interactive Navigation <span class='readonly'>READ ONLY · 动作阻断</span></h1>
-<main class='dashboard'><div class='left'><img class='overview' src='/stream.mjpg' alt='实时六面板'><div class='ratebar'><span>● 导航 5 Hz</span><span>● YOLOE / 建图输入 10 Hz</span><span>● 网页 5 Hz</span><span>● Go2 人工遥控</span></div><div class='mllm-grid'><section class='card'><h3>1 · M1 VLM 感知 <span class='hint'>图片 → 简化问题 → 结果</span></h3><div id='m1' class='events'></div></section><section class='card'><h3>2 · M2 LLM 子目标 <span class='hint'>历史 + 候选 + 目标</span></h3><div id='m2' class='events'></div></section><section class='card'><h3>3 · M3 交互评价 <span class='hint'>规则验证，无模型调用</span></h3><div id='m3' class='m3box'></div></section></div></div><aside class='right'><section class='card'><h3>4 · Go2 当前状态 <span id='stamp' class='hint'>连接中</span></h3><div id='go2'></div></section><section class='card'><h3>5 · 图 1 放大 <span class='hint'>RGB + YOLOE box / seg</span></h3><img class='visual' src='/panel1.mjpg' alt='图1放大'></section><section class='card'><h3>6 · 图 5 放大 <span class='hint'>语义地图 + 3D box</span></h3><img class='visual' src='/panel5.mjpg' alt='图5放大'></section></aside></main>
+<main class='dashboard'><div class='left'><canvas id='overview' class='overview' width='1440' height='540' aria-label='实时六面板'></canvas><div class='ratebar'><span>● 导航 5 Hz</span><span>● YOLOE / 建图输入 10 Hz</span><span>● 网页 5 Hz</span><span>● Go2 人工遥控</span></div><div class='mllm-grid'><section class='card'><h3>1 · M1 VLM 感知 <span class='hint'>图片 → 简化问题 → 结果</span></h3><div id='m1' class='events'></div></section><section class='card'><h3>2 · M2 LLM 子目标 <span class='hint'>历史 + 候选 + 目标</span></h3><div id='m2' class='events'></div></section><section class='card'><h3>3 · M3 交互评价 <span class='hint'>规则验证，无模型调用</span></h3><div id='m3' class='m3box'></div></section></div></div><aside class='right'><section class='card'><h3>4 · Go2 当前状态 <span id='stamp' class='hint'>连接中</span></h3><div id='go2'></div></section><section class='card'><h3>5 · 图 1 放大 <span class='hint'>D435i 原始分辨率 · box + seg</span></h3><canvas id='panel1' class='visual' width='640' height='480' aria-label='高清图1放大'></canvas></section><section class='card'><h3>6 · 图 5 放大 <span class='hint'>语义地图 + 3D box</span></h3><canvas id='panel5' class='visual' width='480' height='270' aria-label='图5放大'></canvas></section></aside></main>
 <script>
 const q=s=>document.querySelector(s), text=v=>String(v??'').replace(/\\s+/g,' ').trim(), clip=(v,n=150)=>{v=text(v);return v.length>n?v.slice(0,n)+'…':v};
 function make(tag,cls,value){const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)e.textContent=value;return e}
 function contextCandidates(e){const c=e?.context?.candidates||e?.payload?.candidates||[];return Array.isArray(c)?c:[]}
 function outputSummary(e){if(e?.error)return '调用失败：'+clip(e.error,120);let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??'';if(typeof raw==='object')raw=JSON.stringify(raw);try{const o=JSON.parse(raw);const ids=o.ranked_ids||o.candidate_id||o.label||o.state||'';return clip([Array.isArray(ids)?ids.join(' → '):ids,o.reason,o.confidence].filter(Boolean).join(' · '),150)}catch(_){return clip(raw||'已完成（无文本结果）',150)}}
 function addChips(parent,items,max=5){const wrap=make('div','chips');items.slice(0,max).forEach(v=>wrap.append(make('span','chip',clip(v,28))));if(items.length>max)wrap.append(make('span','chip','+'+(items.length-max)));parent.append(wrap)}
-function renderEvents(id,events,stage){const box=q(id);box.replaceChildren();if(!events?.length){box.append(make('div','empty','等待 '+stage+' 调用'));return}events.slice(-8).reverse().forEach((e,index)=>{const row=make('article','event'),left=make('div','event-col'),mid=make('div','event-col'),right=make('div','event-col');left.append(make('div','label',stage==='M1'?'输入图像':'候选 subgoal'));if(stage==='M1'){const im=make('img','thumb');im.src='/panel1.mjpg?event='+index;im.alt='M1图像输入';left.append(im)}else{const cs=contextCandidates(e);addChips(left,cs.map(c=>c.id||c.candidate_id||c.target_name||'candidate'))}mid.append(make('div','label',stage==='M2'?'历史 / 目标 / 简化请求':'简化问题'));if(stage==='M2'){const hist=e?.context?.recent_decisions||e?.payload?.recent_decisions||[];const mission=e?.context?.mission||e?.payload?.mission||{};addChips(mid,['历史 '+(Array.isArray(hist)?hist.length:0),'候选 '+contextCandidates(e).length,'目标 '+(mission.target_name||mission.target||mission.mode||'探索')]);mid.append(make('div','prompt','从当前候选中选择下一语义子目标'))}else mid.append(make('div','prompt',clip(e.instruction||'判断当前交互对象属性与状态')));right.append(make('div','label','MLLM 输出'));right.append(make('div','result',outputSummary(e)));const meta=make('div','meta',`${e.timestamp?new Date(e.timestamp*1000).toLocaleTimeString():'--:--:--'} · ${e.latency_s!=null?Number(e.latency_s).toFixed(2)+' s':'等待耗时'} · ${e.model||e.role||''}`);row.append(left,mid,right,meta);box.append(row)})}
+function renderEvents(id,events,stage){const box=q(id);box.replaceChildren();if(!events?.length){box.append(make('div','empty','等待 '+stage+' 调用'));return}events.slice(-8).reverse().forEach((e,index)=>{const row=make('article','event'),left=make('div','event-col'),mid=make('div','event-col'),right=make('div','event-col');left.append(make('div','label',stage==='M1'?'输入图像':'候选 subgoal'));if(stage==='M1'){const im=make('img','thumb');im.src='/panel1.jpg?event='+index+'&ts='+Date.now();im.alt='M1图像输入';left.append(im)}else{const cs=contextCandidates(e);addChips(left,cs.map(c=>c.id||c.candidate_id||c.target_name||'candidate'))}mid.append(make('div','label',stage==='M2'?'历史 / 目标 / 简化请求':'简化问题'));if(stage==='M2'){const hist=e?.context?.recent_decisions||e?.payload?.recent_decisions||[];const mission=e?.context?.mission||e?.payload?.mission||{};addChips(mid,['历史 '+(Array.isArray(hist)?hist.length:0),'候选 '+contextCandidates(e).length,'目标 '+(mission.target_name||mission.target||mission.mode||'探索')]);mid.append(make('div','prompt','从当前候选中选择下一语义子目标'))}else mid.append(make('div','prompt',clip(e.instruction||'判断当前交互对象属性与状态')));right.append(make('div','label','MLLM 输出'));right.append(make('div','result',outputSummary(e)));const meta=make('div','meta',`${e.timestamp?new Date(e.timestamp*1000).toLocaleTimeString():'--:--:--'} · ${e.latency_s!=null?Number(e.latency_s).toFixed(2)+' s':'等待耗时'} · ${e.model||e.role||''}`);row.append(left,mid,right,meta);box.append(row)})}
 function firstObj(...values){return values.find(v=>v&&typeof v==='object')||{}}
 function renderM3(m3){const box=q('#m3');box.replaceChildren();const fb=firstObj(m3?.behavior_feedback,m3?.interaction_result),detail=firstObj(fb.detail,fb.result,fb);let status=text(fb.status||detail.status||'WAITING').toUpperCase(),success=fb.success??detail.success;let kind=success===true||/PASS|SUCCESS|COMPLETE/.test(status)?'good':success===false||/FAIL|ERROR|BLOCK/.test(status)?'bad':'warn';const head=make('div','m3head');head.append(make('div','m3status',status),make('span','badge '+kind,success===true?'验证通过':success===false?'验证未通过':'等待结果'));box.append(head);const grid=make('div','m3details');[['评价对象',fb.target_name||fb.target_id||fb.candidate_id||detail.target||'暂无'],['结果原因',detail.reason||fb.reason||detail.failure_stage||'等待交互反馈'],['状态变化',detail.pre_state&&detail.post_state?detail.pre_state+' → '+detail.post_state:'未产生'],['验证方式','状态/图更新一致性']].forEach(([n,v])=>{const d=make('div','mini');d.append(make('span','',n),make('b','',clip(v,60)));grid.append(d)});box.append(grid)}
 function num(v,d=1){const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--'}
 function speed(t){const v=t?.velocity||t?.linear_velocity||[];if(Array.isArray(v))return Math.hypot(...v.slice(0,3).map(Number));if(v&&typeof v==='object')return Math.hypot(Number(v.x||0),Number(v.y||0),Number(v.z||0));return Number(t?.speed||0)}
-function renderGo2(s){const t=s.telemetry||{},b=t.battery||{},link=s.link||{},grid=make('div','state-grid');const metrics=[['🔋',num(b.soc??t.battery_soc,0)+' %','电量'],['↗',num(speed(t),2)+' m/s','速度'],['⟳',num((Number(t.yaw||0)*180/Math.PI),1)+'°','航向'],['◉',text(t.mode||'站立'),'动作模式'],['↕',num(t.body_height,2)+' m','机身高度'],['⚠',String(t.error_code??0),'错误码']];metrics.forEach(([i,v,n])=>{const d=make('div','metric');d.append(make('div','icon',i),make('div','value',v),make('div','name',n));grid.append(d)});const line=make('div','statusline');line.append(make('span','badge '+(link.connected===false?'bad':'good'),link.connected===false?'相机断开':'相机在线'),make('span','badge good','控制输出阻断'),make('span','badge','图节点 '+(s.graph?.node_count??0)),make('span','badge','候选 '+((s.navigation?.candidates?.candidates||[]).length)));const box=q('#go2');box.replaceChildren(grid,line);q('#stamp').textContent='帧 '+(s.frame_seq??'--')+' · '+new Date().toLocaleTimeString()}
+function renderGo2(s){const t=s.telemetry||{},b=t.battery||{},link=s.link||{},grid=make('div','state-grid');const metrics=[['🔋',num(b.soc??t.battery_soc,0)+' %','电量'],['↗',num(speed(t),2)+' m/s','速度'],['⟳',num((Number(t.yaw||0)*180/Math.PI),1)+'°','航向'],['◉',text(t.mode||'站立'),'动作模式'],['↕',num(t.body_height,2)+' m','机身高度'],['⚠',String(t.error_code??0),'错误码']];metrics.forEach(([i,v,n])=>{const d=make('div','metric');d.append(make('div','icon',i),make('div','value',v),make('div','name',n));grid.append(d)});const line=make('div','statusline');line.append(make('span','badge '+(link.connected===false?'bad':'good'),link.connected===false?'相机断开':'相机在线'),make('span','badge good','控制输出阻断'),make('span','badge','图节点 '+(s.graph?.node_count??0)),make('span','badge','候选 '+((s.navigation?.candidates?.candidates||[]).length)));const box=q('#go2');box.replaceChildren(grid,line);q('#stamp').textContent='导航步 '+(s.navigation_step??'--')+' · 相机帧 '+(s.frame_seq??'--')+' · '+new Date().toLocaleTimeString()}
 async function refresh(){try{const r=await fetch('/api/state-summary?ts='+Date.now(),{cache:'no-store'}),s=await r.json();renderEvents('#m1',s.mllm?.M1,'M1');renderEvents('#m2',s.mllm?.M2,'M2');renderM3(s.m3||{});renderGo2(s)}catch(e){q('#stamp').textContent='刷新失败';q('#go2').replaceChildren(make('div','empty',clip(e,100)))}}
-setInterval(refresh,1000);refresh();
+let videoBusy=false;
+async function refreshVideo(){if(videoBusy)return;videoBusy=true;try{const ts=Date.now(),[overviewResponse,cameraResponse]=await Promise.all([fetch('/snapshot.jpg?ts='+ts,{cache:'no-store'}),fetch('/camera-overlay.jpg?ts='+ts,{cache:'no-store'})]);if(!overviewResponse.ok)throw Error('snapshot '+overviewResponse.status);if(!cameraResponse.ok)throw Error('camera '+cameraResponse.status);const [bmp,cameraBmp]=await Promise.all([createImageBitmap(await overviewResponse.blob()),createImageBitmap(await cameraResponse.blob())]),overview=q('#overview'),camera=q('#panel1');overview.getContext('2d').drawImage(bmp,0,0,overview.width,overview.height);camera.getContext('2d').drawImage(cameraBmp,0,0,camera.width,camera.height);q('#panel5').getContext('2d').drawImage(bmp,480,270,480,270,0,0,480,270);bmp.close();cameraBmp.close()}catch(e){q('#stamp').textContent='视频重试：'+clip(e,50)}finally{videoBusy=false}}
+setInterval(refresh,1000);setInterval(refreshVideo,200);refresh();refreshVideo();
 </script></html>"""
 
 
@@ -703,6 +880,7 @@ def _compact_qwen_context(snapshot: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "frame_seq": snapshot.get("frame_seq", -1),
+        "navigation_step": snapshot.get("navigation_step", -1),
         "telemetry": _compact_telemetry(snapshot.get("telemetry", {})),
         "detections": compact_detections,
         "graph": compact_graph,
@@ -811,7 +989,10 @@ class PhysicalGateway:
             while True:
                 try:
                     frame = self.renderer.render()
-                    with handler.frame_lock: handler.latest_jpeg = frame
+                    camera_frame = self.renderer.render_camera_overlay()
+                    with handler.frame_lock:
+                        handler.latest_jpeg = frame
+                        handler.latest_camera_jpeg = camera_frame
                 except Exception as exc:
                     self.state.last_error = str(exc)
                 time.sleep(.2)
