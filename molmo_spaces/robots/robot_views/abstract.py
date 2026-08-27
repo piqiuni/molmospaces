@@ -592,9 +592,14 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
         """
         ctrl = ctrl.copy()
 
-        # Wrap target yaw to be within +-pi of current yaw
-        curr_yaw = self.joint_pos[2]
-        ctrl[2] = curr_yaw + normalize_ang_error(ctrl[2] - curr_yaw)
+        # Preserve the legacy RBY1 hinge mapping.  The theta joint is
+        # represented on a [-pi, pi] branch; when a target crosses the branch
+        # boundary, move qpos to the equivalent branch before applying ctrl.
+        ctrl[2] = normalize_ang_error(ctrl[2])
+        theta_qpos_idx = self.mj_model.jnt_qposadr[self._joint_ids[2]]
+        current_theta = self.mj_data.qpos[theta_qpos_idx]
+        if abs(current_theta - ctrl[2]) > np.pi:
+            self.mj_data.qpos[theta_qpos_idx] = ctrl[2]
 
         self.mj_data.ctrl[self._actuator_ids] = ctrl
 
