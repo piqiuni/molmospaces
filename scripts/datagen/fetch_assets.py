@@ -36,8 +36,7 @@ def fetch_scene(args):
         install_scene_with_objects_and_grasps_from_path,
     )
 
-    scenes = get_scenes(args.scene_type, split=args.split)
-    print(f"Fetching scene {args.scene_type} index {args.index} split {args.split} variant {args.variant}")
+    scenes = get_scenes(args.scene_type)
     scene_path_or_dict = scenes[args.split][args.index]
     if isinstance(scene_path_or_dict, dict):
         scene_path = scene_path_or_dict[args.variant]

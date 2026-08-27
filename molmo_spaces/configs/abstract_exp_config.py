@@ -56,7 +56,7 @@ class MlSpacesExpConfig(Config, ABC):
     collision_free_pose_limit: int = 3
 
     # Scene configuration
-    scene_dataset: str  # Scenes to use, e.g. ithor, procthor-10k, procthor-objaverse
+    scene_dataset: str  # Scenes to use, e.g. ithor, procthor-10k, procthor-objaverse. If "user", use the scene_xml_paths in task_sampler_config.
     data_split: str = "train"  # Data split to use, e.g. train, val, test
 
     @property
@@ -97,7 +97,6 @@ class MlSpacesExpConfig(Config, ABC):
 
     filter_for_successful_trajectories: bool = True  # If True, only save successful trajectories to main output directory (failed episodes may be sampled 1% for debug directory). If False, save all trajectories to main output directory.
 
-    use_filament: bool = False
     environment_light_intensity: float = 15000.0
 
     def model_post_init(self, _context) -> None:
@@ -108,14 +107,6 @@ class MlSpacesExpConfig(Config, ABC):
         assert (self.ctrl_dt_ms / self.sim_dt_ms).is_integer(), (
             "ctrl_dt_ms must be a multiple of sim_dt"
         )
-
-        # Initialize eval_runtime_params if not set (for backward compatibility)
-        # This ensures it's always available, even for configs created outside evaluation
-        if self.eval_runtime_params is None:
-            # Import here to avoid circular dependency
-            from molmo_spaces.evaluation.eval_main import EvalRuntimeParams
-
-            self.eval_runtime_params = EvalRuntimeParams()
 
     @property
     @abstractmethod
@@ -176,11 +167,7 @@ class MlSpacesExpConfig(Config, ABC):
                     reference_body_names=list(cam.reference_body_names),
                     camera_offset=list(cam.camera_offset),
                     lookat_offset=list(cam.lookat_offset),
-                    camera_quaternion=(
-                        None
-                        if cam.camera_quaternion is None
-                        else list(cam.camera_quaternion)
-                    ),
+                    camera_quaternion=list(cam.camera_quaternion),
                     fov=cam.fov,
                 )
                 sc.camera_config.cameras[i] = new_camera

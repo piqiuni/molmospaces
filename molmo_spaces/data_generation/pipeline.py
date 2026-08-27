@@ -17,8 +17,8 @@ import mujoco
 # import mujoco.viewer
 import psutil
 import torch
-
 import wandb
+
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.molmo_spaces_constants import get_scenes
 from molmo_spaces.policy.base_policy import BasePolicy
@@ -129,7 +129,7 @@ def setup_policy(
     if preloaded_policy is not None:
         policy = preloaded_policy
     else:
-        policy = exp_config.policy_config.policy_cls(exp_config, task)
+        policy = exp_config.policy_config.policy_factory(exp_config, task)
 
     task.register_policy(policy)
 
@@ -219,17 +219,15 @@ def save_house_trajectories(
         if datagen_profiler is not None:
             datagen_profiler.start("save_batch_prep")
 
-        save_videos = bool(getattr(exp_config, "record_videos", True))
         house_trajectory_data = []
         for idx, episode_info in enumerate(house_raw_histories):
             prepared_episode = prepare_episode_for_saving(
                 episode_info["history"],
                 episode_info["sensor_suite"],
                 fps=exp_config.fps,
-                save_dir=house_output_dir if save_videos else None,
+                save_dir=house_output_dir,
                 episode_idx=idx,
                 save_file_suffix=batch_suffix,
-                remove_camera_sensors=True,
             )
             if prepared_episode is not None:
                 house_trajectory_data.append(prepared_episode)
@@ -248,7 +246,7 @@ def save_house_trajectories(
             save_dir=house_output_dir,
             fps=exp_config.fps,
             save_file_suffix=batch_suffix,
-            save_mp4s=save_videos,
+            save_mp4s=True,
             logger=worker_logger,
         )
         if datagen_profiler is not None:
@@ -337,8 +335,7 @@ def cleanup_context():
 def house_processing_worker(
     worker_id: int,
     exp_config: MlSpacesExpConfig,
-    house_indices: list[int],
-    samples_per_house: int,
+    work_items: list[tuple[int, int, int, int]],
     shutdown_event,
     counter_lock,
     house_counter,
@@ -354,23 +351,23 @@ def house_processing_worker(
     runner_class=None,
 ):
     """
-    Standalone worker function that processes houses sequentially from a shared counter.
+    Standalone worker function that processes work items sequentially from a shared counter.
 
+    Each work item is a (house_id, batch_samples, batch_num, total_batches) tuple.
     This function can be run in either a thread or a process. It continually fetches
-    the next house index from a shared counter and processes it.
+    the next work item from a shared counter and processes it.
 
     Args:
         worker_id: Unique ID for this worker
         exp_config: Experiment configuration
-        house_indices: List of all house indices to process
-        samples_per_house: Number of episodes per house
+        work_items: List of (house_id, batch_samples, batch_num, total_batches) tuples
         shutdown_event: Event to signal shutdown
         counter_lock: Lock for thread-safe counter access
-        house_counter: Shared counter for next house to process
+        house_counter: Shared counter for next work item to process
         success_count: Shared counter for successful episodes
         total_count: Shared counter for total episodes
-        completed_houses: Shared counter for completed houses
-        skipped_houses: Shared counter for skipped houses
+        completed_houses: Shared counter for completed work items
+        skipped_houses: Shared counter for skipped work items
         max_allowed_sequential_task_sampler_failures: Max consecutive task sampling failures
         max_allowed_sequential_rollout_failures: Max consecutive rollout failures
         max_allowed_sequential_irrecoverable_failures: Max consecutive irrecoverable failures
@@ -407,26 +404,28 @@ def house_processing_worker(
                     )
                     break
 
-                # Get next house to process atomically
+                # Get next work item to process atomically
                 with counter_lock:
-                    if house_counter.value >= len(house_indices):
-                        break  # No more houses to process
-                    house_idx = house_counter.value
-                    current_house_id = house_indices[house_idx]
+                    if house_counter.value >= len(work_items):
+                        break  # No more work items to process
+                    item_idx = house_counter.value
                     house_counter.value += 1
+                current_house_id, batch_samples, batch_num, total_batches = work_items[item_idx]
 
                 worker_logger.info(
-                    f"Worker {worker_id} starting house {current_house_id} (index {house_idx}/{len(house_indices)})"
+                    f"Worker {worker_id} starting house {current_house_id} "
+                    f"batch {batch_num}/{total_batches} ({batch_samples} episodes) "
+                    f"(item {item_idx}/{len(work_items)})"
                 )
 
-                # Process this house
+                # Process this work item
                 house_success_count, house_total_count, irrecoverable = (
                     runner_class.process_single_house(
                         worker_id,
                         worker_logger,
                         current_house_id,
                         exp_config,
-                        samples_per_house,
+                        batch_samples,
                         shutdown_event,
                         task_sampler,
                         preloaded_policy,
@@ -434,6 +433,8 @@ def house_processing_worker(
                         max_allowed_sequential_rollout_failures,
                         filter_for_successful_trajectories=filter_for_successful_trajectories,
                         runner_class=runner_class,
+                        batch_num=batch_num,
+                        total_batches=total_batches,
                         datagen_profiler=datagen_profiler,
                     )
                 )
@@ -463,7 +464,7 @@ def house_processing_worker(
                     # Reset counter on success
                     num_sequential_irrecoverable_failures = 0
 
-            worker_logger.info(f"Worker {worker_id} completed processing assigned houses")
+            worker_logger.info(f"Worker {worker_id} completed processing assigned work items")
         finally:
             # Log final profiling summary for this worker
             if datagen_profiler is not None:
@@ -522,13 +523,31 @@ class ParallelRolloutRunner:
 
         # don't have houses specified, use all, need to find out which ones those are
         if self.house_indices is None:
-            # For normal datagen: use all houses from scene mapping
-            mapping = get_scenes(exp_config.scene_dataset, exp_config.data_split)
-            self.house_indices = [
-                k for k, v in mapping[exp_config.data_split].items() if v is not None
-            ]
+            # if user-specified scene xml paths, use all of them
+            if exp_config.task_sampler_config.scene_xml_paths:
+                assert exp_config.scene_dataset == "user"
+                self.house_indices = list(
+                    range(len(exp_config.task_sampler_config.scene_xml_paths))
+                )
+            else:
+                # For normal datagen: use all houses from scene mapping
+                mapping = get_scenes(exp_config.scene_dataset, exp_config.data_split)
+                self.house_indices = [
+                    k for k, v in mapping[exp_config.data_split].items() if v is not None
+                ]
 
         self.total_houses = len(self.house_indices)
+
+        # Build (house_id, batch_samples, batch_num, total_batches) work items
+        episodes_per_batch = exp_config.task_sampler_config.episodes_per_batch
+        self.work_items: list[tuple[int, int, int, int]] = []
+        for house_id in self.house_indices:
+            total_batches = max(1, round(self.samples_per_house / episodes_per_batch))
+            base = self.samples_per_house // total_batches
+            extra = self.samples_per_house % total_batches
+            for b in range(total_batches):
+                batch_samples = base + (1 if b < extra else 0)
+                self.work_items.append((house_id, batch_samples, b + 1, total_batches))
 
         # Failure tracking limits
         self.max_allowed_sequential_task_sampler_failures = (
@@ -580,7 +599,8 @@ class ParallelRolloutRunner:
                         "num_workers": exp_config.num_workers,
                         "total_houses": self.total_houses,
                         "samples_per_house": self.samples_per_house,
-                        "total_expected_episodes": self.total_houses * self.samples_per_house,
+                        "total_work_items": len(self.work_items),
+                        "total_expected_episodes": sum(wi[1] for wi in self.work_items),
                         "output_dir": str(exp_config.output_dir),
                         "filter_for_successful_trajectories": exp_config.filter_for_successful_trajectories,
                     },
@@ -718,6 +738,8 @@ class ParallelRolloutRunner:
 
         try:
             task.env.current_model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+            # mujoco 3.11 raised the default sleep_tolerance from 1e-4 to 1e-3
+            task.env.current_model.opt.sleep_tolerance = 1e-3
         except AttributeError:
             print("Not setting mujoco sleep. Needs version >=mujoco-3.8")
 
@@ -734,7 +756,9 @@ class ParallelRolloutRunner:
                 profiler.start("policy_get_action")
             if datagen_profiler is not None:
                 datagen_profiler.start("policy_get_action")
-            action_cmd = policy.get_action(observation)
+            # An action chunk is a list of actions to be applied open-loop before a
+            # new observation is needed.
+            action_chunk = policy.get_action_chunk(observation) or [policy.get_action(observation)]
             if profiler is not None:
                 profiler.end("policy_get_action")
             if datagen_profiler is not None:
@@ -745,16 +769,17 @@ class ParallelRolloutRunner:
                 profiler.start("task_step")
             if datagen_profiler is not None:
                 datagen_profiler.start("task_step")
-            if action_cmd is None:
+            if action_chunk[0] is None:
                 print("Policy returned None action, ending episode")
                 break
-            observation, reward, terminal, truncated, infos = task.step(action_cmd)
+            observation, reward, terminal, truncated, infos = task.step_chunk(
+                action_chunk, stop_on_success=end_on_success
+            )
+            step_count += len(action_chunk)
             if profiler is not None:
                 profiler.end("task_step")
             if datagen_profiler is not None:
                 datagen_profiler.end("task_step")
-
-            step_count += 1
             # Add termination if succ
             if end_on_success and "success" in infos[0] and infos[0]["success"]:
                 success = True
@@ -1192,10 +1217,10 @@ class ParallelRolloutRunner:
         Returns:
             tuple: (success_count, total_count)
         """
-        total_expected_episodes = self.total_houses * self.samples_per_house
+        total_expected_episodes = sum(wi[1] for wi in self.work_items)
         self.logger.info(
-            f"Starting house-by-house rollout of {self.total_houses} houses "
-            f"with {self.samples_per_house} episodes each ({total_expected_episodes} total episodes) "
+            f"Starting rollout of {self.total_houses} houses "
+            f"split into {len(self.work_items)} work items ({total_expected_episodes} total episodes) "
             f"using {self.config.num_workers} worker processes"
         )
 
@@ -1216,8 +1241,7 @@ class ParallelRolloutRunner:
                     args=(
                         worker_id,
                         self.config,
-                        self.house_indices,
-                        self.samples_per_house,
+                        self.work_items,
                         self.shutdown_event,
                         self.counter_lock,
                         self.house_counter,
@@ -1254,9 +1278,10 @@ class ParallelRolloutRunner:
                         active = sum(1 for p in processes if p.is_alive())
 
                         # Calculate metrics
+                        total_work_items = len(self.work_items)
                         success_rate = success / total if total > 0 else 0.0
                         episodes_per_second = total / elapsed_time if elapsed_time > 0 else 0.0
-                        completion_percentage = (completed + skipped) / self.total_houses * 100
+                        completion_percentage = (completed + skipped) / total_work_items * 100
 
                         # Log to WandB
                         wandb.log(
@@ -1274,7 +1299,7 @@ class ParallelRolloutRunner:
                             }
                         )
                         self.logger.info(
-                            f"Progress: {completed}/{self.total_houses} houses completed "
+                            f"Progress: {completed}/{total_work_items} work items completed "
                             f"({completion_percentage:.1f}%), {success}/{total} successful episodes "
                             f"({success_rate * 100:.1f}%), {active} workers active"
                         )
@@ -1296,8 +1321,7 @@ class ParallelRolloutRunner:
             house_processing_worker(
                 worker_id=0,
                 exp_config=self.config,
-                house_indices=self.house_indices,
-                samples_per_house=self.samples_per_house,
+                work_items=self.work_items,
                 shutdown_event=self.shutdown_event,
                 counter_lock=self.counter_lock,
                 house_counter=self.house_counter,
@@ -1310,9 +1334,7 @@ class ParallelRolloutRunner:
                 max_allowed_sequential_irrecoverable_failures=self.max_allowed_sequential_irrecoverable_failures,
                 preloaded_policy=preloaded_policy,
                 filter_for_successful_trajectories=self.config.filter_for_successful_trajectories,
-                runner_class=type(
-                    self
-                ),  # Pass the runner class to enable customization via subclassing
+                runner_class=type(self),
             )
 
         # Extract final values from shared multiprocessing state
@@ -1323,7 +1345,7 @@ class ParallelRolloutRunner:
 
         success_rate = success_count_val / total_count_val if total_count_val > 0 else 0.0
         self.logger.info(
-            f"Completed {completed_houses_val} houses, skipped {skipped_houses_val} houses"
+            f"Completed {completed_houses_val} work items, skipped {skipped_houses_val} work items"
         )
         self.logger.info(f"Success count: {success_count_val}, Total count: {total_count_val}")
         self.logger.info(f"Success rate: {success_rate * 100:.2f}%")

@@ -26,17 +26,13 @@ class CameraSensor(Sensor):
 
     def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> np.ndarray:
         """Get camera image from environment rendering."""
-        try:
-            frame = env.render_rgb_frame(self.camera_name)
-            if frame is not None:
-                return frame
-        except RuntimeError as e:
-            # In viewer debug mode, offscreen EGL can fail to bind context on some drivers.
-            # Fall back to a black frame to keep teleop/debug loop alive.
-            if "EGL" in str(e):
-                width, height = self.img_resolution
-                return np.zeros((height, width, 3), dtype=np.uint8)
-            raise
+
+        # Use camera-specific frame access for multi-camera support
+        # if hasattr(env, 'render_rgb_frame') and callable(env.render_rgb_frame):
+        frame = env.render_rgb_frame(self.camera_name)
+
+        if frame is not None:
+            return frame
 
         # Return black image if no rendering available
         width, height = self.img_resolution
@@ -71,13 +67,9 @@ class DepthSensor(Sensor):
         """Get depth image from environment rendering."""
         # Use camera-specific frame access for multi-camera support
         if hasattr(env, "render_depth_frame") and callable(env.render_depth_frame):
-            try:
-                frame = env.render_depth_frame(self.camera_name)
-                if frame is not None:
-                    return frame
-            except RuntimeError as e:
-                if "EGL" not in str(e):
-                    raise
+            frame = env.render_depth_frame(self.camera_name)
+            if frame is not None:
+                return frame
 
         # Fallback to default camera for backward compatibility
         if hasattr(env, "depth_frame") and env.depth_frame is not None:
@@ -130,9 +122,9 @@ class CameraParameterSensor(Sensor):
 
     def __init__(
         self,
-        camera_name: str = "camera",
+        camera_name: str,
+        img_resolution: tuple[int, int],
         uuid: str | None = None,
-        img_resolution: tuple[int, int] = (480, 480),
     ) -> None:
         self.img_resolution = img_resolution
         self.camera_name = camera_name
@@ -157,7 +149,6 @@ class CameraParameterSensor(Sensor):
         extrinsic_cv = np.linalg.inv(world2cam)[:3, :]  # 3x4 matrix
         cam2world_gl = world2cam
 
-        # img_resolution is stored as (width, height)
         width, height = self.img_resolution
         fovy_degrees = camera.fov
 
@@ -177,68 +168,3 @@ class CameraParameterSensor(Sensor):
             "intrinsic_cv": intrinsic_cv.tolist(),
         }
         return data
-
-
-# # Legacy sensors from other project (keeping for reference)
-# class AgentsCameraParametersSensor(Sensor):
-#     def __init__(
-#         self,
-#         uuid: str = "agent_camera_params",
-#         str_max_len: Union[str, int] = 2000,
-#     ) -> None:
-#         assert isinstance(str_max_len, int)
-#         self.str_max_len = str_max_len
-#         observation_space = self._get_observation_space()
-#         super().__init__(uuid=uuid, observation_space=observation_space)
-
-#     def _get_observation_space(self) -> gyms.MultiDiscrete:
-#         return gyms.Discrete(self.str_max_len)
-
-#     def get_observation(self, env, task, *args, **kwargs) -> np.ndarray:
-#         # Legacy implementation - would need adaptation for molmo-spaces
-#         agent_parameter_sensors = {}
-#         for which_cam in ["front", "left", "right", "down"]:
-#             params = round_floats_in_dict(
-#                 task.controller.camera_registry[which_cam]["camera_parameters"]
-#             )
-#             if params is not None and "camera_intrinsic" in params:
-#                 del params[
-#                     "camera_intrinsic"
-#                 ]  # alternately, make it json-friendly. this seems fine though
-#             agent_parameter_sensors[which_cam] = params
-#         param_string = json.dumps(agent_parameter_sensors)
-#         # Convert string to bytes array for gym compatibility
-#         byte_array = np.zeros(self.str_max_len, dtype=np.uint8)
-#         encoded = param_string.encode('utf-8')[:self.str_max_len]
-#         byte_array[:len(encoded)] = list(encoded)
-#         return byte_array
-
-
-# class RawRGBCameraSensor(Sensor):
-#     def __init__(self, uuid: str, height: int, width: int, which_camera: str):
-#         self.height = height
-#         self.width = width
-#         self.which_camera = which_camera
-
-#         observation_space = gyms.Box(
-#             low=0, high=255,
-#             shape=(height, width, 3),
-#             dtype=np.uint8
-#         )
-#         super().__init__(uuid=uuid, observation_space=observation_space)
-
-#     def get_observation(self, env, task, *args, **kwargs) -> Any:
-#         # Legacy implementation - would need adaptation for molmo-spaces
-#         frame = env.camera_registry[self.which_camera]["rgb"].copy()
-#         if frame.shape[0] != self.height or frame.shape[1] != self.width:
-#             import platform
-#             if platform.system() != "Darwin":
-#                 raise NotImplementedError(
-#                     "Resizing the raw frames is a temp hack to get the warped and raw frames at "
-#                     "the same time for visual comparison. If you are actually generating data, "
-#                     "do not just bypass this check, fix get_core_sensors to actually be "
-#                     "what you want."
-#                 )
-#             import cv2
-#             frame = cv2.resize(frame, (self.width, self.height))
-#         return frame

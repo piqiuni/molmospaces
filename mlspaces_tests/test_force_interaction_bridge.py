@@ -680,7 +680,7 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     )
     task = SimpleNamespace(env=SimpleNamespace(current_model=model, current_data=data))
 
-    for step in range(12):
+    for step in range(20):
         controller.before_step(task, step=step)
         result = controller.after_step(task, step=step)
         if result is not None:
@@ -688,11 +688,11 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
 
     assert result is not None
     assert result["success"] is True
-    assert result["task_steps_consumed"] == 11
+    assert result["task_steps_consumed"] == 16
     assert result["drawer_execution_mode"] == "fast"
     assert result["drawer_observation_steps"] == 3
     assert result["approach_goal_xyyaw"] == [1.0, 2.0, 0.5]
-    assert [item["observation_step"] for item in result["region_results"]] == [3, 8]
+    assert [item["observation_step"] for item in result["region_results"]] == [3, 8, 13]
     assert "interaction_group_results" not in result
     assert "joint_names" not in result
     assert "joint_infos" not in result
@@ -703,6 +703,8 @@ def test_drawer_scan_fast_mode_combines_transitions_and_observations(monkeypatch
     assert prepared_targets == [
         (("drawer_top",), ("drawer_bottom", "drawer_hidden")),
         ((), ("drawer_top",)),
+        (("drawer_hidden",), ("drawer_top", "drawer_bottom")),
+        ((), ("drawer_hidden",)),
         (("drawer_bottom",), ("drawer_top", "drawer_hidden")),
         ((), ("drawer_bottom",)),
     ]

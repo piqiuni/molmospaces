@@ -1,58 +1,34 @@
-from __future__ import annotations
-
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from functools import cache, lru_cache
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from nltk.corpus.reader import Synset
+from nltk.corpus.reader import Synset
 
-
-def _ensure_nltk():
-    import nltk
-
-    for corpus in ["wordnet", "wordnet2022"]:
-        candidates = (f"corpora/{corpus}", f"corpora/{corpus}.zip")
-        if any(_nltk_resource_exists(nltk, candidate) for candidate in candidates):
-            continue
-        nltk.download(corpus, quiet=True, raise_on_error=True)
+_WORDNET = None
 
 
-def _nltk_resource_exists(nltk, resource: str) -> bool:
-    try:
-        nltk.data.find(resource)
-        return True
-    except LookupError:
-        return False
+def get_wordnet():
+    """Lazily download NLTK's wordnet corpora and return the wordnet2022 module.
 
+    Downloading/importing wordnet is deferred to first actual use (rather than
+    module import time) since this module is imported by config/env code that
+    loads on every entry point invocation, regardless of whether any wordnet
+    lookup is ever performed.
+    """
+    global _WORDNET
+    if _WORDNET is None:
+        import nltk
 
-@cache
-def _get_wordnet():
-    """Load and validate the WordNet corpus only when semantic lookup is used."""
+        for corpus in ["wordnet", "wordnet2022"]:
+            nltk.download(corpus)
 
-    _ensure_nltk()
-    from nltk.corpus import wordnet2022
+        from nltk.corpus import wordnet2022 as wn
 
-    wordnet2022.abspaths()
-    return wordnet2022
+        wn.abspaths()
+        _WORDNET = wn
 
+    return _WORDNET
 
-@cache
-def _get_synset_type() -> type:
-    from nltk.corpus.reader import Synset
-
-    return Synset
-
-
-class _LazyWordNet:
-    """Compatibility proxy for callers importing ``synset_utils.wn``."""
-
-    def __getattr__(self, name: str):
-        return getattr(_get_wordnet(), name)
-
-
-wn = _LazyWordNet()
 
 from molmo_spaces.utils.constants.object_constants import AI2THOR_OBJECT_TYPE_TO_WORDNET_SYNSET
 from molmo_spaces.utils.object_metadata import ObjectMeta
@@ -952,7 +928,7 @@ def generate_all_hypernyms_with_exclusions(
         return set()
 
     if isinstance(synset, str):
-        synset = wn.synset(synset)
+        synset = get_wordnet().synset(synset)
 
     return set(
         h
@@ -965,10 +941,10 @@ def generate_all_hypernyms_with_exclusions(
 @lru_cache(maxsize=10000, typed=True)
 def is_hypernym_of(synset: str | Synset, possible_hypernym: str | Synset) -> bool:
     if isinstance(synset, str):
-        synset = wn.synset(synset)
+        synset = get_wordnet().synset(synset)
 
     if isinstance(possible_hypernym, str):
-        possible_hypernym = wn.synset(possible_hypernym)
+        possible_hypernym = get_wordnet().synset(possible_hypernym)
 
     return possible_hypernym in synset.lowest_common_hypernyms(possible_hypernym)
 
@@ -990,14 +966,14 @@ def generate_hypernym_to_descendants(
         return {}
 
     if isinstance(synsets[0], str):
-        synsets = [wn.synset(s) for s in synsets]
+        synsets = [get_wordnet().synset(s) for s in synsets]
 
     synsets = set(synsets)
     synsets = [s.name() for s in synsets]
 
     hypernym_to_descendants = defaultdict(list)
     for s in synsets:
-        s = wn.synset(s)
+        s = get_wordnet().synset(s)
         paths = s.hypernym_paths()
         for hypernym in set(sum(paths, [])):
             hypernym_to_descendants[hypernym.name()].append(s)
@@ -1011,7 +987,7 @@ def filter_synsets_to_remove_hyponyms(synsets: Sequence[str] | Sequence[Synset])
 
     hyper_to_descs = generate_hypernym_to_descendants(synsets=synsets)
 
-    if isinstance(synsets[0], _get_synset_type()):
+    if isinstance(synsets[0], Synset):
         synsets = [s.name() for s in synsets]
 
     to_remove = set()
@@ -1030,7 +1006,7 @@ def get_all_synsets_in_metadata() -> list[Synset]:
     synsets = set(ann["synset"] for ann in anns.values() if "synset" in ann) | set(
         AI2THOR_OBJECT_TYPE_TO_WORDNET_SYNSET.values()
     )
-    synsets = sorted(list(set([wn.synset(s) for s in synsets])), key=lambda s: s.name())
+    synsets = sorted(list(set([get_wordnet().synset(s) for s in synsets])), key=lambda s: s.name())
     return synsets
 
 
@@ -1042,7 +1018,7 @@ def get_hypernym_to_descendants_for_all_metadata_synsets():
 @lru_cache(maxsize=10000, typed=True)
 def get_hyponyms_of_synset(synset: str | Synset, return_strings: bool) -> set[Synset] | set[str]:
     if isinstance(synset, str):
-        synset = wn.synset(synset)
+        synset = get_wordnet().synset(synset)
 
     if return_strings:
         hyps = {synset.name()}
@@ -1086,7 +1062,7 @@ def get_highest_relevant_hypernym(
     excluded: set[str] | str = EXCLUDED_HYPERNYMS,
 ) -> Synset:
     if isinstance(synset, str):
-        synset = wn.synset(synset)
+        synset = get_wordnet().synset(synset)
 
     for hpath in synset.hypernym_paths():
         for hyp in hpath:
@@ -1190,7 +1166,7 @@ def is_valid_receptacle_synset(synset: str | Synset) -> bool:
     if synset is None:
         return False
 
-    if isinstance(synset, _get_synset_type()):
+    if isinstance(synset, Synset):
         synset = synset.name()
 
     return synset in _get_all_valid_receptacle_synsets()
@@ -1253,7 +1229,7 @@ PICKUPABLE_EXCLUDED_EXACT_SYNSETS: dict[str, str] = {
 
 def canonical_lemma(synset_name: str) -> str:
     """Return the first (most canonical) lemma for a WordNet synset name."""
-    return wn.synset(synset_name).lemma_names()[0].replace("_", " ")
+    return get_wordnet().synset(synset_name).lemma_names()[0].replace("_", " ")
 
 
 def _build_pickupable_category_exclusion_set() -> dict[str, str]:
@@ -1306,11 +1282,11 @@ def _pickupable_class_ranking() -> list[tuple[str, list[str]]]:
 
 
 VALID_PICKUPABLE_OBJA_UIDS_PATH = (
-    "/weka/prior/datasets/robomolmo/asset_utility_refs/valid_pickupable_obja_uids.txt"
+    "/weka/robots-default/datasets/robomolmo/asset_utility_refs/valid_pickupable_obja_uids.txt"
 )
 
 BENCHMARK_BLACKLIST_UIDS_PATH = (
-    "/weka/prior/datasets/robomolmo/asset_utility_refs/benchmark_blacklist_uids.txt"
+    "/weka/robots-default/datasets/robomolmo/asset_utility_refs/benchmark_blacklist_uids.txt"
 )
 
 
@@ -1341,13 +1317,13 @@ def get_valid_pickupable_obja_uids(debug: bool = False) -> list[str]:
             print(f"\n=== Loaded {len(uid_list)} pickupable UIDs from cache ===\n")
         return uid_list
 
-    from molmo_spaces.utils.grasp_sample import has_valid_grasp_file
+    from molmo_spaces.utils.grasps import has_valid_pickup_grasps
     from molmo_spaces.utils.object_metadata import ObjectMeta
 
     valid_uids = {}
 
     for uid, anno in ObjectMeta.annotation().items():
-        if has_valid_grasp_file(uid):
+        if has_valid_pickup_grasps(uid):
             valid_uids[uid] = anno
 
     if debug:
