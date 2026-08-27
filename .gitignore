@@ -85,3 +85,8 @@ __pycache__/
 *.ckpt
 *.pb
 *.tflite
+
+# Local physical-navigation captures and external detector source trees
+scripts/InteractiveNav/physical_nav/artifacts/
+detection_models/YOLO-World/
+detection_models/sam3/
