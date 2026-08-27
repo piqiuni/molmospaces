@@ -30,6 +30,10 @@
     <param name="world_frame" value="tf_frame_map"/>
     <param name="camera_frame" value="d435i_color_optical_frame"/>
     <param name="camera_parent" value="tf_frame_base_link"/>
+    <param name="occupancy_grid_topic" value="/physical_nav/occupancy"/>
+    <param name="room_grid_topic" value="/physical_nav/room_segment_grid"/>
+    <param name="global_costmap_topic" value="/move_base/global_costmap/costmap"/>
+    <param name="local_costmap_topic" value="/move_base/local_costmap/costmap"/>
     <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
   </node>

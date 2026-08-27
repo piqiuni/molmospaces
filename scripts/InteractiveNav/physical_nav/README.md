@@ -24,6 +24,14 @@ The Go2 client has no motion publisher or control client. Keyboard/web commands
 are handled by `ReadOnlySafetyGate`, recorded as `READ_ONLY_BLOCKED`, and never
 sent to the robot.
 
+The live six-panel image reuses the established offline interactive-navigation
+renderer: `build_semantic_video_offline.py`'s canonical panel assembly and
+`offline_semantic_renderer.py`'s `OfflineSixPanelRenderer`. The physical adapter
+feeds it recorder-shaped `step` and `RawGrid` values. The panel order is
+`camera / OCC / room` on the first row and `global+local costmaps / semantic XY
+/ topology` on the second row. Real hardware has no simulator GT stream, so no
+GT overlay is fabricated.
+
 The current measured standing-pose camera extrinsic is used by default:
 `base -> camera = (x=+0.03 m, y=0 m, z=+0.75 m)` with zero roll/pitch/yaw.
 This interprets the 38 cm camera location as 3 cm forward of the 70 cm body

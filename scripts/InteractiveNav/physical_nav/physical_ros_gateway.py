@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 import rospy
 from geometry_msgs.msg import TransformStamped
+from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 import sensor_msgs.point_cloud2 as pc2
@@ -49,13 +50,20 @@ class PhysicalRosGateway:
         self.detection_pub = rospy.Publisher("/physical_nav/detections", String, queue_size=1)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(); self.static_broadcaster = tf2_ros.StaticTransformBroadcaster()
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0)); self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
-        self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_state_poll = 0.0; self._last_occupancy_post = 0.0; self._mapped_post_lock = threading.Lock(); self._mapped_post_busy = False
+        self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_state_poll = 0.0; self._last_grid_post: dict[str, float] = {}; self._last_occupancy_post = 0.0; self._mapped_post_lock = threading.Lock(); self._mapped_post_busy = False
         # Detections originate in the non-ROS YOLOE worker and are republished
         # below for the existing mapper.  Do not subscribe to the same topic
         # here: that would feed our own message back into the HTTP state loop.
         for topic, name in (("/physical_nav/unified_graph", "graph"), ("/physical_nav/consistency", "consistency"),):
             rospy.Subscriber(topic, String, self._json_callback(name), queue_size=1)
-        rospy.Subscriber("/physical_nav/occupancy", __import__("nav_msgs.msg", fromlist=["OccupancyGrid"]).OccupancyGrid, self._occupancy_callback, queue_size=1)
+        for topic, name in (
+            (self.args.occupancy_grid_topic, "occupancy"),
+            (self.args.room_grid_topic, "room_grid"),
+            (self.args.global_costmap_topic, "global_costmap"),
+            (self.args.local_costmap_topic, "local_costmap"),
+        ):
+            if topic:
+                rospy.Subscriber(topic, OccupancyGrid, self._grid_callback(name), queue_size=1)
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(args.rate, 1e-3)), self._poll)
 
     def _post_state(self, name: str, value: Any) -> None:
@@ -73,13 +81,44 @@ class PhysicalRosGateway:
             except Exception as exc: rospy.logwarn_throttle(5.0, "physical ROS state %s: %s", name, exc)
         return callback
 
+    @staticmethod
+    def _grid_payload(msg: OccupancyGrid) -> dict[str, Any]:
+        origin = msg.info.origin
+        return {
+            "width": int(msg.info.width),
+            "height": int(msg.info.height),
+            "resolution": float(msg.info.resolution),
+            "frame_id": str(getattr(msg.header, "frame_id", "") or ""),
+            "origin": {
+                "x": float(origin.position.x),
+                "y": float(origin.position.y),
+                "z": float(origin.position.z),
+                "qx": float(origin.orientation.x),
+                "qy": float(origin.orientation.y),
+                "qz": float(origin.orientation.z),
+                "qw": float(origin.orientation.w),
+            },
+            "data": list(msg.data),
+        }
+
+    def _grid_callback(self, name: str):
+        def callback(msg: OccupancyGrid) -> None:
+            # Keep map-stage snapshots visible in the browser and available to
+            # the canonical offline renderer without serializing ROS objects.
+            now = time.monotonic()
+            if now - self._last_grid_post.get(name, 0.0) < self.args.occupancy_period:
+                return
+            self._last_grid_post[name] = now
+            self._post_state(name, self._grid_payload(msg))
+        return callback
+
     def _occupancy_callback(self, msg: Any) -> None:
-        # Keep the map visible in the browser without serializing ROS metadata.
+        """Compatibility callback retained for small unit-test stubs."""
         now = time.monotonic()
         if now - self._last_occupancy_post < self.args.occupancy_period:
             return
         self._last_occupancy_post = now
-        self._post_state("occupancy", {"width": msg.info.width, "height": msg.info.height, "resolution": msg.info.resolution, "origin": {"x": msg.info.origin.position.x, "y": msg.info.origin.position.y}, "data": list(msg.data)})
+        self._post_state("occupancy", self._grid_payload(msg))
 
     def _poll(self, _event: Any) -> None:
         try:
@@ -251,11 +290,11 @@ def _image_msg(array: np.ndarray, encoding: str, stamp: Any, frame: str) -> Imag
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--rate", type=float, default=10.); p.add_argument("--state-period", type=float, default=.2); p.add_argument("--occupancy-period", type=float, default=.5); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--world-frame", default="tf_frame_map"); p.add_argument("--camera-frame", default="d435i_color_optical_frame"); p.add_argument("--camera-parent", default="tf_frame_base_link"); p.add_argument("--camera-x", type=float, default=.03); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=.75); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args, _unknown = p.parse_known_args()
+    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--rate", type=float, default=10.); p.add_argument("--state-period", type=float, default=.2); p.add_argument("--occupancy-period", type=float, default=.5); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--world-frame", default="tf_frame_map"); p.add_argument("--camera-frame", default="d435i_color_optical_frame"); p.add_argument("--camera-parent", default="tf_frame_base_link"); p.add_argument("--camera-x", type=float, default=.03); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=.75); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); p.add_argument("--occupancy-grid-topic", default="/physical_nav/occupancy"); p.add_argument("--room-grid-topic", default="/physical_nav/room_segment_grid"); p.add_argument("--global-costmap-topic", default="/move_base/global_costmap/costmap"); p.add_argument("--local-costmap-topic", default="/move_base/local_costmap/costmap"); args, _unknown = p.parse_known_args()
     # ROS launch appends __name/__log remappings; ignore those in the local
     # CLI parser so the gateway can also be run directly.
     rospy.init_node("physical_ros_gateway", anonymous=False)
-    for name in ("web_url", "rate", "state_period", "occupancy_period", "point_stride", "max_depth_m", "world_frame", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw"):
+    for name in ("web_url", "rate", "state_period", "occupancy_period", "point_stride", "max_depth_m", "world_frame", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw", "occupancy_grid_topic", "room_grid_topic", "global_costmap_topic", "local_costmap_topic"):
         setattr(args, name, rospy.get_param("~" + name, getattr(args, name)))
     PhysicalRosGateway(args); rospy.spin()
 

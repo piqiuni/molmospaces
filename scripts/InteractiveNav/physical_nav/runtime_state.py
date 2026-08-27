@@ -30,6 +30,11 @@ class RuntimeState:
         self.mapped_detection_meta: dict[str, Any] = {}
         self.graph: dict[str, Any] = {}
         self.occupancy = None
+        # Additional raw grids mirror the recorder's map stages.  They remain
+        # in-memory for the live renderer; /api/state exposes metadata only.
+        self.room_grid = None
+        self.global_costmap = None
+        self.local_costmap = None
         self.consistency: dict[str, Any] = {}
         self.qwen: dict[str, Any] = {"requests": [], "results": []}
         self.link: dict[str, Any] = {
@@ -109,7 +114,10 @@ class RuntimeState:
                 "mapped_detections": copy.deepcopy(self.mapped_detections),
                 "mapped_detection_meta": copy.deepcopy(self.mapped_detection_meta),
                 "graph": copy.deepcopy(self.graph),
-                "occupancy": ({k: self.occupancy.get(k) for k in ("width", "height", "resolution", "origin")} if isinstance(self.occupancy, dict) else None),
+                "occupancy": ({k: self.occupancy.get(k) for k in ("width", "height", "resolution", "origin", "frame_id")} if isinstance(self.occupancy, dict) else None),
+                "room_grid": ({k: self.room_grid.get(k) for k in ("width", "height", "resolution", "origin", "frame_id")} if isinstance(self.room_grid, dict) else None),
+                "global_costmap": ({k: self.global_costmap.get(k) for k in ("width", "height", "resolution", "origin", "frame_id")} if isinstance(self.global_costmap, dict) else None),
+                "local_costmap": ({k: self.local_costmap.get(k) for k in ("width", "height", "resolution", "origin", "frame_id")} if isinstance(self.local_costmap, dict) else None),
                 "consistency": copy.deepcopy(self.consistency),
                 "qwen": copy.deepcopy(self.qwen),
                 "link": copy.deepcopy(self.link),

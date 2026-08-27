@@ -11,7 +11,7 @@ from physical_consistency import bbox_iou, evaluate_detection, evaluate_frame, p
 from safety_gate import ReadOnlySafetyGate
 from physical_yoloe_bridge import _label, _rotation, _world_points
 from runtime_state import RuntimeState
-from physical_six_panel_server import _compact_qwen_context
+from physical_six_panel_server import SixPanelRenderer, _compact_qwen_context
 
 
 class PhysicalPlatformTests(unittest.TestCase):
@@ -90,6 +90,34 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert snapshot["detections"][0]["mask"]
     assert snapshot["mapped_detections"][0]["map_transform_status"] == "tf"
     assert snapshot["mapped_detection_meta"]["map_frame"] == "tf_frame_map"
+
+  def test_live_renderer_uses_canonical_offline_six_panel_layout(self):
+    import cv2
+    import numpy as np
+
+    state = RuntimeState()
+    state.rgb = np.zeros((48, 64, 3), dtype=np.uint8)
+    state.frame_seq = 7
+    state.frame_stamp = 1.0
+    state.telemetry = {"position": [0.0, 0.0, 0.0], "yaw": 0.0}
+    state.occupancy = {
+      "width": 20, "height": 20, "resolution": 0.1,
+      "frame_id": "tf_frame_map",
+      "origin": {"x": -1.0, "y": -1.0, "qw": 1.0},
+      "data": [-1] * 400,
+    }
+    state.graph = {
+      "graph_revision": 1,
+      "nodes": [{"id": "chair_1", "type": "object", "label": "chair",
+                 "aabb_center": [0.0, 0.0, 1.0], "aabb_size": [0.2, 0.2, 0.4],
+                 "attributes": {"instance_id": "chair_1"},
+                 "is_currently_visible": True}],
+      "edges": [],
+    }
+    payload = SixPanelRenderer(state).render()
+    image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert image is not None
+    assert image.shape[:2] == (540, 1440)
 
   def test_qwen_context_compacts_sparse_masks_and_graph_interaction(self):
     snapshot = {

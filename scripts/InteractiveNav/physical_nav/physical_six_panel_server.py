@@ -8,6 +8,7 @@ import base64
 import io
 import json
 import math
+import sys
 import threading
 import time
 import urllib.parse
@@ -20,6 +21,27 @@ from physical_protocol import validate_packet
 from runtime_state import RuntimeState
 from safety_gate import ReadOnlySafetyGate
 from qwen_client import QwenClient
+try:
+    from offline_semantic_renderer import (
+        OfflineSixPanelRenderer,
+        RawGrid,
+        TransformResolver,
+        draw_camera_title,
+        draw_task_subgoal_header,
+        known_world_bounds,
+    )
+except ModuleNotFoundError:  # imported from physical_nav/tests
+    _interactive_nav_dir = str(__import__("pathlib").Path(__file__).resolve().parents[1])
+    if _interactive_nav_dir not in sys.path:
+        sys.path.insert(0, _interactive_nav_dir)
+    from offline_semantic_renderer import (
+        OfflineSixPanelRenderer,
+        RawGrid,
+        TransformResolver,
+        draw_camera_title,
+        draw_task_subgoal_header,
+        known_world_bounds,
+    )
 
 try:
     import cv2
@@ -60,6 +82,79 @@ def _decode(value: str, encoding: str) -> Any:
 class SixPanelRenderer:
     def __init__(self, state: RuntimeState, width: int = 640, height: int = 360) -> None:
         self.state, self.width, self.height = state, width, height
+        # Use the exact six-panel renderer shared by build_raw_overview.  The
+        # live physical adapter supplies in-memory RawGrid/step receipts in
+        # the same shape as record_explore_debug.py's offline artifacts.
+        self.panel_size = (480, 270)
+        self._canonical = OfflineSixPanelRenderer(
+            transforms=TransformResolver([], map_frame="tf_frame_map", odom_frame="tf_frame_map")
+        )
+
+    @staticmethod
+    def _raw_grid(payload: Any, default_frame: str = "tf_frame_map") -> RawGrid | None:
+        if not isinstance(payload, dict) or not payload.get("data"):
+            return None
+        try:
+            width, height = int(payload.get("width", 0)), int(payload.get("height", 0))
+            values = np.asarray(payload.get("data", []), dtype=np.int32)
+            if width <= 0 or height <= 0 or values.size < width * height:
+                return None
+            values = values[: width * height].reshape((height, width))
+            origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
+            qz, qw = float(origin.get("qz", 0.0) or 0.0), float(origin.get("qw", 1.0) or 1.0)
+            origin_yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
+            return RawGrid(
+                values=values,
+                width=width,
+                height=height,
+                resolution=float(payload.get("resolution", 0.0) or 0.0),
+                frame_id=str(payload.get("frame_id") or default_frame).lstrip("/"),
+                origin_x=float(origin.get("x", 0.0) or 0.0),
+                origin_y=float(origin.get("y", 0.0) or 0.0),
+                origin_yaw=origin_yaw,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _physical_step(snapshot: dict[str, Any]) -> dict[str, Any]:
+        telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+        position = telemetry.get("map_position") or telemetry.get("position") or [0.0, 0.0, 0.0]
+        try:
+            pose = [float(position[0]), float(position[1]), float(telemetry.get("map_yaw", telemetry.get("yaw", 0.0)) or 0.0)]
+        except (IndexError, TypeError, ValueError):
+            pose = [0.0, 0.0, 0.0]
+        graph = snapshot.get("graph") if isinstance(snapshot.get("graph"), dict) else {}
+        observed = []
+        for node in graph.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            observed.extend(
+                str(value)
+                for value in (
+                    node.get("id"), node.get("name"), node.get("object_id"),
+                    (node.get("attributes") or {}).get("instance_id"),
+                )
+                if value not in {None, ""}
+            )
+        return {
+            "step_index": int(snapshot.get("frame_seq", 0) or 0),
+            "stamp_sec": float(snapshot.get("frame_stamp", 0.0) or 0.0),
+            "pose": pose,
+            "pose_frame_id": "tf_frame_map",
+            "active_goal": [],
+            "active_goal_yaw": 0.0,
+            "distance_m": 0.0,
+            "trajectory": [pose + [float(snapshot.get("frame_stamp", 0.0) or 0.0)]],
+            "global_plan": {}, "local_global_plan": {}, "local_plan": {},
+            "unified_graph": graph,
+            "observed_instance_ids": sorted(set(observed)),
+            "semantic_candidates": {},
+            "semantic_selection": {"active": False},
+            "semantic_execution_state": {},
+            "semantic_behavior_feedback": {},
+            "semantic_decision_trace": {},
+        }
 
     def _placeholder(self, title: str) -> Any:
         panel = np.zeros((self.height, self.width, 3), dtype=np.uint8)
@@ -210,14 +305,65 @@ class SixPanelRenderer:
         if cv2 is None:
             raise RuntimeError("physical viewer requires opencv-python and numpy")
         with self.state._lock:
-            rgb, depth = self.state.rgb, self.state.depth
-            detections, graph, consistency, occupancy = list(self.state.detections), dict(self.state.graph), dict(self.state.consistency), self.state.occupancy
-            telemetry = dict(self.state.telemetry)
-            frame_seq, depth_scale = self.state.frame_seq, self.state.depth_scale
-        panels = [self._image_panel(rgb, f"1 RGB | target=physical-readonly | step={frame_seq}"), self._depth_panel(depth, depth_scale),
-                  self._detection_panel(rgb, detections), self._map_panel(occupancy, telemetry),
-                  self._graph_panel(graph), self._topdown_panel(occupancy, graph, telemetry, consistency)]
-        canvas = np.vstack([np.hstack(panels[:3]), np.hstack(panels[3:])])
+            snapshot = {
+                "frame_seq": self.state.frame_seq,
+                "frame_stamp": self.state.frame_stamp,
+                "telemetry": dict(self.state.telemetry),
+                "graph": dict(self.state.graph),
+                "consistency": dict(self.state.consistency),
+            }
+            rgb = None if self.state.rgb is None else self.state.rgb.copy()
+            planning = self._raw_grid(self.state.occupancy)
+            room = self._raw_grid(self.state.room_grid)
+            global_grid = self._raw_grid(self.state.global_costmap)
+            local_grid = self._raw_grid(self.state.local_costmap)
+        step = self._physical_step(snapshot)
+        if planning is None:
+            global_grid = global_grid or planning
+            local_grid = local_grid or planning
+        else:
+            global_grid = global_grid or planning
+            local_grid = local_grid or planning
+        world_bounds = known_world_bounds(planning, margin_m=2.5) if planning is not None else None
+        width, height = self.panel_size
+        if rgb is None:
+            camera = np.full((height, width, 3), 235, dtype=np.uint8)
+            cv2.putText(camera, "NO RGB YET", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, .9, (80, 80, 80), 2, cv2.LINE_AA)
+        else:
+            camera = cv2.resize(rgb, self.panel_size, interpolation=cv2.INTER_AREA)
+        draw_camera_title(camera, step, int(step["step_index"]))
+        occ = self._canonical.render_map_panel(
+            planning, self.panel_size, step, int(step["step_index"]),
+            title="OCC", kind="occupancy", world_bounds=world_bounds,
+            draw_global_plan=False, draw_local_plan=False, draw_frontiers=False,
+            draw_semantic_candidates=False, draw_route_plan=False,
+        )
+        draw_task_subgoal_header(occ, step, box_width_px=width // 2 - 10, background_alpha=.55)
+        room_panel = self._canonical.render_room_panel(
+            planning, room, self.panel_size, step, int(step["step_index"]), world_bounds,
+            view_scale=1.5,
+        )
+        global_width = width // 2
+        global_panel = self._canonical.render_map_panel(
+            global_grid, (global_width, height), step, int(step["step_index"]),
+            title="GLOBAL COSTMAP", kind="costmap", world_bounds=world_bounds,
+            draw_global_plan=False, draw_local_plan=False, draw_frontiers=False,
+        )
+        local_panel = self._canonical.render_map_panel(
+            local_grid, (width - global_width, height), step, int(step["step_index"]),
+            title="LOCAL COSTMAP", kind="costmap", draw_global_plan=False,
+            draw_local_global_plan=False, draw_local_plan=False, draw_frontiers=False,
+        )
+        costmaps = np.concatenate([global_panel, local_panel], axis=1)
+        spatial = self._canonical.render_semantic_xy(
+            planning, self.panel_size, step, int(step["step_index"]), world_bounds,
+            view_scale=1.8, label_mode="all", draw_overview_inset=False,
+        )
+        topology = self._canonical.render_topology(self.panel_size, step, int(step["step_index"]))
+        canvas = np.vstack([
+            np.concatenate([camera, occ, room_panel], axis=1),
+            np.concatenate([costmaps, spatial, topology], axis=1),
+        ])
         ok, encoded = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 82])
         if not ok:
             raise RuntimeError("six-panel JPEG encoding failed")
@@ -265,7 +411,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         if self.path == "/api/ros-state":
             length = int(self.headers.get("Content-Length", "0")); payload = json.loads(self.rfile.read(length) or b"{}")
             name, value = str(payload.get("name", "")), payload.get("value")
-            if name not in {"detections", "mapped_detections", "graph", "consistency", "occupancy", "telemetry"}:
+            if name not in {"detections", "mapped_detections", "graph", "consistency", "occupancy", "room_grid", "global_costmap", "local_costmap", "telemetry"}:
                 self._json({"accepted": False, "error": "unsupported ROS state"}, 400); return
             self.state.update_topic(name, value); self._json({"accepted": True}); return
         if self.path == "/api/qwen":
