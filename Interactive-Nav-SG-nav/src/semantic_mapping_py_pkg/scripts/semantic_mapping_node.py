@@ -1594,9 +1594,13 @@ class SemanticMappingNode:
 
     @staticmethod
     def _is_successful_open_result(result):
-        if (
-            result.get("success") is not True
-            or str(result.get("action") or "").casefold() != "open"
+        action = str(result.get("action") or "").strip().casefold()
+        observation_only = (
+            str(result.get("observation_outcome") or "").strip().casefold()
+            == "finish_without_action"
+        )
+        if result.get("success") is not True or (
+            action not in {"", "open"} or (not action and not observation_only)
         ):
             return False
         state = str(
@@ -1608,6 +1612,16 @@ class SemanticMappingNode:
             or ""
         ).strip().casefold()
         source = str(result.get("source") or "").strip().casefold()
+        if (
+            observation_only
+            and state in {"open", "opened", "ajar", "static_open"}
+            and isinstance(result.get("portal_aperture_evidence"), dict)
+        ):
+            # An already-open doorway still needs the same post-observation
+            # OCC/room refresh as a force-open result.  Without this bridge the
+            # graph says open while planning OCC waits forever and the candidate
+            # is recreated on the next graph revision.
+            return True
         # ``static_open`` is an immediate capability result, not a physical
         # transition.  Do not arm the post-open raw-OCC bridge or force a room
         # refresh for it; ordinary occupancy updates remain responsible for
@@ -1644,11 +1658,12 @@ class SemanticMappingNode:
                 planning_grid,
                 graph_payload,
             )
+        self.planning_occupancy_grid_pub.publish(effective_grid)
+        if graph_store is not None and overlay is not None:
             if door_clear_mask is not None:
                 self.door_clear_mask_pub.publish(door_clear_mask)
             if planning_update is not None:
                 self.planning_occupancy_grid_updates_pub.publish(planning_update)
-        self.planning_occupancy_grid_pub.publish(effective_grid)
         raw_stamp = self._occupancy_header_stamp_sec(planning_grid)
         rospy.loginfo(
             "[semantic_mapping_node.py] published post-open effective planning OCC: "
@@ -1793,7 +1808,7 @@ class SemanticMappingNode:
             ):
                 continue
             state = str((node.get("interaction") or {}).get("state") or "").casefold()
-            if state not in {"open", "ajar"}:
+            if state not in {"open", "opened", "ajar", "static_open"}:
                 continue
             center = list(
                 attributes.get("interaction_reference_aabb_center")

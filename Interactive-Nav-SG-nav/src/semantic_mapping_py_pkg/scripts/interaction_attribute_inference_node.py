@@ -168,8 +168,12 @@ class InteractionAttributeInferenceNode:
                 )
             ),
         )
-        self.targeted_multiview_max_images = max(
-            1, int(attribute_config.get("targeted_multiview_max_images", 3))
+        # One clear view is sufficient.  A second, materially different view is
+        # allowed only to resolve an inconclusive first observation.  Keeping
+        # this cap in the node prevents stale configs from rebuilding the old
+        # three-or-more-image request pattern.
+        self.targeted_multiview_max_images = min(
+            2, max(1, int(attribute_config.get("targeted_multiview_max_images", 2)))
         )
         self.targeted_multiview_min_step_gap = max(
             1, int(attribute_config.get("targeted_multiview_min_step_gap", 8))
@@ -181,6 +185,17 @@ class InteractionAttributeInferenceNode:
         self.targeted_multiview_min_yaw_gap_rad = max(
             0.0,
             float(attribute_config.get("targeted_multiview_min_yaw_gap_rad", 0.25)),
+        )
+        self.targeted_front_confirmation_min_confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    attribute_config.get(
+                        "targeted_front_confirmation_min_confidence", 0.80
+                    )
+                ),
+            ),
         )
         self.target_bbox_mask_containment_required = bool(
             attribute_config.get("target_bbox_mask_containment_required", True)
@@ -486,6 +501,7 @@ class InteractionAttributeInferenceNode:
                 [int(capture_step)] if capture_step is not None else []
             )
             evidence_observation_poses: list[list[float]] = []
+            evidence_view_metadata: list[dict] = []
             bbox_containment = self._target_bbox_containment(
                 image, detection
             )
@@ -505,6 +521,26 @@ class InteractionAttributeInferenceNode:
                         bbox_containment=bbox_containment,
                     )
                     continue
+                if str(targeted_refresh.get("expected_node_type") or "") == "container":
+                    evidence_rejection = self._target_visual_history_rejection_reason(
+                        object_id,
+                        capture_step=capture_step,
+                        observation_pose_xyyaw=targeted_refresh.get(
+                            "observation_pose_xyyaw"
+                        ),
+                    )
+                    if evidence_rejection:
+                        self._reject_targeted_refresh_evidence(
+                            object_id=object_id,
+                            episode_id=episode_id,
+                            observation_stamp=observation_stamp,
+                            frame_id=frame_id,
+                            image_sequence=image_sequence,
+                            signature=signature,
+                            targeted_refresh=targeted_refresh,
+                            error=evidence_rejection,
+                        )
+                        continue
                 selected_evidence = self._record_and_select_target_visual_history(
                     object_id,
                     visual_evidence,
@@ -514,6 +550,9 @@ class InteractionAttributeInferenceNode:
                         "observation_pose_xyyaw"
                     ),
                     bbox_containment=bbox_containment,
+                    anchor_face_id=targeted_refresh.get("anchor_face_id"),
+                    anchor_face_index=targeted_refresh.get("anchor_face_index"),
+                    anchor_face_axis_xy=targeted_refresh.get("anchor_face_axis_xy"),
                 )
                 if selected_evidence:
                     visual_evidence_history = [
@@ -535,6 +574,10 @@ class InteractionAttributeInferenceNode:
                         for item in selected_evidence
                         if isinstance(item.get("observation_pose_xyyaw"), list)
                         and len(item["observation_pose_xyyaw"]) >= 3
+                    ]
+                    evidence_view_metadata = [
+                        self._target_evidence_public_metadata(item, view_index=index)
+                        for index, item in enumerate(selected_evidence)
                     ]
                     if len(selected_evidence) > 1:
                         with self.lock:
@@ -566,6 +609,7 @@ class InteractionAttributeInferenceNode:
                     "evidence_frame_ids": evidence_frame_ids,
                     "evidence_capture_steps": evidence_capture_steps,
                     "evidence_observation_pose_xyyaw": evidence_observation_poses,
+                    "evidence_view_metadata": evidence_view_metadata,
                     "target_bbox_containment": bbox_containment,
                     "episode_id": episode_id,
                     "frame_id": frame_id,
@@ -1025,6 +1069,7 @@ class InteractionAttributeInferenceNode:
                 self.completed.pop(object_id, None)
                 self.last_request.pop(object_id, None)
                 self.pending.pop(object_id, None)
+                getattr(self, "target_visual_history", {}).pop(object_id, None)
         for object_id in object_ids:
             self.request_queue.discard(object_id)
 
@@ -1061,6 +1106,21 @@ class InteractionAttributeInferenceNode:
                 observation_pose = []
             if not all(math.isfinite(value) for value in observation_pose):
                 observation_pose = []
+        anchor_face_id = str(payload.get("anchor_face_id") or "").strip()[:96]
+        try:
+            anchor_face_index = int(payload.get("anchor_face_index"))
+        except (TypeError, ValueError):
+            anchor_face_index = None
+        raw_face_axis = payload.get("anchor_face_axis_xy")
+        anchor_face_axis_xy: list[float] = []
+        if isinstance(raw_face_axis, (list, tuple)) and len(raw_face_axis) >= 2:
+            try:
+                axis_x, axis_y = float(raw_face_axis[0]), float(raw_face_axis[1])
+            except (TypeError, ValueError):
+                axis_x = axis_y = float("nan")
+            norm = math.hypot(axis_x, axis_y)
+            if math.isfinite(norm) and norm > 1e-6:
+                anchor_face_axis_xy = [axis_x / norm, axis_y / norm]
         return {
             "object_id": object_id,
             "episode_id": str(payload.get("episode_id") or "").strip(),
@@ -1070,6 +1130,12 @@ class InteractionAttributeInferenceNode:
             "request_id": str(payload.get("request_id") or "").strip()[:96],
             "expected_node_type": expected_node_type,
             "observation_pose_xyyaw": observation_pose,
+            # These fields are response-routing metadata only.  They are never
+            # placed in the M1 prompt, but let the selected visual panel retain
+            # the exact AABB face and capture pose that generated it.
+            "anchor_face_id": anchor_face_id,
+            "anchor_face_index": anchor_face_index,
+            "anchor_face_axis_xy": anchor_face_axis_xy,
         }
 
     def _targeted_refresh_callback(self, message: String) -> None:
@@ -1321,9 +1387,10 @@ class InteractionAttributeInferenceNode:
         ]
         if not valid:
             return []
+        max_images = min(2, max(1, int(max_images)))
         selected = [valid[-1]]
         for candidate in reversed(valid[:-1]):
-            if len(selected) >= max(1, int(max_images)):
+            if len(selected) >= max_images:
                 break
             candidate_pose = [float(value) for value in candidate["observation_pose_xyyaw"][:3]]
             candidate_step = int(candidate["capture_step"])
@@ -1351,6 +1418,51 @@ class InteractionAttributeInferenceNode:
                 selected.append(candidate)
         return list(reversed(selected))
 
+    def _target_visual_history_rejection_reason(
+        self,
+        object_id: str,
+        *,
+        capture_step: int | None,
+        observation_pose_xyyaw: object,
+    ) -> str:
+        """Reject duplicate or third container views before contacting M1."""
+
+        pose = list(observation_pose_xyyaw or [])
+        if capture_step is None or len(pose) < 3:
+            return ""
+        with self.lock:
+            history = list(self.target_visual_history.get(str(object_id)) or [])
+        prior = self._select_diverse_target_visual_history(
+            history,
+            max_images=2,
+            min_step_gap=self.targeted_multiview_min_step_gap,
+            min_position_gap_m=self.targeted_multiview_min_position_gap_m,
+            min_yaw_gap_rad=self.targeted_multiview_min_yaw_gap_rad,
+        )
+        if not prior:
+            return ""
+        current = {
+            "capture_step": int(capture_step),
+            "observation_pose_xyyaw": [float(value) for value in pose[:3]],
+            "bbox_containment": {"valid": True},
+        }
+        combined = self._select_diverse_target_visual_history(
+            [*prior, current],
+            max_images=2,
+            min_step_gap=self.targeted_multiview_min_step_gap,
+            min_position_gap_m=self.targeted_multiview_min_position_gap_m,
+            min_yaw_gap_rad=self.targeted_multiview_min_yaw_gap_rad,
+        )
+        current_selected = any(
+            int(item.get("capture_step", -1)) == int(capture_step)
+            for item in combined
+        )
+        if not current_selected or len(combined) == 1:
+            return "m1_duplicate_view_rejected"
+        if len(prior) >= 2:
+            return "m1_two_view_budget_exhausted"
+        return ""
+
     def _record_and_select_target_visual_history(
         self,
         object_id: str,
@@ -1360,6 +1472,9 @@ class InteractionAttributeInferenceNode:
         frame_id: str,
         observation_pose_xyyaw: object,
         bbox_containment: dict,
+        anchor_face_id: object = "",
+        anchor_face_index: object = None,
+        anchor_face_axis_xy: object = None,
     ) -> list[dict]:
         pose = list(observation_pose_xyyaw or [])
         if capture_step is None or len(pose) < 3:
@@ -1370,6 +1485,9 @@ class InteractionAttributeInferenceNode:
             "observation_pose_xyyaw": [float(value) for value in pose[:3]],
             "bbox_containment": dict(bbox_containment),
             "visual_evidence": visual_evidence.copy(),
+            "anchor_face_id": str(anchor_face_id or "")[:96],
+            "anchor_face_index": anchor_face_index,
+            "anchor_face_axis_xy": list(anchor_face_axis_xy or [])[:2],
         }
         with self.lock:
             history = list(self.target_visual_history.get(str(object_id)) or [])
@@ -1388,6 +1506,21 @@ class InteractionAttributeInferenceNode:
             min_position_gap_m=self.targeted_multiview_min_position_gap_m,
             min_yaw_gap_rad=self.targeted_multiview_min_yaw_gap_rad,
         )
+
+    @staticmethod
+    def _target_evidence_public_metadata(item: dict, *, view_index: int) -> dict:
+        """Return prompt-external routing metadata for one montage panel."""
+
+        metadata = {
+            "view_id": f"view_{int(view_index) + 1}",
+            "frame_id": str(item.get("frame_id") or ""),
+            "capture_step": item.get("capture_step"),
+            "observation_pose_xyyaw": list(item.get("observation_pose_xyyaw") or [])[:3],
+            "anchor_face_id": str(item.get("anchor_face_id") or ""),
+            "anchor_face_index": item.get("anchor_face_index"),
+            "anchor_face_axis_xy": list(item.get("anchor_face_axis_xy") or [])[:2],
+        }
+        return metadata
 
     def _force_reserve_targeted_refresh(
         self,
@@ -1495,6 +1628,42 @@ class InteractionAttributeInferenceNode:
                         "target_bbox_validation_failed:"
                         + str(bbox_containment.get("reason") or "unknown")
                     ),
+                )
+            ],
+        )
+
+    def _reject_targeted_refresh_evidence(
+        self,
+        *,
+        object_id: str,
+        episode_id: str,
+        observation_stamp: float,
+        frame_id: str,
+        image_sequence: int,
+        signature: str,
+        targeted_refresh: dict,
+        error: str,
+    ) -> None:
+        """Finish a duplicate/third container view without a model request."""
+
+        with self.lock:
+            self.filter_counts["targeted_refresh_rejected"] += 1
+            self.filter_counts["failed"] += 1
+        self._consume_targeted_refresh(targeted_refresh)
+        self._publish_updates(
+            episode_id,
+            observation_stamp,
+            [
+                self._attribute_status_patch(
+                    {
+                        "object_id": object_id,
+                        "frame_id": frame_id,
+                        "image_sequence": image_sequence,
+                        "signature": signature,
+                        "targeted_refresh": targeted_refresh,
+                    },
+                    "failed",
+                    error=str(error),
                 )
             ],
         )
@@ -2033,6 +2202,7 @@ class InteractionAttributeInferenceNode:
         evidence_frame_ids: list[str] | None = None,
         evidence_capture_steps: list[int] | None = None,
         evidence_observation_pose_xyyaw: list[list[float]] | None = None,
+        evidence_view_metadata: list[dict] | None = None,
         target_bbox_containment: dict | None = None,
     ) -> None:
         request_started = time.monotonic()
@@ -2051,19 +2221,61 @@ class InteractionAttributeInferenceNode:
             ):
                 outcome_status = "stale"
                 return
-            image_data_sequence: list[str] = []
-            for evidence_image in [*list(visual_evidence_history or []), visual_evidence]:
-                encoded = self._encode_jpeg(
-                    self._resize_visual_evidence(
-                        evidence_image, self.visual_evidence_max_side_px
+            evidence_images = [
+                *list(visual_evidence_history or []),
+                visual_evidence,
+            ][-2:]
+            montage = self._compose_multiview_montage(evidence_images)
+            if montage is None:
+                return
+            encoded = self._encode_jpeg(
+                self._resize_visual_evidence(
+                    montage, self.visual_evidence_max_side_px
+                )
+            )
+            if not encoded:
+                return
+            # OpenAI-compatible local endpoints commonly accept at most one
+            # image per prompt.  Multi-view evidence is therefore transported
+            # as one chronological left-to-right montage.
+            image_data_sequence = [
+                "data:image/jpeg;base64,"
+                + __import__("base64").b64encode(encoded).decode("ascii")
+            ]
+            panel_count = len(evidence_images)
+            normalized_view_metadata = [
+                dict(item)
+                for item in list(evidence_view_metadata or [])[-panel_count:]
+                if isinstance(item, dict)
+            ]
+            if len(normalized_view_metadata) != panel_count:
+                normalized_view_metadata = []
+                poses = list(evidence_observation_pose_xyyaw or [])[-panel_count:]
+                steps = list(evidence_capture_steps or [])[-panel_count:]
+                frames = list(evidence_frame_ids or [])[-panel_count:]
+                for index in range(panel_count):
+                    normalized_view_metadata.append(
+                        {
+                            "view_id": f"view_{index + 1}",
+                            "frame_id": frames[index] if index < len(frames) else "",
+                            "capture_step": steps[index] if index < len(steps) else None,
+                            "observation_pose_xyyaw": (
+                                poses[index] if index < len(poses) else []
+                            ),
+                            "anchor_face_id": "",
+                            "anchor_face_index": None,
+                            "anchor_face_axis_xy": [],
+                        }
                     )
-                )
-                if not encoded:
-                    return
-                image_data_sequence.append(
-                    "data:image/jpeg;base64,"
-                    + __import__("base64").b64encode(encoded).decode("ascii")
-                )
+            view_ids = [str(item["view_id"]) for item in normalized_view_metadata]
+            # The newest/rightmost panel is the only action-authorizing view.
+            # Older panels provide comparison context, but asking the model to
+            # choose a dynamic view enum caused the local structured decoder to
+            # emit whitespace until its token budget was exhausted.  Keeping
+            # selection deterministic also guarantees that visual frontality
+            # is bound to the pose and AABB face currently occupied by the
+            # robot, never to a stale historical observation.
+            authoritative_view_id = view_ids[-1]
             remaining_timeout_s = self._remaining_request_timeout(
                 deadline_monotonic, self.request_timeout_s
             )
@@ -2109,23 +2321,26 @@ class InteractionAttributeInferenceNode:
             )
             portal_full_frame = self._is_portal_detection(detection)
             visual_layout_instruction = (
-                "Each image is the complete head-camera image with only a target outline; "
+                "Each panel is the complete head-camera image with only an expanded target outline; "
                 "there is no crop inset. Judge the whole door leaf, frame, aperture, and "
                 "surrounding wall context together. "
                 if portal_full_frame
                 else (
-                    "Each composite shows the complete head-camera image, a target outline, "
+                    "Each panel shows the complete head-camera image, an expanded target outline, "
                     "and a padded target crop inset. "
                 )
             )
             instruction = "".join(
                 (
                     expected_type_instruction,
-                    "Infer the outlined target's pre-interaction visual attributes using "
-                    "only pixels in the supplied composite image sequence. Images are ordered "
-                    "from older to newest and come only from materially separated robot views; "
-                    "the newest image is authoritative for approach_ready and action_regions, "
-                    "while older images only corroborate which physical surface is the front. "
+                    "Infer the outlined target's pre-interaction visual attributes using only "
+                    f"pixels in the single supplied montage. It contains exactly {panel_count} "
+                    f"panel(s), ordered left-to-right as {', '.join(view_ids)} from older to "
+                    "newest. The panels come only from materially separated robot views. "
+                    f"The newest/rightmost panel, {authoritative_view_id}, is the evaluated "
+                    "candidate view. Older panels are comparison context only and must never "
+                    "authorize an action. view_state, approach_ready, and action_regions describe "
+                    f"only {authoritative_view_id}. "
                     "Every image passed a target-mask-inside-outline check. ",
                     visual_layout_instruction,
                     "Do not use object IDs, prior state, category names, map "
@@ -2137,9 +2352,9 @@ class InteractionAttributeInferenceNode:
                     "needs_reobserve, action_regions, interaction_parts, and confidence. ",
                     class_instruction,
                     portal_instruction,
-                    "view_state is front, oblique, side_or_back, occluded, or unknown and "
-                    "describes only the newest camera view of the outlined target. A historical "
-                    "front view must never make a side/oblique newest view approach_ready. Judge "
+                    "view_state is front, oblique, side_or_back, occluded, or unknown and describes "
+                    f"only {authoritative_view_id}. Never mix the appearance of one panel with another "
+                    "panel's pose or face. Judge "
                     "frontality primarily from the target's horizontal perspective: use front "
                     "for a nearly head-on, broad usable face whose left/right extent and visible "
                     "drawer or door fronts/handles face the camera without a dominant receding "
@@ -2157,7 +2372,8 @@ class InteractionAttributeInferenceNode:
                     "direct front view; an oblique, side_or_back, occluded, or unknown view "
                     "must set approach_ready false and needs_reobserve true. "
                     "action_regions is an ordered list of visible actionable centers, in "
-                    "normalized coordinates of the padded target-crop inset (x=0 left, y=0 top). "
+                    f"normalized coordinates of {authoritative_view_id}'s padded target-crop inset "
+                    "(x=0 left, y=0 top). "
                     "For a visibly front-facing drawer-like container, include each visible "
                     "drawer front or handle from top to bottom. A vertically clipped lower "
                     "drawer does not invalidate frontality, but include only action regions "
@@ -2187,7 +2403,8 @@ class InteractionAttributeInferenceNode:
                 },
                 images=image_data_sequence,
                 response_schema=build_attribute_patch_response_schema(
-                    "target", expected_node_type=expected_node_type or None
+                    "target",
+                    expected_node_type=expected_node_type or None,
                 ),
                 timeout_s=remaining_timeout_s,
                 max_tokens=self.max_output_tokens,
@@ -2200,7 +2417,10 @@ class InteractionAttributeInferenceNode:
                     "request_sequence": request_sequence,
                     "queue_lag_sec": queue_lag_sec,
                     "targeted_refresh": bool(targeted_refresh),
-                    "m1_evidence_image_count": len(image_data_sequence),
+                    "m1_evidence_image_count": panel_count,
+                    "m1_transport_image_count": len(image_data_sequence),
+                    "m1_montage_panel_count": panel_count,
+                    "m1_evidence_views": normalized_view_metadata,
                     "m1_evidence_capture_steps": list(evidence_capture_steps or []),
                     "m1_evidence_observation_pose_xyyaw": list(
                         evidence_observation_pose_xyyaw or []
@@ -2212,6 +2432,34 @@ class InteractionAttributeInferenceNode:
                 outcome_error = str(response.error or "empty_model_response")
                 return
             patch = validate_attribute_patch(response.payload)
+            selected_view = normalized_view_metadata[-1]
+            patch["selected_view_id"] = authoritative_view_id
+            if container_refresh:
+                front_confidence = min(
+                    float(patch.get("view_state_confidence", 0.0) or 0.0),
+                    float(patch.get("front_surface_confidence", 0.0) or 0.0),
+                )
+                front_confirmed = bool(
+                    patch.get("view_state") == "front"
+                    and patch.get("front_surface_visible")
+                    and front_confidence
+                    >= float(
+                        getattr(
+                            self,
+                            "targeted_front_confirmation_min_confidence",
+                            0.80,
+                        )
+                    )
+                )
+                patch["m1_front_confirmed"] = front_confirmed
+                patch["m1_front_confirmation_confidence"] = front_confidence
+                # A low-confidence apparent front is precisely the case for
+                # which a second materially different panel is useful.  It may
+                # not authorize the physical approach on its own.
+                if not front_confirmed:
+                    patch["approach_ready"] = False
+                    patch["needs_reobserve"] = True
+                    patch["action_regions"] = []
             if container_refresh and patch.get("interaction_class") != "container":
                 # A compatible endpoint should enforce the strict schema.  Keep
                 # this response-side guard for older/command backends: preserve
@@ -2250,7 +2498,24 @@ class InteractionAttributeInferenceNode:
                     "evidence_observation_pose_xyyaw": list(
                         evidence_observation_pose_xyyaw or []
                     ),
-                    "m1_evidence_image_count": len(image_data_sequence),
+                    "m1_evidence_image_count": panel_count,
+                    "m1_transport_image_count": len(image_data_sequence),
+                    "m1_montage_panel_count": panel_count,
+                    "m1_evidence_views": normalized_view_metadata,
+                    "selected_evidence_capture_step": selected_view.get("capture_step"),
+                    "selected_evidence_frame_id": str(selected_view.get("frame_id") or ""),
+                    "selected_evidence_observation_pose_xyyaw": list(
+                        selected_view.get("observation_pose_xyyaw") or []
+                    )[:3],
+                    "selected_evidence_anchor_face_id": str(
+                        selected_view.get("anchor_face_id") or ""
+                    ),
+                    "selected_evidence_anchor_face_index": selected_view.get(
+                        "anchor_face_index"
+                    ),
+                    "selected_evidence_anchor_face_axis_xy": list(
+                        selected_view.get("anchor_face_axis_xy") or []
+                    )[:2],
                     "target_bbox_containment": dict(target_bbox_containment or {}),
                     "request_sequence": request_sequence,
                     "attribute_status": "ready",
@@ -2654,6 +2919,74 @@ class InteractionAttributeInferenceNode:
             return None
         return image[y0:y1, x0:x1]
 
+    @classmethod
+    def _expanded_visual_bbox_pixels(
+        cls,
+        image: np.ndarray,
+        detection: dict,
+        *,
+        horizontal_ratio: float = 0.30,
+        vertical_ratio: float = 0.20,
+        minimum_margin_px: int = 24,
+    ) -> tuple[int, int, int, int] | None:
+        """Expand the detector box for M1 without changing detector geometry."""
+
+        bbox = cls._bbox_pixels(image, detection)
+        if bbox is None:
+            return None
+        height, width = image.shape[:2]
+        left, top, right, bottom = bbox
+        margin_x = max(
+            int(minimum_margin_px),
+            int(round((right - left) * max(0.0, float(horizontal_ratio)))),
+        )
+        margin_y = max(
+            int(minimum_margin_px),
+            int(round((bottom - top) * max(0.0, float(vertical_ratio)))),
+        )
+        left = max(0, left - margin_x)
+        right = min(width, right + margin_x)
+        top = max(0, top - margin_y)
+        bottom = min(height, bottom + margin_y)
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right, bottom
+
+    @classmethod
+    def _compose_multiview_montage(
+        cls, evidence_images: list[np.ndarray]
+    ) -> np.ndarray | None:
+        """Place at most two full-frame observations in one transport image.
+
+        Panels are chronological and read left-to-right as VIEW_1, VIEW_2.  The
+        prompt carries that mapping explicitly, so the image needs no text that
+        could cover scene pixels.  A narrow white separator makes the boundary
+        unambiguous without obscuring either panel.
+        """
+
+        panels = [
+            image
+            for image in list(evidence_images or [])[-2:]
+            if isinstance(image, np.ndarray) and image.ndim == 3 and image.size
+        ]
+        if not panels:
+            return None
+        if len(panels) == 1:
+            return panels[0].copy()
+        target_height = max(int(panel.shape[0]) for panel in panels)
+        resized: list[np.ndarray] = []
+        for panel in panels:
+            panel_height, panel_width = panel.shape[:2]
+            width = max(1, int(round(panel_width * target_height / panel_height)))
+            resized.append(cls._resize_nearest(panel, width, target_height))
+        separator_width = max(4, target_height // 120)
+        separator = np.full(
+            (target_height, separator_width, resized[0].shape[2]),
+            255,
+            dtype=resized[0].dtype,
+        )
+        return np.concatenate((resized[0], separator, resized[1]), axis=1)
+
     @staticmethod
     def _resize_nearest(image: np.ndarray, width: int, height: int) -> np.ndarray:
         """Resize without making M1 depend on an OpenCV-enabled ROS build."""
@@ -2739,8 +3072,8 @@ class InteractionAttributeInferenceNode:
 
         if not isinstance(image, np.ndarray) or image.ndim != 3:
             return None
-        bbox = cls._bbox_pixels(image, detection)
-        crop = cls._crop(image, detection, margin_ratio=margin_ratio)
+        bbox = cls._expanded_visual_bbox_pixels(image, detection)
+        crop = None if bbox is None else image[bbox[1] : bbox[3], bbox[0] : bbox[2]]
         if bbox is None or (include_crop_inset and (crop is None or crop.size == 0)):
             return None
         composite = image.copy()

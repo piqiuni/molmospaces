@@ -20,6 +20,8 @@ from semantic_rule_decision_node import (
     SemanticRuleDecisionNode,
     aggregate_step_ready_states,
     container_anchor_step_cooldown_active,
+    container_candidate_with_rejected_faces,
+    extend_container_step_cooldown,
     is_completed_drawer_scan_candidate,
     successful_drawer_scan_feedback,
 )
@@ -38,6 +40,34 @@ def test_container_anchor_step_cooldown_is_deterministic() -> None:
         "interaction_target:fridge", 420, deadlines
     )
     assert not container_anchor_step_cooldown_active("", 119, deadlines)
+
+
+def test_container_step_cooldown_extends_monotonically() -> None:
+    deadlines = {"drawer_1": 420}
+
+    assert extend_container_step_cooldown("drawer_1", 100, 300, deadlines) == 420
+    assert extend_container_step_cooldown("drawer_1", 200, 300, deadlines) == 500
+    assert deadlines == {"drawer_1": 500}
+
+
+def test_rejected_container_faces_survive_candidate_rebuild() -> None:
+    original = {
+        "candidate_id": "interaction:drawer_1:open",
+        "metadata": {"container_m1_rejected_face_staging_indices": [15, 16]},
+    }
+
+    rebuilt = container_candidate_with_rejected_faces(original, {0, 1, 15})
+
+    assert rebuilt["metadata"]["container_m1_rejected_face_staging_indices"] == [
+        0,
+        1,
+        15,
+        16,
+    ]
+    assert original["metadata"]["container_m1_rejected_face_staging_indices"] == [
+        15,
+        16,
+    ]
 
 
 def _module(step: int, stamp: float, *, ready: bool = True, strict: bool = False):
@@ -172,6 +202,12 @@ def test_feedback_tombstones_real_drawer_result_before_candidate_rebuild():
         ),
         latest_candidates_payload={"sequence": 7, "candidates": [], "robot_xy": []},
         failure_counts={},
+        container_m1_inconclusive_counts={},
+        container_m1_inconclusive_cooldown_schedule_s=(0.0,),
+        container_anchor_unreachable_until_step={},
+        container_anchor_unreachable_cooldown_s=0.0,
+        container_anchor_unreachable_cooldown_steps=300,
+        container_rejected_face_indices_by_target={},
         cooldown_until={},
         success_cooldown_s=0.0,
         failure_cooldown_schedule_s=(),
@@ -193,6 +229,7 @@ def test_feedback_tombstones_real_drawer_result_before_candidate_rebuild():
         minimum_candidate_sequence=0,
         active_candidate_id=candidate_id,
         preempt_requested_for_decision_id="",
+        approach_exhausted_fingerprints=set(),
         _record_decision_result=lambda _: None,
         _observation_step=lambda _: 0,
         _interaction_target_id=lambda _: target_id,

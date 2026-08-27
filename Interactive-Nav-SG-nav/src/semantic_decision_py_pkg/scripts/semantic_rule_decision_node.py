@@ -82,6 +82,56 @@ def container_anchor_step_cooldown_active(
     )
 
 
+def extend_container_step_cooldown(
+    target_key: str,
+    observation_step: int,
+    cooldown_steps: int,
+    deadlines: dict[str, int],
+) -> int:
+    """Monotonically extend a target cooldown in evaluator-step time."""
+
+    if not target_key:
+        return 0
+    deadline = max(
+        int(deadlines.get(target_key, 0) or 0),
+        int(observation_step) + max(0, int(cooldown_steps)),
+    )
+    deadlines[target_key] = deadline
+    return deadline
+
+
+def container_candidate_with_rejected_faces(
+    payload: dict,
+    rejected_indices: set[int] | frozenset[int] | list[int] | tuple[int, ...],
+) -> dict:
+    """Return a candidate carrying episode-stable rejected AABB face anchors."""
+
+    normalized: set[int] = set()
+    for raw_index in rejected_indices or ():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if index >= 0:
+            normalized.add(index)
+    if not normalized:
+        return payload
+    result = dict(payload)
+    metadata = dict(result.get("metadata") or {})
+    for raw_index in metadata.get(
+        "container_m1_rejected_face_staging_indices", []
+    ):
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if index >= 0:
+            normalized.add(index)
+    metadata["container_m1_rejected_face_staging_indices"] = sorted(normalized)
+    result["metadata"] = metadata
+    return result
+
+
 def aggregate_step_ready_states(
     required_modules, states, *, require_exact_source: bool = False
 ):
@@ -562,6 +612,7 @@ class SemanticRuleDecisionNode:
         self.failure_counts: dict[str, int] = {}
         self.container_m1_inconclusive_counts: dict[str, int] = {}
         self.container_anchor_unreachable_until_step: dict[str, int] = {}
+        self.container_rejected_face_indices_by_target: dict[str, set[int]] = {}
         # Count-bounded executor approach attempts are not object failures.
         # Suppress only the identical candidate fingerprint so another
         # interaction subgoal can be selected immediately, without a timer.
@@ -669,6 +720,7 @@ class SemanticRuleDecisionNode:
                 self.failure_counts.clear()
                 self.container_m1_inconclusive_counts.clear()
                 self.container_anchor_unreachable_until_step.clear()
+                self.container_rejected_face_indices_by_target.clear()
                 self.approach_exhausted_fingerprints.clear()
                 self.interaction_failure_tracker.reset()
                 self.decision_history.clear()
@@ -772,6 +824,27 @@ class SemanticRuleDecisionNode:
                 self.container_m1_inconclusive_counts.pop(
                     successful_target_id, None
                 )
+        feedback_target_id = self._interaction_target_id(candidate_id)
+        rejected_face_indices: set[int] = set()
+        for raw_index in detail.get(
+            "container_m1_rejected_face_staging_indices", []
+        ):
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if index >= 0:
+                rejected_face_indices.add(index)
+        if feedback_target_id and rejected_face_indices:
+            rejected_by_target = getattr(
+                self, "container_rejected_face_indices_by_target", None
+            )
+            if not isinstance(rejected_by_target, dict):
+                rejected_by_target = {}
+                self.container_rejected_face_indices_by_target = rejected_by_target
+            rejected_by_target.setdefault(feedback_target_id, set()).update(
+                rejected_face_indices
+            )
         # A bounded M1 evidence plan may run out of clean views without any
         # physical action or reachability proof.  That is retryable visual
         # uncertainty, not an object/candidate exclusion or target-wide
@@ -902,25 +975,30 @@ class SemanticRuleDecisionNode:
             # so a failed drawer cannot immediately restart at anchor zero.
             if target_id:
                 self.cooldown_until[target_id] = cooldown_deadline
-                if all_container_anchors_unreachable:
-                    current_step = self._observation_step(
-                        self.latest_candidates_payload
-                    )
-                    if not hasattr(
-                        self, "container_anchor_unreachable_until_step"
-                    ):
-                        self.container_anchor_unreachable_until_step = {}
-                    self.container_anchor_unreachable_until_step[target_id] = (
-                        current_step
-                        + int(
-                            getattr(
-                                self,
-                                "container_anchor_unreachable_cooldown_steps",
-                                300,
-                            )
-                            or 0
+                current_step = self._observation_step(
+                    self.latest_candidates_payload
+                )
+                if not hasattr(
+                    self, "container_anchor_unreachable_until_step"
+                ):
+                    self.container_anchor_unreachable_until_step = {}
+                # Any bounded container evidence-plan failure needs a simulator-
+                # step cooldown. Wall time is load-dependent and let H8 replay
+                # the same drawer after only a few observations under parallel
+                # load even though some anchors were globally reachable.
+                extend_container_step_cooldown(
+                    target_id,
+                    current_step,
+                    int(
+                        getattr(
+                            self,
+                            "container_anchor_unreachable_cooldown_steps",
+                            300,
                         )
-                    )
+                        or 0
+                    ),
+                    self.container_anchor_unreachable_until_step,
+                )
         elif (
             candidate_id
             and not preempted_by_target
@@ -992,6 +1070,45 @@ class SemanticRuleDecisionNode:
             if target_id:
                 self.cooldown_until[target_id] = time.monotonic() + max(
                     0.0, self.container_anchor_unreachable_cooldown_s
+                )
+        active_container_kind = str(
+            (self.active_interaction_candidate.get("interaction_command") or {}).get(
+                "container_kind", ""
+            )
+            if isinstance(self.active_interaction_candidate, dict)
+            else ""
+        ).strip().casefold()
+        container_transport_defer = bool(
+            executor_transport_defer
+            and self.active_behavior_type == "INTERACT"
+            and active_container_kind
+            in {"drawer", "fridge", "refrigerator", "container"}
+        )
+        if container_transport_defer and not preempted_by_target:
+            target_id = self._interaction_target_id(candidate_id)
+            if target_id:
+                current_step = self._observation_step(
+                    self.latest_candidates_payload
+                )
+                cooldown_steps = int(
+                    getattr(
+                        self,
+                        "container_anchor_unreachable_cooldown_steps",
+                        300,
+                    )
+                    or 0
+                )
+                step_cooldowns = getattr(
+                    self, "container_anchor_unreachable_until_step", None
+                )
+                if not isinstance(step_cooldowns, dict):
+                    step_cooldowns = {}
+                    self.container_anchor_unreachable_until_step = step_cooldowns
+                extend_container_step_cooldown(
+                    target_id,
+                    current_step,
+                    cooldown_steps,
+                    step_cooldowns,
                 )
         if executor_transport_defer:
             self.next_decision_time = 0.0
@@ -2204,6 +2321,12 @@ class SemanticRuleDecisionNode:
             completed_drawer_scan_target_ids = set(
                 self.completed_drawer_scan_target_ids
             )
+            rejected_face_indices_by_target = {
+                str(target_id): set(indices)
+                for target_id, indices in getattr(
+                    self, "container_rejected_face_indices_by_target", {}
+                ).items()
+            }
             target_goal_complete = bool(self.target_goal_complete)
             terminal_post_interaction_traversal_ids = set(
                 self.terminal_post_interaction_traversal_ids
@@ -2242,6 +2365,11 @@ class SemanticRuleDecisionNode:
             ):
                 rejected[candidate_id] = "candidate_cooldown"
                 continue
+            if target_cooldown_key:
+                payload = container_candidate_with_rejected_faces(
+                    payload,
+                    rejected_face_indices_by_target.get(target_cooldown_key, set()),
+                )
             metadata = payload.get("metadata") or {}
             traversal_event_key = post_interaction_traversal_event_key(
                 candidate_id,

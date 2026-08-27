@@ -721,6 +721,58 @@ def test_container_m1_capture_evidence_uses_staging_pose_without_tf(
     )
 
 
+def test_container_m1_capture_uses_selected_montage_view_pose_and_face(
+    executor_module,
+) -> None:
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.tf_listener = None
+    executor.map_frame = "map"
+    executor.container_m1_capture_pose_tolerance_m = 0.18
+    executor.container_m1_capture_yaw_tolerance_rad = 0.25
+    candidate = {
+        "metadata": {
+            "frame_id": "map",
+            "effective_interaction_approach_pose_xyyaw": [1.0, 2.0, 0.3],
+            "container_m1_front_axis_from_capture": True,
+            "container_m1_face_selection_enabled": True,
+            "container_face_axis_xy_by_staging_index": [[0.0, 1.0], [1.0, 0.0]],
+        },
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [1.0, 2.0, 0.3],
+        },
+    }
+    update = {
+        "observation_capture_step": 20,
+        "selected_evidence_capture_step": 10,
+        "selected_evidence_observation_pose_xyyaw": [1.12, 2.04, 0.42],
+        "selected_evidence_anchor_face_id": "aabb_face_pos_x",
+        "selected_evidence_anchor_face_index": 1,
+        "selected_evidence_anchor_face_axis_xy": [1.0, 0.0],
+        "selected_view_id": "view_1",
+        "view_state": "front",
+        "front_surface_visible": True,
+        "approach_ready": True,
+    }
+    request = {"observation_pose_xyyaw": [9.0, 9.0, 0.0]}
+
+    evidence, reason = executor._container_m1_capture_evidence_locked(
+        candidate, update, request
+    )
+
+    assert reason == "ready"
+    assert evidence is not None
+    assert evidence["capture_step"] == 10
+    assert evidence["capture_pose_xyyaw"] == [1.12, 2.04, 0.42]
+    assert evidence["staging_pose_xyyaw"] == [1.0, 2.0, 0.3]
+    assert evidence["m1_front_axis_xy"] == [1.0, 0.0]
+    assert evidence["m1_front_staging_index"] == 1
+    assert evidence["m1_front_face_id"] == "aabb_face_pos_x"
+    assert (
+        evidence["m1_front_axis_source"]
+        == "m1_selected_montage_view_aabb_cardinal_face"
+    )
+
+
 def test_outer_container_staging_reuses_navigation_pose_before_m1_poll(
     executor_module,
 ) -> None:

@@ -568,10 +568,10 @@ class SemanticBehaviorExecutor:
         self.interaction_dwa_terminal_yaw_settle_max_task_steps = max(
             1, interaction_terminal_yaw_settle_max_task_steps
         )
-        # A transient M1 flip at one fixed staging pose should consume another
-        # observation, not discard the recently valid front/action-region
-        # evidence and jump to a different side.  This is a count bound, not a
-        # wall-clock timeout.
+        # Optional compatibility budget for a transient M1 flip at one fixed
+        # pose.  The current contract disables it: negative evidence must move
+        # to a materially different anchor instead of spending another request
+        # on an effectively identical image.
         self.container_m1_same_pose_flip_retry_count = max(
             0,
             int(config.get("container_m1_same_pose_flip_retry_count", 0)),
@@ -2221,10 +2221,20 @@ class SemanticBehaviorExecutor:
             # not let a delayed targeted response become evidence for the
             # nearer physical action pose.
             return None, "m1_capture_not_outer_staging_phase"
+        selected_evidence_pose = list(
+            update.get("selected_evidence_observation_pose_xyyaw") or []
+        )
+        # Keep the immutable anchor/capture goal as the expected pose token.
+        # A montage panel records the robot's *actual* pose when that image was
+        # captured; using it as ``expected`` makes the later exact staging-token
+        # check fail whenever move_base arrived within tolerance rather than at
+        # bit-identical coordinates.  Validate the selected panel pose against
+        # the goal here, then retain the exact goal in ``staging_pose_xyyaw``.
         expected = list(
-            request.get("observation_pose_xyyaw")
-            or metadata.get("effective_interaction_approach_pose_xyyaw")
+            metadata.get("effective_interaction_approach_pose_xyyaw")
             or interaction.get("interaction_approach_pose_xyyaw")
+            or request.get("observation_goal_xyyaw")
+            or request.get("observation_pose_xyyaw")
             or []
         )
         if len(expected) < 3:
@@ -2242,7 +2252,9 @@ class SemanticBehaviorExecutor:
         # The production executor always has a TF reader.  Keep reduced unit
         # test doubles deterministic by treating their selected staging pose
         # as the capture pose rather than failing solely because they omit TF.
-        actual = pose_reader(frame_id) if callable(pose_reader) else list(expected)
+        actual = list(selected_evidence_pose) if len(selected_evidence_pose) >= 3 else None
+        if actual is None:
+            actual = pose_reader(frame_id) if callable(pose_reader) else list(expected)
         distance_tolerance_m, yaw_tolerance_rad = (
             self._container_m1_capture_evidence_tolerances(candidate)
         )
@@ -2255,7 +2267,8 @@ class SemanticBehaviorExecutor:
         if not bool(validation.get("valid")):
             return None, "m1_capture_pose_mismatch"
         capture_step = self._public_step_or_none(
-            update.get("observation_capture_step")
+            update.get("selected_evidence_capture_step")
+            or update.get("observation_capture_step")
             or update.get("attribute_capture_step")
         )
         if capture_step is None:
@@ -2263,6 +2276,13 @@ class SemanticBehaviorExecutor:
         front_axis = self._container_m1_front_axis_from_capture_pose(
             candidate,
             list(validation.get("actual_pose_xyyaw") or []),
+            selected_face_axis_xy=update.get(
+                "selected_evidence_anchor_face_axis_xy"
+            ),
+            selected_face_index=update.get(
+                "selected_evidence_anchor_face_index"
+            ),
+            selected_face_id=update.get("selected_evidence_anchor_face_id"),
         )
         if front_axis is None:
             return None, "m1_front_axis_unavailable"
@@ -2274,6 +2294,7 @@ class SemanticBehaviorExecutor:
             "view_state": str(update.get("view_state") or ""),
             "front_surface_visible": bool(update.get("front_surface_visible")),
             "approach_ready": bool(update.get("approach_ready")),
+            "selected_view_id": str(update.get("selected_view_id") or ""),
             **front_axis,
         }, "ready"
 
@@ -2281,6 +2302,10 @@ class SemanticBehaviorExecutor:
     def _container_m1_front_axis_from_capture_pose(
         candidate: dict,
         capture_pose_xyyaw: list | tuple,
+        *,
+        selected_face_axis_xy: object = None,
+        selected_face_index: object = None,
+        selected_face_id: object = "",
     ) -> dict | None:
         """Freeze a world-space face only after M1 confirms the current image.
 
@@ -2295,6 +2320,29 @@ class SemanticBehaviorExecutor:
         if not bool(metadata.get("container_m1_front_axis_from_capture", False)):
             return {}
         if bool(metadata.get("container_m1_face_selection_enabled", False)):
+            selected_axis = list(selected_face_axis_xy or [])
+            if len(selected_axis) >= 2:
+                try:
+                    axis_x = float(selected_axis[0])
+                    axis_y = float(selected_axis[1])
+                except (TypeError, ValueError):
+                    return None
+                norm = math.hypot(axis_x, axis_y)
+                if not math.isfinite(norm) or norm <= 1e-6:
+                    return None
+                axis_x /= norm
+                axis_y /= norm
+                try:
+                    staging_index = int(selected_face_index)
+                except (TypeError, ValueError):
+                    staging_index = -1
+                return {
+                    "m1_front_axis_xy": [axis_x, axis_y],
+                    "m1_front_yaw": math.atan2(-axis_y, -axis_x),
+                    "m1_front_axis_source": "m1_selected_montage_view_aabb_cardinal_face",
+                    "m1_front_staging_index": staging_index,
+                    "m1_front_face_id": str(selected_face_id or ""),
+                }
             try:
                 staging_index = int(
                     metadata.get(
@@ -2678,7 +2726,7 @@ class SemanticBehaviorExecutor:
                             getattr(
                                 self,
                                 "container_m1_same_pose_flip_retry_count",
-                                1,
+                                0,
                             )
                             or 0
                         )
@@ -4542,6 +4590,45 @@ class SemanticBehaviorExecutor:
                 # contract for this targeted re-observation.  M1 still decides
                 # visual state and frontality from the new RGB image itself.
                 request["expected_node_type"] = "container"
+                candidate_metadata = dict(
+                    (self.machine.candidate or {}).get("metadata") or {}
+                )
+                try:
+                    anchor_face_index = int(
+                        candidate_metadata.get(
+                            "container_two_stage_staging_goal_option_index",
+                            candidate_metadata.get(
+                                "interaction_approach_goal_option_index", 0
+                            ),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    anchor_face_index = 0
+                face_labels = list(
+                    candidate_metadata.get(
+                        "container_m1_capture_pose_labels_by_staging_index"
+                    )
+                    or candidate_metadata.get("container_staging_pose_labels")
+                    or []
+                )
+                face_axes = list(
+                    candidate_metadata.get(
+                        "container_face_axis_xy_by_staging_index"
+                    )
+                    or []
+                )
+                if 0 <= anchor_face_index < len(face_labels):
+                    request["anchor_face_id"] = str(
+                        face_labels[anchor_face_index] or ""
+                    )[:96]
+                if 0 <= anchor_face_index < len(face_axes):
+                    axis = list(face_axes[anchor_face_index] or [])
+                    if len(axis) >= 2:
+                        request["anchor_face_axis_xy"] = [
+                            float(axis[0]),
+                            float(axis[1]),
+                        ]
+                request["anchor_face_index"] = anchor_face_index
             metadata = (
                 dict(self.machine.candidate.get("metadata") or {})
                 if self.machine.candidate

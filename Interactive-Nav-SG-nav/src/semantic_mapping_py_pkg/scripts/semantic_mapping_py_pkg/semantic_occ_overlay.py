@@ -478,6 +478,17 @@ class SemanticOccupancyOverlay:
         if source_extent <= 0.0:
             return 0.0
         inset_extent = source_extent + 2.0 * self.clear_padding_m
+        # A roughly one-metre doorway is already close to the robot's usable
+        # passage width after costmap inflation.  Do not spend its final map
+        # cell on the conservative lateral inset: retaining the measured
+        # doorway width is still bounded by the immutable closed-door AABB and
+        # avoids sealing narrow portals through rasterisation alone.  Wider
+        # portals keep the 5 cm wall-protection inset.
+        if (
+            self.clear_padding_m < 0.0
+            and 0.95 <= source_extent <= 1.20
+        ):
+            inset_extent = max(inset_extent, source_extent)
         # A negative padding must never erase the portal just because the
         # closed leaf is thinner than twice the requested 5 cm inset.  One map
         # cell is the smallest meaningful clearance in the planning grid.

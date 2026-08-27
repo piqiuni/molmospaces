@@ -279,6 +279,24 @@ def test_open_portal_insets_reference_and_preserves_adjacent_wall_cells():
     assert sum(value > 0 for value in mask) == 16
 
 
+def test_narrow_portal_keeps_measured_width_for_costmap_clearance():
+    """A 1 m doorway must not lose its final raster cell to the inset."""
+    overlay = SemanticOccupancyOverlay(clear_padding_m=-0.05)
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    narrow = portal("closed", size=(1.05, 0.17, 2.0))
+    overlay.update_graph(graph(narrow))
+    narrow["interaction"] = {"state": "open"}
+    overlay.update_graph(graph(narrow))
+
+    planning, mask, stats = overlay.apply(GridInfo(), raw)
+
+    assert stats["active_portal_ids"] == ["portal_door"]
+    # Full measured width (about 1.05 m) is retained; the thin normal slab
+    # remains capped at two cells and cannot erase adjacent wall rows.
+    assert sum(value > 0 for value in mask) >= 20
+    assert planning[10 * GridInfo.width + 10] == 0
+
+
 def test_non_grid_aligned_thin_portal_clears_both_occupied_rows():
     overlay = SemanticOccupancyOverlay(
         clear_padding_m=-0.05,

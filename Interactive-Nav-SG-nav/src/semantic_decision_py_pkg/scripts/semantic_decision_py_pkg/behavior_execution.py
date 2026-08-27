@@ -159,7 +159,14 @@ def interaction_observation_disposition(
             or "unknown"
         ).strip().casefold()
         if state in {"open", "opened", "static_open", "static"}:
-            return "finish_without_action"
+            # This payload is a fresh visual M1 judgement, not authoritative
+            # articulation state.  In particular, a wrong-face physical
+            # rejection must not be converted into success by one later view
+            # flickering from ``closed`` to ``open``.  Already-open containers
+            # are removed before execution by the trusted graph/force state;
+            # an in-flight visual ``open`` therefore remains bounded evidence
+            # and must reobserve another face instead of finishing the action.
+            return "retry"
         if state in {"blocked", "unavailable", "static_closed", "locked"}:
             # M1 is visual evidence, not an authoritative capability oracle.
             # A single "locked"/"unavailable" judgement is therefore only an
@@ -267,9 +274,19 @@ def candidate_with_effective_interaction_approach(
     interaction["interaction_approach_pose_xyyaw"] = list(approach)
     metadata.setdefault("planned_goal_xyyaw", list(result.get("goal_xyyaw") or []))
     metadata["effective_interaction_approach_pose_xyyaw"] = list(approach)
-    metadata["interaction_approach_goal_option_index"] = max(
-        0, int(goal_option_index)
-    )
+    effective_option_index = max(0, int(goal_option_index))
+    metadata["interaction_approach_goal_option_index"] = effective_option_index
+    if bool(metadata.get("container_two_stage_approach", False)) and str(
+        metadata.get("container_two_stage_phase") or "staging"
+    ).strip().casefold() in {"staging", "m1_capture"}:
+        # Batch preflight may choose a non-primary container anchor.  M1
+        # rejection/viewpoint bookkeeping is keyed by the canonical staging
+        # index, so bind that index to the goal actually sent to move_base.
+        # Leaving the generated primary index here caused a negative M1 result
+        # to exclude the wrong face and select the same physical anchor again.
+        metadata["container_two_stage_staging_goal_option_index"] = (
+            effective_option_index
+        )
     if attempts is not None:
         metadata["interaction_approach_attempts"] = [dict(item) for item in attempts]
     result["interaction_command"] = interaction
@@ -2558,6 +2575,16 @@ class BehaviorExecutionStateMachine:
 
         metadata = dict((self.candidate or {}).get("metadata") or {})
         precondition_kind = "drawer" if drawer_pre_action else "container"
+        rejected_face_indices: list[int] = []
+        for raw_index in metadata.get(
+            "container_m1_rejected_face_staging_indices", []
+        ):
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if index >= 0:
+                rejected_face_indices.append(index)
         return self._finish(
             False,
             {
@@ -2583,6 +2610,13 @@ class BehaviorExecutionStateMachine:
                 ),
                 "observation_max_total_requests": (
                     self._interaction_observation_max_total_requests()
+                ),
+                # A side/back M1 result or a physical-front rejection invalidates
+                # the whole canonical AABB face, not just this decision's pose.
+                # Carry that bounded face memory to the decision node so a later
+                # graph revision cannot restart the same rejected face at anchor 0.
+                "container_m1_rejected_face_staging_indices": sorted(
+                    set(rejected_face_indices)
                 ),
                 "precondition_kind": precondition_kind,
             },

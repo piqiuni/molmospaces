@@ -350,6 +350,28 @@ def test_attribute_visual_evidence_is_full_image_with_target_outline_and_inset()
     assert np.any(np.all(evidence == np.array([0, 255, 255]), axis=2))
 
 
+def test_attribute_visual_outline_expands_detector_box_by_requested_margin() -> None:
+    image = np.zeros((120, 200, 3), dtype=np.uint8)
+    detection = {"bbox_2d": [80, 40, 120, 80]}
+
+    expanded = InteractionAttributeInferenceNode._expanded_visual_bbox_pixels(
+        image, detection
+    )
+    evidence = InteractionAttributeInferenceNode._compose_attribute_visual_evidence(
+        image,
+        detection,
+        margin_ratio=0.0,
+        include_crop_inset=False,
+    )
+
+    # 30%/20% would be 12/8 px, so the 24 px per-edge minimum wins.
+    assert expanded == (56, 16, 144, 104)
+    assert evidence is not None
+    assert np.array_equal(evidence[16, 56], np.array([0, 255, 255]))
+    # The old detector edge is no longer painted across the target.
+    assert np.array_equal(evidence[40, 80], image[40, 80])
+
+
 def test_portal_visual_evidence_keeps_full_frame_without_crop_inset() -> None:
     image = np.full((100, 160, 3), 17, dtype=np.uint8)
     image[25:85, 60:110] = (30, 100, 200)
@@ -478,7 +500,66 @@ def test_target_multiview_history_requires_step_and_pose_separation() -> None:
         min_yaw_gap_rad=0.25,
     )
 
-    assert [item["capture_step"] for item in selected] == [10, 34, 50]
+    assert [item["capture_step"] for item in selected] == [34, 50]
+
+
+def test_container_multiview_admission_rejects_duplicate_and_third_view() -> None:
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.targeted_multiview_min_step_gap = 8
+    node.targeted_multiview_min_position_gap_m = 0.25
+    node.targeted_multiview_min_yaw_gap_rad = 0.25
+    evidence = np.zeros((8, 8, 3), dtype=np.uint8)
+    node.target_visual_history = {
+        "fridge_1": [
+            {
+                "capture_step": 10,
+                "observation_pose_xyyaw": [0.0, 0.0, 0.0],
+                "bbox_containment": {"valid": True},
+                "visual_evidence": evidence,
+            }
+        ]
+    }
+
+    assert node._target_visual_history_rejection_reason(
+        "fridge_1",
+        capture_step=20,
+        observation_pose_xyyaw=[0.02, 0.01, 0.02],
+    ) == "m1_duplicate_view_rejected"
+    assert node._target_visual_history_rejection_reason(
+        "fridge_1",
+        capture_step=20,
+        observation_pose_xyyaw=[0.35, 0.0, 0.0],
+    ) == ""
+
+    node.target_visual_history["fridge_1"].append(
+        {
+            "capture_step": 20,
+            "observation_pose_xyyaw": [0.35, 0.0, 0.0],
+            "bbox_containment": {"valid": True},
+            "visual_evidence": evidence,
+        }
+    )
+    assert node._target_visual_history_rejection_reason(
+        "fridge_1",
+        capture_step=30,
+        observation_pose_xyyaw=[0.7, 0.0, 0.0],
+    ) == "m1_two_view_budget_exhausted"
+
+
+def test_multiview_montage_keeps_two_chronological_panels_in_one_image() -> None:
+    first = np.full((20, 30, 3), (1, 2, 3), dtype=np.uint8)
+    second = np.full((20, 30, 3), (4, 5, 6), dtype=np.uint8)
+
+    montage = InteractionAttributeInferenceNode._compose_multiview_montage(
+        [first, second]
+    )
+
+    assert montage is not None
+    assert montage.shape[0] == 20
+    assert np.array_equal(montage[10, 10], first[10, 10])
+    assert np.array_equal(montage[10, -10], second[10, -10])
+    assert np.any(np.all(montage == 255, axis=2))
 
 
 def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> None:
@@ -539,6 +620,91 @@ def test_m1_inference_sends_only_opaque_context_and_one_composite_image() -> Non
     ]
     assert published[0][0]["object_id"] == "object_1"
     assert published[0][0]["approach_ready"] is True
+
+
+def test_m1_multiview_sends_one_montage_and_binds_authoritative_latest_view() -> None:
+    class SelectFirstViewClient(RecordingClient):
+        def request_json(self, **kwargs):
+            response = super().request_json(**kwargs)
+            response.payload["selected_view_id"] = "view_1"
+            return response
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.current_episode_id = "episode_1"
+    node.pending = {
+        "fridge_1": {
+            "request_sequence": 1,
+            "generation": 0,
+            "episode_id": "episode_1",
+        }
+    }
+    node.generations = {"fridge_1": 0}
+    node.last_request = {}
+    node.completed = {}
+    node.filter_counts = {"started": 0, "stale": 0, "completed": 0, "failed": 0}
+    node.visual_evidence_max_side_px = 0
+    node.request_timeout_s = 1.0
+    node.max_output_tokens = 256
+    node.success_refresh_interval_s = 120.0
+    node.client = SelectFirstViewClient()
+    published = []
+    node._publish_updates = lambda _episode, _stamp, updates: published.extend(updates)
+    node._publish_status = lambda: None
+
+    node._infer(
+        object_id="fridge_1",
+        detection={"name": "fridge"},
+        visual_evidence=np.full((40, 60, 3), 20, dtype=np.uint8),
+        visual_evidence_history=[np.full((40, 60, 3), 10, dtype=np.uint8)],
+        episode_id="episode_1",
+        frame_id="20",
+        image_sequence=22,
+        stamp=10.0,
+        signature="fresh",
+        generation=0,
+        request_sequence=1,
+        enqueued_at=0.0,
+        targeted_refresh={"expected_node_type": "container"},
+        evidence_frame_ids=["10", "20"],
+        evidence_capture_steps=[10, 20],
+        evidence_observation_pose_xyyaw=[[1.0, 2.0, 0.1], [3.0, 4.0, 0.2]],
+        evidence_view_metadata=[
+            {
+                "view_id": "view_1",
+                "frame_id": "10",
+                "capture_step": 10,
+                "observation_pose_xyyaw": [1.0, 2.0, 0.1],
+                "anchor_face_id": "aabb_face_pos_x",
+                "anchor_face_index": 0,
+                "anchor_face_axis_xy": [1.0, 0.0],
+            },
+            {
+                "view_id": "view_2",
+                "frame_id": "20",
+                "capture_step": 20,
+                "observation_pose_xyyaw": [3.0, 4.0, 0.2],
+                "anchor_face_id": "aabb_face_pos_y",
+                "anchor_face_index": 1,
+                "anchor_face_axis_xy": [0.0, 1.0],
+            },
+        ],
+    )
+
+    request = node.client.calls[0]
+    assert len(request["images"]) == 1
+    assert "exactly 2 panel(s)" in request["instruction"]
+    assert request["metrics_context"]["m1_transport_image_count"] == 1
+    assert request["metrics_context"]["m1_montage_panel_count"] == 2
+    patch = published[0]
+    # Historical panels are comparison context only.  Even if the model emits
+    # an older selected_view_id, action authorization must stay bound to the
+    # latest/rightmost panel and its actual robot pose/AABB face.
+    assert patch["selected_view_id"] == "view_2"
+    assert patch["selected_evidence_capture_step"] == 20
+    assert patch["selected_evidence_observation_pose_xyyaw"] == [3.0, 4.0, 0.2]
+    assert patch["selected_evidence_anchor_face_id"] == "aabb_face_pos_y"
+    assert patch["selected_evidence_anchor_face_axis_xy"] == [0.0, 1.0]
 
 
 def test_targeted_container_refresh_constrains_class_without_supplying_view() -> None:

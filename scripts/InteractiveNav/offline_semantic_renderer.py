@@ -968,7 +968,7 @@ def _draw_subgoal_direction(
         heading = np.asarray(
             [math.cos(float(yaw)), -math.sin(float(yaw))], dtype=np.float32
         )
-        length = max(10, int(length))
+        length = max(6, int(length))
         start = np.asarray(center, dtype=np.float32) - heading * float(length * 0.18)
         end = np.asarray(center, dtype=np.float32) + heading * float(length)
         cv2.arrowedLine(
@@ -1565,7 +1565,9 @@ class OfflineSixPanelRenderer:
             3,
         )
         ego_arrow_length = max(9, int(round(9 * scale)))
+        ego_pose_px = None
         if pose is not None and (robot_px := to_panel(pose)) is not None:
+            ego_pose_px = robot_px
             _draw_robot_arrow(panel, robot_px, pose[2], ego_arrow_length)
         if draw_global_plan:
             _draw_polyline(panel, [point for item in global_plan if (point := to_panel(item)) is not None], (40, 190, 60), 3)
@@ -1640,15 +1642,28 @@ class OfflineSixPanelRenderer:
                 radius=marker_radius,
                 selected=True,
             )
+            direction_length = max(6, int(round(0.5 * 1.55 * ego_arrow_length)))
+            if ego_pose_px is not None:
+                # Scale the heading by the live spatial relationship, not by
+                # the icon size: the requested arrow reaches half the current
+                # pixel distance from this subgoal to the ego pose.
+                direction_length = max(
+                    6,
+                    int(
+                        round(
+                            0.5
+                            * math.hypot(
+                                live_goal_marker[0][0] - ego_pose_px[0],
+                                live_goal_marker[0][1] - ego_pose_px[1],
+                            )
+                        )
+                    ),
+                )
             _draw_subgoal_direction(
                 panel,
                 live_goal_marker[0],
                 live_goal_marker[2],
-                # ``_draw_robot_arrow`` spans 1.55 * its nominal length from
-                # tail to tip.  Make the selected-goal arrow exactly half of
-                # that visible ego-pose span, rather than half of only its
-                # forward half (which was too short in Fig. 2/Fig. 4).
-                max(10, int(round(0.5 * 1.55 * ego_arrow_length))),
+                direction_length,
                 live_goal_marker[1],
             )
         return panel

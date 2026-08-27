@@ -134,6 +134,7 @@ def test_pre_m1_empty_anchor_batch_defers_without_candidate_exclusion() -> None:
             "m1_observation_staging_required": True,
             "drawer_pre_action_observation": True,
             "interaction_observation_attempts": 0,
+            "container_m1_rejected_face_staging_indices": [7, 8],
         },
     }
     machine.start(candidate, now=0.0)
@@ -148,6 +149,7 @@ def test_pre_m1_empty_anchor_batch_defers_without_candidate_exclusion() -> None:
     assert detail["retryable"] is True
     assert detail["terminal_candidate_exclusion"] is False
     assert detail["m1_capture_not_reached"] is True
+    assert detail["container_m1_rejected_face_staging_indices"] == [7, 8]
 
 
 
@@ -420,6 +422,31 @@ def test_effective_interaction_approach_replaces_bridge_pose_not_primary_goal() 
         distance_tolerance_m=0.45,
         yaw_tolerance_rad=0.55,
     )["valid"]
+
+
+def test_effective_container_anchor_binds_actual_staging_index() -> None:
+    candidate = {
+        "candidate_id": "interaction:container_fridge:open",
+        "behavior_type": "INTERACT",
+        "goal_xyyaw": [1.0, 1.0, 0.0],
+        "interaction_command": {
+            "interaction_approach_pose_xyyaw": [1.0, 1.0, 0.0],
+        },
+        "metadata": {
+            "container_two_stage_approach": True,
+            "container_two_stage_phase": "staging",
+            "container_two_stage_staging_goal_option_index": 27,
+        },
+    }
+
+    bound = candidate_with_effective_interaction_approach(
+        candidate,
+        [0.8, 4.3, 1.83],
+        goal_option_index=29,
+    )
+
+    assert bound["metadata"]["interaction_approach_goal_option_index"] == 29
+    assert bound["metadata"]["container_two_stage_staging_goal_option_index"] == 29
 
 
 def test_pose_precondition_failure_is_not_an_object_failure() -> None:
@@ -1154,6 +1181,35 @@ def test_container_pre_action_confirms_one_negative_before_moving_to_next_view()
     )
     assert machine.state == STATE_INTERACTING
     assert execute[0]["kind"] == "interact"
+
+
+def test_container_visual_open_cannot_finish_after_wrong_face_recovery() -> None:
+    machine = BehaviorExecutionStateMachine()
+    candidate = container_pre_action_candidate()
+    candidate["metadata"]["interaction_observation_same_pose_samples_per_view"] = 1
+    commands = machine.start(candidate, now=0.0)
+    assert commands[0]["kind"] == "navigate"
+    request = machine.on_navigation_result(True, {"capture_step": 10}, now=0.5)
+    assert request[0]["kind"] == "request_interaction_observation"
+
+    retry = machine.on_interaction_observation_result(
+        {
+            "attribute_status": "ready",
+            "attribute_source": "mllm_attribute_inference",
+            "is_currently_visible": True,
+            "state": "open",
+            "view_state": "front",
+            "front_surface_visible": True,
+            "approach_ready": True,
+            "attribute_capture_step": 11,
+            "container_visual_precondition_reason": "ready",
+        },
+        now=1.0,
+    )
+
+    assert machine.state == STATE_APPROACH_INTERACTION
+    assert retry[0]["kind"] == "navigate"
+    assert retry[0]["reason"] == "container_visual_reobserve_next_approach"
 
 
 def test_container_two_stage_m1_staging_navigates_inner_before_bridge() -> None:

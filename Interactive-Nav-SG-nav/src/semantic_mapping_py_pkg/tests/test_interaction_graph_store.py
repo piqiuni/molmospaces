@@ -1534,6 +1534,8 @@ def test_unavailable_portal_feedback_is_terminal_and_not_static_open() -> None:
             "action": "open",
             "success": False,
             "state": "unavailable",
+            # A failed-result hint alone must not promote the portal to open.
+            "pre_state": "open",
             "interaction_capability": "unavailable",
             "interactable": False,
             "retryable": False,
@@ -1579,6 +1581,205 @@ def test_unavailable_portal_feedback_is_terminal_and_not_static_open() -> None:
         "door_leaf": "absent",
         "confidence": 0.9,
     }
+
+
+def test_unavailable_portal_preserves_m1_and_occ_confirmed_open_aperture() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="door_fixed_open_1",
+        semantic_name="door",
+        is_door=True,
+        connected_room_ids=[1, 2],
+        frame_index=7,
+    )
+    store.update_observations([doorway], source_mode="gt_replay", stamp=1.0)
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_fixed_open_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 7,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "portal_morphology": {"door_leaf": "absent", "confidence": 0.95},
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.95,
+            },
+            # The visual-only lane remains conservative for clipped targets.
+            # The unavailable result below adds independent capability evidence.
+            "visual_evidence_truncated": True,
+            "visual_evidence_truncated_edges": ["bottom"],
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_fixed_open_1",
+            "object_id": "door_fixed_open_1",
+            "event_id": "fixed_open_unavailable_feedback",
+            "action": "open",
+            "success": False,
+            "state": "unavailable",
+            "interaction_capability": "unavailable",
+            "interactable": False,
+            "retryable": False,
+            "reason": "non_articulated",
+            "source": "force_interaction_capability_check",
+        },
+        stamp=3.0,
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=3.0)["nodes"]
+        if node["id"] == "portal_door_fixed_open_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "static_open"
+    assert interaction["capability"] == "unavailable"
+    assert interaction["is_interactable"] is False
+    assert interaction["traversable"] is True
+    assert interaction["requires_interaction"] is False
+    assert interaction["state_evidence"] == "m1_open_aperture_and_occ_connectivity"
+    assert portal["attributes"]["portal_unavailable_state_resolution"] == {
+        "state": "static_open",
+        "m1_open_aperture": True,
+        "observed_open_connectivity": True,
+        "reason": "m1_open_aperture_and_occ_connectivity",
+        "event_id": "fixed_open_unavailable_feedback",
+    }
+
+
+def test_finish_without_action_latches_already_open_unavailable_portal() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="door_finish_open_1",
+        semantic_name="door",
+        is_door=True,
+        connected_room_ids=[1, 2],
+        frame_index=4,
+    )
+    store.update_observations([doorway], source_mode="gt_replay", stamp=1.0)
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_finish_open_1",
+            "object_id": "door_finish_open_1",
+            "event_id": "m1_already_open",
+            "success": True,
+            "state": "open",
+            "observation_outcome": "finish_without_action",
+            "portal_aperture_evidence": {"open_aperture": "visible", "confidence": 0.95},
+            "source": "mllm_attribute_inference",
+        },
+        stamp=2.0,
+    )
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=2.0)["nodes"]
+        if node["id"] == "portal_door_finish_open_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "static_open"
+    assert interaction["capability"] == "unavailable"
+    assert interaction["is_interactable"] is False
+    assert interaction["requires_interaction"] is False
+    assert interaction["traversable"] is True
+
+
+def test_known_portal_blocks_occupancy_room_merge() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="door_merge_guard",
+                semantic_name="door",
+                is_door=True,
+                connected_room_ids=[1, 2],
+                room_id=1,
+                position=[1.0, 0.0, 1.0],
+                aabb_center=[1.0, 0.0, 1.0],
+                aabb_size=[0.9, 0.1, 2.0],
+            )
+        ],
+        source_mode="gt_replay",
+    )
+    store._accept_room_geometry(1, [0.0, 0.0, 0.1], [1.0, 1.0, 0.2], 1)
+    store._accept_room_geometry(2, [2.0, 0.0, 0.1], [1.0, 1.0, 0.2], 1)
+    store._ensure_room_node(1)
+    store._ensure_room_node(2)
+    store._apply_room_merges({2: 1})
+    assert 2 not in store.room_redirects
+    assert store.nodes["room_2"].attributes.get("active", True) is True
+
+
+def test_late_m1_and_occ_open_reconciles_unavailable_portal_state() -> None:
+    store = InteractionGraphStore(scene_id="test_scene")
+    doorway = observation(
+        instance_id="door_late_open_1",
+        semantic_name="door",
+        is_door=True,
+        connected_room_ids=[1, 2],
+        frame_index=7,
+    )
+    store.update_observations([doorway], source_mode="gt_replay", stamp=1.0)
+    assert store.update_interaction_result(
+        {
+            "node_id": "portal_door_late_open_1",
+            "object_id": "door_late_open_1",
+            "event_id": "late_open_unavailable_feedback",
+            "action": "open",
+            "success": False,
+            "state": "unavailable",
+            "interaction_capability": "unavailable",
+            "interactable": False,
+            "reason": "non_articulated",
+            "source": "force_interaction_capability_check",
+        },
+        stamp=2.0,
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "door_late_open_1",
+            "attribute_status": "ready",
+            "observation_frame_index": 8,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "portal_morphology": {"door_leaf": "absent", "confidence": 0.95},
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.95,
+            },
+            "visual_evidence_truncated": True,
+            "visual_evidence_truncated_edges": ["bottom"],
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=3.0,
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=3.0)["nodes"]
+        if node["id"] == "portal_door_late_open_1"
+    )
+    interaction = portal["interaction"]
+    assert interaction["state"] == "static_open"
+    assert interaction["capability"] == "unavailable"
+    assert interaction["traversable"] is True
+    assert interaction["requires_interaction"] is False
+    assert portal["attributes"]["portal_state_gate"]["reason"] == (
+        "unavailable_capability_m1_open_and_map_confirmed"
+    )
+    assert portal["attributes"]["portal_unavailable_state_resolution"]["reason"] == (
+        "m1_open_aperture_and_occ_connectivity"
+    )
+    assert portal["attributes"]["interaction_state_override"]["event_id"] == (
+        "late_open_unavailable_feedback"
+    )
 
 
 def test_invalid_unknown_portal_result_persists_noninteractable_static_state() -> None:
