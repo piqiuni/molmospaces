@@ -222,15 +222,14 @@ _HTML = """<!doctype html><meta charset='utf-8'><title>Go2 Physical Interactive 
 def _compact_qwen_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Keep sparse masks out of the text prompt sent to the remote Qwen."""
     compact_detections: list[dict[str, Any]] = []
-    for detection in snapshot.get("detections", []):
-        if not isinstance(detection, dict):
-            continue
+    detections = [item for item in snapshot.get("detections", []) if isinstance(item, dict)]
+    detections.sort(key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
+    for detection in detections[:12]:
         item = {
             key: detection.get(key)
             for key in (
-                "semantic_class", "raw_class", "confidence", "bbox", "mask_area",
-                "depth_median_m", "depth_valid_points", "world_position", "aabb_center",
-                "aabb_size", "map_transform_status", "source_frame", "capture_seq", "stamp",
+                "semantic_class", "confidence", "bbox", "mask_area", "depth_median_m",
+                "world_position", "aabb_center", "aabb_size", "map_transform_status",
             )
             if key in detection
         }
@@ -252,19 +251,19 @@ def _compact_qwen_context(snapshot: dict[str, Any]) -> dict[str, Any]:
             if key in graph
         }
         compact_graph["nodes"] = []
-        for node in graph.get("nodes", []):
-            if not isinstance(node, dict):
-                continue
+        nodes = [item for item in graph.get("nodes", []) if isinstance(item, dict)]
+        nodes.sort(key=lambda item: (bool(item.get("is_currently_visible", True)), float(item.get("last_seen") or 0.0)), reverse=True)
+        for node in nodes[:16]:
             item = {
                 key: node.get(key)
-                for key in ("id", "type", "label", "centroid", "aabb_center", "aabb_size", "parent_id", "room_id", "confidence", "observation_count")
+                for key in ("id", "type", "label", "centroid", "aabb_center", "aabb_size", "room_id")
                 if key in node
             }
             interaction = node.get("interaction")
             if isinstance(interaction, dict):
                 item["interaction"] = {
                     key: interaction.get(key)
-                    for key in ("is_interactable", "interaction_mode", "capability", "state", "cost", "requires_interaction", "traversable", "expected_effect")
+                    for key in ("is_interactable", "interaction_mode", "capability", "state", "cost", "requires_interaction", "traversable")
                     if key in interaction
                 }
             compact_graph["nodes"].append(item)
@@ -272,7 +271,7 @@ def _compact_qwen_context(snapshot: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "frame_seq": snapshot.get("frame_seq", -1),
-        "telemetry": snapshot.get("telemetry", {}),
+        "telemetry": _compact_telemetry(snapshot.get("telemetry", {})),
         "detections": compact_detections,
         "graph": compact_graph,
         "consistency": _compact_consistency(snapshot.get("consistency", {})),
@@ -288,14 +287,34 @@ def _compact_consistency(consistency: Any) -> dict[str, Any]:
         if key in consistency
     }
     result["detections"] = []
-    for item in consistency.get("detections", []):
+    for item in consistency.get("detections", [])[:12]:
         if not isinstance(item, dict):
             continue
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
         result["detections"].append({
-            key: item.get(key)
-            for key in ("object_id", "status", "metrics", "reasons", "confidence")
-            if key in item
+            "object_id": item.get("object_id", ""),
+            "status": item.get("status", ""),
+            "metrics": {
+                key: metrics.get(key)
+                for key in ("bbox_iou", "bbox_center_px", "map_projected_depth_abs_m", "map_distance_m", "map_z_abs_m", "rgbd_depth_lift_abs_m")
+                if key in metrics
+            },
+            "reasons": item.get("reasons", []),
         })
+    return result
+
+
+def _compact_telemetry(telemetry: Any) -> dict[str, Any]:
+    if not isinstance(telemetry, dict):
+        return {}
+    result = {
+        key: telemetry.get(key)
+        for key in ("position", "velocity", "yaw", "yaw_speed", "mode", "error_code", "body_height")
+        if key in telemetry
+    }
+    battery = telemetry.get("battery")
+    if isinstance(battery, dict):
+        result["battery"] = {key: battery.get(key) for key in ("soc", "voltage", "current", "power") if key in battery}
     return result
 
 
