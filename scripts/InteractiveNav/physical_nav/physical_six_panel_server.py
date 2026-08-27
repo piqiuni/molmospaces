@@ -8,6 +8,7 @@ import base64
 import io
 import json
 import math
+import socket
 import sys
 import threading
 import time
@@ -46,6 +47,9 @@ except ModuleNotFoundError:  # imported from physical_nav/tests
 try:
     import cv2
     import numpy as np
+    # The viewer is a diagnostic stream; OpenCV's default worker pool can
+    # create one thread per CPU and starve the HTTP/WebSocket event loops.
+    cv2.setNumThreads(1)
 except ImportError:  # pragma: no cover - useful for protocol-only testing
     cv2 = None
     np = None
@@ -432,14 +436,21 @@ class _WebHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             snapshot = self.state.snapshot(); self._json({"ok": bool(snapshot["frame_seq"] >= 0), "read_only": True, "frame_seq": snapshot["frame_seq"], "generated_at": snapshot["generated_at"]}); return
         if path == "/stream.mjpg":
-            self.send_response(200); self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame"); self.end_headers()
+            # Browser refreshes can leave an old multipart request half-open.
+            # A write timeout ensures those abandoned stream threads are
+            # reclaimed instead of accumulating until the viewer stalls.
+            self.connection.settimeout(2.0)
+            self.send_response(200); self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame"); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.send_header("Connection", "close"); self.end_headers()
             while True:
                 with self.frame_lock: frame = self.latest_jpeg
                 if frame:
                     try:
                         self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"); self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError): return
-                time.sleep(.1)
+                    except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError): return
+                # A physical audit view does not need camera-rate streaming;
+                # limiting this to 5 Hz reduces network pressure for remote
+                # browsers while still showing continuous state changes.
+                time.sleep(.5)
         else:
             html = _HTML.encode()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(html))); self.end_headers(); self.wfile.write(html)
@@ -630,7 +641,7 @@ class PhysicalGateway:
                     with handler.frame_lock: handler.latest_jpeg = frame
                 except Exception as exc:
                     self.state.last_error = str(exc)
-                time.sleep(.1)
+                time.sleep(.5)
         threading.Thread(target=render_loop, daemon=True).start()
         if self.qwen is not None and self.qwen_auto_interval > 0:
             def qwen_loop() -> None:
