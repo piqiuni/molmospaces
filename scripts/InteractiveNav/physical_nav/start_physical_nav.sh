@@ -61,6 +61,7 @@ if [[ "${PHYSICAL_NAV_START_YOLO_WORKER:-1}" == "1" ]]; then
   "${PHYSICAL_NAV_ALGORITHM_PYTHON:-python3}" "${ROOT_DIR}/physical_yoloe_bridge.py" \
     --web-url "http://127.0.0.1:${WEB_PORT}" \
     --model-path "${PHYSICAL_NAV_MODEL_PATH:-/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt}" \
+    --detector-config "${PHYSICAL_NAV_DETECTOR_CONFIG:-${ROOT_DIR}/config/physical_nav.yaml}" \
     --device "${PHYSICAL_NAV_YOLO_DEVICE:-cuda:0}" --rate "${PHYSICAL_NAV_YOLO_RATE:-10}" \
     --camera-x "${CAMERA_X}" --camera-y "${CAMERA_Y}" --camera-z "${CAMERA_Z}" \
     --camera-roll "${CAMERA_ROLL}" --camera-pitch "${CAMERA_PITCH}" --camera-yaw "${CAMERA_YAW}" &

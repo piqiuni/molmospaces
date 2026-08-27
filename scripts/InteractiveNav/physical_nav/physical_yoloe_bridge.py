@@ -13,12 +13,31 @@ import argparse
 import base64
 import json
 import math
+from pathlib import Path
+import sys
 import time
 import urllib.request
 from typing import Any
 
 import cv2
 import numpy as np
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SEMANTIC_MAPPING_SCRIPTS = (
+    _REPO_ROOT
+    / "Interactive-Nav-SG-nav"
+    / "src"
+    / "semantic_mapping_py_pkg"
+    / "scripts"
+)
+if str(_SEMANTIC_MAPPING_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SEMANTIC_MAPPING_SCRIPTS))
+
+from semantic_mapping_py_pkg.detection_filter import DetectionFilter, load_detection_filter_config
+
+
+DEFAULT_DETECTOR_CONFIG = Path(__file__).resolve().parent / "config" / "physical_nav.yaml"
 
 
 def _decode(value: str) -> np.ndarray:
@@ -135,7 +154,13 @@ class YoloeWorker:
         except ImportError as exc:
             raise RuntimeError("YOLOE worker requires ultralytics in the algorithm Python environment") from exc
         self.args = args; self.model = YOLOE(args.model_path); self.last_seq = -1; self.rotation = _rotation(args.camera_roll, args.camera_pitch, args.camera_yaw); self.translation = np.asarray([args.camera_x, args.camera_y, args.camera_z], dtype=np.float32)
-        print(f"YOLOE loaded: {args.model_path} device={args.device}", flush=True)
+        filter_config = load_detection_filter_config(args.detector_config)
+        self.detection_filter = DetectionFilter(filter_config)
+        print(
+            f"YOLOE loaded: {args.model_path} device={args.device} "
+            f"detection_filter={self.detection_filter.enabled} config={args.detector_config}",
+            flush=True,
+        )
 
     def infer(self, raw: dict[str, Any]) -> dict[str, Any]:
         infer_started = time.perf_counter()
@@ -149,6 +174,11 @@ class YoloeWorker:
             mask_data = masks.data.detach().cpu().numpy() if hasattr(masks.data, "detach") else np.asarray(masks.data)
         for index, box in enumerate(xyxy):
             x1, y1, x2, y2 = [int(round(v)) for v in box]; raw_name = names.get(int(classes[index]), str(int(classes[index]))) if isinstance(names, dict) else str(int(classes[index])); mask = mask_data[index] if mask_data is not None and index < len(mask_data) else None
+            filtered_label = self.detection_filter.apply_one(
+                {"semantic_class_raw": str(raw_name), "semantic_class": _label(raw_name)}
+            )
+            if filtered_label is None:
+                continue
             if mask is not None and mask.shape != depth.shape:
                 import cv2
                 mask = cv2.resize(mask.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
@@ -162,7 +192,7 @@ class YoloeWorker:
             world = _world_points(points, raw.get("telemetry", {}), self.translation, (self.args.camera_roll, self.args.camera_pitch, self.args.camera_yaw), optical_frame=True); mins, maxs = np.percentile(world, 10, axis=0), np.percentile(world, 90, axis=0); center = (mins + maxs) / 2; size = np.maximum(maxs - mins, .01)
             sparse_rows, sparse_cols = np.where(mask)
             if sparse_rows.size > 3000: sparse_rows, sparse_cols = sparse_rows[::max(1, sparse_rows.size // 3000)], sparse_cols[::max(1, sparse_cols.size // 3000)]
-            detections.append({"semantic_class": _label(raw_name), "raw_class": str(raw_name), "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "box3d_center": center.astype(float).tolist(), "box3d_size": size.astype(float).tolist(), "source_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")), "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
+            detections.append({"semantic_class": filtered_label["semantic_class"], "semantic_class_raw": filtered_label["semantic_class_raw"], "raw_class": str(raw_name), "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "box3d_center": center.astype(float).tolist(), "box3d_size": size.astype(float).tolist(), "source_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")), "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
         return {"seq": raw["seq"], "stamp": raw["stamp"], "model": self.args.model_path, "inference_ms": (time.perf_counter() - infer_started) * 1000.0, "detections": detections}
 
     def run(self) -> None:
@@ -177,7 +207,7 @@ class YoloeWorker:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--model-path", default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"); p.add_argument("--device", default="cuda:0"); p.add_argument("--imgsz", type=int, default=640); p.add_argument("--conf", type=float, default=.35); p.add_argument("--iou", type=float, default=.7); p.add_argument("--max-det", type=int, default=50); p.add_argument("--rate", type=float, default=10.); p.add_argument("--retry-s", type=float, default=1.); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--min-valid-points", type=int, default=12); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args = p.parse_args(); YoloeWorker(args).run()
+    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--model-path", default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"); p.add_argument("--detector-config", type=Path, default=DEFAULT_DETECTOR_CONFIG); p.add_argument("--device", default="cuda:0"); p.add_argument("--imgsz", type=int, default=640); p.add_argument("--conf", type=float, default=.35); p.add_argument("--iou", type=float, default=.7); p.add_argument("--max-det", type=int, default=50); p.add_argument("--rate", type=float, default=10.); p.add_argument("--retry-s", type=float, default=1.); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--min-valid-points", type=int, default=12); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args = p.parse_args(); YoloeWorker(args).run()
 
 
 if __name__ == "__main__": main()

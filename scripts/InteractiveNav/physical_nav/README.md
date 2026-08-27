@@ -49,6 +49,11 @@ the librealsense driver exposes them. D435i itself has no absolute pose/VO
 stream, so an explicit `camera_pose`/`d435i_pose` quaternion, if supplied by a
 tracking wrapper, takes precedence over the body IMU automatically.
 
+Physical YOLOE detections are filtered before mask point-cloud lifting and 3D
+box construction using `object_detection.detection_filter` in
+`config/physical_nav.yaml`. Set `PHYSICAL_NAV_DETECTOR_CONFIG` to use another
+full semantic-mapping YAML or a filter-only YAML without changing code.
+
 ## Start on the policy machine
 
 Install the side-specific transport dependencies first. The Go2 image uses

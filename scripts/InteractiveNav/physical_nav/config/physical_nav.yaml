@@ -34,6 +34,31 @@ object_detection:
   confidence_threshold: 0.35
   iou_threshold: 0.7
   max_detections: 50
+  # Applied to raw YOLOE labels before mask point-cloud lifting and 3D boxes.
+  detection_filter:
+    enabled: true
+    excluded_raw_labels:
+      - mirror
+      - bathroom_mirror
+      - vanity_mirror
+      - wall_mirror
+      - lamp
+      - lamp_shade
+      - ceiling_light
+      - ceiling_lamp
+      - chandelier
+      - pendant_light
+      - light_fixture
+      - downlight
+      - spotlight
+      - ceiling_fixture
+      - extrude
+      - extruded
+      - extrusion
+    excluded_semantic_labels: []
+    aliases:
+      exit: door
+      exit_door: door
   publish_rate: 10.0
   max_sync_slop_sec: 0.08
   process_each_stamp_once: true
