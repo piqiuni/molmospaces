@@ -284,13 +284,17 @@ def test_room_segment_grid_compacts_stable_ids_for_int8_ros_message() -> None:
     # Stable IDs are unbounded across topology changes, while OccupancyGrid is
     # an int8 transport.  The graph retains these IDs; the display grid must
     # stay serializable instead of crashing the mapper once an ID reaches 128.
-    grid = SemanticMappingNode._build_cropped_room_segment_grid(
+    grid = SemanticMappingNode._build_room_segment_grid(
         node,
         [1, 128, 130, -1],
         raw=raw,
     )
 
     assert list(grid.data) == [1, 2, 3, -1]
+    assert grid.info.width == raw.info.width
+    assert grid.info.height == raw.info.height
+    assert grid.info.origin.position.x == raw.info.origin.position.x
+    assert grid.info.origin.position.y == raw.info.origin.position.y
     assert all(-128 <= int(value) <= 127 for value in grid.data)
 
 

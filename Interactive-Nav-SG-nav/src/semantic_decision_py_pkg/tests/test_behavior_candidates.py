@@ -1475,6 +1475,238 @@ def test_portal_approach_uses_door_aabb_normal() -> None:
         and math.isclose(abs(goal[1] - 5.0), 0.20, abs_tol=1e-6)
         for goal in goals
     )
+
+
+def test_portal_approach_uses_stable_reference_obb_yaw() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_standoff_m=1.0,
+            portal_approach_tangent_offsets_m=(0.0,),
+            portal_opposite_side_fallback_enabled=False,
+            portal_require_reference_yaw=True,
+            interaction_safety_margin_m=0.0,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_rotated",
+                "type": "portal",
+                "centroid": [0.0, 0.0, 1.0],
+                "aabb_center": [0.0, 0.0, 1.0],
+                "aabb_size": [1.0, 0.2, 2.0],
+                "state_age_sec": 0.0,
+                "attributes": {
+                    "interaction_reference_aabb_center": [0.0, 0.0, 1.0],
+                    "interaction_reference_aabb_size": [1.0, 0.2, 2.0],
+                    "interaction_reference_yaw": math.pi / 4.0,
+                },
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    candidate = generator.generate({}, graph, robot_xy=(2.0, -2.0))[0]
+    offset = 1.1 / math.sqrt(2.0)
+    assert candidate.goal_xyyaw[0] == pytest.approx(offset)
+    assert candidate.goal_xyyaw[1] == pytest.approx(-offset)
+    assert candidate.goal_xyyaw[2] == pytest.approx(3.0 * math.pi / 4.0)
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+    labels = candidate.metadata["interaction_approach_pose_labels"]
+    assert len(goals) == 3
+    assert labels == ["portal_source_side"] * 3
+    # Every fallback remains on the robot's side of the door plane.
+    normal = (1.0 / math.sqrt(2.0), -1.0 / math.sqrt(2.0))
+    assert all(goal[0] * normal[0] + goal[1] * normal[1] > 0.0 for goal in goals)
+
+
+def test_portal_approach_exposes_distance_and_small_yaw_fallbacks() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_standoff_m=1.0,
+            portal_approach_standoff_offsets_m=(0.0, 0.20, 0.40),
+            portal_approach_tangent_offsets_m=(0.0,),
+            portal_approach_yaw_offsets_rad=(0.0, -0.10, 0.10),
+            portal_opposite_side_fallback_enabled=False,
+            portal_require_reference_yaw=True,
+            interaction_safety_margin_m=0.0,
+        )
+    )
+    node = {
+        "id": "portal_fallbacks",
+        "type": "portal",
+        "aabb_center": [0.0, 0.0, 1.0],
+        "aabb_size": [1.0, 0.2, 2.0],
+        "state_age_sec": 0.0,
+        "attributes": {
+            "interaction_reference_aabb_center": [0.0, 0.0, 1.0],
+            "interaction_reference_aabb_size": [1.0, 0.2, 2.0],
+            "interaction_reference_yaw": 0.0,
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 1.0,
+        },
+    }
+
+    candidate = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 2.0))[0]
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+    assert len(goals) == 9
+    assert sorted({round(math.hypot(goal[0], goal[1]), 2) for goal in goals}) == [
+        1.1,
+        1.3,
+        1.5,
+    ]
+    base_yaw = -math.pi / 2.0
+    assert sorted(
+        {
+            round(
+                math.atan2(
+                    math.sin(goal[2] - base_yaw),
+                    math.cos(goal[2] - base_yaw),
+                ),
+                2,
+            )
+            for goal in goals
+        }
+    ) == [-0.1, 0.0, 0.1]
+
+
+def test_portal_approach_negative_offsets_generate_closer_stances() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_standoff_m=1.70,
+            portal_approach_standoff_offsets_m=(0.0, -0.25, -0.50, -0.75),
+            portal_approach_tangent_offsets_m=(0.0,),
+            portal_approach_yaw_offsets_rad=(0.0,),
+            portal_opposite_side_fallback_enabled=False,
+            portal_require_reference_yaw=True,
+            interaction_safety_margin_m=0.0,
+        )
+    )
+    node = {
+        "id": "portal_closer_fallbacks",
+        "type": "portal",
+        "aabb_center": [0.0, 0.0, 1.0],
+        "aabb_size": [1.0, 0.2, 2.0],
+        "state_age_sec": 0.0,
+        "attributes": {
+            "interaction_reference_aabb_center": [0.0, 0.0, 1.0],
+            "interaction_reference_aabb_size": [1.0, 0.2, 2.0],
+            "interaction_reference_yaw": 0.0,
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 1.0,
+        },
+    }
+
+    candidate = generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 3.0))[0]
+    surface_standoffs = [
+        round(math.hypot(goal[0], goal[1]) - 0.10, 2)
+        for goal in candidate.metadata["goal_xyyaw_candidates"]
+    ]
+    assert surface_standoffs == [1.70, 1.45, 1.20, 0.95]
+
+
+def test_physical_portal_without_stable_obb_yaw_has_no_interaction_pose() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("portal",),
+            portal_require_reference_yaw=True,
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_missing_yaw",
+                "type": "portal",
+                "centroid": [2.0, 0.0, 1.0],
+                "aabb_size": [1.0, 0.2, 2.0],
+                "state_age_sec": 0.0,
+                "attributes": {
+                    "interaction_reference_aabb_center": [2.0, 0.0, 1.0],
+                    "interaction_reference_aabb_size": [1.0, 0.2, 2.0],
+                },
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    assert generator.generate({}, graph, robot_xy=(0.0, 0.0)) == []
+
+
+def test_portal_robot_side_does_not_flip_inside_hysteresis_band() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(portal_side_hysteresis_m=0.5)
+    )
+    node = {
+        "id": "portal_stable_side",
+        "aabb_center": [0.0, 0.0, 1.0],
+        "aabb_size": [1.0, 0.2, 2.0],
+        "attributes": {
+            "interaction_reference_aabb_center": [0.0, 0.0, 1.0],
+            "interaction_reference_aabb_size": [1.0, 0.2, 2.0],
+            "interaction_reference_yaw": 0.0,
+        },
+    }
+
+    first = generator._portal_approach_pose((0.0, 1.0), (0.0, 0.0), node, 1.0)
+    near_other_side = generator._portal_approach_pose((0.0, -0.1), (0.0, 0.0), node, 1.0)
+    clearly_other_side = generator._portal_approach_pose((0.0, -0.6), (0.0, 0.0), node, 1.0)
+    assert first[1] > 0.0
+    assert near_other_side[1] > 0.0
+    assert clearly_other_side[1] < 0.0
+
+
+def test_portal_approach_can_be_restricted_to_door_centerline() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            portal_standoff_m=1.15,
+            portal_approach_tangent_offsets_m=(0.0,),
+        )
+    )
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_centerline",
+                "type": "portal",
+                "centroid": [5.0, 5.0, 1.0],
+                "aabb_center": [5.0, 5.0, 1.0],
+                "aabb_size": [0.2, 2.0, 2.1],
+                "state_age_sec": 0.0,
+                "is_currently_visible": True,
+                "interaction": {
+                    "is_interactable": True,
+                    "requires_interaction": True,
+                    "state": "closed",
+                    "state_confidence": 1.0,
+                },
+            }
+        ]
+    }
+
+    candidate = generator.generate({}, graph, robot_xy=(2.0, 5.0))[0]
+    goals = candidate.metadata["goal_xyyaw_candidates"]
+    assert len(goals) == 6
+    assert all(math.isclose(goal[1], 5.0, abs_tol=1e-6) for goal in goals)
     assert any(math.isclose(goal[0], 6.25, abs_tol=1e-6) for goal in goals)
     # All approach poses, including mirrored/tangential ones, face the portal.
     for goal_x, goal_y, goal_yaw in goals:

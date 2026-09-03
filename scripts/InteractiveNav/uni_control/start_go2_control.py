@@ -97,6 +97,8 @@ class Launcher:
             command.extend(["--turn-duration", str(self.args.turn_duration)])
         if self.args.enable_motion:
             command.append("--enable-motion")
+        if self.args.bridge_ready_file:
+            command.extend(["--ready-file", self.args.bridge_ready_file])
         for value in self.args.bridge_arg:
             command.append(value)
         return command
@@ -293,6 +295,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tunnel-start-delay", type=float, default=1.0)
     parser.add_argument("--restart-delay", type=float, default=2.0)
     parser.add_argument("--no-restart", action="store_true")
+    parser.add_argument(
+        "--bridge-ready-file",
+        default="",
+        help="bridge-owned readiness PID file passed through to go2_control_bridge.py",
+    )
     parser.add_argument("--bridge-arg", action="append", default=[])
     parser.add_argument("--print-command", action="store_true")
     args = parser.parse_args()

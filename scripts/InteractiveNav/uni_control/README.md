@@ -252,6 +252,17 @@ ROS 输入类型固定为 `geometry_msgs/Twist`。如果实际话题是 `TwistSt
 policy 端仅保留最新一条 ROS 速度，队列大小为 1。bridge 断开时丢弃发送；正常退出 ROS
 source 时会尽力发送一次零速度。
 
+实物交互 policy 可以复用同一条 ROS source 发布语音，不需要建立第二条
+WebSocket 连接。指定 `--speech-request-topic` 后，`std_msgs/String` 的纯文本或
+`{"text":"...","wait":true,"volume":4}` JSON 会被转换为 `speak` 消息并沿当前
+Go2 bridge 播放：
+
+```bash
+python3 policy_control_server.py --control-mode continuous --source ros \
+  --cmd-vel-topic /physical_nav/actuated_cmd_vel \
+  --speech-request-topic /physical_nav/speech_request
+```
+
 ## 5. WebSocket 协议 `v=1`
 
 所有命令共用一个严格递增的 `seq`。bridge 每次建立新的 WebSocket 连接时将接收序列重置为

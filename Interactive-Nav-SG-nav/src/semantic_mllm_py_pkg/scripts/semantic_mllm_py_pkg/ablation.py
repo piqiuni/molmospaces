@@ -5,7 +5,15 @@ from dataclasses import dataclass
 
 MODULE1_MODES = {"static_semantic", "dynamic_rule", "dynamic_mllm"}
 MODULE2_MODES = {"rule_cost", "mllm_score"}
-MODULE3_MODES = {"direct_atomic", "rule_verified", "mllm_skill_verified"}
+MODULE3_MODES = {
+    "direct_atomic",
+    "rule_verified",
+    "mllm_skill_verified",
+    # The physical interaction policy owns the visual postcondition check.
+    # The executor consumes its terminal result and must not issue a duplicate
+    # M3 request of its own.
+    "external_mllm_verified",
+}
 
 
 @dataclass(frozen=True)
@@ -29,7 +37,9 @@ class AblationConfig:
     @property
     def uses_mllm(self) -> bool:
         return any(
-            value.endswith("_mllm") or value.startswith("mllm_")
+            value.endswith("_mllm")
+            or value.startswith("mllm_")
+            or value == "external_mllm_verified"
             for value in (self.module1, self.module2, self.module3)
         )
 

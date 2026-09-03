@@ -148,11 +148,16 @@ def test_post_open_traversal_uses_safe_opposite_interaction_options() -> None:
     )
 
     assert pending is not None
-    assert pending.goal_xyyaw == [1.35, 0.20, 0.0]
-    assert pending.metadata["goal_xyyaw_candidates"] == [[1.35, 0.20, 0.0]]
+    # The fixed 0.9 m projection would still be inside the full AABB, whose
+    # far edge is 1.1 m from the interaction reference center.
+    assert pending.goal_xyyaw == [1.1, 0.0, 0.0]
+    assert pending.metadata["goal_xyyaw_candidates"] == [
+        [1.1, 0.0, 0.0],
+        [1.35, 0.20, 0.0],
+    ]
     assert (
         pending.metadata["post_interaction_traversal_goal_source"]
-        == "opposite_interaction_approach_candidates"
+        == "centerline_axis_projection_with_opposite_fallbacks"
     )
 
     snapshot = refresh_snapshot(
@@ -175,8 +180,39 @@ def test_post_open_traversal_uses_safe_opposite_interaction_options() -> None:
     )
 
     assert projected is not None
-    assert projected["goal_xyyaw"] == [1.55, 0.20, 0.0]
-    assert projected["metadata"]["goal_xyyaw_candidates"] == [[1.55, 0.20, 0.0]]
+    assert math.isclose(projected["goal_xyyaw"][0], 1.3)
+    assert projected["goal_xyyaw"][1:] == [0.0, 0.0]
+    assert math.isclose(
+        projected["metadata"]["goal_xyyaw_candidates"][0][0], 1.3
+    )
+    assert projected["metadata"]["goal_xyyaw_candidates"][0][1:] == [0.0, 0.0]
+    assert projected["metadata"]["goal_xyyaw_candidates"][1] == [
+        1.55,
+        0.20,
+        0.0,
+    ]
+
+
+def test_post_open_axis_goal_includes_physical_clearance_margin() -> None:
+    active = portal_interaction_candidate()
+    active["metadata"].update(
+        {
+            "portal_clearance_aabb_center_xy": [0.50, 0.0],
+            "portal_clearance_aabb_size_xy": [1.20, 2.0],
+        }
+    )
+
+    pending = build_post_interaction_traversal_candidate(
+        active,
+        {"status": "SUCCEEDED", "detail": {"action": "open"}},
+        traversal_distance_m=0.9,
+        clearance_margin_m=0.55,
+    )
+
+    assert pending is not None
+    assert math.isclose(pending.goal_xyyaw[0], 1.65)
+    assert pending.goal_xyyaw[1:] == [0.0, 0.0]
+    assert pending.metadata["post_interaction_traversal_clearance_margin_m"] == 0.55
 
 
 def test_post_open_traversal_reprojects_from_the_fresh_portal_geometry() -> None:

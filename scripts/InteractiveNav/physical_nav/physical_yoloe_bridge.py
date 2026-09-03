@@ -54,6 +54,63 @@ def _post(url: str, value: Any) -> None:
         pass
 
 
+def _encode_detection_overlay(
+    rgb: np.ndarray,
+    detections: list[dict[str, Any]],
+    quality: int = 92,
+) -> str:
+    """Encode the exact YOLO input receipt with readable 2-D boxes."""
+    overlay = np.ascontiguousarray(rgb.copy())
+    for detection in detections:
+        bbox = detection.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        x1, y1, x2, y2 = [int(round(float(value))) for value in bbox[:4]]
+        label = str(detection.get("semantic_class") or "object")
+        confidence = float(detection.get("confidence", 0.0) or 0.0)
+        token = sum((index + 1) * ord(char) for index, char in enumerate(label))
+        palette = (
+            (70, 90, 245), (245, 200, 70), (120, 220, 80), (60, 190, 235),
+            (235, 90, 180), (245, 150, 65), (215, 220, 90), (170, 90, 235),
+        )
+        color = palette[token % len(palette)]
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+        text = f"{label} {confidence:.2f}"
+        (width, height), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2
+        )
+        text_top = max(0, y1 - height - baseline - 6)
+        cv2.rectangle(
+            overlay,
+            (x1, text_top),
+            (min(overlay.shape[1] - 1, x1 + width + 8), y1),
+            color,
+            -1,
+        )
+        cv2.putText(
+            overlay,
+            text,
+            (x1 + 4, max(height + 1, y1 - baseline - 3)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (10, 10, 10),
+            2,
+            cv2.LINE_AA,
+        )
+    ok, encoded = cv2.imencode(
+        ".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, min(100, max(50, int(quality)))]
+    )
+    if not ok:
+        return ""
+    return base64.b64encode(encoded.tobytes()).decode("ascii")
+
+
+def _encode_point_rows(points: np.ndarray) -> str:
+    """Pack Nx3 float32 rows without expanding every coordinate into JSON."""
+    rows = np.ascontiguousarray(points, dtype="<f4").reshape(-1, 3)
+    return base64.b64encode(rows.tobytes()).decode("ascii")
+
+
 def _rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
     cr, sr, cp, sp, cy, sy = math.cos(roll), math.sin(roll), math.cos(pitch), math.sin(pitch), math.cos(yaw), math.sin(yaw)
     return np.asarray([[cy*cp, cy*sp*sr-sy*cr, cy*sp*cr+sy*sr], [sy*cp, sy*sp*sr+cy*cr, sy*sp*cr-cy*sr], [-sp, cp*sr, cp*cr]], dtype=np.float32)
@@ -157,37 +214,53 @@ def _load_object_detection_config(path: Path) -> dict[str, Any]:
     return config
 
 
-def _largest_euclidean_cluster(points: np.ndarray, eps: float, min_points: int) -> np.ndarray:
-    """Keep the dominant compact depth surface without an sklearn dependency."""
+def _supported_euclidean_cluster_mask(points: np.ndarray, eps: float, min_points: int) -> np.ndarray:
+    """Keep every spatially supported cluster without shrinking its extent.
+
+    Occupied voxels provide a bounded-cost connectivity approximation.  The
+    previous implementation found a cluster and then retained only a fixed
+    radius around its centroid, which truncated every object larger than
+    ``3 * eps``.  Here a component is accepted as a whole, and multiple
+    disconnected object surfaces are intentionally retained.
+    """
     if points.shape[0] <= min_points:
-        return points
-    step = max(1, int(math.ceil(points.shape[0] / 800.0)))
-    sampled = points[::step]
-    visited = np.zeros(sampled.shape[0], dtype=bool)
-    best: list[int] = []
-    for start in range(sampled.shape[0]):
+        return np.ones(points.shape[0], dtype=bool)
+    voxel_size = max(float(eps), 1e-3)
+    voxel_keys, inverse, counts = np.unique(
+        np.floor(points / voxel_size).astype(np.int32),
+        axis=0,
+        return_inverse=True,
+        return_counts=True,
+    )
+    lookup = {tuple(key.tolist()): index for index, key in enumerate(voxel_keys)}
+    visited = np.zeros(voxel_keys.shape[0], dtype=bool)
+    accepted_voxels: list[int] = []
+    neighbor_offsets = [
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+    ]
+    for start in range(voxel_keys.shape[0]):
         if visited[start]:
             continue
-        queue, cluster = [start], []
+        queue, component = [start], []
         visited[start] = True
         while queue:
             index = queue.pop()
-            cluster.append(index)
-            delta = sampled - sampled[index]
-            neighbors = np.where(np.sum(delta * delta, axis=1) <= eps * eps)[0]
-            for neighbor in neighbors.tolist():
-                if not visited[neighbor]:
+            component.append(index)
+            key = voxel_keys[index]
+            for dx, dy, dz in neighbor_offsets:
+                neighbor = lookup.get((int(key[0] + dx), int(key[1] + dy), int(key[2] + dz)))
+                if neighbor is not None and not visited[neighbor]:
                     visited[neighbor] = True
                     queue.append(neighbor)
-        if len(cluster) > len(best):
-            best = cluster
-    if len(best) < min_points:
-        return points
-    cluster_points = sampled[np.asarray(best, dtype=np.int32)]
-    center = np.mean(cluster_points, axis=0)
-    keep = np.linalg.norm(points - center[None, :], axis=1) <= max(eps * 1.5, 1e-3)
-    result = points[keep]
-    return result if result.shape[0] >= min_points else cluster_points
+        if int(np.sum(counts[np.asarray(component, dtype=np.int32)])) >= min_points:
+            accepted_voxels.extend(component)
+    if not accepted_voxels:
+        return np.ones(points.shape[0], dtype=bool)
+    keep = np.isin(inverse, np.asarray(accepted_voxels, dtype=np.int32))
+    return keep if int(np.count_nonzero(keep)) >= min_points else np.ones(points.shape[0], dtype=bool)
 
 
 def _prepare_instance_points(
@@ -196,6 +269,7 @@ def _prepare_instance_points(
     intrinsics: tuple[float, float, float, float],
     bbox: tuple[int, int, int, int],
     config: dict[str, Any],
+    semantic_label: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     """Clean one PF-Seg mask and return its camera points and depths."""
     binary = np.asarray(mask, dtype=np.uint8) > 0
@@ -203,53 +277,138 @@ def _prepare_instance_points(
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary.astype(np.uint8), 8)
     if count <= 1:
         return None
-    x1, y1, x2, y2 = bbox
-    center_x = max(0, min(binary.shape[1] - 1, int(round((x1 + x2) * 0.5))))
-    center_y = max(0, min(binary.shape[0] - 1, int(round((y1 + y2) * 0.5))))
-    center_component = int(labels[center_y, center_x])
+    _ = bbox  # retained in the public helper contract for detector call sites
     candidates = [index for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= min_component]
     if not candidates:
         return None
-    selected = center_component if center_component in candidates else max(candidates, key=lambda index: int(stats[index, cv2.CC_STAT_AREA]))
-    cleaned = labels == selected
-    rows, cols = np.where(cleaned)
-    stride = max(1, int(config.get("point_stride", 4)))
-    rows, cols = rows[::stride], cols[::stride]
-    depths = depth[rows, cols] * float(config.get("depth_scale", 1.0))
-    valid = np.isfinite(depths) & (depths > 0.0) & (depths <= float(config.get("max_depth_m", 8.0)))
-    rows, cols, depths = rows[valid], cols[valid], depths[valid]
     min_valid = max(4, int(config.get("min_valid_points", 12)))
-    if depths.size < min_valid:
+    low_q = min(max(float(config.get("depth_band_lower_quantile", 0.02)), 0.0), 1.0)
+    high_q = min(max(float(config.get("depth_band_upper_quantile", 0.98)), low_q), 1.0)
+    depth_scale = float(config.get("depth_scale", 1.0))
+    max_depth = float(config.get("max_depth_m", 8.0))
+    kept_rows: list[np.ndarray] = []
+    kept_cols: list[np.ndarray] = []
+    kept_depths: list[np.ndarray] = []
+    # Filter every sufficiently large 2-D component independently. A global
+    # depth band can erase a valid disconnected surface that lies farther
+    # away than the dominant component of the same instance mask.
+    for component in candidates:
+        rows, cols = np.where(labels == component)
+        depths = depth[rows, cols] * depth_scale
+        valid = np.isfinite(depths) & (depths > 0.0) & (depths <= max_depth)
+        rows, cols, depths = rows[valid], cols[valid], depths[valid]
+        if depths.size < min_valid:
+            continue
+        if depths.size >= max(min_valid * 2, 32):
+            low, high = float(np.quantile(depths, low_q)), float(np.quantile(depths, high_q))
+            in_band = (depths >= low) & (depths <= high)
+            if int(np.count_nonzero(in_band)) >= min_valid:
+                rows, cols, depths = rows[in_band], cols[in_band], depths[in_band]
+        # A door/portal is predominantly a single depth plane.  RGB-D
+        # segmentation often leaks through its edges or holes onto the wall
+        # behind it; those points create an artificially wide world box after
+        # projection.  Use a robust MAD band only for configured planar
+        # classes, retaining the full 2-D extent of the actual plane.
+        planar_labels = {
+            str(item).strip().casefold()
+            for item in config.get("planar_semantic_labels", ("door", "portal"))
+            if str(item).strip()
+        }
+        if semantic_label and str(semantic_label).strip().casefold() in planar_labels and depths.size >= max(min_valid * 2, 32):
+            median = float(np.median(depths))
+            mad = float(np.median(np.abs(depths - median)))
+            tolerance = max(float(config.get("planar_depth_min_tolerance_m", 0.10)), 4.0 * mad)
+            planar_band = np.abs(depths - median) <= tolerance
+            if int(np.count_nonzero(planar_band)) >= min_valid:
+                rows, cols, depths = rows[planar_band], cols[planar_band], depths[planar_band]
+        kept_rows.append(rows)
+        kept_cols.append(cols)
+        kept_depths.append(depths)
+    if not kept_depths:
         return None
-    bottom_ratio = min(max(float(config.get("drop_bottom_ratio", 0.12)), 0.0), 0.9)
-    if bottom_ratio > 0.0:
-        threshold = float(np.quantile(rows, 1.0 - bottom_ratio))
-        keep = rows < threshold
-        if int(np.count_nonzero(keep)) >= min_valid:
-            rows, cols, depths = rows[keep], cols[keep], depths[keep]
-    low_q = min(max(float(config.get("depth_band_lower_quantile", 0.05)), 0.0), 1.0)
-    high_q = min(max(float(config.get("depth_band_upper_quantile", 0.70)), low_q), 1.0)
-    low, high = float(np.quantile(depths, low_q)), float(np.quantile(depths, high_q))
-    keep = (depths >= low) & (depths <= high)
-    if int(np.count_nonzero(keep)) >= min_valid:
-        rows, cols, depths = rows[keep], cols[keep], depths[keep]
+    dense_rows = np.concatenate(kept_rows)
+    dense_cols = np.concatenate(kept_cols)
+    dense_depths = np.concatenate(kept_depths)
+    filtered_mask = np.zeros(binary.shape, dtype=bool)
+    filtered_mask[dense_rows, dense_cols] = True
+    stride = max(1, int(config.get("point_stride", 4)))
+    rows = dense_rows[::stride]
+    cols = dense_cols[::stride]
+    depths = dense_depths[::stride]
     fx, fy, cx, cy = intrinsics
     points = np.stack([(cols - cx) * depths / fx, (rows - cy) * depths / fy, depths], axis=1).astype(np.float32)
     if bool(config.get("enable_euclidean_cluster", True)):
-        points = _largest_euclidean_cluster(
+        cluster_keep = _supported_euclidean_cluster_mask(
             points,
             float(config.get("cluster_eps", 0.18)),
             max(4, int(config.get("cluster_min_points", 12))),
         )
+        points = points[cluster_keep]
+        depths = depths[cluster_keep]
     if points.shape[0] < min_valid:
         return None
-    return cleaned, points, depths
+    # ``filtered_mask``, ``points`` and robust bounds now derive from one
+    # inlier definition. Point stride changes density only, not semantics.
+    return filtered_mask, points, depths
 
 
 def _robust_bounds(points: np.ndarray, config: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     low = min(max(float(config.get("bbox_quantile_lower", 0.10)), 0.0), 1.0)
     high = min(max(float(config.get("bbox_quantile_upper", 0.90)), low), 1.0)
     return np.quantile(points, low, axis=0).astype(np.float32), np.quantile(points, high, axis=0).astype(np.float32)
+
+
+def _rotation_matrix_to_quaternion(matrix: np.ndarray) -> list[float]:
+    """Convert a right-handed 3x3 rotation matrix to an xyzw quaternion."""
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        scale = 2.0 * math.sqrt(trace + 1.0)
+        w = 0.25 * scale
+        x = (matrix[2, 1] - matrix[1, 2]) / scale
+        y = (matrix[0, 2] - matrix[2, 0]) / scale
+        z = (matrix[1, 0] - matrix[0, 1]) / scale
+    else:
+        diagonal = np.diag(matrix)
+        index = int(np.argmax(diagonal))
+        next_index = (index + 1) % 3
+        last_index = (index + 2) % 3
+        scale = 2.0 * math.sqrt(max(1e-12, 1.0 + float(diagonal[index]) - float(diagonal[next_index]) - float(diagonal[last_index])))
+        values = [0.0, 0.0, 0.0, 0.0]
+        values[index] = 0.25 * scale
+        values[3] = (matrix[last_index, next_index] - matrix[next_index, last_index]) / scale
+        values[next_index] = (matrix[next_index, index] + matrix[index, next_index]) / scale
+        values[last_index] = (matrix[last_index, index] + matrix[index, last_index]) / scale
+        x, y, z, w = values
+    quaternion = np.asarray([x, y, z, w], dtype=np.float64)
+    quaternion /= max(float(np.linalg.norm(quaternion)), 1e-12)
+    return quaternion.astype(float).tolist()
+
+
+def _oriented_bounds(points: np.ndarray, config: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, list[float]]:
+    """Fit an upright instance OBB; only horizontal yaw comes from points."""
+    center = np.mean(points, axis=0).astype(np.float32)
+    if points.shape[0] < 3 or float(np.max(np.ptp(points, axis=0))) < 1e-4:
+        mins, maxs = _robust_bounds(points, config)
+        return (mins + maxs) / 2.0, np.maximum(maxs - mins, 0.01), [0.0, 0.0, 0.0, 1.0]
+    centered = points.astype(np.float64) - center.astype(np.float64)
+    covariance_xy = centered[:, :2].T @ centered[:, :2] / max(1, centered.shape[0] - 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance_xy)
+    horizontal = eigenvectors[:, int(np.argmax(eigenvalues))]
+    yaw = math.atan2(float(horizontal[1]), float(horizontal[0]))
+    # Canonicalize the 180-degree eigenvector ambiguity for stable labels.
+    if math.cos(yaw) < 0.0 or (abs(math.cos(yaw)) < 1e-6 and math.sin(yaw) < 0.0):
+        yaw += math.pi
+    c, s = math.cos(yaw), math.sin(yaw)
+    axes = np.asarray([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    projected = centered @ axes
+    low = min(max(float(config.get("bbox_quantile_lower", 0.02)), 0.0), 1.0)
+    high = min(max(float(config.get("bbox_quantile_upper", 0.98)), low), 1.0)
+    mins = np.quantile(projected, low, axis=0)
+    maxs = np.quantile(projected, high, axis=0)
+    local_center = (mins + maxs) / 2.0
+    world_center = center + axes @ local_center
+    size = np.maximum(maxs - mins, 0.01).astype(np.float32)
+    return world_center.astype(np.float32), size, [0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)]
 
 
 def _is_ground_like_box(center: np.ndarray, size: np.ndarray, config: dict[str, Any]) -> bool:
@@ -286,28 +445,127 @@ def _is_implausibly_large_object(label: Any, size: np.ndarray, config: dict[str,
     )
 
 
+def _passes_class_plausibility(
+    label: Any,
+    bbox: tuple[int, int, int, int] | list[int],
+    world_size: np.ndarray,
+    config: dict[str, Any],
+) -> bool:
+    """Apply conservative class-specific gates after RGB-D lifting.
+
+    Open-vocabulary fridge predictions commonly attach to small cabinet
+    patches or an entire wall.  These bounds reject those two failure modes
+    while retaining partial, normally sized refrigerators.
+    """
+
+    semantic = str(label or "").strip().casefold()
+    rules = (config.get("class_plausibility") or {}).get(semantic)
+    if not isinstance(rules, dict):
+        return True
+    if len(bbox) >= 4:
+        width_px = max(0.0, float(bbox[2]) - float(bbox[0]))
+        height_px = max(0.0, float(bbox[3]) - float(bbox[1]))
+        if width_px * height_px < float(rules.get("min_bbox_area_px", 0.0)):
+            return False
+        if min(width_px, height_px) < float(rules.get("min_bbox_side_px", 0.0)):
+            return False
+    size = np.abs(np.asarray(world_size, dtype=np.float32).reshape(-1)[:3])
+    if size.size < 3:
+        return False
+    horizontal_span = max(float(size[0]), float(size[1]))
+    height_m = float(size[2])
+    volume_m3 = float(np.prod(size))
+    return bool(
+        height_m >= float(rules.get("min_height_m", 0.0))
+        and height_m <= float(rules.get("max_height_m", math.inf))
+        and horizontal_span <= float(rules.get("max_horizontal_span_m", math.inf))
+        and volume_m3 <= float(rules.get("max_volume_m3", math.inf))
+    )
+
+
 class YoloeWorker:
     def __init__(self, args: argparse.Namespace) -> None:
         try:
             from ultralytics import YOLOE
         except ImportError as exc:
             raise RuntimeError("YOLOE worker requires ultralytics in the algorithm Python environment") from exc
-        self.args = args; self.model = YOLOE(args.model_path); self.last_seq = -1; self.rotation = _rotation(args.camera_roll, args.camera_pitch, args.camera_yaw); self.translation = np.asarray([args.camera_x, args.camera_y, args.camera_z], dtype=np.float32)
+        self.args = args; self.model = YOLOE(args.model_path); self.last_seq = -1; self.last_stamp = float("-inf"); self.rotation = _rotation(args.camera_roll, args.camera_pitch, args.camera_yaw); self.translation = np.asarray([args.camera_x, args.camera_y, args.camera_z], dtype=np.float32)
         self.detector_config = _load_object_detection_config(args.detector_config)
+        # Keep the physical YAML authoritative.  Previously the CLI defaults
+        # silently won, so changing confidence_threshold did not affect the
+        # running worker unless start_physical_nav.sh also passed --conf.
+        class_thresholds = self.detector_config.get("class_confidence_thresholds") or {}
+        self.args.conf = max(0.001, min(
+            [float(self.detector_config.get("confidence_threshold", args.conf))]
+            + [float(value) for value in class_thresholds.values()]
+        ))
+        self.args.iou = max(
+            0.0,
+            min(1.0, float(self.detector_config.get("iou_threshold", args.iou))),
+        )
+        self.args.max_det = max(
+            1, int(self.detector_config.get("max_detections", args.max_det))
+        )
         filter_config = load_detection_filter_config(args.detector_config)
         self.detection_filter = DetectionFilter(filter_config)
+        self.class_confidence_thresholds = {
+            str(label).strip().casefold().replace(" ", "_"): max(0.001, min(1.0, float(value)))
+            for label, value in class_thresholds.items()
+        }
         print(
             f"YOLOE loaded: {args.model_path} device={args.device} "
+            f"conf={self.args.conf:.3f} iou={self.args.iou:.3f} max_det={self.args.max_det} "
             f"detection_filter={self.detection_filter.enabled} config={args.detector_config}",
             flush=True,
         )
+
+    def _claim_frame(self, raw: dict[str, Any]) -> bool:
+        """Accept each capture once, including after the dog bridge restarts.
+
+        The bridge sequence is process-local and returns to zero on restart.
+        Capture timestamps remain monotonic across that restart, so they are
+        the primary receipt identity; sequence is retained as a fallback for
+        sources that do not provide a usable timestamp.
+        """
+        if not raw.get("rgb") or not raw.get("depth"):
+            return False
+        seq = int(raw.get("seq", -1))
+        try:
+            stamp = float(raw.get("stamp", 0.0))
+        except (TypeError, ValueError):
+            stamp = 0.0
+        has_stamp = math.isfinite(stamp) and stamp > 0.0
+        if has_stamp:
+            if stamp <= self.last_stamp:
+                return False
+        elif seq <= self.last_seq:
+            return False
+        if self.last_seq >= 0 and seq < self.last_seq:
+            print(
+                f"YOLOE source sequence reset: {self.last_seq} -> {seq}; "
+                f"continuing from capture stamp {stamp:.6f}",
+                flush=True,
+            )
+        self.last_seq = seq
+        if has_stamp:
+            self.last_stamp = stamp
+        return True
 
     def infer(self, raw: dict[str, Any]) -> dict[str, Any]:
         infer_started = time.perf_counter()
         rgb = _decode(raw["rgb"]); depth = _decode(raw["depth"]).astype(np.float32); intr = raw.get("intrinsics", {}); fx, fy, cx, cy = [float(intr.get(k, 0)) for k in ("fx", "fy", "cx", "cy")]
         result = self.model.predict(source=rgb, device=self.args.device, imgsz=self.args.imgsz, conf=self.args.conf, iou=self.args.iou, max_det=self.args.max_det, verbose=False, save=False)[0]
-        boxes = getattr(result, "boxes", None); masks = getattr(result, "masks", None); detections = []
-        if boxes is None: return {"seq": raw["seq"], "stamp": raw["stamp"], "model": self.args.model_path, "inference_ms": (time.perf_counter() - infer_started) * 1000.0, "detections": []}
+        boxes = getattr(result, "boxes", None); masks = getattr(result, "masks", None); detections = []; debug_point_sets = []
+        if boxes is None:
+            return {
+                "seq": raw["seq"],
+                "stamp": raw["stamp"],
+                "camera_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")),
+                "model": self.args.model_path,
+                "inference_ms": (time.perf_counter() - infer_started) * 1000.0,
+                "overlay_jpeg": _encode_detection_overlay(rgb, []),
+                "detections": [],
+            }
         xyxy = boxes.xyxy.detach().cpu().numpy() if hasattr(boxes.xyxy, "detach") else np.asarray(boxes.xyxy); confs = boxes.conf.detach().cpu().numpy() if hasattr(boxes.conf, "detach") else np.asarray(boxes.conf); classes = boxes.cls.detach().cpu().numpy().astype(int) if hasattr(boxes.cls, "detach") else np.asarray(boxes.cls, dtype=int); names = getattr(result, "names", {})
         mask_data = None
         if masks is not None and getattr(masks, "data", None) is not None:
@@ -321,15 +579,21 @@ class YoloeWorker:
             )
             if filtered_label is None:
                 continue
+            threshold = self.class_confidence_thresholds.get(
+                str(filtered_label["semantic_class"]).casefold(),
+                float(self.detector_config.get("confidence_threshold", self.args.conf)),
+            )
+            if float(confs[index]) < threshold:
+                continue
             if mask is not None and mask.shape != depth.shape:
-                import cv2
                 mask = cv2.resize(mask.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
             else: mask = mask > .5 if mask is not None else np.zeros(depth.shape, dtype=bool)
             if fx <= 0 or fy <= 0:
                 continue
             geometry_config = dict(self.detector_config)
+            geometry_config["semantic_label"] = filtered_label["semantic_class"]
             geometry_config.update({"point_stride": self.args.point_stride, "max_depth_m": self.args.max_depth_m, "min_valid_points": self.args.min_valid_points, "depth_scale": float(raw.get("depth_scale", .001))})
-            prepared = _prepare_instance_points(mask, depth.astype(np.float32), (fx, fy, cx, cy), (x1, y1, x2, y2), geometry_config)
+            prepared = _prepare_instance_points(mask, depth.astype(np.float32), (fx, fy, cx, cy), (x1, y1, x2, y2), geometry_config, filtered_label["semantic_class"])
             if prepared is None:
                 continue
             mask, points, values = prepared
@@ -337,24 +601,77 @@ class YoloeWorker:
             camera_center = (camera_mins + camera_maxs) / 2
             camera_size = np.maximum(camera_maxs - camera_mins, .01)
             world = _world_points(points, raw.get("telemetry", {}), self.translation, (self.args.camera_roll, self.args.camera_pitch, self.args.camera_yaw), optical_frame=True); mins, maxs = _robust_bounds(world, geometry_config); center = (mins + maxs) / 2; size = np.maximum(maxs - mins, .01)
+            obb_center, obb_size, obb_orientation = _oriented_bounds(world, geometry_config)
             if bool(geometry_config.get("reject_low_mean_height", True)) and float(np.mean(world[:, 2])) <= float(geometry_config.get("min_mean_height_m", 0.08)):
                 continue
             if _is_ground_like_box(center, size, geometry_config):
                 continue
             if _is_implausibly_large_object(filtered_label["semantic_class"], size, geometry_config):
                 continue
+            if not _passes_class_plausibility(
+                filtered_label["semantic_class"],
+                (x1, y1, x2, y2),
+                size,
+                geometry_config,
+            ):
+                continue
+            # Preserve every supported component as a compact ordered
+            # boundary.  The exact same filtered mask already drives the 3-D
+            # points and box, so the web overlay must not silently collapse it
+            # back to the single largest component.
+            contours, _hierarchy = cv2.findContours(
+                mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            mask_polygons: list[list[list[int]]] = []
+            for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+                epsilon = max(1.0, 0.0025 * cv2.arcLength(contour, True))
+                approximated = cv2.approxPolyDP(contour, epsilon, True)
+                if approximated.shape[0] >= 3:
+                    mask_polygons.append(approximated[:, 0, :].astype(int).tolist())
+            # Keep the legacy field for older consumers while the plural
+            # field is authoritative for physical-platform visualization.
+            mask_polygon = mask_polygons[0] if mask_polygons else []
             sparse_rows, sparse_cols = np.where(mask)
             if sparse_rows.size > 3000: sparse_rows, sparse_cols = sparse_rows[::max(1, sparse_rows.size // 3000)], sparse_cols[::max(1, sparse_cols.size // 3000)]
-            detections.append({"semantic_class": filtered_label["semantic_class"], "semantic_class_raw": filtered_label["semantic_class_raw"], "raw_class": str(raw_name), "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "box3d_center": center.astype(float).tolist(), "box3d_size": size.astype(float).tolist(), "source_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")), "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
-        return {"seq": raw["seq"], "stamp": raw["stamp"], "model": self.args.model_path, "inference_ms": (time.perf_counter() - infer_started) * 1000.0, "detections": detections}
+            debug_point_sets.append((points, world))
+            detections.append({"semantic_class": filtered_label["semantic_class"], "semantic_class_raw": filtered_label["semantic_class_raw"], "raw_class": str(raw_name), "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_polygon": mask_polygon, "mask_polygons": mask_polygons, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "box3d_center": obb_center.astype(float).tolist(), "box3d_size": obb_size.astype(float).tolist(), "world_box3d_center": obb_center.astype(float).tolist(), "world_box3d_size": obb_size.astype(float).tolist(), "world_box3d_marker_size": obb_size.astype(float).tolist(), "world_box3d_orientation": obb_orientation, "source_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")), "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask_obb", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
+        debug_max_points = max(32, int(self.detector_config.get("debug_cloud_max_points_per_instance", 400)))
+        for detection, (point_set, world_point_set) in zip(detections, debug_point_sets):
+            stride = max(1, int(math.ceil(float(point_set.shape[0]) / debug_max_points)))
+            # These points come from the exact RGB-D receipt used by YOLOE;
+            # RViz therefore never pairs a segmentation mask with newer depth.
+            camera_debug = point_set[::stride][:debug_max_points]
+            world_debug = world_point_set[::stride][:debug_max_points]
+            detection["segment_point_count"] = int(camera_debug.shape[0])
+            detection["camera_segment_points_f32"] = _encode_point_rows(camera_debug)
+            detection["world_segment_points_f32"] = _encode_point_rows(world_debug)
+        return {
+            "seq": raw["seq"],
+            "stamp": raw["stamp"],
+            "camera_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")),
+            "model": self.args.model_path,
+            "inference_ms": (time.perf_counter() - infer_started) * 1000.0,
+            "overlay_jpeg": _encode_detection_overlay(
+                rgb,
+                detections,
+                int(self.detector_config.get("debug_overlay_jpeg_quality", 92)),
+            ),
+            "detections": detections,
+        }
 
     def run(self) -> None:
         while True:
+            cycle_started = time.monotonic()
             try:
                 with urllib.request.urlopen(self.args.web_url.rstrip("/") + "/api/raw-frame", timeout=.8) as response: raw = json.loads(response.read().decode())
-                seq = int(raw.get("seq", -1))
-                if seq <= self.last_seq or not raw.get("rgb") or not raw.get("depth"): time.sleep(.02); continue
-                self.last_seq = seq; report = self.infer(raw); _post(self.args.web_url, report); time.sleep(max(0., 1. / self.args.rate))
+                if not self._claim_frame(raw): time.sleep(.02); continue
+                report = self.infer(raw)
+                _post(self.args.web_url, report)
+                # ``rate`` is a cycle target, not an additional post-inference
+                # delay. The former fixed sleep halved a 100 ms pipeline from
+                # about 9 Hz to about 4.5 Hz.
+                elapsed = time.monotonic() - cycle_started
+                time.sleep(max(0., 1. / self.args.rate - elapsed))
             except Exception as exc:
                 print(f"YOLOE worker warning: {exc}", flush=True); time.sleep(self.args.retry_s)
 

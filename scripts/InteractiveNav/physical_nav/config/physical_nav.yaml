@@ -13,6 +13,7 @@ topics:
   occupancy_grid: "/physical_nav/occupancy"
   room_context: "/physical_nav/room_context"
   object_detections: "/physical_nav/detections"
+  tracked_detections: "/physical_nav/tracked_detections"
   object_map: "/physical_nav/object_map"
   object_markers: "/physical_nav/object_markers"
   scene_id_grid: "/physical_nav/scene_id_grid"
@@ -36,7 +37,25 @@ object_detection:
   model_path: "/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"
   device: "cuda:0"
   imgsz: 640
-  confidence_threshold: 0.35
+  # Physical-platform operating threshold. Structural/raw label filters below
+  # remain active, and max_detections still bounds load.
+  confidence_threshold: 0.20
+  class_confidence_thresholds:
+    door: 0.10
+    portal: 0.10
+    fridge: 0.40
+    refrigerator: 0.40
+  # Fridge is visually confused with small cabinets and large wall panels in
+  # the current physical room. Require a useful image footprint and plausible
+  # lifted dimensions before it can enter tracking or the interaction graph.
+  class_plausibility:
+    fridge:
+      min_bbox_area_px: 3000
+      min_bbox_side_px: 35
+      min_height_m: 0.30
+      max_height_m: 2.60
+      max_horizontal_span_m: 1.80
+      max_volume_m3: 4.00
   iou_threshold: 0.7
   max_detections: 50
   # Applied to raw YOLOE labels before mask point-cloud lifting and 3D boxes.
@@ -79,6 +98,13 @@ object_detection:
       - extrude
       - extruded
       - extrusion
+      # Floor coverings produce broad, near-ground masks and should not
+      # become persistent object tracks in the physical semantic map.
+      - carpet
+      - rug
+      - area_rug
+      - floor_mat
+      - doormat
     excluded_semantic_labels: []
     # YOLOE PF can return open-vocabulary compound place/structure labels
     # such as wood_wall, airport_terminal or train_interior. Exact matching
@@ -108,6 +134,11 @@ object_detection:
       - basement
       - courtyard
       - building
+      - physics_laboratory
+      - stormy
+      - carpet
+      - rug
+      - mat
     aliases:
       exit: door
       exit_door: door
@@ -119,14 +150,22 @@ object_detection:
   max_depth_m: 8.0
   min_valid_points: 12
   mask_component_min_area: 48
-  drop_bottom_ratio: 0.12
-  depth_band_lower_quantile: 0.05
-  depth_band_upper_quantile: 0.70
+  # One inlier definition drives the displayed 2-D Seg, 3-D Seg and Box.
+  # Preserve all supported mask components; remove only invalid/extreme depth.
+  drop_bottom_ratio: 0.0
+  depth_band_lower_quantile: 0.02
+  depth_band_upper_quantile: 0.98
+  # Planar interaction targets use a robust depth band to reject background
+  # leakage while preserving the complete door/portal surface in 2-D and 3-D.
+  planar_semantic_labels: [door, portal]
+  planar_depth_min_tolerance_m: 0.10
   cluster_eps: 0.18
   cluster_min_points: 12
-  bbox_quantile_lower: 0.10
-  bbox_quantile_upper: 0.90
-  enable_euclidean_cluster: true
+  bbox_quantile_lower: 0.02
+  bbox_quantile_upper: 0.98
+  # 2-D connected components already reject tiny islands. Disabling the old
+  # 3-D centroid crop preserves elongated and disconnected object surfaces.
+  enable_euclidean_cluster: false
   reject_low_mean_height: true
   min_mean_height_m: 0.08
   ground_reject_min_xy_span: 1.20
@@ -140,6 +179,17 @@ object_detection:
   publish_debug_detection_image: true
   publish_debug_world_markers: true
   publish_debug_world_segmented_cloud: true
+  # Exact-frame instance points for RViz only. Keep the local HTTP/ROS debug
+  # payload bounded; future multi-view fusion will maintain a voxel map.
+  debug_cloud_max_points_per_instance: 400
+  # RViz/Foxglove-only world-box association. Raw detections and semantic-map
+  # tracking are unchanged. Two receipts confirm a display track, EMA reduces
+  # RGB-D/pose jitter, and a short hold bridges intermittent YOLO misses.
+  debug_box_min_confirmations: 2
+  debug_box_smoothing_alpha: 0.25
+  debug_box_match_distance_m: 0.60
+  debug_box_hold_s: 3.0
+  debug_overlay_jpeg_quality: 92
   debug_marker_topic: "/physical_nav/boxes_3d"
   debug_segmented_cloud_topic: "/physical_nav/segmented_cloud"
   debug_detection_image_topic: "/physical_nav/detections_overlay"
@@ -153,13 +203,38 @@ semantic_map:
   # Fuse/publish the latest RGB-D/YOLO result at 10 Hz. Navigation consumes
   # these receipts at its independent 5 Hz logical step.
   publish_rate: 10.0
-  object_min_confirmations: 1
+  # Require three temporally consistent observations before inserting an
+  # object into the persistent semantic map. Detection confidence is kept
+  # unchanged here; this is a temporal confirmation gate only.
+  object_min_confirmations: 3
+  # Interaction classes must be present in three uninterrupted detector
+  # receipts. A missed frame resets the streak for both doors and fridges.
+  object_class_min_confirmations:
+    door: 3
+    portal: 3
+    fridge: 3
+    refrigerator: 3
+  # Use the highest world-Z point, not visible box height: close-range boxes
+  # may contain only the visible part of a real door or refrigerator.
+  object_class_min_top_height_m:
+    door: 1.80
+    portal: 1.80
+    fridge: 1.50
+    refrigerator: 1.50
   # Merge split historical tracks only when their latest image boxes are
   # nearly identical and their stable 3D boxes overlap. Distinct adjacent
   # objects remain separate even when their 3D centers are close.
   object_duplicate_bbox_iou_threshold: 0.85
   object_duplicate_3d_overlap_threshold: 0.15
-  graph_min_observations: 1
+  # Associate the same physical door across viewpoints using its unoriented
+  # long axis and 3-D interval overlap. This does not merge adjacent doors on
+  # the same wall when their long-axis intervals do not overlap.
+  object_portal_cross_view_match_enabled: true
+  object_portal_cross_view_normal_distance_m: 0.45
+  object_portal_cross_view_yaw_tolerance_rad: 0.35
+  object_portal_cross_view_min_tangent_overlap_ratio: 0.20
+  object_portal_cross_view_min_vertical_overlap_ratio: 0.35
+  graph_min_observations: 3
   room_segment_use_semantic_overlay: true
   room_portal_cut_enabled: true
   graph_save_path: ""
@@ -177,6 +252,53 @@ attribute_inference:
   targeted_multiview_min_position_gap_m: 0.25
   targeted_multiview_min_yaw_gap_rad: 0.25
   target_bbox_mask_containment_required: true
+
+velocity_safety:
+  input_topic: "/physical_nav/shadow_cmd_vel"
+  output_topic: "/physical_nav/actuated_cmd_vel"
+  scale: 1.0
+  max_linear_mps: 0.60
+  min_linear_mps: 0.40
+  # Let move_base settle at the terminal XY point before it aligns yaw. Tiny
+  # positive/negative DWA residuals must not be promoted to 0.40 m/s.
+  linear_deadband_mps: 0.05
+  max_angular_rps: 1.30
+  # Permit low-speed final heading corrections instead of forcing every
+  # non-deadband turn command to the former 0.70 rad/s minimum.
+  # The physical Go2 does not reliably overcome static yaw resistance at
+  # 0.25 rad/s. Keep final move_base alignment above that measured floor.
+  min_angular_rps: 0.55
+  # Ignore planner/odometry yaw noise below 0.05 rad/s; otherwise the
+  # minimum-turn clamp would make a straight command oscillate at 0.50 rad/s.
+  angular_deadband_rps: 0.05
+  max_linear_accel_mps2: 0.15
+  max_angular_accel_rps2: 2.00
+  stale_after_s: 0.50
+
+interaction_policy:
+  profile: "physical_human"
+  command_topic: "/physical_nav/interaction_command"
+  result_topic: "/physical_nav/interaction_result"
+  speech_topic: "/physical_nav/speech_request"
+  speech_status_topic: "/physical_nav/speech_status"
+  mllm_events_topic: "/physical_nav/mllm_events"
+  stable_open_s: 3.0
+  m3_sample_period_s: 1.0
+  m3_min_confidence: 0.60
+  # Physical actions include speech playback and the operator's motion.  Keep
+  # M3 alive long enough to collect several post-speech observations.
+  interaction_timeout_s: 15.0
+  temporary_skip_s: 30.0
+  # This includes cached AudioHub playback. M3's 10-second window starts only
+  # after the Go2 bridge reports the final completed status.
+  speech_ack_timeout_s: 30.0
+  # The local navigation graph can select an already-nearby door while the
+  # remote Go2 speech/control bridge is still reconnecting after a restart.
+  # Keep the interaction in its human-assist phase instead of immediately
+  # turning that transport startup race into a failed door action.
+  speech_subscriber_wait_s: 60.0
+  speech_retry_count: 2
+  speech_retry_interval_s: 12.0
 
 room_mllm:
   enabled: false

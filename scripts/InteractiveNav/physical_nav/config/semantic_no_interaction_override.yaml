@@ -1,0 +1,17 @@
+# Physical navigation profile for pure navigation/exploration. Interaction
+# candidates and model calls are disabled; the sensor, YOLOE, mapping and
+# move_base chain remain active.
+ablation:
+  module1: "dynamic_rule"
+  module2: "rule_cost"
+  module3: "direct_atomic"
+
+candidate:
+  interaction_types: []
+  interaction_semantic_types: []
+  subgoal_interaction_semantic_types: []
+
+model:
+  mode: "disabled"
+  endpoint: ""
+  model: ""

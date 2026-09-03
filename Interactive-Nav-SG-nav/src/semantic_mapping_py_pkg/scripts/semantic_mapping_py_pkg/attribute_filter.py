@@ -29,10 +29,17 @@ DEFAULT_EXCLUDE_KEYWORDS = (
 def normalized_detection_text(detection: dict) -> str:
     values = (
         detection.get("semantic_name"),
+        # Physical YOLOE publishes ``semantic_class``/``raw_class`` while
+        # simulator observations usually use ``semantic_name``/``category``.
+        # Keep both schemas eligible for M1; otherwise every physical door is
+        # silently filtered before an attribute request is queued.
+        detection.get("semantic_class"),
+        detection.get("class"),
         detection.get("category"),
         detection.get("name"),
         detection.get("source_object_name"),
         detection.get("asset_id"),
+        detection.get("raw_class"),
     )
     return " ".join(str(value or "").casefold() for value in values)
 

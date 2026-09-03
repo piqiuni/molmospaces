@@ -1091,14 +1091,17 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
       const bool observed = (src_idx >= 0 &&
                              src_idx < static_cast<int>(scan.intensities.size()) &&
                              scan.intensities[src_idx] > 0.0f);
+      const bool no_return = (src_idx >= 0 &&
+                              src_idx < static_cast<int>(scan.intensities.size()) &&
+                              scan.intensities[src_idx] >= 1.5f);
       const float r = scan.ranges[src_idx];
 
       // For a forward RGB-D pseudo scan, a missing beam is outside the camera
-      // FoV (or lacks reliable depth), not a max-range free-space ray.  The
-      // projector explicitly encodes a *supported far return* as a finite
-      // no-return value with intensity=2; only that value is allowed to clear
-      // free space.  An unobserved NaN remains ignored by GMapping.
-      if (!observed || !std::isfinite(r) || r < scan.range_min)
+      // FoV (or lacks reliable depth), not a max-range free-space ray. A
+      // supported no-return (intensity=2) belongs only to the local overwrite
+      // layer: feeding its finite endpoint into GMapping would accumulate a
+      // false occupied wall at the conservative clear limit.
+      if (!observed || no_return || !std::isfinite(r) || r < scan.range_min)
         ranges_double[i] = std::numeric_limits<double>::quiet_NaN();
       else
         ranges_double[i] = static_cast<double>(r);
@@ -1109,9 +1112,11 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
     {
       const bool observed = (i < scan.intensities.size() &&
                              scan.intensities[i] > 0.0f);
+      const bool no_return = (i < scan.intensities.size() &&
+                              scan.intensities[i] >= 1.5f);
       const float r = scan.ranges[i];
 
-      if (!observed || !std::isfinite(r) || r < scan.range_min)
+      if (!observed || no_return || !std::isfinite(r) || r < scan.range_min)
         ranges_double[i] = std::numeric_limits<double>::quiet_NaN();
       else
         ranges_double[i] = static_cast<double>(r);
@@ -1707,18 +1712,19 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
   const float no_return_range = static_cast<float>(
       scan.range_max - pointcloud_scan_no_return_margin_m_);
 
-  // Keep the nearest coherent range surface in each bearing.  An unreliable
-  // close edge must not suppress separately supported far free-space evidence,
-  // but a coherent near cluster always wins over that farther background.
+  // Keep the nearest coherent range surface in each bearing. A coherent near
+  // cluster is an obstacle. Sparse finite returns conservatively bound a
+  // clear-only ray; supported far evidence is used only when no near return
+  // exists in the bearing.
   for (int i = 0; i < num_beams; ++i)
   {
     std::vector<float>& samples = beam_ranges[static_cast<size_t>(i)];
     const bool has_supported_far =
         beam_no_return_samples[static_cast<size_t>(i)] >=
         static_cast<size_t>(pointcloud_scan_min_points_per_beam_);
-    const auto select_no_return_fallback = [&]()
+    const auto select_no_return_fallback = [&](float clear_range)
     {
-      candidate_ranges[static_cast<size_t>(i)] = no_return_range;
+      candidate_ranges[static_cast<size_t>(i)] = std::min(clear_range, no_return_range);
       candidate_observed[static_cast<size_t>(i)] = 1;
       candidate_no_return[static_cast<size_t>(i)] = 1;
       ++candidate_count;
@@ -1728,12 +1734,20 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     if (samples.size() <
         static_cast<size_t>(pointcloud_scan_min_points_per_beam_))
     {
-      // A supported set of far finite samples authorizes free-space carving.
       // Sparse in-range points are usually mixed edge/background pixels, not a
-      // reliable obstacle surface.  They must not suppress continuous far
-      // evidence, but a coherent near cluster below still always wins.
-      if (has_supported_far)
-        select_no_return_fallback();
+      // reliable obstacle surface. They still cap the clear-only ray so that
+      // farther background evidence cannot clear through a foreground edge.
+      if (!samples.empty())
+      {
+        // Even a sparse finite return proves that the ray up to that depth is
+        // free.  It is not strong enough to create an occupied endpoint, but
+        // dropping the beam entirely leaves observed open space unknown. A
+        // farther no-return must never clear through this nearer evidence.
+        select_no_return_fallback(
+            *std::min_element(samples.begin(), samples.end()));
+      }
+      else if (has_supported_far)
+        select_no_return_fallback(no_return_range);
       else
         ++rejected_sparse;
       continue;
@@ -1756,15 +1770,10 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
     if (nearest_cluster_end <
         static_cast<size_t>(pointcloud_scan_cluster_min_points_))
     {
-      // Several in-range samples without a coherent nearest cluster are not a
-      // verified obstacle.  If this angular bin also has enough continuous
-      // depth beyond the scan horizon, retain the latter as a no-return ray.
-      // This avoids leaving an observed free corridor unknown merely because
-      // of a few depth-edge samples in the same 0.5-degree bin.
-      if (has_supported_far)
-        select_no_return_fallback();
-      else
-        ++rejected_near_cluster;
+      // The nearest samples do not form a reliable obstacle cluster, yet they
+      // still bound conservative free-space evidence. Preserve that bound
+      // without marking an obstacle; farther no-return evidence cannot win.
+      select_no_return_fallback(samples.front());
       continue;
     }
 
@@ -1827,9 +1836,9 @@ bool SlamGMapping::convertPointCloudToLaserScan(const sensor_msgs::PointCloud2::
       continue;
     scan.ranges[static_cast<size_t>(i)] =
         candidate_ranges[static_cast<size_t>(i)];
-    // Intensities encode source semantics for local overwrite consumers:
-    // 1.0 = obstacle hit, 2.0 = supported no-return/free-space ray. GMapping
-    // treats both as observed finite beams.
+    // Intensities encode source semantics: 1.0 = obstacle hit, 2.0 =
+    // clear-only ray. addScan excludes type 2 from GMapping's occupied map;
+    // the local overwrite layer consumes it below.
     scan.intensities[static_cast<size_t>(i)] =
         candidate_no_return[static_cast<size_t>(i)] ? 2.0f : 1.0f;
     ++accepted_beams;

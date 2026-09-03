@@ -798,6 +798,19 @@ class SemanticBehaviorExecutor:
         self.final_align_timeout_s = float(
             config.get("final_align_timeout_s", 15.0)
         )
+        # EXPLORE normally treats a frontier as position-only. Physical Go2
+        # runs may instead keep the move_base goal alive while DWA performs its
+        # collision-checked terminal rotation. This does not enable the direct
+        # cmd_vel final-align controller used by NAVIGATE/INTERACT.
+        self.explore_terminal_yaw_enabled = bool(
+            config.get("explore_terminal_yaw_enabled", False)
+        )
+        self.explore_terminal_xy_tolerance_m = max(
+            0.01, float(config.get("explore_terminal_xy_tolerance_m", 0.20))
+        )
+        self.explore_terminal_yaw_tolerance_rad = max(
+            0.01, float(config.get("explore_terminal_yaw_tolerance_rad", 0.20))
+        )
         # Interaction approaches have a different terminal geometry contract:
         # their safe standoff and desired facing direction are part of the
         # public bridge precondition.  Keep this independently configurable so
@@ -999,6 +1012,13 @@ class SemanticBehaviorExecutor:
                     self.post_interaction_traversal_make_plan_retry_interval_s,
                 )
             ),
+        )
+        # Physical move_base can consume fresh raw OCC through StaticLayer
+        # before the semantic planning-map topic publishes.  A deployment can
+        # therefore opt into a causal raw-OCC -> costmap fast path; simulation
+        # keeps the stricter three-stage barrier by default.
+        self.post_interaction_costmap_fast_path_enabled = bool(
+            config.get("post_interaction_costmap_fast_path_enabled", False)
         )
         self.explore_make_plan_fail_open_after_retries = bool(
             config.get("explore_make_plan_fail_open_after_retries", True)
@@ -2814,12 +2834,19 @@ class SemanticBehaviorExecutor:
                     )
                 if (
                     self.machine.state == STATE_VERIFYING
-                    and self.ablation.module3 == "direct_atomic"
+                    and self.ablation.module3 in {"direct_atomic", "external_mllm_verified"}
                 ):
                     commands.extend(
                         self.machine.on_verification_result(
                             backend_success,
-                            detail={**payload, "verification_mode": "trusted_backend_result"},
+                            detail={
+                                **payload,
+                                "verification_mode": (
+                                    "physical_policy_m3"
+                                    if self.ablation.module3 == "external_mllm_verified"
+                                    else "trusted_backend_result"
+                                ),
+                            },
                         )
                     )
                 elif (
@@ -3687,6 +3714,10 @@ class SemanticBehaviorExecutor:
                     planning_occupancy_header_stamp_sec=(
                         self._latest_planning_occupancy_header_stamp_sec
                     ),
+                    global_costmap_receipt_count=self._global_costmap_received_count,
+                    global_costmap_update_receipt_count=(
+                        self._global_costmap_update_received_count
+                    ),
                 )
             )
             self._global_costmap_condition.notify_all()
@@ -3924,13 +3955,14 @@ class SemanticBehaviorExecutor:
     def _wait_for_post_interaction_costmap_freshness(
         self, decision_id: str, candidate: dict
     ) -> tuple[bool, dict]:
-        """Hold traversal through raw OCC -> planning OCC -> costmap.
+        """Wait for a causally fresh post-open global costmap.
 
-        A costmap delta immediately after an interaction can describe a
-        pre-open planning map.  Do not call ``make_plan`` until a raw SLAM map
-        newer than the action result has reached the semantic planner and a
-        later global-costmap delta (or full map) has followed it.  The entire
-        causal chain shares one bounded wait budget.
+        The normal chain is raw OCC -> planning OCC -> global costmap.  The
+        physical fast path may skip waiting for planning OCC, because the
+        global costmap consumes raw OCC directly through StaticLayer.  In both
+        cases, raw OCC must be newer than the interaction result and the
+        accepted global-costmap full/update receipt must be newer than that
+        raw OCC receipt; an old map is never admitted to ``make_plan``.
         """
 
         started_at = time.monotonic()
@@ -4170,6 +4202,41 @@ class SemanticBehaviorExecutor:
                         detail["opened_portal_id"],
                     )
                     return False, detail
+                fast_source = ""
+                if (
+                    self.post_interaction_costmap_fast_path_enabled
+                    and raw_barrier is not None
+                    and (
+                        current_update_count
+                        > int(raw_barrier.global_costmap_update_receipt_count)
+                        or current_full_count
+                        > int(raw_barrier.global_costmap_receipt_count)
+                    )
+                ):
+                    fast_source = (
+                        "raw_occupancy_to_global_costmap_update"
+                        if current_update_count
+                        > int(raw_barrier.global_costmap_update_receipt_count)
+                        else "raw_occupancy_to_global_costmap_full"
+                    )
+                if fast_source:
+                    detail["post_open_costmap_fresh"] = True
+                    detail["costmap_fresh"] = True
+                    detail["fresh_source"] = fast_source
+                    detail["post_open_causal_map_stage"] = "ready"
+                    detail["post_open_costmap_fast_path"] = True
+                    rospy.loginfo(
+                        "[semantic_behavior_executor] fast post-open map "
+                        "chain admits preflight: portal=%s source=%s raw=%d "
+                        "update=%d full=%d wait=%.3fs",
+                        baseline.portal_id,
+                        fast_source,
+                        raw_barrier.receipt_count,
+                        current_update_count,
+                        current_full_count,
+                        elapsed_s,
+                    )
+                    return True, detail
                 fresh_source = ""
                 if planning_barrier is not None:
                     fresh_source = post_interaction_costmap_receipts_fresh_source(
@@ -4542,6 +4609,19 @@ class SemanticBehaviorExecutor:
                 # contract for this targeted re-observation.  M1 still decides
                 # visual state and frontality from the new RGB image itself.
                 request["expected_node_type"] = "container"
+                candidate_text = " ".join(
+                    str(self.machine.candidate.get(key) or "")
+                    for key in (
+                        "subject_id", "subject_type", "object_id", "object_type",
+                        "semantic_class", "semantic_name", "name", "label",
+                    )
+                ).casefold()
+                if bool(
+                    (self.machine.candidate.get("metadata") or {}).get(
+                        "fridge_type_confirmation_required", False
+                    )
+                ) or any(token in candidate_text for token in ("fridge", "refrigerator", "冰箱")):
+                    request["expected_object_kind"] = "refrigerator"
             metadata = (
                 dict(self.machine.candidate.get("metadata") or {})
                 if self.machine.candidate
@@ -4796,6 +4876,20 @@ class SemanticBehaviorExecutor:
             interaction.get("action", "open"),
             enabled=self.evaluator_opaque_open_only,
         )
+        target_kind = str(
+            interaction.get("target_kind")
+            or interaction.get("container_kind")
+            or metadata.get("semantic_type")
+            or metadata.get("semantic_class")
+            or ""
+        ).casefold()
+        node_type = str(
+            interaction.get("node_type") or metadata.get("node_type") or ""
+        ).casefold()
+        if node_type == "portal":
+            target_kind = "door"
+        elif target_kind in {"refrigerator", "refrigerator_door", "fridge_door"}:
+            target_kind = "fridge"
         with self.lock:
             self.interaction_command_sequence += 1
             interaction_sequence = self.interaction_command_sequence
@@ -4812,9 +4906,8 @@ class SemanticBehaviorExecutor:
             "event_id": f"{candidate.get('decision_id', 'decision')}_interaction_{interaction_sequence:03d}",
             "node_id": interaction.get("node_id", candidate.get("target_id", "")),
             "object_id": interaction.get("object_id", candidate.get("target_name", "")),
-            "node_type": str(
-                interaction.get("node_type") or metadata.get("node_type") or ""
-            ).casefold(),
+            "node_type": node_type,
+            "target_kind": target_kind,
             "action": action,
             "interaction_mode": interaction.get("interaction_mode", "open_close"),
             "container_kind": str(interaction.get("container_kind") or ""),
@@ -5992,11 +6085,17 @@ class SemanticBehaviorExecutor:
             return False
         self._clear_rear_dwa_monitor(decision_id)
         try:
-            self.move_base.cancel_goal()
-            self.move_base.wait_for_result(
-                rospy.Duration(self.rear_goal_cmd_vel_cancel_wait_s)
-            )
             state = int(self.move_base.get_state())
+            active_states = {0, 1, 6, 7}
+            should_cancel = state in active_states and not (
+                allow_idle_action_client and state == 0
+            )
+            if should_cancel:
+                self.move_base.cancel_goal()
+                self.move_base.wait_for_result(
+                    rospy.Duration(self.rear_goal_cmd_vel_cancel_wait_s)
+                )
+                state = int(self.move_base.get_state())
         except Exception as exc:
             self._last_rear_goal_recovery_detail = {
                 "reason": "rear_goal_cmd_vel_lease_unconfirmed",
@@ -6007,7 +6106,7 @@ class SemanticBehaviorExecutor:
         # actionlib status values: PENDING, ACTIVE, PREEMPTING, RECALLING.
         # Any of these means move_base may still publish a command, so direct
         # executor control fails closed instead of racing the local planner.
-        if state in {0, 1, 6, 7} and not (
+        if state in active_states and not (
             allow_idle_action_client and state == 0
         ):
             self._last_rear_goal_recovery_detail = {
@@ -7413,6 +7512,31 @@ class SemanticBehaviorExecutor:
 
         metadata = (candidate or {}).get("metadata") or {}
         return bool(metadata.get("container_inner_corridor_navigation", False))
+
+    def _interaction_goal_pose_is_current(
+        self,
+        candidate: dict,
+        goal_xyyaw: tuple[float, float, float] | list[float],
+    ) -> bool:
+        """Avoid dispatching a private corridor when Go2 is already at the goal."""
+
+        if str(candidate.get("behavior_type") or "").upper() != "INTERACT":
+            return False
+        if len(goal_xyyaw) < 3:
+            return False
+        metadata = candidate.get("metadata") or {}
+        pose = self._current_pose(str(metadata.get("frame_id") or self.map_frame))
+        if pose is None:
+            return False
+        distance_tolerance = self._interaction_navigation_pose_tolerance_m(candidate)
+        # Position is the relevant guard for the private corridor.  If Go2 is
+        # already inside the interaction standoff but still has a yaw error,
+        # let the normal terminal-yaw controller rotate in place; dispatching a
+        # path waypoint here would make the robot leave the usable subgoal.
+        return bool(
+            math.hypot(float(goal_xyyaw[0]) - pose[0], float(goal_xyyaw[1]) - pose[1])
+            <= distance_tolerance
+        )
 
     @staticmethod
     def _container_inner_corridor_run_id(candidate: dict | None) -> int | None:
@@ -8896,6 +9020,9 @@ class SemanticBehaviorExecutor:
             is_container_two_stage_physical_action(candidate)
             and not self._container_inner_corridor_marker(candidate)
             and start_goal_option_index < len(goal_options)
+            and not self._interaction_goal_pose_is_current(
+                candidate, goal_options[start_goal_option_index]
+            )
             and self._start_container_inner_corridor(
                 decision_id,
                 candidate,
@@ -9073,6 +9200,12 @@ class SemanticBehaviorExecutor:
             option_indices = container_two_stage_m1_preflight_batch_indices(
                 candidate, start_goal_option_index
             )
+        elif str(behavior_type).upper() == "INTERACT":
+            # Keep generic door approaches sequential.  A failed far-side
+            # goal must be surfaced to the retry state machine so it can send
+            # the next closer pose, rather than batching all options and
+            # terminating before a successor is dispatched.
+            option_indices = [start_goal_option_index]
         else:
             option_indices = range(start_goal_option_index, len(goal_options))
         if getattr(self, "_move_base_status_condition", None) is None:
@@ -9456,6 +9589,40 @@ class SemanticBehaviorExecutor:
                     failure_detail,
                 ):
                     return
+            if str(behavior_type).upper() == "INTERACT" and goal_options:
+                # Generic portal interaction: when every preflight option in
+                # this batch is currently unreachable, keep the same door
+                # decision alive and advance from the last attempted option.
+                # Previously this path reported terminal failure immediately,
+                # causing the decision layer to drop the door after option 0.
+                failed_index = max(0, int(start_goal_option_index))
+                if attempted_goals:
+                    try:
+                        failed_index = max(
+                            failed_index, int(attempted_goals[-1].get("index", failed_index))
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                retry_attempts = list(interaction_approach_attempts)
+                retry_attempts.extend(
+                    {
+                        "index": int(item.get("index", 0)),
+                        "goal_xyyaw": list(item.get("goal_xyyaw") or []),
+                        "reachable": False,
+                        "outcome": str(failure_detail.get("reason") or "failed"),
+                    }
+                    for item in attempted_goals
+                    if isinstance(item, dict) and not bool(item.get("reachable"))
+                )
+                if self._retry_interaction_approach(
+                    decision_id,
+                    candidate,
+                    failed_index,
+                    retry_attempts,
+                    len(goal_options),
+                    failure_detail,
+                ):
+                    return
             if is_post_interaction_traversal:
                 with self.lock:
                     latest_graph_revision = int(
@@ -9832,6 +9999,14 @@ class SemanticBehaviorExecutor:
             self.final_align_enabled,
             primary_goal_values,
         )
+        explore_terminal_yaw_required = bool(
+            is_explore
+            and bool(getattr(self, "explore_terminal_yaw_enabled", False))
+            and len(primary_goal_values) > 2
+        )
+        track_terminal_yaw = bool(
+            require_final_yaw or explore_terminal_yaw_required
+        )
         # Track only shortest-angle progress toward the current path heading.
         # This cannot be extended by left/right oscillation: only a material
         # decrease in absolute yaw error rebases the task-step watchdog.
@@ -9942,12 +10117,22 @@ class SemanticBehaviorExecutor:
                         goal_distance_m is None
                         or goal_distance_m > self.final_align_max_distance_m
                     )
+                    and not (
+                        explore_terminal_yaw_required
+                        and goal_distance_m is not None
+                        and goal_distance_m
+                        <= float(
+                            getattr(
+                                self, "explore_terminal_xy_tolerance_m", 0.20
+                            )
+                        )
+                    )
                 ):
                     desired_heading = math.atan2(
                         float(path_lookahead[1]) - float(pose[1]),
                         float(path_lookahead[0]) - float(pose[0]),
                     )
-                elif require_final_yaw:
+                elif track_terminal_yaw:
                     desired_heading = float(yaw)
                 if desired_heading is not None:
                     yaw_error = abs(
@@ -10430,6 +10615,16 @@ class SemanticBehaviorExecutor:
                 and goal_distance_m is not None
                 and goal_distance_m <= self.final_align_max_distance_m
             )
+            explore_dwa_terminal_yaw_in_progress = bool(
+                explore_terminal_yaw_required
+                and pose is not None
+                and goal_distance_m is not None
+                and goal_distance_m
+                <= float(getattr(self, "explore_terminal_xy_tolerance_m", 0.20))
+                and abs(normalize_angle(float(yaw) - float(pose[2])))
+                > float(getattr(self, "explore_terminal_yaw_tolerance_rad", 0.20))
+                and state not in TERMINAL_STATES
+            )
             semantic_progress_detail = {"subgoal_stalled": False, "mission_stalled": False}
             if bool(getattr(self, "semantic_progress_supervisor_enabled", False)):
                 with self.lock:
@@ -10490,6 +10685,7 @@ class SemanticBehaviorExecutor:
                 )
             elif not (
                 near_final_yaw_alignment
+                or explore_dwa_terminal_yaw_in_progress
                 or capture_dwa_final_yaw_in_progress
                 or interaction_dwa_final_yaw_in_progress
                 or beneficial_yaw_progress
@@ -10702,6 +10898,51 @@ class SemanticBehaviorExecutor:
         }
         if not success:
             detail["reason"] = "navigation_terminal_failure"
+            # move_base can publish ABORTED in the same scheduling window in
+            # which TF first reports the selected interaction pose as reached.
+            # Give the exact public pose/yaw contract one final acceptance
+            # check before advancing to a fallback goal.
+            if str(behavior_type).upper() == "INTERACT" and selected_goal is not None:
+                terminal_pose = self._current_pose(goal_frame)
+                terminal_validation = interaction_pose_validation(
+                    list(selected_goal),
+                    None if terminal_pose is None else list(terminal_pose),
+                    distance_tolerance_m=direct_distance_tolerance,
+                    yaw_tolerance_rad=direct_yaw_tolerance,
+                )
+                if bool(terminal_validation.get("valid")):
+                    with self.lock:
+                        arrival_step_index = getattr(
+                            self, "_latest_step_sync_index", None
+                        )
+                    detail.update(
+                        {
+                            "reason": "interaction_pose_reached_on_terminal_failure",
+                            "goal_distance_m": terminal_validation.get(
+                                "position_error_m"
+                            ),
+                            "interaction_pose_validation": terminal_validation,
+                            "interaction_arrival_step_index": arrival_step_index,
+                            "interaction_pose_validation_source": (
+                                "move_base_terminal_failure_tf"
+                            ),
+                        }
+                    )
+                    self._complete_interaction_approach_navigation(
+                        decision_id,
+                        candidate,
+                        selected_goal=selected_goal,
+                        selected_goal_option_index=int(
+                            selected_goal_option_index or 0
+                        ),
+                        interaction_approach_attempts=(
+                            interaction_approach_attempt_history
+                        ),
+                        goal_option_count=len(goal_options),
+                        detail=detail,
+                        navigation_run_token=navigation_run_token,
+                    )
+                    return
             # A short-lived planner ABORT can follow a successful global
             # preflight while the costmap is being refreshed.  For an outer
             # two-stage container stance, give that exact safe pose one fresh

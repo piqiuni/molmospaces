@@ -132,11 +132,8 @@ public:
             publishVoronoiMarkers(msg, width, height);
         }
         
-        // 清理内存
-        for (int x = 0; x < width; x++) {
-            delete[] gridMap[x];
-        }
-        delete[] gridMap;
+        // initializeMap takes ownership of gridMap. It keeps the grid alive
+        // for Voronoi queries and releases it on the next map or at shutdown.
         
         // 保存地图
         last_map_ = *msg;
@@ -455,4 +452,3 @@ int main(int argc, char** argv)
     
     return 0;
 }
-

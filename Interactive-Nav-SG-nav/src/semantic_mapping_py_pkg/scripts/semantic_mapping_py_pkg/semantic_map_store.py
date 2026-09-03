@@ -5,6 +5,42 @@ from statistics import median
 from .geometry_utils import euclidean_2d, grid_index, normalize_label, point_dict, world_to_grid
 
 
+def _detection_yaw(detection):
+    """Read the upright OBB yaw emitted by the physical detector."""
+    value = detection.get("yaw")
+    if value is not None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+    quaternion = detection.get("world_box3d_orientation") or detection.get("orientation")
+    if isinstance(quaternion, (list, tuple)) and len(quaternion) >= 4:
+        try:
+            x, y, z, w = [float(item) for item in quaternion[:4]]
+            return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _yaw_quaternion(yaw):
+    if yaw is None:
+        return [0.0, 0.0, 0.0, 1.0]
+    yaw = float(yaw)
+    return [0.0, 0.0, math.sin(yaw * 0.5), math.cos(yaw * 0.5)]
+
+
+def _axial_yaw_delta(first, second):
+    """Return the unsigned yaw delta for an unoriented box axis."""
+    delta = float(first) - float(second)
+    return abs(0.5 * math.atan2(math.sin(2.0 * delta), math.cos(2.0 * delta)))
+
+
+def _is_portal_label(label):
+    normalized = normalize_label(label)
+    return any(token in normalized for token in ("door", "portal", "gate"))
+
+
 class ObjectMapStore:
     STABLE_BOX_MIN_OVERLAP = 0.5
     STABLE_BOX_MIN_SIZE_RATIO = 0.4
@@ -21,6 +57,13 @@ class ObjectMapStore:
         stable_history_size=5,
         duplicate_bbox_iou_threshold=0.0,
         duplicate_3d_overlap_threshold=0.15,
+        class_min_confirmations=None,
+        class_min_top_height_m=None,
+        portal_cross_view_match_enabled=False,
+        portal_cross_view_normal_distance_m=0.45,
+        portal_cross_view_yaw_tolerance_rad=0.35,
+        portal_cross_view_min_tangent_overlap_ratio=0.20,
+        portal_cross_view_min_vertical_overlap_ratio=0.35,
     ):
         self.match_distance = float(match_distance)
         self.stale_after_sec = float(stale_after_sec)
@@ -29,8 +72,57 @@ class ObjectMapStore:
         self.stable_history_size = max(1, int(stable_history_size))
         self.duplicate_bbox_iou_threshold = max(0.0, float(duplicate_bbox_iou_threshold))
         self.duplicate_3d_overlap_threshold = max(0.0, float(duplicate_3d_overlap_threshold))
+        self.portal_cross_view_match_enabled = bool(portal_cross_view_match_enabled)
+        self.portal_cross_view_normal_distance_m = max(
+            0.0, float(portal_cross_view_normal_distance_m)
+        )
+        self.portal_cross_view_yaw_tolerance_rad = max(
+            0.0, float(portal_cross_view_yaw_tolerance_rad)
+        )
+        self.portal_cross_view_min_tangent_overlap_ratio = min(
+            1.0, max(0.0, float(portal_cross_view_min_tangent_overlap_ratio))
+        )
+        self.portal_cross_view_min_vertical_overlap_ratio = min(
+            1.0, max(0.0, float(portal_cross_view_min_vertical_overlap_ratio))
+        )
+        self.class_min_confirmations = {
+            normalize_label(label): max(1, int(count))
+            for label, count in (class_min_confirmations or {}).items()
+            if normalize_label(label)
+        }
+        self.class_min_top_height_m = {
+            normalize_label(label): max(0.0, float(height))
+            for label, height in (class_min_top_height_m or {}).items()
+            if normalize_label(label)
+        }
         self.objects = []
         self.next_id = 1
+
+    def _required_confirmations(self, label):
+        return self.class_min_confirmations.get(
+            normalize_label(label), self.min_confirmations
+        )
+
+    def _passes_top_height_filter(self, label, detection, center, size):
+        """Filter by highest world-Z, not the close-range visible box height."""
+        minimum = self.class_min_top_height_m.get(normalize_label(label))
+        if minimum is None:
+            return True
+        has_center = any(
+            detection.get(key) is not None
+            for key in ("world_box3d_center", "box3d_center", "world_position", "position")
+        )
+        has_size = any(
+            detection.get(key) is not None
+            for key in ("world_box3d_size", "box3d_size", "size")
+        )
+        if not has_center or not has_size:
+            return True
+        try:
+            top_z = float(center["z"]) + 0.5 * abs(float(size["z"]))
+        except (KeyError, TypeError, ValueError):
+            return True
+        return not math.isfinite(top_z) or top_z >= minimum
 
     def update(self, detections, stamp):
         now = float(stamp if stamp is not None else time.time())
@@ -41,9 +133,18 @@ class ObjectMapStore:
                 continue
             pos = self._point_from_detection(det, "world_position", "position")
             confidence = float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
+            yaw = _detection_yaw(det)
             instance_id = str(det.get("instance_id", ""))
             size = self._point_from_detection(det, "world_box3d_size", "box3d_size", "size")
             center = self._point_from_detection(det, "world_box3d_center", "box3d_center", "world_position", "position")
+            match = self._find_match(label, pos, size, instance_id, yaw=yaw)
+            # Geometry is an admission/confirmation gate only. Once the track
+            # is confirmed, close-range partial boxes keep updating it.
+            if (
+                (match is None or not match.get("is_confirmed"))
+                and not self._passes_top_height_filter(label, det, center, size)
+            ):
+                continue
             viz_center = self._point_from_detection(
                 det,
                 "world_box3d_center",
@@ -60,7 +161,6 @@ class ObjectMapStore:
                 "size",
             )
 
-            match = self._find_match(label, pos, size, instance_id)
             if match is None:
                 match = {
                     "object_id": self.next_id,
@@ -73,6 +173,8 @@ class ObjectMapStore:
                     "aabb_size": [size["x"], size["y"], size["z"]],
                     "viz_aabb_center": [viz_center["x"], viz_center["y"], viz_center["z"]],
                     "viz_aabb_size": [viz_size["x"], viz_size["y"], viz_size["z"]],
+                    "yaw": yaw,
+                    "yaw_history": [],
                     "coord_history": [],
                     "observation_count": 0,
                     "hit_streak": 0,
@@ -86,6 +188,8 @@ class ObjectMapStore:
                     "visible_fraction": 0.0,
                     "max_visible_fraction": 0.0,
                     "max_consecutive_observations": 0,
+                    "latest_segmentation": None,
+                    "capture_step": None,
                 }
                 self.next_id += 1
                 self.objects.append(match)
@@ -108,6 +212,9 @@ class ObjectMapStore:
                 match["aabb_size"] = blended_size
             match["viz_aabb_center"] = [viz_center["x"], viz_center["y"], viz_center["z"]]
             match["viz_aabb_size"] = [viz_size["x"], viz_size["y"], viz_size["z"]]
+            if yaw is not None:
+                self._append_scalar_history(match, "yaw_history", yaw)
+                match["yaw"] = self._history_axial_mean(match.get("yaw_history"))
             match["conf"] = min(1.0, max(float(match["conf"]), confidence) + 0.05 * confidence)
             label_votes = dict(match.get("label_votes") or {})
             label_votes[label] = float(label_votes.get(label, 0.0)) + max(confidence, 0.05)
@@ -127,14 +234,25 @@ class ObjectMapStore:
                 cols = mask.get("cols") or []
                 if len(rows) == len(cols):
                     mask_pixels = len(rows)
-            visible_pixels = int(
-                det.get("visible_pixels", mask_pixels or det.get("mask_area", 0)) or 0
-            )
             bbox_area = 0.0
             if len(bbox_2d) >= 4:
                 bbox_area = max(0.0, float(bbox_2d[2]) - float(bbox_2d[0])) * max(
                     0.0, float(bbox_2d[3]) - float(bbox_2d[1])
                 )
+            has_mask_evidence = any(
+                det.get(key) is not None
+                for key in ("segmentation", "mask", "mask_rle", "segmentation_rle")
+            )
+            has_visible_pixel_count = "visible_pixels" in det or "mask_area" in det
+            if has_mask_evidence or has_visible_pixel_count:
+                visible_pixels = int(
+                    det.get("visible_pixels", mask_pixels or det.get("mask_area", 0)) or 0
+                )
+            else:
+                # The physical YOLO detector publishes boxes but no masks. In
+                # that wire format the visible image support is the box itself;
+                # keeping it at zero incorrectly filters every door before M1.
+                visible_pixels = int(bbox_area)
             visible_fraction = float(
                 det.get(
                     "visible_fraction",
@@ -143,6 +261,20 @@ class ObjectMapStore:
                 or 0.0
             )
             match["bbox_2d"] = bbox_2d
+            segmentation = (
+                det.get("segmentation")
+                or det.get("mask")
+                or det.get("mask_rle")
+                or det.get("segmentation_rle")
+            )
+            if segmentation is not None:
+                match["latest_segmentation"] = segmentation
+            capture_step = det.get("capture_step", det.get("capture_seq"))
+            if capture_step is not None:
+                try:
+                    match["capture_step"] = int(capture_step)
+                except (TypeError, ValueError):
+                    pass
             match["visible_pixels"] = visible_pixels
             match["max_visible_pixels"] = max(
                 int(match.get("max_visible_pixels", 0) or 0), visible_pixels
@@ -155,7 +287,13 @@ class ObjectMapStore:
                 int(match.get("max_consecutive_observations", 0) or 0),
                 int(match["hit_streak"]),
             )
-            match["is_confirmed"] = bool(match["observation_count"] >= self.min_confirmations)
+            # Confirmation is a temporal gate, not an accumulated lifetime
+            # count. Sparse one-frame detections must never become stable just
+            # because the same spatial track is revisited many times.
+            match["is_confirmed"] = bool(
+                int(match["hit_streak"])
+                >= self._required_confirmations(match["semantic_name"])
+            )
             match["last_seen"] = now
             matched_ids.add(int(match["object_id"]))
 
@@ -182,7 +320,12 @@ class ObjectMapStore:
         return intersection / max(area_a + area_b - intersection, 1e-6)
 
     def _merge_duplicate_tracks(self):
-        """Collapse split tracks only when current 2D and stable 3D boxes agree."""
+        """Collapse split tracks when current 2D/3D boxes identify one object.
+
+        A detector can legitimately alternate between neighbouring open-vocabulary
+        labels (notably ``sofa`` and ``bed``).  Keep those label votes on one
+        spatial track instead of creating a new object for every label variant.
+        """
         if self.duplicate_bbox_iou_threshold <= 0.0 or len(self.objects) < 2:
             return
         removed = set()
@@ -195,13 +338,35 @@ class ObjectMapStore:
                 continue
             for duplicate in ordered[index + 1 :]:
                 duplicate_id = int(duplicate.get("object_id", -1))
-                if duplicate_id in removed or keeper.get("semantic_name") != duplicate.get("semantic_name"):
+                if duplicate_id in removed:
                     continue
-                if self._bbox_iou_2d(keeper.get("bbox_2d"), duplicate.get("bbox_2d")) < self.duplicate_bbox_iou_threshold:
+                bbox_iou = self._bbox_iou_2d(keeper.get("bbox_2d"), duplicate.get("bbox_2d"))
+                same_label = keeper.get("semantic_name") == duplicate.get("semantic_name")
+                # Cross-label merges are deliberately restricted to the
+                # furniture family where sofa/bed/couch are common aliases.
+                # Require stronger 2-D overlap than ordinary same-label NMS
+                # so adjacent furniture is not collapsed accidentally.
+                furniture = {"sofa", "bed", "couch", "settee", "divan", "bench"}
+                cross_label = (
+                    not same_label
+                    and str(keeper.get("semantic_name") or "") in furniture
+                    and str(duplicate.get("semantic_name") or "") in furniture
+                    and bbox_iou >= max(self.duplicate_bbox_iou_threshold, 0.70)
+                )
+                if not same_label and not cross_label:
+                    continue
+                if same_label and bbox_iou < self.duplicate_bbox_iou_threshold:
+                    continue
+                if cross_label and bbox_iou < 0.70:
                     continue
                 center_a = keeper.get("aabb_center", keeper.get("coord", [0.0, 0.0, 0.0]))
                 center_b = duplicate.get("aabb_center", duplicate.get("coord", [0.0, 0.0, 0.0]))
-                if math.dist([float(v) for v in center_a], [float(v) for v in center_b]) >= self.match_distance:
+                center_distance = math.dist([float(v) for v in center_a], [float(v) for v in center_b])
+                # Depth can jump between foreground/background surfaces while
+                # the 2-D mask remains the same object.  For near-identical
+                # image boxes, tolerate that depth disagreement and use a
+                # wider spatial gate; ordinary boxes retain the strict gate.
+                if center_distance >= self.match_distance and bbox_iou < 0.90:
                     continue
                 overlap = self._aabb_overlap_ratio(
                     center_a,
@@ -209,7 +374,7 @@ class ObjectMapStore:
                     center_b,
                     duplicate.get("aabb_size", [0.0, 0.0, 0.0]),
                 )
-                if overlap < self.duplicate_3d_overlap_threshold:
+                if overlap < self.duplicate_3d_overlap_threshold and bbox_iou < 0.90:
                     continue
                 keeper["conf"] = max(float(keeper.get("conf", 0.0)), float(duplicate.get("conf", 0.0)))
                 keeper["observation_count"] = max(
@@ -232,8 +397,15 @@ class ObjectMapStore:
                 keeper["is_confirmed"] = bool(keeper.get("is_confirmed") or duplicate.get("is_confirmed"))
                 votes = dict(keeper.get("label_votes") or {})
                 for label, score in (duplicate.get("label_votes") or {}).items():
-                    votes[label] = max(float(votes.get(label, 0.0)), float(score))
+                    # Sum evidence from both tracks so candidate_labels exposes
+                    # all plausible attributes while semantic_name remains the
+                    # highest-vote (dominant) interpretation.
+                    votes[label] = float(votes.get(label, 0.0)) + float(score)
                 keeper["label_votes"] = votes
+                keeper["semantic_name"] = max(
+                    sorted(votes.keys()),
+                    key=lambda key: (float(votes[key]), key == keeper.get("semantic_name")),
+                )
                 removed.add(duplicate_id)
         if removed:
             self.objects = [obj for obj in self.objects if int(obj.get("object_id", -1)) not in removed]
@@ -251,20 +423,36 @@ class ObjectMapStore:
                 "observation_count": int(obj["observation_count"]),
                 "aabb_center": [float(v) for v in obj["aabb_center"]],
                 "aabb_size": [float(v) for v in obj["aabb_size"]],
+                "yaw": obj.get("yaw"),
+                "world_box3d_orientation": _yaw_quaternion(obj.get("yaw")),
             }
             for obj in self.objects
             if obj.get("is_confirmed")
         ]
 
-    def as_tracked_detections(self, min_observations=None, confirmed_only=True):
+    def as_tracked_detections(
+        self,
+        min_observations=None,
+        confirmed_only=True,
+        currently_observed_only=False,
+    ):
         if min_observations is None:
             min_observations = self.min_confirmations if confirmed_only else 1
         min_observations = max(1, int(min_observations))
         detections = []
         for obj in self.objects:
+            required = max(
+                min_observations,
+                self._required_confirmations(obj.get("semantic_name")),
+            )
             if confirmed_only and not obj.get("is_confirmed"):
                 continue
-            if int(obj.get("observation_count", 0)) < min_observations:
+            if currently_observed_only:
+                if int(obj.get("miss_streak", 0) or 0) != 0:
+                    continue
+                if int(obj.get("hit_streak", 0) or 0) < required:
+                    continue
+            elif int(obj.get("observation_count", 0)) < min_observations:
                 continue
             detections.append(
                 {
@@ -272,7 +460,10 @@ class ObjectMapStore:
                     "candidate_labels": self._candidate_labels(obj),
                     "label_votes": {str(k): float(v) for k, v in (obj.get("label_votes") or {}).items()},
                     "confidence": float(obj["conf"]),
-                    "instance_id": str(obj.get("instance_id") or obj["track_id"]),
+                    # Downstream inference and graph consumers must use the
+                    # map-owned identity, never a detector's per-frame ID.
+                    "instance_id": str(obj["track_id"]),
+                    "source_instance_id": str(obj.get("instance_id") or ""),
                     "object_id": int(obj["object_id"]),
                     "track_id": str(obj["track_id"]),
                     "world_position": point_dict(obj["coord"][0], obj["coord"][1], obj["coord"][2]),
@@ -282,8 +473,12 @@ class ObjectMapStore:
                     "world_box3d_size": point_dict(
                         obj["aabb_size"][0], obj["aabb_size"][1], obj["aabb_size"][2]
                     ),
+                    "yaw": obj.get("yaw"),
+                    "world_box3d_orientation": _yaw_quaternion(obj.get("yaw")),
                     "observation_count": int(obj["observation_count"]),
                     "bbox_2d": list(obj.get("bbox_2d") or []),
+                    "segmentation": obj.get("latest_segmentation"),
+                    "capture_step": obj.get("capture_step"),
                     "visible_pixels": int(obj.get("visible_pixels", 0) or 0),
                     "max_visible_pixels": int(obj.get("max_visible_pixels", 0) or 0),
                     "visible_fraction": float(obj.get("visible_fraction", 0.0) or 0.0),
@@ -292,6 +487,7 @@ class ObjectMapStore:
                     "max_consecutive_observations": int(
                         obj.get("max_consecutive_observations", 0) or 0
                     ),
+                    "required_consecutive_observations": required,
                     "source": "tracked_object_store",
                     "viz_aabb_center": point_dict(
                         obj["aabb_center"][0], obj["aabb_center"][1], obj["aabb_center"][2]
@@ -315,6 +511,22 @@ class ObjectMapStore:
         if len(history) > self.stable_history_size:
             history = history[-self.stable_history_size :]
         obj[key] = history
+
+    def _append_scalar_history(self, obj, key, value):
+        history = list(obj.get(key) or [])
+        history.append(float(value))
+        if len(history) > self.stable_history_size:
+            history = history[-self.stable_history_size :]
+        obj[key] = history
+
+    @staticmethod
+    def _history_axial_mean(history):
+        history = [float(value) for value in (history or [])]
+        if not history:
+            return None
+        sine = sum(math.sin(2.0 * value) for value in history)
+        cosine = sum(math.cos(2.0 * value) for value in history)
+        return 0.5 * math.atan2(sine, cosine)
 
     def _history_median(self, history):
         history = list(history or [])
@@ -342,20 +554,21 @@ class ObjectMapStore:
             blended_size.append(min(max(target, lower), upper))
         return blended_center, blended_size
 
-    def _find_match(self, label, pos, size, instance_id):
+    def _find_match(self, label, pos, size, instance_id, yaw=None):
         best = None
-        best_dist = math.inf
+        best_score = math.inf
         for obj in self.objects:
             if instance_id and obj.get("instance_id") == instance_id:
                 return obj
             obj_pos = point_dict(obj["coord"][0], obj["coord"][1], obj["coord"][2])
             dist = euclidean_2d(pos, obj_pos)
-            if dist >= self.match_distance or dist >= best_dist:
+            portal_cross_view = self._portal_cross_view_match(obj, label, pos, size, yaw)
+            if dist >= self.match_distance and not portal_cross_view:
                 continue
             if obj["semantic_name"] != label:
                 if not self._should_merge_cross_label(obj, pos, size):
                     continue
-            elif not self._size_compatible(obj.get("aabb_size", [0.0, 0.0, 0.0]), [size["x"], size["y"], size["z"]]):
+            elif not portal_cross_view and not self._size_compatible(obj.get("aabb_size", [0.0, 0.0, 0.0]), [size["x"], size["y"], size["z"]]):
                 old_center = obj.get("aabb_center", obj.get("coord", [0.0, 0.0, 0.0]))
                 old_size = obj.get("aabb_size", [0.0, 0.0, 0.0])
                 overlap = self._aabb_overlap_ratio(
@@ -366,17 +579,75 @@ class ObjectMapStore:
                 )
                 if overlap < 0.15:
                     continue
-            if dist < best_dist:
+            score = dist if not portal_cross_view else self._portal_cross_view_score(
+                obj, pos, yaw
+            )
+            if score < best_score:
                 best = obj
-                best_dist = dist
+                best_score = score
         return best
+
+    def _portal_cross_view_match(self, obj, label, pos, size, yaw):
+        if not self.portal_cross_view_match_enabled:
+            return False
+        if obj.get("semantic_name") != label or not _is_portal_label(label):
+            return False
+        old_yaw = obj.get("yaw")
+        if old_yaw is None or yaw is None:
+            return False
+        if _axial_yaw_delta(old_yaw, yaw) > self.portal_cross_view_yaw_tolerance_rad:
+            return False
+
+        old_center = obj.get("aabb_center", obj.get("coord", [0.0, 0.0, 0.0]))
+        old_size = obj.get("aabb_size", [0.0, 0.0, 0.0])
+        new_center = [float(pos["x"]), float(pos["y"]), float(pos["z"])]
+        new_size = [float(size["x"]), float(size["y"]), float(size["z"])]
+        tangent_x, tangent_y = math.cos(float(old_yaw)), math.sin(float(old_yaw))
+        normal_x, normal_y = -tangent_y, tangent_x
+        delta_x = new_center[0] - float(old_center[0])
+        delta_y = new_center[1] - float(old_center[1])
+        normal_distance = abs(delta_x * normal_x + delta_y * normal_y)
+        if normal_distance > self.portal_cross_view_normal_distance_m:
+            return False
+
+        tangent_distance = abs(delta_x * tangent_x + delta_y * tangent_y)
+        old_width = max(abs(float(old_size[0])), abs(float(old_size[1])), 1e-3)
+        new_width = max(abs(new_size[0]), abs(new_size[1]), 1e-3)
+        tangent_overlap = max(0.0, 0.5 * (old_width + new_width) - tangent_distance)
+        tangent_overlap_ratio = tangent_overlap / max(min(old_width, new_width), 1e-3)
+        if tangent_overlap_ratio < self.portal_cross_view_min_tangent_overlap_ratio:
+            return False
+
+        old_height = max(abs(float(old_size[2])), 1e-3)
+        new_height = max(abs(new_size[2]), 1e-3)
+        vertical_distance = abs(new_center[2] - float(old_center[2]))
+        vertical_overlap = max(0.0, 0.5 * (old_height + new_height) - vertical_distance)
+        vertical_overlap_ratio = vertical_overlap / max(min(old_height, new_height), 1e-3)
+        return vertical_overlap_ratio >= self.portal_cross_view_min_vertical_overlap_ratio
+
+    @staticmethod
+    def _portal_cross_view_score(obj, pos, yaw):
+        old_yaw = float(obj.get("yaw", 0.0) or 0.0)
+        old_center = obj.get("aabb_center", obj.get("coord", [0.0, 0.0, 0.0]))
+        delta_x = float(pos["x"]) - float(old_center[0])
+        delta_y = float(pos["y"]) - float(old_center[1])
+        normal_distance = abs(-math.sin(old_yaw) * delta_x + math.cos(old_yaw) * delta_y)
+        return normal_distance + 0.25 * _axial_yaw_delta(old_yaw, yaw)
 
     def _point_from_detection(self, det, *keys):
         for key in keys:
             value = det.get(key)
-            if not isinstance(value, dict):
-                continue
-            return point_dict(value.get("x", 0.0), value.get("y", 0.0), value.get("z", 0.0))
+            if isinstance(value, dict):
+                return point_dict(value.get("x", 0.0), value.get("y", 0.0), value.get("z", 0.0))
+            # Physical YOLOE transport uses compact JSON arrays for 3-D
+            # centers/sizes, while older ROS detections use point dicts.
+            # Accept both so graph/map visualization preserves the measured
+            # box dimensions instead of falling back to a zero-size marker.
+            if isinstance(value, (list, tuple)) and len(value) >= 3:
+                try:
+                    return point_dict(value[0], value[1], value[2])
+                except (TypeError, ValueError):
+                    continue
         return point_dict()
 
     def _size_compatible(self, old_size, new_size):

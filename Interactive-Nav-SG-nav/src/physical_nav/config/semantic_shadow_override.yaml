@@ -7,6 +7,7 @@ candidate:
   # Module 2 subgoal selection is narrowed to door/fridge below.
   interaction_semantic_types: ["door", "fridge", "drawer_cabinet"]
   subgoal_interaction_semantic_types: ["door", "fridge"]
+  fridge_direct_interaction_on_arrival: true
 startup_scan:
   enabled: false
 model:

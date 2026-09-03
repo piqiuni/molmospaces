@@ -370,6 +370,92 @@ def test_object_store_confirms_same_label_despite_box_size_jitter():
     assert tracked[0]["world_box3d_size"] == {"x": 0.07050000000000001, "y": 0.30200000000000005, "z": 0.3935}
 
 
+def test_object_store_associates_same_door_across_viewpoints():
+    store = ObjectMapStore(
+        match_distance=0.5,
+        min_confirmations=1,
+        portal_cross_view_match_enabled=True,
+    )
+    first = {
+        "semantic_class": "door",
+        "confidence": 0.9,
+        "world_position": {"x": 0.0, "y": 0.0, "z": 1.0},
+        "world_box3d_center": {"x": 0.0, "y": 0.0, "z": 1.0},
+        "world_box3d_size": {"x": 0.9, "y": 0.15, "z": 2.0},
+        "yaw": 0.0,
+    }
+    second = {
+        **first,
+        "instance_id": "another_view_detection",
+        "world_position": {"x": 0.65, "y": 0.08, "z": 1.02},
+        "world_box3d_center": {"x": 0.65, "y": 0.08, "z": 1.02},
+        # PCA box axes may flip by 180 degrees between viewpoints; that is the
+        # same physical door axis and must remain one stable track.
+        "yaw": math.pi + 0.12,
+    }
+
+    store.update([first], stamp=1.0)
+    store.update([second], stamp=2.0)
+
+    tracked = store.as_tracked_detections()
+    assert len(tracked) == 1
+    assert tracked[0]["track_id"] == "track_0001"
+    assert tracked[0]["observation_count"] == 2
+    assert abs(tracked[0]["yaw"]) < 0.10
+
+
+def test_portal_graph_freezes_first_measured_reference_yaw():
+    store = InteractionGraphStore(scene_id="test_scene")
+    first = observation(
+        observation_id="door_1",
+        instance_id="track_0001",
+        semantic_name="door",
+        category="door",
+        is_door=True,
+        aabb_center=[1.0, 2.0, 1.0],
+        aabb_size=[1.0, 0.2, 2.0],
+        orientation=[0.0, 0.0, math.sin(0.3), math.cos(0.3)],
+        yaw=0.6,
+    )
+    store.update_observations([first], stamp=1.0, source_mode="detector_online")
+    second = dict(first, observation_id="door_2", yaw=0.9)
+    store.update_observations([second], stamp=2.0, source_mode="detector_online")
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert portal["attributes"]["yaw"] == 0.9
+    assert portal["attributes"]["interaction_reference_yaw"] == 0.6
+
+
+def test_object_store_does_not_merge_adjacent_coplanar_doors():
+    store = ObjectMapStore(
+        match_distance=0.5,
+        min_confirmations=1,
+        portal_cross_view_match_enabled=True,
+    )
+    first = {
+        "semantic_class": "door",
+        "confidence": 0.9,
+        "world_position": {"x": 0.0, "y": 0.0, "z": 1.0},
+        "world_box3d_center": {"x": 0.0, "y": 0.0, "z": 1.0},
+        "world_box3d_size": {"x": 0.9, "y": 0.15, "z": 2.0},
+        "yaw": 0.0,
+    }
+    adjacent = {
+        **first,
+        "instance_id": "adjacent_door",
+        "world_position": {"x": 1.25, "y": 0.04, "z": 1.0},
+        "world_box3d_center": {"x": 1.25, "y": 0.04, "z": 1.0},
+        "yaw": math.pi - 0.03,
+    }
+
+    store.update([first], stamp=1.0)
+    store.update([adjacent], stamp=2.0)
+
+    assert len(store.as_tracked_detections()) == 2
+
+
 def test_object_store_rejects_large_box_outlier_from_stable_box():
     store = ObjectMapStore(match_distance=0.5, min_confirmations=2, size_match_ratio=0.7)
     store.update(
@@ -426,6 +512,90 @@ def test_object_store_can_expose_tentative_tracks_for_graph():
     assert tentative[0]["observation_count"] == 1
 
 
+def test_object_store_requires_uninterrupted_class_specific_confirmations():
+    store = ObjectMapStore(
+        match_distance=0.5,
+        min_confirmations=3,
+        class_min_confirmations={"fridge": 4},
+    )
+    detection = {
+        "semantic_class": "fridge",
+        "confidence": 0.8,
+        "world_position": {"x": 1.0, "y": 2.0, "z": 0.8},
+        "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.8},
+        "world_box3d_size": {"x": 0.8, "y": 0.7, "z": 1.8},
+    }
+    store.update([detection], stamp=1.0)
+    store.update([detection], stamp=2.0)
+    store.update([], stamp=3.0)
+    store.update([detection], stamp=4.0)
+    store.update([detection], stamp=5.0)
+
+    assert store.as_tracked_detections() == []
+    assert store.as_tracked_detections(
+        min_observations=1,
+        confirmed_only=False,
+        currently_observed_only=True,
+    ) == []
+
+    store.update([detection], stamp=6.0)
+    store.update([detection], stamp=7.0)
+    tracked = store.as_tracked_detections(currently_observed_only=True)
+    assert len(tracked) == 1
+    assert tracked[0]["consecutive_observations"] == 4
+    assert tracked[0]["required_consecutive_observations"] == 4
+
+
+def test_object_store_top_height_is_only_a_new_track_admission_gate():
+    store = ObjectMapStore(
+        match_distance=0.5,
+        min_confirmations=2,
+        class_min_top_height_m={"door": 1.8, "fridge": 1.5},
+    )
+    short_false_door = {
+        "semantic_class": "door",
+        "confidence": 0.8,
+        "world_position": {"x": 1.0, "y": 2.0, "z": 0.7},
+        "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.7},
+        "world_box3d_size": {"x": 0.7, "y": 0.2, "z": 0.4},
+    }
+    store.update([short_false_door], stamp=1.0)
+    assert store.as_tracked_detections(min_observations=1, confirmed_only=False) == []
+
+    full_door = dict(short_false_door)
+    full_door["world_position"] = {"x": 1.0, "y": 2.0, "z": 0.9}
+    full_door["world_box3d_center"] = {"x": 1.0, "y": 2.0, "z": 0.9}
+    full_door["world_box3d_size"] = {"x": 0.8, "y": 0.2, "z": 2.0}
+    store.update([full_door], stamp=2.0)
+    store.update([full_door], stamp=3.0)
+    # Once confirmed, a partial close-range box updates the same track even
+    # though its current top is below the new-track threshold.
+    store.update([short_false_door], stamp=4.0)
+
+    tracked = store.as_tracked_detections(currently_observed_only=True)
+    assert len(tracked) == 1
+    assert tracked[0]["track_id"] == "track_0001"
+    assert tracked[0]["observation_count"] == 3
+
+
+def test_detector_graph_marks_unmatched_nodes_not_currently_visible():
+    store = InteractionGraphStore(scene_id="test_scene")
+    door = observation(
+        observation_id="door_obs",
+        instance_id="door_1",
+        semantic_name="door",
+        room_id=1,
+        position=[0.0, 0.0, 1.0],
+    )
+    store.update_observations([door], stamp=1.0, source_mode="detector_online")
+    store.update_observations([], stamp=2.0, source_mode="detector_online")
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert portal["is_currently_visible"] is False
+
+
 def test_object_store_preserves_public_visibility_evidence_for_target_candidates():
     store = ObjectMapStore(match_distance=0.5, min_confirmations=1)
     detection = {
@@ -448,6 +618,24 @@ def test_object_store_preserves_public_visibility_evidence_for_target_candidates
     assert tracked[0]["consecutive_observations"] == 2
     assert tracked[0]["max_consecutive_observations"] == 2
     assert tracked[0]["visible_fraction"] > 0.0
+
+
+def test_object_store_uses_bbox_area_when_physical_detector_has_no_mask():
+    store = ObjectMapStore(match_distance=0.5, min_confirmations=1)
+    detection = {
+        "semantic_class": "door",
+        "confidence": 0.9,
+        "world_position": {"x": 1.0, "y": 2.0, "z": 1.0},
+        "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 1.0},
+        "world_box3d_size": {"x": 0.2, "y": 1.0, "z": 2.0},
+        "bbox": [10, 20, 110, 120],
+    }
+
+    store.update([detection], 1.0)
+
+    tracked = store.as_tracked_detections()
+    assert tracked[0]["visible_pixels"] == 10_000
+    assert tracked[0]["visible_fraction"] == 1.0
 
 
 def test_object_store_merges_overlapping_different_labels():
@@ -485,6 +673,24 @@ def test_object_store_merges_overlapping_different_labels():
     assert tracked[0]["label_votes"]["curtain"] == 0.9
 
 
+def test_tracked_detection_exposes_map_track_as_downstream_identity():
+    store = ObjectMapStore(match_distance=0.5, min_confirmations=1)
+    detection = {
+        "semantic_class": "door",
+        "instance_id": "frame_10_detection_3",
+        "confidence": 0.9,
+        "world_position": {"x": 1.0, "y": 2.0, "z": 0.8},
+        "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.8},
+        "world_box3d_size": {"x": 0.1, "y": 0.9, "z": 2.0},
+    }
+    store.update([detection], stamp=1.0)
+
+    tracked = store.as_tracked_detections()
+    assert tracked[0]["track_id"] == "track_0001"
+    assert tracked[0]["instance_id"] == "track_0001"
+    assert tracked[0]["source_instance_id"] == "frame_10_detection_3"
+
+
 def test_detection_observation_keeps_latest_visual_box():
     obs = observation_from_detection(
         {
@@ -495,9 +701,13 @@ def test_detection_observation_keeps_latest_visual_box():
             "world_box3d_size": {"x": 0.12, "y": 0.28, "z": 0.41},
             "viz_aabb_center": {"x": 1.1, "y": 2.1, "z": 0.9},
             "viz_aabb_size": {"x": 0.2, "y": 0.3, "z": 0.4},
+            "yaw": 0.65,
+            "world_box3d_orientation": [0.0, 0.0, math.sin(0.325), math.cos(0.325)],
         },
         observation_id="det_0001",
     )
+    assert obs["yaw"] == 0.65
+    assert obs["orientation"] == [0.0, 0.0, math.sin(0.325), math.cos(0.325)]
 
     assert obs["aabb_size"] == [0.12, 0.28, 0.41]
     assert obs["viz_aabb_center"] == [1.1, 2.1, 0.9]

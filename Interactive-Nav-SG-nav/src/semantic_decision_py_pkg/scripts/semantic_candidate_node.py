@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 
 from semantic_decision_py_pkg.behavior_candidates import (
@@ -20,7 +21,7 @@ from semantic_decision_py_pkg.startup_scan_lifecycle import StartupScanLifecycle
 patch_roslogging_findcaller_for_py311()
 
 import rospy
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from std_msgs.msg import String
 
 
@@ -134,6 +135,36 @@ class SemanticCandidateNode:
                     config.get("remembered_portal_reobservation_enabled", False)
                 ),
                 portal_standoff_m=float(config.get("portal_standoff_m", 1.0)),
+                portal_approach_standoff_offsets_m=tuple(
+                    # Negative offsets intentionally request closer portal
+                    # stances; _approach_candidates clamps the resulting
+                    # absolute standoff, not the offset itself.
+                    float(value)
+                    for value in config.get(
+                        "portal_approach_standoff_offsets_m", [0.0, 0.25, 0.50]
+                    )
+                ),
+                portal_approach_tangent_offsets_m=tuple(
+                    float(value)
+                    for value in config.get(
+                        "portal_approach_tangent_offsets_m", [0.0, 0.20, -0.20]
+                    )
+                ),
+                portal_approach_yaw_offsets_rad=tuple(
+                    float(value)
+                    for value in config.get(
+                        "portal_approach_yaw_offsets_rad", [0.0]
+                    )
+                ),
+                portal_opposite_side_fallback_enabled=bool(
+                    config.get("portal_opposite_side_fallback_enabled", True)
+                ),
+                portal_require_reference_yaw=bool(
+                    config.get("portal_require_reference_yaw", False)
+                ),
+                portal_side_hysteresis_m=max(
+                    0.0, float(config.get("portal_side_hysteresis_m", 0.0))
+                ),
                 portal_traversal_distance_m=float(
                     config.get("portal_traversal_distance_m", 0.8)
                 ),
@@ -166,6 +197,9 @@ class SemanticCandidateNode:
                     ),
                 ),
                 container_pre_action_mllm=bool(container_pre_action_mllm),
+                fridge_direct_interaction_on_arrival=bool(
+                    config.get("fridge_direct_interaction_on_arrival", False)
+                ),
                 container_pre_action_observation_max_attempts=max(
                     1,
                     int(
@@ -382,6 +416,17 @@ class SemanticCandidateNode:
         self.graph: dict = {}
         self.target_context: dict = dict(rospy.get_param("~target", {}) or {})
         self.robot_xy: tuple[float, float] | None = None
+        self.occupancy_grid: OccupancyGrid | None = None
+        self.portal_goal_require_known_free = bool(
+            config.get("portal_goal_require_known_free", False)
+        )
+        self.portal_goal_known_free_radius_m = max(
+            0.0, float(config.get("portal_goal_known_free_radius_m", 0.30))
+        )
+        self.portal_goal_occupied_threshold = max(
+            1, int(config.get("portal_goal_occupied_threshold", 50))
+        )
+        self.filtered_portal_candidate_ids: list[str] = []
         self.sequence = 0
         self.publisher = rospy.Publisher(
             topics.get("candidates", "/semantic_decision/candidates"),
@@ -415,6 +460,12 @@ class SemanticCandidateNode:
         )
         rospy.Subscriber(
             topics.get("odom", "/odom"), Odometry, self._odom_callback, queue_size=1
+        )
+        rospy.Subscriber(
+            topics.get("occupancy_grid", "/struct_mapping/occ_map"),
+            OccupancyGrid,
+            self._occupancy_callback,
+            queue_size=1,
         )
         if self.startup_scan_enabled:
             rospy.Subscriber(
@@ -507,6 +558,78 @@ class SemanticCandidateNode:
             float(message.pose.pose.position.y),
         )
 
+    def _occupancy_callback(self, message: OccupancyGrid) -> None:
+        self.occupancy_grid = message
+
+    def _goal_is_known_free(self, goal: list[float]) -> bool:
+        grid = self.occupancy_grid
+        if grid is None or len(goal or []) < 2:
+            return False
+        origin = grid.info.origin
+        q = origin.orientation
+        origin_yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        dx = float(goal[0]) - float(origin.position.x)
+        dy = float(goal[1]) - float(origin.position.y)
+        cos_yaw, sin_yaw = math.cos(origin_yaw), math.sin(origin_yaw)
+        local_x = cos_yaw * dx + sin_yaw * dy
+        local_y = -sin_yaw * dx + cos_yaw * dy
+        resolution = max(float(grid.info.resolution), 1e-6)
+        center_x = int(math.floor(local_x / resolution))
+        center_y = int(math.floor(local_y / resolution))
+        radius_cells = int(math.ceil(self.portal_goal_known_free_radius_m / resolution))
+        width, height = int(grid.info.width), int(grid.info.height)
+        for offset_y in range(-radius_cells, radius_cells + 1):
+            for offset_x in range(-radius_cells, radius_cells + 1):
+                if math.hypot(offset_x, offset_y) * resolution > self.portal_goal_known_free_radius_m + 1e-9:
+                    continue
+                grid_x, grid_y = center_x + offset_x, center_y + offset_y
+                if not (0 <= grid_x < width and 0 <= grid_y < height):
+                    return False
+                value = int(grid.data[grid_y * width + grid_x])
+                if value < 0 or value >= self.portal_goal_occupied_threshold:
+                    return False
+        return True
+
+    def _filter_portal_goals_by_occupancy(
+        self, candidates: list[BehaviorCandidate]
+    ) -> list[BehaviorCandidate]:
+        self.filtered_portal_candidate_ids = []
+        if not self.portal_goal_require_known_free:
+            return candidates
+        kept = []
+        for candidate in candidates:
+            metadata = candidate.metadata or {}
+            if candidate.behavior_type != "INTERACT" or metadata.get("node_type") != "portal":
+                kept.append(candidate)
+                continue
+            goals = list(metadata.get("goal_xyyaw_candidates") or [])
+            labels = list(metadata.get("interaction_approach_pose_labels") or [])
+            valid_pairs = [
+                (goal, labels[index] if index < len(labels) else "portal_source_side")
+                for index, goal in enumerate(goals)
+                if self._goal_is_known_free(goal)
+            ]
+            if not valid_pairs:
+                self.filtered_portal_candidate_ids.append(candidate.candidate_id)
+                continue
+            valid_goals = [list(pair[0]) for pair in valid_pairs]
+            valid_labels = [pair[1] for pair in valid_pairs]
+            candidate.goal_xyyaw = list(valid_goals[0])
+            metadata["goal_xyyaw_candidates"] = valid_goals
+            metadata["interaction_approach_pose_labels"] = valid_labels
+            metadata["portal_goal_known_free"] = True
+            candidate.metadata = metadata
+            if candidate.interaction_command is not None:
+                candidate.interaction_command["interaction_approach_pose_xyyaw"] = list(
+                    valid_goals[0]
+                )
+                candidate.interaction_command["interaction_approach_pose_labels"] = valid_labels
+            kept.append(candidate)
+        return kept
+
     def _publish(self, _event) -> None:
         explorer_input = (
             self.explorer_proposal_stream
@@ -517,6 +640,7 @@ class SemanticCandidateNode:
         candidates = self.generator.generate(
             explorer_input, self.graph, self.robot_xy, self.target_context
         )
+        candidates = self._filter_portal_goals_by_occupancy(candidates)
         episode_id = str(
             self.graph.get("episode_id")
             or self.startup_scan_lifecycle.bound_episode_id
@@ -612,6 +736,9 @@ class SemanticCandidateNode:
                 "connected_unknown_area_present": connected_unknown_area_present,
                 "combined_frontier_count": len(navigation_frontiers)
                 + len(interaction_frontiers),
+                "occupancy_filtered_portal_candidate_ids": list(
+                    self.filtered_portal_candidate_ids
+                ),
                 "source_frontier_exhausted": bool(
                     explorer_input.get("frontier_exhausted", False)
                 ),

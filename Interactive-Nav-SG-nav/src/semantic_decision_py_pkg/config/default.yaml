@@ -61,6 +61,15 @@ candidate:
   # (wait for visual MLLM evidence).  An ablation may override explicitly.
   # portal_unknown_default_interact: true
   portal_standoff_m: 0.85
+  portal_approach_standoff_offsets_m: [0.0, 0.25, 0.50]
+  portal_approach_tangent_offsets_m: [0.0, 0.20, -0.20]
+  portal_approach_yaw_offsets_rad: [0.0]
+  portal_opposite_side_fallback_enabled: true
+  portal_require_reference_yaw: false
+  portal_side_hysteresis_m: 0.0
+  portal_goal_require_known_free: false
+  portal_goal_known_free_radius_m: 0.30
+  portal_goal_occupied_threshold: 50
   container_standoff_m: 0.5
   # Drawer containers use the same nominal approach distance as other
   # containers.  Keep this explicit so a future task can tune drawers without
@@ -182,6 +191,10 @@ model:
   reserve_unentered_room_frontier_slots: 1
   suppress_semantic_container_mismatch: true
   pre_score_guard_margin: 0.75
+  # M2 exploration diversity: when a reachable unentered room frontier is
+  # available, leave the current/entered room before selecting another local
+  # frontier.  Target and post-interaction traversal priorities still win.
+  force_unentered_room_exploration: true
   history_region_size_m: 1.0
   stale_goal_position_tolerance_m: 0.35
   stale_goal_yaw_tolerance_rad: 0.50
@@ -231,7 +244,7 @@ executor:
   base_frame: "tf_frame_base_link"
   navigation_timeout_s: 180.0
   interaction_navigation_timeout_s: 180.0
-  interaction_timeout_s: 30.0
+  interaction_timeout_s: 15.0
   # A grounded drawer scan has a finite evaluator-step macro.  While those
   # steps keep arriving, do not let host/render wall time turn it into a false
   # failure.  The cap covers the strict public schema maximum of eight regions
@@ -327,6 +340,11 @@ executor:
   rear_goal_reverse_speed_mps: 0.10
   rear_goal_reverse_max_control_steps: 10
   final_align_enabled: false
+  # Optional DWA-owned terminal heading for EXPLORE viewpoints. This is off by
+  # default so simulator behavior is unchanged; the Go2 overlay enables it.
+  explore_terminal_yaw_enabled: false
+  explore_terminal_xy_tolerance_m: 0.20
+  explore_terminal_yaw_tolerance_rad: 0.20
   # Interaction-only final yaw correction is opt-in per task lane.  It never
   # enables generic NAVIGATE/EXPLORE final alignment.
   interaction_final_align_enabled: false

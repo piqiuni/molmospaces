@@ -17,11 +17,13 @@ class QwenClient:
         self.timeout_s = timeout_s
         self.api_key = api_key or os.environ.get("SEMANTIC_MODEL_API_KEY", "")
 
-    def chat(self, prompt: str, *, image_data_url: str | None = None, max_tokens: int = 256) -> dict[str, Any]:
+    def chat(self, prompt: str, *, image_data_url: str | None = None, max_tokens: int = 256, response_format: dict[str, Any] | None = None) -> dict[str, Any]:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         if image_data_url:
             content.append({"type": "image_url", "image_url": {"url": image_data_url}})
         payload = {"model": self.model, "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens}
+        if response_format:
+            payload["response_format"] = dict(response_format)
         headers = {"Content-Type": "application/json"}
         if self.api_key: headers["Authorization"] = "Bearer " + self.api_key
         request = urllib.request.Request(self.base_url + "/chat/completions", data=json.dumps(payload).encode(), headers=headers)

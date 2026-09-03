@@ -455,6 +455,7 @@ class MLLMClient:
             return {
                 "object_id": str(context.get("object_id") or "unknown"),
                 "interactable": False,
+                "observed_object_name": "",
                 "interaction_class": "unknown",
                 "coarse_state": "unknown",
                 "portal_morphology": None,
@@ -591,10 +592,15 @@ class MLLMClient:
         if config.metrics_path:
             path = Path(config.metrics_path).expanduser()
             path.parent.mkdir(parents=True, exist_ok=True)
+            # The live physical dashboard needs the exact M1 source frame,
+            # but duplicating base64 JPEGs into the long-running JSONL metric
+            # file would make it grow by megabytes per minute.
+            disk_record = dict(record)
+            disk_record.pop("m1_input_image_data_url", None)
             with self._metrics_lock, path.open("a", encoding="utf-8") as stream:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
                 try:
-                    stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                    stream.write(json.dumps(disk_record, ensure_ascii=False, default=str) + "\n")
                     stream.flush()
                 finally:
                     fcntl.flock(stream.fileno(), fcntl.LOCK_UN)

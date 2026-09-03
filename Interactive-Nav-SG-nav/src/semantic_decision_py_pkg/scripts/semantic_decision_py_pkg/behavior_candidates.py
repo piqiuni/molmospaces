@@ -96,7 +96,7 @@ class CandidateGeneratorConfig:
     interaction_types: tuple[str, ...] = ("portal", "container")
     # Optional semantic allow-list for physical interaction targets.  Empty
     # keeps the historical type-only behaviour; the Go2 shadow lane narrows
-    # this to door/portal, fridge and drawer/cabinet.
+    # this to door/portal and fridge.
     interaction_semantic_types: tuple[str, ...] = ()
     container_require_same_room: bool = False
     container_allow_connected_room: bool = False
@@ -118,6 +118,26 @@ class CandidateGeneratorConfig:
     # or more fresh observations before an action can be dispatched.
     portal_unknown_observation_max_attempts: int = 2
     portal_standoff_m: float = 1.0
+    # Ordered radial offsets keep one blocked/unreachable door stance from
+    # removing the whole portal candidate. Negative values request a closer
+    # stance; generation clamps the resulting surface standoff at zero. The
+    # executor preflights each pose.
+    portal_approach_standoff_offsets_m: tuple[float, ...] = (0.0, 0.25, 0.50)
+    # Physical deployments can use only zero to require door-centerline poses.
+    portal_approach_tangent_offsets_m: tuple[float, ...] = (0.0, 0.20, -0.20)
+    # Small terminal-heading alternatives share the same safe XY stance. They
+    # help DWA converge when the exact door-normal heading is locally blocked.
+    portal_approach_yaw_offsets_rad: tuple[float, ...] = (0.0,)
+    # Keep the opposite side as a general fallback for simulation. Physical
+    # navigation disables it so an interaction pose can never jump through a
+    # closed door merely because the robot-side pose failed preflight.
+    portal_opposite_side_fallback_enabled: bool = True
+    # Physical interaction must not fall back to a map-axis AABB normal when
+    # the measured rotated door axis has not reached the stable graph yet.
+    portal_require_reference_yaw: bool = False
+    # Prevent a small pose/box update near the door plane from flipping every
+    # generated stance to the other side. Zero preserves the legacy behavior.
+    portal_side_hysteresis_m: float = 0.0
     portal_traversal_distance_m: float = 0.8
     portal_traversal_max_start_distance_m: float = 2.0
     portal_traversal_completion_margin_m: float = 0.35
@@ -150,6 +170,9 @@ class CandidateGeneratorConfig:
     # remembered AABB/ring pose may be useful to obtain a view, but is never by
     # itself authorization to pull/open a fridge, cabinet, or drawer.
     container_pre_action_mllm: bool = False
+    # Physical simplification: a refrigerator staging arrival is already the
+    # interaction subgoal, so skip the extra M1 capture navigation/observation.
+    fridge_direct_interaction_on_arrival: bool = False
     container_pre_action_observation_max_attempts: int = 4
     # ``None`` means drawers inherit ``container_standoff_m``.  These legacy
     # fields describe the requested physical standoff *before* the legacy
@@ -291,6 +314,7 @@ class CandidateGeneratorConfig:
 class CandidateGenerator:
     def __init__(self, config: CandidateGeneratorConfig | None = None) -> None:
         self.config = config or CandidateGeneratorConfig()
+        self._portal_side_sign_by_id: dict[str, float] = {}
 
     def generate(
         self,
@@ -908,7 +932,22 @@ class CandidateGenerator:
                     0.0,
                     float(proposal.get("distance_to_robot", 0.0) or 0.0),
                 )
-            if not cluster_id or len(subgoal) < 2:
+            if not cluster_id:
+                continue
+            # ExplorePy may briefly publish a material unknown component
+            # before its safe-viewpoint worker has populated ``goal_xyyaw``.
+            # Do not turn that state into an empty candidate pool: a frontier
+            # point is still a useful conservative navigation subgoal and will
+            # cause the next scan to refresh the viewpoint.  Only apply this
+            # fallback to genuinely material unknown area; tiny/noisy clusters
+            # remain filtered as before.
+            if len(subgoal) < 2 and len(frontier_point) >= 2 and unknown_area_m2 > 0.0:
+                fx, fy = float(frontier_point[0]), float(frontier_point[1])
+                status_robot_xy = status.get("robot_xy")
+                rx, ry = (float(status_robot_xy[0]), float(status_robot_xy[1])) if status_robot_xy and len(status_robot_xy) >= 2 else (fx, fy)
+                subgoal = [fx, fy, math.atan2(fy - ry, fx - rx)]
+                geometry.setdefault("fallback_goal", "frontier_point")
+            if len(subgoal) < 2:
                 continue
             yaw = (
                 float(subgoal[2])
@@ -1521,6 +1560,14 @@ class CandidateGenerator:
             source_object_name = str(
                 attributes.get("source_object_name") or node.get("name") or node_id
             )
+            # M1 is the visual authority for the display/semantic name, while
+            # the detector source name remains the stable routing identity.
+            display_object_name = str(
+                attributes.get("m1_observed_object_name")
+                or attributes.get("semantic_name")
+                or node.get("label")
+                or source_object_name
+            )
             connected_room_ids = list(attributes.get("connected_room_ids") or [])
             expected_effect = str(
                 interaction.get("expected_effect")
@@ -1688,6 +1735,8 @@ class CandidateGenerator:
                     container_m1_face_selection
                 ),
             )
+            if not goal_candidates:
+                continue
             container_face_axes_by_staging = [
                 list(axis) if axis is not None else []
                 for axis in (
@@ -1913,7 +1962,7 @@ class CandidateGenerator:
                     behavior_type=BEHAVIOR_INTERACT,
                     source="unified_graph",
                     target_id=node_id,
-                    target_name=source_object_name,
+                    target_name=display_object_name,
                     goal_xyyaw=approach,
                     interaction_command=interaction_command,
                     features={
@@ -1938,7 +1987,8 @@ class CandidateGenerator:
                     metadata={
                         "node_type": node_type,
                         "semantic_name": str(
-                            attributes.get("semantic_name")
+                            attributes.get("m1_observed_object_name")
+                            or attributes.get("semantic_name")
                             or attributes.get("category")
                             or node.get("label")
                             or node.get("name")
@@ -2249,6 +2299,10 @@ class CandidateGenerator:
                         # outer observations fail-closed instead of reverting to
                         # a legacy direct open from the staging pose.
                         "container_two_stage_approach": container_two_stage_requested,
+                        "fridge_direct_interaction_on_arrival": bool(
+                            is_refrigerator_container
+                            and self.config.fridge_direct_interaction_on_arrival
+                        ),
                         "container_two_stage_mapping_ready": (
                             container_two_stage_mapping_ready
                         ),
@@ -2276,6 +2330,10 @@ class CandidateGenerator:
                         )
                         if container_two_stage_requested
                         else [],
+                        # All interaction types expose the ordered approach
+                        # list so the decision layer can resume a failed
+                        # portal at the next (closer) pose after refresh.
+                        "goal_xyyaw_candidates": [list(goal) for goal in goal_candidates],
                         "container_staging_source_index_by_index": list(
                             container_staging_source_index_by_index
                         )
@@ -2890,15 +2948,30 @@ class CandidateGenerator:
             labels.append(str(label))
 
         if node_type == "portal":
+            if (
+                self.config.portal_require_reference_yaw
+                and (node.get("attributes") or {}).get(
+                    "interaction_reference_yaw"
+                )
+                is None
+            ):
+                return candidates, labels
             # A single radial approach can put all fallbacks on the blocked
-            # side of a doorway.  Keep the original (robot-side, zero-offset)
-            # candidates first, then try small tangential offsets and the
-            # opposite doorway side.  The executor preflights these in order
-            # and stops at the first reachable pose.
-            for side_multiplier in (1.0, -1.0):
-                for tangent_offset_m in (0.0, 0.20, -0.20):
-                    for extra_standoff in (0.0, 0.25, 0.50):
-                        candidate_standoff = max(0.0, float(standoff_m)) + extra_standoff
+            # side of a doorway. General/simulator runs may try both sides;
+            # physical runs disable the opposite-side list so preflight can
+            # never select a goal through a closed door.
+            side_multipliers = (
+                (1.0, -1.0)
+                if self.config.portal_opposite_side_fallback_enabled
+                else (1.0,)
+            )
+            for side_multiplier in side_multipliers:
+                for tangent_offset_m in self.config.portal_approach_tangent_offsets_m:
+                    for extra_standoff in self.config.portal_approach_standoff_offsets_m:
+                        candidate_standoff = max(
+                            0.0,
+                            float(standoff_m) + float(extra_standoff),
+                        )
                         pose = self._portal_approach_pose(
                             robot_xy,
                             target_xy,
@@ -2907,12 +2980,18 @@ class CandidateGenerator:
                             side_multiplier=side_multiplier,
                             tangent_offset_m=tangent_offset_m,
                         )
-                        append_unique(
-                            pose,
-                            "portal_source_side"
-                            if side_multiplier > 0.0
-                            else "portal_opposite_side",
-                        )
+                        for yaw_offset_rad in self.config.portal_approach_yaw_offsets_rad:
+                            candidate_pose = list(pose)
+                            candidate_pose[2] = math.atan2(
+                                math.sin(candidate_pose[2] + float(yaw_offset_rad)),
+                                math.cos(candidate_pose[2] + float(yaw_offset_rad)),
+                            )
+                            append_unique(
+                                candidate_pose,
+                                "portal_source_side"
+                                if side_multiplier > 0.0
+                                else "portal_opposite_side",
+                            )
             return candidates, labels
 
         outer_offset = self._nonnegative_clearance(
@@ -3826,9 +3905,8 @@ class CandidateGenerator:
         yaw = math.atan2(target_xy[1] - y, target_xy[0] - x)
         return [x, y, yaw]
 
-    @classmethod
     def _portal_approach_pose(
-        cls,
+        self,
         robot_xy: tuple[float, float],
         target_xy: tuple[float, float],
         node: dict[str, Any],
@@ -3855,7 +3933,39 @@ class CandidateGenerator:
         major = max(size_x, size_y)
         minor = min(size_x, size_y)
         elongated = major > 1e-6 and major / max(minor, 1e-6) >= 1.35
-        if elongated:
+        reference_yaw = attributes.get("interaction_reference_yaw")
+        if reference_yaw is None:
+            reference_yaw = attributes.get("yaw")
+        try:
+            reference_yaw = (
+                None if reference_yaw is None else float(reference_yaw)
+            )
+        except (TypeError, ValueError):
+            reference_yaw = None
+        if reference_yaw is not None:
+            # Physical OBB yaw is the door's long/tangent axis. Its
+            # perpendicular is the actual door normal even when the door is
+            # rotated relative to the map X/Y axes.
+            normal_x = -math.sin(reference_yaw)
+            normal_y = math.cos(reference_yaw)
+            signed_distance = (
+                (robot_xy[0] - target_xy[0]) * normal_x
+                + (robot_xy[1] - target_xy[1]) * normal_y
+            )
+            portal_id = str(node.get("id") or "")
+            side = 1.0 if signed_distance >= 0.0 else -1.0
+            previous_side = self._portal_side_sign_by_id.get(portal_id)
+            hysteresis = max(0.0, float(self.config.portal_side_hysteresis_m))
+            if previous_side is not None:
+                # Change sides only after the robot is clearly beyond the
+                # door plane. Near-plane noise must retain the old stance.
+                if signed_distance * previous_side >= -hysteresis:
+                    side = previous_side
+            self._portal_side_sign_by_id[portal_id] = side
+            normal_x *= side * float(side_multiplier)
+            normal_y *= side * float(side_multiplier)
+            boundary_distance = 0.5 * minor
+        elif elongated:
             # The short AABB axis is the doorway normal.  Use the robot side
             # for the primary pose and allow the caller to request the other
             # side with side_multiplier=-1.

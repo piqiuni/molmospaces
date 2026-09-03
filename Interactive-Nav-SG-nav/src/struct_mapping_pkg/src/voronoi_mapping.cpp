@@ -5,6 +5,8 @@
 
 VoronoiMapping::VoronoiMapping() {
   sqrt2 = sqrt(2.0);
+  sizeX = 0;
+  sizeY = 0;
   data = NULL;
   gridMap = NULL;
   obstacle_distance_threshold_ = 1;  // 默认值：1个grid cell
@@ -22,20 +24,28 @@ VoronoiMapping::~VoronoiMapping() {
 }
 
 void VoronoiMapping::initializeEmpty(int _sizeX, int _sizeY, bool initGridMap) {
+  // The existing rows were allocated with the previous width.  Keep that
+  // width until all old storage has been released; using the new width here
+  // corrupts the heap whenever a dynamically growing SLAM map changes size.
+  const int oldSizeX = sizeX;
+  if (data) {
+    for (int x=0; x<oldSizeX; x++) delete[] data[x];
+    delete[] data;
+    data = NULL;
+  }
+
+  if (initGridMap && gridMap) {
+    for (int x=0; x<oldSizeX; x++) delete[] gridMap[x];
+    delete[] gridMap;
+    gridMap = NULL;
+  }
+
   sizeX = _sizeX;
   sizeY = _sizeY;
-  if (data) {
-    for (int x=0; x<sizeX; x++) delete[] data[x];
-    delete[] data;
-  }
   data = new dataCell*[sizeX];
   for (int x=0; x<sizeX; x++) data[x] = new dataCell[sizeY];
 
   if (initGridMap) {
-    if (gridMap) {
-      for (int x=0; x<sizeX; x++) delete[] gridMap[x];
-      delete[] gridMap;
-    }
     gridMap = new bool*[sizeX];
     for (int x=0; x<sizeX; x++) gridMap[x] = new bool[sizeY];
   }
@@ -59,6 +69,12 @@ void VoronoiMapping::initializeEmpty(int _sizeX, int _sizeY, bool initGridMap) {
 }
 
 void VoronoiMapping::initializeMap(int _sizeX, int _sizeY, bool** _gridMap) {
+  // initializeMap takes ownership of the supplied grid.  Release the
+  // previous owned grid before replacing it, using its original dimensions.
+  if (gridMap) {
+    for (int x=0; x<sizeX; x++) delete[] gridMap[x];
+    delete[] gridMap;
+  }
   gridMap = _gridMap;
   initializeEmpty(_sizeX, _sizeY, false);
 

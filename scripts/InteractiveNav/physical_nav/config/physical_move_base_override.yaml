@@ -1,6 +1,19 @@
 # Physical-only move_base overrides. Loaded inside the /move_base private
 # namespace after the shared navigation defaults, leaving simulator settings
 # unchanged.
+DWAPlannerROS:
+  # Physical Go2 speed profile. Keep these planner limits in sync with the
+  # downstream velocity-safety caps so valid DWA commands are not clipped.
+  max_vel_x: 0.56
+  max_vel_trans: 0.60
+  max_vel_theta: 1.30
+  min_vel_theta: 0.55
+  rear_path_rotate_speed: 1.30
+  xy_goal_tolerance: 0.30
+  # Require a tighter terminal heading on the physical base. The velocity
+  # safety layer now preserves the low angular speeds needed to reach it.
+  yaw_goal_tolerance: 0.15
+
 local_costmap:
   rolling_window: true
   width: 8.0
@@ -14,3 +27,26 @@ local_costmap:
   obstacle_layer:
     obstacle_range: 8.0
     raytrace_range: 8.0
+    footprint_clearing_enabled: true
+    # A forward RGB-D camera cannot ray-clear surfaces that leave its field of
+    # view. Rebuild only this rolling, real-time layer from the newest cloud at
+    # a bounded interval; the persistent/global occupancy map is untouched.
+    obstacle_reset_interval: 2.0
+    local_obstacles:
+      # ObstacleLayer does not expire cells when this duration elapses: it
+      # retains old clouds and re-marks their endpoints.  Consume only the
+      # newest RGB-D cloud so depth jitter cannot be replayed as ghost walls.
+      observation_persistence: 0.0
+      # Do not re-inject a delayed frame after a Wi-Fi/WebSocket stall.  A
+      # subsequent fresh cloud provides the clearing rays for observed space.
+      max_observation_age: 0.5
+      marking: true
+      clearing: true
+  inflation_layer:
+    inflation_radius: 0.50
+    cost_scaling_factor: 8.0
+
+global_costmap:
+  inflation_layer:
+    inflation_radius: 0.50
+    cost_scaling_factor: 8.0

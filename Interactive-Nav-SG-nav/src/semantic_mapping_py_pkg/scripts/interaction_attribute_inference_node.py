@@ -561,6 +561,7 @@ class InteractionAttributeInferenceNode:
                     ),
                     "object_id": object_id,
                     "detection": dict(detection),
+                    "raw_image": image.copy(),
                     "visual_evidence": visual_evidence,
                     "visual_evidence_history": visual_evidence_history,
                     "evidence_frame_ids": evidence_frame_ids,
@@ -1069,6 +1070,9 @@ class InteractionAttributeInferenceNode:
             or "targeted_refresh",
             "request_id": str(payload.get("request_id") or "").strip()[:96],
             "expected_node_type": expected_node_type,
+            "expected_object_kind": str(
+                payload.get("expected_object_kind") or ""
+            ).strip().casefold(),
             "observation_pose_xyyaw": observation_pose,
         }
 
@@ -1165,12 +1169,30 @@ class InteractionAttributeInferenceNode:
                 if requested_episode and requested_episode != str(episode_id or ""):
                     continue
                 requested_object_id = str(request.get("object_id") or "")
-                if (
-                    request_key not in canonical_identifiers
-                    and requested_object_id not in identifiers
-                    and requested_object_id not in canonical_identifiers
-                ):
-                    continue
+                exact_match = (
+                    request_key in canonical_identifiers
+                    or requested_object_id in identifiers
+                    or requested_object_id in canonical_identifiers
+                )
+                if not exact_match:
+                    expected_kind = str(
+                        request.get("expected_object_kind") or ""
+                    ).casefold()
+                    detected_kind = str(
+                        detection.get("semantic_class")
+                        or detection.get("semantic_name")
+                        or detection.get("category")
+                        or detection.get("label")
+                        or ""
+                    ).casefold()
+                    # Track IDs can change when the robot reaches the target.
+                    # For a refrigerator confirmation, allow a fresh detector
+                    # observation with the same explicit fridge semantic class;
+                    # the response is rebound to the original request ID below.
+                    if expected_kind != "refrigerator" or not any(
+                        token in detected_kind for token in ("fridge", "refrigerator")
+                    ):
+                        continue
                 try:
                     minimum_capture_step = int(request.get("minimum_capture_step", -1))
                     minimum_image_sequence = int(
@@ -2029,6 +2051,7 @@ class InteractionAttributeInferenceNode:
         enqueued_at: float,
         targeted_refresh: dict,
         deadline_monotonic: float | None = None,
+        raw_image: np.ndarray | None = None,
         visual_evidence_history: list[np.ndarray] | None = None,
         evidence_frame_ids: list[str] | None = None,
         evidence_capture_steps: list[int] | None = None,
@@ -2064,6 +2087,25 @@ class InteractionAttributeInferenceNode:
                     "data:image/jpeg;base64,"
                     + __import__("base64").b64encode(encoded).decode("ascii")
                 )
+            raw_input_encoded = self._encode_jpeg(
+                self._resize_visual_evidence(
+                    raw_image if isinstance(raw_image, np.ndarray) else visual_evidence,
+                    self.visual_evidence_max_side_px,
+                )
+            )
+            raw_input_data_url = (
+                "data:image/jpeg;base64,"
+                + __import__("base64").b64encode(raw_input_encoded).decode("ascii")
+                if raw_input_encoded
+                else ""
+            )
+            public_bbox = self._public_detection_bbox(detection)
+            semantic_label = str(
+                detection.get("semantic_class")
+                or detection.get("semantic_name")
+                or detection.get("category")
+                or "object"
+            )
             remaining_timeout_s = self._remaining_request_timeout(
                 deadline_monotonic, self.request_timeout_s
             )
@@ -2075,37 +2117,44 @@ class InteractionAttributeInferenceNode:
                 targeted_refresh.get("expected_node_type") or ""
             ).strip().casefold()
             container_refresh = expected_node_type == "container"
+            expected_object_kind = str(
+                targeted_refresh.get("expected_object_kind") or ""
+            ).strip().casefold()
             expected_type_instruction = (
-                "This is a targeted re-observation whose public expected_node_type is "
-                "container. It constrains class output only: interaction_class MUST be "
-                "container, portal_morphology and portal_aperture_evidence MUST be null, "
-                "and coarse_state MUST be open, closed, ajar, or unknown. Do not promote "
-                "this target to a portal. Still determine state, frontality, and reobserve "
-                "need from image pixels alone; do not assume a front view or hidden state. "
+                "This is a targeted re-observation whose planner hypothesis is "
+                "container. Verify it from image pixels; M1 may correct it to portal, "
+                "container, none, or unknown. Still determine state, frontality, and "
+                "reobserve need from pixels alone; do not assume a front view or hidden "
+                "state. "
                 if container_refresh
                 else ""
             )
+            if expected_object_kind == "refrigerator":
+                expected_type_instruction += (
+                    "The planner specifically hypothesizes a refrigerator. Verify this "
+                    "from visible pixels: report refrigerator, fridge, or an explicit "
+                    "refrigerator variant only when supported by the image; otherwise "
+                    "report the actual visible object name. Do not treat a generic "
+                    "cabinet, cupboard, door, or appliance-like shape as a refrigerator. "
+                )
             class_instruction = (
-                "interaction_class is container for this targeted refresh. "
+                "The planner currently expects a container, but M1 has priority: return "
+                "portal when the target is actually a door/portal, and return none or "
+                "unknown when it is not interactive. "
                 if container_refresh
                 else "interaction_class is portal, container, none, or unknown. "
             )
             portal_instruction = (
+                "For a portal only, portal_morphology is {door_leaf: absent|present|unknown, "
+                "confidence: 0..1}; report absent only when the image visibly shows a clear "
+                "opening with no door leaf. It is visual morphology only: never infer "
+                "traversability, simulator joints, asset names, or hidden geometry. "
+                "For a portal only, portal_aperture_evidence is {open_aperture: "
+                "visible|not_visible|unknown, confidence: 0..1}; use visible only when "
+                "a real gap/open passage is directly visible in the image. Do not claim "
+                "open or ajar from the class label, handle, or a guessed hidden state. "
                 "For a non-portal, set portal_morphology and "
                 "portal_aperture_evidence to null. "
-                if container_refresh
-                else (
-                    "For a portal only, portal_morphology is {door_leaf: absent|present|unknown, "
-                    "confidence: 0..1}; report absent only when the image visibly shows a clear "
-                    "opening with no door leaf. It is visual morphology only: never infer "
-                    "traversability, simulator joints, asset names, or hidden geometry. "
-                    "For a portal only, portal_aperture_evidence is {open_aperture: "
-                    "visible|not_visible|unknown, confidence: 0..1}; use visible only when "
-                    "a real gap/open passage is directly visible in the image. Do not claim "
-                    "open or ajar from the class label, handle, or a guessed hidden state. "
-                    "For a non-portal, set portal_morphology and "
-                    "portal_aperture_evidence to null. "
-                )
             )
             portal_full_frame = self._is_portal_detection(detection)
             visual_layout_instruction = (
@@ -2128,10 +2177,14 @@ class InteractionAttributeInferenceNode:
                     "while older images only corroborate which physical surface is the front. "
                     "Every image passed a target-mask-inside-outline check. ",
                     visual_layout_instruction,
-                    "Do not use object IDs, prior state, category names, map "
+                    "The detector class is a hypothesis only. Compare the outlined target "
+                    "with detector_class and report the most specific visible name in "
+                    "observed_object_name. If detector_class is wrong, observed_object_name "
+                    "MUST replace it; do not use generic names such as object or thing when "
+                    "a concrete name is visible. Do not use object IDs, prior state, map "
                     "geometry, simulator knowledge, or hidden properties. Return exactly one "
                     "compact, single-line JSON object with only object_id, interactable, "
-                    "interaction_class, coarse_state, portal_morphology, "
+                    "observed_object_name, interaction_class, coarse_state, portal_morphology, "
                     "portal_aperture_evidence, view_state, view_state_confidence, "
                     "front_surface_visible, front_surface_confidence, approach_ready, "
                     "needs_reobserve, action_regions, interaction_parts, and confidence. ",
@@ -2179,6 +2232,7 @@ class InteractionAttributeInferenceNode:
                     # M1 prompt.  ``target`` is an opaque response-routing token
                     # which the caller replaces with the real object ID.
                     "object_id": "target",
+                    "detector_class": semantic_label,
                     **(
                         {"expected_node_type": "container"}
                         if container_refresh
@@ -2187,7 +2241,7 @@ class InteractionAttributeInferenceNode:
                 },
                 images=image_data_sequence,
                 response_schema=build_attribute_patch_response_schema(
-                    "target", expected_node_type=expected_node_type or None
+                    "target", expected_node_type=None
                 ),
                 timeout_s=remaining_timeout_s,
                 max_tokens=self.max_output_tokens,
@@ -2206,25 +2260,28 @@ class InteractionAttributeInferenceNode:
                         evidence_observation_pose_xyyaw or []
                     ),
                     "target_bbox_containment": dict(target_bbox_containment or {}),
+                    "m1_input_image_data_url": raw_input_data_url,
+                    "m1_input_bbox": public_bbox or [],
+                    "m1_input_label": semantic_label,
+                    "m1_detector_class_hypothesis": semantic_label,
+                    "m1_input_track_id": str(detection.get("track_id") or object_id),
+                    "m1_input_object_id": detection.get("object_id"),
                 },
             )
             if response.error or response.payload is None:
                 outcome_error = str(response.error or "empty_model_response")
                 return
             patch = validate_attribute_patch(response.payload)
-            if container_refresh and patch.get("interaction_class") != "container":
-                # A compatible endpoint should enforce the strict schema.  Keep
-                # this response-side guard for older/command backends: preserve
-                # its image-derived state/frontality, but never let a targeted
-                # container refresh turn into a portal update.
-                patch["m1_reported_interaction_class"] = str(
-                    patch.get("interaction_class") or "unknown"
-                )
-                patch["interaction_class"] = "container"
-                if str(patch.get("coarse_state") or "").casefold() == "static_open":
-                    patch["coarse_state"] = "unknown"
-                patch.pop("portal_morphology", None)
-                patch.pop("portal_aperture_evidence", None)
+            targeted_request_object_id = str(
+                targeted_refresh.get("object_id") or ""
+            ).strip()
+            if targeted_request_object_id:
+                patch["m1_detection_object_id"] = object_id
+                patch["object_id"] = targeted_request_object_id
+            if container_refresh:
+                # Keep the planner hypothesis for diagnostics, but never
+                # overwrite M1's visual class decision.
+                patch["m1_expected_node_type"] = "container"
             refresh_interval_s = self._attribute_refresh_interval(detection, patch)
             with self.lock:
                 if episode_id and episode_id != self.current_episode_id:
@@ -2235,7 +2292,11 @@ class InteractionAttributeInferenceNode:
                     return
             patch.update(
                 {
-                    "object_id": object_id,
+                    # A targeted refresh may reacquire the same refrigerator
+                    # with a new detector track after the robot arrives. Keep
+                    # the original request ID for executor correlation while
+                    # retaining the fresh detection ID separately.
+                    "object_id": targeted_request_object_id or object_id,
                     "episode_id": episode_id,
                     "stamp_sec": stamp,
                     "observation_stamp_sec": stamp,
@@ -2252,6 +2313,7 @@ class InteractionAttributeInferenceNode:
                     ),
                     "m1_evidence_image_count": len(image_data_sequence),
                     "target_bbox_containment": dict(target_bbox_containment or {}),
+                    "m1_detector_class_hypothesis": semantic_label,
                     "request_sequence": request_sequence,
                     "attribute_status": "ready",
                     "queue_lag_sec": queue_lag_sec,

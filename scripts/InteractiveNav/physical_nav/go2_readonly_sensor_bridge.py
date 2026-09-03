@@ -24,7 +24,7 @@ from typing import Any
 
 import websocket
 
-from physical_protocol import hello_packet, image_packet, telemetry_packet
+from physical_protocol import encode_wire_packet, hello_packet, image_packet, telemetry_packet
 
 
 class ReadOnlyState:
@@ -212,10 +212,22 @@ class D435iSource:
         self.pipeline.stop()
 
 
-def _encode(rgb: Any, depth: Any) -> tuple[bytes, bytes]:
+def _encode(
+    rgb: Any,
+    depth: Any,
+    *,
+    depth_png_compression: int = 4,
+) -> tuple[bytes, bytes]:
     import cv2
     ok_rgb, rgb_buf = cv2.imencode(".jpg", rgb, [cv2.IMWRITE_JPEG_QUALITY, 82])
-    ok_depth, depth_buf = cv2.imencode(".png", depth)
+    # OpenCV's implicit PNG settings produce unusually large 16-bit D435
+    # depth frames.  An explicit moderate compression level is still exactly
+    # lossless, but nearly halves the bytes sent through the Go2 Wi-Fi link.
+    ok_depth, depth_buf = cv2.imencode(
+        ".png",
+        depth,
+        [cv2.IMWRITE_PNG_COMPRESSION, int(depth_png_compression)],
+    )
     if not ok_rgb or not ok_depth:
         raise RuntimeError("failed to encode D435i frame")
     return bytes(rgb_buf), bytes(depth_buf)
@@ -238,42 +250,118 @@ async def publish(args: argparse.Namespace) -> None:
     source = None if args.dry_run else D435iSource(
         args.width, args.height, args.fps, enable_motion=args.enable_camera_imu
     )
-    seq = 0
-    telemetry_seq = 0
-    while True:
-        try:
-            ws = websocket.create_connection(args.url, timeout=args.connect_timeout, enable_multithread=True)
-            ws.send(json.dumps(hello_packet(host=socket.gethostname(), streams={"camera": "d435i", "fps": args.fps})))
-            last_telemetry = 0.0
-            print(f"connected to policy WebSocket {args.url}", flush=True)
-            while True:
-                # The policy gateway acknowledges packets. Drain those small
-                # messages so a long-running sensor stream cannot fill the TCP
-                # receive window; no command is ever read or acted upon here.
-                try:
-                    # Keep sends blocking so a transiently full TCP buffer is
-                    # retried by the socket instead of surfacing EAGAIN from
-                    # a non-blocking websocket-client socket.  A tiny receive
-                    # timeout is sufficient to drain any queued ACKs.
-                    ws.settimeout(0.001)
-                    while ws.recv():
-                        pass
-                except (websocket.WebSocketTimeoutException, websocket.WebSocketConnectionClosedException, OSError):
-                    pass
-                finally:
-                    ws.settimeout(args.connect_timeout)
-                started = time.monotonic()
+    # D435 capture must never wait for TCP/WebSocket writes.  When networking
+    # slows down, keep draining the hardware stream and overwrite the pending
+    # encoded frame.  The policy host only needs the newest observation.
+    frame_lock = threading.Lock()
+    frame_ready = threading.Event()
+    latest_frame: dict[str, Any] = {}
+
+    def capture_loop() -> None:
+        seq = 0
+        while True:
+            started = time.monotonic()
+            try:
                 if source is None:
                     rgb, depth, sync_ms, intr = _synthetic_frame(args.width, args.height)
                 else:
                     rgb, depth, sync_ms = source.read()
                     intr = source.intrinsics
-                rgb_jpeg, depth_png = _encode(rgb, depth)
+                capture_stamp = time.time()
+                rgb_jpeg, depth_png = _encode(
+                    rgb,
+                    depth,
+                    depth_png_compression=args.depth_png_compression,
+                )
                 seq += 1
-                ws.send(json.dumps(image_packet(seq=seq, stamp=time.time(), rgb_jpeg=rgb_jpeg, depth_png=depth_png,
-                                                 width=rgb.shape[1], height=rgb.shape[0], camera_frame=args.camera_frame,
-                                                 depth_scale=(args.depth_scale if source is None else source.depth_scale),
-                                                 intrinsics=intr, color_depth_sync_ms=sync_ms), separators=(",", ":")))
+                frame = {
+                    "seq": seq,
+                    "stamp": capture_stamp,
+                    "rgb_jpeg": rgb_jpeg,
+                    "depth_png": depth_png,
+                    "width": int(rgb.shape[1]),
+                    "height": int(rgb.shape[0]),
+                    "intrinsics": intr,
+                    "sync_ms": sync_ms,
+                    "depth_scale": args.depth_scale if source is None else source.depth_scale,
+                }
+                with frame_lock:
+                    latest_frame.clear()
+                    latest_frame.update(frame)
+                    frame_ready.set()
+            except Exception as exc:
+                print(f"camera capture warning: {exc}", flush=True)
+                time.sleep(0.1)
+            if source is None:
+                time.sleep(max(0.0, 1.0 / args.fps - (time.monotonic() - started)))
+
+    threading.Thread(target=capture_loop, daemon=True).start()
+    telemetry_seq = 0
+    while True:
+        ws = None
+        try:
+            ws = websocket.create_connection(args.url, timeout=args.connect_timeout, enable_multithread=True)
+            # A short connect timeout is useful, but applying the same timeout
+            # to a large RGB-D send creates a reconnect storm on brief Wi-Fi
+            # congestion.  Capture remains independent and latest-only while
+            # this send waits, so allowing the TCP channel to drain is safe.
+            ws.settimeout(args.send_timeout)
+            raw_socket = getattr(ws.sock, "sock", ws.sock)
+            try:
+                raw_socket.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_SNDBUF,
+                    int(args.send_buffer_kb) * 1024,
+                )
+                # Wake senders as soon as a small amount can leave the kernel
+                # instead of accumulating several stale RGB-D frames.
+                if hasattr(socket, "TCP_NOTSENT_LOWAT"):
+                    raw_socket.setsockopt(
+                        socket.IPPROTO_TCP,
+                        socket.TCP_NOTSENT_LOWAT,
+                        min(32 * 1024, int(args.send_buffer_kb) * 1024),
+                    )
+            except OSError as exc:
+                print(f"sensor socket tuning warning: {exc}", flush=True)
+            ws.send(json.dumps(hello_packet(host=socket.gethostname(), streams={"camera": "d435i", "fps": args.fps})))
+            last_telemetry = 0.0
+            last_sent_seq = -1
+            next_publish = time.monotonic()
+            diagnostic_started = time.monotonic()
+            diagnostic_sends = 0
+            diagnostic_send_s = 0.0
+            diagnostic_max_send_s = 0.0
+            diagnostic_bytes = 0
+            print(f"connected to policy WebSocket {args.url}", flush=True)
+            while True:
+                now = time.monotonic()
+                if now < next_publish:
+                    await asyncio.sleep(min(0.01, next_publish - now))
+                    continue
+                if not frame_ready.wait(timeout=0.02):
+                    await asyncio.sleep(0)
+                    continue
+                with frame_lock:
+                    frame = dict(latest_frame)
+                if not frame or int(frame.get("seq", -1)) == last_sent_seq:
+                    await asyncio.sleep(0.002)
+                    continue
+                packet = image_packet(
+                    seq=int(frame["seq"]), stamp=float(frame["stamp"]),
+                    rgb_jpeg=frame["rgb_jpeg"], depth_png=frame["depth_png"],
+                    width=int(frame["width"]), height=int(frame["height"]),
+                    camera_frame=args.camera_frame, depth_scale=float(frame["depth_scale"]),
+                    intrinsics=frame["intrinsics"], color_depth_sync_ms=frame["sync_ms"],
+                )
+                payload = encode_wire_packet(packet, compression_level=1)
+                send_started = time.monotonic()
+                ws.send_binary(payload)
+                send_s = time.monotonic() - send_started
+                diagnostic_sends += 1
+                diagnostic_send_s += send_s
+                diagnostic_max_send_s = max(diagnostic_max_send_s, send_s)
+                diagnostic_bytes += len(payload)
+                last_sent_seq = int(frame["seq"])
                 now = time.monotonic()
                 if now - last_telemetry >= args.telemetry_period:
                     telemetry_seq += 1
@@ -282,11 +370,32 @@ async def publish(args: argparse.Namespace) -> None:
                         telemetry["camera_imu"] = dict(source.latest_motion)
                     ws.send(json.dumps(telemetry_packet(seq=telemetry_seq, telemetry=telemetry), separators=(",", ":")))
                     last_telemetry = now
-                elapsed = time.monotonic() - started
-                await asyncio.sleep(max(0.0, 1.0 / args.fps - elapsed))
+                if now - diagnostic_started >= 10.0:
+                    wall = max(now - diagnostic_started, 1e-6)
+                    print(
+                        "sensor transport "
+                        f"send_hz={diagnostic_sends / wall:.2f} "
+                        f"avg_send_ms={1000.0 * diagnostic_send_s / max(diagnostic_sends, 1):.1f} "
+                        f"max_send_ms={1000.0 * diagnostic_max_send_s:.1f} "
+                        f"wire_mbps={diagnostic_bytes * 8.0 / wall / 1e6:.2f} "
+                        f"capture_seq={frame['seq']}",
+                        flush=True,
+                    )
+                    diagnostic_started = now
+                    diagnostic_sends = 0
+                    diagnostic_send_s = 0.0
+                    diagnostic_max_send_s = 0.0
+                    diagnostic_bytes = 0
+                next_publish = now + 1.0 / args.publish_fps
         except Exception as exc:
             print(f"sensor link disconnected: {exc}; retrying in {args.reconnect_s}s", flush=True)
             await asyncio.sleep(args.reconnect_s)
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
 
 
 def main() -> None:
@@ -296,8 +405,12 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument("--publish-fps", type=float, default=10.0)
+    parser.add_argument("--depth-png-compression", type=int, default=4)
     parser.add_argument("--telemetry-period", type=float, default=0.2)
     parser.add_argument("--connect-timeout", type=float, default=5.0)
+    parser.add_argument("--send-timeout", type=float, default=3.0)
+    parser.add_argument("--send-buffer-kb", type=int, default=128)
     parser.add_argument("--reconnect-s", type=float, default=2.0)
     parser.add_argument("--camera-frame", default="d435i_color_optical_frame")
     parser.add_argument("--depth-scale", type=float, default=0.001)
@@ -308,6 +421,14 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.publish_fps <= 0:
+        parser.error("--publish-fps must be positive")
+    if not 0 <= args.depth_png_compression <= 9:
+        parser.error("--depth-png-compression must be in [0, 9]")
+    if args.send_timeout <= 0:
+        parser.error("--send-timeout must be positive")
+    if args.send_buffer_kb < 32:
+        parser.error("--send-buffer-kb must be at least 32")
     try:
         asyncio.run(publish(args))
     except KeyboardInterrupt:

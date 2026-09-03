@@ -25,6 +25,7 @@ class ConsistencyNode:
         self._camera_rpy = (args.camera_roll, args.camera_pitch, args.camera_yaw)
         self._camera_frame = args.camera_frame
         self._world_frame = args.world_frame
+        self._evaluation_rate_hz = max(0.1, float(args.evaluation_rate_hz))
         self._tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
         self._pub = rospy.Publisher("/physical_nav/consistency", String, queue_size=1)
@@ -32,7 +33,9 @@ class ConsistencyNode:
         rospy.Subscriber("/physical_nav/unified_graph", String, self._graph_cb, queue_size=1)
         rospy.Subscriber("/physical_nav/camera_info", CameraInfo, self._camera_info_cb, queue_size=1)
         rospy.Subscriber("/physical_nav/odom", Odometry, self._odom_cb, queue_size=1)
-        self._timer = rospy.Timer(rospy.Duration(0.2), self._publish)
+        self._timer = rospy.Timer(
+            rospy.Duration(1.0 / self._evaluation_rate_hz), self._publish
+        )
 
     def _detections_cb(self, msg: Any) -> None:
         try:
@@ -109,10 +112,11 @@ def main() -> None:
         "world_frame": str(rospy.get_param("~world_frame", "tf_frame_map")),
         "camera_x": float(rospy.get_param("~camera_x", 0.03)),
         "camera_y": float(rospy.get_param("~camera_y", 0.0)),
-        "camera_z": float(rospy.get_param("~camera_z", 0.75)),
+        "camera_z": float(rospy.get_param("~camera_z", 0.62)),
         "camera_roll": float(rospy.get_param("~camera_roll", 0.0)),
         "camera_pitch": float(rospy.get_param("~camera_pitch", 0.0)),
         "camera_yaw": float(rospy.get_param("~camera_yaw", 0.0)),
+        "evaluation_rate_hz": float(rospy.get_param("~evaluation_rate_hz", 1.0)),
     })()
     ConsistencyNode(args); rospy.spin()
 

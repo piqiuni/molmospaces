@@ -3463,6 +3463,35 @@ def test_rear_prerotate_refuses_blind_command_without_fresh_costmap(
     )
 
 
+def test_rear_cmd_vel_lease_does_not_cancel_terminal_action_client(
+    executor_module,
+) -> None:
+    class TerminalMoveBase:
+        cancel_count = 0
+
+        @staticmethod
+        def get_state() -> int:
+            return 3  # SUCCEEDED
+
+        def cancel_goal(self) -> None:
+            self.cancel_count += 1
+
+        @staticmethod
+        def wait_for_result(_duration) -> None:
+            raise AssertionError("terminal action client must not be cancelled")
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor._executor_cmd_vel_lease_mode = ""
+    executor._rear_dwa_monitor = None
+    executor.rear_goal_prerotate_step_sync_enabled = True
+    executor.rear_goal_cmd_vel_cancel_wait_s = 0.1
+    executor.move_base = TerminalMoveBase()
+
+    assert executor._acquire_rear_goal_cmd_vel_lease("decision-terminal")
+    assert executor.move_base.cancel_count == 0
+
+
 def test_rear_prerotate_pairs_rgb_with_the_fresh_bridge_window(
     executor_module,
 ) -> None:
@@ -3923,8 +3952,15 @@ def test_two_stage_outer_staging_turn_failure_terminalizes_after_retry_exhaustio
     assert args[2]["rear_goal_turn_retry_to_next_outer_staging"] is True
 
 
-def test_terminal_move_base_success_preserves_safe_staging_arrival_pose(
-    executor_module, monkeypatch
+@pytest.mark.parametrize(
+    ("terminal_outcome", "expected_source"),
+    [
+        ("success", "move_base_terminal"),
+        ("failure", "move_base_terminal_failure_tf"),
+    ],
+)
+def test_terminal_move_base_result_preserves_safe_staging_arrival_pose(
+    executor_module, monkeypatch, terminal_outcome, expected_source
 ) -> None:
     """A terminal action-client success must retain its valid staging sample.
 
@@ -3952,7 +3988,9 @@ def test_terminal_move_base_success_preserves_safe_staging_arrival_pose(
             return None
 
         def get_state(self) -> int:
-            return executor_module.GoalStatus.SUCCEEDED
+            if terminal_outcome == "success":
+                return executor_module.GoalStatus.SUCCEEDED
+            return executor_module.GoalStatus.ABORTED
 
         def get_goal_status_text(self) -> str:
             return "succeeded"
@@ -4026,9 +4064,7 @@ def test_terminal_move_base_success_preserves_safe_staging_arrival_pose(
     assert len(completed) == 1
     _args, kwargs = completed[0]
     assert kwargs["selected_goal"] == tuple(selected_staging_goal)
-    assert kwargs["detail"]["interaction_pose_validation_source"] == (
-        "move_base_terminal"
-    )
+    assert kwargs["detail"]["interaction_pose_validation_source"] == expected_source
     assert kwargs["detail"]["interaction_arrival_step_index"] == 73
     assert kwargs["detail"]["interaction_pose_validation"]["valid"] is True
     assert kwargs["detail"]["goal_distance_m"] == pytest.approx(0.0)

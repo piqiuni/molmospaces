@@ -140,6 +140,29 @@ def _public_portal_aperture_evidence(patch):
     return {"open_aperture": aperture, "confidence": confidence}
 
 
+def _m1_observed_object_name(patch):
+    """Return M1's concrete visual name, ignoring empty/generic answers."""
+
+    raw = str(
+        patch.get("observed_object_name")
+        or patch.get("m1_object_name")
+        or patch.get("object_name")
+        or ""
+    ).strip()
+    normalized = normalize_label(raw)
+    if not normalized or normalized in {
+        "object",
+        "thing",
+        "item",
+        "unknown",
+        "none",
+        "container",
+        "portal",
+    }:
+        return ""
+    return normalized[:64]
+
+
 def _container_m1_hysteresis(
     node,
     interaction_class,
@@ -591,7 +614,7 @@ class InteractionGraphStore:
             self.source_mode = str(source_mode)
         if capture_step is not None:
             self.capture_step = int(capture_step)
-        if self.source_mode == "realtime_gt_observation":
+        if self.source_mode in {"realtime_gt_observation", "detector_online"}:
             for node in self.nodes.values():
                 if node.type not in {"scene", "room"}:
                     node.attributes["_was_visible_previous_update"] = bool(
@@ -1080,6 +1103,22 @@ class InteractionGraphStore:
         interaction_class = normalize_label(patch.get("interaction_class"))
         patch_source = str(patch.get("source") or "mllm_attribute_inference")
         is_visual_mllm_patch = "mllm" in patch_source.casefold()
+        m1_observed_name = _m1_observed_object_name(patch)
+        # M1 is the visual authority for both the concrete name and the
+        # interaction class.  A sufficiently confident M1 answer may correct
+        # a YOLO-established container/portal type; lower-confidence answers
+        # retain the existing topology but are still recorded for diagnostics.
+        m1_class_override = bool(
+            is_visual_mllm_patch
+            and confidence >= 0.5
+            and interaction_class in {"portal", "container", "support", "object"}
+        )
+        m1_noninteractive_override = bool(
+            is_visual_mllm_patch
+            and confidence >= 0.5
+            and not bool(patch.get("interactable", False))
+            and interaction_class in {"none", "unknown"}
+        )
         requested_patch_state = str(
             patch.get("coarse_state") or "unknown"
         ).strip().casefold()
@@ -1097,6 +1136,7 @@ class InteractionGraphStore:
             interaction_class == "portal"
             and observed_topology_type
             and observed_topology_type != "portal"
+            and not m1_class_override
         )
         (
             container_type_locked,
@@ -1114,6 +1154,14 @@ class InteractionGraphStore:
             interaction_class,
             is_visual_mllm_patch=is_visual_mllm_patch,
         )
+        if m1_class_override:
+            # The old hysteresis protects YOLO/source topology from a delayed
+            # one-frame M1 flip.  For physical navigation the user explicitly
+            # makes M1 authoritative, so a confident visual class is allowed
+            # to replace that hypothesis.
+            container_type_locked = False
+            container_state_rejected = False
+            portal_type_locked = False
         if (
             not has_verified_interaction_state
             and confidence >= 0.5
@@ -1123,6 +1171,26 @@ class InteractionGraphStore:
             and not portal_type_locked
         ):
             node.type = interaction_class
+        if m1_noninteractive_override and not has_verified_interaction_state:
+            # A detector may call a wall or furniture a fridge/door.  Once M1
+            # explicitly says it is not interactive, keep the node in the
+            # semantic map but remove it from the interaction-candidate pool.
+            node.type = "object"
+        if m1_observed_name and is_visual_mllm_patch and confidence >= 0.5:
+            # Keep the stable track/instance ID and source detector name, but
+            # replace the public semantic name used by candidates, graph views,
+            # and subsequent M2 prompts with M1's visual result.
+            node.label = m1_observed_name
+            node.name = m1_observed_name
+            node.attributes.update(
+                {
+                    "semantic_name": m1_observed_name,
+                    "category": m1_observed_name,
+                    "m1_observed_object_name": m1_observed_name,
+                    "m1_name_override": True,
+                    "m1_name_confidence": confidence,
+                }
+            )
         parts = list(patch.get("interaction_parts") or [])
         for deprecated_key in (
             "interaction_groups",
@@ -1137,6 +1205,12 @@ class InteractionGraphStore:
                 "attribute_model": str(patch.get("model_name") or ""),
                 "attribute_confidence": confidence,
                 "mllm_interaction_class": interaction_class,
+                "m1_observed_object_name": m1_observed_name,
+                "m1_detector_class_hypothesis": str(
+                    patch.get("m1_detector_class_hypothesis") or ""
+                ),
+                "m1_class_override": m1_class_override,
+                "m1_noninteractive_override": m1_noninteractive_override,
                 "mllm_portal_promotion_rejected": portal_promotion_rejected,
                 "evidence_frame_ids": list(patch.get("evidence_frame_ids") or []),
                 "affordances": list(patch.get("affordances") or []),
@@ -1813,6 +1887,8 @@ class InteractionGraphStore:
                     ),
                 }
             )
+            if observation.get("yaw") is not None:
+                observation_attributes["yaw"] = float(observation["yaw"])
         node.attributes.update(observation_attributes)
         # A new RGB/detection observation can make the previous M1 visual
         # judgment stale. Keep the judgment for diagnostics, but advertise it
@@ -1892,6 +1968,15 @@ class InteractionGraphStore:
                 )
                 node.attributes["interaction_reference_aabb_size"] = list(
                     observation["aabb_size"]
+                )
+            # Upgrade a legacy/reference box as soon as its first measured OBB
+            # yaw arrives, while keeping that reference stable afterward.
+            if (
+                "interaction_reference_yaw" not in node.attributes
+                and observation.get("yaw") is not None
+            ):
+                node.attributes["interaction_reference_yaw"] = float(
+                    observation["yaw"]
                 )
         if interaction_state_override:
             for key in (

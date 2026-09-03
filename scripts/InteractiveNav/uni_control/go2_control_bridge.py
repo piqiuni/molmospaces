@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import json
 import math
+import os
 import queue
 import threading
 import time
@@ -60,6 +62,12 @@ class SpeechJob:
     expires_at: float
 
 
+PRELOADED_INTERACTION_PROMPTS = (
+    "您好，请帮我把前面的门打开，谢谢。",
+    "您好，请帮我把前面的冰箱打开，谢谢。",
+)
+
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -76,6 +84,9 @@ class Go2Driver:
         interface: str,
         state_timeout_s: float,
         enable_motion: bool,
+        motion_enable_attempts: int = 5,
+        motion_enable_retry_s: float = 0.5,
+        min_locomotion_height_m: float = 0.15,
     ) -> None:
         from unitree_sdk2py.core.channel import (
             ChannelFactoryInitialize,
@@ -97,6 +108,8 @@ class Go2Driver:
         self._pose: Optional[Pose2D] = None
         self._telemetry: Optional[dict[str, Any]] = None
         self._state_event = threading.Event()
+        self._min_locomotion_height_m = max(0.0, float(min_locomotion_height_m))
+        self._last_posture_block_log_at = 0.0
         # rt/lowstate publishes at the low-level rate (~500 Hz); refresh the
         # battery cache at 5 Hz so the DDS callback stays cheap.
         self._bms_lock = threading.Lock()
@@ -202,7 +215,10 @@ class Go2Driver:
             self._client = ObstaclesAvoidClient()
             self._client.SetTimeout(3.0)
             self._client.Init()
-            self.enable_velocity_control()
+            self.enable_velocity_control(
+                attempts=motion_enable_attempts,
+                retry_delay_s=motion_enable_retry_s,
+            )
             # Never inherit a command left by an earlier bridge/process. A
             # newly started bridge must be stationary until a fresh command
             # arrives from the policy server.
@@ -225,6 +241,21 @@ class Go2Driver:
             return
         with self._motion_lock:
             moving = abs(vx) > 1e-6 or abs(vy) > 1e-6 or abs(wz) > 1e-6
+            if moving and self._min_locomotion_height_m > 0.0:
+                with self._pose_lock:
+                    telemetry = dict(self._telemetry or {})
+                position = telemetry.get("position") or []
+                height = float(position[2]) if len(position) >= 3 else 0.0
+                if height < self._min_locomotion_height_m:
+                    now = time.monotonic()
+                    if now - self._last_posture_block_log_at >= 2.0:
+                        print(
+                            "motion blocked: Go2 is not in a locomotion-ready "
+                            f"posture (body z={height:.3f} m, "
+                            f"required>={self._min_locomotion_height_m:.3f} m)"
+                        )
+                        self._last_posture_block_log_at = now
+                    return
             if moving and not self._velocity_control_enabled:
                 # StandUp can briefly leave the API lease disabled. Recover
                 # here as well as in set_posture so the first key press after
@@ -250,12 +281,39 @@ class Go2Driver:
             if code not in (None, 0):
                 print(f"motion command rejected with code {code}")
 
-    def enable_velocity_control(self) -> None:
+    def enable_velocity_control(
+        self,
+        *,
+        attempts: int = 1,
+        retry_delay_s: float = 0.0,
+    ) -> None:
         """Re-acquire API motion permission after a posture transition."""
         if self._client is None:
             raise RuntimeError(
                 "velocity control is disabled; start the bridge with --enable-motion"
             )
+        attempts = max(1, int(attempts))
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            self._last_enable_attempt = time.monotonic()
+            try:
+                self._enable_velocity_control_once()
+                return
+            except Exception as exc:
+                self._velocity_control_enabled = False
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                print(
+                    "motion control enable attempt "
+                    f"{attempt}/{attempts} failed: {exc}; retrying"
+                )
+                time.sleep(max(0.0, retry_delay_s))
+        raise RuntimeError(
+            f"motion control enable failed after {attempts} attempts: {last_error}"
+        ) from last_error
+
+    def _enable_velocity_control_once(self) -> None:
         # StandUp/StandDown can reset the obstacle-avoidance service switch.
         # Move() remains locked until this switch is enabled again.
         switch_result = self._client.SwitchGet()
@@ -271,7 +329,6 @@ class Go2Driver:
                     f"ObstaclesAvoidClient.SwitchSet(True) failed with code {switch_code}"
                 )
             time.sleep(0.20)
-        self._last_enable_attempt = time.monotonic()
         code = self._client.UseRemoteCommandFromApi(True)
         if code != 0:
             self._velocity_control_enabled = False
@@ -693,12 +750,24 @@ class MotionController:
 
     def run(self) -> None:
         last_logged: Optional[Tuple[float, float, float]] = None
+        last_applied: Optional[Tuple[float, float, float]] = None
         try:
             while not self.stop_event.wait(self.args.control_period):
                 if self.snapshot()["motion_suspended"]:
                     continue
                 target = self.target(time.monotonic())
-                self.driver.move(*target)
+                moving = any(abs(value) > 1e-6 for value in target)
+                was_moving = bool(
+                    last_applied
+                    and any(abs(value) > 1e-6 for value in last_applied)
+                )
+                # Continuous non-zero motion must be refreshed. An unchanged
+                # zero only needs to be sent once; calling Move(0,0,0) at
+                # 20 Hz while Go2 is prone can repeatedly trigger firmware
+                # warning tones without adding any safety.
+                if moving or was_moving or last_applied is None:
+                    self.driver.move(*target)
+                last_applied = target
                 rounded = tuple(round(value, 3) for value in target)
                 if rounded != last_logged:
                     print(
@@ -736,6 +805,7 @@ class SpeakerWorker:
         self.backend_error = ""
         self.last_synthesis_backend: Optional[str] = None
         self.matcha_synthesizer: Any = None
+        self.persistent_speaker: Any = None
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def start(self) -> None:
@@ -840,15 +910,34 @@ class SpeakerWorker:
                 "fallback_from",
                 "fallback_reason",
                 "total_synthesis_seconds",
+                "audio_cache_hit",
+                "preloaded",
+                "connection_reused",
+                "audio_duration_seconds",
             ):
                 if key in result:
                     payload[key] = result[key]
         self.event_callback(payload)
 
-    def _speak(self, command: SpeechCommand) -> dict[str, object]:
+    def _speak(
+        self,
+        command: SpeechCommand,
+        event_loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> dict[str, object]:
         if self.args.speaker_backend == "simulated":
             time.sleep(0.02)
             return {"synthesis_backend": "simulated"}
+        if self.persistent_speaker is not None and event_loop is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                self.persistent_speaker.speak(
+                    command.text,
+                    voice=command.voice,
+                    volume=command.volume,
+                    retain=command.text in PRELOADED_INTERACTION_PROMPTS,
+                ),
+                event_loop,
+            )
+            return future.result(timeout=max(30.0, command.ttl_ms / 1000.0))
         from go2_voice_intercom import speak_text_once
 
         result = asyncio.run(
@@ -872,45 +961,108 @@ class SpeakerWorker:
         return result
 
     def run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                job = self.jobs.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            command = job.command
-            started_at = time.monotonic()
-            if started_at >= job.expires_at:
-                self._send_final_status(command, "expired", detail="speech_ttl_expired")
-                self.jobs.task_done()
-                continue
-            self._set_state("speaking", command.seq)
-            print(f"speech seq={command.seq} started ({len(command.text)} chars)")
-            try:
-                result = self._speak(command)
-            except Exception as exc:
-                elapsed = time.monotonic() - started_at
-                print(f"speech seq={command.seq} failed: {exc}")
-                self._send_final_status(
-                    command,
-                    "failed",
-                    detail=str(exc),
-                    elapsed_s=elapsed,
+        event_loop: Optional[asyncio.AbstractEventLoop] = None
+        event_loop_thread: Optional[threading.Thread] = None
+        try:
+            if self.args.speaker_backend == "go2":
+                from go2_voice_intercom import PersistentSpeechSession
+
+                event_loop = asyncio.new_event_loop()
+                def run_event_loop() -> None:
+                    assert event_loop is not None
+                    asyncio.set_event_loop(event_loop)
+                    event_loop.run_forever()
+
+                event_loop_thread = threading.Thread(
+                    target=run_event_loop,
+                    name="go2-audiohub-event-loop",
+                    daemon=True,
                 )
-            else:
-                elapsed = time.monotonic() - started_at
-                print(
-                    f"speech seq={command.seq} completed in {elapsed:.2f}s "
-                    f"via {result.get('synthesis_backend', 'unknown')}"
+                event_loop_thread.start()
+                self.persistent_speaker = PersistentSpeechSession(
+                    robot_ip=self.args.robot_controller_ip,
+                    synthesis_backend=self.active_synthesis_backend,
+                    fallback_backend=(
+                        self.fallback_backend
+                        if self.active_synthesis_backend == "matcha"
+                        else "disabled"
+                    ),
+                    matcha_synthesizer=self.matcha_synthesizer,
                 )
-                self._send_final_status(
-                    command,
-                    "completed",
-                    elapsed_s=elapsed,
-                    result=result,
-                )
-            finally:
-                self._set_state("idle", None)
-                self.jobs.task_done()
+                self._set_state("preloading", None)
+                try:
+                    preload = asyncio.run_coroutine_threadsafe(
+                        self.persistent_speaker.preload(
+                            list(PRELOADED_INTERACTION_PROMPTS),
+                            voice="zh-CN-XiaoxiaoNeural",
+                        ),
+                        event_loop,
+                    ).result(timeout=120.0)
+                    print(
+                        "speech AudioHub persistent connection ready; "
+                        f"preloaded={len(preload)} cache_hits="
+                        f"{sum(bool(item.get('audio_cache_hit')) for item in preload)}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    # Keep the worker alive: the first real request retries the
+                    # connection and can still synthesize/upload on demand.
+                    print(f"speech preload failed; will retry on demand: {exc}", flush=True)
+                finally:
+                    self._set_state("idle", None)
+
+            while not self.stop_event.is_set():
+                try:
+                    job = self.jobs.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                command = job.command
+                started_at = time.monotonic()
+                if started_at >= job.expires_at:
+                    self._send_final_status(command, "expired", detail="speech_ttl_expired")
+                    self.jobs.task_done()
+                    continue
+                self._set_state("speaking", command.seq)
+                print(f"speech seq={command.seq} started ({len(command.text)} chars)")
+                try:
+                    result = self._speak(command, event_loop)
+                except Exception as exc:
+                    elapsed = time.monotonic() - started_at
+                    print(f"speech seq={command.seq} failed: {exc}")
+                    self._send_final_status(
+                        command,
+                        "failed",
+                        detail=str(exc),
+                        elapsed_s=elapsed,
+                    )
+                else:
+                    elapsed = time.monotonic() - started_at
+                    print(
+                        f"speech seq={command.seq} completed in {elapsed:.2f}s "
+                        f"via {result.get('synthesis_backend', 'cached')} "
+                        f"cache_hit={bool(result.get('audio_cache_hit'))}"
+                    )
+                    self._send_final_status(
+                        command,
+                        "completed",
+                        elapsed_s=elapsed,
+                        result=result,
+                    )
+                finally:
+                    self._set_state("idle", None)
+                    self.jobs.task_done()
+        finally:
+            if self.persistent_speaker is not None and event_loop is not None:
+                with contextlib.suppress(Exception):
+                    asyncio.run_coroutine_threadsafe(
+                        self.persistent_speaker.close(), event_loop
+                    ).result(timeout=5.0)
+            if event_loop is not None:
+                event_loop.call_soon_threadsafe(event_loop.stop)
+            if event_loop_thread is not None:
+                event_loop_thread.join(timeout=2.0)
+            if event_loop is not None and not event_loop.is_running():
+                event_loop.close()
 
     def close(self) -> None:
         self.stop_event.set()
@@ -922,7 +1074,14 @@ class UnifiedBridge:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.driver = (
-            Go2Driver(args.interface, args.state_timeout, args.enable_motion)
+            Go2Driver(
+                args.interface,
+                args.state_timeout,
+                args.enable_motion,
+                args.motion_enable_attempts,
+                args.motion_enable_retry_s,
+                args.min_locomotion_height_m,
+            )
             if args.state_source == "go2"
             else DryRunDriver()
         )
@@ -1158,6 +1317,22 @@ def parse_args() -> argparse.Namespace:
         help="assumed LiDAR state; with unknown, the first toggle sends OFF",
     )
     parser.add_argument("--state-timeout", type=float, default=5.0)
+    parser.add_argument("--motion-enable-attempts", type=int, default=5)
+    parser.add_argument("--motion-enable-retry-s", type=float, default=0.5)
+    parser.add_argument(
+        "--min-locomotion-height-m",
+        type=float,
+        default=0.15,
+        help=(
+            "reject non-zero velocity while reported body position z is below "
+            "this threshold; use 0 to disable"
+        ),
+    )
+    parser.add_argument(
+        "--ready-file",
+        default="",
+        help="write this PID file only after hardware and motion initialization succeeds",
+    )
     parser.add_argument("--max-state-age", type=float, default=0.5)
     parser.add_argument("--control-period", type=float, default=0.05)
     parser.add_argument("--telemetry-period", type=float, default=0.20)
@@ -1264,6 +1439,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--telemetry-period must be at least 0.05 seconds")
     if args.enable_motion and args.state_source != "go2":
         parser.error("--enable-motion requires --state-source go2")
+    if args.motion_enable_attempts <= 0 or args.motion_enable_retry_s < 0:
+        parser.error("motion enable retries require attempts > 0 and delay >= 0")
     if not 1 <= args.speaker_queue_size <= 20:
         parser.error("--speaker-queue-size must be between 1 and 20")
     if not 1 <= args.tts_threads <= 8:
@@ -1278,13 +1455,27 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     bridge: Optional[UnifiedBridge] = None
+    ready_path = Path(args.ready_file).expanduser() if args.ready_file else None
+    ready_pid = str(os.getpid())
     try:
         bridge = UnifiedBridge(args)
+        if ready_path is not None:
+            ready_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = ready_path.with_name(f".{ready_path.name}.{ready_pid}.tmp")
+            temporary.write_text(ready_pid + "\n", encoding="utf-8")
+            temporary.replace(ready_path)
         bridge.run()
     except KeyboardInterrupt:
         print("Interrupted; stopping Go2 bridge")
         if bridge is not None:
             bridge.controller.stop_event.set()
+    finally:
+        if ready_path is not None:
+            try:
+                if ready_path.read_text(encoding="utf-8").strip() == ready_pid:
+                    ready_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 if __name__ == "__main__":

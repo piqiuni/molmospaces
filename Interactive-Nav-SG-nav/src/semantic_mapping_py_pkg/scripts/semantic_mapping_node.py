@@ -86,6 +86,9 @@ class SemanticMappingNode:
         self.door_clear_mask_topic = topics.get("door_clear_mask", "/semantic_mapping/door_clear_mask")
 
         self.object_map_topic = topics.get("object_map", "/semantic_mapping/obj_map")
+        self.tracked_detections_topic = topics.get(
+            "tracked_detections", "/semantic_mapping/tracked_detections"
+        )
         self.object_markers_topic = topics.get("object_markers", "/semantic_mapping/object_semantic_map_markers")
         self.scene_id_grid_topic = topics.get("scene_id_grid", "/semantic_mapping/scene_id_grid")
         self.scene_confidence_grid_topic = topics.get("scene_confidence_grid", "/semantic_mapping/scene_confidence_grid")
@@ -210,6 +213,23 @@ class SemanticMappingNode:
             stable_history_size=config.get("object_stable_history_size", 5),
             duplicate_bbox_iou_threshold=config.get("object_duplicate_bbox_iou_threshold", 0.0),
             duplicate_3d_overlap_threshold=config.get("object_duplicate_3d_overlap_threshold", 0.15),
+            class_min_confirmations=config.get("object_class_min_confirmations", {}),
+            class_min_top_height_m=config.get("object_class_min_top_height_m", {}),
+            portal_cross_view_match_enabled=config.get(
+                "object_portal_cross_view_match_enabled", False
+            ),
+            portal_cross_view_normal_distance_m=config.get(
+                "object_portal_cross_view_normal_distance_m", 0.45
+            ),
+            portal_cross_view_yaw_tolerance_rad=config.get(
+                "object_portal_cross_view_yaw_tolerance_rad", 0.35
+            ),
+            portal_cross_view_min_tangent_overlap_ratio=config.get(
+                "object_portal_cross_view_min_tangent_overlap_ratio", 0.20
+            ),
+            portal_cross_view_min_vertical_overlap_ratio=config.get(
+                "object_portal_cross_view_min_vertical_overlap_ratio", 0.35
+            ),
         )
         self.scene_store = SceneGridStore(
             unknown_id=scene_types.get("unknown_id", -1),
@@ -386,6 +406,9 @@ class SemanticMappingNode:
 
         self.step_ready_pub = rospy.Publisher("/semantic_decision/ready/semantic_mapping", String, queue_size=32)
         self.object_pub = rospy.Publisher(self.object_map_topic, String, queue_size=1)
+        self.tracked_detections_pub = rospy.Publisher(
+            self.tracked_detections_topic, String, queue_size=1
+        )
         self.marker_pub = rospy.Publisher(self.object_markers_topic, MarkerArray, queue_size=1)
         self.scene_id_pub = rospy.Publisher(self.scene_id_grid_topic, OccupancyGrid, queue_size=1, latch=True)
         self.scene_conf_pub = rospy.Publisher(self.scene_confidence_grid_topic, OccupancyGrid, queue_size=1, latch=True)
@@ -878,7 +901,7 @@ class SemanticMappingNode:
                 cache_store_ms = (time.perf_counter() - cache_store_t0) * 1000.0
 
         crop_t0 = time.perf_counter()
-        room_grid = self._build_cropped_room_segment_grid(room_ids, raw=raw)
+        room_grid = self._build_room_segment_grid(room_ids, raw=raw)
         crop_ms = (time.perf_counter() - crop_t0) * 1000.0
 
         commit_t0 = time.perf_counter()
@@ -1217,6 +1240,20 @@ class SemanticMappingNode:
             tracked_detections = self.object_store.as_tracked_detections(
                 min_observations=self.graph_min_observations,
                 confirmed_only=False,
+                currently_observed_only=True,
+            )
+            self.tracked_detections_pub.publish(
+                String(
+                    data=dumps_compact(
+                        {
+                            "stamp_sec": stamp,
+                            "capture_step": parsed.get(
+                                "capture_step", parsed.get("seq")
+                            ),
+                            "detections": tracked_detections,
+                        }
+                    )
+                )
             )
             observations = [
                 observation_from_detection(det, observation_id=f"det_{index:04d}")
@@ -1850,7 +1887,7 @@ class SemanticMappingNode:
             force_stable=force_stable,
         )
         room_merges = self.room_segmenter.consume_confirmed_merges()
-        self.latest_room_segment_grid = self._build_cropped_room_segment_grid(room_ids)
+        self.latest_room_segment_grid = self._build_room_segment_grid(room_ids)
         self.graph_store.update_room_grid(
             self.latest_occupancy_grid.info,
             room_ids,
@@ -2409,7 +2446,7 @@ class SemanticMappingNode:
         grid.data = [int(value) for value in data]
         return grid
 
-    def _build_cropped_room_segment_grid(self, room_ids, *, raw=None):
+    def _build_room_segment_grid(self, room_ids, *, raw=None):
         if raw is None:
             raw = self.latest_occupancy_grid
         width = int(raw.info.width)
@@ -2417,22 +2454,14 @@ class SemanticMappingNode:
         values = np.asarray(room_ids, dtype=np.int32)
         if values.size != width * height:
             raise ValueError("room grid size does not match occupancy geometry")
-        valid_indices = np.flatnonzero(values >= 0)
-
-        if valid_indices.size:
-            rows = valid_indices // width
-            cols = valid_indices % width
-            row_min = int(rows.min())
-            row_max = int(rows.max()) + 1
-            col_min = int(cols.min())
-            col_max = int(cols.max()) + 1
-        else:
-            row_min = 0
-            row_max = 1
-            col_min = 0
-            col_max = 1
-
-        cropped = values.reshape(height, width)[row_min:row_max, col_min:col_max]
+        # Publish the room raster in exactly the raw occupancy geometry.  The
+        # previous valid-ID crop made the room overlay look like a small dark
+        # island and shifted it relative to OCC.  Cells outside discovered
+        # free space remain -1 (unknown); they are intentionally not assigned
+        # a fabricated room identity.
+        row_min, row_max = 0, height
+        col_min, col_max = 0, width
+        cropped = values.reshape(height, width)
 
         grid = OccupancyGrid()
         grid.header.seq = raw.header.seq

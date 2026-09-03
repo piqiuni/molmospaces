@@ -659,8 +659,12 @@ def _traversal_goal_from_approach(
     approach_xyyaw: Iterable[float],
     portal_center: Iterable[float],
     traversal_distance_m: float,
+    *,
+    clearance_center_xy: Iterable[float] | None = None,
+    clearance_size_xy: Iterable[float] | None = None,
+    clearance_margin_m: float = 0.0,
 ) -> list[float] | None:
-    """Project a far-side portal goal from an approach pose and current center."""
+    """Project a far-side goal beyond the portal's complete clearance AABB."""
 
     approach = list(approach_xyyaw or [])
     center = list(portal_center or [])
@@ -671,6 +675,24 @@ def _traversal_goal_from_approach(
         return None
     unit_x, unit_y = axis
     traversal_distance = max(0.0, float(traversal_distance_m))
+    clearance_center = _xy(clearance_center_xy)
+    clearance_size = _xy(clearance_size_xy)
+    if clearance_center is not None and clearance_size is not None:
+        # Support of an axis-aligned box along the through-door axis.  The
+        # clearance box may be offset from the interaction reference center,
+        # so include that projected offset before adding the far-side extent.
+        center_offset_x = clearance_center[0] - float(center[0])
+        center_offset_y = clearance_center[1] - float(center[1])
+        far_boundary_distance = (
+            center_offset_x * unit_x
+            + center_offset_y * unit_y
+            + 0.5 * abs(clearance_size[0]) * abs(unit_x)
+            + 0.5 * abs(clearance_size[1]) * abs(unit_y)
+        )
+        traversal_distance = max(
+            traversal_distance,
+            far_boundary_distance + max(0.0, float(clearance_margin_m)),
+        )
     return [
         float(center[0]) + unit_x * traversal_distance,
         float(center[1]) + unit_y * traversal_distance,
@@ -684,6 +706,7 @@ def build_post_interaction_traversal_candidate(
     *,
     robot_xy: Iterable[float] | None = None,
     traversal_distance_m: float = 0.9,
+    clearance_margin_m: float = 0.0,
 ) -> BehaviorCandidate | None:
     """Build the immediate one-shot continuation of a successful portal open."""
 
@@ -743,26 +766,30 @@ def build_post_interaction_traversal_candidate(
     source_goal_candidates = _deduplicated_xyyaw(
         metadata.get("goal_xyyaw_candidates") or []
     )
-    traversal_options = _post_open_opposite_portal_options(
+    opposite_options = _post_open_opposite_portal_options(
         approach,
         center,
         clearance_center,
         clearance_size,
         source_goal_candidates,
     )
-    if traversal_options:
-        goal = traversal_options[0]
-        goal_source = "opposite_interaction_approach_candidates"
-    else:
-        goal = _traversal_goal_from_approach(
-            approach,
-            center,
-            traversal_distance,
-        )
-        if goal is None:
-            return None
-        traversal_options = [goal]
-        goal_source = "legacy_axis_projection"
+    axis_goal = _traversal_goal_from_approach(
+        approach,
+        center,
+        traversal_distance,
+        clearance_center_xy=clearance_center,
+        clearance_size_xy=clearance_size,
+        clearance_margin_m=clearance_margin_m,
+    )
+    if axis_goal is None:
+        return None
+    # Enter just beyond the door on its centerline first. The previous primary
+    # target was another full interaction stand-off beyond the door and could
+    # lie outside the newly observed free corridor. Keep those deeper poses as
+    # preflighted fallbacks rather than discarding them.
+    traversal_options = _deduplicated_xyyaw([axis_goal, *opposite_options])
+    goal = traversal_options[0]
+    goal_source = "centerline_axis_projection_with_opposite_fallbacks"
     robot = list(robot_xy or [])
     distance_m = (
         math.hypot(goal[0] - float(robot[0]), goal[1] - float(robot[1]))
@@ -844,6 +871,9 @@ def build_post_interaction_traversal_candidate(
                 else []
             ),
             "post_interaction_traversal_distance_m": traversal_distance,
+            "post_interaction_traversal_clearance_margin_m": max(
+                0.0, float(clearance_margin_m)
+            ),
         },
     )
 
@@ -853,6 +883,7 @@ def reproject_post_interaction_traversal_candidate(
     candidate_snapshot: dict[str, Any],
     *,
     traversal_distance_m: float | None = None,
+    clearance_margin_m: float | None = None,
 ) -> dict[str, Any] | None:
     """Replace a cached traversal's frozen far-side goal with fresh geometry.
 
@@ -909,6 +940,13 @@ def reproject_post_interaction_traversal_candidate(
         if traversal_distance_m is not None
         else float(metadata.get("post_interaction_traversal_distance_m", 0.9))
     )
+    clearance_margin = (
+        float(clearance_margin_m)
+        if clearance_margin_m is not None
+        else float(
+            metadata.get("post_interaction_traversal_clearance_margin_m", 0.0)
+        )
+    )
     source_center = (
         _xy(metadata.get("source_portal_center_xy"))
         or _xy(metadata.get("portal_aabb_center_xy"))
@@ -922,26 +960,26 @@ def reproject_post_interaction_traversal_candidate(
         source_center,
         center,
     )
-    traversal_options = _post_open_opposite_portal_options(
+    opposite_options = _post_open_opposite_portal_options(
         approach,
         center,
         clearance_center,
         clearance_size,
         translated_candidates,
     )
-    if traversal_options:
-        goal = traversal_options[0]
-        goal_source = "refreshed_opposite_interaction_approach_candidates"
-    else:
-        goal = _traversal_goal_from_approach(
-            approach,
-            center,
-            distance,
-        )
-        if goal is None:
-            return None
-        traversal_options = [goal]
-        goal_source = "refreshed_legacy_axis_projection"
+    axis_goal = _traversal_goal_from_approach(
+        approach,
+        center,
+        distance,
+        clearance_center_xy=clearance_center,
+        clearance_size_xy=clearance_size,
+        clearance_margin_m=clearance_margin,
+    )
+    if axis_goal is None:
+        return None
+    traversal_options = _deduplicated_xyyaw([axis_goal, *opposite_options])
+    goal = traversal_options[0]
+    goal_source = "refreshed_centerline_axis_projection_with_opposite_fallbacks"
 
     projected = copy.deepcopy(pending_candidate)
     projected_metadata = projected.setdefault("metadata", {})
@@ -949,6 +987,9 @@ def reproject_post_interaction_traversal_candidate(
     projected_metadata["post_interaction_traversal_goal_source"] = goal_source
     projected_metadata["post_interaction_traversal_option_count"] = len(
         traversal_options
+    )
+    projected_metadata["post_interaction_traversal_clearance_margin_m"] = max(
+        0.0, clearance_margin
     )
     projected_metadata["post_interaction_reprojected"] = True
     projected_metadata["post_interaction_reprojected_graph_revision"] = int(

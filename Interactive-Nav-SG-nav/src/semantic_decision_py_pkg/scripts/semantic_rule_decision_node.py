@@ -331,6 +331,14 @@ class SemanticRuleDecisionNode:
         self.portal_traversal_distance_m = max(
             0.0, float(candidate_config.get("portal_traversal_distance_m", 0.8))
         )
+        self.portal_traversal_clearance_margin_m = max(
+            0.0,
+            float(
+                candidate_config.get(
+                    "portal_traversal_clearance_margin_m", 0.0
+                )
+            ),
+        )
         self.post_interaction_refresh_gate = PostInteractionRefreshGate(
             PostInteractionRefreshConfig(
                 enabled=bool(
@@ -411,6 +419,9 @@ class SemanticRuleDecisionNode:
                 ),
                 pre_score_guard_margin=float(
                     model_config.get("pre_score_guard_margin", 0.75)
+                ),
+                force_unentered_room_exploration=bool(
+                    model_config.get("force_unentered_room_exploration", False)
                 ),
                 subgoal_interaction_semantic_types=tuple(
                     model_config.get("subgoal_interaction_semantic_types", [])
@@ -833,6 +844,17 @@ class SemanticRuleDecisionNode:
             and str(detail.get("reason") or "") == "preempted_by_target"
         )
         terminal_interaction_failure: dict = {}
+        temporary_skip_s = max(
+            0.0,
+            float(
+                payload.get("temporary_skip_s")
+                or detail.get("temporary_skip_s")
+                or 0.0
+            ),
+        )
+        portal_interaction = self._is_portal_interaction_candidate(
+            self.active_interaction_candidate
+        )
         successful_drawer_scan = bool(
             self.active_behavior_type == "INTERACT"
             and successful_drawer_scan_feedback(
@@ -866,7 +888,14 @@ class SemanticRuleDecisionNode:
                     candidate_id=candidate_id,
                     behavior_type=self.active_behavior_type,
                     status=status,
-                    failure_stage=str(detail.get("failure_stage") or ""),
+                    # Once the physical interaction itself has been attempted,
+                    # any failed/rejected result permanently excludes this
+                    # candidate for the remainder of the episode. Approach
+                    # precondition failures remain retryable elsewhere.
+                    failure_stage=str(
+                        detail.get("failure_stage")
+                        or "interaction_execution"
+                    ),
                 )
                 or {}
             )
@@ -928,6 +957,7 @@ class SemanticRuleDecisionNode:
             candidate_id
             and not preempted_by_target
             and not executor_transport_defer
+            and not portal_interaction
             and not approach_precondition_failed
             and not terminal_interaction_failure
         ):
@@ -954,6 +984,7 @@ class SemanticRuleDecisionNode:
             status != "SUCCEEDED"
             and not preempted_by_target
             and self.active_behavior_type == "INTERACT"
+            and not portal_interaction
             and not approach_precondition_failed
             and not terminal_interaction_failure
             and not m1_evidence_inconclusive
@@ -962,7 +993,7 @@ class SemanticRuleDecisionNode:
             target_id = self._interaction_target_id(candidate_id)
             if target_id:
                 self.cooldown_until[target_id] = time.monotonic() + max(
-                    0.0, self.interaction_target_failure_cooldown_s
+                    temporary_skip_s, self.interaction_target_failure_cooldown_s
                 )
         if terminal_interaction_failure:
             # This is candidate-local planning memory, not a target/object
@@ -996,7 +1027,16 @@ class SemanticRuleDecisionNode:
                 self.cooldown_until[target_id] = time.monotonic() + max(
                     0.0, self.container_anchor_unreachable_cooldown_s
                 )
-        if executor_transport_defer:
+        if portal_interaction and not preempted_by_target:
+            # Door poses form an ordered fallback ring.  Clear both candidate
+            # and target memories so the next pose is eligible immediately.
+            self.cooldown_until.pop(candidate_id, None)
+            target_id = self._interaction_target_id(candidate_id)
+            if target_id:
+                self.cooldown_until.pop(target_id, None)
+        if portal_interaction and status != "SUCCEEDED" and not preempted_by_target:
+            self.next_decision_time = 0.0
+        elif executor_transport_defer:
             self.next_decision_time = 0.0
         elif all_container_anchors_unreachable:
             # Skip immediately to another candidate while this target cools
@@ -1106,6 +1146,7 @@ class SemanticRuleDecisionNode:
                 payload,
                 robot_xy=self.latest_candidates_payload.get("robot_xy") or [],
                 traversal_distance_m=self.portal_traversal_distance_m,
+                clearance_margin_m=self.portal_traversal_clearance_margin_m,
             )
             if post_interaction_traversal is not None:
                 pending_payload = post_interaction_traversal.to_dict()
@@ -1242,6 +1283,19 @@ class SemanticRuleDecisionNode:
     ) -> None:
         """Expose a bounded post-open wait without pretending it is a decision."""
 
+        pending = dict(self.pending_post_interaction_traversal or {})
+        pending_view = {
+            key: pending.get(key)
+            for key in (
+                "candidate_id",
+                "behavior_type",
+                "target_id",
+                "target_name",
+                "goal_xyyaw",
+                "source",
+            )
+            if pending.get(key) not in (None, "", [])
+        }
         self.trace_pub.publish(
             String(
                 data=json.dumps(
@@ -1258,6 +1312,7 @@ class SemanticRuleDecisionNode:
                             )
                             or ""
                         ),
+                        "pending_post_interaction_traversal": pending_view,
                         "refresh": refresh_status.to_dict(),
                     },
                     ensure_ascii=False,
@@ -1282,6 +1337,9 @@ class SemanticRuleDecisionNode:
                         self.pending_post_interaction_traversal,
                         self.latest_candidates_payload,
                         traversal_distance_m=self.portal_traversal_distance_m,
+                        clearance_margin_m=(
+                            self.portal_traversal_clearance_margin_m
+                        ),
                     )
                     if refreshed_traversal is not None:
                         self.pending_post_interaction_traversal = refreshed_traversal
@@ -2704,6 +2762,25 @@ class SemanticRuleDecisionNode:
         if len(parts) >= 2 and parts[0] == "interaction" and parts[1]:
             return f"interaction_target:{parts[1]}"
         return ""
+
+    @staticmethod
+    def _is_portal_interaction_candidate(candidate: dict | None) -> bool:
+        """Identify door/portal interactions whose pose failures are retryable."""
+
+        candidate = candidate or {}
+        if str(candidate.get("behavior_type") or "").upper() != "INTERACT":
+            return False
+        metadata = candidate.get("metadata") or {}
+        interaction = candidate.get("interaction_command") or {}
+        values = (
+            metadata.get("node_type"),
+            interaction.get("node_type"),
+            interaction.get("interaction_class"),
+            metadata.get("semantic_name"),
+            candidate.get("target_name"),
+        )
+        normalized = {str(value or "").strip().casefold() for value in values}
+        return bool(normalized & {"portal", "door", "gate", "sliding_door"})
 
     def _publish_goal_status(self, status: str, detail: dict | None = None) -> None:
         payload = {

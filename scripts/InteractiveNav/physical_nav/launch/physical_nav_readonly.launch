@@ -3,29 +3,45 @@
   <arg name="config_file" default="$(find physical_nav)/config/physical_nav.yaml"/>
   <arg name="model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"/>
   <arg name="device" default="cuda:0"/>
-  <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.75"/>
+  <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.62"/>
   <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.0"/><arg name="camera_yaw" default="0.0"/>
   <arg name="ros_python" default="/usr/bin/python3"/>
+  <arg name="system_ros_python" default="/home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/physical_ros_python.sh"/>
   <arg name="start_mapping" default="true"/>
   <arg name="semantic_override_config" default="$(find physical_nav)/config/semantic_shadow_override.yaml"/>
   <arg name="move_base_override_config" default="$(find physical_nav)/config/physical_move_base_override.yaml"/>
+  <arg name="interaction_profile" default="physical_human"/>
+  <arg name="enable_m1" default="true"/>
+  <arg name="enable_interaction_policy" default="true"/>
 
   <!-- Existing nodes are reused through physical topic parameters.  No
        simulator launch or default semantic_mapping config is modified. -->
-  <node name="semantic_mapping_py" pkg="semantic_mapping_py_pkg" type="semantic_mapping_node.py" launch-prefix="$(arg ros_python)" output="screen" respawn="true">
+  <node name="semantic_mapping_py" pkg="semantic_mapping_py_pkg" type="semantic_mapping_node.py" launch-prefix="$(arg ros_python)" output="screen" respawn="false">
     <rosparam file="$(arg config_file)" command="load"/>
     <rosparam file="$(arg semantic_override_config)" command="load"/>
     <param name="semantic_map/subscribe_pointcloud" value="true" type="bool"/>
   </node>
   <!-- Module 1 was previously absent from the physical launch, so detected
        portals entered the graph but never received a visual state patch. -->
-  <node name="interaction_attribute_inference" pkg="semantic_mapping_py_pkg" type="interaction_attribute_inference_node.py" launch-prefix="$(arg ros_python)" output="screen" respawn="true">
+  <node if="$(arg enable_m1)" name="interaction_attribute_inference" pkg="semantic_mapping_py_pkg" type="interaction_attribute_inference_node.py" launch-prefix="$(arg ros_python)" output="screen" respawn="false">
     <rosparam file="$(arg config_file)" command="load"/>
     <rosparam file="$(arg semantic_override_config)" command="load"/>
     <param name="model_name" value="qwen3.6-35b-a3b-fp8"/>
     <param name="max_output_tokens" value="256"/>
     <param name="request_timeout_s" value="20.0"/>
     <param name="min_interval_s" value="2.0"/>
+    <!-- Keep M1's admission vocabulary identical to the physical interaction
+         candidate whitelist: only door and fridge objects may trigger VLM
+         attribute analysis. -->
+    <rosparam param="include_keywords">[door, fridge]</rosparam>
+    <!-- Physical M1 consumes the 3-D ObjectMap's stable tracked detections;
+         the raw mapper topic remains unchanged. Thin door masks commonly
+         occupy 5-15% of their 2-D rectangle, so use a physical-only gate. -->
+    <param name="topics/object_detections" value="/physical_nav/tracked_detections"/>
+    <param name="min_visible_fraction" value="0.04"/>
+    <param name="min_visible_pixels" value="1024"/>
+    <param name="min_bbox_area_px" value="1600"/>
+    <param name="max_distance_m" value="8.0"/>
     <param name="worker_count" value="1"/>
     <param name="max_queue_size" value="8"/>
   </node>
@@ -50,23 +66,43 @@
       <!-- Conservative D435i planar projection for the physical OCC map:
            reject floor/ceiling returns and isolated angular hits while
            retaining supported door/furniture surfaces. -->
-      <param name="maxUrange" value="5.9"/>
-      <param name="pointcloud_scan_range_max" value="6.0"/>
+      <param name="maxUrange" value="7.9"/>
+      <param name="pointcloud_scan_range_max" value="8.0"/>
       <param name="pointcloud_scan_height_min" value="0.12"/>
       <param name="pointcloud_scan_height_max" value="1.60"/>
       <param name="pointcloud_scan_min_points_per_beam" value="4"/>
       <param name="pointcloud_scan_cluster_min_points" value="8"/>
-      <param name="pointcloud_scan_min_support_neighbors" value="2"/>
+      <!-- Per-beam point/cluster checks already reject sparse depth noise.
+           Requiring additional angular neighbours discarded valid clear rays
+           beside depth discontinuities and left unknown seams in OCC. -->
+      <param name="pointcloud_scan_min_support_neighbors" value="0"/>
+      <!-- Re-enable the mapper's existing observed-ray overwrite layer for
+           the physical platform. Supported no-return rays clear cells in the
+           camera-observed range; unobserved directions remain untouched. -->
+      <param name="enable_local_overwrite" value="true"/>
+      <param name="local_overwrite_radius" value="7.9"/>
+      <param name="local_overwrite_mark_occupied" value="true"/>
+      <param name="local_overwrite_clear_confirm_count" value="1"/>
+      <param name="local_overwrite_occupy_confirm_count" value="2"/>
+      <param name="local_overwrite_ttl_sec" value="2.0"/>
+      <param name="local_overwrite_clear_static_occupied" value="true"/>
     </node>
-    <node pkg="struct_mapping_pkg" type="voronoi_mapping_node" name="voronoi_mapping" respawn="true">
+    <node pkg="struct_mapping_pkg" type="voronoi_mapping_node" name="voronoi_mapping" respawn="false">
       <rosparam command="load" file="$(find struct_mapping_pkg)/config/voronoi_params.yaml"/>
     </node>
   </group>
-  <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" launch-prefix="/usr/bin/python3" output="screen" respawn="true">
+  <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" launch-prefix="$(arg ros_python)" output="screen" respawn="false">
+    <rosparam file="$(arg config_file)" command="load"/>
     <param name="web_url" value="http://127.0.0.1:8765"/>
     <param name="world_frame" value="tf_frame_map"/>
     <param name="camera_frame" value="d435i_color_optical_frame"/>
     <param name="camera_parent" value="tf_frame_base_link"/>
+    <!-- Keep reliable obstacle endpoints within 8 m. Finite depth estimates
+         beyond that horizon retain only their bearing as a clear-only point
+         just outside obstacle_range; zero/invalid depth remains absent. -->
+    <param name="point_stride" value="4"/>
+    <param name="max_depth_m" value="8.0"/>
+    <param name="no_return_depth_m" value="8.05"/>
     <param name="occupancy_grid_topic" value="/physical_nav/occupancy"/>
     <param name="room_grid_topic" value="/physical_nav/room_segment_grid"/>
     <param name="global_costmap_topic" value="/move_base/global_costmap/costmap"/>
@@ -75,11 +111,32 @@
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
   </node>
 
-  <node name="physical_nav_consistency" pkg="physical_nav" type="physical_consistency_node.py" launch-prefix="$(arg ros_python)" output="screen">
+  <!-- This adapter only needs rospy/tf2 and must use ROS Noetic's system
+       Python.  Under the Conda 3.11 interpreter rospy.init_node spins before
+       registration, consuming one full CPU core and never publishing. -->
+  <node name="physical_nav_consistency" pkg="physical_nav" type="physical_consistency_node.py" launch-prefix="$(arg system_ros_python)" output="screen">
+    <param name="evaluation_rate_hz" value="1.0"/>
     <param name="camera_frame" value="d435i_color_optical_frame"/>
     <param name="world_frame" value="tf_frame_map"/>
     <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
+  </node>
+  <!-- Physical-only safety output. The read-only launch deliberately leaves
+       this topic unconsumed; an armed control bridge may subscribe later. -->
+  <node name="physical_velocity_safety" pkg="physical_nav" type="physical_velocity_safety.py" launch-prefix="/usr/bin/python3" output="screen" respawn="false">
+    <rosparam file="$(arg config_file)" command="load"/>
+    <param name="input_topic" value="/physical_nav/shadow_cmd_vel"/>
+    <param name="output_topic" value="/physical_nav/actuated_cmd_vel"/>
+  </node>
+  <!-- Idle until semantic_behavior_executor emits an interaction command. -->
+  <!-- rospy from ROS Noetic must run under the system ROS Python here. The
+       Conda 3.11 interpreter can import rospy but spins forever in init_node,
+       leaving speech and M3 topics silently unregistered. -->
+  <node if="$(arg enable_interaction_policy)" name="physical_interaction_policy" pkg="physical_nav" type="physical_interaction_policy_node.py" launch-prefix="$(arg system_ros_python)" output="screen" respawn="true" respawn_delay="1.0">
+    <rosparam file="$(arg config_file)" command="load"/>
+    <param name="profile" value="$(arg interaction_profile)"/>
+    <param name="qwen_base_url" value="http://127.0.0.1:18080/v1"/>
+    <param name="qwen_model" value="qwen3.6-35b-a3b-fp8"/>
   </node>
   <!-- Publish real global/local costmaps while keeping every navigation output
        in an unconsumed shadow namespace. The local obstacle layer consumes
@@ -107,6 +164,7 @@
     <remap from="/move_base_simple/goal" to="/physical_nav/shadow_goal"/>
     <include file="$(find explore_py_pkg)/launch/explore_py.launch">
       <arg name="external_control_enabled" value="true"/>
+      <arg name="override_config_file" value="$(arg semantic_override_config)"/>
     </include>
   </group>
   <group>

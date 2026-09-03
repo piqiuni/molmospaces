@@ -991,6 +991,17 @@ def _draw_subgoal_direction(
         )
 
 
+def _draw_interaction_target_link(
+    panel: np.ndarray,
+    subgoal: tuple[int, int],
+    target: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    """Connect an interaction stance to the object center it faces."""
+    cv2.line(panel, subgoal, target, (18, 18, 18), 3, cv2.LINE_AA)
+    cv2.line(panel, subgoal, target, color, 1, cv2.LINE_AA)
+
+
 def _outlined_text(
     panel: np.ndarray,
     text: str,
@@ -1248,10 +1259,94 @@ def _node_observed(node: dict, observed_ids: set[str]) -> bool:
 
 
 def _node_xy(node: dict) -> tuple[float, float] | None:
-    values = node.get("aabb_center") or node.get("centroid") or []
+    values = (
+        node.get("aabb_center")
+        or node.get("world_box3d_center")
+        or node.get("centroid")
+        or node.get("world_position")
+        or []
+    )
+    if isinstance(values, dict):
+        try:
+            return float(values["x"]), float(values["y"])
+        except (KeyError, TypeError, ValueError):
+            return None
     if len(values) < 2:
         return None
     return float(values[0]), float(values[1])
+
+
+def _node_planar_yaw(node: dict) -> float | None:
+    """Read the graph-owned OBB yaw without treating a valid zero as missing."""
+    value = node.get("yaw")
+    if value is None:
+        value = (node.get("attributes") or {}).get("yaw")
+    if value is not None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+    orientation = (node.get("attributes") or {}).get("orientation")
+    if isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+        try:
+            x, y, z, w = [float(value) for value in orientation[:4]]
+            return math.atan2(
+                2.0 * (w * z + x * y),
+                1.0 - 2.0 * (y * y + z * z),
+            )
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _resolved_node_yaw(
+    node: dict, physical_detections: list[dict] | None = None
+) -> float:
+    """Use graph yaw when measured, otherwise match the live physical OBB."""
+    # Only an explicit scalar yaw proves that the graph retained a detector
+    # measurement. Legacy graph nodes write an identity quaternion even when
+    # orientation was absent, so consult the live OBB before trusting it.
+    explicit_yaw = node.get("yaw")
+    if explicit_yaw is None:
+        explicit_yaw = (node.get("attributes") or {}).get("yaw")
+    if explicit_yaw is not None:
+        try:
+            return float(explicit_yaw)
+        except (TypeError, ValueError):
+            pass
+    node_point = _node_xy(node)
+    node_label = _node_label(node).casefold()
+    nearest = None
+    nearest_distance = float("inf")
+    for detection in physical_detections or []:
+        if node_label and node_label not in str(
+            detection.get("semantic_class", "")
+        ).casefold():
+            continue
+        det_point = _node_xy(detection)
+        if node_point is None or det_point is None:
+            continue
+        distance = math.hypot(
+            node_point[0] - det_point[0], node_point[1] - det_point[1]
+        )
+        if distance < nearest_distance:
+            nearest, nearest_distance = detection, distance
+    if nearest is not None and nearest_distance <= 1.0:
+        detected_yaw = _node_planar_yaw(nearest)
+        if detected_yaw is None:
+            orientation = nearest.get("world_box3d_orientation")
+            if isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+                try:
+                    x, y, z, w = [float(value) for value in orientation[:4]]
+                    detected_yaw = math.atan2(
+                        2.0 * (w * z + x * y),
+                        1.0 - 2.0 * (y * y + z * z),
+                    )
+                except (TypeError, ValueError):
+                    detected_yaw = None
+        if detected_yaw is not None:
+            return detected_yaw
+    return _node_planar_yaw(node) or 0.0
 
 
 def _short_node_id(node: dict) -> str:
@@ -1265,8 +1360,27 @@ def _short_node_id(node: dict) -> str:
 
 
 def _node_label(node: dict) -> str:
-    if str(node.get("type") or "") != "room":
-        return str(node.get("label") or node.get("type") or "object")
+    node_type = str(node.get("type") or "")
+    if node_type != "room":
+        label = str(node.get("label") or node.get("type") or "object").strip()
+        if node_type == "portal":
+            # Portal nodes often carry a generic public label while the
+            # detector/graph attributes contain the concrete class (door,
+            # sliding_door, gate, ...).  Prefer the best voted concrete name.
+            attrs = node.get("attributes") or {}
+            votes = attrs.get("label_votes") or node.get("label_votes") or {}
+            candidates = attrs.get("candidate_labels") or node.get("candidate_labels") or []
+            if isinstance(votes, dict) and votes:
+                candidates = [key for key, _ in sorted(votes.items(), key=lambda item: (-float(item[1]), str(item[0])))]
+            concrete = next(
+                (str(value).strip() for value in candidates if str(value).strip().casefold() not in {"portal", "doorway", "unknown"}),
+                "",
+            )
+            if concrete:
+                return concrete.replace("_", " ")
+            if label.casefold() in {"portal", "doorway"}:
+                return "door"
+        return label.replace("_", " ")
     value = str((node.get("attributes") or {}).get("room_attribute") or "unknown").strip()
     if value == "livingroom":
         return "living room"
@@ -1411,6 +1525,7 @@ class OfflineSixPanelRenderer:
         draw_local_plan: bool = True,
         draw_frontiers: bool = True,
         draw_semantic_candidates: bool = False,
+        draw_interaction_target_links: bool = False,
         draw_route_plan: bool = False,
         episode_trajectory: list[tuple[float, float, float, float]] | None = None,
         view_scale: float = 1.0,
@@ -1581,6 +1696,9 @@ class OfflineSixPanelRenderer:
         candidate_markers: list[
             tuple[tuple[int, int], tuple[int, int, int]]
         ] = []
+        interaction_links: list[
+            tuple[tuple[int, int], tuple[int, int], tuple[int, int, int]]
+        ] = []
         if draw_semantic_candidates:
             for candidate in (step.get("semantic_candidates") or {}).get("candidates") or []:
                 values = list(candidate.get("goal_xyyaw") or [])
@@ -1588,7 +1706,38 @@ class OfflineSixPanelRenderer:
                 candidate_px = to_panel(candidate_point)
                 behavior_type = str(candidate.get("behavior_type") or "EXPLORE").upper()
                 color = candidate_color(behavior_type)
-                if str(candidate.get("candidate_id") or "") == selected_id:
+                is_selected = str(candidate.get("candidate_id") or "") == selected_id
+                if (
+                    draw_interaction_target_links
+                    and behavior_type == "INTERACT"
+                    and candidate_px is not None
+                ):
+                    link_subgoal_px = candidate_px
+                    if is_selected:
+                        selected_values = list(selection.get("goal_xyyaw") or [])
+                        selected_point = self._transform(
+                            selected_values,
+                            self.transforms.map_frame,
+                            grid.frame_id,
+                            step_index,
+                        )
+                        link_subgoal_px = to_panel(selected_point) or candidate_px
+                    metadata = candidate.get("metadata") or {}
+                    target_values = list(
+                        metadata.get("portal_aabb_center_xy")
+                        or metadata.get("container_geometry_anchor_xy")
+                        or []
+                    )
+                    target_point = self._transform(
+                        target_values,
+                        self.transforms.map_frame,
+                        grid.frame_id,
+                        step_index,
+                    )
+                    target_px = to_panel(target_point)
+                    if target_px is not None:
+                        interaction_links.append((link_subgoal_px, target_px, color))
+                if is_selected:
                     # Never render same-ID stale geometry. The live selection
                     # below is authoritative even when the snapshot revision is
                     # old; this validation intentionally remains silent.
@@ -1623,6 +1772,10 @@ class OfflineSixPanelRenderer:
             _draw_occupancy_candidate_legend(
                 panel,
                 str(selection.get("behavior_type") or ""),
+            )
+        for subgoal_px, target_px, link_color in interaction_links:
+            _draw_interaction_target_link(
+                panel, subgoal_px, target_px, link_color
             )
         marker_radius = max(4, min(6, int(round(1.5 * max(scale, 1.0)))))
         for marker_px, marker_color in candidate_markers:
@@ -1758,6 +1911,7 @@ class OfflineSixPanelRenderer:
         world_bounds: tuple[float, float, float, float] | None,
         *,
         view_scale: float = 1.0,
+        draw_global_plan: bool = False,
         snapshot_meta: dict | None = None,
         display_stamp_sec: float = 0.0,
         snapshot_selection_reason: str = "",
@@ -1778,11 +1932,62 @@ class OfflineSixPanelRenderer:
         room_layer = self._warp_grid(panel_size, room, _room_base(room) if room else None, to_px, (246, 246, 246))
         if room_layer is not None:
             panel = cv2.addWeighted(room_layer, 0.38, panel, 0.62, 0.0)
+        if draw_global_plan:
+            global_plan = self._plan_poses(step.get("global_plan"), reference, step_index)
+            pose_for_plan = self._transform(
+                step.get("pose"), self.transforms.odom_frame, reference.frame_id, step_index
+            )
+            if global_plan and pose_for_plan is not None:
+                nearest = min(
+                    range(len(global_plan)),
+                    key=lambda index: math.hypot(
+                        global_plan[index][0] - pose_for_plan[0],
+                        global_plan[index][1] - pose_for_plan[1],
+                    ),
+                )
+                global_plan = [pose_for_plan] + global_plan[nearest:]
+            _draw_polyline(
+                panel,
+                [to_px(point[0], point[1]) for point in global_plan],
+                (40, 190, 60),
+                3,
+            )
         graph = step.get("unified_graph") or {}
         selection = active_semantic_selection(step)
         target_ids = selection_target_ids(selection)
         observed = {str(value) for value in step.get("observed_instance_ids") or []}
         bounded_nodes = _bounded_nodes(graph, observed, target_ids)
+        physical_detections = [
+            item
+            for item in (step.get("physical_detections") or [])
+            if isinstance(item, dict)
+        ]
+        selected_id = str(selection.get("candidate_id") or "")
+        candidate_markers: list[
+            tuple[tuple[int, int], tuple[int, int, int]]
+        ] = []
+        for candidate in (step.get("semantic_candidates") or {}).get("candidates") or []:
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if candidate_id == selected_id:
+                candidate_matches_canonical_selection(selection, candidate)
+                continue
+            values = list(candidate.get("goal_xyyaw") or [])
+            point = self._transform(
+                values,
+                self.transforms.map_frame,
+                reference.frame_id,
+                step_index,
+            )
+            if point is None:
+                continue
+            candidate_markers.append(
+                (
+                    to_px(point[0], point[1]),
+                    candidate_color(
+                        str(candidate.get("behavior_type") or "EXPLORE").upper()
+                    ),
+                )
+            )
         room_labels: list[tuple[tuple[int, int], str]] = []
         for node in bounded_nodes:
             if str(node.get("type") or "") != "room":
@@ -1809,7 +2014,21 @@ class OfflineSixPanelRenderer:
             half_w, half_h = max(3, int(abs(float(size[0])) * scale * 0.5)), max(3, int(abs(float(size[1])) * scale * 0.5))
             is_target = node_matches_selection(node, target_ids)
             color = (235, 35, 210) if is_target else _node_color(node)
-            cv2.rectangle(panel, (center_px[0] - half_w, center_px[1] - half_h), (center_px[0] + half_w, center_px[1] + half_h), color, 4 if is_target else 2, cv2.LINE_AA)
+            yaw = _resolved_node_yaw(node, physical_detections)
+            rect = (
+                (float(center_px[0]), float(center_px[1])),
+                (float(2 * half_w), float(2 * half_h)),
+                -math.degrees(yaw),
+            )
+            corners = cv2.boxPoints(rect).astype(np.int32)
+            cv2.polylines(
+                panel,
+                [corners],
+                True,
+                color,
+                4 if is_target else 2,
+                cv2.LINE_AA,
+            )
             cv2.putText(panel, f"{'INTERACT ' if is_target else ''}{_short_node_id(node)} {node.get('label', node.get('type', ''))}", (center_px[0] + 3, center_px[1] - half_h - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.30, color, 1, cv2.LINE_AA)
         for center_px, label in room_labels:
             text = label[:36]
@@ -1841,6 +2060,39 @@ class OfflineSixPanelRenderer:
             selection_reason=snapshot_selection_reason,
             y=42,
         )
+        marker_radius = max(4, min(6, int(round(1.5 * max(scale, 1.0)))))
+        for marker_px, marker_color in candidate_markers:
+            _draw_subgoal_marker(
+                panel, marker_px, marker_color, radius=marker_radius
+            )
+        live_goal = list(selection.get("goal_xyyaw") or [])
+        if len(live_goal) >= 2:
+            live_point = self._transform(
+                live_goal,
+                self.transforms.map_frame,
+                reference.frame_id,
+                step_index,
+            )
+            if live_point is not None:
+                live_px = to_px(live_point[0], live_point[1])
+                live_color = candidate_color(
+                    str(selection.get("behavior_type") or "NAVIGATE").upper()
+                )
+                _draw_subgoal_marker(
+                    panel,
+                    live_px,
+                    live_color,
+                    radius=marker_radius,
+                    selected=True,
+                )
+                if len(live_goal) >= 3:
+                    _draw_subgoal_direction(
+                        panel,
+                        live_px,
+                        float(live_point[2]),
+                        max(10, int(round(0.5 * 1.55 * 14))),
+                        live_color,
+                    )
         return panel
 
     def render_semantic_xy(
@@ -1895,6 +2147,7 @@ class OfflineSixPanelRenderer:
         for grid_y in range(math.floor(min_y), math.ceil(max_y) + 1):
             cv2.line(panel, to_px(min_x, grid_y), to_px(max_x, grid_y), (226, 226, 226), 1)
         lookup = {str(node.get("id") or ""): node for node in nodes}
+        physical_detections = [item for item in (step.get("physical_detections") or []) if isinstance(item, dict)]
         normalized_label_mode = str(label_mode or "all").casefold()
         if normalized_label_mode not in {"all", "interaction_target_only", "none"}:
             normalized_label_mode = "all"
@@ -1923,7 +2176,35 @@ class OfflineSixPanelRenderer:
                 cv2.addWeighted(overlay, 0.35, panel, 0.65, 0, panel)
                 cv2.rectangle(panel, (pixel[0] - half_w, pixel[1] - half_h), (pixel[0] + half_w, pixel[1] + half_h), (125, 150, 175), 1)
             else:
-                cv2.rectangle(panel, (pixel[0] - half_w, pixel[1] - half_h), (pixel[0] + half_w, pixel[1] + half_h), color, thickness)
+                yaw = _resolved_node_yaw(node, physical_detections)
+                # The live detector carries the authoritative per-instance
+                # OBB.  Fall back to the nearest same-label receipt when the
+                # graph serializer has not retained orientation yet.
+                if abs(yaw) <= 1e-4 and physical_detections and _node_planar_yaw(node) is None:
+                    node_point = _node_xy(node)
+                    node_label = _node_label(node).casefold()
+                    nearest = None
+                    nearest_distance = float("inf")
+                    for detection in physical_detections:
+                        if node_label and node_label not in str(detection.get("semantic_class", "")).casefold():
+                            continue
+                        det_point = _node_xy(detection)
+                        if node_point is None or det_point is None:
+                            continue
+                        distance = math.hypot(node_point[0] - det_point[0], node_point[1] - det_point[1])
+                        if distance < nearest_distance:
+                            nearest, nearest_distance = detection, distance
+                    if nearest is not None and nearest_distance <= 1.0:
+                        orientation = nearest.get("world_box3d_orientation")
+                        if isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+                            x, y, z, w = [float(value) for value in orientation[:4]]
+                            yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+                if abs(yaw) > 1e-4:
+                    rect = ((float(pixel[0]), float(pixel[1])), (float(2 * half_w), float(2 * half_h)), -math.degrees(yaw))
+                    corners = cv2.boxPoints(rect).astype(np.int32)
+                    cv2.polylines(panel, [corners], True, color, thickness, cv2.LINE_AA)
+                else:
+                    cv2.rectangle(panel, (pixel[0] - half_w, pixel[1] - half_h), (pixel[0] + half_w, pixel[1] + half_h), color, thickness)
             node_type = str(node.get("type") or "")
             draw_label = (
                 node_type == "room"

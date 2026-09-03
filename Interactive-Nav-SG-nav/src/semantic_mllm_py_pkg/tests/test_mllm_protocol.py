@@ -328,6 +328,7 @@ def test_attribute_patch_response_schema_binds_target_and_bounds_portal_evidence
     assert set(body["required"]) == {
         "object_id",
         "interactable",
+        "observed_object_name",
         "interaction_class",
         "coarse_state",
         "portal_morphology",

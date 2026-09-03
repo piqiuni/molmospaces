@@ -197,6 +197,11 @@ class ModelPolicyConfig:
     # only applies to deterministic high-priority hints and leaves ordinary
     # semantic/exploration ranking to the MLLM.
     pre_score_guard_margin: float = 0.75
+    # Physical exploration should leave the current/entered room whenever a
+    # reachable frontier in a genuinely unentered room is available.  Keep
+    # this opt-in for simulator/replay compatibility; the Go2 configuration
+    # enables it so M2 cannot repeatedly select same-room frontiers.
+    force_unentered_room_exploration: bool = False
     # Restrict only INTERACT options sent to Module 2.  Navigation/frontier
     # candidates remain available.  Empty preserves the general simulator
     # policy; the physical Go2 lane uses door/fridge.
@@ -1479,6 +1484,37 @@ class ModelPolicyClient:
         ]
         if not new_room_ids:
             return protected_selected
+        if self.config.force_unentered_room_exploration:
+            # A high-confidence semantic mismatch is useful only as a last
+            # resort.  Prefer compatible/unknown new rooms, and fall back to
+            # the full set when that is the only way to make progress.
+            preferred_new_room_ids = [
+                candidate_id
+                for candidate_id in new_room_ids
+                if float(
+                    (candidate_groups[candidate_id][0].metadata or {}).get(
+                        "room_target_affinity", 0.0
+                    )
+                    or 0.0
+                ) >= 0.0
+            ]
+            candidate_ids = preferred_new_room_ids or new_room_ids
+            best_new_room_id = max(
+                candidate_ids,
+                key=lambda candidate_id: (
+                    float(pre_scores.get(candidate_id, 0.0) or 0.0),
+                    candidate_id,
+                ),
+            )
+            if best_new_room_id != protected_selected:
+                self.last_pre_score_guard = (
+                    "NEW_ROOM_FRONTIER_FORCE:"
+                    f"{protected_selected}->{best_new_room_id}"
+                )
+                self.last_reason = "PRE_SCORE_GUARD_NEW_ROOM_FRONTIER_FORCE"
+                self.last_confidence = "high"
+                return best_new_room_id
+            return protected_selected
         best_new_room_id = max(
             new_room_ids,
             key=lambda candidate_id: (
@@ -1604,7 +1640,9 @@ class ModelPolicyClient:
                 "topological route; (4) TARGET_CONTAINER or a semantically plausible container; "
                 "(5) an eligible frontier with room_status=unentered_new_room when its room_target_affinity "
                 "is neutral or positive, before a frontier in current_room or entered_room; "
-                "(6) other frontiers. If room_target_affinity_reason says high_confidence_mismatch, keep "
+                "When such a frontier is present, it is a hard exploration-diversity constraint: do not "
+                "select a current/entered-room frontier unless every unentered-room option is unreachable "
+                "or semantically mismatched. (6) other frontiers. If room_target_affinity_reason says high_confidence_mismatch, keep "
                 "that room as a fallback but rank it below a compatible or unknown new room. decision_hint is "
                 "deterministic graph/goal evidence and pre_score is a transparent "
                 "ranking prior; normally rank a high-priority hint first unless recent_decisions show that the "

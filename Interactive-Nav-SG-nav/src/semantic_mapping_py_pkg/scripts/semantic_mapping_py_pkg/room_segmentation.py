@@ -502,7 +502,14 @@ class RoomSegmenter:
                 thickness=self.room_portal_cut_thickness_cells,
                 lineType=cv2.LINE_8,
             )
-        cut_mask = ((cut_mask > 0) & (segmentation_free > 0)).astype(np.uint8)
+        # Keep the complete rasterised portal line in the mask, including
+        # cells currently labelled occupied/unknown.  A detected doorway is
+        # often sampled exactly on the occupied jamb or an unknown ray edge;
+        # restricting the mask to ``segmentation_free`` made the cut vanish
+        # in that common case and left both sides as one room.  Removing the
+        # line from free space is still the only topology change, so a line
+        # that does not intersect known free cells remains a no-op.
+        cut_mask = (cut_mask > 0).astype(np.uint8)
         segmentation_free[cut_mask > 0] = 0
         return cut_mask
 

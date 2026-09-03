@@ -10,10 +10,13 @@ protocol.
 from __future__ import annotations
 
 import base64
+import json
 import time
 from typing import Any, Mapping
+import zlib
 
 PROTOCOL_VERSION = 1
+WIRE_ZLIB_MAGIC = b"MSZ1"
 
 
 def now_wall() -> float:
@@ -22,6 +25,27 @@ def now_wall() -> float:
 
 def _b64(value: bytes) -> str:
     return base64.b64encode(value).decode("ascii")
+
+
+def encode_wire_packet(packet: Mapping[str, Any], *, compression_level: int = 1) -> bytes:
+    """Encode a packet without changing any RGB or uint16 depth samples.
+
+    JPEG/PNG data is already compressed, but its base64 JSON representation
+    adds roughly one third on the wire. A fast outer zlib pass recovers most
+    of that overhead while keeping protocol-v1 payload semantics unchanged.
+    """
+    payload = json.dumps(dict(packet), separators=(",", ":")).encode("utf-8")
+    return WIRE_ZLIB_MAGIC + zlib.compress(payload, int(compression_level))
+
+
+def decode_wire_packet(raw: str | bytes) -> dict[str, Any]:
+    """Decode either the original text protocol or its compressed envelope."""
+    if isinstance(raw, str):
+        return json.loads(raw)
+    payload = bytes(raw)
+    if payload.startswith(WIRE_ZLIB_MAGIC):
+        payload = zlib.decompress(payload[len(WIRE_ZLIB_MAGIC):])
+    return json.loads(payload.decode("utf-8"))
 
 
 def image_packet(

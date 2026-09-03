@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import base64
 import threading
 import time
 from typing import Any
@@ -43,6 +44,7 @@ class RuntimeState:
         # Native M1/M2 model traces and M3 interaction-result evaluations are
         # retained as a small bounded history for the live dashboard.
         self.mllm_events: list[dict[str, Any]] = []
+        self.m1_input_images: dict[str, bytes] = {}
         self.navigation: dict[str, Any] = {
             "explore_status": {}, "current_subgoal": {}, "candidates": {},
             "selection": {}, "execution_state": {}, "behavior_feedback": {},
@@ -74,6 +76,13 @@ class RuntimeState:
             self.calibration = copy.deepcopy(value)
 
     def update_topic(self, name: str, value: Any) -> None:
+        if name == "mllm_events":
+            if isinstance(value, list):
+                for event in value:
+                    self.add_mllm_event(event)
+            else:
+                self.add_mllm_event(value)
+            return
         with self._lock:
             if name in {"detections", "mapped_detections"} and isinstance(value, dict):
                 meta_attr = "detection_meta" if name == "detections" else "mapped_detection_meta"
@@ -117,8 +126,38 @@ class RuntimeState:
         with self._lock:
             if not isinstance(event, dict):
                 return
-            self.mllm_events.append(copy.deepcopy(event))
+            stored = copy.deepcopy(event)
+            data_url = str(stored.pop("m1_input_image_data_url", "") or "")
+            if data_url.startswith("data:image/") and "," in data_url:
+                key = "{}:{}:{}".format(
+                    stored.get("episode_id", "default"),
+                    stored.get("request_sequence", len(self.mllm_events)),
+                    int(float(stored.get("timestamp", time.time())) * 1000),
+                )
+                try:
+                    self.m1_input_images[key] = base64.b64decode(
+                        data_url.split(",", 1)[1], validate=True
+                    )
+                    stored["m1_input_image_key"] = key
+                except (ValueError, TypeError):
+                    pass
+            self.mllm_events.append(stored)
             self.mllm_events = self.mllm_events[-100:]
+            active_keys = {
+                str(item.get("m1_input_image_key"))
+                for item in self.mllm_events
+                if item.get("m1_input_image_key")
+            }
+            self.m1_input_images = {
+                key: value
+                for key, value in self.m1_input_images.items()
+                if key in active_keys
+            }
+
+    def m1_input_image(self, key: str) -> bytes | None:
+        with self._lock:
+            value = self.m1_input_images.get(str(key))
+            return bytes(value) if value is not None else None
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -152,6 +191,47 @@ class RuntimeState:
                 "read_only": True,
                 "status": "READ_ONLY_BLOCKED",
                 "generated_at": time.time(),
+            }
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return a constant-size liveness view without copying maps/traces."""
+        with self._lock:
+            perception_seq = self.detection_meta.get("seq", -1)
+            perception_stamp = self.detection_meta.get("stamp", 0.0)
+            return {
+                "ok": bool(self.frame_seq >= 0),
+                "read_only": True,
+                "frame_seq": self.frame_seq,
+                "frame_stamp": self.frame_stamp,
+                "perception_seq": perception_seq,
+                "perception_stamp": perception_stamp,
+                "navigation_step": self.navigation_step,
+                "link_connected": bool(self.link.get("connected")),
+                "last_packet_at": self.link.get("last_packet_at", 0.0),
+                "generated_at": time.time(),
+                "last_error": self.last_error,
+            }
+
+    def visualization_snapshot(self) -> dict[str, Any]:
+        """Return raw map/graph receipts for presentation-only redrawers.
+
+        The normal state snapshot deliberately omits grid cell arrays to keep
+        polling payloads small.  Showcase pages use this separate endpoint at
+        a lower rate and redraw their spatial/semantic panels from these raw
+        receipts instead of cropping the six-panel JPEG.
+        """
+        with self._lock:
+            return {
+                "frame_seq": self.frame_seq,
+                "navigation_step": self.navigation_step,
+                "telemetry": copy.deepcopy(self.telemetry),
+                "occupancy": copy.deepcopy(self.occupancy),
+                "room_grid": copy.deepcopy(self.room_grid),
+                "global_costmap": copy.deepcopy(self.global_costmap),
+                "local_costmap": copy.deepcopy(self.local_costmap),
+                "graph": copy.deepcopy(self.graph),
+                "mapped_detections": copy.deepcopy(self.mapped_detections),
+                "navigation": copy.deepcopy(self.navigation),
             }
 
     def raw_frame(self) -> dict[str, Any]:

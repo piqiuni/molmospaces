@@ -8,6 +8,7 @@ import asyncio
 import json
 import sys
 import termios
+import time
 import tty
 from typing import Any, Optional
 
@@ -410,6 +411,7 @@ async def ros_source(server: PolicyControlServer, args: argparse.Namespace) -> N
     try:
         import rospy
         from geometry_msgs.msg import Twist
+        from std_msgs.msg import String
     except ImportError as exc:
         raise RuntimeError(
             "ROS source requires ROS 1 rospy and geometry_msgs in the current environment"
@@ -436,21 +438,126 @@ async def ros_source(server: PolicyControlServer, args: argparse.Namespace) -> N
 
     rospy.init_node(args.ros_node_name, anonymous=False, disable_signals=True)
     subscriber = rospy.Subscriber(args.cmd_vel_topic, Twist, on_cmd_vel, queue_size=1)
+    speech_subscriber = None
+    speech_status_publisher = None
+    if args.speech_request_topic:
+        if args.speech_status_topic:
+            speech_status_publisher = rospy.Publisher(
+                args.speech_status_topic, String, queue_size=4
+            )
+
+        def schedule_speech(payload: dict[str, Any]) -> None:
+            async def send_speech() -> None:
+                request_id = str(payload.get("request_id") or "")
+                try:
+                    result = await server.publish_speech(
+                        str(payload.get("text") or ""),
+                        voice=str(payload.get("voice") or args.speech_voice),
+                        volume=(int(payload["volume"]) if payload.get("volume") is not None else args.speech_volume),
+                        ttl_ms=int(payload.get("ttl_ms", args.speech_ttl_ms)),
+                        wait_for_completion=bool(payload.get("wait", False)),
+                    )
+                    final_state = str(
+                        (result.get("status") or {}).get("state") or "accepted"
+                    ).casefold()
+                    completed = final_state in {"accepted", "completed"}
+                    status_payload = {
+                        "request_id": request_id,
+                        "accepted": completed,
+                        "status": final_state.upper(),
+                        "bridge_result": result,
+                        "timestamp": time.time(),
+                    }
+                    if not completed:
+                        status_payload["reason"] = str(
+                            (result.get("status") or {}).get("detail")
+                            or f"speech_{final_state}"
+                        )[:200]
+                except Exception as exc:
+                    print(f"ROS speech request rejected: {exc}")
+                    status_payload = {
+                        "request_id": request_id,
+                        "accepted": False,
+                        "status": "REJECTED",
+                        "reason": str(exc)[:200],
+                        "timestamp": time.time(),
+                    }
+                if speech_status_publisher is not None:
+                    speech_status_publisher.publish(
+                        String(
+                            data=json.dumps(
+                                status_payload,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        )
+                    )
+
+            if payload.get("text"):
+                asyncio.create_task(send_speech())
+
+        def on_speech(message: String) -> None:
+            try:
+                value = json.loads(message.data)
+                payload = value if isinstance(value, dict) else {"text": str(value)}
+            except (TypeError, json.JSONDecodeError):
+                payload = {"text": str(message.data)}
+            loop.call_soon_threadsafe(schedule_speech, payload)
+
+        speech_subscriber = rospy.Subscriber(args.speech_request_topic, String, on_speech, queue_size=4)
+        print(f"Subscribed to ROS speech topic: {args.speech_request_topic}")
+        if speech_status_publisher is not None:
+            print(f"Publishing ROS speech status: {args.speech_status_topic}")
     print(f"Subscribed to ROS Twist topic: {args.cmd_vel_topic}")
+    latest_command: tuple[float, float, float] | None = None
+    latest_command_at = 0.0
+    stale_zero_sent = False
+    refresh_period_s = 1.0 / args.ros_command_refresh_hz
     try:
         while not rospy.is_shutdown():
             try:
-                vx, vy, wz = await asyncio.wait_for(latest.get(), timeout=0.25)
+                value = await asyncio.wait_for(latest.get(), timeout=refresh_period_s)
             except asyncio.TimeoutError:
-                continue
+                value = None
+            if value is not None:
+                latest_command = value
+                latest_command_at = time.monotonic()
+                stale_zero_sent = False
+                # Collapse a callback burst to the newest ROS command before
+                # sending.  The Go2 consumes a current target, not a history.
+                while not latest.empty():
+                    try:
+                        latest_command = latest.get_nowait()
+                        latest_command_at = time.monotonic()
+                    except asyncio.QueueEmpty:
+                        break
+
+            now = time.monotonic()
+            if (
+                latest_command is None
+                or now - latest_command_at > args.ros_command_stale_after_s
+            ):
+                command = (0.0, 0.0, 0.0)
+                if stale_zero_sent:
+                    continue
+                stale_zero_sent = True
+            else:
+                command = latest_command
+
             try:
+                # Refresh the newest locally valid command faster than the
+                # bridge TTL. move_base may publish at only 5 Hz and can leave
+                # occasional >350 ms gaps while replanning; forwarding only on
+                # callbacks made Go2 alternate between turn and idle.
                 await server.publish_continuous(
-                    vx, vy, wz, args.continuous_ttl_ms
+                    *command, ttl_ms=args.continuous_ttl_ms
                 )
             except ConnectionError:
                 pass
     finally:
         subscriber.unregister()
+        if speech_subscriber is not None:
+            speech_subscriber.unregister()
         if server.bridge is not None:
             await server.publish_continuous(0.0, 0.0, 0.0, args.continuous_ttl_ms)
 
@@ -495,6 +602,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=12333)
     parser.add_argument("--discrete-ttl-ms", type=int, default=6000)
     parser.add_argument("--continuous-ttl-ms", type=int, default=350)
+    parser.add_argument(
+        "--ros-command-refresh-hz",
+        type=float,
+        default=20.0,
+        help="refresh the latest non-stale ROS velocity at this rate",
+    )
+    parser.add_argument(
+        "--ros-command-stale-after-s",
+        type=float,
+        default=0.50,
+        help="send an immediate zero after this much time without a ROS update",
+    )
     parser.add_argument("--wait-discrete-completion", action="store_true")
     parser.add_argument("--keyboard-vx", type=float, default=0.10)
     parser.add_argument("--keyboard-wz", type=float, default=0.30)
@@ -514,10 +633,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--telemetry-print-period", type=float, default=1.0)
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
+    parser.add_argument(
+        "--speech-request-topic",
+        default="",
+        help="optional ROS std_msgs/String topic forwarded to the Go2 speak command",
+    )
+    parser.add_argument(
+        "--speech-status-topic",
+        default="",
+        help="optional ROS std_msgs/String topic carrying Go2 speech acknowledgement",
+    )
     parser.add_argument("--ros-node-name", default="go2_policy_control_server")
     args = parser.parse_args()
     if not 100 <= args.continuous_ttl_ms <= 500:
         parser.error("--continuous-ttl-ms must be between 100 and 500")
+    if not 5.0 <= args.ros_command_refresh_hz <= 50.0:
+        parser.error("--ros-command-refresh-hz must be between 5 and 50")
+    if not 0.1 <= args.ros_command_stale_after_s <= 2.0:
+        parser.error("--ros-command-stale-after-s must be between 0.1 and 2.0")
     if not 100 <= args.discrete_ttl_ms <= 7000:
         parser.error("--discrete-ttl-ms must be between 100 and 7000")
     if args.source == "ros" and args.control_mode != "continuous":

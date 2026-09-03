@@ -962,6 +962,11 @@ class PostInteractionRawMapBarrier:
     planning_occupancy_receipt_count: int
     planning_occupancy_header_seq: int | None = None
     planning_occupancy_header_stamp_sec: float | None = None
+    # Snapshots taken in the raw-map callback let a physical deployment use a
+    # fast raw-OCC -> costmap path without mistaking a costmap receipt that
+    # arrived before the raw map for a causal update.
+    global_costmap_receipt_count: int = 0
+    global_costmap_update_receipt_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1732,6 +1737,15 @@ class BehaviorExecutionStateMachine:
             return self._finish(False, detail or {}, now)
         metadata = (self.candidate or {}).get("metadata") or {}
         if self._container_two_stage_staging_active(metadata):
+            if bool(metadata.get("fridge_direct_interaction_on_arrival", False)):
+                # Arrival at the configured fridge interaction pose is
+                # sufficient for the simplified physical path. Do not gate
+                # execution on a second M1 type confirmation.
+                return self._transition(
+                    STATE_INTERACTING,
+                    now,
+                    {"kind": "interact", "candidate": self.candidate},
+                )
             # A recovery anchor is intentionally farther than the visual
             # capture point.  Reaching that anchor never authorizes M1: move
             # to the paired direct capture pose first.  Legacy candidates have
@@ -2120,6 +2134,76 @@ class BehaviorExecutionStateMachine:
                 ],
                 "reason": "container_navigation_anchor_to_m1_capture",
                 "navigation_anchor_arrival": dict(arrival_detail),
+            },
+        )
+
+    def _begin_fridge_direct_interaction(
+        self, arrival_detail: dict[str, Any], now: float
+    ) -> list[dict[str, Any]]:
+        """Authorize a refrigerator action immediately after subgoal arrival.
+
+        Physical deployments use the generated staging subgoal as the action
+        stance.  This deliberately skips the extra M1 capture/navigation hop;
+        the normal navigation arrival check has already run, and M3 remains in
+        the physical interaction policy as the final verifier.
+        """
+        if self.candidate is None:
+            return []
+        candidate = dict(self.candidate)
+        metadata = dict(candidate.get("metadata") or {})
+        try:
+            staging_index = max(
+                0,
+                int(metadata.get("container_two_stage_staging_goal_option_index", 0)),
+            )
+        except (TypeError, ValueError):
+            staging_index = 0
+        staging_goals = container_two_stage_staging_goal_options(candidate)
+        if not staging_goals or staging_index >= len(staging_goals):
+            return []
+        # The arrived staging subgoal is the physical action pose in this
+        # simplified refrigerator mode; do not silently replace it with the
+        # inner action mapping, which would invalidate the arrival check.
+        action_goal = list(staging_goals[staging_index])
+        interaction = dict(candidate.get("interaction_command") or {})
+        interaction["interaction_approach_pose_xyyaw"] = list(action_goal)
+        try:
+            ready_distance = float(
+                interaction.get(
+                    "container_staging_ready_distance_m",
+                    metadata.get("container_staging_ready_distance_m", 0.30),
+                )
+            )
+        except (TypeError, ValueError):
+            ready_distance = 0.18
+        interaction["interaction_ready_distance_m"] = max(0.05, ready_distance)
+        interaction["navigation_goal_position_tolerance_m"] = max(0.05, ready_distance)
+        metadata.update(
+            {
+                "container_two_stage_phase": "physical_action",
+                "container_two_stage_action_goal_xyyaw": list(action_goal),
+                "container_two_stage_action_goal_option_index": 0,
+                "m1_observation_staging_required": False,
+                "interaction_observation_resolved": True,
+                "observation_required": False,
+                "reobserve": False,
+                "container_pre_action_observation": False,
+                "effective_interaction_approach_pose_xyyaw": list(action_goal),
+                "fridge_direct_interaction_arrival_detail": dict(arrival_detail),
+            }
+        )
+        candidate["goal_xyyaw"] = list(action_goal)
+        candidate["interaction_command"] = interaction
+        candidate["metadata"] = metadata
+        self.candidate = candidate
+        return self._transition(
+            STATE_INTERACTING,
+            now,
+            {
+                "kind": "interact",
+                "candidate": self.candidate,
+                "reason": "fridge_direct_interaction_on_arrival",
+                "navigation_arrival": dict(arrival_detail),
             },
         )
 

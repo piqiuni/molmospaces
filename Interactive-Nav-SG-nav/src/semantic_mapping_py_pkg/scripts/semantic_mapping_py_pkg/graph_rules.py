@@ -404,7 +404,11 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "joint_value": None if minimal_gt else float(observation["joint_value"]) if observation.get("joint_value") is not None else None,
         "joint_infos": [] if minimal_gt else list(observation.get("joint_infos") or []),
         "primary_joint_name": "" if minimal_gt else str(observation.get("primary_joint_name") or ""),
-        "orientation": [0.0, 0.0, 0.0, 1.0] if minimal_gt else list(observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
+        "orientation": [0.0, 0.0, 0.0, 1.0] if minimal_gt else list(observation.get("world_box3d_orientation") or observation.get("orientation") or [0.0, 0.0, 0.0, 1.0]),
+        # Preserve whether the detector actually measured an OBB yaw. An
+        # identity quaternion alone is ambiguous: it can mean yaw=0 or the
+        # legacy fallback used when no orientation was available.
+        "yaw": None if minimal_gt or observation.get("yaw") is None else float(observation.get("yaw")),
         "interaction_approach_axis_xy": interaction_approach_axis_xy,
         "interaction_approach_axis_source": interaction_approach_axis_source,
         "source_object_name": str(
@@ -610,6 +614,16 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
             "asset_id": detection.get("asset_id"),
             "object_id": detection.get("object_id"),
             "source": source,
+            # Keep the stable tracker OBB orientation across the
+            # tracked-detection -> normalized-observation -> graph seam.
+            # Dropping these fields left every portal with the legacy identity
+            # quaternion and made physical candidate generation reject it.
+            "yaw": detection.get("yaw"),
+            "world_box3d_orientation": list(
+                detection.get("world_box3d_orientation")
+                or detection.get("orientation")
+                or []
+            ),
             # Preserve public 2-D detector evidence through the tracked-object
             # seam.  CandidateGenerator uses these fields to distinguish a
             # reliably observed ObjectGoal from a position-only graph node.

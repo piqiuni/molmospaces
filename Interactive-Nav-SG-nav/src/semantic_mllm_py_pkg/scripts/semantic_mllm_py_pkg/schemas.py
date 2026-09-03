@@ -192,6 +192,14 @@ def build_attribute_patch_response_schema(
                     "enum": [normalized_object_id],
                 },
                 "interactable": {"type": "boolean"},
+                # M1 is also the visual class verifier.  This is deliberately
+                # a bounded free-form name rather than an enum: the detector
+                # class is only a hypothesis and M1 may return a more specific
+                # name (for example ``mini_fridge`` or ``door``).
+                "observed_object_name": {
+                    "type": "string",
+                    "maxLength": 64,
+                },
                 "interaction_class": {
                     "type": "string",
                     "enum": (
@@ -285,6 +293,7 @@ def build_attribute_patch_response_schema(
             "required": [
                 "object_id",
                 "interactable",
+                "observed_object_name",
                 "interaction_class",
                 "coarse_state",
                 "portal_morphology",
@@ -308,6 +317,13 @@ def validate_attribute_patch(value: Any) -> dict[str, Any]:
     if not str(result.get("object_id") or ""):
         raise ValueError("attribute patch requires object_id")
     result["interactable"] = bool(result.get("interactable", False))
+    observed_name = str(
+        result.get("observed_object_name")
+        or result.get("m1_object_name")
+        or result.get("object_name")
+        or ""
+    ).strip()
+    result["observed_object_name"] = observed_name[:64]
     result["interaction_class"] = _interaction_class(result.get("interaction_class"))
     result["coarse_state"] = _coarse_interaction_state(result.get("coarse_state"))
     if result["interaction_class"] == "portal":

@@ -1,0 +1,106 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Selection
+    Name: Selection
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 90; 90; 90
+      Name: Ground Grid
+      Plane: XY
+      Plane Cell Count: 40
+      Reference Frame: tf_frame_map
+      Value: true
+    - Class: rviz/PointCloud2
+      Name: Raw D435i Cloud
+      Topic: /physical_nav/points
+      Queue Size: 2
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.015
+      Color Transformer: AxisColor
+      Axis: Z
+      Autocompute Value Bounds: true
+      Decay Time: 0
+      Position Transformer: XYZ
+      Selectable: true
+      Value: true
+    - Class: rviz/PointCloud2
+      Name: YOLOE Segmented Cloud (Map)
+      Topic: /physical_nav/segmented_cloud_world
+      Queue Size: 2
+      Style: Points
+      Size (Pixels): 4
+      Size (m): 0.025
+      Color Transformer: RGB8
+      Decay Time: 0
+      Position Transformer: XYZ
+      Selectable: true
+      Value: true
+    - Class: rviz/PointCloud2
+      Name: YOLOE Segmented Cloud (Camera)
+      Topic: /physical_nav/segmented_cloud
+      Queue Size: 2
+      Style: Points
+      Size (Pixels): 4
+      Size (m): 0.025
+      Color Transformer: RGB8
+      Decay Time: 0
+      Position Transformer: XYZ
+      Selectable: true
+      Value: false
+    - Class: rviz/MarkerArray
+      Name: YOLOE 3D Boxes (Map)
+      Marker Topic: /physical_nav/boxes_3d_world
+      Queue Size: 10
+      Namespaces:
+        physical_yoloe_boxes: true
+        physical_yoloe_labels: true
+      Value: true
+    - Class: rviz/Image
+      Name: RGB + YOLOE Boxes
+      Image Topic: /physical_nav/detections_overlay
+      Queue Size: 2
+      Normalize Range: true
+      Transport Hint: raw
+      Unreliable: false
+      Value: true
+    - Class: rviz/TF
+      Name: TF
+      Frame Timeout: 15
+      Marker Scale: 0.25
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Value: false
+  Enabled: true
+  Global Options:
+    Background Color: 30; 30; 30
+    Fixed Frame: tf_frame_map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 8
+      Focal Point:
+        X: 2
+        Y: 0
+        Z: 0.7
+      Name: Current View
+      Pitch: 0.55
+      Target Frame: tf_frame_map
+      Yaw: 0.75
+Window Geometry:
+  Height: 900
+  Width: 1500

@@ -155,6 +155,10 @@ class MatchaTtsSynthesizer:
             raise ValueError("Matcha thread count must be positive")
         self.model_dir = Path(model_dir)
         self.vocoder = Path(vocoder)
+        # The Baker voice sounds rushed at 1.0 on the Go2 body speaker. Sherpa
+        # defines smaller values as slower, so use a modestly slower profile.
+        self.speech_speed = 0.85
+        self.silence_scale = 0.35
         required = [
             self.model_dir / "model-steps-3.onnx",
             self.model_dir / "lexicon.txt",
@@ -199,8 +203,8 @@ class MatchaTtsSynthesizer:
     def synthesize(self, text: str, wav_path: Path) -> dict[str, object]:
         generation = self.sherpa_onnx.GenerationConfig()
         generation.sid = 0
-        generation.speed = 1.0
-        generation.silence_scale = 0.2
+        generation.speed = self.speech_speed
+        generation.silence_scale = self.silence_scale
         started = time.perf_counter()
         audio = self.tts.generate(text, generation)
         elapsed = time.perf_counter() - started
@@ -308,6 +312,25 @@ class AudioHubSession:
             await asyncio.sleep(0.5)
         raise RuntimeError("uploaded TTS audio did not appear in AudioHub list")
 
+    async def find(self, custom_name: str) -> Optional[str]:
+        """Return an already-uploaded AudioHub item with this stable name."""
+        response = await rpc_request(
+            self.conn,
+            RTC_TOPIC["AUDIO_HUB_REQ"],
+            AUDIO_API["GET_AUDIO_LIST"],
+            json.dumps({}),
+        )
+        require_success("AudioHub list", response)
+        data = response_data(response)
+        audio_list = data.get("audio_list", []) if isinstance(data, dict) else []
+        for item in audio_list:
+            if not isinstance(item, dict) or item.get("CUSTOM_NAME") != custom_name:
+                continue
+            unique_id = item.get("UNIQUE_ID")
+            if unique_id:
+                return str(unique_id)
+        return None
+
     async def play(self, unique_id: str) -> None:
         self.expected_id = unique_id
         self.saw_playing = False
@@ -333,6 +356,225 @@ class AudioHubSession:
             json.dumps({"unique_id": unique_id}),
         )
         require_success("AudioHub delete", response)
+
+
+class PersistentSpeechSession:
+    """Reuse one WebRTC AudioHub connection and stable pre-uploaded prompts."""
+
+    def __init__(
+        self,
+        *,
+        robot_ip: str = ROBOT_CONTROLLER_IP,
+        synthesis_backend: str = "matcha",
+        fallback_backend: str = "edge",
+        matcha_synthesizer: Optional[MatchaTtsSynthesizer] = None,
+        connect_attempts: int = 2,
+    ) -> None:
+        self.robot_ip = robot_ip
+        self.synthesis_backend = synthesis_backend
+        self.fallback_backend = fallback_backend
+        self.matcha_synthesizer = matcha_synthesizer
+        self.connect_attempts = max(1, int(connect_attempts))
+        self.conn: Optional[UnitreeWebRTCConnection] = None
+        self.audio_hub: Optional[AudioHubSession] = None
+        self.cache: dict[str, str] = {}
+
+    def _cache_name(self, text: str, voice: str) -> str:
+        speed = getattr(self.matcha_synthesizer, "speech_speed", 1.0)
+        silence = getattr(self.matcha_synthesizer, "silence_scale", 0.2)
+        profile = f"{self.synthesis_backend}:{speed:.3f}:{silence:.3f}"
+        digest = hashlib.sha256(
+            f"{profile}\0{voice}\0{text}".encode("utf-8")
+        ).hexdigest()[:20]
+        return f"policy_tts_cache_{digest}"
+
+    async def _connect(self) -> None:
+        if self.conn is not None and self.audio_hub is not None:
+            return
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.connect_attempts + 1):
+            candidate = UnitreeWebRTCConnection(
+                WebRTCConnectionMethod.LocalSTA,
+                ip=self.robot_ip,
+            )
+            try:
+                await asyncio.wait_for(candidate.connect(), timeout=25.0)
+                self.conn = candidate
+                self.audio_hub = AudioHubSession(candidate)
+                return
+            except Exception as exc:
+                last_error = exc
+                with contextlib.suppress(Exception):
+                    await candidate.disconnect()
+                if attempt < self.connect_attempts:
+                    await asyncio.sleep(1.0)
+        raise RuntimeError(
+            f"cannot connect to Go2 AudioHub after {self.connect_attempts} attempts"
+        ) from last_error
+
+    async def _disconnect(self) -> None:
+        conn = self.conn
+        self.conn = None
+        self.audio_hub = None
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                await conn.disconnect()
+
+    async def _synthesize(self, text: str, voice: str, wav_path: Path) -> dict[str, object]:
+        summary: dict[str, object] = {
+            "requested_synthesis_backend": self.synthesis_backend,
+            "fallback_backend": self.fallback_backend,
+        }
+        mp3_path = wav_path.with_suffix(".mp3")
+        started = time.perf_counter()
+        try:
+            if self.synthesis_backend == "matcha":
+                synthesizer = self.matcha_synthesizer or MatchaTtsSynthesizer()
+                summary.update(synthesizer.synthesize(text, wav_path))
+            else:
+                await synthesize_text(text, voice, mp3_path, wav_path)
+                summary["synthesis_backend"] = "edge"
+        except Exception as primary_error:
+            if self.synthesis_backend == "edge" or self.fallback_backend != "edge":
+                raise
+            summary["fallback_from"] = self.synthesis_backend
+            summary["fallback_reason"] = (
+                f"{type(primary_error).__name__}: {primary_error}"
+            )
+            await synthesize_text(text, voice, mp3_path, wav_path)
+            summary["synthesis_backend"] = "edge"
+        summary["total_synthesis_seconds"] = time.perf_counter() - started
+        summary["wav_bytes"] = wav_path.stat().st_size
+        return summary
+
+    async def _prepare(
+        self,
+        text: str,
+        voice: str,
+        *,
+        retain: bool,
+    ) -> tuple[str, dict[str, object]]:
+        await self._connect()
+        assert self.audio_hub is not None
+        cache_name = self._cache_name(text, voice)
+        if retain:
+            cached_id = self.cache.get(cache_name)
+            if cached_id:
+                return cached_id, {
+                    "audio_cache_hit": True,
+                    "preloaded": True,
+                    "synthesis_backend": self.synthesis_backend,
+                    "requested_synthesis_backend": self.synthesis_backend,
+                    "total_synthesis_seconds": 0.0,
+                }
+            cached_id = await self.audio_hub.find(cache_name)
+            if cached_id:
+                self.cache[cache_name] = cached_id
+                return cached_id, {
+                    "audio_cache_hit": True,
+                    "preloaded": True,
+                    "synthesis_backend": self.synthesis_backend,
+                    "requested_synthesis_backend": self.synthesis_backend,
+                    "total_synthesis_seconds": 0.0,
+                }
+
+        with tempfile.TemporaryDirectory(prefix="go2_speech_") as temp_dir_name:
+            wav_path = Path(temp_dir_name) / "speech.wav"
+            summary = await self._synthesize(text, voice, wav_path)
+            custom_name = cache_name if retain else f"policy_tts_{int(time.time() * 1000)}"
+            unique_id = await self.audio_hub.upload(wav_path, custom_name)
+        if retain:
+            self.cache[cache_name] = unique_id
+            summary["preloaded"] = True
+        summary["audio_cache_hit"] = False
+        summary["audiohub_unique_id"] = unique_id
+        return unique_id, summary
+
+    async def preload(self, texts: list[str], *, voice: str) -> list[dict[str, object]]:
+        results = []
+        for text in texts:
+            unique_id, summary = await self._prepare(text, voice, retain=True)
+            results.append({"text": text, "audiohub_unique_id": unique_id, **summary})
+        return results
+
+    async def _play_connected(
+        self,
+        text: str,
+        *,
+        voice: str,
+        volume: Optional[int],
+        retain: bool,
+    ) -> dict[str, object]:
+        await self._connect()
+        assert self.conn is not None and self.audio_hub is not None
+        unique_id, summary = await self._prepare(text, voice, retain=retain)
+        original_volume: Optional[int] = None
+        try:
+            volume_response = await rpc_request(self.conn, RTC_TOPIC["VUI"], 1004)
+            require_success("VUI GetVolume", volume_response)
+            volume_data = response_data(volume_response)
+            if isinstance(volume_data, dict) and isinstance(volume_data.get("volume"), int):
+                original_volume = int(volume_data["volume"])
+            summary["original_volume"] = original_volume
+            if volume is not None:
+                response = await rpc_request(
+                    self.conn, RTC_TOPIC["VUI"], 1003, {"volume": volume}
+                )
+                require_success("VUI SetVolume", response)
+                summary["playback_volume"] = volume
+            await self.audio_hub.play(unique_id)
+            summary["status"] = "completed"
+            summary["connection_reused"] = True
+            return summary
+        finally:
+            if not retain:
+                with contextlib.suppress(Exception):
+                    await self.audio_hub.delete(unique_id)
+            if original_volume is not None and volume is not None:
+                with contextlib.suppress(Exception):
+                    response = await rpc_request(
+                        self.conn,
+                        RTC_TOPIC["VUI"],
+                        1003,
+                        {"volume": original_volume},
+                    )
+                    require_success("VUI restore volume", response)
+
+    async def speak(
+        self,
+        text: str,
+        *,
+        voice: str,
+        volume: Optional[int],
+        retain: bool = False,
+    ) -> dict[str, object]:
+        if not text.strip():
+            raise ValueError("speech text must not be empty")
+        if volume is not None and not 0 <= volume <= 10:
+            raise ValueError("volume must be between 0 and 10")
+        last_error: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                return await self._play_connected(
+                    text,
+                    voice=voice,
+                    volume=volume,
+                    retain=retain,
+                )
+            except Exception as exc:
+                last_error = exc
+                await self._disconnect()
+                if retain:
+                    self.cache.pop(self._cache_name(text, voice), None)
+                if attempt == 0:
+                    continue
+        assert last_error is not None
+        raise last_error
+
+    async def close(self) -> None:
+        # Cached prompts intentionally remain in AudioHub and are discovered by
+        # stable name after a bridge restart. Only the transport is closed.
+        await self._disconnect()
 
 
 async def speak_text_once(
