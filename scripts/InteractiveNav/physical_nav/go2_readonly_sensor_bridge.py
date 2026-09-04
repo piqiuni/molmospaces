@@ -192,10 +192,13 @@ class D435iSource:
         print(f"D435i started color {c.width}x{c.height}@{color_fps} + depth {d.width}x{d.height}@{depth_fps}, align={align_to}, depth_scale={self.depth_scale}", flush=True)
 
     def read(self) -> tuple[Any, Any, float]:
-        frames = self.pipeline.wait_for_frames()
-        if self.align is not None:
-            frames = self.align.process(frames)
-        color = frames.get_color_frame()
+        raw_frames = self.pipeline.wait_for_frames()
+        # Keep the complete native color image.  On D435i, retrieving color
+        # from an ``align(depth)`` frameset can return a depth-sized canvas
+        # with black padding/cropping.  Only depth should come from the
+        # aligned frameset; RGB remains the original 1280x720 stream.
+        color = raw_frames.get_color_frame()
+        frames = self.align.process(raw_frames) if self.align is not None else raw_frames
         depth = frames.get_depth_frame()
         if not color or not depth:
             raise RuntimeError("D435i returned an incomplete RGB-D frame")
