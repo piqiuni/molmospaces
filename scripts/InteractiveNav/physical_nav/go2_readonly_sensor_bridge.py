@@ -138,14 +138,18 @@ def _unitree_state_reader(state: ReadOnlyState, interface: str) -> None:
 
 
 class D435iSource:
-    def __init__(self, width: int, height: int, fps: int, enable_motion: bool = False) -> None:
+    def __init__(self, width: int, height: int, fps: int, enable_motion: bool = False,
+                 color_width: int | None = None, color_height: int | None = None,
+                 color_fps: int | None = None, align_to: str = "depth") -> None:
         import pyrealsense2 as rs
 
         self.rs = rs
         self.pipeline = rs.pipeline()
         self.config = rs.config()
-        self.config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        depth_width, depth_height, depth_fps = width, height, fps
+        color_width, color_height, color_fps = color_width or width, color_height or height, color_fps or fps
+        self.config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, depth_fps)
+        self.config.enable_stream(rs.stream.color, color_width, color_height, rs.format.bgr8, color_fps)
         self.motion_enabled = False
         try:
             # D435i exposes gyro/accelerometer streams, but not a standalone
@@ -158,11 +162,13 @@ class D435iSource:
         except Exception as exc:
             print(f"D435i motion streams unavailable: {exc}", flush=True)
         self.profile = self.pipeline.start(self.config)
-        self.align = rs.align(rs.stream.color)
+        if align_to not in ("none", "color", "depth"):
+            raise ValueError("align_to must be none, color, or depth")
+        self.align = None if align_to == "none" else rs.align(getattr(rs.stream, align_to))
         depth_profile = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
         color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
         self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
-        c = color_profile.get_intrinsics()
+        c, d = color_profile.get_intrinsics(), depth_profile.get_intrinsics()
         self.intrinsics = {
             "fx": c.fx,
             "fy": c.fy,
@@ -173,12 +179,22 @@ class D435iSource:
             "distortion_model": str(getattr(c, "model", "")),
             "distortion": [float(v) for v in getattr(c, "coeffs", [])],
         }
-        self.camera_frame = f"{color_profile.stream_name()}_frame"
+        self.depth_intrinsics = {"fx": d.fx, "fy": d.fy, "cx": d.ppx, "cy": d.ppy,
+                                 "width": d.width, "height": d.height, "distortion_model": str(getattr(d, "model", "")),
+                                 "distortion": [float(v) for v in getattr(d, "coeffs", [])]}
+        if align_to == "color":
+            self.depth_intrinsics = dict(self.intrinsics)
+        ext = depth_profile.get_extrinsics_to(color_profile)
+        self.depth_to_color_extrinsics = {"rotation": [float(v) for v in ext.rotation], "translation": [float(v) for v in ext.translation]}
+        target_stream = rs.stream.depth if align_to == "depth" else rs.stream.color
+        self.camera_frame = f"{self.profile.get_stream(target_stream).stream_name()}_frame"
         self.latest_motion: dict[str, Any] = {}
-        print(f"D435i started {c.width}x{c.height}@{fps}, depth_scale={self.depth_scale}", flush=True)
+        print(f"D435i started color {c.width}x{c.height}@{color_fps} + depth {d.width}x{d.height}@{depth_fps}, align={align_to}, depth_scale={self.depth_scale}", flush=True)
 
     def read(self) -> tuple[Any, Any, float]:
-        frames = self.align.process(self.pipeline.wait_for_frames())
+        frames = self.pipeline.wait_for_frames()
+        if self.align is not None:
+            frames = self.align.process(frames)
         color = frames.get_color_frame()
         depth = frames.get_depth_frame()
         if not color or not depth:
@@ -248,7 +264,9 @@ async def publish(args: argparse.Namespace) -> None:
     state = ReadOnlyState()
     threading.Thread(target=_unitree_state_reader, args=(state, args.interface), daemon=True).start()
     source = None if args.dry_run else D435iSource(
-        args.width, args.height, args.fps, enable_motion=args.enable_camera_imu
+        args.depth_width, args.depth_height, args.depth_fps, enable_motion=args.enable_camera_imu,
+        color_width=args.color_width, color_height=args.color_height, color_fps=args.color_fps,
+        align_to=args.align_to,
     )
     # D435 capture must never wait for TCP/WebSocket writes.  When networking
     # slows down, keep draining the hardware stream and overwrite the pending
@@ -282,6 +300,9 @@ async def publish(args: argparse.Namespace) -> None:
                     "width": int(rgb.shape[1]),
                     "height": int(rgb.shape[0]),
                     "intrinsics": intr,
+                    "rgb_intrinsics": source.intrinsics if source is not None else intr,
+                    "depth_intrinsics": source.depth_intrinsics if source is not None else intr,
+                    "depth_to_color_extrinsics": source.depth_to_color_extrinsics if source is not None else {},
                     "sync_ms": sync_ms,
                     "depth_scale": args.depth_scale if source is None else source.depth_scale,
                 }
@@ -352,6 +373,8 @@ async def publish(args: argparse.Namespace) -> None:
                     width=int(frame["width"]), height=int(frame["height"]),
                     camera_frame=args.camera_frame, depth_scale=float(frame["depth_scale"]),
                     intrinsics=frame["intrinsics"], color_depth_sync_ms=frame["sync_ms"],
+                    rgb_intrinsics=frame.get("rgb_intrinsics"), depth_intrinsics=frame.get("depth_intrinsics"),
+                    depth_to_color_extrinsics=frame.get("depth_to_color_extrinsics"),
                 )
                 payload = encode_wire_packet(packet, compression_level=1)
                 send_started = time.monotonic()
@@ -405,6 +428,13 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument("--color-width", type=int, default=1280)
+    parser.add_argument("--color-height", type=int, default=720)
+    parser.add_argument("--color-fps", type=int, default=10)
+    parser.add_argument("--depth-width", type=int, default=848)
+    parser.add_argument("--depth-height", type=int, default=480)
+    parser.add_argument("--depth-fps", type=int, default=10)
+    parser.add_argument("--align-to", choices=("none", "color", "depth"), default="depth")
     parser.add_argument("--publish-fps", type=float, default=10.0)
     parser.add_argument("--depth-png-compression", type=int, default=4)
     parser.add_argument("--telemetry-period", type=float, default=0.2)

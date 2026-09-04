@@ -950,12 +950,13 @@ class PhysicalRosGateway:
             stamp = rospy.Time.now()
             rgb_msg = _image_msg(rgb, "bgr8", stamp, frame)
             depth_msg = _image_msg(depth, "16UC1", stamp, frame)
-        info = CameraInfo(); info.header.stamp = stamp; info.header.frame_id = frame; info.width = int(raw.get("width", rgb.shape[1])); info.height = int(raw.get("height", rgb.shape[0])); intr = raw.get("intrinsics", {}); info.K = [float(intr.get("fx", 0)), 0, float(intr.get("cx", 0)), 0, float(intr.get("fy", 0)), float(intr.get("cy", 0)), 0, 0, 1]
+        intr = raw.get("rgb_intrinsics") or raw.get("intrinsics", {})
+        info = CameraInfo(); info.header.stamp = stamp; info.header.frame_id = frame; info.width = int(intr.get("width", rgb.shape[1])); info.height = int(intr.get("height", rgb.shape[0])); info.K = [float(intr.get("fx", 0)), 0, float(intr.get("cx", 0)), 0, float(intr.get("fy", 0)), float(intr.get("cy", 0)), 0, 0, 1]
         distortion = [float(value) for value in (intr.get("distortion") or [])[:5]]
         info.D = distortion
         info.distortion_model = str(intr.get("distortion_model", "plumb_bob") or "plumb_bob")
         self.rgb_pub.publish(rgb_msg); self.depth_pub.publish(depth_msg); self.info_pub.publish(info)
-        self._publish_cloud(depth, intr, stamp, frame); self._publish_pose(raw.get("telemetry", {}), stamp)
+        self._publish_cloud(depth, raw.get("depth_intrinsics") or intr, stamp, frame); self._publish_pose(raw.get("telemetry", {}), stamp)
 
     def _publish_cloud(self, depth: np.ndarray, intr: dict[str, Any], stamp: Any, frame: str) -> None:
         fx, fy, cx, cy = [_to_float(intr.get(k)) for k in ("fx", "fy", "cx", "cy")]; scale = _to_float(self.last_raw.get("depth_scale", .001) if self.last_raw else .001)

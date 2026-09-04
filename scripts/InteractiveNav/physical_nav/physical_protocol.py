@@ -60,6 +60,9 @@ def image_packet(
     depth_scale: float,
     intrinsics: Mapping[str, float],
     color_depth_sync_ms: float,
+    rgb_intrinsics: Mapping[str, Any] | None = None,
+    depth_intrinsics: Mapping[str, Any] | None = None,
+    depth_to_color_extrinsics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "v": PROTOCOL_VERSION,
@@ -73,6 +76,9 @@ def image_packet(
         "camera_frame": str(camera_frame),
         "depth_scale": float(depth_scale),
         "intrinsics": dict(intrinsics),
+        "rgb_intrinsics": dict(rgb_intrinsics or intrinsics),
+        "depth_intrinsics": dict(depth_intrinsics or intrinsics),
+        "depth_to_color_extrinsics": dict(depth_to_color_extrinsics or {}),
         "color_depth_sync_ms": float(color_depth_sync_ms),
     }
 

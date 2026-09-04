@@ -5,6 +5,15 @@ frames:
   base_frame: "tf_frame_base_link"
   camera_frame: "d435i_color_optical_frame"
 
+camera:
+  color_width: 1280
+  color_height: 720
+  color_fps: 10
+  depth_width: 848
+  depth_height: 480
+  depth_fps: 10
+  align_to: "depth"
+
 topics:
   rgb_image: "/physical_nav/rgb/image_raw"
   depth_image: "/physical_nav/depth/image_raw"

@@ -47,6 +47,29 @@ def _decode(value: str) -> np.ndarray:
     return image
 
 
+def _rgb_mask_to_depth(mask: np.ndarray, depth: np.ndarray, rgb_intr: dict[str, Any], depth_intr: dict[str, Any], extr: dict[str, Any]) -> np.ndarray:
+    """Project an RGB YOLO mask onto the native/aligned depth pixel grid."""
+    if mask.shape == depth.shape:
+        return mask.astype(bool)
+    h, w = depth.shape[:2]
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    z = depth.astype(np.float32)
+    valid = z > 0
+    x = (xx - float(depth_intr.get("cx", 0))) * z / max(float(depth_intr.get("fx", 1)), 1e-6)
+    y = (yy - float(depth_intr.get("cy", 0))) * z / max(float(depth_intr.get("fy", 1)), 1e-6)
+    points = np.stack((x, y, z), axis=-1)
+    rotation = np.asarray(extr.get("rotation", np.eye(3).reshape(-1)), dtype=np.float32).reshape(3, 3)
+    translation = np.asarray(extr.get("translation", [0, 0, 0]), dtype=np.float32).reshape(1, 1, 3)
+    color_points = points @ rotation.T + translation
+    cz = color_points[..., 2]
+    u = np.rint(color_points[..., 0] * float(rgb_intr.get("fx", 1)) / np.maximum(cz, 1e-6) + float(rgb_intr.get("cx", 0))).astype(np.int32)
+    v = np.rint(color_points[..., 1] * float(rgb_intr.get("fy", 1)) / np.maximum(cz, 1e-6) + float(rgb_intr.get("cy", 0))).astype(np.int32)
+    inside = valid & (cz > 0) & (u >= 0) & (u < mask.shape[1]) & (v >= 0) & (v < mask.shape[0])
+    result = np.zeros((h, w), dtype=bool)
+    result[inside] = mask[v[inside], u[inside]] > 0
+    return result
+
+
 def _post(url: str, value: Any) -> None:
     data = json.dumps({"name": "detections", "value": value}, ensure_ascii=False).encode()
     req = urllib.request.Request(url.rstrip("/") + "/api/ros-state", data=data, headers={"Content-Type": "application/json"})
@@ -553,7 +576,10 @@ class YoloeWorker:
 
     def infer(self, raw: dict[str, Any]) -> dict[str, Any]:
         infer_started = time.perf_counter()
-        rgb = _decode(raw["rgb"]); depth = _decode(raw["depth"]).astype(np.float32); intr = raw.get("intrinsics", {}); fx, fy, cx, cy = [float(intr.get(k, 0)) for k in ("fx", "fy", "cx", "cy")]
+        rgb = _decode(raw["rgb"]); depth = _decode(raw["depth"]).astype(np.float32)
+        rgb_intr = raw.get("rgb_intrinsics") or raw.get("intrinsics", {})
+        depth_intr = raw.get("depth_intrinsics") or raw.get("intrinsics", {})
+        fx, fy, cx, cy = [float(depth_intr.get(k, 0)) for k in ("fx", "fy", "cx", "cy")]
         result = self.model.predict(source=rgb, device=self.args.device, imgsz=self.args.imgsz, conf=self.args.conf, iou=self.args.iou, max_det=self.args.max_det, verbose=False, save=False)[0]
         boxes = getattr(result, "boxes", None); masks = getattr(result, "masks", None); detections = []; debug_point_sets = []
         if boxes is None:
@@ -586,7 +612,7 @@ class YoloeWorker:
             if float(confs[index]) < threshold:
                 continue
             if mask is not None and mask.shape != depth.shape:
-                mask = cv2.resize(mask.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+                mask = _rgb_mask_to_depth(mask.astype(np.uint8), depth, rgb_intr, depth_intr, raw.get("depth_to_color_extrinsics") or {})
             else: mask = mask > .5 if mask is not None else np.zeros(depth.shape, dtype=bool)
             if fx <= 0 or fy <= 0:
                 continue
