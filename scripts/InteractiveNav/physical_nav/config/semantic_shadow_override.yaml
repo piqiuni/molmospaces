@@ -71,7 +71,25 @@ executor:
   # costmap is sufficient to trigger make_plan; do not wait for the slower
   # semantic planning-OCC relay before crossing the door.
   post_interaction_costmap_fast_path_enabled: true
+  # The physical action server is launched alongside the semantic stack.  Do
+  # not hold a navigation worker for the simulator's 30-second startup wait
+  # when that server is temporarily absent during a restart.
+  move_base_server_wait_s: 5.0
+  # Bound an unavailable make_plan service check in the physical lane.  The
+  # causal OCC barrier remains authoritative; this only prevents a stale
+  # service wait from delaying the first post-open traversal attempt.
+  make_plan_service_wait_sec: 0.5
+exploration:
+  # ExplorePy is an external-goal producer in the physical lane.  Its
+  # periodic make_plan/recovery preflights otherwise compete with the
+  # executor-owned post-open causal replan and can keep move_base busy while
+  # the new OCC is already available.
+  external_recovery_preflight_enabled: false
+  make_plan_preflight_enabled: false
 policy:
+  # The executor owns the physical raw-OCC -> global-costmap causal barrier.
+  # Do not add a second 30 s semantic-graph freshness gate before it.
+  post_interaction_refresh_enabled: false
   # An M3 timeout skips the unchanged physical object briefly, then allows it
   # to become eligible again after the robot has explored another subgoal.
   interaction_target_failure_cooldown_s: 30.0

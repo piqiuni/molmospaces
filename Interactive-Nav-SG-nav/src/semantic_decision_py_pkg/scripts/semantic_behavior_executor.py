@@ -52,6 +52,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     post_open_path_retryable_preflight_reason,
     post_interaction_costmap_baseline_keys,
     post_interaction_costmap_receipts_fresh_source,
+    post_interaction_global_costmap_fresh_source,
     post_interaction_planning_occupancy_fresh_source,
     post_interaction_raw_occupancy_fresh_source,
     prerotation_control_step_budget,
@@ -1020,6 +1021,14 @@ class SemanticBehaviorExecutor:
         self.post_interaction_costmap_fast_path_enabled = bool(
             config.get("post_interaction_costmap_fast_path_enabled", False)
         )
+        # ``wait_for_server`` runs inside every navigation worker.  The
+        # simulator can take a while to bring up move_base, but on the
+        # physical lane a reconnect must not make the worker appear hung for
+        # the simulator's 30-second default.  Keep the conservative default
+        # and let the physical override shorten it explicitly.
+        self.move_base_server_wait_s = max(
+            0.0, float(config.get("move_base_server_wait_s", 30.0))
+        )
         self.explore_make_plan_fail_open_after_retries = bool(
             config.get("explore_make_plan_fail_open_after_retries", True)
         )
@@ -1300,14 +1309,21 @@ class SemanticBehaviorExecutor:
         self._raw_occupancy_events: deque[PostInteractionRawMapBarrier] = deque(
             maxlen=64
         )
+        # Keep the newest event separately from the bounded diagnostic deque.
+        # A delayed semantic hand-off can outlive 64 high-rate OCC callbacks;
+        # the latest snapshot still carries the planning/global counters taken
+        # at the raw callback and can be checked against the action timestamp.
+        self._latest_raw_occupancy_event: PostInteractionRawMapBarrier | None = None
         # ``costmap_updates`` is the low-latency final signal.  Keep the full
         # map too as a fallback, but only after a newer planning OCC has been
         # observed.
         self._global_costmap_received_count = 0
         self._latest_global_costmap_header_seq: int | None = None
+        self._latest_global_costmap_header_stamp_sec: float | None = None
         self._latest_global_costmap_received_at = 0.0
         self._global_costmap_update_received_count = 0
         self._latest_global_costmap_update_header_seq: int | None = None
+        self._latest_global_costmap_update_header_stamp_sec: float | None = None
         self._latest_global_costmap_update_received_at = 0.0
         self._post_interaction_costmap_baselines: dict[
             str, PostInteractionCostmapBaseline
@@ -1546,6 +1562,15 @@ class SemanticBehaviorExecutor:
                 queue_size=32,
             )
         self.timer = rospy.Timer(rospy.Duration(0.2), self._tick)
+        rospy.loginfo(
+            "[semantic_behavior_executor] post-open map path: "
+            "fast_raw_to_global=%s costmap_timeout=%.2fs "
+            "make_plan_retry=%.2fs move_base_wait=%.2fs",
+            self.post_interaction_costmap_fast_path_enabled,
+            self.post_interaction_costmap_fresh_timeout_s,
+            self.post_interaction_traversal_make_plan_retry_window_s,
+            self.move_base_server_wait_s,
+        )
 
     def _selection_callback(self, message: String) -> None:
         try:
@@ -3700,26 +3725,32 @@ class SemanticBehaviorExecutor:
             self._latest_raw_occupancy_header_seq = header_seq
             self._latest_raw_occupancy_header_stamp_sec = header_stamp_sec
             self._latest_raw_occupancy_received_at = time.monotonic()
-            self._raw_occupancy_events.append(
-                PostInteractionRawMapBarrier(
-                    receipt_count=self._raw_occupancy_received_count,
-                    header_seq=header_seq,
-                    header_stamp_sec=header_stamp_sec,
-                    planning_occupancy_receipt_count=(
-                        self._planning_occupancy_received_count
-                    ),
-                    planning_occupancy_header_seq=(
-                        self._latest_planning_occupancy_header_seq
-                    ),
-                    planning_occupancy_header_stamp_sec=(
-                        self._latest_planning_occupancy_header_stamp_sec
-                    ),
-                    global_costmap_receipt_count=self._global_costmap_received_count,
-                    global_costmap_update_receipt_count=(
-                        self._global_costmap_update_received_count
-                    ),
-                )
+            raw_event = PostInteractionRawMapBarrier(
+                receipt_count=self._raw_occupancy_received_count,
+                header_seq=header_seq,
+                header_stamp_sec=header_stamp_sec,
+                planning_occupancy_receipt_count=(
+                    self._planning_occupancy_received_count
+                ),
+                planning_occupancy_header_seq=(
+                    self._latest_planning_occupancy_header_seq
+                ),
+                planning_occupancy_header_stamp_sec=(
+                    self._latest_planning_occupancy_header_stamp_sec
+                ),
+                global_costmap_receipt_count=self._global_costmap_received_count,
+                global_costmap_update_receipt_count=(
+                    self._global_costmap_update_received_count
+                ),
+                global_costmap_header_stamp_sec=getattr(
+                    self, "_latest_global_costmap_header_stamp_sec", None
+                ),
+                global_costmap_update_header_stamp_sec=getattr(
+                    self, "_latest_global_costmap_update_header_stamp_sec", None
+                ),
             )
+            self._raw_occupancy_events.append(raw_event)
+            self._latest_raw_occupancy_event = raw_event
             self._global_costmap_condition.notify_all()
 
     def _planning_occupancy_callback(self, message: OccupancyGrid) -> None:
@@ -3736,20 +3767,22 @@ class SemanticBehaviorExecutor:
     def _global_costmap_callback(self, message: OccupancyGrid) -> None:
         """Record a full global-costmap fallback publication."""
 
-        header_seq, _ = self._map_header_fields(message)
+        header_seq, header_stamp_sec = self._map_header_fields(message)
         with self._global_costmap_condition:
             self._global_costmap_received_count += 1
             self._latest_global_costmap_header_seq = header_seq
+            self._latest_global_costmap_header_stamp_sec = header_stamp_sec
             self._latest_global_costmap_received_at = time.monotonic()
             self._global_costmap_condition.notify_all()
 
     def _global_costmap_update_callback(self, message: OccupancyGridUpdate) -> None:
         """Record the primary incremental global-costmap planner update."""
 
-        header_seq, _ = self._map_header_fields(message)
+        header_seq, header_stamp_sec = self._map_header_fields(message)
         with self._global_costmap_condition:
             self._global_costmap_update_received_count += 1
             self._latest_global_costmap_update_header_seq = header_seq
+            self._latest_global_costmap_update_header_stamp_sec = header_stamp_sec
             self._latest_global_costmap_update_received_at = time.monotonic()
             self._global_costmap_condition.notify_all()
 
@@ -3881,11 +3914,21 @@ class SemanticBehaviorExecutor:
         recorded = self._post_interaction_raw_map_barriers.get(baseline_key)
         if recorded is not None:
             return recorded
-        for raw_event in self._raw_occupancy_events:
+        events = list(self._raw_occupancy_events)
+        latest_event = getattr(self, "_latest_raw_occupancy_event", None)
+        if latest_event is not None and (
+            not events or latest_event.receipt_count != events[-1].receipt_count
+        ):
+            # The bounded deque is intentionally kept small for diagnostics;
+            # do not lose the newest causal sample when the decision node was
+            # busy with a preceding model/gate hand-off.
+            events.append(latest_event)
+        for raw_event in events:
             raw_fresh_source = post_interaction_raw_occupancy_fresh_source(
                 baseline,
                 raw_event.receipt_count,
                 raw_event.header_stamp_sec,
+                allow_callback_reorder=True,
             )
             if not raw_fresh_source:
                 continue
@@ -3961,8 +4004,12 @@ class SemanticBehaviorExecutor:
         physical fast path may skip waiting for planning OCC, because the
         global costmap consumes raw OCC directly through StaticLayer.  In both
         cases, raw OCC must be newer than the interaction result and the
-        accepted global-costmap full/update receipt must be newer than that
-        raw OCC receipt; an old map is never admitted to ``make_plan``.
+        accepted global-costmap full/update must be a callback received after
+        that raw OCC.  A trusted source-map publisher may opt into accepting a
+        cross-topic callback reorder when its header stamp proves the source
+        relationship; the physical publisher uses a local ``now`` stamp and
+        therefore does not opt in.  An unproven old map is never admitted to
+        ``make_plan``.
         """
 
         started_at = time.monotonic()
@@ -3974,9 +4021,15 @@ class SemanticBehaviorExecutor:
             while True:
                 current_full_count = self._global_costmap_received_count
                 current_full_header_seq = self._latest_global_costmap_header_seq
+                current_full_header_stamp_sec = getattr(
+                    self, "_latest_global_costmap_header_stamp_sec", None
+                )
                 current_update_count = self._global_costmap_update_received_count
                 current_update_header_seq = (
                     self._latest_global_costmap_update_header_seq
+                )
+                current_update_header_stamp_sec = getattr(
+                    self, "_latest_global_costmap_update_header_stamp_sec", None
                 )
                 current_raw_count = self._raw_occupancy_received_count
                 current_raw_header_seq = self._latest_raw_occupancy_header_seq
@@ -3999,17 +4052,30 @@ class SemanticBehaviorExecutor:
                             baseline, baseline_key
                         )
                     )
-                    if raw_barrier is not None:
-                        planning_barrier = (
-                            self._post_interaction_planning_map_barrier_locked(
-                                baseline_key,
-                                raw_barrier,
-                                raw_fresh_source,
+                    # The physical lane deliberately bypasses the semantic
+                    # planning-OCC relay.  Its global costmap StaticLayer reads
+                    # the raw OCC topic directly, so waiting for
+                    # ``planning_occ_map`` here would recreate the very delay
+                    # this fast path is meant to remove.  The strict/sim lane
+                    # below keeps the original raw -> planning -> costmap
+                    # barrier.
+                if (
+                    raw_barrier is not None
+                    and not self.post_interaction_costmap_fast_path_enabled
+                ):
+                    planning_barrier = (
+                        self._post_interaction_planning_map_barrier_locked(
+                            baseline_key,
+                            raw_barrier,
+                            raw_fresh_source,
                             )
                         )
                 if raw_barrier is None:
                     causal_stage = "waiting_raw_occupancy"
-                elif planning_barrier is None:
+                elif (
+                    not self.post_interaction_costmap_fast_path_enabled
+                    and planning_barrier is None
+                ):
                     causal_stage = "waiting_planning_occupancy"
                 else:
                     causal_stage = "waiting_global_costmap"
@@ -4065,6 +4131,9 @@ class SemanticBehaviorExecutor:
                     ),
                     "post_open_costmap_latest_receipt_count": current_full_count,
                     "post_open_costmap_latest_header_seq": current_full_header_seq,
+                    "post_open_costmap_latest_header_stamp_sec": (
+                        current_full_header_stamp_sec
+                    ),
                     "post_open_costmap_baseline_update_receipt_count": (
                         costmap_baseline_update_count
                     ),
@@ -4076,6 +4145,9 @@ class SemanticBehaviorExecutor:
                     ),
                     "post_open_costmap_latest_update_header_seq": (
                         current_update_header_seq
+                    ),
+                    "post_open_costmap_latest_update_header_stamp_sec": (
+                        current_update_header_stamp_sec
                     ),
                     "post_open_costmap_wait_elapsed_s": elapsed_s,
                     "post_open_costmap_wait_timeout_s": (
@@ -4206,18 +4278,18 @@ class SemanticBehaviorExecutor:
                 if (
                     self.post_interaction_costmap_fast_path_enabled
                     and raw_barrier is not None
-                    and (
-                        current_update_count
-                        > int(raw_barrier.global_costmap_update_receipt_count)
-                        or current_full_count
-                        > int(raw_barrier.global_costmap_receipt_count)
-                    )
                 ):
-                    fast_source = (
-                        "raw_occupancy_to_global_costmap_update"
-                        if current_update_count
-                        > int(raw_barrier.global_costmap_update_receipt_count)
-                        else "raw_occupancy_to_global_costmap_full"
+                    fast_source = post_interaction_global_costmap_fresh_source(
+                        raw_barrier,
+                        current_full_count,
+                        current_update_count,
+                        current_full_header_stamp_sec,
+                        current_update_header_stamp_sec,
+                        # The physical costmap publisher stamps with local
+                        # receipt time, so a header-only callback reorder is
+                        # not causal evidence.  Require an actual callback
+                        # after the admitted raw OCC.
+                        allow_callback_reorder=False,
                     )
                 if fast_source:
                     detail["post_open_costmap_fresh"] = True
@@ -8983,7 +9055,11 @@ class SemanticBehaviorExecutor:
                 navigation_run_token=navigation_run_token,
             )
 
-        ready = self.move_base.wait_for_server(rospy.Duration(30.0))
+        ready = self.move_base.wait_for_server(
+            rospy.Duration(
+                max(0.0, float(getattr(self, "move_base_server_wait_s", 30.0)))
+            )
+        )
         if not ready:
             report_result(False, {"reason": "move_base_unavailable"})
             return
@@ -9200,6 +9276,12 @@ class SemanticBehaviorExecutor:
             option_indices = container_two_stage_m1_preflight_batch_indices(
                 candidate, start_goal_option_index
             )
+        elif is_container_two_stage_physical_action(candidate):
+            # Once M1 has authorized a container face, all remaining options
+            # are same-face physical tangents.  They are safe to preflight in
+            # one worker because no new observation is needed; if the primary
+            # is unreachable, the next tangent can be selected immediately.
+            option_indices = range(start_goal_option_index, len(goal_options))
         elif str(behavior_type).upper() == "INTERACT":
             # Keep generic door approaches sequential.  A failed far-side
             # goal must be surfaced to the retry state machine so it can send

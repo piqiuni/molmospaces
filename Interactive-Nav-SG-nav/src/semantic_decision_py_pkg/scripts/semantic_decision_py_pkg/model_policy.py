@@ -279,7 +279,26 @@ def _public_portal_context_ids(nodes: list[dict[str, Any]]) -> dict[str, str]:
 
 
 def compact_graph(graph: dict[str, Any], max_nodes: int = 80, max_edges: int = 160) -> dict[str, Any]:
-    graph_nodes = list(graph.get("nodes") or [])[: max(0, int(max_nodes))]
+    all_graph_nodes = list(graph.get("nodes") or [])
+    node_limit = max(0, int(max_nodes))
+    # Portal geometry is needed for the post-open continuation as well as for
+    # M2's route context.  The full graph is sorted by public node id, so a
+    # busy physical scene can otherwise put every portal after the first 80
+    # objects; the decision node would then be unable to reproject the
+    # far-side goal from the fresh map.  Keep all portals in the compact view
+    # (up to the configured limit), then fill the remaining slots in source
+    # order.  This does not expose private labels or alter ordinary object
+    # ordering among the retained nodes.
+    if len(all_graph_nodes) > node_limit:
+        priority_nodes = [
+            node
+            for node in all_graph_nodes
+            if str(node.get("type") or "").casefold() == "portal"
+        ]
+        ordinary_nodes = [node for node in all_graph_nodes if node not in priority_nodes]
+        graph_nodes = (priority_nodes + ordinary_nodes)[:node_limit]
+    else:
+        graph_nodes = all_graph_nodes[:node_limit]
     public_portal_ids = _public_portal_context_ids(graph_nodes)
     nodes = []
     for node in graph_nodes:
@@ -299,26 +318,52 @@ def compact_graph(graph: dict[str, Any], max_nodes: int = 80, max_edges: int = 1
             else node.get("label")
         )
         public_name = public_label if node_type == "portal" else node.get("name")
-        nodes.append(
-            {
-                "id": public_door_id or node.get("id"),
-                "type": node_type,
-                "label": public_label,
-                "name": public_name,
-                "centroid": list(node.get("centroid") or [])[:3],
-                "room_id": node.get("room_id"),
-                "is_currently_visible": bool(node.get("is_currently_visible")),
-                "state_age_sec": node.get("state_age_sec", 0.0),
-                "connected_room_ids": list(attributes.get("connected_room_ids") or []),
-                "interaction_state": interaction.get("state"),
-                "requires_interaction": interaction.get("requires_interaction"),
-                "traversable": interaction.get("traversable"),
-                "is_interactable": interaction.get("is_interactable"),
-                "interaction_capability": interaction.get("capability"),
-                "interaction_capability_source": interaction.get("capability_source"),
-                "interaction_failure_reason": interaction.get("failure_reason"),
-            }
-        )
+        compact_node = {
+            "id": public_door_id or node.get("id"),
+            "type": node_type,
+            "label": public_label,
+            "name": public_name,
+            "centroid": list(node.get("centroid") or [])[:3],
+            "room_id": node.get("room_id"),
+            "is_currently_visible": bool(node.get("is_currently_visible")),
+            "state_age_sec": node.get("state_age_sec", 0.0),
+            "connected_room_ids": list(attributes.get("connected_room_ids") or []),
+            "interaction_state": interaction.get("state"),
+            "requires_interaction": interaction.get("requires_interaction"),
+            "traversable": interaction.get("traversable"),
+            "is_interactable": interaction.get("is_interactable"),
+            "interaction_capability": interaction.get("capability"),
+            "interaction_capability_source": interaction.get("capability_source"),
+            "interaction_failure_reason": interaction.get("failure_reason"),
+        }
+        if node_type.casefold() == "portal":
+            # ``reproject_post_interaction_traversal_candidate`` consumes the
+            # compact graph, not the mapper's full bundle.  Carry only the
+            # bounded geometry fields required to distinguish the interaction
+            # reference from the complete clearance footprint.  Keeping this
+            # under an explicit key avoids copying the mapper's private/source
+            # attributes into an MLLM prompt.
+            portal_geometry = {}
+            for key in (
+                "interaction_reference_aabb_center",
+                "interaction_reference_aabb_size",
+            ):
+                value = attributes.get(key)
+                if isinstance(value, (list, tuple)) and len(value) >= 2:
+                    try:
+                        portal_geometry[key] = [float(item) for item in value[:3]]
+                    except (TypeError, ValueError):
+                        pass
+            for key in ("aabb_center", "aabb_size"):
+                value = node.get(key)
+                if isinstance(value, (list, tuple)) and len(value) >= 2:
+                    try:
+                        portal_geometry[key] = [float(item) for item in value[:3]]
+                    except (TypeError, ValueError):
+                        pass
+            if portal_geometry:
+                compact_node["portal_geometry"] = portal_geometry
+        nodes.append(compact_node)
     edges = []
     for edge in list(graph.get("edges") or [])[: max(0, int(max_edges))]:
         attributes = dict(edge.get("attributes") or {})

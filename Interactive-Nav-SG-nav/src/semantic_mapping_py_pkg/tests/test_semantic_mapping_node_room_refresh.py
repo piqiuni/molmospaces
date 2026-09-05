@@ -21,6 +21,7 @@ rospy = pytest.importorskip("rospy")
 
 import semantic_mapping_node as semantic_mapping_module
 from semantic_mapping_node import OccupancyGrid, SemanticMappingNode
+from semantic_mapping_py_pkg.semantic_map_store import ObjectMapStore
 from semantic_mapping_py_pkg.semantic_occ_overlay import SemanticOccupancyOverlay
 
 
@@ -78,6 +79,26 @@ class _AlreadyOpenGraphStore(_GraphStore):
         self.result = dict(result)
         self.stamp = stamp
         return False
+
+
+class _GraphObservationRecorder:
+    def __init__(self) -> None:
+        self.observations = []
+
+    def has_confirmed_open_refrigerator(self):
+        return True
+
+    def update_observations(self, observations, *, stamp=None, source_mode=None):
+        self.observations.append(
+            {
+                "observations": list(observations),
+                "stamp": stamp,
+                "source_mode": source_mode,
+            }
+        )
+
+    def prune_stale_nodes(self, _stale_after_sec, *, now=None):
+        return None
 
 
 def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
@@ -147,6 +168,76 @@ def test_successful_open_defers_room_refresh_until_after_direct_raw_publish(
     ]
 
 
+def test_open_refrigerator_admits_one_frame_content_to_graph_only(monkeypatch):
+    """The strict M1 topic stays empty while the graph receives the item."""
+
+    monkeypatch.setattr(
+        semantic_mapping_module.rospy,
+        "loginfo_throttle",
+        lambda *_args: None,
+        raising=False,
+    )
+    node = object.__new__(SemanticMappingNode)
+    node.enable_object_mapping = True
+    node.lock = threading.RLock()
+    node.object_store = ObjectMapStore(
+        match_distance=0.5,
+        min_confirmations=3,
+        class_min_confirmations={"bottle": 3},
+    )
+    node.graph_min_observations = 3
+    node.open_refrigerator_content_mapping_enabled = True
+    node.open_refrigerator_content_min_observations = 1
+    node.open_refrigerator_content_ignore_class_confirmations = True
+    node.object_stale_after_sec = 0.0
+    node.graph_store = _GraphObservationRecorder()
+    published = []
+    node.tracked_detections_pub = SimpleNamespace(
+        publish=lambda message: published.append(message)
+    )
+    node._update_room_portal_hints = lambda *_args, **_kwargs: False
+    node._collect_publish_bundle = lambda: {}
+    node._safe_publish_bundle = lambda _bundle: None
+
+    SemanticMappingNode.object_callback(
+        node,
+        SimpleNamespace(
+            data=json.dumps(
+                {
+                    "secs": 1,
+                    "nsecs": 0,
+                    "detections": [
+                        {
+                            "semantic_class": "bottle",
+                            "confidence": 0.8,
+                            "world_position": {"x": 1.0, "y": 2.0, "z": 0.8},
+                            "world_box3d_center": {
+                                "x": 1.0,
+                                "y": 2.0,
+                                "z": 0.8,
+                            },
+                            "world_box3d_size": {
+                                "x": 0.08,
+                                "y": 0.08,
+                                "z": 0.24,
+                            },
+                        }
+                    ],
+                }
+            )
+        ),
+    )
+
+    assert len(published) == 1
+    assert json.loads(published[0].data)["detections"] == []
+    assert len(node.graph_store.observations) == 1
+    admitted = node.graph_store.observations[0]["observations"]
+    assert len(admitted) == 1
+    assert admitted[0]["semantic_name"] == "bottle"
+    assert admitted[0]["tracking_confirmed"] is False
+    assert admitted[0]["graph_admission_source"] == "open_refrigerator_exposure"
+
+
 def test_static_portal_result_does_not_arm_post_open_transition() -> None:
     static_result = {
         "action": "open",
@@ -165,6 +256,26 @@ def test_static_portal_result_does_not_arm_post_open_transition() -> None:
 
     assert not SemanticMappingNode._is_successful_open_result(static_result)
     assert SemanticMappingNode._is_successful_open_result(physical_result)
+
+
+def test_source_portal_topology_survives_delayed_m1_type_demotion() -> None:
+    """A mutable M1 type must not suppress a source-qualified door result."""
+
+    assert SemanticMappingNode._node_is_topology_portal(
+        {
+            "type": "object",
+            "attributes": {"topology_type": "portal"},
+        }
+    )
+    assert not SemanticMappingNode._node_is_topology_portal(
+        {
+            "type": "portal",
+            "attributes": {"topology_type": "container"},
+        }
+    )
+    # Legacy/replay payloads without provenance retain their public-type
+    # behavior for backwards compatibility.
+    assert SemanticMappingNode._node_is_topology_portal({"type": "portal"})
 
 
 class _SceneStore:

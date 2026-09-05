@@ -259,20 +259,22 @@ class SemanticOccupancyOverlay:
 
         Module 1 may suggest a semantic class while looking at a partial box.
         It must not promote a source-observed container into a topological
-        portal for planning.  Newer graph payloads carry the immutable
+        portal for planning.  Conversely, a delayed M1 answer must not demote
+        a source-observed portal just before its successful open result reaches
+        the raw-OCC bridge. Newer graph payloads carry the immutable
         ``topology_type`` / ``observation_node_type`` provenance; legacy
         payloads without either key retain their historical portal behavior.
         """
 
-        if str(node.get("type") or "").casefold() != "portal":
-            return False
         attributes = node.get("attributes") or {}
         source_type = str(
             attributes.get("topology_type")
             or attributes.get("observation_node_type")
             or ""
         ).strip().casefold()
-        return source_type in {"", "portal"}
+        if source_type:
+            return source_type == "portal"
+        return str(node.get("type") or "").casefold() == "portal"
 
     def has_active_portals(self, *, include_pending: bool = True) -> bool:
         """Whether this consumer needs a materialized overlay right now.

@@ -967,6 +967,8 @@ class PostInteractionRawMapBarrier:
     # arrived before the raw map for a causal update.
     global_costmap_receipt_count: int = 0
     global_costmap_update_receipt_count: int = 0
+    global_costmap_header_stamp_sec: float | None = None
+    global_costmap_update_header_stamp_sec: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1004,6 +1006,8 @@ def post_interaction_raw_occupancy_fresh_source(
     baseline: PostInteractionCostmapBaseline | None,
     current_receipt_count: int,
     current_header_stamp_sec: float | None,
+    *,
+    allow_callback_reorder: bool = False,
 ) -> str:
     """Return how a raw OCC receipt proves it followed the open result.
 
@@ -1013,12 +1017,31 @@ def post_interaction_raw_occupancy_fresh_source(
     for benchmark diagnostics.
     """
 
-    if baseline is None or int(current_receipt_count) <= int(
-        baseline.raw_occupancy_receipt_count
-    ):
+    if baseline is None:
+        return ""
+    try:
+        receipt_advanced = int(current_receipt_count) > int(
+            baseline.raw_occupancy_receipt_count
+        )
+    except (TypeError, ValueError):
         return ""
     result_stamp = _positive_finite_stamp(baseline.interaction_result_stamp_sec)
     raw_stamp = _positive_finite_stamp(current_header_stamp_sec)
+    # The raw-map callback and interaction-result callback are independent ROS
+    # connections.  A map generated after the successful action can therefore
+    # be delivered just before the result callback snapshots its counters.  A
+    # strictly newer source stamp proves that ordering even when the local
+    # receipt count is already in the baseline; without that timestamp proof
+    # retain the normal post-result receipt boundary.
+    if not receipt_advanced:
+        if (
+            allow_callback_reorder
+            and result_stamp is not None
+            and raw_stamp is not None
+            and raw_stamp > result_stamp
+        ):
+            return "header_stamp_reordered"
+        return ""
     if result_stamp is not None and raw_stamp is not None:
         return "header_stamp" if raw_stamp > result_stamp else ""
     if result_stamp is not None:
@@ -1105,6 +1128,81 @@ def post_interaction_costmap_receipts_fresh_source(
     if int(current_receipt_count) > int(baseline_receipt_count):
         return "full"
     return ""
+
+
+def post_interaction_global_costmap_fresh_source(
+    raw_barrier: PostInteractionRawMapBarrier | None,
+    current_receipt_count: int,
+    current_update_receipt_count: int = 0,
+    current_header_stamp_sec: float | None = None,
+    current_update_header_stamp_sec: float | None = None,
+    *,
+    allow_callback_reorder: bool = False,
+) -> str:
+    """Return a global-costmap stream causally downstream of a raw OCC.
+
+    Normally the executor receives the raw OCC before the global-costmap
+    callback, so a local receipt-counter advance is sufficient.  ROS does not
+    guarantee callback ordering across topics, however.  A caller may opt in
+    to accepting a callback delivered first when the costmap publisher's
+    header stamp is a trusted source-map stamp.  This is deliberately disabled
+    by default: the physical costmap publisher stamps messages with
+    ``ros::Time::now()``, which is not evidence that the map was built from the
+    new raw OCC.  In that lane the receipt boundary is the only causal proof.
+    """
+
+    if raw_barrier is None:
+        return ""
+    raw_stamp = _positive_finite_stamp(raw_barrier.header_stamp_sec)
+
+    def stream_source(
+        current_count: int,
+        barrier_count: int,
+        current_stamp: float | None,
+        stream_name: str,
+    ) -> str:
+        try:
+            current_count = int(current_count)
+            barrier_count = int(barrier_count)
+        except (TypeError, ValueError):
+            return ""
+        source_stamp = _positive_finite_stamp(current_stamp)
+        if current_count > barrier_count:
+            if (
+                raw_stamp is not None
+                and source_stamp is not None
+                and source_stamp < raw_stamp
+            ):
+                # A newer local callback carrying an older source map is a
+                # residual/stale costmap and must not release make_plan.
+                return ""
+            return stream_name
+        if (
+            allow_callback_reorder
+            and current_count > 0
+            and raw_stamp is not None
+            and source_stamp is not None
+            and source_stamp >= raw_stamp
+        ):
+            return f"{stream_name}_header_stamp_reordered"
+        return ""
+
+    # Incremental updates are the low-latency planner signal.  Prefer them
+    # whenever both streams can prove freshness.
+    update_source = stream_source(
+        current_update_receipt_count,
+        raw_barrier.global_costmap_update_receipt_count,
+        current_update_header_stamp_sec,
+        "raw_occupancy_to_global_costmap_update",
+    )
+    if update_source:
+        return update_source
+    return stream_source(
+        current_receipt_count,
+        raw_barrier.global_costmap_receipt_count,
+        current_header_stamp_sec,
+        "raw_occupancy_to_global_costmap_full",
+    )
 
 
 def post_interaction_costmap_baseline_keys(

@@ -47,6 +47,7 @@ from semantic_decision_py_pkg.behavior_execution import (
     post_interaction_costmap_receipts_fresh_source,
     post_interaction_costmap_fresh_source,
     post_interaction_costmap_is_fresh,
+    post_interaction_global_costmap_fresh_source,
     post_interaction_planning_occupancy_fresh_source,
     post_interaction_raw_occupancy_fresh_source,
     prerotation_control_step_budget,
@@ -869,6 +870,19 @@ def test_post_open_causal_map_gate_requires_raw_then_planning_then_costmap() -> 
         post_interaction_raw_occupancy_fresh_source(baseline, 8, 100.1)
         == "header_stamp"
     )
+    # The raw callback may have arrived just before the interaction-result
+    # callback snapshots its counter.  Admit that event only through an
+    # explicitly newer source stamp and only when the caller opts into the
+    # cross-topic reorder contract.
+    assert (
+        post_interaction_raw_occupancy_fresh_source(
+            baseline, 7, 100.1, allow_callback_reorder=True
+        )
+        == "header_stamp_reordered"
+    )
+    assert post_interaction_raw_occupancy_fresh_source(
+        baseline, 7, 100.1, allow_callback_reorder=False
+    ) == ""
     raw_barrier = PostInteractionRawMapBarrier(
         receipt_count=8,
         header_seq=71,
@@ -903,6 +917,84 @@ def test_post_open_causal_map_gate_requires_raw_then_planning_then_costmap() -> 
     assert (
         post_interaction_costmap_receipts_fresh_source(18, 41, 18, 42)
         == "costmap_update"
+    )
+
+
+def test_post_open_fast_costmap_gate_rejects_stale_source_and_handles_callback_reorder():
+    raw_barrier = PostInteractionRawMapBarrier(
+        receipt_count=8,
+        header_seq=71,
+        header_stamp_sec=100.1,
+        planning_occupancy_receipt_count=12,
+        global_costmap_receipt_count=18,
+        global_costmap_update_receipt_count=41,
+    )
+
+    # A callback after the raw receipt is still stale when its source stamp is
+    # older than that raw map.
+    assert (
+        post_interaction_global_costmap_fresh_source(
+            raw_barrier,
+            current_receipt_count=19,
+            current_update_receipt_count=42,
+            current_header_stamp_sec=100.0,
+            current_update_header_stamp_sec=100.0,
+        )
+        == ""
+    )
+    assert (
+        post_interaction_global_costmap_fresh_source(
+            raw_barrier,
+            current_receipt_count=19,
+            current_update_receipt_count=42,
+            current_header_stamp_sec=100.2,
+            current_update_header_stamp_sec=100.2,
+        )
+        == "raw_occupancy_to_global_costmap_update"
+    )
+
+    # The physical publisher uses receipt ordering because its header stamp
+    # is generated with ros::Time::now(), not copied from raw OCC.  A matching
+    # stamp therefore does not release the default physical-lane gate.
+    reordered = PostInteractionRawMapBarrier(
+        receipt_count=8,
+        header_seq=71,
+        header_stamp_sec=100.1,
+        planning_occupancy_receipt_count=12,
+        global_costmap_receipt_count=19,
+        global_costmap_update_receipt_count=42,
+    )
+    assert (
+        post_interaction_global_costmap_fresh_source(
+            reordered,
+            current_receipt_count=19,
+            current_update_receipt_count=42,
+            current_header_stamp_sec=100.1,
+            current_update_header_stamp_sec=100.1,
+        )
+        == ""
+    )
+    # Publishers that explicitly guarantee a source-map stamp can opt in to
+    # the cross-topic reorder contract.
+    assert (
+        post_interaction_global_costmap_fresh_source(
+            reordered,
+            current_receipt_count=19,
+            current_update_receipt_count=42,
+            current_header_stamp_sec=100.1,
+            current_update_header_stamp_sec=100.1,
+            allow_callback_reorder=True,
+        )
+        == "raw_occupancy_to_global_costmap_update_header_stamp_reordered"
+    )
+    # Without source stamps, do not weaken the receipt boundary.
+    assert (
+        post_interaction_global_costmap_fresh_source(
+            reordered,
+            current_receipt_count=19,
+            current_update_receipt_count=42,
+        )
+        == ""
     )
 
 

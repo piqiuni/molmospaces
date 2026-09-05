@@ -208,6 +208,71 @@ def test_static_portal_result_skips_mllm_continuation_and_costmap_baseline(
     assert dispatched[0]["detail"]["verification_mode"] == "direct_static_portal_feedback"
 
 
+def test_physical_fast_path_does_not_wait_for_planning_occ(executor_module) -> None:
+    """Raw OCC plus a downstream global update must release make_plan directly."""
+
+    executor = object.__new__(executor_module.SemanticBehaviorExecutor)
+    executor.lock = threading.RLock()
+    executor._global_costmap_condition = threading.Condition(executor.lock)
+    executor.selection = {"decision_id": "decision_fast"}
+    executor.machine = SimpleNamespace(state=executor_module.STATE_NAVIGATING)
+    executor.post_interaction_costmap_fast_path_enabled = True
+    executor.post_interaction_costmap_fresh_timeout_s = 0.05
+    executor.post_interaction_costmap_fresh_poll_interval_s = 0.01
+    executor._post_interaction_costmap_baselines = {
+        "portal:portal_fast": executor_module.PostInteractionCostmapBaseline(
+            portal_id="portal_fast",
+            source_event_id="event_fast",
+            receipt_count=10,
+            update_receipt_count=20,
+            raw_occupancy_receipt_count=30,
+            planning_occupancy_receipt_count=40,
+            interaction_result_stamp_sec=100.0,
+        )
+    }
+    executor._post_interaction_raw_map_barriers = {}
+    raw_barrier = executor_module.PostInteractionRawMapBarrier(
+        receipt_count=31,
+        header_seq=31,
+        header_stamp_sec=100.1,
+        planning_occupancy_receipt_count=40,
+        global_costmap_receipt_count=10,
+        global_costmap_update_receipt_count=20,
+    )
+    executor._raw_occupancy_events = [raw_barrier]
+    executor._latest_raw_occupancy_event = raw_barrier
+    executor._global_costmap_received_count = 10
+    executor._latest_global_costmap_header_seq = 10
+    executor._latest_global_costmap_header_stamp_sec = 100.1
+    executor._global_costmap_update_received_count = 21
+    executor._latest_global_costmap_update_header_seq = 21
+    executor._latest_global_costmap_update_header_stamp_sec = 100.2
+    executor._raw_occupancy_received_count = 31
+    executor._latest_raw_occupancy_header_seq = 31
+    executor._latest_raw_occupancy_header_stamp_sec = 100.1
+    executor._planning_occupancy_received_count = 40
+    executor._latest_planning_occupancy_header_seq = 40
+    executor._latest_planning_occupancy_header_stamp_sec = 100.0
+    executor._post_interaction_planning_map_barrier_locked = lambda *_args: pytest.fail(
+        "physical fast path must not wait for planning OCC"
+    )
+
+    fresh, detail = executor._wait_for_post_interaction_costmap_freshness(
+        "decision_fast",
+        {
+            "target_id": "portal_fast",
+            "metadata": {
+                "opened_portal_id": "portal_fast",
+                "source_interaction_event_id": "event_fast",
+            },
+        },
+    )
+
+    assert fresh is True
+    assert detail["post_open_costmap_fast_path"] is True
+    assert detail["fresh_source"] == "raw_occupancy_to_global_costmap_update"
+
+
 def test_failed_interaction_navigation_is_marked_for_bounded_reachability(
     executor_module,
 ) -> None:

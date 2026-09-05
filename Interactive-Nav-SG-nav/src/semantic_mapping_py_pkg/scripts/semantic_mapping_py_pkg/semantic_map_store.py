@@ -435,15 +435,32 @@ class ObjectMapStore:
         min_observations=None,
         confirmed_only=True,
         currently_observed_only=False,
+        ignore_class_confirmations=False,
     ):
+        """Export tracker records that satisfy the requested temporal gate.
+
+        The physical detector uses stricter per-class confirmation counts for
+        interaction candidates (doors/refrigerators are normally required to
+        persist for several frames).  An opened refrigerator is a special
+        case: newly exposed contents can be visible for only one or two
+        frames, so the semantic graph may request a *graph-only* tentative
+        stream with ``ignore_class_confirmations=True``.  This option changes
+        only the admission threshold used for this export; it never mutates a
+        track's ``is_confirmed`` state and therefore cannot weaken the M1
+        tracked-detection topic.
+        """
         if min_observations is None:
             min_observations = self.min_confirmations if confirmed_only else 1
         min_observations = max(1, int(min_observations))
         detections = []
         for obj in self.objects:
-            required = max(
-                min_observations,
-                self._required_confirmations(obj.get("semantic_name")),
+            required = (
+                min_observations
+                if bool(ignore_class_confirmations)
+                else max(
+                    min_observations,
+                    self._required_confirmations(obj.get("semantic_name")),
+                )
             )
             if confirmed_only and not obj.get("is_confirmed"):
                 continue
@@ -488,6 +505,7 @@ class ObjectMapStore:
                         obj.get("max_consecutive_observations", 0) or 0
                     ),
                     "required_consecutive_observations": required,
+                    "tracking_confirmed": bool(obj.get("is_confirmed")),
                     "source": "tracked_object_store",
                     "viz_aabb_center": point_dict(
                         obj["aabb_center"][0], obj["aabb_center"][1], obj["aabb_center"][2]

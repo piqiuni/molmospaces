@@ -159,7 +159,7 @@ footer{{height:48px;border:1px solid var(--line);border-radius:10px;background:v
 const $=id=>document.getElementById(id),txt=v=>String(v??'').replace(/\\s+/g,' ').trim(),clip=(v,n=54)=>{{v=txt(v);return v.length>n?v.slice(0,n)+'…':v}},num=(v,d=1)=>Number.isFinite(Number(v))?Number(v).toFixed(d):'--';setTimeout(()=>{{draw=function(b,c){{const v=$('view1').getContext('2d');v.drawImage(c,0,0,480,270);[['view3',960,0],['view6',960,270]].forEach(([id,x,y])=>{{const q=$(id).getContext('2d');q.drawImage(b,x,y,480,270,0,0,480,270)}});$('live').textContent='实时运行中'}}}},0);
 function result(e){{if(!e)return '等待调用';if(e.error)return '调用失败';let v=e.raw_text??e.response?.raw_text??e.payload?.result??'';if(typeof v==='object')v=JSON.stringify(v);try{{const o=JSON.parse(v);return clip([o.candidate_id,Array.isArray(o.ranked_ids)?o.ranked_ids.join(' → '):'',o.label,o.state,o.reason].filter(Boolean).join(' · '))}}catch(_){{return clip(v||'调用完成')}}}}
 function renderMetrics(s){{const t=s.telemetry||{{}},b=t.battery||{{}},v=Array.isArray(t.velocity)?Math.hypot(...t.velocity.slice(0,3).map(Number)):Number(t.speed||0),yaw=Number(t.yaw),data=[['🔋','电量',num(b.soc??t.battery_soc,0)+' %'],['↗','速度',num(v,2)+' m/s'],['⟳','航向',Number.isFinite(yaw)?num(yaw*180/Math.PI,1)+'°':'--'],['◉','动作模式',t.mode===undefined?'--':'模式 '+t.mode],['📷','D435i',s.link?.connected===false?'离线':'在线'],['◇','语义节点',String(s.graph?.node_count??0)]];const box=$('metrics');box.replaceChildren();data.forEach(([icon,n,v])=>{{const m=document.createElement('div');m.className='metric';m.innerHTML='<span class="icon"></span><span class="name"></span><span class="value"></span>';m.querySelector('.icon').textContent=icon;m.querySelector('.name').textContent=n;m.querySelector('.value').textContent=v;box.append(m)}});const safe=$('safe');safe.replaceChildren();[['D435i 在线',s.link?.connected!==false],['实物动作安全阻断',true],['感知目标 '+(s.detections?.length??0),false]].forEach(([v,ok])=>{{const p=document.createElement('span');p.className='pill '+(ok?'ok':'');p.textContent=v;safe.append(p)}});$('robot-live').textContent=s.link?.connected===false?'离线':'在线';$('detect-meta').textContent='D435i · YOLOE-26l PF Seg · '+(s.detections?.length??0)+' targets'}}
-function renderCalls(s){{const all=[...(s.mllm?.M1||[]),...(s.mllm?.M2||[])].sort((a,b)=>(b.timestamp||0)-(a.timestamp||0));const latest={{M1:all.find(x=>x.stage==='M1'),M2:all.find(x=>x.stage==='M2')}};const box=$('calls');box.replaceChildren();['M1','M2'].forEach(stage=>{{const e=latest[stage],r=document.createElement('div');r.className='call';r.innerHTML='<span class="stage"></span><span class="result"></span><span class="latency"></span>';r.children[0].textContent=stage;r.children[1].textContent=e?result(e):(stage==='M1'?'等待交互属性识别':'等待子目标选择');r.children[2].textContent=e?.latency_s!=null?num(e.latency_s,2)+' s':'--';box.append(r)}})}}
+function renderCalls(s){{const all=[...(s.mllm?.M1||[]),...(s.mllm?.M2||[]),...(s.mllm?.M3||[])].sort((a,b)=>(b.timestamp||0)-(a.timestamp||0));const latest={{M1:all.find(x=>x.stage==='M1'),M2:all.find(x=>x.stage==='M2'),M3:all.find(x=>x.stage==='M3')}};const box=$('calls');box.replaceChildren();['M1','M2','M3'].forEach(stage=>{{const e=latest[stage],r=document.createElement('div');r.className='call';r.innerHTML='<span class="stage"></span><span class="result"></span><span class="latency"></span>';r.children[0].textContent=stage;r.children[1].textContent=e?result(e):(stage==='M1'?'等待交互属性识别':stage==='M2'?'等待子目标选择':'等待交互结果评价');r.children[2].textContent=e?.latency_s!=null?num(e.latency_s,2)+' s':'--';box.append(r)}})}}
 let lastSig='';function renderTimeline(s){{const n=s.navigation||{{}},d=n.decision_trace||{{}},e=n.execution_state||{{}},f=n.behavior_feedback||{{}},r=n.interaction_result||{{}},candidate=d.executed_candidate_id||d.model_selected_candidate_id||d.active_candidate_id||e.candidate_id||'等待候选',state=e.state||'IDLE',behavior=e.behavior_type||'',status=f.status||r.status||'',transition=(r.pre_state&&r.post_state)?r.pre_state+' → '+r.post_state:'';const events=[['◉','感知','更新 RGB-D、检测与语义地图'],['AI','推理',d.model_reason||d.model_error||'评估交互可达性'],['◎','子目标',candidate],['→','当前指令',behavior?state+' · '+behavior:state==='IDLE'?'保持待机':state],['✓','执行反馈',status||'等待行为反馈'],['M3','结果验证',transition||'等待状态/图一致性验证']];const sig=JSON.stringify(events);if(sig===lastSig)return;lastSig=sig;const box=$('timeline');box.replaceChildren();events.forEach((x,i)=>{{const row=document.createElement('div');row.className='event '+(i===5&&transition?'good':'');const now=new Date();row.innerHTML='<span class="time"></span><span class="dot"></span><span class="eventtext"><b></b><span></span></span>';row.children[0].textContent=now.toLocaleTimeString().slice(0,8);row.children[1].textContent=x[0];row.children[2].children[0].textContent=x[1];row.children[2].children[1].textContent=clip(x[2],70);box.append(row)}})}}
 function renderTask(s){{const n=s.navigation||{{}},d=n.decision_trace||{{}},e=n.execution_state||{{}},r=s.interaction_result||{{}},target=n.task_target||n.goal||d.task_target||s.task_target||'等待任务输入',candidate=d.model_selected_candidate_id||d.active_candidate_id||e.candidate_id||'等待语义目标',status=(r.pre_state&&r.post_state)?r.pre_state+' → '+r.post_state:(e.state||'实时感知与建图');const a=$('task-target'),b=$('task-goal'),c=$('task-status');if(a)a.textContent=clip(target,42);if(b)b.textContent='高层目标：'+clip(candidate,42);if(c)c.textContent='状态：'+clip(status,42)}}
 function darkMap(){{const q=$("view3").getContext('2d'),w=480,h=270;q.fillStyle='#091321';q.fillRect(0,0,w,h);q.strokeStyle='#173554';q.lineWidth=1;for(let x=0;x<w;x+=16){{q.beginPath();q.moveTo(x,0);q.lineTo(x,h);q.stroke()}}for(let y=0;y<h;y+=16){{q.beginPath();q.moveTo(0,y);q.lineTo(w,y);q.stroke()}}q.fillStyle='#1b2c42';[[30,25,175,32],[280,20,160,38],[30,180,125,52],[230,170,205,60]].forEach(a=>q.fillRect(...a));q.strokeStyle='#42dfc0';q.lineWidth=2;q.strokeRect(190,105,35,45);q.fillStyle='#58baff';q.beginPath();q.arc(210,150,8,0,7);q.fill();q.strokeStyle='#64e88b';q.setLineDash([5,4]);q.beginPath();q.moveTo(210,150);q.lineTo(330,95);q.stroke();q.setLineDash([]);q.fillStyle='#f2bf55';q.font='12px sans-serif';q.fillText('ROOM · REACHABILITY',18,22);q.fillStyle='#8da7c3';q.fillText('Go2 pose',220,168);q.fillStyle='#64e88b';q.fillText('candidate portal',300,90)}}function darkGraph(){{const q=$("view6").getContext('2d'),w=480,h=270;q.fillStyle='#091321';q.fillRect(0,0,w,h);q.font='12px sans-serif';q.fillStyle='#8da7c3';q.fillText('ROOM',18,28);q.fillText('PORTAL',18,96);q.fillText('CONTAINER',18,164);q.fillText('OBJECT',18,232);const nodes=[[95,22,'Office','#42dfc0'],[95,90,'door · open','#64e88b'],[95,158,'fridge · closed','#58baff'],[95,226,'target · unknown','#8da7c3'],[270,90,'lobby door','#f2bf55'],[270,158,'cabinet · open','#64e88b'],[400,226,'object','#8da7c3']];q.strokeStyle='#31547a';q.lineWidth=2;[[0,1],[1,2],[2,3],[0,4],[4,5],[5,6]].forEach(([a,b])=>{{q.beginPath();q.moveTo(nodes[a][0]+55,nodes[a][1]+16);q.lineTo(nodes[b][0],nodes[b][1]+16);q.stroke()}});nodes.forEach(([x,y,t,c])=>{{q.fillStyle='#10233a';q.strokeStyle=c;q.strokeRect(x,y,105,32);q.fillStyle=c;q.fillText(t,x+8,y+21)}});q.fillStyle='#f2bf55';q.fillText('SELECTED SUBGOAL',330,24)}}let busy=false;function draw(b,c){{$('view1').getContext('2d').drawImage(c,0,0,480,270);darkMap();darkGraph();$('live').textContent='实时运行中'}}async function video(){{if(busy)return;busy=true;try{{const ts=Date.now(),rs=await Promise.all([fetch('/snapshot.jpg?t='+ts,{{cache:'no-store'}}),fetch('/camera-overlay.jpg?t='+ts,{{cache:'no-store'}})]),b=await createImageBitmap(await rs[0].blob()),c=await createImageBitmap(await rs[1].blob());draw(b,c);b.close();c.close()}}catch(_){{$('live').textContent='画面重连中'}}finally{{busy=false}}}}async function state(){{try{{const r=await fetch('/api/state-summary?t='+Date.now(),{{cache:'no-store'}}),s=await r.json();renderMetrics(s);renderCalls(s);renderTimeline(s);renderTask(s)}}catch(_){{$('robot-live').textContent='重连中'}}}}setInterval(video,200);setInterval(state,1000);video();state();
@@ -178,7 +178,7 @@ function renderTimeline(s){{const [mode,label]=normalizeBehavior(s),n=s.navigati
 function renderDarkSpatial(source){{const q=$('view3').getContext('2d');q.clearRect(0,0,480,270);q.drawImage(source,960,0,480,270,0,0,480,270)}}
 function renderDarkInteraction(source){{const q=$('view6').getContext('2d');q.clearRect(0,0,480,270);q.drawImage(source,960,270,480,270,0,0,480,270)}}
 function draw(b,c){{$('view1').getContext('2d').drawImage(c,0,0,480,270);$('live').textContent='实时运行中'}}
-setTimeout(()=>{{const v=$('view1');v.width=640;v.height=480;draw=function(b,c){{$('view1').getContext('2d').drawImage(c,0,0,640,480);$('live').textContent='实时运行中'}}}},0);setInterval(refreshVisualization,1000);refreshVisualization();
+setTimeout(()=>{{const v=$('view1');/* Camera source is 1280×720 (16:9); keep the native aspect ratio and avoid low-resolution upscaling. */v.width=1280;v.height=720;draw=function(b,c){{const context=$('view1').getContext('2d');context.clearRect(0,0,v.width,v.height);context.drawImage(c,0,0,v.width,v.height);$('live').textContent='实时运行中'}}}},0);setInterval(refreshVisualization,1000);refreshVisualization();
 </script></body></html>"""
 
 
@@ -371,6 +371,9 @@ body.dark .debug-call-chips { display:flex; flex-wrap:wrap; gap:3px; }
 body.dark .debug-call-chip { display:inline-block; max-width:100%; padding:2px 5px; border-radius:5px; background:#1d324b; color:#cfe1ff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 body.dark .debug-call-prompt { color:#d9e5f2; line-height:1.35; word-break:break-word; }
 body.dark .debug-call-result { color:#8ce9c1; line-height:1.35; word-break:break-word; }
+body.dark .debug-call.m3 { border-color:#5f4f86; background:#111326; }
+body.dark .debug-call.m3 .debug-call-stage, body.dark .debug-call.m3 .debug-call-result { color:#d6b8ff; }
+body.dark .debug-call.m3 .debug-call-chip { background:#30254b; border-color:#735aa1; }
 body.dark .debug-call-meta { grid-column:1/-1; color:#7893ad; font-size:9px; padding-top:1px; }
 body.dark .debug-call-empty { min-height:74px; display:grid; place-items:center; border:1px dashed #315d88; border-radius:8px; color:#7893ad; }
 </style>"""
@@ -387,18 +390,18 @@ function darkCallObjectName(event) {
   return names[normalized.toLowerCase()] || normalized;
 }
 function darkCallQuestion(event, stage) {
-  return stage === 'M1'
-    ? '判断图中的' + darkCallObjectName(event) + '是否可交互，并识别其开合状态。'
-    : '结合历史、候选目标和任务目标，选择下一个导航子目标。';
+  if (stage === 'M1') return '判断图中的' + darkCallObjectName(event) + '是否可交互，并识别其开合状态。';
+  if (stage === 'M2') return '结合历史、候选目标和任务目标，选择下一个导航子目标。';
+  return '判断交互后的' + darkCallObjectName(event) + '状态是否与语义图一致，并给出验证结果。';
 }
 function darkCallResult(event) {
   if (event?.error) return '调用失败：' + clip(event.error, 90);
-  let raw = event?.raw_text ?? event?.response?.raw_text ?? event?.payload?.result ?? '';
+  let raw = event?.raw_text ?? event?.response?.raw_text ?? event?.payload?.result ?? event?.result ?? '';
   if (typeof raw === 'object') raw = JSON.stringify(raw);
   try {
     const value = JSON.parse(raw);
-    const choice = value.ranked_ids || value.candidate_id || value.label || value.interaction_class || value.coarse_state || value.state || '';
-    return clip([Array.isArray(choice) ? choice.join(' → ') : choice, value.coarse_state !== choice ? value.coarse_state : '', value.reason, value.confidence != null ? '置信度 ' + value.confidence : ''].filter(Boolean).join(' · '), 110);
+    const choice = value.ranked_ids || value.candidate_id || value.label || value.interaction_class || value.coarse_state || value.state || (value.success === true ? '验证通过' : value.success === false ? '验证失败' : '');
+    return clip([Array.isArray(choice) ? choice.join(' → ') : choice, value.coarse_state !== choice ? value.coarse_state : '', value.post_state && value.pre_state ? value.pre_state + ' → ' + value.post_state : '', value.reason, value.confidence != null ? '置信度 ' + value.confidence : ''].filter(Boolean).join(' · '), 110);
   } catch (_) {
     return clip(raw || '已完成（无文本结果）', 110);
   }
@@ -420,7 +423,7 @@ function darkM1Thumb(event, index) {
 }
 let darkCallSignature='';
 renderCalls = function(state) {
-  const events=[...(state?.mllm?.M1||[]),...(state?.mllm?.M2||[])].sort((a,b)=>{
+  const events=[...(state?.mllm?.M1||[]),...(state?.mllm?.M2||[]),...(state?.mllm?.M3||[])].sort((a,b)=>{
     const timestampOrder=Number(b.timestamp||0)-Number(a.timestamp||0);
     if(timestampOrder!==0)return timestampOrder;
     return Number(b.request_sequence||0)-Number(a.request_sequence||0);
@@ -429,13 +432,16 @@ renderCalls = function(state) {
   if(signature===darkCallSignature)return;
   darkCallSignature=signature;
   const container=$('calls'); container.replaceChildren();
-  if (!events.length) { const empty=document.createElement('div'); empty.className='debug-call-empty'; empty.textContent='等待真实 M1 / M2 调用'; container.append(empty); return; }
+  if (!events.length) { const empty=document.createElement('div'); empty.className='debug-call-empty'; empty.textContent='等待真实 M1 / M2 / M3 调用'; container.append(empty); return; }
   events.forEach((event,index)=>{
     const stage=String(event.stage||event.module||'MLLM').toUpperCase(),row=document.createElement('article');row.className='debug-call';
     const left=document.createElement('div'),middle=document.createElement('div'),right=document.createElement('div');[left,middle,right].forEach(element=>element.className='debug-call-col');
-    const leftLabel=document.createElement('div');leftLabel.className='debug-call-label';leftLabel.textContent=stage==='M1'?'真实 M1 输入':'候选 subgoal';left.append(leftLabel);
-    if(stage==='M1'){left.append(darkM1Thumb(event,index));darkCallChips(left,[darkCallObjectName(event)],1)}else{darkCallChips(left,darkCallCandidates(event).map(candidate=>candidate.id||candidate.candidate_id||candidate.target_name||'candidate'))}
-    const middleLabel=document.createElement('div');middleLabel.className='debug-call-label';middleLabel.textContent=stage==='M2'?'历史 / 目标 / 简化请求':'简化问题';middle.append(middleLabel);
+    row.classList.toggle('m3',stage==='M3');
+    const leftLabel=document.createElement('div');leftLabel.className='debug-call-label';leftLabel.textContent=stage==='M1'?'真实 M1 输入':stage==='M3'?'交互目标':'候选 subgoal';left.append(leftLabel);
+    if(stage==='M1'){left.append(darkM1Thumb(event,index));darkCallChips(left,[darkCallObjectName(event)],1)}
+    else if(stage==='M3'){darkCallChips(left,[darkCallObjectName(event),event?.target_id||event?.object_id||'待确认'],2)}
+    else{darkCallChips(left,darkCallCandidates(event).map(candidate=>candidate.id||candidate.candidate_id||candidate.target_name||'candidate'))}
+    const middleLabel=document.createElement('div');middleLabel.className='debug-call-label';middleLabel.textContent=stage==='M2'?'历史 / 目标 / 简化请求':stage==='M3'?'验证问题':'简化问题';middle.append(middleLabel);
     if(stage==='M2'){const mission=event?.context?.mission||{},history=Number(event?.context?.recent_decision_count||0);darkCallChips(middle,['历史 '+history,'候选 '+darkCallCandidates(event).length,'目标 '+(mission.target_name||mission.target||mission.mode||'探索')],3)}
     const prompt=document.createElement('div');prompt.className='debug-call-prompt';prompt.textContent=darkCallQuestion(event,stage);middle.append(prompt);
     const resultLabel=document.createElement('div');resultLabel.className='debug-call-label';resultLabel.textContent='MLLM 输出';const output=document.createElement('div');output.className='debug-call-result';output.textContent=darkCallResult(event);right.append(resultLabel,output);
@@ -493,6 +499,8 @@ body.dark .record-page span { color:#ff6879; font-size:12px; }
 body.dark .record-page:hover { border-color:#58baff; }
 body.dark .record-page.recording { border-color:#ff6879; background:#45151f; color:#fff; }
 body.dark .record-page.recording span { animation:recordPulse 1s infinite; }
+body.dark .record-page.backend { border-color:#65e99a; color:#bfffe0; }
+body.dark .record-page.backend span { color:#65e99a; }
 @keyframes recordPulse { 50% { opacity:.25; } }
 </style>"""
     script = r"""<script>
@@ -533,7 +541,55 @@ const baseRenderMetrics=renderMetrics;
 renderMetrics=function(state){baseRenderMetrics(state);renderNavigationTask(state)};
 schedulePhoneFrames(10);setInterval(refreshPhoneStatus,1000);setInterval(refreshPhoneAudio,100);refreshPhoneStatus();
 </script>"""
-    return html.replace("</style>", "</style>" + css, 1).replace("</body>", script + "</body>")
+    # Browser display capture remains available as a fallback for clients that
+    # do not expose the gateway API.  The primary button path is server-side:
+    # the gateway records panels, raw receipts, phone audio and right-rail
+    # events continuously in the local recording directory, so page throttling
+    # or a closed tab cannot introduce dropped screen frames.
+    backend_script = r"""<script>
+let physicalRecording=null,physicalRecordingBusy=false,physicalRecordingTimer=0;
+function recordingLabel(status){
+  if(!status?.active)return '后台录制到本机';
+  const seconds=Math.max(0,Math.floor(Number(status.duration_s)||0)),mm=String(Math.floor(seconds/60)).padStart(2,'0'),ss=String(seconds%60).padStart(2,'0');
+  return '停止后台录制 '+mm+':'+ss;
+}
+function updateBackendRecordingButton(status){
+  if(!pageRecordButton)return;
+  const active=Boolean(status?.active),owned=!physicalRecording||!status?.session_id||physicalRecording.session_id===status.session_id;
+  pageRecordButton.classList.toggle('recording',active&&owned);pageRecordButton.classList.toggle('backend',active);
+  const label=pageRecordButton.querySelector('b');if(label)label.textContent=active?recordingLabel(status):'后台录制到本机';
+  pageRecordButton.title=active?'录制正在网关后台运行，关闭网页不会停止':'启动/停止本机后台原始录制';
+}
+async function pollBackendRecording(){
+  try{const response=await fetch('/api/recording/status?t='+Date.now(),{cache:'no-store'});if(!response.ok)return;const status=await response.json();if(status.active&&!physicalRecording)physicalRecording={session_id:status.session_id,token:''};updateBackendRecordingButton(status)}catch(_){ }
+}
+async function backendRecordingRequest(path,payload){
+  const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload||{})});
+  let value={};try{value=await response.json()}catch(_){ }
+  if(!response.ok)throw new Error(value.error||('HTTP '+response.status));return value;
+}
+async function startBackendRecording(){
+  if(physicalRecordingBusy)return;physicalRecordingBusy=true;
+  try{
+    const value=await backendRecordingRequest('/api/recording/start',{mode:'raw_plus_panels',label:'showcase-dark',metadata:{page:'showcase-dark',sections:{perception:'panel1/camera',spatial:'panel3/room',graph:'panel6/topology',right_rail:'state/right_panel'},audio_source:'phone'}});
+    physicalRecording={session_id:value.session_id,token:value.token||''};updateBackendRecordingButton(value);
+    if(!physicalRecordingTimer)physicalRecordingTimer=setInterval(pollBackendRecording,1000);
+  }catch(error){
+    /* Keep the legacy browser recorder as a compatibility fallback. */
+    try{await startPageRecording()}catch(_){alert('无法启动后台录制：'+error.message)}
+  }finally{physicalRecordingBusy=false}
+}
+async function stopBackendRecording(){
+  if(physicalRecordingBusy)return;physicalRecordingBusy=true;
+  try{
+    const value=await backendRecordingRequest('/api/recording/stop',{session_id:physicalRecording?.session_id||'',token:physicalRecording?.token||'',reason:'showcase_button'});
+    physicalRecording=null;updateBackendRecordingButton(value);if(value.record_dir)pageRecordButton.title='已保存：'+value.record_dir;
+  }catch(error){alert('无法停止后台录制：'+error.message)}finally{physicalRecordingBusy=false}
+}
+pageRecordButton.onclick=()=>physicalRecording?.session_id?stopBackendRecording():startBackendRecording();
+pollBackendRecording();
+</script>"""
+    return html.replace("</style>", "</style>" + css, 1).replace("</body>", script + backend_script + "</body>")
 
 
 DARK_SHOWCASE_HTML = _use_original_renderer_panels(DARK_SHOWCASE_HTML, "view3", "view6")
@@ -541,9 +597,5 @@ LIGHT_SHOWCASE_HTML = _use_original_renderer_panels(LIGHT_SHOWCASE_HTML, "view3"
 ACADEMIC_SHOWCASE_HTML = _use_original_renderer_panels(ACADEMIC_SHOWCASE_HTML, "b", "c")
 DARK_SHOWCASE_HTML = _use_debug_style_mllm_cards(DARK_SHOWCASE_HTML)
 DARK_SHOWCASE_HTML = _use_phone_stream_and_navigation_task(DARK_SHOWCASE_HTML)
-# The presentation view is intentionally box-only.  Debug keeps the separate
-# /camera-overlay.jpg endpoint with segmentation fill for diagnosis.
-DARK_SHOWCASE_HTML = DARK_SHOWCASE_HTML.replace(
-    "fetch('/camera-overlay.jpg?t='",
-    "fetch('/camera-box-overlay.jpg?t='",
-)
+# Presentation pages use the full box + segmentation overlay.  The Debug page
+# remains the place where the separate box-only endpoint is shown.

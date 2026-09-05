@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 import math
+import re
 from typing import Any, Iterable
 
 from .behavior_candidates import BehaviorCandidate
@@ -27,6 +28,25 @@ _UNAVAILABLE_INTERACTION_CAPABILITIES = {
     "unavailable",
     "locked",
 }
+_PUBLIC_DOOR_ALIAS_RE = re.compile(r"^portal_(door_(?:[0-9]{1,8}|x))$")
+
+
+def _portal_ids_match(left: object, right: object) -> bool:
+    """Match a routing portal ID to its compact public alias when possible."""
+
+    left_text = str(left or "").strip().casefold()
+    right_text = str(right or "").strip().casefold()
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+    left_alias = _PUBLIC_DOOR_ALIAS_RE.fullmatch(left_text)
+    right_alias = _PUBLIC_DOOR_ALIAS_RE.fullmatch(right_text)
+    if left_alias and left_alias.group(1) == right_text:
+        return True
+    if right_alias and right_alias.group(1) == left_text:
+        return True
+    return False
 
 
 def _feedback_value(
@@ -168,7 +188,7 @@ def _portal_state_sources(
         return []
     sources: list[dict[str, Any]] = []
     for node in graph.get("nodes") or []:
-        if str(node.get("id") or "") != portal_id:
+        if not _portal_ids_match(node.get("id"), portal_id):
             continue
         attributes = node.get("attributes") or {}
         override = attributes.get("interaction_state_override") or {}
@@ -177,9 +197,9 @@ def _portal_state_sources(
     for edge in graph.get("edges") or []:
         attributes = edge.get("attributes") or {}
         if (
-            str(attributes.get("portal_node_id") or "") == portal_id
-            or str(edge.get("src_id") or "") == portal_id
-            or str(edge.get("dst_id") or "") == portal_id
+            _portal_ids_match(attributes.get("portal_node_id"), portal_id)
+            or _portal_ids_match(edge.get("src_id"), portal_id)
+            or _portal_ids_match(edge.get("dst_id"), portal_id)
         ):
             sources.append(attributes)
     return sources
@@ -415,12 +435,15 @@ def portal_center_xy(graph: dict[str, Any], node_id: str) -> list[float] | None:
     """Return the public portal center available in the decision snapshot."""
 
     for node in graph.get("nodes") or []:
-        if str(node.get("id") or "") != str(node_id or ""):
+        if not _portal_ids_match(node.get("id"), node_id):
             continue
         attributes = node.get("attributes") or {}
+        geometry = node.get("portal_geometry") or {}
         center = list(
             attributes.get("interaction_reference_aabb_center")
+            or geometry.get("interaction_reference_aabb_center")
             or node.get("aabb_center")
+            or geometry.get("aabb_center")
             or node.get("centroid")
             or []
         )
@@ -434,12 +457,15 @@ def portal_aabb_size_xy(graph: dict[str, Any], node_id: str) -> list[float] | No
     """Return the interaction-reference portal footprint used for its axis."""
 
     for node in graph.get("nodes") or []:
-        if str(node.get("id") or "") != str(node_id or ""):
+        if not _portal_ids_match(node.get("id"), node_id):
             continue
         attributes = node.get("attributes") or {}
+        geometry = node.get("portal_geometry") or {}
         size = list(
             attributes.get("interaction_reference_aabb_size")
+            or geometry.get("interaction_reference_aabb_size")
             or node.get("aabb_size")
+            or geometry.get("aabb_size")
             or []
         )
         if len(size) < 2:
@@ -463,18 +489,23 @@ def portal_clearance_aabb(
     """
 
     for node in graph.get("nodes") or []:
-        if str(node.get("id") or "") != str(node_id or ""):
+        if not _portal_ids_match(node.get("id"), node_id):
             continue
         attributes = node.get("attributes") or {}
+        geometry = node.get("portal_geometry") or {}
         center = list(
             node.get("aabb_center")
+            or geometry.get("aabb_center")
             or attributes.get("interaction_reference_aabb_center")
+            or geometry.get("interaction_reference_aabb_center")
             or node.get("centroid")
             or []
         )
         size = list(
             node.get("aabb_size")
+            or geometry.get("aabb_size")
             or attributes.get("interaction_reference_aabb_size")
+            or geometry.get("interaction_reference_aabb_size")
             or []
         )
         if len(center) < 2 or len(size) < 2:
@@ -487,6 +518,74 @@ def portal_clearance_aabb(
         except (TypeError, ValueError):
             return None, None
     return None, None
+
+
+def _portal_candidate_geometry(
+    candidate_snapshot: dict[str, Any], portal_id: str
+) -> tuple[
+    list[float] | None,
+    list[float] | None,
+    list[float] | None,
+    list[float] | None,
+]:
+    """Read fresh portal geometry from an executable candidate record.
+
+    The candidate publisher builds candidates from the full mapper graph, then
+    emits a privacy-bounded compact graph for the MLLM.  A portal can therefore
+    be renamed (or fall outside the compact node limit) even though its
+    executable candidate still carries the original routing ID.  Keeping a
+    bounded copy of the four XY geometry vectors on that candidate gives the
+    physical continuation a reliable, ID-stable fallback without exposing
+    source labels or simulator names.
+    """
+
+    requested_id = str(portal_id or "")
+    if not requested_id:
+        return None, None, None, None
+    candidates = list(candidate_snapshot.get("candidates") or [])
+    # Prefer a current post-open traversal record, then an interaction record
+    # for the same portal.  Both are generated from the latest full graph.
+    candidates.sort(
+        key=lambda item: (
+            0
+            if bool((item.get("metadata") or {}).get("post_interaction_traversal"))
+            else 1
+        )
+    )
+    for candidate in candidates:
+        metadata = candidate.get("metadata") or {}
+        candidate_ids = (
+            str(candidate.get("target_id") or ""),
+            str(metadata.get("opened_portal_id") or ""),
+        )
+        if not any(_portal_ids_match(candidate_id, requested_id) for candidate_id in candidate_ids):
+            continue
+        geometry = metadata.get("portal_geometry") or {}
+        if not isinstance(geometry, dict):
+            geometry = {}
+        center = _xy(
+            geometry.get("center_xy")
+            or metadata.get("portal_aabb_center_xy")
+            or metadata.get("source_portal_center_xy")
+        )
+        size = _xy(
+            geometry.get("size_xy")
+            or metadata.get("portal_aabb_size_xy")
+            or metadata.get("source_portal_aabb_size_xy")
+        )
+        clearance_center = _xy(
+            geometry.get("clearance_center_xy")
+            or metadata.get("portal_clearance_aabb_center_xy")
+            or metadata.get("source_portal_clearance_aabb_center_xy")
+        )
+        clearance_size = _xy(
+            geometry.get("clearance_size_xy")
+            or metadata.get("portal_clearance_aabb_size_xy")
+            or metadata.get("source_portal_clearance_aabb_size_xy")
+        )
+        if any(value is not None for value in (center, size, clearance_center, clearance_size)):
+            return center, size, clearance_center, clearance_size
+    return None, None, None, None
 
 
 def _xyyaw(value: object) -> list[float] | None:
@@ -903,34 +1002,39 @@ def reproject_post_interaction_traversal_candidate(
         return None
     metadata = pending_candidate.get("metadata") or {}
     approach = list(metadata.get("source_interaction_approach_xyyaw") or [])
+    graph = candidate_snapshot.get("graph_context") or {}
     center = portal_center_xy(
-        candidate_snapshot.get("graph_context") or {},
+        graph,
         portal_id,
     )
+    portal_size = portal_aabb_size_xy(graph, portal_id)
+    clearance_center, clearance_size = portal_clearance_aabb(graph, portal_id)
+    candidate_center, candidate_size, candidate_clearance_center, candidate_clearance_size = (
+        _portal_candidate_geometry(candidate_snapshot, portal_id)
+    )
+    # The compact graph may use a public alias for the portal ID, or omit the
+    # node after its bounded context selection.  In that case the current
+    # executable candidate is the authoritative fresh-geometry fallback.
+    center = center or candidate_center
     if center is None:
         return None
-    fresh_portal_size = portal_aabb_size_xy(
-        candidate_snapshot.get("graph_context") or {},
-        portal_id,
-    )
     portal_size = (
-        fresh_portal_size
+        portal_size
+        or candidate_size
         or _xy(metadata.get("source_portal_aabb_size_xy"))
         or _xy(metadata.get("portal_aabb_size_xy"))
         or []
     )
-    fresh_clearance_center, fresh_clearance_size = portal_clearance_aabb(
-        candidate_snapshot.get("graph_context") or {},
-        portal_id,
-    )
     clearance_center = (
-        fresh_clearance_center
+        clearance_center
+        or candidate_clearance_center
         or _xy(metadata.get("source_portal_clearance_aabb_center_xy"))
         or _xy(metadata.get("portal_clearance_aabb_center_xy"))
         or center
     )
     clearance_size = (
-        fresh_clearance_size
+        clearance_size
+        or candidate_clearance_size
         or _xy(metadata.get("source_portal_clearance_aabb_size_xy"))
         or _xy(metadata.get("portal_clearance_aabb_size_xy"))
         or portal_size

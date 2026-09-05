@@ -219,6 +219,26 @@ def test_mllm_portal_label_cannot_promote_source_container_to_overlay_portal():
     assert stats["active_portal_ids"] == []
 
 
+def test_delayed_m1_type_demotion_does_not_hide_source_portal_overlay():
+    overlay = SemanticOccupancyOverlay(clear_padding_m=0.0)
+    raw = [100] * (GridInfo.width * GridInfo.height)
+    closed = portal("closed")
+    overlay.update_graph(graph(closed))
+
+    # M1 can temporarily change the public presentation type while the source
+    # detector topology remains a portal.  The successful open must still
+    # clear the cached doorway reference for the next raw OCC frame.
+    demoted = portal("open")
+    demoted["type"] = "object"
+    demoted["attributes"] = {"topology_type": "portal"}
+    overlay.update_graph(graph(demoted))
+    planning, mask, stats = overlay.apply(GridInfo(), raw)
+
+    assert stats["active_portal_ids"] == ["portal_door"]
+    assert planning[10 * GridInfo.width + 10] == 0
+    assert max(mask) > 0
+
+
 def test_ajar_portal_keeps_semantic_clearance():
     overlay = SemanticOccupancyOverlay(
         clear_padding_m=0.0,

@@ -38,6 +38,47 @@ SPATIAL_CONTEXT_LABELS = {
     "wardrobe",
 }
 
+# A detector/M1 label is useful for choosing an interaction policy, but it is
+# not by itself proof that a small crop is an appliance.  Keep the source
+# ontology and the geometry sanity check in this module as a second guard
+# after the graph store's relation inference.  These markers are deliberately
+# conservative: they only veto a refrigerator interpretation when the source
+# observation identifies a clearly movable item or another non-appliance.
+_REFRIGERATOR_CONTENT_SOURCE_LABELS = {
+    "bottle",
+    "cup",
+    "bowl",
+    "dairy",
+    "lemon",
+    "jug",
+    "milk",
+    "vinegar",
+    "persimmon",
+    "fruit",
+    "vegetable",
+    "food",
+    "sushi",
+    "can",
+    "carton",
+    "jar",
+    "plate",
+    "apple",
+    "orange",
+    "banana",
+}
+
+
+def _normalized_marker_match(value: object, markers: set[str]) -> bool:
+    """Match a normalized semantic token without matching arbitrary IDs."""
+
+    text = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    return any(
+        text == marker
+        or text.startswith(f"{marker}_")
+        or text.endswith(f"_{marker}")
+        for marker in markers
+    )
+
 
 def _is_confirmed_portal_open_history(
     interaction: dict[str, Any], event: dict[str, Any]
@@ -2633,6 +2674,33 @@ class CandidateGenerator:
             source_object_name = str(
                 attributes.get("source_object_name") or node.get("name") or node_id
             )
+            reference_size = list(
+                attributes.get("interaction_reference_aabb_size")
+                or node.get("aabb_size")
+                or []
+            )
+            clearance_center = list(
+                node.get("aabb_center") or center or []
+            )
+            clearance_size = list(node.get("aabb_size") or reference_size or [])
+            try:
+                portal_geometry = {
+                    "center_xy": [float(center[0]), float(center[1])],
+                    "size_xy": [
+                        abs(float(reference_size[0])),
+                        abs(float(reference_size[1])),
+                    ],
+                    "clearance_center_xy": [
+                        float(clearance_center[0]),
+                        float(clearance_center[1]),
+                    ],
+                    "clearance_size_xy": [
+                        abs(float(clearance_size[0])),
+                        abs(float(clearance_size[1])),
+                    ],
+                }
+            except (IndexError, TypeError, ValueError):
+                portal_geometry = {}
             potential_room_ids = list(attributes.get("potential_room_ids") or [])
             target_room_id = attributes.get("portal_child_room_id")
             if target_room_id is None and potential_room_ids:
@@ -2682,6 +2750,12 @@ class CandidateGenerator:
                         "requires_approach": False,
                         "verify_target_visibility": False,
                         "goal_xyyaw_candidates": [goal],
+                        # Keep the fresh geometry on the executable traversal
+                        # candidate itself.  ``graph_context`` is deliberately
+                        # compacted for MLLM privacy and may rename or trim a
+                        # portal node; the decision node can still reproject a
+                        # pending continuation from this exact source record.
+                        "portal_geometry": portal_geometry,
                     },
                 )
             )
@@ -3600,42 +3674,180 @@ class CandidateGenerator:
         )
 
     @staticmethod
+    def _source_semantic_labels(node: dict[str, Any]) -> tuple[str, ...]:
+        """Return labels owned by the detector/source lane.
+
+        M1 is allowed to replace the public ``label`` and ``category``.  A
+        delayed answer that calls a bottle a refrigerator must therefore not
+        turn that bottle into a physical fridge candidate.  New graph
+        producers persist the source labels explicitly; the public-field
+        fallback keeps older/replay fixtures compatible when no M1 override
+        is present.
+        """
+
+        attributes = node.get("attributes") or {}
+        values = [
+            attributes.get("source_semantic_name"),
+            attributes.get("source_category"),
+        ]
+        if not any(str(value or "").strip() for value in values):
+            if not bool(attributes.get("m1_name_override")):
+                values.extend(
+                    (
+                        node.get("label"),
+                        node.get("name"),
+                        attributes.get("semantic_name"),
+                        attributes.get("category"),
+                        attributes.get("source_object_name"),
+                    )
+                )
+        normalized = {
+            str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+            for value in values
+            if str(value or "").strip()
+        }
+        return tuple(sorted(normalized))
+
+    @staticmethod
+    def _refrigerator_geometry(node: dict[str, Any]) -> tuple[float, float, float] | None:
+        """Read a stable/reference appliance box for a size sanity check."""
+
+        attributes = node.get("attributes") or {}
+        values = attributes.get("interaction_reference_aabb_size")
+        if not isinstance(values, (list, tuple)) or len(values) < 3:
+            values = node.get("aabb_size") or attributes.get("viz_aabb_size")
+        if not isinstance(values, (list, tuple)) or len(values) < 3:
+            return None
+        try:
+            size = tuple(abs(float(values[index])) for index in range(3))
+        except (IndexError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in size):
+            return None
+        if min(size) <= 1e-6:
+            return None
+        return size
+
+    @staticmethod
+    def _looks_like_refrigerator_body(node: dict[str, Any]) -> bool:
+        """Reject tiny M1/detector crops that cannot be an appliance body."""
+
+        size = CandidateGenerator._refrigerator_geometry(node)
+        if size is None:
+            return False
+        horizontal = max(size[0], size[1])
+        body_volume = size[0] * size[1] * size[2]
+        # Permissive enough for a mini-fridge, but well above the small
+        # hand-held/cropped boxes that caused false physical subgoals.
+        return bool(horizontal >= 0.35 and size[2] >= 0.65 and body_volume >= 0.18)
+
+    @staticmethod
     def _interaction_semantic_label(node: dict[str, Any]) -> str:
         """Normalize graph labels for the physical interaction allow-list."""
+
         interaction = node.get("interaction") or {}
         attributes = node.get("attributes") or {}
         values = (
-            node.get("label"), node.get("name"), node.get("type"),
-            attributes.get("semantic_name"), attributes.get("category"),
+            node.get("label"),
+            node.get("name"),
+            node.get("type"),
+            attributes.get("semantic_name"),
+            attributes.get("category"),
             attributes.get("source_object_name"),
-            interaction.get("interaction_mode"), interaction.get("capability"),
+            attributes.get("interaction_reference_label"),
+            attributes.get("m1_observed_object_name"),
+            interaction.get("interaction_mode"),
+            interaction.get("capability"),
         )
         text = " ".join(str(value or "").casefold() for value in values)
         if any(marker in text for marker in ("door", "portal", "gate")):
             return "door"
-        if any(marker in text for marker in ("fridge", "refrigerator")):
-            return "fridge"
-        if any(marker in text for marker in ("drawer", "cabinet", "dresser", "chest_of_drawers", "chestofdrawers")):
+        if any(marker in text for marker in ("fridge", "freezer", "refrigerator")):
+            # Do not let a mutable M1 answer promote an impossible tiny crop
+            # (or a source bottle) into the physical refrigerator lane.  A
+            # genuine source fridge with a stable body reference remains
+            # fully eligible.
+            if CandidateGenerator._is_refrigerator_container(node):
+                return "fridge"
+        if any(
+            marker in text
+            for marker in (
+                "drawer",
+                "cabinet",
+                "dresser",
+                "chest_of_drawers",
+                "chestofdrawers",
+            )
+        ):
             return "drawer_cabinet"
         return str(node.get("type") or "").strip().casefold()
 
     @staticmethod
     def _is_refrigerator_container(node: dict[str, Any]) -> bool:
-        """Identify refrigerator-like hinged containers for clearance policy."""
+        """Identify refrigerator-like containers without M1 crop hallucinations."""
 
         attributes = node.get("attributes") or {}
-        labels = (
-            node.get("label"),
-            node.get("name"),
-            attributes.get("semantic_name"),
-            attributes.get("category"),
-            attributes.get("source_object_name"),
+        source_labels = CandidateGenerator._source_semantic_labels(node)
+        public_labels = tuple(
+            str(value or "").strip().casefold()
+            for value in (
+                node.get("label"),
+                node.get("name"),
+                attributes.get("semantic_name"),
+                attributes.get("category"),
+                attributes.get("source_object_name"),
+                attributes.get("interaction_reference_label"),
+                attributes.get("m1_observed_object_name"),
+            )
+            if str(value or "").strip()
         )
-        return any(
-            marker in str(label or "").casefold()
-            for label in labels
-            for marker in ("refrigerator", "fridge")
+        fridge_markers = {"fridge", "refrigerator", "freezer"}
+        source_is_fridge = any(
+            _normalized_marker_match(label, fridge_markers)
+            for label in source_labels
         )
+        public_is_fridge = any(
+            _normalized_marker_match(label, fridge_markers)
+            for label in public_labels
+        )
+        if not public_is_fridge:
+            return False
+
+        # A source bottle/food item remains an object even when M1 rewrites
+        # its public name and graph type to ``refrigerator``/``container``.
+        source_is_content = any(
+            _normalized_marker_match(label, _REFRIGERATOR_CONTENT_SOURCE_LABELS)
+            for label in source_labels
+        )
+        if source_is_content and not source_is_fridge:
+            return False
+
+        geometry = CandidateGenerator._refrigerator_geometry(node)
+        geometry_known = geometry is not None
+        geometry_ok = CandidateGenerator._looks_like_refrigerator_body(node)
+        has_explicit_source = bool(
+            any(
+                str(attributes.get(key) or "").strip()
+                for key in ("source_semantic_name", "source_category")
+            )
+        )
+        m1_name_override = bool(attributes.get("m1_name_override"))
+
+        # With fresh source provenance, a fridge class still needs a plausible
+        # body box.  This specifically removes the 0.16 x 0.07 x 0.27 m crop
+        # that previously generated a false INTERACT subgoal.
+        if (source_is_fridge or has_explicit_source) and geometry_known:
+            return geometry_ok
+        if source_is_fridge:
+            return not geometry_known or geometry_ok
+        if m1_name_override:
+            # M1 can correct a generic detector class, but only a body-sized
+            # geometry may authorize that correction as a fridge candidate.
+            return geometry_ok
+        # Legacy hand-written/replay nodes may expose only ``name=fridge``;
+        # preserve that historical behavior when no provenance/override is
+        # available to audit it.
+        return True
 
     @staticmethod
     def _is_openable_container(node: dict[str, Any]) -> bool:

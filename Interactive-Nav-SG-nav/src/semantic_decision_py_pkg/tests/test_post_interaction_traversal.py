@@ -11,6 +11,8 @@ from semantic_decision_py_pkg.post_interaction_traversal import (
     is_terminal_post_interaction_traversal_failure,
     pending_priority_candidate,
     post_interaction_traversal_event_key,
+    portal_aabb_size_xy,
+    portal_clearance_aabb,
     portal_center_xy,
     portal_open_confirmation,
     reproject_post_interaction_traversal_candidate,
@@ -251,6 +253,57 @@ def test_post_open_traversal_reprojects_from_the_fresh_portal_geometry() -> None
     ]
 
 
+def test_reproject_uses_current_candidate_geometry_when_compact_id_is_aliased() -> None:
+    pending = build_post_interaction_traversal_candidate(
+        portal_interaction_candidate(),
+        {"status": "SUCCEEDED", "detail": {"event_id": "event_1", "action": "open"}},
+        robot_xy=(-1.0, 0.0),
+        traversal_distance_m=0.9,
+    )
+    assert pending is not None
+
+    # ``compact_graph`` may expose ``door_1`` while the executable candidate
+    # and pending feedback retain the routing ID ``portal_door_1``.  The
+    # current candidate was built from the full graph and must still provide
+    # the fresh geometry for reprojection.
+    snapshot = {
+        "graph_revision": 12,
+        "robot_xy": [-1.0, 0.0],
+        "graph_context": {
+            "nodes": [
+                {
+                    "id": "door_1",
+                    "type": "portal",
+                }
+            ]
+        },
+        "candidates": [
+            {
+                "target_id": "portal_door_1",
+                "metadata": {
+                    "portal_geometry": {
+                        "center_xy": [2.0, 0.0],
+                        "size_xy": [0.2, 0.8],
+                        "clearance_center_xy": [2.3, 0.0],
+                        "clearance_size_xy": [0.8, 0.8],
+                    }
+                },
+            }
+        ],
+    }
+
+    projected = reproject_post_interaction_traversal_candidate(
+        pending.to_dict(), snapshot, traversal_distance_m=0.9
+    )
+
+    assert projected is not None
+    assert projected["goal_xyyaw"] == [2.9, 0.0, 0.0]
+    assert projected["metadata"]["post_interaction_reprojected_portal_center_xy"] == [
+        2.0,
+        0.0,
+    ]
+
+
 def test_post_interaction_refresh_gate_releases_on_one_graph_update_without_rgb() -> None:
     gate = PostInteractionRefreshGate(
         PostInteractionRefreshConfig(
@@ -365,6 +418,30 @@ def test_portal_center_prefers_interaction_reference_geometry() -> None:
     }
 
     assert portal_center_xy(graph, "portal_1") == [1.0, 2.0]
+
+
+def test_portal_geometry_survives_compact_graph_boundary() -> None:
+    graph = {
+        "nodes": [
+            {
+                "id": "portal_1",
+                "centroid": [50.0, 50.0, 0.0],
+                "portal_geometry": {
+                    "interaction_reference_aabb_center": [2.0, 3.0, 1.0],
+                    "interaction_reference_aabb_size": [0.2, 0.4, 2.0],
+                    "aabb_center": [2.5, 3.0, 1.0],
+                    "aabb_size": [1.4, 0.4, 2.0],
+                },
+            }
+        ]
+    }
+
+    assert portal_center_xy(graph, "portal_1") == [2.0, 3.0]
+    assert portal_aabb_size_xy(graph, "portal_1") == [0.2, 0.4]
+    assert portal_clearance_aabb(graph, "portal_1") == (
+        [2.5, 3.0],
+        [1.4, 0.4],
+    )
 
 
 def test_failed_one_shot_traversal_is_terminal_but_target_preemption_is_not() -> None:

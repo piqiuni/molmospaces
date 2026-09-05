@@ -1199,6 +1199,67 @@ def test_native_interaction_standoffs_keep_drawers_with_containers() -> None:
     assert candidates["drawer_1"].metadata["interaction_standoff_source"] == "drawer"
 
 
+def test_m1_refrigerator_name_on_tiny_source_item_is_not_an_interaction_target():
+    """A bad M1 answer must not create a physical fridge subgoal."""
+
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            interaction_semantic_types=("fridge",),
+        )
+    )
+    hallucinated = {
+        "id": "object_track_bad_fridge",
+        "type": "container",
+        "label": "refrigerator",
+        "name": "refrigerator",
+        "aabb_center": [1.0, 0.0, 1.0],
+        "aabb_size": [0.16, 0.07, 0.27],
+        "attributes": {
+            "source_semantic_name": "bottle",
+            "source_category": "bottle",
+            "m1_name_override": True,
+            "m1_observed_object_name": "refrigerator",
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 0.9,
+        },
+    }
+
+    assert generator._interaction_semantic_label(hallucinated) != "fridge"
+    assert generator.generate({}, {"nodes": [hallucinated]}, (0.0, 0.0)) == []
+
+
+def test_m1_can_promote_a_body_sized_generic_source_to_refrigerator():
+    """The geometry guard preserves a plausible M1 correction."""
+
+    node = {
+        "id": "object_track_real_fridge",
+        "type": "container",
+        "label": "refrigerator",
+        "name": "refrigerator",
+        "aabb_center": [1.0, 0.0, 1.0],
+        "aabb_size": [0.80, 0.60, 1.80],
+        "attributes": {
+            "source_semantic_name": "object",
+            "source_category": "object",
+            "m1_name_override": True,
+            "m1_observed_object_name": "refrigerator",
+        },
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": True,
+            "state": "closed",
+            "state_confidence": 0.9,
+        },
+    }
+
+    assert CandidateGenerator._interaction_semantic_label(node) == "fridge"
+
+
 def test_multi_drawer_metadata_emits_id_only_open_candidate() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(

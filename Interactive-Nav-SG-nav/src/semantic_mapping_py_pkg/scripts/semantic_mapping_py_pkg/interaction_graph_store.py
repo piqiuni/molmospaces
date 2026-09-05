@@ -163,6 +163,93 @@ def _m1_observed_object_name(patch):
     return normalized[:64]
 
 
+def _remember_m1_refrigerator_reference(node, observed_name, confidence):
+    """Persist a body reference when M1 promotes a generic crop to a fridge.
+
+    The detector normally supplies the appliance class before M1 runs, but a
+    physical crop can be emitted as a generic ``object``.  In that case the
+    first M1 answer is the only refrigerator identity available.  Preserve a
+    stable label/box at that point so a later detector frame cannot erase the
+    identity before the sealed open result is rebuilt into relations.  Once an
+    interaction has succeeded, the reference is intentionally frozen: an open
+    door often changes the live box to include the leaf and visible contents.
+    """
+
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        return False
+    if confidence < 0.5 or not _is_refrigerator_label(observed_name):
+        return False
+    attributes = node.attributes or {}
+    normalized_name = normalize_label(observed_name)
+    changed = False
+    if not _is_refrigerator_label(attributes.get("interaction_reference_label")):
+        attributes["interaction_reference_label"] = normalized_name
+        changed = True
+
+    center = getattr(node, "aabb_center", None)
+    size = getattr(node, "aabb_size", None)
+    if _valid_float_vector(center, 3) and _valid_float_vector(size, 3):
+        try:
+            current_size = [abs(float(size[index])) for index in range(3)]
+        except (IndexError, TypeError, ValueError):
+            current_size = []
+        valid_size = len(current_size) == 3 and all(
+            math.isfinite(value) and value > 1e-6 for value in current_size
+        )
+        existing_size = attributes.get("interaction_reference_aabb_size")
+        reference_valid = _valid_float_vector(existing_size, 3)
+        # Do not replace a configured/stable reference after a successful
+        # action.  Before an action, replace only an absent/invalid or clearly
+        # tiny reference with a plausible body-sized crop.
+        try:
+            existing_body_sized = bool(
+                reference_valid
+                and max(abs(float(existing_size[0])), abs(float(existing_size[1])))
+                >= 0.35
+                and abs(float(existing_size[2])) >= 0.65
+                and abs(float(existing_size[0]))
+                * abs(float(existing_size[1]))
+                * abs(float(existing_size[2]))
+                >= 0.18
+            )
+        except (IndexError, TypeError, ValueError):
+            existing_body_sized = False
+        interaction_confirmed = _has_confirmed_refrigerator_interaction(node)
+        configured_reference = str(
+            attributes.get("interaction_geometry_source") or ""
+        ).strip().casefold() == "configured_override"
+        if valid_size and (
+            not reference_valid
+            or (
+                not interaction_confirmed
+                and not configured_reference
+                and not existing_body_sized
+            )
+        ):
+            attributes["interaction_reference_aabb_center"] = [
+                float(center[index]) for index in range(3)
+            ]
+            attributes["interaction_reference_aabb_size"] = current_size
+            changed = True
+    yaw = attributes.get("yaw")
+    if not _valid_float_scalar(attributes.get("interaction_reference_yaw")):
+        try:
+            yaw = float(yaw)
+        except (TypeError, ValueError):
+            yaw = None
+        if yaw is not None and math.isfinite(yaw):
+            attributes["interaction_reference_yaw"] = yaw
+            changed = True
+    attributes["m1_refrigerator_evidence"] = True
+    attributes["m1_refrigerator_evidence_confidence"] = max(
+        float(attributes.get("m1_refrigerator_evidence_confidence", 0.0) or 0.0),
+        confidence,
+    )
+    return changed
+
+
 def _container_m1_hysteresis(
     node,
     interaction_class,
@@ -506,6 +593,25 @@ class InteractionGraphStore:
         self.interaction_event_counter = 1
         self.next_portal_child_room_id = _PORTAL_CHILD_ROOM_ID_BASE
         self._ensure_scene_node()
+
+    def has_confirmed_open_refrigerator(self):
+        """Return whether the graph contains a trusted open refrigerator.
+
+        This small read-only seam is used by the mapper before exporting
+        short-lived detector tracks.  It deliberately re-applies the narrow
+        refrigerator-type restoration rule first: a delayed M1 ``object``
+        label must not hide an appliance whose successful open result is
+        already sealed in ``operation_history``.  No visual M1-only state is
+        accepted as an open transition.
+        """
+
+        for node in self.nodes.values():
+            if node.type not in {"container", "object"}:
+                continue
+            _restore_confirmed_refrigerator_container_type(node)
+            if node.type == "container" and _is_open_refrigerator(node):
+                return True
+        return False
 
     def update_room_grid(
         self,
@@ -1108,8 +1214,16 @@ class InteractionGraphStore:
         # interaction class.  A sufficiently confident M1 answer may correct
         # a YOLO-established container/portal type; lower-confidence answers
         # retain the existing topology but are still recorded for diagnostics.
+        # The physical detector lane uses M1 as the final visual refinement
+        # authority.  Restricted-GT/replay lanes still need the established
+        # topology hysteresis: a single asynchronous crop must not turn a
+        # known portal into a container (or vice versa) while the source
+        # observation stream is authoritative.  Keeping this distinction at
+        # the store boundary preserves the physical fix without regressing
+        # simulator/replay graph semantics.
         m1_class_override = bool(
             is_visual_mllm_patch
+            and self.source_mode == "detector_online"
             and confidence >= 0.5
             and interaction_class in {"portal", "container", "support", "object"}
         )
@@ -1171,7 +1285,12 @@ class InteractionGraphStore:
             and not portal_type_locked
         ):
             node.type = interaction_class
-        if m1_noninteractive_override and not has_verified_interaction_state:
+        if (
+            m1_noninteractive_override
+            and not has_verified_interaction_state
+            and not container_type_locked
+            and not portal_type_locked
+        ):
             # A detector may call a wall or furniture a fridge/door.  Once M1
             # explicitly says it is not interactive, keep the node in the
             # semantic map but remove it from the interaction-candidate pool.
@@ -1191,6 +1310,13 @@ class InteractionGraphStore:
                     "m1_name_confidence": confidence,
                 }
             )
+            if _is_refrigerator_label(m1_observed_name):
+                # A generic detector crop may be promoted to a refrigerator
+                # by M1.  Capture its body geometry before a later source
+                # frame can overwrite the mutable public type/name.
+                _remember_m1_refrigerator_reference(
+                    node, m1_observed_name, confidence
+                )
         parts = list(patch.get("interaction_parts") or [])
         for deprecated_key in (
             "interaction_groups",
@@ -1814,6 +1940,16 @@ class InteractionGraphStore:
                 "observation_node_type": observed_node_type,
                 "topology_type": observed_node_type,
                 "topology_type_source": "source_observation",
+                # Keep the detector/source ontology separate from the mutable
+                # M1-facing ``semantic_name``/``category`` fields below.  M1
+                # can temporarily answer "refrigerator" for a bottle (or
+                # promote a crop to ``container``); relation inference must
+                # still be able to tell which labels came from the geometry
+                # observation when the next graph rebuild runs.
+                "source_semantic_name": normalize_label(
+                    observation.get("semantic_name")
+                ),
+                "source_category": normalize_label(observation.get("category")),
                 "instance_id": observation.get("instance_id") or node.attributes.get("instance_id") or "",
                 "category": observation.get("category"),
                 "candidate_labels": list(observation.get("candidate_labels") or []),
@@ -1836,6 +1972,10 @@ class InteractionGraphStore:
                 "bbox_2d": list(observation.get("bbox_2d") or []),
                 "consecutive_observations": consecutive_observations,
                 "max_consecutive_observations": max_consecutive_observations,
+                "tracking_confirmed": observation.get("tracking_confirmed"),
+                "graph_admission_source": str(
+                    observation.get("graph_admission_source") or ""
+                ),
                 "camera_name": observation.get("camera_name"),
                 "frame_index": int(observation.get("frame_index", 0)),
                 "last_observation_frame_index": int(
@@ -1931,6 +2071,61 @@ class InteractionGraphStore:
             node.attributes["interaction_geometry_source"] = str(
                 geometry_override.get("source") or "configured_override"
             )
+        # Keep the first reliable refrigerator body box as an interaction
+        # reference.  After the door opens, detectors frequently enlarge or
+        # translate the live appliance box to include the door/contents; that
+        # box is useful for visualisation but must not redefine the depth
+        # corridor used to assign the newly visible items.  A configured
+        # geometry override, when present, remains authoritative.
+        refrigerator_label = next(
+            (
+                value
+                for value in (
+                    node.label,
+                    observation.get("semantic_name"),
+                    observation.get("category"),
+                )
+                if _is_refrigerator_label(value)
+            ),
+            None,
+        )
+        known_refrigerator_label = bool(
+            refrigerator_label
+            or _is_refrigerator_label(
+                node.attributes.get("interaction_reference_label")
+            )
+        )
+        if known_refrigerator_label:
+            if not _is_refrigerator_label(
+                node.attributes.get("interaction_reference_label")
+            ):
+                node.attributes["interaction_reference_label"] = normalize_label(
+                    refrigerator_label
+                )
+            if not _valid_float_vector(
+                node.attributes.get("interaction_reference_aabb_center"), 3
+            ):
+                node.attributes["interaction_reference_aabb_center"] = list(
+                    observation["aabb_center"]
+                )
+            if not _valid_float_vector(
+                node.attributes.get("interaction_reference_aabb_size"), 3
+            ):
+                node.attributes["interaction_reference_aabb_size"] = list(
+                    observation["aabb_size"]
+                )
+            if (
+                not _valid_float_scalar(
+                    node.attributes.get("interaction_reference_yaw")
+                )
+                and observation.get("yaw") is not None
+            ):
+                try:
+                    node.attributes["interaction_reference_yaw"] = float(
+                        observation["yaw"]
+                    )
+                except (TypeError, ValueError):
+                    pass
         for deprecated_key in (
             "parent",
             "children",
@@ -2793,6 +2988,14 @@ class InteractionGraphStore:
         scene_node = self._ensure_scene_node()
         scene_node.attributes["source_mode"] = self.source_mode
         scene_node.attributes["episode_id"] = self.episode_id
+        # A delayed M1 answer can arrive after a successful refrigerator open
+        # and temporarily rewrite the mutable graph type to ``object``.  The
+        # source refrigerator identity plus the sealed success history are
+        # stronger evidence than that one-frame class result.  Restore the
+        # container type before building the relation pools so the newly
+        # exposed contents are not silently left parentless.
+        for node in self.nodes.values():
+            _restore_confirmed_refrigerator_container_type(node)
         rooms = {
             node.id: node
             for node in self.nodes.values()
@@ -2918,12 +3121,71 @@ class InteractionGraphStore:
         support_nodes = [node for node in non_rooms if node.type == "support"]
         container_nodes = [node for node in non_rooms if node.type == "container"]
         object_nodes = [node for node in non_rooms if node.type == "object"]
+        # A delayed M1 response can temporarily relabel a bottle/food track as
+        # ``container``.  It is still a possible refrigerator child, whereas
+        # portals/support surfaces are never content.  Keep this relaxed pool
+        # private to the refrigerator fallback; the strict hierarchy below
+        # continues to use the source-observed object type.
+        refrigerator_content_nodes = [
+            node
+            for node in non_rooms
+            if node.type not in {"scene", "room", "portal", "support"}
+        ]
         id_lookup = {node.id: node for node in non_rooms}
+        # A physical refrigerator often reports its contents in the open-door
+        # volume rather than in the closed appliance AABB.  The executor has
+        # already established the open state at this point, so derive one
+        # stable local-depth side from the currently tracked objects.  This is
+        # deliberately scoped to refrigerators; drawers, cabinets and closed
+        # containers retain the strict AABB rule below.
+        open_refrigerator_sides = {}
+        for container in container_nodes:
+            # These fields describe the active inference only.  Retain the
+            # selected side as historical evidence, but do not leave a stale
+            # ``open`` mode visible after a close/unknown observation.
+            container.attributes.pop("containment_inference_mode", None)
+            container.attributes.pop("open_refrigerator_content_side_confidence", None)
+            if not _is_open_refrigerator(container):
+                continue
+            side, confidence = _infer_open_refrigerator_content_side(
+                container, refrigerator_content_nodes
+            )
+            if side is None:
+                continue
+            open_refrigerator_sides[container.id] = side
+            container.attributes.update(
+                {
+                    "open_refrigerator_content_side": (
+                        "positive_depth" if side > 0 else "negative_depth"
+                    ),
+                    "open_refrigerator_content_side_confidence": float(
+                        confidence
+                    ),
+                    "containment_inference_mode": "open_refrigerator_depth",
+                }
+            )
         for container in container_nodes:
             container.attributes["inferred_child_ids"] = []
             container.attributes["inferred_child_count"] = 0
 
-        for obj in object_nodes:
+        # A confident M1 crop may temporarily change a content track's graph
+        # type from ``object`` to ``container``.  Once an opened refrigerator
+        # has a selected depth side, retain those tracks in the relation pass
+        # when their labels still look like a movable item.  Do not broaden
+        # the ordinary (closed-container) hierarchy with this fallback.
+        relation_object_nodes = list(object_nodes)
+        if open_refrigerator_sides:
+            relation_object_ids = {node.id for node in relation_object_nodes}
+            for candidate in refrigerator_content_nodes:
+                if (
+                    candidate.id in relation_object_ids
+                    or not _is_open_refrigerator_content_candidate(candidate)
+                ):
+                    continue
+                relation_object_nodes.append(candidate)
+                relation_object_ids.add(candidate.id)
+
+        for obj in relation_object_nodes:
             previous_parent_id = obj.parent_id
             obj.parent_id = None
             parent = self._find_parent_node(
@@ -2932,6 +3194,7 @@ class InteractionGraphStore:
                 container_nodes,
                 id_lookup,
                 previous_parent_id=previous_parent_id,
+                open_refrigerator_sides=open_refrigerator_sides,
             )
             if parent is None:
                 if obj.room_id is not None:
@@ -2941,7 +3204,21 @@ class InteractionGraphStore:
             if parent.type == "support":
                 self._upsert_edge(parent.id, "supports", obj.id, now=now)
             elif parent.type == "container":
-                self._upsert_edge(parent.id, "contains", obj.id, now=now)
+                edge_attributes = {}
+                if (
+                    parent.id in open_refrigerator_sides
+                    and not _container_contains(obj, parent)
+                ):
+                    edge_attributes["containment_source"] = (
+                        "open_refrigerator_depth_inference"
+                    )
+                self._upsert_edge(
+                    parent.id,
+                    "contains",
+                    obj.id,
+                    attributes=edge_attributes,
+                    now=now,
+                )
                 parent.attributes["inferred_child_ids"].append(obj.id)
 
         for container in container_nodes:
@@ -2965,10 +3242,29 @@ class InteractionGraphStore:
         container_nodes,
         id_lookup,
         previous_parent_id=None,
+        open_refrigerator_sides=None,
     ):
+        # An opened refrigerator's measured body box is often the *closed*
+        # appliance box.  Its newly visible contents therefore have to win
+        # before a stale/nearby closed container or support claims the same
+        # object by ordinary AABB proximity.
+        open_matches = []
+        for container in container_nodes:
+            if container.id == obj.id:
+                continue
+            side = (open_refrigerator_sides or {}).get(container.id)
+            if side is None:
+                continue
+            if _is_open_refrigerator_content(obj, container, side):
+                score = _open_refrigerator_content_score(obj, container, side)
+                open_matches.append((score, container))
+        if open_matches:
+            return min(open_matches, key=lambda item: (item[0], volume(item[1].aabb_size)))[1]
+
         containing = [
             node
             for node in container_nodes
+            if node.id != obj.id
             if _is_plausible_container_content(obj, node)
             and self._is_inside_volume(obj, node)
         ]
@@ -3330,6 +3626,776 @@ def _is_plausible_container_content(obj, container):
     container_volume = volume(container.aabb_size)
     object_volume = volume(obj.aabb_size)
     return container_volume > 1e-6 and object_volume <= min(0.10, 0.10 * container_volume)
+
+
+# The physical detector can leave environmental fixtures in the same depth
+# slab as an open refrigerator.  These labels are not contents even when their
+# 3-D boxes are small enough to pass the relaxed open-door volume test.
+_OPEN_REFRIGERATOR_NON_CONTENT_LABELS = (
+    "person",
+    "picture",
+    "solar_battery",
+    "shelve",
+    "shelf",
+    "rack",
+    "waste",
+    "grid",
+    "logo",
+    "chair",
+    "watch",
+    "safe",
+    "plug",
+    "broom",
+    "faucet",
+    "screen",
+    "barber_shop",
+    "locker",
+    "plant",
+    "houseplant",
+    "succulent",
+    "flower",
+    "tree",
+    "eucalyptus",
+    "table",
+    "desk",
+    "bed",
+    "sofa",
+    "chair",
+    "bench",
+    "cabinet",
+    "cupboard",
+    "drawer",
+    "wardrobe",
+    "closet",
+    "dresser",
+    "microwave",
+    "dishwasher",
+    "oven",
+    "stove",
+    "sink",
+    "door",
+    "portal",
+    "freezer",
+    "fridge",
+    "refrigerator",
+    "wall",
+    "floor",
+    "ceiling",
+)
+_OPEN_REFRIGERATOR_CONTENT_LABELS = frozenset(
+    {
+        "food",
+        "bottle",
+        "cup",
+        "bowl",
+        "dairy",
+        "lemon",
+        "jug",
+        "milk",
+        "vinegar",
+        "persimmon",
+        "fruit",
+        "vegetable",
+        "sushi",
+        "can",
+        "carton",
+        "jar",
+        "plate",
+    }
+)
+
+
+def _valid_float_scalar(value):
+    """Return whether *value* is a finite scalar suitable for geometry."""
+
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _valid_float_vector(value, length):
+    """Return whether a sequence has ``length`` finite numeric entries."""
+
+    if not isinstance(value, (list, tuple)) or len(value) < int(length):
+        return False
+    try:
+        return all(math.isfinite(float(value[index])) for index in range(length))
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+def _is_refrigerator_label(value):
+    """Match refrigerator-family labels without treating arbitrary IDs as one."""
+
+    label = normalize_label(value)
+    return any(
+        _label_matches_marker(label, marker)
+        for marker in ("fridge", "freezer", "refrigerator")
+    )
+
+
+def _is_refrigerator_content_label(label):
+    """Return whether a label describes a likely movable fridge item."""
+
+    return any(
+        _label_matches_marker(label, marker)
+        for marker in _OPEN_REFRIGERATOR_CONTENT_LABELS
+    )
+
+
+def _source_node_type(node):
+    """Return the topology type supplied by the geometry/source lane.
+
+    ``node.type`` is intentionally mutable because a confident M1 response
+    may refine an object to a container.  The source type is the stable
+    provenance needed by the refrigerator relation fallback.
+    """
+
+    attributes = node.attributes or {}
+    value = attributes.get("topology_type") or attributes.get(
+        "observation_node_type"
+    )
+    return str(value or "").strip().casefold()
+
+
+def _source_node_labels(node):
+    """Return only labels owned by the source observation.
+
+    M1's ``observed_object_name`` and its copied ``semantic_name``/``category``
+    are deliberately excluded.  In the physical run a bottle was once
+    answered as "refrigerator" by M1; treating that transient answer as a
+    negative refrigerator-content marker was enough to hide the real child.
+    ``candidate_labels`` are also omitted here because they are an open-vocab
+    hypothesis list, not a primary source class.
+    """
+
+    attributes = node.attributes or {}
+    values = [
+        attributes.get("source_semantic_name"),
+        attributes.get("source_category"),
+    ]
+    # Legacy/replay nodes created before source provenance was persisted still
+    # need the old behavior.  If M1 has not overridden the name, the public
+    # fields are a safe fallback; otherwise no mutable M1 label is promoted to
+    # source evidence.
+    if not any(normalize_label(value) for value in values):
+        if not bool(attributes.get("m1_name_override")):
+            values.extend(
+                [
+                    node.label,
+                    node.name,
+                    attributes.get("semantic_name"),
+                    attributes.get("category"),
+                ]
+            )
+    return tuple(
+        sorted(
+            {
+                normalized
+                for normalized in (normalize_label(value) for value in values)
+                if normalized
+            }
+        )
+    )
+
+
+def _source_node_has_label(node, predicate):
+    """Return whether a predicate matches at least one source label."""
+
+    return any(predicate(label) for label in _source_node_labels(node))
+
+
+def _looks_like_refrigerator_body(node):
+    """Reject tiny M1-only refrigerator hallucinations as parent containers."""
+
+    size = _open_refrigerator_reference_size(node)
+    if size is None or len(size) < 3:
+        return False
+    try:
+        horizontal = sorted(
+            [abs(float(size[0])), abs(float(size[1]))], reverse=True
+        )
+        vertical = abs(float(size[2]))
+        body_volume = volume(size)
+    except (IndexError, TypeError, ValueError):
+        return False
+    # This is intentionally permissive for a mini-fridge, but far above the
+    # small crop boxes produced for a bottle/hand-held item.
+    return bool(
+        horizontal[0] >= 0.35
+        and vertical >= 0.65
+        and body_volume >= 0.18
+    )
+
+
+def _has_confirmed_refrigerator_interaction(node):
+    """Return whether the node has a sealed open/close interaction fact."""
+
+    interaction = node.interaction or {}
+    for event in reversed(interaction.get("operation_history") or []):
+        if not isinstance(event, dict) or not bool(event.get("success")):
+            continue
+        action = str(event.get("action") or "").strip().casefold()
+        post_state = str(event.get("post_state") or "").strip().casefold()
+        if action in {"open", "close", "open_close", "opened", "closed"}:
+            return True
+        if post_state in {
+            "open",
+            "opened",
+            "ajar",
+            "closed",
+            "static_open",
+            "static_closed",
+        }:
+            return True
+    return False
+
+
+def _restore_confirmed_refrigerator_container_type(node):
+    """Keep a proven refrigerator in the container relation/candidate pool.
+
+    M1 class overrides are intentionally authoritative before an interaction
+    has happened.  Once the physical bridge has returned a successful
+    open/close result, however, a later one-frame ``object`` answer must not
+    remove the appliance from the graph just as its contents become visible.
+    This narrow repair requires source-owned refrigerator evidence and a
+    body-sized geometry, so it cannot resurrect the small false-positive
+    crops that the candidate guard rejects.
+    """
+
+    if node is None or str(node.type or "").casefold() == "container":
+        return False
+    attributes = node.attributes or {}
+    source_labels = _source_node_labels(node)
+    reference_label = attributes.get("interaction_reference_label")
+    m1_reference_label = attributes.get("m1_observed_object_name")
+    source_is_refrigerator = any(
+        _is_refrigerator_label(label) for label in source_labels
+    )
+    refrigerator_identity = source_is_refrigerator or _is_refrigerator_label(
+        reference_label
+    ) or (
+        bool(attributes.get("m1_refrigerator_evidence"))
+        and _is_refrigerator_label(m1_reference_label)
+    )
+    if not refrigerator_identity:
+        return False
+    # A large/noisy bottle crop can occasionally pass the permissive body
+    # dimensions.  Source-owned content labels still veto a mutable M1 fridge
+    # promotion unless the detector itself identified the appliance.
+    if not source_is_refrigerator and any(
+        _is_refrigerator_content_label(label) for label in source_labels
+    ):
+        return False
+    source_type = _source_node_type(node)
+    if source_type in {"portal", "support", "scene", "room"}:
+        return False
+    if not _looks_like_refrigerator_body(node):
+        return False
+    if not _has_confirmed_refrigerator_interaction(node):
+        return False
+    node.type = "container"
+    attributes["refrigerator_type_restored_after_success"] = True
+    attributes["refrigerator_type_restore_source"] = "successful_interaction_history"
+    return True
+
+
+def _node_labels(node):
+    """Return normalized labels available on a graph node."""
+
+    attributes = node.attributes or {}
+    values = [
+        node.label,
+        node.name,
+        attributes.get("semantic_name"),
+        attributes.get("category"),
+        attributes.get("interaction_reference_label"),
+        attributes.get("m1_observed_object_name"),
+    ]
+    # ``candidate_labels`` are useful only when they have actual tracker
+    # support.  A raw open-vocabulary candidate list can contain unrelated
+    # words, so include only labels with a non-trivial vote (or the first few
+    # labels when the producer did not send votes at all).
+    candidate_labels = [
+        normalize_label(value) for value in attributes.get("candidate_labels") or []
+    ]
+    votes = attributes.get("label_votes") or {}
+    if isinstance(votes, dict) and votes:
+        try:
+            max_vote = max(float(score) for score in votes.values())
+        except (TypeError, ValueError):
+            max_vote = 0.0
+        for label in candidate_labels:
+            try:
+                score = float(votes.get(label, votes.get(str(label), 0.0)) or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            if score >= max(0.05, 0.20 * max_vote):
+                values.append(label)
+    else:
+        values.extend(candidate_labels[:4])
+    return tuple(sorted({label for label in values if label}))
+
+
+def _label_matches_marker(label, marker):
+    """Match a semantic marker without treating ``track_*`` IDs as labels."""
+
+    label = normalize_label(label)
+    marker = normalize_label(marker)
+    return bool(
+        label
+        and marker
+        and (
+            label == marker
+            or label.startswith(f"{marker}_")
+            or label.endswith(f"_{marker}")
+        )
+    )
+
+
+def _is_open_refrigerator_content_candidate(node):
+    """Filter graph nodes before the relaxed open-door relation pass."""
+
+    # Negative appliance/furniture markers must come from the source lane.
+    # M1's mutable name is allowed as positive evidence (for example, a
+    # source ``object`` crop refined to ``bottle``), but a one-frame M1
+    # "refrigerator" answer must not erase a source bottle from this pool.
+    labels = _node_labels(node)
+    source_labels = _source_node_labels(node)
+    if any(
+        _label_matches_marker(label, token)
+        for label in source_labels
+        for token in _OPEN_REFRIGERATOR_NON_CONTENT_LABELS
+    ):
+        return False
+    source_type = _source_node_type(node)
+    if source_type in {"scene", "room", "portal", "support"}:
+        return False
+    # A source refrigerator/appliance is never its own content, even if M1
+    # temporarily changed its public graph type to ``object``.
+    if _source_node_has_label(node, _is_refrigerator_label):
+        return False
+    # Source-observed objects are already eligible.  A node that M1 relabeled
+    # as a container is eligible only when its semantic label still identifies
+    # a likely item (or is an explicitly generic object token); this avoids
+    # recursively assigning cabinets, boxes, and appliances as contents.
+    if source_type == "object":
+        return True
+    if str(node.type or "").casefold() != "container":
+        return True
+    generic_labels = {"object", "item", "thing", "unknown", "container"}
+    return any(
+        label in generic_labels or _is_refrigerator_content_label(label)
+        for label in labels
+    )
+
+
+def _is_open_refrigerator(container):
+    """Whether a container has a confirmed open refrigerator state."""
+
+    labels = _node_labels(container)
+    source_labels = _source_node_labels(container)
+    source_type = _source_node_type(container)
+    source_is_refrigerator = any(
+        _is_refrigerator_label(label) for label in source_labels
+    )
+    # A stable refrigerator reference can be created from a confident M1
+    # answer on a generic crop.  It must not override a source-owned bottle/
+    # food label, even if a stale command result later lands on that track.
+    # Otherwise the false track could become an ``open`` parent and absorb
+    # nearby objects during the same relation rebuild.
+    if not source_is_refrigerator and any(
+        _is_refrigerator_content_label(label) for label in source_labels
+    ):
+        return False
+    stable_reference_is_refrigerator = _is_refrigerator_label(
+        (container.attributes or {}).get("interaction_reference_label")
+    )
+    m1_only_refrigerator = any(_is_refrigerator_label(label) for label in labels)
+    if not (source_is_refrigerator or stable_reference_is_refrigerator):
+        # Permit a genuinely large source crop that M1 promoted to a
+        # refrigerator, but never let a tiny/object-like M1 hallucination
+        # become a parent container.  This keeps M1 useful when the detector
+        # emitted only a generic object while preserving source bottle tracks.
+        if not m1_only_refrigerator or not _looks_like_refrigerator_body(container):
+            return False
+        if source_type == "object" and any(
+            _is_refrigerator_content_label(label) for label in source_labels
+        ):
+            return False
+    if source_type in {"portal", "support", "scene", "room"}:
+        return False
+    interaction = container.interaction or {}
+    attributes = container.attributes or {}
+    override = attributes.get("interaction_state_override") or {}
+
+    state = str(
+        interaction.get("state")
+        or override.get("state")
+        or interaction.get("coarse_state")
+        or override.get("coarse_state")
+        or ""
+    ).strip().casefold()
+    capability = str(
+        interaction.get("capability")
+        or override.get("capability")
+        or ""
+    ).strip().casefold()
+    state_source = str(
+        interaction.get("state_source")
+        or override.get("state_source")
+        or ""
+    ).strip().casefold()
+
+    # A later successful close/blocked transition supersedes an earlier open
+    # event.  Otherwise stale history would keep projecting contents after a
+    # refrigerator had been closed again.
+    history = interaction.get("operation_history") or []
+    latest_successful_transition = None
+    for event in reversed(history):
+        if not isinstance(event, dict) or not bool(event.get("success")):
+            continue
+        action = str(event.get("action") or "").strip().casefold()
+        post_state = str(event.get("post_state") or "").strip().casefold()
+        if (
+            action in {"close", "closed"}
+            or post_state in {"closed", "static_closed", "blocked", "unavailable"}
+        ):
+            latest_successful_transition = "closed"
+            break
+        if (
+            post_state in {"open", "opened", "ajar", "static_open"}
+            or action in {"open", "open_close"}
+        ):
+            latest_successful_transition = "open"
+            break
+    if latest_successful_transition == "closed" or state in {
+        "closed",
+        "static_closed",
+        "blocked",
+        "unavailable",
+    }:
+        return False
+
+    # A visual M1 answer is deliberately not enough to expose contents.  The
+    # physical bridge may be asynchronous, and accepting that one frame here
+    # made a detector hallucination look like a completed fridge action.  A
+    # successful operation history entry (or an explicitly static-open
+    # executor/oracle result) is the trusted state transition.
+    trusted_static = state == "static_open" and capability == "static"
+    # Preserve compatibility with replay/oracle fixtures that provide an
+    # explicit open state but no operation history, while excluding mllm-only
+    # visual patches.  The source check is intentionally narrow.
+    trusted_explicit_open = state in {"open", "opened", "ajar"} and (
+        state_source in {
+            "successful_action_postcondition",
+            "executor_feedback",
+            "oracle_interaction",
+            "direct_joint_readback",
+            "interaction_result",
+            "evaluator_object_skill",
+        }
+        or (
+            "mllm" not in state_source
+            and interaction.get("capability_observed_step") is not None
+        )
+    )
+    return bool(
+        latest_successful_transition == "open"
+        or trusted_static
+        or trusted_explicit_open
+    )
+
+
+def _node_yaw(node):
+    """Read a detector OBB yaw, falling back to an axis-aligned box."""
+
+    attributes = node.attributes or {}
+    for key in ("interaction_reference_yaw", "yaw"):
+        value = attributes.get(key)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return 0.0
+
+
+def _open_refrigerator_reference_center(container):
+    """Use a stable interaction reference center when one is available."""
+
+    attributes = container.attributes or {}
+    values = attributes.get("interaction_reference_aabb_center")
+    if not isinstance(values, (list, tuple)) or len(values) < 3:
+        values = container.aabb_center
+    try:
+        return [float(values[index]) for index in range(3)]
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _open_refrigerator_reference_size(container):
+    """Return the stable body-box dimensions used by the depth corridor."""
+
+    attributes = container.attributes or {}
+    values = attributes.get("interaction_reference_aabb_size")
+    if not isinstance(values, (list, tuple)) or len(values) < 3:
+        values = container.aabb_size
+    try:
+        return [max(0.0, float(values[index])) for index in range(3)]
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _open_refrigerator_depth_lateral_axes(container):
+    """Return ``(depth_axis, lateral_axis)`` in the refrigerator OBB frame.
+
+    Refrigerator bodies are usually deeper along their shorter horizontal
+    OBB dimension.  Choosing that axis instead of hard-coding local ``y``
+    keeps the inference valid when the detector swaps the two OBB axes.
+    """
+
+    size = _open_refrigerator_reference_size(container)
+    if size is None or len(size) < 2:
+        return 1, 0
+    try:
+        # Tie-breaking to axis 1 preserves the historical local-x/local-y
+        # convention used by existing observations.
+        depth_axis = 0 if float(size[0]) < float(size[1]) - 1e-6 else 1
+    except (TypeError, ValueError):
+        depth_axis = 1
+    return depth_axis, 1 - depth_axis
+
+
+def _open_refrigerator_local_xy(obj, container):
+    """Transform an object's world center into the refrigerator OBB frame."""
+
+    center = _open_refrigerator_reference_center(container)
+    if center is None:
+        return None
+    try:
+        dx = float(obj.aabb_center[0]) - center[0]
+        dy = float(obj.aabb_center[1]) - center[1]
+    except (IndexError, TypeError, ValueError):
+        return None
+    yaw = _node_yaw(container)
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    return (
+        cos_yaw * dx + sin_yaw * dy,
+        -sin_yaw * dx + cos_yaw * dy,
+    )
+
+
+def _open_refrigerator_geometry_candidate(obj, container):
+    """Return local coordinates when an object plausibly lies in an open door.
+
+    The detector's box for an open appliance is frequently the *closed* body
+    box, while contents are projected in front of it.  Use conservative
+    lateral/vertical/volume bounds and a bounded depth extension so nearby
+    room fixtures are not swept into the container.
+    """
+
+    if not _same_room_or_unknown(obj, container):
+        return None
+    # Use source-owned labels for exclusion.  A mutable M1 name such as
+    # ``refrigerator`` can be wrong for an otherwise valid bottle/content
+    # track; geometry and source provenance should remain authoritative for
+    # this negative filter.
+    labels = _source_node_labels(obj)
+    if any(
+        _label_matches_marker(label, token)
+        for label in labels
+        for token in _OPEN_REFRIGERATOR_NON_CONTENT_LABELS
+    ):
+        return None
+    reference_size = _open_refrigerator_reference_size(container)
+    if reference_size is None:
+        return None
+    container_volume = volume(reference_size)
+    object_volume = volume(obj.aabb_size)
+    if container_volume <= 1e-6:
+        return None
+    # Keep a larger allowance than the strict closed-volume rule for noisy
+    # bottle/box detections, but never admit furniture-sized observations.
+    if object_volume > max(0.35, 0.35 * container_volume):
+        return None
+    try:
+        reference_center = _open_refrigerator_reference_center(container)
+        if reference_center is None:
+            return None
+        object_z = float(obj.aabb_center[2])
+        object_half_z = max(0.0, float(obj.aabb_size[2])) * 0.5
+        container_z = reference_center[2]
+        container_half_z = max(0.0, float(reference_size[2])) * 0.5
+        object_half_x = max(0.0, float(obj.aabb_size[0])) * 0.5
+        object_half_y = max(0.0, float(obj.aabb_size[1])) * 0.5
+        container_half_x = max(0.0, float(reference_size[0])) * 0.5
+        container_half_y = max(0.0, float(reference_size[1])) * 0.5
+    except (IndexError, TypeError, ValueError):
+        return None
+    # Contents may be detected a little below the body bottom (e.g. a bowl on
+    # the lowest shelf), but not several metres above/below the appliance.
+    vertical_margin = 0.20
+    if (
+        object_z + object_half_z < container_z - container_half_z - vertical_margin
+        or object_z - object_half_z > container_z + container_half_z + vertical_margin
+    ):
+        return None
+    local_xy = _open_refrigerator_local_xy(obj, container)
+    if local_xy is None:
+        return None
+    depth_axis, lateral_axis = _open_refrigerator_depth_lateral_axes(container)
+    lateral = local_xy[lateral_axis]
+    depth = local_xy[depth_axis]
+    # The larger horizontal extent is the appliance opening width.  Cap the
+    # contribution of a noisy object box so one oversized bottle does not get
+    # rejected solely because its depth box is inflated.
+    opening_half_width = (container_half_x, container_half_y)[lateral_axis]
+    object_horizontal_half = min(max(object_half_x, object_half_y), 0.18)
+    if abs(lateral) + object_horizontal_half > opening_half_width + 0.12:
+        return None
+    body_half_depth = (container_half_x, container_half_y)[depth_axis]
+    minimum_depth = max(0.05, body_half_depth - 0.12)
+    maximum_depth = body_half_depth + max(0.90, 1.5 * body_half_depth)
+    if abs(depth) < minimum_depth or abs(depth) > maximum_depth:
+        return None
+    # Downstream side selection intentionally receives a stable
+    # ``(lateral, depth)`` pair regardless of which OBB axis is deeper.
+    return lateral, depth
+
+
+def _open_refrigerator_content_score(obj, container, side):
+    """Score an open-door match so the nearest compatible fridge wins."""
+
+    local_candidate = _open_refrigerator_geometry_candidate(obj, container)
+    if local_candidate is None:
+        return float("inf")
+    lateral, depth = local_candidate
+    reference_size = _open_refrigerator_reference_size(container) or [0.0, 0.0, 0.0]
+    depth_axis, lateral_axis = _open_refrigerator_depth_lateral_axes(container)
+    try:
+        body_half_depth = max(0.01, float(reference_size[depth_axis]) * 0.5)
+        lateral_half_width = max(0.01, float(reference_size[lateral_axis]) * 0.5)
+    except (IndexError, TypeError, ValueError):
+        body_half_depth = 0.01
+        lateral_half_width = 0.01
+    # Prefer items close to the exposed face and near the opening centre.  The
+    # side term is intentionally a hard filter in the caller; this score only
+    # resolves multiple compatible refrigerators or noisy duplicate tracks.
+    depth_distance = abs(abs(float(depth)) - body_half_depth)
+    lateral_distance = abs(float(lateral)) / lateral_half_width
+    score = depth_distance + 0.08 * lateral_distance
+    labels = _node_labels(obj)
+    if any(_is_refrigerator_content_label(label) for label in labels):
+        score -= 0.05
+    if float(depth) * float(side) < 0.0:
+        score += 0.25
+    return max(0.0, score)
+
+
+def _open_refrigerator_approach_side(container):
+    """Return the local depth side from which the successful open was viewed."""
+
+    center = _open_refrigerator_reference_center(container) or []
+    if len(center) < 2:
+        return None
+    approaches = []
+    history = (container.interaction or {}).get("operation_history") or []
+    for event in reversed(history):
+        if not isinstance(event, dict) or not bool(event.get("success")):
+            continue
+        action = str(event.get("action") or "").strip().casefold()
+        if action and action not in {"open", "open_close"}:
+            continue
+        approach = list(event.get("approach_goal_xyyaw") or [])
+        if len(approach) >= 2:
+            approaches.append(approach)
+    attributes = container.attributes or {}
+    configured_approach = list(
+        attributes.get("interaction_approach_pose_xyyaw") or []
+    )
+    if len(configured_approach) >= 2:
+        approaches.append(configured_approach)
+    yaw = _node_yaw(container)
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    depth_axis, _ = _open_refrigerator_depth_lateral_axes(container)
+    for approach in approaches:
+        try:
+            # Contents are exposed toward the robot/camera approach point,
+            # i.e. from the appliance center toward the approach pose.
+            dx = float(approach[0]) - float(center[0])
+            dy = float(approach[1]) - float(center[1])
+        except (TypeError, ValueError):
+            continue
+        local_xy = (
+            cos_yaw * dx + sin_yaw * dy,
+            -sin_yaw * dx + cos_yaw * dy,
+        )
+        local_depth = local_xy[depth_axis]
+        if abs(local_depth) > 0.15 and math.isfinite(local_depth):
+            return 1 if local_depth > 0.0 else -1
+    return None
+
+
+def _infer_open_refrigerator_content_side(container, object_nodes):
+    """Infer the populated side of an open refrigerator in local depth."""
+
+    scores = {-1: 0.0, 1: 0.0}
+    for obj in object_nodes:
+        if not _is_open_refrigerator_content_candidate(obj):
+            continue
+        local_xy = _open_refrigerator_geometry_candidate(obj, container)
+        if local_xy is None or abs(local_xy[1]) <= 1e-6:
+            continue
+        # A semantic food/container token is useful evidence, but geometry is
+        # sufficient so unknown detector labels remain mappable.
+        labels = _node_labels(obj)
+        weight = 1.0 + (
+            0.15
+            if any(_is_refrigerator_content_label(label) for label in labels)
+            else 0.0
+        )
+        scores[1 if local_xy[1] > 0.0 else -1] += weight
+    positive, negative = scores[1], scores[-1]
+    if positive <= 0.0 and negative <= 0.0:
+        return None, 0.0
+    previous = str(
+        (container.attributes or {}).get("open_refrigerator_content_side") or ""
+    ).strip().casefold()
+    previous_side = (
+        1
+        if previous in {"positive_depth", "positive", "+1", "1"}
+        else -1
+        if previous in {"negative_depth", "negative", "-1"}
+        else None
+    )
+    approach_side = _open_refrigerator_approach_side(container)
+    if approach_side is not None and scores[approach_side] > 0.0:
+        # The approach pose is a causal view of the opened face.  Prefer it
+        # whenever there is candidate evidence on that side; this prevents a
+        # nearby small fixture on the opposite side from winning a raw count
+        # tie, while still falling back to geometry when the pose is absent.
+        side = approach_side
+    elif abs(positive - negative) <= 1e-6 and previous_side is not None:
+        side = previous_side
+    else:
+        side = 1 if positive >= negative else -1
+    total = positive + negative
+    confidence = abs(positive - negative) / total if total > 1e-6 else 0.0
+    return side, confidence
+
+
+def _is_open_refrigerator_content(obj, container, side):
+    """Check an object against the selected open-refrigerator depth side."""
+
+    local_xy = _open_refrigerator_geometry_candidate(obj, container)
+    if local_xy is None:
+        return False
+    return local_xy[1] * float(side) > 0.0
 
 
 InteractionGraphStore._is_inside_volume = staticmethod(_container_contains)

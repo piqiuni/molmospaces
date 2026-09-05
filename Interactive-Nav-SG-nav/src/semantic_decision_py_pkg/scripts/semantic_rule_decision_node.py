@@ -255,6 +255,7 @@ class SemanticRuleDecisionNode:
         candidate_config = rospy.get_param("~candidate", {}) or {}
         mission_config = rospy.get_param("~mission", {}) or {}
         ablation_config = rospy.get_param("~ablation", {}) or {}
+        executor_config = rospy.get_param("~executor", {}) or {}
         self.ablation = AblationConfig(
             module1=str(ablation_config.get("module1", "dynamic_rule")),
             module2=str(ablation_config.get("module2", "rule_cost")),
@@ -339,11 +340,22 @@ class SemanticRuleDecisionNode:
                 )
             ),
         )
+        # On the physical robot the executor owns the causal post-open map
+        # barrier: it records the interaction result, waits for a *new* raw
+        # OCC and then a newer global-costmap update before calling make_plan.
+        # Keeping the semantic candidate gate active as well can add its full
+        # 30 s timeout even though OCC is already fresh.  Delegate that gate
+        # to the executor only when the explicitly configured fast path is on;
+        # the simulator/default path keeps the conservative graph refresh.
+        self.post_interaction_refresh_delegated_to_executor = bool(
+            executor_config.get("post_interaction_costmap_fast_path_enabled", False)
+        )
+        refresh_enabled = bool(config.get("post_interaction_refresh_enabled", True))
+        if self.post_interaction_refresh_delegated_to_executor:
+            refresh_enabled = False
         self.post_interaction_refresh_gate = PostInteractionRefreshGate(
             PostInteractionRefreshConfig(
-                enabled=bool(
-                    config.get("post_interaction_refresh_enabled", True)
-                ),
+                enabled=refresh_enabled,
                 min_candidate_updates=max(
                     1,
                     int(
@@ -369,6 +381,13 @@ class SemanticRuleDecisionNode:
                     )
                 ),
             )
+        )
+        rospy.loginfo(
+            "[semantic_rule_decision_node] post-open refresh: enabled=%s "
+            "delegated_to_executor=%s timeout=%.2fs",
+            refresh_enabled,
+            self.post_interaction_refresh_delegated_to_executor,
+            self.post_interaction_refresh_gate.config.timeout_s,
         )
         self.direct_atomic_outcome_belief_enabled = bool(
             config.get("direct_atomic_outcome_belief_enabled", False)
@@ -714,6 +733,11 @@ class SemanticRuleDecisionNode:
                 )
             self._update_entered_rooms(payload)
             self.latest_candidates_payload = payload
+            # Candidate publications are the first point at which the fresh
+            # post-open portal geometry is available.  Reproject immediately
+            # in the physical delegated lane instead of waiting for the
+            # periodic 0.5 s decision tick.
+            self._reproject_delegated_pending_traversal_locked()
             priority_target = self.target_mission.priority_target_candidate(
                 payload.get("candidates") or []
             )
@@ -783,9 +807,14 @@ class SemanticRuleDecisionNode:
         if status == "SUCCEEDED" and self.active_behavior_type == "INTERACT":
             successful_target_id = self._interaction_target_id(candidate_id)
             if successful_target_id:
-                self.container_m1_inconclusive_counts.pop(
-                    successful_target_id, None
+                # Keep feedback handling compatible with lightweight test
+                # doubles and with nodes created before the per-container M1
+                # inconclusive counter was introduced.
+                inconclusive_counts = getattr(
+                    self, "container_m1_inconclusive_counts", None
                 )
+                if inconclusive_counts is not None:
+                    inconclusive_counts.pop(successful_target_id, None)
         # A bounded M1 evidence plan may run out of clean views without any
         # physical action or reachability proof.  That is retryable visual
         # uncertainty, not an object/candidate exclusion or target-wide
@@ -852,9 +881,12 @@ class SemanticRuleDecisionNode:
                 or 0.0
             ),
         )
-        portal_interaction = self._is_portal_interaction_candidate(
-            self.active_interaction_candidate
+        portal_classifier = getattr(
+            self,
+            "_is_portal_interaction_candidate",
+            SemanticRuleDecisionNode._is_portal_interaction_candidate,
         )
+        portal_interaction = portal_classifier(self.active_interaction_candidate)
         successful_drawer_scan = bool(
             self.active_behavior_type == "INTERACT"
             and successful_drawer_scan_feedback(
@@ -1145,8 +1177,12 @@ class SemanticRuleDecisionNode:
                 self.active_interaction_candidate,
                 payload,
                 robot_xy=self.latest_candidates_payload.get("robot_xy") or [],
-                traversal_distance_m=self.portal_traversal_distance_m,
-                clearance_margin_m=self.portal_traversal_clearance_margin_m,
+                traversal_distance_m=getattr(
+                    self, "portal_traversal_distance_m", 1.0
+                ),
+                clearance_margin_m=getattr(
+                    self, "portal_traversal_clearance_margin_m", 0.0
+                ),
             )
             if post_interaction_traversal is not None:
                 pending_payload = post_interaction_traversal.to_dict()
@@ -1171,6 +1207,13 @@ class SemanticRuleDecisionNode:
                             "post_interaction_refresh_enabled": bool(
                                 refresh_status.active
                             ),
+                            "post_interaction_refresh_delegated_to_executor": bool(
+                                getattr(
+                                    self,
+                                    "post_interaction_refresh_delegated_to_executor",
+                                    False,
+                                )
+                            ),
                             "post_interaction_refresh_baseline_sequence": (
                                 refresh_status.baseline_sequence
                             ),
@@ -1182,8 +1225,28 @@ class SemanticRuleDecisionNode:
                             ),
                         }
                     )
+                    # The physical fast path deliberately does not wait for
+                    # the semantic graph-refresh gate.  If a graph callback
+                    # has already published the post-open portal geometry,
+                    # project the continuation immediately so the executor
+                    # does not dispatch a pre-open/frozen far-side pose.
+                    if getattr(
+                        self,
+                        "post_interaction_refresh_delegated_to_executor",
+                        False,
+                    ):
+                        self._reproject_delegated_pending_traversal_locked()
                     self._publish_post_interaction_refresh_trace(
-                        "started", refresh_status
+                        (
+                            "delegated_to_executor"
+                            if getattr(
+                                self,
+                                "post_interaction_refresh_delegated_to_executor",
+                                False,
+                            )
+                            else "started"
+                        ),
+                        refresh_status,
                     )
                     self.minimum_candidate_sequence = 0
                     self.next_decision_time = 0.0
@@ -1321,6 +1384,58 @@ class SemanticRuleDecisionNode:
             )
         )
 
+    def _reproject_delegated_pending_traversal_locked(self) -> bool:
+        """Refresh a physical continuation from the newest graph geometry.
+
+        The normal simulator lane reprojects when its semantic refresh gate
+        releases.  The physical lane delegates that wait to the executor's
+        raw-OCC/global-costmap barrier, so it needs an equivalent, non-blocking
+        update path.  Reproject at most once per graph revision; a later graph
+        publication can still replace the geometry before dispatch.
+
+        The caller must hold ``state_lock``.  The helper is intentionally
+        best-effort: if the portal is not present in the current snapshot yet,
+        the pending candidate remains intact and the next graph revision gets
+        another chance.
+        """
+
+        if not bool(
+            getattr(self, "post_interaction_refresh_delegated_to_executor", False)
+        ):
+            return False
+        if self.post_interaction_refresh_gate.active:
+            return False
+        pending = self.pending_post_interaction_traversal
+        if not isinstance(pending, dict) or not pending:
+            return False
+        metadata = pending.get("metadata") or {}
+        try:
+            latest_revision = int(
+                self.latest_candidates_payload.get("graph_revision", 0) or 0
+            )
+        except (TypeError, ValueError):
+            latest_revision = 0
+        try:
+            previous_revision = int(
+                metadata.get("post_interaction_reprojected_graph_revision", -1)
+            )
+        except (TypeError, ValueError):
+            previous_revision = -1
+        if bool(metadata.get("post_interaction_reprojected")) and (
+            latest_revision <= previous_revision
+        ):
+            return False
+        refreshed = reproject_post_interaction_traversal_candidate(
+            pending,
+            self.latest_candidates_payload,
+            traversal_distance_m=self.portal_traversal_distance_m,
+            clearance_margin_m=self.portal_traversal_clearance_margin_m,
+        )
+        if refreshed is None:
+            return False
+        self.pending_post_interaction_traversal = refreshed
+        return True
+
     def _tick(self, _event) -> None:
         released_refresh_status: PostInteractionRefreshStatus | None = None
         with self.state_lock:
@@ -1346,6 +1461,12 @@ class SemanticRuleDecisionNode:
                 released_refresh_status = refresh_status
             if self.active_candidate_id or self.decision_in_flight:
                 return
+            # In the physical delegated lane there is no semantic refresh
+            # gate to trigger the reprojection above.  Refresh once for each
+            # newer graph revision immediately before selecting the pending
+            # traversal, while leaving the executor's raw/global-map causal
+            # barrier responsible for the actual make_plan timing.
+            self._reproject_delegated_pending_traversal_locked()
             if time.monotonic() < self.next_decision_time:
                 return
             if self.goal_complete:

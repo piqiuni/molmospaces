@@ -154,6 +154,584 @@ def test_support_and_container_hierarchy_assignment():
     assert ("container_fridge_1", "contains", "object_milk_1") in relations
 
 
+def test_open_refrigerator_maps_contents_projected_outside_closed_aabb() -> None:
+    """An opened fridge may expose contents in front of its body box."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    yaw = 0.35
+    local_contents = [(0.10, -0.82, "milk"), (-0.22, -1.05, "bottle")]
+
+    def world_xy(local_x, local_y):
+        return [
+            math.cos(yaw) * local_x - math.sin(yaw) * local_y,
+            math.sin(yaw) * local_x + math.cos(yaw) * local_y,
+        ]
+
+    observations = [
+        observation(
+            instance_id="fridge_1",
+            semantic_name="refrigerator",
+            category="refrigerator",
+            room_id=1,
+            is_receptacle=True,
+            is_articulable=True,
+            joint_type="hinge",
+            joint_range=[0.0, 1.0],
+            joint_value=1.0,
+            aabb_center=[0.0, 0.0, 1.0],
+            position=[0.0, 0.0, 1.0],
+            aabb_size=[1.2, 0.8, 2.0],
+            yaw=yaw,
+        )
+    ]
+    for index, (local_x, local_y, label) in enumerate(local_contents, start=1):
+        x, y = world_xy(local_x, local_y)
+        observations.append(
+            observation(
+                instance_id=f"content_{index}",
+                semantic_name=label,
+                room_id=1,
+                position=[x, y, 1.0],
+                aabb_center=[x, y, 1.0],
+                aabb_size=[0.10, 0.10, 0.18],
+            )
+        )
+    # A small environmental marker in the same camera/depth slab must not be
+    # promoted to refrigerator content.
+    x, y = world_xy(0.75, -0.90)
+    observations.append(
+        observation(
+            instance_id="picture_1",
+            semantic_name="picture",
+            room_id=1,
+            position=[x, y, 1.0],
+            aabb_center=[x, y, 1.0],
+            aabb_size=[0.10, 0.05, 0.10],
+        )
+    )
+
+    store.update_observations(observations, source_mode="detector_online")
+    assert not any(
+        edge["src_id"] == "container_fridge_1"
+        and edge["relation"] == "contains"
+        for edge in store.as_graph_dict()["edges"]
+    )
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_fridge_1",
+            "action": "open",
+            "success": True,
+            "post_state": "open",
+        }
+    )
+    graph = store.as_graph_dict()
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in graph["edges"]
+    }
+    assert ("container_fridge_1", "contains", "object_content_1") in relations
+    assert ("container_fridge_1", "contains", "object_content_2") in relations
+    assert ("container_fridge_1", "contains", "object_picture_1") not in relations
+
+
+def test_open_refrigerator_maps_m1_relabelled_content_and_keeps_body_reference():
+    """A one-frame M1 container label must not hide a visible fridge item."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_1",
+                semantic_name="refrigerator",
+                category="refrigerator",
+                room_id=1,
+                is_receptacle=True,
+                is_articulable=True,
+                aabb_center=[0.0, 0.0, 1.0],
+                aabb_size=[1.2, 0.8, 2.0],
+                yaw=0.2,
+            ),
+            observation(
+                instance_id="bottle_1",
+                semantic_name="bottle",
+                room_id=1,
+                aabb_center=[0.0, -0.9, 1.0],
+                position=[0.0, -0.9, 1.0],
+                aabb_size=[0.1, 0.1, 0.2],
+            ),
+        ],
+        source_mode="detector_online",
+    )
+    fridge = store.nodes["container_fridge_1"]
+    assert fridge.attributes["interaction_reference_aabb_center"] == [
+        0.0,
+        0.0,
+        1.0,
+    ]
+    assert fridge.attributes["interaction_reference_aabb_size"] == [1.2, 0.8, 2.0]
+
+    # The open-door detector box is wider/deeper than the stable body box.
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_1",
+                semantic_name="refrigerator",
+                category="refrigerator",
+                room_id=1,
+                is_receptacle=True,
+                is_articulable=True,
+                aabb_center=[0.0, -0.35, 1.0],
+                position=[0.0, -0.35, 1.0],
+                aabb_size=[1.4, 1.3, 2.0],
+                yaw=0.2,
+            ),
+            observation(
+                instance_id="bottle_1",
+                semantic_name="bottle",
+                room_id=1,
+                aabb_center=[0.0, -0.9, 1.0],
+                position=[0.0, -0.9, 1.0],
+                aabb_size=[0.1, 0.1, 0.2],
+            ),
+        ],
+        source_mode="detector_online",
+    )
+    assert fridge.attributes["interaction_reference_aabb_center"] == [
+        0.0,
+        0.0,
+        1.0,
+    ]
+    assert fridge.attributes["interaction_reference_aabb_size"] == [1.2, 0.8, 2.0]
+
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "object_bottle_1",
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.95,
+            "interaction_class": "container",
+            "observed_object_name": "bottle",
+            "interactable": False,
+        },
+        stamp=3.0,
+    )
+    assert store.nodes["object_bottle_1"].type == "container"
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_fridge_1",
+            "action": "open",
+            "success": True,
+            "post_state": "open",
+        },
+        stamp=4.0,
+    )
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_fridge_1", "contains", "object_bottle_1") in relations
+
+
+def test_refrigerator_reference_accepts_category_when_semantic_name_is_generic():
+    """A generic detector name must not discard a refrigerator body anchor."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_generic_1",
+                semantic_name="object",
+                category="refrigerator",
+                room_id=1,
+                aabb_center=[1.0, 2.0, 1.0],
+                aabb_size=[1.0, 0.8, 1.8],
+            )
+        ],
+        source_mode="detector_online",
+    )
+    node = store.nodes["object_fridge_generic_1"]
+    assert node.attributes["interaction_reference_label"] == "refrigerator"
+    assert node.attributes["interaction_reference_aabb_center"] == [1.0, 2.0, 1.0]
+    assert node.attributes["interaction_reference_aabb_size"] == [1.0, 0.8, 1.8]
+
+
+def test_m1_promoted_generic_refrigerator_survives_later_detector_frame():
+    """A generic source track stays a container after a successful M1-open."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    fridge = observation(
+        instance_id="generic_fridge_1",
+        semantic_name="object",
+        category="object",
+        room_id=1,
+        aabb_center=[0.0, 0.0, 1.0],
+        position=[0.0, 0.0, 1.0],
+        aabb_size=[1.2, 0.8, 2.0],
+    )
+    milk = observation(
+        instance_id="generic_milk_1",
+        semantic_name="milk",
+        category="milk",
+        room_id=1,
+        aabb_center=[0.0, -0.9, 1.0],
+        position=[0.0, -0.9, 1.0],
+        aabb_size=[0.1, 0.1, 0.2],
+    )
+    store.update_observations([fridge, milk], source_mode="detector_online")
+    assert store.nodes["object_generic_fridge_1"].type == "object"
+
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "object_generic_fridge_1",
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.95,
+            "interaction_class": "container",
+            "observed_object_name": "refrigerator",
+            "coarse_state": "closed",
+            "interactable": True,
+        },
+        stamp=2.0,
+    )
+    promoted = store.nodes["object_generic_fridge_1"]
+    assert promoted.type == "container"
+    assert promoted.attributes["interaction_reference_label"] == "refrigerator"
+    assert promoted.attributes["interaction_reference_aabb_size"] == [1.2, 0.8, 2.0]
+
+    assert store.update_interaction_result(
+        {
+            "node_id": "object_generic_fridge_1",
+            "action": "open",
+            "success": True,
+            "post_state": "open",
+            "approach_goal_xyyaw": [0.0, -1.5, -math.pi / 2.0],
+        },
+        stamp=3.0,
+    )
+
+    # The next detector frame reasserts its generic source class.  The sealed
+    # open history and the M1 refrigerator reference must restore the parent
+    # before relation inference runs.
+    next_fridge = dict(fridge)
+    next_fridge["frame_index"] = 2
+    next_milk = dict(milk)
+    next_milk["frame_index"] = 2
+    store.update_observations(
+        [next_fridge, next_milk],
+        source_mode="detector_online",
+        stamp=4.0,
+    )
+    assert store.nodes["object_generic_fridge_1"].type == "container"
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert (
+        "object_generic_fridge_1",
+        "contains",
+        "object_generic_milk_1",
+    ) in relations
+
+
+def test_open_refrigerator_ignores_m1_refrigerator_hallucination_on_content():
+    """A bottle answered as ``refrigerator`` must remain fridge content."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_1",
+                semantic_name="refrigerator",
+                category="refrigerator",
+                room_id=1,
+                is_receptacle=True,
+                is_articulable=True,
+                aabb_center=[0.0, 0.0, 1.0],
+                aabb_size=[1.2, 0.8, 2.0],
+            ),
+            observation(
+                instance_id="bottle_1",
+                semantic_name="bottle",
+                category="bottle",
+                room_id=1,
+                aabb_center=[0.0, -0.9, 1.0],
+                position=[0.0, -0.9, 1.0],
+                aabb_size=[0.1, 0.1, 0.2],
+            ),
+        ],
+        source_mode="detector_online",
+    )
+    # Reproduce the physical-run failure mode: M1 changes both the graph type
+    # and public name, while the source observation remains a bottle.
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "object_bottle_1",
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.95,
+            "interaction_class": "container",
+            "observed_object_name": "refrigerator",
+            "coarse_state": "closed",
+            "interactable": True,
+        },
+        stamp=2.0,
+    )
+    assert store.nodes["object_bottle_1"].type == "container"
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_fridge_1",
+            "action": "open",
+            "success": True,
+            "post_state": "open",
+        },
+        stamp=3.0,
+    )
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_fridge_1", "contains", "object_bottle_1") in relations
+
+
+def test_stale_result_on_m1_refrigerator_hallucinated_content_cannot_make_parent():
+    """A delayed result must not turn a source bottle into an open fridge."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_1",
+                semantic_name="refrigerator",
+                category="refrigerator",
+                room_id=1,
+                is_receptacle=True,
+                is_articulable=True,
+                aabb_center=[0.0, 0.0, 1.0],
+                aabb_size=[1.2, 0.8, 2.0],
+            ),
+            observation(
+                instance_id="bottle_1",
+                semantic_name="bottle",
+                category="bottle",
+                room_id=1,
+                aabb_center=[0.0, -0.9, 1.0],
+                position=[0.0, -0.9, 1.0],
+                aabb_size=[0.1, 0.1, 0.2],
+            ),
+        ],
+        source_mode="detector_online",
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "object_bottle_1",
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.95,
+            "interaction_class": "container",
+            "observed_object_name": "refrigerator",
+            "coarse_state": "closed",
+            "interactable": True,
+        },
+        stamp=2.0,
+    )
+    # Simulate a stale/misrouted success arriving for the hallucinated track.
+    assert store.update_interaction_result(
+        {
+            "node_id": "object_bottle_1",
+            "action": "open",
+            "success": True,
+            "post_state": "open",
+        },
+        stamp=3.0,
+    )
+    graph = store.as_graph_dict()
+    assert not any(
+        edge["src_id"] == "object_bottle_1" and edge["relation"] == "contains"
+        for edge in graph["edges"]
+    )
+
+
+def test_successful_refrigerator_open_restores_type_after_m1_object_demotion():
+    """A late M1 ``object`` answer must not hide a proven open fridge."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_1",
+                semantic_name="refrigerator",
+                category="refrigerator",
+                room_id=1,
+                is_receptacle=True,
+                is_articulable=True,
+                aabb_center=[0.0, 0.0, 1.0],
+                aabb_size=[1.2, 0.8, 2.0],
+            ),
+            observation(
+                instance_id="milk_1",
+                semantic_name="milk",
+                room_id=1,
+                aabb_center=[0.0, -0.9, 1.0],
+                position=[0.0, -0.9, 1.0],
+                aabb_size=[0.1, 0.1, 0.2],
+            ),
+        ],
+        source_mode="detector_online",
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "container_fridge_1",
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.95,
+            "interaction_class": "object",
+            "observed_object_name": "chair",
+            "interactable": False,
+        },
+        stamp=2.0,
+    )
+    # M1 remains authoritative before any sealed interaction result.
+    assert store.nodes["container_fridge_1"].type == "object"
+
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_fridge_1",
+            "action": "open",
+            "success": True,
+            "post_state": "open",
+        },
+        stamp=3.0,
+    )
+    fridge = store.nodes["container_fridge_1"]
+    assert fridge.type == "container"
+    assert fridge.attributes["refrigerator_type_restored_after_success"] is True
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_fridge_1", "contains", "object_milk_1") in relations
+
+
+def test_open_refrigerator_depth_axis_follows_shorter_obb_dimension():
+    """Contents map correctly when the refrigerator's depth is OBB x."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    # Here x is the short/depth axis and y is the opening/lateral axis.
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_x_depth_1",
+                semantic_name="refrigerator",
+                category="refrigerator",
+                room_id=1,
+                is_receptacle=True,
+                is_articulable=True,
+                aabb_center=[0.0, 0.0, 1.0],
+                position=[0.0, 0.0, 1.0],
+                aabb_size=[0.8, 1.2, 2.0],
+                yaw=0.0,
+            ),
+            observation(
+                instance_id="milk_x_depth_1",
+                semantic_name="milk",
+                room_id=1,
+                aabb_center=[-0.85, 0.0, 1.0],
+                position=[-0.85, 0.0, 1.0],
+                aabb_size=[0.1, 0.1, 0.2],
+            ),
+        ],
+        source_mode="detector_online",
+    )
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_fridge_x_depth_1",
+            "action": "open",
+            "success": True,
+            "post_state": "open",
+            # The successful approach is on the negative local-x face.
+            "approach_goal_xyyaw": [-1.0, 0.0, 0.0],
+        },
+        stamp=2.0,
+    )
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert (
+        "container_fridge_x_depth_1",
+        "contains",
+        "object_milk_x_depth_1",
+    ) in relations
+
+
+def test_open_refrigerator_does_not_use_m1_only_open_or_stale_open_history():
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_observations(
+        [
+            observation(
+                instance_id="fridge_1",
+                semantic_name="refrigerator",
+                category="refrigerator",
+                room_id=1,
+                is_receptacle=True,
+                is_articulable=True,
+                aabb_center=[0.0, 0.0, 1.0],
+                aabb_size=[1.2, 0.8, 2.0],
+            ),
+            observation(
+                instance_id="milk_1",
+                semantic_name="milk",
+                room_id=1,
+                aabb_center=[0.0, -0.9, 1.0],
+                position=[0.0, -0.9, 1.0],
+                aabb_size=[0.1, 0.1, 0.2],
+            ),
+        ],
+        source_mode="detector_online",
+    )
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "container_fridge_1",
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.95,
+            "interaction_class": "container",
+            "coarse_state": "open",
+            "interactable": True,
+        },
+        stamp=2.0,
+    )
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_fridge_1", "contains", "object_milk_1") not in relations
+
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_fridge_1",
+            "action": "open",
+            "success": True,
+            "post_state": "open",
+        },
+        stamp=3.0,
+    )
+    assert store.update_interaction_result(
+        {
+            "node_id": "container_fridge_1",
+            "action": "close",
+            "success": True,
+            "post_state": "closed",
+        },
+        stamp=4.0,
+    )
+    relations = {
+        (edge["src_id"], edge["relation"], edge["dst_id"])
+        for edge in store.as_graph_dict()["edges"]
+    }
+    assert ("container_fridge_1", "contains", "object_milk_1") not in relations
+
+
 def test_object_above_container_is_not_inferred_as_internal_content():
     store = InteractionGraphStore(scene_id="test_scene")
     store.update_observations(
@@ -510,6 +1088,41 @@ def test_object_store_can_expose_tentative_tracks_for_graph():
     assert len(tentative) == 1
     assert tentative[0]["semantic_class"] == "bottle"
     assert tentative[0]["observation_count"] == 1
+
+
+def test_object_store_graph_only_export_can_bypass_class_confirmation():
+    """An exposed fridge item may enter the graph before M1 confirmation."""
+
+    store = ObjectMapStore(
+        match_distance=0.5,
+        min_confirmations=2,
+        class_min_confirmations={"bottle": 3},
+    )
+    detection = {
+        "semantic_class": "bottle",
+        "confidence": 0.75,
+        "world_position": {"x": 1.0, "y": 2.0, "z": 0.8},
+        "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.8},
+        "world_box3d_size": {"x": 0.08, "y": 0.08, "z": 0.24},
+    }
+    store.update([detection], stamp=1.0)
+
+    # The public/M1 stream remains subject to the class-specific three-frame
+    # gate.  The graph-only exposure stream intentionally does not weaken it.
+    assert store.as_tracked_detections(
+        min_observations=1,
+        confirmed_only=False,
+        currently_observed_only=True,
+    ) == []
+    exposed = store.as_tracked_detections(
+        min_observations=1,
+        confirmed_only=False,
+        currently_observed_only=True,
+        ignore_class_confirmations=True,
+    )
+    assert len(exposed) == 1
+    assert exposed[0]["tracking_confirmed"] is False
+    assert exposed[0]["required_consecutive_observations"] == 1
 
 
 def test_object_store_requires_uninterrupted_class_specific_confirmations():

@@ -74,3 +74,85 @@ Webviz 的自托管更自由：官方 README 给出 `docker run -p 8080:8080 cru
 ## 推荐决策
 
 采用 Foxglove 作为独立的网页 RViz 调试界面，第一阶段不嵌入现有六面板，也不替换当前网页。先在本机以 `8766` 启动严格只读的 ROS1 bridge，验证五类数据：原始点云、分割点云、3D box、TF、OCC。Webviz 只保留为“必须完全静态自托管且接受自行维护旧代码”的后备选项。
+
+## 当前实机运行方式（Docker）
+
+当前实机 Foxglove bridge 使用 Docker 运行，不使用 `foxglove-wizard`，也不要求在宿主机安装 `foxglove_bridge` ROS 包。容器使用 host 网络，因此容器内的 `localhost:11311` 就是宿主机 ROS master。
+
+运行前确认 ROS master 已启动：
+
+```bash
+source /opt/ros/noetic/setup.bash
+export ROS_MASTER_URI=http://127.0.0.1:11311
+ss -ltn | grep ':11311'
+```
+
+当前容器参数如下：
+
+```text
+container: foxglove-bridge-ros1
+image: local/foxglove-bridge-ros1:with-ros-msgs
+network: host
+ROS_MASTER_URI: http://localhost:11311
+WebSocket: 8766
+send_buffer_limit: 50000000 (50 MB)
+```
+
+启动或重启：
+
+```bash
+docker start foxglove-bridge-ros1
+# 已在运行时使用：
+docker restart foxglove-bridge-ros1
+```
+
+如果需要从镜像重新创建容器，使用只读 topic 白名单和 50 MB 发送缓存：
+
+```bash
+docker rm -f foxglove-bridge-ros1 2>/dev/null || true
+docker run -d --name foxglove-bridge-ros1 \
+  --network host --restart unless-stopped \
+  -e ROS_MASTER_URI=http://localhost:11311 \
+  -e ROS_HOSTNAME=localhost -e ROS_DISTRO=noetic \
+  -e ROS_WS=/ros1_ws -w /ros1_ws \
+  local/foxglove-bridge-ros1:with-ros-msgs \
+  roslaunch --screen foxglove_bridge foxglove_bridge.launch \
+  port:=8766 address:=0.0.0.0 \
+  "topic_whitelist:=['^/tf$','^/tf_static$','^/physical_nav/.*$']" \
+  "param_whitelist:=['^$']" \
+  "service_whitelist:=['^$']" \
+  "client_topic_whitelist:=['^$']" \
+  "capabilities:=[connectionGraph]" \
+  send_buffer_limit:=50000000
+```
+
+检查容器、端口和缓存参数：
+
+```bash
+docker ps --filter name=foxglove-bridge-ros1
+docker logs --tail 100 foxglove-bridge-ros1
+docker exec foxglove-bridge-ros1 \
+  bash -lc 'source /opt/ros/noetic/setup.bash; rosparam get /foxglove_bridge/send_buffer_limit'
+ss -ltn | grep ':8766'
+```
+
+Foxglove Web App 的连接地址为：
+
+```text
+ws://10.100.5.3:8766
+```
+
+3D Panel 的 Fixed frame 设置为 `tf_frame_map`。当前相机外参 TF 应满足：
+
+```text
+tf_frame_map → tf_frame_base_link → d435i_color_optical_frame
+```
+
+可在宿主机检查相机 TF：
+
+```bash
+source /opt/ros/noetic/setup.bash
+rosrun tf tf_echo tf_frame_base_link d435i_color_optical_frame
+```
+
+容器内已补齐 `ros-noetic-map-msgs` 和 `ros-noetic-tf2-msgs`，用于解析 `OccupancyGridUpdate` 与 `TFMessage`。如果再次出现 `Send buffer limit reached`，说明 Foxglove 客户端处理速度低于点云/图像发布速度；此时先检查是否打开了多个大数据 topic，以及是否存在多个 Foxglove 客户端连接。

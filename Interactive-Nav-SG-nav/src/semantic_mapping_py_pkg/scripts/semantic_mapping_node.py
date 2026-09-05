@@ -190,6 +190,24 @@ class SemanticMappingNode:
         self.lifted_graph_frame = str(config.get("lifted_graph_frame", "tf_frame_map_graph"))
         self.lifted_graph_z_offset = float(config.get("lifted_graph_z_offset", 10.0))
         self.graph_min_observations = max(1, int(config.get("graph_min_observations", 1)))
+        # Newly exposed refrigerator contents are often visible for fewer
+        # frames than the strict interaction-object confirmation window.  Keep
+        # the M1/public tracked-detection stream strict, but optionally admit
+        # currently visible tentative tracks to the graph while a trusted
+        # refrigerator-open state is active.  The graph's geometry/provenance
+        # filters remain the final containment gate.
+        self.open_refrigerator_content_mapping_enabled = bool(
+            config.get("open_refrigerator_content_mapping_enabled", False)
+        )
+        self.open_refrigerator_content_min_observations = max(
+            1,
+            int(config.get("open_refrigerator_content_min_observations", 1)),
+        )
+        self.open_refrigerator_content_ignore_class_confirmations = bool(
+            config.get(
+                "open_refrigerator_content_ignore_class_confirmations", True
+            )
+        )
         self.graph_save_path = str(config.get("graph_save_path", "") or "").strip()
         self.graph_save_dir = str(config.get("graph_save_dir", "") or "").strip()
         self.graph_save_pretty = bool(config.get("graph_save_pretty", True))
@@ -365,6 +383,47 @@ class SemanticMappingNode:
         )
         self.tf_listener = tf.TransformListener()
 
+        # Create every output publisher before registering input subscribers.
+        # rospy may deliver a latched/high-rate detection immediately during
+        # Subscriber construction; registering the subscribers first allowed
+        # ``object_callback`` to build a graph and then crash while publishing
+        # because (for example) ``planning_occupancy_grid_pub`` did not exist
+        # yet.  That startup race dropped the first refrigerator observations
+        # and could leave the graph without the appliance/content relation.
+        self.step_ready_pub = rospy.Publisher("/semantic_decision/ready/semantic_mapping", String, queue_size=32)
+        self.object_pub = rospy.Publisher(self.object_map_topic, String, queue_size=1)
+        self.tracked_detections_pub = rospy.Publisher(
+            self.tracked_detections_topic, String, queue_size=1
+        )
+        self.marker_pub = rospy.Publisher(self.object_markers_topic, MarkerArray, queue_size=1)
+        self.scene_id_pub = rospy.Publisher(self.scene_id_grid_topic, OccupancyGrid, queue_size=1, latch=True)
+        self.scene_conf_pub = rospy.Publisher(self.scene_confidence_grid_topic, OccupancyGrid, queue_size=1, latch=True)
+        self.room_segment_pub = rospy.Publisher(
+            self.room_segment_grid_topic, OccupancyGrid, queue_size=1, latch=True
+        )
+        self.unified_graph_pub = rospy.Publisher(self.unified_graph_topic, String, queue_size=1, latch=True)
+        self.navigation_hints_pub = rospy.Publisher(self.navigation_hints_topic, String, queue_size=1, latch=True)
+        self.room_attribute_requests_pub = rospy.Publisher(
+            self.room_attribute_requests_topic, String, queue_size=1
+        )
+        self.planning_occupancy_grid_pub = rospy.Publisher(
+            self.planning_occupancy_grid_topic, OccupancyGrid, queue_size=1, latch=True
+        )
+        self.planning_occupancy_grid_updates_pub = rospy.Publisher(
+            self.planning_occupancy_grid_updates_topic,
+            OccupancyGridUpdate,
+            queue_size=1,
+        )
+        self.door_clear_mask_pub = rospy.Publisher(
+            self.door_clear_mask_topic, OccupancyGrid, queue_size=1, latch=True
+        )
+        self.unified_graph_markers_pub = rospy.Publisher(
+            self.unified_graph_markers_topic, MarkerArray, queue_size=1, latch=True
+        )
+        self.unified_graph_markers_lifted_pub = rospy.Publisher(
+            self.unified_graph_markers_lifted_topic, MarkerArray, queue_size=1, latch=True
+        )
+
         self.object_sub = rospy.Subscriber(self.object_detection_topic, String, self.object_callback, queue_size=10)
         self.scene_sub = rospy.Subscriber(self.scene_attribute_topic, String, self.scene_callback, queue_size=10)
         self.cloud_sub = None
@@ -402,40 +461,6 @@ class SemanticMappingNode:
             String,
             self.room_attribute_updates_callback,
             queue_size=2,
-        )
-
-        self.step_ready_pub = rospy.Publisher("/semantic_decision/ready/semantic_mapping", String, queue_size=32)
-        self.object_pub = rospy.Publisher(self.object_map_topic, String, queue_size=1)
-        self.tracked_detections_pub = rospy.Publisher(
-            self.tracked_detections_topic, String, queue_size=1
-        )
-        self.marker_pub = rospy.Publisher(self.object_markers_topic, MarkerArray, queue_size=1)
-        self.scene_id_pub = rospy.Publisher(self.scene_id_grid_topic, OccupancyGrid, queue_size=1, latch=True)
-        self.scene_conf_pub = rospy.Publisher(self.scene_confidence_grid_topic, OccupancyGrid, queue_size=1, latch=True)
-        self.room_segment_pub = rospy.Publisher(
-            self.room_segment_grid_topic, OccupancyGrid, queue_size=1, latch=True
-        )
-        self.unified_graph_pub = rospy.Publisher(self.unified_graph_topic, String, queue_size=1, latch=True)
-        self.navigation_hints_pub = rospy.Publisher(self.navigation_hints_topic, String, queue_size=1, latch=True)
-        self.room_attribute_requests_pub = rospy.Publisher(
-            self.room_attribute_requests_topic, String, queue_size=1
-        )
-        self.planning_occupancy_grid_pub = rospy.Publisher(
-            self.planning_occupancy_grid_topic, OccupancyGrid, queue_size=1, latch=True
-        )
-        self.planning_occupancy_grid_updates_pub = rospy.Publisher(
-            self.planning_occupancy_grid_updates_topic,
-            OccupancyGridUpdate,
-            queue_size=1,
-        )
-        self.door_clear_mask_pub = rospy.Publisher(
-            self.door_clear_mask_topic, OccupancyGrid, queue_size=1, latch=True
-        )
-        self.unified_graph_markers_pub = rospy.Publisher(
-            self.unified_graph_markers_topic, MarkerArray, queue_size=1, latch=True
-        )
-        self.unified_graph_markers_lifted_pub = rospy.Publisher(
-            self.unified_graph_markers_lifted_topic, MarkerArray, queue_size=1, latch=True
         )
         self.static_tf_broadcaster = tf2_ros.StaticTransformBroadcaster()
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.publish_rate, 1e-3)), self.publish_callback)
@@ -1242,6 +1267,65 @@ class SemanticMappingNode:
                 confirmed_only=False,
                 currently_observed_only=True,
             )
+            graph_detections = list(tracked_detections)
+            tentative_graph_count = 0
+            if (
+                getattr(
+                    self,
+                    "open_refrigerator_content_mapping_enabled",
+                    False,
+                )
+                and callable(
+                    getattr(
+                        self.graph_store,
+                        "has_confirmed_open_refrigerator",
+                        None,
+                    )
+                )
+                and bool(self.graph_store.has_confirmed_open_refrigerator())
+            ):
+                tentative_detections = self.object_store.as_tracked_detections(
+                    min_observations=getattr(
+                        self,
+                        "open_refrigerator_content_min_observations",
+                        1,
+                    ),
+                    confirmed_only=False,
+                    currently_observed_only=True,
+                    ignore_class_confirmations=bool(
+                        getattr(
+                            self,
+                            "open_refrigerator_content_ignore_class_confirmations",
+                            True,
+                        )
+                    ),
+                )
+                strict_track_ids = {
+                    str(item.get("track_id") or item.get("instance_id") or "")
+                    for item in tracked_detections
+                }
+                for detection in tentative_detections:
+                    track_id = str(
+                        detection.get("track_id")
+                        or detection.get("instance_id")
+                        or ""
+                    )
+                    if track_id in strict_track_ids:
+                        continue
+                    admitted = dict(detection)
+                    admitted["tracking_confirmed"] = False
+                    admitted[
+                        "graph_admission_source"
+                    ] = "open_refrigerator_exposure"
+                    graph_detections.append(admitted)
+                    tentative_graph_count += 1
+                if tentative_graph_count:
+                    rospy.loginfo_throttle(
+                        2.0,
+                        "[semantic_mapping_node] admitting %d tentative "
+                        "refrigerator-content track(s) to graph only",
+                        tentative_graph_count,
+                    )
             self.tracked_detections_pub.publish(
                 String(
                     data=dumps_compact(
@@ -1257,7 +1341,7 @@ class SemanticMappingNode:
             )
             observations = [
                 observation_from_detection(det, observation_id=f"det_{index:04d}")
-                for index, det in enumerate(tracked_detections, start=1)
+                for index, det in enumerate(graph_detections, start=1)
             ]
             self.graph_store.update_observations(
                 observations,
@@ -1671,8 +1755,14 @@ class SemanticMappingNode:
         graph_store = getattr(self, "graph_store", None)
         overlay = getattr(self, "semantic_occ_overlay", None)
         if graph_store is not None and overlay is not None:
+            # Minimal/replay node doubles may not construct the full ablation
+            # object.  The post-open bridge is still safe in that case: use
+            # the unablated graph contract instead of making the first fresh
+            # raw OCC callback fail before it can reach the planner.
+            ablation = getattr(self, "ablation", None)
+            module1_mode = getattr(ablation, "module1", "full")
             graph_payload = apply_module1_ablation(
-                graph_store.as_graph_dict(), self.ablation.module1
+                graph_store.as_graph_dict(), module1_mode
             )
             (
                 effective_grid,
@@ -1765,15 +1855,21 @@ class SemanticMappingNode:
         original portal behavior for replay compatibility.
         """
 
-        if str((node or {}).get("type") or "").casefold() != "portal":
-            return False
         attributes = (node or {}).get("attributes") or {}
         source_type = str(
             attributes.get("topology_type")
             or attributes.get("observation_node_type")
             or ""
         ).strip().casefold()
-        return source_type in {"", "portal"}
+        # The source topology is immutable evidence.  A delayed M1 patch may
+        # temporarily change the public semantic type (for example a door
+        # crop answered as ``object``) before the sealed interaction result
+        # arrives; that must not suppress the post-open raw-OCC bridge.  The
+        # converse is equally important: a source bottle/container answered
+        # as ``portal`` must never be allowed to alter occupancy topology.
+        if source_type:
+            return source_type == "portal"
+        return str((node or {}).get("type") or "").casefold() == "portal"
 
     def _result_references_topology_portal_locked(self, result):
         """Match a command/result only to a source-qualified portal node."""
@@ -2287,6 +2383,21 @@ class SemanticMappingNode:
     def _build_planning_products_locked(self, raw, graph_payload):
         """Legacy synchronous implementation for tests that bypass ``__init__``."""
 
+        # Lightweight compatibility doubles may provide only the pending-state
+        # API used by the interaction callback.  In that case there is no
+        # overlay product to materialize; forwarding the source-new raw grid
+        # still preserves the causal planner barrier and is equivalent to an
+        # inactive overlay in the production implementation.
+        if not (
+            callable(getattr(self.semantic_occ_overlay, "update_graph", None))
+            and callable(getattr(self.semantic_occ_overlay, "apply", None))
+        ):
+            return raw, None, None, {
+                "active_portal_ids": [],
+                "cleared_cells": 0,
+                "update_bounds": None,
+                "valid": True,
+            }
         self.semantic_occ_overlay.update_graph(graph_payload)
         planning_data, mask_data, overlay_stats = self.semantic_occ_overlay.apply(
             raw.info,

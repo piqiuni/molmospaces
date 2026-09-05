@@ -1,6 +1,7 @@
 ablation:
   module1: "dynamic_mllm"
   module2: "mllm_score"
+  module3: "external_mllm_verified"
 candidate:
   # Panel 6 and the physical candidate lane expose only these interaction
   # target families.  Drawer/cabinet remains visible as a graph target, but
@@ -10,6 +11,30 @@ candidate:
   fridge_direct_interaction_on_arrival: true
 startup_scan:
   enabled: false
+executor:
+  # The physical global costmap consumes /physical_nav/occupancy directly.
+  # Once a newer raw OCC receipt follows a successful door open, it is the
+  # planner's causal input; do not wait for the slower semantic OCC relay.
+  post_interaction_costmap_fast_path_enabled: true
+  post_interaction_costmap_fresh_timeout_s: 2.0
+  post_interaction_traversal_make_plan_retry_window_s: 2.0
+  post_interaction_traversal_make_plan_retry_interval_s: 0.10
+  # Keep a physical navigation worker from blocking for the simulator's
+  # default 30-second action-server startup wait during reconnects.
+  move_base_server_wait_s: 5.0
+  # Bound an unavailable make_plan service check in the physical lane.  The
+  # causal OCC barrier remains authoritative; this only prevents a stale
+  # service wait from delaying the first post-open traversal attempt.
+  make_plan_service_wait_sec: 0.5
+exploration:
+  # ExplorePy must not issue its own periodic make_plan/recovery preflights in
+  # the physical lane; the semantic executor owns the post-open replan.
+  external_recovery_preflight_enabled: false
+  make_plan_preflight_enabled: false
+policy:
+  # The executor owns the raw-OCC -> global-costmap barrier in the physical
+  # lane. Leaving this default true adds the old 30 s semantic gate.
+  post_interaction_refresh_enabled: false
 model:
   mode: "http"
   endpoint: "http://127.0.0.1:18080/v1"

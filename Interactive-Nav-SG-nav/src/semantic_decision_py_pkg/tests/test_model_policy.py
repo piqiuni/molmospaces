@@ -144,6 +144,46 @@ def test_compact_graph_redacts_portal_source_labels_from_mllm_context() -> None:
     assert "gt_" not in str(graph).casefold()
 
 
+def test_compact_graph_prioritizes_portals_and_keeps_portal_geometry() -> None:
+    ordinary_nodes = [
+        {
+            "id": f"object_{index}",
+            "type": "object",
+            "label": "bottle",
+            "centroid": [float(index), 0.0, 0.0],
+        }
+        for index in range(4)
+    ]
+    source_portal = {
+        "id": "portal_door_9",
+        "type": "portal",
+        "label": "door",
+        "centroid": [9.0, 9.0, 0.0],
+        "aabb_center": [9.5, 9.0, 1.0],
+        "aabb_size": [1.2, 0.25, 2.0],
+        "attributes": {
+            "interaction_reference_aabb_center": [9.0, 9.0, 1.0],
+            "interaction_reference_aabb_size": [0.2, 0.25, 2.0],
+        },
+        "interaction": {"state": "open", "traversable": True},
+    }
+
+    compact = compact_graph(
+        {"nodes": ordinary_nodes + [source_portal], "edges": []},
+        max_nodes=1,
+    )
+
+    assert len(compact["nodes"]) == 1
+    node = compact["nodes"][0]
+    assert node["id"] == "door_9"
+    assert node["portal_geometry"] == {
+        "interaction_reference_aabb_center": [9.0, 9.0, 1.0],
+        "interaction_reference_aabb_size": [0.2, 0.25, 2.0],
+        "aabb_center": [9.5, 9.0, 1.0],
+        "aabb_size": [1.2, 0.25, 2.0],
+    }
+
+
 def test_compact_semantic_graph_redacts_legacy_portal_identity() -> None:
     graph = compact_semantic_graph(
         {

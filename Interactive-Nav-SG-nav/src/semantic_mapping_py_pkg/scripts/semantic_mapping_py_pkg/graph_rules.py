@@ -426,6 +426,18 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         "consecutive_observations": int(
             0 if minimal_gt else observation.get("consecutive_observations", 0) or 0
         ),
+        # A physical mapper may admit a currently visible, one-frame object
+        # to the graph after a trusted refrigerator open.  Keep that bounded
+        # provenance visible without treating it as a confirmed interaction
+        # track (M1 continues to consume the strict stream).
+        "tracking_confirmed": (
+            None
+            if minimal_gt or observation.get("tracking_confirmed") is None
+            else bool(observation.get("tracking_confirmed"))
+        ),
+        "graph_admission_source": ""
+        if minimal_gt
+        else str(observation.get("graph_admission_source") or ""),
         "camera_name": "" if minimal_gt else str(observation.get("camera_name") or ""),
         # A strict minimal-GT wire record must not smuggle in a caller-owned
         # frame index.  The mapping callback may attach `_capture_step` from
@@ -632,6 +644,10 @@ def observation_from_detection(detection: dict[str, Any], observation_id: str, s
             "visible_fraction": float(detection.get("visible_fraction", 0.0) or 0.0),
             "consecutive_observations": int(
                 detection.get("consecutive_observations", 0) or 0
+            ),
+            "tracking_confirmed": detection.get("tracking_confirmed"),
+            "graph_admission_source": str(
+                detection.get("graph_admission_source") or ""
             ),
             "viz_aabb_center": viz_aabb_center,
             "viz_aabb_size": viz_aabb_size,
