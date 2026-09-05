@@ -155,7 +155,7 @@ object_detection:
   max_sync_slop_sec: 0.08
   process_each_stamp_once: true
   skip_if_busy: true
-  point_stride: 4
+  point_stride: 6
   max_depth_m: 8.0
   min_valid_points: 12
   mask_component_min_area: 48
@@ -244,6 +244,13 @@ semantic_map:
   object_portal_cross_view_min_tangent_overlap_ratio: 0.20
   object_portal_cross_view_min_vertical_overlap_ratio: 0.35
   graph_min_observations: 3
+  # After a confirmed refrigerator open, newly exposed contents may only be
+  # visible for one detector frame.  Admit those currently visible tentative
+  # tracks to the semantic graph only; the strict tracked-detection topic used
+  # by M1 remains governed by the three-frame interaction confirmation above.
+  open_refrigerator_content_mapping_enabled: true
+  open_refrigerator_content_min_observations: 1
+  open_refrigerator_content_ignore_class_confirmations: true
   room_segment_use_semantic_overlay: true
   room_portal_cut_enabled: true
   graph_save_path: ""

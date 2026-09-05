@@ -32,6 +32,10 @@ WS_PORT="${PHYSICAL_NAV_WS_PORT:-12334}"
 QWEN_URL="${PHYSICAL_NAV_QWEN_URL:-http://127.0.0.1:18080/v1}"
 QWEN_MODEL="${PHYSICAL_NAV_QWEN_MODEL:-qwen3.6-35b-a3b-fp8}"
 QWEN_AUTO_INTERVAL="${PHYSICAL_NAV_QWEN_AUTO_INTERVAL:-0}"
+RECORD_DIR="${PHYSICAL_NAV_RECORD_DIR:-/home/user/ldl/recordings/go2_physical}"
+RECORD_MODE="${PHYSICAL_NAV_RECORD_MODE:-raw_plus_panels}"
+RECORD_QUEUE_SIZE="${PHYSICAL_NAV_RECORD_QUEUE_SIZE:-4096}"
+RECORD_ON_START="${PHYSICAL_NAV_RECORD_ON_START:-0}"
 INTERACTION_PROFILE="${PHYSICAL_NAV_INTERACTION_PROFILE:-physical_human}"
 ENABLE_M1="${PHYSICAL_NAV_ENABLE_M1:-true}"
 ENABLE_INTERACTION_POLICY="${PHYSICAL_NAV_ENABLE_INTERACTION_POLICY:-true}"
@@ -46,11 +50,18 @@ export SEMANTIC_MODEL_TRACE_URL="${SEMANTIC_MODEL_TRACE_URL:-http://127.0.0.1:${
 # the base centre (38 cm from a 70 cm rear-to-front body) and 0.62 m above
 # the base. The base-to-ground offset is therefore about 0.43 m (1.05 m
 # camera height), which is not part of this base-frame extrinsic.
-CAMERA_X="${PHYSICAL_NAV_CAMERA_X:-0.03}"; CAMERA_Y="${PHYSICAL_NAV_CAMERA_Y:-0}"; CAMERA_Z="${PHYSICAL_NAV_CAMERA_Z:-0.62}"; CAMERA_ROLL="${PHYSICAL_NAV_CAMERA_ROLL:-0}"; CAMERA_PITCH="${PHYSICAL_NAV_CAMERA_PITCH:-0}"; CAMERA_YAW="${PHYSICAL_NAV_CAMERA_YAW:-0}"
+# Normal standing base_link height is 0.305 m; camera ground height is 1.285 m,
+# so the camera is 0.980 m above base_link. Camera is pitched 13 degrees down.
+CAMERA_X="${PHYSICAL_NAV_CAMERA_X:-0.03}"; CAMERA_Y="${PHYSICAL_NAV_CAMERA_Y:-0}"; CAMERA_Z="${PHYSICAL_NAV_CAMERA_Z:-0.98}"; CAMERA_ROLL="${PHYSICAL_NAV_CAMERA_ROLL:-0}"; CAMERA_PITCH="${PHYSICAL_NAV_CAMERA_PITCH:-0.2268928}"; CAMERA_YAW="${PHYSICAL_NAV_CAMERA_YAW:-0}"
 RUNTIME_DIR="${PHYSICAL_NAV_RUNTIME_DIR:-/tmp/molmospaces-physical-nav-${UID}}"
 LOG_DIR="${PHYSICAL_NAV_LOG_DIR:-${RUNTIME_DIR}/logs}"
 GATEWAY_PID_FILE="${PHYSICAL_NAV_GATEWAY_PID_FILE:-${RUNTIME_DIR}/gateway.pid}"
 mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
+
+declare -a RECORD_ARGS=(--record-dir "${RECORD_DIR}" --record-mode "${RECORD_MODE}" --record-queue-size "${RECORD_QUEUE_SIZE}")
+if [[ "${RECORD_ON_START}" == "1" ]]; then
+  RECORD_ARGS+=(--record-on-start)
+fi
 
 declare -a SUPERVISED_PIDS=()
 declare -A PROCESS_NAMES=()
@@ -153,6 +164,7 @@ start_or_reuse_gateway() {
   --ws-host "${WS_HOST}" --ws-port "${WS_PORT}" \
   --http-host "${WEB_HOST}" --http-port "${WEB_PORT}" \
   --qwen-url "${QWEN_URL}" --qwen-model "${QWEN_MODEL}" --qwen-auto-interval "${QWEN_AUTO_INTERVAL}" \
+  "${RECORD_ARGS[@]}" \
   --camera-x "${CAMERA_X}" --camera-y "${CAMERA_Y}" --camera-z "${CAMERA_Z}" --camera-roll "${CAMERA_ROLL}" --camera-pitch "${CAMERA_PITCH}" --camera-yaw "${CAMERA_YAW}" \
     >>"${LOG_DIR}/gateway.log" 2>&1 </dev/null &
   GATEWAY_PID=$!

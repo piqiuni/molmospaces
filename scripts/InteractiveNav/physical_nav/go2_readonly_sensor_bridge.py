@@ -355,6 +355,7 @@ async def publish(args: argparse.Namespace) -> None:
             diagnostic_sends = 0
             diagnostic_send_s = 0.0
             diagnostic_max_send_s = 0.0
+            diagnostic_encode_s = 0.0
             diagnostic_bytes = 0
             print(f"connected to policy WebSocket {args.url}", flush=True)
             while True:
@@ -374,12 +375,16 @@ async def publish(args: argparse.Namespace) -> None:
                     seq=int(frame["seq"]), stamp=float(frame["stamp"]),
                     rgb_jpeg=frame["rgb_jpeg"], depth_png=frame["depth_png"],
                     width=int(frame["width"]), height=int(frame["height"]),
-                    camera_frame=args.camera_frame, depth_scale=float(frame["depth_scale"]),
+                    camera_frame=args.camera_frame,
+                    depth_frame=("d435i_depth_optical_frame" if source is not None and args.align_to == "depth" else args.camera_frame),
+                    depth_scale=float(frame["depth_scale"]),
                     intrinsics=frame["intrinsics"], color_depth_sync_ms=frame["sync_ms"],
                     rgb_intrinsics=frame.get("rgb_intrinsics"), depth_intrinsics=frame.get("depth_intrinsics"),
                     depth_to_color_extrinsics=frame.get("depth_to_color_extrinsics"),
                 )
+                encode_started = time.monotonic()
                 payload = encode_wire_packet(packet, compression_level=1)
+                diagnostic_encode_s += time.monotonic() - encode_started
                 send_started = time.monotonic()
                 ws.send_binary(payload)
                 send_s = time.monotonic() - send_started
@@ -402,6 +407,7 @@ async def publish(args: argparse.Namespace) -> None:
                         "sensor transport "
                         f"send_hz={diagnostic_sends / wall:.2f} "
                         f"avg_send_ms={1000.0 * diagnostic_send_s / max(diagnostic_sends, 1):.1f} "
+                        f"avg_encode_ms={1000.0 * diagnostic_encode_s / max(diagnostic_sends, 1):.1f} "
                         f"max_send_ms={1000.0 * diagnostic_max_send_s:.1f} "
                         f"wire_mbps={diagnostic_bytes * 8.0 / wall / 1e6:.2f} "
                         f"capture_seq={frame['seq']}",
@@ -410,9 +416,15 @@ async def publish(args: argparse.Namespace) -> None:
                     diagnostic_started = now
                     diagnostic_sends = 0
                     diagnostic_send_s = 0.0
+                    diagnostic_encode_s = 0.0
                     diagnostic_max_send_s = 0.0
                     diagnostic_bytes = 0
-                next_publish = now + 1.0 / args.publish_fps
+                # Schedule against the original cadence.  Adding the encode
+                # time to ``now`` made a 10 Hz target degrade to ~6 Hz even
+                # when capture and socket send were fast.
+                next_publish += 1.0 / args.publish_fps
+                if next_publish < now:
+                    next_publish = now
         except Exception as exc:
             print(f"sensor link disconnected: {exc}; retrying in {args.reconnect_s}s", flush=True)
             await asyncio.sleep(args.reconnect_s)

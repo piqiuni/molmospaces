@@ -15,6 +15,7 @@ import socket
 import ssl
 import subprocess
 import shutil
+import secrets
 import sys
 import tempfile
 import threading
@@ -30,6 +31,7 @@ from physical_protocol import decode_wire_packet, validate_packet
 from runtime_state import RuntimeState
 from safety_gate import ReadOnlySafetyGate
 from qwen_client import QwenClient
+from physical_raw_recorder import DEFAULT_RECORD_DIR, PhysicalRawRecorder
 from showcase_pages import ACADEMIC_SHOWCASE_HTML, DARK_SHOWCASE_HTML, LIGHT_SHOWCASE_HTML
 try:
     from offline_semantic_renderer import (
@@ -73,9 +75,9 @@ def _phone_stream_page(stream_url: str) -> str:
 <meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>
 <title>手机实时视频推流</title><style>
 *{{box-sizing:border-box}}html,body{{margin:0;min-height:100%;background:#06101d;color:#edf7ff;font-family:Inter,'Noto Sans SC',system-ui,sans-serif}}main{{min-height:100vh;padding:18px;display:flex;flex-direction:column;gap:14px;max-width:820px;margin:auto}}h1{{font-size:24px;margin:0;color:#79caff}}.sub{{color:#8da7c3;font-size:13px}}.preview{{position:relative;min-height:260px;flex:1;border:1px solid #315d88;border-radius:14px;background:#02060b;overflow:hidden;display:grid;place-items:center}}video{{width:100%;height:100%;object-fit:contain;background:#000}}.badge{{position:absolute;left:12px;top:12px;padding:6px 10px;border-radius:99px;background:#14283de8;color:#ffd46c;font-size:12px}}.badge.live{{color:#72efad}}.record-badge{{position:absolute;right:12px;top:12px;padding:6px 10px;border-radius:99px;background:#3a1118e8;color:#ff9ca8;font-size:12px}}.record-badge[hidden]{{display:none}}.controls{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}button,.rate-control{{min-height:48px;border:1px solid #3b78ad;border-radius:10px;background:#10263c;color:#e9f5ff;font-size:16px;font-weight:700}}button.primary{{background:#1474ad}}button.recording{{background:#8f2533;border-color:#ff6d7c}}button:disabled{{opacity:.45}}.rate-control{{display:flex;align-items:center;justify-content:center;gap:7px;padding:0 8px;font-size:13px}}.rate-control select{{border:0;border-radius:6px;background:#071625;color:#79caff;font:700 15px system-ui;padding:5px 7px}}.notice{{padding:12px;border:1px solid #315d88;border-radius:10px;background:#0b1a2a;color:#9fb4ca;font-size:12px;line-height:1.55}}code{{color:#72d7ff;word-break:break-all}}canvas{{display:none}}@media(max-width:620px){{.controls{{grid-template-columns:1fr 1fr}}}}
-</style><main><h1>手机实时视频推流</h1><div class='sub'>连接具身智能交互导航展示平台 · 540p 视频 + 48 kHz 高质量音频</div><section class='preview'><video id='video' autoplay muted playsinline></video><span id='status' class='badge'>等待相机与麦克风授权</span><span id='record-status' class='record-badge' hidden>● REC 00:00</span></section><div class='controls'><button id='start' class='primary'>开启音视频推流</button><button id='flip' disabled>切换摄像头</button><label class='rate-control'>推流帧率<select id='fps'><option value='5'>5 FPS</option><option value='10' selected>10 FPS</option><option value='15'>15 FPS</option><option value='20'>20 FPS</option></select></label><button id='record' disabled>录制 MP4</button></div><div class='notice'>推流地址：<code>{escaped_url}</code><br>默认 960×540 / 10 FPS，可实时切换帧率。录制优先原生 MP4；浏览器不支持时，停止后临时转换为 MP4，转换文件不会留在服务器。</div><canvas id='capture'></canvas></main><script>
-const video=document.getElementById('video'),canvas=document.getElementById('capture'),statusBox=document.getElementById('status'),startButton=document.getElementById('start'),flipButton=document.getElementById('flip'),recordButton=document.getElementById('record'),recordStatus=document.getElementById('record-status'),fpsSelect=document.getElementById('fps');
-let stream=null,facing='environment',targetFps=10,uploadTimer=0,uploadBusy=false,frameCount=0,recorder=null,recordChunks=[],recordStartedAt=0,recordTimer=0,audioContext=null,audioSource=null,audioProcessor=null,audioQueue=[],audioUploadBusy=false,audioSequence=0;
+</style><main><h1>手机实时视频推流</h1><div class='sub'>连接具身智能交互导航展示平台 · 540p 视频 + 48 kHz 高质量音频</div><section class='preview'><video id='video' autoplay muted playsinline></video><span id='status' class='badge'>等待相机与麦克风授权</span><span id='record-status' class='record-badge' hidden>● REC 00:00</span></section><div class='controls'><button id='start' class='primary'>开启音视频推流</button><button id='flip' disabled>切换摄像头</button><label class='rate-control'>推流帧率<select id='fps'><option value='5'>5 FPS</option><option value='10' selected>10 FPS</option><option value='15'>15 FPS</option><option value='20'>20 FPS</option></select></label><button id='sync-record' disabled>同步录制到本机</button><button id='record' disabled>录制 MP4（备份）</button></div><div class='notice'>推流地址：<code>{escaped_url}</code><br>默认 960×540 / 10 FPS，可实时切换帧率。点击“同步录制到本机”后，网关后台保存原始视频、手机音频、四路展示面板和右侧状态；浏览器关闭也不会中断。下方 MP4 按钮仅作为手机端本地备份，转换文件不会留在服务器。</div><canvas id='capture'></canvas></main><script>
+const video=document.getElementById('video'),canvas=document.getElementById('capture'),statusBox=document.getElementById('status'),startButton=document.getElementById('start'),flipButton=document.getElementById('flip'),recordButton=document.getElementById('record'),syncRecordButton=document.getElementById('sync-record'),recordStatus=document.getElementById('record-status'),fpsSelect=document.getElementById('fps');
+let stream=null,facing='environment',targetFps=10,uploadTimer=0,uploadBusy=false,frameCount=0,recorder=null,recordChunks=[],recordStartedAt=0,recordTimer=0,audioContext=null,audioSource=null,audioProcessor=null,audioQueue=[],audioUploadBusy=false,audioSequence=0,recordingSession=null,syncRecordingBusy=false;
 function status(text,live=false){{statusBox.textContent=text;statusBox.classList.toggle('live',live)}}
 function recordingTypes(){{return ['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm']}}
 function createRecorder(mediaStream,videoRate){{for(const mimeType of recordingTypes()){{if(!MediaRecorder.isTypeSupported(mimeType))continue;try{{return new MediaRecorder(mediaStream,{{mimeType,videoBitsPerSecond:videoRate,audioBitsPerSecond:192000}})}}catch(_){{}}}}return new MediaRecorder(mediaStream,{{videoBitsPerSecond:videoRate,audioBitsPerSecond:192000}})}}
@@ -86,14 +88,17 @@ function finishRecording(){{if(recordTimer)clearInterval(recordTimer);recordTime
 function stopRecording(){{if(recorder&&recorder.state!=='inactive')recorder.stop();else finishRecording()}}
 function startRecording(){{if(!stream||typeof MediaRecorder==='undefined'){{status('当前浏览器不支持视频录制');return}}try{{recordChunks=[];recorder=createRecorder(stream,3500000);recorder.ondataavailable=event=>{{if(event.data?.size)recordChunks.push(event.data)}};recorder.onerror=event=>{{status('录制失败：'+(event.error?.message||'未知错误'));finishRecording()}};recorder.onstop=async()=>{{const actualMime=recorder.mimeType||'video/webm',blob=new Blob(recordChunks,{{type:actualMime}});recordChunks=[];if(blob.size)await savePhoneMp4(blob);finishRecording()}};recorder.start(4000);recordStartedAt=Date.now();recordStatus.hidden=false;recordButton.classList.add('recording');recordButton.textContent='停止并保存 MP4';updateRecordClock();recordTimer=setInterval(updateRecordClock,1000)}}catch(error){{status('无法录制：'+error.message);finishRecording()}}}}
 function encodePcm16(samples){{const output=new ArrayBuffer(samples.length*2),view=new DataView(output);for(let index=0;index<samples.length;index++){{const sample=Math.max(-1,Math.min(1,samples[index]));view.setInt16(index*2,sample<0?sample*32768:sample*32767,true)}}return output}}
-async function pumpAudio(){{if(audioUploadBusy||!audioQueue.length)return;audioUploadBusy=true;const packet=audioQueue.shift();try{{await fetch('/api/phone-audio?seq='+(++audioSequence)+'&rate='+packet.rate,{{method:'POST',headers:{{'Content-Type':'audio/pcm;format=s16le;channels=1'}},body:packet.data,cache:'no-store'}})}}catch(_){{}}finally{{audioUploadBusy=false;if(audioQueue.length)pumpAudio()}}}}
-async function startAudioUpload(){{const AudioContextClass=window.AudioContext||window.webkitAudioContext;if(!AudioContextClass||!stream?.getAudioTracks().length)return;try{{audioContext=new AudioContextClass({{sampleRate:48000,latencyHint:'interactive'}})}}catch(_){{audioContext=new AudioContextClass()}}await audioContext.resume();audioSource=audioContext.createMediaStreamSource(stream);audioProcessor=audioContext.createScriptProcessor(8192,1,1);audioProcessor.onaudioprocess=event=>{{const samples=event.inputBuffer.getChannelData(0);audioQueue.push({{rate:event.inputBuffer.sampleRate,data:encodePcm16(samples)}});if(audioQueue.length>3)audioQueue.splice(0,audioQueue.length-3);pumpAudio()}};audioSource.connect(audioProcessor);audioProcessor.connect(audioContext.destination)}}
+function recordingQuery(prefix){{if(!recordingSession)return '';return '&recording_session='+encodeURIComponent(recordingSession.session_id||'')+'&recording_token='+encodeURIComponent(recordingSession.token||'')+'&ts='+(Date.now()/1000).toFixed(3)}}
+async function pumpAudio(){{if(audioUploadBusy||!audioQueue.length)return;audioUploadBusy=true;const packet=audioQueue.shift();try{{const response=await fetch('/api/phone-audio?seq='+(++audioSequence)+'&rate='+packet.rate+recordingQuery(),{{method:'POST',headers:{{'Content-Type':'audio/pcm;format=s16le;channels=1'}},body:packet.data,cache:'no-store'}});if(response.status===403){{recordingSession=null;syncRecordButton.classList.remove('recording');syncRecordButton.textContent='同步录制到本机'}}}}catch(_){{}}finally{{audioUploadBusy=false;if(audioQueue.length)pumpAudio()}}}}
+async function startAudioUpload(){{const AudioContextClass=window.AudioContext||window.webkitAudioContext;if(!AudioContextClass||!stream?.getAudioTracks().length)return;try{{audioContext=new AudioContextClass({{sampleRate:48000,latencyHint:'interactive'}})}}catch(_){{audioContext=new AudioContextClass()}}await audioContext.resume();audioSource=audioContext.createMediaStreamSource(stream);audioProcessor=audioContext.createScriptProcessor(8192,1,1);audioProcessor.onaudioprocess=event=>{{const samples=event.inputBuffer.getChannelData(0);audioQueue.push({{rate:event.inputBuffer.sampleRate,data:encodePcm16(samples)}});if(!recordingSession&&audioQueue.length>3)audioQueue.splice(0,audioQueue.length-3);else if(audioQueue.length>100)audioQueue.splice(0,audioQueue.length-100);pumpAudio()}};audioSource.connect(audioProcessor);const silentSink=audioContext.createGain();silentSink.gain.value=0;audioProcessor.connect(silentSink);silentSink.connect(audioContext.destination)}}
 async function stopAudioUpload(){{audioQueue=[];if(audioProcessor){{audioProcessor.onaudioprocess=null;audioProcessor.disconnect()}}if(audioSource)audioSource.disconnect();audioProcessor=null;audioSource=null;if(audioContext){{try{{await audioContext.close()}}catch(_){{}}}}audioContext=null}}
-async function stopCamera(){{if(uploadTimer)clearInterval(uploadTimer);uploadTimer=0;if(recorder&&recorder.state!=='inactive')stopRecording();await stopAudioUpload();if(stream)stream.getTracks().forEach(track=>track.stop());stream=null;video.srcObject=null;startButton.textContent='开启音视频推流';flipButton.disabled=true;recordButton.disabled=true;status('音视频推流已停止')}}
+async function stopCamera(){{if(uploadTimer)clearInterval(uploadTimer);uploadTimer=0;if(recorder&&recorder.state!=='inactive')stopRecording();await stopAudioUpload();if(stream)stream.getTracks().forEach(track=>track.stop());stream=null;video.srcObject=null;startButton.textContent='开启音视频推流';flipButton.disabled=true;recordButton.disabled=true;syncRecordButton.disabled=!recordingSession;status(recordingSession?'音视频已停止 · 后台同步录制仍在继续':'音视频推流已停止')}}
 function scheduleFrameUploads(){{if(uploadTimer)clearInterval(uploadTimer);uploadTimer=0;if(!stream)return;uploadTimer=setInterval(uploadFrame,Math.round(1000/targetFps));uploadFrame()}}
-async function startCamera(){{try{{await stopCamera();if(!navigator.mediaDevices?.getUserMedia)throw new Error('当前浏览器仅允许在安全页面使用相机和麦克风');stream=await navigator.mediaDevices.getUserMedia({{video:{{facingMode:{{ideal:facing}},width:{{ideal:960,max:960}},height:{{ideal:540,max:540}},frameRate:{{ideal:30,max:30}}}},audio:{{channelCount:{{ideal:1,max:1}},sampleRate:{{ideal:48000}},sampleSize:{{ideal:16}},echoCancellation:false,noiseSuppression:false,autoGainControl:false}}}});video.srcObject=stream;await video.play();await startAudioUpload();startButton.textContent='停止音视频推流';flipButton.disabled=false;recordButton.disabled=false;status('正在连接音视频…');scheduleFrameUploads()}}catch(error){{status('无法开启：'+error.message);startButton.textContent='重试开启'}}}}
-async function uploadFrame(){{if(uploadBusy||!stream||video.readyState<2)return;uploadBusy=true;try{{const sourceWidth=video.videoWidth||640,sourceHeight=video.videoHeight||480,width=Math.min(960,sourceWidth),height=Math.max(1,Math.round(width*sourceHeight/sourceWidth)),quality=targetFps>=15?.58:.66;canvas.width=width;canvas.height=height;canvas.getContext('2d',{{alpha:false}}).drawImage(video,0,0,width,height);const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',quality));if(!blob)throw new Error('JPEG 编码失败');const response=await fetch('/api/phone-frame?seq='+(++frameCount)+'&fps='+targetFps,{{method:'POST',headers:{{'Content-Type':'image/jpeg'}},body:blob,cache:'no-store'}});if(!response.ok)throw new Error('上传 '+response.status);status('实时推流中 · '+width+'×'+height+' · '+targetFps+' FPS',true)}}catch(error){{status('推流重试：'+error.message)}}finally{{uploadBusy=false}}}}
-startButton.onclick=()=>stream?stopCamera():startCamera();flipButton.onclick=async()=>{{facing=facing==='environment'?'user':'environment';await startCamera()}};fpsSelect.onchange=()=>{{targetFps=Number(fpsSelect.value)||10;scheduleFrameUploads()}};recordButton.onclick=()=>recorder&&recorder.state==='recording'?stopRecording():startRecording();window.addEventListener('pagehide',stopCamera);startCamera();
+async function startCamera(){{try{{await stopCamera();if(!navigator.mediaDevices?.getUserMedia)throw new Error('当前浏览器仅允许在安全页面使用相机和麦克风');stream=await navigator.mediaDevices.getUserMedia({{video:{{facingMode:{{ideal:facing}},width:{{ideal:960,max:960}},height:{{ideal:540,max:540}},frameRate:{{ideal:30,max:30}}}},audio:{{channelCount:{{ideal:1,max:1}},sampleRate:{{ideal:48000}},sampleSize:{{ideal:16}},echoCancellation:false,noiseSuppression:false,autoGainControl:false}}}});video.srcObject=stream;await video.play();await startAudioUpload();startButton.textContent='停止音视频推流';flipButton.disabled=false;recordButton.disabled=false;syncRecordButton.disabled=false;status('正在连接音视频…');scheduleFrameUploads()}}catch(error){{status('无法开启：'+error.message);startButton.textContent='重试开启'}}}}
+async function uploadFrame(){{if(uploadBusy||!stream||video.readyState<2)return;uploadBusy=true;try{{const sourceWidth=video.videoWidth||640,sourceHeight=video.videoHeight||480,width=Math.min(960,sourceWidth),height=Math.max(1,Math.round(width*sourceHeight/sourceWidth)),quality=targetFps>=15?.58:.66;canvas.width=width;canvas.height=height;canvas.getContext('2d',{{alpha:false}}).drawImage(video,0,0,width,height);const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',quality));if(!blob)throw new Error('JPEG 编码失败');const response=await fetch('/api/phone-frame?seq='+(++frameCount)+'&fps='+targetFps+recordingQuery(),{{method:'POST',headers:{{'Content-Type':'image/jpeg'}},body:blob,cache:'no-store'}});if(response.status===403){{recordingSession=null;syncRecordButton.classList.remove('recording');syncRecordButton.textContent='同步录制到本机'}}else if(!response.ok)throw new Error('上传 '+response.status);status('实时推流中 · '+width+'×'+height+' · '+targetFps+' FPS',true)}}catch(error){{status('推流重试：'+error.message)}}finally{{uploadBusy=false}}}}
+async function startSynchronizedRecording(){{if(syncRecordingBusy||!stream)return;syncRecordingBusy=true;try{{const response=await fetch('/api/recording/phone-join',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{mode:'raw_plus_panels',label:'phone-sync',metadata:{{source:'phone',width:video.videoWidth||960,height:video.videoHeight||540,fps:targetFps,audio:'phone'}}}})}});const value=await response.json();if(!response.ok)throw new Error(value.error||('HTTP '+response.status));recordingSession={{session_id:value.session_id,token:value.token||''}};syncRecordButton.classList.add('recording');syncRecordButton.textContent='停止同步录制';status('后台同步录制中 · 手机音频已保存',true)}}catch(error){{status('同步录制失败：'+error.message)}}finally{{syncRecordingBusy=false}}}}
+async function stopSynchronizedRecording(){{if(syncRecordingBusy||!recordingSession)return;syncRecordingBusy=true;try{{const current=recordingSession;const response=await fetch('/api/recording/stop',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{session_id:current.session_id,token:current.token,reason:'phone_button'}})}});const value=await response.json();if(!response.ok)throw new Error(value.error||('HTTP '+response.status));recordingSession=null;syncRecordButton.classList.remove('recording');syncRecordButton.textContent='同步录制到本机';status('后台录制已保存 · '+(value.record_dir||'本机'),true)}}catch(error){{status('停止同步录制失败：'+error.message)}}finally{{syncRecordingBusy=false}}}}
+startButton.onclick=()=>stream?stopCamera():startCamera();flipButton.onclick=async()=>{{facing=facing==='environment'?'user':'environment';await startCamera()}};fpsSelect.onchange=()=>{{targetFps=Number(fpsSelect.value)||10;scheduleFrameUploads()}};recordButton.onclick=()=>recorder&&recorder.state==='recording'?stopRecording():startRecording();syncRecordButton.onclick=()=>recordingSession?stopSynchronizedRecording():startSynchronizedRecording();window.addEventListener('pagehide',()=>{{if(recordingSession){{navigator.sendBeacon('/api/recording/stop',new Blob([JSON.stringify({{session_id:recordingSession.session_id,token:recordingSession.token,reason:'phone_pagehide'}})],{{type:'application/json'}}));recordingSession=null}}stopCamera()}});startCamera();
 </script></html>"""
 
 
@@ -174,6 +179,14 @@ class SixPanelRenderer:
         # pages.  Keeping these separate avoids browser-side redraws and avoids
         # lossy crop/resize cycles through the composite six-panel JPEG.
         self.latest_original_panels: dict[int, bytes] = {}
+        # Full panel streams are encoded only while a recorder session is
+        # active.  Keeping this off during ordinary viewing avoids six extra
+        # JPEG encodes on every 5 Hz render tick.
+        self.capture_panel_streams = False
+        self.latest_panel_streams: dict[int, bytes] = {}
+
+    def set_capture_panel_streams(self, enabled: bool) -> None:
+        self.capture_panel_streams = bool(enabled)
 
     @staticmethod
     def _raw_grid(payload: Any, default_frame: str = "tf_frame_map") -> RawGrid | None:
@@ -280,7 +293,7 @@ class SixPanelRenderer:
         # unified mask used by 3-D segmentation and box estimation.
         for det in detections if include_masks else ():
             display_mask = np.zeros(panel.shape[:2], dtype=np.uint8)
-            polygons = det.get("mask_polygons")
+            polygons = det.get("rgb_mask_polygons") or det.get("mask_polygons")
             if not isinstance(polygons, list) or not polygons:
                 legacy_polygon = det.get("mask_polygon")
                 polygons = [legacy_polygon] if isinstance(legacy_polygon, list) else []
@@ -758,6 +771,22 @@ class SixPanelRenderer:
             if panel_ok:
                 original_panels[panel_index] = bytes(panel_encoded)
         self.latest_original_panels = original_panels
+        if self.capture_panel_streams:
+            panel_streams: dict[int, bytes] = {}
+            for panel_index, panel in (
+                (1, camera),
+                (2, occ),
+                (3, room_panel),
+                (4, costmaps),
+            ):
+                panel_ok, panel_encoded = cv2.imencode(
+                    ".jpg", panel, [cv2.IMWRITE_JPEG_QUALITY, 95]
+                )
+                if panel_ok:
+                    panel_streams[panel_index] = bytes(panel_encoded)
+            self.latest_panel_streams = panel_streams
+        else:
+            self.latest_panel_streams = {}
         canvas = np.vstack([
             np.concatenate([camera, occ, room_panel], axis=1),
             np.concatenate([costmaps, spatial, topology], axis=1),
@@ -776,6 +805,7 @@ class _WebHandler(BaseHTTPRequestHandler):
     state: RuntimeState
     renderer: SixPanelRenderer
     gate: ReadOnlySafetyGate
+    recorder: PhysicalRawRecorder
     qwen_submit = None
     frame_lock = threading.Lock()
     latest_jpeg: bytes = b""
@@ -809,6 +839,18 @@ class _WebHandler(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
 
+    def _read_json_payload(self) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            length = 0
+        if length < 0 or length > 16 * 1024 * 1024:
+            raise ValueError("JSON payload too large")
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON payload must be an object")
+        return payload
+
     def _phone_stream_url(self) -> str:
         configured = str(self.phone_stream_url or "").strip()
         if configured:
@@ -835,6 +877,30 @@ class _WebHandler(BaseHTTPRequestHandler):
                 "audio_seq": cls.latest_phone_audio_seq,
                 "audio_rate": cls.latest_phone_audio_rate,
             }
+
+    def _recording_credentials(self) -> tuple[str, str]:
+        """Read optional session credentials used by the phone publisher."""
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        session_id = str(
+            self.headers.get("X-Recording-Session")
+            or (query.get("recording_session") or [""])[0]
+            or ""
+        )
+        token = str(
+            self.headers.get("X-Recording-Token")
+            or (query.get("recording_token") or [""])[0]
+            or ""
+        )
+        return session_id, token
+
+    def _recording_allowed(self) -> bool:
+        recorder = getattr(self, "recorder", None)
+        if recorder is None:
+            return False
+        session_id, token = self._recording_credentials()
+        # Existing phone clients remain compatible when no session is active;
+        # credentials are checked whenever a caller supplies them.
+        return not recorder.is_active() or recorder.authorize(session_id, token)
 
     @classmethod
     def _control_snapshot(cls) -> dict[str, Any]:
@@ -913,6 +979,8 @@ class _WebHandler(BaseHTTPRequestHandler):
                     "height",
                     "count",
                     "inference_ms",
+                    "cycle_ms",
+                    "timings_ms",
                 )
                 if detection_meta.get(key) is not None
             }
@@ -1041,7 +1109,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         stages = {
             stage: [
                 item for item in mllm
-                if item.get("stage") == stage or item.get("module") == stage
+                if str(item.get("stage") or item.get("module") or "").upper() == stage
             ][-stage_limits[stage]:]
             for stage in ("M1", "M2", "M3")
         }
@@ -1102,6 +1170,14 @@ class _WebHandler(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", "image/png"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "private, max-age=60"); self.end_headers(); self.wfile.write(data); return
         if path == "/api/phone-status":
             self._json(self._phone_snapshot()); return
+        if path == "/api/recording/status":
+            recorder = getattr(self, "recorder", None)
+            self._json(recorder.status() if recorder is not None else {"active": False, "error": "recorder unavailable"})
+            return
+        if path == "/api/recording/sessions":
+            recorder = getattr(self, "recorder", None)
+            self._json(recorder.list_sessions() if recorder is not None else [])
+            return
         if path == "/phone-frame.jpg":
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -1152,7 +1228,31 @@ class _WebHandler(BaseHTTPRequestHandler):
         if path == "/api/state":
             self._json({**self.state.snapshot(), "safety": self.gate.snapshot()}); return
         if path == "/api/state-summary":
-            self._json(self._state_summary({**self.state.snapshot(), "safety": self.gate.snapshot()})); return
+            summary = self._state_summary({**self.state.snapshot(), "safety": self.gate.snapshot()})
+            recorder = getattr(self, "recorder", None)
+            if recorder is not None:
+                status = recorder.status()
+                summary["recording"] = {
+                    key: status.get(key)
+                    for key in ("active", "session_id", "mode", "duration_s", "queue_size", "degraded")
+                }
+            self._json(summary); return
+        if path == "/api/perception-summary":
+            # Keep high-rate browser polling separate from the full state/MLLM
+            # summary, which is intentionally refreshed at a lower rate.
+            snapshot = self.state.snapshot()
+            meta = snapshot.get("detection_meta")
+            meta = meta if isinstance(meta, dict) else {}
+            self._json({
+                "frame_seq": snapshot.get("frame_seq"),
+                "frame_stamp": snapshot.get("frame_stamp"),
+                "detection_meta": {
+                    key: meta.get(key)
+                    for key in ("seq", "stamp", "camera_frame", "width", "height", "count", "inference_ms", "cycle_ms", "timings_ms")
+                    if meta.get(key) is not None
+                },
+                "detections": self._state_summary(snapshot).get("detections", []),
+            }); return
         if path == "/api/ros-state":
             self._json(self._state_summary(
                 {**self.state.snapshot(), "safety": self.gate.snapshot()},
@@ -1233,7 +1333,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # A physical audit view does not need camera-rate streaming;
                 # limiting this to 5 Hz reduces network pressure for remote
                 # browsers while still showing continuous state changes.
-                time.sleep(.2)
+                time.sleep(0.1)
         elif path in {"/panel1.mjpg", "/panel5.mjpg"}:
             panel_index = 0 if path.startswith("/panel1") else 4
             self.connection.settimeout(2.0)
@@ -1252,7 +1352,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                                 data = bytes(encoded)
                                 self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n"); self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError): return
-                time.sleep(.2)
+                time.sleep(0.1)
         else:
             html = _HTML.encode()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(html))); self.send_header("Cache-Control", "no-cache, no-store, must-revalidate"); self.send_header("Pragma", "no-cache"); self.end_headers(); self.wfile.write(html)
@@ -1301,9 +1401,77 @@ class _WebHandler(BaseHTTPRequestHandler):
                 shutil.copyfileobj(source_file, self.wfile, length=1_048_576)
 
     def do_POST(self) -> None:
-        if urllib.parse.urlparse(self.path).path == "/api/recording-to-mp4":
+        path = urllib.parse.urlparse(self.path).path
+        recorder = getattr(self, "recorder", None)
+        if path == "/api/recording/start":
+            if recorder is None:
+                self._json({"accepted": False, "error": "recorder unavailable"}, 503); return
+            try:
+                payload = self._read_json_payload()
+                mode = str(payload.get("mode") or "raw_plus_panels")
+                label = str(payload.get("label") or "web")
+                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                result = recorder.start(mode=mode, label=label, metadata=metadata)
+                # The token is returned only at explicit start/join time; it is
+                # intentionally omitted from the polling status endpoint.
+                result = {**result, "token": recorder.token()}
+                self._json(result, 201)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._json({"accepted": False, "error": str(exc)}, 400)
+            return
+        if path == "/api/recording/phone-join":
+            if recorder is None:
+                self._json({"accepted": False, "error": "recorder unavailable"}, 503); return
+            try:
+                payload = self._read_json_payload()
+                session_id = str(payload.get("session_id") or "")
+                token = str(payload.get("token") or "")
+                if recorder.is_active() and not recorder.authorize(session_id, token):
+                    self._json({"accepted": False, "error": "recording session token rejected"}, 403); return
+                if not recorder.is_active():
+                    result = recorder.start(
+                        mode=str(payload.get("mode") or "raw_plus_panels"),
+                        label="phone_sync",
+                        metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+                    )
+                else:
+                    result = recorder.status()
+                self._json({**result, "token": recorder.token(), "joined": True}, 200)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._json({"accepted": False, "error": str(exc)}, 400)
+            return
+        if path == "/api/recording/stop":
+            if recorder is None:
+                self._json({"accepted": False, "error": "recorder unavailable"}, 503); return
+            try:
+                payload = self._read_json_payload()
+                session_id = str(payload.get("session_id") or "")
+                token = str(payload.get("token") or "")
+                if recorder.is_active() and not recorder.authorize(session_id, token):
+                    self._json({"accepted": False, "error": "recording session token rejected"}, 403); return
+                self._json(recorder.stop(reason=str(payload.get("reason") or "user")), 200)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._json({"accepted": False, "error": str(exc)}, 400)
+            return
+        if path == "/api/recording/event":
+            if recorder is None:
+                self._json({"accepted": False, "error": "recorder unavailable"}, 503); return
+            try:
+                payload = self._read_json_payload()
+                session_id = str(payload.pop("session_id", "") or "")
+                token = str(payload.pop("token", "") or "")
+                if recorder.is_active() and not recorder.authorize(session_id, token):
+                    self._json({"accepted": False, "error": "recording session token rejected"}, 403); return
+                accepted = recorder.record_event("ui_event", payload, critical=True)
+                self._json({"accepted": accepted}, 202 if accepted else 409)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._json({"accepted": False, "error": str(exc)}, 400)
+            return
+        if path == "/api/recording-to-mp4":
             self._convert_recording_to_mp4(); return
-        if urllib.parse.urlparse(self.path).path == "/api/phone-audio":
+        if path == "/api/phone-audio":
+            if not self._recording_allowed():
+                self._json({"accepted": False, "error": "recording session token rejected"}, 403); return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -1317,6 +1485,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 client_seq = int((query.get("seq") or [0])[0]); sample_rate = int((query.get("rate") or [48_000])[0])
             except (TypeError, ValueError):
                 self._json({"accepted": False, "error": "invalid audio sequence or sample rate"}, 400); return
+            client_timestamp = (query.get("ts") or [""])[0]
             if not 8_000 <= sample_rate <= 96_000 or length % 2:
                 self._json({"accepted": False, "error": "unsupported PCM format"}, 400); return
             packet = self.rfile.read(length)
@@ -1327,8 +1496,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                 sequence = max(cls.latest_phone_audio_seq + 1, client_seq)
                 cls.latest_phone_audio_seq = sequence; cls.latest_phone_audio_at = time.time(); cls.latest_phone_audio_rate = sample_rate
                 cls.phone_audio_packets.append((sequence, sample_rate, packet))
+            recorder = getattr(self, "recorder", None)
+            if recorder is not None:
+                recorder.record_phone_audio(
+                    packet,
+                    sequence=sequence,
+                    sample_rate=sample_rate,
+                    client_timestamp=client_timestamp,
+                )
             self._json({"accepted": True, "audio_seq": sequence}, 202); return
-        if urllib.parse.urlparse(self.path).path == "/api/phone-frame":
+        if path == "/api/phone-frame":
+            if not self._recording_allowed():
+                self._json({"accepted": False, "error": "recording session token rejected"}, 403); return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -1349,6 +1528,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 client_seq = int((query.get("seq") or [0])[0])
             except (TypeError, ValueError):
                 client_seq = 0
+            client_timestamp = (query.get("ts") or [""])[0]
             try:
                 target_fps = min(20, max(5, int((query.get("fps") or [10])[0])))
             except (TypeError, ValueError):
@@ -1361,6 +1541,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                 cls.latest_phone_client = str(self.client_address[0])
                 cls.latest_phone_fps = target_fps
                 sequence = cls.latest_phone_seq
+            recorder = getattr(self, "recorder", None)
+            if recorder is not None:
+                recorder.record_phone_frame(
+                    frame,
+                    sequence=sequence,
+                    client_timestamp=client_timestamp,
+                    metadata={"target_fps": target_fps, "client_ip": str(self.client_address[0])},
+                )
             self._json({"accepted": True, "frame_seq": sequence}, 202); return
         if self.path == "/api/control":
             try:
@@ -1385,9 +1573,21 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self.state.navigation[name] = value
             else:
                 self.state.update_topic(name, value)
+            recorder = getattr(self, "recorder", None)
+            if recorder is not None:
+                if name == "mllm_events":
+                    events = value if isinstance(value, list) else [value]
+                    for event in events:
+                        if isinstance(event, dict):
+                            recorder.record_mllm_event(event, source="ros_state")
+                else:
+                    recorder.record_ros_state(name, value, payload=payload)
             self._json({"accepted": True}); return
         if self.path == "/api/mllm-event":
             length = int(self.headers.get("Content-Length", "0")); payload = json.loads(self.rfile.read(length) or b"{}")
+            recorder = getattr(self, "recorder", None)
+            if recorder is not None:
+                recorder.record_mllm_event(payload, source="trace_http")
             self.state.add_mllm_event(payload); self._json({"accepted": True}); return
         if self.path == "/api/qwen":
             length = int(self.headers.get("Content-Length", "0")); payload = json.loads(self.rfile.read(length) or b"{}")
@@ -1400,7 +1600,7 @@ class _WebHandler(BaseHTTPRequestHandler):
 
 _HTML = """<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Go2 Physical Interactive Navigation</title>
 <style>
-:root{color-scheme:dark;--bg:#0b0d11;--card:#141821;--line:#2e3748;--blue:#67a7ff;--green:#54d68b;--amber:#ffca58;--red:#ff6c67;--muted:#9ba8ba}*{box-sizing:border-box}body{font-family:Inter,"Noto Sans SC",system-ui,sans-serif;background:var(--bg);color:#edf2fa;margin:0;padding:14px}.title{display:flex;align-items:center;gap:12px;margin:0 0 10px;font-size:23px}.readonly{font-size:13px;color:#101418;background:var(--amber);padding:4px 9px;border-radius:99px}.dashboard{display:grid;grid-template-columns:minmax(640px,1fr) 430px;gap:12px;align-items:start}.left{min-width:0}.overview{display:block;width:100%;border:1px solid var(--line);border-radius:8px;background:#111}.ratebar{display:flex;gap:14px;flex-wrap:wrap;color:var(--green);font-size:13px;padding:7px 2px}.mllm-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.right{display:grid;gap:10px}.card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:10px;min-width:0;box-shadow:0 4px 14px #0004}.card h3{display:flex;align-items:center;justify-content:space-between;margin:0 0 8px;color:var(--blue);font-size:15px}.hint{color:var(--muted);font-size:11px;font-weight:400}.visual{width:100%;display:block;border-radius:6px;border:1px solid #343c49;background:#0d0f13}.events{max-height:390px;overflow:auto;display:grid;gap:8px}.event{display:grid;grid-template-columns:minmax(76px,.8fr) minmax(105px,1.25fr) minmax(90px,1fr);gap:7px;padding:7px;border:1px solid #313947;border-radius:8px;background:#0e1218;font-size:11px}.event-col{min-width:0;overflow:hidden}.label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}.thumb{width:100%;height:70px;object-fit:cover;border-radius:4px;border:1px solid #354053}.chips{display:flex;gap:4px;flex-wrap:wrap}.chip{display:inline-block;max-width:100%;padding:2px 5px;border-radius:5px;background:#263248;color:#cfe1ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.prompt,.result{line-height:1.35;word-break:break-word}.result{color:#d9f7e6}.meta{grid-column:1/-1;color:#7f8da1;font-size:10px}.empty{height:110px;display:grid;place-items:center;color:#768397;border:1px dashed #354052;border-radius:8px}.state-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.metric{padding:9px 7px;border:1px solid #303a4a;border-radius:8px;background:#0e1218;text-align:center}.metric .icon{font-size:19px}.metric .value{font-size:16px;font-weight:700;margin-top:2px}.metric .name{font-size:10px;color:var(--muted)}.statusline{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.badge{padding:3px 7px;border-radius:99px;font-size:11px;background:#263248;color:#cfe1ff}.badge.good{background:#173b2b;color:#7ff0ae}.badge.warn{background:#493b14;color:#ffd46c}.badge.bad{background:#4b2021;color:#ff9692}.m3box{display:grid;gap:8px}.m3head{display:flex;align-items:center;gap:8px}.m3status{font-size:22px;font-weight:800}.m3details{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.mini{background:#0e1218;border:1px solid #303a4a;border-radius:7px;padding:7px}.mini b{display:block;color:#eaf1fc;font-size:12px}.mini span{font-size:10px;color:var(--muted)}@media(max-width:1150px){.dashboard{grid-template-columns:1fr}.right{grid-template-columns:repeat(3,minmax(0,1fr));grid-row:2}.mllm-grid{grid-row:3}}@media(max-width:800px){body{padding:8px}.dashboard{display:block}.right,.mllm-grid{grid-template-columns:1fr;margin-top:10px}.event{grid-template-columns:1fr 1fr}.meta{grid-column:1/-1}}
+:root{color-scheme:dark;--bg:#0b0d11;--card:#141821;--line:#2e3748;--blue:#67a7ff;--green:#54d68b;--amber:#ffca58;--red:#ff6c67;--muted:#9ba8ba}*{box-sizing:border-box}body{font-family:Inter,"Noto Sans SC",system-ui,sans-serif;background:var(--bg);color:#edf2fa;margin:0;padding:14px}.title{display:flex;align-items:center;gap:12px;margin:0 0 10px;font-size:23px}.readonly{font-size:13px;color:#101418;background:var(--amber);padding:4px 9px;border-radius:99px}.dashboard{display:grid;grid-template-columns:minmax(640px,1fr) 430px;gap:12px;align-items:start}.left{min-width:0}.overview-wrap{position:relative;width:100%;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#111}.overview{display:block;width:100%;border:0;background:#111}.overview-camera{position:absolute;z-index:2;left:0;top:0;width:33.333333%;height:50%;object-fit:fill;background:#111;border-right:1px solid #aaa;border-bottom:1px solid #aaa}.ratebar{display:flex;gap:14px;flex-wrap:wrap;color:var(--green);font-size:13px;padding:7px 2px}.mllm-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.right{display:grid;gap:10px}.card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:10px;min-width:0;box-shadow:0 4px 14px #0004}.card h3{display:flex;align-items:center;justify-content:space-between;margin:0 0 8px;color:var(--blue);font-size:15px}.hint{color:var(--muted);font-size:11px;font-weight:400}.visual{width:100%;display:block;border-radius:6px;border:1px solid #343c49;background:#0d0f13}.events{max-height:390px;overflow:auto;display:grid;gap:8px}.event{display:grid;grid-template-columns:minmax(76px,.8fr) minmax(105px,1.25fr) minmax(90px,1fr);gap:7px;padding:7px;border:1px solid #313947;border-radius:8px;background:#0e1218;font-size:11px}.event-col{min-width:0;overflow:hidden}.label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}.thumb{width:100%;height:70px;object-fit:cover;border-radius:4px;border:1px solid #354053}.chips{display:flex;gap:4px;flex-wrap:wrap}.chip{display:inline-block;max-width:100%;padding:2px 5px;border-radius:5px;background:#263248;color:#cfe1ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.prompt,.result{line-height:1.35;word-break:break-word}.result{color:#d9f7e6}.meta{grid-column:1/-1;color:#7f8da1;font-size:10px}.empty{height:110px;display:grid;place-items:center;color:#768397;border:1px dashed #354052;border-radius:8px}.state-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.metric{padding:9px 7px;border:1px solid #303a4a;border-radius:8px;background:#0e1218;text-align:center}.metric .icon{font-size:19px}.metric .value{font-size:16px;font-weight:700;margin-top:2px}.metric .name{font-size:10px;color:var(--muted)}.statusline{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.badge{padding:3px 7px;border-radius:99px;font-size:11px;background:#263248;color:#cfe1ff}.badge.good{background:#173b2b;color:#7ff0ae}.badge.warn{background:#493b14;color:#ffd46c}.badge.bad{background:#4b2021;color:#ff9692}.m3box{display:grid;gap:8px}.m3head{display:flex;align-items:center;gap:8px}.m3status{font-size:22px;font-weight:800}.m3details{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.mini{background:#0e1218;border:1px solid #303a4a;border-radius:7px;padding:7px}.mini b{display:block;color:#eaf1fc;font-size:12px}.mini span{font-size:10px;color:var(--muted)}@media(max-width:1150px){.dashboard{grid-template-columns:1fr}.right{grid-template-columns:repeat(3,minmax(0,1fr));grid-row:2}.mllm-grid{grid-row:3}}@media(max-width:800px){body{padding:8px}.dashboard{display:block}.right,.mllm-grid{grid-template-columns:1fr;margin-top:10px}.event{grid-template-columns:1fr 1fr}.meta{grid-column:1/-1}}
 </style>
 <style>
 /* The dashboard always stays within the viewport. Resizing either zoom card
@@ -1425,7 +1625,7 @@ _HTML = """<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='v
 @media(max-width:1150px){.right .card:nth-child(2),.right .card:nth-child(3){width:100%!important;max-width:none}}
 </style>
 <h1 class='title'>Go2 Physical Interactive Navigation <span class='readonly'>动作控制需显式启动</span></h1>
-<main class='dashboard'><div class='left'><img id='overview' class='overview' src='/stream.mjpg' alt='实时六面板'><div class='ratebar'><span>● 导航 5 Hz</span><span>● YOLOE / 建图输入 10 Hz</span><span>● 网页 5 Hz</span><span>● Go2 人工遥控</span></div><div class='mllm-grid'><section class='card'><h3>1 · M1 VLM 感知 <span class='hint'>图片 → 简化问题 → 结果</span></h3><div id='m1' class='events'></div></section><section class='card'><h3>2 · M2 LLM 子目标 <span class='hint'>历史 + 候选 + 目标</span></h3><div id='m2' class='events'></div></section><section class='card'><h3>3 · M3 交互评价 <span class='hint'>对象类别 · 周期 · 历史</span></h3><div id='m3' class='m3box'></div></section></div></div><aside class='right'><section class='card'><h3>4 · Go2 当前状态 <span id='stamp' class='hint'>连接中</span></h3><div class='go2-layout'><div id='go2'></div><div class='go2-controls' aria-label='运动控制'><button id='nav-start'>Start</button><button id='nav-restart'>重启导航栈 + Goal</button><input id='nav-goal' placeholder='goalname' maxlength='80' autocomplete='off'><button id='nav-stop' class='danger'>Stop</button><button id='nav-enable'>开启运动</button><span class='control-status' id='control-status'>Esc / S：Stop</span></div></div></section><section class='card'><h3>5 · 图 1 放大 <span class='hint'>拖动右下角调宽高 · box + seg</span></h3><img id='panel1' class='visual' src='/camera-overlay.jpg' alt='高清图1放大'></section><section class='card'><h3>6 · 图 5 放大 <span class='hint'>拖动右下角调宽高 · 语义地图 + 3D box</span></h3><img id='panel5' class='visual' src='/panel5.jpg' alt='图5放大'></section></aside></main>
+<main class='dashboard'><div class='left'><div class='overview-wrap'><img id='overview' class='overview' src='/snapshot.jpg' alt='实时六面板'><img id='overview-camera' class='overview-camera' src='/camera-box-overlay.jpg' alt='10 Hz 实时感知'></div><div class='ratebar'><span>● 导航 5 Hz</span><span>● YOLOE / 建图输入 10 Hz</span><span>● 网页 5 Hz</span><span>● Go2 人工遥控</span></div><div class='mllm-grid'><section class='card'><h3>1 · M1 VLM 感知 <span class='hint'>图片 → 简化问题 → 结果</span></h3><div id='m1' class='events'></div></section><section class='card'><h3>2 · M2 LLM 子目标 <span class='hint'>历史 + 候选 + 目标</span></h3><div id='m2' class='events'></div></section><section class='card'><h3>3 · M3 交互评价 <span class='hint'>对象类别 · 周期 · 历史</span></h3><div id='m3' class='m3box'></div></section></div></div><aside class='right'><section class='card'><h3>4 · Go2 当前状态 <span id='stamp' class='hint'>连接中</span></h3><div class='go2-layout'><div id='go2'></div><div class='go2-controls' aria-label='运动控制'><button id='nav-start'>Start</button><button id='nav-restart'>重启导航栈 + Goal</button><input id='nav-goal' placeholder='goalname' maxlength='80' autocomplete='off'><button id='nav-stop' class='danger'>Stop</button><button id='nav-enable'>开启运动</button><span class='control-status' id='control-status'>Esc / S：Stop</span></div></div></section><section class='card'><h3>5 · 图 1 放大 <span class='hint'>拖动右下角调宽高 · box + seg</span></h3><img id='panel1' class='visual' src='/camera-overlay.jpg' alt='高清图1放大'></section><section class='card'><h3>6 · 图 5 放大 <span class='hint'>拖动右下角调宽高 · 语义地图 + 3D box</span></h3><img id='panel5' class='visual' src='/panel5.jpg' alt='图5放大'></section></aside></main>
 <script>
 const q=s=>document.querySelector(s), text=v=>String(v??'').replace(/\\s+/g,' ').trim(), clip=(v,n=150)=>{v=text(v);return v.length>n?v.slice(0,n)+'…':v};
 async function navControl(action, goal=''){
@@ -1506,9 +1706,21 @@ function num(v,d=1){const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--
 function speed(t){const v=t?.velocity||t?.linear_velocity||[];if(Array.isArray(v))return Math.hypot(...v.slice(0,3).map(Number));if(v&&typeof v==='object')return Math.hypot(Number(v.x||0),Number(v.y||0),Number(v.z||0));return Number(t?.speed||0)}
 function renderGo2(s){const t=s.telemetry||{},b=t.battery||{},link=s.link||{},grid=make('div','state-grid');const metrics=[['🔋',num(b.soc??t.battery_soc,0)+' %','电量'],['↗',num(speed(t),2)+' m/s','速度'],['⟳',num((Number(t.yaw||0)*180/Math.PI),1)+'°','航向'],['◉',text(t.mode||'站立'),'动作模式'],['↕',num(t.body_height,2)+' m','机身高度'],['⚠',String(t.error_code??0),'错误码']];metrics.forEach(([i,v,n])=>{const d=make('div','metric');d.append(make('div','icon',i),make('div','value',v),make('div','name',n));grid.append(d)});const line=make('div','statusline');line.append(make('span','badge '+(link.connected===false?'bad':'good'),link.connected===false?'相机断开':'相机在线'),make('span','badge good','控制输出阻断'),make('span','badge','图节点 '+(s.graph?.node_count??0)),make('span','badge','候选 '+((s.navigation?.candidates?.candidates||[]).length)));const box=q('#go2');box.replaceChildren(grid,line);q('#stamp').textContent='导航步 '+(s.navigation_step??'--')+' · 相机帧 '+(s.frame_seq??'--')+' · '+new Date().toLocaleTimeString()}
 async function refresh(){try{const r=await fetch('/api/state-summary?ts='+Date.now(),{cache:'no-store'}),s=await r.json();renderEvents('#m1',s.mllm?.M1,'M1');renderEvents('#m2',m2EventsWithLiveState(s),'M2');renderM3(s.m3||{});renderGo2(s)}catch(e){q('#stamp').textContent='刷新失败';q('#go2').replaceChildren(make('div','empty',clip(e,100)))}}
-function refreshStill(id,path){if(document.hidden)return;const image=q(id);if(image)image.src=path+'?ts='+Date.now()}
-function resumeDashboard(){if(document.hidden)return;refresh();const overview=q('#overview');if(overview&&!overview.src.includes('/stream.mjpg'))overview.src='/stream.mjpg';refreshStill('#panel1','/camera-overlay.jpg');refreshStill('#panel5','/panel5.jpg')}
-setupResizableLayout();setInterval(()=>{if(!document.hidden)refresh()},1000);setInterval(()=>refreshStill('#panel1','/camera-overlay.jpg'),400);setInterval(()=>refreshStill('#panel5','/panel5.jpg'),1000);document.addEventListener('visibilitychange',resumeDashboard);resumeDashboard();
+function refreshStill(id,path){
+  if(document.hidden)return;
+  const image=q(id);
+  // Do not replace an in-flight image request.  Reassigning ``src`` every
+  // 100 ms used to cancel a slower LAN response and caused a BrokenPipe /
+  // reconnect storm on the gateway.  A slow client now drops display ticks
+  // locally and immediately resumes at the newest cached frame.
+  if(!image||image.dataset.loading==='1')return;
+  image.dataset.loading='1';
+  const done=()=>{image.dataset.loading='0'};
+  image.onload=done;image.onerror=done;
+  image.src=path+'?ts='+Date.now();
+}
+function resumeDashboard(){if(document.hidden)return;refresh();refreshStill('#overview','/snapshot.jpg');refreshStill('#overview-camera','/camera-box-overlay.jpg');refreshStill('#panel1','/camera-overlay.jpg');refreshStill('#panel5','/panel5.jpg')}
+setupResizableLayout();const rateLabel=document.querySelector('.ratebar span:nth-child(3)');if(rateLabel)rateLabel.textContent='● 感知图 10 Hz · 六面板 5 Hz';setInterval(()=>{if(!document.hidden)refresh()},1000);setInterval(()=>refreshStill('#overview','/snapshot.jpg'),200);setInterval(()=>refreshStill('#overview-camera','/camera-box-overlay.jpg'),100);setInterval(()=>refreshStill('#panel1','/camera-overlay.jpg'),100);setInterval(()=>refreshStill('#panel5','/panel5.jpg'),1000);document.addEventListener('visibilitychange',resumeDashboard);resumeDashboard();
 </script></html>"""
 
 
@@ -1640,11 +1852,17 @@ def _compact_telemetry(telemetry: Any) -> dict[str, Any]:
 
 
 class PhysicalGateway:
-    def __init__(self, host: str, port: int, qwen_url: str = "", qwen_model: str = "qwen3.6-35b-a3b-fp8", camera_parent: str = "tf_frame_base_link", camera_x: float = 0.03, camera_y: float = 0.0, camera_z: float = 0.62, camera_roll: float = 0.0, camera_pitch: float = 0.0, camera_yaw: float = 0.0, qwen_auto_interval: float = 0.0) -> None:
+    def __init__(self, host: str, port: int, qwen_url: str = "", qwen_model: str = "qwen3.6-35b-a3b-fp8", camera_parent: str = "tf_frame_base_link", camera_x: float = 0.03, camera_y: float = 0.0, camera_z: float = 0.62, camera_roll: float = 0.0, camera_pitch: float = 0.0, camera_yaw: float = 0.0, qwen_auto_interval: float = 0.0, record_dir: str = DEFAULT_RECORD_DIR, record_mode: str = "raw_plus_panels", record_queue_size: int = 4096, record_on_start: bool = False) -> None:
         self.host, self.port = host, port
         self.state, self.gate = RuntimeState(), ReadOnlySafetyGate()
         self.renderer = SixPanelRenderer(self.state)
         self.qwen = QwenClient(qwen_url, qwen_model) if qwen_url else None
+        self.recorder = PhysicalRawRecorder(
+            record_dir,
+            default_mode=record_mode,
+            queue_size=record_queue_size,
+            panel_fps=5.0,
+        )
         self.camera_parent, self.camera_translation, self.camera_rpy = camera_parent, (camera_x, camera_y, camera_z), (camera_roll, camera_pitch, camera_yaw)
         self.state.set_calibration(
             parent_frame=camera_parent,
@@ -1668,7 +1886,23 @@ class PhysicalGateway:
         self._sensor_event = threading.Event()
         self._latest_sensor_packet: dict[str, Any] | None = None
         self._latest_sensor_stamp = float("-inf")
+        self._last_record_snapshot_mono = 0.0
         threading.Thread(target=self._sensor_decode_loop, daemon=True).start()
+        if record_on_start:
+            self.recorder.start(
+                mode=record_mode,
+                label="gateway_start",
+                metadata={
+                    "page": "showcase-dark",
+                    "sections": {
+                        "perception": "panel1/camera",
+                        "spatial": "panel3/room",
+                        "graph": "panel6/topology",
+                        "right_rail": "state/right_panel",
+                    },
+                    "audio_source": "phone",
+                },
+            )
 
     def _process_sensor_frame(self, packet: dict[str, Any]) -> None:
         rgb = _decode(packet["rgb"]["data"], "jpeg")
@@ -1680,7 +1914,11 @@ class PhysicalGateway:
             depth_b64=packet["depth"]["data"],
             depth_scale=float(packet.get("depth_scale", .001)),
             intrinsics=packet.get("intrinsics", {}),
+            rgb_intrinsics=packet.get("rgb_intrinsics", packet.get("intrinsics", {})),
+            depth_intrinsics=packet.get("depth_intrinsics", packet.get("intrinsics", {})),
+            depth_to_color_extrinsics=packet.get("depth_to_color_extrinsics", {}),
             camera_frame=packet.get("camera_frame", ""),
+            depth_frame=packet.get("depth_frame", packet.get("camera_frame", "")),
             frame_seq=int(packet["seq"]),
             frame_stamp=float(packet["stamp"]),
             sync_ms=packet.get("color_depth_sync_ms"),
@@ -1689,6 +1927,10 @@ class PhysicalGateway:
     def queue_sensor_frame(self, packet: dict[str, Any]) -> None:
         """Validate and retain only the newest not-yet-decoded RGB-D frame."""
         validate_packet(packet)
+        # Persist the encoded receipt before the latest-only decode queue can
+        # replace it under load.  The recorder is asynchronous and is a no-op
+        # when no session is active.
+        self.recorder.record_sensor_packet(packet)
         self.state.link_packet("sensor_frame")
         stamp = float(packet.get("stamp", 0.0))
         with self._sensor_lock:
@@ -1743,17 +1985,24 @@ class PhysicalGateway:
             # port, no command is forwarded to Go2 or any local actuator.
             return self.gate.handle_intent(packet)
         if packet["type"] == "sensor_frame":
+            self.recorder.record_sensor_packet(packet)
             self._process_sensor_frame(packet)
             # ROS publication is handled by physical_ros_gateway.py using the
             # /api/raw-frame endpoint. Keeping this process ROS-free avoids a
             # Python 3.13/ROS Noetic runtime conflict.
         elif packet["type"] == "telemetry":
+            self.recorder.record_telemetry(packet.get("telemetry", {}), packet=packet)
             self.state.update_topic("telemetry", packet.get("telemetry", {}))
         return {"type": "ack", "v": 1, "seq": packet.get("seq", -1), "accepted": True, "read_only": True}
 
     def start_http(self) -> None:
         handler = type("PhysicalWebHandler", (_WebHandler,), {})
         handler.state, handler.renderer, handler.gate = self.state, self.renderer, self.gate
+        # Keep the recorder on the handler class so every HTTP worker (including
+        # the phone publisher and recording controls) writes into the same
+        # session owned by this gateway.  Omitting this assignment silently
+        # disables all HTTP-side recording while sensor receipts still work.
+        handler.recorder = self.recorder
         handler.phone_stream_url = self.phone_stream_url
         def submit_qwen(payload: dict[str, Any]) -> dict[str, Any]:
             if self.qwen is None: return {"accepted": False, "error": "Qwen client is disabled"}
@@ -1761,23 +2010,60 @@ class PhysicalGateway:
             snapshot = self.state.snapshot()
             context = _compact_qwen_context(snapshot)
             prompt = user_prompt + "\n\n当前实物平台状态(JSON)：\n" + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
-            request = {"prompt": user_prompt, "context": context, "requested_at": time.time(), "model": self.qwen.model}
+            request_id = f"qwen-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
+            request = {"request_id": request_id, "prompt": user_prompt, "context": context, "requested_at": time.time(), "model": self.qwen.model}
             self.state.add_qwen(request)
+            self.recorder.record_qwen_event({"request_id": request_id, "kind": "request", **request}, source="web_api")
             def worker() -> None:
                 result = self.qwen.chat(prompt, max_tokens=int(payload.get("max_tokens", 256)))
-                self.state.add_qwen({}, {"completed_at": time.time(), "prompt": user_prompt, "result": result})
+                response = {"request_id": request_id, "kind": "result", "completed_at": time.time(), "prompt": user_prompt, "result": result}
+                self.state.add_qwen({}, response)
+                self.recorder.record_qwen_event(response, source="web_api")
             threading.Thread(target=worker, daemon=True).start()
             return {"accepted": True, "queued_at": request["requested_at"]}
         # Store as a static callback; otherwise BaseHTTPRequestHandler binds
         # this closure as an instance method and adds an unwanted ``self``.
         handler.qwen_submit = staticmethod(submit_qwen)
         self.http = _ReusableHTTPServer((self.host, self.port), handler)
+        def camera_overlay_loop() -> None:
+            """Publish source-resolution camera overlays independently.
+
+            The six-panel map/graph renderer is intentionally heavier than a
+            camera overlay.  Keeping these two paths in one loop made the
+            10-Hz perception endpoint inherit map rendering latency.  This
+            small loop owns the two cached camera products used by the debug
+            page and the enlarged right-hand image; it never touches robot
+            control and always works from the newest RuntimeState frame.
+            """
+            period = 0.1  # 10 Hz perception display target
+            while True:
+                started = time.monotonic()
+                try:
+                    # Generate each representation once per camera tick.  The
+                    # right-side image intentionally keeps segmentation,
+                    # while the presentation six-panel remains box-only.
+                    camera_seg = self.renderer.render_camera_overlay(include_masks=True)
+                    camera_box = self.renderer.render_camera_overlay(include_masks=False)
+                    with handler.frame_lock:
+                        handler.latest_camera_jpeg = camera_seg
+                        handler.latest_camera_box_jpeg = camera_box
+                except Exception as exc:
+                    self.state.last_error = f"camera overlay: {exc}"
+                time.sleep(max(0.0, period - (time.monotonic() - started)))
+
+        # Camera perception is a separate 10-Hz product; starting it before
+        # the heavier composite loop prevents the right-side image from
+        # waiting behind OCC/graph/costmap drawing.
+        threading.Thread(target=camera_overlay_loop, name="physical-camera-overlay-10hz", daemon=True).start()
+
         def render_loop() -> None:
             while True:
                 try:
+                    self.renderer.set_capture_panel_streams(self.recorder.is_active())
                     frame = self.renderer.render()
-                    camera_frame = self.renderer.render_camera_overlay(include_masks=True)
-                    camera_box_frame = self.renderer.render_camera_overlay(include_masks=False)
+                    with handler.frame_lock:
+                        camera_frame = handler.latest_camera_jpeg
+                        camera_box_frame = handler.latest_camera_box_jpeg
                     original_panels = self.renderer.latest_original_panels
                     with handler.frame_lock:
                         handler.latest_jpeg = frame
@@ -1785,9 +2071,52 @@ class PhysicalGateway:
                         handler.latest_camera_box_jpeg = camera_box_frame
                         handler.latest_panel3_jpeg = original_panels.get(3, b"")
                         handler.latest_panel6_jpeg = original_panels.get(6, b"")
+                    if self.recorder.is_active():
+                        # The dark showcase's four durable sections are the
+                        # perception image (1), OCC/costmap evidence (2–4),
+                        # spatial understanding (3), and interaction graph (6)
+                        # plus the right-rail JSON snapshot.  Keep 1–4 for a
+                        # direct raw chain and panel 6 for exact showcase
+                        # replay; all are source rasters, not browser crops.
+                        self.recorder.record_panel(
+                            1,
+                            camera_box_frame,
+                            stamp=self.state.frame_stamp,
+                            frame_seq=self.state.frame_seq,
+                        )
+                        for panel_index, panel_bytes in self.renderer.latest_panel_streams.items():
+                            if panel_index == 1:
+                                continue
+                            self.recorder.record_panel(
+                                panel_index,
+                                panel_bytes,
+                                stamp=self.state.frame_stamp,
+                                frame_seq=self.state.frame_seq,
+                            )
+                        # Panel 6 is encoded separately from the two native
+                        # enlarged-panel endpoints so offline composition can
+                        # reproduce the complete dark page without sampling a
+                        # low-quality composite JPEG.
+                        topology_bytes = self.renderer.latest_original_panels.get(6, b"")
+                        if topology_bytes:
+                            self.recorder.record_panel(
+                                6,
+                                topology_bytes,
+                                stamp=self.state.frame_stamp,
+                                frame_seq=self.state.frame_seq,
+                            )
+                        self.recorder.record_step_boundary(
+                            step_index=self.state.navigation_step,
+                            stamp=self.state.frame_stamp,
+                            frame_seq=self.state.frame_seq,
+                        )
+                        now_mono = time.monotonic()
+                        if now_mono - self._last_record_snapshot_mono >= 1.0:
+                            self._last_record_snapshot_mono = now_mono
+                            self.recorder.record_state_snapshot(self.state.snapshot())
                 except Exception as exc:
                     self.state.last_error = str(exc)
-                time.sleep(.2)
+                time.sleep(0.1)
         threading.Thread(target=render_loop, daemon=True).start()
         if self.qwen is not None and self.qwen_auto_interval > 0:
             def qwen_loop() -> None:
@@ -1796,10 +2125,14 @@ class PhysicalGateway:
                     snapshot = self.state.snapshot()
                     compact = _compact_qwen_context(snapshot)
                     prompt = "请根据当前全局语义图、检测结果和一致性诊断，简要报告空间关系异常和需要人工确认的对象。\n" + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
-                    request = {"prompt": prompt, "requested_at": time.time(), "model": self.qwen.model, "source": "auto_graph_review"}
+                    request_id = f"qwen-auto-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
+                    request = {"request_id": request_id, "prompt": prompt, "requested_at": time.time(), "model": self.qwen.model, "source": "auto_graph_review"}
                     self.state.add_qwen(request)
+                    self.recorder.record_qwen_event({"request_id": request_id, "kind": "request", **request}, source="auto_graph_review")
                     result = self.qwen.chat(prompt, max_tokens=256)
-                    self.state.add_qwen({}, {"completed_at": time.time(), "source": "auto_graph_review", "result": result})
+                    response = {"request_id": request_id, "kind": "result", "completed_at": time.time(), "source": "auto_graph_review", "result": result}
+                    self.state.add_qwen({}, response)
+                    self.recorder.record_qwen_event(response, source="auto_graph_review")
             threading.Thread(target=qwen_loop, daemon=True).start()
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         print(f"physical six-panel web: http://{self.host}:{self.port}/", flush=True)
@@ -1816,7 +2149,24 @@ class PhysicalGateway:
 
 async def run_gateway(args: argparse.Namespace) -> None:
     import websockets
-    gateway = PhysicalGateway(args.http_host, args.http_port, args.qwen_url, args.qwen_model, args.camera_parent, args.camera_x, args.camera_y, args.camera_z, args.camera_roll, args.camera_pitch, args.camera_yaw, args.qwen_auto_interval)
+    gateway = PhysicalGateway(
+        args.http_host,
+        args.http_port,
+        args.qwen_url,
+        args.qwen_model,
+        args.camera_parent,
+        args.camera_x,
+        args.camera_y,
+        args.camera_z,
+        args.camera_roll,
+        args.camera_pitch,
+        args.camera_yaw,
+        args.qwen_auto_interval,
+        args.record_dir,
+        args.record_mode,
+        args.record_queue_size,
+        args.record_on_start,
+    )
     gateway.https_port, gateway.tls_cert, gateway.tls_key = args.https_port, args.tls_cert, args.tls_key
     gateway.phone_stream_url = args.phone_stream_url
     gateway.start_http()
@@ -1847,15 +2197,21 @@ async def run_gateway(args: argparse.Namespace) -> None:
     # receive loop. Disable protocol pings (which require the client to read
     # and answer them); 5 Hz telemetry already provides application-level
     # liveness and avoids a deterministic ping-timeout reconnect every 40 s.
-    async with websockets.serve(
-        handler,
-        args.ws_host,
-        args.ws_port,
-        max_size=args.max_message_mb * 1024 * 1024,
-        ping_interval=None,
-    ):
-        print(f"physical sensor WebSocket: ws://{args.ws_host}:{args.ws_port}", flush=True)
-        await __import__("asyncio").Future()
+    try:
+        async with websockets.serve(
+            handler,
+            args.ws_host,
+            args.ws_port,
+            max_size=args.max_message_mb * 1024 * 1024,
+            ping_interval=None,
+        ):
+            print(f"physical sensor WebSocket: ws://{args.ws_host}:{args.ws_port}", flush=True)
+            await __import__("asyncio").Future()
+    finally:
+        # Explicit shutdown drains a background recording session.  A hard
+        # process kill still leaves session.json marked as open/incomplete,
+        # which the session listing exposes for recovery.
+        gateway.recorder.stop(reason="gateway_shutdown")
 
 
 def main() -> None:
@@ -1869,6 +2225,10 @@ def main() -> None:
     p.add_argument("--qwen-url", default="", help="e.g. http://127.0.0.1:18080/v1 after SSH forwarding")
     p.add_argument("--qwen-model", default="qwen3.6-35b-a3b-fp8")
     p.add_argument("--qwen-auto-interval", type=float, default=0.0, help="seconds; 0 disables periodic graph review")
+    p.add_argument("--record-dir", default=os.environ.get("PHYSICAL_NAV_RECORD_DIR", DEFAULT_RECORD_DIR), help="local root for physical recording sessions")
+    p.add_argument("--record-mode", choices=sorted(PhysicalRawRecorder.MODES), default=os.environ.get("PHYSICAL_NAV_RECORD_MODE", "raw_plus_panels"))
+    p.add_argument("--record-queue-size", type=int, default=int(os.environ.get("PHYSICAL_NAV_RECORD_QUEUE_SIZE", "4096")))
+    p.add_argument("--record-on-start", action="store_true", default=os.environ.get("PHYSICAL_NAV_RECORD_ON_START", "0") == "1", help="start a raw recording as soon as the gateway starts")
     p.add_argument("--camera-parent", default="tf_frame_base_link")
     p.add_argument("--camera-x", type=float, default=0.03); p.add_argument("--camera-y", type=float, default=0.0); p.add_argument("--camera-z", type=float, default=0.62); p.add_argument("--camera-roll", type=float, default=0.0); p.add_argument("--camera-pitch", type=float, default=0.0); p.add_argument("--camera-yaw", type=float, default=0.0)
     args = p.parse_args()

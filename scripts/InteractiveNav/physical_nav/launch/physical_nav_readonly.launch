@@ -3,8 +3,10 @@
   <arg name="config_file" default="$(find physical_nav)/config/physical_nav.yaml"/>
   <arg name="model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"/>
   <arg name="device" default="cuda:0"/>
-  <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.62"/>
-  <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.0"/><arg name="camera_yaw" default="0.0"/>
+  <!-- Normal standing Go2 base_link height is 0.305 m; camera ground height 1.285 m => relative z 0.980 m. -->
+  <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.98"/>
+  <!-- Camera points 13 degrees forward/down; RPY values are radians. -->
+  <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.2268928"/><arg name="camera_yaw" default="0.0"/>
   <arg name="ros_python" default="/usr/bin/python3"/>
   <arg name="system_ros_python" default="/home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/physical_ros_python.sh"/>
   <arg name="start_mapping" default="true"/>
@@ -100,7 +102,7 @@
     <!-- Keep reliable obstacle endpoints within 8 m. Finite depth estimates
          beyond that horizon retain only their bearing as a clear-only point
          just outside obstacle_range; zero/invalid depth remains absent. -->
-    <param name="point_stride" value="4"/>
+    <param name="point_stride" value="6"/>
     <param name="max_depth_m" value="8.0"/>
     <param name="no_return_depth_m" value="8.05"/>
     <param name="occupancy_grid_topic" value="/physical_nav/occupancy"/>

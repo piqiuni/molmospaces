@@ -19,7 +19,11 @@ class RuntimeState:
         self.depth_b64 = ""
         self.depth_scale = 0.001
         self.intrinsics: dict[str, Any] = {}
+        self.rgb_intrinsics: dict[str, Any] = {}
+        self.depth_intrinsics: dict[str, Any] = {}
+        self.depth_to_color_extrinsics: dict[str, Any] = {}
         self.camera_frame = ""
+        self.depth_frame = ""
         self.calibration: dict[str, Any] = {}
         self.frame_seq = -1
         # Local 5 Hz navigation/viewer step. Unlike the Go2 sensor sequence,
@@ -166,10 +170,14 @@ class RuntimeState:
                 "navigation_step": self.navigation_step,
                 "frame_stamp": self.frame_stamp,
                 "camera_frame": self.camera_frame,
+                "depth_frame": self.depth_frame or self.camera_frame,
                 "calibration": copy.deepcopy(self.calibration),
                 "sync_ms": self.sync_ms,
                 "depth_scale": self.depth_scale,
                 "intrinsics": copy.deepcopy(self.intrinsics),
+                "rgb_intrinsics": copy.deepcopy(self.rgb_intrinsics or self.intrinsics),
+                "depth_intrinsics": copy.deepcopy(self.depth_intrinsics or self.intrinsics),
+                "depth_to_color_extrinsics": copy.deepcopy(self.depth_to_color_extrinsics),
                 "raw_frame_available": bool(self.rgb_b64 and self.depth_b64),
                 "telemetry": copy.deepcopy(self.telemetry),
                 "detections": copy.deepcopy(self.detections),
@@ -245,7 +253,12 @@ class RuntimeState:
                 "width": int(self.intrinsics.get("width", self.rgb.shape[1] if self.rgb is not None else 0)),
                 "height": int(self.intrinsics.get("height", self.rgb.shape[0] if self.rgb is not None else 0)),
                 "camera_frame": self.camera_frame,
+                "depth_frame": self.depth_frame or self.camera_frame,
                 "depth_scale": self.depth_scale,
+                "intrinsics": copy.deepcopy(self.intrinsics),
+                "rgb_intrinsics": copy.deepcopy(self.rgb_intrinsics or self.intrinsics),
+                "depth_intrinsics": copy.deepcopy(self.depth_intrinsics or self.intrinsics),
+                "depth_to_color_extrinsics": copy.deepcopy(self.depth_to_color_extrinsics),
                 "intrinsics": copy.deepcopy(self.intrinsics),
                 "color_depth_sync_ms": self.sync_ms,
                 "telemetry": copy.deepcopy(self.telemetry),

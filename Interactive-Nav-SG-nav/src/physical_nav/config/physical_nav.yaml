@@ -29,7 +29,7 @@ object_detection:
   publish_rate: 10.0
   max_sync_slop_sec: 0.08
   process_each_stamp_once: true
-  point_stride: 4
+  point_stride: 6
   max_depth_m: 8.0
   min_valid_points: 12
   projection_frame_id: tf_frame_map
@@ -43,5 +43,18 @@ object_detection:
   debug_detection_image_topic: /physical_nav/detections_overlay
   debug_world_marker_topic: /physical_nav/boxes_3d_world
   debug_world_segmented_cloud_topic: /physical_nav/segmented_cloud_world
-semantic_map: {enable_object_mapping: true, enable_scene_mapping: true, subscribe_pointcloud: true, publish_rate: 5.0, object_min_confirmations: 1, graph_min_observations: 1}
+semantic_map:
+  enable_object_mapping: true
+  enable_scene_mapping: true
+  subscribe_pointcloud: true
+  publish_rate: 10.0
+  object_min_confirmations: 3
+  object_class_min_confirmations: {door: 3, portal: 3, fridge: 3, refrigerator: 3}
+  object_class_min_top_height_m: {door: 1.80, portal: 1.80, fridge: 1.50, refrigerator: 1.50}
+  graph_min_observations: 3
+  # Newly exposed refrigerator contents can be visible for one frame.  This
+  # graph-only lane does not change the strict tracked-detections/M1 stream.
+  open_refrigerator_content_mapping_enabled: true
+  open_refrigerator_content_min_observations: 1
+  open_refrigerator_content_ignore_class_confirmations: true
 physical_nav: {read_only: true, web_host: 0.0.0.0, web_port: 8765, sensor_ws_host: 0.0.0.0, sensor_ws_port: 12334}

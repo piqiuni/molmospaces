@@ -3,8 +3,10 @@
   <arg name="config_file" default="$(find physical_nav)/config/physical_nav.yaml"/>
   <arg name="model_path" default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"/>
   <arg name="device" default="cuda:0"/>
-  <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.75"/>
-  <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.0"/><arg name="camera_yaw" default="0.0"/>
+  <!-- Normal standing Go2 base_link height is 0.305 m; camera ground height 1.285 m => relative z 0.980 m. -->
+  <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.98"/>
+  <!-- Camera points 13 degrees forward/down; RPY values are radians. -->
+  <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.2268928"/><arg name="camera_yaw" default="0.0"/>
   <arg name="ros_python" default="/usr/bin/python3"/>
   <!-- The YOLOE worker is a non-ROS algorithm process started by
        start_physical_nav.sh. This local ROS node only consumes its JSON. -->

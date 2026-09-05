@@ -136,9 +136,9 @@ def main() -> None:
         "world_frame": str(rospy.get_param("~world_frame", "tf_frame_map")),
         "camera_x": float(rospy.get_param("~camera_x", 0.03)),
         "camera_y": float(rospy.get_param("~camera_y", 0.0)),
-        "camera_z": float(rospy.get_param("~camera_z", 0.75)),
+        "camera_z": float(rospy.get_param("~camera_z", 0.98)),
         "camera_roll": float(rospy.get_param("~camera_roll", 0.0)),
-        "camera_pitch": float(rospy.get_param("~camera_pitch", 0.0)),
+        "camera_pitch": float(rospy.get_param("~camera_pitch", 0.2268928)),
         "camera_yaw": float(rospy.get_param("~camera_yaw", 0.0)),
         "evaluation_rate_hz": float(rospy.get_param("~evaluation_rate_hz", 1.0)),
     })()

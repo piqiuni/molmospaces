@@ -47,24 +47,33 @@ def _decode(value: str) -> np.ndarray:
     return image
 
 
-def _rgb_mask_to_depth(mask: np.ndarray, depth: np.ndarray, rgb_intr: dict[str, Any], depth_intr: dict[str, Any], extr: dict[str, Any]) -> np.ndarray:
+def _rgb_mask_to_depth(mask: np.ndarray, depth: np.ndarray, rgb_intr: dict[str, Any], depth_intr: dict[str, Any], extr: dict[str, Any], projection_maps: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None, bbox: tuple[int, int, int, int] | None = None) -> np.ndarray:
     """Project an RGB YOLO mask onto the native/aligned depth pixel grid."""
     if mask.shape == depth.shape:
         return mask.astype(bool)
     h, w = depth.shape[:2]
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    z = depth.astype(np.float32)
-    valid = z > 0
-    x = (xx - float(depth_intr.get("cx", 0))) * z / max(float(depth_intr.get("fx", 1)), 1e-6)
-    y = (yy - float(depth_intr.get("cy", 0))) * z / max(float(depth_intr.get("fy", 1)), 1e-6)
-    points = np.stack((x, y, z), axis=-1)
-    rotation = np.asarray(extr.get("rotation", np.eye(3).reshape(-1)), dtype=np.float32).reshape(3, 3)
-    translation = np.asarray(extr.get("translation", [0, 0, 0]), dtype=np.float32).reshape(1, 1, 3)
-    color_points = points @ rotation.T + translation
-    cz = color_points[..., 2]
-    u = np.rint(color_points[..., 0] * float(rgb_intr.get("fx", 1)) / np.maximum(cz, 1e-6) + float(rgb_intr.get("cx", 0))).astype(np.int32)
-    v = np.rint(color_points[..., 1] * float(rgb_intr.get("fy", 1)) / np.maximum(cz, 1e-6) + float(rgb_intr.get("cy", 0))).astype(np.int32)
-    inside = valid & (cz > 0) & (u >= 0) & (u < mask.shape[1]) & (v >= 0) & (v < mask.shape[0])
+    if projection_maps is None:
+        yy, xx = np.indices((h, w), dtype=np.float32)
+        z = depth.astype(np.float32)
+        x = (xx - float(depth_intr.get("cx", 0))) * z / max(float(depth_intr.get("fx", 1)), 1e-6)
+        y = (yy - float(depth_intr.get("cy", 0))) * z / max(float(depth_intr.get("fy", 1)), 1e-6)
+        points = np.stack((x, y, z), axis=-1)
+        rotation = np.asarray(extr.get("rotation", np.eye(3).reshape(-1)), dtype=np.float32).reshape(3, 3)
+        translation = np.asarray(extr.get("translation", [0, 0, 0]), dtype=np.float32).reshape(1, 1, 3)
+        color_points = points @ rotation.T + translation
+        cz = color_points[..., 2]
+        u = np.rint(color_points[..., 0] * float(rgb_intr.get("fx", 1)) / np.maximum(cz, 1e-6) + float(rgb_intr.get("cx", 0))).astype(np.int32)
+        v = np.rint(color_points[..., 1] * float(rgb_intr.get("fy", 1)) / np.maximum(cz, 1e-6) + float(rgb_intr.get("cy", 0))).astype(np.int32)
+        inside = (cz > 0) & (u >= 0) & (u < mask.shape[1]) & (v >= 0) & (v < mask.shape[0])
+    else:
+        u, v, inside = projection_maps
+    valid = depth > 0
+    inside = inside & valid
+    if bbox is not None:
+        sx = mask.shape[1] / max(float(rgb_intr.get("width", 1280)), 1.0)
+        sy = mask.shape[0] / max(float(rgb_intr.get("height", 720)), 1.0)
+        x1, y1, x2, y2 = bbox
+        inside &= (u >= int(x1 * sx)) & (u < int(x2 * sx) + 1) & (v >= int(y1 * sy)) & (v < int(y2 * sy) + 1)
     result = np.zeros((h, w), dtype=bool)
     result[inside] = mask[v[inside], u[inside]] > 0
     return result
@@ -316,7 +325,13 @@ def _prepare_instance_points(
     # depth band can erase a valid disconnected surface that lies farther
     # away than the dominant component of the same instance mask.
     for component in candidates:
-        rows, cols = np.where(labels == component)
+        # Restrict the label scan to the component bounding box.  Scanning the
+        # full 384x640 mask once per component dominated CPU post-processing
+        # when YOLO returned many instances.
+        x0 = int(stats[component, cv2.CC_STAT_LEFT]); y0 = int(stats[component, cv2.CC_STAT_TOP])
+        width = int(stats[component, cv2.CC_STAT_WIDTH]); height = int(stats[component, cv2.CC_STAT_HEIGHT])
+        local_rows, local_cols = np.where(labels[y0:y0 + height, x0:x0 + width] == component)
+        rows, cols = local_rows + y0, local_cols + x0
         depths = depth[rows, cols] * depth_scale
         valid = np.isfinite(depths) & (depths > 0.0) & (depths <= max_depth)
         rows, cols, depths = rows[valid], cols[valid], depths[valid]
@@ -512,7 +527,7 @@ class YoloeWorker:
             from ultralytics import YOLOE
         except ImportError as exc:
             raise RuntimeError("YOLOE worker requires ultralytics in the algorithm Python environment") from exc
-        self.args = args; self.model = YOLOE(args.model_path); self.last_seq = -1; self.last_stamp = float("-inf"); self.rotation = _rotation(args.camera_roll, args.camera_pitch, args.camera_yaw); self.translation = np.asarray([args.camera_x, args.camera_y, args.camera_z], dtype=np.float32)
+        self.args = args; self.model = YOLOE(args.model_path); self.last_seq = -1; self.last_stamp = float("-inf"); self.rotation = _rotation(args.camera_roll, args.camera_pitch, args.camera_yaw); self.translation = np.asarray([args.camera_x, args.camera_y, args.camera_z], dtype=np.float32); self._projection_cache_key = None; self._projection_cache = None; self._profile_count = 0; self._profile_totals: dict[str, float] = {}
         self.detector_config = _load_object_detection_config(args.detector_config)
         # Keep the physical YAML authoritative.  Previously the CLI defaults
         # silently won, so changing confidence_threshold did not affect the
@@ -574,13 +589,46 @@ class YoloeWorker:
             self.last_stamp = stamp
         return True
 
+    def _projection_maps(self, depth_shape: tuple[int, int], mask_shape: tuple[int, int], rgb_intr: dict[str, Any], depth_intr: dict[str, Any], extr: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Cache RGB->depth pixel geometry; depth validity remains per-frame."""
+        sx = mask_shape[1] / max(float(rgb_intr.get("width", mask_shape[1])), 1.0)
+        sy = mask_shape[0] / max(float(rgb_intr.get("height", mask_shape[0])), 1.0)
+        key = (depth_shape, mask_shape, tuple(round(float(rgb_intr.get(k, 0)) * (sx if k in ("fx", "cx") else sy), 6) for k in ("fx", "fy", "cx", "cy")), tuple(round(float(depth_intr.get(k, 0)), 6) for k in ("fx", "fy", "cx", "cy")), tuple(round(float(v), 6) for v in (extr.get("rotation") or np.eye(3).reshape(-1))), tuple(round(float(v), 6) for v in (extr.get("translation") or (0, 0, 0))))
+        if key == self._projection_cache_key and self._projection_cache is not None:
+            return self._projection_cache
+        h, w = depth_shape
+        yy, xx = np.indices((h, w), dtype=np.float32)
+        z = np.ones((h, w), dtype=np.float32)
+        x = (xx - float(depth_intr.get("cx", 0))) * z / max(float(depth_intr.get("fx", 1)), 1e-6)
+        y = (yy - float(depth_intr.get("cy", 0))) * z / max(float(depth_intr.get("fy", 1)), 1e-6)
+        points = np.stack((x, y, z), axis=-1)
+        rotation = np.asarray(extr.get("rotation", np.eye(3).reshape(-1)), dtype=np.float32).reshape(3, 3)
+        translation = np.asarray(extr.get("translation", [0, 0, 0]), dtype=np.float32).reshape(1, 1, 3)
+        color_points = points @ rotation.T + translation
+        cz = color_points[..., 2]
+        u = np.rint(color_points[..., 0] * float(rgb_intr.get("fx", 1)) / np.maximum(cz, 1e-6) + float(rgb_intr.get("cx", 0))).astype(np.int32)
+        v = np.rint(color_points[..., 1] * float(rgb_intr.get("fy", 1)) / np.maximum(cz, 1e-6) + float(rgb_intr.get("cy", 0))).astype(np.int32)
+        # YOLO masks are often emitted at the model mask resolution rather
+        # than the original RGB resolution. Scale intrinsics into that grid.
+        sx, sy = mask_shape[1] / max(float(rgb_intr.get("width", 1280)), 1.0), mask_shape[0] / max(float(rgb_intr.get("height", 720)), 1.0)
+        u = np.rint((u - float(rgb_intr.get("cx", 0))) * sx + float(rgb_intr.get("cx", 0)) * sx).astype(np.int32)
+        v = np.rint((v - float(rgb_intr.get("cy", 0))) * sy + float(rgb_intr.get("cy", 0)) * sy).astype(np.int32)
+        inside = (cz > 0) & (u >= 0) & (u < mask_shape[1]) & (v >= 0) & (v < mask_shape[0])
+        self._projection_cache_key, self._projection_cache = key, (u, v, inside)
+        return self._projection_cache
+
     def infer(self, raw: dict[str, Any]) -> dict[str, Any]:
         infer_started = time.perf_counter()
+        decode_started = time.perf_counter()
         rgb = _decode(raw["rgb"]); depth = _decode(raw["depth"]).astype(np.float32)
+        decode_ms = (time.perf_counter() - decode_started) * 1000.0
         rgb_intr = raw.get("rgb_intrinsics") or raw.get("intrinsics", {})
         depth_intr = raw.get("depth_intrinsics") or raw.get("intrinsics", {})
+        depth_frame = str(raw.get("depth_frame") or raw.get("camera_frame", "d435i_depth_optical_frame"))
         fx, fy, cx, cy = [float(depth_intr.get(k, 0)) for k in ("fx", "fy", "cx", "cy")]
+        predict_started = time.perf_counter()
         result = self.model.predict(source=rgb, device=self.args.device, imgsz=self.args.imgsz, conf=self.args.conf, iou=self.args.iou, max_det=self.args.max_det, verbose=False, save=False)[0]
+        predict_ms = (time.perf_counter() - predict_started) * 1000.0
         boxes = getattr(result, "boxes", None); masks = getattr(result, "masks", None); detections = []; debug_point_sets = []
         if boxes is None:
             return {
@@ -596,6 +644,15 @@ class YoloeWorker:
         mask_data = None
         if masks is not None and getattr(masks, "data", None) is not None:
             mask_data = masks.data.detach().cpu().numpy() if hasattr(masks.data, "detach") else np.asarray(masks.data)
+            # Ultralytics versions differ between (N,H,W) and (N,1,H,W).
+            # Normalize once so RGB->depth projection always indexes a 2-D mask.
+            if mask_data.ndim == 4 and mask_data.shape[1] == 1:
+                mask_data = mask_data[:, 0]
+        projection_maps = None
+        if mask_data is not None and mask_data.shape[1:] != depth.shape:
+            projection_maps = self._projection_maps(depth.shape, tuple(mask_data.shape[1:]), rgb_intr, depth_intr, raw.get("depth_to_color_extrinsics") or {})
+        post_started = time.perf_counter()
+        post_parts = {"mask_projection": 0.0, "depth_geometry": 0.0, "contours": 0.0, "serialization": 0.0}
         for index, box in enumerate(xyxy):
             x1, y1, x2, y2 = [int(round(v)) for v in box]; raw_name = names.get(int(classes[index]), str(int(classes[index]))) if isinstance(names, dict) else str(int(classes[index])); mask = mask_data[index] if mask_data is not None and index < len(mask_data) else None
             if _is_excluded_scene_label(raw_name, self.detector_config):
@@ -611,15 +668,27 @@ class YoloeWorker:
             )
             if float(confs[index]) < threshold:
                 continue
+            part_started = time.perf_counter()
+            rgb_mask_polygons: list[list[list[int]]] = []
+            if mask is not None:
+                display_mask = cv2.resize((mask > 0.5).astype(np.uint8), (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+                display_contours, _ = cv2.findContours(display_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for display_contour in sorted(display_contours, key=cv2.contourArea, reverse=True):
+                    if display_contour.shape[0] >= 3:
+                        approx = cv2.approxPolyDP(display_contour, max(1.0, 0.0025 * cv2.arcLength(display_contour, True)), True)
+                        if approx.shape[0] >= 3:
+                            rgb_mask_polygons.append(approx[:, 0, :].astype(int).tolist())
             if mask is not None and mask.shape != depth.shape:
-                mask = _rgb_mask_to_depth(mask.astype(np.uint8), depth, rgb_intr, depth_intr, raw.get("depth_to_color_extrinsics") or {})
+                mask = _rgb_mask_to_depth(mask.astype(np.uint8), depth, rgb_intr, depth_intr, raw.get("depth_to_color_extrinsics") or {}, projection_maps, (x1, y1, x2, y2))
             else: mask = mask > .5 if mask is not None else np.zeros(depth.shape, dtype=bool)
+            post_parts["mask_projection"] += (time.perf_counter() - part_started) * 1000.0
             if fx <= 0 or fy <= 0:
                 continue
             geometry_config = dict(self.detector_config)
             geometry_config["semantic_label"] = filtered_label["semantic_class"]
             geometry_config.update({"point_stride": self.args.point_stride, "max_depth_m": self.args.max_depth_m, "min_valid_points": self.args.min_valid_points, "depth_scale": float(raw.get("depth_scale", .001))})
-            prepared = _prepare_instance_points(mask, depth.astype(np.float32), (fx, fy, cx, cy), (x1, y1, x2, y2), geometry_config, filtered_label["semantic_class"])
+            part_started = time.perf_counter()
+            prepared = _prepare_instance_points(mask, depth, (fx, fy, cx, cy), (x1, y1, x2, y2), geometry_config, filtered_label["semantic_class"])
             if prepared is None:
                 continue
             mask, points, values = prepared
@@ -628,6 +697,7 @@ class YoloeWorker:
             camera_size = np.maximum(camera_maxs - camera_mins, .01)
             world = _world_points(points, raw.get("telemetry", {}), self.translation, (self.args.camera_roll, self.args.camera_pitch, self.args.camera_yaw), optical_frame=True); mins, maxs = _robust_bounds(world, geometry_config); center = (mins + maxs) / 2; size = np.maximum(maxs - mins, .01)
             obb_center, obb_size, obb_orientation = _oriented_bounds(world, geometry_config)
+            post_parts["depth_geometry"] += (time.perf_counter() - part_started) * 1000.0
             if bool(geometry_config.get("reject_low_mean_height", True)) and float(np.mean(world[:, 2])) <= float(geometry_config.get("min_mean_height_m", 0.08)):
                 continue
             if _is_ground_like_box(center, size, geometry_config):
@@ -645,6 +715,7 @@ class YoloeWorker:
             # boundary.  The exact same filtered mask already drives the 3-D
             # points and box, so the web overlay must not silently collapse it
             # back to the single largest component.
+            contour_started = time.perf_counter()
             contours, _hierarchy = cv2.findContours(
                 mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
@@ -654,14 +725,17 @@ class YoloeWorker:
                 approximated = cv2.approxPolyDP(contour, epsilon, True)
                 if approximated.shape[0] >= 3:
                     mask_polygons.append(approximated[:, 0, :].astype(int).tolist())
+            post_parts["contours"] += (time.perf_counter() - contour_started) * 1000.0
             # Keep the legacy field for older consumers while the plural
             # field is authoritative for physical-platform visualization.
             mask_polygon = mask_polygons[0] if mask_polygons else []
+            detection_rgb_mask_polygons = rgb_mask_polygons
             sparse_rows, sparse_cols = np.where(mask)
             if sparse_rows.size > 3000: sparse_rows, sparse_cols = sparse_rows[::max(1, sparse_rows.size // 3000)], sparse_cols[::max(1, sparse_cols.size // 3000)]
             debug_point_sets.append((points, world))
-            detections.append({"semantic_class": filtered_label["semantic_class"], "semantic_class_raw": filtered_label["semantic_class_raw"], "raw_class": str(raw_name), "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_polygon": mask_polygon, "mask_polygons": mask_polygons, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "box3d_center": obb_center.astype(float).tolist(), "box3d_size": obb_size.astype(float).tolist(), "world_box3d_center": obb_center.astype(float).tolist(), "world_box3d_size": obb_size.astype(float).tolist(), "world_box3d_marker_size": obb_size.astype(float).tolist(), "world_box3d_orientation": obb_orientation, "source_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")), "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask_obb", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
+            detections.append({"semantic_class": filtered_label["semantic_class"], "semantic_class_raw": filtered_label["semantic_class_raw"], "raw_class": str(raw_name), "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_polygon": mask_polygon, "mask_polygons": mask_polygons, "rgb_mask_polygons": detection_rgb_mask_polygons, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "box3d_center": obb_center.astype(float).tolist(), "box3d_size": obb_size.astype(float).tolist(), "world_box3d_center": obb_center.astype(float).tolist(), "world_box3d_size": obb_size.astype(float).tolist(), "world_box3d_marker_size": obb_size.astype(float).tolist(), "world_box3d_orientation": obb_orientation, "source_frame": depth_frame, "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask_obb", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
         debug_max_points = max(32, int(self.detector_config.get("debug_cloud_max_points_per_instance", 400)))
+        serialization_started = time.perf_counter()
         for detection, (point_set, world_point_set) in zip(detections, debug_point_sets):
             stride = max(1, int(math.ceil(float(point_set.shape[0]) / debug_max_points)))
             # These points come from the exact RGB-D receipt used by YOLOE;
@@ -671,28 +745,50 @@ class YoloeWorker:
             detection["segment_point_count"] = int(camera_debug.shape[0])
             detection["camera_segment_points_f32"] = _encode_point_rows(camera_debug)
             detection["world_segment_points_f32"] = _encode_point_rows(world_debug)
+        post_parts["serialization"] = (time.perf_counter() - serialization_started) * 1000.0
+        post_ms = (time.perf_counter() - post_started) * 1000.0
+        overlay_started = time.perf_counter()
+        overlay_jpeg = _encode_detection_overlay(
+            rgb,
+            detections,
+            int(self.detector_config.get("debug_overlay_jpeg_quality", 92)),
+        )
+        overlay_ms = (time.perf_counter() - overlay_started) * 1000.0
+        total_ms = (time.perf_counter() - infer_started) * 1000.0
+        timings_ms = {"decode": decode_ms, "model_predict": predict_ms, "postprocess": post_ms, "overlay_encode": overlay_ms, "total": total_ms, "post_parts": post_parts}
         return {
             "seq": raw["seq"],
             "stamp": raw["stamp"],
             "camera_frame": str(raw.get("camera_frame", "d435i_color_optical_frame")),
+            "depth_frame": depth_frame,
             "model": self.args.model_path,
-            "inference_ms": (time.perf_counter() - infer_started) * 1000.0,
-            "overlay_jpeg": _encode_detection_overlay(
-                rgb,
-                detections,
-                int(self.detector_config.get("debug_overlay_jpeg_quality", 92)),
-            ),
+            "inference_ms": total_ms,
+            "timings_ms": timings_ms,
+            "overlay_jpeg": overlay_jpeg,
             "detections": detections,
         }
 
     def run(self) -> None:
+        profile_started = time.monotonic()
+        profile_count = 0
+        profile_totals: dict[str, float] = {}
         while True:
             cycle_started = time.monotonic()
             try:
                 with urllib.request.urlopen(self.args.web_url.rstrip("/") + "/api/raw-frame", timeout=.8) as response: raw = json.loads(response.read().decode())
                 if not self._claim_frame(raw): time.sleep(.02); continue
                 report = self.infer(raw)
+                cycle_ms = (time.monotonic() - cycle_started) * 1000.0
+                report["cycle_ms"] = cycle_ms
                 _post(self.args.web_url, report)
+                profile_count += 1
+                for name, value in (report.get("timings_ms") or {}).items():
+                    if isinstance(value, (int, float)):
+                        profile_totals[name] = profile_totals.get(name, 0.0) + float(value)
+                if time.monotonic() - profile_started >= 10.0:
+                    averages = {name: round(value / max(profile_count, 1), 1) for name, value in profile_totals.items()}
+                    print(f"YOLOE profile n={profile_count} avg_ms={averages} last_cycle_ms={cycle_ms:.1f} last_parts={(report.get('timings_ms') or {}).get('post_parts', {})}", flush=True)
+                    profile_started, profile_count, profile_totals = time.monotonic(), 0, {}
                 # ``rate`` is a cycle target, not an additional post-inference
                 # delay. The former fixed sleep halved a 100 ms pipeline from
                 # about 9 Hz to about 4.5 Hz.
@@ -703,7 +799,7 @@ class YoloeWorker:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--model-path", default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"); p.add_argument("--detector-config", type=Path, default=DEFAULT_DETECTOR_CONFIG); p.add_argument("--device", default="cuda:0"); p.add_argument("--imgsz", type=int, default=640); p.add_argument("--conf", type=float, default=.35); p.add_argument("--iou", type=float, default=.7); p.add_argument("--max-det", type=int, default=50); p.add_argument("--rate", type=float, default=10.); p.add_argument("--retry-s", type=float, default=1.); p.add_argument("--point-stride", type=int, default=4); p.add_argument("--min-valid-points", type=int, default=12); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args = p.parse_args(); YoloeWorker(args).run()
+    p = argparse.ArgumentParser(description=__doc__); p.add_argument("--web-url", default="http://127.0.0.1:8765"); p.add_argument("--model-path", default="/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt"); p.add_argument("--detector-config", type=Path, default=DEFAULT_DETECTOR_CONFIG); p.add_argument("--device", default="cuda:0"); p.add_argument("--imgsz", type=int, default=640); p.add_argument("--conf", type=float, default=.35); p.add_argument("--iou", type=float, default=.7); p.add_argument("--max-det", type=int, default=50); p.add_argument("--rate", type=float, default=10.); p.add_argument("--retry-s", type=float, default=1.); p.add_argument("--point-stride", type=int, default=8, help="RGB-D geometry sampling stride; 8 keeps boxes stable while reducing CPU post-processing"); p.add_argument("--min-valid-points", type=int, default=12); p.add_argument("--max-depth-m", type=float, default=8.); p.add_argument("--camera-x", type=float, default=0.); p.add_argument("--camera-y", type=float, default=0.); p.add_argument("--camera-z", type=float, default=0.); p.add_argument("--camera-roll", type=float, default=0.); p.add_argument("--camera-pitch", type=float, default=0.); p.add_argument("--camera-yaw", type=float, default=0.); args = p.parse_args(); YoloeWorker(args).run()
 
 
 if __name__ == "__main__": main()

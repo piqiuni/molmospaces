@@ -77,10 +77,10 @@ class PhysicalRosGateway:
         self.info_pub = rospy.Publisher("/physical_nav/camera_info", CameraInfo, queue_size=1)
         self.cloud_pub = rospy.Publisher("/physical_nav/points", PointCloud2, queue_size=1)
         self.segmented_cloud_pub = rospy.Publisher(
-            "/physical_nav/segmented_cloud", PointCloud2, queue_size=1, latch=True
+            "/physical_nav/segmented_cloud", PointCloud2, queue_size=1
         )
         self.segmented_cloud_world_pub = rospy.Publisher(
-            "/physical_nav/segmented_cloud_world", PointCloud2, queue_size=1, latch=True
+            "/physical_nav/segmented_cloud_world", PointCloud2, queue_size=1
         )
         self.boxes_pub = rospy.Publisher("/physical_nav/boxes_3d", MarkerArray, queue_size=1)
         self.boxes_world_pub = rospy.Publisher(
@@ -121,7 +121,10 @@ class PhysicalRosGateway:
         self._world_box_tracks: dict[int, dict[str, Any]] = {}
         self._next_world_box_track_id = 1
         self._last_detection_receipt: tuple[Any, Any] | None = None
-        self._static_sent = False; self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_grid_post: dict[str, float] = {}; self._last_occupancy_post = 0.0; self._mapped_post_lock = threading.Lock(); self._mapped_post_busy = False
+        self._static_sent = False; self._static_frames: set[str] = set(); self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_grid_post: dict[str, float] = {}; self._last_occupancy_post = 0.0; self._mapped_post_lock = threading.Lock(); self._mapped_post_busy = False
+        self._debug_cloud_lock = threading.Lock()
+        self._pending_debug_cloud: tuple[list[dict[str, Any]], dict[str, Any], Any] | None = None
+        self._projection_cache: dict[str, Any] = {}
         self._state_poll_lock = threading.Lock()
         self._pose_timer = rospy.Timer(rospy.Duration(0.05), self._refresh_pose_tf)
         # Detections originate in the non-ROS YOLOE worker and are republished
@@ -165,6 +168,12 @@ class PhysicalRosGateway:
         self._state_timer = rospy.Timer(
             rospy.Duration(max(args.state_period, 0.05)),
             self._poll_state,
+        )
+        # Visualization is latest-frame-only and runs independently of the
+        # state/detection processing path at the same configured frequency.
+        self._debug_cloud_timer = rospy.Timer(
+            rospy.Duration(max(args.state_period, 0.05)),
+            self._publish_pending_debug_cloud,
         )
 
     def _post_state(self, name: str, value: Any) -> None:
@@ -358,11 +367,8 @@ class PhysicalRosGateway:
             self.attribute_detection_pub.publish(
                 json.dumps(attribute_envelope, ensure_ascii=False, separators=(",", ":"))
             )
-            self._publish_detection_debug(
-                detections,
-                transform_cache,
-                detection_stamp,
-            )
+            with self._debug_cloud_lock:
+                self._pending_debug_cloud = (detections, transform_cache, detection_stamp)
             self._publish_detection_overlay(state)
             # Keep a compact, map-aligned evidence view for the LAN page while
             # preserving the raw YOLOE masks in ``detections``.
@@ -762,6 +768,7 @@ class PhysicalRosGateway:
         transform_cache: dict[str, Any],
         stamp: Any,
     ) -> None:
+        started = time.perf_counter()
         camera_rows: list[tuple[float, float, float, float]] = []
         world_rows: list[tuple[float, float, float, float]] = []
         camera_frame = self.args.camera_frame
@@ -813,6 +820,20 @@ class PhysicalRosGateway:
             marker_size_key="world_box3d_marker_size",
             persistent=True,
         ))
+        rospy.loginfo_throttle(
+            10.0,
+            "segmented cloud timing: %.1f ms, camera_points=%d world_points=%d detections=%d",
+            (time.perf_counter() - started) * 1000.0,
+            len(camera_rows), len(world_rows), len(detections),
+        )
+
+    def _publish_pending_debug_cloud(self, _event: Any) -> None:
+        """Publish only the newest visualization payload."""
+        with self._debug_cloud_lock:
+            pending = self._pending_debug_cloud
+            self._pending_debug_cloud = None
+        if pending is not None:
+            self._publish_detection_debug(*pending)
 
     def _publish_held_world_boxes(self, stamp: Any) -> None:
         stable_world = self._stable_world_boxes([])
@@ -942,23 +963,28 @@ class PhysicalRosGateway:
         rgb = _decode(raw["rgb"]); depth = _decode(raw["depth"])
         if rgb.ndim == 3 and rgb.shape[2] >= 3: rgb = np.ascontiguousarray(rgb[:, :, ::-1])
         if depth.dtype != np.uint16: depth = depth.astype(np.uint16)
-        stamp = rospy.Time.from_sec(float(raw.get("stamp", time.time()))); frame = str(raw.get("camera_frame", self.args.camera_frame)); rgb_msg = _image_msg(rgb, "bgr8", stamp, frame); depth_msg = _image_msg(depth, "16UC1", stamp, frame)
+        stamp = rospy.Time.from_sec(float(raw.get("stamp", time.time())))
+        rgb_frame = str(raw.get("camera_frame", self.args.camera_frame))
+        depth_frame = str(raw.get("depth_frame", rgb_frame))
+        rgb_msg = _image_msg(rgb, "bgr8", stamp, rgb_frame)
+        depth_msg = _image_msg(depth, "16UC1", stamp, depth_frame)
         # RViz transforms visualization messages at their header time. A
         # queued WebSocket receipt can otherwise make point clouds appear to
         # trail the live TF even when TF itself is current.
         if (rospy.Time.now() - stamp).to_sec() > 0.08:
             stamp = rospy.Time.now()
-            rgb_msg = _image_msg(rgb, "bgr8", stamp, frame)
-            depth_msg = _image_msg(depth, "16UC1", stamp, frame)
+            rgb_msg = _image_msg(rgb, "bgr8", stamp, rgb_frame)
+            depth_msg = _image_msg(depth, "16UC1", stamp, depth_frame)
         intr = raw.get("rgb_intrinsics") or raw.get("intrinsics", {})
-        info = CameraInfo(); info.header.stamp = stamp; info.header.frame_id = frame; info.width = int(intr.get("width", rgb.shape[1])); info.height = int(intr.get("height", rgb.shape[0])); info.K = [float(intr.get("fx", 0)), 0, float(intr.get("cx", 0)), 0, float(intr.get("fy", 0)), float(intr.get("cy", 0)), 0, 0, 1]
+        info = CameraInfo(); info.header.stamp = stamp; info.header.frame_id = rgb_frame; info.width = int(intr.get("width", rgb.shape[1])); info.height = int(intr.get("height", rgb.shape[0])); info.K = [float(intr.get("fx", 0)), 0, float(intr.get("cx", 0)), 0, float(intr.get("fy", 0)), float(intr.get("cy", 0)), 0, 0, 1]
         distortion = [float(value) for value in (intr.get("distortion") or [])[:5]]
         info.D = distortion
         info.distortion_model = str(intr.get("distortion_model", "plumb_bob") or "plumb_bob")
         self.rgb_pub.publish(rgb_msg); self.depth_pub.publish(depth_msg); self.info_pub.publish(info)
-        self._publish_cloud(depth, raw.get("depth_intrinsics") or intr, stamp, frame); self._publish_pose(raw.get("telemetry", {}), stamp)
+        self._publish_cloud(depth, raw.get("depth_intrinsics") or intr, stamp, depth_frame); self._publish_pose(raw.get("telemetry", {}), stamp, depth_frame)
 
     def _publish_cloud(self, depth: np.ndarray, intr: dict[str, Any], stamp: Any, frame: str) -> None:
+        started = time.perf_counter()
         fx, fy, cx, cy = [_to_float(intr.get(k)) for k in ("fx", "fy", "cx", "cy")]; scale = _to_float(self.last_raw.get("depth_scale", .001) if self.last_raw else .001)
         if fx <= 0 or fy <= 0: return
         obstacle_depth = max(0.0, float(self.args.max_depth_m))
@@ -976,18 +1002,30 @@ class PhysicalRosGateway:
         # clear-only layer and costmap_2d can ray-trace it without drawing a
         # GMapping occupied endpoint.
         projected_z = np.where(no_return_mask, no_return_depth, sampled)
-        u = np.arange(0, depth.shape[1], stride, dtype=np.float32)
-        v = np.arange(0, depth.shape[0], stride, dtype=np.float32)
-        uu, vv = np.meshgrid(u, v)
+        cache_key = (depth.shape[0], depth.shape[1], stride, fx, fy, cx, cy)
+        cached = self._projection_cache.get("global")
+        if cached is None or cached[0] != cache_key:
+            u = np.arange(0, depth.shape[1], stride, dtype=np.float32)
+            v = np.arange(0, depth.shape[0], stride, dtype=np.float32)
+            uu, vv = np.meshgrid(u, v)
+            cached = (cache_key, (uu - cx) / fx, (vv - cy) / fy)
+            self._projection_cache["global"] = cached
+        _, x_factor, y_factor = cached
         xyz = np.column_stack((
-            ((uu - cx) * projected_z / fx)[valid],
-            ((vv - cy) * projected_z / fy)[valid],
+            (x_factor * projected_z)[valid],
+            (y_factor * projected_z)[valid],
             projected_z[valid],
         )).astype(np.float32, copy=False)
-        points = xyz.tolist()
         obstacle_points = int(np.count_nonzero(obstacle_mask))
         no_return_points = int(np.count_nonzero(no_return_mask))
-        header = Header(); header.stamp = stamp; header.frame_id = frame; self.cloud_pub.publish(pc2.create_cloud_xyz32(header, points))
+        header = Header(); header.stamp = stamp; header.frame_id = frame
+        msg = PointCloud2(
+            header=header, height=1, width=int(xyz.shape[0]),
+            fields=[PointField("x", 0, PointField.FLOAT32, 1), PointField("y", 4, PointField.FLOAT32, 1), PointField("z", 8, PointField.FLOAT32, 1)],
+            is_bigendian=False, point_step=12, row_step=int(xyz.shape[0] * 12),
+            data=xyz.tobytes(order="C"), is_dense=False,
+        )
+        self.cloud_pub.publish(msg)
         rospy.loginfo_throttle(
             5.0,
             "mapping cloud: obstacle_points=%d no_return_points=%d obstacle_depth=%.2f no_return_depth=%.2f",
@@ -996,8 +1034,14 @@ class PhysicalRosGateway:
             obstacle_depth,
             no_return_depth,
         )
+        rospy.loginfo_throttle(
+            10.0,
+            "global cloud timing: %.1f ms, points=%d stride=%d",
+            (time.perf_counter() - started) * 1000.0,
+            int(xyz.shape[0]), stride,
+        )
 
-    def _publish_pose(self, telemetry: dict[str, Any], stamp: Any) -> None:
+    def _publish_pose(self, telemetry: dict[str, Any], stamp: Any, depth_frame: str | None = None) -> None:
         # The Go2 sensor websocket can queue a capture for a few hundred ms.
         # Publishing that old capture timestamp as TF makes RViz extrapolate a
         # visibly lagging robot/camera pose.  Keep synchronized timestamps when
@@ -1016,7 +1060,12 @@ class PhysicalRosGateway:
         odom.pose.pose.orientation.x, odom.pose.pose.orientation.y, odom.pose.pose.orientation.z, odom.pose.pose.orientation.w = quaternion
         self.odom_pub.publish(odom)
         transform = TransformStamped(); transform.header.stamp = stamp; transform.header.frame_id = "tf_frame_odom"; transform.child_frame_id = "tf_frame_base_link"; transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z = [_to_float(v) for v in position[:3]]; transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z, transform.transform.rotation.w = quaternion; self.tf_broadcaster.sendTransform(transform)
-        if not self._static_sent:
+        static_frames = [self.args.camera_frame]
+        if depth_frame and depth_frame != self.args.camera_frame:
+            static_frames.append(depth_frame)
+        for static_frame in static_frames:
+            if static_frame in self._static_frames:
+                continue
             static = TransformStamped(); static.header.stamp = stamp; static.header.frame_id = self.args.camera_parent; static.child_frame_id = self.args.camera_frame; static.transform.translation.x, static.transform.translation.y, static.transform.translation.z = self.args.camera_x, self.args.camera_y, self.args.camera_z
             # REP-103 optical frame -> Go2 base: optical x=right, y=down,
             # z=forward maps to base x=forward, y=left, z=up.  This is a
@@ -1026,7 +1075,9 @@ class PhysicalRosGateway:
             qx, qy, qz, qw = _quat_multiply(mount, optical)
             static.transform.rotation.x, static.transform.rotation.y = qx, qy
             static.transform.rotation.z, static.transform.rotation.w = qz, qw
-            self.static_broadcaster.sendTransform(static); self._static_sent = True
+            static.child_frame_id = static_frame
+            self.static_broadcaster.sendTransform(static); self._static_frames.add(static_frame)
+        self._static_sent = bool(self._static_frames)
 
 
 def _to_float(value: Any) -> float:
@@ -1080,7 +1131,7 @@ def main() -> None:
     p.add_argument("--rate", type=float, default=10.)
     p.add_argument("--state-period", type=float, default=.2)
     p.add_argument("--occupancy-period", type=float, default=.5)
-    p.add_argument("--point-stride", type=int, default=4)
+    p.add_argument("--point-stride", type=int, default=6)
     p.add_argument("--max-depth-m", type=float, default=8.)
     p.add_argument("--no-return-depth-m", type=float, default=8.05)
     p.add_argument("--world-frame", default="tf_frame_map")
