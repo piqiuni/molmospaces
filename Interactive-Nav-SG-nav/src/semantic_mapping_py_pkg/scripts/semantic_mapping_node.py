@@ -119,6 +119,13 @@ class SemanticMappingNode:
         # detector and offline scene-mapping paths.
         self.subscribe_pointcloud = bool(config.get("subscribe_pointcloud", True))
         self.publish_rate = float(config.get("publish_rate", 2.0))
+        # Room topology changes much more slowly than detector/object state.
+        # Keep the mapper timer responsive while rate-limiting the large
+        # room-segment OccupancyGrid independently.
+        self.room_grid_publish_rate = max(
+            0.1, float(config.get("room_grid_publish_rate", 2.0))
+        )
+        self._last_room_grid_publish_mono = 0.0
         self.object_stale_after_sec = float(config.get("object_stale_after_sec", 0.0))
         self.scene_min_range = float(config.get("scene_min_range", 0.1))
         self.scene_max_range = float(config.get("scene_max_range", 3.0))
@@ -2568,7 +2575,10 @@ class SemanticMappingNode:
                     if int(getattr(self, "_scene_grid_revision", 0)) == int(scene_revision):
                         self._scene_grid_published_revision = int(scene_revision)
         if room_segment_grid is not None:
-            self.room_segment_pub.publish(room_segment_grid)
+            now = time.monotonic()
+            if now - self._last_room_grid_publish_mono >= 1.0 / self.room_grid_publish_rate:
+                self.room_segment_pub.publish(room_segment_grid)
+                self._last_room_grid_publish_mono = now
         if planning_grid is not None:
             self.planning_occupancy_grid_pub.publish(planning_grid)
         if door_clear_mask is not None:

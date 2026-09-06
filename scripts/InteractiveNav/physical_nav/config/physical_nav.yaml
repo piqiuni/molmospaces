@@ -230,8 +230,10 @@ semantic_map:
   # Unconfirmed detector-only tracks remain reclaimable after this timeout.
   object_stale_after_sec: 30.0
   # Fuse/publish the latest RGB-D/YOLO result at 10 Hz. Navigation consumes
-  # these receipts at its independent 5 Hz logical step.
+  # these receipts at its independent 5 Hz logical step. Room topology is
+  # much slower and is published independently below.
   publish_rate: 10.0
+  room_grid_publish_rate: 2.0
   # Require two temporally consecutive observations before inserting an
   # object into the persistent semantic map. Detection confidence is kept
   # unchanged here; this is a temporal confirmation gate only.

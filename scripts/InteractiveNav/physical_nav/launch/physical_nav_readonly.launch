@@ -114,6 +114,9 @@
     <!-- The camera source is 10 Hz. Polling faster only repeats HTTP/JPEG/
          depth work and competes with the dashboard for the same gateway. -->
     <param name="rate" value="10.0"/>
+    <!-- Room topology changes slowly; forward its large grid at 2 Hz while
+         the raw OCC path remains at the higher visualization rate. -->
+    <param name="room_grid_period" value="0.5"/>
     <param name="world_frame" value="tf_frame_map"/>
     <param name="camera_frame" value="d435i_color_optical_frame"/>
     <param name="camera_parent" value="tf_frame_base_link"/>

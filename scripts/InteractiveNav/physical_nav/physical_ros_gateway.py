@@ -65,6 +65,7 @@ class PhysicalRosGateway:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.args.occupancy_period = max(0.0, float(self.args.occupancy_period))
+        self.args.room_grid_period = max(0.0, float(self.args.room_grid_period))
         self.last_seq = -1
         self.last_stamp = float("-inf")
         self.last_raw: dict[str, Any] | None = None
@@ -251,7 +252,12 @@ class PhysicalRosGateway:
             # Keep map-stage snapshots visible in the browser and available to
             # the canonical offline renderer without serializing ROS objects.
             now = time.monotonic()
-            if now - self._last_grid_post.get(name, 0.0) < self.args.occupancy_period:
+            period = (
+                self.args.room_grid_period
+                if name == "room_grid"
+                else self.args.occupancy_period
+            )
+            if now - self._last_grid_post.get(name, 0.0) < period:
                 return
             self._last_grid_post[name] = now
             payload = self._grid_payload(msg)
@@ -1398,6 +1404,7 @@ def main() -> None:
     # every mapper tick starves the web server and semantic consumers. The
     # latest-only post at 5 Hz is sufficient for visualization and planning.
     p.add_argument("--occupancy-period", type=float, default=.2)
+    p.add_argument("--room-grid-period", type=float, default=.5)
     p.add_argument("--point-stride", type=int, default=6)
     p.add_argument("--max-depth-m", type=float, default=8.)
     p.add_argument("--no-return-depth-m", type=float, default=8.05)
@@ -1426,7 +1433,7 @@ def main() -> None:
     # CLI parser so the gateway can also be run directly.
     _patch_roslogging_findcaller_for_py311()
     rospy.init_node("physical_ros_gateway", anonymous=False)
-    for name in ("web_url", "rate", "state_period", "occupancy_period", "point_stride", "max_depth_m", "no_return_depth_m", "world_frame", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw", "box_hold_s", "box_match_distance_m", "box_smoothing_alpha", "box_min_confirmations", "occupancy_grid_topic", "room_grid_topic", "global_costmap_topic", "local_costmap_topic", "global_plan_topic", "local_global_plan_topic", "local_plan_topic"):
+    for name in ("web_url", "rate", "state_period", "occupancy_period", "room_grid_period", "point_stride", "max_depth_m", "no_return_depth_m", "world_frame", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw", "box_hold_s", "box_match_distance_m", "box_smoothing_alpha", "box_min_confirmations", "occupancy_grid_topic", "room_grid_topic", "global_costmap_topic", "local_costmap_topic", "global_plan_topic", "local_global_plan_topic", "local_plan_topic"):
         setattr(args, name, rospy.get_param("~" + name, getattr(args, name)))
     PhysicalRosGateway(args); rospy.spin()
 
