@@ -131,6 +131,14 @@ class PhysicalRosGateway:
         self._next_world_box_track_id = 1
         self._last_detection_receipt: tuple[Any, Any] | None = None
         self._static_sent = False; self._static_frames: set[str] = set(); self._lock = threading.Lock(); self._telemetry: dict[str, Any] = {}; self._last_grid_post: dict[str, float] = {}; self._last_occupancy_post = 0.0; self._mapped_post_lock = threading.Lock(); self._mapped_post_busy = False
+        # Map callbacks must never wait on localhost HTTP/JSON serialization.
+        # Keep one latest payload per map stage and let a daemon worker post it
+        # asynchronously; stale OCC receipts are discarded instead of
+        # accumulating behind a slow web process.
+        self._grid_post_lock = threading.Lock()
+        self._pending_grid_posts: dict[str, dict[str, Any]] = {}
+        self._grid_post_event = threading.Event()
+        threading.Thread(target=self._grid_post_loop, name="physical-grid-post", daemon=True).start()
         self._debug_cloud_lock = threading.Lock()
         self._pending_debug_cloud: tuple[list[dict[str, Any]], dict[str, Any], Any] | None = None
         self._projection_cache: dict[str, Any] = {}
@@ -246,8 +254,24 @@ class PhysicalRosGateway:
             if now - self._last_grid_post.get(name, 0.0) < self.args.occupancy_period:
                 return
             self._last_grid_post[name] = now
-            self._post_state(name, self._grid_payload(msg))
+            payload = self._grid_payload(msg)
+            with self._grid_post_lock:
+                self._pending_grid_posts[name] = payload
+                self._grid_post_event.set()
         return callback
+
+    def _grid_post_loop(self) -> None:
+        while not rospy.is_shutdown():
+            self._grid_post_event.wait(0.5)
+            with self._grid_post_lock:
+                pending = self._pending_grid_posts
+                self._pending_grid_posts = {}
+                self._grid_post_event.clear()
+            for name, payload in pending.items():
+                try:
+                    self._post_state(name, payload)
+                except Exception as exc:
+                    rospy.logwarn_throttle(5.0, "physical grid state %s: %s", name, exc)
 
     def _occupancy_callback(self, msg: Any) -> None:
         """Compatibility callback retained for small unit-test stubs."""
@@ -1196,13 +1220,10 @@ class PhysicalRosGateway:
         depth_frame = str(raw.get("depth_frame", rgb_frame))
         rgb_msg = _image_msg(rgb, "bgr8", stamp, rgb_frame)
         depth_msg = _image_msg(depth, "16UC1", stamp, depth_frame)
-        # RViz transforms visualization messages at their header time. A
-        # queued WebSocket receipt can otherwise make point clouds appear to
-        # trail the live TF even when TF itself is current.
-        if (rospy.Time.now() - stamp).to_sec() > 0.08:
-            stamp = rospy.Time.now()
-            rgb_msg = _image_msg(rgb, "bgr8", stamp, rgb_frame)
-            depth_msg = _image_msg(depth, "16UC1", stamp, depth_frame)
+        # Keep the sensor capture timestamp.  Re-dating a delayed cloud to
+        # ``now`` combines an old camera pose with the current TF pose and
+        # bends the occupancy map when the robot turns.  GMapping now drops
+        # clouds that exceed its age limit instead of accepting this mismatch.
         intr = raw.get("rgb_intrinsics") or raw.get("intrinsics", {})
         depth_intr = raw.get("depth_intrinsics") or intr
         info = CameraInfo(); info.header.stamp = stamp; info.header.frame_id = rgb_frame; info.width = int(intr.get("width", rgb.shape[1])); info.height = int(intr.get("height", rgb.shape[0])); info.K = [float(intr.get("fx", 0)), 0, float(intr.get("cx", 0)), 0, float(intr.get("fy", 0)), float(intr.get("cy", 0)), 0, 0, 1]
@@ -1287,16 +1308,9 @@ class PhysicalRosGateway:
         )
 
     def _publish_pose(self, telemetry: dict[str, Any], stamp: Any, depth_frame: str | None = None) -> None:
-        # The Go2 sensor websocket can queue a capture for a few hundred ms.
-        # Publishing that old capture timestamp as TF makes RViz extrapolate a
-        # visibly lagging robot/camera pose.  Keep synchronized timestamps when
-        # fresh, but re-date delayed TF/odom at receipt time.
-        try:
-            now = rospy.Time.now()
-            if (now - stamp).to_sec() > 0.08:
-                stamp = now
-        except Exception:
-            pass
+        # Preserve the pose timestamp from the same camera capture.  The
+        # transform buffer then provides the matching historical odom pose;
+        # re-dating it to receipt time would pair an old pose with a new TF.
         position = telemetry.get("position", [0, 0, 0]); velocity = telemetry.get("velocity", [0, 0, 0]); yaw = _to_float(telemetry.get("yaw", telemetry.get("imu", {}).get("rpy", [0, 0, 0])[2] if telemetry.get("imu") else 0))
         quaternion = _telemetry_quaternion(telemetry)
         odom = Odometry(); odom.header.stamp = stamp; odom.header.frame_id = "tf_frame_odom"; odom.child_frame_id = "tf_frame_base_link"; odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z = [_to_float(v) for v in position[:3]]; odom.twist.twist.linear.x, odom.twist.twist.linear.y = [_to_float(v) for v in velocity[:2]]

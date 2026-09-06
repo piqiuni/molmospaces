@@ -767,10 +767,12 @@ class ExplorePyNode:
                 self.active_move_base_goal_id = ""
                 return
             if code in TERMINAL_SUCCESS and self._active_goal_distance() <= self.state.config.goal_reach_tolerance_m * 1.5:
-                if self._active_goal_has_frontier():
-                    self.state.mark_active_frontier_unreachable()
-                else:
-                    self.state.mark_active_reached()
+                # A terminal move_base success means the selected viewpoint
+                # was reached.  Do not reinterpret a still-visible frontier
+                # as an unreachable goal: the frontier is expected to remain
+                # visible at the viewpoint and doing so leaves the external
+                # subgoal in the wrong completion state.
+                self.state.mark_active_reached()
                 self.active_move_base_goal_id = ""
                 return
 
@@ -1306,16 +1308,11 @@ class ExplorePyNode:
                     event="preempted_by_target",
                 )
             elif success:
-                has_frontier = self.core.has_frontier_near(
-                    self.latest_grid,
-                    cluster.centroid_world,
-                    self.state.config.frontier_match_distance_m,
-                    min_cells=self.active_goal_frontier_min_cells,
-                ) if self.latest_grid is not None else False
-                if has_frontier:
-                    self.state.mark_active_frontier_unreachable()
-                else:
-                    self.state.mark_active_reached()
+                # The executor has already validated the navigation goal as
+                # successful.  Presence of the original frontier after
+                # arrival is normal; mark the selected viewpoint covered
+                # instead of converting success into ``unreachable``.
+                self.state.mark_active_reached()
             else:
                 self.state.mark_active_failed(
                     str(detail.get("reason") or "semantic_executor_navigation_failed"),

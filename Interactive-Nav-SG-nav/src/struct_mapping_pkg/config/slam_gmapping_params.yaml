@@ -1,5 +1,5 @@
 # 地图更新间隔
-map_update_interval: 0.1
+map_update_interval: 0.05
 reset_topic: "/nav_system/reset"
 odom_topic: "/odom"
 scan_filter_queue_size: 1
@@ -41,9 +41,9 @@ str: 0.001  # 旋转→平移噪声，原0.2降至0.01
 stt: 0.002  # 旋转→旋转噪声，原0.4降至0.02
 
 # 地图更新阈值
-linearUpdate: 0.5
-angularUpdate: 0.2
-temporalUpdate: 0.1
+linearUpdate: 0.10
+angularUpdate: 0.05
+temporalUpdate: 0.05
 resampleThreshold: 0.5
 
 # 粒子滤波参数（里程计准确时可以用更少粒子）
@@ -116,6 +116,9 @@ local_overwrite_reset_on_correction_rot_delta: 0.10
 # 时间同步保护（避免 odom 与 pointcloud 时间错配）
 enable_time_sync_guard: true
 max_odom_cloud_time_diff: 0.03
-max_cloud_age_sec: 0.35
+max_cloud_age_sec: 0.50
+# Never map a capture that is already behind the robot's motion. Accepting
+# stale clouds was the source of bent walls during turns; the latest-only
+# subscriber queue will supply the next fresh capture.
 enforce_cloud_age_drop: false
 odom_stamp_buffer_size: 200

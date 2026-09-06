@@ -32,10 +32,9 @@ DWAPlannerROS:
   acc_lim_trans: 1.0
   # Physical Go2 should use the sampled DWA angular velocity.  The custom
   # rear-path branch otherwise jumps directly to a fixed 1.30 rad/s command.
-  # Rotate in place before driving when the goal lies behind the robot.
-  # This avoids the forward-only DWA window trying to approach a rear goal
-  # with an unnecessarily long forward arc.
-  rear_path_prerotate_enabled: true
+  # Keep the physical lane on the normal DWA path; do not force an
+  # additional in-place pre-rotation before driving to a rear goal.
+  rear_path_prerotate_enabled: false
   rear_path_rotate_speed: 0.30
   # A temporary forced reverse after three failed samples changes the sign of
   # vx abruptly and is unsafe on the long camera mast. Let move_base stop and
@@ -44,7 +43,11 @@ DWAPlannerROS:
   conditional_reverse_enabled: false
   # The downstream safety deadband handles tiny residual commands without
   # converting a valid curved-path correction into a planner failure/stop.
-  reject_degenerate_cmd_enabled: false
+  # Treat a near-zero local command as a planner failure while a path is
+  # active, so the executor can replan instead of appearing stuck.
+  reject_degenerate_cmd_enabled: true
+  degenerate_cmd_min_trans: 0.02
+  degenerate_cmd_min_rot: 0.08
   xy_goal_tolerance: 0.30
   # Require a tighter terminal heading on the physical base. The velocity
   # safety layer now preserves the low angular speeds needed to reach it.

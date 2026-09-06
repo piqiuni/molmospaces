@@ -6271,12 +6271,6 @@ class SemanticBehaviorExecutor:
                 "active_lease": active_lease,
             }
             return False
-        if not self.rear_goal_prerotate_step_sync_enabled:
-            self._last_rear_goal_recovery_detail = {
-                "reason": "rear_goal_step_gate_disabled",
-                "decision_id": decision_id,
-            }
-            return False
         self._clear_rear_dwa_monitor(decision_id)
         try:
             state = int(self.move_base.get_state())
@@ -7213,6 +7207,24 @@ class SemanticBehaviorExecutor:
                 "trigger_source": trigger_source,
             }
             return False
+        # A delayed or briefly reversed local-plan lookahead must not turn a
+        # geometrically forward goal into a rear-goal pre-rotation. Use the
+        # selected goal itself as a guard; DWA follows any curved path after.
+        direct_pose = self._current_pose(frame_id)
+        if direct_pose is not None:
+            direct_heading = math.atan2(
+                float(goal_y) - float(direct_pose[1]),
+                float(goal_x) - float(direct_pose[0]),
+            )
+            direct_error = normalize_angle(direct_heading - float(direct_pose[2]))
+            if abs(direct_error) < float(self.rear_goal_enter_angle_rad):
+                self._last_rear_goal_recovery_detail = {
+                    "reason": "rear_goal_direct_target_forward",
+                    "trigger_source": trigger_source,
+                    "direct_heading_error_rad": direct_error,
+                    "path_heading_target_xy": list(heading_target_xy),
+                }
+                return True
         choice, detail = self._rear_goal_rotation_choice(
             decision_id,
             frame_id,
@@ -7260,12 +7272,26 @@ class SemanticBehaviorExecutor:
                 self.rear_goal_rotate_speed_rad_s,
                 self.rear_goal_prerotate_timeout_s,
                 turn_sign=int(choice["turn_sign"]),
-                max_prerotate_control_steps=int(choice["required_control_steps"]),
+                max_prerotate_control_steps=(
+                    int(choice["required_control_steps"])
+                    if self.rear_goal_prerotate_step_sync_enabled
+                    else None
+                ),
                 step_sync_stall_timeout_s=(
                     self.rear_goal_prerotate_step_sync_stall_timeout_s
+                    if self.rear_goal_prerotate_step_sync_enabled
+                    else None
                 ),
-                step_command_gate=self._rear_goal_prerotate_gate,
-                delivery_retry_steps=self.rear_goal_prerotate_delivery_retry_steps,
+                step_command_gate=(
+                    self._rear_goal_prerotate_gate
+                    if self.rear_goal_prerotate_step_sync_enabled
+                    else None
+                ),
+                delivery_retry_steps=(
+                    self.rear_goal_prerotate_delivery_retry_steps
+                    if self.rear_goal_prerotate_step_sync_enabled
+                    else None
+                ),
                 post_budget_settle_steps=(
                     getattr(
                         self, "rear_goal_prerotate_post_budget_settle_steps", 3
@@ -7274,7 +7300,7 @@ class SemanticBehaviorExecutor:
                 rotation_label="rear-goal-safe-turn",
                 # The bridge applies exactly one fixed-dt target increment per
                 # gate/ack pair; do not let slow ROS wall time alter this path.
-                step_sync_budget_authoritative=True,
+                step_sync_budget_authoritative=self.rear_goal_prerotate_step_sync_enabled,
                 command_guard=self._rear_goal_rotation_command_safe,
             )
         finally:

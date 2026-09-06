@@ -189,6 +189,18 @@ class SixPanelRenderer:
         # the first room-panel world bounds, while its center is the initial
         # robot pose, so later frontier/trajectory points cannot zoom panel 2.
         self._occ_view_bounds: tuple[float, float, float, float] | None = None
+        # Decoding the same ROS grid payload repeatedly was a surprisingly
+        # large part of OCC latency: each render converted a Python list into
+        # a new NumPy array for up to four maps.  Payload dictionaries are
+        # replaced by the ROS bridge on update, so object identity is a safe
+        # and constant-time cache key.  Keep the cache bounded for long runs.
+        self._grid_cache: dict[int, tuple[Any, RawGrid | None]] = {}
+        self._display_costmap_cache_key: tuple[int, int] | None = None
+        self._display_costmap_cache: RawGrid | None = None
+        self._spatial_cache_key: tuple[int, int, int] | None = None
+        self._spatial_cache: Any = None
+        self._topology_cache_key: tuple[int, int, int] | None = None
+        self._topology_cache: Any = None
 
     def set_capture_panel_streams(self, enabled: bool) -> None:
         self.capture_panel_streams = bool(enabled)
@@ -218,6 +230,20 @@ class SixPanelRenderer:
             )
         except (TypeError, ValueError, OverflowError):
             return None
+
+    def _cached_raw_grid(self, payload: Any, default_frame: str = "tf_frame_map") -> RawGrid | None:
+        if not isinstance(payload, dict):
+            return None
+        key = id(payload)
+        cached = self._grid_cache.get(key)
+        if cached is not None and cached[0] is payload:
+            return cached[1]
+        value = self._raw_grid(payload, default_frame)
+        self._grid_cache[key] = (payload, value)
+        if len(self._grid_cache) > 16:
+            # Drop the oldest insertion without retaining old map arrays.
+            self._grid_cache.pop(next(iter(self._grid_cache)))
+        return value
 
     @staticmethod
     def _global_costmap_for_display(planning: RawGrid | None, costmap: RawGrid | None) -> RawGrid | None:
@@ -259,7 +285,7 @@ class SixPanelRenderer:
                 1,
                 98,
             ).astype(np.int32)
-        return RawGrid(
+        result = RawGrid(
             values=values,
             width=planning.width,
             height=planning.height,
@@ -269,6 +295,18 @@ class SixPanelRenderer:
             origin_y=planning.origin_y,
             origin_yaw=planning.origin_yaw,
         )
+        return result
+
+    def _cached_global_costmap_for_display(self, planning: RawGrid | None, costmap: RawGrid | None) -> RawGrid | None:
+        """Memoize the derived display costmap between unchanged map receipts."""
+        cache_key = (id(planning.values) if planning is not None else -1,
+                     id(costmap.values) if costmap is not None else -1)
+        if cache_key == self._display_costmap_cache_key:
+            return self._display_costmap_cache
+        result = self._global_costmap_for_display(planning, costmap)
+        self._display_costmap_cache_key = cache_key
+        self._display_costmap_cache = result
+        return result
 
     @staticmethod
     def _draw_live_detections(panel: Any, detections: list[dict[str, Any]], source_shape: tuple[int, int] | None, *, include_masks: bool = True, include_labels: bool = True) -> None:
@@ -682,10 +720,13 @@ class SixPanelRenderer:
                 "detections": [dict(item) for item in self.state.detections if isinstance(item, dict)],
             }
             rgb = None if self.state.rgb is None else self.state.rgb.copy()
-            planning = self._raw_grid(self.state.occupancy)
-            room = self._raw_grid(self.state.room_grid)
-            global_grid = self._raw_grid(self.state.global_costmap)
-            local_grid = self._raw_grid(self.state.local_costmap)
+            planning = self._cached_raw_grid(self.state.occupancy)
+            room = self._cached_raw_grid(self.state.room_grid)
+            global_grid = self._cached_raw_grid(self.state.global_costmap)
+            local_grid = self._cached_raw_grid(self.state.local_costmap)
+            map_revision = int(getattr(self.state, "map_revision", 0))
+            graph_revision = int(getattr(self.state, "graph_revision", 0))
+            navigation_revision = int(getattr(self.state, "navigation_revision", 0))
         step = self._physical_step(snapshot)
         if planning is None:
             global_grid = global_grid or planning
@@ -751,7 +792,7 @@ class SixPanelRenderer:
             planning, room, self.panel_size, room_step, int(step["step_index"]), world_bounds,
             view_scale=1.75, draw_global_plan=True,
         )
-        global_grid = self._global_costmap_for_display(planning, global_grid)
+        global_grid = self._cached_global_costmap_for_display(planning, global_grid)
         global_width = width // 2
         global_panel = self._canonical.render_map_panel(
             global_grid, (global_width, height), step, int(step["step_index"]),
@@ -781,10 +822,14 @@ class SixPanelRenderer:
             cv2.line(local_panel, (bar_right, bar_y - 4), (bar_right, bar_y + 4), (20, 20, 20), 2, cv2.LINE_AA)
             cv2.putText(local_panel, "1 m", (bar_left, bar_y - 7), cv2.FONT_HERSHEY_PLAIN, .8, (20, 20, 20), 1, cv2.LINE_AA)
         costmaps = np.concatenate([global_panel, local_panel], axis=1)
-        spatial = self._canonical.render_semantic_xy(
-            planning, self.panel_size, step, int(step["step_index"]), world_bounds,
-            view_scale=1.8, label_mode="all", draw_overview_inset=False,
-        )
+        spatial_key = (map_revision, graph_revision, navigation_revision)
+        if spatial_key != self._spatial_cache_key:
+            self._spatial_cache = self._canonical.render_semantic_xy(
+                planning, self.panel_size, step, int(step["step_index"]), world_bounds,
+                view_scale=1.8, label_mode="all", draw_overview_inset=False,
+            )
+            self._spatial_cache_key = spatial_key
+        spatial = self._spatial_cache
         topology_step = dict(step)
         topology_candidates = dict(step.get("semantic_candidates") or {})
         raw_topology_candidates = list(topology_candidates.get("candidates") or [])
@@ -818,7 +863,13 @@ class SixPanelRenderer:
         topology_graph = step.get("unified_graph")
         if isinstance(topology_graph, dict):
             topology_step["unified_graph"] = topology_graph
-        topology = self._canonical.render_topology(self.panel_size, topology_step, int(step["step_index"]))
+        topology_key = (map_revision, graph_revision, navigation_revision)
+        if topology_key != self._topology_cache_key:
+            self._topology_cache = self._canonical.render_topology(
+                self.panel_size, topology_step, int(step["step_index"])
+            )
+            self._topology_cache_key = topology_key
+        topology = self._topology_cache
         original_panels: dict[int, bytes] = {}
         for panel_index, panel in ((3, room_panel), (6, topology)):
             panel_ok, panel_encoded = cv2.imencode(
@@ -1171,8 +1222,8 @@ class _WebHandler(BaseHTTPRequestHandler):
                 "scene_id": graph.get("scene_id"),
                 "graph_revision": graph.get("graph_revision"),
                 "capture_step": graph.get("capture_step"),
-                "node_count": len(graph.get("nodes") or []),
-                "edge_count": len(graph.get("edges") or []),
+                "node_count": len(graph.get("nodes")) if isinstance(graph.get("nodes"), list) else int(graph.get("node_count", 0) or 0),
+                "edge_count": len(graph.get("edges")) if isinstance(graph.get("edges"), list) else int(graph.get("edge_count", 0) or 0),
             }
         mllm = [event_view(item) for item in (snapshot.get("mllm_events") or []) if isinstance(item, dict)]
         stage_limits = {"M1": 8, "M2": 8, "M3": 10}
@@ -1301,7 +1352,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         if path == "/api/state":
             self._json({**self.state.snapshot(), "safety": self.gate.snapshot()}); return
         if path == "/api/state-summary":
-            summary = self._state_summary({**self.state.snapshot(), "safety": self.gate.snapshot()})
+            summary = self._state_summary({**self.state.summary_snapshot(), "safety": self.gate.snapshot()})
             recorder = getattr(self, "recorder", None)
             if recorder is not None:
                 status = recorder.status()
@@ -2150,6 +2201,14 @@ class PhysicalGateway:
         threading.Thread(target=camera_overlay_loop, name="physical-camera-overlay-10hz", daemon=True).start()
 
         def render_loop() -> None:
+            # Keep the composite at the advertised 5 Hz while ensuring one
+            # render can never overlap another.  Heavy map products are
+            # cached above, so this pacing no longer starves sensor callbacks.
+            try:
+                render_hz = float(os.environ.get("PHYSICAL_NAV_RENDER_HZ", "5"))
+            except (TypeError, ValueError):
+                render_hz = 5.0
+            render_period = 1.0 / max(0.5, min(10.0, render_hz))
             while True:
                 render_started = time.monotonic()
                 try:
@@ -2197,16 +2256,11 @@ class PhysicalGateway:
                             self.recorder.record_state_snapshot(self.state.snapshot())
                 except Exception as exc:
                     self.state.last_error = str(exc)
-                # The camera perception overlay is kept at 10 Hz above.  The
-                # composite contains four full map rasters plus topology and
-                # several JPEG encodes; on the physical CPU it is the heavy
-                # product, and rebuilding it at 5 Hz starves ROS callbacks.
-                # Refresh it at 0.5 Hz while the browser continues polling at
-                # 5 Hz, so the browser always gets a cached frame and never
-                # causes a render or JPEG encode in its request path.  The
-                # live camera overlay remains 10 Hz; map/topology panels are
-                # deliberately lower-rate diagnostics.
-                time.sleep(max(0.0, 2.0 - (time.monotonic() - render_started)))
+                # The browser only reads the cached JPEG; it never performs a
+                # render or JPEG encode in the request path.  Sleep to the
+                # configured cadence and yield immediately when a slow map
+                # update exceeds the budget.
+                time.sleep(max(0.0, render_period - (time.monotonic() - render_started)))
         threading.Thread(target=render_loop, daemon=True).start()
         if self.qwen is not None and self.qwen_auto_interval > 0:
             def qwen_loop() -> None:

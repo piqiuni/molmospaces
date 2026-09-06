@@ -86,9 +86,13 @@ executor:
   post_interaction_exit_observation_settle_s: 0.5
   post_interaction_exit_observation_view_timeout_s: 6.0
   post_interaction_exit_observation_return_home: true
-  # The default pre-rotation gate advances on simulator step-sync messages,
-  # which do not exist on Go2. Let move_base/DWA perform physical yaw control.
-  rear_goal_prerotate_enabled: false
+  # Enable the semantic executor's collision-checked in-place turn whenever
+  # the selected goal lies behind the robot. DWA's independent rear-path
+  # branch remains disabled to avoid issuing two competing yaw commands.
+  rear_goal_prerotate_enabled: true
+  # The physical bridge has no simulator step-sync/fresh-command acknowledgement.
+  # Close the loop from live odometry instead of waiting forever for one.
+  rear_goal_prerotate_step_sync_enabled: false
   # Unlike simulator exploration, keep a physical frontier goal active while
   # DWA performs its collision-checked terminal rotation.
   explore_terminal_yaw_enabled: true

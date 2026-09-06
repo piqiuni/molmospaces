@@ -63,6 +63,14 @@ class RuntimeState:
             "last_disconnect_at": 0.0,
         }
         self.counters = {"frames": 0, "detections": 0, "graph_updates": 0, "dropped": 0}
+        # Monotonic revisions let renderers reuse expensive map/graph products
+        # when only the camera frame changed.  Keeping these counters here is
+        # cheaper than hashing megabyte-sized OccupancyGrid payloads on every
+        # six-panel tick.
+        self.revision = 0
+        self.map_revision = 0
+        self.graph_revision = 0
+        self.navigation_revision = 0
         self.last_error = ""
 
     def update_frame(self, **kwargs: Any) -> None:
@@ -70,6 +78,7 @@ class RuntimeState:
             for key, value in kwargs.items():
                 setattr(self, key, value)
             self.counters["frames"] += 1
+            self.revision += 1
 
     def advance_navigation_step(self) -> int:
         with self._lock:
@@ -94,6 +103,13 @@ class RuntimeState:
                 setattr(self, meta_attr, {k: v for k, v in value.items() if k not in {"detections", "objects"}})
                 value = value.get("detections", value.get("objects", []))
             setattr(self, name, value)
+            self.revision += 1
+            if name in {"occupancy", "room_grid", "global_costmap", "local_costmap"}:
+                self.map_revision += 1
+            elif name in {"graph", "mapped_detections", "consistency"}:
+                self.graph_revision += 1
+            elif name == "navigation":
+                self.navigation_revision += 1
             if name == "detections":
                 self.counters["detections"] = len(value) if isinstance(value, list) else 0
             elif name == "graph":
@@ -197,6 +213,47 @@ class RuntimeState:
                 "mllm_events": copy.deepcopy(self.mllm_events),
                 "navigation": copy.deepcopy(self.navigation),
                 "link": copy.deepcopy(self.link),
+                "counters": dict(self.counters),
+                "last_error": self.last_error,
+                "revision": self.revision,
+                "map_revision": self.map_revision,
+                "graph_revision": self.graph_revision,
+                "navigation_revision": self.navigation_revision,
+                "read_only": True,
+                "status": "READ_ONLY_BLOCKED",
+                "generated_at": time.time(),
+            }
+
+    def summary_snapshot(self) -> dict[str, Any]:
+        """Return only fields consumed by the live dashboard.
+
+        The full snapshot deep-copies the accumulated semantic graph and
+        MLLM trace.  Doing that once per browser poll caused visible pauses as
+        the graph grew.  The summary endpoint only needs graph counts and
+        compact recent events, so avoid copying map payloads and graph nodes.
+        """
+        with self._lock:
+            graph = self.graph if isinstance(self.graph, dict) else {}
+            graph_summary = {
+                "scene_id": graph.get("scene_id"),
+                "graph_revision": graph.get("graph_revision"),
+                "capture_step": graph.get("capture_step"),
+                "node_count": len(graph.get("nodes") or []),
+                "edge_count": len(graph.get("edges") or []),
+            }
+            return {
+                "frame_seq": self.frame_seq,
+                "navigation_step": self.navigation_step,
+                "frame_stamp": self.frame_stamp,
+                "telemetry": copy.deepcopy(self.telemetry),
+                "detections": copy.deepcopy(self.detections),
+                "detection_meta": dict(self.detection_meta),
+                "mapped_detections": copy.deepcopy(self.mapped_detections),
+                "graph": graph_summary,
+                "consistency": copy.deepcopy(self.consistency),
+                "mllm_events": copy.deepcopy(self.mllm_events[-40:]),
+                "navigation": copy.deepcopy(self.navigation),
+                "link": dict(self.link),
                 "counters": dict(self.counters),
                 "last_error": self.last_error,
                 "read_only": True,
