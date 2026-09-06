@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -184,6 +185,10 @@ class SixPanelRenderer:
         # JPEG encodes on every 5 Hz render tick.
         self.capture_panel_streams = False
         self.latest_panel_streams: dict[int, bytes] = {}
+        # OCC viewport is locked once at startup.  Its size is copied from
+        # the first room-panel world bounds, while its center is the initial
+        # robot pose, so later frontier/trajectory points cannot zoom panel 2.
+        self._occ_view_bounds: tuple[float, float, float, float] | None = None
 
     def set_capture_panel_streams(self, enabled: bool) -> None:
         self.capture_panel_streams = bool(enabled)
@@ -625,6 +630,34 @@ class SixPanelRenderer:
                 continue
             kind = str(node.get("type", node.get("node_type", "object")))
             color = {"room": (255, 160, 30), "portal": (30, 220, 255), "container": (180, 80, 220)}.get(kind, (60, 190, 80))
+            if kind == "portal":
+                center = node.get("aabb_center") or node.get("centroid") or []
+                size = node.get("aabb_size") or []
+                attrs = node.get("attributes") if isinstance(node.get("attributes"), dict) else {}
+                orientation = attrs.get("orientation") or node.get("orientation")
+                yaw = attrs.get("yaw")
+                if isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+                    try:
+                        yaw = math.atan2(
+                            2.0 * float(orientation[3]) * float(orientation[2]),
+                            1.0 - 2.0 * float(orientation[2]) * float(orientation[2]),
+                        )
+                    except (TypeError, ValueError):
+                        yaw = None
+                try:
+                    if len(center) >= 2 and len(size) >= 2 and yaw is not None:
+                        half_x, half_y = abs(float(size[0])) * 0.5, abs(float(size[1])) * 0.5
+                        cos_yaw, sin_yaw = math.cos(float(yaw)), math.sin(float(yaw))
+                        corners = []
+                        for local_x, local_y in ((-half_x, -half_y), (-half_x, half_y), (half_x, half_y), (half_x, -half_y)):
+                            world_x = float(center[0]) + cos_yaw * local_x - sin_yaw * local_y
+                            world_y = float(center[1]) + sin_yaw * local_x + cos_yaw * local_y
+                            corners.append(world_pixel([world_x, world_y, 0.0]))
+                        if all(corner is not None for corner in corners):
+                            cv2.polylines(canvas, [np.asarray(corners, dtype=np.int32)], True, color, max(2, min(width, height) // 180))
+                            continue
+                except (TypeError, ValueError, IndexError):
+                    pass
             cv2.circle(canvas, point, max(2, min(width, height) // 140), color, -1)
         panel = cv2.resize(canvas, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
         status = str(consistency.get("status", "waiting")) if isinstance(consistency, dict) else "waiting"
@@ -660,7 +693,24 @@ class SixPanelRenderer:
         else:
             global_grid = global_grid or planning
             local_grid = local_grid or planning
+        # Crop the OCC view to the currently known cells.  The SLAM grid is
+        # preallocated much larger than the explored area (often <2% known),
+        # so using a multi-metre margin makes panel 2 mostly unknown space.
         world_bounds = known_world_bounds(planning, margin_m=2.5) if planning is not None else None
+        if self._occ_view_bounds is None and world_bounds is not None:
+            pose = step.get("pose") or []
+            try:
+                cx, cy = float(pose[0]), float(pose[1])
+            except (TypeError, ValueError, IndexError):
+                cx = (world_bounds[0] + world_bounds[2]) * 0.5
+                cy = (world_bounds[1] + world_bounds[3]) * 0.5
+            half_w = max(1.0, (world_bounds[2] - world_bounds[0]) * 0.5)
+            half_h = max(1.0, (world_bounds[3] - world_bounds[1]) * 0.5)
+            self._occ_view_bounds = (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+        # Keep the OCC viewport aligned with the current explored extent. A
+        # startup-locked viewport can leave the robot/path outside the panel
+        # after the map grows or the origin shifts.
+        occ_view_bounds = world_bounds
         width, height = self.panel_size
         if rgb is None:
             camera = np.full((height, width, 3), 235, dtype=np.uint8)
@@ -673,24 +723,44 @@ class SixPanelRenderer:
         self._draw_live_detections(camera, snapshot["detections"], None if rgb is None else (rgb.shape[0], rgb.shape[1]), include_masks=False)
         occ = self._canonical.render_map_panel(
             planning, self.panel_size, step, int(step["step_index"]),
-            title="OCC", kind="occupancy", world_bounds=world_bounds,
+            title="OCC", kind="occupancy", world_bounds=occ_view_bounds,
             draw_global_plan=True, draw_local_plan=False, draw_frontiers=True,
             draw_semantic_candidates=True, draw_route_plan=False,
             draw_interaction_target_links=True,
-            view_scale=1.35,
+            # Match panel 3 (room segments) so OCC and room views use the
+            # same viewport framing and can be compared directly.
+            # Panel 2 should show a slightly wider OCC context than the
+            # room/costmap panels; lower scale means less zoom and more area.
+            view_scale=1.45,
         )
         draw_task_subgoal_header(occ, step, box_width_px=width // 2 - 10, background_alpha=.55)
+        # Showcase spatial-understanding panel should show room geometry and
+        # the global route only; suppress the two exploratory subgoal markers
+        # that belong to the debug/navigation view.
+        room_step = dict(step)
+        room_step["current_subgoal"] = None
+        room_step["selected_subgoal"] = None
+        room_step["semantic_candidates"] = {"candidates": []}
+        # OfflineSixPanelRenderer reads the canonical semantic fields rather
+        # than the convenience keys above. Mark the selection inactive and
+        # clear executor geometry so panel 03 cannot draw either selected or
+        # alternate subgoal markers.
+        room_step["semantic_selection"] = {"active": False}
+        room_step["semantic_execution_state"] = {}
         room_panel = self._canonical.render_room_panel(
-            planning, room, self.panel_size, step, int(step["step_index"]), world_bounds,
+            planning, room, self.panel_size, room_step, int(step["step_index"]), world_bounds,
             view_scale=1.75, draw_global_plan=True,
         )
         global_grid = self._global_costmap_for_display(planning, global_grid)
         global_width = width // 2
         global_panel = self._canonical.render_map_panel(
             global_grid, (global_width, height), step, int(step["step_index"]),
-            title="GLOBAL COSTMAP", kind="costmap", world_bounds=world_bounds,
+            title="GLOBAL COSTMAP", kind="costmap", world_bounds=None,
             draw_global_plan=True, draw_local_plan=False, draw_frontiers=True,
             draw_semantic_candidates=True,
+            # Keep panel 4 framed identically to panel 3 (room segments) and
+            # panel 2 (OCC); only the raster values differ.
+            view_scale=1.75,
         )
         local_panel = self._canonical.render_map_panel(
             local_grid, (width - global_width, height), step, int(step["step_index"]),
@@ -741,26 +811,12 @@ class SixPanelRenderer:
         # are not interaction targets.  Preserve rooms/ordinary objects and
         # retain only door/portal and fridge containers in the topology's
         # interaction layer. Cabinets/drawers remain detector evidence only.
-        topology_graph = dict(step.get("unified_graph") or {})
+        # Panel 6 is a historical semantic interaction graph, not a current
+        # camera-view graph.  Keep every accumulated node and edge (including
+        # ordinary objects and previously observed containers); only the
+        # interaction-candidate list above is policy-filtered.
+        topology_graph = step.get("unified_graph")
         if isinstance(topology_graph, dict):
-            filtered_nodes = []
-            for node in list(topology_graph.get("nodes") or []):
-                if not isinstance(node, dict):
-                    continue
-                if str(node.get("type") or node.get("node_type") or "").casefold() != "container":
-                    filtered_nodes.append(node)
-                    continue
-                node_text = " ".join(
-                    str(value or "").casefold()
-                    for value in (
-                        node.get("label"), node.get("name"),
-                        (node.get("attributes") or {}).get("semantic_name"),
-                        (node.get("attributes") or {}).get("category"),
-                    )
-                )
-                if any(marker in node_text for marker in ("fridge", "refrigerator")):
-                    filtered_nodes.append(node)
-            topology_graph["nodes"] = filtered_nodes
             topology_step["unified_graph"] = topology_graph
         topology = self._canonical.render_topology(self.panel_size, topology_step, int(step["step_index"]))
         original_panels: dict[int, bytes] = {}
@@ -997,11 +1053,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                 "confidence": item.get("confidence"),
                 "bbox": item.get("bbox"),
                 "depth_median_m": item.get("depth_median_m"),
+                # The ROS gateway needs the sensor-frame geometry to apply
+                # the same TF as segmented_cloud_world.  Omitting these
+                # fields forces it to fall back to the worker's legacy,
+                # telemetry-frame world coordinates.
+                "camera_position": item.get("camera_position"),
+                "camera_box3d_center": item.get("camera_box3d_center"),
+                "camera_box3d_size": item.get("camera_box3d_size"),
                 "position": item.get("world_position", item.get("position")),
                 "world_position": item.get("world_position"),
                 "world_box3d_center": item.get("world_box3d_center"),
                 "world_box3d_size": item.get("world_box3d_size"),
                 "world_box3d_orientation": item.get("world_box3d_orientation"),
+                # Preserve the fitted OBB yaw through the compact ROS-state
+                # endpoint.  The gateway must pass this to semantic mapping;
+                # otherwise the portal path sees yaw=None and reconstructs a
+                # default yaw=0, which can rotate the interaction normal by
+                # 90 degrees for doors whose long edge is along Y.
+                "yaw": item.get("yaw"),
+                "world_box3d_yaw": item.get("world_box3d_yaw", item.get("yaw")),
                 "world_box3d_marker_size": item.get("world_box3d_marker_size"),
                 "aabb_center": item.get("aabb_center"),
                 "aabb_size": item.get("aabb_size"),
@@ -1217,6 +1287,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self.send_error(404); return
             self.send_response(200); self.send_header("Content-Type", "image/png"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "public, max-age=3600"); self.end_headers(); self.wfile.write(data); return
         if path in {"/showcase-dark", "/showcase-light", "/showcase-academic"}:
+            if path != "/showcase-dark":
+                self.send_error(404, "Only showcase-dark is enabled during physical testing")
+                return
             if path.endswith("academic"):
                 html = ACADEMIC_SHOWCASE_HTML.encode()
             else:
@@ -1263,6 +1336,10 @@ class _WebHandler(BaseHTTPRequestHandler):
             # this keeps the normal state endpoint lightweight while allowing
             # independent canvas redraws from semantic data.
             self._json(self.state.visualization_snapshot()); return
+        if path == "/api/occupancy":
+            # Dedicated latest-only map endpoint.  Do not make the browser
+            # download RGB/depth/detections when it only needs OCC.
+            self._json(self.state.occupancy_snapshot()); return
         if path == "/api/raw-frame":
             self._json(self.state.raw_frame()); return
         if path == "/api/health":
@@ -1600,7 +1677,7 @@ class _WebHandler(BaseHTTPRequestHandler):
 
 _HTML = """<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Go2 Physical Interactive Navigation</title>
 <style>
-:root{color-scheme:dark;--bg:#0b0d11;--card:#141821;--line:#2e3748;--blue:#67a7ff;--green:#54d68b;--amber:#ffca58;--red:#ff6c67;--muted:#9ba8ba}*{box-sizing:border-box}body{font-family:Inter,"Noto Sans SC",system-ui,sans-serif;background:var(--bg);color:#edf2fa;margin:0;padding:14px}.title{display:flex;align-items:center;gap:12px;margin:0 0 10px;font-size:23px}.readonly{font-size:13px;color:#101418;background:var(--amber);padding:4px 9px;border-radius:99px}.dashboard{display:grid;grid-template-columns:minmax(640px,1fr) 430px;gap:12px;align-items:start}.left{min-width:0}.overview-wrap{position:relative;width:100%;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#111}.overview{display:block;width:100%;border:0;background:#111}.overview-camera{position:absolute;z-index:2;left:0;top:0;width:33.333333%;height:50%;object-fit:fill;background:#111;border-right:1px solid #aaa;border-bottom:1px solid #aaa}.ratebar{display:flex;gap:14px;flex-wrap:wrap;color:var(--green);font-size:13px;padding:7px 2px}.mllm-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.right{display:grid;gap:10px}.card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:10px;min-width:0;box-shadow:0 4px 14px #0004}.card h3{display:flex;align-items:center;justify-content:space-between;margin:0 0 8px;color:var(--blue);font-size:15px}.hint{color:var(--muted);font-size:11px;font-weight:400}.visual{width:100%;display:block;border-radius:6px;border:1px solid #343c49;background:#0d0f13}.events{max-height:390px;overflow:auto;display:grid;gap:8px}.event{display:grid;grid-template-columns:minmax(76px,.8fr) minmax(105px,1.25fr) minmax(90px,1fr);gap:7px;padding:7px;border:1px solid #313947;border-radius:8px;background:#0e1218;font-size:11px}.event-col{min-width:0;overflow:hidden}.label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}.thumb{width:100%;height:70px;object-fit:cover;border-radius:4px;border:1px solid #354053}.chips{display:flex;gap:4px;flex-wrap:wrap}.chip{display:inline-block;max-width:100%;padding:2px 5px;border-radius:5px;background:#263248;color:#cfe1ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.prompt,.result{line-height:1.35;word-break:break-word}.result{color:#d9f7e6}.meta{grid-column:1/-1;color:#7f8da1;font-size:10px}.empty{height:110px;display:grid;place-items:center;color:#768397;border:1px dashed #354052;border-radius:8px}.state-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.metric{padding:9px 7px;border:1px solid #303a4a;border-radius:8px;background:#0e1218;text-align:center}.metric .icon{font-size:19px}.metric .value{font-size:16px;font-weight:700;margin-top:2px}.metric .name{font-size:10px;color:var(--muted)}.statusline{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.badge{padding:3px 7px;border-radius:99px;font-size:11px;background:#263248;color:#cfe1ff}.badge.good{background:#173b2b;color:#7ff0ae}.badge.warn{background:#493b14;color:#ffd46c}.badge.bad{background:#4b2021;color:#ff9692}.m3box{display:grid;gap:8px}.m3head{display:flex;align-items:center;gap:8px}.m3status{font-size:22px;font-weight:800}.m3details{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.mini{background:#0e1218;border:1px solid #303a4a;border-radius:7px;padding:7px}.mini b{display:block;color:#eaf1fc;font-size:12px}.mini span{font-size:10px;color:var(--muted)}@media(max-width:1150px){.dashboard{grid-template-columns:1fr}.right{grid-template-columns:repeat(3,minmax(0,1fr));grid-row:2}.mllm-grid{grid-row:3}}@media(max-width:800px){body{padding:8px}.dashboard{display:block}.right,.mllm-grid{grid-template-columns:1fr;margin-top:10px}.event{grid-template-columns:1fr 1fr}.meta{grid-column:1/-1}}
+:root{color-scheme:dark;--bg:#0b0d11;--card:#141821;--line:#2e3748;--blue:#67a7ff;--green:#54d68b;--amber:#ffca58;--red:#ff6c67;--muted:#9ba8ba}*{box-sizing:border-box}body{font-family:Inter,"Noto Sans SC",system-ui,sans-serif;background:var(--bg);color:#edf2fa;margin:0;padding:14px}.title{display:flex;align-items:center;gap:12px;margin:0 0 10px;font-size:23px}.readonly{font-size:13px;color:#101418;background:var(--amber);padding:4px 9px;border-radius:99px}.dashboard{display:grid;grid-template-columns:minmax(640px,1fr) 430px;gap:12px;align-items:start}.left{min-width:0}.overview-wrap{position:relative;width:100%;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#111}.overview{display:block;width:100%;border:0;background:#111}.overview-camera{position:absolute;z-index:2;left:0;top:0;width:33.333333%;height:50%;object-fit:fill;background:#111;border-right:1px solid #aaa;border-bottom:1px solid #aaa}.ratebar{display:flex;gap:14px;flex-wrap:wrap;color:var(--green);font-size:13px;padding:7px 2px}.mllm-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.right{display:grid;gap:10px}.card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:10px;min-width:0;box-shadow:0 4px 14px #0004}.card h3{display:flex;align-items:center;justify-content:space-between;margin:0 0 8px;color:var(--blue);font-size:15px}.hint{color:var(--muted);font-size:11px;font-weight:400}.visual{width:100%;display:block;border-radius:6px;border:1px solid #343c49;background:#0d0f13}.events{max-height:390px;overflow:auto;display:grid;gap:8px}.event{display:grid;grid-template-columns:minmax(76px,.8fr) minmax(105px,1.25fr) minmax(90px,1fr);gap:7px;padding:7px;border:1px solid #313947;border-radius:8px;background:#0e1218;font-size:11px}.event-col{min-width:0;overflow:hidden}.label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}.thumb{width:100%;height:auto;aspect-ratio:16/9;object-fit:contain;border-radius:4px;border:1px solid #354053;background:#070d15}.chips{display:flex;gap:4px;flex-wrap:wrap}.chip{display:inline-block;max-width:100%;padding:2px 5px;border-radius:5px;background:#263248;color:#cfe1ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.prompt,.result{line-height:1.35;word-break:break-word}.result{color:#d9f7e6}.meta{grid-column:1/-1;color:#7f8da1;font-size:10px}.empty{height:110px;display:grid;place-items:center;color:#768397;border:1px dashed #354052;border-radius:8px}.state-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.metric{padding:9px 7px;border:1px solid #303a4a;border-radius:8px;background:#0e1218;text-align:center}.metric .icon{font-size:19px}.metric .value{font-size:16px;font-weight:700;margin-top:2px}.metric .name{font-size:10px;color:var(--muted)}.statusline{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.badge{padding:3px 7px;border-radius:99px;font-size:11px;background:#263248;color:#cfe1ff}.badge.good{background:#173b2b;color:#7ff0ae}.badge.warn{background:#493b14;color:#ffd46c}.badge.bad{background:#4b2021;color:#ff9692}.m3box{display:grid;gap:8px}.m3head{display:flex;align-items:center;gap:8px}.m3status{font-size:22px;font-weight:800}.m3details{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.mini{background:#0e1218;border:1px solid #303a4a;border-radius:7px;padding:7px}.mini b{display:block;color:#eaf1fc;font-size:12px}.mini span{font-size:10px;color:var(--muted)}@media(max-width:1150px){.dashboard{grid-template-columns:1fr}.right{grid-template-columns:repeat(3,minmax(0,1fr));grid-row:2}.mllm-grid{grid-row:3}}@media(max-width:800px){body{padding:8px}.dashboard{display:block}.right,.mllm-grid{grid-template-columns:1fr;margin-top:10px}.event{grid-template-columns:1fr 1fr}.meta{grid-column:1/-1}}
 </style>
 <style>
 /* The dashboard always stays within the viewport. Resizing either zoom card
@@ -1625,7 +1702,7 @@ _HTML = """<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='v
 @media(max-width:1150px){.right .card:nth-child(2),.right .card:nth-child(3){width:100%!important;max-width:none}}
 </style>
 <h1 class='title'>Go2 Physical Interactive Navigation <span class='readonly'>动作控制需显式启动</span></h1>
-<main class='dashboard'><div class='left'><div class='overview-wrap'><img id='overview' class='overview' src='/snapshot.jpg' alt='实时六面板'><img id='overview-camera' class='overview-camera' src='/camera-box-overlay.jpg' alt='10 Hz 实时感知'></div><div class='ratebar'><span>● 导航 5 Hz</span><span>● YOLOE / 建图输入 10 Hz</span><span>● 网页 5 Hz</span><span>● Go2 人工遥控</span></div><div class='mllm-grid'><section class='card'><h3>1 · M1 VLM 感知 <span class='hint'>图片 → 简化问题 → 结果</span></h3><div id='m1' class='events'></div></section><section class='card'><h3>2 · M2 LLM 子目标 <span class='hint'>历史 + 候选 + 目标</span></h3><div id='m2' class='events'></div></section><section class='card'><h3>3 · M3 交互评价 <span class='hint'>对象类别 · 周期 · 历史</span></h3><div id='m3' class='m3box'></div></section></div></div><aside class='right'><section class='card'><h3>4 · Go2 当前状态 <span id='stamp' class='hint'>连接中</span></h3><div class='go2-layout'><div id='go2'></div><div class='go2-controls' aria-label='运动控制'><button id='nav-start'>Start</button><button id='nav-restart'>重启导航栈 + Goal</button><input id='nav-goal' placeholder='goalname' maxlength='80' autocomplete='off'><button id='nav-stop' class='danger'>Stop</button><button id='nav-enable'>开启运动</button><span class='control-status' id='control-status'>Esc / S：Stop</span></div></div></section><section class='card'><h3>5 · 图 1 放大 <span class='hint'>拖动右下角调宽高 · box + seg</span></h3><img id='panel1' class='visual' src='/camera-overlay.jpg' alt='高清图1放大'></section><section class='card'><h3>6 · 图 5 放大 <span class='hint'>拖动右下角调宽高 · 语义地图 + 3D box</span></h3><img id='panel5' class='visual' src='/panel5.jpg' alt='图5放大'></section></aside></main>
+<main class='dashboard'><div class='left'><div class='overview-wrap'><img id='overview' class='overview' src='/snapshot.jpg' alt='实时六面板'><img id='overview-camera' class='overview-camera' src='/camera-box-overlay.jpg' alt='10 Hz 实时感知'></div><div class='ratebar'><span>● 导航 5 Hz</span><span>● YOLOE / 建图输入 10 Hz</span><span>● 网页 10 Hz</span><span>● Go2 人工遥控</span></div><div class='mllm-grid'><section class='card'><h3>1 · M1 VLM 感知 <span class='hint'>图片 → 简化问题 → 结果</span></h3><div id='m1' class='events'></div></section><section class='card'><h3>2 · M2 LLM 子目标 <span class='hint'>历史 + 候选 + 目标</span></h3><div id='m2' class='events'></div></section><section class='card'><h3>3 · M3 交互评价 <span class='hint'>对象类别 · 周期 · 历史</span></h3><div id='m3' class='m3box'></div></section></div></div><aside class='right'><section class='card'><h3>4 · Go2 当前状态 <span id='stamp' class='hint'>连接中</span></h3><div class='go2-layout'><div id='go2'></div><div class='go2-controls' aria-label='运动控制'><button id='nav-start'>Start</button><button id='nav-restart'>重启导航栈 + Goal</button><input id='nav-goal' placeholder='goalname' maxlength='80' autocomplete='off'><button id='nav-stop' class='danger'>Stop</button><button id='nav-enable'>开启运动</button><span class='control-status' id='control-status'>Esc / S：Stop</span></div></div></section><section class='card panel-suppressed'><h3>5 · 图 1 放大 <span class='hint'>当前测试已关闭</span></h3><div class='empty'>暂时关闭以测试网页负载</div></section><section class='card panel-suppressed'><h3>6 · 图 5 放大 <span class='hint'>当前测试已关闭</span></h3><div class='empty'>暂时关闭以测试网页负载</div></section></aside></main>
 <script>
 const q=s=>document.querySelector(s), text=v=>String(v??'').replace(/\\s+/g,' ').trim(), clip=(v,n=150)=>{v=text(v);return v.length>n?v.slice(0,n)+'…':v};
 async function navControl(action, goal=''){
@@ -1669,11 +1746,12 @@ function contextCandidates(e){const c=e?.context?.candidates||e?.payload?.candid
 const classNames={door:'门',fridge:'冰箱',refrigerator:'冰箱',cabinet:'柜子',closet:'衣柜',wardrobe:'衣柜',drawer:'抽屉',drawer_cabinet:'抽屉柜'};
 function classZh(value){const key=text(value).toLowerCase().replace(/[ -]+/g,'_');return classNames[key]||text(value)||'目标物体'}
 function eventObjectClass(e){let id=text(e?.object_id||e?.target_kind||e?.context?.semantic_class||'');if(id.startsWith('physical_')){const parts=id.slice(9).split('_');while(parts.length>1&&/^-?\\d+$/.test(parts[parts.length-1]))parts.pop();id=parts.join('_')}return classZh(id)}
-function m1DisplayName(e){const label=text(e?.m1_input_label||eventObjectClass(e)).replaceAll('_',' '),raw=text(e?.m1_input_object_id??e?.m1_input_track_id??e?.object_id),match=raw.match(/(\\d+)$/);return label+(match?' #'+Number(match[1]):'')}
-function m1InputCanvas(e,index){const canvas=make('canvas','thumb');canvas.width=320;canvas.height=180;const key=text(e?.m1_input_image_key);if(!key)return canvas;const image=new Image();image.onload=()=>{const c=canvas.getContext('2d'),sx=canvas.width/image.width,sy=canvas.height/image.height;c.drawImage(image,0,0,canvas.width,canvas.height);const b=e?.m1_input_bbox||[];if(b.length>=4){c.strokeStyle='#ffe04b';c.lineWidth=3;c.strokeRect(Number(b[0])*sx,Number(b[1])*sy,(Number(b[2])-Number(b[0]))*sx,(Number(b[3])-Number(b[1]))*sy);const name=m1DisplayName(e),x=Math.max(0,Number(b[0])*sx),y=Math.max(15,Number(b[1])*sy-4);c.font='bold 14px sans-serif';const w=c.measureText(name).width+8;c.fillStyle='#ffe04b';c.fillRect(x,y-15,w,18);c.fillStyle='#101418';c.fillText(name,x+4,y)}};image.src='/api/m1-input-image?key='+encodeURIComponent(key)+'&v='+(e.timestamp||index);return canvas}
-function simplifiedQuestion(e,stage){if(stage==='M1')return `判断图中的${eventObjectClass(e)}是否可交互，并识别它的开合状态。`;if(stage==='M2')return '结合历史和候选目标，选择下一个导航子目标。';return `判断画面中的${eventObjectClass(e)}是否已经打开，并给出置信度。`}
-function m1Prompt(e){return e?.instruction||e?.prompt||e?.request?.instruction||e?.request?.prompt||simplifiedQuestion(e,'M1')}
-function m1Answer(e){let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??e?.result??'';if(typeof raw==='object')raw=JSON.stringify(raw);return raw||'（无 M1 回答）'}
+function isRoomM1(e){if(e?.m1_input_image_key||e?.object_id||e?.m1_input_label)return false;let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??'';try{const o=typeof raw==='string'?JSON.parse(raw):raw;return !!(o&&('room_attribute' in o||'room_id' in o))}catch(_){return false}}
+function m1DisplayName(e){if(isRoomM1(e))return '房间属性';const label=text(e?.m1_input_label||eventObjectClass(e)).replaceAll('_',' '),raw=text(e?.m1_input_object_id??e?.m1_input_track_id??e?.object_id),match=raw.match(/(\\d+)$/);return label+(match?' #'+Number(match[1]):'')}
+function m1InputCanvas(e,index){const kind=text(e?.target_kind||e?.context?.target_kind||'').toLowerCase();if(isRoomM1(e)||kind==='room'||kind==='room_attribute'||kind.includes('room'))return null;const canvas=make('canvas','thumb');canvas.width=320;canvas.height=180;const key=text(e?.m1_input_image_key);if(!key)return null;const image=new Image();image.onload=()=>{const c=canvas.getContext('2d'),sx=canvas.width/image.width,sy=canvas.height/image.height;c.drawImage(image,0,0,canvas.width,canvas.height);const b=e?.m1_input_bbox||[];if(b.length>=4){c.strokeStyle='#ffe04b';c.lineWidth=3;c.strokeRect(Number(b[0])*sx,Number(b[1])*sy,(Number(b[2])-Number(b[0]))*sx,(Number(b[3])-Number(b[1]))*sy);const name=m1DisplayName(e),x=Math.max(0,Number(b[0])*sx),y=Math.max(15,Number(b[1])*sy-4);c.font='bold 14px sans-serif';const w=c.measureText(name).width+8;c.fillStyle='#ffe04b';c.fillRect(x,y-15,w,18);c.fillStyle='#101418';c.fillText(name,x+4,y)}};image.src='/api/m1-input-image?key='+encodeURIComponent(key)+'&v='+(e.timestamp||index);return canvas}
+function simplifiedQuestion(e,stage){if(stage==='M1'){const k=eventObjectClass(e),raw=text(e?.m1_input_label||e?.context?.semantic_class||'').toLowerCase();if(raw==='locker'||k==='locker')return '判断图中标注的 locker 是否为冰箱，给出冰箱置信度，并识别其开合状态。';return `判断图中的${k}是否可交互，并识别它的开合状态。`;}if(stage==='M2')return '结合历史和候选目标，选择下一个导航子目标。';return `判断画面中的${eventObjectClass(e)}是否已经打开，并给出置信度。`}
+function m1Prompt(e){const kind=text(e?.target_kind||e?.context?.target_kind||'').toLowerCase();if(isRoomM1(e)||kind==='room'||kind==='room_attribute'||kind.includes('room'))return '根据当前空间观测判断房间属性与语义类别，并给出房间类别置信度。';return e?.instruction||e?.prompt||e?.request?.instruction||e?.request?.prompt||simplifiedQuestion(e,'M1')}
+function m1Answer(e){let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??e?.result??'';if(typeof raw==='object')raw=JSON.stringify(raw);if(!raw)return '（无 M1 回答）';try{const o=JSON.parse(raw);if(o.room_attribute||o.room_id){return [o.room_attribute||'unknown',o.confidence!=null?'置信度 '+Number(o.confidence).toFixed(2):''].filter(Boolean).join(' · ')}const name=o.observed_object_name||o.semantic_name||o.object_name||o.label||o.interaction_class||o.semantic_class||'';const state=o.coarse_state||o.state||o.status||'';const conf=o.confidence??o.score;const fridgeConf=o.fridge_confidence??o.refrigerator_confidence??o.is_refrigerator_confidence;const category=o.interaction_class||o.semantic_class||'';const confidence=fridgeConf??conf;return [name,category,state,confidence!=null?'置信度 '+Number(confidence).toFixed(2):''].filter(Boolean).join(' · ')}catch(_){return raw.replace(/[{}\[\]"]/g,'').replace(/[:,]/g,' · ').slice(0,180)}}
 function outputSummary(e){if(e?.error)return '调用失败：'+clip(e.error,120);let raw=e?.raw_text??e?.response?.raw_text??e?.payload?.result??'';if(typeof raw==='object')raw=JSON.stringify(raw);try{const o=JSON.parse(raw),choice=o.ranked_ids||o.candidate_id||o.label||o.interaction_class||o.coarse_state||o.state||'',state=o.coarse_state&&o.coarse_state!==choice?o.coarse_state:'';return clip([Array.isArray(choice)?choice.join(' → '):choice,state,o.reason,o.confidence!=null?'置信度 '+o.confidence:''].filter(Boolean).join(' · '),150)}catch(_){return clip(raw||'已完成（无文本结果）',150)}}
 function addChips(parent,items,max=5){const wrap=make('div','chips');items.slice(0,max).forEach(v=>wrap.append(make('span','chip',clip(v,28))));if(items.length>max)wrap.append(make('span','chip','+'+(items.length-max)));parent.append(wrap)}
 function m2EventsWithLiveState(s){
@@ -1685,7 +1763,7 @@ function m2EventsWithLiveState(s){
   return events
 }
 const eventSignatures={};
-function renderEvents(id,events,stage){const box=q(id),recent=(events||[]).slice(-8).reverse(),signature=recent.map(e=>[e.timestamp,e.request_sequence,e.object_id,e.target_id,e.raw_text,e.error].join('|')).join('||');if(eventSignatures[stage]===signature)return;eventSignatures[stage]=signature;box.replaceChildren();if(!recent.length){box.append(make('div','empty','等待 '+stage+' 调用'));return}recent.forEach((e,index)=>{const row=make('article','event'),left=make('div','event-col'),mid=make('div','event-col'),right=make('div','event-col');left.append(make('div','label',stage==='M1'?'真实 M1 输入':'候选 subgoal'));if(stage==='M1'){left.append(m1InputCanvas(e,index),make('div','chip',m1DisplayName(e)))}else{const cs=contextCandidates(e);addChips(left,cs.map(c=>c.id||c.candidate_id||c.target_name||'candidate'))}mid.append(make('div','label',stage==='M2'?'历史 / 目标 / 简化请求':'M1 实际调用文本'));if(stage==='M2'){const hist=e?.context?.recent_decisions||e?.payload?.recent_decisions||[],histCount=Number(e?.context?.recent_decision_count??(Array.isArray(hist)?hist.length:0)),mission=e?.context?.mission||e?.payload?.mission||{};addChips(mid,['历史 '+histCount,'候选 '+contextCandidates(e).length,'目标 '+(mission.target_name||mission.target||mission.mode||'探索')])}if(stage==='M1')mid.append(make('div','prompt',clip(m1Prompt(e),1200)));else mid.append(make('div','prompt',simplifiedQuestion(e,stage)));if(stage==='M1'){right.append(make('div','label','M1 完整回答'));right.append(make('div','result',clip(m1Answer(e),1600)))}else{right.append(make('div','label','MLLM 输出'));right.append(make('div','result',outputSummary(e)))}const meta=make('div','meta',`${e.timestamp?new Date(e.timestamp*1000).toLocaleTimeString():'--:--:--'} · ${e.latency_s!=null?Number(e.latency_s).toFixed(2)+' s':'等待耗时'} · ${e.model||e.role||''}`);row.append(left,mid,right,meta);box.append(row)})}
+function renderEvents(id,events,stage){const box=q(id),recent=(events||[]).slice(-8).reverse(),signature=recent.map(e=>[e.timestamp,e.request_sequence,e.object_id,e.target_id,e.raw_text,e.error].join('|')).join('||');if(eventSignatures[stage]===signature)return;eventSignatures[stage]=signature;box.replaceChildren();if(!recent.length){box.append(make('div','empty','等待 '+stage+' 调用'));return}recent.forEach((e,index)=>{const row=make('article','event'),left=make('div','event-col'),mid=make('div','event-col'),right=make('div','event-col');left.append(make('div','label',stage==='M1'?'真实 M1 输入':'候选 subgoal'));if(stage==='M1'){const thumb=m1InputCanvas(e,index);if(thumb)left.append(thumb);left.append(make('div','chip',m1DisplayName(e)))}else{const cs=contextCandidates(e);addChips(left,cs.map(c=>c.id||c.candidate_id||c.target_name||'candidate'))}mid.append(make('div','label',stage==='M2'?'历史 / 目标 / 简化请求':'M1 实际调用文本'));if(stage==='M2'){const hist=e?.context?.recent_decisions||e?.payload?.recent_decisions||[],histCount=Number(e?.context?.recent_decision_count??(Array.isArray(hist)?hist.length:0)),mission=e?.context?.mission||e?.payload?.mission||{};addChips(mid,['历史 '+histCount,'候选 '+contextCandidates(e).length,'目标 '+(mission.target_name||mission.target||mission.mode||'探索')])}if(stage==='M1')mid.append(make('div','prompt',clip(m1Prompt(e),1200)));else mid.append(make('div','prompt',simplifiedQuestion(e,stage)));if(stage==='M1'){right.append(make('div','label','M1 完整回答'));right.append(make('div','result',clip(m1Answer(e),1600)))}else{right.append(make('div','label','MLLM 输出'));right.append(make('div','result',outputSummary(e)))}const meta=make('div','meta',`${e.timestamp?new Date(e.timestamp*1000).toLocaleTimeString():'--:--:--'} · ${e.latency_s!=null?Number(e.latency_s).toFixed(2)+' s':'等待耗时'} · ${e.model||e.role||''}`);row.append(left,mid,right,meta);box.append(row)})}
 function firstObj(...values){return values.find(v=>v&&typeof v==='object')||{}}
 function renderM3(m3){
   const box=q('#m3');box.replaceChildren();
@@ -1719,8 +1797,8 @@ function refreshStill(id,path){
   image.onload=done;image.onerror=done;
   image.src=path+'?ts='+Date.now();
 }
-function resumeDashboard(){if(document.hidden)return;refresh();refreshStill('#overview','/snapshot.jpg');refreshStill('#overview-camera','/camera-box-overlay.jpg');refreshStill('#panel1','/camera-overlay.jpg');refreshStill('#panel5','/panel5.jpg')}
-setupResizableLayout();const rateLabel=document.querySelector('.ratebar span:nth-child(3)');if(rateLabel)rateLabel.textContent='● 感知图 10 Hz · 六面板 5 Hz';setInterval(()=>{if(!document.hidden)refresh()},1000);setInterval(()=>refreshStill('#overview','/snapshot.jpg'),200);setInterval(()=>refreshStill('#overview-camera','/camera-box-overlay.jpg'),100);setInterval(()=>refreshStill('#panel1','/camera-overlay.jpg'),100);setInterval(()=>refreshStill('#panel5','/panel5.jpg'),1000);document.addEventListener('visibilitychange',resumeDashboard);resumeDashboard();
+function resumeDashboard(){if(document.hidden)return;refresh();refreshStill('#overview','/snapshot.jpg');refreshStill('#overview-camera','/camera-box-overlay.jpg')}
+setupResizableLayout();const rateLabel=document.querySelector('.ratebar span:nth-child(3)');if(rateLabel)rateLabel.textContent='● 感知图 10 Hz · 六面板 5 Hz';setInterval(()=>{if(!document.hidden)refresh()},1000);setInterval(()=>refreshStill('#overview','/snapshot.jpg'),200);setInterval(()=>refreshStill('#overview-camera','/camera-box-overlay.jpg'),100);document.addEventListener('visibilitychange',resumeDashboard);resumeDashboard();
 </script></html>"""
 
 
@@ -1905,6 +1983,8 @@ class PhysicalGateway:
             )
 
     def _process_sensor_frame(self, packet: dict[str, Any]) -> None:
+        if packet.get("camera_imu") and int(packet.get("seq", 0)) % 50 == 0:
+            print(f"camera_imu received seq={packet.get('seq')} keys={list(packet['camera_imu'])}", flush=True)
         rgb = _decode(packet["rgb"]["data"], "jpeg")
         depth = _decode(packet["depth"]["data"], "png16")
         self.state.update_frame(
@@ -1919,6 +1999,7 @@ class PhysicalGateway:
             depth_to_color_extrinsics=packet.get("depth_to_color_extrinsics", {}),
             camera_frame=packet.get("camera_frame", ""),
             depth_frame=packet.get("depth_frame", packet.get("camera_frame", "")),
+            camera_imu=packet.get("camera_imu", {}),
             frame_seq=int(packet["seq"]),
             frame_stamp=float(packet["stamp"]),
             sync_ms=packet.get("color_depth_sync_ms"),
@@ -1985,8 +2066,11 @@ class PhysicalGateway:
             # port, no command is forwarded to Go2 or any local actuator.
             return self.gate.handle_intent(packet)
         if packet["type"] == "sensor_frame":
-            self.recorder.record_sensor_packet(packet)
-            self._process_sensor_frame(packet)
+            # Never decode/process RGB-D inline in the websocket receive
+            # thread.  The decoder owns a latest-only queue (capacity=1), so
+            # a slow YOLO/depth pipeline cannot make the socket retain old
+            # frames and report seconds-old perception results.
+            self.queue_sensor_frame(packet)
             # ROS publication is handled by physical_ros_gateway.py using the
             # /api/raw-frame endpoint. Keeping this process ROS-free avoids a
             # Python 3.13/ROS Noetic runtime conflict.
@@ -2025,6 +2109,8 @@ class PhysicalGateway:
         # this closure as an instance method and adds an unwanted ``self``.
         handler.qwen_submit = staticmethod(submit_qwen)
         self.http = _ReusableHTTPServer((self.host, self.port), handler)
+        camera_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="camera-overlay")
+        record_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="physical-recording")
         def camera_overlay_loop() -> None:
             """Publish source-resolution camera overlays independently.
 
@@ -2042,8 +2128,15 @@ class PhysicalGateway:
                     # Generate each representation once per camera tick.  The
                     # right-side image intentionally keeps segmentation,
                     # while the presentation six-panel remains box-only.
-                    camera_seg = self.renderer.render_camera_overlay(include_masks=True)
-                    camera_box = self.renderer.render_camera_overlay(include_masks=False)
+                    # One source-resolution overlay is sufficient for both
+                    # endpoints. Rendering masked and box-only JPEGs in
+                    # parallel doubled the CPU cost of the 10-Hz camera
+                    # path and starved the actual perception/ROS callbacks.
+                    box_future = camera_pool.submit(
+                        self.renderer.render_camera_overlay, include_masks=False
+                    )
+                    camera_box = box_future.result()
+                    camera_seg = camera_box
                     with handler.frame_lock:
                         handler.latest_camera_jpeg = camera_seg
                         handler.latest_camera_box_jpeg = camera_box
@@ -2058,6 +2151,7 @@ class PhysicalGateway:
 
         def render_loop() -> None:
             while True:
+                render_started = time.monotonic()
                 try:
                     self.renderer.set_capture_panel_streams(self.recorder.is_active())
                     frame = self.renderer.render()
@@ -2078,45 +2172,41 @@ class PhysicalGateway:
                         # plus the right-rail JSON snapshot.  Keep 1–4 for a
                         # direct raw chain and panel 6 for exact showcase
                         # replay; all are source rasters, not browser crops.
-                        self.recorder.record_panel(
-                            1,
-                            camera_box_frame,
-                            stamp=self.state.frame_stamp,
-                            frame_seq=self.state.frame_seq,
-                        )
-                        for panel_index, panel_bytes in self.renderer.latest_panel_streams.items():
-                            if panel_index == 1:
-                                continue
-                            self.recorder.record_panel(
-                                panel_index,
-                                panel_bytes,
-                                stamp=self.state.frame_stamp,
-                                frame_seq=self.state.frame_seq,
-                            )
-                        # Panel 6 is encoded separately from the two native
-                        # enlarged-panel endpoints so offline composition can
-                        # reproduce the complete dark page without sampling a
-                        # low-quality composite JPEG.
+                        record_panels = dict(self.renderer.latest_panel_streams)
                         topology_bytes = self.renderer.latest_original_panels.get(6, b"")
-                        if topology_bytes:
-                            self.recorder.record_panel(
-                                6,
-                                topology_bytes,
-                                stamp=self.state.frame_stamp,
-                                frame_seq=self.state.frame_seq,
-                            )
-                        self.recorder.record_step_boundary(
-                            step_index=self.state.navigation_step,
-                            stamp=self.state.frame_stamp,
-                            frame_seq=self.state.frame_seq,
-                        )
+                        record_stamp = self.state.frame_stamp
+                        record_seq = self.state.frame_seq
+                        record_step = self.state.navigation_step
+                        # JPEG copies and recorder queue submission are kept
+                        # out of the render/navigation loop. The recorder has
+                        # its own bounded writer queue; this extra single
+                        # producer prevents panel bookkeeping from competing
+                        # with YOLO, mapping, and explore callbacks.
+                        def submit_recording() -> None:
+                            self.recorder.record_panel(1, camera_box_frame, stamp=record_stamp, frame_seq=record_seq)
+                            for panel_index, panel_bytes in record_panels.items():
+                                if panel_index != 1:
+                                    self.recorder.record_panel(panel_index, panel_bytes, stamp=record_stamp, frame_seq=record_seq)
+                            if topology_bytes:
+                                self.recorder.record_panel(6, topology_bytes, stamp=record_stamp, frame_seq=record_seq)
+                            self.recorder.record_step_boundary(step_index=record_step, stamp=record_stamp, frame_seq=record_seq)
+                        record_pool.submit(submit_recording)
                         now_mono = time.monotonic()
                         if now_mono - self._last_record_snapshot_mono >= 1.0:
                             self._last_record_snapshot_mono = now_mono
                             self.recorder.record_state_snapshot(self.state.snapshot())
                 except Exception as exc:
                     self.state.last_error = str(exc)
-                time.sleep(0.1)
+                # The camera perception overlay is kept at 10 Hz above.  The
+                # composite contains four full map rasters plus topology and
+                # several JPEG encodes; on the physical CPU it is the heavy
+                # product, and rebuilding it at 5 Hz starves ROS callbacks.
+                # Refresh it at 0.5 Hz while the browser continues polling at
+                # 5 Hz, so the browser always gets a cached frame and never
+                # causes a render or JPEG encode in its request path.  The
+                # live camera overlay remains 10 Hz; map/topology panels are
+                # deliberately lower-rate diagnostics.
+                time.sleep(max(0.0, 2.0 - (time.monotonic() - render_started)))
         threading.Thread(target=render_loop, daemon=True).start()
         if self.qwen is not None and self.qwen_auto_interval > 0:
             def qwen_loop() -> None:

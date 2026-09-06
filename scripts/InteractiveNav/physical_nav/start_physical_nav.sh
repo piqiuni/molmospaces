@@ -51,12 +51,24 @@ export SEMANTIC_MODEL_TRACE_URL="${SEMANTIC_MODEL_TRACE_URL:-http://127.0.0.1:${
 # the base. The base-to-ground offset is therefore about 0.43 m (1.05 m
 # camera height), which is not part of this base-frame extrinsic.
 # Normal standing base_link height is 0.305 m; camera ground height is 1.285 m,
-# so the camera is 0.980 m above base_link. Camera is pitched 13 degrees down.
-CAMERA_X="${PHYSICAL_NAV_CAMERA_X:-0.03}"; CAMERA_Y="${PHYSICAL_NAV_CAMERA_Y:-0}"; CAMERA_Z="${PHYSICAL_NAV_CAMERA_Z:-0.98}"; CAMERA_ROLL="${PHYSICAL_NAV_CAMERA_ROLL:-0}"; CAMERA_PITCH="${PHYSICAL_NAV_CAMERA_PITCH:-0.2268928}"; CAMERA_YAW="${PHYSICAL_NAV_CAMERA_YAW:-0}"
+# so the camera is 0.980 m above base_link. Camera is pitched 8 degrees down.
+CAMERA_X="${PHYSICAL_NAV_CAMERA_X:-0.03}"; CAMERA_Y="${PHYSICAL_NAV_CAMERA_Y:-0}"; CAMERA_Z="${PHYSICAL_NAV_CAMERA_Z:-0.98}"; CAMERA_ROLL="${PHYSICAL_NAV_CAMERA_ROLL:-0}"; CAMERA_PITCH="${PHYSICAL_NAV_CAMERA_PITCH:-0.1396263}"; CAMERA_YAW="${PHYSICAL_NAV_CAMERA_YAW:-0}"
+CAMERA_IMU="${PHYSICAL_NAV_CAMERA_IMU:-0}"
 RUNTIME_DIR="${PHYSICAL_NAV_RUNTIME_DIR:-/tmp/molmospaces-physical-nav-${UID}}"
 LOG_DIR="${PHYSICAL_NAV_LOG_DIR:-${RUNTIME_DIR}/logs}"
 GATEWAY_PID_FILE="${PHYSICAL_NAV_GATEWAY_PID_FILE:-${RUNTIME_DIR}/gateway.pid}"
 mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
+
+# A second supervisor can otherwise start a second roslaunch tree during a
+# restart race.  ROS then lets the newer executor evict the older one (and the
+# older roslaunch may immediately respawn it), leaving neither executor stable.
+# Keep the lock open for the lifetime of this supervisor, not just startup.
+STACK_LOCK_FILE="${RUNTIME_DIR}/stack.lock"
+exec 8>"${STACK_LOCK_FILE}"
+if ! flock -n 8; then
+  echo "physical navigation supervisor already owns ${RUNTIME_DIR}" >&2
+  exit 1
+fi
 
 declare -a RECORD_ARGS=(--record-dir "${RECORD_DIR}" --record-mode "${RECORD_MODE}" --record-queue-size "${RECORD_QUEUE_SIZE}")
 if [[ "${RECORD_ON_START}" == "1" ]]; then
@@ -160,13 +172,16 @@ start_or_reuse_gateway() {
   # failures and ROS stack restarts.
   # Put the persistent visualization/control gateway in its own session so a
   # navigation supervisor restart cannot terminate it via the supervisor PGID.
+  # Close FD 8 explicitly: it is the supervisor's stack.lock descriptor.  If
+  # the persistent gateway inherits it, the gateway keeps the lock held after
+  # the supervisor exits and every later start reports "already owns".
   nohup setsid "${GATEWAY_PYTHON}" "${ROOT_DIR}/physical_six_panel_server.py" \
   --ws-host "${WS_HOST}" --ws-port "${WS_PORT}" \
   --http-host "${WEB_HOST}" --http-port "${WEB_PORT}" \
   --qwen-url "${QWEN_URL}" --qwen-model "${QWEN_MODEL}" --qwen-auto-interval "${QWEN_AUTO_INTERVAL}" \
   "${RECORD_ARGS[@]}" \
   --camera-x "${CAMERA_X}" --camera-y "${CAMERA_Y}" --camera-z "${CAMERA_Z}" --camera-roll "${CAMERA_ROLL}" --camera-pitch "${CAMERA_PITCH}" --camera-yaw "${CAMERA_YAW}" \
-    >>"${LOG_DIR}/gateway.log" 2>&1 </dev/null &
+    >>"${LOG_DIR}/gateway.log" 2>&1 </dev/null 8>&- &
   GATEWAY_PID=$!
   printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
   log_supervisor "started persistent gateway pid=${GATEWAY_PID}"
@@ -203,15 +218,29 @@ if [[ "${START_YOLO}" == "1" ]]; then
       ALGORITHM_PYTHON=python3
     fi
   fi
-  "${ALGORITHM_PYTHON}" "${ROOT_DIR}/physical_yoloe_bridge.py" \
+  # The gateway is intentionally persistent across ROS restarts.  Reusing a
+  # detector already attached to this endpoint is equally important: two
+  # YOLO workers both poll /api/raw-frame and publish competing detections,
+  # saturating CPU and making the dashboard appear frozen.
+  EXISTING_YOLO="$(pgrep -f "[p]hysical_yoloe_bridge.py --web-url http://127.0.0.1:${WEB_PORT}" | head -n1 || true)"
+  if [[ "${EXISTING_YOLO}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${EXISTING_YOLO}" 2>/dev/null; then
+    log_supervisor "reusing persistent yoloe pid=${EXISTING_YOLO}"
+  else
+    CUDA_VISIBLE_DEVICES="${PHYSICAL_NAV_YOLO_CUDA_VISIBLE_DEVICES:-0}" \
+    OMP_NUM_THREADS="${PHYSICAL_NAV_YOLO_OMP_NUM_THREADS:-1}" \
+    OPENBLAS_NUM_THREADS="${PHYSICAL_NAV_YOLO_OPENBLAS_NUM_THREADS:-1}" \
+    MKL_NUM_THREADS="${PHYSICAL_NAV_YOLO_MKL_NUM_THREADS:-1}" \
+    NUMEXPR_NUM_THREADS="${PHYSICAL_NAV_YOLO_NUMEXPR_NUM_THREADS:-1}" \
+    "${ALGORITHM_PYTHON}" "${ROOT_DIR}/physical_yoloe_bridge.py" \
     --web-url "http://127.0.0.1:${WEB_PORT}" \
     --model-path "${PHYSICAL_NAV_MODEL_PATH:-/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt}" \
     --detector-config "${PHYSICAL_NAV_DETECTOR_CONFIG:-${ROOT_DIR}/config/physical_nav.yaml}" \
     --device "${PHYSICAL_NAV_YOLO_DEVICE:-cuda:0}" --rate "${PHYSICAL_NAV_YOLO_RATE:-10}" \
     --camera-x "${CAMERA_X}" --camera-y "${CAMERA_Y}" --camera-z "${CAMERA_Z}" \
     --camera-roll "${CAMERA_ROLL}" --camera-pitch "${CAMERA_PITCH}" --camera-yaw "${CAMERA_YAW}" \
-    >>"${LOG_DIR}/yoloe.log" 2>&1 &
-  register_process yoloe "$!"
+      >>"${LOG_DIR}/yoloe.log" 2>&1 &
+    register_process yoloe "$!"
+  fi
 fi
 
 if [[ "${PHYSICAL_NAV_SKIP_ROS:-0}" == "1" ]]; then

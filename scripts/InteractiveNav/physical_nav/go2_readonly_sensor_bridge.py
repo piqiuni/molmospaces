@@ -156,11 +156,22 @@ class D435iSource:
             # visual-odometry pose stream.  Keep these measurements alongside
             # the Go2 body quaternion so the policy host can use dynamic tilt.
             if enable_motion:
-                self.config.enable_stream(rs.stream.gyro)
-                self.config.enable_stream(rs.stream.accel)
+                self.config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 200)
+                self.config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 100)
                 self.motion_enabled = True
         except Exception as exc:
             print(f"D435i motion streams unavailable: {exc}", flush=True)
+        if enable_motion:
+            # After a previous bridge restart the D435i motion endpoint can
+            # remain in a stale state on the Jetson USB2 controller.  Reset
+            # once before resolving the combined RGB-D+IMU requests.
+            try:
+                devices = self.rs.context().query_devices()
+                if len(devices):
+                    devices[0].hardware_reset()
+                    time.sleep(3.0)
+            except Exception as exc:
+                print(f"D435i hardware reset skipped: {exc}", flush=True)
         self.profile = self.pipeline.start(self.config)
         if align_to not in ("none", "color", "depth"):
             raise ValueError("align_to must be none, color, or depth")
@@ -189,43 +200,118 @@ class D435iSource:
         target_stream = rs.stream.depth if align_to == "depth" else rs.stream.color
         self.camera_frame = f"{self.profile.get_stream(target_stream).stream_name()}_frame"
         self.latest_motion: dict[str, Any] = {}
+        self._imu_rpy = [0.0, 0.0, 0.0]
+        self._imu_reference_rpy = None
+        self._imu_calibration_samples = 0
+        self._imu_calibration_sum = [0.0, 0.0, 0.0]
+        self._imu_last_gyro_ts = None
         print(f"D435i started color {c.width}x{c.height}@{color_fps} + depth {d.width}x{d.height}@{depth_fps}, align={align_to}, depth_scale={self.depth_scale}", flush=True)
 
     def read(self) -> tuple[Any, Any, float]:
-        raw_frames = self.pipeline.wait_for_frames()
+        deadline = time.monotonic() + 0.5
+        raw_frames = None
+        while time.monotonic() < deadline:
+            try:
+                candidate = self.pipeline.wait_for_frames(100)
+            except Exception:
+                time.sleep(0.001)
+                continue
+            if self.motion_enabled:
+                motion: dict[str, Any] = {"source": "d435i_imu", "received_at": time.time()}
+                for stream_name, key, timestamp_key in ((self.rs.stream.gyro, "gyroscope", "gyro_timestamp_ms"), (self.rs.stream.accel, "accelerometer", "accel_timestamp_ms")):
+                    try:
+                        frame = candidate.first_or_default(stream_name)
+                        if frame:
+                            value = frame.as_motion_frame().get_motion_data()
+                            motion[key] = [float(value.x), float(value.y), float(value.z)]
+                            motion[timestamp_key] = float(frame.get_timestamp())
+                    except Exception:
+                        pass
+                if "gyroscope" in motion or "accelerometer" in motion:
+                    self._update_imu_orientation(motion)
+                    self.latest_motion = motion
+            if candidate.get_color_frame() and candidate.get_depth_frame():
+                raw_frames = candidate
+                break
+        if raw_frames is None:
+            raise RuntimeError("D435i RGB-D frame poll timeout")
         # Keep the complete native color image.  On D435i, retrieving color
         # from an ``align(depth)`` frameset can return a depth-sized canvas
         # with black padding/cropping.  Only depth should come from the
         # aligned frameset; RGB remains the original 1280x720 stream.
         color = raw_frames.get_color_frame()
+        if self.motion_enabled:
+            motion: dict[str, Any] = {"source": "d435i_imu", "received_at": time.time()}
+            for stream_name, key, timestamp_key in ((self.rs.stream.gyro, "gyroscope", "gyro_timestamp_ms"), (self.rs.stream.accel, "accelerometer", "accel_timestamp_ms")):
+                try:
+                    frame = raw_frames.first_or_default(stream_name)
+                    if frame:
+                        value = frame.as_motion_frame().get_motion_data()
+                        motion[key] = [float(value.x), float(value.y), float(value.z)]
+                        motion[timestamp_key] = float(frame.get_timestamp())
+                except Exception:
+                    pass
+            if "gyroscope" in motion or "accelerometer" in motion:
+                self._update_imu_orientation(motion)
+                self.latest_motion = motion
         frames = self.align.process(raw_frames) if self.align is not None else raw_frames
         depth = frames.get_depth_frame()
         if not color or not depth:
             raise RuntimeError("D435i returned an incomplete RGB-D frame")
-        if self.motion_enabled:
-            motion: dict[str, Any] = {"source": "d435i_imu", "received_at": time.time()}
-            try:
-                gyro = frames.first_or_default(self.rs.stream.gyro)
-                if gyro:
-                    value = gyro.as_motion_frame().get_motion_data()
-                    motion["gyroscope"] = [float(value.x), float(value.y), float(value.z)]
-                    motion["gyro_timestamp_ms"] = float(gyro.get_timestamp())
-            except Exception:
-                pass
-            try:
-                accel = frames.first_or_default(self.rs.stream.accel)
-                if accel:
-                    value = accel.as_motion_frame().get_motion_data()
-                    motion["accelerometer"] = [float(value.x), float(value.y), float(value.z)]
-                    motion["accel_timestamp_ms"] = float(accel.get_timestamp())
-            except Exception:
-                pass
-            if "gyroscope" in motion or "accelerometer" in motion:
-                self.latest_motion = motion
         stamp = time.time()
         sync_ms = abs(float(color.get_timestamp()) - float(depth.get_timestamp()))
         import numpy as np
         return np.asanyarray(color.get_data()), np.asanyarray(depth.get_data()), sync_ms
+
+    def _update_imu_orientation(self, motion: dict[str, Any]) -> None:
+        """Estimate camera roll/pitch from gravity and yaw by gyro integration.
+
+        D435i motion frames do not provide an absolute quaternion.  The
+        accelerometer stabilizes roll/pitch while the gyro supplies short-term
+        dynamics; yaw is intentionally relative and reset on process start.
+        """
+        accel = motion.get("accelerometer")
+        gyro = motion.get("gyroscope")
+        if accel and len(accel) >= 3:
+            ax, ay, az = (float(v) for v in accel[:3])
+            norm = max((ax * ax + ay * ay + az * az) ** 0.5, 1e-6)
+            ax, ay, az = ax / norm, ay / norm, az / norm
+            gravity_roll = math.atan2(ay, az)
+            gravity_pitch = math.atan2(-ax, max((ay * ay + az * az) ** 0.5, 1e-6))
+            alpha = 0.98
+            self._imu_rpy[0] = alpha * self._imu_rpy[0] + (1.0 - alpha) * gravity_roll
+            self._imu_rpy[1] = alpha * self._imu_rpy[1] + (1.0 - alpha) * gravity_pitch
+        if gyro and len(gyro) >= 3:
+            ts = motion.get("gyro_timestamp_ms")
+            if ts is not None and self._imu_last_gyro_ts is not None:
+                dt = min(max((float(ts) - self._imu_last_gyro_ts) * 1e-3, 0.0), 0.05)
+                self._imu_rpy[2] += float(gyro[2]) * dt
+            if ts is not None:
+                self._imu_last_gyro_ts = float(ts)
+        r, p, y = self._imu_rpy
+        cr, sr = math.cos(r / 2), math.sin(r / 2)
+        cp, sp = math.cos(p / 2), math.sin(p / 2)
+        cy, sy = math.cos(y / 2), math.sin(y / 2)
+        motion["rpy"] = [r, p, y]
+        if self._imu_reference_rpy is None and accel:
+            self._imu_calibration_samples += 1
+            if self._imu_calibration_samples > 150:
+                for index, value in enumerate((r, p, y)):
+                    self._imu_calibration_sum[index] += value
+            if self._imu_calibration_samples >= 250:
+                self._imu_reference_rpy = [
+                    value / max(self._imu_calibration_samples - 150, 1)
+                    for value in self._imu_calibration_sum
+                ]
+        reference = self._imu_reference_rpy or [0.0, 0.0, 0.0]
+        motion["imu_calibrating"] = self._imu_reference_rpy is None
+        motion["correction_rpy"] = [0.0, 0.0, 0.0] if self._imu_reference_rpy is None else [r - reference[0], p - reference[1], y - reference[2]]
+        motion["quaternion"] = [
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        ]
 
     def close(self) -> None:
         self.pipeline.stop()
@@ -308,6 +394,7 @@ async def publish(args: argparse.Namespace) -> None:
                     "depth_to_color_extrinsics": source.depth_to_color_extrinsics if source is not None else {},
                     "sync_ms": sync_ms,
                     "depth_scale": args.depth_scale if source is None else source.depth_scale,
+                    "camera_imu": dict(source.latest_motion) if source is not None else {},
                 }
                 with frame_lock:
                     latest_frame.clear()
@@ -381,6 +468,7 @@ async def publish(args: argparse.Namespace) -> None:
                     intrinsics=frame["intrinsics"], color_depth_sync_ms=frame["sync_ms"],
                     rgb_intrinsics=frame.get("rgb_intrinsics"), depth_intrinsics=frame.get("depth_intrinsics"),
                     depth_to_color_extrinsics=frame.get("depth_to_color_extrinsics"),
+                    camera_imu=frame.get("camera_imu"),
                 )
                 encode_started = time.monotonic()
                 payload = encode_wire_packet(packet, compression_level=1)

@@ -168,6 +168,30 @@ def test_uncertain_portal_result_retries_after_short_refresh_interval(
     ) == 5.0
 
 
+def test_success_cache_ignores_small_view_signature_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A changed coarse bbox signature must not rescan a recently solved object."""
+
+    node = object.__new__(InteractionAttributeInferenceNode)
+    node.lock = threading.Lock()
+    node.pending = {}
+    node.completed = {
+        "locker_3": {
+            "signature": "old-view",
+            "completed_at": 10.0,
+            "refresh_interval_s": 120.0,
+        }
+    }
+    node.last_request = {}
+    node.min_interval_s = 0.0
+    node.request_sequence = 0
+    node.generations = {"locker_3": 0}
+    node.current_episode_id = "episode_1"
+    node.success_refresh_interval_s = 120.0
+
+    monkeypatch.setattr(attribute_module.time, "monotonic", lambda: 15.0)
+    assert node._try_reserve("locker_3", "new-view-after-one-pixel-jitter") is None
+
+
 def test_targeted_refresh_requires_later_capture_and_rgb_sequence() -> None:
     node = object.__new__(InteractionAttributeInferenceNode)
     node.lock = threading.Lock()

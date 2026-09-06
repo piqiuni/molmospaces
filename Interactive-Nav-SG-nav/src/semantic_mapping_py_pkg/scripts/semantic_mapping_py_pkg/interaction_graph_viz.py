@@ -1,3 +1,5 @@
+import math
+
 from geometry_msgs.msg import Point
 import rospy
 from visualization_msgs.msg import Marker, MarkerArray
@@ -50,7 +52,15 @@ def build_graph_marker_array(graph_payload, frame_id, stamp=None):
     clear.pose.orientation.w = 1.0
     markers.markers.append(clear)
 
-    nodes = {node["id"]: node for node in graph_payload.get("nodes", [])}
+    # Draw every persistent graph node, including observations that are no
+    # longer visible in the latest camera frame. Their last known box/state is
+    # useful for inspecting graph persistence and interaction history.
+    visible_nodes = [
+        node
+        for node in graph_payload.get("nodes", [])
+        if isinstance(node, dict)
+    ]
+    nodes = {node["id"]: node for node in visible_nodes}
     edges = list(graph_payload.get("edges", []))
     connect_pairs = {
         frozenset((edge["src_id"], edge["dst_id"]))
@@ -58,7 +68,7 @@ def build_graph_marker_array(graph_payload, frame_id, stamp=None):
         if edge.get("relation") == "connects"
     }
 
-    for index, node in enumerate(graph_payload.get("nodes", [])):
+    for index, node in enumerate(visible_nodes):
         if node.get("type") == "scene":
             continue
         color = _node_color(node)
@@ -74,7 +84,23 @@ def build_graph_marker_array(graph_payload, frame_id, stamp=None):
         marker.pose.position.x = float(box_center[0])
         marker.pose.position.y = float(box_center[1])
         marker.pose.position.z = float(box_center[2])
-        marker.pose.orientation.w = 1.0
+        orientation = node.get("attributes", {}).get("orientation") or node.get("orientation")
+        if isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+            marker.pose.orientation.x = float(orientation[0])
+            marker.pose.orientation.y = float(orientation[1])
+            marker.pose.orientation.z = float(orientation[2])
+            marker.pose.orientation.w = float(orientation[3])
+        else:
+            yaw = node.get("attributes", {}).get("yaw")
+            if yaw is not None:
+                try:
+                    yaw = float(yaw)
+                    marker.pose.orientation.z = math.sin(yaw * 0.5)
+                    marker.pose.orientation.w = math.cos(yaw * 0.5)
+                except (TypeError, ValueError):
+                    marker.pose.orientation.w = 1.0
+            else:
+                marker.pose.orientation.w = 1.0
         marker.scale.x = max(float(box_size[0]), 0.02)
         marker.scale.y = max(float(box_size[1]), 0.02)
         marker.scale.z = max(float(box_size[2]), 0.02)
@@ -99,7 +125,7 @@ def build_graph_marker_array(graph_payload, frame_id, stamp=None):
         label.text = f"{node['type']}:{node['label']}"
         markers.markers.append(label)
 
-    edge_offset = len(graph_payload.get("nodes", [])) * 3
+    edge_offset = len(visible_nodes) * 3
     marker_index = 0
     for edge in edges:
         src = nodes.get(edge["src_id"])

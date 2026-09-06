@@ -32,6 +32,7 @@ from physical_yoloe_bridge import (
   _supported_euclidean_cluster_mask,
   _world_points,
 )
+from physical_ros_gateway import PhysicalRosGateway
 from runtime_state import RuntimeState
 from physical_nav_watchdog import HealthLimits, health_errors
 from velocity_safety import VelocitySafetyConfig, VelocitySafetyLimiter
@@ -118,6 +119,28 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert np.isclose(quaternion[0], 0.0)
     assert np.isclose(quaternion[1], 0.0)
 
+  def test_world_gateway_obb_follows_transformed_segment_points(self):
+    import math
+    import numpy as np
+
+    rng = np.random.default_rng(4)
+    local = np.column_stack((
+      rng.uniform(-1.00, 1.00, 2000),
+      rng.uniform(-0.20, 0.20, 2000),
+      rng.uniform(-0.90, 0.90, 2000),
+    ))
+    yaw = 1.0
+    c, s = math.cos(yaw), math.sin(yaw)
+    axes = np.asarray([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    points = local @ axes.T + np.asarray([3.0, 2.0, 1.0])
+    center, size, quaternion = PhysicalRosGateway._fit_world_obb(points)
+    fitted_yaw = 2.0 * math.atan2(quaternion[2], quaternion[3])
+    axial_error = abs(math.atan2(math.sin(fitted_yaw - yaw), math.cos(fitted_yaw - yaw)))
+    axial_error = min(axial_error, abs(math.pi - axial_error))
+    assert axial_error < 0.05
+    assert np.allclose(center, [3.0, 2.0, 1.0], atol=0.03)
+    assert max(size[0], size[1]) > 1.8
+
   def test_physics_laboratory_is_filtered_as_scene_label(self):
     assert _is_excluded_scene_label("physics_laboratory", {"excluded_label_tokens": ["physics_laboratory"]})
 
@@ -177,12 +200,25 @@ class PhysicalPlatformTests(unittest.TestCase):
     limiter = VelocitySafetyLimiter(VelocitySafetyConfig(
       scale=1.0,
       max_linear_mps=.60,
-      min_linear_mps=.40,
+      min_linear_mps=0.0,
       linear_deadband_mps=.05,
     ))
     assert limiter.limit(.02, 0.0, -.35, now=1.0) == (0.0, 0.0, -.35)
     assert limiter.limit(-.02, 0.0, 0.0, now=2.0) == (0.0, 0.0, 0.0)
-    assert limiter.limit(.06, 0.0, 0.0, now=3.0) == (.40, 0.0, 0.0)
+    assert limiter.limit(.06, 0.0, 0.0, now=3.0) == (.06, 0.0, 0.0)
+
+  def test_physical_velocity_profile_zero_command_stops_immediately(self):
+    limiter = VelocitySafetyLimiter(VelocitySafetyConfig(
+      scale=1.0,
+      max_linear_mps=.60,
+      min_linear_mps=0.0,
+      linear_deadband_mps=.0,
+      min_angular_rps=0.0,
+      angular_deadband_rps=.0,
+      max_linear_accel_mps2=.15,
+    ))
+    assert limiter.limit(.50, 0.0, 0.0, now=1.0) == (.50, 0.0, 0.0)
+    assert limiter.limit(0.0, 0.0, 0.0, now=1.2) == (0.0, 0.0, 0.0)
 
   def test_external_mllm_verified_mode_is_accepted(self):
     from semantic_mllm_py_pkg.ablation import AblationConfig
@@ -398,6 +434,10 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert '"__name:=slam_gmapping"' in service
     assert '"__name:=move_base"' in service
     assert '"__name:=physical_nav_consistency"' in service
+
+  def test_persistent_gateway_does_not_hold_supervisor_stack_lock(self):
+    launcher = (ROOT / "start_physical_nav.sh").read_text()
+    assert '>>"${LOG_DIR}/gateway.log" 2>&1 </dev/null 8>&- &' in launcher
 
   def test_navigation_step_is_local_to_policy_session(self):
     state = RuntimeState()
@@ -806,7 +846,8 @@ class PhysicalPlatformTests(unittest.TestCase):
     service = (ROOT / "physical_nav_service.sh").read_text()
     assert 'name="interaction_attribute_inference"' in launch
     assert 'file="$(find nav_pkg)/launch/nav.launch"' in launch
-    assert '<param name="scan_filter_tolerance_sec" value="0.15"/>' in launch
+    assert '<remap from="/odom" to="/physical_nav/odom"/>' in launch
+    assert '<param name="scan_filter_tolerance_sec" value="0.0"/>' in launch
     assert '<param name="max_odom_cloud_time_diff" value="0.15"/>' in launch
     assert '<param name="maxUrange" value="7.9"/>' in launch
     assert '<param name="pointcloud_scan_range_max" value="8.0"/>' in launch
@@ -818,7 +859,12 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert '<param name="local_overwrite_ttl_sec" value="2.0"/>' in launch
     assert '<arg name="override_config_file" value="$(arg semantic_override_config)"/>' in launch
     assert '<arg name="override_config_file" value="$(arg move_base_override_config)"/>' in launch
-    assert '<remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>' in launch
+    assert '<remap from="/cmd_vel" to="/physical_nav/semantic_cmd_vel"/>' in launch
+    assert '<param name="move_base_topic" value="/physical_nav/move_base_cmd_vel"/>' in launch
+    assert '<param name="semantic_topic" value="/physical_nav/semantic_cmd_vel"/>' in launch
+    assert 'type="velocity_command_mux.py"' in launch
+    assert '<arg name="cmd_vel_topic" value="/physical_nav/move_base_cmd_vel"/>' in launch
+    assert '<arg name="cmd_vel_stamped_topic" value="/physical_nav/shadow_cmd_vel_stamped"/>' in launch
     assert '<remap from="/semantic_mapping/attribute_refresh_requests" to="/physical_nav/attribute_refresh_requests"/>' in launch
     assert '<param name="topics/object_detections" value="/physical_nav/tracked_detections"/>' in launch
     assert 'launch-prefix="$(arg system_ros_python)"' in launch
@@ -862,33 +908,38 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert local_override["local_costmap"]["obstacle_layer"]["local_obstacles"]["observation_persistence"] == 0.0
     assert local_override["local_costmap"]["obstacle_layer"]["local_obstacles"]["max_observation_age"] == 0.5
     assert local_override["local_costmap"]["obstacle_layer"]["local_obstacles"]["clearing"] is True
-    assert local_override["local_costmap"]["inflation_layer"]["inflation_radius"] == 0.50
-    assert local_override["global_costmap"]["inflation_layer"]["inflation_radius"] == 0.50
+    assert local_override["local_costmap"]["inflation_layer"]["inflation_radius"] == 0.40
+    assert local_override["global_costmap"]["inflation_layer"]["inflation_radius"] == 0.40
     assert local_override["local_costmap"]["obstacle_layer"]["local_obstacles"]["observation_persistence"] == 0.0
     assert local_override["local_costmap"]["obstacle_layer"]["footprint_clearing_enabled"] is True
     assert local_override["local_costmap"]["obstacle_layer"]["obstacle_reset_interval"] == 2.0
     assert local_override["DWAPlannerROS"]["max_vel_x"] == 0.56
+    assert local_override["DWAPlannerROS"]["min_vel_x"] == 0.05
     assert local_override["DWAPlannerROS"]["max_vel_trans"] == 0.60
+    assert local_override["DWAPlannerROS"]["min_vel_trans"] == 0.05
     assert local_override["DWAPlannerROS"]["max_vel_theta"] == 1.30
-    assert local_override["DWAPlannerROS"]["min_vel_theta"] == 0.55
-    assert local_override["DWAPlannerROS"]["rear_path_rotate_speed"] == 1.30
+    assert local_override["DWAPlannerROS"]["min_vel_theta"] == 0.05
+    assert local_override["DWAPlannerROS"]["acc_lim_trans"] == 1.0
+    assert local_override["DWAPlannerROS"]["rear_path_prerotate_enabled"] is False
+    assert local_override["DWAPlannerROS"]["conditional_reverse_enabled"] is False
+    assert local_override["DWAPlannerROS"]["reject_degenerate_cmd_enabled"] is False
     assert semantic_override["candidate"]["interaction_ready_yaw_tolerance_rad"] == 0.15
-    assert semantic_override["candidate"]["portal_approach_standoff_offsets_m"] == [0.0, 0.20, 0.40]
-    assert semantic_override["candidate"]["portal_approach_tangent_offsets_m"] == [0.0, -0.20, 0.20]
+    assert semantic_override["candidate"]["portal_approach_standoff_offsets_m"] == [0.0, -0.10, -0.20]
+    assert semantic_override["candidate"]["portal_approach_tangent_offsets_m"] == [0.0]
     assert semantic_override["candidate"]["portal_approach_yaw_offsets_rad"] == [0.0]
     assert semantic_override["candidate"]["portal_opposite_side_fallback_enabled"] is False
     assert semantic_override["candidate"]["portal_require_reference_yaw"] is True
     assert semantic_override["candidate"]["portal_side_hysteresis_m"] == 0.50
-    assert semantic_override["candidate"]["portal_goal_require_known_free"] is True
+    assert semantic_override["candidate"]["portal_goal_require_known_free"] is False
     assert semantic_override["executor"]["explore_terminal_yaw_enabled"] is True
     assert semantic_override["executor"]["explore_terminal_xy_tolerance_m"] == 0.30
     assert semantic_override["executor"]["explore_terminal_yaw_tolerance_rad"] == 0.15
     assert physical_config["semantic_map"]["object_portal_cross_view_match_enabled"] is True
     assert physical_config["velocity_safety"]["max_linear_mps"] == 0.60
-    assert physical_config["velocity_safety"]["min_linear_mps"] == 0.40
+    assert physical_config["velocity_safety"]["min_linear_mps"] == 0.30
     assert physical_config["velocity_safety"]["linear_deadband_mps"] == 0.05
     assert physical_config["velocity_safety"]["max_angular_rps"] == 1.30
-    assert physical_config["velocity_safety"]["min_angular_rps"] == 0.55
+    assert physical_config["velocity_safety"]["min_angular_rps"] == 0.40
     assert '--continuous-ttl-ms "${PHYSICAL_NAV_MOTION_TTL_MS:-500}"' in all_launcher
     assert '--ros-command-refresh-hz "${PHYSICAL_NAV_MOTION_REFRESH_HZ:-20}"' in all_launcher
     assert physical_config["interaction_policy"]["speech_subscriber_wait_s"] == 60.0

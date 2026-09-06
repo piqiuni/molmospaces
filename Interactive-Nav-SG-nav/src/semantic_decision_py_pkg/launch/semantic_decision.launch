@@ -26,7 +26,9 @@
   <node name="semantic_behavior_executor"
         pkg="semantic_decision_py_pkg"
         type="semantic_behavior_executor.py"
-        output="screen">
+        output="screen"
+        respawn="true"
+        respawn_delay="2.0">
     <rosparam file="$(arg config_file)" command="load"/>
     <rosparam if="$(eval arg('override_config_file') != '')"
               file="$(arg override_config_file)"

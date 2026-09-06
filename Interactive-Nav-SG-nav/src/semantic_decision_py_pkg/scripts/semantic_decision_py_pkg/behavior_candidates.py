@@ -159,6 +159,12 @@ class CandidateGeneratorConfig:
     # or more fresh observations before an action can be dispatched.
     portal_unknown_observation_max_attempts: int = 2
     portal_standoff_m: float = 1.0
+    # Minimum costmap clearance for a physical portal approach. If a generated
+    # pose is too close to an occupied cell, the candidate node shifts it
+    # outward along the obstacle/door normal before publication.
+    portal_obstacle_clearance_m: float = 0.30
+    portal_obstacle_push_step_m: float = 0.10
+    portal_obstacle_push_max_m: float = 0.60
     # Ordered radial offsets keep one blocked/unreachable door stance from
     # removing the whole portal candidate. Negative values request a closer
     # stance; generation clamps the resulting surface standoff at zero. The
@@ -1415,7 +1421,55 @@ class CandidateGenerator:
         allowed_types = set(self.config.interaction_types)
         robot_room_id = self._room_id_for_xy(graph, robot_xy)
         for node in graph.get("nodes") or []:
-            node_type = str(node.get("type") or "")
+            source_node_type = str(node.get("type") or "")
+            node_attributes = node.get("attributes") or {}
+            # The physical detector stream may already have accumulated a
+            # tracker streak before the graph receives its first update.  Use
+            # both counters and require two detector observations before a
+            # refrigerator can become a subgoal; this is independent of the
+            # later M1 confirmation gate.
+            if str(node_attributes.get("source") or "").casefold() == "detector":
+                try:
+                    graph_observations = int(node.get("observation_count", 0) or 0)
+                except (TypeError, ValueError):
+                    graph_observations = 0
+                try:
+                    detector_observations = int(
+                        node_attributes.get("consecutive_observations", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    detector_observations = 0
+                if max(graph_observations, detector_observations) < 2:
+                    continue
+            source_labels = set(self._source_semantic_labels(node))
+            m1_name_override = bool(node_attributes.get("m1_name_override"))
+            m1_pending_refrigerator = bool(
+                node_attributes.get("m1_refrigerator_pending_confirmation")
+                and _normalized_marker_match(
+                    node_attributes.get("m1_pending_observed_object_name")
+                    or node_attributes.get("m1_observed_object_name"),
+                    {"fridge", "refrigerator", "freezer"},
+                )
+                and not m1_name_override
+                and self._looks_like_refrigerator_body(node)
+            )
+            provisional_container = bool(
+                not m1_name_override
+                and (
+                    (
+                        source_node_type == "object"
+                        and _normalized_marker_match("locker", source_labels)
+                    )
+                    or m1_pending_refrigerator
+                )
+            )
+            # A physical locker (or a body-sized refrigerator answer still
+            # awaiting its second M1 confirmation) is a provisional container
+            # hypothesis.  It must enter the interaction pool immediately;
+            # M1 may demote it to a water dispenser/non-interactive object on
+            # a later graph snapshot.  Do not require ``is_interactable`` or
+            # an openable-container mode for this provisional admission.
+            node_type = "container" if provisional_container else source_node_type
             if node_type not in allowed_types:
                 continue
             allowed_semantics = {
@@ -1427,7 +1481,7 @@ class CandidateGenerator:
                 continue
             interaction = node.get("interaction") or {}
             node_state = str(interaction.get("state") or "unknown")
-            attributes = node.get("attributes") or {}
+            attributes = node_attributes
             visual_unknown_portal_reobserve = bool(
                 node_type == "portal"
                 and not self.config.portal_unknown_default_interact
@@ -1438,11 +1492,17 @@ class CandidateGenerator:
                     node_state,
                 )
             )
-            if not bool(interaction.get("is_interactable", False)) and not (
-                visual_unknown_portal_reobserve
+            if (
+                not bool(interaction.get("is_interactable", False))
+                and not visual_unknown_portal_reobserve
+                and not provisional_container
             ):
                 continue
-            if node_type == "container" and not self._is_openable_container(node):
+            if (
+                node_type == "container"
+                and not provisional_container
+                and not self._is_openable_container(node)
+            ):
                 continue
             confidence = float(
                 interaction.get("state_confidence", interaction.get("confidence", node.get("confidence", 0.0)))
@@ -1462,7 +1522,13 @@ class CandidateGenerator:
             ):
                 continue
             state_age_sec = max(0.0, float(node.get("state_age_sec", 0.0) or 0.0))
-            if state_age_sec > self.config.max_state_age_sec:
+            persistent_portal = bool(
+                node_type == "portal"
+                and (node.get("attributes") or {}).get(
+                    "persistent_semantic_node", False
+                )
+            )
+            if state_age_sec > self.config.max_state_age_sec and not persistent_portal:
                 continue
             if node_type == "portal":
                 if (
@@ -1637,8 +1703,16 @@ class CandidateGenerator:
                 if is_refrigerator_container
                 else "container"
             )
-            physical_action_standoff = legacy_interaction_standoff
-            physical_action_standoff_source = "legacy_type_standoff_plus_safety_margin"
+            # Portal distances are specified from the door surface.  The
+            # generic interaction safety margin is for container/object
+            # manipulation and must not silently move a door subgoal another
+            # 0.35 m away from the doorway.
+            if node_type == "portal":
+                physical_action_standoff = self._nonnegative_clearance(standoff)
+                physical_action_standoff_source = "portal_surface_standoff"
+            else:
+                physical_action_standoff = legacy_interaction_standoff
+                physical_action_standoff_source = "legacy_type_standoff_plus_safety_margin"
             m1_capture_standoff = physical_action_standoff
             m1_capture_standoff_source = "not_applicable"
             m1_capture_standoff_validation = "not_applicable"
@@ -1718,7 +1792,12 @@ class CandidateGenerator:
                     ]
                 except (TypeError, ValueError, IndexError):
                     container_geometry_anchor_xy = []
-                raw_container_size = list(node.get("aabb_size") or [])
+                raw_container_size = list(
+                    attributes.get("interaction_reference_obb_size")
+                    or attributes.get("viz_aabb_size")
+                    or node.get("aabb_size")
+                    or []
+                )
                 if len(raw_container_size) >= 2:
                     try:
                         container_geometry_aabb_size_xy = [
@@ -1778,17 +1857,59 @@ class CandidateGenerator:
             )
             if not goal_candidates:
                 continue
-            container_face_axes_by_staging = [
-                list(axis) if axis is not None else []
-                for axis in (
-                    self._container_face_axis_from_label(label)
-                    for label in approach_pose_labels
-                )
-            ]
-            container_anchor_robot_distances_m = [
+            raw_container_anchor_robot_distances_m = [
                 math.hypot(float(goal[0]) - robot_xy[0], float(goal[1]) - robot_xy[1])
                 for goal in goal_candidates
             ]
+            if container_two_stage_requested and raw_container_anchor_robot_distances_m:
+                # Keep every index-aligned staging/capture/action array in the
+                # same near-to-far order.  Previously only the diagnostic
+                # distance list knew which face was nearest while goal[0]
+                # remained +X, so the executor navigated to one face and later
+                # mapped M1/action geometry using another.
+                staging_order = sorted(
+                    range(len(raw_container_anchor_robot_distances_m)),
+                    key=lambda index: (
+                        float(raw_container_anchor_robot_distances_m[index]),
+                        int(index),
+                    ),
+                )
+                goal_candidates = [goal_candidates[index] for index in staging_order]
+                approach_pose_labels = [
+                    approach_pose_labels[index] for index in staging_order
+                ]
+                raw_container_anchor_robot_distances_m = [
+                    raw_container_anchor_robot_distances_m[index]
+                    for index in staging_order
+                ]
+            container_face_axes_by_staging = [
+                # Derive the actual normal from the generated pose rather
+                # than decoding the legacy ``pos_x/pos_y`` label.  When the
+                # refrigerator OBB is rotated, those labels describe local
+                # box faces, not world X/Y axes.
+                [
+                    (float(goal[0]) - float(position[0]))
+                    / max(
+                        1e-6,
+                        math.hypot(
+                            float(goal[0]) - float(position[0]),
+                            float(goal[1]) - float(position[1]),
+                        ),
+                    ),
+                    (float(goal[1]) - float(position[1]))
+                    / max(
+                        1e-6,
+                        math.hypot(
+                            float(goal[0]) - float(position[0]),
+                            float(goal[1]) - float(position[1]),
+                        ),
+                    ),
+                ]
+                for goal in goal_candidates
+            ]
+            container_anchor_robot_distances_m = list(
+                raw_container_anchor_robot_distances_m
+            )
             # Keep the visual staging geometry and the physical action
             # geometry as two explicit, index-aligned lists.  The outer pose is
             # generated without a semantic front claim; its radial axis is
@@ -1871,7 +1992,8 @@ class CandidateGenerator:
             else:
                 container_action_goal_options_by_staging = []
                 container_action_option_labels_by_staging = []
-            approach = goal_candidates[0]
+            approach_index = 0
+            approach = goal_candidates[approach_index]
             portal_aperture_observation = (
                 self._portal_aperture_observation(node)
                 if node_type == "portal"
@@ -2027,6 +2149,13 @@ class CandidateGenerator:
                     },
                     metadata={
                         "node_type": node_type,
+                        "interaction_admission_stage": (
+                            "provisional_m1_pending"
+                            if m1_pending_refrigerator
+                            else "provisional_source_hypothesis"
+                            if provisional_container
+                            else "confirmed_semantic_node"
+                        ),
                         "semantic_name": str(
                             attributes.get("m1_observed_object_name")
                             or attributes.get("semantic_name")
@@ -2216,6 +2345,16 @@ class CandidateGenerator:
                             visual_container_axis or []
                         ),
                         "goal_xyyaw_candidates": goal_candidates,
+                        "container_initial_staging_index": (
+                            approach_index if container_two_stage_requested else 0
+                        ),
+                        "interaction_approach_goal_option_index": (
+                            approach_index if container_two_stage_requested else 0
+                        ),
+                        "container_two_stage_staging_goal_option_index": (
+                            approach_index if container_two_stage_requested else 0
+                        ),
+                        "effective_interaction_approach_pose_xyyaw": list(approach),
                         "interaction_approach_pose_labels": approach_pose_labels,
                         "interaction_multiview_reobserve": bool(
                             node_type == "container"
@@ -3099,7 +3238,13 @@ class CandidateGenerator:
             # around that exact cardinal face normal. This removes the former
             # arbitrary robot-ray tilt while keeping the anchors on the visible
             # half of the box.
-            size = list(node.get("aabb_size") or [])
+            attributes = node.get("attributes") or {}
+            size = list(
+                attributes.get("interaction_reference_obb_size")
+                or attributes.get("viz_aabb_size")
+                or node.get("aabb_size")
+                or []
+            )
             if len(size) >= 2:
                 half_x = 0.5 * abs(float(size[0]))
                 half_y = 0.5 * abs(float(size[1]))
@@ -3111,11 +3256,26 @@ class CandidateGenerator:
                 scaled_x = abs(dx) / half_x
                 scaled_y = abs(dy) / half_y
                 if container_m1_face_selection_enabled:
+                    # ``interaction_reference_yaw`` is the stable OBB yaw
+                    # captured by the semantic mapper.  The four face normals
+                    # are local +/-X and +/-Y rotated into the world frame.
+                    # Fall back to cardinal axes only for legacy nodes without
+                    # a measured orientation.
+                    raw_reference_yaw = (node.get("attributes") or {}).get(
+                        "interaction_reference_yaw",
+                        node.get("yaw"),
+                    )
+                    try:
+                        reference_yaw = float(raw_reference_yaw)
+                        if not math.isfinite(reference_yaw):
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        reference_yaw = 0.0
                     face_axes = (
-                        (0.0, "pos_x"),
-                        (math.pi / 2.0, "pos_y"),
-                        (math.pi, "neg_x"),
-                        (-math.pi / 2.0, "neg_y"),
+                        (reference_yaw, "pos_x"),
+                        (reference_yaw + math.pi / 2.0, "pos_y"),
+                        (reference_yaw + math.pi, "neg_x"),
+                        (reference_yaw - math.pi / 2.0, "neg_y"),
                     )
                 elif scaled_x >= scaled_y:
                     face_axes = ((0.0 if dx >= 0.0 else math.pi,
@@ -3128,11 +3288,26 @@ class CandidateGenerator:
                         for angle_deg in fan_angles_deg:
                             angle = normal_angle + math.radians(angle_deg)
                             axis = (math.cos(angle), math.sin(angle))
-                            ray_scale = max(
-                                abs(axis[0]) / half_x,
-                                abs(axis[1]) / half_y,
+                            raw_reference_yaw = (node.get("attributes") or {}).get(
+                                "interaction_reference_yaw", node.get("yaw")
                             )
-                            boundary_distance = 1.0 / ray_scale
+                            try:
+                                reference_yaw = float(raw_reference_yaw)
+                                if not math.isfinite(reference_yaw):
+                                    raise ValueError
+                            except (TypeError, ValueError):
+                                reference_yaw = 0.0
+                            cos_yaw = math.cos(reference_yaw)
+                            sin_yaw = math.sin(reference_yaw)
+                            local_axis = (
+                                cos_yaw * axis[0] + sin_yaw * axis[1],
+                                -sin_yaw * axis[0] + cos_yaw * axis[1],
+                            )
+                            ray_scale = max(
+                                abs(local_axis[0]) / half_x,
+                                abs(local_axis[1]) / half_y,
+                            )
+                            boundary_distance = 1.0 / max(ray_scale, 1e-6)
                             x = target_xy[0] + axis[0] * (
                                 boundary_distance + clearance
                             )
@@ -3229,14 +3404,24 @@ class CandidateGenerator:
                 else (dx / distance, dy / distance)
             )
             if container_m1_face_selection_enabled:
-                # The AABB supplies only geometry.  Enumerate all four
-                # cardinal faces in a stable order; M1, not the robot's
-                # current side, decides which one is the usable front.
+                # Enumerate the four local box faces in a stable order, then
+                # rotate their normals by the measured OBB yaw.  The labels
+                # remain local-face identifiers for retry bookkeeping; the
+                # actual navigation geometry is the rotated axis.
+                raw_reference_yaw = (node.get("attributes") or {}).get(
+                    "interaction_reference_yaw", node.get("yaw")
+                )
+                try:
+                    reference_yaw = float(raw_reference_yaw)
+                    if not math.isfinite(reference_yaw):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    reference_yaw = 0.0
                 axes = (
-                    (1.0, 0.0),
-                    (0.0, 1.0),
-                    (-1.0, 0.0),
-                    (0.0, -1.0),
+                    (math.cos(reference_yaw), math.sin(reference_yaw)),
+                    (-math.sin(reference_yaw), math.cos(reference_yaw)),
+                    (-math.cos(reference_yaw), -math.sin(reference_yaw)),
+                    (math.sin(reference_yaw), -math.cos(reference_yaw)),
                 )
                 face_labels = (
                     "aabb_face_pos_x",
@@ -3747,6 +3932,7 @@ class CandidateGenerator:
 
         interaction = node.get("interaction") or {}
         attributes = node.get("attributes") or {}
+        source_labels = CandidateGenerator._source_semantic_labels(node)
         values = (
             node.get("label"),
             node.get("name"),
@@ -3756,6 +3942,7 @@ class CandidateGenerator:
             attributes.get("source_object_name"),
             attributes.get("interaction_reference_label"),
             attributes.get("m1_observed_object_name"),
+            attributes.get("m1_pending_observed_object_name"),
             interaction.get("interaction_mode"),
             interaction.get("capability"),
         )
@@ -3769,6 +3956,18 @@ class CandidateGenerator:
             # fully eligible.
             if CandidateGenerator._is_refrigerator_container(node):
                 return "fridge"
+        # A locker is a common detector hypothesis for a refrigerator on the
+        # physical lane.  Expose that graph node as a provisional interaction
+        # target immediately; M1 may subsequently demote it to a water
+        # dispenser/non-interactive object, at which point the public labels
+        # no longer resolve to this provisional branch and the candidate is
+        # removed on the next graph update.  Do not do this for
+        # ``water_dispenser``/``dispenser`` source labels: they are negative
+        # refrigerator evidence, not safe provisional open targets.
+        if _normalized_marker_match("locker", set(source_labels)) and not bool(
+            attributes.get("m1_name_override")
+        ):
+            return "locker"
         if any(
             marker in text
             for marker in (
@@ -3798,6 +3997,7 @@ class CandidateGenerator:
                 attributes.get("source_object_name"),
                 attributes.get("interaction_reference_label"),
                 attributes.get("m1_observed_object_name"),
+                attributes.get("m1_pending_observed_object_name"),
             )
             if str(value or "").strip()
         )
@@ -3832,6 +4032,19 @@ class CandidateGenerator:
             )
         )
         m1_name_override = bool(attributes.get("m1_name_override"))
+        # A tiny generic crop is not a refrigerator candidate merely because
+        # one pending M1 answer said "refrigerator".  A body-sized pending
+        # answer is different: it is admitted provisionally, and the second
+        # M1 view may still demote it on the next graph revision.
+        m1_refrigerator_confirmed = bool(
+            attributes.get("m1_refrigerator_confirmed")
+        )
+        m1_recheck_required = bool(
+            set(
+                str(value or "").strip().casefold()
+                for value in source_labels
+            ).intersection({"locker", "safe", "water_dispenser", "dispenser"})
+        )
 
         # With fresh source provenance, a fridge class still needs a plausible
         # body box.  This specifically removes the 0.16 x 0.07 x 0.27 m crop
@@ -3840,10 +4053,16 @@ class CandidateGenerator:
             return geometry_ok
         if source_is_fridge:
             return not geometry_known or geometry_ok
-        if m1_name_override:
+        if m1_name_override and (
+            m1_refrigerator_confirmed or not m1_recheck_required
+        ):
             # M1 can correct a generic detector class, but only a body-sized
             # geometry may authorize that correction as a fridge candidate.
             return geometry_ok
+        if has_explicit_source and not source_is_fridge and not (
+            m1_name_override and not m1_recheck_required
+        ):
+            return False
         # Legacy hand-written/replay nodes may expose only ``name=fridge``;
         # preserve that historical behavior when no provenance/override is
         # available to audit it.
@@ -4103,12 +4322,39 @@ class CandidateGenerator:
                 unit_x, unit_y = dx / distance, dy / distance
         boundary_distance = 0.0
         if node is not None:
-            size = list(node.get("aabb_size") or [])
+            attributes = node.get("attributes") or {}
+            size = list(
+                attributes.get("interaction_reference_obb_size")
+                or attributes.get("viz_aabb_size")
+                or node.get("aabb_size")
+                or []
+            )
             if len(size) >= 2:
                 half_x = 0.5 * abs(float(size[0]))
                 half_y = 0.5 * abs(float(size[1]))
                 if half_x > 1e-6 and half_y > 1e-6:
-                    ray_denominator = abs(unit_x) / half_x + abs(unit_y) / half_y
+                    # ``aabb_size`` is the stable box extent carried with the
+                    # OBB yaw for physical detections.  Project the approach
+                    # normal into that local box frame before finding the
+                    # surface intersection; using world X/Y here moves the
+                    # goal off the actual rotated face.
+                    reference_yaw = None
+                    if node is not None:
+                        attributes = node.get("attributes") or {}
+                        reference_yaw = attributes.get(
+                            "interaction_reference_yaw", node.get("yaw")
+                        )
+                    try:
+                        reference_yaw = float(reference_yaw)
+                        if not math.isfinite(reference_yaw):
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        reference_yaw = 0.0
+                    cos_yaw = math.cos(reference_yaw)
+                    sin_yaw = math.sin(reference_yaw)
+                    local_x = cos_yaw * unit_x + sin_yaw * unit_y
+                    local_y = -sin_yaw * unit_x + cos_yaw * unit_y
+                    ray_denominator = abs(local_x) / half_x + abs(local_y) / half_y
                     if ray_denominator > 1e-6:
                         boundary_distance = 1.0 / ray_denominator
         offset = max(0.0, standoff_m) + boundary_distance

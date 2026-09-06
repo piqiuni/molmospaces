@@ -69,7 +69,7 @@ from physical_six_panel_server import SixPanelRenderer  # noqa: E402
 
 DEFAULT_RECORD_ROOT = Path("/home/user/ldl/recordings/go2_physical")
 THEMES = ("dark", "light", "academic")
-PANEL_SIZE = (640, 360)
+PANEL_SIZE = (1280, 720)
 _CJK_FONT_PATHS = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -369,6 +369,10 @@ def _image_from_record(session: Path, record: dict[str, Any] | None) -> np.ndarr
     if not record:
         return None
     path = _resolve_artifact(session, record.get("image"))
+    if path is None and isinstance(record.get("files"), dict):
+        path = _resolve_artifact(session, record["files"].get("rgb"))
+    if path is None:
+        path = _resolve_artifact(session, record.get("rgb"))
     if path is None:
         return None
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
@@ -388,6 +392,33 @@ def _fit(image: np.ndarray | None, size: tuple[int, int], *, background: tuple[i
     return canvas
 
 
+def _cover(image: np.ndarray | None, size: tuple[int, int], *, background: tuple[int, int, int] = (20, 25, 32)) -> np.ndarray:
+    """Resize and center-crop an image to fill the requested rectangle."""
+    width, height = size
+    canvas = np.full((height, width, 3), background, dtype=np.uint8)
+    if image is None or image.size == 0:
+        return canvas
+    scale = max(width / image.shape[1], height / image.shape[0])
+    draw_w = max(width, int(round(image.shape[1] * scale)))
+    draw_h = max(height, int(round(image.shape[0] * scale)))
+    resized = cv2.resize(image, (draw_w, draw_h), interpolation=cv2.INTER_AREA)
+    ox, oy = (draw_w - width) // 2, (draw_h - height) // 2
+    return resized[oy : oy + height, ox : ox + width].copy()
+
+
+def _zoom_center(image: np.ndarray, factor: float = 1.35) -> np.ndarray:
+    """Enlarge a panel around its center while retaining the output size."""
+    if image is None or image.size == 0 or factor <= 1.0:
+        return image
+    height, width = image.shape[:2]
+    crop_w = max(1, int(round(width / factor)))
+    crop_h = max(1, int(round(height / factor)))
+    x0 = max(0, (width - crop_w) // 2)
+    y0 = max(0, (height - crop_h) // 2)
+    cropped = image[y0 : y0 + crop_h, x0 : x0 + crop_w]
+    return cv2.resize(cropped, (width, height), interpolation=cv2.INTER_CUBIC)
+
+
 def _draw_label(image: np.ndarray, text: str, xy: tuple[int, int], color: tuple[int, int, int], scale: float = .65) -> None:
     value = str(text)[:100]
     # Hershey fonts used by OpenCV do not contain Chinese glyphs and render
@@ -402,7 +433,7 @@ def _draw_label(image: np.ndarray, text: str, xy: tuple[int, int], color: tuple[
     if not font_path:
         cv2.putText(image, value, xy, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
         return
-    font_size = max(10, int(round(float(scale) * 32)))
+    font_size = max(12, int(round(float(scale) * 40)))
     cache_key = (font_path, font_size)
     font = _CJK_FONT_CACHE.get(cache_key)
     if font is None:
@@ -413,7 +444,7 @@ def _draw_label(image: np.ndarray, text: str, xy: tuple[int, int], color: tuple[
             return
         _CJK_FONT_CACHE[cache_key] = font
     probe = _PILImageDraw.Draw(_PILImage.new("RGB", (1, 1)))
-    stroke = max(1, int(round(float(scale) * 1.2)))
+    stroke = 0
     try:
         bounds = probe.textbbox((0, 0), value, font=font, anchor="ls", stroke_width=stroke)
         x, y = int(xy[0]), int(xy[1])
@@ -507,7 +538,7 @@ def _panel_from_raw(data: SessionData, timestamp: float, index: int, renderer: O
             view_scale=1.8, label_mode="all", draw_overview_inset=False,
         )
     if index == 6:
-        return renderer.render_topology(PANEL_SIZE, step, step["step_index"])
+        return _zoom_center(renderer.render_topology(PANEL_SIZE, step, step["step_index"]), 1.32)
     panel = np.full((PANEL_SIZE[1], PANEL_SIZE[0], 3), (28, 34, 42), dtype=np.uint8)
     _draw_label(panel, f"PANEL {index} NOT RECORDED", (18, 38), (190, 200, 215))
     return panel
@@ -515,8 +546,8 @@ def _panel_from_raw(data: SessionData, timestamp: float, index: int, renderer: O
 
 def _theme_palette(theme: str) -> dict[str, tuple[int, int, int]]:
     if theme == "dark":
-        # OpenCV stores BGR (the values below are ordered accordingly).
-        return {"bg": (22, 12, 5), "panel": (48, 29, 12), "line": (166, 111, 50), "text": (255, 245, 235), "muted": (198, 171, 145), "accent": (255, 200, 105), "good": (151, 232, 98), "warn": (255, 201, 95)}
+        # OpenCV stores BGR; these values mirror the live dark showcase CSS.
+        return {"bg": (29, 16, 7), "panel": (41, 25, 13), "line": (85, 59, 38), "text": (255, 248, 244), "muted": (191, 166, 145), "accent": (255, 213, 73), "good": (166, 230, 76), "warn": (107, 198, 245)}
     if theme == "academic":
         return {"bg": (255, 255, 255), "panel": (253, 251, 250), "line": (194, 181, 171), "text": (55, 37, 26), "muted": (126, 106, 91), "accent": (161, 87, 31), "good": (69, 130, 25), "warn": (0, 119, 183)}
     return {"bg": (252, 249, 247), "panel": (255, 255, 255), "line": (220, 204, 190), "text": (101, 57, 27), "muted": (130, 108, 91), "accent": (155, 83, 24), "good": (84, 139, 24), "warn": (0, 133, 196)}
@@ -570,7 +601,13 @@ def _draw_right_rail(snapshot: dict[str, Any], size: tuple[int, int], theme: str
         _draw_label(image, value, (x + 8, y + 42), palette["text"], .58)
     if dog is not None and status_h > 170:
         dog_max_h = max(40, status_h - margin - 54)
-        dog_fit = _fit(dog, (min(220, width // 3), dog_max_h), background=palette["panel"])
+        dog_fit = _cover(dog[:, :, :3] if dog.ndim == 3 and dog.shape[2] >= 3 else dog, (min(220, width // 3), dog_max_h), background=palette["panel"])
+        if dog.ndim == 3 and dog.shape[2] == 4:
+            alpha_image = _cover(dog[:, :, 3], (min(220, width // 3), dog_max_h), background=(0, 0, 0))
+            if alpha_image.ndim == 2:
+                alpha_image = alpha_image[:, :, None]
+            alpha = alpha_image.astype(np.float32) / 255.0
+            dog_fit = (dog_fit.astype(np.float32) * alpha + np.asarray(palette["panel"], dtype=np.float32) * (1.0 - alpha)).astype(np.uint8)
         dx = width - margin - dog_fit.shape[1] - 12
         dy = margin + 42
         image[dy : min(status_h - 2, dy + dog_fit.shape[0]), dx : dx + dog_fit.shape[1]] = dog_fit[: max(0, status_h - 2 - dy)]
@@ -583,6 +620,17 @@ def _draw_right_rail(snapshot: dict[str, Any], size: tuple[int, int], theme: str
     events = snapshot.get("mllm_events") or []
     if not isinstance(events, list):
         events = []
+    if not events:
+        nav = snapshot.get("navigation") if isinstance(snapshot.get("navigation"), dict) else {}
+        decision = nav.get("decision_trace") if isinstance(nav.get("decision_trace"), dict) else {}
+        selection = nav.get("selection") if isinstance(nav.get("selection"), dict) else {}
+        execution = nav.get("execution_state") if isinstance(nav.get("execution_state"), dict) else {}
+        result = nav.get("interaction_result") if isinstance(nav.get("interaction_result"), dict) else {}
+        events = [
+            {"stage": "M1", "result": decision.get("model_reason") or decision.get("model_error") or "等待交互属性识别"},
+            {"stage": "M2", "result": decision.get("model_selected_candidate_id") or selection.get("candidate_id") or "等待子目标选择"},
+            {"stage": "M3", "result": result.get("status") or execution.get("state") or "规则验证"},
+        ]
     events = [item for item in events if isinstance(item, dict)][-6:][::-1]
     _draw_label(image, "MLLM CALLS (M1 / M2 / M3)", (margin + 18, y), palette["muted"], .43)
     y += 15
@@ -695,8 +743,11 @@ def _apply_phone(panel: np.ndarray, phone: np.ndarray | None, mode: str) -> np.n
         return phone_fit
     if mode == "side-by-side":
         half = panel.shape[1] // 2
-        left = _fit(panel, (half, panel.shape[0]))
-        right = _fit(phone, (panel.shape[1] - half, panel.shape[0]), background=(0, 0, 0))
+        # Both views occupy the same full-height slot.  Center-cropping avoids
+        # the black bars produced by letterboxing phone frames with a slightly
+        # different aspect ratio.
+        left = _cover(panel, (half, panel.shape[0]), background=(0, 0, 0))
+        right = _cover(phone, (panel.shape[1] - half, panel.shape[0]), background=(0, 0, 0))
         _draw_label(right, "PHONE", (10, 27), (80, 230, 150), .5)
         return np.concatenate([left, right], axis=1)
     # picture-in-picture
@@ -719,9 +770,7 @@ def _load_dog() -> np.ndarray | None:
             image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
             if image is not None:
                 if image.ndim == 3 and image.shape[2] == 4:
-                    alpha = image[:, :, 3:4].astype(np.float32) / 255.0
-                    bg = np.full(image[:, :, :3].shape, 12, dtype=np.float32)
-                    image = (image[:, :, :3].astype(np.float32) * alpha + bg * (1 - alpha)).astype(np.uint8)
+                    return image
                 return image[:, :, :3]
     return None
 
@@ -950,7 +999,7 @@ def render_theme(
                 image = None if rebuild_from_raw else _image_from_record(data.session, data.panel_record(index, timestamp))
                 if image is None:
                     image = _panel_from_raw(data, timestamp, index, canonical)
-                panels[index] = _fit(image, PANEL_SIZE, background=_theme_palette(theme)["panel"])
+                panels[index] = _cover(image, PANEL_SIZE, background=_theme_palette(theme)["panel"])
                 sinks[index].write(panels[index])
             phone_frame = phone.read(timestamp)
             right_frame = _draw_right_rail(snapshot, right_size, theme, dog)

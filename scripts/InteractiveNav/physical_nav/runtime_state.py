@@ -24,6 +24,7 @@ class RuntimeState:
         self.depth_to_color_extrinsics: dict[str, Any] = {}
         self.camera_frame = ""
         self.depth_frame = ""
+        self.camera_imu: dict[str, Any] = {}
         self.calibration: dict[str, Any] = {}
         self.frame_seq = -1
         # Local 5 Hz navigation/viewer step. Unlike the Go2 sensor sequence,
@@ -165,6 +166,7 @@ class RuntimeState:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            graph = copy.deepcopy(self.graph)
             return {
                 "frame_seq": self.frame_seq,
                 "navigation_step": self.navigation_step,
@@ -178,13 +180,14 @@ class RuntimeState:
                 "rgb_intrinsics": copy.deepcopy(self.rgb_intrinsics or self.intrinsics),
                 "depth_intrinsics": copy.deepcopy(self.depth_intrinsics or self.intrinsics),
                 "depth_to_color_extrinsics": copy.deepcopy(self.depth_to_color_extrinsics),
+                "camera_imu": copy.deepcopy(self.camera_imu),
                 "raw_frame_available": bool(self.rgb_b64 and self.depth_b64),
                 "telemetry": copy.deepcopy(self.telemetry),
                 "detections": copy.deepcopy(self.detections),
                 "detection_meta": copy.deepcopy(self.detection_meta),
                 "mapped_detections": copy.deepcopy(self.mapped_detections),
                 "mapped_detection_meta": copy.deepcopy(self.mapped_detection_meta),
-                "graph": copy.deepcopy(self.graph),
+                "graph": graph,
                 "occupancy": ({k: self.occupancy.get(k) for k in ("width", "height", "resolution", "origin", "frame_id")} if isinstance(self.occupancy, dict) else None),
                 "room_grid": ({k: self.room_grid.get(k) for k in ("width", "height", "resolution", "origin", "frame_id")} if isinstance(self.room_grid, dict) else None),
                 "global_costmap": ({k: self.global_costmap.get(k) for k in ("width", "height", "resolution", "origin", "frame_id")} if isinstance(self.global_costmap, dict) else None),
@@ -223,21 +226,20 @@ class RuntimeState:
     def visualization_snapshot(self) -> dict[str, Any]:
         """Return raw map/graph receipts for presentation-only redrawers.
 
-        The normal state snapshot deliberately omits grid cell arrays to keep
-        polling payloads small.  Showcase pages use this separate endpoint at
-        a lower rate and redraw their spatial/semantic panels from these raw
-        receipts instead of cropping the six-panel JPEG.
+        Keep this endpoint limited to data consumed by the presentation
+        redrawers.  Room/global/local costmaps duplicate OCC at hundreds of
+        kilobytes per poll and are available through their dedicated ROS/UI
+        paths; including them here made the browser download megabyte-sized
+        payloads and serialized the runtime lock for too long.
         """
         with self._lock:
+            graph = copy.deepcopy(self.graph)
             return {
                 "frame_seq": self.frame_seq,
                 "navigation_step": self.navigation_step,
                 "telemetry": copy.deepcopy(self.telemetry),
                 "occupancy": copy.deepcopy(self.occupancy),
-                "room_grid": copy.deepcopy(self.room_grid),
-                "global_costmap": copy.deepcopy(self.global_costmap),
-                "local_costmap": copy.deepcopy(self.local_costmap),
-                "graph": copy.deepcopy(self.graph),
+                "graph": graph,
                 "mapped_detections": copy.deepcopy(self.mapped_detections),
                 "navigation": copy.deepcopy(self.navigation),
             }
@@ -259,7 +261,14 @@ class RuntimeState:
                 "rgb_intrinsics": copy.deepcopy(self.rgb_intrinsics or self.intrinsics),
                 "depth_intrinsics": copy.deepcopy(self.depth_intrinsics or self.intrinsics),
                 "depth_to_color_extrinsics": copy.deepcopy(self.depth_to_color_extrinsics),
+                "camera_imu": copy.deepcopy(self.camera_imu),
                 "intrinsics": copy.deepcopy(self.intrinsics),
                 "color_depth_sync_ms": self.sync_ms,
                 "telemetry": copy.deepcopy(self.telemetry),
             }
+
+    def occupancy_snapshot(self) -> dict[str, Any]:
+        """Return only the latest occupancy grid for the web map panel."""
+        with self._lock:
+            value = self.occupancy
+            return copy.deepcopy(value) if isinstance(value, dict) else {}

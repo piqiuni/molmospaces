@@ -18,6 +18,7 @@ topics:
   rgb_image: "/physical_nav/rgb/image_raw"
   depth_image: "/physical_nav/depth/image_raw"
   camera_info: "/physical_nav/camera_info"
+  depth_camera_info: "/physical_nav/depth_camera_info"
   pointcloud: "/physical_nav/points"
   occupancy_grid: "/physical_nav/occupancy"
   room_context: "/physical_nav/room_context"
@@ -61,8 +62,8 @@ object_detection:
     fridge:
       min_bbox_area_px: 3000
       min_bbox_side_px: 35
-      min_height_m: 0.30
-      max_height_m: 2.60
+      min_height_m: 1.40
+      max_height_m: 1.90
       max_horizontal_span_m: 1.80
       max_volume_m3: 4.00
   iou_threshold: 0.7
@@ -71,6 +72,18 @@ object_detection:
   detection_filter:
     enabled: true
     excluded_raw_labels:
+      # Dataset-style scene labels are not navigation objects. In particular,
+      # ``sunday`` is a frequent false semantic label for wall/furniture and
+      # must never enter the interaction graph.
+      - sunday
+      # A door handle is part of the full door, not a second interaction
+      # object. YOLOE commonly emits both boxes in the same frame.
+      - door_handle
+      # Door hardware is not a navigable portal. YOLOE may emit either the
+      # canonical ``deadbolt`` label or the common ``deadbelt`` typo.
+      - deadbolt
+      - dead_bolt
+      - deadbelt
       - mirror
       - bathroom_mirror
       - vanity_mirror
@@ -184,10 +197,10 @@ object_detection:
   max_noninteraction_box_volume_m3: 4.00
   projection_frame_id: "tf_frame_map"
   publish_debug_markers: true
-  publish_debug_segmented_cloud: true
+  publish_debug_segmented_cloud: false
   publish_debug_detection_image: true
   publish_debug_world_markers: true
-  publish_debug_world_segmented_cloud: true
+  publish_debug_world_segmented_cloud: false
   # Exact-frame instance points for RViz only. Keep the local HTTP/ROS debug
   # payload bounded; future multi-view fusion will maintain a voxel map.
   debug_cloud_max_points_per_instance: 400
@@ -195,7 +208,9 @@ object_detection:
   # tracking are unchanged. Two receipts confirm a display track, EMA reduces
   # RGB-D/pose jitter, and a short hold bridges intermittent YOLO misses.
   debug_box_min_confirmations: 2
-  debug_box_smoothing_alpha: 0.25
+  # The segmented cloud is latest-frame data.  Keep the visualization box at
+  # the same position; persistence is still provided by the track hold below.
+  debug_box_smoothing_alpha: 1.0
   debug_box_match_distance_m: 0.60
   debug_box_hold_s: 3.0
   debug_overlay_jpeg_quality: 92
@@ -209,27 +224,37 @@ semantic_map:
   enable_object_mapping: true
   enable_scene_mapping: true
   subscribe_pointcloud: true
+  # Keep an object track through occlusions. Once a door/container has two
+  # detector frames plus a valid M1 result, both the semantic map and graph
+  # latch its identity indefinitely; visibility is represented separately.
+  # Unconfirmed detector-only tracks remain reclaimable after this timeout.
+  object_stale_after_sec: 30.0
   # Fuse/publish the latest RGB-D/YOLO result at 10 Hz. Navigation consumes
   # these receipts at its independent 5 Hz logical step.
   publish_rate: 10.0
-  # Require three temporally consistent observations before inserting an
+  # Require two temporally consecutive observations before inserting an
   # object into the persistent semantic map. Detection confidence is kept
   # unchanged here; this is a temporal confirmation gate only.
-  object_min_confirmations: 3
-  # Interaction classes must be present in three uninterrupted detector
+  object_min_confirmations: 2
+  # Interaction classes must be present in two uninterrupted detector
   # receipts. A missed frame resets the streak for both doors and fridges.
   object_class_min_confirmations:
-    door: 3
-    portal: 3
-    fridge: 3
-    refrigerator: 3
+    door: 2
+    portal: 2
+    fridge: 2
+    refrigerator: 2
+    # YOLOE may call a refrigerator a locker. Keep it as a locker hypothesis
+    # until M1 confirms it; two identical M1 answers finalize the class.
+    locker: 2
   # Use the highest world-Z point, not visible box height: close-range boxes
   # may contain only the visible part of a real door or refrigerator.
   object_class_min_top_height_m:
-    door: 1.80
-    portal: 1.80
-    fridge: 1.50
-    refrigerator: 1.50
+    # Door boxes are frequently clipped by the image border; the observed
+    # point-cloud top is therefore lower than the physical door top.
+    door: 1.40
+    portal: 1.40
+    fridge: 1.40
+    refrigerator: 1.40
   # Merge split historical tracks only when their latest image boxes are
   # nearly identical and their stable 3D boxes overlap. Distinct adjacent
   # objects remain separate even when their 3D centers are close.
@@ -240,10 +265,15 @@ semantic_map:
   # the same wall when their long-axis intervals do not overlap.
   object_portal_cross_view_match_enabled: true
   object_portal_cross_view_normal_distance_m: 0.45
-  object_portal_cross_view_yaw_tolerance_rad: 0.35
+  # PCA/OBB can flip a planar door by 90 degrees between adjacent frames.
+  # Association accepts that flip; the display tracker keeps one stable axis.
+  object_portal_cross_view_yaw_tolerance_rad: 1.57
   object_portal_cross_view_min_tangent_overlap_ratio: 0.20
   object_portal_cross_view_min_vertical_overlap_ratio: 0.35
-  graph_min_observations: 3
+  # Per-class confirmation remains enforced by object_class_min_confirmations.
+  # A single detector receipt is insufficient for semantic interaction graph
+  # admission; require two observations before exposing the object downstream.
+  graph_min_observations: 2
   # After a confirmed refrigerator open, newly exposed contents may only be
   # visible for one detector frame.  Admit those currently visible tentative
   # tracks to the semantic graph only; the strict tracked-detection topic used
@@ -274,20 +304,20 @@ velocity_safety:
   output_topic: "/physical_nav/actuated_cmd_vel"
   scale: 1.0
   max_linear_mps: 0.60
-  min_linear_mps: 0.40
-  # Let move_base settle at the terminal XY point before it aligns yaw. Tiny
-  # positive/negative DWA residuals must not be promoted to 0.40 m/s.
+  # Keep the physical base above its static-friction threshold. Explicit zero
+  # commands still stop immediately in VelocitySafetyLimiter.stop()/limit().
+  min_linear_mps: 0.30
+  # A non-zero turn must have enough authority to overcome the Go2 drivetrain
+  # dead zone; the deadband below still removes tiny numerical yaw residues.
   linear_deadband_mps: 0.05
   max_angular_rps: 1.30
-  # Permit low-speed final heading corrections instead of forcing every
-  # non-deadband turn command to the former 0.70 rad/s minimum.
-  # The physical Go2 does not reliably overcome static yaw resistance at
-  # 0.25 rad/s. Keep final move_base alignment above that measured floor.
-  min_angular_rps: 0.55
+  min_angular_rps: 0.60
   # Ignore planner/odometry yaw noise below 0.05 rad/s; otherwise the
   # minimum-turn clamp would make a straight command oscillate at 0.50 rad/s.
   angular_deadband_rps: 0.05
-  max_linear_accel_mps2: 0.15
+  # Keep a bounded one-second ramp to the 0.60 m/s cap without adding the
+  # multi-second lag caused by the previous 0.15 m/s^2 limit.
+  max_linear_accel_mps2: 0.60
   max_angular_accel_rps2: 2.00
   stale_after_s: 0.50
 
@@ -317,7 +347,15 @@ interaction_policy:
   speech_retry_interval_s: 12.0
 
 room_mllm:
-  enabled: false
+  # Physical room attributes are inferred by the M1 room worker.  Keep the
+  # latest-only queue so room classification cannot block OCC/room-grid flow.
+  enabled: true
+  worker_count: 1
+  max_queue_size: 2
+  # Room-level M1 is an expensive semantic refresh.  A latest-only queue is
+  # still retained, but do not admit more than one new room analysis per
+  # second; OCC, room-grid publication and object M1 remain unaffected.
+  min_interval_s: 5.0
 
 semantic_occ_overlay:
   enabled: true

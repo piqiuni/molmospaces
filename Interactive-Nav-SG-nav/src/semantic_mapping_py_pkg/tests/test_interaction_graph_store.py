@@ -44,6 +44,189 @@ def observation(**kwargs):
     return base
 
 
+def test_physical_m1_identity_survives_locker_frames_and_missed_detection():
+    store = InteractionGraphStore(scene_id="test_scene")
+    detected = observation(instance_id="locker_1", semantic_name="locker", category="locker")
+    store.update_observations([detected], stamp=1.0, source_mode="detector_online")
+    node_id = "object_locker_1"
+    patch = {
+        "object_id": node_id,
+        "attribute_status": "ready",
+        "source": "mllm_attribute_inference",
+        "confidence": 0.9,
+        "interaction_class": "container",
+        "observed_object_name": "refrigerator",
+        "interactable": True,
+        "coarse_state": "closed",
+    }
+    assert store.apply_attribute_patch(
+        {**patch, "observation_signature": "locker-view-1", "observation_frame_index": 2},
+        stamp=2.0,
+    )
+    # One M1 crop is kept as a pending hypothesis for a locker/safe track;
+    # only an independent second view can promote it to a refrigerator.
+    assert store.nodes[node_id].label == "locker"
+    assert store.nodes[node_id].type == "object"
+    assert store.apply_attribute_patch(
+        {**patch, "observation_signature": "locker-view-2", "observation_frame_index": 3},
+        stamp=3.0,
+    )
+    for stamp, observations in [(4.0, [detected]), (5.0, []), (6.0, [detected])]:
+        store.update_observations(observations, stamp=stamp, source_mode="detector_online")
+        node = store.nodes[node_id]
+        assert node.label == node.name == "refrigerator"
+        assert node.type == "container"
+        assert node.attributes["category"] == "refrigerator"
+        assert node.attributes["source_semantic_name"] == "locker"
+        assert node.attributes["source_category"] == "locker"
+    # Persistence must not prevent a later accepted visual correction.
+    assert store.apply_attribute_patch(
+        {**patch, "observed_object_name": "cabinet", "observation_signature": "locker-view-3"}, stamp=7.0
+    )
+    store.update_observations([detected], stamp=8.0, source_mode="detector_online")
+    assert store.nodes[node_id].label == "cabinet"
+
+
+def test_confirmed_portal_or_container_is_persistent_after_two_frames_and_m1():
+    """Semantic landmarks must outlive detector/OCC visibility dropouts."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    detected = observation(
+        instance_id="fridge_1",
+        semantic_name="fridge",
+        category="fridge",
+        position=[1.0, 2.0, 1.0],
+        aabb_center=[1.0, 2.0, 1.0],
+        aabb_size=[0.8, 0.8, 1.8],
+    )
+    store.update_observations([detected], stamp=1.0, source_mode="detector_online")
+    store.update_observations([detected], stamp=2.0, source_mode="detector_online")
+    node_id = "container_fridge_1"
+    assert store.nodes[node_id].observation_count == 2
+    assert store.apply_attribute_patch(
+        {
+            "object_id": node_id,
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.9,
+            "interaction_class": "container",
+            "observed_object_name": "refrigerator",
+            "interactable": True,
+            "coarse_state": "closed",
+            "observation_signature": "fridge-view-2",
+            "observation_frame_index": 2,
+        },
+        stamp=2.1,
+    )
+    assert store.nodes[node_id].attributes["persistent_semantic_node"] is True
+
+    store.update_observations([], stamp=100.0, source_mode="detector_online")
+    store.prune_stale_nodes(stale_after_sec=1.0, now=100.0)
+    assert node_id in store.nodes
+    assert store.nodes[node_id].is_currently_visible is False
+
+
+def test_tracking_confirmed_one_frame_does_not_admit_interaction_object():
+    """Tracker streak metadata cannot bypass the graph two-frame gate."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    detected = observation(
+        instance_id="locker_one_frame",
+        semantic_name="locker",
+        category="locker",
+        tracking_confirmed=True,
+        consecutive_observations=2,
+    )
+    store.update_observations([detected], stamp=1.0, source_mode="detector_online")
+    node_id = "object_locker_one_frame"
+    assert store.apply_attribute_patch(
+        {
+            "object_id": node_id,
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.9,
+            "interaction_class": "container",
+            "observed_object_name": "water_dispenser",
+            "interactable": True,
+            "coarse_state": "closed",
+            "observation_signature": "locker-view-1",
+        },
+        stamp=1.1,
+    )
+    assert store.nodes[node_id].observation_count == 1
+    assert not store.nodes[node_id].attributes.get("persistent_semantic_node", False)
+
+
+def test_portal_child_room_waits_for_two_frames_and_m1():
+    store = InteractionGraphStore(scene_id="test_scene")
+    detected = observation(
+        instance_id="door_1",
+        semantic_name="door",
+        category="door",
+        room_id=1,
+        position=[2.0, 0.0, 1.0],
+        aabb_center=[2.0, 0.0, 1.0],
+        aabb_size=[1.0, 0.1, 2.0],
+    )
+    store.update_observations([detected], stamp=1.0, source_mode="detector_online")
+    store.update_observations([detected], stamp=2.0, source_mode="detector_online")
+    portal = store.nodes["portal_door_1"]
+    assert store.ensure_provisional_room_for_portal(portal) is None
+    assert not portal.attributes.get("potential_room_ids")
+
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "portal_door_1",
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.9,
+            "interaction_class": "portal",
+            "observed_object_name": "door",
+            "interactable": True,
+            "coarse_state": "closed",
+            "observation_signature": "door-view-2",
+            "observation_frame_index": 2,
+        },
+        stamp=2.1,
+    )
+    child = store.ensure_provisional_room_for_portal(portal)
+    assert child is not None
+    assert portal.attributes["potential_room_ids"] == [child.room_id]
+
+
+def test_wall_panel_m1_rejection_does_not_create_portal_child_room():
+    store = InteractionGraphStore(scene_id="test_scene")
+    detected = observation(
+        instance_id="portal_1",
+        semantic_name="portal",
+        category="portal",
+        room_id=1,
+        position=[2.0, 0.0, 1.0],
+        aabb_center=[2.0, 0.0, 1.0],
+        aabb_size=[1.0, 0.1, 2.0],
+    )
+    store.update_observations([detected], stamp=1.0, source_mode="detector_online")
+    store.update_observations([detected], stamp=2.0, source_mode="detector_online")
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "portal_portal_1",
+            "attribute_status": "ready",
+            "source": "mllm_attribute_inference",
+            "confidence": 0.9,
+            "interaction_class": "none",
+            "observed_object_name": "wall_panel",
+            "interactable": False,
+            "coarse_state": "unknown",
+            "observation_signature": "panel-view-2",
+            "observation_frame_index": 2,
+        },
+        stamp=2.1,
+    )
+    portal = store.nodes["portal_portal_1"]
+    assert not portal.attributes.get("persistent_semantic_node", False)
+    assert store.ensure_provisional_room_for_portal(portal) is None
+
+
 def test_incremental_room_object_graph_growth():
     store = InteractionGraphStore(scene_id="test_scene")
     batches = [
@@ -1191,6 +1374,28 @@ def test_object_store_top_height_is_only_a_new_track_admission_gate():
     assert tracked[0]["observation_count"] == 3
 
 
+def test_object_store_top_height_uses_explicit_point_cloud_max_z():
+    store = ObjectMapStore(
+        match_distance=0.5,
+        min_confirmations=1,
+        class_min_top_height_m={"fridge": 1.4},
+    )
+    detection = {
+        "semantic_class": "fridge",
+        "confidence": 0.8,
+        # The robust OBB center/size would appear below the threshold.
+        "world_box3d_center": {"x": 1.0, "y": 2.0, "z": 0.60},
+        "world_box3d_size": {"x": 0.7, "y": 0.6, "z": 1.5},
+        "world_position": {"x": 1.0, "y": 2.0, "z": 0.60},
+        "world_aabb_max_z": 1.46,
+    }
+    store.update([detection], stamp=1.0)
+    tracked = store.as_tracked_detections(
+        min_observations=1, confirmed_only=False, currently_observed_only=True
+    )
+    assert len(tracked) == 1
+
+
 def test_detector_graph_marks_unmatched_nodes_not_currently_visible():
     store = InteractionGraphStore(scene_id="test_scene")
     door = observation(
@@ -1581,6 +1786,41 @@ def test_portal_room_connections_respect_rotated_grid_origin():
         node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
     )
     assert set(portal["attributes"]["connected_room_ids"]) == {1, 2}
+
+
+def test_portal_room_connections_use_both_sides_of_oriented_door():
+    """A dominant room on the doorway ring must not hide the far room."""
+
+    scene_data = []
+    for _y in range(FakeGridInfo.height):
+        scene_data.extend([1, 1, 1, 1, 2, 2, 2, 2])
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_room_grid(FakeGridInfo(), scene_data, [100] * len(scene_data))
+    store.update_observations(
+        [
+            observation(
+                instance_id="oriented_door",
+                semantic_name="door",
+                is_door=True,
+                is_articulable=True,
+                joint_type="hinge",
+                joint_range=[0.0, 1.0],
+                joint_value=0.0,
+                position=[4.0, 4.0, 1.0],
+                aabb_center=[4.0, 4.0, 1.0],
+                aabb_size=[0.2, 1.0, 2.0],
+                # The long edge runs along Y, so the two room sides are X.
+                yaw=math.pi * 0.5,
+            )
+        ],
+        source_mode="detector_online",
+    )
+
+    portal = next(
+        node for node in store.as_graph_dict()["nodes"] if node["type"] == "portal"
+    )
+    assert set(portal["attributes"]["observed_connected_room_ids"]) == {1, 2}
+    assert portal["attributes"]["connectivity_status"] == "connected"
 
 
 def test_portal_room_ring_does_not_reach_distant_room():
@@ -3122,6 +3362,61 @@ def test_attribute_patch_sets_semantic_state_and_preserves_last_seen():
     assert "observation_evidence" not in portal["attributes"]
     assert portal["last_seen"] == 10.0
     assert portal["attributes"]["attribute_updated_at"] == 20.0
+
+
+def test_m1_visual_open_portal_clears_interaction_without_map_connectivity():
+    """A confirmed M1-open door is no longer an interaction subgoal."""
+
+    store = InteractionGraphStore(scene_id="test_scene")
+    store.update_room_grid(
+        FakeGridInfo(),
+        [1] * (FakeGridInfo.width * FakeGridInfo.height),
+        [100] * (FakeGridInfo.width * FakeGridInfo.height),
+    )
+    door = observation(
+        instance_id="track_0031",
+        semantic_name="door",
+        is_door=True,
+        is_articulable=True,
+        frame_index=31,
+    )
+    store.update_observations([door], stamp=31.0, source_mode="detector_online")
+    assert store.apply_attribute_patch(
+        {
+            "object_id": "track_0031",
+            "attribute_status": "ready",
+            "observation_frame_index": 31,
+            "interactable": True,
+            "interaction_class": "portal",
+            "coarse_state": "open",
+            "portal_morphology": {"door_leaf": "present", "confidence": 0.95},
+            "portal_aperture_evidence": {
+                "open_aperture": "visible",
+                "confidence": 0.95,
+            },
+            "confidence": 0.95,
+            "source": "mllm_attribute_inference",
+        },
+        stamp=32.0,
+    )
+
+    portal = next(
+        node
+        for node in store.as_graph_dict(stamp=32.0)["nodes"]
+        if node["id"] == "portal_track_0031"
+    )
+    assert portal["interaction"]["state"] == "open"
+    assert portal["interaction"]["traversable"] is True
+    assert portal["interaction"]["requires_interaction"] is False
+    assert portal["attributes"]["portal_state_gate"]["accepted"] is True
+    child_room_id = portal["attributes"]["portal_child_room_id"]
+    child = next(
+        node for node in store.as_graph_dict(stamp=32.0)["nodes"]
+        if node.get("room_id") == child_room_id
+    )
+    assert child["attributes"]["active"] is True
+    assert child["attributes"]["is_potential_room"] is True
+    assert portal["attributes"]["connectivity_status"] == "potential"
 
 
 def test_clipped_portal_visual_open_does_not_override_closed_state() -> None:

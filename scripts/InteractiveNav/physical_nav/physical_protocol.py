@@ -64,6 +64,7 @@ def image_packet(
     rgb_intrinsics: Mapping[str, Any] | None = None,
     depth_intrinsics: Mapping[str, Any] | None = None,
     depth_to_color_extrinsics: Mapping[str, Any] | None = None,
+    camera_imu: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "v": PROTOCOL_VERSION,
@@ -81,6 +82,7 @@ def image_packet(
         "rgb_intrinsics": dict(rgb_intrinsics or intrinsics),
         "depth_intrinsics": dict(depth_intrinsics or intrinsics),
         "depth_to_color_extrinsics": dict(depth_to_color_extrinsics or {}),
+        "camera_imu": dict(camera_imu or {}),
         "color_depth_sync_ms": float(color_depth_sync_ms),
     }
 

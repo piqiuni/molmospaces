@@ -6,6 +6,7 @@ catkin_install_python(PROGRAMS
   scripts/physical_consistency_node.py
   scripts/physical_ros_gateway.py
   scripts/physical_velocity_safety.py
+  scripts/velocity_command_mux.py
   scripts/physical_interaction_policy_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 install(FILES scripts/physical_consistency.py DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})

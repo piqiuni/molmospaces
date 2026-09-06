@@ -812,6 +812,36 @@ class SemanticBehaviorExecutor:
         self.explore_terminal_yaw_tolerance_rad = max(
             0.01, float(config.get("explore_terminal_yaw_tolerance_rad", 0.20))
         )
+        # A successful post-interaction traversal ends at the fixed point just
+        # outside the opened door.  That point is the only place where the
+        # physical lane performs the optional left/right visual sweep; normal
+        # frontiers and ordinary NAVIGATE goals never enter this state machine.
+        self.post_interaction_exit_observation_enabled = bool(
+            config.get("post_interaction_exit_observation_enabled", False)
+        )
+        self.post_interaction_exit_observation_angle_rad = max(
+            0.10,
+            float(config.get("post_interaction_exit_observation_angle_rad", math.pi / 2.0)),
+        )
+        self.post_interaction_exit_observation_speed_rad_s = max(
+            0.05,
+            float(config.get("post_interaction_exit_observation_speed_rad_s", 0.30)),
+        )
+        self.post_interaction_exit_observation_tolerance_rad = max(
+            0.03,
+            float(config.get("post_interaction_exit_observation_tolerance_rad", 0.12)),
+        )
+        self.post_interaction_exit_observation_settle_s = max(
+            0.0,
+            float(config.get("post_interaction_exit_observation_settle_s", 0.5)),
+        )
+        self.post_interaction_exit_observation_view_timeout_s = max(
+            1.0,
+            float(config.get("post_interaction_exit_observation_view_timeout_s", 6.0)),
+        )
+        self.post_interaction_exit_observation_return_home = bool(
+            config.get("post_interaction_exit_observation_return_home", True)
+        )
         # Interaction approaches have a different terminal geometry contract:
         # their safe standoff and desired facing direction are part of the
         # public bridge precondition.  Keep this independently configurable so
@@ -1222,6 +1252,7 @@ class SemanticBehaviorExecutor:
         # confused with a new run that happens to reuse the same candidate
         # object or decision ID.
         self._navigation_run_sequence = 0
+        self._post_interaction_exit_observation_decisions: set[str] = set()
         self._navigation_result_sources: dict[tuple[str, int], dict] = {}
         self._active_navigation_run_tokens: dict[str, int] = {}
         self._semantic_navigation_progress = SemanticNavigationProgressSupervisor(
@@ -1629,26 +1660,42 @@ class SemanticBehaviorExecutor:
             active_decision_id = str(self.selection.get("decision_id") or "")
             if requested_decision_id != active_decision_id:
                 return
-            if str(request.get("reason") or "") != "preempted_by_target":
+            reason = str(request.get("reason") or "")
+            if reason not in {
+                "preempted_by_target",
+                "interaction_target_resolved",
+            }:
                 return
-            if str(self.selection.get("behavior_type") or "").upper() != "EXPLORE":
+            behavior_type = str(
+                self.selection.get("behavior_type") or ""
+            ).upper()
+            if reason == "preempted_by_target" and behavior_type != "EXPLORE":
+                return
+            if (
+                reason == "interaction_target_resolved"
+                and behavior_type != "INTERACT"
+            ):
                 return
             selection = dict(self.selection)
             cancel_navigation = self.machine.state in {
                 STATE_NAVIGATING,
                 STATE_APPROACH_INTERACTION,
+                STATE_WAITING_FOR_DRAWER_SCAN,
+                STATE_WAITING_FOR_INTERACTION_OBSERVATION,
+                STATE_VERIFYING,
             }
-            finalize_explore = True
+            finalize_explore = reason == "preempted_by_target"
             self._clear_navigation_tracking_locked(active_decision_id)
             self.selection = None
             self.machine.reset()
         if cancel_navigation:
             self.move_base.cancel_goal()
         detail = {
-            "reason": "preempted_by_target",
+            "reason": reason,
             "replacement_candidate_id": str(
                 request.get("replacement_candidate_id") or ""
             ),
+            "resolved_state": str(request.get("resolved_state") or ""),
         }
         if finalize_explore and selection is not None:
             self._publish_explore_command(
@@ -2370,7 +2417,7 @@ class SemanticBehaviorExecutor:
             return {
                 "m1_front_axis_xy": [axis_x, axis_y],
                 "m1_front_yaw": math.atan2(-axis_y, -axis_x),
-                "m1_front_axis_source": "m1_confirmed_aabb_cardinal_face",
+                "m1_front_axis_source": "m1_confirmed_obb_face_normal",
                 "m1_front_staging_index": staging_index,
             }
         anchor = list(metadata.get("container_geometry_anchor_xy") or [])
@@ -6086,6 +6133,81 @@ class SemanticBehaviorExecutor:
         command.angular.z = float(angular_z)
         self.cmd_vel_pub.publish(command)
 
+    def _run_post_interaction_exit_observation(
+        self, decision_id: str, candidate: dict
+    ) -> dict:
+        """Observe both sides from the fixed post-open doorway waypoint.
+
+        This is intentionally a bounded, synchronous handoff after move_base
+        reports the traversal goal reached.  It does not alter frontier
+        scoring or create another navigation goal; the existing executor owns
+        cmd_vel until the sweep returns to the arrival heading.
+        """
+        if not self.post_interaction_exit_observation_enabled:
+            return {"enabled": False, "status": "disabled"}
+        with self.lock:
+            if decision_id in self._post_interaction_exit_observation_decisions:
+                return {"enabled": True, "status": "already_done"}
+            self._post_interaction_exit_observation_decisions.add(decision_id)
+        pose = self._current_pose(self.map_frame)
+        if pose is None:
+            return {"enabled": True, "status": "skipped", "reason": "pose_unavailable"}
+        home_yaw = float(pose[2])
+        angle = float(self.post_interaction_exit_observation_angle_rad)
+        targets = [normalize_angle(home_yaw - angle), normalize_angle(home_yaw + angle)]
+        if self.post_interaction_exit_observation_return_home:
+            targets.append(normalize_angle(home_yaw))
+        views = []
+        started = time.monotonic()
+        try:
+            for index, target_yaw in enumerate(targets):
+                if not self._navigation_is_current(decision_id):
+                    return {"enabled": True, "status": "canceled", "views": views}
+                reached = False
+                deadline = time.monotonic() + self.post_interaction_exit_observation_view_timeout_s
+                while not rospy.is_shutdown() and time.monotonic() < deadline:
+                    if not self._navigation_is_current(decision_id):
+                        return {"enabled": True, "status": "canceled", "views": views}
+                    current = self._current_pose(self.map_frame)
+                    if current is None:
+                        time.sleep(0.05)
+                        continue
+                    error = normalize_angle(target_yaw - float(current[2]))
+                    if abs(error) <= self.post_interaction_exit_observation_tolerance_rad:
+                        reached = True
+                        break
+                    speed = min(
+                        abs(self.post_interaction_exit_observation_speed_rad_s),
+                        max(0.05, abs(error) * 1.5),
+                    )
+                    self._publish_rotation(speed if error > 0.0 else -speed)
+                    time.sleep(0.05)
+                self._publish_rotation(0.0)
+                if not reached:
+                    return {
+                        "enabled": True,
+                        "status": "timeout",
+                        "views": views,
+                        "failed_view_index": index,
+                        "elapsed_s": time.monotonic() - started,
+                    }
+                current = self._current_pose(self.map_frame)
+                views.append({
+                    "index": index,
+                    "target_yaw": target_yaw,
+                    "yaw": float(current[2]) if current is not None else None,
+                })
+                if self.post_interaction_exit_observation_settle_s > 0.0:
+                    time.sleep(self.post_interaction_exit_observation_settle_s)
+            return {
+                "enabled": True,
+                "status": "completed",
+                "views": views,
+                "elapsed_s": time.monotonic() - started,
+            }
+        finally:
+            self._publish_rotation(0.0)
+
     def _fresh_rear_local_costmap_snapshot(self) -> tuple[OccupancyGrid | None, dict]:
         """Return a recent local costmap or a fail-closed diagnostic."""
 
@@ -9033,6 +9155,17 @@ class SemanticBehaviorExecutor:
             nonlocal result_reported
             if result_reported:
                 return
+            # Only the fixed far-side point generated after a successful door
+            # interaction may trigger this observation sweep.  Run it before
+            # handing success back to the decision machine so the next M2
+            # selection sees the new left/right evidence, while preserving the
+            # original navigation result if the optional sweep times out.
+            if success and is_post_interaction_traversal_navigation(candidate):
+                observation_detail = self._run_post_interaction_exit_observation(
+                    decision_id, candidate
+                )
+                if observation_detail:
+                    detail = {**dict(detail or {}), "exit_observation": observation_detail}
             result_reported = True
             with self.lock:
                 sources = getattr(self, "_navigation_result_sources", None)

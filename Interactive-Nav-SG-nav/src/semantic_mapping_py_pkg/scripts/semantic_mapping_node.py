@@ -43,6 +43,12 @@ class SemanticMappingNode:
     def __init__(self):
         patch_roslogging_findcaller_for_py311()
         rospy.init_node("semantic_mapping_py")
+        # The tracked-detection stream is also the cache epoch for the
+        # asynchronous Module-1 worker.  A mapper restart clears the graph,
+        # so publish a fresh epoch even when the physical detector keeps the
+        # same track IDs; otherwise M1 can retain a completed locker
+        # recheck and never repopulate the newly-created graph node.
+        self.tracked_stream_epoch = f"mapper_{os.getpid()}_{time.time_ns()}"
         topics = get_topics(rospy)
         frames = get_frames(rospy)
         config = get_nested_param(rospy, "semantic_map", {}) or {}
@@ -947,15 +953,21 @@ class SemanticMappingNode:
                 )
             ):
                 self.latest_room_segment_grid = room_grid
-                graph_update_t0 = time.perf_counter()
-                self.graph_store.update_room_grid(
-                    raw.info,
-                    room_ids,
-                    room_conf,
-                    room_merges=room_merges,
-                    geometry_stability_frames=self.room_geometry_stability_frames,
-                )
-                graph_update_ms = (time.perf_counter() - graph_update_t0) * 1000.0
+                # A topology-cache hit means the room IDs/geometry are
+                # unchanged. Reapplying the full room graph under the mapper
+                # lock on every OCC frame was the main source of avoidable
+                # callback stalls. Only commit room topology after a real
+                # segmentation or merge.
+                if not cache_hit:
+                    graph_update_t0 = time.perf_counter()
+                    self.graph_store.update_room_grid(
+                        raw.info,
+                        room_ids,
+                        room_conf,
+                        room_merges=room_merges,
+                        geometry_stability_frames=self.room_geometry_stability_frames,
+                    )
+                    graph_update_ms = (time.perf_counter() - graph_update_t0) * 1000.0
                 graph_cache_hit = bool(
                     getattr(self.graph_store, "last_room_grid_cache_hit", False)
                 )
@@ -1265,6 +1277,15 @@ class SemanticMappingNode:
             tracked_detections = self.object_store.as_tracked_detections(
                 min_observations=self.graph_min_observations,
                 confirmed_only=False,
+                # Keep confirmed semantic objects in the graph/M1 stream when
+                # a detector misses a frame.  Visibility is represented by the
+                # graph node's is_currently_visible flag; removing the record
+                # here made interaction state flicker with YOLO dropouts.
+                # Preserve missed objects inside ObjectMapStore/graph state,
+                # but only feed detections observed in this receipt into the
+                # graph update. Re-emitting every historical track marked all
+                # old boxes visible and caused the semantic graph to accumulate
+                # a large number of duplicate-looking boxes.
                 currently_observed_only=True,
             )
             graph_detections = list(tracked_detections)
@@ -1330,6 +1351,7 @@ class SemanticMappingNode:
                 String(
                     data=dumps_compact(
                         {
+                            "episode_id": self.tracked_stream_epoch,
                             "stamp_sec": stamp,
                             "capture_step": parsed.get(
                                 "capture_step", parsed.get("seq")
@@ -1348,6 +1370,18 @@ class SemanticMappingNode:
                 stamp=stamp,
                 source_mode="detector_online",
             )
+            # Remove synthetic door-side rooms that were created before the
+            # portal passed the two-frame + M1 gate.  Without this cleanup,
+            # old provisional rectangles remain in the graph and overlap the
+            # real OCC room when the detector changes its door hypothesis.
+            self.graph_store.prune_unqualified_provisional_rooms()
+            # The room worker can rebuild graph nodes concurrently with a
+            # detector callback. Snapshot the values before iterating so
+            # a portal merge/prune cannot raise ``dictionary changed size``
+            # and drop the current detection update.
+            for graph_node in list(self.graph_store.nodes.values()):
+                if graph_node.type == "portal":
+                    self.graph_store.ensure_provisional_room_for_portal(graph_node)
             self.graph_store.prune_stale_nodes(self.object_stale_after_sec, now=stamp)
         # Portal-hint state is worker-owned.  Updating it can wait behind an
         # in-flight segmentation, but it must never make every mapper callback
@@ -1566,7 +1600,22 @@ class SemanticMappingNode:
         with self.lock:
             for patch in parsed.get("updates") or []:
                 if isinstance(patch, dict):
+                    observed_name = str(
+                        patch.get("observed_object_name")
+                        or patch.get("m1_observed_object_name")
+                        or ""
+                    )
+                    if observed_name:
+                        object_id = str(patch.get("object_id") or patch.get("instance_id") or "")
+                        if object_id:
+                            track_id = object_id.split("_")[-2:]
+                            track_id = "_".join(track_id) if len(track_id) == 2 else object_id
+                            self.object_store.set_m1_canonical_label(track_id, observed_name)
                     changed = self.graph_store.apply_attribute_patch(patch, stamp=stamp) or changed
+            changed = (
+                self.graph_store.prune_unqualified_provisional_rooms()
+                or changed
+            )
         if changed:
             self._safe_publish_bundle(self._collect_publish_bundle())
 

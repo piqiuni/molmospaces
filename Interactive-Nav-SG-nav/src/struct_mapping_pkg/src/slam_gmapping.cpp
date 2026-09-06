@@ -1479,15 +1479,6 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan,
 {
   ROS_DEBUG("Update map");
   boost::mutex::scoped_lock map_lock (map_mutex_);
-  GMapping::ScanMatcher matcher;
-
-  matcher.setLaserParameters(scan.ranges.size(), &(laser_angles_[0]),
-                             gsp_laser_->getPose());
-
-  matcher.setlaserMaxRange(maxRange_);
-  matcher.setusableRange(maxUrange_);
-  matcher.setgenerateMap(true);
-
   GMapping::GridSlamProcessor::Particle best =
           gsp_->getParticles()[gsp_->getBestParticleIndex()];
   std_msgs::Float64 entropy;
@@ -1506,31 +1497,11 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan,
     map_.map.info.origin.orientation.w = 1.0;
   } 
 
-  GMapping::Point center;
-  center.x=(xmin_ + xmax_) / 2.0;
-  center.y=(ymin_ + ymax_) / 2.0;
-
-  GMapping::ScanMatcherMap smap(center, xmin_, ymin_, xmax_, ymax_, 
-                                delta_);
-
-  ROS_DEBUG("Trajectory tree:");
-  for(GMapping::GridSlamProcessor::TNode* n = best.node;
-      n;
-      n = n->parent)
-  {
-    ROS_DEBUG("  %.3f %.3f %.3f",
-              n->pose.x,
-              n->pose.y,
-              n->pose.theta);
-    if(!n->reading)
-    {
-      ROS_DEBUG("Reading is NULL");
-      continue;
-    }
-    matcher.invalidateActiveArea();
-    matcher.computeActiveArea(smap, n->pose, &((*n->reading)[0]));
-    matcher.registerScan(smap, n->pose, &((*n->reading)[0]));
-  }
+  // The odometry-locked processor now maintains the particle map
+  // incrementally in processScan().  Replaying every TNode here made OCC
+  // latency grow monotonically with runtime (50--80 ms after a few minutes).
+  // Serialize the already-updated map instead.
+  const GMapping::ScanMatcherMap& smap = best.map;
 
   // the map may have expanded, so resize ros message as well
   if(map_.map.info.width != (unsigned int) smap.getMapSizeX() || map_.map.info.height != (unsigned int) smap.getMapSizeY()) {

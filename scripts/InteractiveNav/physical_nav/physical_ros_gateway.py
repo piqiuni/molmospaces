@@ -75,7 +75,14 @@ class PhysicalRosGateway:
         )
         self.depth_pub = rospy.Publisher("/physical_nav/depth/image_raw", Image, queue_size=1)
         self.info_pub = rospy.Publisher("/physical_nav/camera_info", CameraInfo, queue_size=1)
-        self.cloud_pub = rospy.Publisher("/physical_nav/points", PointCloud2, queue_size=1)
+        self.depth_info_pub = rospy.Publisher(
+            "/physical_nav/depth_camera_info", CameraInfo, queue_size=1
+        )
+        # Latest-only transport with TCP_NODELAY keeps a fresh cloud from
+        # waiting behind a large serialized PointCloud2 packet.
+        self.cloud_pub = rospy.Publisher(
+            "/physical_nav/points", PointCloud2, queue_size=1, tcp_nodelay=True
+        )
         self.segmented_cloud_pub = rospy.Publisher(
             "/physical_nav/segmented_cloud", PointCloud2, queue_size=1
         )
@@ -86,7 +93,9 @@ class PhysicalRosGateway:
         self.boxes_world_pub = rospy.Publisher(
             "/physical_nav/boxes_3d_world", MarkerArray, queue_size=1, latch=True
         )
-        self.odom_pub = rospy.Publisher("/physical_nav/odom", Odometry, queue_size=1)
+        self.odom_pub = rospy.Publisher(
+            "/physical_nav/odom", Odometry, queue_size=1, tcp_nodelay=True
+        )
         self.detection_pub = rospy.Publisher("/physical_nav/detections", String, queue_size=1)
         # M1 needs public semantic names and a stable identity, while the raw
         # mapper should continue receiving untouched detector instances.  A
@@ -339,6 +348,42 @@ class PhysicalRosGateway:
                     except Exception:
                         transform_cache[source_frame] = None
             detections = [self._map_detection(item, transform_cache.get(str(item.get("source_frame", "") or ""))) for item in state.get("detections", []) if isinstance(item, dict)]
+            # Use the same history-smoothed portal geometry for semantic
+            # mapping that is used by boxes_3d_world. Otherwise the point
+            # cloud/marker follows the stable OBB while Graph receives the
+            # raw PCA axis and can be rotated by roughly 90 degrees.
+            stable_preview = self._stable_world_boxes(detections)
+            stable_portals = [
+                item for item in stable_preview
+                if str(item.get("semantic_class") or "").casefold() in {"door", "portal", "gate"}
+            ]
+            for detection in detections:
+                if str(detection.get("semantic_class") or "").casefold() not in {"door", "portal", "gate"} or not stable_portals:
+                    continue
+                center = self._point3(detection.get("world_box3d_center"))
+                if center is None:
+                    continue
+                stable = min(
+                    stable_portals,
+                    key=lambda item: math.sqrt(sum(
+                        (center[index] - self._point3(item.get("world_box3d_center"))[index]) ** 2
+                        for index in range(3)
+                    )) if self._point3(item.get("world_box3d_center")) is not None else float("inf"),
+                )
+                stable_center = self._point3(stable.get("world_box3d_center"))
+                stable_size = self._point3(stable.get("world_box3d_size"))
+                if stable_center is None or stable_size is None:
+                    continue
+                detection["world_box3d_center"] = list(stable_center)
+                detection["world_box3d_size"] = list(stable_size)
+                detection["world_box3d_marker_size"] = list(stable_size)
+                detection["world_box3d_orientation"] = list(stable.get("world_box3d_orientation") or [0.0, 0.0, 0.0, 1.0])
+                detection["world_box3d_yaw"] = stable.get("world_box3d_yaw")
+                detection["yaw"] = stable.get("world_box3d_yaw")
+                detection["aabb_center"] = list(stable_center)
+                detection["aabb_size"] = list(stable_size)
+                detection["box3d_center"] = list(stable_center)
+                detection["box3d_size"] = list(stable_size)
             mapping_detections = [
                 {
                     key: value
@@ -709,6 +754,31 @@ class PhysicalRosGateway:
                 detection.get("confidence", 0.0) or 0.0
             )
             track["detection"] = dict(detection)
+            if label.casefold() in {"door", "portal", "gate"}:
+                orientation = detection.get("world_box3d_orientation")
+                raw_yaw = None
+                if isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+                    raw_yaw = self._quaternion_yaw([float(value) for value in orientation[:4]])
+                elif detection.get("world_box3d_yaw") is not None:
+                    try:
+                        raw_yaw = float(detection.get("world_box3d_yaw"))
+                    except (TypeError, ValueError):
+                        raw_yaw = None
+                if raw_yaw is not None and math.isfinite(raw_yaw):
+                    previous_yaw = track.get("yaw")
+                    if previous_yaw is None:
+                        track["yaw"] = raw_yaw
+                    else:
+                        candidates = [raw_yaw + index * (math.pi * 0.5) for index in range(-2, 3)]
+                        aligned_yaw = min(candidates, key=lambda value: abs(0.5 * math.atan2(
+                            math.sin(2.0 * (value - float(previous_yaw))),
+                            math.cos(2.0 * (value - float(previous_yaw))),
+                        )))
+                        delta = 0.5 * math.atan2(
+                            math.sin(2.0 * (aligned_yaw - float(previous_yaw))),
+                            math.cos(2.0 * (aligned_yaw - float(previous_yaw))),
+                        )
+                        track["yaw"] = float(previous_yaw) if abs(delta) > math.pi * 0.25 else float(previous_yaw) + 0.20 * delta
 
         expired = [
             track_id
@@ -726,10 +796,24 @@ class PhysicalRosGateway:
             item["visualization_track_id"] = track_id
             item["world_box3d_center"] = list(track["center"])
             item["world_box3d_size"] = list(track["size"])
+            item["world_box3d_marker_size"] = list(track["size"])
             if track["class_scores"]:
                 item["semantic_class"] = max(
                     track["class_scores"], key=track["class_scores"].get
                 )
+            if str(item.get("semantic_class") or "").casefold() in {"door", "portal", "gate"} and track.get("yaw") is not None:
+                item["world_box3d_orientation"] = [
+                    0.0,
+                    0.0,
+                    math.sin(float(track["yaw"]) * 0.5),
+                    math.cos(float(track["yaw"]) * 0.5),
+                ]
+                item["world_box3d_yaw"] = float(track["yaw"])
+            elif item.get("world_box3d_yaw") is not None:
+                # Non-portal graph boxes must not retain the detector's
+                # pre-TF yaw when the marker has already been fitted in the
+                # map frame.
+                item["yaw"] = float(item["world_box3d_yaw"])
             stable.append(item)
         return stable
 
@@ -880,7 +964,103 @@ class PhysicalRosGateway:
     def _map_detection(self, detection: dict[str, Any], transform: Any = None) -> dict[str, Any]:
         mapped = dict(detection)
         source_frame = str(detection.get("source_frame", "") or "")
+        semantic_label = str(
+            detection.get("semantic_class") or detection.get("raw_class") or ""
+        ).strip().casefold()
+        # Planar interaction targets need their complete visible extent. For
+        # ordinary objects, the outer 2% of RGB-D mask points is frequently a
+        # wall/floor leak and makes boxes metres larger than the object.
+        bounds_low, bounds_high = (
+            (0.02, 0.98)
+            if semantic_label in {"door", "portal"}
+            else (0.10, 0.90)
+        )
         source_point = detection.get("camera_box3d_center") or detection.get("camera_position")
+        # The world segmented cloud below is generated from these exact
+        # camera-frame points and the TF transform.  Prefer their transformed
+        # geometry for the box too, so a box can never be in the worker's
+        # legacy telemetry frame while the cloud is in tf_frame_map.
+        camera_segments = self._segment_points(
+            detection, "camera_segment_points_f32", "camera_segment_points"
+        )
+        transformed_segments: list[tuple[float, float, float]] = []
+        if transform is not None and camera_segments:
+            for value in camera_segments:
+                point = self._point3(value)
+                if point is None or not all(math.isfinite(axis) for axis in point):
+                    continue
+                rotated = self._rotate_point(transform.transform.rotation, point)
+                transformed_segments.append((
+                    rotated[0] + float(transform.transform.translation.x),
+                    rotated[1] + float(transform.transform.translation.y),
+                    rotated[2] + float(transform.transform.translation.z),
+                ))
+        if transformed_segments:
+            # Use the same finite transformed samples that are sent to
+            # segmented_cloud_world. Quantiles reject an occasional depth
+            # outlier while keeping the box centered on the visible cloud.
+            values = np.asarray(transformed_segments, dtype=np.float32)
+            mins = np.quantile(values, bounds_low, axis=0)
+            maxs = np.quantile(values, bounds_high, axis=0)
+            center = (mins + maxs) * 0.5
+            size = np.maximum(maxs - mins, 0.01)
+            obb_center, obb_size, obb_orientation = self._fit_world_obb(values)
+            mapped["world_box3d_center"] = [float(axis) for axis in obb_center]
+            mapped["world_box3d_size"] = [float(axis) for axis in obb_size]
+            mapped["world_box3d_marker_size"] = [float(axis) for axis in obb_size]
+            # ``size`` remains the world AABB for occupancy/semantic
+            # clearance, while the marker gets a horizontal OBB fitted from
+            # the exact TF-transformed segmented points.  Setting the marker
+            # quaternion to identity here made the point cloud and its box
+            # disagree whenever the door was rotated in the map.
+            mapped["world_box3d_orientation"] = obb_orientation
+            mapped["world_box3d_yaw"] = self._quaternion_yaw(obb_orientation)
+            # The semantic/top-down path consumes ``yaw``; keep it aligned
+            # with the orientation used by the world 3-D marker.
+            mapped["yaw"] = mapped["world_box3d_yaw"]
+            mapped["world_position"] = self._point_dict(tuple(float(axis) for axis in center))
+            mapped["position"] = self._point_dict(tuple(float(axis) for axis in center))
+            mapped["aabb_center"] = [float(axis) for axis in center]
+            mapped["aabb_size"] = [float(axis) for axis in size]
+            mapped["box3d_center"] = [float(axis) for axis in center]
+            mapped["box3d_size"] = [float(axis) for axis in size]
+            mapped["map_frame"] = self.world_frame
+            mapped["map_transform_status"] = "tf_segment_points"
+            mapped["map_transform_source_frame"] = source_frame
+            return mapped
+        # If TF is temporarily unavailable, segmented_cloud_world falls back
+        # to the worker-provided world samples. Derive the fallback box from
+        # those same samples instead of mixing them with a different worker
+        # OBB center/size.
+        world_segments = self._segment_points(
+            detection, "world_segment_points_f32", "world_segment_points"
+        )
+        if world_segments:
+            values = np.asarray(
+                [point for point in (self._point3(value) for value in world_segments)
+                 if point is not None and all(math.isfinite(axis) for axis in point)],
+                dtype=np.float32,
+            )
+            if values.size:
+                mins = np.quantile(values, bounds_low, axis=0)
+                maxs = np.quantile(values, bounds_high, axis=0)
+                center = (mins + maxs) * 0.5
+                size = np.maximum(maxs - mins, 0.01)
+                obb_center, obb_size, obb_orientation = self._fit_world_obb(values)
+                mapped["world_box3d_center"] = [float(axis) for axis in obb_center]
+                mapped["world_box3d_size"] = [float(axis) for axis in obb_size]
+                mapped["world_box3d_marker_size"] = [float(axis) for axis in obb_size]
+                mapped["world_box3d_orientation"] = obb_orientation
+                mapped["world_box3d_yaw"] = self._quaternion_yaw(obb_orientation)
+                mapped["yaw"] = mapped["world_box3d_yaw"]
+                mapped["world_position"] = self._point_dict(tuple(float(axis) for axis in center))
+                mapped["position"] = self._point_dict(tuple(float(axis) for axis in center))
+                mapped["aabb_center"] = [float(axis) for axis in center]
+                mapped["aabb_size"] = [float(axis) for axis in size]
+                mapped["box3d_center"] = [float(axis) for axis in center]
+                mapped["box3d_size"] = [float(axis) for axis in size]
+                mapped["map_transform_status"] = "world_segment_points_fallback"
+                return mapped
         if not source_frame or not isinstance(source_point, (dict, list, tuple)):
             mapped.setdefault("map_transform_status", "telemetry_fallback")
             self._copy_world_fallback(mapped)
@@ -926,18 +1106,62 @@ class PhysicalRosGateway:
             mapped["aabb_center"] = list(map_center)
             mapped["box3d_center"] = list(map_center)
             mapped["world_box3d_size"] = self._point_dict(map_size)
-            # The worker's OBB is fitted from this instance's world points;
-            # keep its dimensions/orientation for visualization.  The
-            # transform-derived AABB remains available through aabb_size.
-            if self._point3(detection.get("world_box3d_marker_size")) is not None:
-                mapped["world_box3d_size"] = detection["world_box3d_marker_size"]
-                mapped["world_box3d_marker_size"] = detection["world_box3d_marker_size"]
+            # The marker must use the same transform-derived geometry as the
+            # mapped box.  Do not overwrite it with the worker's legacy
+            # telemetry-frame marker size: that value can be expressed in a
+            # different frame and makes a correct point cloud appear to have
+            # a displaced/inconsistent 3-D box.
+            mapped["world_box3d_marker_size"] = list(map_size)
+            mapped["world_box3d_orientation"] = list(
+                mapped.get("world_box3d_orientation") or [0.0, 0.0, 0.0, 1.0]
+            )
+            mapped["world_box3d_yaw"] = self._quaternion_yaw(
+                mapped["world_box3d_orientation"]
+            )
+            mapped["yaw"] = mapped["world_box3d_yaw"]
             mapped["aabb_size"] = list(map_size)
             mapped["box3d_size"] = list(map_size)
         mapped["map_frame"] = self.world_frame
         mapped["map_transform_status"] = "tf"
         mapped["map_transform_source_frame"] = source_frame
         return mapped
+
+    @staticmethod
+    def _quaternion_yaw(quaternion: list[float]) -> float:
+        if len(quaternion) < 4:
+            return 0.0
+        z = float(quaternion[2])
+        w = float(quaternion[3])
+        return math.atan2(2.0 * w * z, 1.0 - 2.0 * z * z)
+
+    @staticmethod
+    def _fit_world_obb(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, list[float]]:
+        """Fit a yaw-only world OBB to the same points used by the cloud."""
+        points = np.asarray(values, dtype=np.float64)
+        center = np.mean(points, axis=0)
+        if points.shape[0] < 3:
+            return center, np.maximum(np.ptp(points, axis=0), 0.01), [0.0, 0.0, 0.0, 1.0]
+        centered = points - center
+        covariance = centered[:, :2].T @ centered[:, :2] / max(1, points.shape[0] - 1)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        horizontal = eigenvectors[:, int(np.argmax(eigenvalues))]
+        yaw = math.atan2(float(horizontal[1]), float(horizontal[0]))
+        if math.cos(yaw) < 0.0 or (abs(math.cos(yaw)) < 1e-6 and math.sin(yaw) < 0.0):
+            yaw += math.pi
+        c, s = math.cos(yaw), math.sin(yaw)
+        axes = np.asarray([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        # ``axes`` is the local-to-world rotation.  Since points are stored
+        # as row vectors, multiplying by ``axes`` projects world rows back to
+        # the local OBB frame.  Keeping this convention makes the fitted
+        # dimensions and quaternion describe the same box.
+        projected = centered @ axes
+        mins = np.quantile(projected, 0.02, axis=0)
+        maxs = np.quantile(projected, 0.98, axis=0)
+        local_center = (mins + maxs) * 0.5
+        obb_center = center + axes @ local_center
+        obb_size = np.maximum(maxs - mins, 0.01)
+        orientation = [0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)]
+        return obb_center, obb_size, orientation
 
     def _copy_world_fallback(self, mapped: dict[str, Any]) -> None:
         """Expose worker-computed telemetry world geometry when TF is late."""
@@ -956,6 +1180,10 @@ class PhysicalRosGateway:
             mapped["world_box3d_center"] = list(center)
         if size is not None:
             mapped["world_box3d_size"] = list(size)
+            # Keep the marker size in the fallback world frame.  Preserve the
+            # worker OBB quaternion when TF is temporarily unavailable; do
+            # not erase the angle with an identity quaternion.
+            mapped["world_box3d_marker_size"] = list(size)
 
     def _publish(self, raw: dict[str, Any]) -> None:
         if isinstance(raw.get("telemetry"), dict):
@@ -976,11 +1204,28 @@ class PhysicalRosGateway:
             rgb_msg = _image_msg(rgb, "bgr8", stamp, rgb_frame)
             depth_msg = _image_msg(depth, "16UC1", stamp, depth_frame)
         intr = raw.get("rgb_intrinsics") or raw.get("intrinsics", {})
+        depth_intr = raw.get("depth_intrinsics") or intr
         info = CameraInfo(); info.header.stamp = stamp; info.header.frame_id = rgb_frame; info.width = int(intr.get("width", rgb.shape[1])); info.height = int(intr.get("height", rgb.shape[0])); info.K = [float(intr.get("fx", 0)), 0, float(intr.get("cx", 0)), 0, float(intr.get("fy", 0)), float(intr.get("cy", 0)), 0, 0, 1]
         distortion = [float(value) for value in (intr.get("distortion") or [])[:5]]
         info.D = distortion
         info.distortion_model = str(intr.get("distortion_model", "plumb_bob") or "plumb_bob")
-        self.rgb_pub.publish(rgb_msg); self.depth_pub.publish(depth_msg); self.info_pub.publish(info)
+        depth_info = CameraInfo()
+        depth_info.header.stamp = stamp
+        depth_info.header.frame_id = depth_frame
+        depth_info.width = int(depth_intr.get("width", depth.shape[1]))
+        depth_info.height = int(depth_intr.get("height", depth.shape[0]))
+        depth_info.K = [
+            float(depth_intr.get("fx", 0)), 0.0,
+            float(depth_intr.get("cx", 0)), 0.0,
+            float(depth_intr.get("fy", 0)),
+            float(depth_intr.get("cy", 0)), 0.0, 0.0, 1.0,
+        ]
+        depth_info.D = [float(value) for value in (depth_intr.get("distortion") or [])[:5]]
+        depth_info.distortion_model = str(
+            depth_intr.get("distortion_model", "plumb_bob") or "plumb_bob"
+        )
+        self.rgb_pub.publish(rgb_msg); self.depth_pub.publish(depth_msg)
+        self.info_pub.publish(info); self.depth_info_pub.publish(depth_info)
         self._publish_cloud(depth, raw.get("depth_intrinsics") or intr, stamp, depth_frame); self._publish_pose(raw.get("telemetry", {}), stamp, depth_frame)
 
     def _publish_cloud(self, depth: np.ndarray, intr: dict[str, Any], stamp: Any, frame: str) -> None:
@@ -1087,7 +1332,10 @@ def _to_float(value: Any) -> float:
 
 def _telemetry_quaternion(telemetry: dict[str, Any]) -> tuple[float, float, float, float] | None:
     """Read live orientation as (x, y, z, w), preferring camera pose/IMU."""
-    candidates = [telemetry.get("camera_pose"), telemetry.get("d435i_pose"), telemetry.get("pose"), telemetry.get("camera_imu"), telemetry.get("imu")]
+    # This quaternion drives odom -> base_link.  A D435i motion quaternion is
+    # in the camera motion-module frame and must never replace the Go2 body
+    # attitude here.
+    candidates = [telemetry.get("camera_pose"), telemetry.get("d435i_pose"), telemetry.get("pose"), telemetry.get("imu")]
     for source in candidates:
         if not isinstance(source, dict):
             continue
@@ -1130,7 +1378,10 @@ def main() -> None:
     p.add_argument("--web-url", default="http://127.0.0.1:8765")
     p.add_argument("--rate", type=float, default=10.)
     p.add_argument("--state-period", type=float, default=.2)
-    p.add_argument("--occupancy-period", type=float, default=.5)
+    # Forward every fresh map publication to the web/semantic consumers. The
+    # mapper itself already controls map generation; .5 s here imposed an
+    # avoidable 2 Hz ceiling and made rotations appear to smear walls.
+    p.add_argument("--occupancy-period", type=float, default=.1)
     p.add_argument("--point-stride", type=int, default=6)
     p.add_argument("--max-depth-m", type=float, default=8.)
     p.add_argument("--no-return-depth-m", type=float, default=8.05)
@@ -1145,7 +1396,7 @@ def main() -> None:
     p.add_argument("--camera-yaw", type=float, default=0.)
     p.add_argument("--box-hold-s", type=float, default=3.0)
     p.add_argument("--box-match-distance-m", type=float, default=.60)
-    p.add_argument("--box-smoothing-alpha", type=float, default=.25)
+    p.add_argument("--box-smoothing-alpha", type=float, default=1.0)
     p.add_argument("--box-min-confirmations", type=int, default=2)
     p.add_argument("--occupancy-grid-topic", default="/physical_nav/occupancy")
     p.add_argument("--room-grid-topic", default="/physical_nav/room_segment_grid")

@@ -5,6 +5,7 @@ topics:
   rgb_image: /physical_nav/rgb/image_raw
   depth_image: /physical_nav/depth/image_raw
   camera_info: /physical_nav/camera_info
+  depth_camera_info: /physical_nav/depth_camera_info
   pointcloud: /physical_nav/points
   occupancy_grid: /physical_nav/occupancy
   object_detections: /physical_nav/detections
@@ -50,7 +51,7 @@ semantic_map:
   publish_rate: 10.0
   object_min_confirmations: 3
   object_class_min_confirmations: {door: 3, portal: 3, fridge: 3, refrigerator: 3}
-  object_class_min_top_height_m: {door: 1.80, portal: 1.80, fridge: 1.50, refrigerator: 1.50}
+  object_class_min_top_height_m: {door: 1.40, portal: 1.40, fridge: 1.50, refrigerator: 1.50}
   graph_min_observations: 3
   # Newly exposed refrigerator contents can be visible for one frame.  This
   # graph-only lane does not change the strict tracked-detections/M1 stream.

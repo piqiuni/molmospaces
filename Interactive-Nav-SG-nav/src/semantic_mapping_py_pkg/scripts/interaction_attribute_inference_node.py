@@ -80,6 +80,15 @@ class InteractionAttributeInferenceNode:
         self.success_refresh_interval_s = max(
             0.0, float(rospy.get_param("~success_refresh_interval_s", 120.0))
         )
+        # Generic locker/safe tracks need a second independent RGB crop when
+        # M1 calls them a refrigerator.  Keep the physical recheck short
+        # enough to resolve a provisional interaction target promptly during
+        # normal 10 Hz perception, but bounded to two attempts so it cannot
+        # become a permanent GPU workload.
+        self.m1_recheck_refresh_interval_s = max(
+            0.0,
+            float(rospy.get_param("~m1_recheck_refresh_interval_s", 2.0)),
+        )
         # Unknown/weak portal judgments are safety-gated by the decision
         # layer, so keeping them cached for the normal 120 s would make a
         # nearby, better view unusable.  Retry at a bounded short interval;
@@ -1764,8 +1773,28 @@ class InteractionAttributeInferenceNode:
 
         semantic_text = " ".join(
             str(detection.get(key) or "").casefold()
-            for key in ("semantic_name", "category", "name")
+            for key in ("semantic_name", "semantic_class", "category", "name", "raw_class")
         )
+        semantic_text += " " + " ".join(
+            str(value or "").casefold()
+            for value in (detection.get("candidate_labels") or [])
+        )
+        source_tokens = {
+            str(detection.get(key) or "").strip().casefold().replace("-", "_")
+            for key in ("semantic_name", "semantic_class", "category", "name", "raw_class")
+        }
+        m1_name = str(
+            patch.get("observed_object_name")
+            or patch.get("m1_object_name")
+            or patch.get("object_name")
+            or ""
+        ).strip().casefold()
+        if (
+            source_tokens.intersection({"locker", "safe", "water_dispenser", "dispenser"})
+            and any(token in m1_name for token in ("fridge", "refrigerator", "freezer"))
+        ):
+            patch["m1_recheck_required"] = True
+            return self.m1_recheck_refresh_interval_s
         is_portal_candidate = any(
             token in semantic_text for token in ("door", "gate", "barrier", "portal")
         )
@@ -1814,7 +1843,10 @@ class InteractionAttributeInferenceNode:
         score += 6.0 * float(
             any(
                 token in semantic_text
-                for token in ("fridge", "cabinet", "drawer", "dresser", "wardrobe", "closet")
+                for token in (
+                    "fridge", "refrigerator", "locker", "cabinet", "drawer",
+                    "dresser", "wardrobe", "closet",
+                )
             )
         )
         score += 8.0 * float(bool(detection.get("target_relevant")))
@@ -1830,7 +1862,19 @@ class InteractionAttributeInferenceNode:
             if object_id in self.pending:
                 return None
             completed = self.completed.get(object_id)
-            if completed is not None and completed.get("signature") == signature:
+            if completed is not None:
+                # A small detector-box jitter must not invalidate a successful
+                # semantic answer.  Previously the refresh interval was only
+                # applied when the raw/coarse view signature was identical;
+                # a 1-2 px bbox change therefore requeued the same locker at
+                # the perception rate and made M1 scan it continuously.
+                # Explicit targeted refreshes bypass this method and still
+                # force a new view when the planner really needs one.
+                if (
+                    bool(completed.get("m1_recheck_required"))
+                    and int(completed.get("m1_recheck_attempts", 0) or 0) >= 2
+                ):
+                    return None
                 refresh_interval_s = float(
                     completed.get(
                         "refresh_interval_s", self.success_refresh_interval_s
@@ -1838,8 +1882,8 @@ class InteractionAttributeInferenceNode:
                     or 0.0
                 )
                 if (
-                    refresh_interval_s <= 0.0
-                    or now - float(completed.get("completed_at", 0.0))
+                    refresh_interval_s > 0.0
+                    and now - float(completed.get("completed_at", 0.0))
                     < refresh_interval_s
                 ):
                     return None
@@ -2066,6 +2110,7 @@ class InteractionAttributeInferenceNode:
         outcome_status = "failed"
         outcome_error = ""
         refresh_interval_s = self.success_refresh_interval_s
+        m1_recheck_required = False
         try:
             with self.lock:
                 self.filter_counts["started"] += 1
@@ -2100,6 +2145,20 @@ class InteractionAttributeInferenceNode:
                 else ""
             )
             public_bbox = self._public_detection_bbox(detection)
+            # M1 receives the resized visual evidence.  Convert detector
+            # coordinates from the source RGB frame into that exact image
+            # coordinate system; otherwise the dashboard and any downstream
+            # visual trace draw the box at the wrong location.
+            if public_bbox and isinstance(raw_image, np.ndarray) and raw_image.ndim >= 2:
+                src_h, src_w = raw_image.shape[:2]
+                resized = self._resize_visual_evidence(raw_image, self.visual_evidence_max_side_px)
+                dst_h, dst_w = resized.shape[:2]
+                sx = float(dst_w) / max(float(src_w), 1.0)
+                sy = float(dst_h) / max(float(src_h), 1.0)
+                public_bbox = [
+                    public_bbox[0] * sx, public_bbox[1] * sy,
+                    public_bbox[2] * sx, public_bbox[3] * sy,
+                ]
             semantic_label = str(
                 detection.get("semantic_class")
                 or detection.get("semantic_name")
@@ -2129,6 +2188,20 @@ class InteractionAttributeInferenceNode:
                 if container_refresh
                 else ""
             )
+            if semantic_label.strip().casefold().replace("-", "_") in {
+                "locker",
+                "safe",
+                "water_dispenser",
+                "dispenser",
+            }:
+                expected_type_instruction += (
+                    "This is a name-disambiguation recheck. Explicitly distinguish a "
+                    "cold-storage refrigerator/freezer from a drinking-water dispenser, "
+                    "water cooler, or hand-dryer. Use observed_object_name=water_dispenser "
+                    "(or the most specific dispenser name) when the image shows a water "
+                    "outlet/bottle reservoir and no refrigerator storage doors; never let "
+                    "the detector hypothesis locker/safe force the answer refrigerator. "
+                )
             if expected_object_kind == "refrigerator":
                 expected_type_instruction += (
                     "The planner specifically hypothesizes a refrigerator. Verify this "
@@ -2167,9 +2240,16 @@ class InteractionAttributeInferenceNode:
                     "and a padded target crop inset. "
                 )
             )
+            hypothesis_instruction = (
+                "重点判断图中标注的 locker 是否实际为冰箱；给出其为冰箱的置信度，"
+                "并识别冰箱当前的开合状态。若不是冰箱，保留 locker 语义。"
+                if semantic_label.casefold() == "locker"
+                else ""
+            )
             instruction = "".join(
                 (
                     expected_type_instruction,
+                    hypothesis_instruction,
                     "Infer the outlined target's pre-interaction visual attributes using "
                     "only pixels in the supplied composite image sequence. Images are ordered "
                     "from older to newest and come only from materially separated robot views; "
@@ -2283,6 +2363,7 @@ class InteractionAttributeInferenceNode:
                 # overwrite M1's visual class decision.
                 patch["m1_expected_node_type"] = "container"
             refresh_interval_s = self._attribute_refresh_interval(detection, patch)
+            m1_recheck_required = bool(patch.get("m1_recheck_required", False))
             with self.lock:
                 if episode_id and episode_id != self.current_episode_id:
                     outcome_status = "stale"
@@ -2369,11 +2450,22 @@ class InteractionAttributeInferenceNode:
                     if model_call_started:
                         self.last_request[object_id] = time.monotonic()
                 if succeeded and current_request:
+                    previous_completed = self.completed.get(object_id) or {}
+                    m1_recheck_required = bool(
+                        m1_recheck_required
+                        or previous_completed.get("m1_recheck_required")
+                    )
                     self.completed[object_id] = {
                         "signature": signature,
                         "completed_at": time.monotonic(),
                         "request_sequence": request_sequence,
                         "refresh_interval_s": refresh_interval_s,
+                        "m1_recheck_required": m1_recheck_required,
+                        "m1_recheck_attempts": (
+                            int(previous_completed.get("m1_recheck_attempts", 0) or 0) + 1
+                            if m1_recheck_required
+                            else 0
+                        ),
                     }
                 elif (
                     current_request

@@ -5,12 +5,13 @@
   <arg name="device" default="cuda:0"/>
   <!-- Normal standing Go2 base_link height is 0.305 m; camera ground height 1.285 m => relative z 0.980 m. -->
   <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.98"/>
-  <!-- Camera points 13 degrees forward/down; RPY values are radians. -->
-  <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.2268928"/><arg name="camera_yaw" default="0.0"/>
+  <!-- Camera points 8 degrees forward/down; RPY values are radians. -->
+  <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.1396263"/><arg name="camera_yaw" default="0.0"/>
   <arg name="ros_python" default="/usr/bin/python3"/>
   <arg name="system_ros_python" default="/home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/physical_ros_python.sh"/>
   <arg name="start_mapping" default="true"/>
   <arg name="semantic_override_config" default="$(find physical_nav)/config/semantic_shadow_override.yaml"/>
+  <arg name="explore_override_config" default="$(find physical_nav)/config/explore_physical_override.yaml"/>
   <arg name="move_base_override_config" default="$(find physical_nav)/config/physical_move_base_override.yaml"/>
   <arg name="interaction_profile" default="physical_human"/>
   <arg name="enable_m1" default="true"/>
@@ -29,13 +30,20 @@
     <rosparam file="$(arg config_file)" command="load"/>
     <rosparam file="$(arg semantic_override_config)" command="load"/>
     <param name="model_name" value="qwen3.6-35b-a3b-fp8"/>
-    <param name="max_output_tokens" value="256"/>
+    <!-- 256 tokens frequently truncates M1's JSON before the closing
+         interaction_parts/action_regions fields.  Keep the response small,
+         but leave enough room for a valid structured result. -->
+    <param name="max_output_tokens" value="384"/>
     <param name="request_timeout_s" value="20.0"/>
     <param name="min_interval_s" value="2.0"/>
+    <!-- Generic locker/safe tracks that M1 calls refrigerator receive one
+         independent recheck; stop after two confirmations to avoid a permanent
+         GPU refresh loop. -->
+    <param name="m1_recheck_refresh_interval_s" value="2.0"/>
     <!-- Keep M1's admission vocabulary identical to the physical interaction
          candidate whitelist: only door and fridge objects may trigger VLM
          attribute analysis. -->
-    <rosparam param="include_keywords">[door, fridge]</rosparam>
+    <rosparam param="include_keywords">[door, fridge, refrigerator, locker]</rosparam>
     <!-- Physical M1 consumes the 3-D ObjectMap's stable tracked detections;
          the raw mapper topic remains unchanged. Thin door masks commonly
          occupy 5-15% of their 2-D rectangle, so use a physical-only gate. -->
@@ -44,6 +52,9 @@
     <param name="min_visible_pixels" value="1024"/>
     <param name="min_bbox_area_px" value="1600"/>
     <param name="max_distance_m" value="8.0"/>
+    <!-- A one-frame RGB-D box is not sufficient for an interaction object.
+         Require two consecutive observations before M1 sees the track. -->
+    <param name="required_consecutive_observations" value="2"/>
     <param name="worker_count" value="1"/>
     <param name="max_queue_size" value="8"/>
   </node>
@@ -60,7 +71,11 @@
       <param name="use_odom_pose_for_mapping" value="true"/>
       <param name="mapping_scan_source" value="pointcloud"/>
       <param name="mapping_scan_topic" value="/physical_nav/points"/>
-      <param name="scan_filter_tolerance_sec" value="0.15"/>
+      <!-- Do not wait for a future TF transform.  The point cloud is already
+           stamped with the camera capture time and the mapper has its own
+           nearest-odom guard below; a positive MessageFilter tolerance adds
+           avoidable latency to every frame. -->
+      <param name="scan_filter_tolerance_sec" value="0.0"/>
       <!-- D435i and Go2 telemetry arrive over independent WebSocket packets.
            Their measured nearest-stamp delta is commonly 70-150 ms, so the
            simulation-tuned 30 ms guard discarded most physical scans. -->
@@ -130,6 +145,18 @@
     <param name="input_topic" value="/physical_nav/shadow_cmd_vel"/>
     <param name="output_topic" value="/physical_nav/actuated_cmd_vel"/>
   </node>
+  <!-- Single writer for the physical shadow command.  move_base and the
+       semantic executor are separate sources; never let ROS interleave their
+       Twist messages on one topic. -->
+  <node name="physical_velocity_command_mux" pkg="physical_nav" type="velocity_command_mux.py" launch-prefix="/usr/bin/python3" output="screen" respawn="true" respawn_delay="1.0">
+    <param name="move_base_topic" value="/physical_nav/move_base_cmd_vel"/>
+    <param name="semantic_topic" value="/physical_nav/semantic_cmd_vel"/>
+    <param name="output_topic" value="/physical_nav/shadow_cmd_vel"/>
+    <param name="publish_rate_hz" value="20.0"/>
+    <param name="move_base_timeout_s" value="0.35"/>
+    <param name="semantic_timeout_s" value="0.40"/>
+    <param name="semantic_stop_hold_s" value="0.35"/>
+  </node>
   <!-- Idle until semantic_behavior_executor emits an interaction command. -->
   <!-- rospy from ROS Noetic must run under the system ROS Python here. The
        Conda 3.11 interpreter can import rospy but spins forever in init_node,
@@ -144,12 +171,17 @@
        in an unconsumed shadow namespace. The local obstacle layer consumes
        the latest filtered D435i cloud rather than a copy of the SLAM map. -->
   <group>
+    <!-- move_base's odometry helper is private to this include.  Without this
+         remap it subscribes to the unused global /odom name, keeps a stale
+         velocity stamp, and eventually makes the local planner fail TF
+         lookups after the first gateway restart. -->
+    <remap from="/odom" to="/physical_nav/odom"/>
     <remap from="/registered_scan" to="/physical_nav/points"/>
     <remap from="/filtered_pointcloud" to="/physical_nav/filtered_pointcloud"/>
-    <remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>
-    <remap from="/cmd_vel_stamped" to="/physical_nav/shadow_cmd_vel_stamped"/>
     <include file="$(find nav_pkg)/launch/nav.launch">
       <arg name="global_map_topic" value="/physical_nav/occupancy"/>
+      <arg name="cmd_vel_topic" value="/physical_nav/move_base_cmd_vel"/>
+      <arg name="cmd_vel_stamped_topic" value="/physical_nav/shadow_cmd_vel_stamped"/>
       <arg name="move_base_respawn" value="true"/>
       <arg name="override_config_file" value="$(arg move_base_override_config)"/>
     </include>
@@ -161,12 +193,15 @@
     <remap from="/odom" to="/physical_nav/odom"/>
     <remap from="/struct_mapping/occ_map" to="/physical_nav/occupancy"/>
     <remap from="/semantic_mapping/unified_graph" to="/physical_nav/unified_graph"/>
-    <remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>
+    <!-- ExplorePy is an external-control observer on the physical lane.  Its
+         reset/stop callbacks must not compete with move_base or the semantic
+         executor on the real command bus. -->
+    <remap from="/cmd_vel" to="/physical_nav/explore_cmd_vel"/>
     <remap from="/cmd_vel_stamped" to="/physical_nav/shadow_cmd_vel_stamped"/>
     <remap from="/move_base_simple/goal" to="/physical_nav/shadow_goal"/>
     <include file="$(find explore_py_pkg)/launch/explore_py.launch">
       <arg name="external_control_enabled" value="true"/>
-      <arg name="override_config_file" value="$(arg semantic_override_config)"/>
+      <arg name="override_config_file" value="$(arg explore_override_config)"/>
     </include>
   </group>
   <group>
@@ -177,7 +212,7 @@
     <remap from="/semantic_mapping/attribute_updates" to="/physical_nav/attribute_updates"/>
     <remap from="/semantic_mapping/attribute_refresh_requests" to="/physical_nav/attribute_refresh_requests"/>
     <remap from="/semantic_decision/interaction_command" to="/physical_nav/interaction_command"/>
-    <remap from="/cmd_vel" to="/physical_nav/shadow_cmd_vel"/>
+    <remap from="/cmd_vel" to="/physical_nav/semantic_cmd_vel"/>
     <remap from="/cmd_vel_stamped" to="/physical_nav/shadow_cmd_vel_stamped"/>
     <include file="$(find semantic_decision_py_pkg)/launch/semantic_decision.launch">
       <arg name="override_config_file" value="$(arg semantic_override_config)"/>

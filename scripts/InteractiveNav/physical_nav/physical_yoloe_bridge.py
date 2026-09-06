@@ -21,6 +21,8 @@ from typing import Any
 
 import cv2
 import numpy as np
+import rospy
+from sensor_msgs.msg import CameraInfo, Image
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -155,8 +157,9 @@ def _telemetry_quaternion(telemetry: dict[str, Any]) -> tuple[float, float, floa
     tracking source may publish an explicit ``camera_pose.quaternion`` in
     either common mapping/list form; prefer that when present.
     """
-    candidates = [telemetry.get("camera_pose"), telemetry.get("d435i_pose"), telemetry.get("pose"), telemetry.get("camera_imu")]
-    candidates.append(telemetry.get("imu"))
+    # This quaternion is the Go2 body pose used for world points.  The D435i
+    # motion-module quaternion has a different frame and is not a base pose.
+    candidates = [telemetry.get("camera_pose"), telemetry.get("d435i_pose"), telemetry.get("pose"), telemetry.get("imu")]
     for source in candidates:
         if not isinstance(source, dict):
             continue
@@ -223,6 +226,11 @@ def _world_points(
         yaw = float(telemetry.get("yaw", telemetry.get("imu", {}).get("rpy", [0, 0, 0])[2] if telemetry.get("imu") else 0.0))
         c, s = math.cos(yaw), math.sin(yaw)
         base[:, :2] = base[:, :2] @ np.asarray([[c, -s], [s, c]], dtype=np.float32).T
+    # D435i IMU values are retained in telemetry, but are not directly
+    # applied here: their axes are the motion-module frame, not base_link.
+    # Applying those RPY values without the calibrated motion->base rotation
+    # flips the point-cloud axes.  Keep the fixed optical/base transform until
+    # that calibrated extrinsic is available.
     base += position
     return base
 
@@ -438,6 +446,8 @@ def _oriented_bounds(points: np.ndarray, config: dict[str, Any]) -> tuple[np.nda
         yaw += math.pi
     c, s = math.cos(yaw), math.sin(yaw)
     axes = np.asarray([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    # ``axes`` is the local-to-world rotation.  With row-vector points,
+    # multiplying by ``axes`` projects world points into the local OBB frame.
     projected = centered @ axes
     low = min(max(float(config.get("bbox_quantile_lower", 0.02)), 0.0), 1.0)
     high = min(max(float(config.get("bbox_quantile_upper", 0.98)), low), 1.0)
@@ -523,11 +533,28 @@ def _passes_class_plausibility(
 
 class YoloeWorker:
     def __init__(self, args: argparse.Namespace) -> None:
+        # Register ROS subscriptions before loading the large GPU model.  This
+        # also keeps the worker usable from the mlspaces environment, where
+        # cv_bridge is not installed.
+        print("YOLOE startup: initializing ROS", flush=True)
+        # ROS Noetic's Python 3.8 roslogging walks the Python frame stack in
+        # ``findCaller``.  Under the Python 3.11 mlspaces interpreter this
+        # compatibility path can spin indefinitely before the node registers.
+        # The caller metadata is not used by this worker, so use a constant
+        # lightweight implementation for ROS logging.
+        try:
+            import rosgraph.roslogging
+            rosgraph.roslogging.RospyLogger.findCaller = lambda self, *a, **k: ("<physical_yoloe>", 0, "<worker>", None)
+        except Exception:
+            pass
+        rospy.init_node("physical_yoloe_bridge", anonymous=True)
+        print("YOLOE startup: importing ultralytics", flush=True)
         try:
             from ultralytics import YOLOE
         except ImportError as exc:
             raise RuntimeError("YOLOE worker requires ultralytics in the algorithm Python environment") from exc
-        self.args = args; self.model = YOLOE(args.model_path); self.last_seq = -1; self.last_stamp = float("-inf"); self.rotation = _rotation(args.camera_roll, args.camera_pitch, args.camera_yaw); self.translation = np.asarray([args.camera_x, args.camera_y, args.camera_z], dtype=np.float32); self._projection_cache_key = None; self._projection_cache = None; self._profile_count = 0; self._profile_totals: dict[str, float] = {}
+        print(f"YOLOE startup: loading model {args.model_path}", flush=True)
+        self.args = args; self.model = YOLOE(args.model_path); print("YOLOE startup: model loaded", flush=True); self.last_seq = -1; self.last_stamp = float("-inf"); self.rotation = _rotation(args.camera_roll, args.camera_pitch, args.camera_yaw); self.translation = np.asarray([args.camera_x, args.camera_y, args.camera_z], dtype=np.float32); self._projection_cache_key = None; self._projection_cache = None; self._profile_count = 0; self._profile_totals: dict[str, float] = {}
         self.detector_config = _load_object_detection_config(args.detector_config)
         # Keep the physical YAML authoritative.  Previously the CLI defaults
         # silently won, so changing confidence_threshold did not affect the
@@ -550,12 +577,88 @@ class YoloeWorker:
             str(label).strip().casefold().replace(" ", "_"): max(0.001, min(1.0, float(value)))
             for label, value in class_thresholds.items()
         }
+        self._rgb = None
+        self._depth = None
+        self._rgb_stamp = 0.0
+        self._depth_stamp = 0.0
+        self._camera_info = None
+        self._depth_camera_info = None
+        rospy.Subscriber("/physical_nav/rgb/image_raw", Image, self._rgb_callback, queue_size=1)
+        rospy.Subscriber("/physical_nav/depth/image_raw", Image, self._depth_callback, queue_size=1)
+        rospy.Subscriber("/physical_nav/camera_info", CameraInfo, self._camera_info_callback, queue_size=1)
+        rospy.Subscriber(
+            "/physical_nav/depth_camera_info",
+            CameraInfo,
+            self._depth_camera_info_callback,
+            queue_size=1,
+        )
         print(
             f"YOLOE loaded: {args.model_path} device={args.device} "
             f"conf={self.args.conf:.3f} iou={self.args.iou:.3f} max_det={self.args.max_det} "
             f"detection_filter={self.detection_filter.enabled} config={args.detector_config}",
             flush=True,
         )
+
+    def _rgb_callback(self, msg):
+        try:
+            channels = 3 if msg.encoding.lower() in ("bgr8", "rgb8") else 1
+            raw = np.frombuffer(msg.data, dtype=np.uint8)
+            row_width = int(msg.step)
+            rows = raw.reshape(int(msg.height), row_width)
+            image = rows[:, : int(msg.width) * channels].reshape(int(msg.height), int(msg.width), channels)
+            self._rgb = image[:, :, ::-1].copy() if msg.encoding.lower() == "rgb8" else image.copy()
+            self._rgb_stamp = msg.header.stamp.to_sec()
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "YOLO RGB conversion failed: %s", exc)
+
+    def _depth_callback(self, msg):
+        try:
+            dtype = np.float32 if msg.encoding.lower() == "32fc1" else np.uint16
+            itemsize = np.dtype(dtype).itemsize
+            raw = np.frombuffer(msg.data, dtype=dtype)
+            rows = raw.reshape(int(msg.height), int(msg.step) // itemsize)
+            self._depth = rows[:, : int(msg.width)].copy()
+            self._depth_stamp = msg.header.stamp.to_sec()
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "YOLO depth conversion failed: %s", exc)
+
+    def _camera_info_callback(self, msg):
+        self._camera_info = msg
+
+    def _depth_camera_info_callback(self, msg):
+        self._depth_camera_info = msg
+
+    def _latest_raw_frame(self):
+        rgb, depth = self._rgb, self._depth
+        if rgb is None or depth is None or abs(self._rgb_stamp - self._depth_stamp) > 0.12:
+            return None
+        info = self._camera_info
+        depth_info = self._depth_camera_info
+        if info is None or depth_info is None:
+            return None
+        ok_rgb, enc_rgb = cv2.imencode(".jpg", rgb, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        ok_depth, enc_depth = cv2.imencode(".png", depth)
+        if not ok_rgb or not ok_depth:
+            return None
+        stamp = max(self._rgb_stamp, self._depth_stamp)
+        def intrinsics(camera_info):
+            return {
+                "width": int(camera_info.width), "height": int(camera_info.height),
+                "fx": float(camera_info.K[0]), "fy": float(camera_info.K[4]),
+                "cx": float(camera_info.K[2]), "cy": float(camera_info.K[5]),
+                "distortion_model": str(camera_info.distortion_model or ""),
+                "distortion": [float(value) for value in camera_info.D],
+            }
+        return {
+            "seq": int(round(stamp * 1000.0)), "stamp": stamp,
+            "rgb": base64.b64encode(enc_rgb.tobytes()).decode(),
+            "depth": base64.b64encode(enc_depth.tobytes()).decode(),
+            "rgb_intrinsics": intrinsics(info),
+            "depth_intrinsics": intrinsics(depth_info),
+            "depth_scale": 0.001, "depth_to_color_extrinsics": {"rotation": np.eye(3).reshape(-1).tolist(), "translation": [0.0, 0.0, 0.0]},
+            "camera_frame": str(info.header.frame_id or "d435i_color_optical_frame"),
+            "depth_frame": str(depth_info.header.frame_id or "d435i_depth_optical_frame"),
+        }
 
     def _claim_frame(self, raw: dict[str, Any]) -> bool:
         """Accept each capture once, including after the dog bridge restarts.
@@ -696,7 +799,23 @@ class YoloeWorker:
             camera_center = (camera_mins + camera_maxs) / 2
             camera_size = np.maximum(camera_maxs - camera_mins, .01)
             world = _world_points(points, raw.get("telemetry", {}), self.translation, (self.args.camera_roll, self.args.camera_pitch, self.args.camera_yaw), optical_frame=True); mins, maxs = _robust_bounds(world, geometry_config); center = (mins + maxs) / 2; size = np.maximum(maxs - mins, .01)
+            # The robust box is intentionally used for the 3-D dimensions,
+            # but admission thresholds such as the refrigerator top-height
+            # check must use the actual highest observed point. Quantile
+            # clipping can remove the upper edge of a partially observed tall
+            # object and make a valid refrigerator look too short.
+            world_aabb_min_z = float(np.min(world[:, 2]))
+            world_aabb_max_z = float(np.max(world[:, 2]))
             obb_center, obb_size, obb_orientation = _oriented_bounds(world, geometry_config)
+            # The semantic graph uses yaw to construct a portal's tangent and
+            # normal.  ``_oriented_bounds`` already fits this yaw into the
+            # returned quaternion; expose it explicitly as well.  Omitting
+            # it makes every physical portal fall back to yaw=0, which turns
+            # a doorway whose long edge is along Y into a Y-normal approach.
+            obb_yaw = math.atan2(
+                2.0 * float(obb_orientation[3]) * float(obb_orientation[2]),
+                1.0 - 2.0 * float(obb_orientation[2]) * float(obb_orientation[2]),
+            )
             post_parts["depth_geometry"] += (time.perf_counter() - part_started) * 1000.0
             if bool(geometry_config.get("reject_low_mean_height", True)) and float(np.mean(world[:, 2])) <= float(geometry_config.get("min_mean_height_m", 0.08)):
                 continue
@@ -733,7 +852,7 @@ class YoloeWorker:
             sparse_rows, sparse_cols = np.where(mask)
             if sparse_rows.size > 3000: sparse_rows, sparse_cols = sparse_rows[::max(1, sparse_rows.size // 3000)], sparse_cols[::max(1, sparse_cols.size // 3000)]
             debug_point_sets.append((points, world))
-            detections.append({"semantic_class": filtered_label["semantic_class"], "semantic_class_raw": filtered_label["semantic_class_raw"], "raw_class": str(raw_name), "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_polygon": mask_polygon, "mask_polygons": mask_polygons, "rgb_mask_polygons": detection_rgb_mask_polygons, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "box3d_center": obb_center.astype(float).tolist(), "box3d_size": obb_size.astype(float).tolist(), "world_box3d_center": obb_center.astype(float).tolist(), "world_box3d_size": obb_size.astype(float).tolist(), "world_box3d_marker_size": obb_size.astype(float).tolist(), "world_box3d_orientation": obb_orientation, "source_frame": depth_frame, "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask_obb", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
+            detections.append({"semantic_class": filtered_label["semantic_class"], "semantic_class_raw": filtered_label["semantic_class_raw"], "raw_class": str(raw_name), "possible_interaction_class": "fridge" if str(filtered_label["semantic_class"]).casefold() == "locker" else None, "m1_verification_required": str(filtered_label["semantic_class"]).casefold() == "locker", "confidence": float(confs[index]), "bbox": [x1, y1, x2, y2], "mask": {"rows": sparse_rows.astype(int).tolist(), "cols": sparse_cols.astype(int).tolist()}, "mask_polygon": mask_polygon, "mask_polygons": mask_polygons, "rgb_mask_polygons": detection_rgb_mask_polygons, "mask_area": int(np.count_nonzero(mask)), "depth_median_m": float(np.median(values)), "depth_valid_points": int(values.size), "camera_position": {"x": float(camera_center[0]), "y": float(camera_center[1]), "z": float(camera_center[2])}, "camera_box3d_center": camera_center.astype(float).tolist(), "camera_box3d_size": camera_size.astype(float).tolist(), "position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "world_position": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])}, "aabb_center": center.astype(float).tolist(), "aabb_size": size.astype(float).tolist(), "world_aabb_min_z": world_aabb_min_z, "world_aabb_max_z": world_aabb_max_z, "box3d_center": obb_center.astype(float).tolist(), "box3d_size": obb_size.astype(float).tolist(), "world_box3d_center": obb_center.astype(float).tolist(), "world_box3d_size": obb_size.astype(float).tolist(), "world_box3d_marker_size": obb_size.astype(float).tolist(), "world_box3d_orientation": obb_orientation, "yaw": float(obb_yaw), "world_box3d_yaw": float(obb_yaw), "source_frame": depth_frame, "source_model": self.args.model_path, "projection_method": "physical_yoloe_rgbd_mask_obb", "map_transform_status": "telemetry_fallback", "capture_seq": int(raw["seq"]), "stamp": float(raw["stamp"])})
         debug_max_points = max(32, int(self.detector_config.get("debug_cloud_max_points_per_instance", 400)))
         serialization_started = time.perf_counter()
         for detection, (point_set, world_point_set) in zip(detections, debug_point_sets):
@@ -775,7 +894,10 @@ class YoloeWorker:
         while True:
             cycle_started = time.monotonic()
             try:
-                with urllib.request.urlopen(self.args.web_url.rstrip("/") + "/api/raw-frame", timeout=.8) as response: raw = json.loads(response.read().decode())
+                raw = self._latest_raw_frame()
+                if raw is None:
+                    time.sleep(0.01)
+                    continue
                 if not self._claim_frame(raw): time.sleep(.02); continue
                 report = self.infer(raw)
                 cycle_ms = (time.monotonic() - cycle_started) * 1000.0

@@ -97,6 +97,22 @@ class ObjectMapStore:
         }
         self.objects = []
         self.next_id = 1
+        self.m1_canonical_labels = {}
+
+    def set_m1_canonical_label(self, track_id, label):
+        track_id = str(track_id or "")
+        label = normalize_label(label)
+        if track_id and label:
+            self.m1_canonical_labels[track_id] = label
+            # Keep the tracker record alive after it has passed the same
+            # two-frame + M1 gate used by the semantic graph.  Visibility is
+            # still allowed to drop to zero; only identity lifetime changes.
+            for obj in self.objects:
+                if str(obj.get("track_id") or "") != track_id:
+                    continue
+                obj["m1_canonical_label"] = label
+                obj["m1_confirmed"] = True
+                break
 
     def _required_confirmations(self, label):
         return self.class_min_confirmations.get(
@@ -104,22 +120,47 @@ class ObjectMapStore:
         )
 
     def _passes_top_height_filter(self, label, detection, center, size):
-        """Filter by highest world-Z, not the close-range visible box height."""
+        """Filter by the highest observed world-Z point.
+
+        The detector's robust/OBB dimensions are useful for tracking, but
+        their quantile clipping can lower the apparent top of a tall object.
+        Prefer the explicit point-cloud maximum exported by the detector and
+        only derive a top from an axis-aligned box as a legacy fallback.
+        """
         minimum = self.class_min_top_height_m.get(normalize_label(label))
         if minimum is None:
             return True
+        for key in ("world_aabb_max_z", "world_box3d_max_z", "aabb_max_z"):
+            value = detection.get(key)
+            if value is not None:
+                try:
+                    top_z = float(value)
+                except (TypeError, ValueError):
+                    top_z = math.nan
+                if math.isfinite(top_z):
+                    return top_z >= minimum
         has_center = any(
             detection.get(key) is not None
-            for key in ("world_box3d_center", "box3d_center", "world_position", "position")
+            for key in ("aabb_center", "world_position", "position", "world_box3d_center", "box3d_center")
         )
         has_size = any(
             detection.get(key) is not None
-            for key in ("world_box3d_size", "box3d_size", "size")
+            for key in ("aabb_size", "world_box3d_size", "box3d_size", "size")
         )
         if not has_center or not has_size:
             return True
         try:
-            top_z = float(center["z"]) + 0.5 * abs(float(size["z"]))
+            # Legacy payloads did not carry the point-cloud maximum. Prefer
+            # the axis-aligned center/size pair over an oriented-box center;
+            # its upper z face is the actual box top by construction.
+            legacy_center = self._point_from_detection(
+                detection, "aabb_center", "world_position", "position",
+                "world_box3d_center", "box3d_center",
+            )
+            legacy_size = self._point_from_detection(
+                detection, "aabb_size", "world_box3d_size", "box3d_size", "size",
+            )
+            top_z = float(legacy_center["z"]) + 0.5 * abs(float(legacy_size["z"]))
         except (KeyError, TypeError, ValueError):
             return True
         return not math.isfinite(top_z) or top_z >= minimum
@@ -128,13 +169,24 @@ class ObjectMapStore:
         now = float(stamp if stamp is not None else time.time())
         matched_ids = set()
         for det in detections:
-            label = normalize_label(det.get("semantic_class") or det.get("class") or det.get("semantic_name"))
+            source_instance_id = str(det.get("instance_id") or det.get("track_id") or "")
+            canonical = self.m1_canonical_labels.get(source_instance_id, "")
+            label = canonical or normalize_label(
+                det.get("semantic_class") or det.get("class") or det.get("semantic_name")
+            )
             if not label:
                 continue
+            if canonical:
+                det = dict(det)
+                det["semantic_class"] = canonical
+                det["class"] = canonical
+                det["semantic_name"] = canonical
+                det["category"] = canonical
+                det["m1_canonicalized"] = True
             pos = self._point_from_detection(det, "world_position", "position")
             confidence = float(det.get("confidence", det.get("conf", 0.0)) or 0.0)
             yaw = _detection_yaw(det)
-            instance_id = str(det.get("instance_id", ""))
+            instance_id = source_instance_id
             size = self._point_from_detection(det, "world_box3d_size", "box3d_size", "size")
             center = self._point_from_detection(det, "world_box3d_center", "box3d_center", "world_position", "position")
             match = self._find_match(label, pos, size, instance_id, yaw=yaw)
@@ -347,17 +399,44 @@ class ObjectMapStore:
                 # Require stronger 2-D overlap than ordinary same-label NMS
                 # so adjacent furniture is not collapsed accidentally.
                 furniture = {"sofa", "bed", "couch", "settee", "divan", "bench"}
+                # Open-vocabulary detector labels can split one tall appliance
+                # into ``locker``/``safe`` (and M1 may later call both
+                # refrigerator).  A near-identical image box plus overlapping
+                # 3-D body is stronger duplicate evidence than the label in
+                # this case; keep adjacent appliances separate by requiring the
+                # configured high IoU and the existing 3-D overlap gate.
+                appliance_aliases = {
+                    "fridge",
+                    "refrigerator",
+                    "freezer",
+                    "locker",
+                    "safe",
+                    "water_dispenser",
+                    "dispenser",
+                }
                 cross_label = (
                     not same_label
                     and str(keeper.get("semantic_name") or "") in furniture
                     and str(duplicate.get("semantic_name") or "") in furniture
                     and bbox_iou >= max(self.duplicate_bbox_iou_threshold, 0.70)
                 )
+                cross_label_appliance = (
+                    not same_label
+                    and str(keeper.get("semantic_name") or "") in appliance_aliases
+                    and str(duplicate.get("semantic_name") or "") in appliance_aliases
+                    and bbox_iou >= max(self.duplicate_bbox_iou_threshold, 0.85)
+                )
+                if cross_label_appliance:
+                    cross_label = True
                 if not same_label and not cross_label:
                     continue
                 if same_label and bbox_iou < self.duplicate_bbox_iou_threshold:
                     continue
-                if cross_label and bbox_iou < 0.70:
+                if cross_label and not cross_label_appliance and bbox_iou < 0.70:
+                    continue
+                if cross_label_appliance and bbox_iou < max(
+                    self.duplicate_bbox_iou_threshold, 0.85
+                ):
                     continue
                 center_a = keeper.get("aabb_center", keeper.get("coord", [0.0, 0.0, 0.0]))
                 center_b = duplicate.get("aabb_center", duplicate.get("coord", [0.0, 0.0, 0.0]))
@@ -729,7 +808,33 @@ class ObjectMapStore:
     def _purge_stale(self, now):
         if self.stale_after_sec <= 0.0:
             return
-        self.objects = [obj for obj in self.objects if now - obj.get("last_seen", now) <= self.stale_after_sec]
+        persistent_labels = {
+            "door",
+            "portal",
+            "gate",
+            "fridge",
+            "refrigerator",
+            "freezer",
+            "locker",
+            "safe",
+            "water_dispenser",
+            "dispenser",
+        }
+        retained = []
+        for obj in self.objects:
+            age_ok = now - obj.get("last_seen", now) <= self.stale_after_sec
+            labels = {
+                normalize_label(obj.get("semantic_name")),
+                normalize_label(obj.get("m1_canonical_label")),
+            }
+            persistent = bool(
+                obj.get("is_confirmed")
+                and obj.get("m1_confirmed")
+                and labels.intersection(persistent_labels)
+            )
+            if age_ok or persistent:
+                retained.append(obj)
+        self.objects = retained
 
 
 class SceneGridStore:

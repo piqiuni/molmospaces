@@ -102,6 +102,14 @@ class VelocitySafetyLimiter:
             angular = 0.0
         elif abs(angular) < self.config.min_angular_rps:
             angular = math.copysign(self.config.min_angular_rps, angular)
+        # A zero command is an explicit stop from move_base/interaction
+        # control, not a target that should be reached through the normal
+        # acceleration ramp.  Slew-limiting it leaves the robot moving for
+        # several seconds after a goal cancel or obstacle stop.
+        if linear == 0.0 and angular == 0.0:
+            self._last = (0.0, 0.0, 0.0)
+            self._last_at = now
+            return self._last
         requested = (
             linear,
             0.0,  # Go2 physical base is currently configured for no lateral motion.

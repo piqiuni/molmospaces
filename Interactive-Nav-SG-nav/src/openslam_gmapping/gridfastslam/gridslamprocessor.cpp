@@ -430,6 +430,12 @@ void GridSlamProcessor::setMotionModelParameters
 	  for (ParticleVector::iterator it=m_particles.begin(); it!=m_particles.end(); it++){
 	    m_matcher.invalidateActiveArea();
 	    m_matcher.computeActiveArea(it->map, it->pose, plainReading);
+	    // In odometry-locked physical mapping there is no scan-matching
+	    // resampling to rebuild the particle map. Register the observation into
+	    // the persistent map here; the ROS wrapper can then serialize that map
+	    // directly instead of replaying the complete trajectory every frame.
+	    m_matcher.setgenerateMap(true);
+	    m_matcher.registerScan(it->map, it->pose, plainReading);
 	  }
 	} else {
 	  scanMatch(plainReading);
@@ -530,5 +536,4 @@ void GridSlamProcessor::setMotionModelParameters
 
   
 };// end namespace
-
 

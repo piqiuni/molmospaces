@@ -51,10 +51,14 @@ particles: 10   # 原30，减少到10节省计算
 
 # 地图初始范围：室内 house 起始时只需覆盖局部活动区；GMapping 在
 # 观测越界时会动态扩张。避免每次 5 Hz 全图发布都序列化 200m×200m 网格。
-xmin: -20.0
-ymin: -20.0
-xmax: 20.0
-ymax: 20.0
+# Physical Go2 operates in a bounded indoor area.  Keeping the initial map
+# tight is important: updateMap rasterizes the active map on every scan, so
+# the cost is proportional to this area (and not just to the new cloud).
+# GMapping still expands if a scan reaches an edge.
+xmin: -10.0
+ymin: -10.0
+xmax: 10.0
+ymax: 10.0
 #分辨率
 delta: 0.1 
 

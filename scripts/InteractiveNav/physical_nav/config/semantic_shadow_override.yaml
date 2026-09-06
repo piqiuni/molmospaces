@@ -8,20 +8,30 @@ startup_scan:
   enabled: false
 candidate:
   # The physical interaction graph and subgoal pool intentionally expose only
-  # doors and refrigerators. Cabinets/drawers remain ordinary perception
-  # evidence and cannot become INTERACT candidates.
-  interaction_semantic_types: ["door", "fridge"]
-  subgoal_interaction_semantic_types: ["door", "fridge"]
-  # Keep interaction poses farther from the target AABB than the simulator
-  # default. This margin is applied in addition to the type-level standoff.
-  # Physical door/fridge interaction subgoals are each 0.50 m farther than the
-  # previous defaults (door 0.85 -> 1.35; fridge 0.50 -> 1.00).
-  portal_standoff_m: 1.35
-  # Keep every portal candidate on the observed side.  The 1.10 m standoff
-  # was too far for the physical robot and is removed; retain the 0.85 m and
-  # 0.60 m standoffs as ordered fallbacks (before the door AABB boundary).
-  portal_approach_standoff_offsets_m: [-0.50, -0.75]
-  portal_approach_tangent_offsets_m: [0.0, -0.20, 0.20]
+  # doors and refrigerators. ``locker`` is only a provisional detector
+  # hypothesis; it cannot become an interaction candidate until the graph has
+  # two detector observations and a valid M1 result. Cabinets and drawers
+  # remain ordinary perception evidence.
+  interaction_semantic_types: ["door", "fridge", "refrigerator", "locker"]
+  subgoal_interaction_semantic_types: ["door", "fridge", "refrigerator", "locker"]
+  # Door distances are measured from the door surface, not from its center.
+  # The generic interaction safety margin below is intentionally not added to
+  # portal poses.  Keep the three physical fallbacks ordered far to near:
+  # 1.0, 0.9, 0.8 m.
+  portal_standoff_m: 1.00
+  # If the costmap shows an obstacle too close to the generated door pose,
+  # shift the pose along the nearest occupied-cell outward normal in 0.10 m
+  # increments (the door normal is only the fallback when no cell vector is
+  # available).
+  portal_obstacle_clearance_m: 0.30
+  portal_obstacle_push_step_m: 0.10
+  portal_obstacle_push_max_m: 0.60
+  portal_approach_standoff_offsets_m: [0.0, -0.10, -0.20]
+  # A door interaction pose must lie on the door normal: the robot approaches
+  # perpendicular to the door's long edge and stops on its centerline.  The
+  # old +/-0.20 m tangent fallbacks produced poses diagonally offset along the
+  # door, which is unsuitable for the physical opening action.
+  portal_approach_tangent_offsets_m: [0.0]
   portal_approach_yaw_offsets_rad: [0.0]
   # The interaction stance must remain on the robot/camera side of the door.
   # If that side is blocked, reject/skip it instead of trying a pose through
@@ -30,6 +40,9 @@ candidate:
   # Never guess a map-X/Y door normal. Wait for the stable rotated OBB yaw;
   # otherwise the guessed stance can lie along the wall or inside it.
   portal_require_reference_yaw: true
+  # Confirmed doors are persistent interaction subgoals. Temporary camera
+  # occlusion must not remove them from the candidate pool.
+  portal_require_current_visibility: false
   # Retain the initially observed robot side until the base is at least 0.5 m
   # beyond the door plane; this keeps the old valid stance from disappearing
   # due to near-plane pose/OBB jitter.
@@ -42,7 +55,20 @@ candidate:
   # The traversal endpoint must clear the full door AABB, Go2 footprint and
   # inflation margin rather than merely sit a fixed distance from its center.
   portal_traversal_clearance_margin_m: 0.55
+  # Increase the refrigerator interaction clearance by 0.30 m.  The 0.35 m
+  # container safety margin remains active, so the physical surface-to-base
+  # clearance is 1.00 + 0.35 = 1.35 m.
   fridge_standoff_m: 1.00
+  # M1 must authorize the refrigerator front/door face before an open
+  # command. Do not use the current robot-side radial pose as the action pose.
+  container_m1_face_selection_enabled: true
+  container_pre_action_mllm: true
+  # Direct fridge interaction means the published subgoal, M1 capture pose,
+  # and physical action pose must be the same point.  Leaving this false
+  # sends the robot to the legacy safe_farthest staging ring, making the
+  # visible subgoal appear unchanged even when fridge_standoff_m is reduced.
+  container_anchor_shared_pose_enabled: true
+  fridge_direct_interaction_on_arrival: false
   # Treat arrival at the refrigerator interaction subgoal as sufficient for
   # invoking the physical bridge; do not spend another navigation/M1 cycle.
   fridge_direct_interaction_on_arrival: true
@@ -51,6 +77,15 @@ candidate:
   # misaligned with the door normal.
   interaction_ready_yaw_tolerance_rad: 0.15
 executor:
+  # After the fixed post-open traversal point is reached, observe both sides
+  # of the newly opened doorway before returning to normal exploration.
+  post_interaction_exit_observation_enabled: true
+  post_interaction_exit_observation_angle_rad: 1.5707963
+  post_interaction_exit_observation_speed_rad_s: 0.30
+  post_interaction_exit_observation_tolerance_rad: 0.12
+  post_interaction_exit_observation_settle_s: 0.5
+  post_interaction_exit_observation_view_timeout_s: 6.0
+  post_interaction_exit_observation_return_home: true
   # The default pre-rotation gate advances on simulator step-sync messages,
   # which do not exist on Go2. Let move_base/DWA perform physical yaw control.
   rear_goal_prerotate_enabled: false

@@ -9,6 +9,105 @@ from semantic_decision_py_pkg.behavior_candidates import (
 )
 
 
+def test_locker_enters_provisional_interaction_candidate_until_m1_demotes_it() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            interaction_semantic_types=("locker",),
+            container_pre_action_mllm=False,
+        )
+    )
+    node = {
+        "id": "locker_track",
+        "type": "object",
+        "label": "locker",
+        "name": "locker",
+        "centroid": [2.0, 0.0, 0.9],
+        "aabb_center": [2.0, 0.0, 0.9],
+        "aabb_size": [1.0, 0.8, 1.8],
+        "room_id": 1,
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "attributes": {
+            "source_semantic_name": "locker",
+            "source_category": "locker",
+        },
+        "interaction": {
+            "requires_interaction": False,
+            "is_interactable": False,
+            "interaction_mode": "none",
+            "state": "unknown",
+            "state_confidence": 0.9,
+            "capability": "unknown",
+        },
+    }
+    graph = {"nodes": [node], "edges": [], "episode_id": "physical"}
+
+    candidates = generator.generate({}, graph, (0.0, 0.0), {})
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "interaction:locker_track:open"
+    ]
+
+    node["label"] = "water_dispenser"
+    node["name"] = "water_dispenser"
+    node["attributes"].update(
+        {
+            "m1_name_override": True,
+            "m1_observed_object_name": "water_dispenser",
+            "semantic_name": "water_dispenser",
+        }
+    )
+    assert generator.generate({}, graph, (0.0, 0.0), {}) == []
+
+
+def test_pending_m1_refrigerator_is_admitted_before_second_confirmation() -> None:
+    """M1 confirmation refines a fridge candidate; it does not gate admission."""
+
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(
+            interaction_types=("container",),
+            interaction_semantic_types=("fridge",),
+            container_pre_action_mllm=False,
+        )
+    )
+    node = {
+        "id": "object_track_pending_fridge",
+        "type": "object",
+        "label": "object",
+        "name": "object",
+        "centroid": [2.0, 0.0, 0.9],
+        "aabb_center": [2.0, 0.0, 0.9],
+        "aabb_size": [0.8, 0.6, 1.8],
+        "room_id": 1,
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "attributes": {
+            "source_semantic_name": "object",
+            "source_category": "object",
+            "source": "detector",
+            "consecutive_observations": 1,
+            "m1_refrigerator_pending_confirmation": True,
+            "m1_pending_observed_object_name": "refrigerator",
+        },
+        "interaction": {
+            "requires_interaction": False,
+            "is_interactable": False,
+            "interaction_mode": "none",
+            "state": "unknown",
+            "state_confidence": 0.9,
+            "capability": "unknown",
+        },
+    }
+    graph = {"nodes": [node], "edges": [], "episode_id": "physical"}
+
+    assert generator.generate({}, graph, (0.0, 0.0), {}) == []
+    node["attributes"]["consecutive_observations"] = 2
+    candidates = generator.generate({}, graph, (0.0, 0.0), {})
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "interaction:object_track_pending_fridge:open"
+    ]
+
+
 def test_drawer_aabb_fan_anchors_use_true_surface_clearance() -> None:
     generator = CandidateGenerator(CandidateGeneratorConfig())
     center = (8.7270050032, 8.2093864962)
@@ -671,6 +770,28 @@ def test_mllm_unknown_portal_requires_current_ready_visual_observation() -> None
     assert generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0)) == []
 
 
+def test_open_portal_is_removed_from_interaction_subgoals() -> None:
+    generator = CandidateGenerator(
+        CandidateGeneratorConfig(interaction_types=("portal",))
+    )
+    node = {
+        "id": "portal_31",
+        "type": "portal",
+        "centroid": [2.0, 0.0, 1.0],
+        "state_age_sec": 0.0,
+        "is_currently_visible": True,
+        "attributes": {"attribute_status": "ready"},
+        "interaction": {
+            "is_interactable": True,
+            "requires_interaction": False,
+            "state": "open",
+            "state_confidence": 0.95,
+            "traversable": True,
+        },
+    }
+    assert generator.generate({}, {"nodes": [node]}, robot_xy=(0.0, 0.0)) == []
+
+
 def test_remembered_portal_requires_current_visibility_threshold() -> None:
     generator = CandidateGenerator(
         CandidateGeneratorConfig(
@@ -1186,7 +1307,7 @@ def test_native_interaction_standoffs_keep_drawers_with_containers() -> None:
     }
 
     assert math.isclose(
-        candidates["portal_1"].metadata["interaction_standoff_m"], 1.10
+        candidates["portal_1"].metadata["interaction_standoff_m"], 0.85
     )
     assert candidates["portal_1"].metadata["interaction_standoff_source"] == "portal"
     assert math.isclose(

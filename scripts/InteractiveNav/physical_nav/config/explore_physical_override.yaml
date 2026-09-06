@@ -1,0 +1,26 @@
+# Physical Go2 exploration override.  The D435i map is sparse and the long
+# camera mast produces conservative unknown/clearance boundaries, so use a
+# smaller frontier stand-off and do not require a full in-place turn before a
+# safe exploration viewpoint is accepted.  This file is loaded only by the
+# physical_nav_readonly launch; the simulator defaults remain unchanged.
+frontier:
+  min_cluster_cells: 6
+  min_viewpoint_frontier_distance_m: 0.50
+  max_viewpoint_frontier_distance_m: 3.50
+  min_obstacle_clearance_m: 0.25
+  robot_radius_m: 0.22
+  footprint_safety_margin_m: 0.10
+  require_turning_clearance: false
+  near_frontier_relax_distance_m: 2.0
+  relaxed_min_viewpoint_frontier_distance_m: 0.25
+  # Unknown cells are still not treated as traversable; only the viewpoint
+  # safety margin is relaxed for physical exploration.
+  footprint_unknown_is_free: false
+
+# In semantic-control mode the semantic executor owns move_base planning and
+# recovery.  Disable ExplorePy's independent make_plan polling; otherwise it
+# repeatedly calls /move_base/make_plan while the physical planner is active,
+# adding CPU load and competing with the executor's post-interaction plan.
+exploration:
+  external_recovery_preflight_enabled: false
+  make_plan_preflight_enabled: false

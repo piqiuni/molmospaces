@@ -135,6 +135,15 @@ class SemanticCandidateNode:
                     config.get("remembered_portal_reobservation_enabled", False)
                 ),
                 portal_standoff_m=float(config.get("portal_standoff_m", 1.0)),
+                portal_obstacle_clearance_m=float(
+                    config.get("portal_obstacle_clearance_m", 0.30)
+                ),
+                portal_obstacle_push_step_m=float(
+                    config.get("portal_obstacle_push_step_m", 0.10)
+                ),
+                portal_obstacle_push_max_m=float(
+                    config.get("portal_obstacle_push_max_m", 0.60)
+                ),
                 portal_approach_standoff_offsets_m=tuple(
                     # Negative offsets intentionally request closer portal
                     # stances; _approach_candidates clamps the resulting
@@ -597,7 +606,7 @@ class SemanticCandidateNode:
         self, candidates: list[BehaviorCandidate]
     ) -> list[BehaviorCandidate]:
         self.filtered_portal_candidate_ids = []
-        if not self.portal_goal_require_known_free:
+        if not self.portal_goal_require_known_free and self.occupancy_grid is None:
             return candidates
         kept = []
         for candidate in candidates:
@@ -607,11 +616,23 @@ class SemanticCandidateNode:
                 continue
             goals = list(metadata.get("goal_xyyaw_candidates") or [])
             labels = list(metadata.get("interaction_approach_pose_labels") or [])
-            valid_pairs = [
-                (goal, labels[index] if index < len(labels) else "portal_source_side")
-                for index, goal in enumerate(goals)
-                if self._goal_is_known_free(goal)
-            ]
+            valid_pairs = []
+            push_distances = []
+            for index, goal in enumerate(goals):
+                adjusted_goal, pushed_m = self._push_portal_goal_from_obstacle(
+                    goal, metadata
+                )
+                if self.portal_goal_require_known_free and not self._goal_is_known_free(
+                    adjusted_goal
+                ):
+                    continue
+                valid_pairs.append(
+                    (
+                        adjusted_goal,
+                        labels[index] if index < len(labels) else "portal_source_side",
+                    )
+                )
+                push_distances.append(float(pushed_m))
             if not valid_pairs:
                 self.filtered_portal_candidate_ids.append(candidate.candidate_id)
                 continue
@@ -620,7 +641,13 @@ class SemanticCandidateNode:
             candidate.goal_xyyaw = list(valid_goals[0])
             metadata["goal_xyyaw_candidates"] = valid_goals
             metadata["interaction_approach_pose_labels"] = valid_labels
-            metadata["portal_goal_known_free"] = True
+            metadata["portal_obstacle_push_m"] = (
+                push_distances[0] if push_distances else 0.0
+            )
+            metadata["portal_obstacle_push_applied"] = bool(
+                any(distance > 1e-6 for distance in push_distances)
+            )
+            metadata["portal_goal_known_free"] = bool(self.portal_goal_require_known_free)
             candidate.metadata = metadata
             if candidate.interaction_command is not None:
                 candidate.interaction_command["interaction_approach_pose_xyyaw"] = list(
@@ -629,6 +656,118 @@ class SemanticCandidateNode:
                 candidate.interaction_command["interaction_approach_pose_labels"] = valid_labels
             kept.append(candidate)
         return kept
+
+    def _nearest_occupied_vector(
+        self, goal: list[float], search_radius_m: float
+    ) -> tuple[float, float, float]:
+        """Return distance and outward vector from nearest occupied cell.
+
+        The vector is expressed in world XY and points from the occupied cell
+        toward the goal.  For a wall this is the local obstacle normal, which
+        is the correct direction for moving an interaction stance away from
+        the obstacle.  Returning the vector (rather than only its length)
+        avoids using the door centre as a proxy for the obstacle normal when
+        the door frame, inflation layer, or a neighbouring object is what
+        actually blocks the generated pose.
+        """
+
+        grid = self.occupancy_grid
+        if grid is None or len(goal or []) < 2:
+            return math.inf, 0.0, 0.0
+        origin = grid.info.origin
+        q = origin.orientation
+        origin_yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        resolution = max(float(grid.info.resolution), 1e-6)
+        dx = float(goal[0]) - float(origin.position.x)
+        dy = float(goal[1]) - float(origin.position.y)
+        cos_yaw, sin_yaw = math.cos(origin_yaw), math.sin(origin_yaw)
+        local_x = cos_yaw * dx + sin_yaw * dy
+        local_y = -sin_yaw * dx + cos_yaw * dy
+        center_x = int(math.floor(local_x / resolution))
+        center_y = int(math.floor(local_y / resolution))
+        radius_cells = int(math.ceil(max(0.0, search_radius_m) / resolution))
+        width, height = int(grid.info.width), int(grid.info.height)
+        nearest = math.inf
+        nearest_dx = nearest_dy = 0.0
+        for offset_y in range(-radius_cells, radius_cells + 1):
+            for offset_x in range(-radius_cells, radius_cells + 1):
+                grid_x, grid_y = center_x + offset_x, center_y + offset_y
+                if not (0 <= grid_x < width and 0 <= grid_y < height):
+                    continue
+                value = int(grid.data[grid_y * width + grid_x])
+                if value < self.portal_goal_occupied_threshold:
+                    continue
+                cell_local_x = (grid_x + 0.5) * resolution
+                cell_local_y = (grid_y + 0.5) * resolution
+                world_x = float(origin.position.x) + cos_yaw * cell_local_x - sin_yaw * cell_local_y
+                world_y = float(origin.position.y) + sin_yaw * cell_local_x + cos_yaw * cell_local_y
+                delta_x = float(goal[0]) - world_x
+                delta_y = float(goal[1]) - world_y
+                distance = math.hypot(delta_x, delta_y)
+                if distance < nearest:
+                    nearest = distance
+                    nearest_dx, nearest_dy = delta_x, delta_y
+        return nearest, nearest_dx, nearest_dy
+
+    def _occupied_clearance_m(self, goal: list[float], search_radius_m: float) -> float:
+        """Distance from a goal to the nearest occupied costmap cell center."""
+
+        return self._nearest_occupied_vector(goal, search_radius_m)[0]
+
+    def _push_portal_goal_from_obstacle(
+        self, goal: list[float], metadata: dict[str, Any]
+    ) -> tuple[list[float], float]:
+        """Push a portal goal away along its door/obstacle normal if needed."""
+
+        required = max(0.0, float(self.generator.config.portal_obstacle_clearance_m))
+        step = max(0.01, float(self.generator.config.portal_obstacle_push_step_m))
+        max_push = max(0.0, float(self.generator.config.portal_obstacle_push_max_m))
+        if self.occupancy_grid is None or required <= 0.0 or max_push <= 0.0:
+            return list(goal), 0.0
+        search_radius = required + max_push + 0.5
+        clearance, normal_x, normal_y = self._nearest_occupied_vector(
+            goal, search_radius
+        )
+        if clearance >= required:
+            return list(goal), 0.0
+
+        # Use the nearest occupied cell's outward normal.  The door OBB
+        # normal is only a fallback when the costmap contains no usable
+        # occupied cell vector (for example while the map is being updated).
+        away_x, away_y = normal_x, normal_y
+        norm = math.hypot(away_x, away_y)
+        if norm <= 1e-6:
+            center = list(
+                metadata.get("portal_clearance_aabb_center_xy")
+                or metadata.get("portal_aabb_center_xy")
+                or []
+            )
+            if len(center) >= 2:
+                away_x = float(goal[0]) - float(center[0])
+                away_y = float(goal[1]) - float(center[1])
+                norm = math.hypot(away_x, away_y)
+            if norm <= 1e-6:
+                yaw = float(goal[2]) if len(goal) >= 3 else 0.0
+                away_x, away_y, norm = -math.cos(yaw), -math.sin(yaw), 1.0
+        away_x /= norm
+        away_y /= norm
+        pushed = 0.0
+        best = list(goal)
+        while pushed < max_push - 1e-9:
+            pushed = min(max_push, pushed + step)
+            trial = list(goal)
+            trial[0] += away_x * pushed
+            trial[1] += away_y * pushed
+            best = trial
+            trial_clearance, _, _ = self._nearest_occupied_vector(
+                trial, search_radius
+            )
+            if trial_clearance >= required:
+                return trial, pushed
+        return best, pushed
 
     def _publish(self, _event) -> None:
         explorer_input = (

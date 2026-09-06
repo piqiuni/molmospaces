@@ -6,8 +6,13 @@
     <arg name="global_map_topic" default="/struct_mapping/occ_map"/>
     <arg name="move_base_respawn" default="true"/>
     <arg name="move_base_respawn_delay" default="2.0"/>
+    <arg name="cmd_vel_topic" default="/cmd_vel"/>
+    <arg name="cmd_vel_stamped_topic" default="/cmd_vel_stamped"/>
 
-    <node pkg="nav_pkg" type="relay_node" name="relay_node" output="screen"/>
+    <node pkg="nav_pkg" type="relay_node" name="relay_node" output="screen">
+        <param name="input_topic" value="$(arg cmd_vel_topic)"/>
+        <param name="output_topic" value="$(arg cmd_vel_stamped_topic)"/>
+    </node>
 
     <node pkg="move_base"
           type="move_base"
@@ -15,6 +20,7 @@
           output="screen"
           respawn="$(arg move_base_respawn)"
           respawn_delay="$(arg move_base_respawn_delay)">
+        <remap from="/cmd_vel" to="$(arg cmd_vel_topic)"/>
         <rosparam file="$(find nav_pkg)/configs/costmap_common_params.yaml" command="load" ns="global_costmap" />
         <rosparam file="$(find nav_pkg)/configs/costmap_common_params.yaml" command="load" ns="local_costmap" />
 

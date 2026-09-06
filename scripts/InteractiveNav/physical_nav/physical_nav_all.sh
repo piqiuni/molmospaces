@@ -28,6 +28,7 @@ GO2_DEPTH_WIDTH="${PHYSICAL_NAV_GO2_DEPTH_WIDTH:-848}"
 GO2_DEPTH_HEIGHT="${PHYSICAL_NAV_GO2_DEPTH_HEIGHT:-480}"
 GO2_DEPTH_FPS="${PHYSICAL_NAV_GO2_DEPTH_FPS:-10}"
 GO2_ALIGN_TO="${PHYSICAL_NAV_GO2_ALIGN_TO:-depth}"
+GO2_CAMERA_IMU="${PHYSICAL_NAV_GO2_CAMERA_IMU:-0}"
 GO2_TELEMETRY_PERIOD="${PHYSICAL_NAV_GO2_TELEMETRY_PERIOD:-0.05}"
 # Both machines are on the same experiment LAN. Direct WebSocket transport
 # avoids SSH channel head-of-line buffering and lets a reconnect discard an
@@ -103,7 +104,7 @@ start_go2_components() {
     "${GO2_TUNNEL_TARGET}" "${GO2_BRIDGE_PATH}" "${GO2_BRIDGE_LOG}" \
     "${GO2_INTERFACE}" "${GO2_FPS}" "${GO2_TELEMETRY_PERIOD}" \
     "${GO2_SENSOR_URL}" "${GO2_COLOR_WIDTH}" "${GO2_COLOR_HEIGHT}" "${GO2_COLOR_FPS}" \
-    "${GO2_DEPTH_WIDTH}" "${GO2_DEPTH_HEIGHT}" "${GO2_DEPTH_FPS}" "${GO2_ALIGN_TO}" <<'REMOTE'
+    "${GO2_DEPTH_WIDTH}" "${GO2_DEPTH_HEIGHT}" "${GO2_DEPTH_FPS}" "${GO2_ALIGN_TO}" "${GO2_CAMERA_IMU}" <<'REMOTE'
 set -u
 tunnel_pid="0"
 tunnel_owned=0
@@ -127,6 +128,7 @@ bridge_owned=0
     --color-width "$8" --color-height "$9" --color-fps "${10}" \
     --depth-width "${11}" --depth-height "${12}" --depth-fps "${13}" --align-to "${14}" \
     --telemetry-period "$6" \
+    $(if [ "${15}" = 1 ]; then echo --enable-camera-imu; fi) \
     >>"$3" 2>&1 </dev/null &
   bridge_pid=$!
   bridge_owned=1

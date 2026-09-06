@@ -1,18 +1,60 @@
 # Physical-only move_base overrides. Loaded inside the /move_base private
 # namespace after the shared navigation defaults, leaving simulator settings
 # unchanged.
+# move_base's outer controller loop controls how often the planner command is
+# emitted. Keep it at the same 10 Hz as the physical command/safety bridge;
+# changing only DWAPlannerROS/controller_frequency leaves the outer loop at 5 Hz.
+controller_frequency: 10.0
+
 DWAPlannerROS:
-  # Physical Go2 speed profile. Keep these planner limits in sync with the
-  # downstream velocity-safety caps so valid DWA commands are not clipped.
+  # The physical command bridge and safety limiter run at 10 Hz.  A 5-Hz DWA
+  # loop produces visible 200-ms command steps and makes recovery oscillation
+  # look like stop-go motion.
+  controller_frequency: 10.0
+  # The planner must be able to accelerate from rest inside one 10-Hz DWA
+  # window.  The physical minimum speed is applied downstream by
+  # physical_velocity_safety; do not duplicate that floor here.
   max_vel_x: 0.56
+  min_vel_x: 0.05
   max_vel_trans: 0.60
+  min_vel_trans: 0.05
   max_vel_theta: 1.30
-  min_vel_theta: 0.55
-  rear_path_rotate_speed: 1.30
+  # Keep DWA angular sampling independent from the physical minimum-turn
+  # mapping, which is applied by physical_velocity_safety only for non-zero
+  # commands.  A low planner floor avoids eliminating gentle curved paths.
+  min_vel_theta: 0.05
+  # The shared DWA default (0.1 m/s^2) is appropriate for a very conservative
+  # simulator profile, but at a 10 Hz physical loop it leaves only a 0.01 m/s
+  # translational dynamic window per cycle.  The planner then frequently
+  # selects angular-only samples even when the local path is forward.  This
+  # value remains below the Go2 safety limiter's 0.60 m/s cap and lets the
+  # window open quickly enough for normal forward tracking.
+  acc_lim_trans: 1.0
+  # Physical Go2 should use the sampled DWA angular velocity.  The custom
+  # rear-path branch otherwise jumps directly to a fixed 1.30 rad/s command.
+  # Rotate in place before driving when the goal lies behind the robot.
+  # This avoids the forward-only DWA window trying to approach a rear goal
+  # with an unnecessarily long forward arc.
+  rear_path_prerotate_enabled: true
+  rear_path_rotate_speed: 0.30
+  # A temporary forced reverse after three failed samples changes the sign of
+  # vx abruptly and is unsafe on the long camera mast. Let move_base stop and
+  # replan instead; valid reverse trajectories remain available through DWA's
+  # normal velocity window when explicitly requested by the global path.
+  conditional_reverse_enabled: false
+  # The downstream safety deadband handles tiny residual commands without
+  # converting a valid curved-path correction into a planner failure/stop.
+  reject_degenerate_cmd_enabled: false
   xy_goal_tolerance: 0.30
   # Require a tighter terminal heading on the physical base. The velocity
   # safety layer now preserves the low angular speeds needed to reach it.
   yaw_goal_tolerance: 0.15
+
+GlobalPlanner:
+  # Exploration and post-interaction planning must be able to cross cells
+  # that have not been observed yet. Lethal obstacle cells remain blocked;
+  # only the NO_INFORMATION value is made traversable by the global planner.
+  allow_unknown: true
 
 local_costmap:
   rolling_window: true
@@ -43,10 +85,10 @@ local_costmap:
       marking: true
       clearing: true
   inflation_layer:
-    inflation_radius: 0.50
+    inflation_radius: 0.40
     cost_scaling_factor: 8.0
 
 global_costmap:
   inflation_layer:
-    inflation_radius: 0.50
+    inflation_radius: 0.40
     cost_scaling_factor: 8.0

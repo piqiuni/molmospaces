@@ -22,6 +22,8 @@
   <arg name="attribute_max_distance_m" default="6.0"/>
   <arg name="attribute_required_consecutive_observations" default="2"/>
   <arg name="attribute_targeted_refresh_topic" default="/semantic_mapping/attribute_refresh_requests"/>
+  <arg name="attribute_object_detections_topic" default=""/>
+  <arg name="attribute_include_keywords" default=""/>
   <!-- start_attribute_inference launches both independent Module-1 lanes:
        RGB object attributes and text-only room attributes. -->
   <arg name="attribute_room_enabled" default="true"/>
@@ -105,6 +107,10 @@
       <param name="max_distance_m" value="$(arg attribute_max_distance_m)"/>
       <param name="required_consecutive_observations" value="$(arg attribute_required_consecutive_observations)"/>
       <param name="topics/attribute_refresh_requests" value="$(arg attribute_targeted_refresh_topic)"/>
+      <param if="$(eval arg('attribute_object_detections_topic') != '')" name="topics/object_detections" value="$(arg attribute_object_detections_topic)"/>
+      <!-- Keep the physical locker/fridge hypothesis in the generic launch
+           too; the detector label is still only a provisional M1 input. -->
+      <rosparam param="include_keywords">[door, fridge, refrigerator, locker]</rosparam>
       <param name="room_mllm/enabled" value="$(arg attribute_room_enabled)"/>
     </node>
   </group>

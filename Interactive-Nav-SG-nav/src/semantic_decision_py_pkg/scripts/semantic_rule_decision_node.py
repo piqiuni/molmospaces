@@ -733,6 +733,90 @@ class SemanticRuleDecisionNode:
                 )
             self._update_entered_rooms(payload)
             self.latest_candidates_payload = payload
+            # A door can become open from an asynchronous M1 observation while
+            # its approach subgoal is still active.  Do not leave the executor
+            # driving toward an interaction that the fresh graph has already
+            # satisfied.  The executor will cancel the owned navigation goal
+            # and return one ordinary CANCELED feedback event.
+            if (
+                self.active_candidate_id
+                and self.active_behavior_type == "INTERACT"
+                and self.preempt_requested_for_decision_id != self.active_decision_id
+            ):
+                active_target_id = str(
+                    self.active_interaction_candidate.get("target_id")
+                    or self._interaction_target_id(self.active_candidate_id)
+                    or ""
+                )
+                graph_nodes = (payload.get("graph_context") or {}).get("nodes") or []
+                matched_open_portal = None
+                matched_direct = False
+                active_goal = list(self.active_interaction_candidate.get("goal_xyyaw") or [])
+                nearest_distance = float("inf")
+                for graph_node in graph_nodes:
+                    attributes = graph_node.get("attributes") or {}
+                    direct_match = str(graph_node.get("id") or "") == active_target_id or str(
+                        attributes.get("instance_id") or ""
+                    ) == active_target_id
+                    if not direct_match and str(graph_node.get("type") or "").casefold() != "portal":
+                        continue
+                    interaction = graph_node.get("interaction") or {}
+                    graph_state = str(
+                        interaction.get("state")
+                        or graph_node.get("interaction_state")
+                        or "unknown"
+                    ).casefold()
+                    if graph_state not in {"open", "opened", "ajar", "static_open"}:
+                        continue
+                    if direct_match:
+                        matched_open_portal = graph_node
+                        matched_direct = True
+                        break
+                    center = list(
+                        graph_node.get("centroid")
+                        or (graph_node.get("portal_geometry") or {}).get("aabb_center")
+                        or []
+                    )
+                    if len(center) >= 2 and len(active_goal) >= 2:
+                        distance = math.hypot(
+                            float(center[0]) - float(active_goal[0]),
+                            float(center[1]) - float(active_goal[1]),
+                        )
+                        if distance < nearest_distance:
+                            nearest_distance = distance
+                            matched_open_portal = graph_node
+                if (
+                    matched_open_portal is None
+                    or (not matched_direct and nearest_distance > 2.5)
+                ):
+                    matched_open_portal = None
+                if matched_open_portal is not None:
+                    self.preempt_requested_for_decision_id = self.active_decision_id
+                    self.preempt_pub.publish(
+                        String(
+                            data=json.dumps(
+                                {
+                                    "decision_id": self.active_decision_id,
+                                    "candidate_id": self.active_candidate_id,
+                                    "replacement_candidate_id": "",
+                                    "reason": "interaction_target_resolved",
+                                    "resolved_state": str(
+                                        (matched_open_portal.get("interaction") or {}).get(
+                                            "state"
+                                        )
+                                        or matched_open_portal.get("interaction_state")
+                                        or "open"
+                                    ).casefold(),
+                                    "candidate_sequence": int(
+                                        payload.get("sequence", 0) or 0
+                                    ),
+                                    "timestamp": time.time(),
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        )
+                    )
             # Candidate publications are the first point at which the fresh
             # post-open portal geometry is available.  Reproject immediately
             # in the physical delegated lane instead of waiting for the
@@ -868,9 +952,11 @@ class SemanticRuleDecisionNode:
             and self.active_behavior_type == "INTERACT"
             and is_interaction_pose_precondition_failure(detail)
         )
+        preempt_reason = str(detail.get("reason") or "")
         preempted_by_target = bool(
             status == "CANCELED"
-            and str(detail.get("reason") or "") == "preempted_by_target"
+            and preempt_reason
+            in {"preempted_by_target", "interaction_target_resolved"}
         )
         terminal_interaction_failure: dict = {}
         temporary_skip_s = max(

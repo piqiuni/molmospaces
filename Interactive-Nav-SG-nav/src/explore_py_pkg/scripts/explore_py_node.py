@@ -333,6 +333,8 @@ class ExplorePyNode:
 
         self.latest_grid_msg = None
         self.latest_grid = None
+        self._last_occ_content_key = None
+        self._occ_duplicate_count = 0
         self.robot_xy = None
         self.robot_yaw = None
         self.latest_clusters = []
@@ -525,6 +527,21 @@ class ExplorePyNode:
         rospy.logwarn("[explore_py] exploration state reset for a new scene")
 
     def occupancy_callback(self, msg):
+        # GMapping may publish the same map repeatedly while the robot is
+        # stationary. Do not rebuild frontier/value maps for an identical OCC;
+        # retain the latest header for diagnostics but process only new map
+        # content.
+        info = msg.info
+        content_key = (
+            int(info.width), int(info.height), round(float(info.resolution), 6),
+            round(float(info.origin.position.x), 3),
+            round(float(info.origin.position.y), 3),
+            hash(tuple(int(value) for value in msg.data)),
+        )
+        if content_key == self._last_occ_content_key:
+            self._occ_duplicate_count += 1
+            return
+        self._last_occ_content_key = content_key
         self.latest_grid_msg = msg
         self.latest_grid = self._convert_grid(msg)
         self.step_ready_pub.publish(String(data=json.dumps({

@@ -14,6 +14,7 @@ from .geometry_utils import (
     world_to_grid,
 )
 from .graph_rules import (
+    PORTAL_LABELS,
     default_interaction_payload,
     distance_xy,
     infer_node_type,
@@ -37,6 +38,72 @@ _SEMANTIC_POSTCONDITION_BY_ACTION = {
 # hypothesis only and must never be written into the occupancy-derived room
 # grid.
 _PORTAL_CHILD_ROOM_ID_BASE = 1_000_000
+
+# These are semantic landmarks rather than short-lived detector tracks.  Once
+# the temporal detector gate and the visual Module-1 gate have both passed,
+# their identity must survive occlusion, viewpoint changes, and detector
+# dropouts.  Visibility and geometry continue to be refreshed separately.
+_PERSISTENT_SEMANTIC_TYPES = frozenset({"room", "portal", "container"})
+
+
+def _portal_geometry_plausible(size):
+    """Reject degenerate RGB-D portal boxes before they become topology."""
+
+    try:
+        values = [abs(float(value)) for value in list(size or [])[:3]]
+    except (TypeError, ValueError):
+        return False
+    if len(values) < 3 or not all(math.isfinite(value) for value in values):
+        return False
+    horizontal = max(values[0], values[1])
+    return bool(
+        horizontal >= 0.25
+        and values[2] >= 0.90
+        and horizontal * values[2] >= 0.35
+    )
+
+
+def _portal_attrs_geometry_plausible(attrs):
+    attrs = attrs or {}
+    for key in (
+        "viz_aabb_size",
+        "interaction_reference_aabb_size",
+        "interaction_reference_obb_size",
+    ):
+        if key in attrs and attrs.get(key):
+            return _portal_geometry_plausible(attrs.get(key))
+    return True
+
+
+def _has_m1_portal_confirmation(attrs):
+    """Return whether M1 positively identified a detector portal as a door."""
+
+    # A detector portal is not necessarily a door.  M1 can correctly reject
+    # a wall panel, cabinet face, or other flat structure while the detector
+    # keeps its provisional ``portal`` label.  Such a result must never create
+    # a synthetic room behind it.
+    if str(attrs.get("attribute_status") or "").casefold() != "ready":
+        return False
+    if str(attrs.get("mllm_interaction_class") or "").casefold() != "portal":
+        return False
+    if not _portal_attrs_geometry_plausible(attrs):
+        return False
+    observed_name = normalize_label(attrs.get("m1_observed_object_name"))
+    # A portal class with a contradictory concrete name (for example
+    # ``thermostat``) is not a confirmed door, even if the detector proposed
+    # portal and the crop contains a flat, door-like shape.  M1's concrete
+    # identity is the final semantic check for topology.
+    return observed_name in PORTAL_LABELS
+
+
+def _has_persistent_semantic_evidence(node):
+    """Return whether a node has passed the two-frame + M1 admission gate."""
+
+    if node is None or node.type not in _PERSISTENT_SEMANTIC_TYPES:
+        return False
+    if not bool(node.attributes.get("persistent_semantic_node", False)):
+        return False
+    return node.type != "portal" or _has_m1_portal_confirmation(node.attributes)
 
 
 def _resolved_interaction_state(result):
@@ -385,21 +452,19 @@ def _portal_visual_state_gate(
         and float(aperture_evidence.get("confidence", 0.0) or 0.0) >= 0.70
     )
     if requested in {"open", "ajar"}:
-        # A head-camera aperture is only a local appearance claim.  It becomes
-        # a navigable portal state once the occupancy/room observation has
-        # independently seen free connectivity on both sides.  This is also a
-        # fail-safe for boxes clipped at the image border: an apparent dark gap
-        # must not suppress the first open interaction or create a route.
+        # M1's ``open`` result is a direct visual state observation.  Once the
+        # crop contains a confident visible aperture, the door interaction is
+        # already satisfied and must leave the interaction-candidate pool.
+        # Room/OCC connectivity is still used by the traversal planner, but it
+        # must not keep an already-open door as a repeated ``open`` subgoal.
         map_connected = _portal_has_observed_open_connectivity(node)
         return (
-            aperture_visible and map_connected,
+            aperture_visible,
             "visual_open_aperture_and_map_confirmed"
             if aperture_visible and map_connected
-            else (
-                "missing_visual_open_aperture_evidence"
-                if not aperture_visible
-                else "missing_observed_open_connectivity"
-            ),
+            else "missing_visual_open_aperture_evidence"
+            if not aperture_visible
+            else "visual_open_aperture_confirmed",
         )
     fixed_opening = bool(
         isinstance(morphology, dict)
@@ -571,6 +636,7 @@ class InteractionGraphStore:
         self.capture_step = None
         self.interaction_event_counter = 1
         self.next_portal_child_room_id = _PORTAL_CHILD_ROOM_ID_BASE
+        self.force_provisional_portal_rooms = True
         self._ensure_scene_node()
 
     def reset(self, episode_id="", source_mode=None):
@@ -731,6 +797,11 @@ class InteractionGraphStore:
             observation = normalize_observation(raw_observation)
             node = self._find_or_create_node(observation)
             self._apply_observation(node, observation, now)
+        # ObjectMapStore can legitimately hand off a physical doorway to a
+        # new detector track after an occlusion or a large viewpoint change.
+        # The opaque track id is not a semantic identity, so collapse portal
+        # nodes again at the graph boundary before rebuilding room relations.
+        self._merge_duplicate_portal_nodes()
         for node in self.nodes.values():
             node.attributes.pop("_was_visible_previous_update", None)
         self._refresh_room_nodes_from_grid()
@@ -829,6 +900,21 @@ class InteractionGraphStore:
                     "drawer_scan_covered_region_count": len(grounded_regions),
                 }
             )
+            # A refrigerator with an M1-observed door is an open/close
+            # interaction even when the model omits an explicit mode field.
+            # Candidate generation rejects container modes other than
+            # open_close/slide, so leaving this as ``none`` hides the fridge
+            # from the subgoal pool despite is_interactable=true.
+            if (
+                patch_interactable
+                and _is_refrigerator_label(m1_observed_name or node.label)
+                and any(
+                    str(part.get("type") or "").casefold() in {"door", "lid", "drawer"}
+                    for part in (patch.get("interaction_parts") or [])
+                    if isinstance(part, dict)
+                )
+            ):
+                node.interaction["interaction_mode"] = "open_close"
         result_source = str(
             result.get("source")
             or result.get("verification_source")
@@ -1210,6 +1296,95 @@ class InteractionGraphStore:
         patch_source = str(patch.get("source") or "mllm_attribute_inference")
         is_visual_mllm_patch = "mllm" in patch_source.casefold()
         m1_observed_name = _m1_observed_object_name(patch)
+        # A generic detector label (locker/safe/object) is only a hypothesis
+        # until M1 has independently confirmed the refrigerator name twice.
+        # One crop is not enough to distinguish the field refrigerator from a
+        # drinking-water dispenser, which is exactly the failure mode seen on
+        # the physical platform.  Count distinct observation signatures rather
+        # than the number of image tiles in one request; repeated tiles from a
+        # single frame are not independent evidence.
+        source_labels = {
+            normalize_label(value)
+            for value in (
+                node.attributes.get("source_semantic_name"),
+                node.attributes.get("source_category"),
+            )
+            if normalize_label(value)
+        }
+        source_is_refrigerator = any(
+            _is_refrigerator_label(value) for value in source_labels
+        )
+        m1_recheck_required = bool(
+            source_labels.intersection(
+                {"locker", "safe", "water_dispenser", "dispenser"}
+            )
+        )
+        m1_refrigerator_answer = bool(
+            is_visual_mllm_patch
+            and confidence >= 0.5
+            and _is_refrigerator_label(m1_observed_name)
+        )
+        confirmation_signatures = [
+            str(value)
+            for value in list(
+                node.attributes.get("m1_refrigerator_confirmation_signatures") or []
+            )
+            if str(value)
+        ]
+        # The compact view signature intentionally stays stable while the
+        # robot holds still.  For this *recheck* it must be combined with the
+        # actual capture frame, otherwise two M1 calls on later frames would be
+        # mistaken for one piece of evidence forever.
+        confirmation_signature = str(patch_signature or "")
+        if patch_frame_index is not None:
+            confirmation_signature += f"|frame:{patch_frame_index}"
+        elif not confirmation_signature:
+            confirmation_signature = (
+                f"capture:{patch.get('observation_capture_step')}"
+            )
+        confirmation_count = int(
+            node.attributes.get("m1_refrigerator_confirmation_count", 0) or 0
+        )
+        if m1_refrigerator_answer and m1_recheck_required and not source_is_refrigerator:
+            if confirmation_signature and confirmation_signature not in confirmation_signatures:
+                confirmation_signatures.append(confirmation_signature)
+                confirmation_signatures = confirmation_signatures[-8:]
+                confirmation_count = len(confirmation_signatures)
+        m1_refrigerator_confirmed = bool(
+            source_is_refrigerator or confirmation_count >= 2
+        )
+        m1_refrigerator_pending = bool(
+            m1_refrigerator_answer
+            and m1_recheck_required
+            and not m1_refrigerator_confirmed
+            and not source_is_refrigerator
+        )
+        source_observation_is_portal = bool(
+            source_labels.intersection({"portal", "door", "doorway", "gate"})
+        )
+        portal_morphology = _public_portal_morphology(patch)
+        portal_aperture_evidence = _public_portal_aperture_evidence(patch)
+        portal_visual_evidence = bool(
+            isinstance(portal_morphology, dict)
+            and str(portal_morphology.get("door_leaf") or "")
+            in {"present", "absent"}
+            and float(portal_morphology.get("confidence", 0.0) or 0.0) >= 0.70
+        ) or bool(
+            isinstance(portal_aperture_evidence, dict)
+            and str(portal_aperture_evidence.get("open_aperture") or "")
+            == "visible"
+            and float(portal_aperture_evidence.get("confidence", 0.0) or 0.0)
+            >= 0.70
+        )
+        portal_name_is_door = bool(
+            not m1_observed_name or m1_observed_name in PORTAL_LABELS
+        )
+        portal_identity_authorized = bool(
+            interaction_class == "portal"
+            and portal_name_is_door
+            and (source_observation_is_portal or portal_visual_evidence)
+            and _portal_geometry_plausible(node.aabb_size)
+        )
         # M1 is the visual authority for both the concrete name and the
         # interaction class.  A sufficiently confident M1 answer may correct
         # a YOLO-established container/portal type; lower-confidence answers
@@ -1226,12 +1401,22 @@ class InteractionGraphStore:
             and self.source_mode == "detector_online"
             and confidence >= 0.5
             and interaction_class in {"portal", "container", "support", "object"}
+            and (not m1_refrigerator_answer or m1_refrigerator_confirmed)
+            and (interaction_class != "portal" or portal_identity_authorized)
         )
         m1_noninteractive_override = bool(
             is_visual_mllm_patch
             and confidence >= 0.5
-            and not bool(patch.get("interactable", False))
-            and interaction_class in {"none", "unknown"}
+            and (
+                (
+                    not bool(patch.get("interactable", False))
+                    and interaction_class in {"none", "unknown"}
+                )
+                or (
+                    interaction_class == "portal"
+                    and not portal_identity_authorized
+                )
+            )
         )
         requested_patch_state = str(
             patch.get("coarse_state") or "unknown"
@@ -1248,9 +1433,14 @@ class InteractionGraphStore:
         # refinements (for example generic object -> container) remain allowed.
         portal_promotion_rejected = bool(
             interaction_class == "portal"
-            and observed_topology_type
-            and observed_topology_type != "portal"
-            and not m1_class_override
+            and (
+                (
+                    observed_topology_type
+                    and observed_topology_type != "portal"
+                    and not m1_class_override
+                )
+                or not portal_identity_authorized
+            )
         )
         (
             container_type_locked,
@@ -1283,6 +1473,7 @@ class InteractionGraphStore:
             and not portal_promotion_rejected
             and not container_type_locked
             and not portal_type_locked
+            and not m1_refrigerator_pending
         ):
             node.type = interaction_class
         if (
@@ -1295,7 +1486,12 @@ class InteractionGraphStore:
             # explicitly says it is not interactive, keep the node in the
             # semantic map but remove it from the interaction-candidate pool.
             node.type = "object"
-        if m1_observed_name and is_visual_mllm_patch and confidence >= 0.5:
+        if (
+            m1_observed_name
+            and is_visual_mllm_patch
+            and confidence >= 0.5
+            and not m1_refrigerator_pending
+        ):
             # Keep the stable track/instance ID and source detector name, but
             # replace the public semantic name used by candidates, graph views,
             # and subsequent M2 prompts with M1's visual result.
@@ -1336,6 +1532,13 @@ class InteractionGraphStore:
                     patch.get("m1_detector_class_hypothesis") or ""
                 ),
                 "m1_class_override": m1_class_override,
+                "m1_refrigerator_confirmation_count": confirmation_count,
+                "m1_refrigerator_confirmation_signatures": confirmation_signatures,
+                "m1_refrigerator_confirmed": m1_refrigerator_confirmed,
+                "m1_refrigerator_pending_confirmation": m1_refrigerator_pending,
+                "m1_pending_observed_object_name": (
+                    m1_observed_name if m1_refrigerator_pending else ""
+                ),
                 "m1_noninteractive_override": m1_noninteractive_override,
                 "mllm_portal_promotion_rejected": portal_promotion_rejected,
                 "evidence_frame_ids": list(patch.get("evidence_frame_ids") or []),
@@ -1559,7 +1762,37 @@ class InteractionGraphStore:
             }
             node.attributes["interaction_state_override"]["timestamp"] = patch_stamp
 
+            # A visually confirmed open/ajar portal is already traversable,
+            # but the far-side occupancy cells may still be unknown. Keep a
+            # graph-only provisional child room now so planning can target
+            # the doorway; OCC will replace it with a real room after the
+            # robot crosses and observes free space there.
+            if (
+                self.portal_child_room_enabled
+                and node.type == "portal"
+                and str(patch_state).casefold() in {"open", "ajar"}
+            ):
+                self._ensure_open_portal_child_room(node, previous_history)
+
+        # Keep the interaction mode canonical even when a repeated M1 patch
+        # does not change the closed/open state.  Otherwise the first patch
+        # may leave mode=none and every later patch preserves that value.
+        if (
+            bool(patch.get("interactable", False))
+            and _is_refrigerator_label(m1_observed_name or node.label)
+            and any(
+                str(part.get("type") or "").casefold() in {"door", "lid", "drawer"}
+                for part in (patch.get("interaction_parts") or [])
+                if isinstance(part, dict)
+            )
+        ):
+            node.interaction["interaction_mode"] = "open_close"
+            override = dict(node.attributes.get("interaction_state_override") or {})
+            override["interaction_mode"] = "open_close"
+            node.attributes["interaction_state_override"] = override
+
         node.attributes["attribute_updated_at"] = patch_stamp
+        self._update_persistent_semantic_gate(node)
         self._rebuild_relations(now=patch_stamp)
         self._bump_revision()
         return True
@@ -1766,7 +1999,18 @@ class InteractionGraphStore:
         stale_ids = [
             node_id
             for node_id, node in self.nodes.items()
-            if node.type != "room" and node.last_seen is not None and now - float(node.last_seen) > stale_after_sec
+            if (
+                node.type != "room"
+                and node.last_seen is not None
+                and now - float(node.last_seen) > stale_after_sec
+                and not _has_persistent_semantic_evidence(node)
+                # Successful interaction state is mission memory, not a
+                # detector track. Keep it even when the object leaves view;
+                # ordinary unconfirmed/stale detections may be reclaimed.
+                and not bool(node.interaction.get("operation_history"))
+                and str(node.interaction.get("state") or "").casefold()
+                not in {"open", "opened", "ajar", "static_open", "blocked", "unavailable"}
+            )
         ]
         if not stale_ids:
             return
@@ -1798,7 +2042,22 @@ class InteractionGraphStore:
         for node in self.nodes.values():
             if node.type == "room":
                 continue
-            if node.type != node_type or node.label != label:
+            if node.type != node_type:
+                continue
+            # M1 and detector paths may alternate the public label between
+            # ``door`` and ``portal`` while retaining the same physical
+            # surface. Treat portal-family labels as equivalent for spatial
+            # association so a label canonicalization cannot split a track.
+            portal_labels = {
+                "portal", "door", "doorway", "doorframe", "door_leaf",
+                "gate", "entrance",
+            }
+            portal_equivalent = (
+                node_type == "portal"
+                and node.label in portal_labels
+                and label in portal_labels
+            )
+            if node.label != label and not portal_equivalent:
                 continue
             dist = distance_xy(node.centroid, observation["position"])
             if dist <= self.match_distance and (best is None or dist < best_dist):
@@ -1816,6 +2075,170 @@ class InteractionGraphStore:
         )
         self.nodes[node_id] = node
         return node
+
+    @staticmethod
+    def _portal_axis_delta(first_yaw, second_yaw):
+        """Return the unoriented (pi-periodic) angle between door axes."""
+
+        try:
+            delta = abs(float(first_yaw) - float(second_yaw))
+        except (TypeError, ValueError):
+            return math.inf
+        return abs((delta + 0.5 * math.pi) % math.pi - 0.5 * math.pi)
+
+    def _portal_nodes_cross_view_match(self, first, second):
+        """Whether two graph portal nodes describe one physical doorway."""
+
+        if first is None or second is None:
+            return False
+        if first.type != "portal" or second.type != "portal":
+            return False
+        first_attrs = first.attributes or {}
+        second_attrs = second.attributes or {}
+        first_yaw = first_attrs.get("interaction_reference_yaw", first_attrs.get("yaw"))
+        second_yaw = second_attrs.get("interaction_reference_yaw", second_attrs.get("yaw"))
+        if first_yaw is None or second_yaw is None:
+            return distance_xy(first.aabb_center, second.aabb_center) <= max(
+                self.match_distance, 0.5
+            )
+        # Close-range partial masks can rotate the PCA axis by roughly one
+        # radian even when the observed doorway is unchanged.  The spatial
+        # normal/tangent/height gates below remain authoritative for rejecting
+        # adjacent doors.
+        if self._portal_axis_delta(first_yaw, second_yaw) > 1.20:
+            return False
+
+        first_center = list(first.aabb_center or first.centroid or [0.0, 0.0, 0.0])
+        second_center = list(second.aabb_center or second.centroid or [0.0, 0.0, 0.0])
+        first_size = list(first.aabb_size or [0.0, 0.0, 0.0])
+        second_size = list(second.aabb_size or [0.0, 0.0, 0.0])
+        # PCA/OBB yaw can jump substantially for a thin, partially visible
+        # door leaf.  If the two axis-aligned RGB-D boxes are nevertheless
+        # almost coincident, that is stronger duplicate evidence than the
+        # unstable yaw.  The minimum-volume overlap keeps adjacent doors
+        # separate even when their centers are nearby.
+        center_distance = distance_xy(first_center, second_center)
+        if center_distance <= 0.35:
+            overlap_volume = 1.0
+            for axis in range(3):
+                first_half = 0.5 * abs(float(first_size[axis]))
+                second_half = 0.5 * abs(float(second_size[axis]))
+                overlap_axis = max(
+                    0.0,
+                    first_half + second_half
+                    - abs(float(second_center[axis]) - float(first_center[axis])),
+                )
+                overlap_volume *= overlap_axis
+            first_volume = math.prod(max(abs(float(value)), 1e-3) for value in first_size[:3])
+            second_volume = math.prod(max(abs(float(value)), 1e-3) for value in second_size[:3])
+            overlap_ratio = overlap_volume / max(min(first_volume, second_volume), 1e-6)
+            if overlap_ratio >= 0.15:
+                return True
+        tangent_x = math.cos(float(first_yaw))
+        tangent_y = math.sin(float(first_yaw))
+        normal_x = -tangent_y
+        normal_y = tangent_x
+        delta_x = float(second_center[0]) - float(first_center[0])
+        delta_y = float(second_center[1]) - float(first_center[1])
+        if abs(delta_x * normal_x + delta_y * normal_y) > 0.45:
+            return False
+
+        tangent_distance = abs(delta_x * tangent_x + delta_y * tangent_y)
+        first_width = max(abs(float(first_size[0])), abs(float(first_size[1])), 1e-3)
+        second_width = max(abs(float(second_size[0])), abs(float(second_size[1])), 1e-3)
+        tangent_overlap = max(
+            0.0, 0.5 * (first_width + second_width) - tangent_distance
+        )
+        if tangent_overlap / max(min(first_width, second_width), 1e-3) < 0.20:
+            return False
+
+        first_height = max(abs(float(first_size[2])), 1e-3)
+        second_height = max(abs(float(second_size[2])), 1e-3)
+        vertical_distance = abs(float(second_center[2]) - float(first_center[2]))
+        vertical_overlap = max(
+            0.0, 0.5 * (first_height + second_height) - vertical_distance
+        )
+        return (
+            vertical_overlap / max(min(first_height, second_height), 1e-3)
+            >= 0.35
+        )
+
+    def _merge_duplicate_portal_nodes(self):
+        """Merge split doorway graph nodes while retaining the strongest node."""
+
+        portals = [node for node in self.nodes.values() if node.type == "portal"]
+        if len(portals) < 2:
+            return
+        ordered = sorted(
+            portals,
+            key=lambda node: (
+                -int(node.observation_count or 0),
+                -(float(node.confidence or 0.0)),
+                str(node.id),
+            ),
+        )
+        removed = set()
+        aliases = {}
+        for index, keeper in enumerate(ordered):
+            if keeper.id in removed:
+                continue
+            for duplicate in ordered[index + 1 :]:
+                if duplicate.id in removed or not self._portal_nodes_cross_view_match(
+                    keeper, duplicate
+                ):
+                    continue
+                # Preserve the strongest M1/topology decision if the current
+                # keeper is a newly handed-off track without an attribute patch.
+                keeper_attrs = keeper.attributes
+                duplicate_attrs = duplicate.attributes
+                if (
+                    str(keeper_attrs.get("attribute_status") or "").casefold()
+                    != "ready"
+                    and str(duplicate_attrs.get("attribute_status") or "").casefold()
+                    == "ready"
+                ):
+                    for key in (
+                        "attribute_status",
+                        "attribute_confidence",
+                        "m1_observed_object_name",
+                        "mllm_interaction_class",
+                        "mllm_portal_promotion_rejected",
+                        "m1_noninteractive_override",
+                    ):
+                        if key in duplicate_attrs:
+                            keeper_attrs[key] = duplicate_attrs[key]
+                    keeper.interaction.update(duplicate.interaction)
+                keeper.observation_count = max(
+                    int(keeper.observation_count or 0),
+                    int(duplicate.observation_count or 0),
+                )
+                keeper.confidence = max(
+                    float(keeper.confidence or 0.0),
+                    float(duplicate.confidence or 0.0),
+                )
+                keeper.last_seen = max(
+                    value
+                    for value in (keeper.last_seen, duplicate.last_seen)
+                    if value is not None
+                ) if keeper.last_seen is not None or duplicate.last_seen is not None else None
+                connected = set(keeper_attrs.get("connected_room_ids") or [])
+                connected.update(duplicate_attrs.get("connected_room_ids") or [])
+                if connected:
+                    keeper_attrs["connected_room_ids"] = sorted(connected)
+                aliases[duplicate.id] = keeper.id
+                removed.add(duplicate.id)
+
+        if not removed:
+            return
+        for edge_id, edge in list(self.edges.items()):
+            edge.src_id = aliases.get(edge.src_id, edge.src_id)
+            edge.dst_id = aliases.get(edge.dst_id, edge.dst_id)
+            if edge.src_id == edge.dst_id:
+                self.edges.pop(edge_id, None)
+        # Relations are rebuilt below from the surviving portal set. Remove
+        # stale duplicate nodes now so they cannot re-enter candidates or M1.
+        for node_id in removed:
+            self.nodes.pop(node_id, None)
 
     @staticmethod
     def _node_matches_identity(node, identity: str) -> bool:
@@ -1897,9 +2320,32 @@ class InteractionGraphStore:
             node.attributes.get("interaction_state_override") or {}
         )
         observed_node_type = infer_node_type(observation)
+        if observed_node_type == "portal" and not _portal_geometry_plausible(
+            observation.get("aabb_size")
+        ):
+            # A detector portal label with a degenerate RGB-D box is usually a
+            # clipped mask/depth failure, not a doorway. Keep it as an
+            # ordinary object until M1 supplies valid topology evidence.
+            observed_node_type = "object"
         node.type = observed_node_type
         node.label = normalize_label(observation.get("semantic_name")) or node.type
         node.name = str(observation.get("name") or node.label or node.type)
+        # Physical detector frames refresh geometry, not an accepted M1
+        # identity. Keep source labels below for diagnostics; replay/GT
+        # observations remain authoritative in their own lanes.
+        retained_m1_name = ""
+        if self.source_mode == "detector_online":
+            if node.attributes.get("m1_name_override"):
+                retained_m1_name = normalize_label(
+                    node.attributes.get("semantic_name")
+                )
+                if retained_m1_name:
+                    node.label = retained_m1_name
+                    node.name = retained_m1_name
+            if node.attributes.get("m1_class_override"):
+                node.type = node.attributes.get("mllm_interaction_class") or node.type
+            elif node.attributes.get("m1_noninteractive_override"):
+                node.type = "object"
         node.centroid = self._ground_non_room_centroid(observation["position"], observation["aabb_size"])
         node.aabb_center = self._ground_non_room_centroid(observation["aabb_center"], observation["aabb_size"])
         node.aabb_size = list(observation["aabb_size"])
@@ -1985,6 +2431,14 @@ class InteractionGraphStore:
                 "box_3d_frame_id": observation.get("box_3d_frame_id"),
                 "viz_aabb_center": list(observation.get("viz_aabb_center") or observation["aabb_center"]),
                 "viz_aabb_size": list(observation.get("viz_aabb_size") or observation["aabb_size"]),
+                # Physical YOLOE publishes the oriented 3-D box in the
+                # visualization fields while ``aabb_size`` remains a world
+                # axis-aligned envelope. Preserve the oriented extent for
+                # interaction-face geometry; otherwise a rotated appliance's
+                # surface intersection is computed with the wrong half-widths.
+                "interaction_reference_obb_size": list(
+                    observation.get("viz_aabb_size") or observation["aabb_size"]
+                ),
             }
         if not (minimal_gt and node.type == "portal"):
             observation_attributes["source_object_name"] = observation.get(
@@ -2030,6 +2484,8 @@ class InteractionGraphStore:
             if observation.get("yaw") is not None:
                 observation_attributes["yaw"] = float(observation["yaw"])
         node.attributes.update(observation_attributes)
+        if retained_m1_name:
+            node.attributes["category"] = retained_m1_name
         # A new RGB/detection observation can make the previous M1 visual
         # judgment stale. Keep the judgment for diagnostics, but advertise it
         # as current only for a small causal capture window.
@@ -2164,15 +2620,41 @@ class InteractionGraphStore:
                 node.attributes["interaction_reference_aabb_size"] = list(
                     observation["aabb_size"]
                 )
-            # Upgrade a legacy/reference box as soon as its first measured OBB
-            # yaw arrives, while keeping that reference stable afterward.
-            if (
-                "interaction_reference_yaw" not in node.attributes
-                and observation.get("yaw") is not None
-            ):
-                node.attributes["interaction_reference_yaw"] = float(
-                    observation["yaw"]
+            # Upgrade a legacy/reference portal yaw when a measured OBB yaw
+            # arrives.  Older physical detections did not serialize yaw and
+            # consequently left ``interaction_reference_yaw=0`` even when
+            # the door's long edge was along Y.  Keep a valid measured yaw
+            # stable, but replace that legacy axis-aligned value when the new
+            # OBB clearly differs by ~90 degrees.
+            observed_yaw = observation.get("yaw")
+            if observed_yaw is not None:
+                try:
+                    observed_yaw = float(observed_yaw)
+                except (TypeError, ValueError):
+                    observed_yaw = None
+            reference_yaw = node.attributes.get("interaction_reference_yaw")
+            try:
+                reference_yaw = (
+                    None if reference_yaw is None else float(reference_yaw)
                 )
+            except (TypeError, ValueError):
+                reference_yaw = None
+            if observed_yaw is not None and math.isfinite(observed_yaw):
+                if reference_yaw is None:
+                    node.attributes["interaction_reference_yaw"] = observed_yaw
+                else:
+                    # Yaw is axial (theta and theta+pi are equivalent).  A
+                    # mismatch above 45 degrees is not normal OBB jitter and
+                    # identifies the old missing-yaw reference.
+                    delta = abs(
+                        math.atan2(
+                            math.sin(observed_yaw - reference_yaw),
+                            math.cos(observed_yaw - reference_yaw),
+                        )
+                    )
+                    axial_delta = min(delta, abs(math.pi - delta))
+                    if axial_delta > math.pi / 4.0:
+                        node.attributes["interaction_reference_yaw"] = observed_yaw
         if interaction_state_override:
             for key in (
                 "state",
@@ -2196,6 +2678,54 @@ class InteractionGraphStore:
                     node.interaction[key] = interaction_state_override[key]
 
         node.interaction.update(previous_interaction_memory)
+
+        self._update_persistent_semantic_gate(node)
+
+    @staticmethod
+    def _update_persistent_semantic_gate(node):
+        """Latch persistence after two detector frames and a valid M1 result."""
+
+        if node.type not in {"portal", "container"}:
+            return
+        # ``tracking_confirmed`` is a tracker-level streak flag and can be
+        # true even when this graph node has only received one observation
+        # (for example after a startup race or a track hand-off).  It must not
+        # promote a one-frame RGB-D box to a persistent interaction object.
+        # Use graph receipts as the admission evidence instead.
+        two_frames = node.observation_count >= 2
+        m1_status = str(node.attributes.get("attribute_status") or "").casefold()
+        m1_confidence = float(node.attributes.get("attribute_confidence", 0.0) or 0.0)
+        m1_name = normalize_label(node.attributes.get("m1_observed_object_name"))
+        # A locker/safe refrigerator recheck is intentionally not persistent
+        # after its first ambiguous answer; the graph store only latches it
+        # once the existing two-independent-M1-evidence rule is satisfied.
+        m1_recheck_pending = bool(
+            node.attributes.get("m1_refrigerator_pending_confirmation", False)
+        )
+        m1_confirmed = bool(
+            m1_status == "ready"
+            and m1_confidence >= 0.5
+            and (m1_name or node.attributes.get("mllm_interaction_class"))
+            and not m1_recheck_pending
+        )
+        if node.type == "portal":
+            m1_confirmed = _has_m1_portal_confirmation(node.attributes)
+        if two_frames and m1_confirmed:
+            node.attributes.update(
+                {
+                    "persistent_semantic_node": True,
+                    "semantic_confirmation": "two_detector_frames_plus_m1",
+                    "persistent_since": node.attributes.get("persistent_since")
+                    or node.last_seen,
+                }
+            )
+        elif node.type == "portal":
+            # M1 may later reject a detector portal as a wall panel or other
+            # non-door surface.  Clear the latch immediately so any synthetic
+            # child room can be removed on the same callback.
+            node.attributes.pop("persistent_semantic_node", None)
+            node.attributes.pop("semantic_confirmation", None)
+            node.attributes.pop("persistent_since", None)
 
     def _refresh_room_nodes_from_grid(self, geometry_stability_frames=None):
         if not self.room_grid:
@@ -2314,6 +2844,15 @@ class InteractionGraphStore:
         center = list(statistic["center"])
         size = list(statistic["size"])
         node = self._ensure_room_node(room_id)
+        # Room grids are the temporal observation stream for room identity.
+        # Count accepted grid receipts independently of geometry stability so
+        # a room can pass the same two-observation gate as object tracks.
+        node.attributes["room_observation_count"] = int(
+            node.attributes.get("room_observation_count", 0) or 0
+        ) + 1
+        node.attributes["room_consecutive_observations"] = int(
+            node.attributes.get("room_consecutive_observations", 0) or 0
+        ) + 1
         stable_geometry = self._accept_room_geometry(
             room_id,
             center,
@@ -2329,7 +2868,11 @@ class InteractionGraphStore:
         node.confidence = max(node.confidence, confidence / 100.0)
         node.attributes["cell_count"] = int(statistic["cell_count"])
         node.attributes["active"] = True
-        node.attributes["room_lifecycle"] = "active"
+        node.attributes["room_lifecycle"] = (
+            "persistent"
+            if _has_persistent_semantic_evidence(node)
+            else "active"
+        )
         node.attributes.pop("retired_reason", None)
         node.attributes.pop("retired_graph_revision", None)
 
@@ -2371,6 +2914,16 @@ class InteractionGraphStore:
             # absence; do not replace its explicit alias metadata.
             if room_id in self.room_redirects:
                 node.attributes["active"] = False
+                continue
+            # A room that passed the two-grid-frame + M1 gate is a persistent
+            # semantic landmark.  Temporary absence from the current OCC
+            # window only means it is not visible now; it is not evidence that
+            # the room ceased to exist.
+            if _has_persistent_semantic_evidence(node):
+                node.attributes["active"] = True
+                node.attributes["room_lifecycle"] = "persistent_unobserved"
+                node.attributes.pop("retired_reason", None)
+                node.attributes.pop("retired_graph_revision", None)
                 continue
             node.attributes["active"] = False
             node.attributes["room_lifecycle"] = "retired"
@@ -2657,6 +3210,12 @@ class InteractionGraphStore:
             center[2] = 0.5 * self.room_box_height
             size = [max(max_corner[i] - min_corner[i], 0.1) for i in range(3)]
             size[2] = self.room_box_height
+            room_node.attributes["room_observation_count"] = int(
+                room_node.attributes.get("room_observation_count", 0) or 0
+            ) + 1
+            room_node.attributes["room_consecutive_observations"] = int(
+                room_node.attributes.get("room_consecutive_observations", 0) or 0
+            ) + 1
             stable_center, stable_size = self._accept_room_geometry(
                 room_id,
                 center,
@@ -2694,6 +3253,103 @@ class InteractionGraphStore:
                 node.attributes["cell_count"] = int(geometry["cell_count"])
             self.nodes[node_id] = node
         return node
+
+    def ensure_provisional_room_for_portal(self, portal_node):
+        """Create a planning-only room behind a stable physical portal."""
+        if not self.force_provisional_portal_rooms or portal_node is None:
+            return None
+        if getattr(portal_node, "type", "") != "portal":
+            return None
+        # Do not manufacture a room from a raw YOLO door hypothesis.  The
+        # portal must first pass the same two-frame + M1 persistence gate as
+        # every other semantic landmark; otherwise every transient door box
+        # creates an overlapping synthetic room.
+        if not _has_persistent_semantic_evidence(portal_node):
+            return None
+        attrs = portal_node.attributes
+        existing = [int(v) for v in (attrs.get("potential_room_ids") or []) if str(v).lstrip("-").isdigit()]
+        if existing:
+            room = self._ensure_room_node(existing[0])
+            # Keep the same provisional node alive across OCC frames.  It is
+            # intentionally absent from the room grid until the robot crosses
+            # the doorway, so the normal "absent from latest grid" retirement
+            # path must not turn it into a stale inactive room.
+            if not room.attributes.get("resolved_to_room_id"):
+                room.attributes.update(
+                    {
+                        "active": True,
+                        "is_potential_room": True,
+                        "room_lifecycle": "provisional",
+                        "room_assignment_source": "portal_prior",
+                        "confirmed": False,
+                        "observed_free_space": False,
+                        "parent_portal_id": portal_node.id,
+                    }
+                )
+                room.attributes.pop("retired_reason", None)
+                room.attributes.pop("retired_graph_revision", None)
+            return room
+        room_id = int(self.next_portal_child_room_id)
+        self.next_portal_child_room_id += 1
+        room = self._ensure_room_node(room_id)
+        room.attributes.update({
+            "active": True,
+            "is_potential_room": True,
+            "room_lifecycle": "provisional",
+            "room_assignment_source": "portal_prior",
+            "confirmed": False,
+            "observed_free_space": False,
+            "parent_portal_id": portal_node.id,
+        })
+        attrs["potential_room_ids"] = [room_id]
+        attrs["potential_room_source"] = "forced_portal_room"
+        attrs["potential_room_confirmed"] = False
+        return room
+
+    def prune_unqualified_provisional_rooms(self):
+        """Remove synthetic door-side rooms whose portal lacks M1 evidence."""
+
+        invalid_room_ids = []
+        for room_id, room in self.nodes.items():
+            if room.type != "room" or not room.attributes.get("is_potential_room"):
+                continue
+            portal_id = str(
+                room.attributes.get("source_portal_id")
+                or room.attributes.get("parent_portal_id")
+                or ""
+            )
+            portal = self.nodes.get(portal_id)
+            if portal is None or not _has_persistent_semantic_evidence(portal):
+                invalid_room_ids.append(room_id)
+        if not invalid_room_ids:
+            return False
+        invalid = set(invalid_room_ids)
+        for room_id in invalid_room_ids:
+            self.nodes.pop(room_id, None)
+        self.edges = {
+            edge_id: edge
+            for edge_id, edge in self.edges.items()
+            if edge.src_id not in invalid and edge.dst_id not in invalid
+        }
+        for portal in self.nodes.values():
+            if portal.type != "portal":
+                continue
+            potential_ids = [
+                int(value)
+                for value in (portal.attributes.get("potential_room_ids") or [])
+                if str(value).lstrip("-").isdigit() and int(value) not in invalid
+            ]
+            if potential_ids:
+                portal.attributes["potential_room_ids"] = potential_ids
+            else:
+                portal.attributes.pop("potential_room_ids", None)
+                portal.attributes.pop("potential_room_source", None)
+                portal.attributes.pop("potential_room_confirmed", None)
+                portal.attributes.pop("portal_child_room_id", None)
+                portal.attributes.pop("portal_child_source_room_id", None)
+        self._rebuild_relations()
+        self._bump_revision()
+        return True
 
     def _default_room_center(self, room_id):
         if not self.room_grid:
@@ -2861,6 +3517,12 @@ class InteractionGraphStore:
         leaving every unknown occupancy-grid cell at ``room_unknown_id``.
         """
 
+        # An open-looking crop or an executor event is not enough to invent a
+        # room. Require the portal's two-frame + M1 semantic confirmation so
+        # transient door detections cannot leave overlapping child regions.
+        if not _has_persistent_semantic_evidence(node):
+            return None
+
         observed_room_ids = self._portal_observed_room_ids(node)
         if len(observed_room_ids) >= 2:
             return None
@@ -2881,7 +3543,27 @@ class InteractionGraphStore:
             child_room_id = None
         if child_room_id is not None:
             child = self.nodes.get(f"room_{child_room_id}")
-            if child is not None and child.attributes.get("active", True):
+            if child is not None and (
+                child.attributes.get("active", True)
+                or child.attributes.get("is_potential_room", False)
+                or child.attributes.get("room_lifecycle") == "provisional"
+            ):
+                # A provisional child is graph-only until OCC observes free
+                # space on the far side. Older graph revisions could have
+                # retired it during a transient room-grid refresh; revive the
+                # same ID instead of allocating a second synthetic room.
+                child.attributes.update(
+                    {
+                        "active": True,
+                        "is_potential_room": True,
+                        "room_lifecycle": "provisional",
+                        "confirmed": False,
+                        "observed_free_space": False,
+                        "source_portal_id": node.id,
+                    }
+                )
+                child.attributes.pop("retired_reason", None)
+                child.attributes.pop("retired_graph_revision", None)
                 attributes["portal_child_source_room_id"] = int(source_room_id)
                 attributes["potential_room_ids"] = [child_room_id]
                 return child_room_id
@@ -3368,6 +4050,14 @@ class InteractionGraphStore:
         scene_data = self.room_grid["scene_data"]
         if grid_info is None or not scene_data:
             return [node.room_id] if node.room_id is not None else []
+
+        # A portal connects the free-space components on its two sides.  The
+        # old implementation only counted a circular ring around the box;
+        # when one room occupied most of that ring, the second room was lost
+        # even though it was directly across the doorway.  Use the measured
+        # OBB yaw (or the long AABB axis when yaw is unavailable) to cast
+        # short rays through both doorway sides first.  This keeps the
+        # association local and avoids accidentally linking a distant room.
         counts = defaultdict(int)
         center_x, center_y = float(node.aabb_center[0]), float(node.aabb_center[1])
         radii = sorted(
@@ -3393,6 +4083,82 @@ class InteractionGraphStore:
                     room_id = int(scene_data[data_index])
                     if room_id >= 0:
                         counts[room_id] += weight
+
+        # Read the portal's axial orientation.  ``interaction_reference_yaw``
+        # is the stable OBB yaw; ``yaw`` is the live observation fallback.
+        yaw = node.attributes.get("interaction_reference_yaw")
+        if yaw is None:
+            yaw = node.attributes.get("yaw")
+        try:
+            yaw = float(yaw)
+            yaw_valid = math.isfinite(yaw)
+        except (TypeError, ValueError):
+            yaw_valid = False
+        if not yaw_valid:
+            size = list(node.aabb_size or [])
+            size_x = abs(float(size[0])) if len(size) >= 1 else 0.0
+            size_y = abs(float(size[1])) if len(size) >= 2 else 0.0
+            # The long box axis is the doorway span, therefore its
+            # perpendicular is the crossing direction.
+            yaw = math.pi * 0.5 if size_y >= size_x else 0.0
+
+        normal_x = -math.sin(yaw)
+        normal_y = math.cos(yaw)
+        tangent_x = math.cos(yaw)
+        tangent_y = math.sin(yaw)
+        size = list(node.aabb_size or [])
+        span = max(
+            abs(float(size[0])) if len(size) >= 1 else 0.0,
+            abs(float(size[1])) if len(size) >= 2 else 0.0,
+        )
+        # Keep the side probe local to the doorway.  A few tangent offsets
+        # make this robust to a slightly off-centre detector box without
+        # widening the search enough to reach an unrelated room.
+        tangent_offsets = (-0.25 * span, 0.0, 0.25 * span)
+        side_room_ids = []
+        for side in (-1.0, 1.0):
+            side_counts = defaultdict(int)
+            for radius_index, radius in enumerate(radii):
+                # Near samples get more weight; farther samples are only a
+                # fallback when the doorway opens into a larger room.
+                weight = len(radii) - radius_index
+                for offset in tangent_offsets:
+                    px = center_x + side * normal_x * radius + tangent_x * offset
+                    py = center_y + side * normal_y * radius + tangent_y * offset
+                    coords = world_to_grid(px, py, grid_info)
+                    if coords is None:
+                        continue
+                    data_index = grid_index(coords[0], coords[1], grid_info.width)
+                    if 0 <= data_index < len(scene_data):
+                        room_id = int(scene_data[data_index])
+                        if room_id >= 0:
+                            side_counts[room_id] += weight
+            if side_counts:
+                side_room_ids.append(
+                    max(
+                        sorted(side_counts.keys()),
+                        key=lambda room_id: side_counts[room_id],
+                    )
+                )
+
+        # Prefer two distinct room labels found on opposite sides.  Preserve
+        # the current room as the first endpoint when possible so graph edge
+        # ordering remains stable for navigation consumers.
+        distinct_side_ids = []
+        for room_id in side_room_ids:
+            if room_id not in distinct_side_ids:
+                distinct_side_ids.append(room_id)
+        if len(distinct_side_ids) >= 2:
+            current_room = (
+                self._resolve_room_id(node.room_id)
+                if node.room_id is not None
+                else None
+            )
+            if current_room in distinct_side_ids:
+                distinct_side_ids.remove(current_room)
+                distinct_side_ids.insert(0, current_room)
+            return distinct_side_ids[:2]
+
         ranked = sorted(counts, key=lambda room_id: (-counts[room_id], room_id))
         return ranked[:2]
 
@@ -3444,6 +4210,23 @@ class InteractionGraphStore:
                 and mllm_attribute not in {"", "unknown"}
                 and mllm_confidence >= self.room_mllm_min_confidence
             )
+            # A room becomes a persistent semantic landmark only after two
+            # accepted room-grid observations and a usable M1 room result.
+            # Before that point it may still be shown as a provisional room,
+            # but it remains eligible for the normal lifecycle handling.
+            if (
+                mllm_is_usable
+                and int(room_node.attributes.get("room_observation_count", 0) or 0)
+                >= 2
+            ):
+                room_node.attributes.update(
+                    {
+                        "persistent_semantic_node": True,
+                        "semantic_confirmation": "two_room_frames_plus_m1",
+                        "room_lifecycle": "persistent",
+                        "active": True,
+                    }
+                )
             if mllm_is_usable:
                 room_node.attributes.update(
                     {

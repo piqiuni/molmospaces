@@ -2645,10 +2645,11 @@ class BehaviorExecutionStateMachine:
             metadata.pop(key, None)
         candidate["interaction_command"] = interaction
         candidate["metadata"] = metadata
-        # Preserve the canonical primary outer goal.  The executor receives the
-        # original index below, so its preflight/debug trace remains aligned
-        # with the immutable outer-to-inner mapping.
-        candidate["goal_xyyaw"] = list(staging_goals[0])
+        # Publish the selected retry pose as the active goal.  The staging
+        # arrays remain immutable/index-aligned, but exposing index zero here
+        # made the UI and downstream goal consumer jump back to the +X face
+        # even after the nearest-side preflight had selected another face.
+        candidate["goal_xyyaw"] = list(staging_goals[next_index])
         self.candidate = candidate
         now = time.monotonic() if now is None else float(now)
         return self._transition(
