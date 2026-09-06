@@ -35,6 +35,10 @@ DWAPlannerROS:
   # reach a rear waypoint with a forward arc (which becomes a circle after
   # the physical velocity limiter is applied).
   rear_path_prerotate_enabled: true
+  # Enter the in-place branch for ordinary 90-degree hallway/door turns too;
+  # the shared 1.75-rad rear-path threshold is too late for the physical base.
+  rear_path_enter_angle: 1.00
+  rear_path_exit_angle: 0.20
   rear_path_rotate_speed: 0.40
   # A temporary forced reverse after three failed samples changes the sign of
   # vx abruptly and is unsafe on the long camera mast. Let move_base stop and
