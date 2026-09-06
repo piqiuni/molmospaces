@@ -125,6 +125,10 @@ class SemanticMappingNode:
         self.room_grid_publish_rate = max(
             0.1, float(config.get("room_grid_publish_rate", 2.0))
         )
+        self.room_segment_min_interval_sec = max(
+            0.0, float(config.get("room_segment_min_interval_sec", 0.5))
+        )
+        self._room_last_worker_start_mono = 0.0
         self._last_room_grid_publish_mono = 0.0
         self.object_stale_after_sec = float(config.get("object_stale_after_sec", 0.0))
         self.scene_min_range = float(config.get("scene_min_range", 0.1))
@@ -655,6 +659,12 @@ class SemanticMappingNode:
                     return
                 request = self._room_work_pending
                 self._room_work_pending = None
+            wait_s = self.room_segment_min_interval_sec - (
+                time.monotonic() - self._room_last_worker_start_mono
+            )
+            if wait_s > 0.0:
+                time.sleep(wait_s)
+            self._room_last_worker_start_mono = time.monotonic()
             try:
                 self._process_room_refresh_request(request)
             except Exception as exc:

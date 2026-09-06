@@ -234,6 +234,7 @@ semantic_map:
   # much slower and is published independently below.
   publish_rate: 10.0
   room_grid_publish_rate: 2.0
+  room_segment_min_interval_sec: 0.5
   # Require two temporally consecutive observations before inserting an
   # object into the persistent semantic map. Detection confidence is kept
   # unchanged here; this is a temporal confirmation gate only.
