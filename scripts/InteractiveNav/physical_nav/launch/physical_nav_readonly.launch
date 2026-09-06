@@ -111,9 +111,9 @@
   <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" launch-prefix="$(arg ros_python)" output="screen" respawn="false">
     <rosparam file="$(arg config_file)" command="load"/>
     <param name="web_url" value="http://127.0.0.1:8765"/>
-    <!-- Poll the latest-only raw frame twice per 10 Hz sensor period. This
-         reduces phase latency without creating an old-frame queue. -->
-    <param name="rate" value="20.0"/>
+    <!-- The camera source is 10 Hz. Polling faster only repeats HTTP/JPEG/
+         depth work and competes with the dashboard for the same gateway. -->
+    <param name="rate" value="10.0"/>
     <param name="world_frame" value="tf_frame_map"/>
     <param name="camera_frame" value="d435i_color_optical_frame"/>
     <param name="camera_parent" value="tf_frame_base_link"/>

@@ -311,9 +311,10 @@ velocity_safety:
   # dead zone; the deadband below still removes tiny numerical yaw residues.
   linear_deadband_mps: 0.05
   max_angular_rps: 1.30
-  min_angular_rps: 0.60
-  # Ignore planner/odometry yaw noise below 0.05 rad/s; otherwise the
-  # minimum-turn clamp would make a straight command oscillate at 0.50 rad/s.
+  min_angular_rps: 0.40
+  # Applied only to pure in-place rotations. Moving commands preserve their
+  # DWA curvature in velocity_safety.py, so this floor cannot turn an arc into
+  # a tight circle.
   angular_deadband_rps: 0.05
   # Keep a bounded one-second ramp to the 0.60 m/s cap without adding the
   # multi-second lag caused by the previous 0.15 m/s^2 limit.

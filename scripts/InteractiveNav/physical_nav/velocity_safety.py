@@ -90,18 +90,31 @@ class VelocitySafetyLimiter:
         if not all(math.isfinite(v) for v in values):
             return self.stop()
         scale = self.config.scale
-        linear = self._clamp(values[0] * scale, self.config.max_linear_mps)
+        raw_linear = self._clamp(values[0] * scale, self.config.max_linear_mps)
+        linear = raw_linear
         if abs(linear) <= self.config.linear_deadband_mps:
             linear = 0.0
         elif abs(linear) < self.config.min_linear_mps:
             linear = math.copysign(self.config.min_linear_mps, linear)
-        angular = self._clamp(values[2] * scale, self.config.max_angular_rps)
+        raw_angular = self._clamp(values[2] * scale, self.config.max_angular_rps)
+        angular = raw_angular
         # DWA/teleop often leaves a tiny yaw residue during straight motion.
         # Do not turn that residue into the configured minimum turn speed.
         if abs(angular) <= self.config.angular_deadband_rps:
             angular = 0.0
         elif abs(angular) < self.config.min_angular_rps:
-            angular = math.copysign(self.config.min_angular_rps, angular)
+            # Preserve the curvature of a moving DWA command. Independently
+            # promoting wz (for example 0.11 -> 0.60 rad/s) turns a valid
+            # forward arc into a tight circle. The minimum angular speed is
+            # only for pure in-place rotations; moving commands keep their
+            # sampled angular velocity, with a proportional adjustment when
+            # the linear static-friction floor was applied.
+            if linear != 0.0:
+                if raw_linear != 0.0 and abs(linear) > abs(raw_linear):
+                    angular *= abs(linear / raw_linear)
+                angular = self._clamp(angular, self.config.max_angular_rps)
+            else:
+                angular = math.copysign(self.config.min_angular_rps, angular)
         # A zero command is an explicit stop from move_base/interaction
         # control, not a target that should be reached through the normal
         # acceleration ramp.  Slew-limiting it leaves the robot moving for

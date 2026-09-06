@@ -1849,7 +1849,7 @@ function refreshStill(id,path){
   image.src=path+'?ts='+Date.now();
 }
 function resumeDashboard(){if(document.hidden)return;refresh();refreshStill('#overview','/snapshot.jpg');refreshStill('#overview-camera','/camera-box-overlay.jpg')}
-setupResizableLayout();const rateLabel=document.querySelector('.ratebar span:nth-child(3)');if(rateLabel)rateLabel.textContent='● 感知图 10 Hz · 六面板 5 Hz';setInterval(()=>{if(!document.hidden)refresh()},1000);setInterval(()=>refreshStill('#overview','/snapshot.jpg'),200);setInterval(()=>refreshStill('#overview-camera','/camera-box-overlay.jpg'),100);document.addEventListener('visibilitychange',resumeDashboard);resumeDashboard();
+setupResizableLayout();const rateLabel=document.querySelector('.ratebar span:nth-child(3)');if(rateLabel)rateLabel.textContent='● 感知图 5 Hz · 六面板 5 Hz';setInterval(()=>{if(!document.hidden)refresh()},1000);setInterval(()=>refreshStill('#overview','/snapshot.jpg'),200);setInterval(()=>refreshStill('#overview-camera','/camera-box-overlay.jpg'),200);document.addEventListener('visibilitychange',resumeDashboard);resumeDashboard();
 </script></html>"""
 
 

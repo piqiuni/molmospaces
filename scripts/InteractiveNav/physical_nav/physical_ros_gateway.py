@@ -352,8 +352,9 @@ class PhysicalRosGateway:
             detection_stamp = rospy.Time.from_sec(
                 float(receipt[1] or state.get("frame_stamp", time.time()) or time.time())
             )
-            if (rospy.Time.now() - detection_stamp).to_sec() > 0.08:
-                detection_stamp = rospy.Time.now()
+            # Keep the capture timestamp. Re-dating delayed detections to the
+            # current wall time makes their boxes use a newer TF than the
+            # point cloud and produces apparent motion/rotation in the map.
             if receipt == self._last_detection_receipt:
                 # Do not count the same HTTP state snapshot as repeated YOLO
                 # confirmations. Keep publishing held tracks so their timeout
@@ -1392,10 +1393,11 @@ def main() -> None:
     p.add_argument("--web-url", default="http://127.0.0.1:8765")
     p.add_argument("--rate", type=float, default=10.)
     p.add_argument("--state-period", type=float, default=.2)
-    # Forward every fresh map publication to the web/semantic consumers. The
-    # mapper itself already controls map generation; .5 s here imposed an
-    # avoidable 2 Hz ceiling and made rotations appear to smear walls.
-    p.add_argument("--occupancy-period", type=float, default=.1)
+    # Keep ROS map publication independent from the HTTP dashboard. A full
+    # OccupancyGrid is hundreds of KB when encoded as JSON; forwarding it at
+    # every mapper tick starves the web server and semantic consumers. The
+    # latest-only post at 5 Hz is sufficient for visualization and planning.
+    p.add_argument("--occupancy-period", type=float, default=.2)
     p.add_argument("--point-stride", type=int, default=6)
     p.add_argument("--max-depth-m", type=float, default=8.)
     p.add_argument("--no-return-depth-m", type=float, default=8.05)

@@ -116,9 +116,9 @@ local_overwrite_reset_on_correction_rot_delta: 0.10
 # 时间同步保护（避免 odom 与 pointcloud 时间错配）
 enable_time_sync_guard: true
 max_odom_cloud_time_diff: 0.03
-max_cloud_age_sec: 0.50
-# Never map a capture that is already behind the robot's motion. Accepting
-# stale clouds was the source of bent walls during turns; the latest-only
-# subscriber queue will supply the next fresh capture.
-enforce_cloud_age_drop: false
+max_cloud_age_sec: 0.35
+# Do not insert a cloud after the robot has moved substantially beyond its
+# capture time. Historical TF remains authoritative for accepted clouds, but
+# dropping very old receipts prevents bent walls during fast turns.
+enforce_cloud_age_drop: true
 odom_stamp_buffer_size: 200

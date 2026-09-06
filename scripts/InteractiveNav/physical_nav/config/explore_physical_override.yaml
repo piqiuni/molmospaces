@@ -22,5 +22,8 @@ frontier:
 # repeatedly calls /move_base/make_plan while the physical planner is active,
 # adding CPU load and competing with the executor's post-interaction plan.
 exploration:
+  # Frontier selection is a planning task, not a sensor callback. Keep the
+  # latest OCC only and rebuild its value/frontier maps at 2 Hz.
+  occupancy_process_period_sec: 0.5
   external_recovery_preflight_enabled: false
   make_plan_preflight_enabled: false

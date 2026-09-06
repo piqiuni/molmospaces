@@ -333,8 +333,19 @@ class ExplorePyNode:
 
         self.latest_grid_msg = None
         self.latest_grid = None
-        self._last_occ_content_key = None
+        # OCC conversion/frontier preparation is deliberately outside the ROS
+        # subscription callback. The callback only retains the newest message;
+        # an old 200k-cell map must never queue behind a newer one.
+        self._occ_lock = threading.Lock()
+        self._occ_event = threading.Event()
+        self._latest_occ_msg = None
+        self._latest_occ_receipt = None
+        self._processed_occ_receipt = None
         self._occ_duplicate_count = 0
+        self.occupancy_process_period_sec = max(
+            0.1,
+            float(exploration_cfg.get("occupancy_process_period_sec", 0.5)),
+        )
         self.robot_xy = None
         self.robot_yaw = None
         self.latest_clusters = []
@@ -445,6 +456,12 @@ class ExplorePyNode:
                 )
 
         self.timer = rospy.Timer(rospy.Duration(1.0 / max(self.tick_rate_hz, 1e-3)), self.tick)
+        self._occ_worker = threading.Thread(
+            target=self._occupancy_worker,
+            name="explore-occ-worker",
+            daemon=True,
+        )
+        self._occ_worker.start()
         self.initial_spin_cmd_timer = rospy.Timer(
             rospy.Duration(1.0 / max(self.initial_spin_cmd_rate_hz, 1e-3)),
             self._initial_spin_cmd_timer_callback,
@@ -460,6 +477,11 @@ class ExplorePyNode:
         self.value_fusion = ValueMapFusion()
         self.latest_grid_msg = None
         self.latest_grid = None
+        with self._occ_lock:
+            self._latest_occ_msg = None
+            self._latest_occ_receipt = None
+            self._processed_occ_receipt = None
+            self._occ_event.clear()
         self.robot_xy = None
         self.robot_yaw = None
         self.latest_clusters = []
@@ -527,23 +549,54 @@ class ExplorePyNode:
         rospy.logwarn("[explore_py] exploration state reset for a new scene")
 
     def occupancy_callback(self, msg):
-        # GMapping may publish the same map repeatedly while the robot is
-        # stationary. Do not rebuild frontier/value maps for an identical OCC;
-        # retain the latest header for diagnostics but process only new map
-        # content.
-        info = msg.info
-        content_key = (
-            int(info.width), int(info.height), round(float(info.resolution), 6),
-            round(float(info.origin.position.x), 3),
-            round(float(info.origin.position.y), 3),
-            hash(tuple(int(value) for value in msg.data)),
-        )
-        if content_key == self._last_occ_content_key:
-            self._occ_duplicate_count += 1
-            return
-        self._last_occ_content_key = content_key
-        self.latest_grid_msg = msg
-        self.latest_grid = self._convert_grid(msg)
+        # Keep this callback O(1). Computing a hash over 200k cells and
+        # converting the complete grid here blocks odometry, goal and timer
+        # callbacks in the same rospy process. A receipt key is sufficient to
+        # suppress duplicate deliveries; the worker performs conversion at a
+        # bounded rate and always takes the newest pending message.
+        header = getattr(msg, "header", None)
+        stamp = float(header.stamp.to_sec()) if header and header.stamp else 0.0
+        receipt = (int(getattr(header, "seq", -1)), stamp,
+                   int(getattr(msg.info, "width", 0)),
+                   int(getattr(msg.info, "height", 0)))
+        with self._occ_lock:
+            if receipt == self._latest_occ_receipt:
+                self._occ_duplicate_count += 1
+                return
+            self._latest_occ_msg = msg
+            self._latest_occ_receipt = receipt
+            self._occ_event.set()
+
+    def _occupancy_worker(self):
+        """Convert only the newest OCC at a bounded exploration rate."""
+        while not rospy.is_shutdown():
+            self._occ_event.wait(0.5)
+            if rospy.is_shutdown():
+                return
+            with self._occ_lock:
+                msg = self._latest_occ_msg
+                receipt = self._latest_occ_receipt
+                self._occ_event.clear()
+            if msg is None or receipt == self._processed_occ_receipt:
+                continue
+            # Frontier/value computation is intentionally lower-rate than map
+            # publication. It is navigation guidance, not a sensor stream.
+            time.sleep(self.occupancy_process_period_sec)
+            with self._occ_lock:
+                msg = self._latest_occ_msg
+                receipt = self._latest_occ_receipt
+            if msg is None or receipt == self._processed_occ_receipt:
+                continue
+            grid = self._convert_grid(msg)
+            self.latest_grid_msg = msg
+            self.latest_grid = grid
+            self._processed_occ_receipt = receipt
+            self.step_ready_pub.publish(String(data=json.dumps({
+                "module": "explore_py", "ready": grid is not None,
+                "step_index": int(getattr(msg.header, "seq", -1)),
+                "stamp_sec": float(msg.header.stamp.to_sec()) if msg.header.stamp else 0.0,
+                "timestamp": time.time(),
+            }, separators=(",", ":"))))
         self.step_ready_pub.publish(String(data=json.dumps({
             "module": "explore_py", "ready": self.latest_grid is not None,
             "step_index": int(getattr(msg.header, "seq", -1)),

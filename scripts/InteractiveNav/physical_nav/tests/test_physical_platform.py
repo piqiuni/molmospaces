@@ -207,6 +207,23 @@ class PhysicalPlatformTests(unittest.TestCase):
     assert limiter.limit(-.02, 0.0, 0.0, now=2.0) == (0.0, 0.0, 0.0)
     assert limiter.limit(.06, 0.0, 0.0, now=3.0) == (.06, 0.0, 0.0)
 
+  def test_physical_velocity_profile_preserves_moving_curvature(self):
+    limiter = VelocitySafetyLimiter(VelocitySafetyConfig(
+      scale=1.0,
+      max_linear_mps=.60,
+      min_linear_mps=.30,
+      min_angular_rps=.60,
+      max_linear_accel_mps2=10.0,
+      max_angular_accel_rps2=10.0,
+    ))
+    # A gentle DWA arc must not become a tight circle merely because the
+    # physical base has a minimum in-place turn speed.
+    result = limiter.limit(.2269, 0.0, -.1138, now=1.0)
+    assert result[0] == .30 and result[1] == 0.0
+    self.assertAlmostEqual(result[2], -.15046, places=4)
+    # The minimum angular speed remains applicable to a pure rotation.
+    assert limiter.limit(0.0, 0.0, .10, now=2.0)[2] == .60
+
   def test_physical_velocity_profile_zero_command_stops_immediately(self):
     limiter = VelocitySafetyLimiter(VelocitySafetyConfig(
       scale=1.0,
