@@ -937,6 +937,9 @@ class _WebHandler(BaseHTTPRequestHandler):
     control_goal = ""
     control_started_at = 0.0
     control_log = ""
+    controller_status_lock = threading.Lock()
+    controller_status_cache: dict[str, Any] = {}
+    controller_status_at = 0.0
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
@@ -1019,6 +1022,71 @@ class _WebHandler(BaseHTTPRequestHandler):
                     "started_at": cls.control_started_at, "log": cls.control_log}
 
     @classmethod
+    def _controller_status(cls) -> dict[str, Any]:
+        """Return the live policy/Go2 control transport state.
+
+        ``ReadOnlySafetyGate`` describes browser intent and is deliberately
+        always blocked; it must not be used as the actuator status.  The
+        launcher writes a mode marker after the remote bridge is ready, while
+        the TCP connection proves that the bridge is still attached to the
+        local policy server.
+        """
+        now = time.time()
+        with cls.controller_status_lock:
+            if now - cls.controller_status_at < 0.4 and cls.controller_status_cache:
+                return dict(cls.controller_status_cache)
+        state_dir = Path(os.environ.get(
+            "PHYSICAL_NAV_ALL_RUNTIME_DIR",
+            f"/tmp/molmospaces-physical-nav-all-{os.getuid()}",
+        ))
+        pid_file = Path(os.environ.get("PHYSICAL_NAV_POLICY_PID_FILE", state_dir / "policy_control.pid"))
+        mode_file = state_dir / "motion_control.status"
+        policy_pid = None
+        try:
+            candidate = int(pid_file.read_text().strip())
+            os.kill(candidate, 0)
+            policy_pid = candidate
+        except (OSError, ValueError):
+            pass
+        port = int(os.environ.get("PHYSICAL_NAV_MOTION_POLICY_PORT", "12333"))
+        bridge_connected = False
+        try:
+            result = subprocess.run(
+                ["ss", "-Htn", "state", "established", "(", "sport", "=", f":{port}", ")"],
+                capture_output=True, text=True, timeout=0.15, check=False,
+            )
+            bridge_connected = bool(result.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        mode = ""
+        try:
+            mode = mode_file.read_text().strip()
+        except OSError:
+            pass
+        web = cls._control_snapshot()
+        if web.get("running"):
+            status, label = "starting", f"{web.get('action') or 'control'} 启动中"
+        elif policy_pid is None:
+            status, label = "blocked", "控制器未运行"
+        elif not bridge_connected:
+            status, label = "starting", "控制器连接中"
+        elif mode == "enable_motion":
+            status, label = "enabled", "控制输出已启用"
+        elif mode == "speech_only":
+            status, label = "blocked", "控制输出阻断（语音模式）"
+        else:
+            status, label = "unknown", "控制器状态未知"
+        value = {
+            "status": status, "label": label, "mode": mode or None,
+            "policy_running": policy_pid is not None, "policy_pid": policy_pid,
+            "bridge_connected": bridge_connected, "policy_port": port,
+            "updated_at": now,
+        }
+        with cls.controller_status_lock:
+            cls.controller_status_cache, cls.controller_status_at = value, now
+        return dict(value)
+
+    @classmethod
     def _run_control(cls, action: str, goal: str) -> dict[str, Any]:
         if action == "stop":
             # Stop only the policy/control transport.  The ROS navigation and
@@ -1029,6 +1097,17 @@ class _WebHandler(BaseHTTPRequestHandler):
                 "PHYSICAL_NAV_POLICY_PID_FILE",
                 f"/tmp/molmospaces-physical-nav-all-{os.getuid()}/policy_control.pid",
             ))
+            # Clear the launcher marker first.  Older runs can leave a stale
+            # PID file behind; returning early in that case used to leave the
+            # dashboard showing the previous enabled state forever.
+            state_dir = pid_file.parent
+            try:
+                (state_dir / "motion_control.status").unlink()
+            except FileNotFoundError:
+                pass
+            with cls.controller_status_lock:
+                cls.controller_status_cache = {}
+                cls.controller_status_at = 0.0
             try:
                 pid = int(pid_file.read_text().strip())
             except (OSError, ValueError):
@@ -1353,6 +1432,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._json({**self.state.snapshot(), "safety": self.gate.snapshot()}); return
         if path == "/api/state-summary":
             summary = self._state_summary({**self.state.summary_snapshot(), "safety": self.gate.snapshot()})
+            summary["control"] = self._controller_status()
             recorder = getattr(self, "recorder", None)
             if recorder is not None:
                 status = recorder.status()
@@ -1396,7 +1476,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self._json(self.state.health_snapshot()); return
         if path == "/api/control-status":
-            self._json(self._control_snapshot()); return
+            self._json({**self._controller_status(), "request": self._control_snapshot()}); return
         if path == "/api/m1-input-image":
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             key = str((query.get("key") or [""])[0])
@@ -1833,7 +1913,7 @@ function renderM3(m3){
 }
 function num(v,d=1){const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--'}
 function speed(t){const v=t?.velocity||t?.linear_velocity||[];if(Array.isArray(v))return Math.hypot(...v.slice(0,3).map(Number));if(v&&typeof v==='object')return Math.hypot(Number(v.x||0),Number(v.y||0),Number(v.z||0));return Number(t?.speed||0)}
-function renderGo2(s){const t=s.telemetry||{},b=t.battery||{},link=s.link||{},grid=make('div','state-grid');const metrics=[['🔋',num(b.soc??t.battery_soc,0)+' %','电量'],['↗',num(speed(t),2)+' m/s','速度'],['⟳',num((Number(t.yaw||0)*180/Math.PI),1)+'°','航向'],['◉',text(t.mode||'站立'),'动作模式'],['↕',num(t.body_height,2)+' m','机身高度'],['⚠',String(t.error_code??0),'错误码']];metrics.forEach(([i,v,n])=>{const d=make('div','metric');d.append(make('div','icon',i),make('div','value',v),make('div','name',n));grid.append(d)});const line=make('div','statusline');line.append(make('span','badge '+(link.connected===false?'bad':'good'),link.connected===false?'相机断开':'相机在线'),make('span','badge good','控制输出阻断'),make('span','badge','图节点 '+(s.graph?.node_count??0)),make('span','badge','候选 '+((s.navigation?.candidates?.candidates||[]).length)));const box=q('#go2');box.replaceChildren(grid,line);q('#stamp').textContent='导航步 '+(s.navigation_step??'--')+' · 相机帧 '+(s.frame_seq??'--')+' · '+new Date().toLocaleTimeString()}
+function renderGo2(s){const t=s.telemetry||{},b=t.battery||{},link=s.link||{},ctl=s.control||{},grid=make('div','state-grid');const metrics=[['🔋',num(b.soc??t.battery_soc,0)+' %','电量'],['↗',num(speed(t),2)+' m/s','速度'],['⟳',num((Number(t.yaw||0)*180/Math.PI),1)+'°','航向'],['◉',text(t.mode||'站立'),'动作模式'],['↕',num(t.body_height,2)+' m','机身高度'],['⚠',String(t.error_code??0),'错误码']];metrics.forEach(([i,v,n])=>{const d=make('div','metric');d.append(make('div','icon',i),make('div','value',v),make('div','name',n));grid.append(d)});const line=make('div','statusline');const controlClass=ctl.status==='enabled'?'good':(ctl.status==='blocked'?'bad':'warn');line.append(make('span','badge '+(link.connected===false?'bad':'good'),link.connected===false?'相机断开':'相机在线'),make('span','badge '+controlClass,ctl.label||'控制器状态未知'),make('span','badge','图节点 '+(s.graph?.node_count??0)),make('span','badge','候选 '+((s.navigation?.candidates?.candidates||[]).length)));const box=q('#go2');box.replaceChildren(grid,line);q('#control-status').textContent=ctl.label||'控制器状态未知';q('#stamp').textContent='导航步 '+(s.navigation_step??'--')+' · 相机帧 '+(s.frame_seq??'--')+' · '+new Date().toLocaleTimeString()}
 async function refresh(){try{const r=await fetch('/api/state-summary?ts='+Date.now(),{cache:'no-store'}),s=await r.json();renderEvents('#m1',s.mllm?.M1,'M1');renderEvents('#m2',m2EventsWithLiveState(s),'M2');renderM3(s.m3||{});renderGo2(s)}catch(e){q('#stamp').textContent='刷新失败';q('#go2').replaceChildren(make('div','empty',clip(e,100)))}}
 function refreshStill(id,path){
   if(document.hidden)return;

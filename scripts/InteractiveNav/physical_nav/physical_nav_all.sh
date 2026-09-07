@@ -46,6 +46,7 @@ POLICY_PID_FILE="${STATE_DIR}/policy_control.pid"
 MOTION_REMOTE_PID_FILE="${PHYSICAL_NAV_MOTION_REMOTE_PID_FILE:-/home/unitree/uni_control/go2_control.pid}"
 MOTION_REMOTE_READY_FILE="${PHYSICAL_NAV_MOTION_REMOTE_READY_FILE:-/home/unitree/uni_control/go2_control.ready}"
 MOTION_OWNED_FILE="${STATE_DIR}/motion_control.owned"
+MOTION_STATUS_FILE="${STATE_DIR}/motion_control.status"
 MOTION_MAX_VX="${PHYSICAL_NAV_MOTION_MAX_VX:-0.6}"
 MOTION_MAX_WZ="${PHYSICAL_NAV_MOTION_MAX_WZ:-1.3}"
 MOTION_ENABLED=0
@@ -76,6 +77,23 @@ wait_local_port() {
     sleep .1
   done
   return 1
+}
+
+wait_ros_command_subscriber() {
+  local topic="${PHYSICAL_NAV_MOTION_CMD_VEL_TOPIC:-/physical_nav/actuated_cmd_vel}"
+  local timeout="${PHYSICAL_NAV_MOTION_READY_TIMEOUT_S:-30}"
+  command -v rostopic >/dev/null 2>&1 || return 0
+  for _ in $(seq 1 $((timeout * 4))); do
+    # Do not start the remote actuator until the local mux/safety chain has a
+    # live subscriber.  Without this barrier the bridge can become ready first
+    # and the first command is lost, making startup appear randomly delayed.
+    if rostopic info "${topic}" 2>/dev/null | grep -q '^ Subscribers:'; then
+      return 0
+    fi
+    sleep .25
+  done
+  echo "warning: no ROS subscriber on ${topic} after ${timeout}s; continuing" >&2
+  return 0
 }
 
 start_qwen_tunnel() {
@@ -306,11 +324,11 @@ REMOTE
     return 1
   fi
   echo "${result}"
-  if [[ "${result}" == *auxiliary_control_started* ]]; then
-    : >"${MOTION_OWNED_FILE}"
-  else
-    rm -f "${MOTION_OWNED_FILE}"
-  fi
+  # Keep a small local status record even when the remote bridge was reused.
+  # The dashboard uses this together with the policy TCP connection, instead
+  # of displaying a permanently hard-coded read-only badge.
+  printf '%s\n' "${motion_mode}" >"${MOTION_STATUS_FILE}"
+  if [[ "${result}" == *auxiliary_control_started* ]]; then : >"${MOTION_OWNED_FILE}"; else rm -f "${MOTION_OWNED_FILE}"; fi
   local connected=0 policy_port="${PHYSICAL_NAV_MOTION_POLICY_PORT:-12333}"
   for _ in {1..40}; do
     if ss -Htn state established "( sport = :${policy_port} )" | grep -q .; then
@@ -346,6 +364,7 @@ start_all() {
   PHYSICAL_NAV_WATCHDOG_STARTUP_GRACE_S="${PHYSICAL_NAV_WATCHDOG_STARTUP_GRACE_S:-180}" \
     bash "${SERVICE}" start
   wait_local_port "${PHYSICAL_NAV_WS_PORT:-12334}" 100
+  wait_ros_command_subscriber
   start_go2_components
   publish_object_goal
   start_motion_control
@@ -372,7 +391,11 @@ stop_motion_control() {
     rm -f "${POLICY_PID_FILE}"
     echo "stopped policy control server (pid=${pid})"
   fi
-  [[ -f "${MOTION_OWNED_FILE}" ]] || return 0
+  rm -f "${MOTION_STATUS_FILE}"
+  # An explicit `restart enable_motion` is a request for a clean actuator
+  # handshake, including a bridge that was reused from an earlier run.  A
+  # plain read-only stop still leaves bridges we do not own untouched.
+  if [[ ! -f "${MOTION_OWNED_FILE}" && "${MOTION_ENABLED}" != 1 ]]; then return 0; fi
   ssh -o BatchMode=yes -o ConnectTimeout=5 "${GO2_SSH_TARGET}" \
     "if [ -f \"${MOTION_REMOTE_PID_FILE}\" ]; then \
        pid=\$(cat \"${MOTION_REMOTE_PID_FILE}\"); \
