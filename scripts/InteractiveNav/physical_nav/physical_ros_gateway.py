@@ -64,6 +64,7 @@ def _patch_roslogging_findcaller_for_py311() -> None:
 class PhysicalRosGateway:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.web_state_enabled = bool(getattr(args, "web_state_enabled", True))
         self.args.occupancy_period = max(0.0, float(self.args.occupancy_period))
         self.args.room_grid_period = max(0.0, float(self.args.room_grid_period))
         self.last_seq = -1
@@ -150,6 +151,7 @@ class PhysicalRosGateway:
         # here: that would feed our own message back into the HTTP state loop.
         for topic, name in (("/physical_nav/unified_graph", "graph"), ("/physical_nav/consistency", "consistency"),):
             rospy.Subscriber(topic, String, self._json_callback(name), queue_size=1)
+        rospy.Subscriber("/physical_nav/yolo_report", String, self._yolo_report_callback, queue_size=1)
         # Shadow navigation/decision outputs are observed for rendering and
         # evaluation only. They are never forwarded to a robot controller.
         for topic, name in (
@@ -179,14 +181,15 @@ class PhysicalRosGateway:
         ):
             if topic:
                 rospy.Subscriber(topic, OccupancyGrid, self._grid_callback(name), queue_size=1)
-        self.timer = rospy.Timer(rospy.Duration(1.0 / max(args.rate, 1e-3)), self._poll)
+        self.timer = None
+        if bool(getattr(args, "legacy_http_sensor", True)) and args.rate > 0:
+            self.timer = rospy.Timer(rospy.Duration(1.0 / max(args.rate, 1e-3)), self._poll)
         # Detection/graph projection may take longer than one camera period.
         # Keep it off the RGB-D timer so 10 Hz image and point-cloud delivery
         # isn't serialized behind presentation/debug work.
-        self._state_timer = rospy.Timer(
-            rospy.Duration(max(args.state_period, 0.05)),
-            self._poll_state,
-        )
+        self._state_timer = None
+        if bool(getattr(args, "legacy_http_state", True)) and args.state_period > 0:
+            self._state_timer = rospy.Timer(rospy.Duration(max(args.state_period, 0.05)), self._poll_state)
         # Visualization is latest-frame-only and runs independently of the
         # state/detection processing path at the same configured frequency.
         self._debug_cloud_timer = rospy.Timer(
@@ -195,6 +198,8 @@ class PhysicalRosGateway:
         )
 
     def _post_state(self, name: str, value: Any) -> None:
+        if not self.web_state_enabled:
+            return
         payload = json.dumps({"name": name, "value": value}, ensure_ascii=False).encode()
         request = urllib.request.Request(self.args.web_url.rstrip("/") + "/api/ros-state", data=payload, headers={"Content-Type": "application/json"})
         try:
@@ -344,13 +349,19 @@ class PhysicalRosGateway:
         if telemetry:
             self._publish_pose(telemetry, rospy.Time.now())
 
-    def _publish_state(self) -> None:
+    def _publish_state(self, state_override: dict[str, Any] | None = None) -> None:
         try:
             # ROS/RViz uses a dedicated projection containing bounded compact
             # point clouds. Browser dashboards keep polling the lighter
             # /api/state-summary and do not pay this transport cost.
-            with urllib.request.urlopen(self.args.web_url.rstrip("/") + "/api/ros-state", timeout=.6) as response: state = json.loads(response.read().decode())
-            detection_meta = state.get("detection_meta") or {}
+            if state_override is None:
+                with urllib.request.urlopen(self.args.web_url.rstrip("/") + "/api/ros-state", timeout=.6) as response: state = json.loads(response.read().decode())
+            else:
+                state = state_override
+            detection_meta = state.get("detection_meta") or {
+                "seq": state.get("seq", -1),
+                "stamp": state.get("stamp", 0.0),
+            }
             receipt = (
                 detection_meta.get("seq", -1),
                 detection_meta.get("stamp", 0.0),
@@ -466,6 +477,15 @@ class PhysicalRosGateway:
             self._post_mapped_state({"seq": receipt[0], "stamp": receipt[1], "map_frame": self.world_frame, "detections": compact})
         except Exception as exc:
             rospy.logwarn_throttle(5.0, "physical state polling: %s", exc)
+
+    def _yolo_report_callback(self, msg: String) -> None:
+        """Consume detector output directly from ROS; HTTP is only a mirror."""
+        try:
+            report = json.loads(msg.data)
+            if isinstance(report, dict):
+                self._publish_state(report)
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "physical YOLO ROS report: %s", exc)
 
     @staticmethod
     def _attribute_detection(item: dict[str, Any]) -> dict[str, Any]:
@@ -851,6 +871,10 @@ class PhysicalRosGateway:
     def _publish_detection_overlay(self, state: dict[str, Any]) -> None:
         meta = state.get("detection_meta") or {}
         encoded = meta.get("overlay_jpeg") if isinstance(meta, dict) else None
+        if not encoded and not self.web_state_enabled:
+            # In headless mode the detector report is authoritative and the
+            # optional dashboard binary endpoint does not exist.
+            return
         try:
             if encoded:
                 rgb = _decode(str(encoded))
@@ -1399,6 +1423,9 @@ def main() -> None:
     p.add_argument("--web-url", default="http://127.0.0.1:8765")
     p.add_argument("--rate", type=float, default=10.)
     p.add_argument("--state-period", type=float, default=.2)
+    p.add_argument("--legacy-http-sensor", action="store_true")
+    p.add_argument("--legacy-http-state", action="store_true")
+    p.add_argument("--web-state-enabled", action="store_true")
     # Keep ROS map publication independent from the HTTP dashboard. A full
     # OccupancyGrid is hundreds of KB when encoded as JSON; forwarding it at
     # every mapper tick starves the web server and semantic consumers. The
@@ -1433,7 +1460,7 @@ def main() -> None:
     # CLI parser so the gateway can also be run directly.
     _patch_roslogging_findcaller_for_py311()
     rospy.init_node("physical_ros_gateway", anonymous=False)
-    for name in ("web_url", "rate", "state_period", "occupancy_period", "room_grid_period", "point_stride", "max_depth_m", "no_return_depth_m", "world_frame", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw", "box_hold_s", "box_match_distance_m", "box_smoothing_alpha", "box_min_confirmations", "occupancy_grid_topic", "room_grid_topic", "global_costmap_topic", "local_costmap_topic", "global_plan_topic", "local_global_plan_topic", "local_plan_topic"):
+    for name in ("web_url", "rate", "state_period", "occupancy_period", "room_grid_period", "point_stride", "max_depth_m", "no_return_depth_m", "world_frame", "camera_frame", "camera_parent", "camera_x", "camera_y", "camera_z", "camera_roll", "camera_pitch", "camera_yaw", "box_hold_s", "box_match_distance_m", "box_smoothing_alpha", "box_min_confirmations", "occupancy_grid_topic", "room_grid_topic", "global_costmap_topic", "local_costmap_topic", "global_plan_topic", "local_global_plan_topic", "local_plan_topic", "legacy_http_sensor", "legacy_http_state", "web_state_enabled"):
         setattr(args, name, rospy.get_param("~" + name, getattr(args, name)))
     PhysicalRosGateway(args); rospy.spin()
 

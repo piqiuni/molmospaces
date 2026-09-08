@@ -33,7 +33,8 @@ GO2_TELEMETRY_PERIOD="${PHYSICAL_NAV_GO2_TELEMETRY_PERIOD:-0.05}"
 # Both machines are on the same experiment LAN. Direct WebSocket transport
 # avoids SSH channel head-of-line buffering and lets a reconnect discard an
 # incomplete stale frame. Set this to ws://127.0.0.1:12334 to restore tunneling.
-GO2_SENSOR_URL="${PHYSICAL_NAV_GO2_SENSOR_URL:-ws://10.100.5.3:12334}"
+GO2_SENSOR_URL="${PHYSICAL_NAV_GO2_SENSOR_URL:-ws://10.100.5.3:12335}"
+SENSOR_WS_PORT="${PHYSICAL_NAV_SENSOR_WS_PORT:-12335}"
 QWEN_TUNNEL_SCRIPT="${ROOT_DIR}/qwen_ssh_tunnel.py"
 QWEN_LOG="${LOG_DIR}/qwen_tunnel.log"
 
@@ -140,7 +141,25 @@ if [ "$7" = "ws://127.0.0.1:12334" ]; then
 fi
 bridge_pid="$(pgrep -f "[p]ython3? .*${2}" | head -n1 || true)"
 bridge_owned=0
-  if [ -z "${bridge_pid}" ]; then
+if [ -n "${bridge_pid}" ]; then
+  bridge_args="$(tr '\0' ' ' <"/proc/${bridge_pid}/cmdline" 2>/dev/null || true)"
+  # A stale bridge can still be connected to the legacy 12334 dashboard
+  # socket. Reuse it only when its sensor URL matches this launch request;
+  # otherwise stop that exact bridge before creating the new transport.
+  case " ${bridge_args} " in
+    *" --url ${7} "*|*" --url=${7} "*) ;;
+    *)
+      kill -TERM "${bridge_pid}" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "${bridge_pid}" 2>/dev/null || break
+        sleep .25
+      done
+      kill -KILL "${bridge_pid}" 2>/dev/null || true
+      bridge_pid=""
+      ;;
+  esac
+fi
+if [ -z "${bridge_pid}" ]; then
   nohup setsid python3 "$2" \
     --url "$7" --interface "$4" --fps "$5" \
     --color-width "$8" --color-height "$9" --color-fps "${10}" \
@@ -363,7 +382,10 @@ start_all() {
   PHYSICAL_NAV_YOLO_RATE="${PHYSICAL_NAV_YOLO_RATE:-10}" \
   PHYSICAL_NAV_WATCHDOG_STARTUP_GRACE_S="${PHYSICAL_NAV_WATCHDOG_STARTUP_GRACE_S:-180}" \
     bash "${SERVICE}" start
-  wait_local_port "${PHYSICAL_NAV_WS_PORT:-12334}" 100
+  wait_local_port "${SENSOR_WS_PORT}" 200
+  if [[ "${PHYSICAL_NAV_START_WEB:-1}" == "1" ]]; then
+    wait_local_port "${PHYSICAL_NAV_WS_PORT:-12334}" 100
+  fi
   wait_ros_command_subscriber
   start_go2_components
   publish_object_goal

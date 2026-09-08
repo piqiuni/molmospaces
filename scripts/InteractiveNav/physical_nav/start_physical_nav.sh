@@ -36,6 +36,7 @@ RECORD_DIR="${PHYSICAL_NAV_RECORD_DIR:-/home/user/ldl/recordings/go2_physical}"
 RECORD_MODE="${PHYSICAL_NAV_RECORD_MODE:-raw_plus_panels}"
 RECORD_QUEUE_SIZE="${PHYSICAL_NAV_RECORD_QUEUE_SIZE:-4096}"
 RECORD_ON_START="${PHYSICAL_NAV_RECORD_ON_START:-0}"
+START_WEB="${PHYSICAL_NAV_START_WEB:-1}"
 INTERACTION_PROFILE="${PHYSICAL_NAV_INTERACTION_PROFILE:-physical_human}"
 ENABLE_M1="${PHYSICAL_NAV_ENABLE_M1:-true}"
 ENABLE_INTERACTION_POLICY="${PHYSICAL_NAV_ENABLE_INTERACTION_POLICY:-true}"
@@ -189,9 +190,16 @@ start_or_reuse_gateway() {
 
 # Start/reuse the gateway first so downstream workers never enter a long retry
 # loop before their only input endpoint exists. It is intentionally persistent.
-start_or_reuse_gateway
+if [[ "${START_WEB}" == "1" ]]; then
+  start_or_reuse_gateway
+else
+  log_supervisor "web dashboard disabled; ROS sensor path remains active"
+  GATEWAY_PID=""
+fi
 
 GATEWAY_READY=0
+if [[ "${START_WEB}" != "1" ]]; then GATEWAY_READY=1; fi
+if [[ "${START_WEB}" == "1" ]]; then
 for _ in {1..100}; do
   if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then break; fi
   if (exec 3<>/dev/tcp/127.0.0.1/"${WEB_PORT}") 2>/dev/null; then
@@ -201,6 +209,7 @@ for _ in {1..100}; do
   fi
   sleep .1
 done
+fi
 if (( GATEWAY_READY == 0 )); then
   EXIT_REASON="gateway failed to become ready; see ${LOG_DIR}/gateway.log"
   exit 1
@@ -218,11 +227,9 @@ if [[ "${START_YOLO}" == "1" ]]; then
       ALGORITHM_PYTHON=python3
     fi
   fi
-  # The gateway is intentionally persistent across ROS restarts.  Reusing a
-  # detector already attached to this endpoint is equally important: two
-  # YOLO workers both poll /api/raw-frame and publish competing detections,
-  # saturating CPU and making the dashboard appear frozen.
-  EXISTING_YOLO="$(pgrep -f "[p]hysical_yoloe_bridge.py --web-url http://127.0.0.1:${WEB_PORT}" | head -n1 || true)"
+  # Reusing one detector is important: two workers would consume the same
+  # latest-only ROS image stream and publish competing detections.
+  EXISTING_YOLO="$(pgrep -f '[p]hysical_yoloe_bridge.py' | head -n1 || true)"
   if [[ "${EXISTING_YOLO}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${EXISTING_YOLO}" 2>/dev/null; then
     log_supervisor "reusing persistent yoloe pid=${EXISTING_YOLO}"
   else
@@ -232,7 +239,7 @@ if [[ "${START_YOLO}" == "1" ]]; then
     MKL_NUM_THREADS="${PHYSICAL_NAV_YOLO_MKL_NUM_THREADS:-1}" \
     NUMEXPR_NUM_THREADS="${PHYSICAL_NAV_YOLO_NUMEXPR_NUM_THREADS:-1}" \
     "${ALGORITHM_PYTHON}" "${ROOT_DIR}/physical_yoloe_bridge.py" \
-    --web-url "http://127.0.0.1:${WEB_PORT}" \
+    --web-url "$([[ "${START_WEB}" == "1" ]] && echo "http://127.0.0.1:${WEB_PORT}" || echo "")" \
     --model-path "${PHYSICAL_NAV_MODEL_PATH:-/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt}" \
     --detector-config "${PHYSICAL_NAV_DETECTOR_CONFIG:-${ROOT_DIR}/config/physical_nav.yaml}" \
     --device "${PHYSICAL_NAV_YOLO_DEVICE:-cuda:0}" --rate "${PHYSICAL_NAV_YOLO_RATE:-10}" \
@@ -253,6 +260,8 @@ elif command -v roscore >/dev/null 2>&1 && command -v roslaunch >/dev/null 2>&1;
     model_path:="${PHYSICAL_NAV_MODEL_PATH:-/home/user/ldl/molmospaces/detection_models/yoloe/weights/yoloe-26l-seg-pf.pt}" \
     camera_x:="${CAMERA_X}" camera_y:="${CAMERA_Y}" camera_z:="${CAMERA_Z}" \
     camera_roll:="${CAMERA_ROLL}" camera_pitch:="${CAMERA_PITCH}" camera_yaw:="${CAMERA_YAW}" \
+    sensor_ws_url:="ws://127.0.0.1:${PHYSICAL_NAV_SENSOR_WS_PORT:-12335}" \
+    web_url:="http://127.0.0.1:${WEB_PORT}" web_state_enabled:="${START_WEB}" \
     interaction_profile:="${INTERACTION_PROFILE}" enable_m1:="${ENABLE_M1}" \
     enable_interaction_policy:="${ENABLE_INTERACTION_POLICY}" \
     ros_python:="${PHYSICAL_NAV_ROS_PYTHON:-/home/user/miniconda3/envs/mlspaces/bin/python3}" \
@@ -263,7 +272,7 @@ else
   log_supervisor "ROS1 tools not found; running gateway and detector only"
 fi
 
-if [[ "${PHYSICAL_NAV_WATCHDOG_ENABLED:-1}" == "1" ]]; then
+if [[ "${PHYSICAL_NAV_WATCHDOG_ENABLED:-1}" == "1" && "${START_WEB}" == "1" ]]; then
   WATCHDOG_ARGS=(
     --url "http://127.0.0.1:${WEB_PORT}/api/health"
     --interval-s "${PHYSICAL_NAV_WATCHDOG_INTERVAL_S:-2}"
@@ -278,9 +287,13 @@ if [[ "${PHYSICAL_NAV_WATCHDOG_ENABLED:-1}" == "1" ]]; then
   python3 "${ROOT_DIR}/physical_nav_watchdog.py" "${WATCHDOG_ARGS[@]}" \
     >>"${LOG_DIR}/watchdog.log" 2>&1 &
   register_process watchdog "$!"
+elif [[ "${PHYSICAL_NAV_WATCHDOG_ENABLED:-1}" == "1" ]]; then
+  log_supervisor "web health watchdog disabled in headless mode"
 fi
 
-log_supervisor "Physical gateway: http://$(hostname -I | awk '{print $1}'):${WEB_PORT}/"
+if [[ "${START_WEB}" == "1" ]]; then
+  log_supervisor "Physical gateway: http://$(hostname -I | awk '{print $1}'):${WEB_PORT}/"
+fi
 log_supervisor "component logs: ${LOG_DIR}"
 
 # Any critical child exit is an all-stack failure.  This prevents ROS from

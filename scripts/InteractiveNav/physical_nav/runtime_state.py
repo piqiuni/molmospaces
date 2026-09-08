@@ -128,6 +128,18 @@ class RuntimeState:
             self.link["last_packet_at"] = time.time()
             self.link["last_packet_type"] = str(packet_type)
 
+    def sensor_link_active(self) -> None:
+        """A received RGB-D frame proves the sensor link is alive.
+
+        The direct 12335/mirror transport carries sensor data independently of
+        the legacy 12334 WebSocket, so a fresh frame stream is the authoritative
+        "connected" signal for the watchdog and the dashboard.
+        """
+        with self._lock:
+            self.link["connected"] = True
+            self.link["last_packet_at"] = time.time()
+            self.link["last_packet_type"] = "sensor_frame"
+
     def link_disconnected(self) -> None:
         with self._lock:
             self.link["connections"] = max(0, int(self.link.get("connections", 1)) - 1)

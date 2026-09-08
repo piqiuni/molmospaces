@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 import rospy
 from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import String
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -577,6 +578,7 @@ class YoloeWorker:
             str(label).strip().casefold().replace(" ", "_"): max(0.001, min(1.0, float(value)))
             for label, value in class_thresholds.items()
         }
+        self.report_pub = rospy.Publisher("/physical_nav/yolo_report", String, queue_size=1)
         self._rgb = None
         self._depth = None
         self._rgb_stamp = 0.0
@@ -902,7 +904,15 @@ class YoloeWorker:
                 report = self.infer(raw)
                 cycle_ms = (time.monotonic() - cycle_started) * 1000.0
                 report["cycle_ms"] = cycle_ms
-                _post(self.args.web_url, report)
+                # ROS is the authoritative detector output.  The HTTP post is
+                # retained only as an optional dashboard mirror for backwards
+                # compatibility; a missing web server must never stop YOLO.
+                self.report_pub.publish(String(data=json.dumps(report, ensure_ascii=False, separators=(",", ":"))))
+                if self.args.web_url:
+                    try:
+                        _post(self.args.web_url, report)
+                    except Exception:
+                        pass
                 profile_count += 1
                 for name, value in (report.get("timings_ms") or {}).items():
                     if isinstance(value, (int, float)):

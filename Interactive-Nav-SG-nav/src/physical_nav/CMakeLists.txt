@@ -5,6 +5,7 @@ catkin_package(CATKIN_DEPENDS rospy std_msgs sensor_msgs nav_msgs geometry_msgs 
 catkin_install_python(PROGRAMS
   scripts/physical_consistency_node.py
   scripts/physical_ros_gateway.py
+  scripts/physical_sensor_ros_bridge.py
   scripts/physical_velocity_safety.py
   scripts/velocity_command_mux.py
   scripts/physical_interaction_policy_node.py

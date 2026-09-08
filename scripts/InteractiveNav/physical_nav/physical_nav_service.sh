@@ -53,10 +53,12 @@ is_pipeline_residual() {
     *"${ROOT_DIR}/physical_yoloe_bridge.py"*|\
     *"${ROOT_DIR}/physical_nav_watchdog.py"*|\
     *"physical_nav_readonly.launch"*|\
+    *"physical_sensor_ros_bridge.py"*|\
     *"__name:=semantic_mapping_py"*|\
     *"__name:=interaction_attribute_inference"*|\
     *"__name:=slam_gmapping"*|\
     *"__name:=voronoi_mapping"*|\
+    *"__name:=physical_sensor_ros_bridge"*|\
     *"__name:=physical_ros_gateway"*|\
     *"__name:=physical_nav_consistency"*|\
     *"__name:=physical_velocity_safety"*|\

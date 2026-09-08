@@ -1611,6 +1611,39 @@ class _WebHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         recorder = getattr(self, "recorder", None)
+        if path == "/api/raw-frame":
+            gateway = getattr(self, "gateway", None)
+            if gateway is None:
+                self._json({"accepted": False, "error": "sensor mirror unavailable"}, 503)
+                return
+            try:
+                packet = self._read_json_payload()
+                if packet.get("type") != "sensor_frame":
+                    raise ValueError("raw-frame payload must be a sensor_frame")
+                gateway.queue_sensor_frame(packet)
+                self._json({"accepted": True, "seq": packet.get("seq", -1)}, 202)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._json({"accepted": False, "error": str(exc)}, 400)
+            return
+        if path == "/api/telemetry":
+            # Latest-only Go2 telemetry mirror from the direct 12335 bridge.
+            # Mirrors the legacy 12334 receive() telemetry handling so the
+            # dashboard robot pose/heading and raw recorder stay live.
+            try:
+                payload = self._read_json_payload()
+                telemetry = payload.get("telemetry") if isinstance(payload, dict) and isinstance(payload.get("telemetry"), dict) else payload
+                if not isinstance(telemetry, dict) or not telemetry:
+                    raise ValueError("telemetry payload must be a non-empty object")
+                self.state.update_topic("telemetry", telemetry)
+                if recorder is not None:
+                    try:
+                        recorder.record_telemetry(telemetry, source="mirror")
+                    except Exception:
+                        pass
+                self._json({"accepted": True}, 202)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._json({"accepted": False, "error": str(exc)}, 400)
+            return
         if path == "/api/recording/start":
             if recorder is None:
                 self._json({"accepted": False, "error": "recorder unavailable"}, 503); return
@@ -2143,7 +2176,7 @@ class PhysicalGateway:
         # replace it under load.  The recorder is asynchronous and is a no-op
         # when no session is active.
         self.recorder.record_sensor_packet(packet)
-        self.state.link_packet("sensor_frame")
+        self.state.sensor_link_active()
         stamp = float(packet.get("stamp", 0.0))
         with self._sensor_lock:
             pending_stamp = (
@@ -2202,9 +2235,9 @@ class PhysicalGateway:
             # a slow YOLO/depth pipeline cannot make the socket retain old
             # frames and report seconds-old perception results.
             self.queue_sensor_frame(packet)
-            # ROS publication is handled by physical_ros_gateway.py using the
-            # /api/raw-frame endpoint. Keeping this process ROS-free avoids a
-            # Python 3.13/ROS Noetic runtime conflict.
+            # The direct physical_sensor_ros_bridge owns ROS publication. This
+            # process only decodes a latest-frame copy for the optional web
+            # panels, keeping the dashboard outside the sensor critical path.
         elif packet["type"] == "telemetry":
             self.recorder.record_telemetry(packet.get("telemetry", {}), packet=packet)
             self.state.update_topic("telemetry", packet.get("telemetry", {}))
@@ -2213,6 +2246,7 @@ class PhysicalGateway:
     def start_http(self) -> None:
         handler = type("PhysicalWebHandler", (_WebHandler,), {})
         handler.state, handler.renderer, handler.gate = self.state, self.renderer, self.gate
+        handler.gateway = self
         # Keep the recorder on the handler class so every HTTP worker (including
         # the phone publisher and recording controls) writes into the same
         # session owned by this gateway.  Omitting this assignment silently

@@ -11,13 +11,17 @@ the local policy machine.
 ```text
 D435i + Unitree state subscribers (Go2)
   -> JSON WebSocket (RGB JPEG, depth PNG16, intrinsics, timestamps, pose)
-  -> physical_six_panel_server.py (WebSocket gateway + LAN web page)
-  -> physical_ros_gateway.py (system-Python ROS bridge via /api/raw-frame)
-  -> physical_yoloe_bridge.py (algorithm Python, no ROS dependency)
+  -> physical_sensor_ros_bridge.py (direct latest-only ROS sensor publisher)
+       -> physical_yoloe_bridge.py (algorithm Python, ROS RGB-D input)
        YOLOE-26l PF Seg -> RGB-D 3-D boxes/pointcloud -> ROS detections
   -> semantic_mapping_py_pkg/semantic_mapping_node.py
        object map/room segmentation/interaction graph
   -> physical_consistency_node.py -> /physical_nav/consistency
+
+Optional observer path (does not carry algorithm input):
+  physical_sensor_ros_bridge.py -> POST /api/raw-frame (latest-only mirror)
+  physical_six_panel_server.py -> LAN dashboard on :8765
+  physical_ros_gateway.py -> ROS state/debug mirror and overlays
 ```
 
 The Go2 client has no motion publisher or control client. Keyboard/web commands
@@ -121,6 +125,16 @@ bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh status
 # stop only processes started by the wrapper
 bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh stop
 ```
+
+To run the full ROS perception, mapping and navigation chain without starting
+the dashboard, use:
+
+```bash
+PHYSICAL_NAV_START_WEB=0 bash scripts/InteractiveNav/physical_nav/physical_nav_all.sh start
+```
+
+In this mode Go2 still sends frames to the direct sensor socket on port
+`12335`; only the optional raw-frame and ROS-state mirrors are disabled.
 
 To start the ROS velocity control path from the same wrapper, pass the
 explicit second argument `enable_motion`:
@@ -302,8 +316,8 @@ not vendored. They must already be provided by the corresponding platform
 environment; YOLOE is loaded only on the policy machine.
 
 The following commands are for component-level debugging. For a complete run,
-prefer `physical_nav_service.sh start` above. Start the WebSocket/web gateway
-before the Go2 client. It binds to all interfaces so a LAN browser can connect:
+prefer `physical_nav_service.sh start` above. The dashboard is an optional
+observer and binds to all interfaces so a LAN browser can connect:
 
 ```bash
 cd /home/user/ldl/molmospaces
@@ -316,14 +330,14 @@ python3 scripts/InteractiveNav/physical_nav/physical_six_panel_server.py \
   --qwen-url http://127.0.0.1:18080/v1
 ```
 
-The ROS bridge (`physical_ros_gateway.py`) is started by
-`physical_nav_readonly.launch`; it uses the system ROS Python and polls the
-gateway's encoded frame endpoint. This process separation is required on ROS
-Noetic hosts whose `rospy` is not compatible with the Python environment used
-by YOLOE. It posts graph, consistency and occupancy snapshots back to
-`/api/ros-state` for the detailed web area. The ROS bridge republishes
-the detector JSON from the web gateway to `/physical_nav/detections`; graph,
-consistency and occupancy messages flow in the opposite direction.
+`physical_sensor_ros_bridge.py` is started by
+`physical_nav_readonly.launch`; it accepts Go2 frames directly on port `12335`
+and publishes RGB, depth, camera info, odometry, TF and the point cloud to ROS.
+YOLO, mapping and navigation therefore continue when the dashboard is stopped
+or never started. `physical_ros_gateway.py` consumes detector output from
+`/physical_nav/yolo_report`, publishes the mapped detections, and only mirrors
+graph, consistency and occupancy snapshots to `/api/ros-state` when the
+dashboard is enabled.
 Before republishing detections, it resolves each RGB-D 3-D center from the
 D435i frame into `tf_frame_map` through the live GMapping TF. If that TF is not
 available during startup, the detector's Unitree-odometry estimate is retained

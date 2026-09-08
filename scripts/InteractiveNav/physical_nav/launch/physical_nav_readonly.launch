@@ -7,6 +7,9 @@
   <arg name="camera_x" default="0.03"/><arg name="camera_y" default="0.0"/><arg name="camera_z" default="0.98"/>
   <!-- Camera points 8 degrees forward/down; RPY values are radians. -->
   <arg name="camera_roll" default="0.0"/><arg name="camera_pitch" default="0.1396263"/><arg name="camera_yaw" default="0.0"/>
+  <arg name="sensor_ws_url" default="ws://127.0.0.1:12335"/>
+  <arg name="web_url" default="http://127.0.0.1:8765"/>
+  <arg name="web_state_enabled" default="true"/>
   <arg name="ros_python" default="/usr/bin/python3"/>
   <arg name="system_ros_python" default="/home/user/ldl/molmospaces/scripts/InteractiveNav/physical_nav/physical_ros_python.sh"/>
   <arg name="start_mapping" default="true"/>
@@ -110,7 +113,10 @@
   </group>
   <node name="physical_ros_gateway" pkg="physical_nav" type="physical_ros_gateway.py" launch-prefix="$(arg ros_python)" output="screen" respawn="false">
     <rosparam file="$(arg config_file)" command="load"/>
-    <param name="web_url" value="http://127.0.0.1:8765"/>
+    <param name="web_url" value="$(arg web_url)"/>
+    <param name="legacy_http_sensor" value="false" type="bool"/>
+    <param name="legacy_http_state" value="false" type="bool"/>
+    <param name="web_state_enabled" value="$(arg web_state_enabled)" type="bool"/>
     <!-- The camera source is 10 Hz. Polling faster only repeats HTTP/JPEG/
          depth work and competes with the dashboard for the same gateway. -->
     <param name="rate" value="10.0"/>
@@ -132,6 +138,19 @@
     <param name="local_costmap_topic" value="/move_base/local_costmap/costmap"/>
     <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
     <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
+  </node>
+
+  <!-- The direct WebSocket bridge needs the websockets package from the
+       algorithm environment. It still uses rospy, like the gateway below;
+       system_ros_python intentionally remains reserved for ROS-only nodes. -->
+  <node name="physical_sensor_ros_bridge" pkg="physical_nav" type="physical_sensor_ros_bridge.py" launch-prefix="$(arg ros_python)" output="screen" respawn="true" respawn_delay="1.0">
+    <param name="url" value="$(arg sensor_ws_url)"/>
+    <param name="web_url" value="$(arg web_url)"/>
+    <param name="web_mirror_enabled" value="$(arg web_state_enabled)" type="bool"/>
+    <param name="camera_frame" value="d435i_color_optical_frame"/><param name="camera_parent" value="tf_frame_base_link"/>
+    <param name="camera_x" value="$(arg camera_x)"/><param name="camera_y" value="$(arg camera_y)"/><param name="camera_z" value="$(arg camera_z)"/>
+    <param name="camera_roll" value="$(arg camera_roll)"/><param name="camera_pitch" value="$(arg camera_pitch)"/><param name="camera_yaw" value="$(arg camera_yaw)"/>
+    <param name="point_stride" value="6"/><param name="max_depth_m" value="8.0"/><param name="no_return_depth_m" value="8.05"/>
   </node>
 
   <!-- This adapter only needs rospy/tf2 and must use ROS Noetic's system
