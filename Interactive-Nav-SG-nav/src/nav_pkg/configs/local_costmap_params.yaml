@@ -34,13 +34,17 @@ local_costmap:
        # cycles between sensor frames.  Door-specific clearing must not shorten
        # this below the actual point-cloud interval, otherwise the obstacle
        # layer repeatedly runs without an observation.
-       observation_persistence: 0.5
+       # The organized-depth stream can be ~1.1--1.5 s apart under six-way
+       # simulation load. Keep the last cloud long enough to bridge that gap,
+       # while the semantic door overlay remains responsible for explicit
+       # post-open clearing.
+       observation_persistence: 1.0
        max_obstacle_height: 1.85
        min_obstacle_height: 0.05
 
    inflation_layer:
-     # Keep a modest safety margin over the 0.40 m global layer without
-     # rejecting corridors that the global planner can actually traverse.
-     inflation_radius: 0.45
+     # Keep the stable local-planner clearance while the global layer carries
+     # the separately requested 0.45 m inflation experiment.
+     inflation_radius: 0.50
      cost_scaling_factor: 10.0
    

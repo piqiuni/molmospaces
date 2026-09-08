@@ -568,6 +568,15 @@ class SemanticBehaviorExecutor:
         self.interaction_dwa_terminal_yaw_settle_max_task_steps = max(
             1, interaction_terminal_yaw_settle_max_task_steps
         )
+        try:
+            interaction_terminal_yaw_no_progress_task_steps = int(
+                config.get("interaction_dwa_terminal_yaw_no_progress_task_steps", 20)
+            )
+        except (TypeError, ValueError):
+            interaction_terminal_yaw_no_progress_task_steps = 20
+        self.interaction_dwa_terminal_yaw_no_progress_task_steps = max(
+            1, interaction_terminal_yaw_no_progress_task_steps
+        )
         # Optional compatibility budget for a transient M1 flip at one fixed
         # pose.  The current contract disables it: negative evidence must move
         # to a materially different anchor instead of spending another request
@@ -1364,6 +1373,8 @@ class SemanticBehaviorExecutor:
             queue_size=4,
             latch=True,
         )
+        self._interaction_command_sent_at = 0.0
+        self._interaction_command_sent_id = ""
         # ExplorePy and the semantic executor share one display seam.  Publishing
         # every actually dispatched fallback goal keeps the video overlay bound
         # to actionlib state instead of to the higher-level selection cadence.
@@ -2779,6 +2790,8 @@ class SemanticBehaviorExecutor:
         with self.lock:
             if not self._matches_active(payload):
                 return
+            self._interaction_command_sent_at = 0.0
+            self._interaction_command_sent_id = ""
             if str(payload.get("command_id") or "") == str(
                 (getattr(self, "_drawer_scan_execution_wait", {}) or {}).get(
                     "command_id", ""
@@ -3457,13 +3470,13 @@ class SemanticBehaviorExecutor:
             return "interaction_timeout"
         now = time.monotonic() if now is None else float(now)
         started_at = float(context.get("started_at_monotonic_s", now) or now)
-        if now - started_at > self.drawer_scan_execution_wall_cap_s:
-            return "drawer_scan_execution_wall_cap"
         started_step = self._public_step_or_none(context.get("started_step_index"))
         latest_step = self._public_step_or_none(self._latest_step_sync_index)
         if started_step is None or latest_step is None:
             # Do not extend the generic timeout without a public evaluator-step
             # clock.  This preserves a bounded failure for a missing bridge.
+            if now - started_at > self.drawer_scan_execution_wall_cap_s:
+                return "drawer_scan_execution_wall_cap"
             return "interaction_timeout"
         if latest_step <= started_step:
             if now - started_at >= self.drawer_scan_execution_step_sync_stall_timeout_s:
@@ -4359,7 +4372,15 @@ class SemanticBehaviorExecutor:
         reservation_retry = None
         with self.lock:
             reason = self._effective_timeout_reason_locked()
-            if reason in {"navigation_timeout", "interaction_navigation_timeout"}:
+            if (
+                not reason
+                and self.machine.state == STATE_INTERACTING
+                and self._interaction_command_sent_at > 0.0
+                and time.monotonic() - self._interaction_command_sent_at
+                > self.machine.config.interaction_timeout_s
+            ):
+                reason = "interaction_result_timeout"
+            if reason == "navigation_timeout":
                 reason = ""
             cancel_navigation = bool(reason) and self.machine.state in {
                 STATE_NAVIGATING,
@@ -4381,6 +4402,20 @@ class SemanticBehaviorExecutor:
                     self._drawer_scan_wait_records[decision_id] = dict(detail)
                     self._drawer_scan_wait_contexts.pop(decision_id, None)
                 commands = self.machine.on_drawer_scan_wait_failed(detail)
+            elif reason == "interaction_result_timeout":
+                commands = self.machine.on_interaction_result(
+                    False,
+                    detail={
+                        "reason": "interaction_result_timeout",
+                        "failure_reason": "interaction_result_timeout",
+                        "failure_stage": "interaction_execution",
+                        "terminal_candidate_exclusion": True,
+                        "interaction_command_id": self._interaction_command_sent_id,
+                        "timeout_s": self.machine.config.interaction_timeout_s,
+                    },
+                )
+                self._interaction_command_sent_at = 0.0
+                self._interaction_command_sent_id = ""
             else:
                 commands = self.machine.fail_timeout(reason) if reason else []
             if (
@@ -4814,24 +4849,34 @@ class SemanticBehaviorExecutor:
 
     @staticmethod
     def _has_valid_drawer_visual_contract(interaction: dict) -> bool:
+        sequence_type = str(interaction.get("sequence_type") or "").strip().casefold()
         regions = interaction.get("open_regions")
-        if not isinstance(regions, list) or not regions:
+        if not isinstance(regions, list):
             return False
-        valid_region = False
-        for region in regions:
-            if not isinstance(region, dict):
-                continue
-            center = region.get("center")
-            if not isinstance(center, (list, tuple)) or len(center) < 2:
-                continue
-            try:
-                x, y = float(center[0]), float(center[1])
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(x) and math.isfinite(y) and 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
-                valid_region = True
-                break
-        if not valid_region:
+        if regions:
+            valid_region = False
+            for region in regions:
+                if not isinstance(region, dict):
+                    continue
+                center = region.get("center")
+                if not isinstance(center, (list, tuple)) or len(center) < 2:
+                    continue
+                try:
+                    x, y = float(center[0]), float(center[1])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(x) and math.isfinite(y) and 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+                    valid_region = True
+                    break
+            if not valid_region:
+                return False
+        elif sequence_type != "drawer_scan" or not bool(
+            interaction.get("drawer_scan_fallback_to_all", False)
+        ):
+            # ``drawer_open`` and legacy hand-authored commands must remain
+            # grounded to at least one visible action region.  Only the sealed
+            # drawer_scan macro may use the trusted bridge's explicit
+            # all-slide-joints fallback when a low view has no usable region.
             return False
         if SemanticBehaviorExecutor._finite_public_bbox(
             interaction.get("drawer_container_bbox_2d")
@@ -4944,6 +4989,41 @@ class SemanticBehaviorExecutor:
             "interaction_ready_yaw_tolerance_rad": float(
                 interaction.get("interaction_ready_yaw_tolerance_rad", 0.55) or 0.55
             ),
+            # Preserve the explicit per-goal navigation contract through the
+            # ROS JSON bridge.  Without forwarding these two fields the bridge
+            # falls back to its broad legacy ready envelope and can accept a
+            # pose that move_base was never required to converge to.
+            "navigation_goal_position_tolerance_m": float(
+                interaction.get(
+                    "navigation_goal_position_tolerance_m",
+                    interaction.get("interaction_ready_distance_m", 0.45),
+                )
+                or 0.45
+            ),
+            "navigation_goal_yaw_tolerance_rad": float(
+                interaction.get(
+                    "navigation_goal_yaw_tolerance_rad",
+                    interaction.get("interaction_ready_yaw_tolerance_rad", 0.55),
+                )
+                or 0.55
+            ),
+            "navigation_goal_tolerance_contract_explicit": bool(
+                interaction.get("navigation_goal_tolerance_contract_explicit", False)
+            ),
+            "interaction_front_position_tolerance_rad": float(
+                interaction.get(
+                    "interaction_front_position_tolerance_rad",
+                    interaction.get("interaction_ready_yaw_tolerance_rad", 0.55),
+                )
+                or 0.55
+            ),
+            "interaction_front_yaw_tolerance_rad": float(
+                interaction.get(
+                    "interaction_front_yaw_tolerance_rad",
+                    interaction.get("interaction_ready_yaw_tolerance_rad", 0.55),
+                )
+                or 0.55
+            ),
         }
         # The bridge accepts only this compact public geometry contract for a
         # fixed portal.  Do not forward graph internals, source object names,
@@ -4968,6 +5048,8 @@ class SemanticBehaviorExecutor:
             self.pre_interaction_image_sequence = self.latest_image_sequence
             if drawer_sequence_type == "drawer_scan":
                 self._arm_drawer_scan_execution_wait_locked(payload)
+            self._interaction_command_sent_at = time.monotonic()
+            self._interaction_command_sent_id = str(payload.get("command_id") or "")
         self.interaction_command_pub.publish(
             String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         )
@@ -9902,6 +9984,7 @@ class SemanticBehaviorExecutor:
             ),
         )
         interaction_dwa_terminal_yaw_started_step_index: int | None = None
+        interaction_dwa_terminal_yaw_last_progress_step_index: int | None = None
         interaction_dwa_terminal_yaw_best_error_rad: float | None = None
         interaction_dwa_terminal_yaw_settle_max_task_steps = max(
             1,
@@ -9909,7 +9992,17 @@ class SemanticBehaviorExecutor:
                 getattr(
                     self,
                     "interaction_dwa_terminal_yaw_settle_max_task_steps",
-                    75,
+                    100,
+                )
+            ),
+        )
+        interaction_dwa_terminal_yaw_no_progress_task_steps = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "interaction_dwa_terminal_yaw_no_progress_task_steps",
+                    20,
                 )
             ),
         )
@@ -10298,6 +10391,9 @@ class SemanticBehaviorExecutor:
                         interaction_dwa_terminal_yaw_started_step_index = (
                             latest_task_step_index
                         )
+                        interaction_dwa_terminal_yaw_last_progress_step_index = (
+                            latest_task_step_index
+                        )
                         interaction_dwa_terminal_yaw_best_error_rad = (
                             current_yaw_error_rad
                         )
@@ -10308,6 +10404,9 @@ class SemanticBehaviorExecutor:
                     ):
                         interaction_dwa_terminal_yaw_best_error_rad = (
                             current_yaw_error_rad
+                        )
+                        interaction_dwa_terminal_yaw_last_progress_step_index = (
+                            latest_task_step_index
                         )
                     elapsed_task_steps = (
                         0
@@ -10343,6 +10442,37 @@ class SemanticBehaviorExecutor:
                             "settle_max_task_steps": (
                                 interaction_dwa_terminal_yaw_settle_max_task_steps
                             ),
+                        }
+                        self.move_base.cancel_goal()
+                        if self._retry_interaction_approach(
+                            decision_id,
+                            candidate,
+                            selected_goal_option_index,
+                            interaction_approach_attempt_history,
+                            len(goal_options),
+                            terminal_yaw_detail,
+                        ):
+                            return
+                        report_result(False, terminal_yaw_detail)
+                        return
+                    if (
+                        interaction_dwa_terminal_yaw_last_progress_step_index is not None
+                        and latest_task_step_index is not None
+                        and latest_task_step_index
+                        - interaction_dwa_terminal_yaw_last_progress_step_index
+                        >= interaction_dwa_terminal_yaw_no_progress_task_steps
+                    ):
+                        terminal_yaw_detail = {
+                            "reason": "interaction_dwa_terminal_yaw_no_progress",
+                            "failure_reason": "interaction_dwa_terminal_yaw_no_progress",
+                            "goal_distance_m": goal_distance_m,
+                            "interaction_pose_validation": interaction_pose_detail,
+                            "best_yaw_error_rad": interaction_dwa_terminal_yaw_best_error_rad,
+                            "current_yaw_error_rad": current_yaw_error_rad,
+                            "started_step_index": interaction_dwa_terminal_yaw_started_step_index,
+                            "latest_step_index": latest_task_step_index,
+                            "elapsed_task_steps": elapsed_task_steps,
+                            "no_progress_task_steps": interaction_dwa_terminal_yaw_no_progress_task_steps,
                         }
                         self.move_base.cancel_goal()
                         if self._retry_interaction_approach(

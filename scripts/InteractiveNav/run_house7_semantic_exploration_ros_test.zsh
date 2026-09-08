@@ -105,10 +105,6 @@ STEP_READY_WARMUP_SKIP_FRAMES=${STEP_READY_WARMUP_SKIP_FRAMES:-0}
 GT_ROI_X_MIN_RATIO=${GT_ROI_X_MIN_RATIO:-0.10}
 GT_ROI_X_MAX_RATIO=${GT_ROI_X_MAX_RATIO:-0.90}
 GT_MIN_FORWARD_COSINE=${GT_MIN_FORWARD_COSINE:-0.15}
-# Keep the launch-time override consistent with the checked-in global/local
-# costmap configs.  A stale 0.30 default here silently defeated the requested
-# 0.40 m local inflation in every house-run smoke.
-LOCAL_COSTMAP_INFLATION_RADIUS=${LOCAL_COSTMAP_INFLATION_RADIUS:-0.45}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-1200}
 ROUTE_NAV_CONFIG=${ROUTE_NAV_CONFIG:-${SCRIPT_DIR}/configs/semantic_decision/semantic_interaction_nav.yaml}
 EXPLORE_PY_CONFIG_OVERRIDE=${EXPLORE_PY_CONFIG_OVERRIDE:-}
@@ -340,8 +336,8 @@ if [[ -z "${GT_EMIT_INTERACTION_APPROACH_AXIS}" && -n "${SEMANTIC_DECISION_OVERR
   GT_EMIT_INTERACTION_APPROACH_AXIS=$(python -c 'import sys,yaml; data=yaml.safe_load(open(sys.argv[1])) or {}; value=(data.get("runtime") or {}).get("rule_oracle_gt_interaction_axis", False); print("true" if bool(value) else "false")' "${SEMANTIC_DECISION_OVERRIDE}")
 fi
 GT_EMIT_INTERACTION_APPROACH_AXIS=${GT_EMIT_INTERACTION_APPROACH_AXIS:-false}
-if [[ "${GT_EMIT_INTERACTION_APPROACH_AXIS}" == true && "${METHOD}" != interactive_rule ]]; then
-  print -u2 -- "GT_EMIT_INTERACTION_APPROACH_AXIS is restricted to METHOD=interactive_rule"
+if [[ "${GT_EMIT_INTERACTION_APPROACH_AXIS}" == true && "${METHOD}" != interactive_rule && "${METHOD}" != full_mllm_exploration ]]; then
+  print -u2 -- "GT_EMIT_INTERACTION_APPROACH_AXIS is restricted to interactive_rule or full_mllm_exploration"
   exit 2
 fi
 
@@ -584,7 +580,6 @@ roslaunch "${REPO_ROOT}/Interactive-Nav-SG-nav/src/nav_pkg/launch/molmospaces_na
   semantic_decision_config_override_file:="${SEMANTIC_DECISION_OVERRIDE}" \
   semantic_config_override_file:="${SEMANTIC_MAPPING_OVERRIDE}" \
   nav_config_override_file:="${ROUTE_NAV_CONFIG}" \
-  local_costmap_inflation_radius:="${LOCAL_COSTMAP_INFLATION_RADIUS}" \
   exploration_only:=true \
   randomize_camera:=false \
   publish_debug_front_camera:="${PUBLISH_DEBUG_FRONT_CAMERA}" \

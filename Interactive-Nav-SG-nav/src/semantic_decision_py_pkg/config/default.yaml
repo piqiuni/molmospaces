@@ -60,6 +60,8 @@ candidate:
   # (wait for visual MLLM evidence).  An ablation may override explicitly.
   # portal_unknown_default_interact: true
   portal_standoff_m: 0.85
+  portal_allow_opposite_side_interaction: false
+  portal_interaction_front_angle_tolerance_rad: 0.15
   container_standoff_m: 0.5
   # Drawer containers use the same nominal approach distance as other
   # containers.  Keep this explicit so a future task can tune drawers without
@@ -73,6 +75,9 @@ candidate:
   # container planning candidates.  Successful open state remains in the graph;
   # this gate applies only while generating a new portal INTERACT candidate.
   portal_require_current_visibility: false
+  # Keep unresolved, currently invisible portals represented as re-observation
+  # candidates instead of dropping them when another candidate is present.
+  remembered_portal_reobservation_enabled: true
   portal_min_visible_pixels: 128
   portal_min_visible_fraction: 0.2
   target_standoff_m: 1.0
@@ -198,6 +203,13 @@ completion:
   # Three terminal move-base approach failures make one concrete interaction
   # subgoal planner-unreachable for the rest of this episode.
   interaction_approach_failure_limit: 3
+  # Unlike the executor-local watchdog, this clock includes IDLE gaps and
+  # short failed EXPLORE/NAVIGATE decisions.  Stationary physical interaction
+  # macros are paused under their own evaluator-step budget.
+  global_subgoal_no_progress_task_steps: 60
+  global_mission_no_progress_task_steps: 180
+  global_no_progress_min_displacement_m: 0.10
+  active_frontier_missing_confirmations: 2
   # Once a concrete INTERACT candidate reaches the failure limit above, if no
   # executable replacement appears for this many simulator observations, end
   # the exploration attempt rather than advancing silent timeout/noop steps to
@@ -337,7 +349,8 @@ executor:
   # If move_base is still ACTIVE after entering the interaction XY envelope,
   # keep DWA as the single terminal-yaw controller for this many evaluator
   # steps (75 steps = 15 simulated seconds at the default dt=.2).
-  interaction_dwa_terminal_yaw_settle_max_task_steps: 75
+  interaction_dwa_terminal_yaw_settle_max_task_steps: 100
+  interaction_dwa_terminal_yaw_no_progress_task_steps: 20
   # When interaction final-align is enabled by a task override, emit each
   # rotation only inside a same-step RGB/fresh-command window.
   interaction_final_align_step_sync_enabled: true
