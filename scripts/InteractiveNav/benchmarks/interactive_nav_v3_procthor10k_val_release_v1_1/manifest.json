@@ -1,0 +1,43 @@
+{
+  "schema_version": "interactive_nav_v3_repository_bundle_v1",
+  "release_id": "interactive-nav-v3-procthor10k-val-release-v1.1",
+  "scene_dataset": "procthor-10k",
+  "data_split": "val",
+  "encoding": "deterministic-gzip-json",
+  "formal_episode_count": 2968,
+  "pinned_assets_file": "pinned_assets.json",
+  "pinned_assets": {
+    "robots": {"rby1": "20251224"},
+    "scenes": {"procthor-10k-val": "20251217"},
+    "objects": {"thor": "20251117"}
+  },
+  "domains": {
+    "channel": {
+      "file": "channel.json.gz",
+      "episode_count": 1000,
+      "archive_size_bytes": 7292534,
+      "archive_sha256": "044b8e89bd0b4a9eb08f1ed20b0196a797349bb32919105659602ae517da1645",
+      "uncompressed_sha256": "9459cd54056ac238d30331c3ae80e1a724d5d7722a1fd50afa7710cc2363c046"
+    },
+    "container": {
+      "file": "container.json.gz",
+      "episode_count": 976,
+      "archive_size_bytes": 9293457,
+      "archive_sha256": "443708068e8226468eb3c54752c6a9d42c0ea237129da90754ccbc131ab0df96",
+      "uncompressed_sha256": "a0e693da497d7eb5073c7f751f96d26dbaf869f783dd65667e476d1f87a47ab4"
+    },
+    "mixed": {
+      "file": "mixed.json.gz",
+      "episode_count": 992,
+      "archive_size_bytes": 10700735,
+      "archive_sha256": "0134980d2c4d2030bc99668af69bf4b48f15ca432289d0b5ae72e3dc4f223ad3",
+      "uncompressed_sha256": "349f2a04b53e3af97bb014215c084e7b3684d9fa222a3ae0c877be86312fff7c"
+    }
+  },
+  "aggregate": {
+    "included": false,
+    "episode_count": 2968,
+    "uncompressed_sha256": "91106ca03a73665b1344251cdc276cfdc931bc7066a877c938a4ca1e370efc9e",
+    "reason": "The aggregate is exactly the three domain lists concatenated and would duplicate repository data."
+  }
+}
