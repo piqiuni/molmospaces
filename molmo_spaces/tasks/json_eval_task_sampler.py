@@ -582,6 +582,7 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
         the exact configuration from the episode spec:
         - Robot joint positions from robot.init_qpos
         - Object poses from scene_modifications.object_poses
+        - Articulated joint positions from scene_modifications.articulation_states
         """
         # Log episode spec details for debugging
         log.info(
@@ -633,6 +634,7 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
 
         mujoco.mj_forward(model, data)
         self.set_joint_values(env)
+        self.apply_articulation_states(env)
 
         # Set robot joint positions from episode spec
         for group_name, qpos in self.episode_spec.robot.init_qpos.items():
@@ -648,7 +650,108 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
             # recompute control
             robot.set_stationary()
             robot.compute_control()
+
+        # Scene state is changed outside ``env.step``.  Cached AABBs and other
+        # data-dependent queries must not survive into the first observation.
+        for object_manager in env.object_managers:
+            object_manager.invalidate_data_cache()
         log.info("Scene setup from episode spec completed.")
+
+    def apply_articulation_states(self, env: CPUMujocoEnv) -> None:
+        """Restore the exact hinge/slide state recorded in an episode."""
+
+        states = self.episode_spec.scene_modifications.articulation_states
+        if not states:
+            return
+
+        model = env.current_model
+        data = env.current_data
+
+        def is_descendant(body_id: int, ancestor_id: int) -> bool:
+            current = body_id
+            while current >= 0:
+                if current == ancestor_id:
+                    return True
+                parent = int(model.body_parentid[current])
+                if parent == current:
+                    break
+                current = parent
+            return False
+
+        for state in states:
+            object_body_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, state.object_name
+            )
+            if object_body_id < 0:
+                raise ValueError(
+                    f"Articulation object '{state.object_name}' was not found in "
+                    f"house {self.episode_spec.house_index}"
+                )
+            joint_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, state.joint_name
+            )
+            if joint_id < 0:
+                raise ValueError(
+                    f"Articulation joint '{state.joint_name}' for '{state.object_name}' "
+                    f"was not found in house {self.episode_spec.house_index}"
+                )
+            joint_body_id = int(model.jnt_bodyid[joint_id])
+            if not is_descendant(joint_body_id, object_body_id):
+                joint_body_name = mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_BODY, joint_body_id
+                )
+                raise ValueError(
+                    f"Articulation joint '{state.joint_name}' belongs to "
+                    f"'{joint_body_name}', not '{state.object_name}'"
+                )
+
+            joint_type = int(model.jnt_type[joint_id])
+            if joint_type not in (
+                int(mujoco.mjtJoint.mjJNT_HINGE),
+                int(mujoco.mjtJoint.mjJNT_SLIDE),
+            ):
+                raise ValueError(
+                    "Articulation state only supports hinge/slide joints, "
+                    f"got type={joint_type} for '{state.joint_name}'"
+                )
+
+            # ``joint_index`` is the index in MlSpacesArticulationObject's full
+            # joint list.  Movable assets commonly have a root free joint before
+            # their drawer/door hinge, so preserve every joint type here.  The
+            # selected recorded joint itself is still restricted to hinge/slide.
+            object_joint_ids = [
+                candidate_id
+                for candidate_id in range(model.njnt)
+                if is_descendant(int(model.jnt_bodyid[candidate_id]), object_body_id)
+            ]
+            if state.joint_index is not None:
+                joint_index = int(state.joint_index)
+                if not 0 <= joint_index < len(object_joint_ids):
+                    raise ValueError(
+                        f"joint_index={joint_index} is invalid for '{state.object_name}' "
+                        f"with {len(object_joint_ids)} joints"
+                    )
+                expected_joint_id = object_joint_ids[joint_index]
+                if expected_joint_id != joint_id:
+                    expected_name = mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_JOINT, expected_joint_id
+                    )
+                    raise ValueError(
+                        f"joint_index={joint_index} for '{state.object_name}' maps to "
+                        f"'{expected_name}', not '{state.joint_name}'"
+                    )
+
+            if bool(model.jnt_limited[joint_id]):
+                lower, upper = (float(value) for value in model.jnt_range[joint_id])
+                if not lower - 1e-6 <= float(state.position) <= upper + 1e-6:
+                    raise ValueError(
+                        f"Joint position {state.position} is outside [{lower}, {upper}] "
+                        f"for '{state.joint_name}'"
+                    )
+            qpos_address = int(model.jnt_qposadr[joint_id])
+            data.qpos[qpos_address] = float(state.position)
+
+        mujoco.mj_forward(model, data)
 
     def _randomize_colors(self, env: CPUMujocoEnv) -> None:
         # TODO(wilbert): we're testing this on beaker rn to figure out how to make it work

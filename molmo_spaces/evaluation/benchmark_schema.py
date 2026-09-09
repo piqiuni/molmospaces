@@ -82,6 +82,16 @@ class ExocentricCameraSpec(BaseModel):
 CameraSpec = RobotMountedCameraSpec | ExocentricCameraSpec
 
 
+class ArticulationStateSpec(BaseModel):
+    """Initial state of one articulated object joint."""
+
+    object_name: str
+    joint_name: str
+    joint_index: int | None = None
+    position: float
+    open_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 class SceneModificationsSpec(BaseModel):
     """Scene modifications required for this episode.
 
@@ -100,6 +110,9 @@ class SceneModificationsSpec(BaseModel):
     # Objects to remove from the base scene: list of object names
     # These objects will be removed from the scene spec before adding auxiliary objects
     removed_objects: list[str] = Field(default_factory=list)
+
+    # Initial positions for articulated joints (doors, drawers, containers, ...)
+    articulation_states: list[ArticulationStateSpec] = Field(default_factory=list)
 
 
 class BaseTaskSpec(BaseModel):
@@ -244,6 +257,18 @@ class LanguageSpec(BaseModel):
     """Natural language task specification."""
 
     task_description: str
+
+    # These fields were introduced after the first frozen V3 release. Keep
+    # legacy benchmark records loadable with conservative object-goal defaults.
+    instruction_type: Literal[
+        "object_goal",
+        "point_goal",
+        "route_instruction",
+        "interaction_instruction",
+        "route_interaction_instruction",
+    ] = "object_goal"
+    locale: str = "en-US"
+    interaction_disclosure: Literal["hidden", "partial", "explicit"] = "hidden"
 
     # Semantic referral expressions for objects
     # e.g. {"pickup_name": "red mug", "place_name": "white bowl"}

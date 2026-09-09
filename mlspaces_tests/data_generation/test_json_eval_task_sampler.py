@@ -12,8 +12,10 @@ USAGE:
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import mujoco
 import pytest
 
 from molmo_spaces.configs.camera_configs import (
@@ -21,6 +23,7 @@ from molmo_spaces.configs.camera_configs import (
     RobotMountedCameraConfig,
 )
 from molmo_spaces.evaluation.benchmark_schema import (
+    ArticulationStateSpec,
     EpisodeSpec,
     ExocentricCameraSpec,
     RobotMountedCameraSpec,
@@ -258,6 +261,110 @@ class TestJsonEvalTaskSamplerConfiguration:
             task_cls = sampler._get_task_class()
             assert task_cls is not None
             print(f"Loaded task class: {task_cls.__name__}")
+
+    def test_apply_articulation_states_validates_and_restores_joint(self, first_episode):
+        model = mujoco.MjModel.from_xml_string(
+            """
+            <mujoco>
+              <worldbody>
+                <body name="test_container">
+                  <joint name="drawer_joint" type="slide" axis="1 0 0" range="0 1"/>
+                  <geom type="box" size="0.1 0.1 0.1"/>
+                </body>
+              </worldbody>
+            </mujoco>
+            """
+        )
+        data = mujoco.MjData(model)
+        scene_modifications = first_episode.scene_modifications.model_copy(
+            update={
+                "articulation_states": [
+                    ArticulationStateSpec(
+                        object_name="test_container",
+                        joint_name="drawer_joint",
+                        joint_index=0,
+                        position=0.6,
+                        open_fraction=0.6,
+                    )
+                ]
+            }
+        )
+        sampler = JsonEvalTaskSampler.__new__(JsonEvalTaskSampler)
+        sampler.episode_spec = first_episode.model_copy(
+            update={"scene_modifications": scene_modifications}
+        )
+
+        sampler.apply_articulation_states(
+            SimpleNamespace(current_model=model, current_data=data)
+        )
+
+        joint_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, "drawer_joint"
+        )
+        qpos_address = int(model.jnt_qposadr[joint_id])
+        assert data.qpos[qpos_address] == pytest.approx(0.6)
+
+        movable_model = mujoco.MjModel.from_xml_string(
+            """
+            <mujoco>
+              <worldbody>
+                <body name="movable_container">
+                  <freejoint name="container_free"/>
+                  <geom type="box" size="0.1 0.1 0.1"/>
+                  <body name="drawer_body">
+                    <joint name="movable_drawer_joint" type="slide" axis="1 0 0" range="0 1"/>
+                    <geom type="box" size="0.05 0.05 0.05"/>
+                  </body>
+                </body>
+              </worldbody>
+            </mujoco>
+            """
+        )
+        movable_data = mujoco.MjData(movable_model)
+        movable_modifications = scene_modifications.model_copy(
+            update={
+                "articulation_states": [
+                    ArticulationStateSpec(
+                        object_name="movable_container",
+                        joint_name="movable_drawer_joint",
+                        joint_index=1,
+                        position=0.4,
+                    )
+                ]
+            }
+        )
+        sampler.episode_spec = first_episode.model_copy(
+            update={"scene_modifications": movable_modifications}
+        )
+        sampler.apply_articulation_states(
+            SimpleNamespace(current_model=movable_model, current_data=movable_data)
+        )
+        movable_joint_id = mujoco.mj_name2id(
+            movable_model, mujoco.mjtObj.mjOBJ_JOINT, "movable_drawer_joint"
+        )
+        assert movable_data.qpos[int(movable_model.jnt_qposadr[movable_joint_id])] == pytest.approx(
+            0.4
+        )
+
+        invalid_modifications = scene_modifications.model_copy(
+            update={
+                "articulation_states": [
+                    ArticulationStateSpec(
+                        object_name="test_container",
+                        joint_name="drawer_joint",
+                        joint_index=1,
+                        position=0.6,
+                    )
+                ]
+            }
+        )
+        sampler.episode_spec = first_episode.model_copy(
+            update={"scene_modifications": invalid_modifications}
+        )
+        with pytest.raises(ValueError, match="joint_index=1"):
+            sampler.apply_articulation_states(
+                SimpleNamespace(current_model=model, current_data=data)
+            )
 
 
 class TestPrintEpisodeDetails:
