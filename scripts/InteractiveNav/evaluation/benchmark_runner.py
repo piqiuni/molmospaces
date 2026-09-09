@@ -64,6 +64,7 @@ from .benchmark_interaction_adapter import (
     validate_public_interaction_observation,
     validate_public_interaction_pose,
 )
+from .benchmark_io import load_benchmark_episodes
 from .benchmark_policies import (
     BenchmarkPolicy,
     NoOpPolicy,
@@ -880,13 +881,7 @@ def _sha256(path: Path) -> str:
 
 
 def _load_episodes(benchmark: Path) -> tuple[Path, list[dict[str, Any]]]:
-    benchmark_file = benchmark / "benchmark.json" if benchmark.is_dir() else benchmark
-    payload = json.loads(benchmark_file.read_text())
-    if isinstance(payload, dict):
-        payload = payload.get("episodes", [])
-    if not isinstance(payload, list):
-        raise ValueError(f"Expected a list of episodes in {benchmark_file}")
-    return benchmark_file, payload
+    return load_benchmark_episodes(benchmark)
 
 
 def _selected_indices(config: BenchmarkEvaluationConfig, episodes: list[dict[str, Any]]) -> list[int]:
@@ -3477,6 +3472,7 @@ def _protocol_implementation_sha256() -> str:
     digest = hashlib.sha256()
     for path in (
         Path(__file__),
+        Path(__file__).with_name("benchmark_io.py"),
         Path(__file__).with_name("benchmark_metrics.py"),
         Path(__file__).with_name("benchmark_policies.py"),
         Path(__file__).with_name("benchmark_interaction_adapter.py"),

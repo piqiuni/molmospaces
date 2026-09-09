@@ -1019,7 +1019,55 @@ scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge.yaml
 scripts/InteractiveNav/configs/semantic_decision/object_goal_fridge_model_mock.yaml
 ```
 
-### 5.3.3 冻结 V3 单 episode 可视化评测
+### 5.3.3 外部 Python policy 三域 benchmark 评测
+
+非 ROS policy 通过 `module.path:factory` 接入统一三域评测。默认 benchmark 是仓库内
+`scripts/InteractiveNav/benchmarks/interactive_nav_v3_procthor10k_val_release_v1_1/`
+的冻结 Channel、Container、Mixed 数据；无需传机器相关的绝对 benchmark 路径。
+
+先进行不启动 MuJoCo 的调度检查：
+
+```bash
+TMPDIR=/home/ldl/tmp/interactive-nav-eval-dry \
+XDG_CACHE_HOME=/home/ldl/.cache/interactive-nav-eval-dry \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/run_interactive_nav_benchmark_eval.py \
+  --output-dir /home/ldl/outputs/interactive-nav/external-policy-dry \
+  --max-episodes 3 --workers 3 \
+  --policy factory \
+  --policy-factory your_package.your_policy:build_policy \
+  --dry-run --no-render-topdown
+```
+
+三域各运行一条真实场景 smoke：
+
+```bash
+TMPDIR=/home/ldl/tmp/interactive-nav-eval-smoke \
+XDG_CACHE_HOME=/home/ldl/.cache/interactive-nav-eval-smoke \
+/home/ldl/conda_envs/mlspaces/bin/python \
+  scripts/InteractiveNav/run_interactive_nav_benchmark_eval.py \
+  --output-dir /home/ldl/outputs/interactive-nav/external-policy-smoke \
+  --episodes-per-domain 1 --workers 3 --max-steps 1 \
+  --policy factory \
+  --policy-factory your_package.your_policy:build_policy \
+  --no-render-topdown
+```
+
+接口自检时可以暂用
+`scripts.InteractiveNav.evaluation.example_external_policy:build_policy`；它只停止任务，
+不能作为性能 baseline。正式接入约定见
+`scripts/InteractiveNav/evaluation/evaluation_protocol.md`。完成后检查
+`summary.json` 中 `completed_episode_count`、`scoring_eligible_episode_count` 与
+`exception_count`，不能只检查进程退出码。
+
+相关离线测试：
+
+```bash
+/home/ldl/conda_envs/mlspaces/bin/python -m pytest -q \
+  mlspaces_tests/data_generation/test_interactive_nav_benchmark_eval_wrapper.py
+```
+
+### 5.3.4 冻结 V3 单 episode 可视化评测
 
 冻结 benchmark 的 ROS object-goal 评测使用专用单 episode 入口。它会自行启动独立 ROS master 和 ROS 算法栈；默认还会启动 recorder，并强制输出六联图视频与俯视结果图。不要把多个 episode 放进同一次调用，以免把不同 episode 的 ROS 轨迹混入同一份 recorder 产物。
 

@@ -20,10 +20,11 @@ results.
 
 ## Fixed input
 
-The formal validation input is the runtime-qualified v1.1 release:
+The formal validation input is the runtime-qualified v1.1 release bundled as
+three losslessly compressed domain shards:
 
 ```text
-scripts/InteractiveNav/output/interactive_nav_v3_procthor10k_val_release_v1_1/benchmark/benchmark.json
+scripts/InteractiveNav/benchmarks/interactive_nav_v3_procthor10k_val_release_v1_1/
 ```
 
 The source candidate contained 3000 episodes.  After the frozen runtime quality
@@ -33,6 +34,11 @@ gate, the formal scoring denominator is 2968: 1000 Channel, 976 Container and
 included in aggregate metrics.  The evaluator must not modify the formal JSON.
 Each episode's `scene_modifications` is the authoritative initial
 object/articulation state.
+
+The evaluator transparently reads `.json` and `.json.gz`. The omitted aggregate
+is exactly `channel + container + mixed` in that order, so the three shards retain
+all 2,968 formal episodes without duplicating 135 MB in Git. `manifest.json`
+records both archive and uncompressed hashes.
 
 ### Runtime compatibility gate
 
@@ -113,6 +119,38 @@ For backward compatibility, result field `success` is the same as
 `interaction_conditioned_success`.  Reports also expose both rates explicitly,
 along with navigation success, required interaction success, sequence success,
 wrong interaction count, path length, and terminal reason.
+
+## External policy factory
+
+Use the mixed-domain wrapper to evaluate an ordinary Python policy across all
+three domains without starting ROS:
+
+```bash
+python scripts/InteractiveNav/run_interactive_nav_benchmark_eval.py \
+  --output-dir /home/ldl/outputs/interactive-nav/my_policy \
+  --policy factory \
+  --policy-factory my_package.my_policy:build_policy \
+  --policy-kwargs-json '{"checkpoint":"/home/ldl/checkpoints/model.pt"}' \
+  --workers 3
+```
+
+The factory is constructed once per episode and may accept `public_episode`,
+`episode`, `kwargs`, named policy options, or `**kwargs`. Its returned object may
+provide `reset(episode_dict)` (or `reset()`), `act(PolicyObservation)` (or
+`get_action(raw_observation)`), and optional `close()`.
+
+The generic factory receives only `PublicEpisode` fields and public sensor
+observations; it never receives the live task, `interactive_nav`, oracle plans,
+object names, or joint names. It may return `PolicyAction`, an action dictionary,
+or `{ "action": ... }`. Supported kinds are `base`, `interact`, `view`, `observe`,
+and `stop`. Generic interaction actions must select a visible target using
+`pixel_xy` or `normalized_pixel_xy`; opaque `instance_id` belongs to the separate
+restricted-GT ROS interface, and simulator `object_name` is debug/oracle-only.
+
+`scripts.InteractiveNav.evaluation.example_external_policy:build_policy` is a
+zero-performance stop policy intended only to verify environment, policy, and
+result wiring. Use `--episodes-per-domain 1 --max-steps 1 --no-render-topdown`
+for the smallest real-scene integration run.
 
 ### ROS step accounting and command liveness
 

@@ -22,6 +22,11 @@ import cv2
 import numpy as np
 import yaml
 
+try:
+    from .benchmark_io import load_benchmark_episodes
+except ImportError:  # Support direct execution of this file.
+    from benchmark_io import load_benchmark_episodes
+
 
 TOPDOWN_SCHEMA_VERSION = "interactive_nav_v3_episode_topdown_v2"
 _UNKNOWN_MIN = 50
@@ -65,13 +70,7 @@ def _load_result_document(path: Path) -> tuple[dict[str, Any], list[dict[str, An
 
 
 def _load_benchmark_episode(path: Path, *, episode_index: int, case_id: str | None) -> dict[str, Any]:
-    benchmark_path = path / "benchmark.json" if path.is_dir() else path
-    payload = _load_json(benchmark_path)
-    episodes = payload.get("episodes", payload) if isinstance(payload, dict) else payload
-    if isinstance(episodes, dict):
-        episodes = list(episodes.values())
-    if not isinstance(episodes, list):
-        raise ValueError(f"Benchmark does not contain an episode list: {benchmark_path}")
+    benchmark_path, episodes = load_benchmark_episodes(path)
     if 0 <= episode_index < len(episodes) and isinstance(episodes[episode_index], dict):
         candidate = episodes[episode_index]
         candidate_case_id = candidate.get("interactive_nav", {}).get("case_id")

@@ -50,12 +50,11 @@ class PolicyObservation:
 class PolicyAction:
     """Normalized action accepted by the standalone evaluator.
 
-    Non-oracle interaction requests may use ``pixel_xy`` (or
-    ``normalized_pixel_xy``), or an opaque ``instance_id`` previously supplied
-    by the restricted-GT perception protocol.  The evaluator resolves either
-    selector privately.  ``object_name`` remains available only for an
-    explicitly oracle/debug policy because it is a simulator-internal
-    identifier.
+    Generic external policies select an interaction with ``pixel_xy`` (or
+    ``normalized_pixel_xy``). ``instance_id`` is reserved for the restricted-GT
+    ROS protocol, which is the only interface that publishes opaque instance
+    IDs. ``object_name`` remains available only for an explicitly oracle/debug
+    policy because it is a simulator-internal identifier.
     """
 
     kind: ActionKind
